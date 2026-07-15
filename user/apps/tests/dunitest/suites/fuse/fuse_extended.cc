@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <signal.h>
 #include <sched.h>
 #include <setjmp.h>
@@ -212,19 +213,19 @@ static uint64_t p4_mock_cookie(const struct p4_readdir_daemon_args *args, size_t
 
 struct p4_shared_readdir_args {
     int fd;
-    volatile int *ready;
-    volatile int *go;
+    std::atomic<int> *ready;
+    std::atomic<int> *go;
     pthread_mutex_t *lock;
     unsigned int *name_counts;
     const int64_t *expected_cookies;
-    volatile int error;
+    int error;
 };
 
 struct p4_shared_seek_args {
     int fd;
-    volatile int *go;
-    volatile int *stop;
-    volatile int error;
+    std::atomic<int> *go;
+    std::atomic<int> *stop;
+    int error;
 };
 
 static int p4_mock_entry_index(const char *name) {
@@ -238,8 +239,8 @@ static int p4_mock_entry_index(const char *name) {
 
 static void *p4_shared_readdir_thread(void *opaque) {
     struct p4_shared_readdir_args *args = (struct p4_shared_readdir_args *)opaque;
-    __sync_fetch_and_add(args->ready, 1);
-    while (!*args->go) {
+    args->ready->fetch_add(1, std::memory_order_release);
+    while (args->go->load(std::memory_order_acquire) == 0) {
         sched_yield();
     }
     for (;;) {
@@ -273,10 +274,10 @@ static void *p4_shared_readdir_thread(void *opaque) {
 
 static void *p4_shared_seek_thread(void *opaque) {
     struct p4_shared_seek_args *args = (struct p4_shared_seek_args *)opaque;
-    while (!*args->go) {
+    while (args->go->load(std::memory_order_acquire) == 0) {
         sched_yield();
     }
-    while (!*args->stop) {
+    while (args->stop->load(std::memory_order_acquire) == 0) {
         if (lseek(args->fd, 0, SEEK_CUR) < 0) {
             args->error = errno;
             return NULL;
@@ -9764,14 +9765,14 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
     uint32_t lookup_before = 0;
     uint32_t getattr_before = 0;
     uint32_t forget_before = 0;
-    volatile int readers_ready = 0;
-    volatile int start_readers = 0;
+    std::atomic<int> readers_ready{0};
+    std::atomic<int> start_readers{0};
     pthread_mutex_t counts_lock = PTHREAD_MUTEX_INITIALIZER;
     unsigned int concurrent_name_counts[5] = {0};
     struct p4_shared_readdir_args reader_args[2];
     pthread_t reader_threads[2];
     size_t readers_started = 0;
-    volatile int stop_seeker = 0;
+    std::atomic<int> stop_seeker{0};
     struct p4_shared_seek_args seeker_args;
     pthread_t seeker_thread;
     bool seeker_started = false;
@@ -9853,17 +9854,15 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
         }
         readers_started++;
     }
-    while (readers_ready != 2) {
+    while (readers_ready.load(std::memory_order_acquire) != 2) {
         sched_yield();
     }
-    start_readers = 1;
-    __sync_synchronize();
+    start_readers.store(1, std::memory_order_release);
     for (size_t i = 0; i < readers_started; i++) {
         pthread_join(reader_threads[i], NULL);
     }
     readers_started = 0;
-    stop_seeker = 1;
-    __sync_synchronize();
+    stop_seeker.store(1, std::memory_order_release);
     pthread_join(seeker_thread, NULL);
     seeker_started = false;
     for (size_t i = 0; i < 5; i++) {
@@ -10079,13 +10078,11 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
     return 0;
 
 fail:
-    start_readers = 1;
-    __sync_synchronize();
+    start_readers.store(1, std::memory_order_release);
     for (size_t i = 0; i < readers_started; i++) {
         pthread_join(reader_threads[i], NULL);
     }
-    stop_seeker = 1;
-    __sync_synchronize();
+    stop_seeker.store(1, std::memory_order_release);
     if (seeker_started) {
         pthread_join(seeker_thread, NULL);
     }

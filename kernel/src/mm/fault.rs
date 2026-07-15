@@ -337,6 +337,11 @@ impl<'a> PageFaultMessage<'a> {
 /// 缺页中断处理结构体
 pub struct PageFaultHandler;
 
+enum FilemapMkwriteSize {
+    FetchFromInode,
+    Stable(usize),
+}
+
 impl PageFaultHandler {
     #[inline(always)]
     fn account_new_present_mapping(mm: &Arc<AddressSpace>) {
@@ -1185,6 +1190,24 @@ impl PageFaultHandler {
     }
 
     pub unsafe fn filemap_page_mkwrite(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        Self::filemap_page_mkwrite_inner(pfm, FilemapMkwriteSize::FetchFromInode)
+    }
+
+    /// Prepare a shared writable file-backed page using an inode size which
+    /// the filesystem has already stabilized against truncate and dirty-page
+    /// admission.  Filesystems whose metadata operation can enter userspace
+    /// must use this entry point from a fault critical section.
+    pub unsafe fn filemap_page_mkwrite_with_stable_size(
+        pfm: &mut PageFaultMessage,
+        stable_size: usize,
+    ) -> VmFaultReason {
+        Self::filemap_page_mkwrite_inner(pfm, FilemapMkwriteSize::Stable(stable_size))
+    }
+
+    unsafe fn filemap_page_mkwrite_inner(
+        pfm: &mut PageFaultMessage,
+        size_source: FilemapMkwriteSize,
+    ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
@@ -1210,8 +1233,15 @@ impl PageFaultHandler {
             return VmFaultReason::VM_FAULT_RETRY;
         }
 
-        if let Ok(md) = file.inode().metadata() {
-            let size = md.size.max(0) as usize;
+        let size = match size_source {
+            FilemapMkwriteSize::FetchFromInode => file
+                .inode()
+                .metadata()
+                .ok()
+                .map(|metadata| metadata.size.max(0) as usize),
+            FilemapMkwriteSize::Stable(size) => Some(size),
+        };
+        if let Some(size) = size {
             if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
@@ -1219,10 +1249,17 @@ impl PageFaultHandler {
 
         match page_cache.manager().prepare_page_mkwrite(page_index, &page) {
             Ok(()) => {}
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => return VmFaultReason::VM_FAULT_RETRY,
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                if let Some(wait) = page_cache
+                    .manager()
+                    .page_mkwrite_retry_wait(page_index, &page)
+                {
+                    pfm.set_retry_wait(wait);
+                }
+                return VmFaultReason::VM_FAULT_RETRY;
+            }
             Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
         }
-
         VmFaultReason::empty()
     }
 

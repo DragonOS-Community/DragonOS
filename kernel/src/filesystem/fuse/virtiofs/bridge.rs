@@ -30,8 +30,8 @@ use crate::{
 use super::super::{
     conn::{FuseConn, FuseReplyCapacitySource, FuseReplyContract, FuseRequest},
     protocol::{
-        fuse_pack_struct, fuse_read_struct, FuseOutHeader, FUSE_DESTROY, FUSE_FORGET,
-        FUSE_INTERRUPT, FUSE_READ,
+        fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FuseWriteIn, FUSE_DESTROY,
+        FUSE_FORGET, FUSE_INTERRUPT, FUSE_READ, FUSE_WRITE,
     },
     stats, trace,
 };
@@ -906,6 +906,17 @@ impl VirtioFsBridgeContext {
         } else {
             None
         };
+        let write_requested_bytes =
+            if trace_opcode == FUSE_WRITE && stats::write_request_stats_enabled() {
+                pending
+                    .req
+                    .bytes()
+                    .get(core::mem::size_of::<FuseInHeader>()..)
+                    .and_then(|payload| fuse_read_struct::<FuseWriteIn>(payload).ok())
+                    .map(|input| input.size as usize)
+            } else {
+                None
+            };
         let queue_size = match kind {
             QueueKind::Hiprio => self.hiprio_vq.as_ref().ok_or(SystemError::EIO)?.size(),
             QueueKind::Request(slot) => self
@@ -1083,6 +1094,9 @@ impl VirtioFsBridgeContext {
         };
         debug_assert!(replaced.is_none());
         stats::on_virtiofs_submitted(trace_opcode, req_len);
+        if let Some(requested_bytes) = write_requested_bytes {
+            stats::on_virtiofs_write_requested(requested_bytes);
+        }
         if let Some(requested_bytes) = read_requested_bytes {
             stats::on_virtiofs_read_requested(
                 requested_bytes,

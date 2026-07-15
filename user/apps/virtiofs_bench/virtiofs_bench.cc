@@ -539,12 +539,21 @@ struct IoCounters {
     uint64_t eintr = 0;
 };
 
+struct WritePhaseTimings {
+    uint64_t data_loop_us = 0;
+    uint64_t fsync_us = 0;
+    uint64_t close_us = 0;
+    uint64_t end_to_end_us = 0;
+};
+
 void emit_result(const char* workload, const Options& opt, uint64_t elapsed_us, uint64_t bytes,
-                 uint64_t ops, int err, const IoCounters& io = {}, uint64_t checksum = 0) {
+                 uint64_t ops, int err, const IoCounters& io = {}, uint64_t checksum = 0,
+                 const WritePhaseTimings& write_timings = {}) {
     utsname uts = {};
     uname(&uts);
     printf("result workload=%s status=%s errno=%d elapsed_us=%llu bytes=%llu ops=%llu "
            "syscalls=%llu short_io=%llu eintr=%llu checksum=%016llx "
+           "data_loop_us=%llu fsync_us=%llu close_us=%llu end_to_end_us=%llu "
            "mount=%s dataset=%s seed=%llu files=%zu file_size=%zu block_size=%zu "
            "iterations=%zu workers=%zu run_id=%s "
            "cache_mode=%s mount_options=%s expect_dax=%s sysname=%s release=%s\n",
@@ -555,7 +564,11 @@ void emit_result(const char* workload, const Options& opt, uint64_t elapsed_us, 
            static_cast<unsigned long long>(io.syscalls),
            static_cast<unsigned long long>(io.short_io),
            static_cast<unsigned long long>(io.eintr),
-           static_cast<unsigned long long>(checksum), opt.mount.c_str(),
+           static_cast<unsigned long long>(checksum),
+           static_cast<unsigned long long>(write_timings.data_loop_us),
+           static_cast<unsigned long long>(write_timings.fsync_us),
+           static_cast<unsigned long long>(write_timings.close_us),
+           static_cast<unsigned long long>(write_timings.end_to_end_us), opt.mount.c_str(),
            opt.path.empty() ? "ephemeral" : opt.path.c_str(),
            static_cast<unsigned long long>(opt.seed), opt.files, opt.file_size, opt.block_size,
            opt.iterations, opt.workers, env_or_empty("VIRTIOFS_BENCH_RUN_ID"),
@@ -640,6 +653,10 @@ struct DatasetManifest {
 
 void phase_marker(const Options& opt, const char* workload, const char* phase, const char* event,
                   uint64_t offset, uint64_t requested, int64_t returned, int err) {
+    const char* enabled = getenv("VIRTIOFS_BENCH_PHASE_MARKERS");
+    if (enabled && strcmp(enabled, "0") == 0) {
+        return;
+    }
     // DragonOS's current stderr formatter truncates at 64-bit printf
     // conversions. Build the record from decimal strings so each phase remains
     // a single, shell-tokenizable line without losing timing or I/O context.
@@ -1089,9 +1106,11 @@ int sequential_write_phase(const Options& opt, WorkloadSpec workload) {
     uint64_t bytes = 0;
     IoCounters io;
     uint64_t elapsed_us = 0;
+    WritePhaseTimings write_timings;
     if (fd >= 0) {
         phase_marker(opt, label, "data_loop", "begin", 0, opt.file_size, 0, 0);
-        uint64_t start = now_us();
+        const uint64_t end_to_end_start = now_us();
+        uint64_t start = end_to_end_start;
         while (err == 0 && bytes < opt.file_size) {
             size_t requested = std::min(opt.block_size, opt.file_size - static_cast<size_t>(bytes));
             if (!write_all_counted(fd, data.data() + bytes, requested, &io)) {
@@ -1101,16 +1120,23 @@ int sequential_write_phase(const Options& opt, WorkloadSpec workload) {
             bytes += requested;
         }
         elapsed_us = now_us() - start;
+        write_timings.data_loop_us = elapsed_us;
         phase_marker(opt, label, "data_loop", "end", bytes, 0,
                      err == 0 ? static_cast<int64_t>(bytes) : -1, err);
 
         if (err == 0) {
             phase_marker(opt, label, "fsync", "begin", bytes, 0, 0, 0);
+            start = now_us();
             fsync_preserve_error(fd, &err);
+            write_timings.fsync_us = now_us() - start;
             phase_marker(opt, label, "fsync", "end", bytes, 0, err == 0 ? 0 : -1, err);
         }
         phase_marker(opt, label, "close", "begin", bytes, 0, 0, 0);
+        start = now_us();
         close_preserve_error(fd, &err);
+        const uint64_t close_end = now_us();
+        write_timings.close_us = close_end - start;
+        write_timings.end_to_end_us = close_end - end_to_end_start;
         phase_marker(opt, label, "close", "end", bytes, 0, err == 0 ? 0 : -1, err);
     }
 
@@ -1127,7 +1153,7 @@ int sequential_write_phase(const Options& opt, WorkloadSpec workload) {
         unlinkat(root_fd, manifest_temp.c_str(), 0);
     }
     close(root_fd);
-    emit_result(label, opt, elapsed_us, bytes, io.syscalls, err, io, checksum);
+    emit_result(label, opt, elapsed_us, bytes, io.syscalls, err, io, checksum, write_timings);
     emit_io_summary(label, io, checksum, 0);
     return err == 0 ? 0 : -1;
 }

@@ -1,19 +1,262 @@
 #include <gtest/gtest.h>
 
 #include <signal.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <time.h>
 
 #include "fuse_gtest_common.h"
+
+#ifndef MNT_DETACH
+#define MNT_DETACH 2
+#endif
 
 static sigjmp_buf g_fuse_sigbus_jmp;
 static volatile sig_atomic_t g_fuse_sigbus_seen = 0;
 static sigjmp_buf g_fuse_sigsegv_jmp;
 static volatile sig_atomic_t g_fuse_sigsegv_seen = 0;
+
+struct fuse_fsync_worker_args {
+    int fd;
+    volatile int done;
+    int result;
+    int saved_errno;
+};
+
+static void *fuse_fsync_worker(void *opaque) {
+    struct fuse_fsync_worker_args *args = (struct fuse_fsync_worker_args *)opaque;
+    args->result = fsync(args->fd);
+    args->saved_errno = errno;
+    __sync_synchronize();
+    args->done = 1;
+    return NULL;
+}
+
+struct fuse_mmap_single_write_args {
+    volatile char *address;
+    char value;
+    volatile int started;
+    volatile int done;
+};
+
+static void *fuse_mmap_single_write_worker(void *opaque) {
+    struct fuse_mmap_single_write_args *args =
+        (struct fuse_mmap_single_write_args *)opaque;
+    args->started = 1;
+    __sync_synchronize();
+    *args->address = args->value;
+    __sync_synchronize();
+    args->done = 1;
+    return NULL;
+}
+
+static int fuse_monotonic_ms(uint64_t *value) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0) {
+        return -1;
+    }
+    *value = (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+    return 0;
+}
+
+static int fuse_wait_flag(volatile int *flag, unsigned int timeout_ms) {
+    uint64_t started_ms = 0;
+    uint64_t now_ms = 0;
+    if (fuse_monotonic_ms(&started_ms) != 0) {
+        return -1;
+    }
+    while (1) {
+        if (*flag) {
+            return 0;
+        }
+        if (fuse_monotonic_ms(&now_ms) != 0 || now_ms - started_ms >= timeout_ms) {
+            break;
+        }
+        usleep(1000);
+    }
+    return -1;
+}
+
+static int fuse_parse_u64_counter(const char *report, const char *field, uint64_t *value) {
+    size_t field_len = strlen(field);
+    const char *line = report;
+    while (line && *line) {
+        if (strncmp(line, field, field_len) == 0 && line[field_len] == ' ') {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long parsed = strtoull(line + field_len + 1, &end, 10);
+            if (errno == 0 && end != line + field_len + 1) {
+                *value = (uint64_t)parsed;
+                return 0;
+            }
+            break;
+        }
+        line = strchr(line, '\n');
+        if (line) {
+            ++line;
+        }
+    }
+    return -1;
+}
+
+static char *fuse_read_stats_report(const char *path) {
+    char *report = (char *)malloc(32768);
+    if (!report) {
+        return NULL;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        free(report);
+        return NULL;
+    }
+    size_t used = 0;
+    while (used + 1 < 32768) {
+        ssize_t n = read(fd, report + used, 32767 - used);
+        if (n < 0) {
+            close(fd);
+            free(report);
+            return NULL;
+        }
+        if (n == 0) {
+            break;
+        }
+        used += (size_t)n;
+    }
+    close(fd);
+    report[used] = '\0';
+    return report;
+}
+
+static int fuse_read_u64_counter(const char *path, const char *field, uint64_t *value) {
+    char *report = fuse_read_stats_report(path);
+    if (!report) {
+        return -1;
+    }
+    int result = fuse_parse_u64_counter(report, field, value);
+    free(report);
+    return result;
+}
+
+static int fuse_wait_counter_increase(const char *path, const char *field, uint64_t before,
+                                      uint64_t *after, unsigned int timeout_ms) {
+    uint64_t started_ms = 0;
+    uint64_t now_ms = 0;
+    if (fuse_monotonic_ms(&started_ms) != 0) {
+        return -1;
+    }
+    while (1) {
+        if (fuse_read_u64_counter(path, field, after) == 0 && *after > before) {
+            return 0;
+        }
+        if (fuse_monotonic_ms(&now_ms) != 0 || now_ms - started_ms >= timeout_ms) {
+            break;
+        }
+        usleep(1000);
+    }
+    return -1;
+}
+
+static int fuse_read_launder_counters(const char *path, uint64_t *batches, uint64_t *pages) {
+    char *report = fuse_read_stats_report(path);
+    if (!report) {
+        return -1;
+    }
+    int result = fuse_parse_u64_counter(report, "invalidation_launder_batches_total", batches);
+    if (result == 0) {
+        result = fuse_parse_u64_counter(report, "invalidation_launder_pages_total", pages);
+    }
+    free(report);
+    return result;
+}
+
+static int fuse_count_mounted_filesystems() {
+    FILE *mounts = fopen("/proc/mounts", "r");
+    if (!mounts) {
+        return -1;
+    }
+    int count = 0;
+    char type[64];
+    while (fscanf(mounts, "%*s %*s %63s %*[^\n]\n", type) == 1) {
+        if (strcmp(type, "fuse") == 0 || strncmp(type, "fuse.", 5) == 0 ||
+            strcmp(type, "fuseblk") == 0 || strcmp(type, "virtiofs") == 0) {
+            ++count;
+        }
+    }
+    fclose(mounts);
+    return count;
+}
+
+static volatile int *fuse_alloc_child_done() {
+    void *mapping = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) {
+        return NULL;
+    }
+    memset(mapping, 0, sizeof(int));
+    return (volatile int *)mapping;
+}
+
+static void fuse_publish_child_done(volatile int *done) {
+    __sync_synchronize();
+    *done = 1;
+    __sync_synchronize();
+}
+
+// DragonOS wait4(WNOHANG) is not used as the deadline primitive here: if that
+// syscall regresses into a blocking wait, the watchdog itself becomes
+// unbounded. The shared flag is published immediately before _exit(), so a
+// blocking reap is safe only after the flag is visible or SIGKILL was sent.
+static int fuse_reap_child_bounded(pid_t child, volatile int *done, int *status,
+                                   unsigned int timeout_ms) {
+    if (fuse_wait_flag(done, timeout_ms) == 0) {
+        return waitpid(child, status, 0) == child ? 1 : -1;
+    }
+    if (kill(child, SIGKILL) != 0 && errno != ESRCH) {
+        return -1;
+    }
+    return waitpid(child, status, 0) == child ? 0 : -1;
+}
+
+static int fuse_cleanup_mounts_bounded(const char *mp, const char *debug_root) {
+    volatile int *done = fuse_alloc_child_done();
+    if (!done) {
+        return -1;
+    }
+    pid_t cleaner = fork();
+    if (cleaner < 0) {
+        munmap((void *)done, sizeof(int));
+        return -1;
+    }
+    if (cleaner == 0) {
+        int failed = 0;
+        if (umount2(mp, MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT) {
+            failed = 1;
+        }
+        if (umount2(debug_root, MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT) {
+            failed = 1;
+        }
+        if (rmdir(mp) != 0 && errno != ENOENT) {
+            failed = 1;
+        }
+        if (rmdir(debug_root) != 0 && errno != ENOENT) {
+            failed = 1;
+        }
+        fuse_publish_child_done(done);
+        _exit(failed ? 1 : 0);
+    }
+    int status = 0;
+    int waited = fuse_reap_child_bounded(cleaner, done, &status, 2000);
+    munmap((void *)done, sizeof(int));
+    if (waited == 1) {
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    }
+    return -1;
+}
 
 static void fuse_sigbus_longjmp_handler(int sig) {
     (void)sig;
@@ -43,6 +286,22 @@ static void fuse_sigsegv_longjmp_handler(int sig) {
 #define XATTR_SIZE_MAX 65536
 #endif
 
+#ifndef __NR_sync_file_range
+#if defined(__x86_64__)
+#define __NR_sync_file_range 277
+#elif defined(__riscv) || defined(__loongarch64)
+#define __NR_sync_file_range 84
+#else
+#error "__NR_sync_file_range is not defined for this architecture"
+#endif
+#endif
+#ifndef SYNC_FILE_RANGE_WRITE
+#define SYNC_FILE_RANGE_WRITE 2
+#endif
+#ifndef SYNC_FILE_RANGE_WAIT_AFTER
+#define SYNC_FILE_RANGE_WAIT_AFTER 4
+#endif
+
 static void fill_user_xattr_name(char *buf, size_t len) {
     memset(buf, 'a', len);
     memcpy(buf, "user.", strlen("user."));
@@ -53,6 +312,7 @@ static int ext_test_p2_ops() {
     const char *mp = "/tmp/test_fuse_p2_ops";
     int f = -1;
     int dfd = -1;
+    int direct_fd = -1;
     ssize_t tn = -1;
     ssize_t rn = -1;
     char hello[256];
@@ -60,6 +320,9 @@ static int ext_test_p2_ops() {
     char symlink_path[256];
     char target_buf[256];
     char hard_path[256];
+    char batch_path[256];
+    char error_path[256];
+    char direct_path[256];
     char sparse_path[256];
     char rbuf[64];
     char dst_exist[256];
@@ -68,7 +331,9 @@ static int ext_test_p2_ops() {
     const char sparse_marker = 'S';
     const off_t sparse_offset = 5000;
     const size_t sparse_size = (size_t)sparse_offset + 1;
+    const size_t batch_size = 3 * 4096 + 17;
     unsigned char *sparse_contents = NULL;
+    unsigned char *batch_data = NULL;
     if (ensure_dir(mp) != 0) {
         printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         return -1;
@@ -88,13 +353,26 @@ static int ext_test_p2_ops() {
     volatile uint32_t fsync_count = 0;
     volatile uint32_t fsyncdir_count = 0;
     volatile uint32_t create_count = 0;
+    volatile uint64_t last_create_nodeid = 0;
     volatile uint32_t rename2_count = 0;
     volatile uint32_t write_count = 0;
+    volatile uint32_t dynamic_open_out_flags = 0;
+    volatile uint64_t last_write_offset = 0;
     volatile uint32_t last_write_size = 0;
     volatile uint32_t last_write_flags = 0;
     volatile uint32_t write_count_at_fsync = 0;
     volatile uint32_t last_write_flags_at_fsync = 0;
     volatile unsigned char extension_write_byte = 0;
+    volatile uint64_t large_write_nodeid = 0;
+    volatile uint64_t write_offsets[4] = {0};
+    volatile uint32_t write_sizes[4] = {0};
+    volatile uint32_t write_flags[4] = {0};
+    volatile int forced_write_errno = 0;
+    volatile uint64_t forced_write_offset = UINT64_MAX;
+    volatile uint64_t forced_short_write_offset = UINT64_MAX;
+    volatile uint32_t forced_short_write_size = 0;
+    unsigned char batch_backend[16384];
+    memset(batch_backend, 0, sizeof(batch_backend));
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -108,15 +386,30 @@ static int ext_test_p2_ops() {
     args.fsync_count = &fsync_count;
     args.fsyncdir_count = &fsyncdir_count;
     args.create_count = &create_count;
+    args.last_create_nodeid = &last_create_nodeid;
     args.rename2_count = &rename2_count;
     args.write_count = &write_count;
+    args.dynamic_open_out_flags = &dynamic_open_out_flags;
+    args.last_write_offset = &last_write_offset;
     args.last_write_size = &last_write_size;
     args.last_write_flags = &last_write_flags;
     args.write_count_at_fsync = &write_count_at_fsync;
     args.last_write_flags_at_fsync = &last_write_flags_at_fsync;
+    args.large_write_backing = batch_backend;
+    args.large_write_backing_capacity = sizeof(batch_backend);
+    args.large_write_nodeid = &large_write_nodeid;
+    args.write_offsets = write_offsets;
+    args.write_sizes = write_sizes;
+    args.write_flags = write_flags;
+    args.write_trace_capacity = 4;
+    args.forced_write_errno = &forced_write_errno;
+    args.forced_write_offset = &forced_write_offset;
+    args.forced_short_write_offset = &forced_short_write_offset;
+    args.forced_short_write_size = &forced_short_write_size;
     args.write_watch_offset = 200;
     args.last_write_watch_byte = &extension_write_byte;
     args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_WRITEBACK_CACHE;
+    args.init_out_max_write_override = 8192;
     args.link_reuse_old_nodeid = 1;
     args.access_deny_mask = 2;
 
@@ -201,6 +494,7 @@ static int ext_test_p2_ops() {
     // Exercise writeback of an extension in the original EOF page. The
     // writeback length must be calculated from the extended local size.
     write_count = 0;
+    last_write_offset = UINT64_MAX;
     last_write_size = 0;
     write_count_at_fsync = 0;
     if (pwrite(f, &extension, 1, 200) != 1) {
@@ -221,6 +515,190 @@ static int ext_test_p2_ops() {
         goto fail;
     }
     close(f);
+
+    // P3: four locally dirty pages (the last one partial) must be submitted in
+    // max_write-sized batches rather than one request per page.
+    batch_data = (unsigned char *)malloc(batch_size);
+    if (!batch_data) {
+        printf("[FAIL] allocate batched write payload\n");
+        goto fail;
+    }
+    for (size_t i = 0; i < batch_size; ++i) {
+        batch_data[i] = (unsigned char)(i * 17u + 3u);
+    }
+    snprintf(batch_path, sizeof(batch_path), "%s/p3_batch.txt", mp);
+    f = open(batch_path, O_CREAT | O_RDWR, 0644);
+    if (f < 0 || write(f, batch_data, batch_size) != (ssize_t)batch_size) {
+        printf("[FAIL] create batched write file: %s (errno=%d)\n", strerror(errno), errno);
+        free(batch_data);
+        if (f >= 0)
+            close(f);
+        goto fail;
+    }
+    large_write_nodeid = last_create_nodeid;
+    write_count = 0;
+    last_write_offset = UINT64_MAX;
+    last_write_size = 0;
+    last_write_flags = 0;
+    if (fsync(f) != 0) {
+        printf("[FAIL] fsync batched write: %s (errno=%d)\n", strerror(errno), errno);
+        free(batch_data);
+        close(f);
+        goto fail;
+    }
+    if (write_count != 2 || write_offsets[0] != 0 || write_sizes[0] != 8192 ||
+        write_offsets[1] != 8192 || write_sizes[1] != batch_size - 8192 ||
+        write_flags[0] != FUSE_WRITE_CACHE || write_flags[1] != FUSE_WRITE_CACHE ||
+        last_write_offset != 8192 || last_write_size != batch_size - 8192 ||
+        (last_write_flags & FUSE_WRITE_CACHE) == 0 || large_write_nodeid == 0 ||
+        memcmp(batch_backend, batch_data, batch_size) != 0) {
+        printf("[FAIL] batched write requests=%u first=(%llu,%u,0x%x) second=(%llu,%u,0x%x) node=%llu expected_size=%zu\n",
+               write_count, (unsigned long long)write_offsets[0], write_sizes[0],
+               write_flags[0], (unsigned long long)write_offsets[1], write_sizes[1],
+               write_flags[1], (unsigned long long)large_write_nodeid, batch_size);
+        free(batch_data);
+        close(f);
+        goto fail;
+    }
+    close(f);
+
+    // Exercise the asynchronous WRITE|WAIT_AFTER path. Failure of the second
+    // max_write batch must be reported, leave only that failed batch dirty,
+    // and permit a later call to retry it without resending the first batch.
+    memset(batch_backend, 0, sizeof(batch_backend));
+    large_write_nodeid = 0;
+    snprintf(error_path, sizeof(error_path), "%s/p3_error.txt", mp);
+    f = open(error_path, O_CREAT | O_RDWR, 0644);
+    if (f < 0 || write(f, batch_data, batch_size) != (ssize_t)batch_size) {
+        printf("[FAIL] create async error file: %s (errno=%d)\n", strerror(errno), errno);
+        free(batch_data);
+        if (f >= 0)
+            close(f);
+        goto fail;
+    }
+    large_write_nodeid = last_create_nodeid;
+    write_count = 0;
+    forced_write_offset = 8192;
+    forced_write_errno = EIO;
+    errno = 0;
+    if (syscall(__NR_sync_file_range, f, 0, batch_size,
+                SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER) != -1 ||
+        errno != EIO || write_count != 2 ||
+        !((write_offsets[0] == 0 && write_sizes[0] == 8192 &&
+           write_offsets[1] == 8192 && write_sizes[1] == batch_size - 8192) ||
+          (write_offsets[1] == 0 && write_sizes[1] == 8192 &&
+           write_offsets[0] == 8192 && write_sizes[0] == batch_size - 8192))) {
+        printf("[FAIL] async batched EIO rc/errno/count=%d/%d/%u first=(%llu,%u) second=(%llu,%u)\n",
+               errno == EIO ? -1 : 0, errno, write_count,
+               (unsigned long long)write_offsets[0], write_sizes[0],
+               (unsigned long long)write_offsets[1], write_sizes[1]);
+        forced_write_errno = 0;
+        free(batch_data);
+        close(f);
+        goto fail;
+    }
+    forced_write_errno = 0;
+    forced_write_offset = UINT64_MAX;
+    write_count = 0;
+    if (syscall(__NR_sync_file_range, f, 0, batch_size,
+                SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER) != 0 ||
+        write_count != 1 || write_offsets[0] != 8192 ||
+        write_sizes[0] != batch_size - 8192 ||
+        memcmp(batch_backend, batch_data, batch_size) != 0) {
+        printf("[FAIL] async EIO retry count=%u write=(%llu,%u) errno=%d\n", write_count,
+               (unsigned long long)write_offsets[0], write_sizes[0], errno);
+        free(batch_data);
+        close(f);
+        goto fail;
+    }
+
+    // A short successful reply is an EIO for the whole request. Both pages in
+    // that batch must return to Dirty and be resent together on retry.
+    if (pwrite(f, batch_data, batch_size, 0) != (ssize_t)batch_size) {
+        printf("[FAIL] redirty async short-write file: %s (errno=%d)\n", strerror(errno), errno);
+        free(batch_data);
+        close(f);
+        goto fail;
+    }
+    write_count = 0;
+    forced_short_write_offset = 0;
+    forced_short_write_size = 4096;
+    errno = 0;
+    if (syscall(__NR_sync_file_range, f, 0, batch_size,
+                SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER) != -1 ||
+        errno != EIO || write_count != 2) {
+        printf("[FAIL] async short reply errno/count=%d/%u\n", errno, write_count);
+        forced_short_write_offset = UINT64_MAX;
+        free(batch_data);
+        close(f);
+        goto fail;
+    }
+    forced_short_write_offset = UINT64_MAX;
+    forced_short_write_size = 0;
+    write_count = 0;
+    if (syscall(__NR_sync_file_range, f, 0, batch_size,
+                SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER) != 0 ||
+        write_count != 1 || write_offsets[0] != 0 || write_sizes[0] != 8192 ||
+        memcmp(batch_backend, batch_data, batch_size) != 0) {
+        printf("[FAIL] async short retry count=%u write=(%llu,%u) errno=%d\n", write_count,
+               (unsigned long long)write_offsets[0], write_sizes[0], errno);
+        free(batch_data);
+        close(f);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+
+    // A direct write must drain overlapping cached dirty pages through the
+    // same stable-size batch path before issuing direct FUSE_WRITE requests.
+    // With max_write=8192, both phases split as 8192 + 4113 and direct writes
+    // must not carry FUSE_WRITE_CACHE. Direct writes do carry the current
+    // file lock owner, matching the ordinary FUSE direct-I/O path.
+    memset(batch_backend, 0, sizeof(batch_backend));
+    large_write_nodeid = 0;
+    snprintf(direct_path, sizeof(direct_path), "%s/p3_direct_drain.txt", mp);
+    f = open(direct_path, O_CREAT | O_RDWR, 0644);
+    if (f < 0 || write(f, batch_data, batch_size) != (ssize_t)batch_size) {
+        printf("[FAIL] create dirty direct-drain file: %s (errno=%d)\n", strerror(errno),
+               errno);
+        free(batch_data);
+        goto fail;
+    }
+    large_write_nodeid = last_create_nodeid;
+    write_count = 0;
+    dynamic_open_out_flags = FOPEN_DIRECT_IO;
+    direct_fd = open(direct_path, O_WRONLY);
+    if (direct_fd < 0 || pwrite(direct_fd, batch_data, batch_size, 0) != (ssize_t)batch_size) {
+        printf("[FAIL] direct write after dirty batch: %s (errno=%d)\n", strerror(errno),
+               errno);
+        dynamic_open_out_flags = 0;
+        free(batch_data);
+        goto fail;
+    }
+    dynamic_open_out_flags = 0;
+    close(direct_fd);
+    direct_fd = -1;
+    if (write_count != 4 || write_offsets[0] != 0 || write_sizes[0] != 8192 ||
+        write_flags[0] != FUSE_WRITE_CACHE || write_offsets[1] != 8192 ||
+        write_sizes[1] != batch_size - 8192 || write_flags[1] != FUSE_WRITE_CACHE ||
+        write_offsets[2] != 0 || write_sizes[2] != 8192 ||
+        write_flags[2] != FUSE_WRITE_LOCKOWNER ||
+        write_offsets[3] != 8192 || write_sizes[3] != batch_size - 8192 ||
+        write_flags[3] != FUSE_WRITE_LOCKOWNER ||
+        memcmp(batch_backend, batch_data, batch_size) != 0) {
+        printf("[FAIL] direct drain trace count=%u cached=(%llu,%u,0x%x),(%llu,%u,0x%x) direct=(%llu,%u,0x%x),(%llu,%u,0x%x)\n",
+               write_count, (unsigned long long)write_offsets[0], write_sizes[0],
+               write_flags[0], (unsigned long long)write_offsets[1], write_sizes[1],
+               write_flags[1], (unsigned long long)write_offsets[2], write_sizes[2],
+               write_flags[2], (unsigned long long)write_offsets[3], write_sizes[3],
+               write_flags[3]);
+        free(batch_data);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+    free(batch_data);
+    batch_data = NULL;
 
     // A short daemon READ inside a locally extended sparse file denotes a
     // hole under FUSE_WRITEBACK_CACHE. It must neither shrink local i_size nor
@@ -373,6 +851,9 @@ static int ext_test_p2_ops() {
     return 0;
 
 fail:
+    if (direct_fd >= 0) {
+        close(direct_fd);
+    }
     umount(mp);
 fail_no_umount:
     stop = 1;
@@ -380,6 +861,310 @@ fail_no_umount:
     pthread_join(th, NULL);
     rmdir(mp);
     return -1;
+}
+
+static int ext_test_dirty_multibatch_notify_invalidation_inner() {
+    char mp[128];
+    char debug_root[128];
+    const size_t payload_size = 3 * 4096 + 17;
+    char path[256];
+    char stats_path[256];
+    unsigned char payload[3 * 4096 + 17];
+    unsigned char backing[16384];
+    char first = 0;
+    char tail = 0;
+    int fd = -1;
+    int file = -1;
+    int mounted = 0;
+    int debug_mounted = 0;
+    int daemon_active = 0;
+    int fsync_active = 0;
+    uint32_t reads_before = 0;
+    uint64_t launder_batches_before = 0;
+    uint64_t launder_batches_after = 0;
+    uint64_t launder_pages_before = 0;
+    uint64_t launder_pages_after = 0;
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile int write_entered = 0;
+    volatile int release_write = 1;
+    volatile uint64_t block_write_offset = 0;
+    volatile uint32_t create_count = 0;
+    volatile uint64_t last_create_nodeid = 0;
+    volatile uint64_t large_write_nodeid = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint64_t write_offsets[4] = {0};
+    volatile uint32_t write_sizes[4] = {0};
+    volatile uint32_t write_flags[4] = {0};
+    pthread_t daemon_thread;
+    pthread_t fsync_thread;
+    struct fuse_fsync_worker_args fsync_args;
+    struct {
+        struct fuse_out_header out;
+        struct fuse_notify_inval_inode_out inval;
+    } notify;
+
+    memset(backing, 0, sizeof(backing));
+    for (size_t i = 0; i < payload_size; ++i) {
+        payload[i] = (unsigned char)(i * 29u + 7u);
+    }
+    memset(&fsync_args, 0, sizeof(fsync_args));
+    memset(&notify, 0, sizeof(notify));
+    snprintf(mp, sizeof(mp), "/tmp/test_fuse_p3_notify_dirty_%d", getpid());
+    snprintf(debug_root, sizeof(debug_root), "/tmp/test_fuse_p3_notify_debugfs_%d", getpid());
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+    if (ensure_dir(debug_root) != 0 || mount("none", debug_root, "debugfs", 0, NULL) != 0) {
+        printf("[FAIL] mount debugfs: %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(debug_root);
+        rmdir(mp);
+        return -1;
+    }
+    debug_mounted = 1;
+    snprintf(stats_path, sizeof(stats_path), "%s/fuse/stats", debug_root);
+    if (fuse_count_mounted_filesystems() != 0) {
+        printf("[FAIL] dirty notify test requires an isolated guest with no FUSE mount\n");
+        goto fail;
+    }
+    fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        umount(debug_root);
+        rmdir(debug_root);
+        rmdir(mp);
+        return -1;
+    }
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.create_count = &create_count;
+    args.last_create_nodeid = &last_create_nodeid;
+    args.read_count = &read_count;
+    args.write_count = &write_count;
+    args.write_offsets = write_offsets;
+    args.write_sizes = write_sizes;
+    args.write_flags = write_flags;
+    args.write_trace_capacity = 4;
+    args.large_write_backing = backing;
+    args.large_write_backing_capacity = sizeof(backing);
+    args.large_write_nodeid = &large_write_nodeid;
+    args.block_write_offset = &block_write_offset;
+    args.write_entered = &write_entered;
+    args.release_write = &release_write;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_WRITEBACK_CACHE;
+    args.init_out_max_write_override = 8192;
+
+    if (pthread_create(&daemon_thread, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create daemon\n");
+        close(fd);
+        umount(debug_root);
+        rmdir(debug_root);
+        rmdir(mp);
+        return -1;
+    }
+    daemon_active = 1;
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,allow_other",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 1;
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+    if (fuse_count_mounted_filesystems() != 1) {
+        printf("[FAIL] dirty notify test lost exclusive FUSE mount ownership\n");
+        goto fail;
+    }
+    if (fuse_read_launder_counters(stats_path, &launder_batches_before,
+                                   &launder_pages_before) != 0) {
+        printf("[FAIL] read invalidation laundering counters before notify\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/dirty-notify.bin", mp);
+    file = open(path, O_CREAT | O_RDWR, 0644);
+    if (file < 0 || write(file, payload, payload_size) != (ssize_t)payload_size) {
+        printf("[FAIL] create dirty notify file: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    large_write_nodeid = last_create_nodeid;
+    if (create_count != 1 || large_write_nodeid == 0 || write_count != 0) {
+        printf("[FAIL] dirty setup create=%u node=%llu writes=%u\n", create_count,
+               (unsigned long long)large_write_nodeid, write_count);
+        goto fail;
+    }
+
+    release_write = 0;
+    __sync_synchronize();
+    notify.out.len = sizeof(notify);
+    notify.out.error = FUSE_NOTIFY_INVAL_INODE;
+    notify.out.unique = 0;
+    notify.inval.ino = large_write_nodeid;
+    notify.inval.off = 0;
+    notify.inval.len = -1;
+    if (write(fd, &notify, sizeof(notify)) != (ssize_t)sizeof(notify)) {
+        printf("[FAIL] write dirty inode notify: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (fuse_wait_flag(&write_entered, 5000) != 0) {
+        printf("[FAIL] notify worker did not enter laundering WRITE\n");
+        goto fail;
+    }
+
+    fsync_args.fd = file;
+    if (pthread_create(&fsync_thread, NULL, fuse_fsync_worker, &fsync_args) != 0) {
+        printf("[FAIL] pthread_create fsync\n");
+        goto fail;
+    }
+    fsync_active = 1;
+    release_write = 1;
+    __sync_synchronize();
+    pthread_join(fsync_thread, NULL);
+    fsync_active = 0;
+    if (fsync_args.result != 0) {
+        errno = fsync_args.saved_errno;
+        printf("[FAIL] fsync after dirty notify: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (fuse_count_mounted_filesystems() != 1 ||
+        fuse_read_launder_counters(stats_path, &launder_batches_after,
+                                   &launder_pages_after) != 0 ||
+        launder_batches_after - launder_batches_before != 2 ||
+        launder_pages_after - launder_pages_before != 4) {
+        printf("[FAIL] notify laundering counter delta batches=%llu->%llu pages=%llu->%llu\n",
+               (unsigned long long)launder_batches_before,
+               (unsigned long long)launder_batches_after,
+               (unsigned long long)launder_pages_before,
+               (unsigned long long)launder_pages_after);
+        goto fail;
+    }
+
+    if (write_count != 2 || write_offsets[0] != 0 || write_sizes[0] != 8192 ||
+        write_flags[0] != FUSE_WRITE_CACHE || write_offsets[1] != 8192 ||
+        write_sizes[1] != payload_size - 8192 || write_flags[1] != FUSE_WRITE_CACHE ||
+        memcmp(backing, payload, payload_size) != 0) {
+        printf("[FAIL] notify laundering trace count=%u first=(%llu,%u,0x%x) second=(%llu,%u,0x%x)\n",
+               write_count, (unsigned long long)write_offsets[0], write_sizes[0],
+               write_flags[0], (unsigned long long)write_offsets[1], write_sizes[1],
+               write_flags[1]);
+        goto fail;
+    }
+
+    // The worker has released the exclusive writeback barrier before fsync
+    // can complete. Mutating daemon backing now makes a subsequent cache hit
+    // distinguishable from a fresh FUSE_READ after successful invalidation.
+    backing[0] = 'Q';
+    backing[9000] = 'R';
+    reads_before = read_count;
+    if (pread(file, &first, 1, 0) != 1 || pread(file, &tail, 1, 9000) != 1 ||
+        first != 'Q' || tail != 'R' || read_count <= reads_before) {
+        printf("[FAIL] notify did not invalidate cache first=%d tail=%d reads=%u->%u errno=%d\n",
+               first, tail, reads_before, read_count, errno);
+        goto fail;
+    }
+
+    close(file);
+    file = -1;
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 0;
+    stop = 1;
+    close(fd);
+    fd = -1;
+    pthread_join(daemon_thread, NULL);
+    daemon_active = 0;
+    umount(debug_root);
+    debug_mounted = 0;
+    rmdir(debug_root);
+    rmdir(mp);
+    return 0;
+
+fail:
+    release_write = 1;
+    __sync_synchronize();
+    if (fsync_active) {
+        pthread_join(fsync_thread, NULL);
+    }
+    if (file >= 0) {
+        close(file);
+    }
+    if (mounted) {
+        umount(mp);
+    }
+    stop = 1;
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (daemon_active) {
+        pthread_join(daemon_thread, NULL);
+    }
+    if (debug_mounted) {
+        umount(debug_root);
+    }
+    rmdir(debug_root);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_dirty_multibatch_notify_invalidation() {
+    char mp[128];
+    char debug_root[128];
+    volatile int *done = fuse_alloc_child_done();
+    if (!done) {
+        printf("[FAIL] allocate dirty notify child status: %s (errno=%d)\n", strerror(errno),
+               errno);
+        return -1;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        printf("[FAIL] fork dirty notify test: %s (errno=%d)\n", strerror(errno), errno);
+        munmap((void *)done, sizeof(int));
+        return -1;
+    }
+    if (child == 0) {
+        int result = ext_test_dirty_multibatch_notify_invalidation_inner();
+        fflush(NULL);
+        fuse_publish_child_done(done);
+        _exit(result == 0 ? 0 : 1);
+    }
+    snprintf(mp, sizeof(mp), "/tmp/test_fuse_p3_notify_dirty_%d", child);
+    snprintf(debug_root, sizeof(debug_root), "/tmp/test_fuse_p3_notify_debugfs_%d", child);
+
+    int status = 0;
+    int waited = fuse_reap_child_bounded(child, done, &status, 15000);
+    munmap((void *)done, sizeof(int));
+    int result = -1;
+    if (waited == 1) {
+        result = WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    } else {
+        printf(waited == 0 ? "[FAIL] dirty notify test timed out\n"
+                           : "[FAIL] waitpid dirty notify child failed\n");
+    }
+
+    // The child shares the mount namespace. All potentially blocking cleanup
+    // runs in its own bounded child so even teardown regressions cannot hang
+    // the FuseExtended parent.
+    if (fuse_cleanup_mounts_bounded(mp, debug_root) != 0) {
+        printf("[FAIL] bounded cleanup of dirty notify mounts failed\n");
+        result = -1;
+    }
+    return result;
 }
 
 static int ext_test_positive_lookup_cache_respects_entry_ttl() {
@@ -1466,6 +2251,127 @@ fail_no_umount:
     return -1;
 }
 
+static int ext_test_noopen_close_flushes_dirty_data_with_zero_fh() {
+    const char *mp = "/tmp/test_fuse_noopen_close_flush";
+    const char marker = 'N';
+    int f = -1;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t open_count = 0;
+    volatile uint32_t flush_count = 0;
+    volatile uint32_t release_count = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint32_t write_count_at_flush = 0;
+    volatile uint32_t last_write_flags = 0;
+    volatile uint64_t last_flush_fh = UINT64_MAX;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.open_count = &open_count;
+    args.flush_count = &flush_count;
+    args.release_count = &release_count;
+    args.write_count = &write_count;
+    args.write_count_at_flush = &write_count_at_flush;
+    args.last_write_flags = &last_write_flags;
+    args.last_flush_fh = &last_flush_fh;
+    args.force_open_enosys = 1;
+    args.init_out_flags_override =
+        FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_NO_OPEN_SUPPORT | FUSE_WRITEBACK_CACHE;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (pwrite(f, &marker, 1, 1) != 1) {
+        printf("[FAIL] pwrite(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (write_count != 0) {
+        printf("[FAIL] no-open WB write reached daemon before close: writes=%u\n", write_count);
+        goto fail;
+    }
+    if (close(f) != 0) {
+        printf("[FAIL] close(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        f = -1;
+        goto fail;
+    }
+    f = -1;
+
+    if (open_count != 1 || write_count_at_flush == 0 || flush_count != 1 ||
+        last_flush_fh != 0 || release_count != 0 ||
+        (last_write_flags & FUSE_WRITE_CACHE) == 0) {
+        printf("[FAIL] no-open close ordering open=%u writes=%u writes_at_flush=%u flush=%u flush_fh=%llu release=%u flags=0x%x\n",
+               open_count, write_count, write_count_at_flush, flush_count,
+               (unsigned long long)last_flush_fh, release_count, last_write_flags);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_fsync_enosys_cached_success() {
     const char *mp = "/tmp/test_fuse_fsync_enosys";
     int f = -1;
@@ -2222,6 +3128,257 @@ fail_no_umount:
     stop = 1;
     close(fd);
     pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_writeback_cache_noflush_still_flushes() {
+    const char *mp = "/tmp/test_fuse_wb_noflush_flush";
+    char path[256];
+    int f = -1;
+    int fd = -1;
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t flush_count = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint32_t write_count_at_flush = 0;
+    volatile uint32_t last_write_flags = 0;
+    const char marker = 'W';
+    pthread_t th;
+    int thread_started = 0;
+    int mounted = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+    fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.flush_count = &flush_count;
+    args.write_count = &write_count;
+    args.write_count_at_flush = &write_count_at_flush;
+    args.last_write_flags = &last_write_flags;
+    args.hello_open_out_flags = FOPEN_NOFLUSH;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_WRITEBACK_CACHE;
+
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+    thread_started = 1;
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 1;
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (pwrite(f, &marker, 1, 1) != 1) {
+        printf("[FAIL] pwrite(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (write_count != 0) {
+        printf("[FAIL] writeback-cache write reached daemon before close: writes=%u\n",
+               write_count);
+        goto fail;
+    }
+    if (close(f) != 0) {
+        printf("[FAIL] close(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        f = -1;
+        goto fail;
+    }
+    f = -1;
+
+    if (flush_count != 1 || write_count_at_flush == 0 ||
+        (last_write_flags & FUSE_WRITE_CACHE) == 0) {
+        printf("[FAIL] WB+NOFLUSH ordering writes=%u writes_at_flush=%u flush=%u flags=0x%x\n",
+               write_count, write_count_at_flush, flush_count, last_write_flags);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 0;
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    if (mounted) {
+        umount(mp);
+    }
+    stop = 1;
+    close(fd);
+    if (thread_started) {
+        pthread_join(th, NULL);
+    }
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_nonwriteback_mmap_close_flushes_dirty_mapping() {
+    const char *mp = "/tmp/test_fuse_nonwb_mmap_close";
+    char path[256];
+    int f = -1;
+    int fd = -1;
+    void *addr = MAP_FAILED;
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t flush_count = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint32_t write_count_at_flush = 0;
+    volatile uint32_t last_write_flags = 0;
+    pthread_t th;
+    int thread_started = 0;
+    int mounted = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+    fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.flush_count = &flush_count;
+    args.read_count = &read_count;
+    args.write_count = &write_count;
+    args.write_count_at_flush = &write_count_at_flush;
+    args.last_write_flags = &last_write_flags;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES;
+
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+    thread_started = 1;
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 1;
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (((volatile char *)addr)[0] != 'h') {
+        printf("[FAIL] non-WB shared mmap first byte got=%d\n",
+               ((volatile char *)addr)[0]);
+        goto fail;
+    }
+    ((volatile char *)addr)[3] = 'C';
+    if (write_count != 0) {
+        printf("[FAIL] dirty mmap reached daemon before close: writes=%u\n", write_count);
+        goto fail;
+    }
+    if (close(f) != 0) {
+        printf("[FAIL] close(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        f = -1;
+        goto fail;
+    }
+    f = -1;
+
+    if (((volatile char *)addr)[3] != 'C' || read_count != 1 || flush_count != 1 ||
+        write_count_at_flush == 0 || (last_write_flags & FUSE_WRITE_CACHE) == 0) {
+        printf("[FAIL] non-WB mmap close ordering reads=%u writes=%u writes_at_flush=%u flush=%u flags=0x%x mapped=%d\n",
+               read_count, write_count, write_count_at_flush, flush_count, last_write_flags,
+               ((volatile char *)addr)[3]);
+        goto fail;
+    }
+
+    if (munmap(addr, 4096) != 0) {
+        printf("[FAIL] munmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = MAP_FAILED;
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 0;
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (addr != MAP_FAILED) {
+        munmap(addr, 4096);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    if (mounted) {
+        umount(mp);
+    }
+    stop = 1;
+    close(fd);
+    if (thread_started) {
+        pthread_join(th, NULL);
+    }
     rmdir(mp);
     return -1;
 }
@@ -5292,6 +6449,489 @@ fail:
     munmap(shared, sizeof(*shared));
     rmdir(mp);
     return -1;
+}
+
+static int ext_test_mmap_writeback_retry_outside_mm_guard_inner(volatile int *stage) {
+    char mp[128];
+    char debug_root[128];
+    char path[256];
+    char stats_path[256];
+    int fd = -1;
+    int f = -1;
+    void *addr = MAP_FAILED;
+    int mounted = 0;
+    int debug_mounted = 0;
+    pthread_t daemon_thread;
+    pthread_t fsync_thread;
+    pthread_t writer_thread;
+    int daemon_active = 0;
+    int fsync_active = 0;
+    int writer_active = 0;
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint64_t last_create_nodeid = 0;
+    volatile uint64_t large_write_nodeid = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint64_t write_offsets[8] = {0};
+    volatile uint32_t write_sizes[8] = {0};
+    volatile uint32_t write_flags[8] = {0};
+    volatile uint64_t block_write_offset = 0;
+    volatile int write_entered = 0;
+    volatile int release_write = 0;
+    uint64_t retry_count_before = 0;
+    uint64_t retry_count_after = 0;
+    unsigned char backing[8192];
+    unsigned char payload[8192];
+    struct fuse_fsync_worker_args fsync_args;
+    struct fuse_mmap_single_write_args writer_args;
+    memset(backing, 0, sizeof(backing));
+    for (size_t i = 0; i < sizeof(payload); ++i) {
+        payload[i] = (unsigned char)(i * 13u + 7u);
+    }
+    memset(&fsync_args, 0, sizeof(fsync_args));
+    memset(&writer_args, 0, sizeof(writer_args));
+    snprintf(mp, sizeof(mp), "/tmp/test_fuse_mmap_writeback_retry_%d", getpid());
+    snprintf(debug_root, sizeof(debug_root), "/tmp/test_fuse_mmap_writeback_debugfs_%d",
+             getpid());
+    snprintf(stats_path, sizeof(stats_path), "%s/fuse/stats", debug_root);
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+    if (ensure_dir(debug_root) != 0 || mount("none", debug_root, "debugfs", 0, NULL) != 0) {
+        printf("[FAIL] mount mmap retry debugfs: %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(debug_root);
+        rmdir(mp);
+        return -1;
+    }
+    debug_mounted = 1;
+    if (fuse_count_mounted_filesystems() != 0) {
+        printf("[FAIL] mmap retry test requires an isolated guest with no FUSE mount\n");
+        goto fail;
+    }
+    if (fuse_read_u64_counter(stats_path, "mmap_writeback_admission_retries_total",
+                              &retry_count_before) != 0) {
+        printf("[FAIL] read mmap admission retry counter before test\n");
+        goto fail;
+    }
+    fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    struct fuse_daemon_args daemon_args;
+    memset(&daemon_args, 0, sizeof(daemon_args));
+    daemon_args.fd = fd;
+    daemon_args.stop = &stop;
+    daemon_args.init_done = &init_done;
+    daemon_args.enable_write_ops = 1;
+    daemon_args.stop_on_destroy = 1;
+    daemon_args.last_create_nodeid = &last_create_nodeid;
+    daemon_args.write_count = &write_count;
+    daemon_args.write_offsets = write_offsets;
+    daemon_args.write_sizes = write_sizes;
+    daemon_args.write_flags = write_flags;
+    daemon_args.write_trace_capacity = 8;
+    daemon_args.large_write_backing = backing;
+    daemon_args.large_write_backing_capacity = sizeof(backing);
+    daemon_args.large_write_nodeid = &large_write_nodeid;
+    daemon_args.block_write_offset = &block_write_offset;
+    daemon_args.write_entered = &write_entered;
+    daemon_args.release_write = &release_write;
+    daemon_args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_WRITEBACK_CACHE;
+    daemon_args.init_out_max_write_override = 4096;
+    if (pthread_create(&daemon_thread, NULL, fuse_daemon_thread, &daemon_args) != 0) {
+        printf("[FAIL] pthread_create fuse daemon\n");
+        goto fail;
+    }
+    daemon_active = 1;
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount/init mmap retry daemon: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 1;
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] mmap retry init handshake timeout\n");
+        goto fail;
+    }
+    if (fuse_count_mounted_filesystems() != 1) {
+        printf("[FAIL] mmap retry test lost exclusive FUSE mount ownership\n");
+        goto fail;
+    }
+    *stage = 1;
+    __sync_synchronize();
+    snprintf(path, sizeof(path), "%s/two_pages", mp);
+    f = open(path, O_CREAT | O_RDWR, 0644);
+    if (f < 0 || write(f, payload, sizeof(payload)) != (ssize_t)sizeof(payload)) {
+        printf("[FAIL] create two-page mmap retry file: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    large_write_nodeid = last_create_nodeid;
+    if (large_write_nodeid == 0 || write_count != 0) {
+        printf("[FAIL] writeback-cache setup node=%llu writes=%u\n",
+               (unsigned long long)large_write_nodeid, write_count);
+        goto fail;
+    }
+    addr = mmap(NULL, sizeof(payload), PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
+    if (addr == MAP_FAILED || ((volatile unsigned char *)addr)[4096] != payload[4096]) {
+        printf("[FAIL] prefault second mmap page: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    fsync_args.fd = f;
+    if (pthread_create(&fsync_thread, NULL, fuse_fsync_worker, &fsync_args) != 0) {
+        printf("[FAIL] pthread_create fsync worker\n");
+        goto fail;
+    }
+    fsync_active = 1;
+    if (fuse_wait_flag(&write_entered, 5000) != 0 || write_count != 0) {
+        printf("[FAIL] first split WRITE did not enter blocking daemon entered=%d count=%u\n",
+               write_entered, write_count);
+        goto fail;
+    }
+    *stage = 2;
+    __sync_synchronize();
+
+    writer_args.address = (volatile char *)addr + 4096;
+    writer_args.value = 'Z';
+    if (pthread_create(&writer_thread, NULL, fuse_mmap_single_write_worker, &writer_args) != 0) {
+        printf("[FAIL] pthread_create mmap writer\n");
+        goto fail;
+    }
+    writer_active = 1;
+    if (fuse_wait_flag(&writer_args.started, 1000) != 0) {
+        printf("[FAIL] mmap writer did not start\n");
+        goto fail;
+    }
+    *stage = 3;
+    __sync_synchronize();
+    if (fuse_wait_counter_increase(stats_path, "mmap_writeback_admission_retries_total",
+                                   retry_count_before, &retry_count_after, 5000) != 0 ||
+        writer_args.done) {
+        printf("[FAIL] mmap writer did not enter admission retry count=%llu->%llu done=%d\n",
+               (unsigned long long)retry_count_before,
+               (unsigned long long)retry_count_after, writer_args.done);
+        goto fail;
+    }
+    *stage = 4;
+    __sync_synchronize();
+
+    release_write = 1;
+    __sync_synchronize();
+    *stage = 5;
+    __sync_synchronize();
+    if (fuse_wait_flag(&fsync_args.done, 5000) != 0) {
+        *stage = 6;
+        __sync_synchronize();
+        printf("[FAIL] mmap/fsync retry did not complete fsync=%d writer=%d\n",
+               fsync_args.done, writer_args.done);
+        goto fail;
+    }
+    *stage = 7;
+    __sync_synchronize();
+    if (fuse_wait_flag(&writer_args.done, 5000) != 0) {
+        *stage = 8;
+        __sync_synchronize();
+        printf("[FAIL] mmap/fsync retry did not complete fsync=%d writer=%d\n",
+               fsync_args.done, writer_args.done);
+        goto fail;
+    }
+    *stage = 9;
+    __sync_synchronize();
+    pthread_join(fsync_thread, NULL);
+    fsync_active = 0;
+    pthread_join(writer_thread, NULL);
+    writer_active = 0;
+    if (fsync_args.result != 0 || fsync(f) != 0) {
+        printf("[FAIL] mmap retry fsync results first=%d/%d final=%d\n", fsync_args.result,
+               fsync_args.saved_errno, errno);
+        goto fail;
+    }
+    payload[4096] = 'Z';
+    if (write_count != 3 || write_offsets[0] != 0 || write_offsets[1] != 4096 ||
+        write_offsets[2] != 4096 || write_sizes[0] != 4096 || write_sizes[1] != 4096 ||
+        write_sizes[2] != 4096 || write_flags[0] != FUSE_WRITE_CACHE ||
+        write_flags[1] != FUSE_WRITE_CACHE || write_flags[2] != FUSE_WRITE_CACHE ||
+        memcmp(backing, payload, sizeof(payload)) != 0) {
+        printf("[FAIL] mmap retry trace count=%u writes=(%llu,%u,0x%x),(%llu,%u,0x%x),(%llu,%u,0x%x)\n",
+               write_count, (unsigned long long)write_offsets[0], write_sizes[0], write_flags[0],
+               (unsigned long long)write_offsets[1], write_sizes[1], write_flags[1],
+               (unsigned long long)write_offsets[2], write_sizes[2], write_flags[2]);
+        goto fail;
+    }
+
+    munmap(addr, sizeof(payload));
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount mmap retry mount: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 0;
+    stop = 1;
+    close(fd);
+    fd = -1;
+    pthread_join(daemon_thread, NULL);
+    daemon_active = 0;
+    if (umount(debug_root) != 0) {
+        printf("[FAIL] umount mmap retry debugfs: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    debug_mounted = 0;
+    rmdir(debug_root);
+    rmdir(mp);
+    return 0;
+
+fail:
+    release_write = 1;
+    __sync_synchronize();
+    if (fsync_active) {
+        pthread_join(fsync_thread, NULL);
+    }
+    if (writer_active) {
+        pthread_join(writer_thread, NULL);
+    }
+    if (addr != MAP_FAILED) {
+        munmap(addr, sizeof(payload));
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    if (mounted) {
+        umount(mp);
+    }
+    stop = 1;
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (daemon_active) {
+        pthread_join(daemon_thread, NULL);
+    }
+    if (debug_mounted) {
+        umount(debug_root);
+    }
+    rmdir(debug_root);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_mmap_writeback_retry_outside_mm_guard() {
+    char mp[128];
+    char debug_root[128];
+    volatile int *done = fuse_alloc_child_done();
+    if (!done) {
+        printf("[FAIL] allocate mmap retry child status: %s (errno=%d)\n", strerror(errno),
+               errno);
+        return -1;
+    }
+    volatile int *stage = fuse_alloc_child_done();
+    if (!stage) {
+        printf("[FAIL] allocate mmap retry stage: %s (errno=%d)\n", strerror(errno), errno);
+        munmap((void *)done, sizeof(int));
+        return -1;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        printf("[FAIL] fork mmap retry test: %s (errno=%d)\n", strerror(errno), errno);
+        munmap((void *)stage, sizeof(int));
+        munmap((void *)done, sizeof(int));
+        return -1;
+    }
+    if (child == 0) {
+        int result = ext_test_mmap_writeback_retry_outside_mm_guard_inner(stage);
+        fflush(NULL);
+        fuse_publish_child_done(done);
+        _exit(result == 0 ? 0 : 1);
+    }
+    snprintf(mp, sizeof(mp), "/tmp/test_fuse_mmap_writeback_retry_%d", child);
+    snprintf(debug_root, sizeof(debug_root), "/tmp/test_fuse_mmap_writeback_debugfs_%d", child);
+
+    int status = 0;
+    int waited = fuse_reap_child_bounded(child, done, &status, 15000);
+    munmap((void *)done, sizeof(int));
+    int result = -1;
+    if (waited == 1) {
+        result = WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    } else {
+        int failed_stage = *stage;
+        fprintf(stderr, waited == 0 ? "[FAIL] mmap retry test timed out at stage=%d\n"
+                                    : "[FAIL] waitpid mmap retry child failed at stage=%d\n",
+                failed_stage);
+        fflush(stderr);
+        munmap((void *)stage, sizeof(int));
+        // The timed-out child owned the daemon. Issuing mount cleanup after
+        // killing it can itself enqueue FUSE requests with no consumer, hiding
+        // the original stage behind a second hang. A failed isolated run is
+        // intentionally left for the fresh-guest harness to discard.
+        return -100 - failed_stage;
+    }
+    munmap((void *)stage, sizeof(int));
+    if (fuse_cleanup_mounts_bounded(mp, debug_root) != 0) {
+        printf("[FAIL] bounded cleanup of mmap retry mounts failed\n");
+        result = -1;
+    }
+    return result;
+}
+
+static int ext_test_beyond_eof_dirty_page_retires_inner() {
+    char mp[128];
+    char path[256];
+    int fuse_fd = -1;
+    int file_fd = -1;
+    int mounted = 0;
+    int daemon_active = 0;
+    int fsync_result = -1;
+    unsigned char original = 0;
+    volatile unsigned char *bytes = NULL;
+    void *mapping = MAP_FAILED;
+    pthread_t daemon_thread;
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint64_t getattr_size_override = UINT64_MAX;
+    struct stat st;
+
+    snprintf(mp, sizeof(mp), "/tmp/test_fuse_beyond_eof_dirty_%d", getpid());
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+    fuse_fd = open("/dev/fuse", O_RDWR);
+    if (fuse_fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fuse_fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.write_count = &write_count;
+    args.getattr_size_override = &getattr_size_override;
+    args.hello_generated_size_override = 2 * 4096;
+    // Deliberately omit FUSE_WRITEBACK_CACHE: a fresh daemon GETATTR may then
+    // shrink i_size below an already dirtied mmap page.
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES;
+    args.init_out_max_write_override = 8192;
+    if (pthread_create(&daemon_thread, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create beyond-EOF daemon\n");
+        goto fail;
+    }
+    daemon_active = 1;
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fuse_fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0 || fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] mount/init beyond-EOF daemon: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 1;
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    file_fd = open(path, O_RDWR);
+    if (file_fd < 0) {
+        printf("[FAIL] open beyond-EOF file: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mapping = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, file_fd, 0);
+    if (mapping == MAP_FAILED) {
+        printf("[FAIL] mmap beyond-EOF file: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    bytes = (volatile unsigned char *)mapping;
+    original = bytes[4096];
+    bytes[4096] = (unsigned char)(original ^ 0x5a);
+    __sync_synchronize();
+
+    getattr_size_override = 0;
+    __sync_synchronize();
+    if (fstat(file_fd, &st) != 0 || st.st_size != 0) {
+        printf("[FAIL] GETATTR did not publish daemon shrink size=%lld errno=%d\n",
+               (long long)st.st_size, errno);
+        goto fail;
+    }
+    fsync_result = fsync(file_fd);
+    if (fsync_result != 0 || write_count != 0) {
+        printf("[FAIL] beyond-EOF dirty retirement fsync/write_count=%d/%u errno=%d\n",
+               fsync_result, write_count, errno);
+        goto fail;
+    }
+
+    munmap(mapping, 2 * 4096);
+    mapping = MAP_FAILED;
+    close(file_fd);
+    file_fd = -1;
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount beyond-EOF mount: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 0;
+    stop = 1;
+    close(fuse_fd);
+    fuse_fd = -1;
+    pthread_join(daemon_thread, NULL);
+    daemon_active = 0;
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (mapping != MAP_FAILED)
+        munmap(mapping, 2 * 4096);
+    if (file_fd >= 0)
+        close(file_fd);
+    if (mounted)
+        umount(mp);
+    stop = 1;
+    if (fuse_fd >= 0)
+        close(fuse_fd);
+    if (daemon_active)
+        pthread_join(daemon_thread, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_beyond_eof_dirty_page_retires() {
+    char mp[128];
+    volatile int *done = fuse_alloc_child_done();
+    if (!done) {
+        printf("[FAIL] allocate beyond-EOF child status: %s (errno=%d)\n", strerror(errno),
+               errno);
+        return -1;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        printf("[FAIL] fork beyond-EOF test: %s (errno=%d)\n", strerror(errno), errno);
+        munmap((void *)done, sizeof(int));
+        return -1;
+    }
+    if (child == 0) {
+        int result = ext_test_beyond_eof_dirty_page_retires_inner();
+        fflush(NULL);
+        fuse_publish_child_done(done);
+        _exit(result == 0 ? 0 : 1);
+    }
+    snprintf(mp, sizeof(mp), "/tmp/test_fuse_beyond_eof_dirty_%d", child);
+    int status = 0;
+    int waited = fuse_reap_child_bounded(child, done, &status, 10000);
+    munmap((void *)done, sizeof(int));
+    int result = waited == 1 && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    if (waited != 1) {
+        printf(waited == 0 ? "[FAIL] beyond-EOF dirty test timed out\n"
+                           : "[FAIL] waitpid beyond-EOF dirty child failed\n");
+    }
+    if (fuse_cleanup_mounts_bounded(mp, mp) != 0) {
+        printf("[FAIL] bounded cleanup of beyond-EOF dirty mount failed\n");
+        result = -1;
+    }
+    return result;
 }
 
 static int ext_test_shared_writable_mmap_msync_writeback() {
@@ -8434,6 +10074,10 @@ TEST(FuseExtended, OpsAccessCreateSymlinkLinkRename2FlushFsync) {
     ASSERT_EQ(0, ext_test_p2_ops());
 }
 
+TEST(FuseExtended, DirtyMultibatchNotifyInvalidation) {
+    ASSERT_EQ(0, ext_test_dirty_multibatch_notify_invalidation());
+}
+
 TEST(FuseExtended, PositiveLookupCacheRespectsEntryTtl) {
     ASSERT_EQ(0, ext_test_positive_lookup_cache_respects_entry_ttl());
 }
@@ -8504,6 +10148,14 @@ TEST(FuseExtended, DirectIoMmapPolicy) {
 
 TEST(FuseExtended, SharedWritableMmapMsyncWriteback) {
     ASSERT_EQ(0, ext_test_shared_writable_mmap_msync_writeback());
+}
+
+TEST(FuseExtended, MmapWritebackRetryWaitsOutsideMmGuard) {
+    ASSERT_EQ(0, ext_test_mmap_writeback_retry_outside_mm_guard());
+}
+
+TEST(FuseExtended, BeyondEofDirtyPageRetiresWithoutWrite) {
+    ASSERT_EQ(0, ext_test_beyond_eof_dirty_page_retires());
 }
 
 TEST(FuseExtended, SharedMmapDirtyThenPwriteKeepsLatestData) {
@@ -8594,6 +10246,10 @@ TEST(FuseExtended, NoOpenFsyncUsesZeroFh) {
     ASSERT_EQ(0, ext_test_noopen_fsync_uses_zero_fh());
 }
 
+TEST(FuseExtended, NoOpenCloseFlushesDirtyDataWithZeroFh) {
+    ASSERT_EQ(0, ext_test_noopen_close_flushes_dirty_data_with_zero_fh());
+}
+
 TEST(FuseExtended, FsyncEnosysCachedSuccess) {
     ASSERT_EQ(0, ext_test_fsync_enosys_cached_success());
 }
@@ -8624,6 +10280,14 @@ TEST(FuseExtended, FsetflUpdatesFuseDevNonblock) {
 
 TEST(FuseExtended, FopenNoFlushSkipsFlush) {
     ASSERT_EQ(0, ext_test_fopen_noflush_skips_flush());
+}
+
+TEST(FuseExtended, WritebackCacheNoFlushStillFlushes) {
+    ASSERT_EQ(0, ext_test_writeback_cache_noflush_still_flushes());
+}
+
+TEST(FuseExtended, NonWritebackMmapCloseFlushesDirtyMapping) {
+    ASSERT_EQ(0, ext_test_nonwriteback_mmap_close_flushes_dirty_mapping());
 }
 
 TEST(FuseExtended, CloseReturnsFlushErrorAndClosesFd) {

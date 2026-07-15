@@ -43,7 +43,7 @@ impl IndexNode for FuseNode {
     }
 
     fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
-        Some(self.fs())
+        self.try_fs()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -400,7 +400,7 @@ impl IndexNode for FuseNode {
 
         if (fopen_flags & FOPEN_DIRECT_IO) != 0 || (file_flags & FileFlags::O_DIRECT.bits()) != 0 {
             let _barrier = self.writeback_barrier.write();
-            self.prepare_direct_io_range(offset, len, &private_data, false)?;
+            self.prepare_direct_io_range(offset, len, &private_data, false, &_barrier)?;
             let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
             return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
         }
@@ -482,7 +482,15 @@ impl IndexNode for FuseNode {
         };
         let mut total_written = 0usize;
         if !cached_write {
-            self.prepare_direct_io_range(offset, len, &private_data, true)?;
+            self.prepare_direct_io_range(
+                offset,
+                len,
+                &private_data,
+                true,
+                _direct_write_guard
+                    .as_ref()
+                    .expect("direct writeback admission guard"),
+            )?;
         }
         if cached_write && self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
             while total_written < len {
@@ -612,7 +620,9 @@ impl IndexNode for FuseNode {
             writeback_cache.then(|| self.writeback_barrier.write())
         };
         if writeback_cache {
-            self.sync_dirty_cached_pages()?;
+            self.sync_dirty_cached_pages_admitted(
+                _barrier.as_ref().expect("writeback admission guard"),
+            )?;
         }
         if metadata.size > old.size {
             self.resolve_pending_short_read_truncate(metadata.size.max(0) as usize)?;
@@ -793,7 +803,7 @@ impl IndexNode for FuseNode {
         };
         if changes_contents {
             // Close dirty admission between the first drain and exclusivity.
-            self.sync_dirty_cached_pages()?;
+            self.sync_dirty_cached_pages_admitted(&_barrier)?;
         }
 
         let in_arg = FuseFallocateIn {
@@ -822,7 +832,8 @@ impl IndexNode for FuseNode {
                     self.bump_attr_version();
                 }
                 drop(metadata);
-                self.cached_metadata_deadline_ns.store(0, Ordering::Relaxed);
+                self.cached_metadata_deadline_ticks
+                    .store(0, Ordering::Relaxed);
                 Ok(())
             }
             Err(SystemError::ENOSYS) => {
@@ -862,7 +873,7 @@ impl IndexNode for FuseNode {
         match fuse_data {
             FuseFilePrivateData::File(p) => {
                 let _barrier = self.writeback_barrier.write();
-                let sync_result = self.sync_cached_pages();
+                let sync_result = self.sync_dirty_cached_pages_admitted(&_barrier);
                 let wb_error_result = self.check_and_advance_open_wb_error(&p);
                 sync_result?;
                 wb_error_result?;
@@ -891,11 +902,9 @@ impl IndexNode for FuseNode {
 
         if let FuseFilePrivateData::File(_) = &fuse_data {
             let _barrier = self.writeback_barrier.write();
-            if let Some(page_cache) = self.cached_page_cache() {
-                let start_index = start >> MMArch::PAGE_SHIFT;
-                let end_index = end >> MMArch::PAGE_SHIFT;
-                page_cache.manager().sync_range(start_index, end_index)?;
-            }
+            let start_index = start >> MMArch::PAGE_SHIFT;
+            let end_index = end >> MMArch::PAGE_SHIFT;
+            self.sync_cached_range_admitted(start_index, end_index, &_barrier)?;
             if let FuseFilePrivateData::File(p) = fuse_data {
                 self.check_and_advance_open_wb_error(&p)?;
                 return self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync);
@@ -912,6 +921,10 @@ impl IndexNode for FuseNode {
 
     fn fs(&self) -> Arc<dyn FileSystem> {
         self.fs.upgrade().unwrap()
+    }
+
+    fn try_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        self.fs.upgrade().map(|fs| fs as Arc<dyn FileSystem>)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {

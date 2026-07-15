@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <string>
 
 #include "../fuse/fuse_gtest_common.h"
@@ -163,14 +164,20 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "light direct_read_dma,read_size_buckets\n");
     expect_field(whole, "init_epoch ");
     expect_field(whole, "negotiated_max_read_bytes ");
+    expect_field(whole, "negotiated_max_write_bytes ");
     expect_field(whole, "negotiated_max_pages ");
     expect_field(whole, "negotiated_max_readahead_bytes ");
     expect_field(whole, "negotiated_async_read ");
+    expect_field(whole, "negotiated_writeback_cache ");
     expect_field(whole, "effective_read_payload_limit_bytes ");
+    expect_field(whole, "effective_write_payload_limit_bytes ");
     expect_field(whole, "request_queue_current ");
     expect_field(whole, "dispatch_current ");
     expect_field(whole, "processing_current ");
     expect_field(whole, "read_reservation_current ");
+    expect_field(whole, "invalidation_launder_batches_total ");
+    expect_field(whole, "invalidation_launder_pages_total ");
+    expect_field(whole, "mmap_writeback_admission_retries_total ");
     expect_field(whole, "requests_queued_total ");
     expect_field(whole, "requests_dequeued_total ");
     expect_field(whole, "requests_replied_ok_total ");
@@ -191,6 +198,18 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     EXPECT_EQ(0, parse_counter(after_fuse, "dispatch_current"));
     EXPECT_EQ(0, parse_counter(after_fuse, "processing_current"));
     EXPECT_EQ(0, parse_counter(after_fuse, "read_reservation_current"));
+    const long long negotiated_max_write =
+        parse_counter(after_fuse, "negotiated_max_write_bytes");
+    const long long negotiated_max_pages =
+        parse_counter(after_fuse, "negotiated_max_pages");
+    ASSERT_GE(negotiated_max_write, 4096);
+    ASSERT_GE(negotiated_max_pages, 1);
+    EXPECT_LE(negotiated_max_write, 1024 * 1024);
+    EXPECT_EQ(0, parse_counter(after_fuse, "negotiated_writeback_cache"));
+    const long long expected_write_pages =
+        std::min(64LL, std::min(negotiated_max_pages, negotiated_max_write / 4096));
+    EXPECT_EQ(expected_write_pages * 4096,
+              parse_counter(after_fuse, "effective_write_payload_limit_bytes"));
 
     expect_field(whole, "[virtiofs]\n");
     expect_field(whole, "device_queue_depth_max ");

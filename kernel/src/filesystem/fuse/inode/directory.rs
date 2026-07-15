@@ -48,13 +48,13 @@ impl FuseNode {
             self.invalidate_lookup_cache(name);
             return;
         }
-        let deadline_ns = Self::cache_deadline(valid, valid_nsec);
+        let deadline_ticks = Self::cache_deadline(valid, valid_nsec);
         self.prune_lookup_cache();
 
         let mut removed = Vec::new();
         {
             let mut cache = self.lookup_cache.lock();
-            if deadline_ns == 0 || child.dax_dontcache() {
+            if deadline_ticks == 0 || child.dax_dontcache() {
                 if let Some(entry) = cache.remove(name) {
                     removed.push(entry);
                 }
@@ -69,14 +69,14 @@ impl FuseNode {
                 if let Some(entry) = cache.get_mut(name) {
                     if Arc::ptr_eq(&entry.child, child) {
                         entry.generation = generation;
-                        entry.deadline_ns = deadline_ns;
+                        entry.deadline_ticks = deadline_ticks;
                     } else {
                         let old_entry = replace(
                             entry,
                             FuseLookupCacheEntry {
                                 child: child.clone(),
                                 generation,
-                                deadline_ns,
+                                deadline_ticks,
                             },
                         );
                         removed.push(old_entry);
@@ -87,7 +87,7 @@ impl FuseNode {
                         FuseLookupCacheEntry {
                             child: child.clone(),
                             generation,
-                            deadline_ns,
+                            deadline_ticks,
                         },
                     );
                 }
@@ -134,7 +134,7 @@ impl FuseNode {
     pub(crate) fn notify_expire_child(&self, name: &str) -> Result<(), SystemError> {
         let mut cache = self.lookup_cache.lock();
         let entry = cache.get_mut(name).ok_or(SystemError::ENOENT)?;
-        entry.deadline_ns = 0;
+        entry.deadline_ticks = 0;
         self.invalidate_cached_metadata();
         Ok(())
     }
@@ -172,7 +172,7 @@ impl FuseNode {
         entry: &FuseLookupCacheEntry,
         now: u64,
     ) -> bool {
-        (entry.deadline_ns != u64::MAX && now >= entry.deadline_ns)
+        (entry.deadline_ticks != u64::MAX && now >= entry.deadline_ticks)
             || entry.child.dax_dontcache()
             || entry.child.check_not_stale().is_err()
             || entry.child.generation() != entry.generation
@@ -190,7 +190,7 @@ impl FuseNode {
     }
 
     fn prune_lookup_cache(&self) {
-        let now = Self::now_ns();
+        let now = Self::now_ticks();
         let removed = {
             let mut cache = self.lookup_cache.lock();
             let stale_keys: Vec<String> = cache

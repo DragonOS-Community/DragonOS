@@ -21,6 +21,7 @@ use crate::{
     },
     mm::IDLE_PROCESS_ADDRESS_SPACE,
     process::{
+        kthread::KernelThreadMechanism,
         pid::{Pid, PidType},
         ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
     },
@@ -136,7 +137,7 @@ impl ProcessManager {
             // Explicitly wake kthreadd when a kthread exits so that it can
             // reap the zombie.
             if is_kthread {
-                let _ = ProcessManager::wakeup(&parent_pcb);
+                KernelThreadMechanism::notify_daemon();
             }
 
             // TODO: The signal delivery decision should also consider thread-group

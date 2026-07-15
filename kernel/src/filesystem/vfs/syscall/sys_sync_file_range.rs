@@ -113,7 +113,9 @@ fn sync_file_range(
         file.check_and_advance_wb_error(&page_cache)?;
     }
     if flags.contains(SyncFileRangeFlags::WRITE) {
-        manager.start_writeback_range(start_index, end_index)?;
+        let sync_all =
+            flags.contains(SyncFileRangeFlags::WAIT_BEFORE | SyncFileRangeFlags::WAIT_AFTER);
+        manager.start_writeback_range(start_index, end_index, sync_all)?;
     }
     if flags.contains(SyncFileRangeFlags::WAIT_AFTER) {
         manager.wait_writeback_range(start_index, end_index)?;

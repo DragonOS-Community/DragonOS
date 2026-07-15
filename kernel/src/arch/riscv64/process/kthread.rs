@@ -58,10 +58,6 @@ impl KernelThreadMechanism {
             e
         })?;
 
-        let pcb = ProcessManager::find(pid).unwrap();
-        pcb.set_name(info.name().clone());
-        info.setup_pcb(&pcb);
-
         return Ok(pid);
     }
 }

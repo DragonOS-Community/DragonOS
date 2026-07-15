@@ -31,6 +31,7 @@ use super::{
         fuse_read_struct, FuseStatfsOut, FOPEN_DIRECT_IO, FUSE_ATTR_SUBMOUNT, FUSE_ROOT_ID,
         FUSE_STATFS,
     },
+    stats,
 };
 
 #[derive(Debug)]
@@ -843,11 +844,18 @@ impl FileSystem for FuseFS {
             p.node.clone()
         };
 
-        node.with_writeback_admission(|| {
+        let mut result = VmFaultReason::VM_FAULT_SIGBUS;
+        let admitted = node.try_with_writeback_admission(&mut || {
             let Ok(_pin) = node.pin_writeback_handle() else {
-                return VmFaultReason::VM_FAULT_SIGBUS;
+                return Ok(());
             };
-            let result = PageFaultHandler::filemap_page_mkwrite(pfm);
+            let Some(metadata) = node.cached_metadata_snapshot() else {
+                return Ok(());
+            };
+            result = PageFaultHandler::filemap_page_mkwrite_with_stable_size(
+                pfm,
+                metadata.size.max(0) as usize,
+            );
             if !result.intersects(
                 VmFaultReason::VM_FAULT_SIGBUS
                     | VmFaultReason::VM_FAULT_OOM
@@ -855,8 +863,21 @@ impl FileSystem for FuseFS {
             ) {
                 node.note_mmap_write();
             }
-            result
-        })
+            Ok(())
+        });
+        match admitted {
+            Ok(true) => result,
+            Ok(false) => {
+                // Never block on a writer-preferred admission semaphore while
+                // the architecture fault path owns AddressSpace::write(). The
+                // retry waiter acquires/releases it only after the MM guard is
+                // dropped, closing the barrier<->mkclean cycle.
+                stats::on_mmap_writeback_admission_retry();
+                pfm.set_retry_wait(node.writeback_admission_retry_wait());
+                VmFaultReason::VM_FAULT_RETRY
+            }
+            Err(_) => VmFaultReason::VM_FAULT_SIGBUS,
+        }
     }
 
     fn mprotect(&self, _old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {

@@ -976,6 +976,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
 
+    /// 获取 inode 所在的文件系统；供异步回收等可能与卸载并发的路径使用。
+    ///
+    /// 默认实现适用于 inode 强持有文件系统的实现。仅当 inode 与文件系统之间
+    /// 使用弱引用、且调用方允许文件系统已完成销毁时才应覆盖此方法。
+    fn try_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
+
     /// @brief 获取当前 inode 所在挂载点的挂载标志
     fn mount_flags(&self) -> MountFlags {
         MountFlags::empty()

@@ -72,7 +72,6 @@ impl PacketSocket {
         // concurrent delivers from other NICs are not blocked by setup/teardown.
         let ring_arc = self.rx_ring.lock().as_ref().cloned();
         if let Some(ring_arc) = ring_arc {
-
             let metadata = PacketMetadata {
                 src_mac: src,
                 protocol,

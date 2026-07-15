@@ -24,11 +24,8 @@ use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 
-
-pub use uapi::{
-    eth_protocol, packet_option, PacketType, SockAddrLl, TpacketAuxdata,
-};
 pub use ring::{RingWriteResult, TpacketVersion};
+pub use uapi::{eth_protocol, packet_option, PacketType, SockAddrLl, TpacketAuxdata};
 
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;

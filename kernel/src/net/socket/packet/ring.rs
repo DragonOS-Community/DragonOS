@@ -25,8 +25,8 @@ use crate::mm::MemoryManagementArch;
 use crate::mm::VmFaultReason;
 
 use super::uapi::{
-    tpacket_align, TPACKET2_HDRLEN, TPACKET_HDRLEN, TP_STATUS_KERNEL, TP_STATUS_USER,
-    TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID, Tpacket2Hdr, TpacketHdr,
+    tpacket_align, Tpacket2Hdr, TpacketHdr, TPACKET2_HDRLEN, TPACKET_HDRLEN, TP_STATUS_KERNEL,
+    TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID,
 };
 use super::{PacketMetadata, PacketSocketType};
 

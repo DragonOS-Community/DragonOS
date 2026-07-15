@@ -362,7 +362,10 @@ impl<T: Socket + 'static> IndexNode for T {
     /// page-fault path never reaches the `unreachable!()` in `fs()`.
     fn mmap(&self, _start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
         let layout = super::base::Socket::mmap_layout(self).ok_or(SystemError::EINVAL)?;
-        if offset.checked_add(len).map_or(true, |end| end > layout.size) {
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > layout.size)
+        {
             return Err(SystemError::EINVAL);
         }
         Ok(())

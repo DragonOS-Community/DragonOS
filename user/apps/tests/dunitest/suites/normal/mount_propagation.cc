@@ -491,6 +491,184 @@ TEST_F(MountPropagationTest, OrdinaryUmountRejectsMountedDescendant) {
     best_effort_rmdir(base);
 }
 
+TEST_F(MountPropagationTest, UmountUsesExactEdgeAfterChildBecomesPrivate) {
+    char base[160] = {};
+    char peer[160] = {};
+    char child[192] = {};
+    char peer_child[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(peer, sizeof(peer), "%s/slave", root_);
+    snprintf(child, sizeof(child), "%s/child", base);
+    snprintf(peer_child, sizeof(peer_child), "%s/child", peer);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(peer)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, peer, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child)) << strerror(errno);
+    ASSERT_EQ(0, mount("", child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(child, "propagated")) << strerror(errno);
+    ASSERT_TRUE(marker_exists(peer_child, "propagated"));
+
+    ASSERT_EQ(0, mount(nullptr, child, nullptr, MS_PRIVATE, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, umount2(child, MNT_DETACH)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(peer_child, "after_umount")) << strerror(errno);
+    EXPECT_TRUE(marker_exists(child, "after_umount"));
+
+    best_effort_umount(peer_child);
+    best_effort_umount(peer);
+    best_effort_umount(base);
+    best_effort_rmdir(child);
+    best_effort_rmdir(peer);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, LazyUmountPropagatesCompleteSourceSubtree) {
+    char base[160] = {};
+    char peer[160] = {};
+    char child[192] = {};
+    char peer_child[192] = {};
+    char grandchild[224] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(peer, sizeof(peer), "%s/slave", root_);
+    snprintf(child, sizeof(child), "%s/child", base);
+    snprintf(peer_child, sizeof(peer_child), "%s/child", peer);
+    snprintf(grandchild, sizeof(grandchild), "%s/grandchild", child);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(peer)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, peer, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child)) << strerror(errno);
+    ASSERT_EQ(0, mount("", child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(grandchild)) << strerror(errno);
+    ASSERT_EQ(0, mount("", grandchild, "ramfs", 0, nullptr)) << strerror(errno);
+
+    ASSERT_EQ(0, umount2(child, MNT_DETACH)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(peer_child, "subtree_removed")) << strerror(errno);
+    EXPECT_TRUE(marker_exists(child, "subtree_removed"));
+
+    best_effort_umount(peer_child);
+    best_effort_umount(peer);
+    best_effort_umount(base);
+    best_effort_rmdir(grandchild);
+    best_effort_rmdir(child);
+    best_effort_rmdir(peer);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, LazyUmountRemovesSelectedRootTopper) {
+    char base[160] = {};
+    char peer[160] = {};
+    char child[192] = {};
+    char peer_child[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(peer, sizeof(peer), "%s/slave", root_);
+    snprintf(child, sizeof(child), "%s/child", base);
+    snprintf(peer_child, sizeof(peer_child), "%s/child", peer);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(peer)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, peer, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(child, "underlay")) << strerror(errno);
+    ASSERT_EQ(0, mount("", child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(child, "lower")) << strerror(errno);
+    ASSERT_EQ(0, mount("", child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(child, "topper")) << strerror(errno);
+    ASSERT_TRUE(marker_exists(peer_child, "topper"));
+
+    ASSERT_EQ(0, umount2(base, MNT_DETACH)) << strerror(errno);
+    EXPECT_TRUE(marker_exists(peer_child, "underlay"));
+    EXPECT_FALSE(marker_exists(peer_child, "lower"));
+    EXPECT_FALSE(marker_exists(peer_child, "topper"));
+
+    best_effort_umount(peer_child);
+    best_effort_umount(peer);
+    best_effort_umount(base);
+    best_effort_rmdir(child);
+    best_effort_rmdir(peer);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, UmountRetainsPeerWithPrivateNonRootChild) {
+    char base[160] = {};
+    char peer[160] = {};
+    char child[192] = {};
+    char peer_child[192] = {};
+    char peer_grandchild[224] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(peer, sizeof(peer), "%s/slave", root_);
+    snprintf(child, sizeof(child), "%s/child", base);
+    snprintf(peer_child, sizeof(peer_child), "%s/child", peer);
+    snprintf(peer_grandchild, sizeof(peer_grandchild), "%s/grandchild", peer_child);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(peer)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, peer, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child)) << strerror(errno);
+    ASSERT_EQ(0, mount("", child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, peer_child, nullptr, MS_PRIVATE, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(peer_grandchild)) << strerror(errno);
+    ASSERT_EQ(0, mount("", peer_grandchild, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(peer_grandchild, "retained")) << strerror(errno);
+
+    ASSERT_EQ(0, umount(child)) << strerror(errno);
+    EXPECT_TRUE(marker_exists(peer_grandchild, "retained"));
+    ASSERT_EQ(0, create_marker(peer_child, "peer_only")) << strerror(errno);
+    EXPECT_FALSE(marker_exists(child, "peer_only"));
+
+    best_effort_umount(peer_grandchild);
+    best_effort_umount(peer_child);
+    best_effort_umount(peer);
+    best_effort_umount(base);
+    best_effort_rmdir(peer_grandchild);
+    best_effort_rmdir(child);
+    best_effort_rmdir(peer);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, UmountRestoresPeerRootCover) {
+    char base[160] = {};
+    char peer[160] = {};
+    char child[192] = {};
+    char peer_child[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(peer, sizeof(peer), "%s/slave", root_);
+    snprintf(child, sizeof(child), "%s/child", base);
+    snprintf(peer_child, sizeof(peer_child), "%s/child", peer);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(peer)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, peer, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child)) << strerror(errno);
+    ASSERT_EQ(0, mount("", child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, peer_child, nullptr, MS_PRIVATE, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount("", peer_child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(peer_child, "cover")) << strerror(errno);
+
+    ASSERT_EQ(0, mount(nullptr, child, nullptr, MS_PRIVATE, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, umount2(child, MNT_DETACH)) << strerror(errno);
+    EXPECT_TRUE(marker_exists(peer_child, "cover"));
+    ASSERT_EQ(0, create_marker(peer_child, "cover_only")) << strerror(errno);
+    EXPECT_FALSE(marker_exists(child, "cover_only"));
+
+    best_effort_umount(peer_child);
+    best_effort_umount(peer);
+    best_effort_umount(base);
+    best_effort_rmdir(child);
+    best_effort_rmdir(peer);
+    best_effort_rmdir(base);
+}
+
 TEST_F(MountPropagationTest, ParentUmountRemovesLockedCrossUserNamespaceCopy) {
     char base[160] = {};
     char host[192] = {};

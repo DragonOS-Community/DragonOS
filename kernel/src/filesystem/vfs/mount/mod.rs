@@ -27,8 +27,8 @@ use crate::{
             propagation::{
                 abort_mount_propagation, commit_mount_propagation_locked, detach_mount_propagation,
                 ensure_subtree_shared, inherit_bind_mount_propagation,
-                prepare_mount_propagation_locked, propagate_umount, propagation_umount_busy,
-                MountPropagation,
+                prepare_mount_propagation_locked, propagate_umount_sources,
+                propagation_umount_busy, MountPropagation,
             },
         },
         ProcessManager,
@@ -403,6 +403,7 @@ struct MountLifecycle {
     state: MountLifecycleState,
     external_pins: usize,
     construction_reserved: bool,
+    propagation_attached: bool,
     detached_component: Option<Arc<DetachedMountComponent>>,
 }
 
@@ -1115,6 +1116,7 @@ impl MountFS {
                 state: MountLifecycleState::Constructing,
                 external_pins: 0,
                 construction_reserved: state_init.construction_reserved,
+                propagation_attached: true,
                 detached_component: None,
             }),
         });
@@ -1159,6 +1161,7 @@ impl MountFS {
                 state: MountLifecycleState::Constructing,
                 external_pins: 0,
                 construction_reserved: true,
+                propagation_attached: true,
                 detached_component: None,
             }),
         });
@@ -1378,6 +1381,133 @@ impl MountFS {
             }
             _ => Err(SystemError::EINVAL),
         }
+    }
+
+    /// Remove one exact mount edge while moving every mount stacked on the
+    /// removed mount's root back to the removed edge in chronological order.
+    ///
+    /// This is the `umount_list()` restoration operation used by propagated
+    /// umount. Each tuple identifies whether that root child is restored to the
+    /// original parent (`true`) or retained below a lazy-detached parent
+    /// (`false`). Commit capacity is reserved during preflight.
+    pub(crate) fn detach_exact_restoring_root_children(
+        &self,
+        mount_fs: &Arc<MountFS>,
+        root_children: Vec<(Arc<MountFS>, bool)>,
+        reservation: &MountEdgeReservation,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let original_mountpoint = mount_fs.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        if !Arc::ptr_eq(&original_mountpoint.mount_fs, &self.self_ref())
+            || !Arc::ptr_eq(&reservation.parent, &self.self_ref())
+            || !Arc::ptr_eq(reservation.mountpoint(), &original_mountpoint)
+            || Arc::ptr_eq(&self.self_ref(), mount_fs)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let root_mountpoint = mount_fs.mountpoint_root_inode();
+        let original_dentry = original_mountpoint.shared_dentry();
+        let root_dentry = root_mountpoint.shared_dentry();
+
+        with_dentry_mount_gates(Some(&original_dentry), Some(&root_dentry), || {
+            fn replace_edge(
+                parent_mountpoints: &mut HashMap<DentryId, Vec<Arc<MountFS>>>,
+                child_mountpoints: &mut HashMap<DentryId, Vec<Arc<MountFS>>>,
+                original_mountpoint: &Arc<MountFSInode>,
+                root_mountpoint: &Arc<MountFSInode>,
+                mount_fs: &Arc<MountFS>,
+                root_children: &[(Arc<MountFS>, bool)],
+            ) -> Result<(), SystemError> {
+                let parent_stack = parent_mountpoints
+                    .get(&original_mountpoint.dentry_id())
+                    .ok_or(SystemError::ENOENT)?;
+                let parent_index = parent_stack
+                    .iter()
+                    .position(|child| Arc::ptr_eq(child, mount_fs))
+                    .ok_or(SystemError::ENOENT)?;
+                let actual_root_children = child_mountpoints
+                    .get(&root_mountpoint.dentry_id())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if actual_root_children.len() != root_children.len()
+                    || actual_root_children
+                        .iter()
+                        .zip(root_children)
+                        .any(|(actual, (expected, _))| !Arc::ptr_eq(actual, expected))
+                {
+                    return Err(SystemError::EBUSY);
+                }
+
+                let parent_stack = parent_mountpoints
+                    .get_mut(&original_mountpoint.dentry_id())
+                    .expect("validated propagated-umount parent stack");
+                parent_stack.remove(parent_index);
+                let mut offset = 0;
+                for (child, restore) in root_children {
+                    if !restore {
+                        continue;
+                    }
+                    child.relocate_mountpoint(Some(original_mountpoint.clone()));
+                    child.tucked_under.store(false, Ordering::Release);
+                    parent_stack.insert(parent_index + offset, child.clone());
+                    offset += 1;
+                }
+                let remove_root_key = if root_children.is_empty() {
+                    false
+                } else {
+                    let root_stack = child_mountpoints
+                        .get_mut(&root_mountpoint.dentry_id())
+                        .expect("validated propagated-umount root stack");
+                    let mut index = 0;
+                    root_stack.retain(|_| {
+                        let retain = !root_children[index].1;
+                        index += 1;
+                        retain
+                    });
+                    root_stack.is_empty()
+                };
+                if remove_root_key {
+                    child_mountpoints.remove(&root_mountpoint.dentry_id());
+                }
+                Ok(())
+            }
+
+            if self.mount_id.data() < mount_fs.mount_id.data() {
+                let mut parent_mountpoints = self.mountpoints.lock();
+                let mut child_mountpoints = mount_fs.mountpoints.lock();
+                replace_edge(
+                    &mut parent_mountpoints,
+                    &mut child_mountpoints,
+                    &original_mountpoint,
+                    &root_mountpoint,
+                    mount_fs,
+                    &root_children,
+                )?;
+            } else {
+                let mut child_mountpoints = mount_fs.mountpoints.lock();
+                let mut parent_mountpoints = self.mountpoints.lock();
+                replace_edge(
+                    &mut parent_mountpoints,
+                    &mut child_mountpoints,
+                    &original_mountpoint,
+                    &root_mountpoint,
+                    mount_fs,
+                    &root_children,
+                )?;
+            }
+
+            let restored_count = root_children.iter().filter(|(_, restore)| *restore).count();
+            root_dentry
+                .mount_edges
+                .fetch_sub(restored_count, Ordering::Release);
+            if restored_count == 0 {
+                original_dentry.mount_edges.fetch_sub(1, Ordering::Release);
+            } else if restored_count > 1 {
+                original_dentry
+                    .mount_edges
+                    .fetch_add(restored_count - 1, Ordering::Release);
+            }
+            Ok(mount_fs.clone())
+        })
     }
 
     fn restore_exact_cover(
@@ -1755,22 +1885,29 @@ impl MountFS {
     pub(crate) fn deactivate(&self) {
         let (should_remove, release_construction, should_leave_propagation) = {
             let mut lifecycle = self.lifecycle.lock();
-            match lifecycle.state {
+            let should_leave_propagation = lifecycle.propagation_attached;
+            lifecycle.propagation_attached = false;
+            let (should_remove, release_construction) = match lifecycle.state {
                 MountLifecycleState::Constructing => {
                     lifecycle.state = MountLifecycleState::Detached;
                     let reserved = lifecycle.construction_reserved;
                     lifecycle.construction_reserved = false;
-                    (false, reserved, true)
+                    (false, reserved)
                 }
                 MountLifecycleState::Live
                 | MountLifecycleState::Detaching
                 | MountLifecycleState::DetachedConnected => {
                     lifecycle.state = MountLifecycleState::Detached;
                     lifecycle.detached_component = None;
-                    (true, false, true)
+                    (true, false)
                 }
-                MountLifecycleState::Detached => (false, false, false),
-            }
+                MountLifecycleState::Detached => (false, false),
+            };
+            (
+                should_remove,
+                release_construction,
+                should_leave_propagation,
+            )
         };
         if should_leave_propagation {
             detach_mount_propagation(&self.self_ref());
@@ -1780,6 +1917,22 @@ impl MountFS {
         }
         if should_remove && self.super_block_state.remove_mount() {
             Self::schedule_final_shutdown(self.self_ref());
+        }
+    }
+
+    /// Record that a prepared batch graph commit already removed this mount's
+    /// propagation relationships. Later lifecycle teardown must not repeat it.
+    pub(crate) fn mark_propagation_detached(&self) {
+        self.lifecycle.lock().propagation_attached = false;
+    }
+
+    fn detach_propagation_once(&self) {
+        let should_detach = {
+            let mut lifecycle = self.lifecycle.lock();
+            core::mem::replace(&mut lifecycle.propagation_attached, false)
+        };
+        if should_detach {
+            detach_mount_propagation(&self.self_ref());
         }
     }
 
@@ -1895,7 +2048,7 @@ impl MountFS {
                 namespace.remove_mount_exact(mount);
             }
             mount.clear_namespace();
-            detach_mount_propagation(mount);
+            mount.detach_propagation_once();
         }
 
         let mut component_roots = vec![root.clone()];
@@ -2111,7 +2264,17 @@ impl MountFS {
         }
 
         let root_mountpoint = root.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        root.commit_umount_at(&root_mountpoint, lazy)?;
+        if let Err(error) = propagate_umount_sources(&mounts, lazy) {
+            for mount in &mounts {
+                let mut lifecycle = mount.lifecycle.lock();
+                if lifecycle.state == MountLifecycleState::Detaching {
+                    lifecycle.state = MountLifecycleState::Live;
+                }
+            }
+            return Err(error);
+        }
+        root.commit_umount_at(&root_mountpoint, lazy)
+            .expect("prepared local umount edge commit cannot fail");
         // Final filesystem shutdown may sleep and may itself need pathname
         // operations. Never wait while holding the topology/admission lock.
         drop(_topology);
@@ -2127,6 +2290,7 @@ impl MountFS {
     /// pre-detach sync; final shared-superblock shutdown remains deferred until
     /// every mount and external pin is gone.
     pub fn umount_with_mode(&self, lazy: bool) -> Result<Arc<MountFS>, SystemError> {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let mountpoint = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
 
         if !lazy && propagation_umount_busy(&mountpoint.mount_fs, &mountpoint) {
@@ -2143,8 +2307,14 @@ impl MountFS {
             }
             lifecycle.state = MountLifecycleState::Detaching;
         }
-
-        self.commit_umount_at(&mountpoint, lazy)
+        if let Err(error) = propagate_umount_sources(core::slice::from_ref(&self.self_ref()), lazy)
+        {
+            self.lifecycle.lock().state = MountLifecycleState::Live;
+            return Err(error);
+        }
+        Ok(self
+            .commit_umount_at(&mountpoint, lazy)
+            .expect("prepared local umount edge commit cannot fail"))
     }
 
     fn commit_umount_at(
@@ -2155,12 +2325,6 @@ impl MountFS {
         let parent = mountpoint.mount_fs();
         let this_mount = self.self_ref();
 
-        // Propagation performs a full preflight and commits only peer/slave
-        // copies. Keep the local edge intact until that transaction succeeds,
-        // so failure needs no local topology rollback.
-        if parent.propagation().is_shared() {
-            propagate_umount(&parent, mountpoint, &this_mount, lazy)?;
-        }
         let result = parent.detach_exact(&this_mount);
 
         if result.is_ok() {

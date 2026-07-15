@@ -87,6 +87,29 @@ check_result_only_transcript() {
     '
 }
 
+check_readdir_failure_result() {
+    expected_errno=$1
+    awk -v expected_errno="$expected_errno" '
+        function value(prefix,    i) {
+            for (i = 1; i <= NF; ++i) {
+                if (index($i, prefix "=") == 1) {
+                    return substr($i, length(prefix) + 2)
+                }
+            }
+            return "__missing__"
+        }
+        $1 == "result" {
+            seen++
+            if (value("workload") != "readdir_scan" || value("status") != "fail" ||
+                value("errno") != expected_errno || value("bytes") != "0" ||
+                value("ops") != "0") {
+                bad = 1
+            }
+        }
+        END { exit bad || seen != 1 }
+    '
+}
+
 MOUNT="$WORK_DIR/mount"
 mkdir "$MOUNT"
 
@@ -121,6 +144,63 @@ awk '
     }
     END { exit bad || seen != 1 }
 ' "$WORK_DIR/readdir-scan.log"
+
+# A pre-scan quiescence timeout must still terminate the workload transcript
+# with one machine-readable failure result for benchmark parsers.
+: >"$WORK_DIR/non-quiescent.stats"
+set +e
+VIRTIOFS_BENCH_RUN_ID=readdir_timeout \
+    VIRTIOFS_STATS_PATH="$WORK_DIR/non-quiescent.stats" \
+    "$BIN" --mount "$MOUNT" --workload readdir_scan --path readdir_schema \
+    --files 2048 --iterations 3 >"$WORK_DIR/readdir-timeout.log" 2>&1
+readdir_timeout_rc=$?
+set -e
+if [ "$readdir_timeout_rc" -eq 0 ]; then
+    echo "readdir quiescence timeout unexpectedly succeeded" >&2
+    exit 1
+fi
+check_result_only_transcript <"$WORK_DIR/readdir-timeout.log"
+check_readdir_failure_result 110 <"$WORK_DIR/readdir-timeout.log"
+
+# Keep quiescence sampling independent from stats collection so that a stable
+# transport with an unavailable baseline exercises the adjacent EIO path.
+cat >"$WORK_DIR/quiescent.stats" <<'EOF'
+[fuse]
+request_queue_current 0
+dispatch_current 0
+processing_current 0
+background_inflight_current 0
+read_reservation_current 0
+requests_queued_total 0
+requests_dequeued_total 0
+requests_replied_ok_total 0
+requests_replied_err_total 0
+requests_aborted_total 0
+[virtiofs]
+inflight_current 0
+hiprio_inflight_current 0
+request_inflight_current 0
+queue_full_blocked_current 0
+reply_retained_current 0
+bridge_submitted_total 0
+bridge_completed_total 0
+direct_read_requested_bytes_total 0
+direct_read_completed_bytes_total 0
+EOF
+set +e
+VIRTIOFS_BENCH_RUN_ID=readdir_baseline_unavailable \
+    VIRTIOFS_QUIESCENCE_PATH="$WORK_DIR/quiescent.stats" \
+    VIRTIOFS_STATS_PATH="$WORK_DIR/missing.stats" \
+    "$BIN" --mount "$MOUNT" --workload readdir_scan --path readdir_schema \
+    --files 2048 --iterations 3 >"$WORK_DIR/readdir-baseline-unavailable.log" 2>&1
+readdir_baseline_rc=$?
+set -e
+if [ "$readdir_baseline_rc" -eq 0 ]; then
+    echo "readdir missing baseline unexpectedly succeeded" >&2
+    exit 1
+fi
+check_result_only_transcript <"$WORK_DIR/readdir-baseline-unavailable.log"
+check_readdir_failure_result 5 <"$WORK_DIR/readdir-baseline-unavailable.log"
 
 VIRTIOFS_BENCH_RUN_ID=readdir_cleanup \
     "$BIN" --mount "$MOUNT" --workload readdir_cleanup --path readdir_schema \

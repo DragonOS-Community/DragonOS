@@ -1333,12 +1333,18 @@ int readdir_scan_workload(const Options& opt, const std::string&) {
     }
     const bool verify_stats = !stats_path().empty();
     if (!wait_for_quiescence(label, "before")) {
-        close(root_fd);
-        return -1;
+        err = ETIMEDOUT;
     }
-    StatsMap before = read_stats();
-    if (verify_stats && before.empty()) {
-        close(root_fd);
+    StatsMap before;
+    if (err == 0) {
+        before = read_stats();
+        if (verify_stats && before.empty()) {
+            err = EIO;
+        }
+    }
+    if (err != 0) {
+        close_preserve_error(root_fd, &err);
+        emit_result(label, opt, 0, 0, 0, err);
         return -1;
     }
 

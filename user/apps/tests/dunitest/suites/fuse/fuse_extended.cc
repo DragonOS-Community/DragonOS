@@ -161,6 +161,257 @@ static int fuse_wait_counter_increase(const char *path, const char *field, uint6
     return -1;
 }
 
+struct p4_readdir_daemon_args {
+    struct fuse_daemon_args common;
+    volatile uint32_t lookup_count;
+    volatile uint32_t getattr_count;
+    volatile uint32_t forget_count;
+    volatile uint32_t readdir_count;
+    volatile uint32_t readdirplus_count;
+    volatile uint32_t dir_trace_count;
+    uint32_t dir_opcode_trace[16];
+    uint64_t dir_offset_trace[16];
+    int one_entry_per_reply;
+};
+
+struct p4_linux_dirent64 {
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[1];
+};
+
+struct p4_mock_dir_entry {
+    const char *name;
+    uint64_t nodeid;
+    uint64_t ino;
+    uint32_t type;
+    uint64_t next_cookie;
+};
+
+static const struct p4_mock_dir_entry p4_mock_dir_entries[] = {
+    {".", 1, 1, DT_DIR, 11},
+    {"..", 1, 1, DT_DIR, 29},
+    {"hello.txt", 2, 2, DT_REG, 101},
+    {"alpha.txt", 3, 3, DT_REG, 4099},
+    {"beta.txt", 4, 4, DT_REG, 65537},
+};
+
+struct p4_shared_readdir_args {
+    int fd;
+    volatile int *ready;
+    volatile int *go;
+    pthread_mutex_t *lock;
+    unsigned int *name_counts;
+    volatile int error;
+};
+
+struct p4_shared_seek_args {
+    int fd;
+    volatile int *go;
+    volatile int *stop;
+    volatile int error;
+};
+
+static int p4_mock_entry_index(const char *name) {
+    for (size_t i = 0; i < sizeof(p4_mock_dir_entries) / sizeof(p4_mock_dir_entries[0]); i++) {
+        if (strcmp(name, p4_mock_dir_entries[i].name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void *p4_shared_readdir_thread(void *opaque) {
+    struct p4_shared_readdir_args *args = (struct p4_shared_readdir_args *)opaque;
+    __sync_fetch_and_add(args->ready, 1);
+    while (!*args->go) {
+        sched_yield();
+    }
+    for (;;) {
+        unsigned char buf[32];
+        ssize_t n = syscall(SYS_getdents64, args->fd, buf, sizeof(buf));
+        if (n < 0) {
+            args->error = errno;
+            return NULL;
+        }
+        if (n == 0) {
+            return NULL;
+        }
+        if ((size_t)n < offsetof(struct p4_linux_dirent64, d_name)) {
+            args->error = EIO;
+            return NULL;
+        }
+        struct p4_linux_dirent64 *entry = (struct p4_linux_dirent64 *)buf;
+        int index = p4_mock_entry_index(entry->d_name);
+        if (index < 0 || entry->d_reclen != (unsigned short)n ||
+            entry->d_off != (int64_t)p4_mock_dir_entries[index].next_cookie ||
+            entry->d_ino != p4_mock_dir_entries[index].ino ||
+            entry->d_type != p4_mock_dir_entries[index].type) {
+            args->error = EIO;
+            return NULL;
+        }
+        pthread_mutex_lock(args->lock);
+        args->name_counts[index]++;
+        pthread_mutex_unlock(args->lock);
+    }
+}
+
+static void *p4_shared_seek_thread(void *opaque) {
+    struct p4_shared_seek_args *args = (struct p4_shared_seek_args *)opaque;
+    while (!*args->go) {
+        sched_yield();
+    }
+    while (!*args->stop) {
+        if (lseek(args->fd, 0, SEEK_CUR) < 0) {
+            args->error = errno;
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static void p4_add_mock_file(struct simplefs *fs, const char *name) {
+    struct simplefs_node *node = simplefs_alloc(fs);
+    if (!node) {
+        return;
+    }
+    node->parent = 1;
+    node->mode = S_IFREG | 0644;
+    node->is_dir = 0;
+    strncpy(node->name, name, sizeof(node->name) - 1);
+    node->name[sizeof(node->name) - 1] = '\0';
+}
+
+static int p4_handle_readdir(struct p4_readdir_daemon_args *args,
+                             const struct fuse_in_header *header, const unsigned char *payload,
+                             size_t payload_len) {
+    if (payload_len < sizeof(struct fuse_read_in)) {
+        return -1;
+    }
+    const struct fuse_read_in *in = (const struct fuse_read_in *)payload;
+    const bool plus = header->opcode == FUSE_READDIRPLUS;
+    size_t index = 0;
+    if (in->offset != 0) {
+        bool found = false;
+        for (size_t i = 0; i < sizeof(p4_mock_dir_entries) / sizeof(p4_mock_dir_entries[0]); i++) {
+            if (p4_mock_dir_entries[i].next_cookie == in->offset) {
+                index = i + 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return fuse_write_reply(args->common.fd, header->unique, -EINVAL, NULL, 0);
+        }
+    }
+
+    unsigned char outbuf[1024];
+    memset(outbuf, 0, sizeof(outbuf));
+    size_t outlen = 0;
+    size_t output_limit = in->size < sizeof(outbuf) ? in->size : sizeof(outbuf);
+    for (; index < sizeof(p4_mock_dir_entries) / sizeof(p4_mock_dir_entries[0]); index++) {
+        const struct p4_mock_dir_entry *entry = &p4_mock_dir_entries[index];
+        size_t name_len = strlen(entry->name);
+        size_t record_len =
+            plus ? fuse_direntplus_rec_len(name_len) : fuse_dirent_rec_len(name_len);
+        if (outlen + record_len > output_limit) {
+            break;
+        }
+        if (plus) {
+            struct fuse_direntplus dirent;
+            memset(&dirent, 0, sizeof(dirent));
+            struct simplefs_node *node = simplefs_find_node(&args->common.fs, entry->nodeid);
+            dirent.entry_out.nodeid = entry->nodeid;
+            dirent.entry_out.generation = node ? node->generation : 1;
+            dirent.entry_out.entry_valid = args->common.entry_valid_sec;
+            dirent.entry_out.attr_valid = args->common.attr_valid_sec;
+            if (node) {
+                simplefs_fill_attr(node, &dirent.entry_out.attr);
+            }
+            dirent.dirent.ino = entry->ino;
+            dirent.dirent.off = entry->next_cookie;
+            dirent.dirent.namelen = (uint32_t)name_len;
+            dirent.dirent.type = entry->type;
+            memcpy(outbuf + outlen, &dirent, sizeof(dirent));
+            memcpy(outbuf + outlen + sizeof(dirent), entry->name, name_len);
+        } else {
+            struct fuse_dirent dirent;
+            memset(&dirent, 0, sizeof(dirent));
+            dirent.ino = entry->ino;
+            dirent.off = entry->next_cookie;
+            dirent.namelen = (uint32_t)name_len;
+            dirent.type = entry->type;
+            memcpy(outbuf + outlen, &dirent, sizeof(dirent));
+            memcpy(outbuf + outlen + sizeof(dirent), entry->name, name_len);
+        }
+        outlen += record_len;
+        if (args->one_entry_per_reply) {
+            break;
+        }
+    }
+    return fuse_write_reply(args->common.fd, header->unique, 0, outbuf, outlen);
+}
+
+static void *p4_readdir_daemon_thread(void *opaque) {
+    struct p4_readdir_daemon_args *args = (struct p4_readdir_daemon_args *)opaque;
+    unsigned char *buf = (unsigned char *)malloc(FUSE_TEST_BUF_SIZE);
+    if (!buf) {
+        return NULL;
+    }
+    simplefs_init(&args->common.fs);
+    p4_add_mock_file(&args->common.fs, "alpha.txt");
+    p4_add_mock_file(&args->common.fs, "beta.txt");
+
+    while (!*args->common.stop) {
+        ssize_t n = read(args->common.fd, buf, FUSE_TEST_BUF_SIZE);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (fuse_daemon_read_should_stop(errno)) {
+                break;
+            }
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        const struct fuse_in_header *header = (const struct fuse_in_header *)buf;
+        if ((size_t)n != header->len || (size_t)n < sizeof(*header)) {
+            continue;
+        }
+        const unsigned char *payload = buf + sizeof(*header);
+        size_t payload_len = (size_t)n - sizeof(*header);
+        if (header->opcode == FUSE_LOOKUP) {
+            args->lookup_count++;
+        } else if (header->opcode == FUSE_GETATTR) {
+            args->getattr_count++;
+        } else if (header->opcode == FUSE_FORGET) {
+            args->forget_count++;
+        } else if (header->opcode == FUSE_READDIR) {
+            args->readdir_count++;
+        } else if (header->opcode == FUSE_READDIRPLUS) {
+            args->readdirplus_count++;
+        }
+        if (header->opcode == FUSE_READDIR || header->opcode == FUSE_READDIRPLUS) {
+            uint32_t trace_index = args->dir_trace_count++;
+            if (trace_index < sizeof(args->dir_opcode_trace) / sizeof(args->dir_opcode_trace[0]) &&
+                payload_len >= sizeof(struct fuse_read_in)) {
+                const struct fuse_read_in *read_in = (const struct fuse_read_in *)payload;
+                args->dir_opcode_trace[trace_index] = header->opcode;
+                args->dir_offset_trace[trace_index] = read_in->offset;
+            }
+            (void)p4_handle_readdir(args, header, payload, payload_len);
+        } else {
+            (void)fuse_handle_one(&args->common, buf, (size_t)n);
+        }
+    }
+    free(buf);
+    return NULL;
+}
+
 static int fuse_read_launder_counters(const char *path, uint64_t *batches, uint64_t *pages) {
     char *report = fuse_read_stats_report(path);
     if (!report) {
@@ -8977,18 +9228,6 @@ static bool forget_trace_contains(volatile uint64_t *nodeids, uint32_t count, ui
     return false;
 }
 
-static bool forget_trace_contains_pair(volatile uint64_t *nodeids,
-                                       volatile uint64_t *nlookups,
-                                       uint32_t count, uint64_t nodeid,
-                                       uint64_t nlookup) {
-    for (uint32_t i = 0; i < count && i < 32; i++) {
-        if (nodeids[i] == nodeid && nlookups[i] == nlookup) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static int ext_test_positive_lookup_cache_expires_and_forgets_before_umount() {
     const char *mp = "/tmp/test_fuse_positive_lookup_lifetime";
     char parent_path[512];
@@ -9490,6 +9729,449 @@ fail:
     return -1;
 }
 
+static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies() {
+    const char *mp = "/tmp/test_fuse_readdir_typed_entries";
+    const char *overlay_root = "/tmp/test_fuse_readdir_typed_overlay";
+    char upper[256] = {};
+    char work[256] = {};
+    char merged[256] = {};
+    char overlay_options[1024] = {};
+    bool overlay_mounted = false;
+    int fuse_fd = -1;
+    int dir_fd = -1;
+    pthread_t daemon_thread;
+    bool daemon_started = false;
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    struct p4_readdir_daemon_args args;
+    const char *expected_names[] = {".", "..", "hello.txt", "alpha.txt", "beta.txt"};
+    const int64_t expected_cookies[] = {11, 29, 101, 4099, 65537};
+    uint64_t overlay_inos[5] = {0};
+    uint32_t lookup_before = 0;
+    uint32_t getattr_before = 0;
+    uint32_t forget_before = 0;
+    volatile int readers_ready = 0;
+    volatile int start_readers = 0;
+    pthread_mutex_t counts_lock = PTHREAD_MUTEX_INITIALIZER;
+    unsigned int concurrent_name_counts[5] = {0};
+    struct p4_shared_readdir_args reader_args[2];
+    pthread_t reader_threads[2];
+    size_t readers_started = 0;
+    volatile int stop_seeker = 0;
+    struct p4_shared_seek_args seeker_args;
+    pthread_t seeker_thread;
+    bool seeker_started = false;
+    size_t seen = 0;
+    unsigned char resume_buf[32];
+    ssize_t resume_n = -1;
+    struct p4_linux_dirent64 *resumed = NULL;
+    memset(&args, 0, sizeof(args));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+    fuse_fd = open("/dev/fuse", O_RDWR);
+    if (fuse_fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+    args.common.fd = fuse_fd;
+    args.common.stop = &stop;
+    args.common.init_done = &init_done;
+    args.common.stop_on_destroy = 1;
+    args.common.force_opendir_enosys = 1;
+    args.common.entry_valid_sec = 60;
+    args.common.attr_valid_sec = 60;
+    args.common.init_out_flags_override =
+        FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_NO_OPENDIR_SUPPORT;
+    if (pthread_create(&daemon_thread, NULL, p4_readdir_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fuse_fd);
+        rmdir(mp);
+        return -1;
+    }
+    daemon_started = true;
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fuse_fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+    dir_fd = open(mp, O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+
+    lookup_before = args.lookup_count;
+    getattr_before = args.getattr_count;
+    forget_before = args.forget_count;
+    memset(&seeker_args, 0, sizeof(seeker_args));
+    seeker_args.fd = dir_fd;
+    seeker_args.go = &start_readers;
+    seeker_args.stop = &stop_seeker;
+    if (pthread_create(&seeker_thread, NULL, p4_shared_seek_thread, &seeker_args) != 0) {
+        printf("[FAIL] pthread_create shared directory seeker\n");
+        goto fail;
+    }
+    seeker_started = true;
+    for (size_t i = 0; i < 2; i++) {
+        memset(&reader_args[i], 0, sizeof(reader_args[i]));
+        reader_args[i].fd = dir_fd;
+        reader_args[i].ready = &readers_ready;
+        reader_args[i].go = &start_readers;
+        reader_args[i].lock = &counts_lock;
+        reader_args[i].name_counts = concurrent_name_counts;
+        if (pthread_create(&reader_threads[i], NULL, p4_shared_readdir_thread,
+                           &reader_args[i]) != 0) {
+            printf("[FAIL] pthread_create shared readdir reader\n");
+            goto fail;
+        }
+        readers_started++;
+    }
+    while (readers_ready != 2) {
+        sched_yield();
+    }
+    start_readers = 1;
+    __sync_synchronize();
+    for (size_t i = 0; i < readers_started; i++) {
+        pthread_join(reader_threads[i], NULL);
+    }
+    readers_started = 0;
+    stop_seeker = 1;
+    __sync_synchronize();
+    pthread_join(seeker_thread, NULL);
+    seeker_started = false;
+    for (size_t i = 0; i < 5; i++) {
+        if (reader_args[0].error != 0 || reader_args[1].error != 0 ||
+            seeker_args.error != 0 || concurrent_name_counts[i] != 1) {
+            printf("[FAIL] shared readdir entry[%zu] count=%u errors=%d/%d seek=%d\n", i,
+                   concurrent_name_counts[i], reader_args[0].error, reader_args[1].error,
+                   seeker_args.error);
+            goto fail;
+        }
+    }
+    if (lseek(dir_fd, 0, SEEK_SET) != 0) {
+        printf("[FAIL] reset directory after shared readdir: %s (errno=%d)\n", strerror(errno),
+               errno);
+        goto fail;
+    }
+    for (;;) {
+        unsigned char buf[32];
+        ssize_t n = syscall(SYS_getdents64, dir_fd, buf, sizeof(buf));
+        if (n < 0) {
+            printf("[FAIL] getdents64 small buffer: %s (errno=%d)\n", strerror(errno), errno);
+            goto fail;
+        }
+        if (n == 0) {
+            break;
+        }
+        if ((size_t)n < offsetof(struct p4_linux_dirent64, d_name)) {
+            printf("[FAIL] short getdents64 record: n=%zd\n", n);
+            goto fail;
+        }
+        struct p4_linux_dirent64 *entry = (struct p4_linux_dirent64 *)buf;
+        if (entry->d_reclen != (unsigned short)n || seen >= 5 ||
+            strcmp(entry->d_name, expected_names[seen]) != 0 ||
+            entry->d_off != expected_cookies[seen] ||
+            entry->d_ino != p4_mock_dir_entries[seen].ino ||
+            entry->d_type != p4_mock_dir_entries[seen].type) {
+            printf("[FAIL] dirent[%zu] name=%s off=%lld reclen=%u n=%zd\n", seen,
+                   entry->d_name, (long long)entry->d_off, entry->d_reclen, n);
+            goto fail;
+        }
+        seen++;
+    }
+    if (seen != 5 || args.lookup_count != lookup_before || args.getattr_count != getattr_before ||
+        args.readdir_count == 0 || args.readdirplus_count != 0) {
+        printf("[FAIL] READDIR typed-entry counters seen=%zu lookup=%u/%u getattr=%u/%u "
+               "readdir=%u plus=%u\n",
+               seen, lookup_before, args.lookup_count, getattr_before, args.getattr_count,
+               args.readdir_count, args.readdirplus_count);
+        goto fail;
+    }
+
+    if (lseek(dir_fd, 29, SEEK_SET) != 29) {
+        printf("[FAIL] seekdir cookie 29: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    errno = 0;
+    if (syscall(SYS_getdents64, dir_fd, resume_buf, 24) >= 0 || errno != EINVAL) {
+        printf("[FAIL] undersized getdents expected EINVAL without advancing: errno=%d\n", errno);
+        goto fail;
+    }
+    resume_n = syscall(SYS_getdents64, dir_fd, resume_buf, sizeof(resume_buf));
+    if (resume_n <= 0) {
+        printf("[FAIL] getdents64 after undersized buffer: n=%zd errno=%d\n", resume_n, errno);
+        goto fail;
+    }
+    resumed = (struct p4_linux_dirent64 *)resume_buf;
+    if (strcmp(resumed->d_name, "hello.txt") != 0 || resumed->d_off != 101) {
+        printf("[FAIL] undersized buffer advanced name=%s off=%lld\n", resumed->d_name,
+               (long long)resumed->d_off);
+        goto fail;
+    }
+
+    if (lseek(dir_fd, 101, SEEK_SET) != 101) {
+        printf("[FAIL] seekdir cookie 101: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    resume_n = syscall(SYS_getdents64, dir_fd, resume_buf, sizeof(resume_buf));
+    if (resume_n <= 0) {
+        printf("[FAIL] getdents64 after cookie seek: n=%zd errno=%d\n", resume_n, errno);
+        goto fail;
+    }
+    resumed = (struct p4_linux_dirent64 *)resume_buf;
+    if (strcmp(resumed->d_name, "alpha.txt") != 0 || resumed->d_off != 4099) {
+        printf("[FAIL] cookie resume name=%s off=%lld\n", resumed->d_name,
+               (long long)resumed->d_off);
+        goto fail;
+    }
+
+    close(dir_fd);
+    dir_fd = -1;
+    snprintf(upper, sizeof(upper), "%s/upper", overlay_root);
+    snprintf(work, sizeof(work), "%s/work", overlay_root);
+    snprintf(merged, sizeof(merged), "%s/merged", overlay_root);
+    if (ensure_dir(overlay_root) != 0 || ensure_dir(upper) != 0 || ensure_dir(work) != 0 ||
+        ensure_dir(merged) != 0) {
+        printf("[FAIL] create typed overlay directories: %s (errno=%d)\n", strerror(errno),
+               errno);
+        goto fail;
+    }
+    snprintf(overlay_options, sizeof(overlay_options), "lowerdir=%s,upperdir=%s,workdir=%s", mp,
+             upper, work);
+    if (mount("overlay", merged, "overlay", 0, overlay_options) != 0) {
+        printf("[FAIL] mount typed overlay: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    overlay_mounted = true;
+    dir_fd = open(merged, O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) {
+        printf("[FAIL] open typed overlay: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    lookup_before = args.lookup_count;
+    getattr_before = args.getattr_count;
+    forget_before = args.forget_count;
+    memset(concurrent_name_counts, 0, sizeof(concurrent_name_counts));
+    for (;;) {
+        unsigned char overlay_buf[512];
+        ssize_t overlay_n = syscall(SYS_getdents64, dir_fd, overlay_buf, sizeof(overlay_buf));
+        if (overlay_n < 0) {
+            printf("[FAIL] overlay getdents64: %s (errno=%d)\n", strerror(errno), errno);
+            goto fail;
+        }
+        if (overlay_n == 0) {
+            break;
+        }
+        size_t offset = 0;
+        while (offset < (size_t)overlay_n) {
+            struct p4_linux_dirent64 *entry =
+                (struct p4_linux_dirent64 *)(overlay_buf + offset);
+            int index = p4_mock_entry_index(entry->d_name);
+            if (index < 0 || entry->d_reclen == 0 ||
+                offset + entry->d_reclen > (size_t)overlay_n ||
+                entry->d_ino == 0 ||
+                entry->d_type != p4_mock_dir_entries[index].type) {
+                printf("[FAIL] overlay typed dirent name=%s ino=%llu type=%u\n", entry->d_name,
+                       (unsigned long long)entry->d_ino, entry->d_type);
+                goto fail;
+            }
+            concurrent_name_counts[index]++;
+            overlay_inos[index] = entry->d_ino;
+            offset += entry->d_reclen;
+        }
+    }
+    for (size_t i = 0; i < 5; i++) {
+        if (concurrent_name_counts[i] != 1) {
+            printf("[FAIL] overlay typed entry[%zu] count=%u\n", i,
+                   concurrent_name_counts[i]);
+            goto fail;
+        }
+    }
+    if (args.lookup_count != lookup_before || args.getattr_count != getattr_before ||
+        args.forget_count != forget_before) {
+        printf("[FAIL] overlay readdir issued N+1 lookup=%u/%u getattr=%u/%u forget=%u/%u\n",
+               lookup_before, args.lookup_count, getattr_before, args.getattr_count,
+               forget_before, args.forget_count);
+        goto fail;
+    }
+    for (size_t i = 2; i < 5; i++) {
+        struct stat overlay_stat;
+        if (fstatat(dir_fd, expected_names[i], &overlay_stat, AT_SYMLINK_NOFOLLOW) != 0 ||
+            (uint64_t)overlay_stat.st_ino != overlay_inos[i]) {
+            printf("[FAIL] overlay ino mismatch name=%s dirent=%llu stat=%llu errno=%d\n",
+                   expected_names[i], (unsigned long long)overlay_inos[i],
+                   (unsigned long long)overlay_stat.st_ino, errno);
+            goto fail;
+        }
+    }
+    close(dir_fd);
+    dir_fd = -1;
+    umount(merged);
+    overlay_mounted = false;
+    rmdir(merged);
+    rmdir(work);
+    rmdir(upper);
+    rmdir(overlay_root);
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fuse_fd);
+    pthread_join(daemon_thread, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    start_readers = 1;
+    __sync_synchronize();
+    for (size_t i = 0; i < readers_started; i++) {
+        pthread_join(reader_threads[i], NULL);
+    }
+    stop_seeker = 1;
+    __sync_synchronize();
+    if (seeker_started) {
+        pthread_join(seeker_thread, NULL);
+    }
+    if (dir_fd >= 0) {
+        close(dir_fd);
+    }
+    if (overlay_mounted) {
+        umount(merged);
+    }
+    rmdir(merged);
+    rmdir(work);
+    rmdir(upper);
+    rmdir(overlay_root);
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fuse_fd);
+    if (daemon_started) {
+        pthread_join(daemon_thread, NULL);
+    }
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_readdirplus_auto_uses_plus_only_for_initial_batch() {
+    const char *mp = "/tmp/test_fuse_readdirplus_auto";
+    int fuse_fd = -1;
+    int dir_fd = -1;
+    pthread_t daemon_thread;
+    bool daemon_started = false;
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    struct p4_readdir_daemon_args args;
+    unsigned char buf[512];
+    ssize_t n = -1;
+    int rounds = 0;
+    memset(&args, 0, sizeof(args));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+    fuse_fd = open("/dev/fuse", O_RDWR);
+    if (fuse_fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+    args.common.fd = fuse_fd;
+    args.common.stop = &stop;
+    args.common.init_done = &init_done;
+    args.common.stop_on_destroy = 1;
+    args.common.force_opendir_enosys = 1;
+    args.common.entry_valid_sec = 60;
+    args.common.attr_valid_sec = 60;
+    args.common.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES |
+                                          FUSE_NO_OPENDIR_SUPPORT | FUSE_DO_READDIRPLUS |
+                                          FUSE_READDIRPLUS_AUTO;
+    args.one_entry_per_reply = 1;
+    if (pthread_create(&daemon_thread, NULL, p4_readdir_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fuse_fd);
+        rmdir(mp);
+        return -1;
+    }
+    daemon_started = true;
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fuse_fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+    dir_fd = open(mp, O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    do {
+        n = syscall(SYS_getdents64, dir_fd, buf, sizeof(buf));
+        if (n < 0) {
+            printf("[FAIL] AUTO getdents64: n=%zd errno=%d\n", n, errno);
+            goto fail;
+        }
+        rounds++;
+    } while (n > 0 && rounds < 16);
+    if (n != 0) {
+        printf("[FAIL] AUTO getdents64 did not reach EOF after %d rounds\n", rounds);
+        goto fail;
+    }
+    if (args.readdirplus_count != 1 || args.readdir_count == 0 || args.dir_trace_count < 2 ||
+        args.dir_opcode_trace[0] != FUSE_READDIRPLUS || args.dir_offset_trace[0] != 0 ||
+        args.dir_opcode_trace[1] != FUSE_READDIR || args.dir_offset_trace[1] == 0) {
+        printf("[FAIL] AUTO sequence plus=%u readdir=%u trace=%u first=(%u,%llu) "
+               "second=(%u,%llu)\n",
+               args.readdirplus_count, args.readdir_count, args.dir_trace_count,
+               args.dir_opcode_trace[0], (unsigned long long)args.dir_offset_trace[0],
+               args.dir_opcode_trace[1], (unsigned long long)args.dir_offset_trace[1]);
+        goto fail;
+    }
+
+    close(dir_fd);
+    dir_fd = -1;
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fuse_fd);
+    pthread_join(daemon_thread, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (dir_fd >= 0) {
+        close(dir_fd);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fuse_fd);
+    if (daemon_started) {
+        pthread_join(daemon_thread, NULL);
+    }
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_readdirplus_generation_mismatch_stales_old_node() {
     const char *mp = "/tmp/test_fuse_readdirplus_generation";
     char file_path[512];
@@ -9616,124 +10298,6 @@ fail:
     }
     if (old_fd >= 0) {
         close(old_fd);
-    }
-    umount(mp);
-    stop = 1;
-    close(fd);
-    pthread_join(th, NULL);
-    rmdir(mp);
-    return -1;
-}
-
-static int ext_test_readdirplus_invalid_attr_forgets_unconsumed_entry() {
-    const char *mp = "/tmp/test_fuse_readdirplus_invalid_attr";
-    DIR *dir = NULL;
-    int saw = 0;
-
-    if (ensure_dir(mp) != 0) {
-        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
-        return -1;
-    }
-
-    int fd = open("/dev/fuse", O_RDWR);
-    if (fd < 0) {
-        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
-        rmdir(mp);
-        return -1;
-    }
-
-    volatile int stop = 0;
-    volatile int init_done = 0;
-    volatile uint32_t readdirplus_count = 0;
-    volatile uint32_t forget_count = 0;
-    volatile uint64_t forget_trace_nodeids[32] = {0};
-    volatile uint64_t forget_trace_nlookups[32] = {0};
-
-    struct fuse_daemon_args args;
-    memset(&args, 0, sizeof(args));
-    args.fd = fd;
-    args.stop = &stop;
-    args.init_done = &init_done;
-    args.stop_on_destroy = 1;
-    args.force_opendir_enosys = 1;
-    args.init_out_flags_override =
-        FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_NO_OPENDIR_SUPPORT | FUSE_DO_READDIRPLUS;
-    args.entry_valid_sec = 60;
-    args.attr_valid_sec = 60;
-    args.readdirplus_count = &readdirplus_count;
-    args.readdirplus_invalid_attr_name = "hello.txt";
-    args.readdirplus_invalid_attr_size = 0x8000000000000000ULL;
-    args.forget_count = &forget_count;
-    args.forget_trace_nodeids = forget_trace_nodeids;
-    args.forget_trace_nlookups = forget_trace_nlookups;
-    args.forget_trace_capacity = 32;
-
-    pthread_t th;
-    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
-        printf("[FAIL] pthread_create\n");
-        close(fd);
-        rmdir(mp);
-        return -1;
-    }
-
-    char opts[256];
-    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
-    if (mount("none", mp, "fuse", 0, opts) != 0) {
-        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
-        stop = 1;
-        close(fd);
-        pthread_join(th, NULL);
-        rmdir(mp);
-        return -1;
-    }
-    if (fuseg_wait_init(&init_done) != 0) {
-        printf("[FAIL] init handshake timeout\n");
-        goto fail;
-    }
-
-    dir = opendir(mp);
-    if (!dir) {
-        printf("[FAIL] opendir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
-        goto fail;
-    }
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
-        if (strcmp(de->d_name, "hello.txt") == 0) {
-            saw = 1;
-        }
-    }
-    closedir(dir);
-    dir = NULL;
-    if (!saw || readdirplus_count == 0) {
-        printf("[FAIL] expected hello.txt from READDIRPLUS, saw=%d count=%u\n", saw,
-               readdirplus_count);
-        goto fail;
-    }
-
-    for (int i = 0; i < 200; i++) {
-        if (forget_trace_contains_pair(forget_trace_nodeids, forget_trace_nlookups, forget_count, 2,
-                                       1)) {
-            break;
-        }
-        usleep(10 * 1000);
-    }
-    if (!forget_trace_contains_pair(forget_trace_nodeids, forget_trace_nlookups, forget_count, 2,
-                                    1)) {
-        printf("[FAIL] invalid READDIRPLUS entry was not forgotten before umount: count=%u\n",
-               forget_count);
-        goto fail;
-    }
-
-    umount(mp);
-    stop = 1;
-    close(fd);
-    pthread_join(th, NULL);
-    rmdir(mp);
-    return 0;
-
-fail:
-    if (dir) {
-        closedir(dir);
     }
     umount(mp);
     stop = 1;
@@ -10222,8 +10786,12 @@ TEST(FuseExtended, ReaddirplusGenerationMismatchStalesOldNode) {
     ASSERT_EQ(0, ext_test_readdirplus_generation_mismatch_stales_old_node());
 }
 
-TEST(FuseExtended, ReaddirplusInvalidAttrForgetsUnconsumedEntry) {
-    ASSERT_EQ(0, ext_test_readdirplus_invalid_attr_forgets_unconsumed_entry());
+TEST(FuseExtended, ReaddirTypedEntriesAvoidNPlusOneAndPreserveCookies) {
+    ASSERT_EQ(0, ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies());
+}
+
+TEST(FuseExtended, ReaddirplusAutoUsesPlusOnlyForInitialBatch) {
+    ASSERT_EQ(0, ext_test_readdirplus_auto_uses_plus_only_for_initial_batch());
 }
 
 TEST(FuseExtended, SameGenerationTypeMismatchStalesOldNode) {

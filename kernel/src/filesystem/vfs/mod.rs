@@ -295,6 +295,19 @@ pub const DT_WHT: u16 = 14;
 #[allow(dead_code)]
 pub const DT_MAX: u16 = 16;
 
+/// Filesystem-supplied directory record used by `getdents(2)`.
+///
+/// `next_cookie` is an opaque continuation token. Filesystems backed by an
+/// external daemon must preserve that token instead of replacing it with a
+/// vector index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub ino: u64,
+    pub d_type: u8,
+    pub next_cookie: u64,
+}
+
 /// VFS 允许的最大符号链接跟随次数。
 ///
 /// Linux 6.6: MAXSYMLINKS = 40
@@ -996,6 +1009,40 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 列出当前inode下的所有目录项的名字
     fn list(&self) -> Result<Vec<String>, SystemError> {
         Err(SystemError::ENOTDIR)
+    }
+
+    /// List directory records including the inode number, type and continuation
+    /// cookie already known by the filesystem.
+    ///
+    /// The default keeps existing filesystems source-compatible. Implementations
+    /// with a native directory record format should override this method to avoid
+    /// one lookup and metadata fetch per entry.
+    fn list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+        let names = self.list()?;
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let metadata = match name.as_str() {
+                "." => self.metadata(),
+                ".." => self.parent().and_then(|parent| parent.metadata()),
+                _ => match self.find(&name) {
+                    Ok(child) => child.metadata(),
+                    Err(SystemError::ENOENT) => continue,
+                    Err(error) => return Err(error),
+                },
+            };
+            let metadata = match metadata {
+                Ok(metadata) => metadata,
+                Err(SystemError::ENOENT) => continue,
+                Err(error) => return Err(error),
+            };
+            entries.push(DirectoryEntry {
+                name,
+                ino: metadata.inode_id.into() as u64,
+                d_type: metadata.file_type.get_file_type_num() as u8,
+                next_cookie: (entries.len() + 1) as u64,
+            });
+        }
+        Ok(entries)
     }
 
     /// # mount - 挂载文件系统

@@ -8,8 +8,9 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::{mem::size_of, num::NonZeroUsize};
+use lru::LruCache;
 
 use system_error::SystemError;
 
@@ -287,7 +288,11 @@ pub struct FuseNode {
     cached_metadata: Mutex<Option<Metadata>>,
     page_cache: Mutex<Option<Arc<PageCache>>>,
     writeback_handles: Mutex<Vec<Arc<FuseWritebackHandle>>>,
-    lookup_cache: Mutex<BTreeMap<String, FuseLookupCacheEntry>>,
+    lookup_cache: Mutex<LruCache<String, FuseLookupCacheEntry>>,
+    /// Linux FUSE_I_INIT_RDPLUS equivalent for the first cache use of a child.
+    readdirplus_init: AtomicBool,
+    /// Linux FUSE_I_ADVISE_RDPLUS equivalent for the next directory batch.
+    readdirplus_advised: AtomicBool,
     /// Serializes dirty-page admission against operations which must drain and
     /// invalidate the page cache (truncate and direct I/O).
     writeback_barrier: RwSem<()>,
@@ -370,7 +375,11 @@ impl FuseNode {
             cached_metadata: Mutex::new(cached),
             page_cache: Mutex::new(None),
             writeback_handles: Mutex::new(Vec::new()),
-            lookup_cache: Mutex::new(BTreeMap::new()),
+            lookup_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(Self::LOOKUP_CACHE_MAX_ENTRIES).unwrap(),
+            )),
+            readdirplus_init: AtomicBool::new(false),
+            readdirplus_advised: AtomicBool::new(false),
             writeback_barrier: RwSem::new(()),
             dax_reclaim_serial: Mutex::new(()),
             dax_mappings: RwSem::new(DaxMappingTree::default()),
@@ -1174,10 +1183,6 @@ impl FuseNode {
         *self.name.lock() = Some(name.to_string());
     }
 
-    pub(crate) fn has_dname(&self, name: &str) -> bool {
-        self.name.lock().as_deref() == Some(name)
-    }
-
     pub(crate) fn clear_dname_if(&self, name: &str) {
         let mut dname = self.name.lock();
         if dname.as_deref() == Some(name) {
@@ -1372,10 +1377,6 @@ impl FuseNode {
 
     pub(crate) fn fuse_fs(&self) -> Option<Arc<FuseFS>> {
         self.fs.upgrade()
-    }
-
-    pub(crate) fn parent_fuse_nodeid(&self) -> u64 {
-        *self.parent_nodeid.lock()
     }
 
     fn request_name(&self, opcode: u32, nodeid: u64, name: &str) -> Result<FuseReply, SystemError> {

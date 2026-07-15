@@ -48,6 +48,7 @@ check_transcript() {
                 !decimal("ops") || !decimal("syscalls") || !decimal("short_io") ||
                 !decimal("eintr") || !decimal("data_loop_us") || !decimal("fsync_us") ||
                 !decimal("close_us") || !decimal("end_to_end_us") ||
+                !decimal("process_cpu_us") ||
                 checksum !~ /^[0-9a-f]+$/ || length(checksum) != 16) {
                 bad = 1
             }
@@ -88,6 +89,47 @@ check_result_only_transcript() {
 
 MOUNT="$WORK_DIR/mount"
 mkdir "$MOUNT"
+
+VIRTIOFS_BENCH_RUN_ID=readdir_prepare \
+    "$BIN" --mount "$MOUNT" --workload readdir_prepare --path readdir_schema \
+    --files 2048 >"$WORK_DIR/readdir-prepare.log" 2>&1
+check_transcript <"$WORK_DIR/readdir-prepare.log"
+
+VIRTIOFS_BENCH_RUN_ID=readdir_scan \
+    "$BIN" --mount "$MOUNT" --workload readdir_scan --path readdir_schema \
+    --files 2048 --iterations 3 >"$WORK_DIR/readdir-scan.log" 2>&1
+check_transcript <"$WORK_DIR/readdir-scan.log"
+awk '
+    function value(prefix,    i) {
+        for (i = 1; i <= NF; ++i) {
+            if (index($i, prefix "=") == 1) {
+                return substr($i, length(prefix) + 2)
+            }
+        }
+        return "__missing__"
+    }
+    $1 == "result" {
+        seen++
+        if (value("workload") != "readdir_scan" || value("status") != "ok" ||
+            value("files") != "2048" || value("iterations") != "3" ||
+            value("ops") != "6144" || value("syscalls") !~ /^[1-9][0-9]*$/ ||
+            value("syscalls") + 0 <= 6 ||
+            value("process_cpu_us") !~ /^[0-9]+$/ ||
+            value("checksum") !~ /^[0-9a-f]+$/ || length(value("checksum")) != 16) {
+            bad = 1
+        }
+    }
+    END { exit bad || seen != 1 }
+' "$WORK_DIR/readdir-scan.log"
+
+VIRTIOFS_BENCH_RUN_ID=readdir_cleanup \
+    "$BIN" --mount "$MOUNT" --workload readdir_cleanup --path readdir_schema \
+    --files 2048 >"$WORK_DIR/readdir-cleanup.log" 2>&1
+check_transcript <"$WORK_DIR/readdir-cleanup.log"
+if [ -e "$MOUNT/.virtiofs_bench_readdir_schema" ]; then
+    echo "readdir cleanup left its dataset directory" >&2
+    exit 1
+fi
 
 VIRTIOFS_BENCH_RUN_ID=host_prepare VIRTIOFS_BENCH_CACHE_MODE=warm \
     "$BIN" --mount "$MOUNT" --workload prepare --path schema_test \

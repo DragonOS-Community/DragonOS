@@ -12,8 +12,8 @@ use crate::{
             permission::PermissionMask,
             syscall::RenameFlags,
             utils::DName,
-            FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata, SetMetadataMask,
-            XattrFlags,
+            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata,
+            SetMetadataMask, XattrFlags,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -928,6 +928,14 @@ impl IndexNode for FuseNode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        Ok(self
+            .list_entries()?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect())
+    }
+
+    fn list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
 
@@ -940,16 +948,16 @@ impl IndexNode for FuseNode {
         };
         let fh = dir_p.fh;
         let open_flags = dir_p.open_flags;
-        let mut use_readdirplus = self.conn.use_readdirplus();
         // Linux issues uncached READDIR with a single PAGE_SIZE output page. DragonOS keeps the
         // existing larger batch when the connection supports it, but must not exceed either the
         // mount's max_read value or the negotiated max_pages descriptor bound.
         let readdir_size = self.readdir_request_size();
 
-        let mut names: Vec<String> = Vec::new();
+        let mut entries: Vec<DirectoryEntry> = Vec::new();
         let mut offset: u64 = 0;
 
         loop {
+            let mut use_readdirplus = self.use_readdirplus(offset);
             let read_in = FuseReadIn {
                 fh,
                 offset,
@@ -983,10 +991,14 @@ impl IndexNode for FuseNode {
 
             let mut last_off: u64 = offset;
             if use_readdirplus {
-                last_off =
-                    self.parse_readdirplus_payload(&payload, &mut names, last_off, request_epoch)?;
+                last_off = self.parse_readdirplus_payload(
+                    &payload,
+                    &mut entries,
+                    last_off,
+                    request_epoch,
+                )?;
             } else {
-                last_off = Self::parse_readdir_payload(&payload, &mut names, last_off)?;
+                last_off = Self::parse_readdir_payload(&payload, &mut entries, last_off)?;
             }
 
             if last_off == offset {
@@ -1000,7 +1012,7 @@ impl IndexNode for FuseNode {
         if !dir_p.no_open {
             self.release_common(FUSE_RELEASEDIR, fh, open_flags, 0);
         }
-        Ok(names)
+        Ok(entries)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -1079,6 +1091,7 @@ impl IndexNode for FuseNode {
             entry.entry_valid,
             entry.entry_valid_nsec,
         );
+        self.advise_readdirplus();
         Ok(child)
     }
 

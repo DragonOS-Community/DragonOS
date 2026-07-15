@@ -1,8 +1,8 @@
 use super::{
     file::{File, FileFlags, FileMode, PreopenedFile},
     utils::DName,
-    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, InodeRetentionKind,
-    PollableInode, SetMetadataMask, SuperBlock, XattrFlags,
+    DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode,
+    InodeRetentionKind, PollableInode, SetMetadataMask, SuperBlock, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -3787,6 +3787,11 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
         return self.dentry.inode.list();
+    }
+
+    #[inline]
+    fn list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+        self.dentry.inode.list_entries()
     }
 
     fn mount(

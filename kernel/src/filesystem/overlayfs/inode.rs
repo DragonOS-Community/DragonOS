@@ -8,8 +8,8 @@ use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{
-    self, inode_lifecycle::InodeRetentionGuard, FileSystem, FileType, IndexNode, InodeId,
-    InodeRetentionKind, Metadata, SetMetadataMask, XattrFlags,
+    self, inode_lifecycle::InodeRetentionGuard, DirectoryEntry, FileSystem, FileType, IndexNode,
+    InodeId, InodeRetentionKind, Metadata, SetMetadataMask, XattrFlags,
 };
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::Mutex;
@@ -53,7 +53,7 @@ pub(super) struct DirVersion {
 #[derive(Debug, Default)]
 struct DirStateData {
     generation: u64,
-    readdir_cache: Option<(u64, Arc<Vec<String>>)>,
+    readdir_cache: Option<(u64, Arc<Vec<DirectoryEntry>>)>,
     lookup_cache: BTreeMap<String, Weak<OvlInode>>,
     lookup_order: VecDeque<String>,
     backing_version: Option<Vec<DirVersion>>,
@@ -86,7 +86,10 @@ impl DirState {
         data
     }
 
-    pub(super) fn cached_readdir(&self, version: &[DirVersion]) -> Option<Arc<Vec<String>>> {
+    pub(super) fn cached_readdir(
+        &self,
+        version: &[DirVersion],
+    ) -> Option<Arc<Vec<DirectoryEntry>>> {
         let mut data = self.data.lock();
         let data = Self::revalidate(&mut data, version);
         data.readdir_cache
@@ -95,7 +98,7 @@ impl DirState {
             .map(|(_, entries)| entries.clone())
     }
 
-    pub(super) fn cache_readdir(&self, version: &[DirVersion], entries: Arc<Vec<String>>) {
+    pub(super) fn cache_readdir(&self, version: &[DirVersion], entries: Arc<Vec<DirectoryEntry>>) {
         let mut data = self.data.lock();
         let data = Self::revalidate(&mut data, version);
         let generation = data.generation;
@@ -515,6 +518,10 @@ impl IndexNode for OvlInode {
 
     fn list(&self) -> Result<Vec<String>, system_error::SystemError> {
         readdir::list(self)
+    }
+
+    fn list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+        readdir::list_entries(self)
     }
 
     fn mkdir(

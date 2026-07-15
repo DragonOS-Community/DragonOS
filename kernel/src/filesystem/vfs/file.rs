@@ -12,7 +12,8 @@ use super::{
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
     mount::{MountExternalGuard, MountFSInode},
     utils::should_remove_sgid,
-    FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask, SpecialNodeData,
+    DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask,
+    SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -587,8 +588,8 @@ pub struct File {
     mode: RwSem<FileMode>,
     /// 文件类型
     file_type: FileType,
-    /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
-    readdir_subdirs_name: Mutex<Vec<String>>,
+    /// Per-open immutable directory snapshot and its next record index.
+    readdir_state: Mutex<ReaddirState>,
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
@@ -620,6 +621,12 @@ pub struct File {
     /// Pins the mount used to resolve this pathname independently from the
     /// operation inode (which device/FIFO resolution may replace).
     _mount_guard: Option<MountExternalGuard>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReaddirState {
+    entries: Option<Arc<[DirectoryEntry]>>,
+    next_index: usize,
 }
 
 impl File {
@@ -1053,7 +1060,7 @@ impl File {
             flags: RwSem::new(flags),
             mode: RwSem::new(mode),
             file_type,
-            readdir_subdirs_name: Mutex::new(Vec::default()),
+            readdir_state: Mutex::new(ReaddirState::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
             owner: Mutex::new(FileOwner::new()),
@@ -1525,15 +1532,37 @@ impl File {
                 }
             }
         }
+        if file_type == FileType::Dir {
+            let mut state = self.readdir_state.lock();
+            let pos = match origin {
+                SeekFrom::SeekSet(offset) => offset,
+                SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
+                SeekFrom::SeekEnd(_) => {
+                    // Preserve the existing directory SEEK_END behavior.
+                    return Ok(MAX_LFS_FILESIZE as usize);
+                }
+                SeekFrom::Invalid => return Err(SystemError::EINVAL),
+            };
+            if pos < 0 {
+                return Err(SystemError::EINVAL);
+            }
+            if pos == 0 {
+                state.entries = None;
+                state.next_index = 0;
+            } else if let Some(entries) = state.entries.as_ref() {
+                state.next_index = entries
+                    .iter()
+                    .position(|entry| entry.next_cookie == pos as u64)
+                    .map_or(entries.len(), |index| index + 1);
+            }
+            self.offset.store(pos as usize, Ordering::SeqCst);
+            return Ok(pos as usize);
+        }
+
         let pos: i64 = match origin {
             SeekFrom::SeekSet(offset) => offset,
             SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
             SeekFrom::SeekEnd(offset) => {
-                if FileType::Dir == file_type {
-                    // 对目录，返回 Linux 常见语义：允许 SEEK_END 并返回 MAX_LFS_FILESIZE。
-                    // 测试接受 MAX_LFS_FILESIZE 或 EINVAL，但为通过当前测试选择返回 MAX_LFS_FILESIZE。
-                    return Ok(MAX_LFS_FILESIZE as usize);
-                }
                 let metadata = self.metadata()?;
                 metadata.size + offset
             }
@@ -1607,8 +1636,6 @@ impl File {
         }
 
         let inode: &Arc<dyn IndexNode> = &self.inode;
-        let mut current_pos = self.offset.load(Ordering::SeqCst);
-
         // POSIX 标准要求readdir应该返回. 和 ..
         // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
 
@@ -1616,37 +1643,50 @@ impl File {
         // 为了保证在目录内容动态变化（例如 /proc/self/fd）时不会因为重新
         // 创建列表而丢失尚未读取的目录项，这里缓存第一次生成的列表，在
         // 文件偏移被 seek 到 0 之前复用该缓存。
-        let mut cached_names = self.readdir_subdirs_name.lock();
-        if current_pos == 0 || cached_names.is_empty() {
-            *cached_names = inode.list()?;
+        let mut state = self.readdir_state.lock();
+        let current_cookie = self.offset.load(Ordering::SeqCst) as u64;
+        if current_cookie == 0 {
+            state.entries = Some(Arc::from(inode.list_entries()?));
+            state.next_index = 0;
+        } else {
+            if state.entries.is_none() {
+                state.entries = Some(Arc::from(inode.list_entries()?));
+            }
+            let expected_cookie = state.entries.as_ref().and_then(|entries| {
+                state
+                    .next_index
+                    .checked_sub(1)
+                    .and_then(|index| entries.get(index))
+                    .map(|entry| entry.next_cookie)
+            });
+            if expected_cookie != Some(current_cookie) {
+                let entries = state
+                    .entries
+                    .as_ref()
+                    .expect("readdir snapshot initialized");
+                state.next_index = entries
+                    .iter()
+                    .position(|entry| entry.next_cookie == current_cookie)
+                    .map_or(entries.len(), |index| index + 1);
+            }
         }
-        let readdir_subdirs_name = cached_names.clone();
-        drop(cached_names);
 
-        let subdirs_name_len = readdir_subdirs_name.len();
-        while current_pos < subdirs_name_len {
-            let name = &readdir_subdirs_name[current_pos];
-            let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
-                Ok(i) => i,
-                Err(e) => {
-                    if e == SystemError::ENOENT {
-                        // 目录项在本次读取过程中被移除，跳过它，继续读取后续条目
-                        self.offset.fetch_add(1, Ordering::SeqCst);
-                        current_pos += 1;
-                        continue;
-                    }
-                    error!("Readdir error: Failed to find sub inode");
-                    return Err(e);
-                }
-            };
-
-            let inode_metadata = sub_inode.metadata().unwrap();
-            let entry_ino = inode_metadata.inode_id.into() as u64;
-            let entry_d_type = inode_metadata.file_type.get_file_type_num() as u8;
-            match ctx.fill_dir(name, current_pos, entry_ino, entry_d_type) {
+        let entries = state
+            .entries
+            .as_ref()
+            .expect("readdir snapshot initialized")
+            .clone();
+        if state.next_index > entries.len() {
+            return Err(SystemError::EINVAL);
+        }
+        while state.next_index < entries.len() {
+            let entry = &entries[state.next_index];
+            let next_cookie =
+                usize::try_from(entry.next_cookie).map_err(|_| SystemError::EOVERFLOW)?;
+            match ctx.fill_dir(&entry.name, next_cookie, entry.ino, entry.d_type) {
                 Ok(_) => {
-                    self.offset.fetch_add(1, Ordering::SeqCst);
-                    current_pos += 1;
+                    state.next_index += 1;
+                    self.offset.store(next_cookie, Ordering::SeqCst);
                 }
                 Err(SystemError::EINVAL) => {
                     return Ok(());
@@ -1717,7 +1757,7 @@ impl File {
             flags: RwSem::new(flags),
             mode: RwSem::new(mode),
             file_type: self.file_type,
-            readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
+            readdir_state: Mutex::new(self.readdir_state.lock().clone()),
             private_data,
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),

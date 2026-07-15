@@ -30,6 +30,7 @@ use crate::{
                 prepare_mount_propagation_locked, propagate_umount_sources,
                 propagation_umount_busy, MountPropagation,
             },
+            user_namespace::UserNamespace,
         },
         ProcessManager,
     },
@@ -45,7 +46,7 @@ use core::{
     cell::RefCell,
     fmt::Debug,
     hash::Hash,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 use hashbrown::HashMap;
 use ida::IdAllocator;
@@ -282,6 +283,23 @@ impl MountFlags {
     }
 }
 
+bitflags! {
+    /// Internal per-mount locks corresponding to Linux `MNT_LOCK_*` flags.
+    ///
+    /// These are deliberately separate from userspace-visible `MS_*` flags:
+    /// topology locking and attribute locking have different lifetimes. In
+    /// particular, a mount propagated across a user-namespace boundary may
+    /// have its topology lock cleared while retaining all attribute locks.
+    struct MountLockFlags: u32 {
+        const TOPOLOGY = 1 << 0;
+        const ATIME = 1 << 1;
+        const READONLY = 1 << 2;
+        const NODEV = 1 << 3;
+        const NOSUID = 1 << 4;
+        const NOEXEC = 1 << 5;
+    }
+}
+
 pub(crate) fn append_comma_options(base: &mut String, extra: String) {
     if extra.is_empty() {
         return;
@@ -357,8 +375,8 @@ pub struct MountFS {
     mount_flags: RwSem<MountFlags>,
     super_block_state: Arc<SuperBlockState>,
     mount_source: RwSem<Option<String>>,
-    /// Internal MNT_LOCKED equivalent; never exposed as a userspace MS_* bit.
-    locked: AtomicBool,
+    /// Internal `MNT_LOCK_*` state; never exposed as userspace `MS_*` bits.
+    mount_locks: AtomicU32,
     lifecycle: Mutex<MountLifecycle>,
 }
 
@@ -520,6 +538,9 @@ unsafe impl Sync for MountExternalGuard {}
 
 #[derive(Debug)]
 pub struct SuperBlockState {
+    /// User namespace that owns this superblock, matching Linux `s_user_ns`.
+    /// Bind mounts and mount-namespace copies retain the same owner.
+    owner_user_ns: Arc<UserNamespace>,
     flags: RwSem<MountFlags>,
     write_count: AtomicUsize,
     wb_error: ErrSeq,
@@ -696,6 +717,7 @@ struct MountStateInit {
 impl SuperBlockState {
     pub fn new(flags: MountFlags) -> Self {
         Self {
+            owner_user_ns: ProcessManager::current_user_ns(),
             flags: RwSem::new(flags & MountFlags::SB_SETTABLE_MASK),
             write_count: AtomicUsize::new(0),
             wb_error: ErrSeq::new(),
@@ -710,6 +732,10 @@ impl SuperBlockState {
             }),
             shutdown_wait: WaitQueue::default(),
         }
+    }
+
+    pub fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
     }
 
     fn activate_mount(&self, construction_reserved: bool) -> Result<(), SystemError> {
@@ -1117,7 +1143,7 @@ impl MountFS {
             mount_flags: RwSem::new(mount_flags),
             super_block_state: state_init.super_block_state,
             mount_source: RwSem::new(state_init.mount_source),
-            locked: AtomicBool::new(false),
+            mount_locks: AtomicU32::new(0),
             lifecycle: Mutex::new(MountLifecycle {
                 state: MountLifecycleState::Constructing,
                 external_pins: 0,
@@ -1162,7 +1188,7 @@ impl MountFS {
             mount_flags: RwSem::new(self.mount_flags()),
             super_block_state: self.super_block_state.clone(),
             mount_source: RwSem::new(mount_source),
-            locked: AtomicBool::new(self.locked.load(Ordering::Acquire)),
+            mount_locks: AtomicU32::new(self.mount_locks.load(Ordering::Acquire)),
             lifecycle: Mutex::new(MountLifecycle {
                 state: MountLifecycleState::Constructing,
                 external_pins: 0,
@@ -1793,15 +1819,61 @@ impl MountFS {
     }
 
     pub(crate) fn lock_mount(&self) {
-        self.locked.store(true, Ordering::Release);
+        self.mount_locks
+            .fetch_or(MountLockFlags::TOPOLOGY.bits(), Ordering::Release);
     }
 
     pub(crate) fn unlock_mount(&self) {
-        self.locked.store(false, Ordering::Release);
+        self.mount_locks
+            .fetch_and(!MountLockFlags::TOPOLOGY.bits(), Ordering::Release);
     }
 
     pub(crate) fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Acquire)
+        self.mount_locks.load(Ordering::Acquire) & MountLockFlags::TOPOLOGY.bits() != 0
+    }
+
+    /// Linux `lock_mnt_tree()` semantics for mounts copied across a user
+    /// namespace boundary. Attribute locks snapshot per-mount flags only;
+    /// superblock flags have separate ownership and reconfiguration rules.
+    pub(crate) fn lock_cross_user_mount(&self) {
+        let mount_flags = self.mount_flags();
+        let mut locks = MountLockFlags::TOPOLOGY | MountLockFlags::ATIME;
+        if mount_flags.contains(MountFlags::RDONLY) {
+            locks.insert(MountLockFlags::READONLY);
+        }
+        if mount_flags.contains(MountFlags::NODEV) {
+            locks.insert(MountLockFlags::NODEV);
+        }
+        if mount_flags.contains(MountFlags::NOSUID) {
+            locks.insert(MountLockFlags::NOSUID);
+        }
+        if mount_flags.contains(MountFlags::NOEXEC) {
+            locks.insert(MountLockFlags::NOEXEC);
+        }
+        self.mount_locks.fetch_or(locks.bits(), Ordering::Release);
+    }
+
+    /// Linux `can_change_locked_flags()` equivalent for remount admission.
+    /// Locks prevent relaxing attributes that were present at lock time and
+    /// prevent changing the atime policy, while still allowing stricter flags
+    /// that were not locked to be added.
+    pub(crate) fn can_reconfigure_mount_flags(&self, requested: MountFlags) -> bool {
+        let locks = MountLockFlags::from_bits_truncate(self.mount_locks.load(Ordering::Acquire));
+        if locks.contains(MountLockFlags::READONLY) && !requested.contains(MountFlags::RDONLY) {
+            return false;
+        }
+        if locks.contains(MountLockFlags::NODEV) && !requested.contains(MountFlags::NODEV) {
+            return false;
+        }
+        if locks.contains(MountLockFlags::NOSUID) && !requested.contains(MountFlags::NOSUID) {
+            return false;
+        }
+        if locks.contains(MountLockFlags::NOEXEC) && !requested.contains(MountFlags::NOEXEC) {
+            return false;
+        }
+        !locks.contains(MountLockFlags::ATIME)
+            || (self.mount_flags() & MountFlags::MNT_ATIME_MASK)
+                == (requested & MountFlags::MNT_ATIME_MASK)
     }
 
     #[inline(never)]
@@ -2019,6 +2091,11 @@ impl MountFS {
 
     pub(crate) fn has_external_pins(&self) -> bool {
         self.lifecycle.lock().external_pins != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn superblock_external_pin_count(&self) -> usize {
+        self.super_block_state.lifecycle.lock().external_pins
     }
 
     pub(crate) fn subtree_has_external_pins(&self) -> bool {

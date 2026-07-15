@@ -209,6 +209,38 @@ fn test_recursive_prepare_capacity_failure_changes_nothing() {
 }
 
 #[test]
+fn test_prepared_registration_failure_changes_no_reverse_indexes() {
+    let source = new_test_mount(MountPropagation::new_shared().unwrap());
+    let group_id = source.propagation().peer_group_id();
+    register_peer(group_id, &source);
+
+    let copy = source.deepcopy(None).unwrap();
+    copy.propagation().set_private();
+    copy.propagation().set_slave(Some(Arc::downgrade(&source)));
+    let peers_before = get_peers(group_id, &source);
+    let slaves_before = source.propagation().slaves();
+    let calls = Cell::new(0);
+
+    let result = PreparedRegistrations::prepare_with(&[copy.clone()], || {
+        let call = calls.get();
+        calls.set(call + 1);
+        if call == 1 {
+            Err(SystemError::ENOMEM)
+        } else {
+            Ok(())
+        }
+    });
+
+    assert!(matches!(result, Err(SystemError::ENOMEM)));
+    assert_eq!(get_peers(group_id, &source).len(), peers_before.len());
+    assert_eq!(source.propagation().slaves().len(), slaves_before.len());
+    assert!(copy.namespace().is_none());
+    assert!(!copy.is_live());
+    MountFS::deactivate_disconnected_subtree(&copy);
+    assert!(copy.propagation().is_private());
+}
+
+#[test]
 fn test_group_allocator_reuses_multiple_holes_in_minimum_order_without_free_storage() {
     let mut allocator = PropagationGroupIdAllocator::new();
     let ids: Vec<_> = (0..6).map(|_| allocator.alloc().unwrap()).collect();

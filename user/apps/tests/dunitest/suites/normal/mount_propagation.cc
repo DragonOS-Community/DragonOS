@@ -137,6 +137,35 @@ bool mount_source_at(const char* mount_point, const char* expected_source) {
     return found;
 }
 
+bool mount_has_option(const char* mount_point, const char* expected_option) {
+    FILE* fp = fopen("/proc/self/mountinfo", "r");
+    if (fp == nullptr) {
+        return false;
+    }
+
+    bool found = false;
+    char line[2048] = {};
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        char parsed_mount_point[256] = {};
+        char options[512] = {};
+        if (sscanf(line, "%*s %*s %*s %*s %255s %511s", parsed_mount_point, options) != 2 ||
+            strcmp(parsed_mount_point, mount_point) != 0) {
+            continue;
+        }
+        char* save = nullptr;
+        for (char* option = strtok_r(options, ",", &save); option != nullptr;
+             option = strtok_r(nullptr, ",", &save)) {
+            if (strcmp(option, expected_option) == 0) {
+                found = true;
+                break;
+            }
+        }
+        break;
+    }
+    fclose(fp);
+    return found;
+}
+
 struct PropagationTags {
     int shared = -1;
     int master = -1;
@@ -251,6 +280,34 @@ bool write_exact(int fd, const void* buffer, size_t length) {
     }
     return true;
 }
+
+class ChildProcessGuard {
+public:
+    explicit ChildProcessGuard(pid_t pid) : pid_(pid) {}
+
+    ~ChildProcessGuard() {
+        if (pid_ <= 0) {
+            return;
+        }
+        kill(pid_, SIGKILL);
+        while (waitpid(pid_, nullptr, 0) < 0 && errno == EINTR) {
+        }
+    }
+
+    pid_t wait(int* status) {
+        pid_t result;
+        do {
+            result = waitpid(pid_, status, 0);
+        } while (result < 0 && errno == EINTR);
+        if (result == pid_) {
+            pid_ = -1;
+        }
+        return result;
+    }
+
+private:
+    pid_t pid_;
+};
 
 void terminate_children(pid_t* children, size_t count) {
     for (size_t i = 0; i < count; ++i) {
@@ -466,6 +523,363 @@ TEST_F(MountPropagationTest, CrossUserNamespaceCanMakeLockedRootPrivate) {
     ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST_F(MountPropagationTest, CrossUserCopyIsOneWayAndKeepsAttributeLocksAcrossCopy) {
+    char base[160] = {};
+    char host[192] = {};
+    char local[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(host, sizeof(host), "%s/host", base);
+    snprintf(local, sizeof(local), "%s/local", base);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(host)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(local)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr,
+                       MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr))
+        << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    const int source_group = shared_group_id(base);
+    ASSERT_GT(source_group, 0);
+
+    int parent_to_child[2] = {-1, -1};
+    int child_to_parent[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(parent_to_child)) << strerror(errno);
+    ASSERT_EQ(0, pipe(child_to_parent)) << strerror(errno);
+
+    struct ChildReport {
+        PropagationTags initial_tags;
+        PropagationTags nested_tags;
+        int initial_remount_errno;
+        int add_readonly_errno;
+        int readonly_after_add;
+        int remove_readonly_errno;
+        int readonly_after_remove;
+        int atime_remount_errno;
+        int nested_unshare_errno;
+        int nested_remount_errno;
+        int ordinary_remount_errno;
+        int saw_parent_mount;
+        int local_mount_errno;
+        int saw_local_mount;
+    };
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    ChildProcessGuard child_guard(child);
+    if (child == 0) {
+        close(parent_to_child[1]);
+        close(child_to_parent[0]);
+        ChildReport report = {};
+        report.initial_tags = {};
+        report.nested_tags = {};
+
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+            _exit(1);
+        }
+        const char* points[] = {base};
+        if (!read_propagation_snapshot(points, 1, &report.initial_tags)) {
+            _exit(2);
+        }
+        errno = 0;
+        if (mount(nullptr, base, nullptr, MS_REMOUNT | MS_BIND, nullptr) == 0) {
+            report.initial_remount_errno = 0;
+        } else {
+            report.initial_remount_errno = errno;
+        }
+        errno = 0;
+        if (mount(nullptr, base, nullptr,
+                  MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                  nullptr) != 0) {
+            report.add_readonly_errno = errno;
+        }
+        report.readonly_after_add = mount_has_option(base, "ro") ? 1 : 0;
+        errno = 0;
+        if (mount(nullptr, base, nullptr,
+                  MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) {
+            report.remove_readonly_errno = errno;
+        }
+        report.readonly_after_remove = mount_has_option(base, "ro") ? 1 : 0;
+        errno = 0;
+        if (mount(nullptr, base, nullptr,
+                  MS_REMOUNT | MS_BIND | MS_NOATIME | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                  nullptr) == 0) {
+            report.atime_remount_errno = 0;
+        } else {
+            report.atime_remount_errno = errno;
+        }
+
+        errno = 0;
+        if (unshare(CLONE_NEWNS) != 0) {
+            report.nested_unshare_errno = errno;
+        } else {
+            if (!read_propagation_snapshot(points, 1, &report.nested_tags)) {
+                _exit(3);
+            }
+            errno = 0;
+            if (mount(nullptr, base, nullptr, MS_REMOUNT | MS_BIND, nullptr) == 0) {
+                report.nested_remount_errno = 0;
+            } else {
+                report.nested_remount_errno = errno;
+            }
+            errno = 0;
+            if (mount(nullptr, base, nullptr, MS_REMOUNT, nullptr) == 0) {
+                report.ordinary_remount_errno = 0;
+            } else {
+                report.ordinary_remount_errno = errno;
+            }
+        }
+
+        const char ready = 'R';
+        if (!write_exact(child_to_parent[1], &ready, sizeof(ready))) {
+            _exit(4);
+        }
+        char release = 0;
+        if (!read_exact(parent_to_child[0], &release, sizeof(release))) {
+            _exit(5);
+        }
+        report.saw_parent_mount = marker_exists(host, "from_parent") ? 1 : 0;
+        errno = 0;
+        if (mount("issue2103-child", local, "ramfs", 0, nullptr) != 0) {
+            report.local_mount_errno = errno;
+        }
+        report.saw_local_mount = mount_source_at(local, "issue2103-child") ? 1 : 0;
+        if (!write_exact(child_to_parent[1], &report, sizeof(report))) {
+            _exit(6);
+        }
+        _exit(0);
+    }
+
+    close(parent_to_child[0]);
+    close(child_to_parent[1]);
+    char ready = 0;
+    ASSERT_TRUE(read_exact(child_to_parent[0], &ready, sizeof(ready)));
+    ASSERT_EQ('R', ready);
+    ASSERT_EQ(0, mount("", host, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(host, "from_parent")) << strerror(errno);
+    const char release = 'G';
+    ASSERT_TRUE(write_exact(parent_to_child[1], &release, sizeof(release)));
+
+    ChildReport report = {};
+    ASSERT_TRUE(read_exact(child_to_parent[0], &report, sizeof(report)));
+    int status = 0;
+    ASSERT_EQ(child, child_guard.wait(&status)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+
+    EXPECT_EQ(-1, report.initial_tags.shared);
+    EXPECT_EQ(source_group, report.initial_tags.master);
+    EXPECT_EQ(EPERM, report.initial_remount_errno);
+    EXPECT_EQ(0, report.add_readonly_errno);
+    EXPECT_EQ(1, report.readonly_after_add);
+    EXPECT_EQ(0, report.remove_readonly_errno);
+    EXPECT_EQ(0, report.readonly_after_remove);
+    EXPECT_EQ(EPERM, report.atime_remount_errno);
+    EXPECT_EQ(0, report.nested_unshare_errno);
+    EXPECT_EQ(-1, report.nested_tags.shared);
+    EXPECT_EQ(source_group, report.nested_tags.master);
+    EXPECT_EQ(EPERM, report.nested_remount_errno);
+    EXPECT_EQ(EPERM, report.ordinary_remount_errno);
+    EXPECT_EQ(1, report.saw_parent_mount);
+    EXPECT_EQ(0, report.local_mount_errno);
+    EXPECT_EQ(1, report.saw_local_mount);
+    EXPECT_FALSE(mount_source_at(local, "issue2103-child"));
+
+    close(parent_to_child[1]);
+    close(child_to_parent[0]);
+    best_effort_umount(host);
+    best_effort_umount(base);
+    best_effort_rmdir(host);
+    best_effort_rmdir(local);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, SameUserNamespaceCopyRemainsInSharedPeerGroup) {
+    char base[160] = {};
+    char local[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(local, sizeof(local), "%s/local", base);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(local)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    const int source_group = shared_group_id(base);
+    ASSERT_GT(source_group, 0);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (unshare(CLONE_NEWNS) != 0) {
+            _exit(1);
+        }
+        const char* points[] = {base};
+        PropagationTags tags = {};
+        if (!read_propagation_snapshot(points, 1, &tags) || tags.shared != source_group ||
+            tags.master >= 0) {
+            _exit(2);
+        }
+        if (mount(nullptr, base, nullptr, MS_REMOUNT | MS_BIND | MS_NOATIME, nullptr) != 0 ||
+            !mount_has_option(base, "noatime")) {
+            _exit(3);
+        }
+        if (mount("", local, "ramfs", 0, nullptr) != 0 ||
+            create_marker(local, "same_user") != 0) {
+            _exit(4);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    EXPECT_TRUE(marker_exists(local, "same_user"));
+
+    best_effort_umount(local);
+    best_effort_umount(base);
+    best_effort_rmdir(local);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, CrossUserCopyCannotReconfigureSourceSuperblock) {
+    char base[160] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+            _exit(1);
+        }
+        errno = 0;
+        if (mount(nullptr, base, nullptr, MS_REMOUNT | MS_RDONLY, nullptr) == 0 ||
+            errno != EPERM) {
+            _exit(2);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_REMOUNT | MS_RDONLY, nullptr))
+        << strerror(errno);
+    EXPECT_TRUE(mount_has_option(base, "ro"));
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_REMOUNT, nullptr)) << strerror(errno);
+    EXPECT_FALSE(mount_has_option(base, "ro"));
+
+    best_effort_umount(base);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, UserAndMountNamespaceCreationOrderMatchesLinux) {
+    char base[160] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    const int source_group = shared_group_id(base);
+    ASSERT_GT(source_group, 0);
+
+    pid_t sequential = fork();
+    ASSERT_GE(sequential, 0) << strerror(errno);
+    if (sequential == 0) {
+        if (unshare(CLONE_NEWUSER) != 0 || unshare(CLONE_NEWNS) != 0) {
+            _exit(1);
+        }
+        const char* points[] = {base};
+        PropagationTags tags = {};
+        if (!read_propagation_snapshot(points, 1, &tags) || tags.shared >= 0 ||
+            tags.master != source_group) {
+            _exit(2);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(sequential, waitpid(sequential, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+
+    pid_t reverse = fork();
+    ASSERT_GE(reverse, 0) << strerror(errno);
+    if (reverse == 0) {
+        if (unshare(CLONE_NEWNS) != 0 || unshare(CLONE_NEWUSER) != 0) {
+            _exit(1);
+        }
+        errno = 0;
+        if (mount(nullptr, base, nullptr, MS_PRIVATE, nullptr) == 0 || errno != EPERM) {
+            _exit(2);
+        }
+        if (unshare(CLONE_NEWNS) != 0) {
+            _exit(3);
+        }
+        const char* points[] = {base};
+        PropagationTags tags = {};
+        if (!read_propagation_snapshot(points, 1, &tags) || tags.shared >= 0 ||
+            tags.master != source_group) {
+            _exit(4);
+        }
+        if (mount(nullptr, base, nullptr, MS_PRIVATE, nullptr) != 0) {
+            _exit(5);
+        }
+        _exit(0);
+    }
+
+    ASSERT_EQ(reverse, waitpid(reverse, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+
+    best_effort_umount(base);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, CrossUserSharedSlaveUsesSourceAsImmediateMaster) {
+    char base[160] = {};
+    char slave[160] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(slave, sizeof(slave), "%s/slave", root_);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(slave)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, slave, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, slave, nullptr, MS_SLAVE, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, slave, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    const int source_group = shared_group_id(slave);
+    ASSERT_GT(source_group, 0);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+            _exit(1);
+        }
+        const char* points[] = {slave};
+        PropagationTags tags = {};
+        if (!read_propagation_snapshot(points, 1, &tags) || tags.shared >= 0 ||
+            tags.master != source_group) {
+            _exit(2);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+
+    best_effort_umount(slave);
+    best_effort_umount(base);
+    best_effort_rmdir(slave);
+    best_effort_rmdir(base);
 }
 
 TEST_F(MountPropagationTest, OrdinaryUmountRejectsMountedDescendant) {

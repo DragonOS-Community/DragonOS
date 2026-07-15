@@ -324,6 +324,9 @@ fn do_reconfigure_bind_mount(
     if !target_mfs.is_live() || !target_mfs.is_belongs_to_mntns(&current_mntns) {
         return Err(SystemError::EINVAL);
     }
+    if !target_mfs.can_reconfigure_mount_flags(requested_flags) {
+        return Err(SystemError::EPERM);
+    }
     target_mfs.update_mount_flags(|mount_flags| {
         let preserved = *mount_flags & !MountFlags::MNT_USER_SETTABLE_MASK;
         let new_settable = requested_flags & MountFlags::MNT_USER_SETTABLE_MASK;
@@ -366,9 +369,17 @@ fn do_remount(
         if !target_mfs.is_live() || !target_mfs.is_belongs_to_mntns(&current_mntns) {
             return Err(SystemError::EINVAL);
         }
+        if !target_mfs.can_reconfigure_mount_flags(requested_mnt_flags) {
+            return Err(SystemError::EPERM);
+        }
     }
     let old_sb_flags = target_mfs.super_block_flags();
     let (data_sb_flags, data_sb_flags_mask, fs_private_data) = parse_remount_data(data.as_deref())?;
+    // Linux do_remount() requires CAP_SYS_ADMIN in sb->s_user_ns before a
+    // legacy remount may change shared superblock or filesystem-private state.
+    if !ns_capable(super_block_state.owner_user_ns(), CAPFlags::CAP_SYS_ADMIN) {
+        return Err(SystemError::EPERM);
+    }
     let sb_flags_mask = MountFlags::RMT_MASK | data_sb_flags_mask;
     let requested_sb_flags = (requested_sb_flags & !data_sb_flags_mask) | data_sb_flags;
     let new_sb_flags = (old_sb_flags & !sb_flags_mask) | (requested_sb_flags & sb_flags_mask);

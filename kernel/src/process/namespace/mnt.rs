@@ -17,8 +17,7 @@ use super::{
     nsproxy::NsCommon,
     propagation::{
         abort_moved_tree_propagation_locked, commit_moved_tree_propagation_locked,
-        prepare_moved_tree_propagation_locked, register_peer, register_slave_with_master,
-        MountPropagation,
+        prepare_moved_tree_propagation_locked, MountPropagation, PreparedRegistrations,
     },
     user_namespace::UserNamespace,
     NamespaceOps,
@@ -28,6 +27,10 @@ static mut INIT_MNT_NAMESPACE: Option<Arc<MntNamespace>> = None;
 
 const DEFAULT_MOUNT_MAX: u32 = 100_000;
 static MOUNT_MAX: AtomicU32 = AtomicU32::new(DEFAULT_MOUNT_MAX);
+
+#[cfg(test)]
+static FAIL_COPY_REGISTRATION_PREPARE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 pub fn mount_max() -> u32 {
     MOUNT_MAX.load(Ordering::Relaxed)
@@ -569,6 +572,20 @@ impl MntNamespace {
             }
         };
 
+        #[cfg(test)]
+        if FAIL_COPY_REGISTRATION_PREPARE.swap(false, Ordering::AcqRel) {
+            MountFS::deactivate_disconnected_subtree(&new_root_mntfs);
+            return Err(SystemError::ENOMEM);
+        }
+        let prepared_registrations =
+            match PreparedRegistrations::prepare_iter(copied_mounts.iter().map(|(_, copy)| copy)) {
+                Ok(registrations) => registrations,
+                Err(error) => {
+                    MountFS::deactivate_disconnected_subtree(&new_root_mntfs);
+                    return Err(error);
+                }
+            };
+
         let mut ns_common = self.ns_common.clone();
         ns_common.level += 1;
         let new_mntns = Arc::new_cyclic(|self_ref| Self {
@@ -594,17 +611,11 @@ impl MntNamespace {
         for (_old_mount, new_mount) in copied_mounts {
             new_mount.set_namespace(Arc::downgrade(&new_mntns));
             new_mount.mark_namespace_accounted(&new_mntns);
-            let propagation = new_mount.propagation();
-            if propagation.is_shared() {
-                register_peer(propagation.peer_group_id(), &new_mount);
-            }
-            if propagation.is_slave() {
-                register_slave_with_master(&new_mount);
-            }
             new_mount
                 .activate()
                 .expect("a detached namespace copy is published exactly once");
         }
+        prepared_registrations.commit();
 
         Ok(new_mntns)
     }
@@ -810,7 +821,7 @@ fn restrict_cross_user_propagation(
     if !cross_user_namespace {
         return;
     }
-    copy.lock_mount();
+    copy.lock_cross_user_mount();
     if !source.propagation().is_shared() {
         return;
     }
@@ -827,6 +838,42 @@ impl ProcessManager {
         } else {
             root_mnt_namespace()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::namespace::{
+        propagation::{get_peers, register_peer},
+        user_namespace::INIT_USER_NAMESPACE,
+    };
+
+    #[test]
+    fn registration_prepare_failure_cleans_namespace_copy() {
+        let namespace = MntNamespace::new_root();
+        let root = namespace.root_mntfs();
+        root.propagation().set_shared().unwrap();
+        let group_id = root.propagation().peer_group_id();
+        register_peer(group_id, &root);
+        let peers_before = get_peers(group_id, &root).len();
+        let slaves_before = root.propagation().slaves().len();
+        let pins_before = root.superblock_external_pin_count();
+        let mount_count_before = namespace.inner.read().mount_count.mounts;
+
+        FAIL_COPY_REGISTRATION_PREPARE.store(true, Ordering::Release);
+        let result = namespace.copy_mnt_ns(&CloneFlags::CLONE_NEWNS, INIT_USER_NAMESPACE.clone());
+
+        assert!(matches!(result, Err(SystemError::ENOMEM)));
+        assert_eq!(root.superblock_external_pin_count(), pins_before);
+        assert_eq!(get_peers(group_id, &root).len(), peers_before);
+        assert_eq!(root.propagation().slaves().len(), slaves_before);
+        assert_eq!(
+            namespace.inner.read().mount_count.mounts,
+            mount_count_before
+        );
+        assert!(root.is_live());
+        assert!(root.is_belongs_to_mntns(&namespace));
     }
 }
 

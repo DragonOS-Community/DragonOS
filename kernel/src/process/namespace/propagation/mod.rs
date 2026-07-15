@@ -21,8 +21,10 @@ pub use event::propagation_umount_busy;
 pub(crate) use event::{
     abort_mount_propagation, abort_moved_tree_propagation_locked, commit_mount_propagation_locked,
     commit_moved_tree_propagation_locked, ensure_subtree_shared, prepare_mount_propagation_locked,
-    prepare_moved_tree_propagation_locked, PreparedPropagation,
+    prepare_moved_tree_propagation_locked, PreparedPropagation, PreparedRegistrations,
 };
+#[cfg(test)]
+pub(crate) use group::get_peers;
 #[allow(unused_imports)]
 pub use group::{register_peer, PropagationGroupId};
 pub(crate) use state::detach_mount_propagation;

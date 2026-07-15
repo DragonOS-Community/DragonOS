@@ -371,6 +371,7 @@ impl PeerGroupRegistry {
 ///
 /// This is a convenience function that delegates to the global `PeerGroupRegistry`.
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn register_peer(group_id: PropagationGroupId, mount: &Arc<MountFS>) {
     PEER_GROUP_REGISTRY.register(group_id, mount);
 }
@@ -459,7 +460,7 @@ where
 /// discoverable at an event commit. Every final member vector and every new
 /// registry key is reserved before the first topology edge is published.
 pub(super) fn prepare_peer_registrations(
-    mounts: &[Arc<MountFS>],
+    mounts: &[&Arc<MountFS>],
 ) -> Result<Vec<PreparedPeerGroupState>, SystemError> {
     let mut additions = Vec::new();
     additions
@@ -469,7 +470,7 @@ pub(super) fn prepare_peer_registrations(
         let propagation = mount.propagation();
         let group_id = propagation.peer_group_id();
         if propagation.is_shared() && group_id.is_valid() {
-            additions.push((group_id, mount.clone()));
+            additions.push((group_id, (*mount).clone()));
         }
     }
     additions.sort_unstable_by_key(|(group_id, _)| group_id.data());

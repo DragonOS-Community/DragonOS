@@ -350,7 +350,7 @@ pub struct MountFS {
     /// Weak reference to this MountFS
     self_ref: Weak<MountFS>,
 
-    namespace: RwSem<Option<Weak<MntNamespace>>>,
+    namespace: RwSem<MountNamespaceMembership>,
     propagation: Arc<MountPropagation>,
     mount_id: MountId,
 
@@ -360,6 +360,12 @@ pub struct MountFS {
     /// Internal MNT_LOCKED equivalent; never exposed as a userspace MS_* bit.
     locked: AtomicBool,
     lifecycle: Mutex<MountLifecycle>,
+}
+
+#[derive(Debug, Default)]
+struct MountNamespaceMembership {
+    owner: Option<Weak<MntNamespace>>,
+    accounted: bool,
 }
 
 /// Capacity reserved for one future mount edge. Creating an empty map entry is
@@ -1105,7 +1111,7 @@ impl MountFS {
             tucked_under: AtomicBool::new(false),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
-            namespace: RwSem::new(None),
+            namespace: RwSem::new(MountNamespaceMembership::default()),
             propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(mount_flags),
@@ -1150,7 +1156,7 @@ impl MountFS {
             tucked_under: AtomicBool::new(self.tucked_under.load(Ordering::Acquire)),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
-            namespace: RwSem::new(None),
+            namespace: RwSem::new(MountNamespaceMembership::default()),
             propagation: new_propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(self.mount_flags()),
@@ -1636,6 +1642,21 @@ impl MountFS {
             .collect()
     }
 
+    pub(crate) fn try_mount_children(&self) -> Result<Vec<Arc<MountFS>>, SystemError> {
+        let mountpoints = self.mountpoints.lock();
+        let count = mountpoints.values().try_fold(0usize, |count, stack| {
+            count.checked_add(stack.len()).ok_or(SystemError::ENOMEM)
+        })?;
+        let mut children = Vec::new();
+        children
+            .try_reserve(count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        for stack in mountpoints.values() {
+            children.extend(stack.iter().cloned());
+        }
+        Ok(children)
+    }
+
     pub fn mountpoints(&self) -> MutexGuard<'_, HashMap<DentryId, Vec<Arc<MountFS>>>> {
         self.mountpoints.lock()
     }
@@ -1683,15 +1704,75 @@ impl MountFS {
     }
 
     pub fn set_namespace(&self, namespace: Weak<MntNamespace>) {
-        *self.namespace.write() = Some(namespace);
+        let mut membership = self.namespace.write();
+        assert!(
+            !membership.accounted,
+            "an accounted mount cannot change namespace ownership"
+        );
+        if let Some(owner) = membership.owner.as_ref() {
+            assert!(
+                Weak::ptr_eq(owner, &namespace),
+                "a constructing mount cannot be rebound to another namespace"
+            );
+        }
+        membership.owner = Some(namespace);
     }
 
     pub fn namespace(&self) -> Option<Arc<MntNamespace>> {
-        self.namespace.read().as_ref().and_then(|ns| ns.upgrade())
+        self.namespace.read().owner.as_ref().and_then(Weak::upgrade)
     }
 
     pub fn clear_namespace(&self) {
-        *self.namespace.write() = None;
+        let mut membership = self.namespace.write();
+        assert!(
+            !membership.accounted,
+            "namespace accounting must be released before clearing ownership"
+        );
+        membership.owner = None;
+    }
+
+    pub(crate) fn can_mark_namespace_accounted(&self, namespace: &Arc<MntNamespace>) -> bool {
+        let expected = Arc::downgrade(namespace);
+        let membership = self.namespace.read();
+        !membership.accounted
+            && membership
+                .owner
+                .as_ref()
+                .is_some_and(|owner| Weak::ptr_eq(owner, &expected))
+    }
+
+    pub(crate) fn mark_namespace_accounted(&self, namespace: &Arc<MntNamespace>) {
+        self.mark_namespace_accounted_weak(&Arc::downgrade(namespace));
+    }
+
+    pub(crate) fn mark_namespace_accounted_weak(&self, namespace: &Weak<MntNamespace>) {
+        let mut membership = self.namespace.write();
+        assert!(
+            !membership.accounted
+                && membership
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| Weak::ptr_eq(owner, namespace)),
+            "mount accounting must match its namespace owner"
+        );
+        membership.accounted = true;
+    }
+
+    pub(crate) fn take_namespace_accounted(&self, namespace: &Weak<MntNamespace>) -> bool {
+        let mut membership = self.namespace.write();
+        let owner_matches = membership
+            .owner
+            .as_ref()
+            .is_some_and(|owner| Weak::ptr_eq(owner, namespace));
+        assert!(
+            !membership.accounted || owner_matches,
+            "an accounted mount cannot be released by another namespace"
+        );
+        if !owner_matches || !membership.accounted {
+            return false;
+        }
+        membership.accounted = false;
+        true
     }
 
     /// check_mnt(): Check whether the current MountFS belongs to the specified mount namespace.
@@ -2043,23 +2124,29 @@ impl MountFS {
                 lifecycle.state = MountLifecycleState::Detaching;
             }
         }
+        let mut component_roots = vec![root.clone()];
+        for mount in mounts.iter().filter(|mount| !Arc::ptr_eq(mount, root)) {
+            if mount.is_locked() {
+                continue;
+            }
+            let parent = mount
+                .parent_mount()
+                .expect("validated lazy-detach descendant retains its parent edge");
+            parent
+                .detach_exact_restoring_cover(mount)
+                .expect("validated lazy-detach edge commit cannot fail");
+            mount.set_self_mountpoint(None);
+            component_roots.push(mount.clone());
+        }
+
+        // Every fallible topology decision is complete. Release namespace
+        // capacity only after the detached graph can no longer be rolled back.
         for mount in &mounts {
             if let Some(namespace) = mount.namespace() {
                 namespace.remove_mount_exact(mount);
             }
             mount.clear_namespace();
             mount.detach_propagation_once();
-        }
-
-        let mut component_roots = vec![root.clone()];
-        for mount in mounts.iter().filter(|mount| !Arc::ptr_eq(mount, root)) {
-            if mount.is_locked() {
-                continue;
-            }
-            let parent = mount.parent_mount().ok_or(SystemError::EINVAL)?;
-            parent.detach_exact_restoring_cover(mount)?;
-            mount.set_self_mountpoint(None);
-            component_roots.push(mount.clone());
         }
 
         for component_root in component_roots {
@@ -2335,40 +2422,6 @@ impl MountFS {
         }
 
         return result;
-    }
-
-    /// Recursively unmount a mount and all its child mounts, removing them from the namespace's mount_list.
-    ///
-    /// Used for atomic rollback on recursive bind mount failure, ensuring all-or-nothing semantics.
-    pub fn umount_tree(root: &Arc<MountFS>) {
-        let mntns = ProcessManager::current_mntns();
-
-        // 1. DFS collect all descendant MountFS
-        let mut all_descendants: Vec<Arc<MountFS>> = Vec::new();
-        let mut stack: Vec<Arc<MountFS>> = Vec::new();
-
-        for child_mfs in root.mount_children() {
-            stack.push(child_mfs);
-        }
-
-        while let Some(mfs) = stack.pop() {
-            for child_mfs in mfs.mount_children() {
-                stack.push(child_mfs);
-            }
-            all_descendants.push(mfs);
-        }
-
-        // 2. Process in reverse order (deepest child mounts first), ensuring child mounts are cleaned up before parent mounts
-        all_descendants.reverse();
-
-        for child_mfs in &all_descendants {
-            mntns.remove_mount_exact(child_mfs);
-            let _ = child_mfs.umount();
-        }
-
-        // 3. Finally unmount the root mount itself
-        mntns.remove_mount_exact(root);
-        let _ = root.umount();
     }
 
     /// Corresponds to Linux `sync_inodes_sb()`: write back all dirty page caches under the specified mount.

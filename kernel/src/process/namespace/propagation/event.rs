@@ -12,6 +12,7 @@ use crate::filesystem::vfs::{
     MountFS,
 };
 
+use super::super::mnt::MountCountReservation;
 use super::change::PreparedPropagationRemoval;
 use super::group::{
     apply_prepared_peer_groups, get_peers, prepare_peer_registrations, PreparedPeerGroupState,
@@ -45,7 +46,25 @@ pub(crate) struct PreparedPropagation {
     new_child: Arc<MountFS>,
     mounts: Vec<PreparedMount>,
     registrations: PreparedRegistrations,
+    count_reservations: Vec<MountCountReservation>,
     _local_reservation: MountEdgeReservation,
+}
+
+fn try_collect_subtree(root: &Arc<MountFS>) -> Result<Vec<Arc<MountFS>>, SystemError> {
+    let mut result = Vec::new();
+    let mut pending = Vec::new();
+    pending.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+    pending.push(root.clone());
+    while let Some(mount) = pending.pop() {
+        let children = mount.try_mount_children()?;
+        pending
+            .try_reserve(children.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        pending.extend(children);
+        result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        result.push(mount);
+    }
+    Ok(result)
 }
 
 pub(super) struct CorrespondingSources {
@@ -363,6 +382,15 @@ pub(crate) fn prepare_mount_propagation_locked(
     mountpoint: &Arc<MountFSInode>,
     new_child: &Arc<MountFS>,
 ) -> Result<Option<PreparedPropagation>, SystemError> {
+    prepare_mount_propagation_with_counting_locked(source_mnt, mountpoint, new_child, true)
+}
+
+fn prepare_mount_propagation_with_counting_locked(
+    source_mnt: &Arc<MountFS>,
+    mountpoint: &Arc<MountFSInode>,
+    new_child: &Arc<MountFS>,
+    count_local_tree: bool,
+) -> Result<Option<PreparedPropagation>, SystemError> {
     let source_prop = source_mnt.propagation();
     let canonical_mountpoint = source_mnt.wrapper_for_dentry(mountpoint.shared_dentry())?;
     if canonical_mountpoint.dentry_id() != mountpoint.dentry_id() {
@@ -375,6 +403,15 @@ pub(crate) fn prepare_mount_propagation_locked(
     let source_dentry = mountpoint.shared_dentry();
     let mut slave_groups = BTreeMap::new();
     let mut mounts = Vec::new();
+    let mut count_reservations = Vec::new();
+    if count_local_tree {
+        if let Some(namespace) = source_mnt.namespace() {
+            count_reservations
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+            count_reservations.push(namespace.reserve_mounts(try_collect_subtree(new_child)?)?);
+        }
+    }
     let mut propagated_sources = CorrespondingSources::new();
     propagated_sources.insert(source_mnt, new_child.clone());
     let targets = if source_prop.is_shared() {
@@ -401,6 +438,11 @@ pub(crate) fn prepare_mount_propagation_locked(
         if matches!(kind, PropagationTargetKind::Slave) && master_source.is_none() {
             continue;
         }
+        let target_namespace = target_parent.namespace();
+        if target_namespace.is_some() && count_reservations.try_reserve(1).is_err() {
+            abandon_prepared(&mounts);
+            return Err(SystemError::ENOMEM);
+        }
         let target_mp = match target_parent.wrapper_for_dentry(source_dentry.clone()) {
             Ok(mountpoint) => mountpoint,
             // Equivalent to Linux propagate_mnt skipping a peer whose bind
@@ -426,6 +468,18 @@ pub(crate) fn prepare_mount_propagation_locked(
                 return Err(error);
             }
         };
+        if let Some(namespace) = target_namespace {
+            let reservation =
+                match try_collect_subtree(&clone).and_then(|tree| namespace.reserve_mounts(tree)) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        MountFS::deactivate_disconnected_subtree(&clone);
+                        abandon_prepared(&mounts);
+                        return Err(error);
+                    }
+                };
+            count_reservations.push(reservation);
+        }
         let target_reservation = if expected_top.is_none() {
             match target_parent.reserve_mount_edge(&target_mp, 1) {
                 Ok(reservation) => Some(reservation),
@@ -472,12 +526,14 @@ pub(crate) fn prepare_mount_propagation_locked(
             return Err(error);
         }
     };
+
     Ok(Some(PreparedPropagation {
         source_mnt: source_mnt.clone(),
         mountpoint: canonical_mountpoint,
         new_child: new_child.clone(),
         mounts,
         registrations,
+        count_reservations,
         _local_reservation: local_reservation,
     }))
 }
@@ -592,6 +648,9 @@ pub(crate) fn commit_mount_propagation_locked(
     }
 
     prepared.registrations.commit();
+    for reservation in prepared.count_reservations {
+        reservation.commit();
+    }
     Ok(())
 }
 
@@ -637,14 +696,18 @@ pub(crate) fn prepare_moved_tree_propagation_locked(
             prop.set_shared_with_group(group.clone());
         }
     }
-    let propagation =
-        match prepare_mount_propagation_locked(target_parent, moved_root_mountpoint, moved_root) {
-            Ok(propagation) => propagation,
-            Err(error) => {
-                restore_invented_groups(invented);
-                return Err(error);
-            }
-        };
+    let propagation = match prepare_mount_propagation_with_counting_locked(
+        target_parent,
+        moved_root_mountpoint,
+        moved_root,
+        false,
+    ) {
+        Ok(propagation) => propagation,
+        Err(error) => {
+            restore_invented_groups(invented);
+            return Err(error);
+        }
+    };
     Ok(PreparedMovePropagation {
         propagation,
         invented,

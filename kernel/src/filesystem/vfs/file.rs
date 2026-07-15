@@ -629,6 +629,19 @@ struct ReaddirState {
     next_index: usize,
 }
 
+impl ReaddirState {
+    fn resume_after_cookie(&mut self, cookie: u64) {
+        let Some(entries) = self.entries.as_ref() else {
+            self.next_index = 0;
+            return;
+        };
+        self.next_index = entries
+            .iter()
+            .position(|entry| entry.next_cookie == cookie)
+            .map_or(entries.len(), |index| index + 1);
+    }
+}
+
 impl File {
     pub fn resolved_path(&self) -> Result<super::utils::ResolvedPath, SystemError> {
         let mount_guard = self
@@ -1549,11 +1562,8 @@ impl File {
             if pos == 0 {
                 state.entries = None;
                 state.next_index = 0;
-            } else if let Some(entries) = state.entries.as_ref() {
-                state.next_index = entries
-                    .iter()
-                    .position(|entry| entry.next_cookie == pos as u64)
-                    .map_or(entries.len(), |index| index + 1);
+            } else {
+                state.resume_after_cookie(pos as u64);
             }
             self.offset.store(pos as usize, Ordering::SeqCst);
             return Ok(pos as usize);
@@ -1647,7 +1657,11 @@ impl File {
         let current_cookie = self.offset.load(Ordering::SeqCst) as u64;
         if state.entries.is_none() {
             state.entries = Some(Arc::from(inode.list_entries()?));
-            state.next_index = 0;
+            if current_cookie == 0 {
+                state.next_index = 0;
+            } else {
+                state.resume_after_cookie(current_cookie);
+            }
         } else {
             let expected_cookie = state.entries.as_ref().and_then(|entries| {
                 state
@@ -1657,14 +1671,7 @@ impl File {
                     .map(|entry| entry.next_cookie)
             });
             if state.next_index > 0 && expected_cookie != Some(current_cookie) {
-                let entries = state
-                    .entries
-                    .as_ref()
-                    .expect("readdir snapshot initialized");
-                state.next_index = entries
-                    .iter()
-                    .position(|entry| entry.next_cookie == current_cookie)
-                    .map_or(entries.len(), |index| index + 1);
+                state.resume_after_cookie(current_cookie);
             }
         }
 

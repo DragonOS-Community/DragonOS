@@ -9935,6 +9935,30 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
         goto fail;
     }
 
+    // Rewinding discards the cached snapshot. A subsequent seek to an opaque
+    // cookie must still resume after that cookie when getdents rebuilds it.
+    if (lseek(dir_fd, 0, SEEK_SET) != 0 || lseek(dir_fd, 101, SEEK_SET) != 101) {
+        printf("[FAIL] seekdir cookie after snapshot reset: %s (errno=%d)\n", strerror(errno),
+               errno);
+        goto fail;
+    }
+    errno = 0;
+    if (syscall(SYS_getdents64, dir_fd, resume_buf, 24) >= 0 || errno != EINVAL) {
+        printf("[FAIL] snapshot-reset seek advanced on undersized getdents: errno=%d\n", errno);
+        goto fail;
+    }
+    resume_n = syscall(SYS_getdents64, dir_fd, resume_buf, sizeof(resume_buf));
+    if (resume_n <= 0) {
+        printf("[FAIL] getdents64 after snapshot-reset seek: n=%zd errno=%d\n", resume_n, errno);
+        goto fail;
+    }
+    resumed = (struct p4_linux_dirent64 *)resume_buf;
+    if (strcmp(resumed->d_name, "alpha.txt") != 0 || resumed->d_off != 4099) {
+        printf("[FAIL] snapshot-reset cookie resume name=%s off=%lld\n", resumed->d_name,
+               (long long)resumed->d_off);
+        goto fail;
+    }
+
     close(dir_fd);
     dir_fd = -1;
     snprintf(upper, sizeof(upper), "%s/upper", overlay_root);

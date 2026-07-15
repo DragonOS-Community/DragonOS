@@ -593,92 +593,64 @@ fn do_bind_mount(
         .downcast_arc::<MountFSInode>()
         .ok_or(SystemError::EINVAL)?;
 
-    // Get the source's filesystem
-    let source_fs = source_inode.fs();
-
-    // Check if source is on a MountFS
-    let source_mfs = source_fs.clone().downcast_arc::<MountFS>();
-
-    // The source mount must belong to the current mount namespace.
-    if let Some(ref mfs) = source_mfs {
-        let current_mntns = ProcessManager::current_mntns();
-        if !mfs.is_belongs_to_mntns(&current_mntns) {
-            return Err(SystemError::EINVAL);
-        }
-    }
-
-    // Check if source is unbindable - if so, reject the bind mount
-    if let Some(ref mfs) = source_mfs {
-        if mfs.propagation().is_unbindable() {
-            return Err(SystemError::EINVAL);
-        }
-        if !flags.contains(MountFlags::REC)
-            && has_locked_children_in_view(mfs, &source_mount_inode)?
-        {
-            return Err(SystemError::EINVAL);
-        }
-    }
-
-    // Clone source_mfs for recursive bind mount (need to keep it for later use)
-    let source_mfs_for_recursive = source_mfs.clone();
-
-    let root_inner_inode = if is_mountpoint_root(&source_inode) {
-        source_mfs
-            .as_ref()
-            .map(|mfs| mfs.root_inner_inode())
-            .unwrap_or_else(|| source_inode.clone())
-    } else {
-        source_inode
-            .clone()
-            .downcast_arc::<MountFSInode>()
-            .map(|inode| inode.underlying_inode())
-            .unwrap_or_else(|| source_inode.clone())
-    };
-
-    // Get the inner filesystem for mounting while preserving the source subtree root.
-    let inner_fs = source_mfs
-        .map(|mfs| mfs.inner_filesystem())
-        .unwrap_or(source_fs);
-
-    // do_loopback: the target mount point must belong to the current mount namespace.
-    let current_mntns = ProcessManager::current_mntns();
-    let target_mount_fs = target_inode
+    let source_mfs = source_inode
         .fs()
         .downcast_arc::<MountFS>()
         .ok_or(SystemError::EINVAL)?;
-    if !target_mount_fs.is_belongs_to_mntns(&current_mntns) {
-        return Err(SystemError::EINVAL);
-    }
 
     let target_mountpoint = target_inode
         .clone()
         .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
         .ok_or(SystemError::EINVAL)?;
-    let target_mfs = target_mountpoint.prepare_subtree_with_root_dentry(
-        inner_fs,
-        root_inner_inode,
-        Some(source_mount_inode.shared_dentry()),
-        source_mfs_for_recursive
-            .as_ref()
-            .map(|mount| mount.mount_flags())
-            .unwrap_or_else(MountFlags::empty),
-        source_mfs_for_recursive
-            .as_ref()
-            .map(|mfs| mfs.super_block_state()),
-        source_mfs_for_recursive.as_ref(),
-    )?;
-    target_mfs.set_mount_source(Some(source_path.clone()));
+    let target_mount_fs = target_mountpoint.mount_fs();
+    let current_mntns = ProcessManager::current_mntns();
 
-    // Build the complete recursive clone while detached. The root edge is the
-    // publication point, so lookup never observes a half-copied bind tree.
-    if flags.contains(MountFlags::REC) {
-        if let Some(ref mfs) = source_mfs_for_recursive {
-            if let Err(e) = do_recursive_bind_mount(mfs, &target_mfs) {
+    // Linux holds namespace_lock across check_mnt(), clone_mnt(root), and
+    // copy_tree(children). Take one mount+dentry snapshot for the equivalent
+    // source validation and complete detached clone so root and descendants
+    // cannot observe different lifecycle or propagation states.
+    let target_mfs = with_topology_snapshot(|| {
+        if !source_mfs.is_live()
+            || !source_mfs.is_belongs_to_mntns(&current_mntns)
+            || !target_mount_fs.is_live()
+            || !target_mount_fs.is_belongs_to_mntns(&current_mntns)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        if source_mfs.propagation().is_unbindable() {
+            return Err(SystemError::EINVAL);
+        }
+        if !flags.contains(MountFlags::REC)
+            && has_locked_children_in_view_locked(&source_mfs, &source_mount_inode)?
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let root_inner_inode = if is_mountpoint_root(&source_inode) {
+            source_mfs.root_inner_inode()
+        } else {
+            source_mount_inode.underlying_inode()
+        };
+        let target_mfs = target_mountpoint.prepare_subtree_with_root_dentry_prevalidated(
+            source_mfs.inner_filesystem(),
+            root_inner_inode,
+            Some(source_mount_inode.shared_dentry()),
+            source_mfs.mount_flags(),
+            Some(source_mfs.super_block_state()),
+            Some(&source_mfs),
+        )?;
+        target_mfs.set_mount_source(Some(source_path.clone()));
+
+        // The root edge is the publication point, so lookup never observes a
+        // half-copied recursive bind tree.
+        if flags.contains(MountFlags::REC) {
+            if let Err(error) = do_recursive_bind_mount_locked(&source_mfs, &target_mfs) {
                 MountFS::deactivate_disconnected_subtree(&target_mfs);
-                return Err(e);
+                return Err(error);
             }
         }
-    }
+        Ok(target_mfs)
+    })?;
 
     if let Err(error) = target_mountpoint.publish_prepared_subtree(&target_mfs) {
         MountFS::deactivate_disconnected_subtree(&target_mfs);
@@ -690,26 +662,25 @@ fn do_bind_mount(
 
 /// Linux rejects a non-recursive bind when it would uncover locked child
 /// mounts below the selected source dentry (has_locked_children()).
-fn has_locked_children_in_view(
+/// Caller holds the mount+dentry topology snapshot.
+fn has_locked_children_in_view_locked(
     source_mount: &Arc<MountFS>,
     source_root: &Arc<MountFSInode>,
 ) -> Result<bool, SystemError> {
-    with_topology_snapshot(|| {
-        let mut pending = source_mount.mount_children();
-        while let Some(child) = pending.pop() {
-            let mountpoint = child.self_mountpoint().ok_or(SystemError::EINVAL)?;
-            if mountpoint
-                .relative_path_from_snapshot(source_root)?
-                .is_none()
-            {
-                continue;
-            }
-            if child.is_locked() {
-                return Ok(true);
-            }
+    let mut pending = source_mount.mount_children();
+    while let Some(child) = pending.pop() {
+        let mountpoint = child.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        if mountpoint
+            .relative_path_from_snapshot(source_root)?
+            .is_none()
+        {
+            continue;
         }
-        Ok(false)
-    })
+        if child.is_locked() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Change the propagation type of a mount point.
@@ -829,13 +800,12 @@ fn do_move_mount(
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(SystemError)` on failure
-fn do_recursive_bind_mount(
+///
+/// Caller holds the mount+dentry topology snapshot for the complete detached copy.
+fn do_recursive_bind_mount_locked(
     source_mfs: &Arc<MountFS>,
     target_mfs: &Arc<MountFS>,
 ) -> Result<(), SystemError> {
-    // Mount edge mutations use the same lock. Holding it for the complete
-    // detached copy gives MS_BIND|MS_REC one coherent source-tree snapshot.
-    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
     let mut pending = vec![(source_mfs.clone(), target_mfs.clone())];
     while let Some((source_parent, target_parent)) = pending.pop() {
         for source_child in source_parent.mount_children() {

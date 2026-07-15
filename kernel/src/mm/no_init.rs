@@ -209,7 +209,7 @@ pub unsafe fn pseudo_unmap_phys(vaddr: VirtAddr, count: PageFrameCount) {
 
     for i in 0..count.data() {
         let vaddr = vaddr + i * MMArch::PAGE_SIZE;
-        if let Some((_, _, flusher)) = mapper.unmap_phys(vaddr, true) {
+        if let Some((_, _, flusher)) = mapper.unmap_phys(vaddr, false) {
             flusher.ignore();
         };
     }

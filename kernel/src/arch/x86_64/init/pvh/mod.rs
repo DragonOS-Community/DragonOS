@@ -38,7 +38,7 @@ impl BootCallbacks for PvhBootCallback {
     fn init_bootloader_name(&self) -> Result<Option<String>, SystemError> {
         return Ok(Some("x86 PVH".to_string()));
     }
-    
+
     fn init_acpi_args(&self) -> Result<BootloaderAcpiArg, SystemError> {
         let si = START_INFO.get();
         log::info!(
@@ -46,10 +46,10 @@ impl BootCallbacks for PvhBootCallback {
             si.magic, si.version, si.flags, si.nr_modules,
             si.rsdp_paddr, si.memmap_paddr, si.memmap_entries
         );
-	
+
         let rsdp_paddr = PhysAddr::new(si.rsdp_paddr as usize);
 
-	// if RSDP has been provided
+        // if RSDP has been provided
         if rsdp_paddr.data() != 0 {
             return Ok(BootloaderAcpiArg::Rsdp(rsdp_paddr));
         }

@@ -6,7 +6,7 @@
 //! Reference: Linux `acpi_find_root_pointer()` in drivers/acpi/acpica/tbxfroot.c
 //! Also see: https://wiki.osdev.org/RSDP
 
-use crate::mm::{PhysAddr, early_ioremap::EarlyIoRemap};
+use crate::mm::{early_ioremap::EarlyIoRemap, PhysAddr};
 
 // On IA-PC systems, the RSDP is either located within the first 1 KiB of
 // the EBDA or in the memory region from 0x000E0000 to 0x000FFFFF.

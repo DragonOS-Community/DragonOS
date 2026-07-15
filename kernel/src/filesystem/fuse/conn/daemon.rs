@@ -619,15 +619,15 @@ impl FuseConn {
             })?;
             self.background
                 .configure(max_background, congestion_threshold);
-            stats::on_fuse_io_limits_negotiated(
-                self.max_read(),
-                self.max_write(),
-                negotiated_max_pages as usize,
-                init_out.max_readahead as usize,
-                (enabled_flags & FUSE_ASYNC_READ) != 0,
-                (enabled_flags & FUSE_WRITEBACK_CACHE) != 0,
-                self.effective_read_payload_limit(),
-                core::cmp::min(
+            stats::on_fuse_io_limits_negotiated(stats::NegotiatedFuseIoLimits {
+                max_read: self.max_read(),
+                max_write: self.max_write(),
+                max_pages: negotiated_max_pages as usize,
+                max_readahead: init_out.max_readahead as usize,
+                async_read: (enabled_flags & FUSE_ASYNC_READ) != 0,
+                writeback_cache: (enabled_flags & FUSE_WRITEBACK_CACHE) != 0,
+                effective_read_payload_limit: self.effective_read_payload_limit(),
+                effective_write_payload_limit: core::cmp::min(
                     core::cmp::min(
                         negotiated_max_pages as usize,
                         self.max_write() / MMArch::PAGE_SIZE,
@@ -635,7 +635,7 @@ impl FuseConn {
                     64,
                 )
                 .saturating_mul(MMArch::PAGE_SIZE),
-            );
+            });
             self.init_wait.wakeup(None);
         } else {
             self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;

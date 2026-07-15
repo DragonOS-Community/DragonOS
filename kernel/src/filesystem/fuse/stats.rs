@@ -278,16 +278,18 @@ static BACKGROUND_MAX_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_CONGESTION_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MMAP_WRITEBACK_ADMISSION_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-pub fn on_fuse_io_limits_negotiated(
-    max_read: usize,
-    max_write: usize,
-    max_pages: usize,
-    max_readahead: usize,
-    async_read: bool,
-    writeback_cache: bool,
-    effective_read_payload_limit: usize,
-    effective_write_payload_limit: usize,
-) {
+pub struct NegotiatedFuseIoLimits {
+    pub max_read: usize,
+    pub max_write: usize,
+    pub max_pages: usize,
+    pub max_readahead: usize,
+    pub async_read: bool,
+    pub writeback_cache: bool,
+    pub effective_read_payload_limit: usize,
+    pub effective_write_payload_limit: usize,
+}
+
+pub fn on_fuse_io_limits_negotiated(limits: NegotiatedFuseIoLimits) {
     let sequence = loop {
         let current = INIT_LIMITS_SEQ.load(Ordering::Acquire);
         if current & 1 != 0 {
@@ -306,16 +308,20 @@ pub fn on_fuse_io_limits_negotiated(
             break current;
         }
     };
-    NEGOTIATED_MAX_READ_BYTES.store(max_read as u64, Ordering::Relaxed);
-    NEGOTIATED_MAX_WRITE_BYTES.store(max_write as u64, Ordering::Relaxed);
-    NEGOTIATED_MAX_PAGES.store(max_pages as u64, Ordering::Relaxed);
-    NEGOTIATED_MAX_READAHEAD_BYTES.store(max_readahead as u64, Ordering::Relaxed);
-    NEGOTIATED_ASYNC_READ.store(async_read as u64, Ordering::Relaxed);
-    NEGOTIATED_WRITEBACK_CACHE.store(writeback_cache as u64, Ordering::Relaxed);
-    EFFECTIVE_READ_PAYLOAD_LIMIT_BYTES
-        .store(effective_read_payload_limit as u64, Ordering::Relaxed);
-    EFFECTIVE_WRITE_PAYLOAD_LIMIT_BYTES
-        .store(effective_write_payload_limit as u64, Ordering::Relaxed);
+    NEGOTIATED_MAX_READ_BYTES.store(limits.max_read as u64, Ordering::Relaxed);
+    NEGOTIATED_MAX_WRITE_BYTES.store(limits.max_write as u64, Ordering::Relaxed);
+    NEGOTIATED_MAX_PAGES.store(limits.max_pages as u64, Ordering::Relaxed);
+    NEGOTIATED_MAX_READAHEAD_BYTES.store(limits.max_readahead as u64, Ordering::Relaxed);
+    NEGOTIATED_ASYNC_READ.store(limits.async_read as u64, Ordering::Relaxed);
+    NEGOTIATED_WRITEBACK_CACHE.store(limits.writeback_cache as u64, Ordering::Relaxed);
+    EFFECTIVE_READ_PAYLOAD_LIMIT_BYTES.store(
+        limits.effective_read_payload_limit as u64,
+        Ordering::Relaxed,
+    );
+    EFFECTIVE_WRITE_PAYLOAD_LIMIT_BYTES.store(
+        limits.effective_write_payload_limit as u64,
+        Ordering::Relaxed,
+    );
     INIT_EPOCH.fetch_add(1, Ordering::Relaxed);
     INIT_LIMITS_SEQ.store(sequence.wrapping_add(2), Ordering::Release);
 }

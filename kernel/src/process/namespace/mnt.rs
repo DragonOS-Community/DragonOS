@@ -497,9 +497,6 @@ impl MntNamespace {
         if inner.mount_count.pending_mounts != 0 {
             return Err(SystemError::EBUSY);
         }
-        if inner.mount_count.mounts > mount_max() {
-            return Err(SystemError::ENOSPC);
-        }
 
         let old_root_mntfs = Self::root_mntfs_locked(&inner);
         let new_root_mntfs = old_root_mntfs.deepcopy(None)?;
@@ -546,13 +543,8 @@ impl MntNamespace {
         }
 
         let prepared_metadata = (|| {
-            let mut copied_for_accounting = Vec::new();
-            copied_for_accounting
-                .try_reserve(copied_mounts.len())
-                .map_err(|_| SystemError::ENOMEM)?;
-            copied_for_accounting.extend(copied_mounts.iter().map(|(_, new)| new.clone()));
             let copied_count =
-                u32::try_from(copied_for_accounting.len()).map_err(|_| SystemError::ENOSPC)?;
+                u32::try_from(copied_mounts.len()).map_err(|_| SystemError::ENOSPC)?;
             assert_eq!(
                 copied_count, inner.mount_count.mounts,
                 "namespace copy topology must match the source committed count"
@@ -567,9 +559,9 @@ impl MntNamespace {
                     .iter()
                     .map(|(old, new)| (Arc::downgrade(old), Arc::downgrade(new))),
             );
-            Ok::<_, SystemError>((copied_for_accounting, copy_sources))
+            Ok::<_, SystemError>((copied_count, copy_sources))
         })();
-        let (copied_for_accounting, copy_sources) = match prepared_metadata {
+        let (copied_count, copy_sources) = match prepared_metadata {
             Ok(metadata) => metadata,
             Err(error) => {
                 MountFS::deactivate_disconnected_subtree(&new_root_mntfs);
@@ -586,28 +578,22 @@ impl MntNamespace {
             inner: RwSem::new(InnerMntNamespace {
                 _dead: false,
                 root_mountfs: new_root_mntfs,
-                mount_count: MountCountState::default(),
+                // Linux copy_mnt_ns() initializes the copied namespace's
+                // existing mount count directly. mount-max only admits new
+                // mount trees; it must not reject cloning existing topology.
+                mount_count: MountCountState {
+                    mounts: copied_count,
+                    pending_mounts: 0,
+                },
                 copy_sources,
             }),
         });
-
-        let count_reservation = match new_mntns.reserve_mounts(copied_for_accounting) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                // MntNamespace::drop() takes the topology lock. Release the
-                // source snapshot and its outer lock before invoking the sole
-                // cleanup owner for this unpublished namespace.
-                drop(inner);
-                drop(_topology);
-                drop(new_mntns);
-                return Err(error);
-            }
-        };
 
         // Publication is infallible and occurs only after the detached copy is
         // complete, so observers can never see a partially copied namespace.
         for (_old_mount, new_mount) in copied_mounts {
             new_mount.set_namespace(Arc::downgrade(&new_mntns));
+            new_mount.mark_namespace_accounted(&new_mntns);
             let propagation = new_mount.propagation();
             if propagation.is_shared() {
                 register_peer(propagation.peer_group_id(), &new_mount);
@@ -619,7 +605,6 @@ impl MntNamespace {
                 .activate()
                 .expect("a detached namespace copy is published exactly once");
         }
-        count_reservation.commit();
 
         Ok(new_mntns)
     }

@@ -273,20 +273,24 @@ TEST_F(MountLimitTest, PropagationAndSharedMoveReserveCompleteCopies) {
     EXPECT_EQ(before, mount_count());
 }
 
-TEST_F(MountLimitTest, NamespaceCopyAndConcurrentCreatorsCannotExceedLimit) {
+TEST_F(MountLimitTest, NamespaceCopyIgnoresLoweredLimitAndCreatorsRespectIt) {
     int before = mount_count();
     ASSERT_GT(before, 1);
     ASSERT_EQ(0, write_mount_max(before - 1)) << strerror(errno);
-    errno = 0;
-    EXPECT_EQ(-1, unshare(CLONE_NEWNS));
-    EXPECT_EQ(ENOSPC, errno);
-    EXPECT_EQ(before, mount_count());
-    ASSERT_EQ(0, write_mount_max(before)) << strerror(errno);
     ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
     EXPECT_EQ(before, mount_count());
 
     const std::string p1 = dir("/p1");
     const std::string p2 = dir("/p2");
+    errno = 0;
+    EXPECT_EQ(-1, mount("none", p1.c_str(), "ramfs", 0, nullptr));
+    EXPECT_EQ(ENOSPC, errno);
+    EXPECT_EQ(before, mount_count());
+
+    ASSERT_EQ(0, write_mount_max(before)) << strerror(errno);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    EXPECT_EQ(before, mount_count());
+
     ASSERT_EQ(0, write_mount_max(before + 1)) << strerror(errno);
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};

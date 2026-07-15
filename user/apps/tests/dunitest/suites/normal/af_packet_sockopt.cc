@@ -42,6 +42,7 @@ inline constexpr int kSoSndtimeoOld = 21;
 inline constexpr int kSoRcvtimeoNew = 66;
 inline constexpr int kSoSndtimeoNew = 67;
 inline constexpr int kSoAttachFilter = 26;
+inline constexpr int kSoDetachFilter = 27;
 
 struct TestSockFilter {
     uint16_t code;
@@ -397,14 +398,22 @@ TEST(AfPacketSockopt, SocketBufferOptionsAreIndependent) {
     EXPECT_EQ(actual, second_default_receive);
 }
 
-TEST(AfPacketSockopt, AttachFilterIsNotSilentlyAccepted) {
+TEST(AfPacketSockopt, AttachFilterAcceptsValidProgram) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
     TestSockFilter accept_all{0x06, 0, 0, 0xffffffff};
-    TestSockFprog program{1, &accept_all};
+    TestSockFProg program{1, &accept_all};
     errno = 0;
-    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &program, sizeof(program)), -1);
-    EXPECT_EQ(errno, ENOPROTOOPT) << ErrnoString(errno);
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &program, sizeof(program)), 0)
+        << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, DetachFilterReturnsEnoentWhenNoFilter) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter, nullptr, 0), -1);
+    EXPECT_EQ(errno, ENOENT) << ErrnoString(errno);
 }
 
 TEST(AfPacketSockopt, ReceiveTimeoutOldAndNewRoundTrip) {

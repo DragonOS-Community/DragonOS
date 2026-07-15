@@ -3,13 +3,13 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::mem::{replace, size_of, take};
+use core::mem::size_of;
 
 use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
-    filesystem::vfs::{FileType, IndexNode},
+    filesystem::vfs::{DirectoryEntry, FileType, IndexNode},
     mm::MemoryManagementArch,
 };
 
@@ -19,6 +19,43 @@ use super::super::protocol::{
 use super::{FuseLookupCacheEntry, FuseNode};
 
 impl FuseNode {
+    const FUSE_NAME_MAX: usize = 1024;
+
+    pub(super) fn use_readdirplus(&self, offset: u64) -> bool {
+        if !self.conn().use_readdirplus() {
+            return false;
+        }
+        if !self.conn().readdirplus_auto() {
+            return true;
+        }
+        if self
+            .readdirplus_advised
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            return true;
+        }
+        offset == 0
+    }
+
+    pub(super) fn advise_readdirplus(&self) {
+        if self.conn().readdirplus_auto() {
+            self.readdirplus_advised
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn mark_readdirplus_init(&self) {
+        if self.conn().readdirplus_auto() {
+            self.readdirplus_init
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn consume_readdirplus_init(&self) -> bool {
+        self.readdirplus_init
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+    }
+
     fn readdir_request_size_for_limits(max_read: usize, max_pages: usize) -> u32 {
         let max_pages_bytes = core::cmp::max(1, max_pages).saturating_mul(MMArch::PAGE_SIZE);
         let size = core::cmp::min(
@@ -49,47 +86,34 @@ impl FuseNode {
             return;
         }
         let deadline_ticks = Self::cache_deadline(valid, valid_nsec);
-        self.prune_lookup_cache();
+        self.prune_expired_lookup_cache_lru();
 
         let mut removed = Vec::new();
         {
             let mut cache = self.lookup_cache.lock();
             if deadline_ticks == 0 || child.dax_dontcache() {
-                if let Some(entry) = cache.remove(name) {
+                if let Some(entry) = cache.pop(name) {
                     removed.push(entry);
                 }
-            } else {
-                if !cache.contains_key(name) && cache.len() >= Self::LOOKUP_CACHE_MAX_ENTRIES {
-                    if let Some(victim) = cache.keys().next().cloned() {
-                        if let Some(entry) = cache.remove(&victim) {
-                            removed.push(entry);
-                        }
-                    }
-                }
-                if let Some(entry) = cache.get_mut(name) {
-                    if Arc::ptr_eq(&entry.child, child) {
-                        entry.generation = generation;
-                        entry.deadline_ticks = deadline_ticks;
-                    } else {
-                        let old_entry = replace(
-                            entry,
-                            FuseLookupCacheEntry {
-                                child: child.clone(),
-                                generation,
-                                deadline_ticks,
-                            },
-                        );
-                        removed.push(old_entry);
-                    }
-                } else {
-                    cache.insert(
-                        name.to_string(),
-                        FuseLookupCacheEntry {
-                            child: child.clone(),
-                            generation,
-                            deadline_ticks,
-                        },
-                    );
+            } else if cache
+                .peek(name)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.child, child))
+            {
+                let entry = cache
+                    .get_mut(name)
+                    .expect("peeked lookup cache entry still exists");
+                entry.generation = generation;
+                entry.deadline_ticks = deadline_ticks;
+            } else if let Some((_key, entry)) = cache.push(
+                name.to_string(),
+                FuseLookupCacheEntry {
+                    child: child.clone(),
+                    generation,
+                    deadline_ticks,
+                },
+            ) {
+                if !Arc::ptr_eq(&entry.child, child) {
+                    removed.push(entry);
                 }
             }
         }
@@ -133,17 +157,36 @@ impl FuseNode {
 
     pub(crate) fn notify_expire_child(&self, name: &str) -> Result<(), SystemError> {
         let mut cache = self.lookup_cache.lock();
-        let entry = cache.get_mut(name).ok_or(SystemError::ENOENT)?;
+        let entry = cache.peek_mut(name).ok_or(SystemError::ENOENT)?;
         entry.deadline_ticks = 0;
         self.invalidate_cached_metadata();
         Ok(())
     }
 
     pub(super) fn lookup_cached_child(&self, name: &str) -> Option<Arc<FuseNode>> {
-        self.prune_lookup_cache();
-        let cache = self.lookup_cache.lock();
-        let entry = cache.get(name).cloned()?;
-        Some(entry.child)
+        self.prune_expired_lookup_cache_lru();
+        let entry = self.lookup_cache.lock().get(name).cloned()?;
+        let now = Self::now_ticks();
+        if !Self::lookup_cache_entry_expired_or_stale(&entry, now) {
+            if entry.child.consume_readdirplus_init() {
+                self.advise_readdirplus();
+            }
+            return Some(entry.child);
+        }
+
+        let removed = {
+            let mut cache = self.lookup_cache.lock();
+            let same_entry = cache.peek(name).is_some_and(|current| {
+                Arc::ptr_eq(&current.child, &entry.child)
+                    && current.generation == entry.generation
+                    && current.deadline_ticks == entry.deadline_ticks
+            });
+            same_entry.then(|| cache.pop(name)).flatten()
+        };
+        if let Some(removed) = removed {
+            Self::clear_removed_lookup_entries(vec![removed]);
+        }
+        None
     }
 
     pub(crate) fn purge_lookup_alias(&self, child: &Arc<FuseNode>) {
@@ -156,62 +199,58 @@ impl FuseNode {
                 .collect();
             aliases
                 .into_iter()
-                .filter_map(|name| cache.remove(&name))
+                .filter_map(|name| cache.pop(&name))
                 .collect()
         };
         Self::clear_removed_lookup_entries(removed);
     }
 
     fn remove_lookup_cache_entry(&self, name: &str) -> Option<FuseLookupCacheEntry> {
-        self.lookup_cache.lock().remove(name)
+        self.lookup_cache.lock().pop(name)
     }
 
-    fn lookup_cache_entry_expired_or_stale(
-        parent_nodeid: u64,
-        name: &str,
-        entry: &FuseLookupCacheEntry,
-        now: u64,
-    ) -> bool {
+    fn lookup_cache_entry_expired_or_stale(entry: &FuseLookupCacheEntry, now: u64) -> bool {
         (entry.deadline_ticks != u64::MAX && now >= entry.deadline_ticks)
             || entry.child.dax_dontcache()
             || entry.child.check_not_stale().is_err()
             || entry.child.generation() != entry.generation
-            || entry.child.parent_fuse_nodeid() != parent_nodeid
-            || !entry.child.has_dname(name)
     }
 
-    fn take_lookup_cache_entries(&self) -> Vec<FuseLookupCacheEntry> {
-        let mut cache = self.lookup_cache.lock();
-        take(&mut *cache).into_values().collect()
-    }
-
-    pub(crate) fn clear_lookup_cache_tree(&self) {
-        Self::clear_removed_lookup_entries(self.take_lookup_cache_entries());
-    }
-
-    fn prune_lookup_cache(&self) {
+    /// Reclaim expired entries from the LRU edge without scanning the cache or
+    /// promoting live entries. A live oldest entry stops the best-effort pass;
+    /// every named lookup still validates its target lazily.
+    fn prune_expired_lookup_cache_lru(&self) {
         let now = Self::now_ticks();
         let removed = {
             let mut cache = self.lookup_cache.lock();
-            let stale_keys: Vec<String> = cache
-                .iter()
-                .filter_map(|(name, entry)| {
-                    if Self::lookup_cache_entry_expired_or_stale(self.nodeid, name, entry, now) {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
             let mut removed = Vec::new();
-            for key in stale_keys {
-                if let Some(entry) = cache.remove(&key) {
+            for _ in 0..Self::LOOKUP_CACHE_PRUNE_BUDGET {
+                let Some((_name, entry)) = cache.peek_lru() else {
+                    break;
+                };
+                if !Self::lookup_cache_entry_expired_or_stale(entry, now) {
+                    break;
+                }
+                if let Some((_name, entry)) = cache.pop_lru() {
                     removed.push(entry);
                 }
             }
             removed
         };
         Self::clear_removed_lookup_entries(removed);
+    }
+
+    fn take_lookup_cache_entries(&self) -> Vec<FuseLookupCacheEntry> {
+        let mut cache = self.lookup_cache.lock();
+        let mut entries = Vec::with_capacity(cache.len());
+        while let Some((_name, entry)) = cache.pop_lru() {
+            entries.push(entry);
+        }
+        entries
+    }
+
+    pub(crate) fn clear_lookup_cache_tree(&self) {
+        Self::clear_removed_lookup_entries(self.take_lookup_cache_entries());
     }
 
     fn clear_removed_lookup_entries(entries: Vec<FuseLookupCacheEntry>) {
@@ -221,8 +260,55 @@ impl FuseNode {
         }
     }
 
+    #[cfg(test)]
     fn align_dirent_record_len(base_len: usize) -> usize {
         (base_len + Self::FUSE_DIRENT_ALIGN - 1) & !(Self::FUSE_DIRENT_ALIGN - 1)
+    }
+
+    fn checked_dirent_record_len(header_len: usize, name_len: usize) -> Option<usize> {
+        header_len
+            .checked_add(name_len)?
+            .checked_add(Self::FUSE_DIRENT_ALIGN - 1)
+            .map(|len| len & !(Self::FUSE_DIRENT_ALIGN - 1))
+    }
+
+    fn visit_readdirplus_lookups(payload: &[u8], mut pos: usize, mut visit: impl FnMut(u64)) {
+        while pos
+            .checked_add(size_of::<FuseDirentPlus>())
+            .is_some_and(|end| end <= payload.len())
+        {
+            let Ok(plus) = fuse_read_struct::<FuseDirentPlus>(&payload[pos..]) else {
+                break;
+            };
+            let name_start = pos + size_of::<FuseDirentPlus>();
+            let Some(name_end) = name_start.checked_add(plus.dirent.namelen as usize) else {
+                break;
+            };
+            if name_end > payload.len() {
+                break;
+            }
+            let name = &payload[name_start..name_end];
+            let is_dot = name == b"." || name == b"..";
+            if !is_dot && plus.entry_out.nodeid != 0 {
+                visit(plus.entry_out.nodeid);
+            }
+            let Some(rec_len) = Self::checked_dirent_record_len(
+                size_of::<FuseDirentPlus>(),
+                plus.dirent.namelen as usize,
+            ) else {
+                break;
+            };
+            if rec_len > payload.len() - pos {
+                break;
+            }
+            pos += rec_len;
+        }
+    }
+
+    fn forget_readdirplus_from(&self, payload: &[u8], pos: usize) {
+        Self::visit_readdirplus_lookups(payload, pos, |nodeid| {
+            let _ = self.conn.queue_forget(nodeid, 1);
+        });
     }
 
     fn cache_child_from_entry(&self, entry: &FuseEntryOut, name: &str, request_epoch: u64) {
@@ -245,6 +331,7 @@ impl FuseNode {
             consumed = true;
             child.set_dname(name);
             child.set_lookup_attr_flags(entry.attr.flags);
+            child.mark_readdirplus_init();
             child.merge_cached_metadata_from_daemon(
                 md,
                 entry.attr_valid,
@@ -269,7 +356,7 @@ impl FuseNode {
     pub(super) fn parse_readdirplus_payload(
         &self,
         payload: &[u8],
-        names: &mut Vec<String>,
+        entries: &mut Vec<DirectoryEntry>,
         mut last_off: u64,
         request_epoch: u64,
     ) -> Result<u64, SystemError> {
@@ -278,61 +365,82 @@ impl FuseNode {
             let plus: FuseDirentPlus = fuse_read_struct(&payload[pos..])?;
             let dirent = plus.dirent;
             let name_start = pos + size_of::<FuseDirentPlus>();
-            let name_end = name_start + dirent.namelen as usize;
-            if name_end > payload.len() {
+            let Some(rec_len) = Self::checked_dirent_record_len(
+                size_of::<FuseDirentPlus>(),
+                dirent.namelen as usize,
+            ) else {
+                self.forget_readdirplus_from(payload, pos);
+                break;
+            };
+            if rec_len > payload.len() - pos {
+                self.forget_readdirplus_from(payload, pos);
                 break;
             }
+            let name_end = name_start + dirent.namelen as usize;
 
             let name_bytes = &payload[name_start..name_end];
-            if let Ok(name) = core::str::from_utf8(name_bytes) {
-                if !name.is_empty() && name != "." && name != ".." {
-                    names.push(name.to_string());
+            if name_bytes.is_empty()
+                || name_bytes.len() > Self::FUSE_NAME_MAX
+                || name_bytes.contains(&b'/')
+            {
+                self.forget_readdirplus_from(payload, pos);
+                return Err(SystemError::EIO);
+            }
+            entries.push(DirectoryEntry {
+                name: name_bytes.to_vec(),
+                ino: dirent.ino,
+                d_type: dirent.typ as u8,
+                next_cookie: dirent.off,
+            });
+            if name_bytes != b"." && name_bytes != b".." {
+                if let Ok(name) = core::str::from_utf8(name_bytes) {
                     self.cache_child_from_entry(&plus.entry_out, name, request_epoch);
+                } else if plus.entry_out.nodeid != 0 {
+                    let _ = self.conn.queue_forget(plus.entry_out.nodeid, 1);
                 }
-            } else if plus.entry_out.nodeid != 0 {
-                let _ = self.conn.queue_forget(plus.entry_out.nodeid, 1);
             }
 
             last_off = dirent.off;
-            let rec_len = Self::align_dirent_record_len(
-                size_of::<FuseDirentPlus>() + dirent.namelen as usize,
-            );
-            if rec_len == 0 {
-                break;
-            }
-            pos = pos.saturating_add(rec_len);
+            pos += rec_len;
         }
         Ok(last_off)
     }
 
     pub(super) fn parse_readdir_payload(
         payload: &[u8],
-        names: &mut Vec<String>,
+        entries: &mut Vec<DirectoryEntry>,
         mut last_off: u64,
     ) -> Result<u64, SystemError> {
         let mut pos: usize = 0;
         while pos + size_of::<FuseDirent>() <= payload.len() {
             let dirent: FuseDirent = fuse_read_struct(&payload[pos..])?;
             let name_start = pos + size_of::<FuseDirent>();
-            let name_end = name_start + dirent.namelen as usize;
-            if name_end > payload.len() {
+            let Some(rec_len) =
+                Self::checked_dirent_record_len(size_of::<FuseDirent>(), dirent.namelen as usize)
+            else {
+                break;
+            };
+            if rec_len > payload.len() - pos {
                 break;
             }
+            let name_end = name_start + dirent.namelen as usize;
 
             let name_bytes = &payload[name_start..name_end];
-            if let Ok(name) = core::str::from_utf8(name_bytes) {
-                if !name.is_empty() && name != "." && name != ".." {
-                    names.push(name.to_string());
-                }
+            if name_bytes.is_empty()
+                || name_bytes.len() > Self::FUSE_NAME_MAX
+                || name_bytes.contains(&b'/')
+            {
+                return Err(SystemError::EIO);
             }
+            entries.push(DirectoryEntry {
+                name: name_bytes.to_vec(),
+                ino: dirent.ino,
+                d_type: dirent.typ as u8,
+                next_cookie: dirent.off,
+            });
 
             last_off = dirent.off;
-            let rec_len =
-                Self::align_dirent_record_len(size_of::<FuseDirent>() + dirent.namelen as usize);
-            if rec_len == 0 {
-                break;
-            }
-            pos = pos.saturating_add(rec_len);
+            pos += rec_len;
         }
         Ok(last_off)
     }
@@ -411,8 +519,30 @@ impl FuseNode {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+    use core::mem::size_of;
+
     use super::FuseNode;
-    use crate::{arch::MMArch, mm::MemoryManagementArch};
+    use crate::{
+        arch::MMArch,
+        filesystem::{
+            fuse::protocol::{fuse_pack_struct, FuseDirent, FuseDirentPlus},
+            vfs::{DT_DIR, DT_REG},
+        },
+        mm::MemoryManagementArch,
+    };
+
+    fn push_dirent(payload: &mut Vec<u8>, ino: u64, cookie: u64, typ: u32, name: &[u8]) {
+        let dirent = FuseDirent {
+            ino,
+            off: cookie,
+            namelen: name.len() as u32,
+            typ,
+        };
+        payload.extend_from_slice(fuse_pack_struct(&dirent));
+        payload.extend_from_slice(name);
+        payload.resize(FuseNode::align_dirent_record_len(payload.len()), 0);
+    }
 
     #[test]
     fn readdir_request_size_honors_read_and_page_limits() {
@@ -432,5 +562,98 @@ mod tests {
             FuseNode::readdir_request_size_for_limits(4 * 1024, 0),
             MMArch::PAGE_SIZE as u32
         );
+    }
+
+    #[test]
+    fn readdir_parser_preserves_type_dot_entries_and_opaque_cookies() {
+        let mut payload = Vec::new();
+        push_dirent(&mut payload, 10, 7, DT_DIR as u32, b".");
+        push_dirent(&mut payload, 11, 41, DT_REG as u32, b"file");
+
+        let mut entries = Vec::new();
+        let last = FuseNode::parse_readdir_payload(&payload, &mut entries, 0).unwrap();
+        assert_eq!(last, 41);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, b".");
+        assert_eq!(entries[0].next_cookie, 7);
+        assert_eq!(entries[1].ino, 11);
+        assert_eq!(entries[1].d_type, DT_REG as u8);
+        assert_eq!(entries[1].next_cookie, 41);
+    }
+
+    #[test]
+    fn readdir_parser_rejects_names_with_slashes() {
+        let mut payload = Vec::new();
+        push_dirent(&mut payload, 10, 1, DT_REG as u32, b"bad/name");
+        let mut entries = Vec::new();
+        assert_eq!(
+            FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
+            Err(system_error::SystemError::EIO)
+        );
+    }
+
+    #[test]
+    fn readdir_parser_does_not_emit_record_with_truncated_padding() {
+        let mut payload = Vec::new();
+        push_dirent(&mut payload, 10, 7, DT_REG as u32, b"x");
+        payload.pop();
+        let mut entries = Vec::new();
+        assert_eq!(
+            FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
+            Ok(0)
+        );
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn readdir_parser_preserves_non_utf8_names() {
+        let mut payload = Vec::new();
+        push_dirent(&mut payload, 10, 7, DT_REG as u32, b"f\xffo");
+        let mut entries = Vec::new();
+        assert_eq!(
+            FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
+            Ok(7)
+        );
+        assert_eq!(entries[0].name, b"f\xffo");
+    }
+
+    #[test]
+    fn readdir_parser_preserves_zero_and_repeated_cookies() {
+        let mut payload = Vec::new();
+        push_dirent(&mut payload, 10, 0, DT_REG as u32, b"zero");
+        let mut entries = Vec::new();
+        assert_eq!(
+            FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
+            Ok(0)
+        );
+        assert_eq!(entries[0].next_cookie, 0);
+
+        payload.clear();
+        push_dirent(&mut payload, 10, 7, DT_REG as u32, b"first");
+        push_dirent(&mut payload, 11, 7, DT_REG as u32, b"second");
+        entries.clear();
+        assert_eq!(
+            FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
+            Ok(7)
+        );
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn truncated_readdirplus_padding_still_visits_lookup() {
+        // FuseDirentPlus is an integer-only wire structure.
+        let mut plus: FuseDirentPlus = unsafe { core::mem::zeroed() };
+        plus.entry_out.nodeid = 42;
+        plus.dirent.namelen = 3;
+        let mut payload = fuse_pack_struct(&plus).to_vec();
+        payload.extend_from_slice(b"abc");
+        assert!(
+            FuseNode::checked_dirent_record_len(size_of::<FuseDirentPlus>(), 3).unwrap()
+                > payload.len()
+        );
+
+        let mut nodeids = Vec::new();
+        FuseNode::visit_readdirplus_lookups(&payload, 0, |nodeid| nodeids.push(nodeid));
+        assert_eq!(nodeids, [42]);
     }
 }

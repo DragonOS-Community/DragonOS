@@ -1,6 +1,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{mem::size_of, sync::atomic::Ordering};
 
+use hashbrown::HashSet;
 use system_error::SystemError;
 
 use crate::{
@@ -12,8 +13,8 @@ use crate::{
             permission::PermissionMask,
             syscall::RenameFlags,
             utils::DName,
-            FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata, SetMetadataMask,
-            XattrFlags,
+            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata,
+            SetMetadataMask, XattrFlags,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -928,6 +929,14 @@ impl IndexNode for FuseNode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        self.list_entries()?
+            .expect("FUSE provides native directory entries")
+            .into_iter()
+            .map(|entry| String::from_utf8(entry.name).map_err(|_| SystemError::EIO))
+            .collect()
+    }
+
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
 
@@ -940,89 +949,112 @@ impl IndexNode for FuseNode {
         };
         let fh = dir_p.fh;
         let open_flags = dir_p.open_flags;
-        let mut use_readdirplus = self.conn.use_readdirplus();
+        let no_open = dir_p.no_open;
         // Linux issues uncached READDIR with a single PAGE_SIZE output page. DragonOS keeps the
         // existing larger batch when the connection supports it, but must not exceed either the
         // mount's max_read value or the negotiated max_pages descriptor bound.
         let readdir_size = self.readdir_request_size();
 
-        let mut names: Vec<String> = Vec::new();
+        let mut entries: Vec<DirectoryEntry> = Vec::new();
+        let mut requested_offsets = HashSet::new();
         let mut offset: u64 = 0;
 
-        loop {
-            let read_in = FuseReadIn {
-                fh,
-                offset,
-                size: readdir_size,
-                read_flags: 0,
-                lock_owner: 0,
-                flags: open_flags,
-                padding: 0,
-            };
-            let opcode = if use_readdirplus {
-                FUSE_READDIRPLUS
-            } else {
-                FUSE_READDIR
-            };
-            let request_epoch = self.conn.sample_attr_epoch();
-            let payload = match self
-                .conn()
-                .request(opcode, self.nodeid, fuse_pack_struct(&read_in))
-            {
-                Ok(v) => v,
-                Err(SystemError::ENOSYS) if use_readdirplus => {
-                    self.conn.disable_readdirplus();
-                    use_readdirplus = false;
-                    continue;
+        let result = (|| {
+            loop {
+                if !requested_offsets.insert(offset) {
+                    break;
                 }
-                Err(e) => return Err(e),
-            };
-            if payload.is_empty() {
-                break;
-            }
+                let mut use_readdirplus = self.use_readdirplus(offset);
+                let read_in = FuseReadIn {
+                    fh,
+                    offset,
+                    size: readdir_size,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: open_flags,
+                    padding: 0,
+                };
+                let opcode = if use_readdirplus {
+                    FUSE_READDIRPLUS
+                } else {
+                    FUSE_READDIR
+                };
+                let request_epoch = self.conn.sample_attr_epoch();
+                let payload =
+                    match self
+                        .conn()
+                        .request(opcode, self.nodeid, fuse_pack_struct(&read_in))
+                    {
+                        Ok(v) => v,
+                        Err(SystemError::ENOSYS) if use_readdirplus => {
+                            self.conn.disable_readdirplus();
+                            requested_offsets.remove(&offset);
+                            use_readdirplus = false;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                if payload.is_empty() {
+                    break;
+                }
 
-            let mut last_off: u64 = offset;
-            if use_readdirplus {
-                last_off =
-                    self.parse_readdirplus_payload(&payload, &mut names, last_off, request_epoch)?;
-            } else {
-                last_off = Self::parse_readdir_payload(&payload, &mut names, last_off)?;
-            }
+                let mut last_off: u64 = offset;
+                if use_readdirplus {
+                    last_off = self.parse_readdirplus_payload(
+                        &payload,
+                        &mut entries,
+                        last_off,
+                        request_epoch,
+                    )?;
+                } else {
+                    last_off = Self::parse_readdir_payload(&payload, &mut entries, last_off)?;
+                }
 
-            if last_off == offset {
-                // Avoid infinite loop if userspace doesn't advance offsets.
-                break;
+                if last_off == offset {
+                    // Avoid infinite loop if userspace doesn't advance offsets.
+                    break;
+                }
+                offset = last_off;
             }
-            offset = last_off;
-        }
+            Ok(Some(entries))
+        })();
 
         // RELEASEDIR (best-effort)
-        if !dir_p.no_open {
+        if !no_open {
             self.release_common(FUSE_RELEASEDIR, fh, open_flags, 0);
         }
-        Ok(names)
+        result
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.find_bytes(name.as_bytes())
+    }
+
+    fn find_bytes(&self, name: &[u8]) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
-        if name == "." {
+        if name == b"." {
             let this = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
             return Ok(this);
         }
-        if name == ".." {
+        if name == b".." {
             return self.parent();
         }
 
-        if let Some(child) = self.lookup_cached_child(name) {
-            return Ok(child);
+        let utf8_name = core::str::from_utf8(name).ok();
+        if let Some(name) = utf8_name {
+            if let Some(child) = self.lookup_cached_child(name) {
+                return Ok(child);
+            }
         }
 
         let request_epoch = self.conn.sample_attr_epoch();
-        let payload = match self.request_name(FUSE_LOOKUP, self.nodeid, name) {
+        let payload = match self.request_name_bytes(FUSE_LOOKUP, self.nodeid, name) {
             Ok(payload) => payload,
             Err(err) => {
-                self.invalidate_lookup_cache(name);
+                if let Some(name) = utf8_name {
+                    self.invalidate_lookup_cache(name);
+                }
                 return Err(err);
             }
         };
@@ -1063,7 +1095,9 @@ impl IndexNode for FuseNode {
                 return Err(err);
             }
         };
-        child.set_dname(name);
+        if let Some(name) = utf8_name {
+            child.set_dname(name);
+        }
         child.set_lookup_attr_flags(entry.attr.flags);
         child.merge_cached_metadata_from_daemon(
             md,
@@ -1072,13 +1106,16 @@ impl IndexNode for FuseNode {
             request_epoch,
             entry.attr.flags,
         );
-        self.cache_lookup_child(
-            name,
-            &child,
-            entry.generation,
-            entry.entry_valid,
-            entry.entry_valid_nsec,
-        );
+        if let Some(name) = utf8_name {
+            self.cache_lookup_child(
+                name,
+                &child,
+                entry.generation,
+                entry.entry_valid,
+                entry.entry_valid_nsec,
+            );
+        }
+        self.advise_readdirplus();
         Ok(child)
     }
 

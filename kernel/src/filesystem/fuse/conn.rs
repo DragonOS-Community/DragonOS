@@ -1362,6 +1362,13 @@ impl FuseConn {
         !g.no_readdirplus && (g.init.flags & FUSE_DO_READDIRPLUS) != 0
     }
 
+    pub fn readdirplus_auto(&self) -> bool {
+        let g = self.inner.lock();
+        !g.no_readdirplus
+            && (g.init.flags & (FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO))
+                == (FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO)
+    }
+
     pub fn disable_readdirplus(&self) {
         let mut g = self.inner.lock();
         g.no_readdirplus = true;

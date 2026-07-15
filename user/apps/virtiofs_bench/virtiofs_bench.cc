@@ -10,6 +10,7 @@
 #include <sys/mount.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -59,6 +60,9 @@ enum class WorkloadSpec {
     All,
     Metadata,
     Readdir,
+    ReaddirPrepare,
+    ReaddirScan,
+    ReaddirCleanup,
     Sequential,
     Prepare,
     SequentialWrite,
@@ -77,6 +81,12 @@ const char* workload_name(WorkloadSpec workload) {
             return "metadata";
         case WorkloadSpec::Readdir:
             return "readdir";
+        case WorkloadSpec::ReaddirPrepare:
+            return "readdir_prepare";
+        case WorkloadSpec::ReaddirScan:
+            return "readdir_scan";
+        case WorkloadSpec::ReaddirCleanup:
+            return "readdir_cleanup";
         case WorkloadSpec::Sequential:
             return "sequential";
         case WorkloadSpec::Prepare:
@@ -104,6 +114,9 @@ bool parse_workload(const std::string& value, WorkloadSpec* workload) {
     } specs[] = {{"all", WorkloadSpec::All},
                  {"metadata", WorkloadSpec::Metadata},
                  {"readdir", WorkloadSpec::Readdir},
+                 {"readdir_prepare", WorkloadSpec::ReaddirPrepare},
+                 {"readdir_scan", WorkloadSpec::ReaddirScan},
+                 {"readdir_cleanup", WorkloadSpec::ReaddirCleanup},
                  {"sequential", WorkloadSpec::Sequential},
                  {"prepare", WorkloadSpec::Prepare},
                  {"sequential_write", WorkloadSpec::SequentialWrite},
@@ -134,6 +147,7 @@ struct Options {
     size_t block_size = 4096;
     size_t iterations = 4096;
     size_t workers = 4;
+    bool iterations_explicit = false;
 };
 
 using StatsMap = std::map<std::string, long long>;
@@ -141,6 +155,15 @@ using StatsMap = std::map<std::string, long long>;
 uint64_t now_us() {
     timespec ts = {};
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL +
+           static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
+}
+
+uint64_t process_cpu_us() {
+    timespec ts = {};
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) {
         return 0;
     }
     return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL +
@@ -329,6 +352,28 @@ bool stats_delta(const StatsMap& before, const StatsMap& after, const std::strin
     return true;
 }
 
+bool require_readdir_no_nplusone(const char* workload, const StatsMap& before,
+                                 const StatsMap& after) {
+    long long lookup = 0;
+    long long forget = 0;
+    long long getattr = 0;
+    long long readdir = 0;
+    long long readdirplus = 0;
+    bool present =
+        stats_delta(before, after, "virtiofs_opcode.opcode_1_requests_total", &lookup) &&
+        stats_delta(before, after, "virtiofs_opcode.opcode_2_requests_total", &forget) &&
+        stats_delta(before, after, "virtiofs_opcode.opcode_3_requests_total", &getattr) &&
+        stats_delta(before, after, "virtiofs_opcode.opcode_28_requests_total", &readdir) &&
+        stats_delta(before, after, "virtiofs_opcode.opcode_44_requests_total", &readdirplus);
+    bool passed = present && lookup == 0 && forget == 0 && getattr == 0 &&
+                  readdir + readdirplus > 0;
+    printf("stats_assert workload=%s check=readdir_nplusone status=%s present=%d "
+           "lookup=%lld forget=%lld getattr=%lld readdir=%lld readdirplus=%lld\n",
+           workload, passed ? "ok" : "fail", present ? 1 : 0, lookup, forget, getattr,
+           readdir, readdirplus);
+    return passed;
+}
+
 bool require_zero_copy_transfer(const char* workload, const StatsMap& before,
                                 const StatsMap& after, int opcode) {
     const std::string prefix =
@@ -454,7 +499,7 @@ bool validate_zero_copy_metrics(WorkloadSpec workload, const Options& opt,
     if (workload == WorkloadSpec::SequentialRead) {
         return require_cached_read_data_path(name, opt.file_size, before, after);
     }
-    if (workload == WorkloadSpec::Readdir) {
+    if (workload == WorkloadSpec::Readdir || workload == WorkloadSpec::ReaddirScan) {
         long long readdir_requests = 0;
         long long readdirplus_requests = 0;
         stats_delta(before, after, "virtiofs_opcode.opcode_28_requests_total",
@@ -548,12 +593,13 @@ struct WritePhaseTimings {
 
 void emit_result(const char* workload, const Options& opt, uint64_t elapsed_us, uint64_t bytes,
                  uint64_t ops, int err, const IoCounters& io = {}, uint64_t checksum = 0,
-                 const WritePhaseTimings& write_timings = {}) {
+                 const WritePhaseTimings& write_timings = {}, uint64_t cpu_us = 0) {
     utsname uts = {};
     uname(&uts);
     printf("result workload=%s status=%s errno=%d elapsed_us=%llu bytes=%llu ops=%llu "
            "syscalls=%llu short_io=%llu eintr=%llu checksum=%016llx "
            "data_loop_us=%llu fsync_us=%llu close_us=%llu end_to_end_us=%llu "
+           "process_cpu_us=%llu "
            "mount=%s dataset=%s seed=%llu files=%zu file_size=%zu block_size=%zu "
            "iterations=%zu workers=%zu run_id=%s "
            "cache_mode=%s mount_options=%s expect_dax=%s sysname=%s release=%s\n",
@@ -568,7 +614,8 @@ void emit_result(const char* workload, const Options& opt, uint64_t elapsed_us, 
            static_cast<unsigned long long>(write_timings.data_loop_us),
            static_cast<unsigned long long>(write_timings.fsync_us),
            static_cast<unsigned long long>(write_timings.close_us),
-           static_cast<unsigned long long>(write_timings.end_to_end_us), opt.mount.c_str(),
+           static_cast<unsigned long long>(write_timings.end_to_end_us),
+           static_cast<unsigned long long>(cpu_us), opt.mount.c_str(),
            opt.path.empty() ? "ephemeral" : opt.path.c_str(),
            static_cast<unsigned long long>(opt.seed), opt.files, opt.file_size, opt.block_size,
            opt.iterations, opt.workers, env_or_empty("VIRTIOFS_BENCH_RUN_ID"),
@@ -1070,6 +1117,323 @@ int readdir_workload(const Options& opt, const std::string& root) {
     return err == 0 ? 0 : -1;
 }
 
+constexpr const char* kReaddirEntryPrefix = "entry_";
+constexpr size_t kReaddirEntryDigits = 8;
+constexpr size_t kReaddirBufferSize = 64 * 1024;
+
+struct LinuxDirent64 {
+    uint64_t ino;
+    int64_t off;
+    uint16_t reclen;
+    uint8_t type;
+    char name[1];
+};
+
+std::string readdir_entry_name(size_t index) {
+    std::string name = kReaddirEntryPrefix;
+    name.resize(name.size() + kReaddirEntryDigits, '0');
+    for (size_t pos = name.size(); pos > sizeof("entry_") - 1; --pos) {
+        name[pos - 1] = static_cast<char>('0' + index % 10);
+        index /= 10;
+    }
+    return name;
+}
+
+bool readdir_entry_index(const char* name, size_t len, size_t files, size_t* index) {
+    constexpr size_t prefix_len = sizeof("entry_") - 1;
+    if (len != prefix_len + kReaddirEntryDigits ||
+        memcmp(name, kReaddirEntryPrefix, prefix_len) != 0) {
+        return false;
+    }
+    size_t value = 0;
+    for (size_t i = prefix_len; i < len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = value * 10 + static_cast<size_t>(c - '0');
+    }
+    if (value >= files) {
+        return false;
+    }
+    *index = value;
+    return true;
+}
+
+uint64_t readdir_dataset_checksum(size_t files) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < files; ++i) {
+        const std::string name = readdir_entry_name(i);
+        for (unsigned char c : name) {
+            hash ^= c;
+            hash *= 1099511628211ULL;
+        }
+        hash ^= 0xff;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+struct ReaddirScanCounters {
+    uint64_t bytes = 0;
+    uint64_t getdents_calls = 0;
+};
+
+struct ReaddirScanScratch {
+    explicit ReaddirScanScratch(size_t files)
+        : seen(files, false), buffer(kReaddirBufferSize) {}
+
+    void reset() {
+        std::fill(seen.begin(), seen.end(), false);
+    }
+
+    std::vector<bool> seen;
+    std::vector<unsigned char> buffer;
+};
+
+int scan_readdir_once(int fd, const Options& opt, ReaddirScanScratch* scratch,
+                      ReaddirScanCounters* counters) {
+    bool seen_dot = false;
+    bool seen_dotdot = false;
+    bool have_terminal_cookie = false;
+    int64_t terminal_cookie = 0;
+
+    for (;;) {
+        ++counters->getdents_calls;
+        long nread = syscall(SYS_getdents64, fd, scratch->buffer.data(), scratch->buffer.size());
+        if (nread < 0 && errno == EINTR) {
+            continue;
+        }
+        if (nread < 0) {
+            return errno_or_eio();
+        }
+        if (nread == 0) {
+            break;
+        }
+        counters->bytes += static_cast<uint64_t>(nread);
+        size_t offset = 0;
+        int64_t this_terminal_cookie = terminal_cookie;
+        while (offset < static_cast<size_t>(nread)) {
+            constexpr size_t header = offsetof(LinuxDirent64, name);
+            if (static_cast<size_t>(nread) - offset < header) {
+                return EIO;
+            }
+            const auto* entry =
+                reinterpret_cast<const LinuxDirent64*>(scratch->buffer.data() + offset);
+            if (entry->reclen < header + 1 || entry->reclen % sizeof(uint64_t) != 0 ||
+                entry->reclen > static_cast<size_t>(nread) - offset) {
+                return EIO;
+            }
+            const size_t name_capacity = entry->reclen - header;
+            const void* terminator = memchr(entry->name, '\0', name_capacity);
+            if (!terminator) {
+                return EIO;
+            }
+            const size_t name_len = static_cast<const char*>(terminator) - entry->name;
+            if (name_len == 0 || memchr(entry->name, '/', name_len)) {
+                return EIO;
+            }
+            if (name_len == 1 && entry->name[0] == '.') {
+                if (seen_dot) {
+                    return EIO;
+                }
+                seen_dot = true;
+            } else if (name_len == 2 && entry->name[0] == '.' && entry->name[1] == '.') {
+                if (seen_dotdot) {
+                    return EIO;
+                }
+                seen_dotdot = true;
+            } else {
+                size_t index = 0;
+                if (!readdir_entry_index(entry->name, name_len, opt.files, &index) ||
+                    scratch->seen[index] || entry->ino == 0 || entry->type != DT_REG) {
+                    return EIO;
+                }
+                scratch->seen[index] = true;
+            }
+            this_terminal_cookie = entry->off;
+            offset += entry->reclen;
+        }
+        if (offset != static_cast<size_t>(nread) ||
+            (have_terminal_cookie && this_terminal_cookie == terminal_cookie)) {
+            return EIO;
+        }
+        terminal_cookie = this_terminal_cookie;
+        have_terminal_cookie = true;
+    }
+    if (seen_dot != seen_dotdot ||
+        std::find(scratch->seen.begin(), scratch->seen.end(), false) != scratch->seen.end()) {
+        return EIO;
+    }
+    return 0;
+}
+
+int readdir_prepare_workload(const Options& opt, const std::string&) {
+    const char* label = workload_name(WorkloadSpec::ReaddirPrepare);
+    const uint64_t start = now_us();
+    int err = 0;
+    uint64_t ops = 0;
+    phase_marker(opt, label, "prepare", "begin", 0, opt.files, 0, 0);
+    DatasetWriteLock lock;
+    if (!lock.acquire(opt, &err)) {
+        phase_marker(opt, label, "prepare", "end", 0, opt.files, -1, err);
+        emit_result(label, opt, now_us() - start, 0, 0, err);
+        return -1;
+    }
+    int root_fd = open_dataset_dir(opt, true);
+    if (root_fd < 0) {
+        err = errno_or_eio();
+    }
+    for (size_t i = 0; err == 0 && i < opt.files; ++i) {
+        const std::string name = readdir_entry_name(i);
+        int fd = openat(root_fd, name.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                        0644);
+        if (fd < 0 && errno == EEXIST) {
+            struct stat st = {};
+            if (fstatat(root_fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                err = errno_or_eio();
+            } else if (!S_ISREG(st.st_mode) || st.st_size != 0) {
+                err = EINVAL;
+            }
+        } else if (fd < 0) {
+            err = errno_or_eio();
+        } else {
+            close_preserve_error(fd, &err);
+        }
+        if (err == 0) {
+            ++ops;
+        }
+    }
+    ReaddirScanCounters scan = {};
+    ReaddirScanScratch scratch(opt.files);
+    scratch.reset();
+    if (err == 0 && lseek(root_fd, 0, SEEK_SET) < 0) {
+        err = errno_or_eio();
+    }
+    if (err == 0) {
+        err = scan_readdir_once(root_fd, opt, &scratch, &scan);
+    }
+    if (root_fd >= 0) {
+        close_preserve_error(root_fd, &err);
+    }
+    phase_marker(opt, label, "prepare", "end", ops, opt.files, err == 0 ? 0 : -1, err);
+    emit_result(label, opt, now_us() - start, 0, ops, err, {},
+                err == 0 ? readdir_dataset_checksum(opt.files) : 0);
+    return err == 0 ? 0 : -1;
+}
+
+int readdir_scan_workload(const Options& opt, const std::string&) {
+    const char* label = workload_name(WorkloadSpec::ReaddirScan);
+    int err = 0;
+    int root_fd = open_dataset_dir(opt, false);
+    if (root_fd < 0) {
+        err = errno_or_eio();
+        emit_result(label, opt, 0, 0, 0, err);
+        return -1;
+    }
+    const bool verify_stats = !stats_path().empty();
+    if (!wait_for_quiescence(label, "before")) {
+        err = ETIMEDOUT;
+    }
+    StatsMap before;
+    if (err == 0) {
+        before = read_stats();
+        if (verify_stats && before.empty()) {
+            err = EIO;
+        }
+    }
+    if (err != 0) {
+        close_preserve_error(root_fd, &err);
+        emit_result(label, opt, 0, 0, 0, err);
+        return -1;
+    }
+
+    phase_marker(opt, label, "scan", "begin", 0, opt.files, 0, 0);
+    ReaddirScanCounters scan = {};
+    ReaddirScanScratch scratch(opt.files);
+    uint64_t elapsed_us = 0;
+    uint64_t cpu_us = 0;
+    for (size_t iteration = 0; err == 0 && iteration < opt.iterations; ++iteration) {
+        if (iteration != 0 && lseek(root_fd, 0, SEEK_SET) < 0) {
+            err = errno_or_eio();
+            break;
+        }
+        scratch.reset();
+        const uint64_t cpu_start = process_cpu_us();
+        const uint64_t wall_start = now_us();
+        err = scan_readdir_once(root_fd, opt, &scratch, &scan);
+        elapsed_us += now_us() - wall_start;
+        const uint64_t cpu_end = process_cpu_us();
+        if (cpu_end >= cpu_start) {
+            cpu_us += cpu_end - cpu_start;
+        }
+    }
+    phase_marker(opt, label, "scan", "end", scan.bytes, opt.files,
+                 err == 0 ? static_cast<int64_t>(opt.files * opt.iterations) : -1, err);
+
+    if (!wait_for_quiescence(label, "after")) {
+        err = err == 0 ? ETIMEDOUT : err;
+    }
+    StatsMap after = read_stats();
+    emit_stats_delta(label, before, after);
+    if (err == 0 && verify_stats &&
+        (after.empty() ||
+         !validate_zero_copy_metrics(WorkloadSpec::ReaddirScan, opt, before, after) ||
+         !require_readdir_no_nplusone(label, before, after))) {
+        err = EIO;
+    }
+    close_preserve_error(root_fd, &err);
+
+    IoCounters io = {};
+    io.syscalls = scan.getdents_calls;
+    const uint64_t ops = opt.files * opt.iterations;
+    emit_result(label, opt, elapsed_us, scan.bytes, ops, err, io,
+                err == 0 ? readdir_dataset_checksum(opt.files) : 0, {}, cpu_us);
+    return err == 0 ? 0 : -1;
+}
+
+int readdir_cleanup_workload(const Options& opt, const std::string&) {
+    const char* label = workload_name(WorkloadSpec::ReaddirCleanup);
+    const uint64_t start = now_us();
+    int err = 0;
+    uint64_t ops = 0;
+    phase_marker(opt, label, "cleanup", "begin", 0, opt.files, 0, 0);
+    DatasetWriteLock lock;
+    if (!lock.acquire(opt, &err)) {
+        emit_result(label, opt, now_us() - start, 0, 0, err);
+        return -1;
+    }
+    int root_fd = open_dataset_dir(opt, false);
+    if (root_fd < 0) {
+        if (errno != ENOENT) {
+            err = errno_or_eio();
+        }
+    } else {
+        for (size_t i = 0; i < opt.files; ++i) {
+            const std::string name = readdir_entry_name(i);
+            if (unlinkat(root_fd, name.c_str(), 0) == 0) {
+                ++ops;
+            } else if (errno != ENOENT) {
+                record_first_error(&err, errno_or_eio());
+            }
+        }
+        close_preserve_error(root_fd, &err);
+    }
+    int mount_fd = open(opt.mount.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (mount_fd < 0) {
+        record_first_error(&err, errno_or_eio());
+    } else {
+        const std::string dirname = ".virtiofs_bench_" + opt.path;
+        if (unlinkat(mount_fd, dirname.c_str(), AT_REMOVEDIR) != 0 && errno != ENOENT) {
+            record_first_error(&err, errno_or_eio());
+        }
+        close_preserve_error(mount_fd, &err);
+    }
+    phase_marker(opt, label, "cleanup", "end", ops, opt.files, err == 0 ? 0 : -1, err);
+    emit_result(label, opt, now_us() - start, 0, ops, err);
+    return err == 0 ? 0 : -1;
+}
+
 int sequential_write_phase(const Options& opt, WorkloadSpec workload) {
     const char* label = workload_name(workload);
     std::vector<unsigned char> data;
@@ -1565,8 +1929,9 @@ int concurrent_workload(const Options& opt, const std::string& root) {
 
 void usage(const char* argv0) {
     fprintf(stderr,
-            "usage: %s --mount PATH [--workload all|metadata|readdir|sequential|prepare|"
-            "sequential_write|sequential_read|cleanup|random_read|mmap|concurrent] "
+            "usage: %s --mount PATH [--workload all|metadata|readdir|readdir_prepare|"
+            "readdir_scan|readdir_cleanup|sequential|prepare|sequential_write|"
+            "sequential_read|cleanup|random_read|mmap|concurrent] "
             "[--path RELATIVE_DATASET] [--seed N] [--expect-dax always|never] [--files N] "
             "[--file-size N] [--block-size N] [--iterations N] [--workers N]\n",
             argv0);
@@ -1639,7 +2004,9 @@ bool valid_dataset_component(const std::string& path) {
 
 bool is_dataset_lifecycle_workload(WorkloadSpec workload) {
     return workload == WorkloadSpec::Prepare || workload == WorkloadSpec::SequentialWrite ||
-           workload == WorkloadSpec::SequentialRead || workload == WorkloadSpec::Cleanup;
+           workload == WorkloadSpec::SequentialRead || workload == WorkloadSpec::Cleanup ||
+           workload == WorkloadSpec::ReaddirPrepare || workload == WorkloadSpec::ReaddirScan ||
+           workload == WorkloadSpec::ReaddirCleanup;
 }
 
 bool mount_options_contain(const std::string& options, const std::string& expected) {
@@ -1704,6 +2071,7 @@ bool parse_args(int argc, char** argv, Options* opt) {
         } else if (strcmp(argv[i], "--iterations") == 0) {
             const char* v = need(argv[i]);
             if (!v || !parse_size("--iterations", v, kMaxIterations, &opt->iterations)) return false;
+            opt->iterations_explicit = true;
         } else if (strcmp(argv[i], "--workers") == 0) {
             const char* v = need(argv[i]);
             if (!v || !parse_size("--workers", v, kMaxWorkers, &opt->workers)) return false;
@@ -1717,6 +2085,17 @@ bool parse_args(int argc, char** argv, Options* opt) {
     }
     if (is_dataset_lifecycle_workload(opt->workload) && opt->path.empty()) {
         fprintf(stderr, "%s requires --path RELATIVE_DATASET\n", workload_name(opt->workload));
+        return false;
+    }
+    if (opt->workload == WorkloadSpec::ReaddirScan && !opt->iterations_explicit) {
+        opt->iterations = 1;
+    }
+    if ((opt->workload == WorkloadSpec::ReaddirPrepare ||
+         opt->workload == WorkloadSpec::ReaddirScan ||
+         opt->workload == WorkloadSpec::ReaddirCleanup) &&
+        (opt->files == 0 || opt->iterations == 0)) {
+        fprintf(stderr, "%s requires non-zero --files and --iterations\n",
+                workload_name(opt->workload));
         return false;
     }
     if (opt->tag.empty()) {
@@ -1864,7 +2243,9 @@ int main(int argc, char** argv) {
         opt.path = std::to_string(getpid());
     }
     std::string root = path_join(opt.mount, ".virtiofs_bench_" + opt.path);
-    if (opt.workload != WorkloadSpec::Cleanup) {
+    if (opt.workload != WorkloadSpec::Cleanup &&
+        opt.workload != WorkloadSpec::ReaddirCleanup &&
+        opt.workload != WorkloadSpec::ReaddirScan) {
         int root_fd = open_dataset_dir(opt, true);
         if (root_fd < 0) {
             fprintf(stderr, "failed to create safe dataset %s: %s\n", root.c_str(),
@@ -1880,6 +2261,17 @@ int main(int argc, char** argv) {
     }
     if (opt.workload == WorkloadSpec::All || opt.workload == WorkloadSpec::Readdir) {
         rc |= run_with_stats_delta(WorkloadSpec::Readdir, readdir_workload, opt, root);
+    }
+    if (opt.workload == WorkloadSpec::ReaddirPrepare) {
+        rc |= run_with_stats_delta(WorkloadSpec::ReaddirPrepare, readdir_prepare_workload, opt,
+                                   root);
+    }
+    if (opt.workload == WorkloadSpec::ReaddirScan) {
+        rc |= readdir_scan_workload(opt, root);
+    }
+    if (opt.workload == WorkloadSpec::ReaddirCleanup) {
+        rc |= run_with_stats_delta(WorkloadSpec::ReaddirCleanup, readdir_cleanup_workload, opt,
+                                   root);
     }
     if (opt.workload == WorkloadSpec::All || opt.workload == WorkloadSpec::Sequential) {
         rc |= run_with_stats_delta(WorkloadSpec::Sequential, sequential_workload, opt, root);

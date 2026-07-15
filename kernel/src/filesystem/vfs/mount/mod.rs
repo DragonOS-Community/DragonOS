@@ -1,8 +1,8 @@
 use super::{
     file::{File, FileFlags, FileMode, PreopenedFile},
     utils::DName,
-    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, InodeRetentionKind,
-    PollableInode, SetMetadataMask, SuperBlock, XattrFlags,
+    DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode,
+    InodeRetentionKind, PollableInode, SetMetadataMask, SuperBlock, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -3793,6 +3793,16 @@ impl IndexNode for MountFSInode {
         }
     }
 
+    fn find_bytes(&self, name: &[u8]) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if let Ok(name) = core::str::from_utf8(name) {
+            return self.find(name);
+        }
+        // Mount dentries are currently keyed by UTF-8 DName. Raw-name lookup is
+        // still required for metadata/whiteout checks during getdents, so pass
+        // byte-only names to the backing filesystem without inventing a lossy key.
+        self.dentry.inode.find_bytes(name)
+    }
+
     #[inline]
     fn get_entry_name(&self, ino: InodeId) -> Result<alloc::string::String, SystemError> {
         return self.dentry.inode.get_entry_name(ino);
@@ -3819,6 +3829,11 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, SystemError> {
         return self.dentry.inode.list();
+    }
+
+    #[inline]
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        self.dentry.inode.list_entries()
     }
 
     fn mount(

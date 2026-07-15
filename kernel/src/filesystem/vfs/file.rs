@@ -12,7 +12,8 @@ use super::{
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
     mount::{MountExternalGuard, MountFSInode},
     utils::should_remove_sgid,
-    FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask, SpecialNodeData,
+    DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask,
+    SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -587,8 +588,8 @@ pub struct File {
     mode: RwSem<FileMode>,
     /// 文件类型
     file_type: FileType,
-    /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
-    readdir_subdirs_name: Mutex<Vec<String>>,
+    /// Per-open immutable directory snapshot and its next record index.
+    readdir_state: Mutex<ReaddirState>,
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
@@ -620,6 +621,77 @@ pub struct File {
     /// Pins the mount used to resolve this pathname independently from the
     /// operation inode (which device/FIFO resolution may replace).
     _mount_guard: Option<MountExternalGuard>,
+}
+
+#[derive(Debug, Clone)]
+enum ReaddirSnapshot {
+    Typed(Arc<[DirectoryEntry]>),
+    Names(Arc<[String]>),
+}
+
+impl ReaddirSnapshot {
+    fn len(&self) -> usize {
+        match self {
+            Self::Typed(entries) => entries.len(),
+            Self::Names(names) => names.len(),
+        }
+    }
+
+    fn cookie_after(&self, index: usize) -> Option<u64> {
+        match self {
+            Self::Typed(entries) => entries.get(index).map(|entry| entry.next_cookie),
+            Self::Names(names) => (index < names.len()).then(|| (index + 1) as u64),
+        }
+    }
+
+    fn index_after_cookie(&self, cookie: u64) -> usize {
+        match self {
+            Self::Typed(entries) => entries
+                .iter()
+                .position(|entry| entry.next_cookie == cookie)
+                .map_or(entries.len(), |index| index + 1),
+            Self::Names(names) => usize::try_from(cookie)
+                .ok()
+                .filter(|index| *index <= names.len())
+                .unwrap_or(names.len()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReaddirState {
+    snapshot: Option<ReaddirSnapshot>,
+    next_index: usize,
+}
+
+impl ReaddirState {
+    fn resume_after_cookie(&mut self, cookie: u64) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            self.next_index = 0;
+            return;
+        };
+        self.next_index = snapshot.index_after_cookie(cookie);
+    }
+}
+
+fn checked_dirent_cookie(cookie: u64) -> Result<usize, SystemError> {
+    let cookie = i64::try_from(cookie).map_err(|_| SystemError::EOVERFLOW)?;
+    usize::try_from(cookie).map_err(|_| SystemError::EOVERFLOW)
+}
+
+#[cfg(test)]
+mod readdir_tests {
+    use super::checked_dirent_cookie;
+    use system_error::SystemError;
+
+    #[test]
+    fn dirent_cookie_must_fit_signed_offset() {
+        assert_eq!(checked_dirent_cookie(1), Ok(1));
+        assert_eq!(
+            checked_dirent_cookie(i64::MAX as u64 + 1),
+            Err(SystemError::EOVERFLOW)
+        );
+    }
 }
 
 impl File {
@@ -1053,7 +1125,7 @@ impl File {
             flags: RwSem::new(flags),
             mode: RwSem::new(mode),
             file_type,
-            readdir_subdirs_name: Mutex::new(Vec::default()),
+            readdir_state: Mutex::new(ReaddirState::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
             owner: Mutex::new(FileOwner::new()),
@@ -1525,15 +1597,35 @@ impl File {
                 }
             }
         }
+        if file_type == FileType::Dir {
+            let mut state = self.readdir_state.lock();
+            let pos = match origin {
+                SeekFrom::SeekSet(offset) => offset,
+                SeekFrom::SeekCurrent(0) => return Ok(self.offset.load(Ordering::SeqCst)),
+                SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
+                SeekFrom::SeekEnd(_) => {
+                    // Preserve the existing directory SEEK_END behavior.
+                    return Ok(MAX_LFS_FILESIZE as usize);
+                }
+                SeekFrom::Invalid => return Err(SystemError::EINVAL),
+            };
+            if pos < 0 {
+                return Err(SystemError::EINVAL);
+            }
+            if pos == 0 {
+                state.snapshot = None;
+                state.next_index = 0;
+            } else {
+                state.resume_after_cookie(pos as u64);
+            }
+            self.offset.store(pos as usize, Ordering::SeqCst);
+            return Ok(pos as usize);
+        }
+
         let pos: i64 = match origin {
             SeekFrom::SeekSet(offset) => offset,
             SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
             SeekFrom::SeekEnd(offset) => {
-                if FileType::Dir == file_type {
-                    // 对目录，返回 Linux 常见语义：允许 SEEK_END 并返回 MAX_LFS_FILESIZE。
-                    // 测试接受 MAX_LFS_FILESIZE 或 EINVAL，但为通过当前测试选择返回 MAX_LFS_FILESIZE。
-                    return Ok(MAX_LFS_FILESIZE as usize);
-                }
                 let metadata = self.metadata()?;
                 metadata.size + offset
             }
@@ -1607,8 +1699,6 @@ impl File {
         }
 
         let inode: &Arc<dyn IndexNode> = &self.inode;
-        let mut current_pos = self.offset.load(Ordering::SeqCst);
-
         // POSIX 标准要求readdir应该返回. 和 ..
         // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
 
@@ -1616,37 +1706,81 @@ impl File {
         // 为了保证在目录内容动态变化（例如 /proc/self/fd）时不会因为重新
         // 创建列表而丢失尚未读取的目录项，这里缓存第一次生成的列表，在
         // 文件偏移被 seek 到 0 之前复用该缓存。
-        let mut cached_names = self.readdir_subdirs_name.lock();
-        if current_pos == 0 || cached_names.is_empty() {
-            *cached_names = inode.list()?;
+        let mut state = self.readdir_state.lock();
+        let current_cookie = self.offset.load(Ordering::SeqCst) as u64;
+        if state.snapshot.is_none() {
+            state.snapshot = Some(match inode.list_entries()? {
+                Some(entries) => ReaddirSnapshot::Typed(Arc::from(entries)),
+                None => ReaddirSnapshot::Names(Arc::from(inode.list()?)),
+            });
+            if current_cookie == 0 {
+                state.next_index = 0;
+            } else {
+                state.resume_after_cookie(current_cookie);
+            }
+        } else {
+            let expected_cookie = state.snapshot.as_ref().and_then(|snapshot| {
+                state
+                    .next_index
+                    .checked_sub(1)
+                    .and_then(|index| snapshot.cookie_after(index))
+            });
+            if state.next_index > 0 && expected_cookie != Some(current_cookie) {
+                state.resume_after_cookie(current_cookie);
+            }
         }
-        let readdir_subdirs_name = cached_names.clone();
-        drop(cached_names);
 
-        let subdirs_name_len = readdir_subdirs_name.len();
-        while current_pos < subdirs_name_len {
-            let name = &readdir_subdirs_name[current_pos];
-            let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
-                Ok(i) => i,
-                Err(e) => {
-                    if e == SystemError::ENOENT {
-                        // 目录项在本次读取过程中被移除，跳过它，继续读取后续条目
-                        self.offset.fetch_add(1, Ordering::SeqCst);
-                        current_pos += 1;
-                        continue;
-                    }
-                    error!("Readdir error: Failed to find sub inode");
-                    return Err(e);
+        let snapshot = state
+            .snapshot
+            .as_ref()
+            .expect("readdir snapshot initialized")
+            .clone();
+        if state.next_index > snapshot.len() {
+            return Err(SystemError::EINVAL);
+        }
+        while state.next_index < snapshot.len() {
+            let index = state.next_index;
+            let (name, cookie, metadata) = match &snapshot {
+                ReaddirSnapshot::Typed(entries) => {
+                    let entry = &entries[index];
+                    (
+                        entry.name.as_slice(),
+                        entry.next_cookie,
+                        Some((entry.ino, entry.d_type)),
+                    )
+                }
+                ReaddirSnapshot::Names(names) => {
+                    let name = &names[index];
+                    (name.as_bytes(), (index + 1) as u64, None)
                 }
             };
-
-            let inode_metadata = sub_inode.metadata().unwrap();
-            let entry_ino = inode_metadata.inode_id.into() as u64;
-            let entry_d_type = inode_metadata.file_type.get_file_type_num() as u8;
-            match ctx.fill_dir(name, current_pos, entry_ino, entry_d_type) {
+            let next_cookie = checked_dirent_cookie(cookie)?;
+            let (ino, d_type) = if let Some(metadata) = metadata {
+                metadata
+            } else {
+                let metadata = match name {
+                    b"." => inode.metadata(),
+                    b".." => inode.parent().and_then(|parent| parent.metadata()),
+                    _ => inode.find_bytes(name).and_then(|child| child.metadata()),
+                };
+                let metadata = match metadata {
+                    Ok(metadata) => metadata,
+                    Err(SystemError::ENOENT) => {
+                        state.next_index += 1;
+                        self.offset.store(next_cookie, Ordering::SeqCst);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                (
+                    metadata.inode_id.into() as u64,
+                    metadata.file_type.get_file_type_num() as u8,
+                )
+            };
+            match ctx.fill_dir(name, next_cookie, ino, d_type) {
                 Ok(_) => {
-                    self.offset.fetch_add(1, Ordering::SeqCst);
-                    current_pos += 1;
+                    state.next_index += 1;
+                    self.offset.store(next_cookie, Ordering::SeqCst);
                 }
                 Err(SystemError::EINVAL) => {
                     return Ok(());
@@ -1717,7 +1851,7 @@ impl File {
             flags: RwSem::new(flags),
             mode: RwSem::new(mode),
             file_type: self.file_type,
-            readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
+            readdir_state: Mutex::new(self.readdir_state.lock().clone()),
             private_data,
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),

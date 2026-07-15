@@ -26,7 +26,7 @@ use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::rcu::RcuOptionArcSlot;
 
-pub(crate) use fanout::{FanoutGroup, FanoutMode};
+pub(crate) use fanout::{FanoutGroup, FanoutJoinParams};
 #[allow(unused_imports)]
 pub use uapi::{
     eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,

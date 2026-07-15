@@ -67,6 +67,27 @@ impl FanoutMode {
     }
 }
 
+/// Join-time parameter bundle for `NetNamespace::fanout_group_join`.
+///
+/// Grouping these values keeps that entry point under clippy's
+/// `too_many_arguments` threshold while letting the packet module hand the
+/// netns a single, self-describing value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FanoutJoinParams {
+    /// Explicit group id requested by the socket (ignored when `unique`).
+    pub id_req: u16,
+    /// `true` for `PACKET_FANOUT_FLAG_UNIQUEID`: allocate a fresh group.
+    pub unique: bool,
+    /// Distribution algorithm for the group.
+    pub mode: FanoutMode,
+    /// Raw `PACKET_FANOUT_FLAG_*` bits requested by the creator.
+    pub flags: u16,
+    /// Joining socket's type / binding filter — enforced on every join.
+    pub sock_type: PacketSocketType,
+    pub bound_ifindex: u32,
+    pub bound_protocol: u16,
+}
+
 /// RCU-published member list of a fanout group (mirrors the broadcast
 /// `PacketSocketRegistrySnapshot` COW pattern).
 #[derive(Debug, Default)]
@@ -355,13 +376,15 @@ impl PacketSocket {
         let (bound_ifindex, bound_protocol) = self.binding.load();
         self.netns.fanout_group_join(
             &socket,
-            id_req,
-            unique,
-            mode,
-            flags,
-            sock_type,
-            bound_ifindex,
-            bound_protocol,
+            FanoutJoinParams {
+                id_req,
+                unique,
+                mode,
+                flags,
+                sock_type,
+                bound_ifindex,
+                bound_protocol,
+            },
         )
     }
 

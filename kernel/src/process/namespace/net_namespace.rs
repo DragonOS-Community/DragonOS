@@ -9,7 +9,9 @@ use crate::net::routing::Router;
 use crate::net::socket::netlink::table::{
     generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
 };
-use crate::net::socket::packet::{FanoutGroup, FanoutMode, PacketIngressMetadata, PacketSocket};
+use crate::net::socket::packet::{
+    FanoutGroup, FanoutJoinParams, PacketIngressMetadata, PacketSocket,
+};
 use crate::net::socket::unix::ns::UnixAbstractTable;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
@@ -533,14 +535,17 @@ impl NetNamespace {
     pub(crate) fn fanout_group_join(
         &self,
         socket: &Arc<PacketSocket>,
-        id_req: u16,
-        unique: bool,
-        mode: FanoutMode,
-        flags: u16,
-        sock_type: crate::net::socket::packet::PacketSocketType,
-        bound_ifindex: u32,
-        bound_protocol: u16,
+        params: FanoutJoinParams,
     ) -> Result<(), SystemError> {
+        let FanoutJoinParams {
+            id_req,
+            unique,
+            mode,
+            flags,
+            sock_type,
+            bound_ifindex,
+            bound_protocol,
+        } = params;
         let mut writer = self.fanout_groups_writer.lock();
         if socket.has_fanout_group() {
             return Err(SystemError::EBUSY);

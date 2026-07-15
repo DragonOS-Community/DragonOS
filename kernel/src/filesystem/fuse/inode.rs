@@ -13,7 +13,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use system_error::SystemError;
 
-use crate::time::timekeep::ktime_get_real_ns;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
@@ -26,7 +25,7 @@ use crate::{
         wait_queue::WaitQueue,
     },
     mm::{fault::FaultRetryWait, MemoryManagementArch},
-    time::PosixTimeSpec,
+    time::{jiffies::NSEC_PER_JIFFY, timer::clock, PosixTimeSpec, NSEC_PER_SEC},
 };
 
 use super::reply::FuseReply;
@@ -300,7 +299,7 @@ pub struct FuseNode {
     dax_mappings: RwSem<DaxMappingTree>,
     dax_host_invalidation: Arc<DaxHostInvalidationGate>,
     dax_pte_epoch: AtomicU64,
-    cached_metadata_deadline_ns: AtomicU64,
+    cached_metadata_deadline_ticks: AtomicU64,
     attr_version: AtomicU64,
     /// Version chain produced while short READ replies from one metadata
     /// snapshot monotonically converge on the lowest observed EOF.
@@ -325,7 +324,7 @@ pub struct FuseNode {
 struct FuseLookupCacheEntry {
     child: Arc<FuseNode>,
     generation: u64,
-    deadline_ns: u64,
+    deadline_ticks: u64,
 }
 
 impl FuseNode {
@@ -377,7 +376,7 @@ impl FuseNode {
             dax_mappings: RwSem::new(DaxMappingTree::default()),
             dax_host_invalidation: DaxHostInvalidationGate::new(),
             dax_pte_epoch: AtomicU64::new(0),
-            cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
+            cached_metadata_deadline_ticks: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             attr_version: AtomicU64::new(initial_attr_epoch),
             short_read_source_attr_version: AtomicU64::new(0),
             short_read_chain_attr_version: AtomicU64::new(0),
@@ -1233,7 +1232,7 @@ impl FuseNode {
         *metadata = Some(md);
         self.bump_attr_version();
         drop(metadata);
-        self.cached_metadata_deadline_ns
+        self.cached_metadata_deadline_ticks
             .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
         self.note_dax_attr_change(attr_flags);
     }
@@ -1271,7 +1270,7 @@ impl FuseNode {
         *metadata = Some(md.clone());
         self.bump_attr_version();
         drop(metadata);
-        self.cached_metadata_deadline_ns.store(
+        self.cached_metadata_deadline_ticks.store(
             if stale_reply {
                 0
             } else {
@@ -1303,7 +1302,8 @@ impl FuseNode {
 
     pub(crate) fn invalidate_cached_metadata(&self) {
         self.bump_attr_version();
-        self.cached_metadata_deadline_ns.store(0, Ordering::Release);
+        self.cached_metadata_deadline_ticks
+            .store(0, Ordering::Release);
     }
 
     /// 累计该 inode 在 userspace daemon 侧持有的 LOOKUP 引用。
@@ -1329,18 +1329,41 @@ impl FuseNode {
         let _ = self.conn.queue_forget(self.nodeid, nlookup);
     }
 
-    fn now_ns() -> u64 {
-        ktime_get_real_ns().max(0) as u64
+    fn now_ticks() -> u64 {
+        // FUSE cache expiry is an elapsed-time deadline, not wall-clock time.
+        // Match Linux fuse_time_to_jiffies(): use the monotonic timer tick
+        // counter so each hot-path attr/entry-cache check is an in-memory read
+        // and settimeofday cannot extend or prematurely expire the cache.
+        clock()
     }
 
-    fn cache_deadline(valid: u64, valid_nsec: u32) -> u64 {
+    fn cache_timeout_ticks(valid: u64, valid_nsec: u32) -> u64 {
         if valid == 0 && valid_nsec == 0 {
             return 0;
         }
-        let delta_ns = valid
-            .saturating_mul(1_000_000_000)
-            .saturating_add(valid_nsec as u64);
-        Self::now_ns().saturating_add(delta_ns)
+
+        // Linux clamps the daemon-provided nanosecond component before
+        // converting the relative timeout to jiffies.  Calculate in u128 so a
+        // malformed, extremely large finite timeout cannot overflow into the
+        // u64::MAX sentinel reserved for kernel-owned permanent snapshots.
+        let nsec = valid_nsec.min(NSEC_PER_SEC - 1) as u128;
+        let delta_ns = (valid as u128)
+            .saturating_mul(NSEC_PER_SEC as u128)
+            .saturating_add(nsec);
+        delta_ns
+            .div_ceil(NSEC_PER_JIFFY as u128)
+            .min((u64::MAX - 1) as u128) as u64
+    }
+
+    fn cache_deadline(valid: u64, valid_nsec: u32) -> u64 {
+        let delta_ticks = Self::cache_timeout_ticks(valid, valid_nsec);
+        if delta_ticks == 0 {
+            return 0;
+        }
+        Self::now_ticks()
+            .checked_add(delta_ticks)
+            .filter(|deadline| *deadline < u64::MAX)
+            .unwrap_or(u64::MAX - 1)
     }
 
     pub(crate) fn conn(&self) -> &Arc<FuseConn> {
@@ -1494,8 +1517,8 @@ impl FuseNode {
         fh: Option<u64>,
     ) -> Result<Metadata, SystemError> {
         if let Some(m) = self.cached_metadata.lock().clone() {
-            let deadline = self.cached_metadata_deadline_ns.load(Ordering::Relaxed);
-            if deadline == u64::MAX || (deadline != 0 && Self::now_ns() < deadline) {
+            let deadline = self.cached_metadata_deadline_ticks.load(Ordering::Relaxed);
+            if deadline == u64::MAX || (deadline != 0 && Self::now_ticks() < deadline) {
                 return Ok(m);
             }
         }
@@ -1520,8 +1543,8 @@ impl FuseNode {
         // for every AUTO_INVAL_DATA read dominates 4 KiB cached I/O. The TTL is
         // independently published, so reuse that snapshot while it remains
         // valid and issue GETATTR_FH only after expiry.
-        let deadline = self.cached_metadata_deadline_ns.load(Ordering::Acquire);
-        if deadline == u64::MAX || (deadline != 0 && Self::now_ns() < deadline) {
+        let deadline = self.cached_metadata_deadline_ticks.load(Ordering::Acquire);
+        if deadline == u64::MAX || (deadline != 0 && Self::now_ticks() < deadline) {
             return Ok(cached);
         }
         self.fetch_attr_with_file_handle(Some(fh))
@@ -1581,6 +1604,28 @@ mod tests {
         let open_file_query = getattr_request_input(Some(0x1234_5678));
         assert_eq!(open_file_query.getattr_flags, FUSE_GETATTR_FH);
         assert_eq!(open_file_query.fh, 0x1234_5678);
+    }
+
+    #[test]
+    fn cache_timeout_matches_linux_jiffy_and_nsec_rules() {
+        assert_eq!(FuseNode::cache_timeout_ticks(0, 0), 0);
+        assert_eq!(FuseNode::cache_timeout_ticks(0, 1), 1);
+
+        let clamped = FuseNode::cache_timeout_ticks(0, NSEC_PER_SEC - 1);
+        assert_eq!(FuseNode::cache_timeout_ticks(0, u32::MAX), clamped);
+        assert_eq!(
+            FuseNode::cache_timeout_ticks(1, 0),
+            (NSEC_PER_SEC as u64).div_ceil(NSEC_PER_JIFFY as u64)
+        );
+    }
+
+    #[test]
+    fn finite_cache_timeout_never_becomes_permanent_sentinel() {
+        assert_eq!(
+            FuseNode::cache_timeout_ticks(u64::MAX, u32::MAX),
+            u64::MAX - 1
+        );
+        assert_ne!(FuseNode::cache_deadline(u64::MAX, u32::MAX), u64::MAX);
     }
 
     #[test]

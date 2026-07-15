@@ -46,11 +46,43 @@ check_transcript() {
                 (value("status") != "ok" && value("status") != "fail") ||
                 !decimal("errno") || !decimal("elapsed_us") || !decimal("bytes") ||
                 !decimal("ops") || !decimal("syscalls") || !decimal("short_io") ||
-                !decimal("eintr") || checksum !~ /^[0-9a-f]+$/ || length(checksum) != 16) {
+                !decimal("eintr") || !decimal("data_loop_us") || !decimal("fsync_us") ||
+                !decimal("close_us") || !decimal("end_to_end_us") ||
+                checksum !~ /^[0-9a-f]+$/ || length(checksum) != 16) {
+                bad = 1
+            }
+            workload = value("workload")
+            data_loop = value("data_loop_us") + 0
+            fsync_time = value("fsync_us") + 0
+            close_time = value("close_us") + 0
+            end_to_end = value("end_to_end_us") + 0
+            elapsed = value("elapsed_us") + 0
+            if (workload == "sequential_write" || workload == "prepare") {
+                if (data_loop == 0 || end_to_end == 0 || elapsed != data_loop ||
+                    end_to_end < data_loop + fsync_time + close_time) {
+                    bad = 1
+                }
+            } else if (data_loop != 0 || fsync_time != 0 || close_time != 0 ||
+                       end_to_end != 0) {
                 bad = 1
             }
         }
         END { exit bad || phases == 0 || results != 1 }
+    '
+}
+
+check_result_only_transcript() {
+    awk '
+        $1 == "phase" { phases++ }
+        $1 == "result" {
+            results++
+            for (i = 1; i <= NF; ++i) {
+                if ($i ~ /^(data_loop_us|fsync_us|close_us|end_to_end_us)=[0-9]+$/) {
+                    timings++
+                }
+            }
+        }
+        END { exit phases != 0 || results != 1 || timings != 4 }
     '
 }
 
@@ -62,10 +94,34 @@ VIRTIOFS_BENCH_RUN_ID=host_prepare VIRTIOFS_BENCH_CACHE_MODE=warm \
     --file-size 16384 --block-size 4096 >"$WORK_DIR/prepare.log" 2>&1
 check_transcript <"$WORK_DIR/prepare.log"
 
+VIRTIOFS_BENCH_PHASE_MARKERS=0 VIRTIOFS_BENCH_RUN_ID=host_perf \
+    "$BIN" --mount "$MOUNT" --workload prepare --path perf_schema_test \
+    --file-size 16384 --block-size 4096 >"$WORK_DIR/perf.log" 2>&1
+check_result_only_transcript <"$WORK_DIR/perf.log"
+
 VIRTIOFS_BENCH_RUN_ID=host_read VIRTIOFS_BENCH_CACHE_MODE=warm \
     "$BIN" --mount "$MOUNT" --workload sequential_read --path schema_test \
     --file-size 16384 --block-size 4096 >"$WORK_DIR/read.log" 2>&1
 check_transcript <"$WORK_DIR/read.log"
+
+VIRTIOFS_BENCH_RUN_ID=host_write VIRTIOFS_BENCH_CACHE_MODE=warm \
+    "$BIN" --mount "$MOUNT" --workload sequential_write --path schema_test \
+    --file-size 16384 --block-size 4096 >"$WORK_DIR/write.log" 2>&1
+check_transcript <"$WORK_DIR/write.log"
+
+# Timing fields are a semantic schema, not just four decimal strings.
+sed 's/ data_loop_us=[^ ]*/ data_loop_us=1/' "$WORK_DIR/read.log" \
+    >"$WORK_DIR/malformed-read-timing.log"
+if check_transcript <"$WORK_DIR/malformed-read-timing.log"; then
+    echo "non-write timing unexpectedly accepted" >&2
+    exit 1
+fi
+sed 's/ elapsed_us=[^ ]*/ elapsed_us=0/' "$WORK_DIR/write.log" \
+    >"$WORK_DIR/malformed-write-timing.log"
+if check_transcript <"$WORK_DIR/malformed-write-timing.log"; then
+    echo "inconsistent write timing unexpectedly accepted" >&2
+    exit 1
+fi
 
 # A missing mandatory result field must be rejected by the host parser.
 sed 's/ syscalls=[^ ]*//' "$WORK_DIR/read.log" >"$WORK_DIR/malformed.log"

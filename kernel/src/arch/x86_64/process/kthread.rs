@@ -59,10 +59,6 @@ impl KernelThreadMechanism {
             unsafe { KernelThreadCreateInfo::parse_unsafe_arc_ptr(create_info) };
         })?;
 
-        let pcb = ProcessManager::find_task_by_vpid(pid).unwrap();
-        pcb.set_name(info.name().clone());
-        info.setup_pcb(&pcb);
-
         return Ok(pid);
     }
 }

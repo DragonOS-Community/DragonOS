@@ -46,10 +46,13 @@ static STATS_MODE: AtomicU8 = AtomicU8::new(FuseStatsMode::Off as u8);
 pub struct FuseStatsSnapshot {
     pub init_epoch: u64,
     pub negotiated_max_read_bytes: u64,
+    pub negotiated_max_write_bytes: u64,
     pub negotiated_max_pages: u64,
     pub negotiated_max_readahead_bytes: u64,
     pub negotiated_async_read: u64,
+    pub negotiated_writeback_cache: u64,
     pub effective_read_payload_limit_bytes: u64,
+    pub effective_write_payload_limit_bytes: u64,
     pub request_queue_current: u64,
     pub dispatch_current: u64,
     pub processing_current: u64,
@@ -79,8 +82,14 @@ pub struct FuseStatsSnapshot {
     pub readahead_saturated_single_page_extensions_total: u64,
     pub readahead_reservation_conflicts_total: u64,
     pub readahead_short_reads_total: u64,
+    pub write_requested_requests_total: u64,
+    pub write_requested_bytes_total: u64,
+    pub write_requested_bytes_max: u64,
     pub background_inflight_current: u64,
     pub read_reservation_current: u64,
+    pub invalidation_launder_batches_total: u64,
+    pub invalidation_launder_pages_total: u64,
+    pub mmap_writeback_admission_retries_total: u64,
     pub background_inflight_peak: u64,
     pub background_max_blocked_total: u64,
     pub background_congestion_skipped_total: u64,
@@ -228,10 +237,13 @@ static REQUESTS_QUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static INIT_EPOCH: AtomicU64 = AtomicU64::new(0);
 static INIT_LIMITS_SEQ: AtomicU64 = AtomicU64::new(0);
 static NEGOTIATED_MAX_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static NEGOTIATED_MAX_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 static NEGOTIATED_MAX_PAGES: AtomicU64 = AtomicU64::new(0);
 static NEGOTIATED_MAX_READAHEAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static NEGOTIATED_ASYNC_READ: AtomicU64 = AtomicU64::new(0);
+static NEGOTIATED_WRITEBACK_CACHE: AtomicU64 = AtomicU64::new(0);
 static EFFECTIVE_READ_PAYLOAD_LIMIT_BYTES: AtomicU64 = AtomicU64::new(0);
+static EFFECTIVE_WRITE_PAYLOAD_LIMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_DEQUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_QUEUE_CURRENT: AtomicU64 = AtomicU64::new(0);
 static DISPATCH_CURRENT: AtomicU64 = AtomicU64::new(0);
@@ -264,13 +276,17 @@ static BACKGROUND_INFLIGHT_CURRENT: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_INFLIGHT_PEAK: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_MAX_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_CONGESTION_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static MMAP_WRITEBACK_ADMISSION_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-pub fn on_fuse_read_limits_negotiated(
+pub fn on_fuse_io_limits_negotiated(
     max_read: usize,
+    max_write: usize,
     max_pages: usize,
     max_readahead: usize,
     async_read: bool,
+    writeback_cache: bool,
     effective_read_payload_limit: usize,
+    effective_write_payload_limit: usize,
 ) {
     let sequence = loop {
         let current = INIT_LIMITS_SEQ.load(Ordering::Acquire);
@@ -291,16 +307,20 @@ pub fn on_fuse_read_limits_negotiated(
         }
     };
     NEGOTIATED_MAX_READ_BYTES.store(max_read as u64, Ordering::Relaxed);
+    NEGOTIATED_MAX_WRITE_BYTES.store(max_write as u64, Ordering::Relaxed);
     NEGOTIATED_MAX_PAGES.store(max_pages as u64, Ordering::Relaxed);
     NEGOTIATED_MAX_READAHEAD_BYTES.store(max_readahead as u64, Ordering::Relaxed);
     NEGOTIATED_ASYNC_READ.store(async_read as u64, Ordering::Relaxed);
+    NEGOTIATED_WRITEBACK_CACHE.store(writeback_cache as u64, Ordering::Relaxed);
     EFFECTIVE_READ_PAYLOAD_LIMIT_BYTES
         .store(effective_read_payload_limit as u64, Ordering::Relaxed);
+    EFFECTIVE_WRITE_PAYLOAD_LIMIT_BYTES
+        .store(effective_write_payload_limit as u64, Ordering::Relaxed);
     INIT_EPOCH.fetch_add(1, Ordering::Relaxed);
     INIT_LIMITS_SEQ.store(sequence.wrapping_add(2), Ordering::Release);
 }
 
-fn fuse_init_limits_snapshot() -> (u64, u64, u64, u64, u64, u64) {
+fn fuse_init_limits_snapshot() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     loop {
         let before = INIT_LIMITS_SEQ.load(Ordering::Acquire);
         if before & 1 != 0 {
@@ -310,10 +330,13 @@ fn fuse_init_limits_snapshot() -> (u64, u64, u64, u64, u64, u64) {
         let values = (
             INIT_EPOCH.load(Ordering::Relaxed),
             NEGOTIATED_MAX_READ_BYTES.load(Ordering::Relaxed),
+            NEGOTIATED_MAX_WRITE_BYTES.load(Ordering::Relaxed),
             NEGOTIATED_MAX_PAGES.load(Ordering::Relaxed),
             NEGOTIATED_MAX_READAHEAD_BYTES.load(Ordering::Relaxed),
             NEGOTIATED_ASYNC_READ.load(Ordering::Relaxed),
+            NEGOTIATED_WRITEBACK_CACHE.load(Ordering::Relaxed),
             EFFECTIVE_READ_PAYLOAD_LIMIT_BYTES.load(Ordering::Relaxed),
+            EFFECTIVE_WRITE_PAYLOAD_LIMIT_BYTES.load(Ordering::Relaxed),
         );
         if before == INIT_LIMITS_SEQ.load(Ordering::Acquire) {
             return values;
@@ -373,6 +396,14 @@ pub fn on_background_pressure(speculative: bool) {
     } else {
         inc(&BACKGROUND_MAX_BLOCKED_TOTAL);
     }
+}
+
+/// Count mmap write faults which must retry after dropping the address-space
+/// guard because an exclusive cached-writeback operation owns the inode gate.
+/// This is always-on: it is a correctness/lifecycle observation rather than
+/// optional hot-path detail, and the increment occurs only on contention.
+pub fn on_mmap_writeback_admission_retry() {
+    inc(&MMAP_WRITEBACK_ADMISSION_RETRIES_TOTAL);
 }
 
 static DEVICE_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
@@ -439,6 +470,13 @@ static READ_REQUESTED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_REQUESTED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 static READ_REQUESTED_PAGES: [AtomicU64; READ_PAGE_BUCKETS] =
     [const { AtomicU64::new(0) }; READ_PAGE_BUCKETS];
+
+// WRITE request-size diagnostics use FuseWriteIn.size at the successful
+// virtqueue submission point. They are optional so normal benchmarks do not
+// pay atomic RMW costs or mistake protocol/header bytes for file data.
+static WRITE_REQUESTED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_REQUESTED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_REQUESTED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 
 static OPCODE_REQUESTS_TOTAL: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
@@ -1034,6 +1072,24 @@ pub fn on_virtiofs_read_requested(requested_bytes: usize, pages: usize) {
     inc(&READ_REQUESTED_PAGES[read_page_bucket(pages)]);
 }
 
+/// Record the file-data payload declared by a successfully submitted
+/// FUSE_WRITE. The caller obtains this value from `FuseWriteIn.size`.
+#[inline]
+pub fn on_virtiofs_write_requested(requested_bytes: usize) {
+    if !light_stats_enabled() || requested_bytes == 0 {
+        return;
+    }
+    inc(&WRITE_REQUESTED_REQUESTS_TOTAL);
+    add(&WRITE_REQUESTED_BYTES_TOTAL, requested_bytes as u64);
+    update_peak(&WRITE_REQUESTED_BYTES_MAX, requested_bytes as u64);
+}
+
+/// Whether callers should pay the cost of decoding WRITE request details.
+#[inline]
+pub fn write_request_stats_enabled() -> bool {
+    light_stats_enabled()
+}
+
 /// Queue acceptance is the DMA ownership commit point.
 #[inline]
 pub fn on_virtiofs_direct_read_requested(requested_bytes: usize) {
@@ -1141,15 +1197,28 @@ pub fn on_virtiofs_dax_device_reset() {
 }
 
 pub fn fuse_snapshot() -> FuseStatsSnapshot {
-    let (init_epoch, max_read, max_pages, max_readahead, async_read, effective_read) =
-        fuse_init_limits_snapshot();
+    let (
+        init_epoch,
+        max_read,
+        max_write,
+        max_pages,
+        max_readahead,
+        async_read,
+        writeback_cache,
+        effective_read,
+        effective_write,
+    ) = fuse_init_limits_snapshot();
+    let page_cache = page_cache_stats::snapshot();
     FuseStatsSnapshot {
         init_epoch,
         negotiated_max_read_bytes: max_read,
+        negotiated_max_write_bytes: max_write,
         negotiated_max_pages: max_pages,
         negotiated_max_readahead_bytes: max_readahead,
         negotiated_async_read: async_read,
+        negotiated_writeback_cache: writeback_cache,
         effective_read_payload_limit_bytes: effective_read,
+        effective_write_payload_limit_bytes: effective_write,
         request_queue_current: REQUEST_QUEUE_CURRENT.load(Ordering::Acquire),
         dispatch_current: DISPATCH_CURRENT.load(Ordering::Acquire),
         processing_current: PROCESSING_CURRENT.load(Ordering::Acquire),
@@ -1185,8 +1254,15 @@ pub fn fuse_snapshot() -> FuseStatsSnapshot {
         readahead_reservation_conflicts_total: READAHEAD_RESERVATION_CONFLICTS_TOTAL
             .load(Ordering::Relaxed),
         readahead_short_reads_total: READAHEAD_SHORT_READS_TOTAL.load(Ordering::Relaxed),
+        write_requested_requests_total: WRITE_REQUESTED_REQUESTS_TOTAL.load(Ordering::Relaxed),
+        write_requested_bytes_total: WRITE_REQUESTED_BYTES_TOTAL.load(Ordering::Relaxed),
+        write_requested_bytes_max: WRITE_REQUESTED_BYTES_MAX.load(Ordering::Relaxed),
         background_inflight_current: BACKGROUND_INFLIGHT_CURRENT.load(Ordering::Acquire),
-        read_reservation_current: page_cache_stats::snapshot().read_dma_reservations,
+        read_reservation_current: page_cache.read_dma_reservations,
+        invalidation_launder_batches_total: page_cache.invalidation_launder_batches,
+        invalidation_launder_pages_total: page_cache.invalidation_launder_pages,
+        mmap_writeback_admission_retries_total: MMAP_WRITEBACK_ADMISSION_RETRIES_TOTAL
+            .load(Ordering::Relaxed),
         background_inflight_peak: BACKGROUND_INFLIGHT_PEAK.load(Ordering::Relaxed),
         background_max_blocked_total: BACKGROUND_MAX_BLOCKED_TOTAL.load(Ordering::Relaxed),
         background_congestion_skipped_total: BACKGROUND_CONGESTION_SKIPPED_TOTAL
@@ -1302,10 +1378,13 @@ detailed opcode,copy,allocation\n\
 [fuse]\n\
 init_epoch {}\n\
 negotiated_max_read_bytes {}\n\
+negotiated_max_write_bytes {}\n\
 negotiated_max_pages {}\n\
 negotiated_max_readahead_bytes {}\n\
 negotiated_async_read {}\n\
+negotiated_writeback_cache {}\n\
 effective_read_payload_limit_bytes {}\n\
+effective_write_payload_limit_bytes {}\n\
 request_queue_current {}\n\
 dispatch_current {}\n\
 processing_current {}\n\
@@ -1335,8 +1414,14 @@ readahead_window_extension_pages_total {}\n\
 readahead_saturated_single_page_extensions_total {}\n\
 readahead_reservation_conflicts_total {}\n\
 readahead_short_reads_total {}\n\
+write_requested_requests_total {}\n\
+write_requested_bytes_total {}\n\
+write_requested_bytes_max {}\n\
 background_inflight_current {}\n\
 read_reservation_current {}\n\
+invalidation_launder_batches_total {}\n\
+invalidation_launder_pages_total {}\n\
+mmap_writeback_admission_retries_total {}\n\
 background_inflight_peak {}\n\
 background_max_blocked_total {}\n\
 background_congestion_skipped_total {}\n\
@@ -1434,10 +1519,13 @@ dax_device_resets_total {}\n",
         stats_mode().as_str(),
         fuse.init_epoch,
         fuse.negotiated_max_read_bytes,
+        fuse.negotiated_max_write_bytes,
         fuse.negotiated_max_pages,
         fuse.negotiated_max_readahead_bytes,
         fuse.negotiated_async_read,
+        fuse.negotiated_writeback_cache,
         fuse.effective_read_payload_limit_bytes,
+        fuse.effective_write_payload_limit_bytes,
         fuse.request_queue_current,
         fuse.dispatch_current,
         fuse.processing_current,
@@ -1467,8 +1555,14 @@ dax_device_resets_total {}\n",
         fuse.readahead_saturated_single_page_extensions_total,
         fuse.readahead_reservation_conflicts_total,
         fuse.readahead_short_reads_total,
+        fuse.write_requested_requests_total,
+        fuse.write_requested_bytes_total,
+        fuse.write_requested_bytes_max,
         fuse.background_inflight_current,
         fuse.read_reservation_current,
+        fuse.invalidation_launder_batches_total,
+        fuse.invalidation_launder_pages_total,
+        fuse.mmap_writeback_admission_retries_total,
         fuse.background_inflight_peak,
         fuse.background_max_blocked_total,
         fuse.background_congestion_skipped_total,

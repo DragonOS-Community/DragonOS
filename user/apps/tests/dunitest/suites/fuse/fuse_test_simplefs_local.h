@@ -720,6 +720,7 @@ struct fuse_daemon_args {
     uint32_t root_open_out_flags;
     uint32_t hello_open_out_flags;
     volatile uint32_t *dynamic_hello_open_out_flags;
+    volatile uint32_t *dynamic_open_out_flags;
     volatile unsigned char *dynamic_hello_first_byte;
     volatile size_t *dynamic_hello_read_size;
     volatile size_t *dynamic_hello_byte_offset;
@@ -736,12 +737,14 @@ struct fuse_daemon_args {
     volatile uint32_t *access_count;
     volatile uint32_t *lookup_count;
     volatile uint32_t *flush_count;
+    volatile uint32_t *write_count_at_flush;
     volatile uint32_t *last_flush_uid;
     volatile uint32_t *last_flush_gid;
     volatile uint32_t *last_flush_pid;
     volatile uint32_t *fsync_count;
     volatile uint32_t *fsyncdir_count;
     volatile uint32_t *create_count;
+    volatile uint64_t *last_create_nodeid;
     volatile uint32_t *mknod_count;
     volatile uint32_t *rename2_count;
     volatile uint32_t *open_count;
@@ -757,6 +760,9 @@ struct fuse_daemon_args {
     volatile uint64_t *last_setattr_fh;
     volatile uint64_t *last_setattr_size;
     volatile uint64_t *last_setattr_lock_owner;
+    // UINT64_MAX means no override.  Tests use this to model a daemon-side
+    // size shrink observed by GETATTR without issuing a local SETATTR first.
+    volatile uint64_t *getattr_size_override;
     volatile uint64_t *last_fallocate_fh;
     volatile uint64_t *last_fallocate_offset;
     volatile uint64_t *last_fallocate_length;
@@ -790,7 +796,17 @@ struct fuse_daemon_args {
     volatile unsigned char *write_watch_bytes;
     volatile unsigned char *write_covers_watch;
     volatile unsigned char *backend_watch_byte;
+    unsigned char *large_write_backing;
+    size_t large_write_backing_capacity;
+    volatile uint64_t *large_write_nodeid;
     uint32_t write_trace_capacity;
+    volatile int *forced_write_errno;
+    volatile uint64_t *forced_write_offset;
+    volatile uint64_t *forced_short_write_offset;
+    volatile uint32_t *forced_short_write_size;
+    volatile uint64_t *block_write_offset;
+    volatile int *write_entered;
+    volatile int *release_write;
     volatile uint64_t *last_fsync_fh;
     volatile uint32_t *write_count_at_fsync;
     volatile uint32_t *last_write_flags_at_fsync;
@@ -1054,6 +1070,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct fuse_attr_out out;
         memset(&out, 0, sizeof(out));
         simplefs_fill_attr(node, &out.attr);
+        if (a->getattr_size_override && *a->getattr_size_override != UINT64_MAX) {
+            out.attr.size = *a->getattr_size_override;
+            out.attr.blocks = (out.attr.size + 511) / 512;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
     case FUSE_OPENDIR:
@@ -1093,7 +1113,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (h->opcode == FUSE_OPEN && (in->flags & O_TRUNC)) {
             node->size = 0;
         }
-        if (h->opcode == FUSE_OPEN && h->nodeid == 2 && a->dynamic_hello_open_out_flags) {
+        if (h->opcode == FUSE_OPEN && a->dynamic_open_out_flags) {
+            node->open_out_flags = *a->dynamic_open_out_flags;
+        } else if (h->opcode == FUSE_OPEN && h->nodeid == 2 &&
+                   a->dynamic_hello_open_out_flags) {
             node->open_out_flags = *a->dynamic_hello_open_out_flags;
         }
         struct fuse_open_out out;
@@ -1167,6 +1190,14 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return fuse_write_reply(a->fd, h->unique, -forced_errno, NULL, 0);
         }
         size_t effective_size = node->size;
+        const unsigned char *read_backing = node->data;
+        if (a->large_write_backing && a->large_write_nodeid &&
+            *a->large_write_nodeid == h->nodeid) {
+            effective_size = node->size < a->large_write_backing_capacity
+                                 ? node->size
+                                 : a->large_write_backing_capacity;
+            read_backing = a->large_write_backing;
+        }
         int generated_hello = h->nodeid == 2 && a->hello_generated_size_override > 0;
         if (generated_hello) {
             effective_size = a->hello_generated_size_override;
@@ -1253,7 +1284,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             free(generated);
             return ret;
         }
-        return fuse_write_reply(a->fd, h->unique, 0, node->data + in->offset, to_copy);
+        return fuse_write_reply(a->fd, h->unique, 0, read_backing + in->offset, to_copy);
     }
     case FUSE_READDIR:
     case FUSE_READDIRPLUS: {
@@ -1452,6 +1483,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return -1;
         }
         const struct fuse_flush_in *in = (const struct fuse_flush_in *)payload;
+        if (a->write_count_at_flush && a->write_count) {
+            *a->write_count_at_flush = *a->write_count;
+        }
         if (a->flush_count) {
             (*a->flush_count)++;
         }
@@ -1541,7 +1575,25 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!node || simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
             return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
         }
-        if (in->offset >= SIMPLEFS_DATA_MAX) {
+        unsigned char *write_backing = node->data;
+        size_t write_capacity = SIMPLEFS_DATA_MAX;
+        if (a->large_write_backing && a->large_write_nodeid &&
+            ((*a->large_write_nodeid == h->nodeid) ||
+             (*a->large_write_nodeid == 0 &&
+              in->offset + in->size > SIMPLEFS_DATA_MAX))) {
+            if (*a->large_write_nodeid == 0 && in->offset > 0) {
+                size_t prefix = (size_t)in->offset;
+                if (prefix > SIMPLEFS_DATA_MAX)
+                    prefix = SIMPLEFS_DATA_MAX;
+                if (prefix > a->large_write_backing_capacity)
+                    prefix = a->large_write_backing_capacity;
+                memcpy(a->large_write_backing, node->data, prefix);
+            }
+            *a->large_write_nodeid = h->nodeid;
+            write_backing = a->large_write_backing;
+            write_capacity = a->large_write_backing_capacity;
+        }
+        if (in->offset >= write_capacity) {
             return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
         }
         uint32_t write_index = 0;
@@ -1573,8 +1625,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             *a->last_write_pid = h->pid;
         }
         size_t to_copy = in->size;
-        if (in->offset + to_copy > SIMPLEFS_DATA_MAX) {
-            to_copy = SIMPLEFS_DATA_MAX - (size_t)in->offset;
+        if (in->offset + to_copy > write_capacity) {
+            to_copy = write_capacity - (size_t)in->offset;
         }
         unsigned char watch_byte = 0;
         int covers_watch = 0;
@@ -1604,14 +1656,36 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 a->write_covers_watch[write_index] = covers_watch ? 1 : 0;
             }
         }
-        memcpy(node->data + in->offset, data, to_copy);
+        if (a->block_write_offset && a->write_entered && a->release_write &&
+            in->offset == *a->block_write_offset && !*a->release_write) {
+            __sync_synchronize();
+            *a->write_entered = 1;
+            __sync_synchronize();
+            while (!*a->release_write && (!a->stop || !*a->stop)) {
+                usleep(1000);
+            }
+        }
+        if (a->forced_write_errno && a->forced_write_offset &&
+            *a->forced_write_errno > 0 && in->offset == *a->forced_write_offset) {
+            if (a->write_count) {
+                __sync_synchronize();
+                (*a->write_count)++;
+            }
+            return fuse_write_reply(a->fd, h->unique, -*a->forced_write_errno, NULL, 0);
+        }
+        if (a->forced_short_write_offset && a->forced_short_write_size &&
+            in->offset == *a->forced_short_write_offset &&
+            *a->forced_short_write_size < to_copy) {
+            to_copy = *a->forced_short_write_size;
+        }
+        memcpy(write_backing + in->offset, data, to_copy);
         if (node->size < in->offset + to_copy) {
             node->size = (size_t)in->offset + to_copy;
         }
         if (a->backend_watch_byte) {
             uint64_t watch = a->write_watch_offset;
-            if (watch < node->size && watch < SIMPLEFS_DATA_MAX) {
-                *a->backend_watch_byte = node->data[watch];
+            if (watch < node->size && watch < write_capacity) {
+                *a->backend_watch_byte = write_backing[watch];
             }
         }
         if (a->write_count) {
@@ -1673,6 +1747,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = 0;
+        if (a->last_create_nodeid) {
+            *a->last_create_nodeid = nnode->nodeid;
+        }
 
         struct {
             struct fuse_entry_out entry;

@@ -15,13 +15,26 @@ use crate::{
         },
         vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
     },
-    libs::mutex::Mutex,
+    libs::{mutex::Mutex, rwsem::RwSemWriteGuard},
     mm::{
+        fault::FaultRetryWait,
         readahead::{FileReadaheadState, ReadaheadControl},
         MemoryManagementArch,
     },
     time::PosixTimeSpec,
 };
+
+#[derive(Debug)]
+struct FuseWritebackAdmissionRetryWait {
+    node: Arc<FuseNode>,
+}
+
+impl FaultRetryWait for FuseWritebackAdmissionRetryWait {
+    fn wait(&self) -> Result<(), SystemError> {
+        drop(self.node.writeback_barrier.read());
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FuseReadaheadEvent {
@@ -210,6 +223,55 @@ impl PageCacheBackend for FusePageCacheBackend {
         node.writeback_page_with_handle(index, buf)
     }
 
+    fn write_batch_pages(&self) -> Result<usize, SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        let max_pages = node.conn().max_pages();
+        let max_write = node.conn().max_write();
+        if max_pages == 0 || max_write < MMArch::PAGE_SIZE {
+            return Err(SystemError::EIO);
+        }
+        let _ = max_pages
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let pages = core::cmp::min(max_pages, max_write / MMArch::PAGE_SIZE);
+        if pages == 0 {
+            return Err(SystemError::EIO);
+        }
+        Ok(pages)
+    }
+
+    fn write_pages(&self, start_index: usize, data: &[u8]) -> Result<(), SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        match node.writeback_pages_with_handle(start_index, data) {
+            Ok(written) if written == data.len() => Ok(()),
+            Ok(_) => Err(SystemError::EIO),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        node.with_writeback_admission(claim)
+    }
+
+    fn try_with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<bool, SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        node.try_with_writeback_admission(claim)
+    }
+
+    fn stable_writeback_size(&self, _inode: &Arc<dyn IndexNode>) -> Result<usize, SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        node.cached_metadata_snapshot()
+            .ok_or(SystemError::EIO)
+            .map(|metadata| metadata.size.max(0) as usize)
+    }
+
     fn npages(&self) -> usize {
         let Some(node) = self.node.upgrade() else {
             return 0;
@@ -296,24 +358,38 @@ impl FuseNode {
                 // invalidating the ordinary page cache. The host-invalidation
                 // blocker independently prevents DAX window use/PTE publish.
                 let layout = node.dax_layout_write();
-                if let Some(cache) = page_cache.as_ref() {
+                let mut first_error = None;
+                if page_cache.is_some() {
                     // Match Linux invalidate_inode_pages2_range(): only the
                     // notified pages participate in laundering. An unrelated
                     // dirty-page error must not abort the FUSE connection.
-                    cache
-                        .manager()
-                        .launder_range_for_invalidate(start_index, end_index)?;
+                    if let Err(error) =
+                        node.launder_cached_range_admitted(start_index, end_index, &layout)
+                    {
+                        first_error = Some(error);
+                    }
                 }
-                node.invalidate_page_cache_range(
+                // Even when laundering retained an errored/dirty page, evict
+                // every page that was successfully cleaned. Otherwise a late
+                // batch error could leave earlier clean cache entries stale
+                // after the host notification has been acknowledged.
+                if let Err(error) = node.invalidate_page_cache_range(
                     start,
                     end_exclusive
                         .and_then(|end| end.checked_sub(start))
                         .unwrap_or(usize::MAX - start),
-                )?;
+                ) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
                 drop(layout);
 
                 if blocker.lock().is_some() {
                     drop(node.dax_layout_write_for_host_invalidation(start, end_exclusive)?);
+                }
+                if let Some(error) = first_error {
+                    return Err(error);
                 }
                 Ok::<(), SystemError>(())
             })();
@@ -350,6 +426,26 @@ impl FuseNode {
     pub(crate) fn with_writeback_admission<T>(&self, f: impl FnOnce() -> T) -> T {
         let _guard = self.writeback_barrier.read();
         f()
+    }
+
+    pub(crate) fn try_with_writeback_admission(
+        &self,
+        f: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<bool, SystemError> {
+        let Some(_guard) = self.writeback_barrier.try_read() else {
+            return Ok(false);
+        };
+        f()?;
+        Ok(true)
+    }
+
+    pub(crate) fn writeback_admission_retry_wait(&self) -> Arc<dyn FaultRetryWait> {
+        Arc::new(FuseWritebackAdmissionRetryWait {
+            node: self
+                .self_ref
+                .upgrade()
+                .expect("live FuseNode must retain its self reference"),
+        })
     }
 
     pub(crate) fn note_mmap_write(&self) {
@@ -540,7 +636,7 @@ impl FuseNode {
         } else {
             self.writeback_barrier.write()
         };
-        self.sync_dirty_cached_pages()?;
+        self.sync_dirty_cached_pages_admitted(&_barrier)?;
         let mut valid = FATTR_SIZE;
         if lock_owner.is_some() {
             valid |= FATTR_LOCKOWNER;
@@ -582,8 +678,8 @@ impl FuseNode {
                 atime = metadata.atime.tv_sec as u64;
                 atimensec = metadata.atime.tv_nsec as u32;
             }
-            // DragonOS does not currently negotiate WRITEBACK_CACHE. Match
-            // Linux FUSE by accepting the daemon-returned cmtime for truncate
+            // Under WRITEBACK_CACHE, Linux trusts the locally maintained cmtime;
+            // otherwise accept the daemon-returned values for automatic truncate
             // instead of sending a second SETATTR without the file handle.
             if mask.contains(SetMetadataMask::MTIME) && (!automatic || trust_local_cmtime) {
                 valid |= FATTR_MTIME;
@@ -671,7 +767,7 @@ impl FuseNode {
                         .store(chain_version, Ordering::Release);
                     self.pending_short_read_eof
                         .fetch_min(eof as u64, Ordering::AcqRel);
-                    self.cached_metadata_deadline_ns
+                    self.cached_metadata_deadline_ticks
                         .store(u64::MAX, Ordering::Relaxed);
                     if let Some(cache) = self.cached_page_cache() {
                         let start_page = eof / MMArch::PAGE_SIZE;
@@ -797,6 +893,60 @@ impl FuseNode {
         page_cache.manager().sync()
     }
 
+    fn stable_writeback_size(&self) -> Result<usize, SystemError> {
+        Ok(self
+            .cached_metadata_snapshot()
+            .ok_or(SystemError::EIO)?
+            .size
+            .max(0) as usize)
+    }
+
+    pub(super) fn sync_dirty_cached_pages_admitted(
+        &self,
+        _guard: &RwSemWriteGuard<'_, ()>,
+    ) -> Result<(), SystemError> {
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        page_cache
+            .manager()
+            .sync_with_stable_size(self.stable_writeback_size()?)
+    }
+
+    pub(super) fn sync_cached_range_admitted(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        _guard: &RwSemWriteGuard<'_, ()>,
+    ) -> Result<(), SystemError> {
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        page_cache.manager().sync_range_with_stable_size(
+            start_index,
+            end_index,
+            self.stable_writeback_size()?,
+        )
+    }
+
+    pub(super) fn launder_cached_range_admitted(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        _guard: &RwSemWriteGuard<'_, ()>,
+    ) -> Result<(), SystemError> {
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        page_cache
+            .manager()
+            .launder_range_for_invalidate_with_stable_size(
+                start_index,
+                end_index,
+                self.stable_writeback_size()?,
+            )
+    }
+
     pub(super) fn check_and_advance_open_wb_error(
         &self,
         data: &FuseOpenPrivateData,
@@ -816,22 +966,33 @@ impl FuseNode {
         data: &FuseOpenPrivateData,
         lock_owner: u64,
     ) -> Result<(), SystemError> {
+        let writeback_cache = self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
+        // Linux skips both data-cache writeback and protocol FLUSH for
+        // FOPEN_NOFLUSH only when writeback-cache is disabled.
+        if !writeback_cache && (data.fopen_flags & FOPEN_NOFLUSH) != 0 {
+            return Ok(());
+        }
+
         // Linux fuse_flush() drains inode writeback even when this particular
         // descriptor is read-only: another writable open may have admitted
         // dirty data for the same inode.
-        let writeback_cache = self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
-        let _barrier = writeback_cache.then(|| self.writeback_barrier.write());
-        let writeback_result = if writeback_cache {
-            self.sync_dirty_cached_pages()
-        } else {
-            Ok(())
-        };
-        let wb_error_result = self.check_and_advance_open_wb_error(data);
-
+        let barrier = self.writeback_barrier.write();
+        // Linux fuse_flush() calls write_inode_now() in both cache modes. This
+        // matters when a shared mapping dirtied a cached page while the file
+        // descriptor is being closed, even without WRITEBACK_CACHE.
+        let writeback_result = self.sync_dirty_cached_pages_admitted(&barrier);
+        // Linux leaves NOWRITE after fuse_sync_writes(), before the blocking
+        // daemon FLUSH request. WRITE-before-FLUSH is already guaranteed by
+        // the synchronous drain, so retaining the barrier would only block new
+        // dirty admission and expose a notify/daemon reverse-wait cycle.
+        drop(barrier);
         writeback_result?;
-        wb_error_result?;
+        self.check_and_advance_open_wb_error(data)?;
 
-        if data.no_open || (data.fopen_flags & FOPEN_NOFLUSH) != 0 || self.conn().no_flush() {
+        // FOPEN_NOFLUSH only suppresses FLUSH when writeback-cache is disabled.
+        // With writeback-cache Linux must still send FLUSH after draining dirty
+        // pages so daemon-side flush/lock semantics and errors are preserved.
+        if self.conn().no_flush() {
             return Ok(());
         }
 
@@ -865,7 +1026,7 @@ impl FuseNode {
         Err(SystemError::EIO)
     }
 
-    fn writeback_page_with_handle(
+    fn writeback_pages_with_handle(
         &self,
         page_index: usize,
         buf: &[u8],
@@ -925,10 +1086,26 @@ impl FuseNode {
             if out.size as usize != chunk {
                 return Err(SystemError::EIO);
             }
+            self.check_not_stale()?;
+            let reply_generation = self.generation();
+            if handle.open_context.node_generation != 0
+                && reply_generation != 0
+                && handle.open_context.node_generation != reply_generation
+            {
+                return Err(SystemError::ESTALE);
+            }
             total += chunk;
         }
 
         Ok(total)
+    }
+
+    fn writeback_page_with_handle(
+        &self,
+        page_index: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.writeback_pages_with_handle(page_index, buf)
     }
 
     pub(super) fn set_open_private_data(
@@ -1044,7 +1221,7 @@ impl FuseNode {
         if atomic_dax_truncate {
             self.sync_dirty_cached_pages()?;
         }
-        let _dax_truncate_layout = if atomic_dax_truncate {
+        let dax_truncate_layout = if atomic_dax_truncate {
             Some(self.dax_layout_write_for_all()?)
         } else {
             None
@@ -1052,7 +1229,11 @@ impl FuseNode {
         if atomic_dax_truncate {
             // Close dirty admission between the optimistic drain and layout
             // exclusivity before OPEN can atomically change the host file.
-            self.sync_dirty_cached_pages()?;
+            self.sync_dirty_cached_pages_admitted(
+                dax_truncate_layout
+                    .as_ref()
+                    .expect("atomic DAX truncate guard"),
+            )?;
         }
         let file_flags = flags.bits();
         if self.conn.should_skip_open(opcode) {
@@ -1927,6 +2108,7 @@ impl FuseNode {
         len: usize,
         data: &FuseOpenPrivateData,
         discard_clean: bool,
+        _guard: &RwSemWriteGuard<'_, ()>,
     ) -> Result<(), SystemError> {
         let Some((start_page_index, end_page_index, end_page_exclusive)) =
             Self::direct_io_page_range(offset, len)?
@@ -1937,12 +2119,11 @@ impl FuseNode {
             return Ok(());
         };
 
-        page_cache
-            .manager()
-            .writeback_range(start_page_index, end_page_index)?;
-        page_cache
-            .manager()
-            .wait_writeback_range(start_page_index, end_page_index)?;
+        page_cache.manager().sync_range_with_stable_size(
+            start_page_index,
+            end_page_index,
+            self.stable_writeback_size()?,
+        )?;
         self.check_and_advance_open_wb_error(data)?;
 
         if discard_clean {

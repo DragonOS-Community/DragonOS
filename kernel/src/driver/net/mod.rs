@@ -2,7 +2,7 @@ use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
 use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use sysfs::netdev_register_kobject;
 
 use crate::driver::net::napi::NapiStruct;
@@ -279,6 +279,10 @@ pub struct IfaceCommon {
     /// TCP listener/backlog 语义辅助（Linux-like 丢 SYN 等）。
     tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog,
     ipv4_multicast_refcnt: Mutex<Vec<(smoltcp::wire::Ipv4Address, usize)>>,
+    /// AF_PACKET 混杂模式引用计数 (PACKET_MR_PROMISC)。
+    promiscuity: AtomicI32,
+    /// AF_PACKET 全多播引用计数 (PACKET_MR_ALLMULTI)。
+    allmulti: AtomicI32,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -323,6 +327,8 @@ impl IfaceCommon {
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
             tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
             ipv4_multicast_refcnt: Mutex::new(Vec::new()),
+            promiscuity: AtomicI32::new(0),
+            allmulti: AtomicI32::new(0),
         }
     }
 
@@ -754,5 +760,33 @@ impl IfaceCommon {
         let before = neighbors.len();
         neighbors.retain(|existing| existing.ip_addr != ip_addr);
         neighbors.len() != before
+    }
+
+    /// 调整混杂模式引用计数，仅在 0↔非0 转换时原子修改 flag。
+    pub fn adjust_promiscuity(&self, inc: i32) {
+        let old = self.promiscuity.fetch_add(inc, Ordering::AcqRel);
+        let was_active = old > 0;
+        let now_active = old + inc > 0;
+        if !was_active && now_active {
+            self.flags
+                .fetch_or(InterfaceFlags::PROMISC.bits(), Ordering::Release);
+        } else if was_active && !now_active {
+            self.flags
+                .fetch_and(!InterfaceFlags::PROMISC.bits(), Ordering::Release);
+        }
+    }
+
+    /// 调整全多播引用计数。
+    pub fn adjust_allmulti(&self, inc: i32) {
+        let old = self.allmulti.fetch_add(inc, Ordering::AcqRel);
+        let was_active = old > 0;
+        let now_active = old + inc > 0;
+        if !was_active && now_active {
+            self.flags
+                .fetch_or(InterfaceFlags::ALLMULTI.bits(), Ordering::Release);
+        } else if was_active && !now_active {
+            self.flags
+                .fetch_and(!InterfaceFlags::ALLMULTI.bits(), Ordering::Release);
+        }
     }
 }

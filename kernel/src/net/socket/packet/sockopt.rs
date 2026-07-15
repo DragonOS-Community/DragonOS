@@ -65,9 +65,8 @@ impl PacketSocket {
         match level {
             PSOL::SOCKET => self.set_socket_option(name, value),
             PSOL::PACKET => match name {
-                packet_option::PACKET_ADD_MEMBERSHIP | packet_option::PACKET_DROP_MEMBERSHIP => {
-                    Ok(())
-                }
+                packet_option::PACKET_ADD_MEMBERSHIP => self.add_membership(value),
+                packet_option::PACKET_DROP_MEMBERSHIP => self.drop_membership(value),
                 packet_option::PACKET_AUXDATA => {
                     self.options.write().auxdata = Self::parse_i32(value)? != 0;
                     Ok(())

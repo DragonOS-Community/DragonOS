@@ -211,8 +211,8 @@ TEST(AfPacketMcast, AddDropMembershipAllmulti) {
         << ErrnoString(errno) << " (should restore)";
 }
 
-// origin/master keeps membership as an unconditional compatibility no-op.
-TEST(AfPacketMcast, ArbitraryMembershipPayloadRemainsCompatible) {
+// DragonOS rejects invalid mr_type with EINVAL (stricter than Linux 6.6 which accepts it).
+TEST(AfPacketMcast, InvalidMrTypeReturnsEINVAL) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
@@ -224,11 +224,11 @@ TEST(AfPacketMcast, ArbitraryMembershipPayloadRemainsCompatible) {
     mreq.mr_ifindex = static_cast<unsigned int>(ifindex);
     mreq.mr_type = 999;  // invalid type
     errno = 0;
-    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
-        << ErrnoString(errno);
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), -1);
+    EXPECT_EQ(errno, EINVAL);
 }
 
-TEST(AfPacketMcast, UnknownIfindexRemainsCompatibleNoop) {
+TEST(AfPacketMcast, UnknownIfindexReturnsENODEV) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
@@ -240,8 +240,8 @@ TEST(AfPacketMcast, UnknownIfindexRemainsCompatibleNoop) {
     mreq.mr_ifindex = 99999;  // non-existent interface
     mreq.mr_type = PACKET_MR_PROMISC;
     errno = 0;
-    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
-        << ErrnoString(errno);
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), -1);
+    EXPECT_EQ(errno, ENODEV);
 }
 
 // ===== Test 6: ADD/DROP MEMBERSHIP (PACKET_MR_MULTICAST, specific multicast MAC) =====

@@ -78,6 +78,7 @@ impl PacketSocket {
 
     pub(super) fn close_binding(&self) -> Result<(), SystemError> {
         let _guard = self.bind_lock.lock();
+        self.revert_all_memberships();
         self.netns.unregister_packet_socket(&self.self_ref);
         *self.bound_iface.write() = None;
         self.binding.store(0, 0);

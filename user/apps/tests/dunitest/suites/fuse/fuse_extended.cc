@@ -172,6 +172,8 @@ struct p4_readdir_daemon_args {
     uint32_t dir_opcode_trace[16];
     uint64_t dir_offset_trace[16];
     int one_entry_per_reply;
+    int zero_first_cookie;
+    int duplicate_middle_cookie;
 };
 
 struct p4_linux_dirent64 {
@@ -198,12 +200,23 @@ static const struct p4_mock_dir_entry p4_mock_dir_entries[] = {
     {"beta.txt", 4, 4, DT_REG, 65537},
 };
 
+static uint64_t p4_mock_cookie(const struct p4_readdir_daemon_args *args, size_t index) {
+    if (args->zero_first_cookie && index == 0) {
+        return 0;
+    }
+    if (args->duplicate_middle_cookie && index == 3) {
+        return p4_mock_dir_entries[2].next_cookie;
+    }
+    return p4_mock_dir_entries[index].next_cookie;
+}
+
 struct p4_shared_readdir_args {
     int fd;
     volatile int *ready;
     volatile int *go;
     pthread_mutex_t *lock;
     unsigned int *name_counts;
+    const int64_t *expected_cookies;
     volatile int error;
 };
 
@@ -246,7 +259,7 @@ static void *p4_shared_readdir_thread(void *opaque) {
         struct p4_linux_dirent64 *entry = (struct p4_linux_dirent64 *)buf;
         int index = p4_mock_entry_index(entry->d_name);
         if (index < 0 || entry->d_reclen != (unsigned short)n ||
-            entry->d_off != (int64_t)p4_mock_dir_entries[index].next_cookie ||
+            entry->d_off != args->expected_cookies[index] ||
             entry->d_ino != p4_mock_dir_entries[index].ino ||
             entry->d_type != p4_mock_dir_entries[index].type) {
             args->error = EIO;
@@ -296,7 +309,7 @@ static int p4_handle_readdir(struct p4_readdir_daemon_args *args,
     if (in->offset != 0) {
         bool found = false;
         for (size_t i = 0; i < sizeof(p4_mock_dir_entries) / sizeof(p4_mock_dir_entries[0]); i++) {
-            if (p4_mock_dir_entries[i].next_cookie == in->offset) {
+            if (p4_mock_cookie(args, i) == in->offset) {
                 index = i + 1;
                 found = true;
                 break;
@@ -313,6 +326,7 @@ static int p4_handle_readdir(struct p4_readdir_daemon_args *args,
     size_t output_limit = in->size < sizeof(outbuf) ? in->size : sizeof(outbuf);
     for (; index < sizeof(p4_mock_dir_entries) / sizeof(p4_mock_dir_entries[0]); index++) {
         const struct p4_mock_dir_entry *entry = &p4_mock_dir_entries[index];
+        uint64_t next_cookie = p4_mock_cookie(args, index);
         size_t name_len = strlen(entry->name);
         size_t record_len =
             plus ? fuse_direntplus_rec_len(name_len) : fuse_dirent_rec_len(name_len);
@@ -331,7 +345,7 @@ static int p4_handle_readdir(struct p4_readdir_daemon_args *args,
                 simplefs_fill_attr(node, &dirent.entry_out.attr);
             }
             dirent.dirent.ino = entry->ino;
-            dirent.dirent.off = entry->next_cookie;
+            dirent.dirent.off = next_cookie;
             dirent.dirent.namelen = (uint32_t)name_len;
             dirent.dirent.type = entry->type;
             memcpy(outbuf + outlen, &dirent, sizeof(dirent));
@@ -340,7 +354,7 @@ static int p4_handle_readdir(struct p4_readdir_daemon_args *args,
             struct fuse_dirent dirent;
             memset(&dirent, 0, sizeof(dirent));
             dirent.ino = entry->ino;
-            dirent.off = entry->next_cookie;
+            dirent.off = next_cookie;
             dirent.namelen = (uint32_t)name_len;
             dirent.type = entry->type;
             memcpy(outbuf + outlen, &dirent, sizeof(dirent));
@@ -9745,7 +9759,7 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
     volatile int init_done = 0;
     struct p4_readdir_daemon_args args;
     const char *expected_names[] = {".", "..", "hello.txt", "alpha.txt", "beta.txt"};
-    const int64_t expected_cookies[] = {11, 29, 101, 4099, 65537};
+    const int64_t expected_cookies[] = {0, 29, 101, 101, 65537};
     uint64_t overlay_inos[5] = {0};
     uint32_t lookup_before = 0;
     uint32_t getattr_before = 0;
@@ -9786,6 +9800,8 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
     args.common.attr_valid_sec = 60;
     args.common.init_out_flags_override =
         FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_NO_OPENDIR_SUPPORT;
+    args.zero_first_cookie = 1;
+    args.duplicate_middle_cookie = 1;
     if (pthread_create(&daemon_thread, NULL, p4_readdir_daemon_thread, &args) != 0) {
         printf("[FAIL] pthread_create\n");
         close(fuse_fd);
@@ -9829,6 +9845,7 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
         reader_args[i].go = &start_readers;
         reader_args[i].lock = &counts_lock;
         reader_args[i].name_counts = concurrent_name_counts;
+        reader_args[i].expected_cookies = expected_cookies;
         if (pthread_create(&reader_threads[i], NULL, p4_shared_readdir_thread,
                            &reader_args[i]) != 0) {
             printf("[FAIL] pthread_create shared readdir reader\n");
@@ -9887,6 +9904,11 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
                    entry->d_name, (long long)entry->d_off, entry->d_reclen, n);
             goto fail;
         }
+        if (lseek(dir_fd, 0, SEEK_CUR) != expected_cookies[seen]) {
+            printf("[FAIL] SEEK_CUR query changed opaque cookie at entry %zu: %s (errno=%d)\n",
+                   seen, strerror(errno), errno);
+            goto fail;
+        }
         seen++;
     }
     if (seen != 5 || args.lookup_count != lookup_before || args.getattr_count != getattr_before ||
@@ -9929,7 +9951,7 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
         goto fail;
     }
     resumed = (struct p4_linux_dirent64 *)resume_buf;
-    if (strcmp(resumed->d_name, "alpha.txt") != 0 || resumed->d_off != 4099) {
+    if (strcmp(resumed->d_name, "alpha.txt") != 0 || resumed->d_off != 101) {
         printf("[FAIL] cookie resume name=%s off=%lld\n", resumed->d_name,
                (long long)resumed->d_off);
         goto fail;
@@ -9953,7 +9975,7 @@ static int ext_test_readdir_typed_entries_avoid_n_plus_one_and_preserve_cookies(
         goto fail;
     }
     resumed = (struct p4_linux_dirent64 *)resume_buf;
-    if (strcmp(resumed->d_name, "alpha.txt") != 0 || resumed->d_off != 4099) {
+    if (strcmp(resumed->d_name, "alpha.txt") != 0 || resumed->d_off != 101) {
         printf("[FAIL] snapshot-reset cookie resume name=%s off=%lld\n", resumed->d_name,
                (long long)resumed->d_off);
         goto fail;

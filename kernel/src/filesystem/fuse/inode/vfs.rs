@@ -930,12 +930,13 @@ impl IndexNode for FuseNode {
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
         self.list_entries()?
+            .expect("FUSE provides native directory entries")
             .into_iter()
             .map(|entry| String::from_utf8(entry.name).map_err(|_| SystemError::EIO))
             .collect()
     }
 
-    fn list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
 
@@ -1015,7 +1016,7 @@ impl IndexNode for FuseNode {
                 }
                 offset = last_off;
             }
-            Ok(entries)
+            Ok(Some(entries))
         })();
 
         // RELEASEDIR (best-effort)

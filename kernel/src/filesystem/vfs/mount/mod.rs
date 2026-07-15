@@ -3800,7 +3800,7 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
-    fn list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
         self.dentry.inode.list_entries()
     }
 

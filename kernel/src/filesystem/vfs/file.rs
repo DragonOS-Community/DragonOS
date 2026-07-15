@@ -623,22 +623,74 @@ pub struct File {
     _mount_guard: Option<MountExternalGuard>,
 }
 
+#[derive(Debug, Clone)]
+enum ReaddirSnapshot {
+    Typed(Arc<[DirectoryEntry]>),
+    Names(Arc<[String]>),
+}
+
+impl ReaddirSnapshot {
+    fn len(&self) -> usize {
+        match self {
+            Self::Typed(entries) => entries.len(),
+            Self::Names(names) => names.len(),
+        }
+    }
+
+    fn cookie_after(&self, index: usize) -> Option<u64> {
+        match self {
+            Self::Typed(entries) => entries.get(index).map(|entry| entry.next_cookie),
+            Self::Names(names) => (index < names.len()).then(|| (index + 1) as u64),
+        }
+    }
+
+    fn index_after_cookie(&self, cookie: u64) -> usize {
+        match self {
+            Self::Typed(entries) => entries
+                .iter()
+                .position(|entry| entry.next_cookie == cookie)
+                .map_or(entries.len(), |index| index + 1),
+            Self::Names(names) => usize::try_from(cookie)
+                .ok()
+                .filter(|index| *index <= names.len())
+                .unwrap_or(names.len()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ReaddirState {
-    entries: Option<Arc<[DirectoryEntry]>>,
+    snapshot: Option<ReaddirSnapshot>,
     next_index: usize,
 }
 
 impl ReaddirState {
     fn resume_after_cookie(&mut self, cookie: u64) {
-        let Some(entries) = self.entries.as_ref() else {
+        let Some(snapshot) = self.snapshot.as_ref() else {
             self.next_index = 0;
             return;
         };
-        self.next_index = entries
-            .iter()
-            .position(|entry| entry.next_cookie == cookie)
-            .map_or(entries.len(), |index| index + 1);
+        self.next_index = snapshot.index_after_cookie(cookie);
+    }
+}
+
+fn checked_dirent_cookie(cookie: u64) -> Result<usize, SystemError> {
+    let cookie = i64::try_from(cookie).map_err(|_| SystemError::EOVERFLOW)?;
+    usize::try_from(cookie).map_err(|_| SystemError::EOVERFLOW)
+}
+
+#[cfg(test)]
+mod readdir_tests {
+    use super::checked_dirent_cookie;
+    use system_error::SystemError;
+
+    #[test]
+    fn dirent_cookie_must_fit_signed_offset() {
+        assert_eq!(checked_dirent_cookie(1), Ok(1));
+        assert_eq!(
+            checked_dirent_cookie(i64::MAX as u64 + 1),
+            Err(SystemError::EOVERFLOW)
+        );
     }
 }
 
@@ -1549,6 +1601,7 @@ impl File {
             let mut state = self.readdir_state.lock();
             let pos = match origin {
                 SeekFrom::SeekSet(offset) => offset,
+                SeekFrom::SeekCurrent(0) => return Ok(self.offset.load(Ordering::SeqCst)),
                 SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
                 SeekFrom::SeekEnd(_) => {
                     // Preserve the existing directory SEEK_END behavior.
@@ -1560,7 +1613,7 @@ impl File {
                 return Err(SystemError::EINVAL);
             }
             if pos == 0 {
-                state.entries = None;
+                state.snapshot = None;
                 state.next_index = 0;
             } else {
                 state.resume_after_cookie(pos as u64);
@@ -1655,39 +1708,76 @@ impl File {
         // 文件偏移被 seek 到 0 之前复用该缓存。
         let mut state = self.readdir_state.lock();
         let current_cookie = self.offset.load(Ordering::SeqCst) as u64;
-        if state.entries.is_none() {
-            state.entries = Some(Arc::from(inode.list_entries()?));
+        if state.snapshot.is_none() {
+            state.snapshot = Some(match inode.list_entries()? {
+                Some(entries) => ReaddirSnapshot::Typed(Arc::from(entries)),
+                None => ReaddirSnapshot::Names(Arc::from(inode.list()?)),
+            });
             if current_cookie == 0 {
                 state.next_index = 0;
             } else {
                 state.resume_after_cookie(current_cookie);
             }
         } else {
-            let expected_cookie = state.entries.as_ref().and_then(|entries| {
+            let expected_cookie = state.snapshot.as_ref().and_then(|snapshot| {
                 state
                     .next_index
                     .checked_sub(1)
-                    .and_then(|index| entries.get(index))
-                    .map(|entry| entry.next_cookie)
+                    .and_then(|index| snapshot.cookie_after(index))
             });
             if state.next_index > 0 && expected_cookie != Some(current_cookie) {
                 state.resume_after_cookie(current_cookie);
             }
         }
 
-        let entries = state
-            .entries
+        let snapshot = state
+            .snapshot
             .as_ref()
             .expect("readdir snapshot initialized")
             .clone();
-        if state.next_index > entries.len() {
+        if state.next_index > snapshot.len() {
             return Err(SystemError::EINVAL);
         }
-        while state.next_index < entries.len() {
-            let entry = &entries[state.next_index];
-            let next_cookie =
-                usize::try_from(entry.next_cookie).map_err(|_| SystemError::EOVERFLOW)?;
-            match ctx.fill_dir(&entry.name, next_cookie, entry.ino, entry.d_type) {
+        while state.next_index < snapshot.len() {
+            let index = state.next_index;
+            let (name, cookie, metadata) = match &snapshot {
+                ReaddirSnapshot::Typed(entries) => {
+                    let entry = &entries[index];
+                    (
+                        entry.name.as_slice(),
+                        entry.next_cookie,
+                        Some((entry.ino, entry.d_type)),
+                    )
+                }
+                ReaddirSnapshot::Names(names) => {
+                    let name = &names[index];
+                    (name.as_bytes(), (index + 1) as u64, None)
+                }
+            };
+            let next_cookie = checked_dirent_cookie(cookie)?;
+            let (ino, d_type) = if let Some(metadata) = metadata {
+                metadata
+            } else {
+                let metadata = match name {
+                    b"." => inode.metadata(),
+                    b".." => inode.parent().and_then(|parent| parent.metadata()),
+                    _ => inode.find_bytes(name).and_then(|child| child.metadata()),
+                };
+                let metadata = match metadata {
+                    Ok(metadata) => metadata,
+                    Err(SystemError::ENOENT) => {
+                        state.next_index += 1;
+                        self.offset.store(next_cookie, Ordering::SeqCst);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                (
+                    metadata.inode_id.into() as u64,
+                    metadata.file_type.get_file_type_num() as u8,
+                )
+            };
+            match ctx.fill_dir(name, next_cookie, ino, d_type) {
                 Ok(_) => {
                     state.next_index += 1;
                     self.offset.store(next_cookie, Ordering::SeqCst);

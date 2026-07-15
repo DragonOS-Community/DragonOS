@@ -114,7 +114,7 @@ fn merge_layer(
     needs_overlay_metadata: &mut BTreeSet<Vec<u8>>,
     map_all_visible: bool,
 ) -> Result<(), SystemError> {
-    for entry in layer.list_entries()? {
+    for entry in layer.materialize_list_entries()? {
         if !seen.insert(entry.name.clone()) {
             continue;
         }

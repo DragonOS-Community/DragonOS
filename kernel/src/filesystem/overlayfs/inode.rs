@@ -520,8 +520,8 @@ impl IndexNode for OvlInode {
         readdir::list(self)
     }
 
-    fn list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
-        readdir::list_entries(self)
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        readdir::list_entries(self).map(Some)
     }
 
     fn mkdir(

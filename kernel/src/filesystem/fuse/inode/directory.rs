@@ -272,7 +272,7 @@ impl FuseNode {
             .map(|len| len & !(Self::FUSE_DIRENT_ALIGN - 1))
     }
 
-    fn forget_readdirplus_from(&self, payload: &[u8], mut pos: usize) {
+    fn visit_readdirplus_lookups(payload: &[u8], mut pos: usize, mut visit: impl FnMut(u64)) {
         while pos
             .checked_add(size_of::<FuseDirentPlus>())
             .is_some_and(|end| end <= payload.len())
@@ -280,6 +280,18 @@ impl FuseNode {
             let Ok(plus) = fuse_read_struct::<FuseDirentPlus>(&payload[pos..]) else {
                 break;
             };
+            let name_start = pos + size_of::<FuseDirentPlus>();
+            let Some(name_end) = name_start.checked_add(plus.dirent.namelen as usize) else {
+                break;
+            };
+            if name_end > payload.len() {
+                break;
+            }
+            let name = &payload[name_start..name_end];
+            let is_dot = name == b"." || name == b"..";
+            if !is_dot && plus.entry_out.nodeid != 0 {
+                visit(plus.entry_out.nodeid);
+            }
             let Some(rec_len) = Self::checked_dirent_record_len(
                 size_of::<FuseDirentPlus>(),
                 plus.dirent.namelen as usize,
@@ -289,15 +301,14 @@ impl FuseNode {
             if rec_len > payload.len() - pos {
                 break;
             }
-            let name_start = pos + size_of::<FuseDirentPlus>();
-            let name_end = name_start + plus.dirent.namelen as usize;
-            let name = &payload[name_start..name_end];
-            let is_dot = name == b"." || name == b"..";
-            if !is_dot && plus.entry_out.nodeid != 0 {
-                let _ = self.conn.queue_forget(plus.entry_out.nodeid, 1);
-            }
             pos += rec_len;
         }
+    }
+
+    fn forget_readdirplus_from(&self, payload: &[u8], pos: usize) {
+        Self::visit_readdirplus_lookups(payload, pos, |nodeid| {
+            let _ = self.conn.queue_forget(nodeid, 1);
+        });
     }
 
     fn cache_child_from_entry(&self, entry: &FuseEntryOut, name: &str, request_epoch: u64) {
@@ -362,6 +373,7 @@ impl FuseNode {
                 break;
             };
             if rec_len > payload.len() - pos {
+                self.forget_readdirplus_from(payload, pos);
                 break;
             }
             let name_end = name_start + dirent.namelen as usize;
@@ -508,12 +520,13 @@ impl FuseNode {
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
+    use core::mem::size_of;
 
     use super::FuseNode;
     use crate::{
         arch::MMArch,
         filesystem::{
-            fuse::protocol::{fuse_pack_struct, FuseDirent},
+            fuse::protocol::{fuse_pack_struct, FuseDirent, FuseDirentPlus},
             vfs::{DT_DIR, DT_REG},
         },
         mm::MemoryManagementArch,
@@ -624,5 +637,23 @@ mod tests {
             Ok(7)
         );
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn truncated_readdirplus_padding_still_visits_lookup() {
+        // FuseDirentPlus is an integer-only wire structure.
+        let mut plus: FuseDirentPlus = unsafe { core::mem::zeroed() };
+        plus.entry_out.nodeid = 42;
+        plus.dirent.namelen = 3;
+        let mut payload = fuse_pack_struct(&plus).to_vec();
+        payload.extend_from_slice(b"abc");
+        assert!(
+            FuseNode::checked_dirent_record_len(size_of::<FuseDirentPlus>(), 3).unwrap()
+                > payload.len()
+        );
+
+        let mut nodeids = Vec::new();
+        FuseNode::visit_readdirplus_lookups(&payload, 0, |nodeid| nodeids.push(nodeid));
+        assert_eq!(nodeids, [42]);
     }
 }

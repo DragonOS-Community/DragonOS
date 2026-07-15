@@ -1019,16 +1019,22 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Err(SystemError::ENOTDIR)
     }
 
-    /// List directory records including the inode number, type and continuation
-    /// cookie already known by the filesystem.
-    ///
-    /// The default keeps existing filesystems source-compatible. Implementations
-    /// with a native directory record format should override this method to avoid
-    /// one lookup and metadata fetch per entry.
-    fn list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+    /// Return directory records already typed by the filesystem. `None` keeps
+    /// legacy filesystems on the lazy name lookup path so a small getdents
+    /// buffer does not force metadata lookup for the entire directory.
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        Ok(None)
+    }
+
+    /// Materialize typed records for callers, such as overlay merging, that
+    /// necessarily need metadata for the complete directory.
+    fn materialize_list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+        if let Some(entries) = self.list_entries()? {
+            return Ok(entries);
+        }
         let names = self.list()?;
         let mut entries = Vec::with_capacity(names.len());
-        for name in names {
+        for (index, name) in names.into_iter().enumerate() {
             let metadata = match name.as_str() {
                 "." => self.metadata(),
                 ".." => self.parent().and_then(|parent| parent.metadata()),
@@ -1047,7 +1053,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
                 name: name.into_bytes(),
                 ino: metadata.inode_id.into() as u64,
                 d_type: metadata.file_type.get_file_type_num() as u8,
-                next_cookie: (entries.len() + 1) as u64,
+                next_cookie: (index + 1) as u64,
             });
         }
         Ok(entries)

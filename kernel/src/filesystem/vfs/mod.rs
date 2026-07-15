@@ -302,7 +302,8 @@ pub const DT_MAX: u16 = 16;
 /// vector index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryEntry {
-    pub name: String,
+    /// Raw name bytes; Linux directory entries do not require UTF-8.
+    pub name: Vec<u8>,
     pub ino: u64,
     pub d_type: u8,
     pub next_cookie: u64,
@@ -945,6 +946,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Look up a child by its raw directory-entry name. Filesystems whose
+    /// on-wire names are byte strings should override this method.
+    fn find_bytes(&self, name: &[u8]) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let name = core::str::from_utf8(name).map_err(|_| SystemError::EIO)?;
+        self.find(name)
+    }
+
     /// @brief 根据inode号，获取子目录项的名字
     ///
     /// @param ino inode号
@@ -1036,7 +1044,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
                 Err(error) => return Err(error),
             };
             entries.push(DirectoryEntry {
-                name,
+                name: name.into_bytes(),
                 ino: metadata.inode_id.into() as u64,
                 d_type: metadata.file_type.get_file_type_num() as u8,
                 next_cookie: (entries.len() + 1) as u64,
@@ -2287,13 +2295,13 @@ impl<'a> FilldirContext<'a> {
     /// - d_type 目录项的inode的file_type_num
     pub(crate) fn fill_dir(
         &mut self,
-        name: &str,
+        name: &[u8],
         offset: usize,
         ino: u64,
         d_type: u8,
     ) -> Result<(), SystemError> {
         let name_len = name.len();
-        let name_bytes = name.as_bytes();
+        let name_bytes = name;
 
         // 根据格式计算基础结构大小
         // linux_dirent (旧格式): d_ino(8) + d_off(8) + d_reclen(2) = 18 bytes

@@ -1645,13 +1645,10 @@ impl File {
         // 文件偏移被 seek 到 0 之前复用该缓存。
         let mut state = self.readdir_state.lock();
         let current_cookie = self.offset.load(Ordering::SeqCst) as u64;
-        if current_cookie == 0 {
+        if state.entries.is_none() {
             state.entries = Some(Arc::from(inode.list_entries()?));
             state.next_index = 0;
         } else {
-            if state.entries.is_none() {
-                state.entries = Some(Arc::from(inode.list_entries()?));
-            }
             let expected_cookie = state.entries.as_ref().and_then(|entries| {
                 state
                     .next_index
@@ -1659,7 +1656,7 @@ impl File {
                     .and_then(|index| entries.get(index))
                     .map(|entry| entry.next_cookie)
             });
-            if expected_cookie != Some(current_cookie) {
+            if state.next_index > 0 && expected_cookie != Some(current_cookie) {
                 let entries = state
                     .entries
                     .as_ref()

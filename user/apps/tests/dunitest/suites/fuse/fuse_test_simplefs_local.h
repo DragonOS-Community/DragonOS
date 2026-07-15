@@ -1322,6 +1322,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 memset(&dp, 0, sizeof(dp));
                 dp.entry_out.nodeid = 1;
                 dp.entry_out.generation = a->fs.nodes[0].generation;
+                dp.entry_out.entry_valid = a->entry_valid_sec;
+                dp.entry_out.attr_valid = a->attr_valid_sec;
                 simplefs_fill_attr(&a->fs.nodes[0], &dp.entry_out.attr);
                 dp.dirent.ino = 1;
                 dp.dirent.off = idx + 1;
@@ -1347,7 +1349,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         uint64_t cur = idx;
         for (int i = 0; i < SIMPLEFS_MAX_NODES; i++) {
             struct simplefs_node *c = &a->fs.nodes[i];
-            if (!c->used || c->parent != h->nodeid)
+            if (!c->used || c->nodeid == h->nodeid || c->parent != h->nodeid)
                 continue;
             if (cur < child_base) {
                 cur = child_base;
@@ -1367,6 +1369,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 memset(&dp, 0, sizeof(dp));
                 dp.entry_out.nodeid = c->nodeid;
                 dp.entry_out.generation = c->generation;
+                dp.entry_out.entry_valid = a->entry_valid_sec;
+                dp.entry_out.attr_valid = a->attr_valid_sec;
                 simplefs_fill_attr(c, &dp.entry_out.attr);
                 if (a->readdirplus_invalid_attr_name &&
                     strcmp(c->name, a->readdirplus_invalid_attr_name) == 0) {

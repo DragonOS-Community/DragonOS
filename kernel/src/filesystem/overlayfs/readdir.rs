@@ -7,10 +7,10 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 pub(super) fn list(inode: &OvlInode) -> Result<Vec<String>, SystemError> {
-    Ok(list_entries(inode)?
+    list_entries(inode)?
         .into_iter()
-        .map(|entry| entry.name)
-        .collect())
+        .map(|entry| String::from_utf8(entry.name).map_err(|_| SystemError::EIO))
+        .collect()
 }
 
 pub(super) fn list_entries(inode: &OvlInode) -> Result<Vec<DirectoryEntry>, SystemError> {
@@ -24,10 +24,10 @@ pub(super) fn list_entries(inode: &OvlInode) -> Result<Vec<DirectoryEntry>, Syst
 }
 
 pub(super) fn list_locked(inode: &OvlInode, state: &DirState) -> Result<Vec<String>, SystemError> {
-    Ok(list_entries_locked(inode, state, None, false)?
+    list_entries_locked(inode, state, None, false)?
         .into_iter()
-        .map(|entry| entry.name)
-        .collect())
+        .map(|entry| String::from_utf8(entry.name).map_err(|_| SystemError::EIO))
+        .collect()
 }
 
 fn list_entries_locked(
@@ -67,12 +67,12 @@ fn list_entries_locked(
         let mut mapped_entries = Vec::with_capacity(entries.len());
         for mut entry in entries {
             if needs_overlay_metadata.contains(&entry.name) {
-                let mapped_ino = if entry.name == "." {
+                let mapped_ino = if entry.name == b"." {
                     dot_inos.map(|(dot, _)| dot)
-                } else if entry.name == ".." {
+                } else if entry.name == b".." {
                     dot_inos.map(|(_, dotdot)| dotdot)
-                } else {
-                    let child = match super::lookup::find_locked(inode, &entry.name, state) {
+                } else if let Ok(name) = core::str::from_utf8(&entry.name) {
+                    let child = match super::lookup::find_locked(inode, name, state) {
                         Ok(child) => child,
                         Err(SystemError::ENOENT) => continue,
                         Err(err) => return Err(err),
@@ -82,6 +82,10 @@ fn list_entries_locked(
                         Err(SystemError::ENOENT) => continue,
                         Err(err) => return Err(err),
                     }
+                } else {
+                    // The current pathname lookup API is UTF-8-only. Preserve the
+                    // filesystem-supplied inode number for byte-only names.
+                    None
                 };
                 if let Some(mapped_ino) = mapped_ino {
                     entry.ino = mapped_ino;
@@ -106,8 +110,8 @@ fn list_entries_locked(
 fn merge_layer(
     layer: &Arc<dyn IndexNode>,
     entries: &mut Vec<DirectoryEntry>,
-    seen: &mut BTreeSet<String>,
-    needs_overlay_metadata: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<Vec<u8>>,
+    needs_overlay_metadata: &mut BTreeSet<Vec<u8>>,
     map_all_visible: bool,
 ) -> Result<(), SystemError> {
     for entry in layer.list_entries()? {
@@ -117,7 +121,7 @@ fn merge_layer(
         let visible = if is_dot_entry(&entry.name) {
             true
         } else if entry.d_type as u16 == DT_CHR || entry.d_type as u16 == DT_UNKNOWN {
-            match layer.find(&entry.name) {
+            match layer.find_bytes(&entry.name) {
                 Ok(found) => !OvlInode::is_whiteout_inode_checked(&found)?,
                 Err(SystemError::ENOENT) => false,
                 Err(err) => return Err(err),
@@ -139,6 +143,6 @@ fn merge_layer(
     Ok(())
 }
 
-fn is_dot_entry(name: &str) -> bool {
-    name == "." || name == ".."
+fn is_dot_entry(name: &[u8]) -> bool {
+    name == b"." || name == b".."
 }

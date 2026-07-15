@@ -335,6 +335,7 @@ struct FuseLookupCacheEntry {
 impl FuseNode {
     const FUSE_DIRENT_ALIGN: usize = 8;
     const LOOKUP_CACHE_MAX_ENTRIES: usize = 1024;
+    const LOOKUP_CACHE_PRUNE_BUDGET: usize = 64;
     const READDIR_BUFFER_SIZE: usize = 64 * 1024;
     const XATTR_SIZE_MAX: usize = 65536;
     const XATTR_LIST_MAX: usize = 65536;
@@ -1380,16 +1381,20 @@ impl FuseNode {
     }
 
     fn request_name(&self, opcode: u32, nodeid: u64, name: &str) -> Result<FuseReply, SystemError> {
-        self.check_not_stale()?;
-        let payload = Self::pack_name_payload(name);
-        self.conn().request(opcode, nodeid, &payload)
+        self.request_name_bytes(opcode, nodeid, name.as_bytes())
     }
 
-    fn pack_name_payload(name: &str) -> Vec<u8> {
+    fn request_name_bytes(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        name: &[u8],
+    ) -> Result<FuseReply, SystemError> {
+        self.check_not_stale()?;
         let mut payload = Vec::with_capacity(name.len() + 1);
-        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(name);
         payload.push(0);
-        payload
+        self.conn().request(opcode, nodeid, &payload)
     }
 
     fn pack_struct_and_name_payload<T: Copy>(inarg: &T, name: &str) -> Vec<u8> {

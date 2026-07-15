@@ -3761,6 +3761,16 @@ impl IndexNode for MountFSInode {
         }
     }
 
+    fn find_bytes(&self, name: &[u8]) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if let Ok(name) = core::str::from_utf8(name) {
+            return self.find(name);
+        }
+        // Mount dentries are currently keyed by UTF-8 DName. Raw-name lookup is
+        // still required for metadata/whiteout checks during getdents, so pass
+        // byte-only names to the backing filesystem without inventing a lossy key.
+        self.dentry.inode.find_bytes(name)
+    }
+
     #[inline]
     fn get_entry_name(&self, ino: InodeId) -> Result<alloc::string::String, SystemError> {
         return self.dentry.inode.get_entry_name(ino);

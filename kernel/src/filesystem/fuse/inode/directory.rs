@@ -86,6 +86,7 @@ impl FuseNode {
             return;
         }
         let deadline_ticks = Self::cache_deadline(valid, valid_nsec);
+        self.prune_expired_lookup_cache_lru();
 
         let mut removed = Vec::new();
         {
@@ -163,6 +164,7 @@ impl FuseNode {
     }
 
     pub(super) fn lookup_cached_child(&self, name: &str) -> Option<Arc<FuseNode>> {
+        self.prune_expired_lookup_cache_lru();
         let entry = self.lookup_cache.lock().get(name).cloned()?;
         let now = Self::now_ticks();
         if !Self::lookup_cache_entry_expired_or_stale(&entry, now) {
@@ -212,6 +214,30 @@ impl FuseNode {
             || entry.child.dax_dontcache()
             || entry.child.check_not_stale().is_err()
             || entry.child.generation() != entry.generation
+    }
+
+    /// Reclaim expired entries from the LRU edge without scanning the cache or
+    /// promoting live entries. A live oldest entry stops the best-effort pass;
+    /// every named lookup still validates its target lazily.
+    fn prune_expired_lookup_cache_lru(&self) {
+        let now = Self::now_ticks();
+        let removed = {
+            let mut cache = self.lookup_cache.lock();
+            let mut removed = Vec::new();
+            for _ in 0..Self::LOOKUP_CACHE_PRUNE_BUDGET {
+                let Some((_name, entry)) = cache.peek_lru() else {
+                    break;
+                };
+                if !Self::lookup_cache_entry_expired_or_stale(entry, now) {
+                    break;
+                }
+                if let Some((_name, entry)) = cache.pop_lru() {
+                    removed.push(entry);
+                }
+            }
+            removed
+        };
+        Self::clear_removed_lookup_entries(removed);
     }
 
     fn take_lookup_cache_entries(&self) -> Vec<FuseLookupCacheEntry> {
@@ -348,21 +374,18 @@ impl FuseNode {
                 self.forget_readdirplus_from(payload, pos);
                 return Err(SystemError::EIO);
             }
-            let name = match core::str::from_utf8(name_bytes) {
-                Ok(name) => name,
-                Err(_) => {
-                    self.forget_readdirplus_from(payload, pos);
-                    return Err(SystemError::EIO);
-                }
-            };
             entries.push(DirectoryEntry {
-                name: name.to_string(),
+                name: name_bytes.to_vec(),
                 ino: dirent.ino,
                 d_type: dirent.typ as u8,
                 next_cookie: dirent.off,
             });
-            if name != "." && name != ".." {
-                self.cache_child_from_entry(&plus.entry_out, name, request_epoch);
+            if name_bytes != b"." && name_bytes != b".." {
+                if let Ok(name) = core::str::from_utf8(name_bytes) {
+                    self.cache_child_from_entry(&plus.entry_out, name, request_epoch);
+                } else if plus.entry_out.nodeid != 0 {
+                    let _ = self.conn.queue_forget(plus.entry_out.nodeid, 1);
+                }
             }
 
             last_off = dirent.off;
@@ -397,9 +420,8 @@ impl FuseNode {
             {
                 return Err(SystemError::EIO);
             }
-            let name = core::str::from_utf8(name_bytes).map_err(|_| SystemError::EIO)?;
             entries.push(DirectoryEntry {
-                name: name.to_string(),
+                name: name_bytes.to_vec(),
                 ino: dirent.ino,
                 d_type: dirent.typ as u8,
                 next_cookie: dirent.off,
@@ -497,7 +519,7 @@ mod tests {
         mm::MemoryManagementArch,
     };
 
-    fn push_dirent(payload: &mut Vec<u8>, ino: u64, cookie: u64, typ: u32, name: &str) {
+    fn push_dirent(payload: &mut Vec<u8>, ino: u64, cookie: u64, typ: u32, name: &[u8]) {
         let dirent = FuseDirent {
             ino,
             off: cookie,
@@ -505,7 +527,7 @@ mod tests {
             typ,
         };
         payload.extend_from_slice(fuse_pack_struct(&dirent));
-        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(name);
         payload.resize(FuseNode::align_dirent_record_len(payload.len()), 0);
     }
 
@@ -532,14 +554,14 @@ mod tests {
     #[test]
     fn readdir_parser_preserves_type_dot_entries_and_opaque_cookies() {
         let mut payload = Vec::new();
-        push_dirent(&mut payload, 10, 7, DT_DIR as u32, ".");
-        push_dirent(&mut payload, 11, 41, DT_REG as u32, "file");
+        push_dirent(&mut payload, 10, 7, DT_DIR as u32, b".");
+        push_dirent(&mut payload, 11, 41, DT_REG as u32, b"file");
 
         let mut entries = Vec::new();
         let last = FuseNode::parse_readdir_payload(&payload, &mut entries, 0).unwrap();
         assert_eq!(last, 41);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, ".");
+        assert_eq!(entries[0].name, b".");
         assert_eq!(entries[0].next_cookie, 7);
         assert_eq!(entries[1].ino, 11);
         assert_eq!(entries[1].d_type, DT_REG as u8);
@@ -549,7 +571,7 @@ mod tests {
     #[test]
     fn readdir_parser_rejects_names_with_slashes() {
         let mut payload = Vec::new();
-        push_dirent(&mut payload, 10, 1, DT_REG as u32, "bad/name");
+        push_dirent(&mut payload, 10, 1, DT_REG as u32, b"bad/name");
         let mut entries = Vec::new();
         assert_eq!(
             FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
@@ -560,7 +582,7 @@ mod tests {
     #[test]
     fn readdir_parser_does_not_emit_record_with_truncated_padding() {
         let mut payload = Vec::new();
-        push_dirent(&mut payload, 10, 7, DT_REG as u32, "x");
+        push_dirent(&mut payload, 10, 7, DT_REG as u32, b"x");
         payload.pop();
         let mut entries = Vec::new();
         assert_eq!(
@@ -568,5 +590,39 @@ mod tests {
             Ok(0)
         );
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn readdir_parser_preserves_non_utf8_names() {
+        let mut payload = Vec::new();
+        push_dirent(&mut payload, 10, 7, DT_REG as u32, b"f\xffo");
+        let mut entries = Vec::new();
+        assert_eq!(
+            FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
+            Ok(7)
+        );
+        assert_eq!(entries[0].name, b"f\xffo");
+    }
+
+    #[test]
+    fn readdir_parser_preserves_zero_and_repeated_cookies() {
+        let mut payload = Vec::new();
+        push_dirent(&mut payload, 10, 0, DT_REG as u32, b"zero");
+        let mut entries = Vec::new();
+        assert_eq!(
+            FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
+            Ok(0)
+        );
+        assert_eq!(entries[0].next_cookie, 0);
+
+        payload.clear();
+        push_dirent(&mut payload, 10, 7, DT_REG as u32, b"first");
+        push_dirent(&mut payload, 11, 7, DT_REG as u32, b"second");
+        entries.clear();
+        assert_eq!(
+            FuseNode::parse_readdir_payload(&payload, &mut entries, 0),
+            Ok(7)
+        );
+        assert_eq!(entries.len(), 2);
     }
 }

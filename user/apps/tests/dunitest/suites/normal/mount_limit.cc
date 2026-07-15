@@ -11,9 +11,13 @@
 #include <string>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000
+#endif
 #ifndef CLONE_NEWNS
 #define CLONE_NEWNS 0x00020000
 #endif
@@ -199,6 +203,83 @@ TEST_F(MountLimitTest, SysctlMatchesLinuxNumericSemantics) {
     EXPECT_EQ(12, read_mount_max());
     ASSERT_EQ(0, write_mount_max_text(" 12345 \n")) << strerror(errno);
     EXPECT_EQ(12345, read_mount_max());
+}
+
+TEST_F(MountLimitTest, SysctlWritePermissionUsesGlobalEffectiveUid) {
+    const int candidate = original_max_ - 1;
+    char text[32] = {};
+    const int text_len = snprintf(text, sizeof(text), "%d\n", candidate);
+    ASSERT_GT(text_len, 0);
+    ASSERT_LT(static_cast<size_t>(text_len), sizeof(text));
+
+    int inherited_fd = open(kMountMaxPath, O_WRONLY);
+    ASSERT_GE(inherited_fd, 0) << strerror(errno);
+    pid_t child = fork();
+    if (child < 0) {
+        const int saved_errno = errno;
+        close(inherited_fd);
+        errno = saved_errno;
+    }
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0) {
+            _exit(10);
+        }
+        if (setuid(1000) != 0) {
+            _exit(11);
+        }
+        if (unshare(CLONE_NEWUSER) != 0) {
+            _exit(12);
+        }
+
+        errno = 0;
+        if (pwrite(inherited_fd, text, static_cast<size_t>(text_len), 0) != -1 ||
+            errno != EPERM) {
+            _exit(13);
+        }
+        close(inherited_fd);
+
+        errno = 0;
+        int reopened_fd = open(kMountMaxPath, O_WRONLY);
+        if (reopened_fd < 0) {
+            _exit(errno == EACCES || errno == EPERM ? 0 : 14);
+        }
+        errno = 0;
+        const ssize_t written = write(reopened_fd, text, static_cast<size_t>(text_len));
+        const int write_errno = errno;
+        close(reopened_fd);
+        _exit(written == -1 && write_errno == EPERM ? 0 : 15);
+    }
+    close(inherited_fd);
+
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(child, waited) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    EXPECT_EQ(original_max_, read_mount_max());
+    ASSERT_EQ(0, write_mount_max(original_max_)) << strerror(errno);
+
+    child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER) != 0) {
+            _exit(20);
+        }
+        _exit(write_mount_max(candidate) == 0 ? 0 : 21);
+    }
+    status = 0;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(child, waited) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    EXPECT_EQ(candidate, read_mount_max());
+    ASSERT_EQ(0, write_mount_max(original_max_)) << strerror(errno);
 }
 
 TEST_F(MountLimitTest, SimpleBoundaryAndUnmountReleaseCapacity) {

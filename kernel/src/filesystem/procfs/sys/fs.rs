@@ -9,7 +9,10 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     libs::mutex::MutexGuard,
-    process::namespace::mnt::{mount_max, set_mount_max},
+    process::{
+        namespace::mnt::{mount_max, set_mount_max},
+        ProcessManager,
+    },
 };
 use alloc::{
     format,
@@ -92,6 +95,12 @@ impl FileOps for MountMaxFileOps {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        // Linux rechecks a 0644 sysctl against the caller's global effective
+        // UID on every write. In particular, capabilities gained by entering
+        // a child user namespace must not authorize this global parameter.
+        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+            return Err(SystemError::EPERM);
+        }
         // Linux strict numeric sysctls consume non-zero-offset writes without
         // changing the value.
         if offset != 0 {

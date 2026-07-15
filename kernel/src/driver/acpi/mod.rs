@@ -23,6 +23,7 @@ pub mod bus;
 pub mod glue;
 pub mod pmtmr;
 pub mod reboot;
+pub mod rsdp;
 mod sysfs;
 
 static mut __ACPI_TABLE: Option<acpi::AcpiTables<AcpiHandlerImpl>> = None;

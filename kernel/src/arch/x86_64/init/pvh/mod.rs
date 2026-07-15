@@ -9,7 +9,8 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     driver::{
-        serial::serial8250::send_to_default_serial8250_port, video::fbdev::base::BootTimeScreenInfo,
+        acpi::rsdp::find_rsdp_in_bios, serial::serial8250::send_to_default_serial8250_port,
+        video::fbdev::base::BootTimeScreenInfo,
     },
     init::{
         boot::{register_boot_callbacks, BootCallbacks, BootloaderAcpiArg},
@@ -29,14 +30,30 @@ impl BootCallbacks for PvhBootCallback {
     fn init_bootloader_name(&self) -> Result<Option<String>, SystemError> {
         return Ok(Some("x86 PVH".to_string()));
     }
-
+    
     fn init_acpi_args(&self) -> Result<BootloaderAcpiArg, SystemError> {
-        let rsdp_paddr = PhysAddr::new(START_INFO.get().rsdp_paddr as usize);
+        let si = START_INFO.get();
+        log::info!(
+            "pvh: HvmStartInfo: magic={:#010x} version={} flags={:#x} nr_modules={} rsdp_paddr={:#x} memmap_paddr={:#x} memmap_entries={}",
+            si.magic, si.version, si.flags, si.nr_modules,
+            si.rsdp_paddr, si.memmap_paddr, si.memmap_entries
+        );
+	
+        let rsdp_paddr = PhysAddr::new(si.rsdp_paddr as usize);
+
+	// if RSDP has been provided
         if rsdp_paddr.data() != 0 {
-            Ok(BootloaderAcpiArg::Rsdp(rsdp_paddr))
-        } else {
-            Ok(BootloaderAcpiArg::NotProvided)
+            return Ok(BootloaderAcpiArg::Rsdp(rsdp_paddr));
         }
+
+        log::info!("pvh: rsdp_paddr not provided, scanning BIOS area for RSDP");
+        if let Some(paddr) = find_rsdp_in_bios() {
+            log::info!("pvh: found RSDP at {:#x}", paddr.data());
+            return Ok(BootloaderAcpiArg::Rsdp(paddr));
+        }
+
+        log::warn!("pvh: RSDP not found");
+        Ok(BootloaderAcpiArg::NotProvided)
     }
 
     fn init_kernel_cmdline(&self) -> Result<(), SystemError> {
@@ -86,7 +103,7 @@ impl BootCallbacks for PvhBootCallback {
 
                 total_mem_size += size;
                 match typ {
-                    param::E820Type::Ram => {
+                    E820Type::Ram => {
                         usable_mem_size += size;
                         mem_block_manager()
                             .add_block(start, size)

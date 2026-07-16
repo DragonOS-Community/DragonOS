@@ -554,14 +554,7 @@ impl NetNamespace {
             // UNIQUEID always creates a fresh group with a kernel-assigned id;
             // it cannot attach to an existing group.
             let new_id = writer.id_alloc.alloc().ok_or(SystemError::ENOMEM)? as u16;
-            let group = FanoutGroup::new(
-                new_id,
-                mode,
-                flags,
-                sock_type,
-                bound_ifindex,
-                bound_protocol,
-            );
+            let group = FanoutGroup::new(new_id, params);
             writer.by_id.insert(new_id, group.clone());
             group
         } else {
@@ -581,14 +574,7 @@ impl NetNamespace {
                     if writer.id_alloc.alloc_specific(id_req as usize).is_none() {
                         return Err(SystemError::EINVAL);
                     }
-                    let group = FanoutGroup::new(
-                        id_req,
-                        mode,
-                        flags,
-                        sock_type,
-                        bound_ifindex,
-                        bound_protocol,
-                    );
+                    let group = FanoutGroup::new(id_req, params);
                     writer.by_id.insert(id_req, group.clone());
                     group
                 }
@@ -600,9 +586,7 @@ impl NetNamespace {
         group.add_member(socket.self_ref().clone());
         socket.set_fanout_group(group.clone());
 
-        let groups: Vec<Arc<FanoutGroup>> = writer.by_id.values().cloned().collect();
-        self.fanout_groups
-            .store_deferred(Arc::new(FanoutGroupRegistry { groups }));
+        self.publish_fanout_groups(&writer);
         self.fanout_groups_need_cleanup
             .store(false, Ordering::Release);
         Ok(())
@@ -628,9 +612,7 @@ impl NetNamespace {
         if group.live_count() == 0 {
             writer.by_id.remove(&group.id);
             writer.id_alloc.free(group.id as usize);
-            let groups: Vec<Arc<FanoutGroup>> = writer.by_id.values().cloned().collect();
-            self.fanout_groups
-                .store_deferred(Arc::new(FanoutGroupRegistry { groups }));
+            self.publish_fanout_groups(&writer);
         }
         self.fanout_groups_need_cleanup
             .store(false, Ordering::Release);
@@ -655,10 +637,15 @@ impl NetNamespace {
             writer.id_alloc.free(*id as usize);
         }
         if !dead.is_empty() {
-            let groups: Vec<Arc<FanoutGroup>> = writer.by_id.values().cloned().collect();
-            self.fanout_groups
-                .store_deferred(Arc::new(FanoutGroupRegistry { groups }));
+            self.publish_fanout_groups(&writer);
         }
+    }
+
+    /// Rebuild the registry Vec from `writer` and publish a fresh RCU snapshot.
+    fn publish_fanout_groups(&self, writer: &FanoutGroupWriter) {
+        let groups: Vec<Arc<FanoutGroup>> = writer.by_id.values().cloned().collect();
+        self.fanout_groups
+            .store_deferred(Arc::new(FanoutGroupRegistry { groups }));
     }
 
     #[inline]

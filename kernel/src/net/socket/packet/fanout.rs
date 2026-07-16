@@ -121,24 +121,17 @@ pub(crate) struct FanoutGroup {
 }
 
 impl FanoutGroup {
-    pub(crate) fn new(
-        id: u16,
-        mode: FanoutMode,
-        flags: u16,
-        sock_type: PacketSocketType,
-        bound_ifindex: u32,
-        bound_protocol: u16,
-    ) -> Arc<Self> {
+    pub(crate) fn new(id: u16, params: FanoutJoinParams) -> Arc<Self> {
         // A per-group random seed prevents flows from polarizing onto the same
         // member across groups that happen to share a hash function.
         let hash_seed = crate::arch::rand::rand() as u32;
         Arc::new(Self {
             id,
-            mode,
-            flags,
-            sock_type,
-            bound_ifindex,
-            bound_protocol,
+            mode: params.mode,
+            flags: params.flags,
+            sock_type: params.sock_type,
+            bound_ifindex: params.bound_ifindex,
+            bound_protocol: params.bound_protocol,
             hash_seed,
             members: RcuArcSlot::new(Arc::new(FanoutMemberSnapshot::default())),
             members_writer: Mutex::new(()),

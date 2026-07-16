@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use core::ptr::NonNull;
+use system_error::SystemError;
 
 use crate::arch::mm::kernel_page_flags;
 use crate::arch::MMArch;
@@ -73,12 +74,23 @@ unsafe impl Sync for DmaBuffer {}
 
 impl DmaBuffer {
     pub fn alloc_bytes(size: usize, options: DmaAllocOptions) -> Self {
-        dma_allocator().alloc_bytes(size, options)
+        Self::try_alloc_bytes(size, options).expect("dma alloc bytes failed")
+    }
+
+    /// Allocate a physically contiguous DMA buffer without turning memory
+    /// pressure or invalid sizing into a kernel panic.
+    pub fn try_alloc_bytes(size: usize, options: DmaAllocOptions) -> Result<Self, SystemError> {
+        dma_allocator().try_alloc_bytes(size, options)
     }
 
     #[allow(dead_code)]
     pub fn alloc_pages(pages: usize, options: DmaAllocOptions) -> Self {
-        dma_allocator().alloc_pages(pages, options)
+        Self::try_alloc_pages(pages, options).expect("dma alloc pages failed")
+    }
+
+    #[allow(dead_code)]
+    pub fn try_alloc_pages(pages: usize, options: DmaAllocOptions) -> Result<Self, SystemError> {
+        dma_allocator().try_alloc_pages(pages, options)
     }
 
     #[allow(dead_code)]
@@ -180,24 +192,34 @@ impl DmaAllocator {
         Self { pools }
     }
 
-    pub fn alloc_bytes(&self, size: usize, options: DmaAllocOptions) -> DmaBuffer {
-        let page_count = page_count_from_bytes(size);
-        self.alloc_with_pages(page_count, size, options)
+    pub fn try_alloc_bytes(
+        &self,
+        size: usize,
+        options: DmaAllocOptions,
+    ) -> Result<DmaBuffer, SystemError> {
+        let page_count = page_count_from_bytes(size).ok_or(SystemError::ENOMEM)?;
+        self.try_alloc_with_pages(page_count, size, options)
     }
 
     #[allow(dead_code)]
-    pub fn alloc_pages(&self, pages: usize, options: DmaAllocOptions) -> DmaBuffer {
-        let page_count = page_count_from_pages(pages);
-        let size = pages * MMArch::PAGE_SIZE;
-        self.alloc_with_pages(page_count, size, options)
+    pub fn try_alloc_pages(
+        &self,
+        pages: usize,
+        options: DmaAllocOptions,
+    ) -> Result<DmaBuffer, SystemError> {
+        let page_count = page_count_from_pages(pages).ok_or(SystemError::ENOMEM)?;
+        let size = pages
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::ENOMEM)?;
+        self.try_alloc_with_pages(page_count, size, options)
     }
 
-    fn alloc_with_pages(
+    fn try_alloc_with_pages(
         &self,
         page_count: PageFrameCount,
         len: usize,
         options: DmaAllocOptions,
-    ) -> DmaBuffer {
+    ) -> Result<DmaBuffer, SystemError> {
         let pool_pages = self.pool_pages_for(page_count.data(), options.use_pool);
         let raw = if let Some(pages) = pool_pages {
             if let Some(raw) = self.take_from_pool(pages) {
@@ -206,25 +228,37 @@ impl DmaAllocator {
                 }
                 raw
             } else {
-                self.alloc_raw(page_count, &options)
+                self.try_alloc_raw(page_count, &options)?
             }
         } else {
-            self.alloc_raw(page_count, &options)
+            self.try_alloc_raw(page_count, &options)?
         };
-        DmaBuffer {
+        Ok(DmaBuffer {
             paddr: raw.paddr.data(),
             vaddr: raw.vaddr,
             len,
             page_count: raw.page_count,
             cache_policy: options.cache_policy,
             pool_pages,
-        }
+        })
     }
 
-    fn alloc_raw(&self, page_count: PageFrameCount, options: &DmaAllocOptions) -> DmaRawAllocation {
-        let (paddr, count) = unsafe { allocate_page_frames(page_count) }
-            .unwrap_or_else(|| panic!("dma alloc pages failed"));
-        let virt = unsafe { MMArch::phys_2_virt(paddr).unwrap() };
+    fn try_alloc_raw(
+        &self,
+        page_count: PageFrameCount,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, SystemError> {
+        let (paddr, count) =
+            unsafe { allocate_page_frames(page_count) }.ok_or(SystemError::ENOMEM)?;
+        let virt = match unsafe { MMArch::phys_2_virt(paddr) } {
+            Some(virt) => virt,
+            None => {
+                unsafe {
+                    deallocate_page_frames(PhysPageFrame::new(paddr), count);
+                }
+                return Err(SystemError::ENOMEM);
+            }
+        };
         if options.zeroed {
             unsafe {
                 core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
@@ -236,18 +270,24 @@ impl DmaAllocator {
             DmaCachePolicy::Cached => EntryFlags::mmio_flags(),
         };
         let mut kernel_mapper = KernelMapper::lock();
-        let kernel_mapper = kernel_mapper.as_mut().unwrap();
-        let flusher = unsafe {
-            kernel_mapper
-                .remap(virt, dma_flags)
-                .expect("dma remap failed")
+        let Some(kernel_mapper) = kernel_mapper.as_mut() else {
+            unsafe {
+                deallocate_page_frames(PhysPageFrame::new(paddr), count);
+            }
+            return Err(SystemError::ENOMEM);
+        };
+        let Some(flusher) = (unsafe { kernel_mapper.remap(virt, dma_flags) }) else {
+            unsafe {
+                deallocate_page_frames(PhysPageFrame::new(paddr), count);
+            }
+            return Err(SystemError::ENOMEM);
         };
         flusher.flush();
-        DmaRawAllocation {
+        Ok(DmaRawAllocation {
             paddr,
             vaddr: NonNull::new(virt.data() as *mut u8).unwrap(),
             page_count: count,
-        }
+        })
     }
 
     fn zero_raw(&self, alloc: &DmaRawAllocation) {
@@ -295,13 +335,15 @@ impl DmaAllocator {
 
 pub fn dma_alloc_pages_raw(pages: usize, mut options: DmaAllocOptions) -> (usize, NonNull<u8>) {
     options.use_pool = false;
-    let page_count = page_count_from_pages(pages);
-    let raw = dma_allocator().alloc_raw(page_count, &options);
+    let page_count = page_count_from_pages(pages).expect("invalid dma page count");
+    let raw = dma_allocator()
+        .try_alloc_raw(page_count, &options)
+        .expect("dma alloc pages failed");
     (raw.paddr.data(), raw.vaddr)
 }
 
 pub unsafe fn dma_dealloc_pages_raw(paddr: usize, vaddr: NonNull<u8>, pages: usize) -> i32 {
-    let page_count = page_count_from_pages(pages);
+    let page_count = page_count_from_pages(pages).expect("invalid dma deallocation page count");
     let vaddr = VirtAddr::new(vaddr.as_ptr() as usize);
     let mut kernel_mapper = KernelMapper::lock();
     let kernel_mapper = kernel_mapper.as_mut().unwrap();
@@ -315,12 +357,12 @@ pub unsafe fn dma_dealloc_pages_raw(paddr: usize, vaddr: NonNull<u8>, pages: usi
     0
 }
 
-fn page_count_from_pages(pages: usize) -> PageFrameCount {
+fn page_count_from_pages(pages: usize) -> Option<PageFrameCount> {
     let pages = pages.max(1);
-    PageFrameCount::new(pages.next_power_of_two())
+    Some(PageFrameCount::new(pages.checked_next_power_of_two()?))
 }
 
-fn page_count_from_bytes(size: usize) -> PageFrameCount {
+fn page_count_from_bytes(size: usize) -> Option<PageFrameCount> {
     let pages = size.div_ceil(MMArch::PAGE_SIZE).max(1);
     page_count_from_pages(pages)
 }

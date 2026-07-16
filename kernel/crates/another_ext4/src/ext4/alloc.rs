@@ -4,6 +4,14 @@ use crate::ext4_defs::*;
 use crate::format_error;
 use crate::prelude::*;
 use crate::return_error;
+use core::cmp::min;
+
+pub(super) struct DirectRangeAllocation {
+    pub first: PBlockId,
+    pub allocation_homes: [PBlockId; 3],
+}
+
+const DIRECT_RANGE_MAX_GROUP_PROBES: u32 = 4;
 
 fn extent_tail_batch_limit(
     first_data_block: PBlockId,
@@ -69,6 +77,135 @@ impl Ext4 {
             return 0;
         }
         core::cmp::min(sb.blocks_per_group() as u64, total - first) as usize
+    }
+
+    /// Stage one group-local contiguous data allocation without publishing
+    /// any cache or disk metadata.  The caller owns the filesystem-wide
+    /// transactional metadata gate, so no direct allocator can race the
+    /// transaction-private bitmap snapshot while zero I/O is in progress.
+    pub(super) fn transaction_alloc_direct_range(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode_id: InodeId,
+        preferred_first: Option<PBlockId>,
+        require_preferred: bool,
+        count: u32,
+    ) -> Result<DirectRangeAllocation> {
+        if count == 0 {
+            return_error!(ErrCode::EINVAL, "Cannot allocate an empty block range");
+        }
+        let mut sb = self.transaction_read_super_block(transaction)?;
+        self.prepare_stats.record_superblock_io();
+        let bg_count = sb.block_group_count();
+        let preferred_inode_group = ((inode_id - 1) / sb.inodes_per_group()) as BlockGroupId;
+        let preferred_group = preferred_first
+            .filter(|block| *block >= sb.first_data_block() as PBlockId)
+            .map(|block| {
+                ((block - sb.first_data_block() as PBlockId) / sb.blocks_per_group() as PBlockId)
+                    as BlockGroupId
+            })
+            .filter(|group| *group < bg_count)
+            .unwrap_or(preferred_inode_group);
+        let count_usize = count as usize;
+
+        for offset in 0..min(bg_count, DIRECT_RANGE_MAX_GROUP_PROBES) {
+            let bgid = ((preferred_group as u64 + offset as u64) % bg_count as u64) as BlockGroupId;
+            let blocks_in_group = Self::block_group_block_count(&sb, bgid);
+            if blocks_in_group < count_usize {
+                continue;
+            }
+            let mut bg = self.transaction_read_block_group(transaction, bgid)?;
+            self.prepare_stats.record_gdt_io();
+            if bg.desc.get_free_blocks_count() < count as u64 {
+                continue;
+            }
+            let bitmap_home = bg.desc.block_bitmap_block();
+            let bitmap_block = transaction.read(self.block_device.as_ref(), bitmap_home)?;
+            self.prepare_stats.record_bitmap_io();
+            let checksum_bytes = (sb.clusters_per_group() as usize) / 8;
+            if sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
+                if !bg.verify_checksum(sb.metadata_checksum_seed()) {
+                    return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
+                }
+                if !bg.desc.verify_block_bitmap_csum(
+                    sb.metadata_checksum_seed(),
+                    &*bitmap_block,
+                    checksum_bytes,
+                ) {
+                    return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
+                }
+            }
+
+            let group_first = Self::block_group_first_block(&sb, bgid);
+            let exact_hint = preferred_first
+                .filter(|_| offset == 0)
+                .and_then(|block| block.checked_sub(group_first))
+                .and_then(|bit| usize::try_from(bit).ok())
+                .filter(|bit| {
+                    bit.checked_add(count_usize)
+                        .is_some_and(|end| end <= blocks_in_group)
+                        && (*bit..*bit + count_usize)
+                            .all(|index| bitmap_block[index / 8] & (1 << (index % 8)) == 0)
+                });
+            let bit = exact_hint.or_else(|| {
+                (!require_preferred)
+                    .then(|| {
+                        Bitmap::first_clear_run_in(
+                            &*bitmap_block,
+                            blocks_in_group,
+                            0,
+                            blocks_in_group,
+                            count_usize,
+                        )
+                    })
+                    .flatten()
+            });
+            let Some(bit) = bit else { continue };
+            let first = group_first
+                .checked_add(bit as PBlockId)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+            self.validate_data_blocks(first, count as u64)?;
+            let new_bg_free = bg
+                .desc
+                .get_free_blocks_count()
+                .checked_sub(count as u64)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            let new_sb_free = sb
+                .free_blocks_count()
+                .checked_sub(count as u64)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+
+            {
+                let image = self.transaction_block_for_update(transaction, bitmap_home)?;
+                self.prepare_stats.record_bitmap_io();
+                let mut bitmap = Bitmap::new(image, blocks_in_group);
+                if (bit..bit + count_usize).any(|index| !bitmap.is_bit_clear(index)) {
+                    return_error!(ErrCode::EIO, "Direct range changed during planning");
+                }
+                for index in bit..bit + count_usize {
+                    bitmap.set_bit(index);
+                }
+                if !bg.desc.update_block_bitmap_csum(
+                    sb.metadata_checksum_seed(),
+                    image,
+                    checksum_bytes,
+                ) {
+                    return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
+                }
+            }
+            bg.desc.set_free_blocks_count(new_bg_free);
+            self.transaction_stage_block_group_with_csum(transaction, &mut bg)?;
+            self.prepare_stats.record_gdt_io();
+            sb.set_free_blocks_count(new_sb_free);
+            self.transaction_stage_super_block(transaction, &sb)?;
+            self.prepare_stats.record_superblock_io();
+            let (gdt_home, _) = self.block_group_disk_pos(bgid)?;
+            return Ok(DirectRangeAllocation {
+                first,
+                allocation_homes: [bitmap_home, gdt_home, 0],
+            });
+        }
+        return_error!(ErrCode::ENOSPC, "No contiguous direct range available");
     }
 
     /// Stage the release of one contiguous physical-block range.
@@ -764,6 +901,7 @@ impl Ext4 {
             // extent physical block numbers are absolute filesystem block numbers.
             let bitmap_block_id = bg.desc.block_bitmap_block();
             let mut bitmap_block = self.read_block(bitmap_block_id)?;
+            self.prepare_stats.record_bitmap_io();
             let old_bitmap_block = bitmap_block.clone();
             let old_bg = BlockGroupRef::new(bg.id, bg.desc);
             let old_sb = sb;
@@ -785,6 +923,7 @@ impl Ext4 {
                 return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
             }
             self.write_block(&bitmap_block)?;
+            self.prepare_stats.record_bitmap_io();
 
             // Update block group counters
             bg.desc
@@ -844,6 +983,7 @@ impl Ext4 {
             }
             return Err(init_error);
         }
+        self.prepare_stats.record_zero_io();
         Ok(pblock)
     }
 

@@ -309,6 +309,10 @@ impl<'a> ExtentNode<'a> {
         unsafe { &*(self.raw_data.as_ptr() as *const ExtentHeader) }
     }
 
+    pub fn entry_capacity(&self) -> usize {
+        (self.raw_data.len() - size_of::<ExtentHeader>()) / size_of::<Extent>()
+    }
+
     /// Get a immutable reference to the extent at a given position
     pub fn extent_at(&self, pos: usize) -> &Extent {
         unsafe { &*((self.header() as *const ExtentHeader).add(1) as *const Extent).add(pos) }

@@ -26,7 +26,104 @@ pub(super) struct ExtentTail {
     pub unwritten: bool,
 }
 
+pub(super) struct DirectAppendShape {
+    pub preferred_first: Option<PBlockId>,
+    pub requires_merge: bool,
+}
+
 impl Ext4 {
+    pub(super) fn direct_append_shape(
+        &self,
+        inode: &InodeRef,
+        start_lblock: LBlockId,
+        count: u32,
+    ) -> Result<Option<DirectAppendShape>> {
+        if count == 0 || count > u16::MAX as u32 || !inode.inode.uses_extents() {
+            return Ok(None);
+        }
+        let root = inode.inode.extent_root();
+        let header = root.header();
+        self.validate_extent_node(inode.id, &root)?;
+        if header.depth() != 0
+            || header.max_entries_count() as usize != root.entry_capacity()
+            || header.entries_count() as usize > root.entry_capacity()
+        {
+            return Ok(None);
+        }
+        let entries = header.entries_count() as usize;
+        if entries == 0 {
+            return Ok((start_lblock == 0).then_some(DirectAppendShape {
+                preferred_first: None,
+                requires_merge: false,
+            }));
+        }
+        let last = root.extent_at(entries - 1);
+        if last.is_unwritten() {
+            return Ok(None);
+        }
+        for index in 0..entries {
+            let extent = root.extent_at(index);
+            self.validate_data_blocks(extent.start_pblock(), extent.block_count() as u64)?;
+        }
+        let next_lblock = last
+            .start_lblock()
+            .checked_add(last.block_count())
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if next_lblock != start_lblock {
+            return Ok(None);
+        }
+        let preferred_first = last
+            .start_pblock()
+            .checked_add(last.block_count() as PBlockId)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        let candidate = Extent::new(start_lblock, preferred_first, count as u16);
+        let can_merge = Extent::can_append(last, &candidate);
+        let root_full = entries == header.max_entries_count() as usize;
+        if root_full && !can_merge {
+            return Ok(None);
+        }
+        Ok(Some(DirectAppendShape {
+            preferred_first: Some(preferred_first),
+            requires_merge: root_full,
+        }))
+    }
+
+    pub(super) fn stage_direct_append_extent(
+        &self,
+        inode: &mut InodeRef,
+        start_lblock: LBlockId,
+        start_pblock: PBlockId,
+        count: u32,
+    ) -> Result<()> {
+        let new_extent = Extent::new(start_lblock, start_pblock, count as u16);
+        let mut root = inode.inode.extent_root_mut();
+        let entries = root.header().entries_count() as usize;
+        if entries > 0 {
+            let last = *root.extent_at(entries - 1);
+            if Extent::can_append(&last, &new_extent) {
+                root.extent_mut_at(entries - 1)
+                    .set_block_count(last.block_count() + count);
+            } else if root.insert_extent(&new_extent, entries).is_err() {
+                return Err(format_error!(
+                    ErrCode::ENOTSUP,
+                    "Inline extent root requires a split"
+                ));
+            }
+        } else if root.insert_extent(&new_extent, 0).is_err() {
+            return Err(format_error!(
+                ErrCode::ENOTSUP,
+                "Inline extent root requires a split"
+            ));
+        }
+        let blocks = inode
+            .inode
+            .fs_block_count()
+            .checked_add(count as u64)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        inode.inode.set_fs_block_count(blocks);
+        Ok(())
+    }
+
     fn verify_extent_block_checksum(&self, inode_ref: &InodeRef, image: &[u8]) -> Result<()> {
         let sb = self.read_super_block_cached();
         if !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
@@ -74,6 +171,7 @@ impl Ext4 {
         self.ensure_valid_pblock(inode_ref.id, pblock, "extent tree node")?;
         self.validate_data_blocks(pblock, 1)?;
         let block = self.read_block(pblock)?;
+        self.prepare_stats.record_extent_io();
         self.verify_extent_block_checksum(inode_ref, &block.data[..])?;
         Ok(block)
     }
@@ -345,6 +443,7 @@ impl Ext4 {
         // Write checksum into the tail
         block.data[tail_offset..tail_offset + 4].copy_from_slice(&csum.to_le_bytes());
         self.write_block(block)
+            .inspect(|_| self.prepare_stats.record_extent_io())
     }
 }
 
@@ -862,6 +961,15 @@ impl Ext4 {
                 inode_id
             ));
         }
+        if header.max_entries_count() as usize > ex_node.entry_capacity()
+            || header.entries_count() as usize > ex_node.entry_capacity()
+        {
+            return Err(format_error!(
+                ErrCode::EIO,
+                "extent header exceeds node capacity on inode {}",
+                inode_id
+            ));
+        }
         let entries = header.entries_count() as usize;
         if header.depth() > 0 {
             if entries == 0 {
@@ -1000,6 +1108,7 @@ mod tests {
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
+            prepare_stats: crate::ext4::PrepareStats::new(),
         }
     }
 
@@ -1031,6 +1140,7 @@ mod tests {
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
+            prepare_stats: crate::ext4::PrepareStats::new(),
         }
     }
 
@@ -1090,6 +1200,36 @@ mod tests {
             .validate_extent_node(4, &node.as_immut())
             .expect_err("unsorted index must be rejected");
         assert_eq!(err.code(), ErrCode::EIO);
+    }
+
+    #[test]
+    fn validate_extent_node_rejects_header_larger_than_inline_storage() {
+        let fs = make_test_fs(1024);
+        let mut raw = [0u8; 60];
+        ExtentNodeMut::from_bytes(&mut raw).init(0, 0);
+        raw[2..4].copy_from_slice(&5u16.to_le_bytes());
+        raw[4..6].copy_from_slice(&5u16.to_le_bytes());
+        let node = ExtentNode::from_bytes(&raw);
+
+        let error = fs.validate_extent_node(5, &node).unwrap_err();
+
+        assert_eq!(error.code(), ErrCode::EIO);
+    }
+
+    #[test]
+    fn direct_append_rejects_unwritten_tail() {
+        let fs = make_test_fs(1024);
+        let mut inode = InodeRef::new(6, Box::new(Inode::default()));
+        inode.inode.extent_init();
+        let mut extent = Extent::new(0, 100, 16);
+        extent.mark_unwritten();
+        inode
+            .inode
+            .extent_root_mut()
+            .insert_extent(&extent, 0)
+            .unwrap();
+
+        assert!(fs.direct_append_shape(&inode, 16, 16).unwrap().is_none());
     }
 
     #[test]

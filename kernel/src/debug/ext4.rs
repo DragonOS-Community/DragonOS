@@ -13,9 +13,53 @@ use system_error::SystemError;
 #[derive(Debug)]
 struct Ext4LifecycleSelftestCallback;
 
+#[derive(Debug)]
+struct Ext4PrepareStatsCallback;
+
 impl KernFSCallback for Ext4LifecycleSelftestCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
         let report = crate::filesystem::ext4::inode::run_lifecycle_selftests();
+        data.file_private_data_mut()
+            .replace(KernFilePrivateData::DebugTextSnapshot(report));
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        data: KernCallbackData,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let report: &String = match data.file_private_data() {
+            Some(KernFilePrivateData::DebugTextSnapshot(report)) => report,
+            _ => return Err(SystemError::EINVAL),
+        };
+        let bytes = report.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(bytes.len() - offset);
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write(
+        &self,
+        _data: KernCallbackData,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EPERM)
+    }
+
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
+        Ok(PollStatus::READ)
+    }
+}
+
+impl KernFSCallback for Ext4PrepareStatsCallback {
+    fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        let report = crate::filesystem::ext4::filesystem::prepare_stats_report();
         data.file_private_data_mut()
             .replace(KernFilePrivateData::DebugTextSnapshot(report));
         Ok(())
@@ -69,6 +113,13 @@ pub fn init_debugfs_ext4() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&Ext4LifecycleSelftestCallback),
+    )?;
+    ext4.add_file(
+        "prepare_stats".to_string(),
+        InodeMode::S_IRUSR,
+        Some(16384),
+        None,
+        Some(&Ext4PrepareStatsCallback),
     )?;
     Ok(())
 }

@@ -28,9 +28,11 @@ use crate::{
 };
 use alloc::{
     collections::BTreeMap,
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::fmt::Write;
 use kdepends::another_ext4;
 use lazy_static::lazy_static;
 use linkme::distributed_slice;
@@ -54,6 +56,39 @@ struct Ext4EvictionQueueState {
 
 lazy_static! {
     static ref EXT4_EVICTION_WQ: Arc<WorkQueue> = WorkQueue::new("ext4_evict");
+    static ref EXT4_STATS_REGISTRY: SpinLock<Vec<Weak<Ext4FileSystem>>> = SpinLock::new(Vec::new());
+}
+
+pub(crate) fn prepare_stats_report() -> String {
+    let mut report = String::new();
+    let mut registry = EXT4_STATS_REGISTRY.lock();
+    registry.retain(|entry| entry.strong_count() != 0);
+    for entry in registry.iter().filter_map(Weak::upgrade) {
+        let snapshot = entry.fs.prepare_stats_snapshot();
+        let _ = writeln!(
+            report,
+            "device={} generation={} enabled={} journal={} reliable_flush={} write_barrier={} calls={} requested_blocks={} mapped_blocks={} missing_blocks={} failures={} elapsed_cycles={} bitmap_io={} gdt_io={} superblock_io={} inode_io={} extent_io={} zero_io={}",
+            entry.raw_dev.data(),
+            snapshot.generation,
+            snapshot.enabled as usize,
+            entry.fs.uses_journal() as usize,
+            entry.fs.supports_reliable_flush() as usize,
+            entry._mount_options.write_barrier as usize,
+            snapshot.calls,
+            snapshot.requested_blocks,
+            snapshot.mapped_blocks,
+            snapshot.missing_blocks,
+            snapshot.failures,
+            snapshot.elapsed_cycles,
+            snapshot.bitmap_io,
+            snapshot.gdt_io,
+            snapshot.superblock_io,
+            snapshot.inode_io,
+            snapshot.extent_io,
+            snapshot.zero_io,
+        );
+    }
+    report
 }
 
 #[must_use]
@@ -887,6 +922,7 @@ impl Ext4FileSystem {
             eviction_wait: WaitQueue::default(),
             _mount_options: mount_options,
         });
+        EXT4_STATS_REGISTRY.lock().push(Arc::downgrade(&fs));
 
         let mut guard = fs.root_inode.inner.lock();
         guard.fs_ptr = Arc::downgrade(&fs);

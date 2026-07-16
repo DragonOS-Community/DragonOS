@@ -293,11 +293,23 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+        lba_id_start
+            .checked_add(count)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if buf.len() < expected {
+            return Err(SystemError::EINVAL);
+        }
         let bio = self.submit_bio_read(lba_id_start, count)?;
         let data = bio.wait()?;
-        let copy_len = core::cmp::min(buf.len(), data.len());
-        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-        Ok(copy_len)
+        if data.len() != expected {
+            return Err(SystemError::EIO);
+        }
+        buf[..expected].copy_from_slice(&data);
+        Ok(expected)
     }
 
     /// # 函数的功能
@@ -308,9 +320,19 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+        lba_id_start
+            .checked_add(count)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if buf.len() != expected {
+            return Err(SystemError::EINVAL);
+        }
         let bio = self.submit_bio_write(lba_id_start, count, buf)?;
-        let _ = bio.wait()?;
-        Ok(core::cmp::min(buf.len(), count * LBA_SIZE))
+        bio.wait_status()?;
+        Ok(expected)
     }
 
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
@@ -403,15 +425,16 @@ pub trait BlockDevice: Device {
         lba_start: BlockId,
         count: usize,
     ) -> Result<Arc<super::bio::BioRequest>, SystemError> {
-        let bio = super::bio::BioRequest::new_read(lba_start, count);
+        let bio = super::bio::BioRequest::try_new_read(lba_start, count)?;
         match self.submit_bio(bio.clone()) {
             Ok(()) => Ok(bio),
             Err(SystemError::ENOSYS) => {
                 log::trace!("BlockDevice submit_bio_read ENOSYS, falling back to sync read");
                 let buf_ptr = bio.buffer_mut();
                 let buf = unsafe { &mut *buf_ptr };
-                self.read_at_sync(lba_start, count, &mut buf[..count * LBA_SIZE])?;
-                bio.complete(Ok(count * LBA_SIZE));
+                let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+                let completed = self.read_at_sync(lba_start, count, &mut buf[..expected])?;
+                bio.complete(Ok(completed));
                 Ok(bio)
             }
             Err(e) => Err(e),
@@ -425,14 +448,15 @@ pub trait BlockDevice: Device {
         count: usize,
         data: &[u8],
     ) -> Result<Arc<super::bio::BioRequest>, SystemError> {
-        let bio = super::bio::BioRequest::new_write(lba_start, count, data);
+        let bio = super::bio::BioRequest::try_new_write(lba_start, count, data)?;
         match self.submit_bio(bio.clone()) {
             Ok(()) => Ok(bio),
             Err(SystemError::ENOSYS) => {
                 let buf_ptr = bio.buffer();
                 let buf = unsafe { &*buf_ptr };
-                self.write_at_sync(lba_start, count, &buf[..count * LBA_SIZE])?;
-                bio.complete(Ok(count * LBA_SIZE));
+                let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+                let completed = self.write_at_sync(lba_start, count, &buf[..expected])?;
+                bio.complete(Ok(completed));
                 Ok(bio)
             }
             Err(e) => Err(e),

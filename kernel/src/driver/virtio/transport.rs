@@ -19,6 +19,38 @@ use super::{
     irq::DefaultVirtioIrqHandler, transport_mmio::VirtIOMmioTransport, transport_pci::PciTransport,
 };
 
+/// An MMIO interrupt request which must not be installed until the concrete
+/// VirtIO device has been fully constructed.
+pub(crate) struct DeferredVirtioIrq {
+    irq: IrqNumber,
+}
+
+impl DeferredVirtioIrq {
+    pub(crate) fn install(self, dev_id: Arc<DeviceId>) -> Result<(), system_error::SystemError> {
+        irq_manager().request_irq(
+            self.irq,
+            "Virtio_IRQ".to_string(),
+            &DefaultVirtioIrqHandler,
+            IrqHandleFlags::IRQF_SHARED,
+            Some(dev_id),
+        )
+    }
+}
+
+pub(crate) enum VirtioIrqSetup {
+    Installed,
+    Deferred(DeferredVirtioIrq),
+}
+
+impl VirtioIrqSetup {
+    pub(crate) fn into_deferred(self) -> Option<DeferredVirtioIrq> {
+        match self {
+            Self::Installed => None,
+            Self::Deferred(irq) => Some(irq),
+        }
+    }
+}
+
 /// A validated VirtIO shared-memory region descriptor.
 ///
 /// This is address metadata only. It does not grant access to the region or describe a safe
@@ -102,7 +134,10 @@ impl VirtIOTransport {
     }
 
     /// 设置中断
-    pub fn setup_irq(&self, dev_id: Arc<DeviceId>) -> Result<(), system_error::SystemError> {
+    pub(crate) fn setup_irq(
+        &self,
+        dev_id: Arc<DeviceId>,
+    ) -> Result<VirtioIrqSetup, system_error::SystemError> {
         match self {
             VirtIOTransport::Pci(transport) => {
                 let standard_device = transport.pci_device().as_standard_device().unwrap();
@@ -130,16 +165,12 @@ impl VirtIOTransport {
                     .map_err(|_| system_error::SystemError::EIO)?;
             }
             VirtIOTransport::Mmio(_) => {
-                irq_manager().request_irq(
-                    self.irq(),
-                    "Virtio_IRQ".to_string(),
-                    &DefaultVirtioIrqHandler,
-                    IrqHandleFlags::IRQF_SHARED,
-                    Some(dev_id),
-                )?;
+                return Ok(VirtioIrqSetup::Deferred(DeferredVirtioIrq {
+                    irq: self.irq(),
+                }));
             }
         }
-        Ok(())
+        Ok(VirtioIrqSetup::Installed)
     }
 }
 

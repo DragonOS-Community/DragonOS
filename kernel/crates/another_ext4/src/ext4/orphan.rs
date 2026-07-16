@@ -44,9 +44,12 @@ fn unsupported_orphan_format(sb: &SuperBlock) -> bool {
     unsupported_orphan_features(sb.compatible_features(), sb.read_only_compatible_features())
 }
 
-fn unsupported_orphan_features(compatible: u32, read_only_compatible: u32) -> bool {
-    compatible & SuperBlock::FEATURE_COMPAT_ORPHAN_FILE != 0
-        || read_only_compatible & SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT != 0
+fn unsupported_orphan_features(_compatible: u32, read_only_compatible: u32) -> bool {
+    // FEATURE_COMPAT_ORPHAN_FILE is a *compat* feature: kernels without orphan-file
+    // support can still mount read-write and simply ignore the dedicated orphan inode.
+    // Reject only when ORPHAN_PRESENT is set, which means there are actual unrecovered
+    // orphans in the orphan file that this implementation cannot process.
+    read_only_compatible & SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT != 0
 }
 
 fn valid_orphan_number<R: LegacyOrphanReader>(reader: &R, inode: InodeId) -> bool {
@@ -395,7 +398,7 @@ mod tests {
     #[test]
     fn preflight_rejects_each_orphan_file_feature() {
         assert!(!unsupported_orphan_features(0, 0));
-        assert!(unsupported_orphan_features(
+        assert!(!unsupported_orphan_features(
             SuperBlock::FEATURE_COMPAT_ORPHAN_FILE,
             0
         ));

@@ -718,18 +718,6 @@ impl ProcessManager {
             )
         });
 
-        // Keep the fs_struct snapshot and child publication on the same side
-        // of pivot_root's exclusive migration barrier.
-        let fs_refs_copy = lock_fs_refs_copy();
-
-        // 拷贝文件系统信息
-        Self::copy_fs(&clone_flags, current_pcb, pcb, &fs_refs_copy).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
-
         // 拷贝信号相关数据
         Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
@@ -762,14 +750,6 @@ impl ProcessManager {
             )
         });
 
-        // 拷贝namespace
-        Self::copy_namespaces(&clone_flags, current_pcb, pcb, &fs_refs_copy).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
-
         // 拷贝线程
         Self::copy_thread(current_pcb, pcb, &clone_args, current_trapframe).unwrap_or_else(|e| {
             panic!(
@@ -788,6 +768,39 @@ impl ProcessManager {
 
         // 继承 cmdline（/proc/<pid>/cmdline 语义）
         pcb.set_cmdline_bytes(current_pcb.cmdline_bytes());
+
+        let current_leader = {
+            let ti = current_pcb.thread.read_irqsave();
+            ti.group_leader().unwrap_or_else(|| current_pcb.clone())
+        };
+        let clone_into_cgroup_target = Self::resolve_clone_into_cgroup_target(&clone_args)?;
+
+        // The default CPU is selected by wake_up_new_task(). Preserve only an
+        // explicit hint here, outside the fs publication barrier.
+        pcb.sched_info().mark_new_task(clone_args.target_cpu);
+
+        // Keep only the fs/namespace snapshot and the remaining child
+        // publication path on the same side of pivot_root's exclusive
+        // migration barrier. Potentially slow address-space, signal and
+        // architecture state copies above do not depend on this protocol.
+        let fs_refs_copy = lock_fs_refs_copy();
+
+        // 拷贝文件系统信息
+        Self::copy_fs(&clone_flags, current_pcb, pcb, &fs_refs_copy).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
+
+        // 拷贝namespace。CLONE_NEWNS 的 fs 路径投影依赖刚复制的 fs_struct，
+        // 因而这两步必须相邻且同处 publication barrier 内。
+        Self::copy_namespaces(&clone_flags, current_pcb, pcb, &fs_refs_copy).unwrap_or_else(|e| {
+            panic!(
+                "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(), pcb.raw_pid(), e
+            )
+        });
 
         // alloc_pid
         if pcb.raw_pid() == RawPid::UNASSIGNED {
@@ -829,12 +842,6 @@ impl ProcessManager {
             }
         }
 
-        let current_leader = {
-            let ti = current_pcb.thread.read_irqsave();
-            ti.group_leader().unwrap_or_else(|| current_pcb.clone())
-        };
-
-        let clone_into_cgroup_target = Self::resolve_clone_into_cgroup_target(&clone_args)?;
         let reserved_cgroup = if pcb.raw_pid() > RawPid(0) {
             let charge_node = clone_into_cgroup_target
                 .as_ref()
@@ -889,9 +896,6 @@ impl ProcessManager {
             pidfd_file = Some(prepared.file);
         }
 
-        // 新任务的默认落点 CPU 应在 wake_up_new_task() 时再选择；这里只保留显式 hint，
-        // 以避免 fork 长路径内父任务迁移导致的“过早采样当前 CPU”问题。
-        pcb.sched_info().mark_new_task(clone_args.target_cpu);
         sched_cgroup_fork(pcb);
 
         // 处理 rseq 状态。按 Linux copy_process() 顺序，应在任务对外可见前完成。
@@ -1046,7 +1050,7 @@ impl ProcessManager {
                 .install_reserved_fd(reservation, file)?;
         }
 
-        if pcb.raw_pid() > RawPid(0) {
+        let published_cgroup = if pcb.raw_pid() > RawPid(0) {
             let cgroup = pcb.task_cgroup_node();
             let needs_oom_score_adj_sync = Self::needs_oom_score_adj_clone_vm_sync(&clone_flags);
             let oom_score_adj_guard = if needs_oom_score_adj_sync {
@@ -1059,12 +1063,18 @@ impl ProcessManager {
             }
             ProcessManager::add_pcb(pcb.clone(), &fs_refs_copy);
             drop(oom_score_adj_guard);
+            Some(cgroup)
+        } else {
+            None
+        };
+        drop(fs_refs_copy);
+
+        if let Some(cgroup) = published_cgroup {
             cgroup.add_task(pcb.raw_pid());
             pcb.mark_visible_thread_accounted();
             inc_visible_thread_count();
             account_successful_fork();
         }
-        drop(fs_refs_copy);
 
         // 设置child_tid，意味着子线程能够知道自己的id。
         // 按 Linux schedule_tail 语义，在子任务首次运行时再 best-effort 写入。

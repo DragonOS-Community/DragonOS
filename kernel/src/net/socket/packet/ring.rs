@@ -60,18 +60,10 @@ impl FileSystem for PacketFakeFs {
         PageFaultHandler::filemap_fault(pfm)
     }
     unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
-        // Ring-buffer pages are pre-allocated as PageType::Normal and inserted
-        // into the page cache via insert_ready_page — they are NOT disk-backed
-        // file pages, so the generic filemap_page_mkwrite (which requires
-        // PageType::File, checks inode size, and prepares writeback) is both
-        // unnecessary and harmful (it returns SIGBUS because the page type is
-        // Normal, not File).
-        //
-        // Returning success here lets do_wp_page upgrade the PTE to read-write
-        // in-place. The dirty-tracking block in do_wp_page is skipped for
-        // Normal pages, which is correct — ring pages are never written back
-        // to disk. This matches how the perf subsystem (PerfFakeFs) handles
-        // its ring buffers.
+        // Ring pages are pre-allocated PageType::Normal (not disk-backed), so
+        // the generic filemap_page_mkwrite — which requires PageType::File and
+        // prepares writeback — would wrongly SIGBUS. Match PerfFakeFs: succeed
+        // and let do_wp_page upgrade the PTE in place.
         VmFaultReason::empty()
     }
     unsafe fn map_pages(
@@ -208,23 +200,8 @@ impl PacketRing {
     /// Returns `true` if at least one frame is in `TP_STATUS_USER` (readable by
     /// userspace). Used by `can_recv()` / poll readiness.
     ///
-    /// # 性能说明
-    ///
-    /// 这是 O(frame_nr) 线性扫描，每个帧做一次 `tp_status` 原子读。它仅在
-    /// poll/epoll readiness 检查路径（`can_recv` → `has_user_frames`）上调用，
-    /// 不在数据收发的热路径上，因此不会逐包执行。
-    ///
-    /// 对于典型 ring（frame_nr = 1024），每次 poll 最多扫描 1024 次原子读；早
-    /// 命中即返回，平均成本远低于最坏情况。该开销在 poll 路径上可接受。
-    ///
-    /// # 未来优化方向（当前不实现）
-    ///
-    /// 若未来需要在超大 ring 或高 poll 频率场景下进一步降低成本，可维护一个
-    /// `AtomicU32 user_frame_count` 计数器：`write_frame` 发布 KERNEL→USER 时
-    /// 自增，从而把扫描降到 O(1)。但用户态把 `tp_status` 翻回 `TP_STATUS_KERNEL`
-    /// 时无法主动通知内核，计数无法准确递减，必须在 `has_user_frames` 中走懒
-    /// 更新（扫描确认）或要求用户态显式 `recv`/`poll` 来同步状态。这会让计数方案
-    /// 的复杂度显著高于当前的简单扫描，故暂不引入。
+    /// O(frame_nr) scan; only on the poll readiness path, never per-packet, so
+    /// the cost is acceptable for typical rings.
     pub fn has_user_frames(&self) -> bool {
         for i in 0..self.config.frame_nr {
             let base = self.frame_base(i);
@@ -339,13 +316,12 @@ impl PacketRing {
         let tp_mac = data_off as u16;
         let tp_net = netoff as u16;
 
-        // Compute snaplen and wire length from the *visible* (VLAN-stripped) length.
-        let visible_len = if is_vlan {
+        // Visible (VLAN-stripped) length — this becomes tp_len (wire length).
+        let wire_len = if is_vlan {
             frame.len().saturating_sub(4)
         } else {
             frame.len()
         };
-        let wire_len = visible_len;
         let snaplen = wire_len.min(data_cap);
 
         // Timestamps are taken from per-version sources to match Linux
@@ -394,13 +370,9 @@ impl PacketRing {
                 }
             }
 
-            // Fill the sockaddr_ll region that follows the aligned header.
-            // sll_offset = TPACKET_ALIGN(sizeof(hdr)) for both V1 (align(28)=32)
-            // and V2 (align(32)=32).  20 bytes total.
-            let sll_off = tpacket_align(match self.version {
-                TpacketVersion::V1 => 28,
-                TpacketVersion::V2 => 32,
-            });
+            // sockaddr_ll follows the aligned header. hdrlen() already includes
+            // the 20-byte sockaddr_ll, so the region starts at hdrlen - 20.
+            let sll_off = self.version.hdrlen() - 20;
             *(dst.add(sll_off) as *mut u16) = 17u16; // sll_family = AF_PACKET
             *(dst.add(sll_off + 2) as *mut u16) = meta.protocol.to_be(); // sll_protocol
             *(dst.add(sll_off + 4) as *mut i32) = meta.ifindex as i32; // sll_ifindex

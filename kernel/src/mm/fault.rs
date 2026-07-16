@@ -1215,43 +1215,21 @@ impl PageFaultHandler {
 
         let page = match pfm.page.clone() {
             Some(page) => page,
-            None => {
-                log::warn!("filemap_page_mkwrite: SIGBUS — pfm.page is None");
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            }
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
         };
         let (page_cache, page_index) = match page.read().page_type().clone() {
             PageType::File(info) => match info.page_cache.upgrade() {
                 Some(page_cache) => (page_cache, info.index),
-                None => {
-                    log::warn!(
-                        "filemap_page_mkwrite: SIGBUS — PageType::File but page_cache weak ref invalid"
-                    );
-                    return VmFaultReason::VM_FAULT_SIGBUS;
-                }
+                None => return VmFaultReason::VM_FAULT_SIGBUS,
             },
-            other => {
-                log::warn!(
-                    "filemap_page_mkwrite: SIGBUS — page type is {:?}, not File",
-                    other
-                );
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            }
+            _ => return VmFaultReason::VM_FAULT_SIGBUS,
         };
 
         let backing_pgoff = match pfm.backing_pgoff {
             Some(backing_pgoff) => backing_pgoff,
-            None => {
-                log::warn!("filemap_page_mkwrite: SIGBUS — backing_pgoff is None");
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            }
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
         };
         if page_index != backing_pgoff {
-            log::warn!(
-                "filemap_page_mkwrite: RETRY — page_index {} != backing_pgoff {}",
-                page_index,
-                backing_pgoff
-            );
             return VmFaultReason::VM_FAULT_RETRY;
         }
 
@@ -1265,11 +1243,6 @@ impl PageFaultHandler {
         };
         if let Some(size) = size {
             if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
-                log::warn!(
-                    "filemap_page_mkwrite: SIGBUS — file size {} too small for pgoff {}",
-                    size,
-                    backing_pgoff
-                );
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
         }
@@ -1285,13 +1258,7 @@ impl PageFaultHandler {
                 }
                 return VmFaultReason::VM_FAULT_RETRY;
             }
-            Err(e) => {
-                log::warn!(
-                    "filemap_page_mkwrite: SIGBUS — prepare_page_mkwrite failed: {:?}",
-                    e
-                );
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            }
+            Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
         }
         VmFaultReason::empty()
     }

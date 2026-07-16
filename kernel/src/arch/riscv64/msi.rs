@@ -1,4 +1,14 @@
 use crate::driver::pci::pci_irq::TriggerMode;
+use crate::exception::IrqNumber;
+use system_error::SystemError;
+
+pub fn arch_pci_msi_vector_alloc() -> Option<IrqNumber> {
+    None
+}
+
+pub fn arch_pci_msi_vector_setup(_vector: IrqNumber) -> Result<(), SystemError> {
+    Err(SystemError::ENOSYS)
+}
 
 /// @brief 获得MSI Message Address
 /// @param processor 目标CPU ID号

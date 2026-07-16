@@ -1827,9 +1827,11 @@ impl VirtioFsBridgeContext {
                 break;
             }
 
-            if let Some(transport) = self.transport.as_mut() {
-                if transport.ack_interrupt() {
-                    stats::on_virtiofs_ack_interrupt();
+            if !self.irq_wake_enabled {
+                if let Some(transport) = self.transport.as_mut() {
+                    if transport.ack_interrupt() {
+                        stats::on_virtiofs_ack_interrupt();
+                    }
                 }
             }
             let completed = self.drain_completions()?;

@@ -1,6 +1,9 @@
 //! PCI transport for VirtIO.
 
-use crate::arch::{PciArch, TraitPciArch};
+use crate::arch::{
+    msi::{arch_pci_msi_vector_alloc, arch_pci_msi_vector_setup},
+    PciArch, TraitPciArch,
+};
 use crate::driver::base::device::DeviceId;
 use crate::driver::pci::pci::{
     BusDeviceFunction, PciAddr, PciBarMappingRequest, PciBarSubresourceGuard, PciDeviceStructure,
@@ -69,8 +72,6 @@ fn shared_memory_cap_len_supported(cap_len: u8) -> bool {
     cap_len >= VIRTIO_PCI_CAP64_LEN
 }
 
-/// The interrupt vector number for VirtIO device receive interrupts.
-const VIRTIO_RECV_VECTOR: IrqNumber = IrqNumber::new(56);
 /// The MSI-X table entry index for VirtIO device receive interrupts.
 const VIRTIO_RECV_VECTOR_INDEX: u16 = 0;
 // Receive queue number
@@ -94,7 +95,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 ///
 /// Ref: 4.1 Virtio Over PCI Bus
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.
@@ -110,7 +111,6 @@ pub struct PciTransport {
     isr_status: NonNull<Volatile<u8>>,
     /// The VirtIO device-specific configuration within some BAR.
     config_space: Option<NonNull<[u32]>>,
-    irq: IrqNumber,
     dev_id: Arc<DeviceId>,
     device: Arc<PciDeviceStructureGeneralDevice>,
     shared_memory_regions: Vec<(u8, Option<VirtioSharedMemoryRegion>)>,
@@ -151,7 +151,6 @@ impl PciTransport {
         device: Arc<PciDeviceStructureGeneralDevice>,
         dev_id: Arc<DeviceId>,
     ) -> Result<Self, VirtioPciError> {
-        let irq = VIRTIO_RECV_VECTOR;
         let header = &device.common_header;
         let bus_device_function = header.bus_device_function;
         if header.vendor_id != VIRTIO_VENDOR_ID {
@@ -220,12 +219,6 @@ impl PciTransport {
             .bar_ioremap_with_mappings(&shared_memory_bars, &transport_config_mappings)
             .unwrap()?;
         device.enable_master();
-        let standard_device = device.as_standard_device().unwrap();
-        // Currently there is no unified management of PCI device interrupt numbers, so an
-        // interrupt number must be specified here. It must not conflict with other interrupts.
-        let irq_vector = standard_device.irq_vector_mut().unwrap();
-        irq_vector.write().push(irq);
-
         // panic!();
         // device_capability is an iterator; iterating over it traverses all capability space.
         for capability in device.capabilities().unwrap() {
@@ -363,7 +356,6 @@ impl PciTransport {
             queue_notify_indices,
             isr_status,
             config_space,
-            irq,
             dev_id,
             device,
             shared_memory_regions,
@@ -374,8 +366,31 @@ impl PciTransport {
         self.device.clone()
     }
 
+    /// Reserves the CPU vector when an interrupt-driven driver actually requests IRQ setup.
+    /// Polling-only users such as virtio-vsock do not consume an MSI vector.
+    pub(super) fn setup_irq_vector(&self) -> Result<IrqNumber, VirtioPciError> {
+        let standard_device = self.device.as_standard_device().unwrap();
+        let irq_vector = standard_device.irq_vector_mut().unwrap();
+        let mut irq_vector = irq_vector.write();
+        if !irq_vector.is_empty() {
+            return Err(VirtioPciError::IrqVectorAlreadyAssigned);
+        }
+        let irq = arch_pci_msi_vector_alloc().ok_or(VirtioPciError::IrqVectorUnavailable)?;
+        arch_pci_msi_vector_setup(irq).map_err(|_| VirtioPciError::IrqVectorUnavailable)?;
+        irq_vector.push(irq);
+        Ok(irq)
+    }
+
     pub fn irq(&self) -> IrqNumber {
-        self.irq
+        *self
+            .device
+            .as_standard_device()
+            .unwrap()
+            .irq_vector_mut()
+            .unwrap()
+            .read()
+            .first()
+            .expect("VirtIO PCI IRQ must be configured before it is queried")
     }
 
     pub fn interrupt_ack(&self) -> PciInterruptAck {
@@ -708,6 +723,10 @@ pub enum VirtioPciError {
     BarGetVaddrFailed,
     /// A generic PCI error,
     Pci(PciError),
+    /// No CPU vector is available from the architecture PCI MSI/MSI-X range.
+    IrqVectorUnavailable,
+    /// The same PCI function was already assigned an interrupt vector.
+    IrqVectorAlreadyAssigned,
 }
 
 impl Display for VirtioPciError {
@@ -746,6 +765,13 @@ impl Display for VirtioPciError {
             ),
             Self::BarGetVaddrFailed => write!(f, "Get bar virtaddress failed"),
             Self::Pci(pci_error) => pci_error.fmt(f),
+            Self::IrqVectorUnavailable => write!(f, "No PCI MSI/MSI-X CPU vector is available."),
+            Self::IrqVectorAlreadyAssigned => {
+                write!(
+                    f,
+                    "The PCI function already has an assigned interrupt vector."
+                )
+            }
         }
     }
 }

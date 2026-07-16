@@ -8,10 +8,10 @@ use crate::{
         pci::pci_irq::IrqType,
         pci::{
             pci::{PciBarSubresourceGuard, PciDeviceStructure, PciError},
-            pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqError, PciIrqMsg, IRQ},
+            pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ},
         },
     },
-    exception::IrqNumber,
+    exception::{irqdesc::IrqHandleFlags, manage::irq_manager, IrqNumber},
     mm::PhysAddr,
 };
 
@@ -102,27 +102,44 @@ impl VirtIOTransport {
     }
 
     /// 设置中断
-    pub fn setup_irq(&self, dev_id: Arc<DeviceId>) -> Result<(), PciError> {
-        if let VirtIOTransport::Pci(transport) = self {
-            let standard_device = transport.pci_device().as_standard_device().unwrap();
-            let _irq_type = standard_device
-                .irq_init(IRQ::PCI_IRQ_MSIX | IRQ::PCI_IRQ_MSI)
-                .ok_or(PciError::PciIrqError(PciIrqError::IrqNotInited))?;
+    pub fn setup_irq(&self, dev_id: Arc<DeviceId>) -> Result<(), system_error::SystemError> {
+        match self {
+            VirtIOTransport::Pci(transport) => {
+                let standard_device = transport.pci_device().as_standard_device().unwrap();
+                standard_device
+                    .irq_init(IRQ::PCI_IRQ_MSIX | IRQ::PCI_IRQ_MSI)
+                    .ok_or(system_error::SystemError::ENODEV)?;
+                transport
+                    .setup_irq_vector()
+                    .map_err(|_| system_error::SystemError::ENOSPC)?;
 
-            // 中断相关信息
-            let msg = PciIrqMsg {
-                irq_common_message: IrqCommonMsg::init_from(
-                    0,
+                let msg = PciIrqMsg {
+                    irq_common_message: IrqCommonMsg::init_from(
+                        0,
+                        "Virtio_IRQ".to_string(),
+                        &DefaultVirtioIrqHandler,
+                        dev_id,
+                    ),
+                    irq_specific_message: IrqSpecificMsg::msi_default(),
+                };
+                standard_device
+                    .irq_install(msg)
+                    .map_err(|_| system_error::SystemError::EIO)?;
+                standard_device
+                    .irq_enable(true)
+                    .map_err(|_| system_error::SystemError::EIO)?;
+            }
+            VirtIOTransport::Mmio(_) => {
+                irq_manager().request_irq(
+                    self.irq(),
                     "Virtio_IRQ".to_string(),
                     &DefaultVirtioIrqHandler,
-                    dev_id,
-                ),
-                irq_specific_message: IrqSpecificMsg::msi_default(),
-            };
-            standard_device.irq_install(msg)?;
-            standard_device.irq_enable(true)?;
+                    IrqHandleFlags::IRQF_SHARED,
+                    Some(dev_id),
+                )?;
+            }
         }
-        return Ok(());
+        Ok(())
     }
 }
 

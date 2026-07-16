@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -35,6 +36,10 @@
 
 #ifndef MS_REC
 #define MS_REC 16384
+#endif
+
+#ifndef RAMFS_MAGIC
+#define RAMFS_MAGIC 0x858458f6
 #endif
 
 namespace {
@@ -894,12 +899,20 @@ void case_chroot_ordinary_directory_rejected() {
     child_pass();
 }
 
-void case_rootfs_rejected() {
+void case_namespace_root_pivot() {
     const char* base = "/tmp/test_pivot_root/namespace_root";
     const char* new_root = "/tmp/test_pivot_root/namespace_root/newroot";
     const char* put_old = "/tmp/test_pivot_root/namespace_root/newroot/oldroot";
     const char* old_marker = "/tmp/test_pivot_root/namespace_root_old_marker";
     const char* new_marker = "/tmp/test_pivot_root/namespace_root/newroot/new_marker";
+
+    struct statfs current_root = {};
+    if (statfs("/", &current_root) != 0) {
+        child_fail("statfs current root failed");
+    }
+    if (current_root.f_type == RAMFS_MAGIC) {
+        child_skip("initial ramfs root is intentionally unattached");
+    }
 
     ensure_parent_tree();
     ensure_dir(base);
@@ -918,12 +931,12 @@ void case_rootfs_rejected() {
         (mkdir(new_marker, 0755) != 0 && errno != EEXIST)) {
         child_fail("prepare namespace-root markers failed");
     }
-    errno = 0;
-    if (do_pivot_root(new_root, put_old) != -1 || errno != EINVAL) {
-        child_fail("pivot_root from unattached namespace root did not return EINVAL");
+    if (do_pivot_root(new_root, put_old) != 0) {
+        child_fail("pivot_root from attached namespace root failed");
     }
-    if (access(old_marker, F_OK) != 0 || access(new_marker, F_OK) != 0) {
-        child_fail("failed rootfs pivot changed the original topology");
+    if (access("/new_marker", F_OK) != 0 ||
+        access("/oldroot/tmp/test_pivot_root/namespace_root_old_marker", F_OK) != 0) {
+        child_fail("namespace-root pivot did not preserve old and new roots");
     }
     child_pass();
 }
@@ -1443,8 +1456,8 @@ TEST(PivotRoot, ChrootOrdinaryDirectoryRejected) {
                              case_chroot_ordinary_directory_rejected);
 }
 
-TEST(PivotRoot, RootFsRejected) {
-    expect_case_pass_or_skip("pivot_root_rootfs_rejected", case_rootfs_rejected);
+TEST(PivotRoot, NamespaceRootPivot) {
+    expect_case_pass_or_skip("pivot_root_namespace_root", case_namespace_root_pivot);
 }
 
 TEST(PivotRoot, NamespaceRootIdentityBusy) {

@@ -400,7 +400,7 @@ impl UnixStreamSocket {
             .expect("UnixStreamSocket inner is None")
         {
             Inner::Connected(connected) => {
-                connected.readable_len(self.is_seqpacket) != 0 || connected.peer_send_shutdown()
+                connected.readable_len(self.is_seqpacket) != 0 || connected.recv_closed()
             }
             _ => false,
         }
@@ -1606,8 +1606,11 @@ impl Socket for UnixStreamSocket {
         self.inner
             .read()
             .as_ref()
-            .expect("UnixStreamSocket inner is None")
-            .check_io_events()
+            .map(Inner::check_io_events)
+            // Concurrent close has already made the socket terminal and
+            // emitted its wakeups. Event queries racing with it must observe
+            // HUP rather than panic on the consumed Inner value.
+            .unwrap_or(EPollEventType::EPOLLHUP)
     }
 
     fn socket_inode_id(&self) -> InodeId {

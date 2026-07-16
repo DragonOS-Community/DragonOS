@@ -767,7 +767,11 @@ impl ProcessControlBlock {
         ) > 1
     }
 
-    pub fn set_fs_struct(&self, fs: Arc<FsStruct>) -> Arc<FsStruct> {
+    pub(crate) fn set_fs_struct(
+        &self,
+        fs: Arc<FsStruct>,
+        _fs_refs: &super::FsRefsReadGuard,
+    ) -> Arc<FsStruct> {
         let _slot_update = self.fs_slot_update_lock.lock();
         let mut guard = self.fs.write();
         let old = guard.replace(fs).expect("live task must have an fs_struct");

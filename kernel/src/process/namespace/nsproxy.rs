@@ -13,7 +13,7 @@ use crate::{
             net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
             uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
         },
-        ProcessControlBlock, ProcessManager,
+        FsRefsReadGuard, ProcessControlBlock, ProcessManager,
     },
 };
 use core::{fmt::Debug, intrinsics::likely};
@@ -122,10 +122,11 @@ impl ProcessManager {
     ///
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?r=&mo=3770&fi=151#151
     #[inline(never)]
-    pub fn copy_namespaces(
+    pub(crate) fn copy_namespaces(
         clone_flags: &CloneFlags,
         _parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
+        _fs_refs: &FsRefsReadGuard,
     ) -> Result<(), SystemError> {
         // log::debug!(
         //     "copy_namespaces: clone_flags={:?}, parent pid={}, child pid={}, child name={}",
@@ -284,14 +285,16 @@ pub fn exec_task_namespaces() -> Result<(), SystemError> {
     let user_ns = tsk.cred().user_ns.clone();
     let new_nsproxy = create_new_namespaces(&CloneFlags::empty(), &tsk, user_ns)?;
     // todo: time_ns的逻辑
-    switch_task_namespaces(&tsk, new_nsproxy)?;
+    let fs_refs = crate::process::lock_fs_refs_copy();
+    switch_task_namespaces(&tsk, new_nsproxy, &fs_refs)?;
 
     return Ok(());
 }
 
-pub fn switch_task_namespaces(
+pub(crate) fn switch_task_namespaces(
     tsk: &Arc<ProcessControlBlock>,
     new_nsproxy: Arc<NsProxy>,
+    _fs_refs: &FsRefsReadGuard,
 ) -> Result<(), SystemError> {
     // Check sharing before taking our temporary Arc below.  Counting after
     // cloning the Arc would mistake this function's own reference for a
@@ -305,6 +308,7 @@ pub(crate) fn switch_task_namespaces_with_fs(
     tsk: &Arc<ProcessControlBlock>,
     fs: &Arc<FsStruct>,
     new_nsproxy: Arc<NsProxy>,
+    _fs_refs: &FsRefsReadGuard,
 ) -> Result<(), SystemError> {
     // unshare(CLONE_NEWNS) passes either a freshly copied fs_struct or the
     // task's proven-private one, so there is no CLONE_FS peer to reject.

@@ -13,7 +13,7 @@ use crate::{
         FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
-    process::{all_process, lock_fs_refs_tasklist, ProcessControlBlock, ProcessManager},
+    process::{all_process, lock_fs_refs_pivot, ProcessControlBlock, ProcessManager},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::vfs_check_and_clone_cstr,
@@ -45,7 +45,7 @@ impl Syscall for SysPivotRootHandle {
         // Match Linux's tasklist_lock boundary around chroot_fs_refs(): a
         // newly copied fs_struct cannot become visible between this fixed
         // published-task snapshot and the exact-reference migration.
-        let _fs_refs_tasklist = lock_fs_refs_tasklist();
+        let fs_refs_pivot = lock_fs_refs_pivot();
         let tasks = snapshot_all_processes()?;
         let mut changed_fs = HashMap::new();
         changed_fs
@@ -66,7 +66,7 @@ impl Syscall for SysPivotRootHandle {
             &mut refresh_tasks,
         );
         drop(topology);
-        drop(_fs_refs_tasklist);
+        drop(fs_refs_pivot);
         refresh_cwd_caches(&refresh_tasks);
 
         Ok(0)

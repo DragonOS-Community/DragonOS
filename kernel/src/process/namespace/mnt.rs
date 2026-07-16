@@ -268,17 +268,19 @@ impl MntNamespace {
         let old_root = old_root_path.mount_fs();
         let new_root = new_root_path.mount_fs();
         let put_old_mnt = put_old_mountpoint.mount_fs();
+        let namespace_root = self.inner.read().root_mountfs.clone();
+        let old_is_namespace_root = Arc::ptr_eq(&old_root, &namespace_root);
         // lock_mount(&old) rejects a path whose containing mount was lazily
         // detached after pathname resolution before pivot validation.
         if !put_old_mnt.is_live() || !put_old_mnt.is_belongs_to_mntns(&namespace) {
             return Err(SystemError::ENOENT);
         }
-        // Linux keeps an unattached namespace root parented to itself. Mirror
-        // that identity for the checks which precede the explicit
-        // mnt_has_parent() rejection, so an old_mnt == root_mnt loop still
-        // reports EBUSY before the unattached-root EINVAL.
-        let root_parent = old_root
-            .self_mountpoint()
+        // DragonOS represents the namespace root without a visible parent
+        // edge. Attached caller roots use their exact parent below; the
+        // namespace-root branch instead publishes through root_mountfs.
+        let old_root_mountpoint = old_root.self_mountpoint();
+        let root_parent = old_root_mountpoint
+            .as_ref()
             .map(|mountpoint| mountpoint.mount_fs())
             .unwrap_or_else(|| old_root.clone());
         let new_root_parent = new_root
@@ -288,7 +290,7 @@ impl MntNamespace {
 
         if put_old_mnt.propagation().is_shared()
             || new_root_parent.propagation().is_shared()
-            || root_parent.propagation().is_shared()
+            || (!old_is_namespace_root && root_parent.propagation().is_shared())
             || !old_root.is_live()
             || !new_root.is_live()
             || !old_root.is_belongs_to_mntns(&namespace)
@@ -303,7 +305,9 @@ impl MntNamespace {
         if Arc::ptr_eq(&new_root, &old_root) || Arc::ptr_eq(&put_old_mnt, &old_root) {
             return Err(SystemError::EBUSY);
         }
-        let old_root_mountpoint = old_root.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        if !old_is_namespace_root && old_root_mountpoint.is_none() {
+            return Err(SystemError::EINVAL);
+        }
         let new_root_mountpoint = new_root.self_mountpoint().ok_or(SystemError::EINVAL)?;
         if !old_root_path.same_path_ref(&old_root.mountpoint_root_inode())
             || !new_root_path.same_path_ref(&new_root.mountpoint_root_inode())
@@ -321,14 +325,30 @@ impl MntNamespace {
         // keep the original new-root key alive and guarantee one put-old slot.
         let _new_edge = new_root_parent.reserve_mount_edge(&new_root_mountpoint, 0)?;
         let _put_old_edge = put_old_mnt.reserve_mount_edge(&put_old_mountpoint, 1)?;
+        let mut namespace_inner = if old_is_namespace_root {
+            let inner = self.inner.write();
+            if !Arc::ptr_eq(&inner.root_mountfs, &old_root) {
+                return Err(SystemError::EINVAL);
+            }
+            Some(inner)
+        } else {
+            None
+        };
 
         new_root_parent
             .detach_exact_keep_slot(&new_root)
             .expect("validated pivot new-root edge must exist");
-        new_root.relocate_mountpoint(Some(old_root_mountpoint.clone()));
-        root_parent
-            .replace_exact_edge_prepared(&old_root, new_root.clone())
-            .expect("validated pivot old-root edge must remain exact");
+        if old_is_namespace_root {
+            new_root.relocate_mountpoint(None);
+        } else {
+            let old_root_mountpoint = old_root_mountpoint
+                .as_ref()
+                .expect("validated attached caller root must keep its mountpoint");
+            new_root.relocate_mountpoint(Some(old_root_mountpoint.clone()));
+            root_parent
+                .replace_exact_edge_prepared(&old_root, new_root.clone())
+                .expect("validated pivot old-root edge must remain exact");
+        }
         old_root.relocate_mountpoint(Some(put_old_mountpoint.clone()));
         put_old_mnt
             .attach_new_top(&put_old_mountpoint, old_root.clone())
@@ -340,6 +360,9 @@ impl MntNamespace {
         if old_root.is_locked() {
             old_root.unlock_mount();
             new_root.lock_mount();
+        }
+        if let Some(inner) = namespace_inner.as_mut() {
+            inner.root_mountfs = new_root;
         }
 
         Ok(topology)

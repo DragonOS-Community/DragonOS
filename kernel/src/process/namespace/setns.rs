@@ -7,6 +7,7 @@ use crate::{
     process::{
         cred::{ns_capable, CAPFlags, Cred},
         fork::CloneFlags,
+        lock_fs_refs_copy,
         pid::PidType,
         ProcessManager,
     },
@@ -183,7 +184,8 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         }
 
         let new_nsproxy = Arc::new(new_inner);
-        switch_task_namespaces(&current, new_nsproxy)?;
+        let fs_refs = lock_fs_refs_copy();
+        switch_task_namespaces(&current, new_nsproxy, &fs_refs)?;
         return Ok(());
     }
 
@@ -259,7 +261,8 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
     let new_nsproxy = Arc::new(new_inner);
 
     // 5. 原子切换当前任务的 namespace 代理
-    switch_task_namespaces(&current, new_nsproxy)?;
+    let fs_refs = lock_fs_refs_copy();
+    switch_task_namespaces(&current, new_nsproxy, &fs_refs)?;
 
     Ok(())
 }

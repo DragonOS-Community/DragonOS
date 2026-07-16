@@ -755,10 +755,12 @@ void case_chroot_ordinary_directory_rejected() {
     child_pass();
 }
 
-void case_namespace_root_rejected() {
+void case_namespace_root_pivot() {
     const char* base = "/tmp/test_pivot_root/namespace_root";
     const char* new_root = "/tmp/test_pivot_root/namespace_root/newroot";
     const char* put_old = "/tmp/test_pivot_root/namespace_root/newroot/oldroot";
+    const char* old_marker = "/tmp/test_pivot_root/namespace_root/old_marker";
+    const char* new_marker = "/tmp/test_pivot_root/namespace_root/newroot/new_marker";
 
     ensure_parent_tree();
     ensure_dir(base);
@@ -767,13 +769,18 @@ void case_namespace_root_rejected() {
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
         child_skip(strerror(errno));
     }
-    if (mkdir(put_old, 0755) != 0 && errno != EEXIST) {
-        child_fail("mkdir(oldroot) failed");
+    if ((mkdir(put_old, 0755) != 0 && errno != EEXIST) ||
+        (mkdir(old_marker, 0755) != 0 && errno != EEXIST) ||
+        (mkdir(new_marker, 0755) != 0 && errno != EEXIST)) {
+        child_fail("prepare namespace-root markers failed");
     }
 
-    errno = 0;
-    if (do_pivot_root(new_root, put_old) != -1 || errno != EINVAL) {
-        child_fail("pivot_root from namespace root did not return EINVAL");
+    if (do_pivot_root(new_root, put_old) != 0) {
+        child_fail("pivot_root from namespace root failed");
+    }
+    if (access("/new_marker", F_OK) != 0 ||
+        access("/oldroot/tmp/test_pivot_root/namespace_root/old_marker", F_OK) != 0) {
+        child_fail("namespace-root pivot published incomplete topology");
     }
     child_pass();
 }
@@ -1185,8 +1192,8 @@ TEST(PivotRoot, ChrootOrdinaryDirectoryRejected) {
                              case_chroot_ordinary_directory_rejected);
 }
 
-TEST(PivotRoot, NamespaceRootRejected) {
-    expect_case_pass_or_skip("pivot_root_namespace_root_rejected", case_namespace_root_rejected);
+TEST(PivotRoot, NamespaceRootPivot) {
+    expect_case_pass_or_skip("pivot_root_namespace_root", case_namespace_root_pivot);
 }
 
 TEST(PivotRoot, NewRootOnRootMount) {

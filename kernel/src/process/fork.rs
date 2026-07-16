@@ -29,8 +29,10 @@ use crate::{
 use super::{
     account_successful_fork, alloc_pid, inc_visible_thread_count,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
+    lock_fs_refs_copy,
     pid::{Pid, PidType},
-    KernelStack, ProcessControlBlock, ProcessManager, RawPid, PTRACE_RELATION_LOCK,
+    FsRefsReadGuard, KernelStack, ProcessControlBlock, ProcessManager, RawPid,
+    PTRACE_RELATION_LOCK,
 };
 pub const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -716,8 +718,12 @@ impl ProcessManager {
             )
         });
 
+        // Keep the fs_struct snapshot and child publication on the same side
+        // of pivot_root's exclusive migration barrier.
+        let fs_refs_copy = lock_fs_refs_copy();
+
         // 拷贝文件系统信息
-        Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+        Self::copy_fs(&clone_flags, current_pcb, pcb, &fs_refs_copy).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
@@ -757,7 +763,7 @@ impl ProcessManager {
         });
 
         // 拷贝namespace
-        Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
+        Self::copy_namespaces(&clone_flags, current_pcb, pcb, &fs_refs_copy).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
@@ -1051,13 +1057,14 @@ impl ProcessManager {
             if needs_oom_score_adj_sync {
                 Self::sync_oom_score_adj_for_clone_vm(current_pcb, pcb);
             }
-            ProcessManager::add_pcb(pcb.clone());
+            ProcessManager::add_pcb(pcb.clone(), &fs_refs_copy);
             drop(oom_score_adj_guard);
             cgroup.add_task(pcb.raw_pid());
             pcb.mark_visible_thread_accounted();
             inc_visible_thread_count();
             account_successful_fork();
         }
+        drop(fs_refs_copy);
 
         // 设置child_tid，意味着子线程能够知道自己的id。
         // 按 Linux schedule_tail 语义，在子任务首次运行时再 best-effort 写入。
@@ -1100,6 +1107,7 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
+        fs_refs: &FsRefsReadGuard,
     ) -> Result<(), SystemError> {
         let fs = parent_pcb.fs_struct();
         let child_fs = if clone_flags.contains(CloneFlags::CLONE_FS) {
@@ -1107,7 +1115,7 @@ impl ProcessManager {
         } else {
             Arc::new((*fs).clone())
         };
-        child_pcb.set_fs_struct(child_fs);
+        child_pcb.set_fs_struct(child_fs, fs_refs);
         Ok(())
     }
 

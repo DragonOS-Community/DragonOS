@@ -540,7 +540,9 @@ impl PageReclaimer {
         };
 
         if len > 0 {
-            page_cache.mark_page_writeback(page_index);
+            if !page_cache.try_mark_page_writeback(page_index, paddr) {
+                return;
+            }
             guard.remove_flags(PageFlags::PG_DIRTY);
             let data = unsafe {
                 core::slice::from_raw_parts(

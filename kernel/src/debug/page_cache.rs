@@ -14,9 +14,53 @@ use crate::{
 #[derive(Debug)]
 struct PageCacheCompletionSelftestCallback;
 
+#[derive(Debug)]
+struct PageCacheAccountingSelftestCallback;
+
 impl KernFSCallback for PageCacheCompletionSelftestCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
         let report = crate::filesystem::page_cache::run_completion_domain_debug_selftest()?;
+        data.file_private_data_mut()
+            .replace(KernFilePrivateData::DebugTextSnapshot(report));
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        data: KernCallbackData,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let report: &String = match data.file_private_data() {
+            Some(KernFilePrivateData::DebugTextSnapshot(report)) => report,
+            _ => return Err(SystemError::EINVAL),
+        };
+        let bytes = report.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(bytes.len() - offset);
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write(
+        &self,
+        _data: KernCallbackData,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EPERM)
+    }
+
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
+        Ok(PollStatus::READ)
+    }
+}
+
+impl KernFSCallback for PageCacheAccountingSelftestCallback {
+    fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        let report = crate::filesystem::page_cache::run_accounting_debug_selftest()?;
         data.file_private_data_mut()
             .replace(KernFilePrivateData::DebugTextSnapshot(report));
         Ok(())
@@ -70,6 +114,13 @@ pub fn init_debugfs_page_cache() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&PageCacheCompletionSelftestCallback),
+    )?;
+    page_cache.add_file(
+        "accounting_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&PageCacheAccountingSelftestCallback),
     )?;
     Ok(())
 }

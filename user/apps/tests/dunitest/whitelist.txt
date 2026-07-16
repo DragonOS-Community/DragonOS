@@ -68,6 +68,7 @@ normal/devfs_ptmx_unlink
 normal/devtmpfs_semantics
 normal/mknod_socket
 normal/pmem_block
+normal/page_cache_accounting
 normal/pipe_release_wakeup
 normal/pipe_waitqueue_wakeup
 normal/oom_killer_semantics

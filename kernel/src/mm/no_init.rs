@@ -32,7 +32,7 @@ pub static EARLY_IOREMAP_PAGES: SpinLock<EarlyIoRemapPages> =
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 struct EarlyRemapPage {
-    data: [u64; MMArch::PAGE_SIZE],
+    data: [u64; MMArch::PAGE_SIZE / core::mem::size_of::<u64>()],
 }
 
 impl EarlyRemapPage {
@@ -60,7 +60,7 @@ impl EarlyIoRemapPages {
     const fn new() -> Self {
         Self {
             pages: [EarlyRemapPage {
-                data: [0; MMArch::PAGE_SIZE],
+                data: [0; MMArch::PAGE_SIZE / core::mem::size_of::<u64>()],
             }; Self::EARLY_REMAP_PAGES_NUM],
             bmp: StaticBitmap::new(),
         }
@@ -209,7 +209,7 @@ pub unsafe fn pseudo_unmap_phys(vaddr: VirtAddr, count: PageFrameCount) {
 
     for i in 0..count.data() {
         let vaddr = vaddr + i * MMArch::PAGE_SIZE;
-        if let Some((_, _, flusher)) = mapper.unmap_phys(vaddr, false) {
+        if let Some((_, _, flusher)) = mapper.unmap_phys(vaddr, true) {
             flusher.ignore();
         };
     }

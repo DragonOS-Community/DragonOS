@@ -1760,7 +1760,7 @@ impl MountFS {
             || replacement
                 .self_mountpoint()
                 .as_ref()
-                .is_none_or(|replacement_mp| !Arc::ptr_eq(replacement_mp, &mountpoint))
+                .is_none_or(|replacement_mp| !Arc::ptr_eq(replacement_mp, mountpoint))
         {
             return Err(SystemError::EINVAL);
         }

@@ -357,11 +357,7 @@ impl MntNamespace {
                     .expect("validated attached caller root must keep its mountpoint");
                 new_root.relocate_mountpoint(Some(old_root_mountpoint.clone()));
                 root_parent
-                    .replace_exact_edge_prepared_with_token(
-                        &old_root,
-                        new_root.clone(),
-                        gate_token,
-                    )
+                    .replace_exact_edge_prepared_with_token(&old_root, new_root.clone(), gate_token)
                     .expect("validated pivot old-root edge must remain exact");
             }
             old_root.relocate_mountpoint(Some(put_old_mountpoint.clone()));

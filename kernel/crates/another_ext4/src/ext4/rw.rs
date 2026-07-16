@@ -122,10 +122,12 @@ impl Ext4 {
         // cannot overwrite with all-zero block; also need to update superblock checksum,
         // otherwise Linux will consider the filesystem corrupted and require e2fsck.
         let mut block = self.read_block(0)?;
+        self.prepare_stats.record_superblock_io();
         let mut sb_with_csum = *sb;
         sb_with_csum.set_checksum();
         block.write_offset_as(BASE_OFFSET, &sb_with_csum);
         self.write_block(&block)?;
+        self.prepare_stats.record_superblock_io();
         // Disk write succeeded, now commit to cache.
         *self.cached_super_block.lock() = *sb;
         Ok(())
@@ -141,6 +143,7 @@ impl Ext4 {
         // Cache miss: read from disk
         let (block_id, offset) = self.inode_disk_pos(inode_id)?;
         let block = self.read_block(block_id)?;
+        self.prepare_stats.record_inode_io();
         let inode_ref = InodeRef::new(inode_id, Box::new(block.read_offset_as(offset)));
         // Populate cache
         self.inode_cache.lock().insert(inode_ref.clone());
@@ -151,6 +154,7 @@ impl Ext4 {
     pub(super) fn read_inode_uncached(&self, inode_id: InodeId) -> Result<InodeRef> {
         let (block_id, offset) = self.inode_disk_pos(inode_id)?;
         let block = self.read_block(block_id)?;
+        self.prepare_stats.record_inode_io();
         Ok(InodeRef::new(
             inode_id,
             Box::new(block.read_offset_as(offset)),
@@ -174,8 +178,10 @@ impl Ext4 {
     pub(super) fn write_inode_without_csum(&self, inode_ref: &InodeRef) -> Result<()> {
         let (block_id, offset) = self.inode_disk_pos(inode_ref.id)?;
         let mut block = self.read_block(block_id)?;
+        self.prepare_stats.record_inode_io();
         block.write_offset_as(offset, &*inode_ref.inode);
         self.write_block(&block)?;
+        self.prepare_stats.record_inode_io();
         // Update cache with the latest inode data
         self.inode_cache.lock().update(inode_ref);
         Ok(())
@@ -209,8 +215,10 @@ impl Ext4 {
         let block_id = sb.first_data_block() + bg_ref.id / desc_per_block + 1;
         let offset = (bg_ref.id % desc_per_block) * sb.desc_size() as u32;
         let mut block = self.read_block(block_id as PBlockId)?;
+        self.prepare_stats.record_gdt_io();
         block.write_offset_as(offset as usize, &bg_ref.desc);
         self.write_block(&block)?;
+        self.prepare_stats.record_gdt_io();
         if let Some(cached) = self.cached_block_groups.get(bg_ref.id as usize) {
             *cached.lock() = bg_ref.desc;
         }
@@ -245,7 +253,10 @@ impl Ext4 {
 
     /// Get disk position of a block group. Return block id and offset within the block.
     #[allow(unused)]
-    fn block_group_disk_pos(&self, block_group_id: BlockGroupId) -> Result<(PBlockId, usize)> {
+    pub(super) fn block_group_disk_pos(
+        &self,
+        block_group_id: BlockGroupId,
+    ) -> Result<(PBlockId, usize)> {
         let super_block = self.read_super_block_cached();
         if block_group_id >= super_block.block_group_count() {
             return Err(crate::format_error!(

@@ -1,6 +1,7 @@
 use core::{
     any::Any,
-    fmt::{Debug, Formatter},
+    fmt::{Debug, Formatter, Write},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -20,7 +21,7 @@ use virtio_drivers::{
 };
 
 use crate::{
-    arch::CurrentIrqArch,
+    arch::{CurrentIrqArch, CurrentTimeArch},
     driver::{
         base::{
             block::{
@@ -71,7 +72,7 @@ use crate::{
         ProcessControlBlock, ProcessManager,
     },
     sched::prio::MAX_RT_PRIO,
-    time::{sleep::nanosleep, PosixTimeSpec},
+    time::{sleep::nanosleep, PosixTimeSpec, TimeArch},
 };
 
 const VIRTIO_BLK_BASENAME: &str = "virtio_blk";
@@ -81,6 +82,168 @@ const IO_BUDGET: usize = 32; // 每次最多处理32个请求
 const SLEEP_MS: usize = 20; // 达到budget后睡眠20ms
 const SHUTDOWN_DRAIN_RETRIES: usize = 32;
 const SHUTDOWN_DRAIN_INTERVAL_NS: i64 = 1_000_000;
+const P6_2_STATS_ENABLED: bool = option_env!("DRAGONOS_P6_2_STATS").is_some();
+const BIO_LATENCY_CYCLES_SHORT: usize = 10_000;
+const BIO_LATENCY_CYCLES_MEDIUM: usize = 100_000;
+const BIO_LATENCY_CYCLES_LONG: usize = 1_000_000;
+static NEXT_VIRTIO_BLK_STATS_GENERATION: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Default)]
+struct InflightTiming {
+    last_cycle: usize,
+    inflight: usize,
+    weighted_cycles: usize,
+    observed_cycles: usize,
+}
+
+struct VirtIOBlkStats {
+    generation: usize,
+    submits: AtomicUsize,
+    completes: AtomicUsize,
+    reads: AtomicUsize,
+    writes: AtomicUsize,
+    flushes: AtomicUsize,
+    bytes: AtomicUsize,
+    errors: AtomicUsize,
+    short: AtomicUsize,
+    inflight: AtomicUsize,
+    peak_inflight: AtomicUsize,
+    depth_1: AtomicUsize,
+    depth_2_4: AtomicUsize,
+    depth_5_16: AtomicUsize,
+    depth_17_plus: AtomicUsize,
+    size_4k: AtomicUsize,
+    size_16k: AtomicUsize,
+    size_32k: AtomicUsize,
+    size_64k: AtomicUsize,
+    size_large: AtomicUsize,
+    budget_hits: AtomicUsize,
+    latency_short: AtomicUsize,
+    latency_medium: AtomicUsize,
+    latency_long: AtomicUsize,
+    latency_very_long: AtomicUsize,
+    timing: SpinLock<InflightTiming>,
+}
+
+impl VirtIOBlkStats {
+    fn new() -> Self {
+        Self {
+            generation: NEXT_VIRTIO_BLK_STATS_GENERATION.fetch_add(1, Ordering::Relaxed),
+            submits: AtomicUsize::new(0),
+            completes: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            flushes: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
+            short: AtomicUsize::new(0),
+            inflight: AtomicUsize::new(0),
+            peak_inflight: AtomicUsize::new(0),
+            depth_1: AtomicUsize::new(0),
+            depth_2_4: AtomicUsize::new(0),
+            depth_5_16: AtomicUsize::new(0),
+            depth_17_plus: AtomicUsize::new(0),
+            size_4k: AtomicUsize::new(0),
+            size_16k: AtomicUsize::new(0),
+            size_32k: AtomicUsize::new(0),
+            size_64k: AtomicUsize::new(0),
+            size_large: AtomicUsize::new(0),
+            budget_hits: AtomicUsize::new(0),
+            latency_short: AtomicUsize::new(0),
+            latency_medium: AtomicUsize::new(0),
+            latency_long: AtomicUsize::new(0),
+            latency_very_long: AtomicUsize::new(0),
+            timing: SpinLock::new(InflightTiming::default()),
+        }
+    }
+
+    fn account_time(&self, now: usize, inflight_delta: isize) {
+        let mut timing = self.timing.lock_irqsave();
+        if timing.last_cycle != 0 {
+            let elapsed = now.wrapping_sub(timing.last_cycle);
+            timing.observed_cycles = timing.observed_cycles.wrapping_add(elapsed);
+            timing.weighted_cycles = timing
+                .weighted_cycles
+                .wrapping_add(elapsed.wrapping_mul(timing.inflight));
+        }
+        timing.last_cycle = now;
+        if inflight_delta > 0 {
+            timing.inflight += inflight_delta as usize;
+        } else {
+            timing.inflight = timing.inflight.saturating_sub((-inflight_delta) as usize);
+        }
+    }
+
+    fn begin(&self, kind: BioType, bytes: usize, now: usize) {
+        if !P6_2_STATS_ENABLED {
+            return;
+        }
+        self.submits.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        match kind {
+            BioType::Read => &self.reads,
+            BioType::Write => &self.writes,
+            BioType::Flush => &self.flushes,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        if kind != BioType::Flush {
+            match bytes {
+                1..=4096 => &self.size_4k,
+                4097..=16384 => &self.size_16k,
+                16385..=32768 => &self.size_32k,
+                32769..=65536 => &self.size_64k,
+                _ => &self.size_large,
+            }
+            .fetch_add(1, Ordering::Relaxed);
+        }
+        let depth = self.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_inflight.fetch_max(depth, Ordering::Relaxed);
+        match depth {
+            1 => &self.depth_1,
+            2..=4 => &self.depth_2_4,
+            5..=16 => &self.depth_5_16,
+            _ => &self.depth_17_plus,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        self.account_time(now, 1);
+    }
+
+    fn finish(
+        &self,
+        result: &Result<usize, SystemError>,
+        expected: usize,
+        start: usize,
+        now: usize,
+    ) {
+        if !P6_2_STATS_ENABLED {
+            return;
+        }
+        self.completes.fetch_add(1, Ordering::Relaxed);
+        let previous = self.inflight.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous != 0);
+        match result {
+            Ok(completed) if *completed != expected => {
+                self.short.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        let latency = now.wrapping_sub(start);
+        let bucket = if latency <= BIO_LATENCY_CYCLES_SHORT {
+            &self.latency_short
+        } else if latency <= BIO_LATENCY_CYCLES_MEDIUM {
+            &self.latency_medium
+        } else if latency <= BIO_LATENCY_CYCLES_LONG {
+            &self.latency_long
+        } else {
+            &self.latency_very_long
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+        self.account_time(now, -1);
+    }
+}
 
 /// Token映射表：virtqueue token -> BioRequest
 /// BIO请求的完整上下文，包含virtio需要的req和resp
@@ -224,7 +387,7 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
                     Err(VirtioError::NotReady) => {
                         if token_map.insert(token, ctx).is_err() {
                             error!("VirtIOBlk: token {} reinsert failed", token);
-                            bio.complete(Err(SystemError::EIO));
+                            device.complete_accounted_bio(&bio, Err(SystemError::EIO));
                         }
                         break;
                     }
@@ -249,7 +412,7 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
                     Err(VirtioError::NotReady) => {
                         if token_map.insert(token, ctx).is_err() {
                             error!("VirtIOBlk: token {} reinsert failed", token);
-                            bio.complete(Err(SystemError::EIO));
+                            device.complete_accounted_bio(&bio, Err(SystemError::EIO));
                         }
                         break;
                     }
@@ -265,7 +428,7 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
                     Err(VirtioError::NotReady) => {
                         if token_map.insert(token, ctx).is_err() {
                             error!("VirtIOBlk: token {} reinsert failed", token);
-                            bio.complete(Err(SystemError::EIO));
+                            device.complete_accounted_bio(&bio, Err(SystemError::EIO));
                         }
                         break;
                     }
@@ -277,7 +440,7 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
             }
         };
         drop(inner);
-        bio.complete(result);
+        device.complete_accounted_bio(&bio, result);
         completed += 1;
     }
 
@@ -298,6 +461,51 @@ pub fn virtio_blk_0() -> Option<Arc<VirtIOBlkDevice>> {
         .first()
         .cloned()
         .map(|dev| dev.arc_any().downcast().unwrap())
+}
+
+pub fn virtio_blk_stats_report() -> String {
+    let mut report = String::new();
+    for device in virtio_blk_driver().devices() {
+        let Ok(device) = device.arc_any().downcast::<VirtIOBlkDevice>() else {
+            continue;
+        };
+        let stats = &device.stats;
+        let timing = stats.timing.lock_irqsave();
+        let _ = writeln!(
+            report,
+            "device={} generation={} enabled={} submits={} completes={} reads={} writes={} flushes={} bytes={} errors={} short={} inflight={} peak_inflight={} depth_1={} depth_2_4={} depth_5_16={} depth_17_plus={} size_4k={} size_16k={} size_32k={} size_64k={} size_large={} budget_hits={} latency_le_10k={} latency_le_100k={} latency_le_1m={} latency_gt_1m={} weighted_inflight_cycles={} observed_cycles={}",
+            device.blkdev_meta.devname.name(),
+            stats.generation,
+            P6_2_STATS_ENABLED as usize,
+            stats.submits.load(Ordering::Relaxed),
+            stats.completes.load(Ordering::Relaxed),
+            stats.reads.load(Ordering::Relaxed),
+            stats.writes.load(Ordering::Relaxed),
+            stats.flushes.load(Ordering::Relaxed),
+            stats.bytes.load(Ordering::Relaxed),
+            stats.errors.load(Ordering::Relaxed),
+            stats.short.load(Ordering::Relaxed),
+            stats.inflight.load(Ordering::Relaxed),
+            stats.peak_inflight.load(Ordering::Relaxed),
+            stats.depth_1.load(Ordering::Relaxed),
+            stats.depth_2_4.load(Ordering::Relaxed),
+            stats.depth_5_16.load(Ordering::Relaxed),
+            stats.depth_17_plus.load(Ordering::Relaxed),
+            stats.size_4k.load(Ordering::Relaxed),
+            stats.size_16k.load(Ordering::Relaxed),
+            stats.size_32k.load(Ordering::Relaxed),
+            stats.size_64k.load(Ordering::Relaxed),
+            stats.size_large.load(Ordering::Relaxed),
+            stats.budget_hits.load(Ordering::Relaxed),
+            stats.latency_short.load(Ordering::Relaxed),
+            stats.latency_medium.load(Ordering::Relaxed),
+            stats.latency_long.load(Ordering::Relaxed),
+            stats.latency_very_long.load(Ordering::Relaxed),
+            timing.weighted_cycles,
+            timing.observed_cycles,
+        );
+    }
+    report
 }
 
 pub fn virtio_blk(
@@ -404,6 +612,7 @@ pub struct VirtIOBlkDevice {
     parent: RwLock<Weak<LockedDevFSInode>>,
     fs: RwLock<Weak<DevFS>>,
     metadata: Metadata,
+    stats: VirtIOBlkStats,
 }
 
 impl Debug for VirtIOBlkDevice {
@@ -475,6 +684,7 @@ impl VirtIOBlkDevice {
                 crate::filesystem::vfs::FileType::BlockDevice,
                 InodeMode::from_bits_truncate(0o755),
             ),
+            stats: VirtIOBlkStats::new(),
         });
 
         let device_weak = Arc::downgrade(&dev);
@@ -514,6 +724,25 @@ impl VirtIOBlkDevice {
         self.inner.lock_irqsave()
     }
 
+    fn expected_bio_bytes(bio: &BioRequest) -> usize {
+        match bio.bio_type() {
+            BioType::Read | BioType::Write => bio.count() * LBA_SIZE,
+            BioType::Flush => 0,
+        }
+    }
+
+    fn complete_accounted_bio(&self, bio: &BioRequest, result: Result<usize, SystemError>) {
+        if P6_2_STATS_ENABLED {
+            self.stats.finish(
+                &result,
+                Self::expected_bio_bytes(bio),
+                bio.stats_submit_cycle(),
+                CurrentTimeArch::get_cycles(),
+            );
+        }
+        bio.complete(result);
+    }
+
     fn abort_initialization(self: &Arc<Self>) {
         let devname_id = self.blkdev_meta.devname.id();
         if let Err(err) = self.shutdown() {
@@ -551,7 +780,7 @@ impl VirtIOBlkDevice {
 
         if let Some(bio_queue) = &bio_queue {
             for bio in bio_queue.stop_and_drain() {
-                bio.complete(Err(SystemError::ESHUTDOWN));
+                self.complete_accounted_bio(&bio, Err(SystemError::ESHUTDOWN));
             }
         }
 
@@ -595,7 +824,7 @@ impl VirtIOBlkDevice {
                 );
             }
             for ctx in pending {
-                ctx.bio.complete(Err(SystemError::ESHUTDOWN));
+                self.complete_accounted_bio(&ctx.bio, Err(SystemError::ESHUTDOWN));
             }
         }
 
@@ -706,12 +935,19 @@ impl BlockDevice for VirtIOBlkDevice {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+        if buf.len() < expected {
+            return Err(SystemError::EINVAL);
+        }
         let bio = self.submit_bio_read(lba_id_start, count)?;
         let data = bio
             .wait()
             .inspect_err(|e| log::error!("VirtIOBlkDevice read_at_sync error: {:?}", e))?;
-        buf[..count * LBA_SIZE].copy_from_slice(&data[..count * LBA_SIZE]);
-        Ok(count)
+        buf[..expected].copy_from_slice(&data);
+        Ok(expected)
     }
 
     fn write_at_sync(
@@ -720,18 +956,23 @@ impl BlockDevice for VirtIOBlkDevice {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        let bio = self.submit_bio_write(lba_id_start, count, &buf[..count * LBA_SIZE])?;
-        let _ = bio
-            .wait()
+        if count == 0 {
+            return Ok(0);
+        }
+        let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+        if buf.len() != expected {
+            return Err(SystemError::EINVAL);
+        }
+        let bio = self.submit_bio_write(lba_id_start, count, buf)?;
+        bio.wait_status()
             .inspect_err(|e| log::error!("VirtIOBlkDevice write_at_sync error: {:?}", e))?;
-        Ok(count)
+        Ok(expected)
     }
 
     fn sync(&self) -> Result<(), SystemError> {
         let bio = BioRequest::new_flush();
         self.submit_bio(bio.clone())?;
-        let _ = bio
-            .wait()
+        bio.wait_status()
             .inspect_err(|e| log::error!("VirtIOBlkDevice sync flush error: {:?}", e))?;
         Ok(())
     }
@@ -773,7 +1014,33 @@ impl BlockDevice for VirtIOBlkDevice {
             return Err(SystemError::ESHUTDOWN);
         }
         if let Some(bio_queue) = &inner.bio_queue {
-            bio_queue.submit(bio)
+            let (expected, now) = if P6_2_STATS_ENABLED {
+                let expected = match bio.bio_type() {
+                    BioType::Read | BioType::Write => bio
+                        .count()
+                        .checked_mul(LBA_SIZE)
+                        .ok_or(SystemError::EOVERFLOW)?,
+                    BioType::Flush => 0,
+                };
+                let now = CurrentTimeArch::get_cycles();
+                bio.set_stats_submit_cycle(now);
+                self.stats.begin(bio.bio_type(), expected, now);
+                (expected, now)
+            } else {
+                (0, 0)
+            };
+            if let Err(error) = bio_queue.submit(bio) {
+                if P6_2_STATS_ENABLED {
+                    self.stats.finish(
+                        &Err(error.clone()),
+                        expected,
+                        now,
+                        CurrentTimeArch::get_cycles(),
+                    );
+                }
+                return Err(error);
+            }
+            Ok(())
         } else {
             Err(SystemError::ENOSYS)
         }
@@ -1010,7 +1277,7 @@ impl Drop for VirtIOBlkDevice {
                     break;
                 }
                 for bio in batch {
-                    bio.complete(Err(SystemError::ENODEV));
+                    self.complete_accounted_bio(&bio, Err(SystemError::ENODEV));
                 }
             }
         }
@@ -1023,7 +1290,7 @@ impl Drop for VirtIOBlkDevice {
                 .map(|(_, v)| v)
                 .collect();
             for ctx in pending {
-                ctx.bio.complete(Err(SystemError::ENODEV));
+                self.complete_accounted_bio(&ctx.bio, Err(SystemError::ENODEV));
             }
         }
     }
@@ -1267,7 +1534,7 @@ fn bio_io_thread_loop(device_weak: Weak<VirtIOBlkDevice>) -> i32 {
                     if let Err(e) = submit_bio_to_virtio(&device, bio.clone()) {
                         log::error!("virtio submit_bio_to_virtio failed: {:?}", e);
                         // 失败时立即完成BIO
-                        bio.complete(Err(e));
+                        device.complete_accounted_bio(&bio, Err(e));
                     }
                     processed += 1;
 
@@ -1279,6 +1546,9 @@ fn bio_io_thread_loop(device_weak: Weak<VirtIOBlkDevice>) -> i32 {
 
             // 达到budget，主动睡眠20ms，避免独占CPU
             if processed >= IO_BUDGET {
+                if P6_2_STATS_ENABLED {
+                    device.stats.budget_hits.fetch_add(1, Ordering::Relaxed);
+                }
                 let sleep_time = PosixTimeSpec::new(0, (SLEEP_MS as i64) * 1_000_000); // 20ms
                 let _ = nanosleep(sleep_time);
             }
@@ -1381,7 +1651,7 @@ fn submit_bio_to_virtio(
     let token = match token {
         Some(token) => token,
         None => {
-            bio.complete(Ok(0));
+            device.complete_accounted_bio(&bio, Ok(0));
             drop(irq_guard);
             return Ok(());
         }

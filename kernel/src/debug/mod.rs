@@ -1,3 +1,4 @@
+pub mod block;
 pub mod errseq;
 pub mod ext4;
 pub mod fuse;

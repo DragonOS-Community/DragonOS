@@ -63,6 +63,7 @@ impl JournalContext {
 /// callers cannot retain a second publishable copy past commit/abort.
 pub struct StagedBlock {
     home: PBlockId,
+    original: Option<Box<[u8; BLOCK_SIZE]>>,
     image: Box<[u8; BLOCK_SIZE]>,
 }
 
@@ -147,6 +148,18 @@ impl DirectTransactionCore {
     }
 
     pub fn start(&self, credits: usize) -> Result<Transaction<'_>> {
+        self.start_with_originals(credits, false)
+    }
+
+    pub(super) fn start_direct_range(&self, credits: usize) -> Result<Transaction<'_>> {
+        self.start_with_originals(credits, true)
+    }
+
+    fn start_with_originals(
+        &self,
+        credits: usize,
+        preserve_originals: bool,
+    ) -> Result<Transaction<'_>> {
         if credits == 0 || self.is_poisoned() {
             return Err(Ext4Error::new(if credits == 0 {
                 ErrCode::EINVAL
@@ -161,7 +174,11 @@ impl DirectTransactionCore {
         {
             return Err(Ext4Error::new(ErrCode::EAGAIN));
         }
-        Ok(Transaction::new(TransactionCoreRef::Direct(self), credits))
+        Ok(Transaction::new(
+            TransactionCoreRef::Direct(self),
+            credits,
+            preserve_originals,
+        ))
     }
 
     fn poison(&self) {
@@ -232,7 +249,11 @@ impl JournalTransactionCore {
             self.writer.store(false, Ordering::Release);
             return Err(Ext4Error::new(ErrCode::E2BIG));
         }
-        Ok(Transaction::new(TransactionCoreRef::Journal(self), credits))
+        Ok(Transaction::new(
+            TransactionCoreRef::Journal(self),
+            credits,
+            false,
+        ))
     }
 
     fn poison(&self) {
@@ -250,15 +271,21 @@ pub struct Transaction<'a> {
     core: TransactionCoreRef<'a>,
     credits: usize,
     staged: BTreeMap<PBlockId, StagedBlock>,
+    preserve_originals: bool,
     owns_writer: bool,
 }
 
 impl Transaction<'_> {
-    fn new(core: TransactionCoreRef<'_>, credits: usize) -> Transaction<'_> {
+    fn new(
+        core: TransactionCoreRef<'_>,
+        credits: usize,
+        preserve_originals: bool,
+    ) -> Transaction<'_> {
         Transaction {
             core,
             credits,
             staged: BTreeMap::new(),
+            preserve_originals,
             owns_writer: true,
         }
     }
@@ -268,7 +295,14 @@ impl Transaction<'_> {
         if !self.staged.contains_key(&home) && self.staged.len() == self.credits {
             return Err(Ext4Error::new(ErrCode::E2BIG));
         }
-        self.staged.insert(home, StagedBlock { home, image });
+        self.staged.insert(
+            home,
+            StagedBlock {
+                home,
+                original: None,
+                image,
+            },
+        );
         Ok(())
     }
 
@@ -287,10 +321,12 @@ impl Transaction<'_> {
                 return Err(Ext4Error::new(ErrCode::E2BIG));
             }
             let block = device.read_block(home)?;
+            let original = self.preserve_originals.then(|| block.data.clone());
             self.staged.insert(
                 home,
                 StagedBlock {
                     home,
+                    original,
                     image: block.data,
                 },
             );
@@ -328,6 +364,106 @@ impl Transaction<'_> {
             TransactionCoreRef::Journal(_) => self.commit_journal(device, publisher),
             TransactionCoreRef::Direct(_) => self.commit_direct(device, publisher),
         }
+    }
+
+    /// Commit a nojournal range allocation in semantic order.
+    ///
+    /// Allocation homes are written before the inode-table home which makes
+    /// the extent reachable.  A failure before the inode write rolls back the
+    /// completed allocation homes from their transaction-private snapshots.
+    /// Once the inode write is attempted its on-disk state is uncertain, so
+    /// the direct backend is poisoned instead of releasing possibly-owned
+    /// blocks for reuse.
+    pub(super) fn commit_direct_range(
+        mut self,
+        device: &dyn BlockDevice,
+        publisher: &dyn CachePublisher,
+        allocation_homes: &[PBlockId],
+        inode_home: PBlockId,
+    ) -> core::result::Result<(), CommitError> {
+        let TransactionCoreRef::Direct(core) = self.core else {
+            return self.fail(
+                Ext4Error::new(ErrCode::EINVAL),
+                CommitFailure::BeforeCommit,
+                false,
+            );
+        };
+        if !device.supports_reliable_flush()
+            || inode_home >= core.target_blocks
+            || allocation_homes.is_empty()
+            || allocation_homes.contains(&inode_home)
+            || self.staged.len() != allocation_homes.len() + 1
+            || !self.staged.contains_key(&inode_home)
+            || allocation_homes.iter().any(|home| {
+                *home >= core.target_blocks
+                    || !self.staged.contains_key(home)
+                    || self.staged[home].original.is_none()
+            })
+            || self.staged[&inode_home].original.is_none()
+        {
+            return self.fail(
+                Ext4Error::new(ErrCode::EINVAL),
+                CommitFailure::BeforeCommit,
+                false,
+            );
+        }
+
+        for (completed, home) in allocation_homes.iter().enumerate() {
+            let staged = &self.staged[home];
+            if let Err(error) = write_bytes(device, *home, staged.bytes()) {
+                // The failed write may have reached the device partially.
+                // Rewrite its old image as well as every earlier home before
+                // declaring the operation safely aborted.
+                let rollback = self.rollback_direct_range(device, &allocation_homes[..=completed]);
+                return match rollback {
+                    Ok(()) => self.fail(error, CommitFailure::BeforeCommit, false),
+                    Err(rollback_error) => {
+                        self.fail(rollback_error, CommitFailure::CheckpointFailed, true)
+                    }
+                };
+            }
+        }
+
+        // The inode must never become durable before the allocation metadata
+        // that owns its blocks. Without this boundary a volatile device cache
+        // may persist the inode first and expose its blocks as free after a
+        // crash. A failed flush is still before publication, so restore every
+        // allocation home while the exclusive transaction owner is held.
+        if let Err(error) = device.flush() {
+            let rollback = self.rollback_direct_range(device, allocation_homes);
+            return match rollback {
+                Ok(()) => self.fail(error, CommitFailure::BeforeCommit, false),
+                Err(rollback_error) => {
+                    self.fail(rollback_error, CommitFailure::CheckpointFailed, true)
+                }
+            };
+        }
+
+        let inode = &self.staged[&inode_home];
+        if let Err(error) = write_bytes(device, inode_home, inode.bytes()) {
+            return self.fail(error, CommitFailure::CommitUncertain, true);
+        }
+        publisher.publish(&self.staged);
+        self.release_writer();
+        Ok(())
+    }
+
+    fn rollback_direct_range(
+        &self,
+        device: &dyn BlockDevice,
+        completed_homes: &[PBlockId],
+    ) -> Result<()> {
+        for home in completed_homes.iter().rev() {
+            let original = self.staged[home]
+                .original
+                .as_ref()
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            write_bytes(device, *home, original)?;
+        }
+        if !completed_homes.is_empty() && device.supports_reliable_flush() {
+            device.flush()?;
+        }
+        Ok(())
     }
 
     fn commit_direct(
@@ -726,12 +862,19 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    const TEST_MAX_FAST_METADATA_IMAGES: usize = 16;
+    const TEST_LARGE_JOURNAL_BLOCKS: u32 = 64;
+
     struct MemoryDevice {
         volatile: spin::Mutex<BTreeMap<PBlockId, Box<[u8; BLOCK_SIZE]>>>,
         stable: spin::Mutex<BTreeMap<PBlockId, Box<[u8; BLOCK_SIZE]>>>,
         operation: AtomicUsize,
         fail_at: AtomicUsize,
+        fail_at_second: AtomicUsize,
         write_order: spin::Mutex<Vec<PBlockId>>,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        flushes: AtomicUsize,
     }
 
     impl MemoryDevice {
@@ -741,13 +884,19 @@ mod tests {
                 stable: spin::Mutex::new(BTreeMap::new()),
                 operation: AtomicUsize::new(0),
                 fail_at: AtomicUsize::new(usize::MAX),
+                fail_at_second: AtomicUsize::new(usize::MAX),
                 write_order: spin::Mutex::new(Vec::new()),
+                reads: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+                flushes: AtomicUsize::new(0),
             }
         }
 
         fn step(&self) -> Result<()> {
             let operation = self.operation.fetch_add(1, Ordering::SeqCst);
-            if operation == self.fail_at.load(Ordering::SeqCst) {
+            if operation == self.fail_at.load(Ordering::SeqCst)
+                || operation == self.fail_at_second.load(Ordering::SeqCst)
+            {
                 Err(Ext4Error::new(ErrCode::EIO))
             } else {
                 Ok(())
@@ -766,6 +915,7 @@ mod tests {
 
     impl BlockDevice for MemoryDevice {
         fn read_block(&self, block_id: PBlockId) -> Result<Block> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(Block::new(
                 block_id,
                 self.volatile
@@ -777,6 +927,7 @@ mod tests {
         }
 
         fn write_block(&self, block: &Block) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
             self.step()?;
             self.write_order.lock().push(block.id);
             self.volatile.lock().insert(block.id, block.data.clone());
@@ -784,6 +935,7 @@ mod tests {
         }
 
         fn flush(&self) -> Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
             self.step()?;
             *self.stable.lock() = self.volatile.lock().clone();
             Ok(())
@@ -862,6 +1014,225 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_transactions_do_not_retain_rollback_images() {
+        let device = MemoryDevice::new();
+        let core = DirectTransactionCore::new(8).unwrap();
+        let mut transaction = core.start(1).unwrap();
+
+        transaction.read_for_update(&device, 1).unwrap()[0] = 1;
+
+        assert!(transaction.staged[&1].original.is_none());
+        transaction.abort();
+    }
+
+    #[test]
+    fn direct_range_transactions_retain_rollback_images() {
+        let device = MemoryDevice::new();
+        let core = DirectTransactionCore::new(8).unwrap();
+        let mut transaction = core.start_direct_range(1).unwrap();
+
+        transaction.read_for_update(&device, 1).unwrap()[0] = 1;
+
+        assert!(transaction.staged[&1].original.is_some());
+        transaction.abort();
+    }
+
+    fn staged_direct_range<'a>(
+        core: &'a DirectTransactionCore,
+        device: &MemoryDevice,
+    ) -> Transaction<'a> {
+        let mut transaction = core.start_direct_range(4).unwrap();
+        for (home, value) in [(9, 9), (2, 2), (5, 5), (7, 7)] {
+            transaction
+                .read_for_update(device, home)
+                .unwrap()
+                .fill(value);
+        }
+        transaction
+    }
+
+    #[test]
+    fn direct_range_uses_allocation_order_and_inode_last() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap();
+
+        assert_eq!(&*device.write_order.lock(), &[9, 2, 5, 7]);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(device.stable_block(9).unwrap().as_slice(), &[9; BLOCK_SIZE]);
+        assert!(device.stable_block(7).is_none());
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 4);
+        assert!(!core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_restores_failed_allocation_home_before_continuing() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(1, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::BeforeCommit);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        assert_eq!(&*device.write_order.lock(), &[9, 2, 9]);
+        assert_eq!(device.volatile.lock()[&9].as_slice(), &[0; BLOCK_SIZE]);
+        assert_eq!(device.volatile.lock()[&2].as_slice(), &[0; BLOCK_SIZE]);
+        assert!(!core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_restores_each_failed_allocation_home() {
+        for failed_home in 0..3 {
+            let device = MemoryDevice::new();
+            device.fail_at.store(failed_home, Ordering::SeqCst);
+            let publisher = Publisher(AtomicUsize::new(0));
+            let core = DirectTransactionCore::new(128).unwrap();
+            let transaction = staged_direct_range(&core, &device);
+
+            let error = transaction
+                .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+                .unwrap_err();
+
+            assert_eq!(error.failure, CommitFailure::BeforeCommit);
+            assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+            for home in [9, 2, 5] {
+                let image = device
+                    .volatile
+                    .lock()
+                    .get(&home)
+                    .cloned()
+                    .unwrap_or_else(|| Box::new([0; BLOCK_SIZE]));
+                assert_eq!(image.as_slice(), &[0; BLOCK_SIZE]);
+            }
+            assert!(!core.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn direct_range_rollback_write_failure_poisons_backend() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(1, Ordering::SeqCst);
+        device.fail_at_second.store(2, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::CheckpointFailed);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        assert!(core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_rollback_flush_failure_poisons_backend() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(1, Ordering::SeqCst);
+        device.fail_at_second.store(4, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::CheckpointFailed);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        assert!(core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_inode_write_failure_is_uncertain_and_poisons() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(4, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::CommitUncertain);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        assert!(core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_allocation_flush_failure_restores_all_homes() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(3, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::BeforeCommit);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        for home in [9, 2, 5] {
+            assert_eq!(
+                device.stable_block(home).unwrap().as_slice(),
+                &[0; BLOCK_SIZE]
+            );
+        }
+        assert!(device.stable_block(7).is_none());
+        assert!(!core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_allocation_flush_rollback_failure_poisons_backend() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(3, Ordering::SeqCst);
+        device.fail_at_second.store(4, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::CheckpointFailed);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        assert!(core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_rejects_out_of_range_inode_without_io() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(8).unwrap();
+        let mut transaction = core.start_direct_range(4).unwrap();
+        for home in [1, 2, 3, 8] {
+            transaction.read_for_update(&device, home).unwrap()[0] = 1;
+        }
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[1, 2, 3], 8)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::BeforeCommit);
+        assert_eq!(device.writes.load(Ordering::SeqCst), 0);
+        assert!(!core.is_poisoned());
+    }
+
+    #[test]
     fn read_for_update_merges_shared_block_and_charges_one_credit() {
         let device = MemoryDevice::new();
         let core = JournalTransactionCore::new(context()).unwrap();
@@ -877,6 +1248,10 @@ mod tests {
     }
 
     fn context() -> JournalContext {
+        context_with_ring(8, 7)
+    }
+
+    fn context_with_ring(max_len: u32, head: u32) -> JournalContext {
         let features = Features::validate(
             0,
             crate::jbd2::FEATURE_INCOMPAT_CSUM_V3 | crate::jbd2::FEATURE_INCOMPAT_64BIT,
@@ -891,9 +1266,9 @@ mod tests {
         .encode_into(&mut image[..])
         .unwrap();
         image[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
-        image[16..20].copy_from_slice(&8u32.to_be_bytes());
+        image[16..20].copy_from_slice(&max_len.to_be_bytes());
         image[20..24].copy_from_slice(&1u32.to_be_bytes());
-        image[24..28].copy_from_slice(&7u32.to_be_bytes());
+        image[24..28].copy_from_slice(&head.to_be_bytes());
         image[40..44].copy_from_slice(
             &(crate::jbd2::FEATURE_INCOMPAT_CSUM_V3 | crate::jbd2::FEATURE_INCOMPAT_64BIT)
                 .to_be_bytes(),
@@ -902,11 +1277,11 @@ mod tests {
         image[80] = CRC32C_CHKSUM;
         update_superblock(
             &mut image,
-            7,
+            head,
             0,
             &Superblock {
                 block_size: BLOCK_SIZE as u32,
-                max_len: 8,
+                max_len,
                 first: 1,
                 sequence: 7,
                 start: 0,
@@ -919,12 +1294,44 @@ mod tests {
         .unwrap();
         JournalContext {
             superblock: Superblock::parse(&image[..], BLOCK_SIZE as u32).unwrap(),
-            logical_blocks: Vec::from_iter(100..108).into(),
-            journal_blocks: Arc::new(BTreeSet::from_iter(100..108)),
+            logical_blocks: Vec::from_iter(100..100 + max_len as u64).into(),
+            journal_blocks: Arc::new(BTreeSet::from_iter(100..100 + max_len as u64)),
             target_blocks: 1000,
-            head: 7,
+            head,
             superblock_image: image,
         }
+    }
+
+    fn assert_counted_commit_shape(homes: usize, expected_reads: usize, expected_writes: usize) {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context_with_ring(
+            TEST_LARGE_JOURNAL_BLOCKS,
+            TEST_LARGE_JOURNAL_BLOCKS - 1,
+        ))
+        .unwrap();
+        let mut transaction = core.start(homes).unwrap();
+        for home in 42..42 + homes as u64 {
+            transaction.read_for_update(&device, home).unwrap()[0] = home as u8;
+        }
+
+        transaction.commit(&device, &publisher).unwrap();
+
+        assert_eq!(device.reads.load(Ordering::SeqCst), expected_reads);
+        assert_eq!(device.writes.load(Ordering::SeqCst), expected_writes);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 5);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), homes);
+        assert!(!core.is_poisoned());
+    }
+
+    #[test]
+    fn journal_commit_four_homes_has_expected_fixed_io_shape() {
+        assert_counted_commit_shape(4, 6, 12);
+    }
+
+    #[test]
+    fn journal_commit_max_fast_metadata_images_has_expected_fixed_io_shape() {
+        assert_counted_commit_shape(TEST_MAX_FAST_METADATA_IMAGES, 18, 36);
     }
 
     #[test]

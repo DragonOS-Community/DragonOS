@@ -1,5 +1,5 @@
 use crate::{
-    arch::MMArch,
+    arch::{CurrentTimeArch, MMArch},
     driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
@@ -21,7 +21,7 @@ use crate::{
     process::{ProcessManager, RawPid},
     sched::sched_yield,
     time::sleep::nanosleep,
-    time::PosixTimeSpec,
+    time::{PosixTimeSpec, TimeArch},
 };
 use alloc::{
     collections::BTreeMap,
@@ -438,7 +438,11 @@ impl IndexNode for LockedExt4Inode {
                 log::warn!("Failed to get current time, using 0");
                 0
             });
-            Self::retry_metadata_contention(|| {
+            let stats_start = fs
+                .fs
+                .prepare_stats_enabled()
+                .then(CurrentTimeArch::get_cycles);
+            let prepare_result = Self::retry_metadata_contention(|| {
                 fs.fs.prepare_buffered_write(
                     inode_num,
                     alloc_start,
@@ -446,7 +450,13 @@ impl IndexNode for LockedExt4Inode {
                     new_end as u64,
                     Some(time),
                 )
-            })?;
+            });
+            if let Some(start) = stats_start {
+                fs.fs.record_prepare_elapsed_cycles(
+                    CurrentTimeArch::get_cycles().wrapping_sub(start),
+                );
+            }
+            prepare_result?;
 
             // 写入范围的磁盘块已就绪，现在安全写入 page cache。
             let write_len = PageCache::write(&page_cache, offset, buf)?;

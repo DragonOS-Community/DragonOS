@@ -105,6 +105,158 @@ pub struct Ext4 {
     /// sharding so unrelated apt download files do not serialize on one global
     /// filesystem-wide spin lock.
     inode_mutation_locks: Vec<spin::Mutex<()>>,
+    prepare_stats: PrepareStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrepareStatsSnapshot {
+    pub enabled: bool,
+    pub generation: usize,
+    pub calls: usize,
+    pub requested_blocks: usize,
+    pub mapped_blocks: usize,
+    pub missing_blocks: usize,
+    pub failures: usize,
+    pub elapsed_cycles: usize,
+    pub bitmap_io: usize,
+    pub gdt_io: usize,
+    pub superblock_io: usize,
+    pub inode_io: usize,
+    pub extent_io: usize,
+    pub zero_io: usize,
+}
+
+struct PrepareStats {
+    generation: usize,
+    calls: AtomicUsize,
+    requested_blocks: AtomicUsize,
+    mapped_blocks: AtomicUsize,
+    missing_blocks: AtomicUsize,
+    failures: AtomicUsize,
+    elapsed_cycles: AtomicUsize,
+    bitmap_io: AtomicUsize,
+    gdt_io: AtomicUsize,
+    superblock_io: AtomicUsize,
+    inode_io: AtomicUsize,
+    extent_io: AtomicUsize,
+    zero_io: AtomicUsize,
+}
+
+impl PrepareStats {
+    fn new() -> Self {
+        Self {
+            generation: NEXT_PREPARE_STATS_GENERATION.fetch_add(1, Ordering::Relaxed),
+            calls: AtomicUsize::new(0),
+            requested_blocks: AtomicUsize::new(0),
+            mapped_blocks: AtomicUsize::new(0),
+            missing_blocks: AtomicUsize::new(0),
+            failures: AtomicUsize::new(0),
+            elapsed_cycles: AtomicUsize::new(0),
+            bitmap_io: AtomicUsize::new(0),
+            gdt_io: AtomicUsize::new(0),
+            superblock_io: AtomicUsize::new(0),
+            inode_io: AtomicUsize::new(0),
+            extent_io: AtomicUsize::new(0),
+            zero_io: AtomicUsize::new(0),
+        }
+    }
+
+    fn record_call(&self) {
+        if P6_2_STATS_ENABLED {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_requested(&self, blocks: usize) {
+        if P6_2_STATS_ENABLED {
+            self.requested_blocks.fetch_add(blocks, Ordering::Relaxed);
+        }
+    }
+
+    fn record_mapped(&self) {
+        if P6_2_STATS_ENABLED {
+            self.mapped_blocks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_missing(&self) {
+        if P6_2_STATS_ENABLED {
+            self.missing_blocks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_missing_blocks(&self, blocks: usize) {
+        if P6_2_STATS_ENABLED {
+            self.missing_blocks.fetch_add(blocks, Ordering::Relaxed);
+        }
+    }
+
+    fn record_failure(&self) {
+        if P6_2_STATS_ENABLED {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_elapsed_cycles(&self, cycles: usize) {
+        if P6_2_STATS_ENABLED {
+            self.elapsed_cycles.fetch_add(cycles, Ordering::Relaxed);
+        }
+    }
+
+    fn record_bitmap_io(&self) {
+        if P6_2_STATS_ENABLED {
+            self.bitmap_io.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_gdt_io(&self) {
+        if P6_2_STATS_ENABLED {
+            self.gdt_io.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_superblock_io(&self) {
+        if P6_2_STATS_ENABLED {
+            self.superblock_io.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_inode_io(&self) {
+        if P6_2_STATS_ENABLED {
+            self.inode_io.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_extent_io(&self) {
+        if P6_2_STATS_ENABLED {
+            self.extent_io.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_zero_io(&self) {
+        if P6_2_STATS_ENABLED {
+            self.zero_io.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> PrepareStatsSnapshot {
+        PrepareStatsSnapshot {
+            enabled: P6_2_STATS_ENABLED,
+            generation: self.generation,
+            calls: self.calls.load(Ordering::Relaxed),
+            requested_blocks: self.requested_blocks.load(Ordering::Relaxed),
+            mapped_blocks: self.mapped_blocks.load(Ordering::Relaxed),
+            missing_blocks: self.missing_blocks.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            elapsed_cycles: self.elapsed_cycles.load(Ordering::Relaxed),
+            bitmap_io: self.bitmap_io.load(Ordering::Relaxed),
+            gdt_io: self.gdt_io.load(Ordering::Relaxed),
+            superblock_io: self.superblock_io.load(Ordering::Relaxed),
+            inode_io: self.inode_io.load(Ordering::Relaxed),
+            extent_io: self.extent_io.load(Ordering::Relaxed),
+            zero_io: self.zero_io.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub(super) enum MetadataMutationMode {
@@ -125,6 +277,8 @@ struct MetadataMutationGate {
 
 const METADATA_GATE_EXCLUSIVE: usize = 1usize << (usize::BITS - 1);
 const METADATA_GATE_DIRECT_MAX: usize = METADATA_GATE_EXCLUSIVE - 1;
+const P6_2_STATS_ENABLED: bool = option_env!("DRAGONOS_P6_2_STATS").is_some();
+static NEXT_PREPARE_STATS_GENERATION: AtomicUsize = AtomicUsize::new(1);
 
 impl MetadataMutationGate {
     const fn new() -> Self {
@@ -203,6 +357,18 @@ const INODE_CACHE_SIZE: usize = 512;
 pub(super) const INODE_MUTATION_LOCK_SHARDS: usize = 64;
 
 impl Ext4 {
+    pub fn prepare_stats_snapshot(&self) -> PrepareStatsSnapshot {
+        self.prepare_stats.snapshot()
+    }
+
+    pub const fn prepare_stats_enabled(&self) -> bool {
+        P6_2_STATS_ENABLED
+    }
+
+    pub fn record_prepare_elapsed_cycles(&self, cycles: usize) {
+        self.prepare_stats.record_elapsed_cycles(cycles);
+    }
+
     fn is_power_of(mut value: u32, base: u32) -> bool {
         while value > base && value.is_multiple_of(base) {
             value /= base;
@@ -452,6 +618,7 @@ impl Ext4 {
             write_barrier: true,
             direct_restore_clean: false,
             inode_mutation_locks,
+            prepare_stats: PrepareStats::new(),
         })
     }
 

@@ -146,8 +146,13 @@ impl Ext4 {
         Ok(())
     }
 
-    pub(super) fn uses_journal(&self) -> bool {
+    pub fn uses_journal(&self) -> bool {
         matches!(self.metadata_mode, MetadataMutationMode::Journal(_))
+    }
+
+    pub(super) fn supports_direct_range_stage(&self) -> bool {
+        matches!(self.metadata_mode, MetadataMutationMode::Direct(_))
+            && self.block_device.supports_reliable_flush()
     }
 
     pub fn shutdown_writable(&self) -> Result<()> {
@@ -196,6 +201,17 @@ impl Ext4 {
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Journal(core) => core.start(credits),
             MetadataMutationMode::Direct(core) => core.start(credits),
+        }
+    }
+
+    pub(super) fn transaction_start_direct_range(
+        &self,
+        credits: usize,
+    ) -> Result<journal_transaction::Transaction<'_>> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Direct(core) => core.start_direct_range(credits),
+            MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Journal(_) => Err(Ext4Error::new(ErrCode::ENOTSUP)),
         }
     }
 

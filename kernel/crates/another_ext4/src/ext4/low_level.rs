@@ -11,6 +11,22 @@ use crate::prelude::*;
 use crate::return_error;
 use core::cmp::min;
 
+const DIRECT_RANGE_MIN_BLOCKS: usize = 16;
+const DIRECT_RANGE_MAX_BLOCKS: usize = 256;
+const DIRECT_RANGE_ZERO_CHUNK_BLOCKS: usize = 8;
+
+enum DirectRangePrepare {
+    Handled,
+    Unsupported,
+}
+
+struct DirectRangePlan {
+    start_lblock: LBlockId,
+    count: u32,
+    preferred_first: Option<PBlockId>,
+    requires_merge: bool,
+}
+
 /// Attributes that can be set on an inode via `setattr`.
 #[derive(Default)]
 pub struct SetAttr {
@@ -40,6 +56,151 @@ impl SetAttr {
 }
 
 impl Ext4 {
+    fn initialize_direct_range(&self, first: PBlockId, count: usize, zeros: &[u8]) -> Result<()> {
+        let mut done = 0usize;
+        while done < count {
+            let blocks = min(DIRECT_RANGE_ZERO_CHUNK_BLOCKS, count - done);
+            let pblock = first
+                .checked_add(done as PBlockId)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+            self.block_device
+                .write_blocks(pblock, &zeros[..blocks * BLOCK_SIZE])?;
+            self.prepare_stats.record_zero_io();
+            done += blocks;
+        }
+        self.block_device.flush()
+    }
+
+    fn direct_range_plan(
+        &self,
+        inode: &InodeRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<Option<DirectRangePlan>> {
+        if len == 0 {
+            return Ok(None);
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        let start_lblock =
+            u32::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let end_lblock =
+            u32::try_from((end - 1) / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let count = end_lblock
+            .checked_sub(start_lblock)
+            .and_then(|blocks| blocks.checked_add(1))
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if start_lblock.checked_add(count).is_none()
+            || (count as usize) < DIRECT_RANGE_MIN_BLOCKS
+            || (count as usize) > DIRECT_RANGE_MAX_BLOCKS
+        {
+            return Ok(None);
+        }
+        let persistent_blocks = inode
+            .inode
+            .size()
+            .checked_add(BLOCK_SIZE as u64 - 1)
+            .map(|size| size / BLOCK_SIZE as u64)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if (start_lblock as u64) < persistent_blocks {
+            return Ok(None);
+        }
+        let Some(shape) = self.direct_append_shape(inode, start_lblock, count)? else {
+            return Ok(None);
+        };
+        Ok(Some(DirectRangePlan {
+            start_lblock,
+            count,
+            preferred_first: shape.preferred_first,
+            requires_merge: shape.requires_merge,
+        }))
+    }
+
+    fn try_prepare_direct_range(
+        &self,
+        inode: &mut InodeRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<DirectRangePrepare> {
+        if len == 0 {
+            return Ok(DirectRangePrepare::Handled);
+        }
+        let Some(plan) = self.direct_range_plan(inode, offset, len)? else {
+            return Ok(DirectRangePrepare::Unsupported);
+        };
+
+        let zero_bytes = DIRECT_RANGE_ZERO_CHUNK_BLOCKS * BLOCK_SIZE;
+        let mut zeros = Vec::new();
+        if zeros.try_reserve_exact(zero_bytes).is_err() {
+            return Ok(DirectRangePrepare::Unsupported);
+        }
+        zeros.resize(zero_bytes, 0);
+
+        let mut transaction = self.transaction_start_direct_range(4)?;
+        let allocation = match self.transaction_alloc_direct_range(
+            &mut transaction,
+            inode.id,
+            plan.preferred_first,
+            plan.requires_merge,
+            plan.count,
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) if error.code() == ErrCode::ENOSPC => {
+                transaction.abort();
+                return Ok(DirectRangePrepare::Unsupported);
+            }
+            Err(error) => return Err(error),
+        };
+
+        self.prepare_stats.record_call();
+        self.prepare_stats.record_requested(plan.count as usize);
+        self.prepare_stats
+            .record_missing_blocks(plan.count as usize);
+        let initialized =
+            self.initialize_direct_range(allocation.first, plan.count as usize, zeros.as_slice());
+        if let Err(error) = initialized {
+            self.prepare_stats.record_failure();
+            transaction.abort();
+            if error.code() == ErrCode::ENOMEM {
+                return Ok(DirectRangePrepare::Unsupported);
+            }
+            return Err(error);
+        }
+
+        if let Err(error) =
+            self.stage_direct_append_extent(inode, plan.start_lblock, allocation.first, plan.count)
+        {
+            self.prepare_stats.record_failure();
+            transaction.abort();
+            return Err(error);
+        }
+        let (inode_home, _) = self.inode_disk_pos(inode.id)?;
+        if let Err(error) = self.transaction_stage_inode_with_csum(&mut transaction, inode) {
+            self.prepare_stats.record_failure();
+            transaction.abort();
+            return Err(error);
+        }
+        self.prepare_stats.record_inode_io();
+        if let Err(error) = transaction.commit_direct_range(
+            self.block_device.as_ref(),
+            self,
+            &allocation.allocation_homes,
+            inode_home,
+        ) {
+            self.prepare_stats.record_failure();
+            if error.failure != super::journal_transaction::CommitFailure::BeforeCommit {
+                self.poison(ErrCode::EIO);
+            }
+            return Err(error.error);
+        }
+        self.prepare_stats.record_bitmap_io();
+        self.prepare_stats.record_gdt_io();
+        self.prepare_stats.record_superblock_io();
+        self.prepare_stats.record_inode_io();
+        Ok(DirectRangePrepare::Handled)
+    }
+
     fn xattr_checksum_seed(&self) -> Result<Option<MetadataChecksumSeed>> {
         let sb = self.read_super_block_cached();
         if !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
@@ -198,39 +359,55 @@ impl Ext4 {
         if len == 0 {
             return Ok(());
         }
-        let end = offset.checked_add(len).ok_or(format_error!(
-            ErrCode::EFBIG,
-            "write range overflow: offset={} len={}",
-            offset,
-            len
-        ))?;
-        let start_iblock = (offset / BLOCK_SIZE) as LBlockId;
-        let end_iblock = ((end - 1) / BLOCK_SIZE) as LBlockId;
-        let mut changed = false;
-        for iblock in start_iblock..=end_iblock {
-            match self.extent_query(inode, iblock) {
-                Ok(_) => {}
-                Err(err) if err.code() == ErrCode::ENOENT => {
-                    self.extent_query_or_create(inode, iblock, 1)?;
-                    self.extent_query(inode, iblock).map_err(|err| {
-                        format_error!(
-                            ErrCode::EIO,
-                            "extent allocation invariant failed: inode {} iblock {} missing after create: {:?}",
-                            inode.id,
-                            iblock,
-                            err
-                        )
-                    })?;
-                    changed = true;
+        self.prepare_stats.record_call();
+        let result = (|| {
+            let end = offset.checked_add(len).ok_or(format_error!(
+                ErrCode::EFBIG,
+                "write range overflow: offset={} len={}",
+                offset,
+                len
+            ))?;
+            let start_iblock = (offset / BLOCK_SIZE) as LBlockId;
+            let end_iblock = ((end - 1) / BLOCK_SIZE) as LBlockId;
+            let requested_blocks = end_iblock
+                .checked_sub(start_iblock)
+                .and_then(|blocks| blocks.checked_add(1))
+                .and_then(|blocks| usize::try_from(blocks).ok())
+                .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+            self.prepare_stats.record_requested(requested_blocks);
+            let mut changed = false;
+            for iblock in start_iblock..=end_iblock {
+                match self.extent_query(inode, iblock) {
+                    Ok(_) => {
+                        self.prepare_stats.record_mapped();
+                    }
+                    Err(err) if err.code() == ErrCode::ENOENT => {
+                        self.prepare_stats.record_missing();
+                        self.extent_query_or_create(inode, iblock, 1)?;
+                        self.extent_query(inode, iblock).map_err(|err| {
+                            format_error!(
+                                ErrCode::EIO,
+                                "extent allocation invariant failed: inode {} iblock {} missing after create: {:?}",
+                                inode.id,
+                                iblock,
+                                err
+                            )
+                        })?;
+                        changed = true;
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
+            if changed {
+                self.recompute_inode_block_count(inode)?;
+                self.write_inode_with_csum(inode)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.prepare_stats.record_failure();
         }
-        if changed {
-            self.recompute_inode_block_count(inode)?;
-            self.write_inode_with_csum(inode)?;
-        }
-        Ok(())
+        result
     }
 
     /// Ensure extents exist for the bytes that will actually be written.
@@ -264,14 +441,44 @@ impl Ext4 {
         _mtime: Option<u32>,
     ) -> Result<()> {
         self.ensure_mutable()?;
+        if self.supports_direct_range_stage() {
+            // Classify the request under a compatible direct guard first.
+            // Unsupported small, overwrite, sparse, and oversized writes can
+            // continue through the legacy allocator without ever contending
+            // for the exclusive transaction snapshot gate.
+            {
+                let _metadata_guard = self.lock_direct_metadata_mutation()?;
+                let _mutation_guard =
+                    self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+                let mut inode = self.read_inode(id)?;
+                if inode.inode.mode().bits() == 0 {
+                    return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
+                }
+                if self.direct_range_plan(&inode, offset, len)?.is_none() {
+                    return self.ensure_blocks_for_write_range_locked(&mut inode, offset, len);
+                }
+            }
+            let outcome = {
+                let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+                let _mutation_guard =
+                    self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+                let mut inode = self.read_inode(id)?;
+                if inode.inode.mode().bits() == 0 {
+                    return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
+                }
+                self.try_prepare_direct_range(&mut inode, offset, len)?
+            };
+            if matches!(outcome, DirectRangePrepare::Handled) {
+                return Ok(());
+            }
+        }
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
-        self.ensure_blocks_for_write_range_locked(&mut inode, offset, len)?;
-        Ok(())
+        self.ensure_blocks_for_write_range_locked(&mut inode, offset, len)
     }
 
     /// Commit cached inode metadata to disk without allocating data blocks.
@@ -1496,6 +1703,7 @@ impl Ext4 {
 mod tests {
     use super::*;
     use crate::FileType;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct StubBlockDevice {
         sb_block: Block,
@@ -1535,6 +1743,10 @@ mod tests {
 
     fn make_test_fs(block_count: u32) -> Ext4 {
         let block_device = Arc::new(StubBlockDevice::with_block_count(block_count));
+        make_test_fs_with_device(block_count, block_device)
+    }
+
+    fn make_test_fs_with_device(block_count: u32, block_device: Arc<dyn BlockDevice>) -> Ext4 {
         let block = block_device.read_block(0).unwrap();
         let sb = block.read_offset_as::<SuperBlock>(BASE_OFFSET);
         Ext4 {
@@ -1556,7 +1768,126 @@ mod tests {
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
+            prepare_stats: crate::ext4::PrepareStats::new(),
         }
+    }
+
+    struct RangeInitDevice {
+        sb_block: Block,
+        writes: AtomicUsize,
+        flushes: AtomicUsize,
+        fail_write_at: AtomicUsize,
+        fail_flush: AtomicBool,
+    }
+
+    impl RangeInitDevice {
+        fn new(block_count: u32) -> Self {
+            let stub = StubBlockDevice::with_block_count(block_count);
+            Self {
+                sb_block: stub.sb_block,
+                writes: AtomicUsize::new(0),
+                flushes: AtomicUsize::new(0),
+                fail_write_at: AtomicUsize::new(usize::MAX),
+                fail_flush: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl BlockDevice for RangeInitDevice {
+        fn read_block(&self, block_id: PBlockId) -> Result<Block> {
+            if block_id == 0 {
+                Ok(self.sb_block.clone())
+            } else {
+                Ok(Block::new(block_id, Box::new([0; BLOCK_SIZE])))
+            }
+        }
+
+        fn write_block(&self, _block: &Block) -> Result<()> {
+            Ok(())
+        }
+
+        fn write_blocks(&self, _start: PBlockId, _data: &[u8]) -> Result<()> {
+            let write = self.writes.fetch_add(1, Ordering::SeqCst);
+            if write == self.fail_write_at.load(Ordering::SeqCst) {
+                Err(Ext4Error::new(ErrCode::ENOMEM))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_flush.load(Ordering::SeqCst) {
+                Err(Ext4Error::new(ErrCode::EIO))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn supports_reliable_flush(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn direct_range_zero_failure_stops_before_flush() {
+        let device = Arc::new(RangeInitDevice::new(128));
+        device.fail_write_at.store(1, Ordering::SeqCst);
+        let fs = make_test_fs_with_device(128, device.clone());
+        let zeros = [0; DIRECT_RANGE_ZERO_CHUNK_BLOCKS * BLOCK_SIZE];
+
+        let error = fs
+            .initialize_direct_range(32, DIRECT_RANGE_ZERO_CHUNK_BLOCKS * 2, &zeros)
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrCode::ENOMEM);
+        assert_eq!(device.writes.load(Ordering::SeqCst), 2);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn direct_range_flush_failure_is_reported_after_all_zero_chunks() {
+        let device = Arc::new(RangeInitDevice::new(128));
+        device.fail_flush.store(true, Ordering::SeqCst);
+        let fs = make_test_fs_with_device(128, device.clone());
+        let zeros = [0; DIRECT_RANGE_ZERO_CHUNK_BLOCKS * BLOCK_SIZE];
+
+        let error = fs
+            .initialize_direct_range(32, DIRECT_RANGE_ZERO_CHUNK_BLOCKS * 2, &zeros)
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrCode::EIO);
+        assert_eq!(device.writes.load(Ordering::SeqCst), 2);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn direct_range_plan_filters_legacy_writes_before_transaction_gate() {
+        let fs = make_test_fs(1024);
+        let mut inode = Inode::default();
+        inode.extent_init();
+        let mut inode = InodeRef::new(2, Box::new(inode));
+
+        assert!(fs
+            .direct_range_plan(&inode, 0, (DIRECT_RANGE_MIN_BLOCKS - 1) * BLOCK_SIZE)
+            .unwrap()
+            .is_none());
+        assert!(fs
+            .direct_range_plan(&inode, 0, (DIRECT_RANGE_MAX_BLOCKS + 1) * BLOCK_SIZE)
+            .unwrap()
+            .is_none());
+        assert!(fs
+            .direct_range_plan(&inode, 0, DIRECT_RANGE_MIN_BLOCKS * BLOCK_SIZE)
+            .unwrap()
+            .is_some());
+
+        inode
+            .inode
+            .set_size((DIRECT_RANGE_MIN_BLOCKS * BLOCK_SIZE) as u64);
+        assert!(fs
+            .direct_range_plan(&inode, 0, DIRECT_RANGE_MIN_BLOCKS * BLOCK_SIZE)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

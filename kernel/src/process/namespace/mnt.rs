@@ -1,7 +1,8 @@
 use crate::{
     filesystem::vfs::{
         mount::{
-            lock_mount_topology, MountFSInode, MountFlags, MountTopologyGuard, MOUNT_LIFECYCLE_LOCK,
+            lock_mount_lifecycle, MountFSInode, MountFlags, MountTopologyGuard,
+            MOUNT_LIFECYCLE_LOCK,
         },
         FileSystem, IndexNode, MountFS,
     },
@@ -255,26 +256,21 @@ impl MntNamespace {
         new_root_path: Arc<MountFSInode>,
         put_old_mountpoint: Arc<MountFSInode>,
     ) -> Result<MountTopologyGuard, SystemError> {
-        let topology = lock_mount_topology();
+        let lifecycle = lock_mount_lifecycle();
         let namespace = self.self_ref.upgrade().ok_or(SystemError::EINVAL)?;
 
         // Linux lock_mount(&old) follows any mount stacked on put_old while
         // holding namespace topology serialization.
         let put_old_mountpoint = put_old_mountpoint.overlaid_inode();
-        if put_old_mountpoint.is_disconnected() {
-            return Err(SystemError::ENOENT);
-        }
-
         let old_root = old_root_path.mount_fs();
         let new_root = new_root_path.mount_fs();
         let put_old_mnt = put_old_mountpoint.mount_fs();
-        let namespace_root = self.inner.read().root_mountfs.clone();
+        // Namespace publication precedes dentry gates in the canonical order.
+        // Keeping this writer across the commit also pins the namespace root
+        // identity until the final publication step.
+        let mut namespace_inner = self.inner.write();
+        let namespace_root = namespace_inner.root_mountfs.clone();
         let old_is_namespace_root = Arc::ptr_eq(&old_root, &namespace_root);
-        // lock_mount(&old) rejects a path whose containing mount was lazily
-        // detached after pathname resolution before pivot validation.
-        if !put_old_mnt.is_live() || !put_old_mnt.is_belongs_to_mntns(&namespace) {
-            return Err(SystemError::ENOENT);
-        }
         // DragonOS represents the namespace root without a visible parent
         // edge. Attached caller roots use their exact parent below; the
         // namespace-root branch instead publishes through root_mountfs.
@@ -283,89 +279,108 @@ impl MntNamespace {
             .as_ref()
             .map(|mountpoint| mountpoint.mount_fs())
             .unwrap_or_else(|| old_root.clone());
-        let new_root_parent = new_root
-            .self_mountpoint()
-            .map(|mountpoint| mountpoint.mount_fs())
-            .unwrap_or_else(|| new_root.clone());
-
-        if put_old_mnt.propagation().is_shared()
-            || new_root_parent.propagation().is_shared()
-            || (!old_is_namespace_root && root_parent.propagation().is_shared())
-            || !old_root.is_live()
-            || !new_root.is_live()
-            || !old_root.is_belongs_to_mntns(&namespace)
-            || !new_root.is_belongs_to_mntns(&namespace)
-            || new_root.is_locked()
-        {
-            return Err(SystemError::EINVAL);
-        }
-        if new_root_path.is_disconnected() {
-            return Err(SystemError::ENOENT);
-        }
-        if Arc::ptr_eq(&new_root, &old_root) || Arc::ptr_eq(&put_old_mnt, &old_root) {
-            return Err(SystemError::EBUSY);
-        }
         if !old_is_namespace_root && old_root_mountpoint.is_none() {
             return Err(SystemError::EINVAL);
         }
         let new_root_mountpoint = new_root.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        if !old_root_path.same_path_ref(&old_root.mountpoint_root_inode())
-            || !new_root_path.same_path_ref(&new_root.mountpoint_root_inode())
-            || put_old_mountpoint
-                .relative_path_from_snapshot(&new_root_path)?
-                .is_none()
-            || new_root_path
-                .relative_path_from_snapshot(&old_root_path)?
-                .is_none()
-        {
-            return Err(SystemError::EINVAL);
-        }
+        let new_root_parent = new_root_mountpoint.mount_fs();
+        let gates = [
+            Some(new_root_mountpoint.clone()),
+            if old_is_namespace_root {
+                None
+            } else {
+                old_root_mountpoint.clone()
+            },
+            Some(put_old_mountpoint.clone()),
+        ];
 
-        // Prepare every allocation before changing an edge. The reservations
-        // keep the original new-root key alive and guarantee one put-old slot.
-        let _new_edge = new_root_parent.reserve_mount_edge(&new_root_mountpoint, 0)?;
-        let _put_old_edge = put_old_mnt.reserve_mount_edge(&put_old_mountpoint, 1)?;
-        let mut namespace_inner = if old_is_namespace_root {
-            let inner = self.inner.write();
-            if !Arc::ptr_eq(&inner.root_mountfs, &old_root) {
+        lifecycle.commit_mount_edges(gates, |gate_token| {
+            // Repeat every admission check only after both dentry aliases and
+            // all affected edge gates have been frozen. This is the atomic
+            // validation point for the transaction.
+            if put_old_mountpoint.is_disconnected() {
+                return Err(SystemError::ENOENT);
+            }
+            // lock_mount(&old) rejects a path whose containing mount was
+            // lazily detached after pathname resolution.
+            if !put_old_mnt.is_live() || !put_old_mnt.is_belongs_to_mntns(&namespace) {
+                return Err(SystemError::ENOENT);
+            }
+            if put_old_mnt.propagation().is_shared()
+                || new_root_parent.propagation().is_shared()
+                || (!old_is_namespace_root && root_parent.propagation().is_shared())
+                || !old_root.is_live()
+                || !new_root.is_live()
+                || !old_root.is_belongs_to_mntns(&namespace)
+                || !new_root.is_belongs_to_mntns(&namespace)
+                || new_root.is_locked()
+                || !Arc::ptr_eq(&namespace_inner.root_mountfs, &namespace_root)
+                || new_root
+                    .self_mountpoint()
+                    .as_ref()
+                    .is_none_or(|mountpoint| !Arc::ptr_eq(mountpoint, &new_root_mountpoint))
+            {
                 return Err(SystemError::EINVAL);
             }
-            Some(inner)
-        } else {
-            None
-        };
+            if new_root_path.is_disconnected() {
+                return Err(SystemError::ENOENT);
+            }
+            if Arc::ptr_eq(&new_root, &old_root) || Arc::ptr_eq(&put_old_mnt, &old_root) {
+                return Err(SystemError::EBUSY);
+            }
+            if !old_root_path.same_path_ref(&old_root.mountpoint_root_inode())
+                || !new_root_path.same_path_ref(&new_root.mountpoint_root_inode())
+                || put_old_mountpoint
+                    .relative_path_from_snapshot(&new_root_path)?
+                    .is_none()
+                || new_root_path
+                    .relative_path_from_snapshot(&old_root_path)?
+                    .is_none()
+            {
+                return Err(SystemError::EINVAL);
+            }
 
-        new_root_parent
-            .detach_exact_keep_slot(&new_root)
-            .expect("validated pivot new-root edge must exist");
-        if old_is_namespace_root {
-            new_root.relocate_mountpoint(None);
-        } else {
-            let old_root_mountpoint = old_root_mountpoint
-                .as_ref()
-                .expect("validated attached caller root must keep its mountpoint");
-            new_root.relocate_mountpoint(Some(old_root_mountpoint.clone()));
-            root_parent
-                .replace_exact_edge_prepared(&old_root, new_root.clone())
-                .expect("validated pivot old-root edge must remain exact");
-        }
-        old_root.relocate_mountpoint(Some(put_old_mountpoint.clone()));
-        put_old_mnt
-            .attach_new_top(&put_old_mountpoint, old_root.clone())
-            .expect("reserved pivot put-old edge must attach without allocation");
+            // Prepare every allocation before changing an edge. The
+            // reservations keep the original new-root key alive and
+            // guarantee one put-old slot.
+            let _new_edge = new_root_parent.reserve_mount_edge(&new_root_mountpoint, 0)?;
+            let _put_old_edge = put_old_mnt.reserve_mount_edge(&put_old_mountpoint, 1)?;
 
-        // Linux transfers MNT_LOCKED from the old root to the new root at
-        // commit. The old root now lives below put_old, outside the boundary
-        // that the lock protected before pivot_root.
-        if old_root.is_locked() {
-            old_root.unlock_mount();
-            new_root.lock_mount();
-        }
-        if let Some(inner) = namespace_inner.as_mut() {
-            inner.root_mountfs = new_root;
-        }
+            new_root_parent
+                .detach_exact_keep_slot_with_token(&new_root, gate_token)
+                .expect("validated pivot new-root edge must exist");
+            if old_is_namespace_root {
+                new_root.relocate_mountpoint(None);
+            } else {
+                let old_root_mountpoint = old_root_mountpoint
+                    .as_ref()
+                    .expect("validated attached caller root must keep its mountpoint");
+                new_root.relocate_mountpoint(Some(old_root_mountpoint.clone()));
+                root_parent
+                    .replace_exact_edge_prepared_with_token(
+                        &old_root,
+                        new_root.clone(),
+                        gate_token,
+                    )
+                    .expect("validated pivot old-root edge must remain exact");
+            }
+            old_root.relocate_mountpoint(Some(put_old_mountpoint.clone()));
+            put_old_mnt
+                .attach_new_top_prelocked(&put_old_mountpoint, old_root.clone(), gate_token)
+                .expect("reserved pivot put-old edge must attach without allocation");
 
-        Ok(topology)
+            // Linux transfers MNT_LOCKED from the old root to the new root at
+            // commit. The old root now lives below put_old, outside the
+            // boundary that the lock protected before pivot_root.
+            if old_root.is_locked() {
+                old_root.unlock_mount();
+                new_root.lock_mount();
+            }
+            if old_is_namespace_root {
+                namespace_inner.root_mountfs = new_root.clone();
+            }
+            Ok(())
+        })
     }
 
     /// Move a complete mount subtree onto an exact shared dentry.

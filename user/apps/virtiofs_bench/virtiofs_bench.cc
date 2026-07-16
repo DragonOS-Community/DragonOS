@@ -71,6 +71,8 @@ enum class WorkloadSpec {
     RandomRead,
     Mmap,
     Concurrent,
+    ParallelReadPrepare,
+    ParallelRead,
 };
 
 const char* workload_name(WorkloadSpec workload) {
@@ -103,6 +105,10 @@ const char* workload_name(WorkloadSpec workload) {
             return "mmap";
         case WorkloadSpec::Concurrent:
             return "concurrent";
+        case WorkloadSpec::ParallelReadPrepare:
+            return "parallel_read_prepare";
+        case WorkloadSpec::ParallelRead:
+            return "parallel_read";
     }
     return "unknown";
 }
@@ -124,7 +130,9 @@ bool parse_workload(const std::string& value, WorkloadSpec* workload) {
                  {"cleanup", WorkloadSpec::Cleanup},
                  {"random_read", WorkloadSpec::RandomRead},
                  {"mmap", WorkloadSpec::Mmap},
-                 {"concurrent", WorkloadSpec::Concurrent}};
+                 {"concurrent", WorkloadSpec::Concurrent},
+                 {"parallel_read_prepare", WorkloadSpec::ParallelReadPrepare},
+                 {"parallel_read", WorkloadSpec::ParallelRead}};
     for (const auto& spec : specs) {
         if (value == spec.name) {
             *workload = spec.workload;
@@ -149,6 +157,8 @@ struct Options {
     size_t workers = 4;
     bool iterations_explicit = false;
 };
+
+constexpr size_t kParallelReadMemoryLimit = 256 * 1024 * 1024;
 
 using StatsMap = std::map<std::string, long long>;
 
@@ -1689,6 +1699,7 @@ int cleanup_workload(const Options& opt, const std::string&) {
                 }
                 const std::string name = entry->d_name;
                 const bool known = name == kDatasetFile || name == kManifestFile ||
+                                   name.rfind("parallel_read_worker_", 0) == 0 ||
                                    name.rfind(kSeqTempPrefix, 0) == 0 ||
                                    name.rfind(kManifestTempPrefix, 0) == 0 ||
                                    name.rfind(kSeqBackupPrefix, 0) == 0 ||
@@ -1927,11 +1938,275 @@ int concurrent_workload(const Options& opt, const std::string& root) {
     return rc;
 }
 
+constexpr const char* kParallelReadFilePrefix = "parallel_read_worker_";
+
+std::string parallel_read_file_path(const std::string& root, size_t worker) {
+    return path_join(root,
+                     std::string(kParallelReadFilePrefix) + std::to_string(worker) + ".dat");
+}
+
+int parallel_read_prepare_workload(const Options& opt, const std::string& root) {
+    const char* label = workload_name(WorkloadSpec::ParallelReadPrepare);
+    uint64_t start = now_us();
+    uint64_t bytes = 0;
+    uint64_t ops = 0;
+    int err = 0;
+    for (size_t i = 0; i < opt.workers; ++i) {
+        err = prepare_data_file(opt, parallel_read_file_path(root, i),
+                                static_cast<char>('A' + (i % 26)));
+        if (err != 0) {
+            break;
+        }
+        bytes += opt.file_size;
+        ++ops;
+    }
+    emit_result(label, opt, now_us() - start, bytes, ops, err);
+    return err == 0 ? 0 : -1;
+}
+
+struct ConcurrentStartGate {
+    std::atomic<size_t> ready{0};
+    std::atomic<size_t> read_done{0};
+    std::atomic<bool> released{false};
+    std::atomic<bool> verify_released{false};
+    std::atomic<bool> aborted{false};
+};
+
+constexpr uint64_t kConcurrentGateTimeoutUs = 10ULL * 1000 * 1000;
+
+void concurrent_gate_pause() {
+    // Keep pre-timing coordination from saturating small guests. The bounded
+    // wait uses a short nominal interval without consuming a runnable vCPU.
+    usleep(50);
+}
+
+bool wait_for_gate_count(const std::atomic<size_t>& count, size_t expected) {
+    const uint64_t start = now_us();
+    while (count.load(std::memory_order_acquire) != expected) {
+        const uint64_t now = now_us();
+        if (start == 0 || now == 0 || now - start >= kConcurrentGateTimeoutUs) {
+            return false;
+        }
+        concurrent_gate_pause();
+    }
+    return true;
+}
+
+void wait_for_read_completion(const std::atomic<size_t>& count, size_t expected) {
+    // I/O itself has no artificial benchmark timeout. External harnesses own
+    // workload timeouts.
+    while (count.load(std::memory_order_acquire) != expected) {
+        concurrent_gate_pause();
+    }
+}
+
+struct ConcurrentReadArg {
+    const Options* opt = nullptr;
+    ConcurrentStartGate* gate = nullptr;
+    size_t id = 0;
+    int fd = -1;
+    int err = 0;
+    uint64_t bytes = 0;
+    uint64_t ops = 0;
+    uint64_t checksum = 1469598103934665603ULL;
+    IoCounters io;
+    std::vector<unsigned char> buffer;
+    bool started = false;
+};
+
+void* concurrent_read_worker(void* raw) {
+    ConcurrentReadArg* arg = static_cast<ConcurrentReadArg*>(raw);
+    arg->gate->ready.fetch_add(1, std::memory_order_release);
+    while (!arg->gate->released.load(std::memory_order_acquire) &&
+           !arg->gate->aborted.load(std::memory_order_acquire)) {
+        concurrent_gate_pause();
+    }
+    if (arg->gate->aborted.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+
+    size_t offset = 0;
+    while (offset < arg->opt->file_size) {
+        const size_t requested = std::min(arg->opt->block_size, arg->opt->file_size - offset);
+        ++arg->io.syscalls;
+        ssize_t n;
+        do {
+            n = pread(arg->fd, arg->buffer.data() + offset, requested,
+                      static_cast<off_t>(offset));
+            if (n < 0 && errno == EINTR) {
+                ++arg->io.eintr;
+                ++arg->io.syscalls;
+            }
+        } while (n < 0 && errno == EINTR);
+        if (n < 0) {
+            arg->err = errno_or_eio();
+            break;
+        }
+        if (static_cast<size_t>(n) != requested) {
+            ++arg->io.short_io;
+            arg->err = EIO;
+            break;
+        }
+        arg->bytes += static_cast<uint64_t>(n);
+        ++arg->ops;
+        offset += static_cast<size_t>(n);
+    }
+    if (arg->err == 0) {
+        unsigned char eof = 0;
+        ++arg->io.syscalls;
+        ssize_t n;
+        do {
+            n = pread(arg->fd, &eof, 1, static_cast<off_t>(arg->opt->file_size));
+            if (n < 0 && errno == EINTR) {
+                ++arg->io.eintr;
+                ++arg->io.syscalls;
+            }
+        } while (n < 0 && errno == EINTR);
+        if (n != 0) {
+            arg->err = n < 0 ? errno_or_eio() : EIO;
+        }
+    }
+    arg->gate->read_done.fetch_add(1, std::memory_order_release);
+    while (!arg->gate->verify_released.load(std::memory_order_acquire)) {
+        concurrent_gate_pause();
+    }
+
+    if (arg->err == 0) {
+        const unsigned char expected = static_cast<unsigned char>('A' + (arg->id % 26));
+        for (unsigned char value : arg->buffer) {
+            if (value != expected) {
+                arg->err = EILSEQ;
+                break;
+            }
+            arg->checksum ^= value;
+            arg->checksum *= 1099511628211ULL;
+        }
+    }
+    return nullptr;
+}
+
+int parallel_read_workload(const Options& opt, const std::string& root) {
+    const char* label = workload_name(WorkloadSpec::ParallelRead);
+    std::vector<pthread_t> threads(opt.workers);
+    std::vector<ConcurrentReadArg> args(opt.workers);
+    ConcurrentStartGate gate;
+    int err = 0;
+
+    for (size_t i = 0; i < opt.workers; ++i) {
+        args[i].opt = &opt;
+        args[i].gate = &gate;
+        args[i].id = i;
+        args[i].fd = open(parallel_read_file_path(root, i).c_str(),
+                          O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (args[i].fd < 0) {
+            err = errno_or_eio();
+            break;
+        }
+        struct stat st = {};
+        if (fstat(args[i].fd, &st) != 0) {
+            err = errno_or_eio();
+            break;
+        }
+        if (!S_ISREG(st.st_mode) || st.st_size != static_cast<off_t>(opt.file_size)) {
+            err = EIO;
+            break;
+        }
+        try {
+            args[i].buffer.resize(opt.file_size);
+        } catch (const std::bad_alloc&) {
+            err = ENOMEM;
+            break;
+        }
+    }
+
+    if (err == 0) {
+        for (size_t i = 0; i < opt.workers; ++i) {
+            int rc = pthread_create(&threads[i], nullptr, concurrent_read_worker, &args[i]);
+            if (rc != 0) {
+                err = rc;
+                break;
+            }
+            args[i].started = true;
+        }
+    }
+
+    const bool verify_stats = !stats_path().empty();
+    StatsMap before;
+    if (err == 0 && !wait_for_quiescence(label, "before")) {
+        err = ETIMEDOUT;
+    }
+    if (err == 0) {
+        before = read_stats();
+        if (verify_stats && before.empty()) {
+            err = EIO;
+        }
+    }
+
+    uint64_t start = 0;
+    uint64_t elapsed = 0;
+    uint64_t cpu_start = 0;
+    uint64_t cpu_elapsed = 0;
+    if (err != 0) {
+        gate.aborted.store(true, std::memory_order_release);
+    } else {
+        if (!wait_for_gate_count(gate.ready, opt.workers)) {
+            err = ETIMEDOUT;
+            gate.aborted.store(true, std::memory_order_release);
+        } else {
+            cpu_start = process_cpu_us();
+            start = now_us();
+            gate.released.store(true, std::memory_order_release);
+            wait_for_read_completion(gate.read_done, opt.workers);
+            const uint64_t end = now_us();
+            const uint64_t cpu_end = process_cpu_us();
+            if (start != 0 && end >= start) {
+                elapsed = end - start;
+            }
+            if (cpu_start != 0 && cpu_end >= cpu_start) {
+                cpu_elapsed = cpu_end - cpu_start;
+            }
+            gate.verify_released.store(true, std::memory_order_release);
+        }
+    }
+
+    uint64_t bytes = 0;
+    uint64_t ops = 0;
+    uint64_t checksum = 0;
+    IoCounters io;
+    for (size_t i = 0; i < opt.workers; ++i) {
+        if (args[i].started) {
+            int rc = pthread_join(threads[i], nullptr);
+            record_first_error(&err, rc);
+        }
+        if (args[i].fd >= 0) {
+            close_preserve_error(args[i].fd, &err);
+        }
+        record_first_error(&err, args[i].err);
+        bytes += args[i].bytes;
+        ops += args[i].ops;
+        io.syscalls += args[i].io.syscalls;
+        io.short_io += args[i].io.short_io;
+        io.eintr += args[i].io.eintr;
+        checksum ^= mix64(args[i].checksum ^ i);
+    }
+    if (err == 0 && !wait_for_quiescence(label, "after")) {
+        err = ETIMEDOUT;
+    }
+    StatsMap after = read_stats();
+    emit_stats_delta(label, before, after);
+    if (err == 0 && verify_stats && after.empty()) {
+        err = EIO;
+    }
+    emit_result(label, opt, elapsed, bytes, ops, err, io, checksum, {}, cpu_elapsed);
+    return err == 0 ? 0 : -1;
+}
+
 void usage(const char* argv0) {
     fprintf(stderr,
             "usage: %s --mount PATH [--workload all|metadata|readdir|readdir_prepare|"
             "readdir_scan|readdir_cleanup|sequential|prepare|sequential_write|"
-            "sequential_read|cleanup|random_read|mmap|concurrent] "
+            "sequential_read|cleanup|random_read|mmap|concurrent|parallel_read_prepare|"
+            "parallel_read] "
             "[--path RELATIVE_DATASET] [--seed N] [--expect-dax always|never] [--files N] "
             "[--file-size N] [--block-size N] [--iterations N] [--workers N]\n",
             argv0);
@@ -2006,7 +2281,9 @@ bool is_dataset_lifecycle_workload(WorkloadSpec workload) {
     return workload == WorkloadSpec::Prepare || workload == WorkloadSpec::SequentialWrite ||
            workload == WorkloadSpec::SequentialRead || workload == WorkloadSpec::Cleanup ||
            workload == WorkloadSpec::ReaddirPrepare || workload == WorkloadSpec::ReaddirScan ||
-           workload == WorkloadSpec::ReaddirCleanup;
+           workload == WorkloadSpec::ReaddirCleanup ||
+           workload == WorkloadSpec::ParallelReadPrepare ||
+           workload == WorkloadSpec::ParallelRead;
 }
 
 bool mount_options_contain(const std::string& options, const std::string& expected) {
@@ -2090,12 +2367,27 @@ bool parse_args(int argc, char** argv, Options* opt) {
     if (opt->workload == WorkloadSpec::ReaddirScan && !opt->iterations_explicit) {
         opt->iterations = 1;
     }
+    if ((opt->workload == WorkloadSpec::ParallelReadPrepare ||
+         opt->workload == WorkloadSpec::ParallelRead) &&
+        !opt->iterations_explicit) {
+        opt->iterations = 1;
+    }
     if ((opt->workload == WorkloadSpec::ReaddirPrepare ||
          opt->workload == WorkloadSpec::ReaddirScan ||
          opt->workload == WorkloadSpec::ReaddirCleanup) &&
         (opt->files == 0 || opt->iterations == 0)) {
         fprintf(stderr, "%s requires non-zero --files and --iterations\n",
                 workload_name(opt->workload));
+        return false;
+    }
+    if ((opt->workload == WorkloadSpec::ParallelReadPrepare ||
+         opt->workload == WorkloadSpec::ParallelRead) &&
+        (opt->iterations != 1 || opt->workers == 0 || opt->file_size == 0 ||
+         opt->block_size == 0 || opt->file_size > kParallelReadMemoryLimit / opt->workers)) {
+        fprintf(stderr,
+                "%s requires --iterations 1, non-zero sizes/workers, and workers * file-size "
+                "no greater than %zu\n",
+                workload_name(opt->workload), kParallelReadMemoryLimit);
         return false;
     }
     if (opt->tag.empty()) {
@@ -2245,7 +2537,8 @@ int main(int argc, char** argv) {
     std::string root = path_join(opt.mount, ".virtiofs_bench_" + opt.path);
     if (opt.workload != WorkloadSpec::Cleanup &&
         opt.workload != WorkloadSpec::ReaddirCleanup &&
-        opt.workload != WorkloadSpec::ReaddirScan) {
+        opt.workload != WorkloadSpec::ReaddirScan &&
+        opt.workload != WorkloadSpec::ParallelRead) {
         int root_fd = open_dataset_dir(opt, true);
         if (root_fd < 0) {
             fprintf(stderr, "failed to create safe dataset %s: %s\n", root.c_str(),
@@ -2306,6 +2599,13 @@ int main(int argc, char** argv) {
     }
     if (opt.workload == WorkloadSpec::All || opt.workload == WorkloadSpec::Concurrent) {
         rc |= run_with_stats_delta(WorkloadSpec::Concurrent, concurrent_workload, opt, root);
+    }
+    if (opt.workload == WorkloadSpec::ParallelReadPrepare) {
+        rc |= run_with_stats_delta(WorkloadSpec::ParallelReadPrepare,
+                                   parallel_read_prepare_workload, opt, root);
+    }
+    if (opt.workload == WorkloadSpec::ParallelRead) {
+        rc |= parallel_read_workload(opt, root);
     }
 
     return rc == 0 ? 0 : 1;

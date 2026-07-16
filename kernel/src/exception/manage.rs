@@ -240,7 +240,7 @@ impl IrqManager {
         {
             error!(
                 "Flags mismatch for irq {} (name: {}, flags: {:?}). old action name: {}, old flags: {:?}",
-                desc.irq_data().irq().data(),
+                desc_guard.irq_data().irq().data(),
                 action_guard.name(),
                 action_guard.flags(),
                 old_action_guard.name(),

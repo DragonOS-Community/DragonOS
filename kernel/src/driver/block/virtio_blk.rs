@@ -42,7 +42,7 @@ use crate::{
         },
         virtio::{
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
-            transport::VirtIOTransport,
+            transport::{DeferredVirtioIrq, VirtIOTransport},
             virtio_impl::HalImpl,
             VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
             VIRTIO_VENDOR_ID,
@@ -306,9 +306,20 @@ pub fn virtio_blk(
     dev_parent: Option<Arc<dyn Device>>,
 ) {
     let device = VirtIOBlkDevice::new(transport, dev_id);
-    if let Some(device) = device {
+    if let Some((device, deferred_irq)) = device {
         if let Some(dev_parent) = dev_parent {
             device.set_dev_parent(Some(Arc::downgrade(&dev_parent)));
+        }
+        if let Some(deferred_irq) = deferred_irq {
+            if let Err(err) = deferred_irq.install(device.dev_id().clone()) {
+                error!(
+                    "VirtIOBlkDevice '{:?}' setup_irq failed: {:?}",
+                    device.dev_id(),
+                    err
+                );
+                device.abort_initialization();
+                return;
+            }
         }
         virtio_device_manager()
             .device_add(device.clone() as Arc<dyn VirtIODevice>)
@@ -408,12 +419,18 @@ unsafe impl Send for VirtIOBlkDevice {}
 unsafe impl Sync for VirtIOBlkDevice {}
 
 impl VirtIOBlkDevice {
-    pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+    pub(crate) fn new(
+        transport: VirtIOTransport,
+        dev_id: Arc<DeviceId>,
+    ) -> Option<(Arc<Self>, Option<DeferredVirtioIrq>)> {
         // 设置中断
-        if let Err(err) = transport.setup_irq(dev_id.clone()) {
-            error!("VirtIOBlkDevice '{dev_id:?}' setup_irq failed: {:?}", err);
-            return None;
-        }
+        let irq_setup = match transport.setup_irq(dev_id.clone()) {
+            Ok(setup) => setup,
+            Err(err) => {
+                error!("VirtIOBlkDevice '{dev_id:?}' setup_irq failed: {:?}", err);
+                return None;
+            }
+        };
 
         let devname = virtioblk_manager().alloc_id()?;
         let irq = Some(transport.irq());
@@ -490,11 +507,23 @@ impl VirtIOBlkDevice {
             return None;
         }
 
-        Some(dev)
+        Some((dev, irq_setup.into_deferred()))
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkDevice> {
         self.inner.lock_irqsave()
+    }
+
+    fn abort_initialization(self: &Arc<Self>) {
+        let devname_id = self.blkdev_meta.devname.id();
+        if let Err(err) = self.shutdown() {
+            error!(
+                "VirtIOBlkDevice '{:?}' initialization cleanup failed: {:?}",
+                self.dev_id, err
+            );
+            return;
+        }
+        virtioblk_manager().free_id(devname_id);
     }
 
     fn shutdown(self: &Arc<Self>) -> Result<(), SystemError> {

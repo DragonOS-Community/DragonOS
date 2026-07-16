@@ -32,7 +32,7 @@ use crate::{
         },
         virtio::{
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
-            transport::VirtIOTransport,
+            transport::{DeferredVirtioIrq, VirtIOTransport},
             virtio_drivers_error_to_system_error,
             virtio_impl::HalImpl,
             VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
@@ -126,15 +126,18 @@ unsafe impl Send for VirtIOPmemDevice {}
 unsafe impl Sync for VirtIOPmemDevice {}
 
 impl VirtIOPmemDevice {
-    pub fn new(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
-        let irq_ready = match transport.setup_irq(dev_id.clone()) {
-            Ok(()) => true,
+    pub(crate) fn new(
+        mut transport: VirtIOTransport,
+        dev_id: Arc<DeviceId>,
+    ) -> Option<(Arc<Self>, Option<DeferredVirtioIrq>)> {
+        let (irq_ready, deferred_irq) = match transport.setup_irq(dev_id.clone()) {
+            Ok(setup) => (true, setup.into_deferred()),
             Err(err) => {
                 warn!(
                     "VirtIOPmemDevice '{dev_id:?}' setup_irq failed, falling back to polling: {:?}",
                     err
                 );
-                false
+                (false, None)
             }
         };
 
@@ -169,7 +172,7 @@ impl VirtIOPmemDevice {
 
         let irq = irq_ready.then(|| transport.irq());
         let irq_is_msix = irq_ready && transport.irq_is_msix();
-        Some(Arc::new(Self {
+        let device = Arc::new(Self {
             dev_id,
             inner: SpinLock::new(InnerVirtIOPmemDevice {
                 transport: Some(transport),
@@ -189,7 +192,14 @@ impl VirtIOPmemDevice {
             locked_kobj_state: LockedKObjectState::default(),
             flush_mutex: Mutex::new(()),
             flush_wait: WaitQueue::default(),
-        }))
+        });
+        Some((device, deferred_irq))
+    }
+
+    fn fallback_to_polling(&self) {
+        let mut inner = self.inner();
+        inner.irq = None;
+        inner.irq_is_msix = false;
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOPmemDevice> {
@@ -737,11 +747,21 @@ pub fn virtio_pmem(
     dev_id: Arc<DeviceId>,
     dev_parent: Option<Arc<dyn Device>>,
 ) {
-    let Some(device) = VirtIOPmemDevice::new(transport, dev_id) else {
+    let Some((device, deferred_irq)) = VirtIOPmemDevice::new(transport, dev_id) else {
         return;
     };
     if let Some(dev_parent) = dev_parent {
         device.set_dev_parent(Some(Arc::downgrade(&dev_parent)));
+    }
+    if let Some(deferred_irq) = deferred_irq {
+        if let Err(err) = deferred_irq.install(device.dev_id().clone()) {
+            warn!(
+                "VirtIOPmemDevice '{:?}' setup_irq failed, falling back to polling: {:?}",
+                device.dev_id(),
+                err
+            );
+            device.fallback_to_polling();
+        }
     }
     virtio_device_manager()
         .device_add(device as Arc<dyn VirtIODevice>)

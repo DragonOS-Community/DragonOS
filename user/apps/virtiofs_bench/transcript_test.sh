@@ -416,4 +416,139 @@ VIRTIOFS_BENCH_RUN_ID=cleanup_again \
     "$BIN" --mount "$MOUNT" --workload cleanup --path schema_test \
     >"$WORK_DIR/cleanup-again.log" 2>&1
 check_transcript <"$WORK_DIR/cleanup-again.log"
+
+# The formal parallel-read phase uses one immutable file per worker and starts
+# only after every fd, buffer and worker thread is ready.
+VIRTIOFS_BENCH_RUN_ID=parallel_prepare \
+    "$BIN" --mount "$MOUNT" --workload parallel_read_prepare --path parallel_schema \
+    --file-size 16384 --block-size 4096 --workers 4 --iterations 1 \
+    >"$WORK_DIR/parallel-prepare.log" 2>&1
+check_result_only_transcript <"$WORK_DIR/parallel-prepare.log"
+awk '
+    function value(prefix,    i) {
+        for (i = 1; i <= NF; ++i) {
+            if (index($i, prefix "=") == 1) {
+                return substr($i, length(prefix) + 2)
+            }
+        }
+        return "__missing__"
+    }
+    $1 == "result" {
+        seen++
+        if (value("workload") != "parallel_read_prepare" || value("status") != "ok" ||
+            value("errno") != "0" || value("bytes") != "65536" || value("ops") != "4") {
+            bad = 1
+        }
+    }
+    END { exit bad || seen != 1 }
+' "$WORK_DIR/parallel-prepare.log"
+PARALLEL_DIR="$MOUNT/.virtiofs_bench_parallel_schema"
+if [ "$(find "$PARALLEL_DIR" -maxdepth 1 -type f -name 'parallel_read_worker_*.dat' | wc -l)" \
+    -ne 4 ]; then
+    echo "parallel prepare did not create one file per worker" >&2
+    exit 1
+fi
+find "$PARALLEL_DIR" -maxdepth 1 -type f -name 'parallel_read_worker_*.dat' -print0 \
+    | sort -z | xargs -0 sha256sum >"$WORK_DIR/parallel-before.sha256"
+
+for run in first second; do
+    VIRTIOFS_BENCH_RUN_ID="parallel_${run}" \
+        "$BIN" --mount "$MOUNT" --workload parallel_read --path parallel_schema \
+        --file-size 16384 --block-size 4096 --workers 4 --iterations 1 \
+        >"$WORK_DIR/parallel-${run}.log" 2>&1
+    check_result_only_transcript <"$WORK_DIR/parallel-${run}.log"
+    awk '
+        function value(prefix,    i) {
+            for (i = 1; i <= NF; ++i) {
+                if (index($i, prefix "=") == 1) {
+                    return substr($i, length(prefix) + 2)
+                }
+            }
+            return "__missing__"
+        }
+        $1 == "result" {
+            seen++
+            if (value("workload") != "parallel_read" || value("status") != "ok" ||
+                value("errno") != "0" || value("bytes") != "65536" ||
+                value("ops") != "16" || value("syscalls") != "20" ||
+                value("short_io") != "0" || value("eintr") != "0") {
+                bad = 1
+            }
+        }
+        END { exit bad || seen != 1 }
+    ' "$WORK_DIR/parallel-${run}.log"
+done
+first_checksum=$(sed -n 's/.* checksum=\([^ ]*\).*/\1/p' "$WORK_DIR/parallel-first.log")
+second_checksum=$(sed -n 's/.* checksum=\([^ ]*\).*/\1/p' "$WORK_DIR/parallel-second.log")
+if [ -z "$first_checksum" ] || [ "$first_checksum" != "$second_checksum" ] || \
+    ! grep -q ' bytes=65536 ' "$WORK_DIR/parallel-first.log"; then
+    echo "parallel read aggregate result is not deterministic" >&2
+    exit 1
+fi
+find "$PARALLEL_DIR" -maxdepth 1 -type f -name 'parallel_read_worker_*.dat' -print0 \
+    | sort -z | xargs -0 sha256sum >"$WORK_DIR/parallel-after.sha256"
+cmp -s "$WORK_DIR/parallel-before.sha256" "$WORK_DIR/parallel-after.sha256"
+
+mv "$PARALLEL_DIR/parallel_read_worker_2.dat" "$WORK_DIR/missing-worker.dat"
+set +e
+"$BIN" --mount "$MOUNT" --workload parallel_read --path parallel_schema \
+    --file-size 16384 --block-size 4096 --workers 4 --iterations 1 \
+    >"$WORK_DIR/parallel-missing.log" 2>&1
+parallel_missing_rc=$?
+set -e
+if [ "$parallel_missing_rc" -eq 0 ]; then
+    echo "parallel read unexpectedly accepted a missing worker file" >&2
+    exit 1
+fi
+check_result_only_transcript <"$WORK_DIR/parallel-missing.log"
+awk '
+    function value(prefix,    i) {
+        for (i = 1; i <= NF; ++i) {
+            if (index($i, prefix "=") == 1) {
+                return substr($i, length(prefix) + 2)
+            }
+        }
+        return "__missing__"
+    }
+    $1 == "result" {
+        seen++
+        if (value("workload") != "parallel_read" || value("status") != "fail" ||
+            value("errno") != "2" || value("bytes") != "0" || value("ops") != "0" ||
+            value("syscalls") != "0") {
+            bad = 1
+        }
+    }
+    END { exit bad || seen != 1 }
+' "$WORK_DIR/parallel-missing.log"
+mv "$WORK_DIR/missing-worker.dat" "$PARALLEL_DIR/parallel_read_worker_2.dat"
+
+set +e
+"$BIN" --mount "$MOUNT" --workload parallel_read --path parallel_schema \
+    --file-size 67108865 --block-size 4096 --workers 4 --iterations 1 \
+    >"$WORK_DIR/parallel-memory-limit.log" 2>&1
+parallel_memory_rc=$?
+set -e
+if [ "$parallel_memory_rc" -ne 2 ]; then
+    echo "parallel read memory limit returned $parallel_memory_rc, expected parse failure 2" >&2
+    exit 1
+fi
+set +e
+"$BIN" --mount "$MOUNT" --workload parallel_read --path parallel_schema \
+    --file-size 16384 --block-size 4096 --workers 0 --iterations 1 \
+    >"$WORK_DIR/parallel-zero-workers.log" 2>&1
+parallel_zero_workers_rc=$?
+set -e
+if [ "$parallel_zero_workers_rc" -ne 2 ]; then
+    echo "parallel read zero workers returned $parallel_zero_workers_rc, expected parse failure 2" >&2
+    exit 1
+fi
+
+VIRTIOFS_BENCH_RUN_ID=parallel_cleanup \
+    "$BIN" --mount "$MOUNT" --workload cleanup --path parallel_schema \
+    >"$WORK_DIR/parallel-cleanup.log" 2>&1
+check_transcript <"$WORK_DIR/parallel-cleanup.log"
+if [ -e "$PARALLEL_DIR" ]; then
+    echo "parallel cleanup left its dataset behind" >&2
+    exit 1
+fi
 echo "virtiofs benchmark transcript tests: PASS"

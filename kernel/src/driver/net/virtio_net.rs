@@ -37,7 +37,7 @@ use crate::{
         virtio::{
             irq::virtio_irq_manager,
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
-            transport::VirtIOTransport,
+            transport::{DeferredVirtioIrq, VirtIOTransport},
             virtio_impl::HalImpl,
             VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
             VIRTIO_VENDOR_ID,
@@ -108,12 +108,18 @@ impl Debug for InnerVirtIONetDevice {
 }
 
 impl VirtIONetDevice {
-    pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+    pub(crate) fn new(
+        transport: VirtIOTransport,
+        dev_id: Arc<DeviceId>,
+    ) -> Option<(Arc<Self>, Option<DeferredVirtioIrq>)> {
         // 设置中断
-        if let Err(err) = transport.setup_irq(dev_id.clone()) {
-            error!("VirtIONetDevice '{dev_id:?}' setup_irq failed: {:?}", err);
-            return None;
-        }
+        let irq_setup = match transport.setup_irq(dev_id.clone()) {
+            Ok(setup) => setup,
+            Err(err) => {
+                error!("VirtIONetDevice '{dev_id:?}' setup_irq failed: {:?}", err);
+                return None;
+            }
+        };
 
         let irq_is_msix = transport.irq_is_msix();
         let driver_net: VirtIONet<HalImpl, VirtIOTransport, 2> =
@@ -144,7 +150,7 @@ impl VirtIONetDevice {
 
         // dev.set_driver(Some(Arc::downgrade(&virtio_net_driver()) as Weak<dyn Driver>));
 
-        return Some(dev);
+        return Some((dev, irq_setup.into_deferred()));
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIONetDevice> {
@@ -767,10 +773,20 @@ pub fn virtio_net(
     dev_parent: Option<Arc<dyn Device>>,
 ) {
     let virtio_net_deivce = VirtIONetDevice::new(transport, dev_id);
-    if let Some(virtio_net_deivce) = virtio_net_deivce {
+    if let Some((virtio_net_deivce, deferred_irq)) = virtio_net_deivce {
         debug!("VirtIONetDevice '{:?}' created", virtio_net_deivce.dev_id);
         if let Some(dev_parent) = dev_parent {
             virtio_net_deivce.set_dev_parent(Some(Arc::downgrade(&dev_parent)));
+        }
+        if let Some(deferred_irq) = deferred_irq {
+            if let Err(err) = deferred_irq.install(virtio_net_deivce.dev_id().clone()) {
+                error!(
+                    "VirtIONetDevice '{:?}' setup_irq failed: {:?}",
+                    virtio_net_deivce.dev_id(),
+                    err
+                );
+                return;
+            }
         }
         virtio_device_manager()
             .device_add(virtio_net_deivce.clone() as Arc<dyn VirtIODevice>)

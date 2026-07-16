@@ -113,7 +113,9 @@ pub fn initramfs_init() -> Result<(), SystemError> {
     }
     {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-        mount_fs.activate();
+        mount_fs
+            .activate()
+            .expect("the initramfs mount is published exactly once");
     }
 
     // Linux 中，内嵌的 initramfs 始终存在

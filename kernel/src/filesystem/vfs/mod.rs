@@ -49,7 +49,7 @@ use crate::{
 pub use self::inode_lifecycle::{EvictionEpoch, InodeRetentionKind, InodeRetentionState};
 pub use self::{file::FilePrivateData, mount::MountFS};
 use self::{
-    file::{FileFlags, FileMode},
+    file::{FileFlags, FileMode, PreopenedFile},
     utils::DName,
     vcore::generate_inode_id,
 };
@@ -295,6 +295,20 @@ pub const DT_WHT: u16 = 14;
 #[allow(dead_code)]
 pub const DT_MAX: u16 = 16;
 
+/// Filesystem-supplied directory record used by `getdents(2)`.
+///
+/// `next_cookie` is an opaque continuation token. Filesystems backed by an
+/// external daemon must preserve that token instead of replacing it with a
+/// vector index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    /// Raw name bytes; Linux directory entries do not require UTF-8.
+    pub name: Vec<u8>,
+    pub ino: u64,
+    pub d_type: u8,
+    pub next_cookie: u64,
+}
+
 /// VFS 允许的最大符号链接跟随次数。
 ///
 /// Linux 6.6: MAXSYMLINKS = 40
@@ -423,6 +437,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         }
     }
 
+    /// Return the stable filesystem owner used to identify this inode's
+    /// atomic-append lock domain.
+    ///
+    /// Anonymous and protocol-style inodes default to no append lock: their
+    /// writes do not use regular-file offsets and some do not belong to a
+    /// mountable filesystem at all. Inodes implementing ordinary persistent
+    /// file semantics must opt in with their canonical filesystem instance.
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        None
+    }
+
     /// 是否支持 seek（lseek）。
     ///
     /// 默认：普通文件/目录/块设备可 seek；Pipe/Socket/CharDevice 不可 seek；
@@ -469,6 +494,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _vm_flags: VmFlags,
     ) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    /// Allow a filesystem to add internal VMA flags after VFS permission
+    /// checks derived the user-visible protection and sharing flags.
+    fn mmap_vm_flags(&self, _file: &Arc<File>, vm_flags: VmFlags) -> Result<VmFlags, SystemError> {
+        Ok(vm_flags)
     }
 
     fn mmap_effective_file(&self, file: &Arc<File>) -> Result<Arc<File>, SystemError> {
@@ -656,6 +687,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Incarnation paired with `inode_id` for VFS cache identity.
+    ///
+    /// Filesystems which can reuse inode numbers while old dentries are still
+    /// referenced (notably FUSE) must override this with an identity that
+    /// changes whenever a new in-memory inode replaces the old one. Filesystems
+    /// without such reuse may keep zero.
+    fn inode_generation(&self) -> u64 {
+        0
+    }
+
     /// @brief 设置inode的元数据
     ///
     /// @return 成功：Ok()
@@ -767,6 +808,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return self.create_with_data(name, file_type, mode, 0);
     }
 
+    /// Atomically create and open a regular file when supported by the
+    /// filesystem.  The returned guard owns the open handle until VFS builds
+    /// the corresponding open file description.
+    fn create_and_open(
+        &self,
+        _name: &str,
+        _mode: InodeMode,
+        _flags: &FileFlags,
+    ) -> Result<PreopenedFile, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
     /// @brief 在当前目录下创建一个新的inode，并传入一个简单的data字段，方便进行初始化。
     ///
     /// @param name 目录项的名字
@@ -819,6 +872,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Execute a namespace mutation as part of one layered VFS transaction.
+    /// Filesystems that delegate to mounted backing paths must propagate the
+    /// context instead of recursively acquiring the global dentry lock.
+    fn unlink_with_context(
+        &self,
+        name: &str,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.unlink(name)
+    }
+
     /// @brief 删除文件夹
     ///
     /// @param name 文件夹名称
@@ -827,6 +892,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 失败 Err(错误码)
     fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    fn rmdir_with_context(
+        &self,
+        name: &str,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.rmdir(name)
     }
 
     /// 将指定的`old_name`子目录项移动到target目录下, 并予以`new_name`。
@@ -844,6 +918,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    fn move_to_with_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flag: RenameFlags,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.move_to(old_name, target, new_name, flag)
+    }
+
     /// @brief 专用于 remote 权限模型下 access(2) 的检查
     fn check_access(&self, _mask: PermissionMask) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
@@ -858,6 +944,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Look up a child by its raw directory-entry name. Filesystems whose
+    /// on-wire names are byte strings should override this method.
+    fn find_bytes(&self, name: &[u8]) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let name = core::str::from_utf8(name).map_err(|_| SystemError::EIO)?;
+        self.find(name)
     }
 
     /// @brief 根据inode号，获取子目录项的名字
@@ -904,6 +997,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
 
+    /// 获取 inode 所在的文件系统；供异步回收等可能与卸载并发的路径使用。
+    ///
+    /// 默认实现适用于 inode 强持有文件系统的实现。仅当 inode 与文件系统之间
+    /// 使用弱引用、且调用方允许文件系统已完成销毁时才应覆盖此方法。
+    fn try_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
+
     /// @brief 获取当前 inode 所在挂载点的挂载标志
     fn mount_flags(&self) -> MountFlags {
         MountFlags::empty()
@@ -916,6 +1017,46 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 列出当前inode下的所有目录项的名字
     fn list(&self) -> Result<Vec<String>, SystemError> {
         Err(SystemError::ENOTDIR)
+    }
+
+    /// Return directory records already typed by the filesystem. `None` keeps
+    /// legacy filesystems on the lazy name lookup path so a small getdents
+    /// buffer does not force metadata lookup for the entire directory.
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        Ok(None)
+    }
+
+    /// Materialize typed records for callers, such as overlay merging, that
+    /// necessarily need metadata for the complete directory.
+    fn materialize_list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+        if let Some(entries) = self.list_entries()? {
+            return Ok(entries);
+        }
+        let names = self.list()?;
+        let mut entries = Vec::with_capacity(names.len());
+        for (index, name) in names.into_iter().enumerate() {
+            let metadata = match name.as_str() {
+                "." => self.metadata(),
+                ".." => self.parent().and_then(|parent| parent.metadata()),
+                _ => match self.find(&name) {
+                    Ok(child) => child.metadata(),
+                    Err(SystemError::ENOENT) => continue,
+                    Err(error) => return Err(error),
+                },
+            };
+            let metadata = match metadata {
+                Ok(metadata) => metadata,
+                Err(SystemError::ENOENT) => continue,
+                Err(error) => return Err(error),
+            };
+            entries.push(DirectoryEntry {
+                name: name.into_bytes(),
+                ino: metadata.inode_id.into() as u64,
+                d_type: metadata.file_type.get_file_type_num() as u8,
+                next_cookie: (index + 1) as u64,
+            });
+        }
+        Ok(entries)
     }
 
     /// # mount - 挂载文件系统
@@ -1671,7 +1812,8 @@ impl SuperBlock {
 bitflags! {
     pub struct Magic: u64 {
         const DEVFS_MAGIC = 0x1373;
-        const FAT_MAGIC =  0xf2f52011;
+        // Linux UAPI: MSDOS_SUPER_MAGIC.
+        const FAT_MAGIC = 0x4d44;
         const EXT4_MAGIC = 0xef53;
         const FUSE_MAGIC = 0x65735546;
         const TMPFS_MAGIC = 0x01021994;
@@ -1756,6 +1898,16 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 对于磁盘文件系统（如 ext4、fat），需要从磁盘预读数据，应该支持 readahead
     fn support_readahead(&self) -> bool {
         true // 默认支持 readahead
+    }
+
+    /// Whether a filesystem fault must run before generic fault-around.
+    ///
+    /// Most filesystems keep the Linux-style fast path where `map_pages()`
+    /// gets the first chance to install an already cached page. Remote
+    /// filesystems that must drop MM locks and retry before doing I/O can opt
+    /// in to the opposite ordering.
+    fn fault_before_map_pages(&self) -> bool {
+        false
     }
 
     /// @brief 本函数用于实现动态转换。
@@ -1845,10 +1997,8 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         mount: &MountFS,
         out: &mut dyn Write,
     ) -> Result<(), SystemError> {
-        match mount.root_inner_inode().absolute_path() {
-            Ok(root) if !root.is_empty() => out.write_str(&root).map_err(|_| SystemError::EINVAL),
-            _ => out.write_char('/').map_err(|_| SystemError::EINVAL),
-        }
+        let root = mount.root_path()?;
+        out.write_str(&root).map_err(|_| SystemError::EINVAL)
     }
 
     /// Render fs-specific stats for `/proc/*/mountstats`.
@@ -2151,13 +2301,13 @@ impl<'a> FilldirContext<'a> {
     /// - d_type 目录项的inode的file_type_num
     pub(crate) fn fill_dir(
         &mut self,
-        name: &str,
+        name: &[u8],
         offset: usize,
         ino: u64,
         d_type: u8,
     ) -> Result<(), SystemError> {
         let name_len = name.len();
-        let name_bytes = name.as_bytes();
+        let name_bytes = name;
 
         // 根据格式计算基础结构大小
         // linux_dirent (旧格式): d_ino(8) + d_off(8) + d_reclen(2) = 18 bytes

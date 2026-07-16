@@ -17,7 +17,10 @@ use lru::LruCache;
 use crate::{
     arch::{mm::LockedFrameAllocator, MMArch},
     filesystem::{
-        page_cache::{list_page_caches, PageCache},
+        page_cache::{
+            async_writeback_progress_snapshot, list_page_caches, wait_for_async_writeback_progress,
+            PageCache,
+        },
         vfs::FilePrivateData,
     },
     init::initcall::INITCALL_CORE,
@@ -283,9 +286,22 @@ fn page_reclaim_thread() -> i32 {
         // 保留4096个页面，总计16MB的空闲空间
         if usage.free().data() < 4096 {
             let page_to_free = 4096;
+            let writeback_generation = async_writeback_progress_snapshot();
             // 分离选择和回收阶段，避免长时间持有页面回收器锁导致与
             // page_manager/page_cache 的锁顺序反转。
-            PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
+            let progress = PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
+            if progress.reclaimed == 0 {
+                // Any no-progress pass must yield: dirty pages may need an
+                // asynchronous writeback completion, while mapped,
+                // unevictable, or otherwise busy pages cannot be reclaimed by
+                // immediately draining the same LRU again.  If there is no
+                // writeback to wait for, use a bounded retry backoff.
+                if progress.dirty_seen == 0
+                    || !wait_for_async_writeback_progress(writeback_generation)
+                {
+                    let _ = nanosleep(PosixTimeSpec::new(0, 1_000_000));
+                }
+            }
         } else {
             //TODO Temporarily let page reclaim thread handle dirty page writeback; should be separated later.
             PageReclaimer::flush_dirty_pages();
@@ -306,12 +322,21 @@ pub fn page_reclaimer_lock() -> MutexGuard<'static, PageReclaimer> {
 /// 页面回收器
 pub struct PageReclaimer {
     lru: LruCache<PhysAddr, Arc<Page>>,
+    writeback_cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReclaimProgress {
+    pub reclaimed: usize,
+    pub dirty_seen: usize,
+    pub writeback_scheduled: usize,
 }
 
 impl PageReclaimer {
     pub fn new() -> Self {
         Self {
             lru: LruCache::unbounded(),
+            writeback_cursor: 0,
         }
     }
 
@@ -331,7 +356,7 @@ impl PageReclaimer {
     /// 分两阶段：
     /// 1) 持有回收器锁，从 LRU 中摘下目标页面列表；
     /// 2) 释放回收器锁后，逐个执行写回与回收，避免锁顺序反转。
-    pub fn shrink_list(count: PageFrameCount) {
+    pub fn shrink_list(count: PageFrameCount) -> ReclaimProgress {
         // 阶段1：仅持有回收器锁，摘取受害者
         let victims = {
             let mut reclaimer = page_reclaimer_lock();
@@ -339,7 +364,7 @@ impl PageReclaimer {
         };
 
         // 阶段2：不持有回收器锁，安全地回收页面
-        Self::evict_pages(victims);
+        Self::evict_pages(victims)
     }
 
     /// 从 LRU 中批量弹出页面，不做任何回收操作。
@@ -355,9 +380,10 @@ impl PageReclaimer {
     }
 
     /// 在不持有回收器锁的情况下，完成页面写回与回收。
-    fn evict_pages(victims: Vec<Arc<Page>>) {
+    fn evict_pages(victims: Vec<Arc<Page>>) -> ReclaimProgress {
+        let mut progress = ReclaimProgress::default();
         for page in victims {
-            let mut guard = page.write();
+            let guard = page.write();
             if let PageType::File(info) = guard.page_type().clone() {
                 if guard.flags().contains(PageFlags::PG_UNEVICTABLE) {
                     continue;
@@ -376,6 +402,8 @@ impl PageReclaimer {
                 let paddr = guard.phys_address();
 
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    progress.dirty_seen += 1;
+                    const MAX_RECLAIMER_PAGES_PER_BATCH: usize = 64;
                     let writeback_target = match guard.page_type() {
                         PageType::File(info) => info
                             .page_cache
@@ -386,22 +414,28 @@ impl PageReclaimer {
                     drop(guard);
 
                     if let Some((page_cache, page_index)) = writeback_target {
-                        let _ = page_cache.manager().writeback_page(page_index);
+                        // Reclaim must never synchronously enter a filesystem
+                        // or FUSE daemon. Schedule the same bounded, try-only
+                        // worker used by background writeback and keep the
+                        // victim on the LRU until a later pass observes it
+                        // clean. This also lets adjacent victims coalesce.
+                        let end = page_index.saturating_add(MAX_RECLAIMER_PAGES_PER_BATCH - 1);
+                        if page_cache
+                            .manager()
+                            .try_start_reclaimer_writeback_range(page_index, end)
+                            .unwrap_or(false)
+                        {
+                            progress.writeback_scheduled += 1;
+                        }
+                        page_reclaimer_lock().insert_page(paddr, &page);
+                        continue;
                     } else {
                         let mut guard = page.write();
                         guard.remove_flags(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK);
                         drop(guard);
-                        page_manager_lock().remove_page(&paddr);
-                        continue;
-                    }
-
-                    guard = page.write();
-                    if guard.flags().intersects(
-                        PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
-                    ) || guard.map_count() != 0
-                    {
-                        drop(guard);
-                        page_reclaimer_lock().insert_page(paddr, &page);
+                        if page_manager_lock().remove_page(&paddr).is_some() {
+                            progress.reclaimed += 1;
+                        }
                         continue;
                     }
                 }
@@ -427,9 +461,12 @@ impl PageReclaimer {
                         continue;
                     }
                 }
-                page_manager_lock().remove_page(&paddr);
+                if page_manager_lock().remove_page(&paddr).is_some() {
+                    progress.reclaimed += 1;
+                }
             }
         }
+        progress
     }
 
     /// Drop clean pagecache pages only, matching Linux drop_caches semantics.
@@ -503,7 +540,9 @@ impl PageReclaimer {
         };
 
         if len > 0 {
-            page_cache.mark_page_writeback(page_index);
+            if !page_cache.try_mark_page_writeback(page_index, paddr) {
+                return;
+            }
             guard.remove_flags(PageFlags::PG_DIRTY);
             let data = unsafe {
                 core::slice::from_raw_parts(
@@ -542,32 +581,64 @@ impl PageReclaimer {
         }
     }
 
-    /// lru脏页刷新
-    fn dirty_pages_snapshot(&self) -> Vec<Arc<Page>> {
-        self.lru
-            .iter()
-            .filter_map(|(_paddr, page)| {
-                let guard = page.read();
-                if guard.flags().contains(PageFlags::PG_DIRTY) {
-                    Some(page.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
+    /// Take a bounded, rotating LRU snapshot without acquiring any page lock
+    /// while the global reclaimer lock is held.
+    fn writeback_scan_snapshot(&mut self) -> Vec<Arc<Page>> {
+        const MAX_RECLAIMER_SCAN_PAGES: usize = 512;
+        const RECLAIMER_SCAN_STRIDE: usize = 8;
+        let total = self.lru.len();
+        if total == 0 {
+            self.writeback_cursor = 0;
+            return Vec::new();
+        }
+
+        let start = self.writeback_cursor % total;
+        let count = total.min(MAX_RECLAIMER_SCAN_PAGES);
+        let mut pages = Vec::new();
+        if pages.try_reserve_exact(count).is_err() {
+            return pages;
+        }
+        pages.extend(
+            self.lru
+                .iter()
+                .skip(start)
+                .chain(self.lru.iter().take(start))
+                .take(count)
+                .map(|(_paddr, page)| page.clone()),
+        );
+        // Large LRUs advance by the whole sampled window so every region is
+        // visited before windows overlap. When the entire LRU fits, retain a
+        // small stride to rotate which hot cache gets the first scheduling
+        // slots without skipping any page from the snapshot.
+        let advance = if total > count {
+            count
+        } else {
+            RECLAIMER_SCAN_STRIDE.min(total)
+        };
+        self.writeback_cursor = if advance >= total - start {
+            advance - (total - start)
+        } else {
+            start + advance
+        };
+        pages
     }
 
     pub fn flush_dirty_pages() {
         let pages = {
-            let reclaimer = page_reclaimer_lock();
-            reclaimer.dirty_pages_snapshot()
+            let mut reclaimer = page_reclaimer_lock();
+            reclaimer.writeback_scan_snapshot()
         };
         Self::flush_dirty_pages_snapshot(pages);
     }
 
     fn flush_dirty_pages_snapshot(pages: Vec<Arc<Page>>) {
+        const MAX_RECLAIMER_RUNNERS: usize = 8;
+        const MAX_RECLAIMER_PAGES_PER_RUN: usize = 512;
+        let mut scheduled_runners = 0;
         for page in pages {
-            let mut guard = page.write();
+            let Some(guard) = page.try_read() else {
+                continue;
+            };
             if guard.flags().contains(PageFlags::PG_DIRTY) {
                 let writeback_target = match guard.page_type() {
                     PageType::File(info) => info
@@ -578,9 +649,28 @@ impl PageReclaimer {
                 };
                 if let Some((page_cache, page_index)) = writeback_target {
                     drop(guard);
-                    let _ = page_cache.manager().writeback_page(page_index);
+                    if scheduled_runners < MAX_RECLAIMER_RUNNERS {
+                        // Anchor every attempt at a page from the LRU snapshot,
+                        // then let one cache runner drain the same bounded
+                        // 512-page window as multiple backend-sized batches.
+                        // A contended cache is skipped immediately and later
+                        // snapshot candidates are still considered.
+                        let end = page_index.saturating_add(MAX_RECLAIMER_PAGES_PER_RUN - 1);
+                        if page_cache
+                            .manager()
+                            .try_start_reclaimer_writeback_range(page_index, end)
+                            .unwrap_or(false)
+                        {
+                            scheduled_runners += 1;
+                        }
+                    }
                 } else {
-                    Self::page_writeback(&mut guard, false);
+                    drop(guard);
+                    if let Some(mut guard) = page.try_write() {
+                        if guard.flags().contains(PageFlags::PG_DIRTY) {
+                            Self::page_writeback(&mut guard, false);
+                        }
+                    }
                 }
             }
         }
@@ -682,12 +772,20 @@ impl Page {
         self.inner.read()
     }
 
+    pub fn try_read(&self) -> Option<RwSemReadGuard<'_, InnerPage>> {
+        self.inner.try_read()
+    }
+
     pub fn upread(&self) -> RwSemUpgradeableGuard<'_, InnerPage> {
         self.inner.upread()
     }
 
     pub fn write(&self) -> RwSemWriteGuard<'_, InnerPage> {
         self.inner.write()
+    }
+
+    pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, InnerPage>> {
+        self.inner.try_write()
     }
 }
 

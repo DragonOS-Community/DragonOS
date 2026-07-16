@@ -8,8 +8,8 @@ use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{
-    self, inode_lifecycle::InodeRetentionGuard, FileSystem, FileType, IndexNode, InodeId,
-    InodeRetentionKind, Metadata, SetMetadataMask, XattrFlags,
+    self, inode_lifecycle::InodeRetentionGuard, DirectoryEntry, FileSystem, FileType, IndexNode,
+    InodeId, InodeRetentionKind, Metadata, SetMetadataMask, XattrFlags,
 };
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::Mutex;
@@ -53,7 +53,7 @@ pub(super) struct DirVersion {
 #[derive(Debug, Default)]
 struct DirStateData {
     generation: u64,
-    readdir_cache: Option<(u64, Arc<Vec<String>>)>,
+    readdir_cache: Option<(u64, Arc<Vec<DirectoryEntry>>)>,
     lookup_cache: BTreeMap<String, Weak<OvlInode>>,
     lookup_order: VecDeque<String>,
     backing_version: Option<Vec<DirVersion>>,
@@ -86,7 +86,10 @@ impl DirState {
         data
     }
 
-    pub(super) fn cached_readdir(&self, version: &[DirVersion]) -> Option<Arc<Vec<String>>> {
+    pub(super) fn cached_readdir(
+        &self,
+        version: &[DirVersion],
+    ) -> Option<Arc<Vec<DirectoryEntry>>> {
         let mut data = self.data.lock();
         let data = Self::revalidate(&mut data, version);
         data.readdir_cache
@@ -95,7 +98,7 @@ impl DirState {
             .map(|(_, entries)| entries.clone())
     }
 
-    pub(super) fn cache_readdir(&self, version: &[DirVersion], entries: Arc<Vec<String>>) {
+    pub(super) fn cache_readdir(&self, version: &[DirVersion], entries: Arc<Vec<DirectoryEntry>>) {
         let mut data = self.data.lock();
         let data = Self::revalidate(&mut data, version);
         let generation = data.generation;
@@ -303,6 +306,10 @@ impl OvlInode {
 }
 
 impl IndexNode for OvlInode {
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
+
     fn open(
         &self,
         data: crate::libs::mutex::MutexGuard<FilePrivateData>,
@@ -513,6 +520,10 @@ impl IndexNode for OvlInode {
         readdir::list(self)
     }
 
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        readdir::list_entries(self).map(Some)
+    }
+
     fn mkdir(
         &self,
         name: &str,
@@ -525,8 +536,24 @@ impl IndexNode for OvlInode {
         dir::rmdir(self, name)
     }
 
+    fn rmdir_with_context(
+        &self,
+        name: &str,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        dir::rmdir_with_context(self, name, context)
+    }
+
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         dir::unlink(self, name)
+    }
+
+    fn unlink_with_context(
+        &self,
+        name: &str,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        dir::unlink_with_context(self, name, context)
     }
 
     fn link(
@@ -554,6 +581,17 @@ impl IndexNode for OvlInode {
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
         rename::move_to(self, old_name, target, new_name, flags)
+    }
+
+    fn move_to_with_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        rename::move_to_with_context(self, old_name, target, new_name, flags, context)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {

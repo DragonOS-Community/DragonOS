@@ -101,11 +101,15 @@ fn migrate_virtual_filesystem(
     let current_mntns = ProcessManager::current_mntns();
     let old_root_inode = current_mntns.root_inode();
     let old_mntfs = current_mntns.root_mntfs();
+    assert!(
+        old_mntfs.propagation().is_private(),
+        "the boot root must remain private until rootfs migration"
+    );
     let new_fs = MountFS::new(
         new_fs,
         None,
         None,
-        old_mntfs.propagation(),
+        crate::process::namespace::propagation::MountPropagation::new_private(),
         Some(&current_mntns),
         root_mount_flags,
         old_mntfs.mount_source(),
@@ -134,7 +138,9 @@ fn migrate_virtual_filesystem(
 
     {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-        new_fs.activate();
+        new_fs
+            .activate()
+            .expect("the replacement root mount is published exactly once");
         current_mntns.force_change_root_mountfs(new_fs);
     }
 

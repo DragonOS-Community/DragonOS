@@ -334,6 +334,93 @@ impl SigHand {
         true
     }
 
+    /// Apply a job-control stop and publish its wait event as one state
+    /// transition. The callback runs while the shared sighand is locked, so a
+    /// concurrent SIGCONT cannot wake the group between the scheduler-state
+    /// update and the persistent stop-state publication.
+    ///
+    /// Returns whether this completed a fresh group stop which should be
+    /// reported to the parent. Repeated stop signals keep the existing event.
+    pub fn transition_group_stop<F>(&self, sig: Signal, stop_group: F) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || !stop_group() {
+            return false;
+        }
+        if g.flags.contains(SignalFlags::STOP_STOPPED) {
+            return false;
+        }
+
+        g.stop_signal = sig;
+        g.flags.remove(SignalFlags::STOP_MASK);
+        g.flags
+            .insert(SignalFlags::STOP_STOPPED | SignalFlags::CLD_STOPPED);
+        true
+    }
+
+    /// Continue a job-control-stopped group as one transition. The callback is
+    /// run whenever group exit has not started because SIGCONT resumes stopped
+    /// tasks even when no parent notification is pending. A continued event is
+    /// generated only for a completed group stop, matching Linux's
+    /// SIGNAL_STOP_STOPPED test.
+    pub fn transition_group_continue<F>(&self, continue_group: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) {
+            return false;
+        }
+        let was_stopped = g.flags.contains(SignalFlags::STOP_STOPPED);
+
+        continue_group();
+        if was_stopped {
+            g.flags.remove(SignalFlags::STOP_MASK);
+            g.flags
+                .insert(SignalFlags::STOP_CONTINUED | SignalFlags::CLD_CONTINUED);
+        }
+        was_stopped
+    }
+
+    /// Observe the persistent natural-child group-stop event. The stop state,
+    /// stop signal, and optional consumption are protected by one lock, as are
+    /// Linux's SIGNAL_STOP_STOPPED and group_exit_code checks.
+    pub fn group_stop_event(&self, consume: bool) -> Option<Signal> {
+        let mut g = self.inner_mut();
+        if !g.flags.contains(SignalFlags::STOP_STOPPED)
+            || !g.flags.contains(SignalFlags::CLD_STOPPED)
+        {
+            return None;
+        }
+
+        let sig = g.stop_signal;
+        if consume {
+            g.flags.remove(SignalFlags::CLD_STOPPED);
+        }
+        Some(sig)
+    }
+
+    /// Observe a ptrace stop without imposing the natural-child
+    /// STOP_STOPPED requirement. The scheduler-state recheck, event code, and
+    /// optional consumption stay in the same sighand critical section.
+    pub fn ptrace_stop_event<F>(&self, consume: bool, is_stopped: F) -> Option<Signal>
+    where
+        F: FnOnce() -> bool,
+    {
+        let mut g = self.inner_mut();
+        if !is_stopped() || !g.flags.contains(SignalFlags::CLD_STOPPED) {
+            return None;
+        }
+
+        let sig = g.stop_signal;
+        if consume {
+            g.flags.remove(SignalFlags::CLD_STOPPED);
+        }
+        Some(sig)
+    }
+
     pub fn stop_signal(&self) -> Signal {
         self.inner().stop_signal
     }
@@ -446,6 +533,9 @@ impl SigHand {
         if g.flags.contains(SignalFlags::GROUP_EXIT) {
             g.group_exit_code
         } else {
+            // Linux do_group_exit() replaces signal->flags with
+            // SIGNAL_GROUP_EXIT, discarding all job-control wait state.
+            g.flags.remove(SignalFlags::STOP_MASK);
             g.flags.insert(SignalFlags::GROUP_EXIT);
             g.group_exit_code = exit_code;
             exit_code

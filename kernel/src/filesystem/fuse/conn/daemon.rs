@@ -4,18 +4,22 @@ use core::{mem::size_of, sync::atomic::Ordering};
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
-use crate::filesystem::epoll::{EPollEventType, EPollItem};
+use crate::{
+    arch::MMArch,
+    filesystem::epoll::{EPollEventType, EPollItem},
+    mm::MemoryManagementArch,
+};
 
 use super::super::protocol::{
     fuse_read_struct, FuseAttrOut, FuseEntryOut, FuseInHeader, FuseInitOut, FuseNotifyDeleteOut,
     FuseNotifyInvalEntryOut, FuseNotifyInvalInodeOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut,
-    FuseWriteIn, FUSE_CREATE, FUSE_DESTROY, FUSE_EXPIRE_ONLY, FUSE_FLUSH, FUSE_GETATTR,
-    FUSE_GETXATTR, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION,
-    FUSE_KERNEL_VERSION, FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MAP_ALIGNMENT,
-    FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_MKDIR, FUSE_MKNOD, FUSE_NOTIFY_DELETE,
-    FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE,
-    FUSE_NOTIFY_STORE, FUSE_READ, FUSE_REMOVEXATTR, FUSE_SETATTR, FUSE_SETXATTR, FUSE_STATFS,
-    FUSE_SYMLINK,
+    FuseWriteIn, FUSE_ASYNC_READ, FUSE_CREATE, FUSE_DESTROY, FUSE_EXPIRE_ONLY, FUSE_FLUSH,
+    FUSE_GETATTR, FUSE_GETXATTR, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT,
+    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP,
+    FUSE_MAP_ALIGNMENT, FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_MKDIR, FUSE_MKNOD,
+    FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL,
+    FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE, FUSE_READ, FUSE_REMOVEXATTR, FUSE_SETATTR,
+    FUSE_SETXATTR, FUSE_STATFS, FUSE_SYMLINK, FUSE_WRITEBACK_CACHE,
 };
 use super::{
     stats, trace, wait_with_recheck, FuseConn, FuseConnInner, FuseInitNegotiated, FuseRequest,
@@ -201,6 +205,7 @@ impl FuseConn {
         out: &mut [u8],
     ) -> Result<usize, SystemError> {
         out[..req.bytes.len()].copy_from_slice(&req.bytes);
+        req.stats_mark_external_dequeued();
         self.account_dequeued_request(&req);
         Ok(req.bytes.len())
     }
@@ -230,6 +235,7 @@ impl FuseConn {
             // other priority queue cannot be starved by a producer of oversized requests.
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
+        req.stats_mark_dispatched();
         self.account_dequeued_request(&req);
         Ok(req)
     }
@@ -613,6 +619,23 @@ impl FuseConn {
             })?;
             self.background
                 .configure(max_background, congestion_threshold);
+            stats::on_fuse_io_limits_negotiated(stats::NegotiatedFuseIoLimits {
+                max_read: self.max_read(),
+                max_write: self.max_write(),
+                max_pages: negotiated_max_pages as usize,
+                max_readahead: init_out.max_readahead as usize,
+                async_read: (enabled_flags & FUSE_ASYNC_READ) != 0,
+                writeback_cache: (enabled_flags & FUSE_WRITEBACK_CACHE) != 0,
+                effective_read_payload_limit: self.effective_read_payload_limit(),
+                effective_write_payload_limit: core::cmp::min(
+                    core::cmp::min(
+                        negotiated_max_pages as usize,
+                        self.max_write() / MMArch::PAGE_SIZE,
+                    ),
+                    64,
+                )
+                .saturating_mul(MMArch::PAGE_SIZE),
+            });
             self.init_wait.wakeup(None);
         } else {
             self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;

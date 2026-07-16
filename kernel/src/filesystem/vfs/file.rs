@@ -8,11 +8,12 @@ use log::error;
 use system_error::SystemError;
 
 use super::{
-    append_lock::with_inode_append_lock,
+    append_lock::{with_inode_append_lock, AppendLockKey},
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
     mount::{MountExternalGuard, MountFSInode},
     utils::should_remove_sgid,
-    FileType, IndexNode, InodeId, Metadata, SetMetadataMask, SpecialNodeData,
+    DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask,
+    SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -75,12 +76,42 @@ fn alloc_lock_owner_id() -> usize {
     NEXT_LOCK_OWNER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn canonical_inode_for_posix_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
+fn canonical_inode_for_file_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
     loop {
         match inode.clone().downcast_arc::<MountFSInode>() {
             Some(mnt_inode) => inode = mnt_inode.underlying_inode(),
             None => return inode,
         }
+    }
+}
+
+/// Append-lock domain and the owner that keeps its allocation identity alive.
+///
+/// The inode part of the key is deliberately derived from current metadata at
+/// write time. A stacked filesystem may change backing identity during open
+/// (for example, overlayfs copy-up), so caching the complete key here can split
+/// concurrent appenders across two locks.
+#[derive(Clone, Debug)]
+struct AppendLockDomain {
+    fs_instance: usize,
+    fs_owner: Arc<dyn FileSystem>,
+}
+
+impl AppendLockDomain {
+    fn new(fs_owner: Arc<dyn FileSystem>) -> Self {
+        let fs_instance = Arc::as_ptr(&fs_owner) as *const () as usize;
+        Self {
+            fs_instance,
+            fs_owner,
+        }
+    }
+
+    fn key(&self, metadata: &Metadata) -> AppendLockKey {
+        debug_assert_eq!(
+            self.fs_instance,
+            Arc::as_ptr(&self.fs_owner) as *const () as usize
+        );
+        AppendLockKey::new(self.fs_instance, metadata.dev_id, metadata.inode_id)
     }
 }
 
@@ -251,6 +282,47 @@ pub enum FilePrivateData {
 impl Default for FilePrivateData {
     fn default() -> Self {
         return Self::Unused;
+    }
+}
+
+/// Owns filesystem private data for an inode that has already been opened.
+///
+/// The guard stays armed until a [`File`] takes ownership.  This closes the
+/// filesystem handle on every error path between an atomic create/open and
+/// construction of the open file description.
+pub struct PreopenedFile {
+    inode: Arc<dyn IndexNode>,
+    private_data: Option<FilePrivateData>,
+}
+
+impl PreopenedFile {
+    pub fn new(inode: Arc<dyn IndexNode>, private_data: FilePrivateData) -> Self {
+        Self {
+            inode,
+            private_data: Some(private_data),
+        }
+    }
+
+    pub fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
+
+    pub fn replace_inode(&mut self, inode: Arc<dyn IndexNode>) {
+        self.inode = inode;
+    }
+
+    fn take_private_data(&mut self) -> FilePrivateData {
+        self.private_data
+            .take()
+            .expect("preopened file private data already consumed")
+    }
+}
+
+impl Drop for PreopenedFile {
+    fn drop(&mut self) {
+        if let Some(data) = self.private_data.take() {
+            let _ = self.inode.close(Mutex::new(data).lock());
+        }
     }
 }
 
@@ -501,6 +573,13 @@ pub struct File {
     /// 唯一 open file description id，用于 flock owner 标识。
     open_file_id: usize,
     inode: Arc<dyn IndexNode>,
+    /// Filesystem selected when this open file description was created.
+    ///
+    /// Mount wrappers retain the mount selected by path lookup. Cache that
+    /// filesystem on the open file description so fd-based I/O and mmap fault
+    /// paths use the same identity directly without cloning an Arc while MM
+    /// locks are held.
+    io_fs: Option<Arc<dyn FileSystem>>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
     /// 文件的打开模式
@@ -509,8 +588,8 @@ pub struct File {
     mode: RwSem<FileMode>,
     /// 文件类型
     file_type: FileType,
-    /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
-    readdir_subdirs_name: Mutex<Vec<String>>,
+    /// Per-open immutable directory snapshot and its next record index.
+    readdir_state: Mutex<ReaddirState>,
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
@@ -519,6 +598,10 @@ pub struct File {
     /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
     /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
     posix_lock_key: (usize, InodeId),
+    /// Internal filesystem domain for serializing atomic append operations.
+    /// Only regular, non-O_PATH files retain one; the inode key is resolved
+    /// from current metadata when an append starts.
+    append_lock_domain: Option<AppendLockDomain>,
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
     /// 当前 open file description 已观测到的 page cache 写回错误序列。
@@ -538,6 +621,77 @@ pub struct File {
     /// Pins the mount used to resolve this pathname independently from the
     /// operation inode (which device/FIFO resolution may replace).
     _mount_guard: Option<MountExternalGuard>,
+}
+
+#[derive(Debug, Clone)]
+enum ReaddirSnapshot {
+    Typed(Arc<[DirectoryEntry]>),
+    Names(Arc<[String]>),
+}
+
+impl ReaddirSnapshot {
+    fn len(&self) -> usize {
+        match self {
+            Self::Typed(entries) => entries.len(),
+            Self::Names(names) => names.len(),
+        }
+    }
+
+    fn cookie_after(&self, index: usize) -> Option<u64> {
+        match self {
+            Self::Typed(entries) => entries.get(index).map(|entry| entry.next_cookie),
+            Self::Names(names) => (index < names.len()).then(|| (index + 1) as u64),
+        }
+    }
+
+    fn index_after_cookie(&self, cookie: u64) -> usize {
+        match self {
+            Self::Typed(entries) => entries
+                .iter()
+                .position(|entry| entry.next_cookie == cookie)
+                .map_or(entries.len(), |index| index + 1),
+            Self::Names(names) => usize::try_from(cookie)
+                .ok()
+                .filter(|index| *index <= names.len())
+                .unwrap_or(names.len()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReaddirState {
+    snapshot: Option<ReaddirSnapshot>,
+    next_index: usize,
+}
+
+impl ReaddirState {
+    fn resume_after_cookie(&mut self, cookie: u64) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            self.next_index = 0;
+            return;
+        };
+        self.next_index = snapshot.index_after_cookie(cookie);
+    }
+}
+
+fn checked_dirent_cookie(cookie: u64) -> Result<usize, SystemError> {
+    let cookie = i64::try_from(cookie).map_err(|_| SystemError::EOVERFLOW)?;
+    usize::try_from(cookie).map_err(|_| SystemError::EOVERFLOW)
+}
+
+#[cfg(test)]
+mod readdir_tests {
+    use super::checked_dirent_cookie;
+    use system_error::SystemError;
+
+    #[test]
+    fn dirent_cookie_must_fit_signed_offset() {
+        assert_eq!(checked_dirent_cookie(1), Ok(1));
+        assert_eq!(
+            checked_dirent_cookie(i64::MAX as u64 + 1),
+            Err(SystemError::EOVERFLOW)
+        );
+    }
 }
 
 impl File {
@@ -790,7 +944,13 @@ impl File {
             .downcast_arc::<MountFSInode>()
             .map(|inode| inode.mount_fs().try_pin_external())
             .transpose()?;
-        Self::new_with_private_data_and_mount_guard(inode, flags, private_data_init, mount_guard)
+        Self::new_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            private_data_init,
+            mount_guard,
+            None,
+        )
     }
 
     /// Construct a pathname-backed file by consuming the mount pin acquired
@@ -806,6 +966,26 @@ impl File {
             flags,
             FilePrivateData::default(),
             mount_guard,
+            None,
+        );
+        drop(operation_guard);
+        file
+    }
+
+    /// Construct a pathname-backed file from an already-opened inode.
+    pub fn new_preopened_with_mount_guard(
+        preopened: PreopenedFile,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+    ) -> Result<Self, SystemError> {
+        let inode = preopened.inode();
+        let file = Self::new_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+            Some(preopened),
         );
         drop(operation_guard);
         file
@@ -816,6 +996,7 @@ impl File {
         mut flags: FileFlags,
         private_data_init: FilePrivateData,
         mount_guard: Option<MountExternalGuard>,
+        mut preopened: Option<PreopenedFile>,
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let mut file_type = inode.metadata()?.file_type;
@@ -848,12 +1029,17 @@ impl File {
             flags.insert(FileFlags::O_APPEND);
         }
 
-        let canonical_inode = canonical_inode_for_posix_lock(inode.clone());
-        let posix_lock_key = if Arc::ptr_eq(&canonical_inode, &inode) {
-            (metadata.dev_id, metadata.inode_id)
+        let canonical_inode = canonical_inode_for_file_lock(inode.clone());
+        let canonical_metadata = if Arc::ptr_eq(&canonical_inode, &inode) {
+            metadata.clone()
         } else {
-            let lock_md = canonical_inode.metadata()?;
-            (lock_md.dev_id, lock_md.inode_id)
+            canonical_inode.metadata()?
+        };
+        let posix_lock_key = (canonical_metadata.dev_id, canonical_metadata.inode_id);
+        let append_lock_domain = if file_type == FileType::File && !is_path {
+            canonical_inode.append_lock_fs().map(AppendLockDomain::new)
+        } else {
+            None
         };
 
         // O_CLOEXEC 是 per-fd 属性，由 alloc_fd/alloc_fd_arc 的 cloexec 参数控制，
@@ -866,11 +1052,20 @@ impl File {
         let inode_retention =
             InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::OpenFileDescription)?;
 
-        let private_data = Mutex::new(private_data_init);
+        if is_path && preopened.is_some() {
+            return Err(SystemError::EINVAL);
+        }
+        let already_open = preopened.is_some();
+        let private_data = Mutex::new(match preopened.as_mut() {
+            Some(preopened) => preopened.take_private_data(),
+            None => private_data_init,
+        });
         if is_path {
             mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
         } else {
-            inode.open(private_data.lock(), &flags)?;
+            if !already_open {
+                inode.open(private_data.lock(), &flags)?;
+            }
 
             // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
             if inode.is_stream() {
@@ -917,19 +1112,25 @@ impl File {
             .downcast_arc::<MountFSInode>()
             .map(|mnt_inode| mnt_inode.mount_fs().sample_wb_error())
             .unwrap_or(0);
+        let io_fs = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt_inode| mnt_inode.mount_fs() as Arc<dyn FileSystem>);
 
         let f = File {
             open_file_id: alloc_open_file_id(),
             inode,
+            io_fs,
             offset: AtomicUsize::new(0),
             flags: RwSem::new(flags),
             mode: RwSem::new(mode),
             file_type,
-            readdir_subdirs_name: Mutex::new(Vec::default()),
+            readdir_state: Mutex::new(ReaddirState::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
+            append_lock_domain,
             ra_state: Mutex::new(FileReadaheadState::new()),
             wb_error_seq: Mutex::new(wb_error_seq),
             sb_error_seq: Mutex::new(sb_error_seq),
@@ -1111,7 +1312,7 @@ impl File {
         }
 
         // 检查文件系统是否支持 readahead
-        if !self.inode.fs().support_readahead() {
+        if !self.with_io_fs(|fs| fs.support_readahead()) {
             return Ok(());
         }
 
@@ -1227,15 +1428,13 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        let is_append = (flags.contains(FileFlags::O_APPEND) || force_append)
-            && matches!(file_type, FileType::File);
+        let is_append = matches!(file_type, FileType::File)
+            && (flags.contains(FileFlags::O_APPEND) || force_append);
 
-        // Linux 语义要求 O_APPEND（以及 RWF_APPEND）在并发下满足“取 EOF + 写入”的原子性，
-        // 否则多个线程可能拿到相同 EOF 导致覆盖写，最终 size 比预期小。
+        // 普通文件始终按 EOF 执行 O_APPEND/RWF_APPEND；提供稳定锁域的文件系统
+        // 还会在 VFS 层串行化“取 EOF + 写入”，避免并发追加互相覆盖。
         if is_append {
-            let dev_id = md.dev_id;
-            let inode_id = md.inode_id;
-            return with_inode_append_lock(dev_id, inode_id, || {
+            let append_write = || {
                 // 在锁内刷新元数据，确保 EOF 是最新的。
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
@@ -1252,7 +1451,11 @@ impl File {
                         inode_flags,
                     },
                 )
-            });
+            };
+            return match self.append_lock_domain.as_ref() {
+                Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
+                None => append_write(),
+            };
         }
 
         let actual_offset = offset;
@@ -1295,14 +1498,13 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        let is_append = (flags.contains(FileFlags::O_APPEND) || force_append)
-            && matches!(file_type, FileType::File);
+        let is_append = matches!(file_type, FileType::File)
+            && (flags.contains(FileFlags::O_APPEND) || force_append);
 
-        // Linux semantics require O_APPEND (and RWF_APPEND) to atomically fetch EOF and write under concurrency.
+        // Always select EOF for regular-file append semantics. Filesystems
+        // with a stable lock domain additionally serialize EOF lookup + write.
         if is_append {
-            let dev_id = md.dev_id;
-            let inode_id = md.inode_id;
-            return with_inode_append_lock(dev_id, inode_id, || {
+            let append_write = || {
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
                 let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
@@ -1318,7 +1520,11 @@ impl File {
                         inode_flags,
                     },
                 )
-            });
+            };
+            return match self.append_lock_domain.as_ref() {
+                Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
+                None => append_write(),
+            };
         }
 
         let actual_offset = offset;
@@ -1391,15 +1597,35 @@ impl File {
                 }
             }
         }
+        if file_type == FileType::Dir {
+            let mut state = self.readdir_state.lock();
+            let pos = match origin {
+                SeekFrom::SeekSet(offset) => offset,
+                SeekFrom::SeekCurrent(0) => return Ok(self.offset.load(Ordering::SeqCst)),
+                SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
+                SeekFrom::SeekEnd(_) => {
+                    // Preserve the existing directory SEEK_END behavior.
+                    return Ok(MAX_LFS_FILESIZE as usize);
+                }
+                SeekFrom::Invalid => return Err(SystemError::EINVAL),
+            };
+            if pos < 0 {
+                return Err(SystemError::EINVAL);
+            }
+            if pos == 0 {
+                state.snapshot = None;
+                state.next_index = 0;
+            } else {
+                state.resume_after_cookie(pos as u64);
+            }
+            self.offset.store(pos as usize, Ordering::SeqCst);
+            return Ok(pos as usize);
+        }
+
         let pos: i64 = match origin {
             SeekFrom::SeekSet(offset) => offset,
             SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
             SeekFrom::SeekEnd(offset) => {
-                if FileType::Dir == file_type {
-                    // 对目录，返回 Linux 常见语义：允许 SEEK_END 并返回 MAX_LFS_FILESIZE。
-                    // 测试接受 MAX_LFS_FILESIZE 或 EINVAL，但为通过当前测试选择返回 MAX_LFS_FILESIZE。
-                    return Ok(MAX_LFS_FILESIZE as usize);
-                }
                 let metadata = self.metadata()?;
                 metadata.size + offset
             }
@@ -1473,8 +1699,6 @@ impl File {
         }
 
         let inode: &Arc<dyn IndexNode> = &self.inode;
-        let mut current_pos = self.offset.load(Ordering::SeqCst);
-
         // POSIX 标准要求readdir应该返回. 和 ..
         // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
 
@@ -1482,37 +1706,81 @@ impl File {
         // 为了保证在目录内容动态变化（例如 /proc/self/fd）时不会因为重新
         // 创建列表而丢失尚未读取的目录项，这里缓存第一次生成的列表，在
         // 文件偏移被 seek 到 0 之前复用该缓存。
-        let mut cached_names = self.readdir_subdirs_name.lock();
-        if current_pos == 0 || cached_names.is_empty() {
-            *cached_names = inode.list()?;
+        let mut state = self.readdir_state.lock();
+        let current_cookie = self.offset.load(Ordering::SeqCst) as u64;
+        if state.snapshot.is_none() {
+            state.snapshot = Some(match inode.list_entries()? {
+                Some(entries) => ReaddirSnapshot::Typed(Arc::from(entries)),
+                None => ReaddirSnapshot::Names(Arc::from(inode.list()?)),
+            });
+            if current_cookie == 0 {
+                state.next_index = 0;
+            } else {
+                state.resume_after_cookie(current_cookie);
+            }
+        } else {
+            let expected_cookie = state.snapshot.as_ref().and_then(|snapshot| {
+                state
+                    .next_index
+                    .checked_sub(1)
+                    .and_then(|index| snapshot.cookie_after(index))
+            });
+            if state.next_index > 0 && expected_cookie != Some(current_cookie) {
+                state.resume_after_cookie(current_cookie);
+            }
         }
-        let readdir_subdirs_name = cached_names.clone();
-        drop(cached_names);
 
-        let subdirs_name_len = readdir_subdirs_name.len();
-        while current_pos < subdirs_name_len {
-            let name = &readdir_subdirs_name[current_pos];
-            let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
-                Ok(i) => i,
-                Err(e) => {
-                    if e == SystemError::ENOENT {
-                        // 目录项在本次读取过程中被移除，跳过它，继续读取后续条目
-                        self.offset.fetch_add(1, Ordering::SeqCst);
-                        current_pos += 1;
-                        continue;
-                    }
-                    error!("Readdir error: Failed to find sub inode");
-                    return Err(e);
+        let snapshot = state
+            .snapshot
+            .as_ref()
+            .expect("readdir snapshot initialized")
+            .clone();
+        if state.next_index > snapshot.len() {
+            return Err(SystemError::EINVAL);
+        }
+        while state.next_index < snapshot.len() {
+            let index = state.next_index;
+            let (name, cookie, metadata) = match &snapshot {
+                ReaddirSnapshot::Typed(entries) => {
+                    let entry = &entries[index];
+                    (
+                        entry.name.as_slice(),
+                        entry.next_cookie,
+                        Some((entry.ino, entry.d_type)),
+                    )
+                }
+                ReaddirSnapshot::Names(names) => {
+                    let name = &names[index];
+                    (name.as_bytes(), (index + 1) as u64, None)
                 }
             };
-
-            let inode_metadata = sub_inode.metadata().unwrap();
-            let entry_ino = inode_metadata.inode_id.into() as u64;
-            let entry_d_type = inode_metadata.file_type.get_file_type_num() as u8;
-            match ctx.fill_dir(name, current_pos, entry_ino, entry_d_type) {
+            let next_cookie = checked_dirent_cookie(cookie)?;
+            let (ino, d_type) = if let Some(metadata) = metadata {
+                metadata
+            } else {
+                let metadata = match name {
+                    b"." => inode.metadata(),
+                    b".." => inode.parent().and_then(|parent| parent.metadata()),
+                    _ => inode.find_bytes(name).and_then(|child| child.metadata()),
+                };
+                let metadata = match metadata {
+                    Ok(metadata) => metadata,
+                    Err(SystemError::ENOENT) => {
+                        state.next_index += 1;
+                        self.offset.store(next_cookie, Ordering::SeqCst);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                (
+                    metadata.inode_id.into() as u64,
+                    metadata.file_type.get_file_type_num() as u8,
+                )
+            };
+            match ctx.fill_dir(name, next_cookie, ino, d_type) {
                 Ok(_) => {
-                    self.offset.fetch_add(1, Ordering::SeqCst);
-                    current_pos += 1;
+                    state.next_index += 1;
+                    self.offset.store(next_cookie, Ordering::SeqCst);
                 }
                 Err(SystemError::EINVAL) => {
                     return Ok(());
@@ -1528,6 +1796,22 @@ impl File {
 
     pub fn inode(&self) -> Arc<dyn IndexNode> {
         return self.inode.clone();
+    }
+
+    /// Invoke an operation on the filesystem selected for this open file.
+    ///
+    /// Pathname-backed files retain their selected mount and therefore avoid
+    /// both a topology lookup and an Arc refcount operation in fault hot paths.
+    /// Anonymous/pseudo files fall back lazily because several such inodes do
+    /// not implement `fs()` and must remain constructible (for example epoll).
+    #[inline]
+    pub fn with_io_fs<T>(&self, op: impl FnOnce(&dyn FileSystem) -> T) -> T {
+        if let Some(fs) = self.io_fs.as_ref() {
+            op(fs.as_ref())
+        } else {
+            let fs = self.inode.fs();
+            op(fs.as_ref())
+        }
     }
 
     /// @brief 尝试克隆一个文件
@@ -1562,15 +1846,17 @@ impl File {
         let res = Self {
             open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
+            io_fs: self.io_fs.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
             flags: RwSem::new(flags),
             mode: RwSem::new(mode),
             file_type: self.file_type,
-            readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
+            readdir_state: Mutex::new(self.readdir_state.lock().clone()),
             private_data,
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
+            append_lock_domain: self.append_lock_domain.clone(),
             ra_state: Mutex::new(self.ra_state.lock().clone()),
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),

@@ -678,8 +678,7 @@ impl Tmpfs {
         result.0.lock().self_ref = Arc::downgrade(&result);
         let inode_dyn: Arc<dyn IndexNode> = result.clone();
         let backend = Arc::new(TmpfsPageCacheBackend::new(Arc::downgrade(&inode_dyn)));
-        let pc = PageCache::new(Some(Arc::downgrade(&inode_dyn)), Some(backend));
-        pc.set_shmem(true);
+        let pc = PageCache::new_shmem(Some(Arc::downgrade(&inode_dyn)), Some(backend));
         result.0.lock().page_cache = Some(pc.clone());
 
         Ok(Arc::new(TmpfsShmemFile {
@@ -734,6 +733,10 @@ impl MountableFileSystem for Tmpfs {
 register_mountable_fs!(Tmpfs, TMPFSMAKER, "tmpfs");
 
 impl IndexNode for LockedTmpfsInode {
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         Ok(())
     }
@@ -1147,11 +1150,10 @@ impl IndexNode for LockedTmpfsInode {
             let backend = Arc::new(TmpfsPageCacheBackend::new(
                 Arc::downgrade(&result) as Weak<dyn IndexNode>
             ));
-            let pc = PageCache::new(
+            let pc = PageCache::new_shmem(
                 Some(Arc::downgrade(&result) as Weak<dyn IndexNode>),
                 Some(backend),
             );
-            pc.set_shmem(true);
             result.0.lock().page_cache = Some(pc);
         }
 

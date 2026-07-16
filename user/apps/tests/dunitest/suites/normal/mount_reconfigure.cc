@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
@@ -905,6 +906,114 @@ TEST(MountReconfigure, StackedMountRepeatedUnmountKeepsLowerIndex) {
     }
 
     rmdir(target);
+    rmdir(base);
+}
+
+TEST(MountReconfigure, BindNamespaceOverOpenFileKeepsOpenFileIoFs) {
+    const char *base = "/tmp/test_mount_open_file_io_fs";
+    const char *target = "/tmp/test_mount_open_file_io_fs/ipc";
+    constexpr size_t kPageSize = 4096;
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    // tmpfs implements the ordinary file mmap callbacks exercised below;
+    // ramfs currently does not and would turn this mount-identity regression
+    // into an unrelated default map_pages panic.
+    ASSERT_EQ(0, mount("", base, "tmpfs", 0, NULL)) << strerror(errno);
+    int fd = open(target, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(fd, kPageSize)) << strerror(errno);
+    ASSERT_EQ(5, pwrite(fd, "lower", 5, 0)) << strerror(errno);
+    struct statfs lower_fd_statfs = {};
+    ASSERT_EQ(0, fstatfs(fd, &lower_fd_statfs)) << strerror(errno);
+
+    // This is the same bind shape used by Cube agent when it persists IPC
+    // namespaces. Path operations must resolve the newly mounted namespace
+    // inode, while the already-open fd must retain the ramfs selected at open.
+    ASSERT_EQ(0, mount("/proc/self/ns/ipc", target, NULL, MS_BIND, NULL)) << strerror(errno);
+
+    struct statfs overmounted_fd_statfs = {};
+    ASSERT_EQ(0, fstatfs(fd, &overmounted_fd_statfs)) << strerror(errno);
+    EXPECT_EQ(lower_fd_statfs.f_type, overmounted_fd_statfs.f_type);
+    struct statfs overmounted_path_statfs = {};
+    ASSERT_EQ(0, statfs(target, &overmounted_path_statfs)) << strerror(errno);
+    EXPECT_NE(lower_fd_statfs.f_type, overmounted_path_statfs.f_type);
+
+    void *mapping = mmap(NULL, kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    EXPECT_EQ(0, memcmp(mapping, "lower", 5));
+    static_cast<char *>(mapping)[0] = 'L';
+    ASSERT_EQ(0, msync(mapping, kPageSize, MS_SYNC)) << strerror(errno);
+    ASSERT_EQ(0, munmap(mapping, kPageSize)) << strerror(errno);
+
+    ASSERT_EQ(0, umount(target)) << strerror(errno);
+    char value[5] = {};
+    ASSERT_EQ(5, pread(fd, value, sizeof(value), 0)) << strerror(errno);
+    EXPECT_EQ(0, memcmp(value, "Lower", 5));
+    close(fd);
+    unlink(target);
+    ASSERT_EQ(0, umount(base)) << strerror(errno);
+    rmdir(base);
+}
+
+TEST(MountReconfigure, ProcFdMagicLinkKeepsReferencedMountProjection) {
+    const char *base = "/tmp/test_mount_proc_fd_projection";
+    const char *source = "/tmp/test_mount_proc_fd_projection/source";
+    const char *topper = "/tmp/test_mount_proc_fd_projection/topper";
+    const char *target = "/tmp/test_mount_proc_fd_projection/target";
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    ASSERT_EQ(0, mount("", base, "tmpfs", 0, NULL)) << strerror(errno);
+
+    int source_fd = open(source, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(source_fd, 0) << strerror(errno);
+    ASSERT_EQ(6, write(source_fd, "source", 6)) << strerror(errno);
+    int topper_fd = open(topper, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(topper_fd, 0) << strerror(errno);
+    ASSERT_EQ(6, write(topper_fd, "topper", 6)) << strerror(errno);
+    close(topper_fd);
+    int target_fd = open(target, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(target_fd, 0) << strerror(errno);
+    close(target_fd);
+
+    char proc_fd[64] = {};
+    snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", source_fd);
+    // The proc-fd magic link retains the lower open file's struct path even
+    // after the pathname is covered by a different mount.
+    ASSERT_EQ(0, mount(topper, source, NULL, MS_BIND, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount(proc_fd, target, NULL, MS_BIND, NULL)) << strerror(errno);
+
+    struct stat source_stat = {};
+    struct stat target_stat = {};
+    ASSERT_EQ(0, fstat(source_fd, &source_stat)) << strerror(errno);
+    ASSERT_EQ(0, stat(target, &target_stat)) << strerror(errno);
+    EXPECT_EQ(source_stat.st_dev, target_stat.st_dev);
+    EXPECT_EQ(source_stat.st_ino, target_stat.st_ino);
+    char value[6] = {};
+    int bound_fd = open(target, O_RDONLY);
+    ASSERT_GE(bound_fd, 0) << strerror(errno);
+    ASSERT_EQ(6, read(bound_fd, value, sizeof(value))) << strerror(errno);
+    EXPECT_EQ(0, memcmp(value, "source", sizeof(value)));
+    close(bound_fd);
+
+    ASSERT_EQ(0, umount(target)) << strerror(errno);
+    ASSERT_EQ(0, umount(source)) << strerror(errno);
+    close(source_fd);
+    unlink(source);
+    unlink(topper);
+    unlink(target);
+    ASSERT_EQ(0, umount(base)) << strerror(errno);
     rmdir(base);
 }
 

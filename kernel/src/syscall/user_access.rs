@@ -89,64 +89,71 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
         let region = VirtRegion::new(start_page, region_len);
 
         let mm = AddressSpace::current()?;
-        let mut space_guard = mm.write_guard_no_reservation_conflict(region);
         let mut current = start_page;
-        loop {
-            let vma = space_guard
-                .mappings
-                .contains(current)
-                .ok_or(SystemError::EFAULT)?;
-            let vm_flags = *vma.lock().vm_flags();
-            let permitted = if write {
-                vm_flags.contains(VmFlags::VM_WRITE)
-            } else {
-                vm_flags.contains(VmFlags::VM_READ)
-            };
-            if !permitted {
-                return Err(SystemError::EFAULT);
-            }
+        'retry: loop {
+            let mut space_guard = mm.write_guard_no_reservation_conflict(region);
+            loop {
+                let vma = space_guard
+                    .mappings
+                    .contains(current)
+                    .ok_or(SystemError::EFAULT)?;
+                let vm_flags = *vma.lock().vm_flags();
+                let permitted = if write {
+                    vm_flags.contains(VmFlags::VM_WRITE)
+                } else {
+                    vm_flags.contains(VmFlags::VM_READ)
+                };
+                if !permitted {
+                    return Err(SystemError::EFAULT);
+                }
 
-            let fault_flags = if write {
-                FaultFlags::FAULT_FLAG_WRITE
-            } else {
-                FaultFlags::empty()
-            };
-            let fault = unsafe {
-                let message = PageFaultMessage::new(
-                    vma,
-                    current,
-                    fault_flags,
-                    &mut space_guard.user_mapper.utable,
-                    mm.clone(),
+                let fault_flags = if write {
+                    FaultFlags::FAULT_FLAG_WRITE
+                } else {
+                    FaultFlags::empty()
+                };
+                let fault = unsafe {
+                    let message = PageFaultMessage::new(
+                        vma,
+                        current,
+                        fault_flags,
+                        &mut space_guard.user_mapper.utable,
+                        mm.clone(),
+                    );
+                    PageFaultHandler::handle_mm_fault(message)
+                };
+                if fault.reason.contains(VmFaultReason::VM_FAULT_OOM) {
+                    return Err(SystemError::ENOMEM);
+                }
+                if fault.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
+                    let wait = fault.retry_wait;
+                    drop(space_guard);
+                    if let Some(wait) = wait {
+                        wait.wait().map_err(|_| SystemError::EFAULT)?;
+                    }
+                    continue 'retry;
+                }
+                if fault.reason.intersects(
+                    VmFaultReason::VM_FAULT_SIGBUS
+                        | VmFaultReason::VM_FAULT_SIGSEGV
+                        | VmFaultReason::VM_FAULT_HWPOISON
+                        | VmFaultReason::VM_FAULT_HWPOISON_LARGE
+                        | VmFaultReason::VM_FAULT_FALLBACK,
+                ) {
+                    return Err(SystemError::EFAULT);
+                }
+
+                if current == end_page {
+                    return Ok(());
+                }
+                current = VirtAddr::new(
+                    current
+                        .data()
+                        .checked_add(MMArch::PAGE_SIZE)
+                        .ok_or(SystemError::EFAULT)?,
                 );
-                PageFaultHandler::handle_mm_fault(message)
-            };
-            if fault.contains(VmFaultReason::VM_FAULT_OOM) {
-                return Err(SystemError::ENOMEM);
             }
-            if fault.intersects(
-                VmFaultReason::VM_FAULT_SIGBUS
-                    | VmFaultReason::VM_FAULT_SIGSEGV
-                    | VmFaultReason::VM_FAULT_HWPOISON
-                    | VmFaultReason::VM_FAULT_HWPOISON_LARGE
-                    | VmFaultReason::VM_FAULT_FALLBACK
-                    | VmFaultReason::VM_FAULT_RETRY,
-            ) {
-                return Err(SystemError::EFAULT);
-            }
-
-            if current == end_page {
-                break;
-            }
-            current = VirtAddr::new(
-                current
-                    .data()
-                    .checked_add(MMArch::PAGE_SIZE)
-                    .ok_or(SystemError::EFAULT)?,
-            );
         }
-
-        Ok(())
     }
 }
 

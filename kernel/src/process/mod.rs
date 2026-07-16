@@ -48,7 +48,7 @@ pub use info::{
 pub use kstack::{KernelStack, KernelStackType};
 pub(crate) use manager::{
     account_context_switch, account_successful_fork, all_process, dec_visible_thread_count,
-    inc_visible_thread_count,
+    inc_visible_thread_count, lock_fs_refs_copy, lock_fs_refs_pivot, FsRefsReadGuard,
 };
 #[allow(unused_imports)]
 pub use manager::{

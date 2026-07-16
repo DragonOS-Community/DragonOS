@@ -37,7 +37,7 @@ fn corruption() -> Ext4Error {
 
 pub(super) fn inode_checksum_valid(sb: &SuperBlock, inode: &InodeRef) -> bool {
     !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM)
-        || inode.verify_checksum(&sb.uuid())
+        || inode.verify_checksum(sb.metadata_checksum_seed())
 }
 
 fn unsupported_orphan_format(sb: &SuperBlock) -> bool {
@@ -410,15 +410,15 @@ mod tests {
         let sb: SuperBlock = unsafe { core::mem::zeroed() };
         let mut inode = InodeRef::new(11, Box::default());
         inode.inode.set_generation(7);
-        inode.set_checksum(&sb.uuid());
+        inode.set_checksum(sb.metadata_checksum_seed());
         inode.inode.set_generation(8);
 
-        assert!(!inode.verify_checksum(&sb.uuid()));
+        assert!(!inode.verify_checksum(sb.metadata_checksum_seed()));
         assert!(inode_checksum_valid(&sb, &inode));
 
         let checked_sb = SuperBlock::validation_fixture();
         inode.inode.set_generation(9);
-        inode.set_checksum(&checked_sb.uuid());
+        inode.set_checksum(checked_sb.metadata_checksum_seed());
         inode.inode.set_generation(10);
         assert!(!inode_checksum_valid(&checked_sb, &inode));
     }

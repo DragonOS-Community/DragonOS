@@ -20,9 +20,8 @@ use crate::{
             kobject::KObject,
             subsys::SubSysPrivate,
         },
-        virtio::irq::{virtio_irq_manager, DefaultVirtioIrqHandler},
+        virtio::irq::virtio_irq_manager,
     },
-    exception::{irqdesc::IrqHandleFlags, manage::irq_manager},
     filesystem::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
@@ -265,22 +264,6 @@ impl VirtIODeviceManager {
             return Ok(());
         }
         let irq = irq.unwrap();
-        if let Err(e) = irq_manager().request_irq(
-            irq,
-            dev.device_name(),
-            &DefaultVirtioIrqHandler,
-            IrqHandleFlags::IRQF_SHARED,
-            Some(dev.dev_id().clone()),
-        ) {
-            error!(
-                "Failed to request irq for virtio device '{}': irq: {:?}, error {:?}",
-                dev.device_name(),
-                irq,
-                e
-            );
-            return Err(e);
-        }
-
         virtio_irq_manager()
             .register_device(dev.clone())
             .map_err(|e| {

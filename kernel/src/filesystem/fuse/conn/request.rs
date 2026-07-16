@@ -101,7 +101,7 @@ impl FuseConn {
     }
 
     pub(crate) fn request_dax_mapping(
-        &self,
+        self: &Arc<Self>,
         opcode: u32,
         nodeid: u64,
         payload: &[u8],
@@ -120,14 +120,12 @@ impl FuseConn {
         let (result, kind) = match pending.wait_result_with_kind_uninterruptible() {
             Ok(result) => result,
             Err(_) => {
-                // A dead wait queue is an internal connection failure. Abort
-                // first so the request obtains a real terminal state before
-                // its allocator pin/reservation can be released.
-                self.abort();
-                match pending.wait_result_with_kind() {
-                    Ok(result) => result,
-                    Err(error) => return FuseDaxRequestOutcome::Disconnected(error),
-                }
+                // The DAX caller still owns an admission guard. Synchronous
+                // abort would wait for that same guard and self-deadlock, so
+                // defer connection teardown until this stack has unwound.
+                let conn = self.clone();
+                schedule_work(Work::new(move || conn.abort()));
+                return FuseDaxRequestOutcome::Disconnected(SystemError::ENOTCONN);
             }
         };
         match (result, kind) {
@@ -269,15 +267,47 @@ impl FuseConn {
         speculative: bool,
         ctx: BackgroundReadPagesCtx,
     ) -> Result<Option<Arc<FusePendingState>>, SystemError> {
+        self.enqueue_read_pages(nodeid, payload, req_cred, Some(speculative), ctx)
+    }
+
+    /// Submit one cache READ without background credit.  This is the FUSE
+    /// `ASYNC_READ=0` transport: callers must wait for this request before
+    /// submitting the next chunk, while retaining the same DMA completion and
+    /// page-cache publication path as asynchronous READs.
+    pub(crate) fn enqueue_synchronous_read_pages(
+        &self,
+        nodeid: u64,
+        payload: &[u8],
+        req_cred: FuseRequestCred,
+        ctx: BackgroundReadPagesCtx,
+    ) -> Result<Arc<FusePendingState>, SystemError> {
+        self.enqueue_read_pages(nodeid, payload, req_cred, None, ctx)?
+            .ok_or(SystemError::EIO)
+    }
+
+    fn enqueue_read_pages(
+        &self,
+        nodeid: u64,
+        payload: &[u8],
+        req_cred: FuseRequestCred,
+        background_speculative: Option<bool>,
+        ctx: BackgroundReadPagesCtx,
+    ) -> Result<Option<Arc<FusePendingState>>, SystemError> {
         self.wait_initialized()?;
-        let Some(credit) = self.acquire_background_credit(speculative)? else {
-            return Ok(None);
+        let credit = match background_speculative {
+            Some(speculative) => {
+                let Some(credit) = self.acquire_background_credit(speculative)? else {
+                    return Ok(None);
+                };
+                Some(credit)
+            }
+            None => None,
         };
         let unique = self.alloc_unique();
         let pending = Arc::new(FusePendingState::new_with_credit(
             unique,
             FUSE_READ,
-            Some(credit),
+            credit,
             Some(super::FuseReadCompletion {
                 target: ctx.destination.clone(),
                 node: ctx.node,
@@ -585,12 +615,17 @@ impl FuseConn {
         let mut bytes = Vec::with_capacity(hdr.len as usize);
         bytes.extend_from_slice(fuse_pack_struct(&hdr));
         bytes.extend_from_slice(payload);
+        let track_direct_read_stats = read_pages_destination
+            .as_ref()
+            .is_some_and(|target| target.tracks_direct_read_stats());
         Ok(Arc::new(FuseRequest {
             bytes,
             unique,
             opcode,
             reply_contract,
             read_pages_destination,
+            track_direct_read_stats,
+            stats_owner: Default::default(),
         }))
     }
 
@@ -615,17 +650,21 @@ impl FuseConn {
             if g.teardown_started && opcode != FUSE_DESTROY {
                 return Err(SystemError::ENOTCONN);
             }
+            // Publish under the dequeue lock so a fast consumer cannot retire
+            // an owner before its acquisition is observable.
+            req.stats_mark_queued();
+            stats::on_fuse_request_queued(req_len, no_reply);
             if g.separate_hiprio_pending && Self::is_high_priority_opcode(opcode) {
                 g.hiprio_pending.push_back(req);
             } else {
                 g.pending.push_back(req);
             }
             if let Some(pending) = pending_state {
+                pending.mark_processing_owner();
                 g.processing.insert(unique, pending);
             }
         }
 
-        stats::on_fuse_request_queued(req_len, no_reply);
         trace::trace_fuse_request_queue(unique, opcode, req_len as u64, no_reply as u8);
         self.read_wait.wakeup(None);
         self.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);

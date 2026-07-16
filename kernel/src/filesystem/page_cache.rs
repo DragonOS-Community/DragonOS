@@ -8,7 +8,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use hashbrown::HashMap;
+use hashbrown::{hash_map::Entry, HashMap};
 use system_error::SystemError;
 
 use super::vfs::{
@@ -22,10 +22,12 @@ use crate::libs::mutex::MutexGuard;
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
+use crate::mm::fault::FaultRetryWait;
 use crate::mm::page::FileMapInfo;
 use crate::mm::page_cache_stats as pc_stats;
 use crate::mm::ucontext::LockedVMA;
 use crate::sched::completion::Completion;
+use crate::time::Duration;
 use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
@@ -42,9 +44,79 @@ use lazy_static::lazy_static;
 
 static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
 static PAGE_CACHE_DMA_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
+static PAGE_CACHE_WRITEBACK_TAG_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 const PAGECACHE_IO_WORKERS: usize = 4;
+const MAX_ASYNC_WRITEBACK_BATCHES: usize = PAGECACHE_IO_WORKERS * 2;
 static PAGECACHE_IO_RR: AtomicUsize = AtomicUsize::new(0);
+static PAGECACHE_WRITEBACK_RR: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_WRITEBACK_BATCHES: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_WRITEBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static ASYNC_WRITEBACK_WAIT: WaitQueue = WaitQueue::default();
+static PAGECACHE_COMPLETION_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
+static PAGECACHE_ACCOUNTING_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
+
+// A batch large enough to dominate normal background noise verifies the
+// page-cache VM counters, including the final-drop path that regressed. The
+// tolerance avoids treating the global snapshot as an exact local oracle.
+const PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES: usize = 128;
+const PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE: i128 = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum PageCacheKind {
+    File = 1,
+    Shmem = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum PageEntryAccounting {
+    Unaccounted = 0,
+    File = 1,
+    Shmem = 2,
+}
+
+struct PageCacheCompletionSelftestGuard;
+
+impl Drop for PageCacheCompletionSelftestGuard {
+    fn drop(&mut self) {
+        PAGECACHE_COMPLETION_SELFTEST_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+struct PageCacheAccountingSelftestGuard;
+
+impl Drop for PageCacheAccountingSelftestGuard {
+    fn drop(&mut self) {
+        PAGECACHE_ACCOUNTING_SELFTEST_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+struct PageCacheCompletionSelftestState {
+    generic_started: AtomicUsize,
+    generic_released: AtomicUsize,
+    completion_done: AtomicBool,
+    abort: AtomicBool,
+    wait: WaitQueue,
+}
+
+impl PageCacheCompletionSelftestState {
+    fn new() -> Self {
+        Self {
+            generic_started: AtomicUsize::new(0),
+            generic_released: AtomicUsize::new(0),
+            completion_done: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            wait: WaitQueue::default(),
+        }
+    }
+
+    fn release_waiters(&self) {
+        self.abort.store(true, Ordering::Release);
+        self.wait.wake_all();
+    }
+}
 
 #[derive(Debug, Default)]
 struct FileVmaIndex {
@@ -121,12 +193,517 @@ lazy_static! {
         }
         wqs
     };
+    // Keep completion of already-published Writeback pages independent from
+    // generic page-cache work. In particular, host invalidation runs on the
+    // generic pool and may hold the filesystem admission barrier while waiting
+    // for Writeback. Sharing a FIFO worker could strand the corresponding
+    // writeback work behind that waiter and deadlock permanently.
+    static ref PAGECACHE_WRITEBACK_WQS: Vec<Arc<WorkQueue>> = {
+        let mut wqs = Vec::new();
+        for i in 0..PAGECACHE_IO_WORKERS {
+            wqs.push(WorkQueue::new(&format!("pagecache-wb-{i}")));
+        }
+        wqs
+    };
     static ref PAGECACHE_REGISTRY: SpinLock<Vec<Weak<PageCache>>> = SpinLock::new(Vec::new());
 }
 
 pub(crate) fn schedule_pagecache_io(work: Arc<Work>) {
     let idx = PAGECACHE_IO_RR.fetch_add(1, Ordering::Relaxed) % PAGECACHE_IO_WQS.len();
     PAGECACHE_IO_WQS[idx].enqueue(work);
+}
+
+fn schedule_pagecache_writeback(work: Arc<Work>) {
+    let idx =
+        PAGECACHE_WRITEBACK_RR.fetch_add(1, Ordering::Relaxed) % PAGECACHE_WRITEBACK_WQS.len();
+    PAGECACHE_WRITEBACK_WQS[idx].enqueue(work);
+}
+
+/// Verify that terminal writeback completion cannot be stranded behind generic
+/// page-cache workers waiting for that completion.
+///
+/// This is only called from a root-readable debugfs selftest. It injects no
+/// delay or branch into normal page-cache operation.
+pub(crate) fn run_completion_domain_debug_selftest() -> Result<alloc::string::String, SystemError> {
+    if PAGECACHE_COMPLETION_SELFTEST_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(SystemError::EBUSY);
+    }
+    let _running = PageCacheCompletionSelftestGuard;
+    let state = Arc::new(PageCacheCompletionSelftestState::new());
+
+    // Place exactly one waiter on every generic page-cache worker. Direct queue
+    // selection keeps the test deterministic even if unrelated page-cache work
+    // advances the production round-robin counter concurrently. The waiters
+    // model host invalidation after it has observed a published Writeback page.
+    for workqueue in PAGECACHE_IO_WQS.iter() {
+        let waiter_state = state.clone();
+        workqueue.enqueue(Work::new(move || {
+            waiter_state.generic_started.fetch_add(1, Ordering::AcqRel);
+            waiter_state.wait.wake_all();
+            waiter_state.wait.wait_until(|| {
+                (waiter_state.completion_done.load(Ordering::Acquire)
+                    || waiter_state.abort.load(Ordering::Acquire))
+                .then_some(())
+            });
+            waiter_state.generic_released.fetch_add(1, Ordering::AcqRel);
+            waiter_state.wait.wake_all();
+        }));
+    }
+
+    const SELFTEST_TIMEOUT: Duration = Duration::from_secs(2);
+    if let Err(error) = state.wait.wait_until_timeout(
+        || (state.generic_started.load(Ordering::Acquire) == PAGECACHE_IO_WORKERS).then_some(()),
+        SELFTEST_TIMEOUT,
+    ) {
+        state.release_waiters();
+        return Ok(alloc::format!(
+            "status=fail stage=occupy_generic error={error:?} started={} expected={}\n",
+            state.generic_started.load(Ordering::Acquire),
+            PAGECACHE_IO_WORKERS
+        ));
+    }
+
+    let completion_state = state.clone();
+    PAGECACHE_WRITEBACK_WQS[0].enqueue(Work::new(move || {
+        completion_state
+            .completion_done
+            .store(true, Ordering::Release);
+        completion_state.wait.wake_all();
+    }));
+
+    let completion_result = state.wait.wait_until_timeout(
+        || state.completion_done.load(Ordering::Acquire).then_some(()),
+        SELFTEST_TIMEOUT,
+    );
+    if completion_result.is_err() {
+        state.release_waiters();
+    }
+    let released_result = state.wait.wait_until_timeout(
+        || (state.generic_released.load(Ordering::Acquire) == PAGECACHE_IO_WORKERS).then_some(()),
+        SELFTEST_TIMEOUT,
+    );
+    state.release_waiters();
+
+    if let Err(error) = completion_result {
+        return Ok(alloc::format!(
+            "status=fail stage=completion error={error:?} released={} expected={}\n",
+            state.generic_released.load(Ordering::Acquire),
+            PAGECACHE_IO_WORKERS
+        ));
+    }
+    if let Err(error) = released_result {
+        return Ok(alloc::format!(
+            "status=fail stage=release error={error:?} released={} expected={}\n",
+            state.generic_released.load(Ordering::Acquire),
+            PAGECACHE_IO_WORKERS
+        ));
+    }
+
+    Ok(alloc::format!(
+        "status=ok generic_waiters={} completion_domain=independent\n",
+        PAGECACHE_IO_WORKERS
+    ))
+}
+
+/// Exercise page-cache membership accounting with local identity assertions and
+/// a high-signal aggregate check of the production vmstat wiring.
+pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, SystemError> {
+    if PAGECACHE_ACCOUNTING_SELFTEST_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(SystemError::EBUSY);
+    }
+    let _running = PageCacheAccountingSelftestGuard;
+
+    #[allow(dead_code)]
+    struct PageEntryLayoutBaseline {
+        page: Arc<Page>,
+        state: AtomicU8,
+        writeback_tag: AtomicU64,
+        accounted_unevictable: AtomicBool,
+        active_users: AtomicUsize,
+        wait_queue: WaitQueue,
+    }
+
+    let entry_size = core::mem::size_of::<PageEntry>();
+    let baseline_size = core::mem::size_of::<PageEntryLayoutBaseline>();
+    if entry_size > baseline_size {
+        return Ok(alloc::format!(
+            "status=fail stage=layout baseline_size={baseline_size} entry_size={entry_size}\n"
+        ));
+    }
+
+    // Ordinary file membership: insert, explicit remove, and duplicate remove.
+    let file_cache = PageCache::new(None, None);
+    let file_page = file_cache.get_or_create_page_zero(0)?;
+    let file_entry = file_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    let file_ok = file_entry.accounting() == PageEntryAccounting::File
+        && file_cache.manager.remove_page(0)?.is_some()
+        && file_entry.accounting() == PageEntryAccounting::Unaccounted
+        && file_cache.manager.remove_page(0)?.is_none();
+    let file_paddr = file_page.phys_address();
+    page_manager_lock().remove_page(&file_paddr);
+    let _ = page_reclaimer_lock().remove_page(&file_paddr);
+    if !file_ok {
+        return Ok("status=fail stage=file_membership\n".into());
+    }
+
+    // Shmem classification is immutable and follows the entry identity.
+    let shmem_cache = PageCache::new_shmem(None, None);
+    let shmem_page = shmem_cache.get_or_create_page_zero(0)?;
+    let shmem_entry = shmem_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    let shmem_ok = shmem_entry.accounting() == PageEntryAccounting::Shmem
+        && shmem_cache.manager.remove_page(0)?.is_some()
+        && shmem_entry.accounting() == PageEntryAccounting::Unaccounted;
+    let shmem_paddr = shmem_page.phys_address();
+    page_manager_lock().remove_page(&shmem_paddr);
+    let _ = page_reclaimer_lock().remove_page(&shmem_paddr);
+    if !shmem_ok {
+        return Ok("status=fail stage=shmem_identity\n".into());
+    }
+
+    // Loading rollback consumes membership once; a late state publication on
+    // the detached entry must not revive it.
+    let state_cache = PageCache::new(None, None);
+    let loading_page = state_cache.allocate_page(Arc::downgrade(&state_cache), 0)?;
+    let loading_entry = Arc::new(PageEntry::new(loading_page.clone(), PageState::Loading));
+    state_cache
+        .inner
+        .lock()
+        .insert_entry(0, loading_entry.clone());
+    let loading_removed = state_cache.inner.lock().remove_page(0).is_some();
+    loading_entry.account_state_transition(PageState::Loading, PageState::UpToDate);
+    loading_entry.set_state(PageState::UpToDate);
+    let loading_ok =
+        loading_removed && loading_entry.accounting() == PageEntryAccounting::Unaccounted;
+    let loading_paddr = loading_page.phys_address();
+    page_manager_lock().remove_page(&loading_paddr);
+    let _ = page_reclaimer_lock().remove_page(&loading_paddr);
+    if !loading_ok {
+        return Ok("status=fail stage=loading_rollback\n".into());
+    }
+
+    // Exercise the production writeback claim/completion state machine. A
+    // successful completion returns to UpToDate; an error completion redirties
+    // the same attached entry before normal removal closes the accounting.
+    let writeback_cache = PageCache::new(None, None);
+    let writeback_page = writeback_cache.get_or_create_page_zero(0)?;
+    let writeback_entry = writeback_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    let writeback_paddr = writeback_page.phys_address();
+    if !writeback_cache.try_mark_page_writeback(0, writeback_paddr) {
+        return Ok("status=fail stage=writeback_claim_success\n".into());
+    }
+    {
+        let inner = writeback_cache.inner.lock();
+        if !inner.writeback_pages.contains(&0) || inner.dirty_pages.contains(&0) {
+            return Ok("status=fail stage=writeback_set_success\n".into());
+        }
+    }
+    PageCacheManager::finish_writeback_entry_state(
+        writeback_cache.clone(),
+        0,
+        writeback_entry.clone(),
+        writeback_page.clone(),
+        Ok(()),
+        false,
+    )?;
+    {
+        let inner = writeback_cache.inner.lock();
+        if writeback_entry.state() != PageState::UpToDate
+            || inner.writeback_pages.contains(&0)
+            || inner.dirty_pages.contains(&0)
+        {
+            return Ok("status=fail stage=writeback_complete_success\n".into());
+        }
+    }
+    if !writeback_cache.try_mark_page_writeback(0, writeback_paddr) {
+        return Ok("status=fail stage=writeback_claim_error\n".into());
+    }
+    if PageCacheManager::finish_writeback_entry_state(
+        writeback_cache.clone(),
+        0,
+        writeback_entry.clone(),
+        writeback_page.clone(),
+        Err(SystemError::EIO),
+        false,
+    )
+    .is_ok()
+    {
+        return Ok("status=fail stage=writeback_error_result\n".into());
+    }
+    let writeback_removed = {
+        let mut inner = writeback_cache.inner.lock();
+        if writeback_entry.state() != PageState::Dirty
+            || inner.writeback_pages.contains(&0)
+            || !inner.dirty_pages.contains(&0)
+        {
+            return Ok("status=fail stage=writeback_complete_error\n".into());
+        }
+        inner.remove_page(0).is_some()
+    };
+    let writeback_ok =
+        writeback_removed && writeback_entry.accounting() == PageEntryAccounting::Unaccounted;
+    page_manager_lock().remove_page(&writeback_paddr);
+    let _ = page_reclaimer_lock().remove_page(&writeback_paddr);
+    if !writeback_ok {
+        return Ok("status=fail stage=writeback_teardown\n".into());
+    }
+
+    // Generic asynchronous reads may leave a Loading entry at final drop. A
+    // late completion owns only the detached entry and must not revive its
+    // mapping accounting or physical manager/reclaimer membership.
+    let drop_cache = PageCache::new(None, None);
+    let drop_page = drop_cache.allocate_page(Arc::downgrade(&drop_cache), 0)?;
+    let drop_paddr = drop_page.phys_address();
+    let drop_entry = Arc::new(PageEntry::new(drop_page, PageState::Loading));
+    drop_cache.inner.lock().insert_entry(0, drop_entry.clone());
+    drop(drop_cache);
+    drop_entry.account_state_transition(PageState::Loading, PageState::UpToDate);
+    drop_entry.set_state(PageState::UpToDate);
+    if drop_entry.accounting() != PageEntryAccounting::Unaccounted
+        || page_manager_lock().contains(&drop_paddr)
+        || page_reclaimer_lock().get(&drop_paddr).is_some()
+    {
+        return Ok("status=fail stage=final_drop_loading\n".into());
+    }
+
+    let before = pc_stats::snapshot();
+    let wiring_cache = PageCache::new_shmem(None, None);
+    wiring_cache.set_unevictable(true);
+    let mut wiring_pages = Vec::with_capacity(PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES);
+    let mut first_wiring_entry = None;
+    for index in 0..PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES {
+        let page = wiring_cache.get_or_create_page_zero(index)?;
+        let mut inner = wiring_cache.inner.lock();
+        let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
+        if entry.state() != PageState::UpToDate || !inner.page_indices.contains(&index) {
+            return Ok("status=fail stage=dirty_fixture\n".into());
+        }
+        entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+        entry.set_state(PageState::Dirty);
+        inner.dirty_pages.insert(index);
+        if !inner.dirty_pages.contains(&index) {
+            return Ok("status=fail stage=dirty_set\n".into());
+        }
+        drop(inner);
+        if index == 0 {
+            first_wiring_entry = Some(entry);
+        }
+        wiring_pages.push(page);
+    }
+    let first_wiring_entry = first_wiring_entry.ok_or(SystemError::EIO)?;
+    let first_wiring_paddr = wiring_pages[0].phys_address();
+    let unevictable_local_ok = first_wiring_entry
+        .accounted_unevictable
+        .load(Ordering::Acquire)
+        && wiring_pages[0]
+            .read()
+            .flags()
+            .contains(PageFlags::PG_UNEVICTABLE)
+        && page_manager_lock().contains(&first_wiring_paddr)
+        && page_reclaimer_lock().get(&first_wiring_paddr).is_none();
+    if !unevictable_local_ok {
+        return Ok("status=fail stage=unevictable_fixture\n".into());
+    }
+    let dirty_populated = pc_stats::snapshot();
+    for (index, page) in wiring_pages.iter().enumerate() {
+        if !wiring_cache.try_mark_page_writeback(index, page.phys_address()) {
+            return Ok("status=fail stage=writeback_batch_claim\n".into());
+        }
+    }
+    let writeback_populated = pc_stats::snapshot();
+    for (index, page) in wiring_pages.iter().enumerate() {
+        let entry = wiring_cache
+            .inner
+            .lock()
+            .get_entry(index)
+            .ok_or(SystemError::EIO)?;
+        PageCacheManager::finish_writeback_entry_state(
+            wiring_cache.clone(),
+            index,
+            entry,
+            page.clone(),
+            Ok(()),
+            false,
+        )?;
+    }
+    {
+        let inner = wiring_cache.inner.lock();
+        if !inner.writeback_pages.is_empty()
+            || !inner.dirty_pages.is_empty()
+            || inner
+                .pages
+                .values()
+                .any(|entry| entry.state() != PageState::UpToDate)
+        {
+            return Ok("status=fail stage=writeback_batch_complete\n".into());
+        }
+    }
+    let writeback_completed = pc_stats::snapshot();
+    drop(wiring_cache);
+    let after = pc_stats::snapshot();
+    let unevictable_drop_local_ok = first_wiring_entry.accounting()
+        == PageEntryAccounting::Unaccounted
+        && !first_wiring_entry
+            .accounted_unevictable
+            .load(Ordering::Acquire)
+        && !page_manager_lock().contains(&first_wiring_paddr)
+        && page_reclaimer_lock().get(&first_wiring_paddr).is_none();
+    if !unevictable_drop_local_ok {
+        return Ok("status=fail stage=unevictable_drop\n".into());
+    }
+    drop(wiring_pages);
+
+    let file_insert_delta = dirty_populated.file_pages as i128 - before.file_pages as i128;
+    let shmem_insert_delta = dirty_populated.shmem_pages as i128 - before.shmem_pages as i128;
+    let dirty_insert_delta = dirty_populated.file_dirty as i128 - before.file_dirty as i128;
+    let unevictable_insert_delta = dirty_populated.unevictable as i128 - before.unevictable as i128;
+    let writeback_insert_delta =
+        writeback_populated.file_writeback as i128 - before.file_writeback as i128;
+    let writeback_completion_drift =
+        writeback_completed.file_writeback as i128 - before.file_writeback as i128;
+    let file_drop_drift = after.file_pages as i128 - before.file_pages as i128;
+    let shmem_drop_drift = after.shmem_pages as i128 - before.shmem_pages as i128;
+    let dirty_drop_drift = after.file_dirty as i128 - before.file_dirty as i128;
+    let unevictable_drop_drift = after.unevictable as i128 - before.unevictable as i128;
+    let writeback_drop_drift = after.file_writeback as i128 - before.file_writeback as i128;
+    let insert_delta_ok = |delta: i128| {
+        (delta - PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES as i128).abs()
+            <= PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+    };
+    if !insert_delta_ok(file_insert_delta)
+        || !insert_delta_ok(shmem_insert_delta)
+        || !insert_delta_ok(dirty_insert_delta)
+        || !insert_delta_ok(unevictable_insert_delta)
+        || !insert_delta_ok(writeback_insert_delta)
+        || writeback_completion_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || file_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || shmem_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || dirty_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || unevictable_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || writeback_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+    {
+        return Ok(alloc::format!(
+            "status=fail stage=global_wiring file_insert_delta={file_insert_delta} shmem_insert_delta={shmem_insert_delta} dirty_insert_delta={dirty_insert_delta} unevictable_insert_delta={unevictable_insert_delta} writeback_insert_delta={writeback_insert_delta} writeback_completion_drift={writeback_completion_drift} file_drop_drift={file_drop_drift} shmem_drop_drift={shmem_drop_drift} dirty_drop_drift={dirty_drop_drift} unevictable_drop_drift={unevictable_drop_drift} writeback_drop_drift={writeback_drop_drift}\n"
+        ));
+    }
+
+    Ok(alloc::format!(
+        "status=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\nwriteback_membership=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+    ))
+}
+
+struct AsyncWritebackPermit;
+
+impl AsyncWritebackPermit {
+    fn try_acquire() -> Option<Self> {
+        let mut current = ASYNC_WRITEBACK_BATCHES.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_ASYNC_WRITEBACK_BATCHES {
+                return None;
+            }
+            match ASYNC_WRITEBACK_BATCHES.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn acquire() -> Self {
+        ASYNC_WRITEBACK_WAIT.wait_until(Self::try_acquire)
+    }
+}
+
+impl Drop for AsyncWritebackPermit {
+    fn drop(&mut self) {
+        ASYNC_WRITEBACK_BATCHES.fetch_sub(1, Ordering::AcqRel);
+        ASYNC_WRITEBACK_COMPLETIONS.fetch_add(1, Ordering::AcqRel);
+        ASYNC_WRITEBACK_WAIT.wake_all();
+    }
+}
+
+/// Capture the completion generation before a reclaim scan schedules dirty
+/// writeback.  Pair this with [`wait_for_async_writeback_progress`] so a fast
+/// completion between the scan and the wait cannot be lost.
+pub(crate) fn async_writeback_progress_snapshot() -> u64 {
+    ASYNC_WRITEBACK_COMPLETIONS.load(Ordering::Acquire)
+}
+
+/// Throttle a no-progress reclaim pass until asynchronous writeback advances.
+///
+/// The wait is bounded: a stuck backend must not pin the global reclaimer
+/// forever, because another cache may become reclaimable meanwhile.  Returning
+/// `false` means no blocking wait was performed (the sampled generation had
+/// already advanced, no writeback remained in flight, or the wait was
+/// interrupted); callers should apply a short retry backoff instead of
+/// immediately rescanning the same LRU.
+pub(crate) fn wait_for_async_writeback_progress(observed: u64) -> bool {
+    if ASYNC_WRITEBACK_COMPLETIONS.load(Ordering::Acquire) != observed {
+        return false;
+    }
+    if ASYNC_WRITEBACK_BATCHES.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+
+    const RECLAIM_WRITEBACK_WAIT: Duration = Duration::from_millis(10);
+    let result = ASYNC_WRITEBACK_WAIT.wait_until_timeout(
+        || {
+            if ASYNC_WRITEBACK_COMPLETIONS.load(Ordering::Acquire) != observed
+                || ASYNC_WRITEBACK_BATCHES.load(Ordering::Acquire) == 0
+            {
+                Some(())
+            } else {
+                None
+            }
+        },
+        RECLAIM_WRITEBACK_WAIT,
+    );
+    !matches!(result, Err(SystemError::ERESTARTSYS))
+}
+
+struct ReclaimerRunnerGuard {
+    cache: Arc<PageCache>,
+}
+
+impl ReclaimerRunnerGuard {
+    fn try_acquire(cache: &Arc<PageCache>) -> Option<Self> {
+        cache
+            .reclaimer_writeback_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self {
+                cache: cache.clone(),
+            })
+    }
+}
+
+impl Drop for ReclaimerRunnerGuard {
+    fn drop(&mut self) {
+        self.cache
+            .reclaimer_writeback_active
+            .store(false, Ordering::Release);
+    }
 }
 
 fn register_page_cache(cache: &Arc<PageCache>) {
@@ -153,6 +730,55 @@ pub trait PageCacheBackend: Send + Sync + core::fmt::Debug {
     fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError>;
     fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError>;
     fn npages(&self) -> usize;
+
+    /// Maximum number of consecutive pages which are useful in one backend
+    /// write request.  Backends are single-page by default.
+    fn write_batch_pages(&self) -> Result<usize, SystemError> {
+        Ok(1)
+    }
+
+    /// Write a stable, i_size-clipped snapshot beginning at `start_index`.
+    /// All chunks except the final one are full pages.
+    fn write_pages(&self, start_index: usize, data: &[u8]) -> Result<(), SystemError> {
+        for (page_offset, chunk) in data.chunks(MMArch::PAGE_SIZE).enumerate() {
+            let index = start_index
+                .checked_add(page_offset)
+                .ok_or(SystemError::EOVERFLOW)?;
+            match self.write_page(index, chunk) {
+                Ok(written) if written == chunk.len() => {}
+                Ok(_) => return Err(SystemError::EIO),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the page-cache claim while the filesystem's write admission is
+    /// held. Filesystems with an explicit writeback barrier override this
+    /// method. The page-cache manager samples i_size only after it has also
+    /// acquired the invalidate read lock.
+    fn with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        claim()
+    }
+
+    /// Try-only admission used by reclaimer workers. Returning `false` means
+    /// no page state was changed and the candidate remains Dirty.
+    fn try_with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<bool, SystemError> {
+        claim()?;
+        Ok(true)
+    }
+
+    /// Read authoritative i_size while filesystem admission and the page
+    /// cache invalidate read lock are both held.
+    fn stable_writeback_size(&self, inode: &Arc<dyn IndexNode>) -> Result<usize, SystemError> {
+        Ok(inode.metadata()?.size.max(0) as usize)
+    }
 
     fn read_page_async(&self, index: usize, page: &Arc<Page>) -> Arc<PageIoWaiter> {
         let waiter = PageIoWaiter::new();
@@ -262,7 +888,7 @@ impl PageCacheBackend for AsyncPageCacheBackend {
             let res = inode.write_sync(index * MMArch::PAGE_SIZE, &data);
             waiter_cb.complete(res);
         });
-        schedule_pagecache_io(work);
+        schedule_pagecache_writeback(work);
         waiter
     }
 }
@@ -280,8 +906,10 @@ pub struct PageCache {
     file_vmas: SpinLock<FileVmaIndex>,
     writeback_error: ErrSeq,
     unevictable: AtomicBool,
-    is_shmem: AtomicBool,
+    kind: PageCacheKind,
     reclassify_lock: Mutex<()>,
+    tagged_writeback_lock: Mutex<()>,
+    reclaimer_writeback_active: AtomicBool,
     manager: PageCacheManager,
 }
 
@@ -307,9 +935,16 @@ pub struct InnerPageCache {
     pages: HashMap<usize, Arc<PageEntry>>,
     page_indices: BTreeSet<usize>,
     dirty_pages: BTreeSet<usize>,
+    /// Page indices whose entries are currently in `PageState::Writeback`.
+    ///
+    /// This is maintained under the same `inner` lock as the entry state so
+    /// range completion checks remain atomic without scanning every cached
+    /// page while holding the lock.
+    writeback_pages: BTreeSet<usize>,
     /// Aggregated semantic owner for all dirty and writeback pages in this mapping.
     dirty_retention: Option<InodeRetentionGuard>,
     dirty_preparations: usize,
+    kind: PageCacheKind,
     page_cache_ref: Weak<PageCache>,
 }
 
@@ -372,9 +1007,27 @@ impl PageState {
 struct PageEntry {
     page: Arc<Page>,
     state: AtomicU8,
+    writeback_tag: AtomicU64,
+    accounting: AtomicU8,
     accounted_unevictable: AtomicBool,
     active_users: AtomicUsize,
     wait_queue: WaitQueue,
+}
+
+struct PageWritebackRetryWait {
+    entry: Arc<PageEntry>,
+}
+
+impl core::fmt::Debug for PageWritebackRetryWait {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageWritebackRetryWait").finish()
+    }
+}
+
+impl FaultRetryWait for PageWritebackRetryWait {
+    fn wait(&self) -> Result<(), SystemError> {
+        PageCacheManager::wait_writeback_entry(self.entry.clone())
+    }
 }
 
 impl core::fmt::Debug for PageEntry {
@@ -433,6 +1086,23 @@ struct PageCacheReadDmaItem {
     page: Arc<Page>,
 }
 
+/// Counts live DMA reservations without exposing or changing their state
+/// machine. Ownership follows the reservation on every completion/error path.
+struct PageCacheReadDmaStatsGuard;
+
+impl PageCacheReadDmaStatsGuard {
+    fn acquire() -> Self {
+        pc_stats::begin_read_dma_reservation();
+        Self
+    }
+}
+
+impl Drop for PageCacheReadDmaStatsGuard {
+    fn drop(&mut self) {
+        pc_stats::end_read_dma_reservation();
+    }
+}
+
 /// Owns candidate pages which are inaccessible to page-cache readers until DMA
 /// has retired, the unread tail has been initialized, and each exact marker is
 /// published.
@@ -441,6 +1111,8 @@ pub struct PageCacheReadDmaReservation {
     cache: Arc<PageCache>,
     state: AtomicU8,
     items: ManuallyDrop<Vec<PageCacheReadDmaItem>>,
+    _stats_guard: ManuallyDrop<PageCacheReadDmaStatsGuard>,
+    track_direct_read_stats: bool,
 }
 
 impl core::fmt::Debug for PageCacheReadDmaReservation {
@@ -470,12 +1142,17 @@ impl Drop for PageCacheReadDmaReservation {
         }
         self.rollback_markers(SystemError::EIO, true);
         unsafe { ManuallyDrop::drop(&mut self.items) };
+        unsafe { ManuallyDrop::drop(&mut self._stats_guard) };
     }
 }
 
 impl PageCacheReadDmaReservation {
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn tracks_direct_read_stats(&self) -> bool {
+        self.track_direct_read_stats
     }
 
     pub fn state(&self) -> PageCacheReadDmaState {
@@ -593,8 +1270,7 @@ impl PageCacheReadDmaReservation {
             let current = inner
                 .get_entry(item.descriptor.page_index)
                 .expect("DMA reservation identity was validated under the same lock");
-            self.cache
-                .account_state_transition(PageState::Loading, PageState::UpToDate);
+            current.account_state_transition(PageState::Loading, PageState::UpToDate);
             current.set_state(PageState::UpToDate);
             published.push(item.page.clone());
             current.wait_queue.wake_all();
@@ -778,6 +1454,16 @@ impl Drop for WritebackGuard {
     }
 }
 
+struct ClaimedWritebackBatch {
+    cache: Arc<PageCache>,
+    backend: Option<Arc<dyn PageCacheBackend>>,
+    first_index: usize,
+    file_size: usize,
+    entries: Vec<(usize, Arc<PageEntry>, Arc<Page>)>,
+    guards: Vec<WritebackGuard>,
+    data: Vec<u8>,
+}
+
 impl PageCacheManager {
     fn new(owner: Weak<PageCache>) -> Self {
         Self { owner }
@@ -794,27 +1480,32 @@ impl PageCacheManager {
     /// Reserve absent cache indices as full-page DMA destinations.
     ///
     /// Existing pages, including another Loading entry, are never replaced.
+    /// The caller must hold this cache's invalidate read guard. Keeping that
+    /// ownership at the fill-operation boundary avoids recursively acquiring
+    /// the writer-preferring invalidate semaphore while an invalidator waits.
     pub fn reserve_read_dma(
         &self,
         start_page_index: usize,
         page_count: usize,
+        track_direct_read_stats: bool,
     ) -> Result<PageCacheReadDmaReservation, SystemError> {
         if page_count == 0 || start_page_index.checked_add(page_count - 1).is_none() {
             return Err(SystemError::EINVAL);
         }
 
         let cache = self.upgrade()?;
-        let _invalidate = cache.invalidate_read();
-        let page_cache_ref = cache.inner.lock().page_cache_ref.clone();
+        let stats_guard = PageCacheReadDmaStatsGuard::acquire();
+        let page_cache_ref = {
+            let inner = cache.inner.lock();
+            if (0..page_count).any(|offset| inner.get_entry(start_page_index + offset).is_some()) {
+                return Err(SystemError::EEXIST);
+            }
+            inner.page_cache_ref.clone()
+        };
         let mut items: Vec<PageCacheReadDmaItem> = Vec::with_capacity(page_count);
 
         for offset in 0..page_count {
             let page_index = start_page_index + offset;
-            if cache.inner.lock().get_entry(page_index).is_some() {
-                PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
-                return Err(SystemError::EEXIST);
-            }
-
             let page = match cache.allocate_page(page_cache_ref.clone(), page_index) {
                 Ok(page) => page,
                 Err(error) => {
@@ -829,16 +1520,6 @@ impl PageCacheManager {
                 return Err(SystemError::EFAULT);
             };
             let entry = Arc::new(PageEntry::new(page.clone(), PageState::Loading));
-            let mut inner = cache.inner.lock();
-            if inner.get_entry(page_index).is_some() {
-                drop(inner);
-                cache.discard_unlinked_page(&page);
-                PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
-                return Err(SystemError::EEXIST);
-            }
-            inner.insert_entry(page_index, entry.clone());
-            drop(inner);
-            cache.reconcile_entry_unevictable_for_insert(&entry);
             items.push(PageCacheReadDmaItem {
                 descriptor: PageCacheReadDmaDescriptor {
                     page_index,
@@ -850,12 +1531,33 @@ impl PageCacheManager {
             });
         }
 
-        drop(_invalidate);
+        // Publish the complete Loading range atomically.  Exposing a prefix
+        // while allocating later pages lets a waiter attach to that prefix and
+        // then observe a synthetic EIO when a later-page conflict rolls it back.
+        let mut inner = cache.inner.lock();
+        if items
+            .iter()
+            .any(|item| inner.get_entry(item.descriptor.page_index).is_some())
+        {
+            drop(inner);
+            PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
+            return Err(SystemError::EEXIST);
+        }
+        for item in &items {
+            inner.insert_entry(item.descriptor.page_index, item.entry.clone());
+        }
+        drop(inner);
+        for item in &items {
+            cache.reconcile_entry_unevictable_for_insert(&item.entry);
+        }
+
         Ok(PageCacheReadDmaReservation {
             id: PAGE_CACHE_DMA_RESERVATION_ID.fetch_add(1, Ordering::Relaxed),
             cache,
             state: AtomicU8::new(PageCacheReadDmaState::Prepared as u8),
             items: ManuallyDrop::new(items),
+            _stats_guard: ManuallyDrop::new(stats_guard),
+            track_direct_read_stats,
         })
     }
 
@@ -1075,13 +1777,569 @@ impl PageCacheManager {
                     PageState::UpToDate | PageState::Dirty => {
                         let old_state = current.state();
                         inner.dirty_pages.insert(page_index);
-                        cache.account_state_transition(old_state, PageState::Dirty);
+                        current.account_state_transition(old_state, PageState::Dirty);
                         current.set_state(PageState::Dirty);
                     }
                 }
             }
 
             return Ok(true);
+        }
+    }
+
+    pub fn page_mkwrite_retry_wait(
+        &self,
+        page_index: usize,
+        page: &Arc<Page>,
+    ) -> Option<Arc<dyn FaultRetryWait>> {
+        let cache = self.upgrade().ok()?;
+        let entry = cache.inner.lock().get_entry(page_index)?;
+        if !Arc::ptr_eq(&entry.page, page) || entry.state() != PageState::Writeback {
+            return None;
+        }
+        Some(Arc::new(PageWritebackRetryWait { entry }))
+    }
+
+    fn claim_next_writeback_batch(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+        required_first: Option<(usize, &Arc<PageEntry>, u64)>,
+    ) -> Result<Option<ClaimedWritebackBatch>, SystemError> {
+        if start_index > end_index {
+            return Ok(None);
+        }
+        let backend = cache.backend();
+        let reported_pages = match backend.as_ref() {
+            Some(backend) => backend.write_batch_pages()?,
+            None => 1,
+        };
+        if reported_pages == 0 {
+            return Err(SystemError::EIO);
+        }
+        let batch_pages = reported_pages.min(64);
+        let max_data_len = batch_pages
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(batch_pages)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut prepared = Vec::new();
+        let mut guards = Vec::new();
+        let mut data = Vec::new();
+        prepared
+            .try_reserve_exact(batch_pages)
+            .map_err(|_| SystemError::ENOMEM)?;
+        guards
+            .try_reserve_exact(batch_pages)
+            .map_err(|_| SystemError::ENOMEM)?;
+        data.try_reserve_exact(max_data_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+
+        let first_index = {
+            let mut inner = cache.inner.lock();
+            if let Some((required_index, required_entry, epoch)) = required_first {
+                let Some(current) = inner.pages.get(&required_index) else {
+                    return Ok(None);
+                };
+                if required_index < start_index
+                    || required_index > end_index
+                    || !Arc::ptr_eq(current, required_entry)
+                    || !inner.dirty_pages.contains(&required_index)
+                    || current.writeback_tag() != epoch
+                    || !matches!(
+                        current.state(),
+                        PageState::UpToDate | PageState::Dirty | PageState::Error
+                    )
+                {
+                    return Ok(None);
+                }
+            }
+            let mut expected = None;
+            for index in inner.dirty_pages.range(start_index..=end_index) {
+                if candidates.len() == batch_pages {
+                    break;
+                }
+                let Some(entry) = inner.pages.get(index).cloned() else {
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    break;
+                };
+                let eligible = matches!(
+                    entry.state(),
+                    PageState::UpToDate | PageState::Dirty | PageState::Error
+                );
+                let tagged = required_first
+                    .map(|(_, _, epoch)| entry.writeback_tag() == epoch)
+                    .unwrap_or(true);
+                if !eligible || !tagged {
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    break;
+                }
+                if let Some(expected) = expected {
+                    if *index != expected {
+                        break;
+                    }
+                }
+                candidates.push((*index, entry));
+                expected = index.checked_add(1);
+            }
+            let Some((first_index, _)) = candidates.first() else {
+                return Ok(None);
+            };
+            let first_index = *first_index;
+
+            // Validate every fallible condition before publishing any member
+            // as Writeback.  The state/identity recheck and dirty-set removal
+            // below then happen under this same inner critical section.
+            for (page_index, entry) in candidates.iter() {
+                page_index
+                    .checked_mul(MMArch::PAGE_SIZE)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let Some(current) = inner.pages.get(page_index) else {
+                    return Ok(None);
+                };
+                if !Arc::ptr_eq(current, entry) {
+                    return Ok(None);
+                }
+                if current.state() == PageState::Error {
+                    return Err(SystemError::EIO);
+                }
+            }
+
+            for (page_index, entry) in candidates.drain(..) {
+                let old_state = entry.state();
+                if old_state == PageState::UpToDate {
+                    entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+                    entry.set_state(PageState::Dirty);
+                }
+                debug_assert_eq!(entry.state(), PageState::Dirty);
+                entry.set_state(PageState::Writeback);
+                if required_first.is_some() {
+                    entry.set_writeback_tag(0);
+                }
+                entry.account_state_transition(PageState::Dirty, PageState::Writeback);
+                inner.dirty_pages.remove(&page_index);
+                inner.writeback_pages.insert(page_index);
+                let page = entry.page.clone();
+                guards.push(WritebackGuard::new(
+                    cache.clone(),
+                    page_index,
+                    entry.clone(),
+                    page.clone(),
+                ));
+                prepared.push((page_index, entry, page));
+            }
+            first_index
+        };
+
+        Ok(Some(ClaimedWritebackBatch {
+            cache: cache.clone(),
+            backend,
+            first_index,
+            file_size,
+            entries: prepared,
+            guards,
+            data,
+        }))
+    }
+
+    fn complete_writeback_batch(
+        mut batch: ClaimedWritebackBatch,
+        result: Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        if let Err(error) = result.as_ref() {
+            batch
+                .cache
+                .record_writeback_error_with_superblock(error.clone());
+        }
+        let mut first_error = result.as_ref().err().cloned();
+        for (guard, (page_index, entry, page)) in
+            batch.guards.iter_mut().zip(batch.entries.drain(..))
+        {
+            guard.disarm();
+            if let Err(error) = Self::finish_writeback_entry_state(
+                batch.cache.clone(),
+                page_index,
+                entry,
+                page,
+                result.clone(),
+                false,
+            ) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn snapshot_writeback_batch(batch: &mut ClaimedWritebackBatch) -> Result<(), SystemError> {
+        for (page_index, _entry, page) in batch.entries.iter() {
+            let page_start = page_index
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let len = batch
+                .file_size
+                .saturating_sub(page_start)
+                .min(MMArch::PAGE_SIZE);
+            // Every entry in this batch has already transitioned from Dirty
+            // to Writeback.  Even when a concurrent size change leaves the
+            // page wholly beyond the stable EOF, complete the dirty snapshot
+            // transition so completion can retire it instead of observing
+            // PG_DIRTY and requeueing it forever.  A zero length only omits
+            // payload; it does not undo the claimed writeback state.
+            batch.cache.mkclean_page(*page_index, false)?;
+            let mut page_guard = page.write();
+            page_guard.remove_flags(PageFlags::PG_DIRTY);
+            if len == 0 {
+                continue;
+            }
+            let src = unsafe { page_guard.as_slice() };
+            batch.data.extend_from_slice(&src[..len]);
+        }
+        Ok(())
+    }
+
+    /// Submit an already snapshotted batch.  This function must never acquire
+    /// invalidate/admission locks: async callers may run after a truncate has
+    /// started waiting for the published Writeback entries.
+    fn submit_writeback_batch(batch: ClaimedWritebackBatch) -> Result<(), SystemError> {
+        let result = if batch.data.is_empty() {
+            Ok(())
+        } else if let Some(backend) = batch.backend.as_ref() {
+            backend.write_pages(batch.first_index, &batch.data)
+        } else {
+            let inode = batch
+                .cache
+                .inode()
+                .and_then(|inode| inode.upgrade())
+                .ok_or(SystemError::EIO);
+            let offset = batch
+                .first_index
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW);
+            match (inode, offset) {
+                (Ok(inode), Ok(offset)) => inode
+                    .write_direct(
+                        offset,
+                        batch.data.len(),
+                        &batch.data,
+                        Mutex::new(FilePrivateData::Unused).lock(),
+                    )
+                    .and_then(|written| {
+                        if written == batch.data.len() {
+                            Ok(())
+                        } else {
+                            Err(SystemError::EIO)
+                        }
+                    }),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        };
+        Self::complete_writeback_batch(batch, result)
+    }
+
+    fn claim_and_snapshot_with_stable_size(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+    ) -> Result<Option<ClaimedWritebackBatch>, SystemError> {
+        let _invalidate = cache.invalidate_read();
+        Self::claim_and_snapshot_locked(cache, start_index, end_index, file_size)
+    }
+
+    /// Claim and snapshot with the invalidate read lock already held.
+    fn claim_and_snapshot_locked(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+    ) -> Result<Option<ClaimedWritebackBatch>, SystemError> {
+        let Some(mut batch) =
+            Self::claim_next_writeback_batch(cache, start_index, end_index, file_size, None)?
+        else {
+            return Ok(None);
+        };
+        if let Err(error) = Self::snapshot_writeback_batch(&mut batch) {
+            return Self::complete_writeback_batch(batch, Err(error)).map(|_| None);
+        }
+        Ok(Some(batch))
+    }
+
+    fn claim_and_snapshot_tagged_locked(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+        required_entry: &Arc<PageEntry>,
+        epoch: u64,
+    ) -> Result<Option<ClaimedWritebackBatch>, SystemError> {
+        let Some(mut batch) = Self::claim_next_writeback_batch(
+            cache,
+            start_index,
+            end_index,
+            file_size,
+            Some((start_index, required_entry, epoch)),
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Err(error) = Self::snapshot_writeback_batch(&mut batch) {
+            return Self::complete_writeback_batch(batch, Err(error)).map(|_| None);
+        }
+        Ok(Some(batch))
+    }
+
+    fn writeback_next_batch_with_stable_size(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+    ) -> Result<bool, SystemError> {
+        let Some(batch) =
+            Self::claim_and_snapshot_with_stable_size(cache, start_index, end_index, file_size)?
+        else {
+            return Ok(false);
+        };
+        Self::submit_writeback_batch(batch)?;
+        Ok(true)
+    }
+
+    fn claim_next_batch_with_admission(
+        &self,
+        cache: &Arc<PageCache>,
+        inode: &Arc<dyn IndexNode>,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<Option<ClaimedWritebackBatch>, SystemError> {
+        let Some(backend) = cache.backend() else {
+            let _invalidate = cache.invalidate_read();
+            let file_size = inode.metadata()?.size.max(0) as usize;
+            return Self::claim_and_snapshot_locked(cache, start_index, end_index, file_size);
+        };
+        let mut claimed = None;
+        backend.with_write_admission(&mut || {
+            let _invalidate = cache.invalidate_read();
+            let file_size = backend.stable_writeback_size(inode)?;
+            claimed = Self::claim_and_snapshot_locked(cache, start_index, end_index, file_size)?;
+            Ok(())
+        })?;
+        Ok(claimed)
+    }
+
+    fn claim_tagged_batch_with_admission(
+        &self,
+        cache: &Arc<PageCache>,
+        inode: &Arc<dyn IndexNode>,
+        start_index: usize,
+        end_index: usize,
+        required_entry: &Arc<PageEntry>,
+        epoch: u64,
+    ) -> Result<Option<ClaimedWritebackBatch>, SystemError> {
+        let Some(backend) = cache.backend() else {
+            let _invalidate = cache.invalidate_read();
+            let file_size = inode.metadata()?.size.max(0) as usize;
+            return Self::claim_and_snapshot_tagged_locked(
+                cache,
+                start_index,
+                end_index,
+                file_size,
+                required_entry,
+                epoch,
+            );
+        };
+        let mut claimed = None;
+        backend.with_write_admission(&mut || {
+            let _invalidate = cache.invalidate_read();
+            let file_size = backend.stable_writeback_size(inode)?;
+            claimed = Self::claim_and_snapshot_tagged_locked(
+                cache,
+                start_index,
+                end_index,
+                file_size,
+                required_entry,
+                epoch,
+            )?;
+            Ok(())
+        })?;
+        Ok(claimed)
+    }
+
+    fn try_claim_next_batch_with_admission(
+        &self,
+        cache: &Arc<PageCache>,
+        inode: &Arc<dyn IndexNode>,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<Option<ClaimedWritebackBatch>, SystemError> {
+        let Some(backend) = cache.backend() else {
+            let Some(_invalidate) = cache.try_invalidate_read() else {
+                return Ok(None);
+            };
+            let file_size = inode.metadata()?.size.max(0) as usize;
+            return Self::claim_and_snapshot_locked(cache, start_index, end_index, file_size);
+        };
+        let mut invalidate_acquired = false;
+        let mut claimed = None;
+        let admitted = backend.try_with_write_admission(&mut || {
+            let Some(_invalidate) = cache.try_invalidate_read() else {
+                return Ok(());
+            };
+            invalidate_acquired = true;
+            let file_size = backend.stable_writeback_size(inode)?;
+            claimed = Self::claim_and_snapshot_locked(cache, start_index, end_index, file_size)?;
+            Ok(())
+        })?;
+        if !admitted || !invalidate_acquired {
+            return Ok(None);
+        }
+        Ok(claimed)
+    }
+
+    fn writeback_next_batch(
+        &self,
+        cache: &Arc<PageCache>,
+        inode: &Arc<dyn IndexNode>,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<bool, SystemError> {
+        let Some(batch) =
+            self.claim_next_batch_with_admission(cache, inode, start_index, end_index)?
+        else {
+            return Ok(false);
+        };
+        Self::submit_writeback_batch(batch)?;
+        Ok(true)
+    }
+
+    fn wait_data_range_clean(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<bool, SystemError> {
+        if start_index > end_index {
+            return Ok(true);
+        }
+        Self::wait_writeback_range_bounded(cache, start_index, end_index)?;
+        let inner = cache.inner.lock();
+        let has_dirty = inner
+            .dirty_pages
+            .range(start_index..=end_index)
+            .next()
+            .is_some();
+        let has_writeback = inner
+            .writeback_pages
+            .range(start_index..=end_index)
+            .next()
+            .is_some();
+        Ok(!has_dirty && !has_writeback)
+    }
+
+    fn wait_writeback_range_bounded(
+        cache: &Arc<PageCache>,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<(), SystemError> {
+        if start_index > end_index {
+            return Ok(());
+        }
+        const WAIT_BATCH_ENTRIES: usize = 64;
+        const WAIT_SCAN_INDICES: usize = 256;
+        let mut cursor = start_index;
+        let mut first_error = None;
+        loop {
+            if cursor > end_index {
+                break;
+            }
+            let (entries, last_scanned) = {
+                let inner = cache.inner.lock();
+                let mut entries = Vec::new();
+                entries
+                    .try_reserve_exact(WAIT_BATCH_ENTRIES)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                let mut last_scanned = None;
+                let mut scanned = 0usize;
+                for index in inner.page_indices.range(cursor..=end_index) {
+                    last_scanned = Some(*index);
+                    scanned += 1;
+                    let Some(entry) = inner.pages.get(index) else {
+                        if scanned == WAIT_SCAN_INDICES {
+                            break;
+                        }
+                        continue;
+                    };
+                    if entry.state() == PageState::Writeback {
+                        entries.push(entry.clone());
+                    }
+                    if entries.len() == WAIT_BATCH_ENTRIES || scanned == WAIT_SCAN_INDICES {
+                        break;
+                    }
+                }
+                (entries, last_scanned)
+            };
+            let Some(last_scanned) = last_scanned else {
+                break;
+            };
+            for entry in entries {
+                if let Err(error) = Self::wait_writeback_entry(entry) {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if last_scanned == usize::MAX {
+                break;
+            }
+            cursor = last_scanned + 1;
+            crate::sched::sched_yield();
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn sync_data_with_stable_size(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+    ) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        loop {
+            while Self::writeback_next_batch_with_stable_size(
+                &cache,
+                start_index,
+                end_index,
+                file_size,
+            )? {}
+            if Self::wait_data_range_clean(&cache, start_index, end_index)? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn sync_data_admitted(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+    ) -> Result<(), SystemError> {
+        self.sync_data_with_stable_size(start_index, end_index, file_size)
+    }
+
+    fn sync_data(&self, start_index: usize, end_index: usize) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        let inode = cache
+            .inode()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+        loop {
+            while self.writeback_next_batch(&cache, &inode, start_index, end_index)? {}
+            if Self::wait_data_range_clean(&cache, start_index, end_index)? {
+                return Ok(());
+            }
         }
     }
 
@@ -1097,41 +2355,7 @@ impl PageCacheManager {
             .ok_or(SystemError::EIO)?;
         let _sync_retention =
             InodeRetentionGuard::new(sync_inode.clone(), InodeRetentionKind::AsyncWork)?;
-        loop {
-            let (dirty_entries, writeback_entries): (Vec<_>, Vec<_>) = {
-                let inner = cache.inner.lock();
-                let dirty = inner
-                    .dirty_pages
-                    .iter()
-                    .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
-                    .collect();
-                let writeback = inner
-                    .pages
-                    .values()
-                    .filter(|entry| entry.state() == PageState::Writeback)
-                    .cloned()
-                    .collect();
-                (dirty, writeback)
-            };
-
-            for (page_index, entry) in dirty_entries {
-                Self::writeback_entry(&cache, page_index, entry)?;
-            }
-            for entry in writeback_entries {
-                Self::wait_writeback_entry(entry)?;
-            }
-
-            let inner = cache.inner.lock();
-            let done = inner.dirty_pages.is_empty()
-                && !inner
-                    .pages
-                    .values()
-                    .any(|entry| entry.state() == PageState::Writeback);
-            drop(inner);
-            if done {
-                break;
-            }
-        }
+        self.sync_data(0, usize::MAX)?;
 
         // 脏页写完后调 write_inode 回写元数据。
         let wbc = WritebackControl::sync_all_for_sync();
@@ -1144,36 +2368,130 @@ impl PageCacheManager {
         Ok(())
     }
 
+    /// Synchronize after the filesystem has already blocked new dirty-page
+    /// admission and supplied the authoritative i_size.  Callers must not use
+    /// this as a substitute for `PageCacheBackend::with_write_admission`.
+    pub(crate) fn sync_with_stable_size(&self, file_size: usize) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        let sync_inode = cache
+            .inode()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+        let _sync_retention =
+            InodeRetentionGuard::new(sync_inode.clone(), InodeRetentionKind::AsyncWork)?;
+        self.sync_data_admitted(0, usize::MAX, file_size)?;
+
+        let wbc = WritebackControl::sync_all_for_sync();
+        if let Err(error) = sync_inode.write_inode(&wbc) {
+            cache.record_writeback_error_with_superblock(error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Write and wait for every dirty or in-flight page in an inclusive range.
     ///
     /// Unlike `writeback_range`, this is a data-integrity operation: pages
     /// already under writeback when the call starts must complete before the
     /// caller may issue a backend fsync request.
     pub fn sync_range(&self, start_index: usize, end_index: usize) -> Result<(), SystemError> {
-        let cache = self.upgrade()?;
-        loop {
-            let (dirty_entries, writeback_entries): (Vec<_>, Vec<_>) = {
-                let inner = cache.inner.lock();
-                let dirty = inner
-                    .dirty_pages
-                    .range(start_index..=end_index)
-                    .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
-                    .collect();
-                let writeback = inner
-                    .page_indices
-                    .range(start_index..=end_index)
-                    .filter_map(|idx| inner.pages.get(idx))
-                    .filter(|entry| entry.state() == PageState::Writeback)
-                    .cloned()
-                    .collect();
-                (dirty, writeback)
-            };
+        self.sync_data(start_index, end_index)
+    }
 
-            for (page_index, entry) in dirty_entries {
-                Self::writeback_entry(&cache, page_index, entry)?;
+    /// Range counterpart of `sync_with_stable_size` for filesystem-private
+    /// wrappers which already hold their write admission barrier.
+    pub(crate) fn sync_range_with_stable_size(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+    ) -> Result<(), SystemError> {
+        self.sync_data_admitted(start_index, end_index, file_size)
+    }
+
+    pub fn resize(&self, len: usize) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        cache.truncate(len)
+    }
+
+    pub fn writeback_range(&self, start_index: usize, end_index: usize) -> Result<(), SystemError> {
+        self.sync_data(start_index, end_index)
+    }
+
+    pub fn wait_writeback_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        Self::wait_writeback_range_bounded(&cache, start_index, end_index)
+    }
+
+    /// Launder a complete range for best-effort cache invalidation.
+    ///
+    /// Ordinary range writeback is fail-fast. Invalidation instead mirrors
+    /// Linux invalidate_inode_pages2_range(): retain the first error but keep
+    /// processing every later page in the range.
+    pub(crate) fn launder_range_for_invalidate_with_stable_size(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        file_size: usize,
+    ) -> Result<(), SystemError> {
+        if start_index > end_index {
+            return Ok(());
+        }
+        let cache = self.upgrade()?;
+        let mut first_error = None;
+        loop {
+            let mut cursor = start_index;
+            while cursor <= end_index {
+                let prepared = {
+                    let _invalidate = cache.invalidate_read();
+                    match Self::claim_next_writeback_batch(
+                        &cache, cursor, end_index, file_size, None,
+                    ) {
+                        Ok(Some(mut batch)) => {
+                            pc_stats::record_invalidation_launder_batch(batch.entries.len());
+                            let last_index = batch
+                                .entries
+                                .last()
+                                .map(|(index, _, _)| *index)
+                                .unwrap_or(cursor);
+                            let snapshot_result = Self::snapshot_writeback_batch(&mut batch);
+                            Ok(Some((batch, last_index, snapshot_result)))
+                        }
+                        Ok(None) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                };
+                let Some((batch, last_index, snapshot_result)) = (match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        break;
+                    }
+                }) else {
+                    break;
+                };
+                let result = match snapshot_result {
+                    Ok(()) => Self::submit_writeback_batch(batch),
+                    Err(error) => Self::complete_writeback_batch(batch, Err(error)),
+                };
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+                if last_index == usize::MAX {
+                    break;
+                }
+                cursor = last_index + 1;
             }
-            for entry in writeback_entries {
-                Self::wait_writeback_entry(entry)?;
+
+            if let Err(error) = Self::wait_writeback_range_bounded(&cache, start_index, end_index) {
+                first_error.get_or_insert(error);
+            }
+            if let Some(error) = first_error.take() {
+                return Err(error);
             }
 
             let inner = cache.inner.lock();
@@ -1183,102 +2501,18 @@ impl PageCacheManager {
                 .next()
                 .is_some();
             let has_writeback = inner
-                .page_indices
+                .writeback_pages
                 .range(start_index..=end_index)
-                .filter_map(|idx| inner.pages.get(idx))
-                .any(|entry| entry.state() == PageState::Writeback);
+                .next()
+                .is_some();
             if !has_dirty && !has_writeback {
                 return Ok(());
             }
+            // A generation may have been redirtied behind an older Writeback
+            // before the filesystem barrier became exclusive. The old
+            // completion restores it to Dirty; restart from the range head so
+            // invalidation cannot report success with that generation left.
         }
-    }
-
-    pub fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let cache = self.upgrade()?;
-        cache.truncate(len)
-    }
-
-    pub fn writeback_range(&self, start_index: usize, end_index: usize) -> Result<(), SystemError> {
-        let cache = self.upgrade()?;
-        let dirty_entries: Vec<(usize, Arc<PageEntry>)> = {
-            let inner = cache.inner.lock();
-            inner
-                .dirty_pages
-                .range(start_index..=end_index)
-                .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
-                .collect()
-        };
-
-        for (page_index, entry) in dirty_entries {
-            Self::writeback_entry(&cache, page_index, entry)?;
-        }
-
-        Ok(())
-    }
-
-    pub fn wait_writeback_range(
-        &self,
-        start_index: usize,
-        end_index: usize,
-    ) -> Result<(), SystemError> {
-        let cache = self.upgrade()?;
-        let entries: Vec<Arc<PageEntry>> = {
-            let inner = cache.inner.lock();
-            inner
-                .page_indices
-                .range(start_index..=end_index)
-                .filter_map(|idx| inner.pages.get(idx).cloned())
-                .collect()
-        };
-
-        for entry in entries {
-            Self::wait_writeback_entry(entry)?;
-        }
-
-        Ok(())
-    }
-
-    /// Launder a complete range for best-effort cache invalidation.
-    ///
-    /// Ordinary range writeback is fail-fast. Invalidation instead mirrors
-    /// Linux invalidate_inode_pages2_range(): retain the first error but keep
-    /// processing every later page in the range.
-    pub(crate) fn launder_range_for_invalidate(
-        &self,
-        start_index: usize,
-        end_index: usize,
-    ) -> Result<(), SystemError> {
-        let cache = self.upgrade()?;
-        let dirty_entries: Vec<(usize, Arc<PageEntry>)> = {
-            let inner = cache.inner.lock();
-            inner
-                .dirty_pages
-                .range(start_index..=end_index)
-                .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
-                .collect()
-        };
-        let mut first_error = None;
-        for (page_index, entry) in dirty_entries {
-            if let Err(error) = Self::writeback_entry(&cache, page_index, entry) {
-                first_error.get_or_insert(error);
-            }
-        }
-
-        let entries: Vec<Arc<PageEntry>> = {
-            let inner = cache.inner.lock();
-            inner
-                .page_indices
-                .range(start_index..=end_index)
-                .filter_map(|idx| inner.pages.get(idx).cloned())
-                .collect()
-        };
-        for entry in entries {
-            if let Err(error) = Self::wait_writeback_entry(entry) {
-                first_error.get_or_insert(error);
-            }
-        }
-
-        first_error.map_or(Ok(()), Err)
     }
 
     pub fn prepare_page_mkwrite(
@@ -1299,15 +2533,19 @@ impl PageCacheManager {
                 }
                 entry
             };
-
             match entry.state() {
                 PageState::Loading => {
                     let _ = entry.wait_ready()?;
                     continue;
                 }
                 PageState::Writeback => {
-                    Self::wait_writeback_entry(entry)?;
-                    continue;
+                    // The fault path holds AddressSpace::write(). Batch
+                    // writeback publishes this state before mkclean_page()
+                    // takes AddressSpace::read(), so waiting here would form
+                    // mm.write -> writeback -> mm.read. The fault handler
+                    // installs a wait token and retries after dropping the MM
+                    // guard.
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 PageState::Error => return Err(SystemError::EIO),
                 PageState::UpToDate | PageState::Dirty => {}
@@ -1331,7 +2569,7 @@ impl PageCacheManager {
                 PageState::UpToDate | PageState::Dirty => {
                     let old_state = current.state();
                     inner.dirty_pages.insert(page_index);
-                    cache.account_state_transition(old_state, PageState::Dirty);
+                    current.account_state_transition(old_state, PageState::Dirty);
                     current.set_state(PageState::Dirty);
                     return Ok(());
                 }
@@ -1343,22 +2581,243 @@ impl PageCacheManager {
         &self,
         start_index: usize,
         end_index: usize,
+        sync_all: bool,
     ) -> Result<(), SystemError> {
+        if start_index > end_index {
+            return Ok(());
+        }
         let cache = self.upgrade()?;
-        let dirty_entries: Vec<(usize, Arc<PageEntry>)> = {
+        let inode = cache
+            .inode()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+        let _tagged_writeback = cache.tagged_writeback_lock.lock();
+
+        // Freeze the caller-visible dirty set with an epoch tag, equivalent to
+        // Linux's PAGECACHE_TAG_TOWRITE pass but without materializing an
+        // unbounded Vec. A monotonic index walk bounds transient memory and
+        // prevents a low-index redirtier from starving later pages.
+        let mut epoch = PAGE_CACHE_WRITEBACK_TAG_EPOCH.fetch_add(1, Ordering::AcqRel);
+        if epoch == 0 {
+            epoch = PAGE_CACHE_WRITEBACK_TAG_EPOCH.fetch_add(1, Ordering::AcqRel);
+        }
+        const WRITEBACK_TAG_CHUNK: usize = 256;
+        let Some(frozen_end) = ({
             let inner = cache.inner.lock();
             inner
                 .dirty_pages
                 .range(start_index..=end_index)
-                .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
-                .collect()
+                .next_back()
+                .copied()
+        }) else {
+            return Ok(());
         };
-
-        for (page_index, entry) in dirty_entries {
-            Self::start_writeback_entry(&cache, page_index, entry)?;
+        let mut tag_cursor = start_index;
+        loop {
+            let last_tagged = {
+                let inner = cache.inner.lock();
+                let mut last = None;
+                for index in inner
+                    .dirty_pages
+                    .range(tag_cursor..=frozen_end)
+                    .take(WRITEBACK_TAG_CHUNK)
+                {
+                    if let Some(entry) = inner.pages.get(index) {
+                        entry.set_writeback_tag(epoch);
+                        last = Some(*index);
+                    }
+                }
+                last
+            };
+            let Some(last_tagged) = last_tagged else {
+                break;
+            };
+            if last_tagged >= frozen_end || last_tagged == usize::MAX {
+                break;
+            }
+            tag_cursor = last_tagged + 1;
+            // Mirror Linux tag_pages_for_writeback(): do not monopolize the
+            // page-cache index lock or CPU while tagging a very large range.
+            crate::sched::sched_yield();
         }
 
+        let mut cursor = start_index;
+        loop {
+            if cursor > frozen_end {
+                break;
+            }
+            let (target, last_scanned) = {
+                let inner = cache.inner.lock();
+                let mut target = None;
+                let mut last_scanned = None;
+                for index in inner
+                    .dirty_pages
+                    .range(cursor..=frozen_end)
+                    .take(WRITEBACK_TAG_CHUNK)
+                {
+                    last_scanned = Some(*index);
+                    let Some(entry) = inner.pages.get(index) else {
+                        continue;
+                    };
+                    if entry.writeback_tag() == epoch {
+                        let mut tagged_end = *index;
+                        for next in inner
+                            .dirty_pages
+                            .range(*index..=frozen_end)
+                            .skip(1)
+                            .take(WRITEBACK_TAG_CHUNK - 1)
+                        {
+                            if *next != tagged_end.saturating_add(1) {
+                                break;
+                            }
+                            let Some(next_entry) = inner.pages.get(next) else {
+                                break;
+                            };
+                            if next_entry.writeback_tag() != epoch {
+                                break;
+                            }
+                            tagged_end = *next;
+                        }
+                        target = Some((*index, entry.clone(), tagged_end));
+                        break;
+                    }
+                }
+                (target, last_scanned)
+            };
+            let Some((target_index, target_entry, tagged_end)) = target else {
+                let Some(last_scanned) = last_scanned else {
+                    break;
+                };
+                if last_scanned >= frozen_end || last_scanned == usize::MAX {
+                    break;
+                }
+                cursor = last_scanned + 1;
+                crate::sched::sched_yield();
+                continue;
+            };
+
+            if target_entry.state() == PageState::Writeback {
+                if sync_all {
+                    Self::wait_writeback_entry(target_entry.clone())?;
+                    continue;
+                } else {
+                    if target_index == usize::MAX {
+                        break;
+                    }
+                    cursor = target_index + 1;
+                    continue;
+                }
+            }
+
+            let permit = AsyncWritebackPermit::acquire();
+            let Some(batch) = self.claim_tagged_batch_with_admission(
+                &cache,
+                &inode,
+                target_index,
+                tagged_end,
+                &target_entry,
+                epoch,
+            )?
+            else {
+                drop(permit);
+                let (same_tagged_entry, state) = {
+                    let inner = cache.inner.lock();
+                    match inner.pages.get(&target_index) {
+                        Some(current)
+                            if Arc::ptr_eq(current, &target_entry)
+                                && inner.dirty_pages.contains(&target_index)
+                                && current.writeback_tag() == epoch =>
+                        {
+                            (true, current.state())
+                        }
+                        _ => (false, target_entry.state()),
+                    }
+                };
+                if sync_all && same_tagged_entry {
+                    if state == PageState::Writeback {
+                        Self::wait_writeback_entry(target_entry.clone())?;
+                    }
+                    // Dirty may have raced with another completion between
+                    // admission and claim. Retry the same tagged target; only
+                    // identity removal or loss of the epoch permits advance.
+                    continue;
+                }
+                if target_index == usize::MAX {
+                    break;
+                }
+                cursor = target_index + 1;
+                continue;
+            };
+            let last_index = batch
+                .entries
+                .last()
+                .map(|(index, _, _)| *index)
+                .unwrap_or(target_index);
+            let work_state = Mutex::new(Some((permit, batch)));
+            schedule_pagecache_writeback(Work::new(move || {
+                let Some((permit, batch)) = work_state.lock().take() else {
+                    return;
+                };
+                let _permit = permit;
+                let _ = Self::submit_writeback_batch(batch);
+            }));
+            if last_index == usize::MAX {
+                break;
+            }
+            cursor = last_index + 1;
+        }
         Ok(())
+    }
+
+    /// Schedule one bounded reclaimer batch without doing page/MM work on the
+    /// reclaim thread. A busy runner or global budget leaves pages Dirty for a
+    /// later round; lock-taking claim/snapshot work runs in the I/O worker.
+    pub(crate) fn try_start_reclaimer_writeback_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<bool, SystemError> {
+        let cache = self.upgrade()?;
+        let Some(runner) = ReclaimerRunnerGuard::try_acquire(&cache) else {
+            return Ok(false);
+        };
+        let Some(permit) = AsyncWritebackPermit::try_acquire() else {
+            return Ok(false);
+        };
+        let inode = cache
+            .inode()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+        let manager = self.clone();
+        let work_state = Mutex::new(Some((runner, permit, cache, inode)));
+        schedule_pagecache_io(Work::new(move || {
+            let Some((runner, permit, cache, inode)) = work_state.lock().take() else {
+                return;
+            };
+            let _runner = runner;
+            let _permit = permit;
+            // Drain the caller's bounded scan range in file-offset order.
+            // Keeping one runner per cache prevents overlapping reclaimer
+            // workers, while advancing after each submitted batch avoids the
+            // former one-batch-per-5-second throughput ceiling. A page dirtied
+            // again behind the cursor is intentionally left for a later scan.
+            let mut cursor = start_index;
+            while cursor <= end_index {
+                let Ok(Some(batch)) =
+                    manager.try_claim_next_batch_with_admission(&cache, &inode, cursor, end_index)
+                else {
+                    break;
+                };
+                let Some(last_index) = batch.entries.last().map(|(index, _, _)| *index) else {
+                    break;
+                };
+                if Self::submit_writeback_batch(batch).is_err() || last_index == usize::MAX {
+                    break;
+                }
+                cursor = last_index + 1;
+            }
+        }));
+        Ok(true)
     }
 
     pub fn invalidate_range(
@@ -1509,12 +2968,7 @@ impl PageCacheManager {
     }
 
     pub fn writeback_page(&self, page_index: usize) -> Result<(), SystemError> {
-        let cache = self.upgrade()?;
-        let entry = match cache.inner.lock().get_entry(page_index) {
-            Some(entry) => entry,
-            None => return Ok(()),
-        };
-        Self::writeback_entry(&cache, page_index, entry)
+        self.sync_data(page_index, page_index)
     }
 
     fn wait_writeback_entry(entry: Arc<PageEntry>) -> Result<(), SystemError> {
@@ -1525,98 +2979,6 @@ impl PageCacheManager {
         })
     }
 
-    fn prepare_writeback_entry(
-        cache: &Arc<PageCache>,
-        page_index: usize,
-        entry: &Arc<PageEntry>,
-    ) -> Result<bool, SystemError> {
-        loop {
-            match entry.state() {
-                PageState::Loading => {
-                    let _ = entry.wait_ready()?;
-                    continue;
-                }
-                PageState::Writeback => {
-                    Self::wait_writeback_entry(entry.clone())?;
-                    continue;
-                }
-                PageState::Error => return Err(SystemError::EIO),
-                PageState::UpToDate => {
-                    let guard = entry.page.read();
-                    if !guard.flags().contains(PageFlags::PG_DIRTY) {
-                        return Ok(false);
-                    }
-                    drop(guard);
-                    let mut inner = cache.inner.lock();
-                    cache.ensure_dirty_retention_locked(&mut inner)?;
-                    entry.set_state(PageState::Dirty);
-                    inner.dirty_pages.insert(page_index);
-                    continue;
-                }
-                PageState::Dirty => {
-                    let guard = entry.page.read();
-                    if !guard.flags().contains(PageFlags::PG_DIRTY) {
-                        return Ok(false);
-                    }
-                }
-            }
-            if entry
-                .compare_exchange_state(PageState::Dirty, PageState::Writeback)
-                .is_ok()
-            {
-                cache.account_state_transition(PageState::Dirty, PageState::Writeback);
-                let mut inner = cache.inner.lock();
-                inner.dirty_pages.remove(&page_index);
-                return Ok(true);
-            }
-        }
-    }
-
-    fn try_prepare_async_writeback_entry(
-        cache: &Arc<PageCache>,
-        page_index: usize,
-        entry: &Arc<PageEntry>,
-    ) -> Result<bool, SystemError> {
-        loop {
-            match entry.state() {
-                PageState::Loading => {
-                    let _ = entry.wait_ready()?;
-                    continue;
-                }
-                PageState::Writeback => return Ok(false),
-                PageState::Error => return Err(SystemError::EIO),
-                PageState::UpToDate => {
-                    let guard = entry.page.read();
-                    if !guard.flags().contains(PageFlags::PG_DIRTY) {
-                        return Ok(false);
-                    }
-                    drop(guard);
-                    let mut inner = cache.inner.lock();
-                    cache.ensure_dirty_retention_locked(&mut inner)?;
-                    entry.set_state(PageState::Dirty);
-                    inner.dirty_pages.insert(page_index);
-                    continue;
-                }
-                PageState::Dirty => {
-                    let guard = entry.page.read();
-                    if !guard.flags().contains(PageFlags::PG_DIRTY) {
-                        return Ok(false);
-                    }
-                }
-            }
-
-            if entry
-                .compare_exchange_state(PageState::Dirty, PageState::Writeback)
-                .is_ok()
-            {
-                cache.account_state_transition(PageState::Dirty, PageState::Writeback);
-                let mut inner = cache.inner.lock();
-                inner.dirty_pages.remove(&page_index);
-                return Ok(true);
-            }
-        }
-    }
-
     fn finish_writeback_entry(
         cache: Arc<PageCache>,
         page_index: usize,
@@ -1624,16 +2986,36 @@ impl PageCacheManager {
         page: Arc<Page>,
         result: Result<(), SystemError>,
     ) -> Result<(), SystemError> {
+        Self::finish_writeback_entry_state(cache, page_index, entry, page, result, true)
+    }
+
+    fn finish_writeback_entry_state(
+        cache: Arc<PageCache>,
+        page_index: usize,
+        entry: Arc<PageEntry>,
+        page: Arc<Page>,
+        result: Result<(), SystemError>,
+        record_error: bool,
+    ) -> Result<(), SystemError> {
         if let Err(e) = result {
-            cache.record_writeback_error_with_superblock(e.clone());
+            if record_error {
+                cache.record_writeback_error_with_superblock(e.clone());
+            }
             {
                 let mut guard = page.write();
                 guard.add_flags(PageFlags::PG_ERROR | PageFlags::PG_DIRTY);
             }
             {
                 let mut inner = cache.inner.lock();
-                cache.account_state_transition(PageState::Writeback, PageState::Dirty);
-                inner.dirty_pages.insert(page_index);
+                let attached = inner
+                    .pages
+                    .get(&page_index)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry));
+                if attached {
+                    entry.account_state_transition(PageState::Writeback, PageState::Dirty);
+                    inner.writeback_pages.remove(&page_index);
+                    inner.dirty_pages.insert(page_index);
+                }
                 entry.set_state(PageState::Dirty);
             }
             entry.wait_queue.wake_all();
@@ -1648,6 +3030,21 @@ impl PageCacheManager {
         let page_dirty = page.read().flags().contains(PageFlags::PG_DIRTY);
         {
             let mut inner = cache.inner.lock();
+            let attached = inner
+                .pages
+                .get(&page_index)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry));
+            if !attached {
+                entry.set_state(if page_dirty {
+                    PageState::Dirty
+                } else {
+                    PageState::UpToDate
+                });
+                drop(inner);
+                entry.wait_queue.wake_all();
+                drop(cache.detach_dirty_retention_if_idle());
+                return Ok(());
+            }
             // `mark_page_dirty{,_prepared}()` publishes redirty through
             // `dirty_pages` while holding `inner`.  The PG_DIRTY sample above
             // must therefore be combined with that publication after taking
@@ -1657,12 +3054,13 @@ impl PageCacheManager {
             // writeback paths acquire the page lock before updating the page
             // cache, so doing so would invert the established lock order.
             let redirtied = page_dirty || inner.dirty_pages.contains(&page_index);
+            inner.writeback_pages.remove(&page_index);
             if redirtied {
-                cache.account_state_transition(PageState::Writeback, PageState::Dirty);
+                entry.account_state_transition(PageState::Writeback, PageState::Dirty);
                 inner.dirty_pages.insert(page_index);
                 entry.set_state(PageState::Dirty);
             } else {
-                cache.account_state_transition(PageState::Writeback, PageState::UpToDate);
+                entry.account_state_transition(PageState::Writeback, PageState::UpToDate);
                 inner.dirty_pages.remove(&page_index);
                 entry.set_state(PageState::UpToDate);
             }
@@ -1670,163 +3068,6 @@ impl PageCacheManager {
         entry.wait_queue.wake_all();
         drop(cache.detach_dirty_retention_if_idle());
         Ok(())
-    }
-
-    fn start_writeback_entry(
-        cache: &Arc<PageCache>,
-        page_index: usize,
-        entry: Arc<PageEntry>,
-    ) -> Result<(), SystemError> {
-        let _invalidate = cache.invalidate_read();
-        if !Self::try_prepare_async_writeback_entry(cache, page_index, &entry)? {
-            return Ok(());
-        }
-
-        let page = entry.page.clone();
-
-        // If the inode has been freed, restore page state via finish_writeback_entry and return error.
-        let inode = match cache.inode().and_then(|inode| inode.upgrade()) {
-            Some(inode) => inode,
-            None => {
-                Self::finish_writeback_entry(
-                    cache.clone(),
-                    page_index,
-                    entry,
-                    page,
-                    Err(SystemError::EIO),
-                )?;
-                return Err(SystemError::EIO);
-            }
-        };
-        let backend = cache.backend();
-        let page_start = page_index * MMArch::PAGE_SIZE;
-        let len = if let Ok(metadata) = inode.metadata() {
-            let file_size = metadata.size.max(0) as usize;
-            if file_size <= page_start {
-                0
-            } else {
-                core::cmp::min(MMArch::PAGE_SIZE, file_size - page_start)
-            }
-        } else {
-            MMArch::PAGE_SIZE
-        };
-
-        let data = if len > 0 {
-            let _ = cache.mkclean_page(page_index, false);
-            let mut guard = page.write();
-            guard.remove_flags(PageFlags::PG_DIRTY);
-            let src = unsafe { guard.as_slice() };
-            Some(src[..len].to_vec())
-        } else {
-            None
-        };
-
-        let cache = cache.clone();
-        let work_page = page.clone();
-        let work_entry = entry.clone();
-        let work = Work::new(move || {
-            let result = match &data {
-                Some(data) => {
-                    if let Some(backend) = &backend {
-                        match backend.write_page(page_index, data) {
-                            Ok(written) if written == data.len() => Ok(()),
-                            Ok(_) => Err(SystemError::EIO),
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        inode
-                            .write_direct(
-                                page_start,
-                                data.len(),
-                                data,
-                                Mutex::new(FilePrivateData::Unused).lock(),
-                            )
-                            .map(|_| ())
-                    }
-                }
-                None => Ok(()),
-            };
-            let _ = Self::finish_writeback_entry(
-                cache.clone(),
-                page_index,
-                work_entry.clone(),
-                work_page.clone(),
-                result,
-            );
-        });
-        schedule_pagecache_io(work);
-        Ok(())
-    }
-
-    fn writeback_entry(
-        cache: &Arc<PageCache>,
-        page_index: usize,
-        entry: Arc<PageEntry>,
-    ) -> Result<(), SystemError> {
-        let _invalidate = cache.invalidate_read();
-        if !Self::prepare_writeback_entry(cache, page_index, &entry)? {
-            return Ok(());
-        }
-
-        let page = entry.page.clone();
-        // RAII: if any subsequent path exits early, WritebackGuard ensures the page reverts to Dirty.
-        let mut wb_guard =
-            WritebackGuard::new(cache.clone(), page_index, entry.clone(), page.clone());
-
-        let inode = cache
-            .inode()
-            .and_then(|inode| inode.upgrade())
-            .ok_or(SystemError::EIO)?;
-        let backend = cache.backend();
-        let page_start = page_index * MMArch::PAGE_SIZE;
-        let len = if let Ok(metadata) = inode.metadata() {
-            let file_size = metadata.size.max(0) as usize;
-            if file_size <= page_start {
-                0
-            } else {
-                core::cmp::min(MMArch::PAGE_SIZE, file_size - page_start)
-            }
-        } else {
-            MMArch::PAGE_SIZE
-        };
-
-        if len > 0 {
-            let _ = cache.mkclean_page(page_index, false);
-            {
-                let mut guard = page.write();
-                guard.remove_flags(PageFlags::PG_DIRTY);
-            }
-            let result = if let Some(backend) = backend {
-                let data = {
-                    let guard = page.read();
-                    let src = unsafe { guard.as_slice() };
-                    src[..len].to_vec()
-                };
-                match backend.write_page(page_index, &data) {
-                    Ok(written) if written == data.len() => Ok(len),
-                    Ok(_) => Err(SystemError::EIO),
-                    Err(e) => Err(e),
-                }
-            } else {
-                let data = unsafe {
-                    core::slice::from_raw_parts(
-                        MMArch::phys_2_virt(page.phys_address()).unwrap().data() as *const u8,
-                        len,
-                    )
-                };
-                inode.write_direct(
-                    page_start,
-                    len,
-                    data,
-                    Mutex::new(FilePrivateData::Unused).lock(),
-                )
-            };
-            wb_guard.disarm();
-            Self::finish_writeback_entry(cache.clone(), page_index, entry, page, result.map(|_| ()))
-        } else {
-            wb_guard.disarm();
-            Self::finish_writeback_entry(cache.clone(), page_index, entry, page, Ok(()))
-        }
     }
 }
 
@@ -1841,9 +3082,86 @@ impl PageEntry {
         Self {
             page,
             state: AtomicU8::new(state as u8),
+            writeback_tag: AtomicU64::new(0),
+            accounting: AtomicU8::new(PageEntryAccounting::Unaccounted as u8),
             accounted_unevictable: AtomicBool::new(false),
             active_users: AtomicUsize::new(0),
             wait_queue: WaitQueue::default(),
+        }
+    }
+
+    fn accounting(&self) -> PageEntryAccounting {
+        match self.accounting.load(Ordering::Acquire) {
+            1 => PageEntryAccounting::File,
+            2 => PageEntryAccounting::Shmem,
+            _ => PageEntryAccounting::Unaccounted,
+        }
+    }
+
+    fn account_insert(&self, kind: PageCacheKind, mapping_unevictable: bool) {
+        let accounting = match kind {
+            PageCacheKind::File => PageEntryAccounting::File,
+            PageCacheKind::Shmem => PageEntryAccounting::Shmem,
+        };
+        self.accounting
+            .compare_exchange(
+                PageEntryAccounting::Unaccounted as u8,
+                accounting as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("page-cache entry inserted more than once");
+        pc_stats::inc_file_pages();
+        if accounting == PageEntryAccounting::Shmem {
+            pc_stats::inc_shmem_pages();
+        }
+        if mapping_unevictable {
+            self.account_unevictable_if_needed();
+        }
+    }
+
+    fn account_remove(&self) -> PageEntryAccounting {
+        let accounting = match self
+            .accounting
+            .swap(PageEntryAccounting::Unaccounted as u8, Ordering::AcqRel)
+        {
+            1 => PageEntryAccounting::File,
+            2 => PageEntryAccounting::Shmem,
+            _ => PageEntryAccounting::Unaccounted,
+        };
+        if accounting == PageEntryAccounting::Unaccounted {
+            return accounting;
+        }
+
+        pc_stats::dec_file_pages();
+        if accounting == PageEntryAccounting::Shmem {
+            pc_stats::dec_shmem_pages();
+        }
+        self.unaccount_unevictable_if_needed();
+        match self.state() {
+            PageState::Dirty => pc_stats::dec_file_dirty(),
+            PageState::Writeback => {
+                log::error!("detaching a page-cache entry while writeback is active");
+                pc_stats::dec_file_writeback();
+            }
+            _ => {}
+        }
+        accounting
+    }
+
+    fn account_state_transition(&self, old: PageState, new: PageState) {
+        if old == new || self.accounting() == PageEntryAccounting::Unaccounted {
+            return;
+        }
+        match old {
+            PageState::Dirty => pc_stats::dec_file_dirty(),
+            PageState::Writeback => pc_stats::dec_file_writeback(),
+            _ => {}
+        }
+        match new {
+            PageState::Dirty => pc_stats::inc_file_dirty(),
+            PageState::Writeback => pc_stats::inc_file_writeback(),
+            _ => {}
         }
     }
 
@@ -1853,6 +3171,14 @@ impl PageEntry {
 
     fn set_state(&self, state: PageState) {
         self.state.store(state as u8, Ordering::Release);
+    }
+
+    fn writeback_tag(&self) -> u64 {
+        self.writeback_tag.load(Ordering::Acquire)
+    }
+
+    fn set_writeback_tag(&self, epoch: u64) {
+        self.writeback_tag.store(epoch, Ordering::Release);
     }
 
     fn account_unevictable_if_needed(&self) {
@@ -1886,22 +3212,6 @@ impl PageEntry {
         PageEntryPin {
             entry: self.clone(),
         }
-    }
-
-    fn compare_exchange_state(
-        &self,
-        current: PageState,
-        new: PageState,
-    ) -> Result<PageState, PageState> {
-        self.state
-            .compare_exchange(
-                current as u8,
-                new as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map(Self::decode_state)
-            .map_err(Self::decode_state)
     }
 
     fn wait_ready(&self) -> Result<Arc<Page>, SystemError> {
@@ -1961,14 +3271,16 @@ impl PageCachePagePin {
 }
 
 impl InnerPageCache {
-    pub fn new(page_cache_ref: Weak<PageCache>, id: usize) -> InnerPageCache {
+    fn new(page_cache_ref: Weak<PageCache>, id: usize, kind: PageCacheKind) -> InnerPageCache {
         Self {
             id,
             pages: HashMap::new(),
             page_indices: BTreeSet::new(),
             dirty_pages: BTreeSet::new(),
+            writeback_pages: BTreeSet::new(),
             dirty_retention: None,
             dirty_preparations: 0,
+            kind,
             page_cache_ref,
         }
     }
@@ -1981,9 +3293,8 @@ impl InnerPageCache {
         let entry = self.pages.remove(&offset)?;
         self.page_indices.remove(&offset);
         self.dirty_pages.remove(&offset);
-        if let Some(cache) = self.page_cache_ref.upgrade() {
-            cache.account_entry_remove(&entry);
-        }
+        self.writeback_pages.remove(&offset);
+        entry.account_remove();
         Some(entry.page.clone())
     }
 
@@ -1992,13 +3303,16 @@ impl InnerPageCache {
     }
 
     fn insert_entry(&mut self, offset: usize, entry: Arc<PageEntry>) {
-        if let Some(cache) = self.page_cache_ref.upgrade() {
-            cache.account_entry_insert(&entry);
-        }
-        if let Some(old_entry) = self.pages.insert(offset, entry) {
-            if let Some(cache) = self.page_cache_ref.upgrade() {
-                cache.account_entry_remove(&old_entry);
+        let mapping_unevictable = self
+            .page_cache_ref
+            .upgrade()
+            .is_some_and(|cache| cache.mapping_unevictable());
+        match self.pages.entry(offset) {
+            Entry::Vacant(slot) => {
+                entry.account_insert(self.kind, mapping_unevictable);
+                slot.insert(entry);
             }
+            Entry::Occupied(_) => panic!("page-cache insert requires a vacant slot"),
         }
         self.page_indices.insert(offset);
     }
@@ -2025,9 +3339,7 @@ impl Drop for InnerPageCache {
             .collect::<Vec<_>>();
         let mut page_manager = page_manager_lock();
         for entry in self.pages.values() {
-            if let Some(cache) = self.page_cache_ref.upgrade() {
-                cache.account_entry_remove(entry);
-            }
+            entry.account_remove();
             page_manager.remove_page(&entry.page.phys_address());
         }
         drop(page_manager);
@@ -2046,10 +3358,25 @@ impl PageCache {
         inode: Option<Weak<dyn IndexNode>>,
         backend: Option<Arc<dyn PageCacheBackend>>,
     ) -> Arc<PageCache> {
+        Self::new_with_kind(inode, backend, PageCacheKind::File)
+    }
+
+    pub fn new_shmem(
+        inode: Option<Weak<dyn IndexNode>>,
+        backend: Option<Arc<dyn PageCacheBackend>>,
+    ) -> Arc<PageCache> {
+        Self::new_with_kind(inode, backend, PageCacheKind::Shmem)
+    }
+
+    fn new_with_kind(
+        inode: Option<Weak<dyn IndexNode>>,
+        backend: Option<Arc<dyn PageCacheBackend>>,
+        kind: PageCacheKind,
+    ) -> Arc<PageCache> {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
         let cache = Arc::new_cyclic(|weak| Self {
             id,
-            inner: Mutex::new(InnerPageCache::new(weak.clone(), id)),
+            inner: Mutex::new(InnerPageCache::new(weak.clone(), id, kind)),
             inode: {
                 let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
                 if let Some(inode) = inode {
@@ -2070,8 +3397,10 @@ impl PageCache {
             file_vmas: SpinLock::new(FileVmaIndex::default()),
             writeback_error: ErrSeq::new(),
             unevictable: AtomicBool::new(false),
-            is_shmem: AtomicBool::new(false),
+            kind,
             reclassify_lock: Mutex::new(()),
+            tagged_writeback_lock: Mutex::new(()),
+            reclaimer_writeback_active: AtomicBool::new(false),
             manager: PageCacheManager::new(weak.clone()),
         });
         register_page_cache(&cache);
@@ -2097,12 +3426,16 @@ impl PageCache {
         self.writeback_error.set(error);
     }
 
-    /// Record a writeback error in both the page cache mapping and its
-    /// mounted superblock, matching Linux mapping_set_error() semantics.
+    /// Record a writeback error in the page cache mapping and, while it is
+    /// still alive, its mounted superblock, matching Linux mapping_set_error()
+    /// semantics without assuming that a weak filesystem owner survived an
+    /// asynchronous writeback completion.
     pub fn record_writeback_error_with_superblock(&self, error: SystemError) {
         self.record_writeback_error(error.clone());
         if let Some(inode) = self.inode().and_then(|w| w.upgrade()) {
-            record_writeback_error_for_fs(&inode.fs(), error);
+            if let Some(fs) = inode.try_fs() {
+                record_writeback_error_for_fs(&fs, error);
+            }
         }
     }
 
@@ -2160,6 +3493,10 @@ impl PageCache {
 
     pub fn invalidate_read(&self) -> RwSemReadGuard<'_, ()> {
         self.invalidate_lock.read()
+    }
+
+    pub fn try_invalidate_read(&self) -> Option<RwSemReadGuard<'_, ()>> {
+        self.invalidate_lock.try_read()
     }
 
     pub fn invalidate_write(&self) -> RwSemWriteGuard<'_, ()> {
@@ -2378,8 +3715,11 @@ impl PageCache {
                         retry_after_unmap = true;
                         None
                     } else {
+                        // invalidate_write prevents a new mapping after this
+                        // zero-map observation. Drop the page lock before
+                        // taking inner, then revalidate every mutable entry
+                        // property under the membership lock.
                         drop(page_guard);
-
                         let mut guard = self.inner.lock();
                         let Some(current) = guard.get_entry(page_index) else {
                             break;
@@ -2392,14 +3732,22 @@ impl PageCache {
                             current.wait_inactive();
                             continue;
                         }
-
-                        let page_guard = current.page.read();
-                        if page_guard.map_count() != 0 {
-                            retry_after_unmap = true;
-                            None
-                        } else {
-                            drop(page_guard);
-                            guard.remove_page(page_index)
+                        match current.state() {
+                            PageState::Loading => {
+                                drop(guard);
+                                let _ = current.wait_ready();
+                                continue;
+                            }
+                            PageState::Writeback => {
+                                drop(guard);
+                                let _ = current.wait_queue.wait_until(|| match current.state() {
+                                    PageState::Writeback => None,
+                                    PageState::Error => Some(Err(SystemError::EIO)),
+                                    _ => Some(Ok(())),
+                                });
+                                continue;
+                            }
+                            _ => guard.remove_page(page_index),
                         }
                     }
                 };
@@ -2419,14 +3767,18 @@ impl PageCache {
         if new_size > 0 && !new_size.is_multiple_of(MMArch::PAGE_SIZE) {
             let last_page_index = (new_size - 1) >> MMArch::PAGE_SHIFT;
             let last_len = new_size - (last_page_index << MMArch::PAGE_SHIFT);
-            let entry = {
-                let guard = self.inner.lock();
-                guard.get_entry(last_page_index)
-            };
-            if let Some(entry) = entry {
+            loop {
+                let entry = {
+                    let guard = self.inner.lock();
+                    guard.get_entry(last_page_index)
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
                 match entry.state() {
                     PageState::Loading => {
                         let _ = entry.wait_ready();
+                        continue;
                     }
                     PageState::Writeback => {
                         let _ = entry.wait_queue.wait_until(|| match entry.state() {
@@ -2434,12 +3786,26 @@ impl PageCache {
                             PageState::Error => Some(Err(SystemError::EIO)),
                             _ => Some(Ok(())),
                         });
+                        continue;
                     }
                     _ => {}
                 }
-                unsafe {
-                    entry.page.write().truncate(last_len);
+
+                let mut page_guard = entry.page.write();
+                let inner = self.inner.lock();
+                let Some(current) = inner.pages.get(&last_page_index) else {
+                    continue;
+                };
+                if !Arc::ptr_eq(current, &entry) {
+                    continue;
                 }
+                match current.state() {
+                    PageState::Loading | PageState::Writeback => continue,
+                    _ => unsafe {
+                        page_guard.truncate(last_len);
+                    },
+                }
+                break;
             }
         }
 
@@ -2526,6 +3892,7 @@ impl PageCache {
     fn clean_evict_indices(&self, range: Option<(usize, usize)>) -> Vec<usize> {
         let guard = self.inner.lock();
         match range {
+            Some((start, end)) if start > end => Vec::new(),
             Some((start, end)) => guard.page_indices.range(start..=end).copied().collect(),
             None => guard.page_indices.iter().copied().collect(),
         }
@@ -2606,12 +3973,8 @@ impl PageCache {
         self.unevictable.load(Ordering::Relaxed)
     }
 
-    pub fn set_shmem(&self, shmem: bool) {
-        self.is_shmem.store(shmem, Ordering::Relaxed);
-    }
-
     fn is_shmem(&self) -> bool {
-        self.is_shmem.load(Ordering::Relaxed)
+        self.kind == PageCacheKind::Shmem
     }
 
     fn page_flags(&self) -> PageFlags {
@@ -2660,6 +4023,7 @@ impl PageCache {
                     if !self.mapping_unevictable() {
                         return;
                     }
+                    let mut page_guard = page.write();
                     let guard = self.inner.lock();
                     let Some(current) = guard.pages.get(&index) else {
                         continue;
@@ -2671,7 +4035,6 @@ impl PageCache {
                         continue;
                     }
 
-                    let mut page_guard = page.write();
                     let was_unevictable = page_guard.flags().contains(PageFlags::PG_UNEVICTABLE);
                     if !was_unevictable {
                         page_guard.add_flags(PageFlags::PG_UNEVICTABLE);
@@ -2684,6 +4047,7 @@ impl PageCache {
                         let _ = page_reclaimer_lock().remove_page(&paddr);
                     }
                 } else {
+                    let mut page_guard = page.write();
                     let guard = self.inner.lock();
                     let Some(current) = guard.pages.get(&index) else {
                         continue;
@@ -2692,7 +4056,6 @@ impl PageCache {
                         continue;
                     }
 
-                    let mut page_guard = page.write();
                     let keep_unevictable = page_guard.has_unevictable_source();
                     let was_unevictable = page_guard.flags().contains(PageFlags::PG_UNEVICTABLE);
                     entry.unaccount_unevictable_if_needed();
@@ -2712,16 +4075,6 @@ impl PageCache {
             if next_index == usize::MAX {
                 break;
             }
-        }
-    }
-
-    fn account_entry_insert(&self, entry: &PageEntry) {
-        pc_stats::inc_file_pages();
-        if self.is_shmem() {
-            pc_stats::inc_shmem_pages();
-        }
-        if self.mapping_unevictable() {
-            entry.account_unevictable_if_needed();
         }
     }
 
@@ -2751,35 +4104,6 @@ impl PageCache {
             if should_reclaim {
                 page_reclaimer_lock().insert_page(paddr, &entry.page);
             }
-        }
-    }
-
-    fn account_entry_remove(&self, entry: &PageEntry) {
-        pc_stats::dec_file_pages();
-        if self.is_shmem() {
-            pc_stats::dec_shmem_pages();
-        }
-        entry.unaccount_unevictable_if_needed();
-        let state = entry.state();
-        match state {
-            PageState::Dirty => pc_stats::dec_file_dirty(),
-            PageState::Writeback => pc_stats::dec_file_writeback(),
-            _ => {}
-        }
-    }
-    fn account_state_transition(&self, old: PageState, new: PageState) {
-        if old == new {
-            return;
-        }
-        match old {
-            PageState::Dirty => pc_stats::dec_file_dirty(),
-            PageState::Writeback => pc_stats::dec_file_writeback(),
-            _ => {}
-        }
-        match new {
-            PageState::Dirty => pc_stats::inc_file_dirty(),
-            PageState::Writeback => pc_stats::inc_file_writeback(),
-            _ => {}
         }
     }
 
@@ -3084,6 +4408,38 @@ impl PageCache {
         self.inner.lock().is_page_ready(page_index)
     }
 
+    /// Test an entire half-open page range while holding the cache lock once.
+    pub fn is_range_ready(&self, start_page_index: usize, end_page_index: usize) -> bool {
+        if start_page_index >= end_page_index {
+            return true;
+        }
+        let inner = self.inner.lock();
+        (start_page_index..end_page_index).all(|index| inner.is_page_ready(index))
+    }
+
+    /// Wait for an entry that actually conflicts with a DMA reservation range.
+    ///
+    /// The conflicting entry may disappear between `reserve_read_dma()` returning
+    /// `EEXIST` and this lookup.  In that case the caller should simply retry
+    /// discovery instead of creating a new entry for an index that never
+    /// conflicted.
+    pub fn wait_read_dma_conflict(
+        &self,
+        start_page_index: usize,
+        page_count: usize,
+    ) -> Result<bool, SystemError> {
+        let entry = {
+            let inner = self.inner.lock();
+            (0..page_count)
+                .find_map(|offset| inner.get_entry(start_page_index.saturating_add(offset)))
+        };
+        let Some(entry) = entry else {
+            return Ok(false);
+        };
+        let _ = entry.wait_ready()?;
+        Ok(true)
+    }
+
     pub fn get_ready_page(&self, page_index: usize) -> Option<Arc<Page>> {
         let guard = self.inner.lock();
         guard
@@ -3372,11 +4728,10 @@ impl PageCache {
 
     fn detach_dirty_retention_if_idle(&self) -> Option<InodeRetentionGuard> {
         let mut inner = self.inner.lock();
-        let has_writeback = inner
-            .pages
-            .values()
-            .any(|entry| entry.state() == PageState::Writeback);
-        if inner.dirty_preparations == 0 && inner.dirty_pages.is_empty() && !has_writeback {
+        if inner.dirty_preparations == 0
+            && inner.dirty_pages.is_empty()
+            && inner.writeback_pages.is_empty()
+        {
             inner.dirty_retention.take()
         } else {
             None
@@ -3392,7 +4747,7 @@ impl PageCache {
             if old_state == PageState::Writeback {
                 return Ok(());
             }
-            self.account_state_transition(old_state, PageState::Dirty);
+            entry.account_state_transition(old_state, PageState::Dirty);
             entry.set_state(PageState::Dirty);
             return Ok(());
         }
@@ -3415,7 +4770,7 @@ impl PageCache {
             let old_state = entry.state();
             guard.dirty_pages.insert(page_index);
             if old_state != PageState::Writeback {
-                self.account_state_transition(old_state, PageState::Dirty);
+                entry.account_state_transition(old_state, PageState::Dirty);
                 entry.set_state(PageState::Dirty);
             }
             return Ok(());
@@ -3425,23 +4780,42 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn mark_page_writeback(&self, page_index: usize) {
+    /// Claim writeback only while the page locked by the caller is still the
+    /// entry attached at this index. A reclaimer snapshot may outlive mapping
+    /// removal, so index alone is not a sufficient identity.
+    pub fn try_mark_page_writeback(
+        &self,
+        page_index: usize,
+        expected_paddr: crate::mm::PhysAddr,
+    ) -> bool {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
+            if entry.page.phys_address() != expected_paddr
+                || matches!(
+                    entry.state(),
+                    PageState::Loading | PageState::Writeback | PageState::Error
+                )
+            {
+                return false;
+            }
             let old_state = entry.state();
-            self.account_state_transition(old_state, PageState::Writeback);
+            entry.account_state_transition(old_state, PageState::Writeback);
             entry.set_state(PageState::Writeback);
             guard.dirty_pages.remove(&page_index);
+            guard.writeback_pages.insert(page_index);
+            return true;
         }
+        false
     }
 
     pub fn mark_page_uptodate(&self, page_index: usize) {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
             let old_state = entry.state();
-            self.account_state_transition(old_state, PageState::UpToDate);
+            entry.account_state_transition(old_state, PageState::UpToDate);
             entry.set_state(PageState::UpToDate);
             guard.dirty_pages.remove(&page_index);
+            guard.writeback_pages.remove(&page_index);
         }
         drop(guard);
         drop(self.detach_dirty_retention_if_idle());
@@ -3452,8 +4826,9 @@ impl PageCache {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
             let old_state = entry.state();
-            self.account_state_transition(old_state, PageState::Dirty);
+            entry.account_state_transition(old_state, PageState::Dirty);
             guard.dirty_pages.insert(page_index);
+            guard.writeback_pages.remove(&page_index);
             entry.set_state(PageState::Dirty);
             entry.wait_queue.wake_all();
         }

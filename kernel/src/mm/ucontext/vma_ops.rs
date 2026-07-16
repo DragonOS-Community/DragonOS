@@ -355,11 +355,13 @@ impl InnerAddressSpace {
     }
 
     pub(super) fn notify_vma_close(notification: VmaCloseNotification) {
-        notification.file.inode().fs().vma_close(
-            &notification.file,
-            notification.region,
-            notification.vm_flags,
-        );
+        notification.file.with_io_fs(|fs| {
+            fs.vma_close(
+                &notification.file,
+                notification.region,
+                notification.vm_flags,
+            )
+        });
     }
 
     pub(super) fn mprotect_collect(
@@ -409,7 +411,8 @@ impl InnerAddressSpace {
                     continue;
                 }
                 if let Some(file) = guard.vm_file() {
-                    if let Err(err) = file.inode().fs().mprotect(old_vm_flags, new_vm_flags) {
+                    if let Err(err) = file.with_io_fs(|fs| fs.mprotect(old_vm_flags, new_vm_flags))
+                    {
                         for plan in plans {
                             plan.split_lifecycle
                                 .rollback_into(&mut rollback_notifications);
@@ -834,9 +837,11 @@ impl InnerAddressSpace {
             if let Some((paddr, _)) = mapper.translate(vaddr) {
                 let page = {
                     let mut page_manager_guard = page_manager_lock();
-                    page_manager_guard.get_unwrap(&paddr)
+                    page_manager_guard.get(&paddr)
                 };
-                Self::remove_page_unevictable_if_unneeded(&page);
+                if let Some(page) = page {
+                    Self::remove_page_unevictable_if_unneeded(&page);
+                }
             }
             vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
         }

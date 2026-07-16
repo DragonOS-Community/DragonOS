@@ -8,17 +8,33 @@ use crate::libs::mutex::Mutex;
 
 use super::InodeId;
 
-/// Append lock key: uniquely identifies an inode across filesystems.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct AppendLockKey {
-    /// Device ID
+/// Internal append-lock identity for one inode in one filesystem instance.
+///
+/// `dev_id`/`inode_id` alone are not sufficient: stacked filesystems such as
+/// overlayfs may deliberately expose the backing inode's stat identity while
+/// still owning a distinct inode lock domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct AppendLockKey {
+    /// Allocation identity of the canonical filesystem instance.
+    fs_instance: usize,
+    /// Device namespace within that filesystem instance.
     dev_id: usize,
-    /// Inode ID
+    /// Inode identity within the device namespace.
     inode_id: InodeId,
 }
 
-/// 这里51个bucket是因为，AppendLockKey的大小加起来刚好小于2048字节，
-/// 内核会分配2K给这个结构体，所以51个bucket刚好合适，避免内部碎片
+impl AppendLockKey {
+    pub(super) const fn new(fs_instance: usize, dev_id: usize, inode_id: InodeId) -> Self {
+        Self {
+            fs_instance,
+            dev_id,
+            inode_id,
+        }
+    }
+}
+
+/// Keep enough shards to avoid a single append-lock map bottleneck without
+/// allocating a large fixed table. Each shard owns its entries dynamically.
 const APPEND_LOCK_SHARDS: usize = 51;
 
 struct AppendLockShard {
@@ -45,9 +61,12 @@ impl AppendLockManager {
     fn shard_index(key: &AppendLockKey) -> usize {
         // Use jhash to compute a stable hash for sharding.
         // Convert usize values to u32 arrays for jhash2.
+        let fs_instance = key.fs_instance as u64;
         let dev_id = key.dev_id as u64;
         let inode_id = key.inode_id.data() as u64;
         let key_array = [
+            (fs_instance >> 32) as u32,
+            fs_instance as u32,
             (dev_id >> 32) as u32,
             dev_id as u32,
             (inode_id >> 32) as u32,
@@ -60,11 +79,10 @@ impl AppendLockManager {
     /// Run `f` while holding the per-inode append lock.
     ///
     /// Notes:
-    /// - Map access is protected by a sharded spinlock to avoid a single global bottleneck.
+    /// - Map access is protected by sharded mutexes to avoid a single global bottleneck.
     /// - The per-inode lock is a sleeping `Mutex` since the critical section may schedule.
     /// - We opportunistically remove the map entry when it becomes unused.
-    pub fn with_lock<R>(&self, dev_id: usize, inode_id: InodeId, f: impl FnOnce() -> R) -> R {
-        let key = AppendLockKey { dev_id, inode_id };
+    fn with_lock<R>(&self, key: AppendLockKey, f: impl FnOnce() -> R) -> R {
         let shard_idx = Self::shard_index(&key);
         let shard = &self.shards[shard_idx];
 
@@ -109,6 +127,37 @@ pub fn init_append_lock_manager() {
 }
 
 #[inline]
-pub fn with_inode_append_lock<R>(dev_id: usize, inode_id: InodeId, f: impl FnOnce() -> R) -> R {
-    APPEND_LOCK_MANAGER.get().with_lock(dev_id, inode_id, f)
+pub(super) fn with_inode_append_lock<R>(key: AppendLockKey, f: impl FnOnce() -> R) -> R {
+    APPEND_LOCK_MANAGER.get().with_lock(key, f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_lock_key_keeps_stacked_filesystem_domains_distinct() {
+        let inode = InodeId::new(42);
+        let overlay = AppendLockKey::new(0x1000, 7, inode);
+        let backing = AppendLockKey::new(0x2000, 7, inode);
+
+        assert_ne!(overlay, backing);
+    }
+
+    #[test]
+    fn append_lock_key_keeps_device_namespaces_distinct() {
+        let inode = InodeId::new(42);
+        let first_origin = AppendLockKey::new(0x1000, 7, inode);
+        let second_origin = AppendLockKey::new(0x1000, 8, inode);
+
+        assert_ne!(first_origin, second_origin);
+    }
+
+    #[test]
+    fn append_lock_key_matches_same_canonical_inode() {
+        let first = AppendLockKey::new(0x1000, 7, InodeId::new(42));
+        let second = AppendLockKey::new(0x1000, 7, InodeId::new(42));
+
+        assert_eq!(first, second);
+    }
 }

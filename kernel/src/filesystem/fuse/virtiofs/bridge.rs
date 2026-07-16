@@ -30,8 +30,8 @@ use crate::{
 use super::super::{
     conn::{FuseConn, FuseReplyCapacitySource, FuseReplyContract, FuseRequest},
     protocol::{
-        fuse_pack_struct, fuse_read_struct, FuseOutHeader, FUSE_DESTROY, FUSE_FORGET,
-        FUSE_INTERRUPT,
+        fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FuseWriteIn, FUSE_DESTROY,
+        FUSE_FORGET, FUSE_INTERRUPT, FUSE_READ, FUSE_WRITE,
     },
     stats, trace,
 };
@@ -53,6 +53,40 @@ const VIRTIOFS_HIPRIO_COMPLETE_BUDGET: usize = 4;
 enum QueueKind {
     Hiprio,
     Request(usize),
+}
+
+/// Publishes one transport completion before retiring its inflight gauge on
+/// every return path following a successful `pop_used`.
+struct InflightStatsRetireGuard {
+    kind: stats::VirtioFsQueueKind,
+    used_len: usize,
+    noreply: bool,
+    completion_published: bool,
+}
+
+impl InflightStatsRetireGuard {
+    fn new(kind: stats::VirtioFsQueueKind, used_len: usize, noreply: bool) -> Self {
+        Self {
+            kind,
+            used_len,
+            noreply,
+            completion_published: false,
+        }
+    }
+
+    fn publish_completion(&mut self) {
+        if !self.completion_published {
+            stats::on_virtiofs_completed(self.used_len, self.noreply);
+            self.completion_published = true;
+        }
+    }
+}
+
+impl Drop for InflightStatsRetireGuard {
+    fn drop(&mut self) {
+        self.publish_completion();
+        stats::on_virtiofs_inflight_remove(self.kind, 1);
+    }
 }
 
 #[derive(Debug)]
@@ -860,6 +894,29 @@ impl VirtioFsBridgeContext {
         let trace_unique = pending.unique;
         let trace_opcode = pending.opcode;
         let req_len = pending.req.bytes().len();
+        let read_requested_bytes = if trace_opcode == FUSE_READ {
+            match pending.req.reply_contract() {
+                FuseReplyContract::Reply {
+                    capacity: Some(capacity),
+                } => capacity
+                    .bytes
+                    .checked_sub(core::mem::size_of::<FuseOutHeader>()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let write_requested_bytes =
+            if trace_opcode == FUSE_WRITE && stats::write_request_stats_enabled() {
+                pending
+                    .req
+                    .bytes()
+                    .get(core::mem::size_of::<FuseInHeader>()..)
+                    .and_then(|payload| fuse_read_struct::<FuseWriteIn>(payload).ok())
+                    .map(|input| input.size as usize)
+            } else {
+                None
+            };
         let queue_size = match kind {
             QueueKind::Hiprio => self.hiprio_vq.as_ref().ok_or(SystemError::EIO)?.size(),
             QueueKind::Request(slot) => self
@@ -874,6 +931,7 @@ impl VirtioFsBridgeContext {
                 .is_some_and(|descriptors| descriptors <= queue_size)
         });
         let direct_selected = direct_target.is_some();
+        let track_direct_read_stats = pending.req.tracks_direct_read_stats();
         let (mut output, retained_capacity, fallback) = match pending.req.reply_contract() {
             FuseReplyContract::NoReply => (None, None, false),
             FuseReplyContract::Reply { capacity } => {
@@ -1026,13 +1084,28 @@ impl VirtioFsBridgeContext {
         if let Some(output) = inflight.output.as_ref() {
             stats::on_virtiofs_response_submitted(trace_opcode, output.writable_len(), fallback);
         }
+        // Transfer the observable owner without a zero-owner interval. The
+        // inflight map insertion below is local to this locked bridge state.
+        stats::on_virtiofs_inflight_add(kind.stats_kind());
+        inflight.pending().req.stats_mark_transport_owned();
         let replaced = match kind {
             QueueKind::Hiprio => self.hiprio_inflight.insert(token, inflight),
             QueueKind::Request(slot) => self.request_inflight[slot].insert(token, inflight),
         };
         debug_assert!(replaced.is_none());
-        stats::on_virtiofs_inflight_add(kind.stats_kind());
         stats::on_virtiofs_submitted(trace_opcode, req_len);
+        if let Some(requested_bytes) = write_requested_bytes {
+            stats::on_virtiofs_write_requested(requested_bytes);
+        }
+        if let Some(requested_bytes) = read_requested_bytes {
+            stats::on_virtiofs_read_requested(
+                requested_bytes,
+                requested_bytes.div_ceil(MMArch::PAGE_SIZE),
+            );
+            if direct_selected && track_direct_read_stats {
+                stats::on_virtiofs_direct_read_requested(requested_bytes);
+            }
+        }
 
         let retry_succeeded = {
             let state = self
@@ -1228,11 +1301,12 @@ impl VirtioFsBridgeContext {
             }
         };
         inflight.mark_completed();
-        stats::on_virtiofs_inflight_remove(kind.stats_kind(), 1);
 
         let unique = pending.unique;
         let opcode = pending.opcode;
         let noreply = pending.noreply;
+        let mut inflight_stats_retire =
+            InflightStatsRetireGuard::new(kind.stats_kind(), used_len, noreply);
 
         let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
         trace::trace_virtiofs_complete(
@@ -1245,7 +1319,7 @@ impl VirtioFsBridgeContext {
         );
 
         if noreply {
-            stats::on_virtiofs_completed(used_len, true);
+            inflight_stats_retire.publish_completion();
             return Ok(true);
         }
 
@@ -1307,7 +1381,7 @@ impl VirtioFsBridgeContext {
             {
                 let _ = target.rollback(SystemError::EIO);
             }
-            stats::on_virtiofs_completed(used_len, false);
+            inflight_stats_retire.publish_completion();
             self.response_pool.release(header, true);
             return Ok(true);
         }
@@ -1321,7 +1395,7 @@ impl VirtioFsBridgeContext {
         // SAFETY: pop_used succeeded for this exact token and DMA identity, so the descriptor is
         // retired before the device-written prefix becomes readable or releasable.
         if unsafe { rsp_buf.complete_after_pop(used_len) }.is_err() {
-            stats::on_virtiofs_completed(used_len, false);
+            inflight_stats_retire.publish_completion();
             self.terminate_pending_with_error(&pending, SystemError::EIO);
             self.response_pool.release(rsp_buf, false);
             return Ok(true);
@@ -1329,7 +1403,7 @@ impl VirtioFsBridgeContext {
         if capacity > used_len {
             stats::on_virtiofs_response_buffer_waste(capacity - used_len);
         }
-        stats::on_virtiofs_completed(used_len, false);
+        inflight_stats_retire.publish_completion();
 
         if opcode == FUSE_DESTROY && used_len == 0 {
             let reusable = match self.conn.complete_destroy_without_reply(unique) {
@@ -1753,9 +1827,11 @@ impl VirtioFsBridgeContext {
                 break;
             }
 
-            if let Some(transport) = self.transport.as_mut() {
-                if transport.ack_interrupt() {
-                    stats::on_virtiofs_ack_interrupt();
+            if !self.irq_wake_enabled {
+                if let Some(transport) = self.transport.as_mut() {
+                    if transport.ack_interrupt() {
+                        stats::on_virtiofs_ack_interrupt();
+                    }
                 }
             }
             let completed = self.drain_completions()?;
@@ -1785,17 +1861,39 @@ impl VirtioFsBridgeContext {
     }
 
     fn finish(&mut self) -> bool {
+        let had_dax = self.conn.dax_allocator().is_some();
         if self.irq_wake_enabled {
             self.instance.disable_irq_wake();
         }
         self.clear_queue_full_blocked_stats();
         self.instance.clear_bridge_wake(self.session_id);
         self.response_pool.close();
+        if let Err(error) = self.conn.abort_and_revoke_dax() {
+            log::error!(
+                "virtiofs bridge: DAX cleanup failed before reset; quarantining session id={} tag='{}' dev={:?}: {:?}",
+                self.session_id,
+                self.instance.tag(),
+                self.instance.dev_id(),
+                error
+            );
+            self.fail_unfinished_preserving_inflight_dma(SystemError::ENOTCONN);
+            if !self
+                .instance
+                .release_session_without_transport(self.session_id)
+            {
+                warn!(
+                    "virtiofs bridge: failed to release DAX-quarantined session id={} tag='{}' dev={:?}",
+                    self.session_id,
+                    self.instance.tag(),
+                    self.instance.dev_id()
+                );
+            }
+            return false;
+        }
         if !self.reset_device_and_unset_queues() {
             // Idle pooled buffers are not visible to the device. Release them before the
             // reset-timeout quarantine keeps the transport, queues and inflight DMA buffers alive.
             self.fail_unfinished_preserving_inflight_dma(SystemError::ENOTCONN);
-            self.conn.abort();
             if !self
                 .instance
                 .release_session_without_transport(self.session_id)
@@ -1809,8 +1907,10 @@ impl VirtioFsBridgeContext {
             }
             return false;
         }
+        if had_dax {
+            stats::on_virtiofs_dax_device_reset();
+        }
         self.fail_all_unfinished(SystemError::ENOTCONN);
-        self.conn.abort();
 
         if let Some(transport) = self.transport.take() {
             self.instance.put_transport_after_session(transport);

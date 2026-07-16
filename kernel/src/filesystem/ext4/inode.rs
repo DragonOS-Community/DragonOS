@@ -248,6 +248,10 @@ pub struct LockedExt4Inode {
 }
 
 impl IndexNode for LockedExt4Inode {
+    fn append_lock_fs(&self) -> Option<Arc<dyn vfs::FileSystem>> {
+        Some(self.fs())
+    }
+
     fn retention_state(&self) -> Option<&InodeRetentionState> {
         Some(&self.retention)
     }
@@ -701,7 +705,9 @@ impl IndexNode for LockedExt4Inode {
         if let Some(page_cache) = self.page_cache() {
             page_cache.manager().sync()?;
         }
-        self.flush_metadata(false)
+        self.flush_metadata(false)?;
+        let fs = self.inner.lock().concret_fs();
+        fs.finish_sync_durability_boundary()
     }
 
     fn datasync(&self) -> Result<(), SystemError> {
@@ -709,7 +715,9 @@ impl IndexNode for LockedExt4Inode {
         if let Some(page_cache) = self.page_cache() {
             page_cache.manager().sync()?;
         }
-        self.flush_metadata(true)
+        self.flush_metadata(true)?;
+        let fs = self.inner.lock().concret_fs();
+        fs.finish_sync_durability_boundary()
     }
 
     fn sync_file(&self, datasync: bool, _data: PrivateData) -> Result<(), SystemError> {
@@ -735,7 +743,9 @@ impl IndexNode for LockedExt4Inode {
                 .manager()
                 .writeback_range(start_index, end_index)?;
         }
-        self.flush_metadata(datasync)
+        self.flush_metadata(datasync)?;
+        let fs = self.inner.lock().concret_fs();
+        fs.finish_sync_durability_boundary()
     }
 
     fn write_inode(&self, _wbc: &vfs::WritebackControl) -> Result<(), SystemError> {

@@ -9,20 +9,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <string>
 
 #include "../fuse/fuse_gtest_common.h"
 
 namespace {
 
-std::string read_all_with_chunk(const char* path, size_t chunk) {
-    int fd = open(path, O_RDONLY);
-    EXPECT_GE(fd, 0) << "open(" << path << ") failed: errno=" << errno << " ("
-                     << strerror(errno) << ")";
-    if (fd < 0) {
-        return {};
-    }
-
+std::string read_fd_with_chunk(int fd, const char* path, size_t chunk) {
     std::string out;
     char buf[64];
     if (chunk > sizeof(buf)) {
@@ -36,12 +30,22 @@ std::string read_all_with_chunk(const char* path, size_t chunk) {
         EXPECT_GT(n, 0) << "read(" << path << ") failed: errno=" << errno << " ("
                         << strerror(errno) << ")";
         if (n <= 0) {
-            close(fd);
             return {};
         }
         out.append(buf, static_cast<size_t>(n));
     }
 
+    return out;
+}
+
+std::string read_all_with_chunk(const char* path, size_t chunk) {
+    int fd = open(path, O_RDONLY);
+    EXPECT_GE(fd, 0) << "open(" << path << ") failed: errno=" << errno << " ("
+                     << strerror(errno) << ")";
+    if (fd < 0) {
+        return {};
+    }
+    std::string out = read_fd_with_chunk(fd, path, chunk);
     EXPECT_EQ(0, close(fd)) << "close(" << path << ") failed: errno=" << errno << " ("
                             << strerror(errno) << ")";
     return out;
@@ -76,6 +80,19 @@ void expect_counter_increased(const std::string& before, const std::string& afte
     EXPECT_GT(new_value, old_value) << field << " did not increase";
 }
 
+void write_control(const char* path, const char* value) {
+    int fd = open(path, O_WRONLY);
+    ASSERT_GE(fd, 0) << "open(" << path << ") failed: errno=" << errno << " ("
+                     << strerror(errno) << ")";
+    if (fd < 0) {
+        return;
+    }
+    size_t len = strlen(value);
+    EXPECT_EQ(static_cast<ssize_t>(len), write(fd, value, len))
+        << "write(" << path << ") failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(0, close(fd));
+}
+
 void drive_minimal_fuse_request() {
     char mp[128] = {};
     snprintf(mp, sizeof(mp), "/tmp/fuse_stats_mount_%d", getpid());
@@ -100,8 +117,10 @@ void drive_minimal_fuse_request() {
 TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     char root[128] = {};
     char stats_path[192] = {};
+    char stats_mode_path[192] = {};
     snprintf(root, sizeof(root), "/tmp/fuse_stats_debugfs_%d", getpid());
     snprintf(stats_path, sizeof(stats_path), "%s/fuse/stats", root);
+    snprintf(stats_mode_path, sizeof(stats_mode_path), "%s/fuse/stats_mode", root);
 
     ASSERT_EQ(0, ensure_dir("/tmp")) << strerror(errno);
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
@@ -113,11 +132,27 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
                << ")";
     }
 
-    std::string whole = read_all_with_chunk(stats_path, 64);
-    std::string small = read_all_with_chunk(stats_path, 7);
+    const std::string original_mode = read_all_with_chunk(stats_mode_path, 64);
+    write_control(stats_mode_path, "off\n");
+    EXPECT_EQ("off\n", read_all_with_chunk(stats_mode_path, 64));
+    write_control(stats_mode_path, "light\n");
+    EXPECT_EQ("light\n", read_all_with_chunk(stats_mode_path, 64));
+    write_control(stats_mode_path, "detailed\n");
+    EXPECT_EQ("detailed\n", read_all_with_chunk(stats_mode_path, 64));
+
+    int stats_fd = open(stats_path, O_RDONLY);
+    ASSERT_GE(stats_fd, 0) << strerror(errno);
+    std::string whole = read_fd_with_chunk(stats_fd, stats_path, 64);
+    ASSERT_EQ(0, lseek(stats_fd, 0, SEEK_SET)) << strerror(errno);
+    std::string small = read_fd_with_chunk(stats_fd, stats_path, 7);
+    EXPECT_EQ(0, close(stats_fd));
+    write_control(stats_mode_path, "off\n");
+    std::string before_fuse = read_all_with_chunk(stats_path, 64);
     drive_minimal_fuse_request();
     std::string after_fuse = read_all_with_chunk(stats_path, 64);
 
+    write_control(stats_mode_path, original_mode.c_str());
+    EXPECT_EQ(original_mode, read_all_with_chunk(stats_mode_path, 64));
     EXPECT_EQ(0, umount(root)) << strerror(errno);
     EXPECT_EQ(0, rmdir(root)) << strerror(errno);
 
@@ -125,6 +160,24 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     ASSERT_EQ(whole, small);
 
     expect_field(whole, "[fuse]\n");
+    expect_field(whole, "always_on aggregate_transport,quiescence_owner\n");
+    expect_field(whole, "light direct_read_dma,read_size_buckets\n");
+    expect_field(whole, "init_epoch ");
+    expect_field(whole, "negotiated_max_read_bytes ");
+    expect_field(whole, "negotiated_max_write_bytes ");
+    expect_field(whole, "negotiated_max_pages ");
+    expect_field(whole, "negotiated_max_readahead_bytes ");
+    expect_field(whole, "negotiated_async_read ");
+    expect_field(whole, "negotiated_writeback_cache ");
+    expect_field(whole, "effective_read_payload_limit_bytes ");
+    expect_field(whole, "effective_write_payload_limit_bytes ");
+    expect_field(whole, "request_queue_current ");
+    expect_field(whole, "dispatch_current ");
+    expect_field(whole, "processing_current ");
+    expect_field(whole, "read_reservation_current ");
+    expect_field(whole, "invalidation_launder_batches_total ");
+    expect_field(whole, "invalidation_launder_pages_total ");
+    expect_field(whole, "mmap_writeback_admission_retries_total ");
     expect_field(whole, "requests_queued_total ");
     expect_field(whole, "requests_dequeued_total ");
     expect_field(whole, "requests_replied_ok_total ");
@@ -139,6 +192,24 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "dev_fuse_input_copy_bytes_total ");
     expect_field(whole, "virtiofs_compat_copy_count_total ");
     expect_field(whole, "virtiofs_compat_copy_bytes_total ");
+
+    expect_counter_increased(before_fuse, after_fuse, "requests_queued_total");
+    EXPECT_EQ(0, parse_counter(after_fuse, "request_queue_current"));
+    EXPECT_EQ(0, parse_counter(after_fuse, "dispatch_current"));
+    EXPECT_EQ(0, parse_counter(after_fuse, "processing_current"));
+    EXPECT_EQ(0, parse_counter(after_fuse, "read_reservation_current"));
+    const long long negotiated_max_write =
+        parse_counter(after_fuse, "negotiated_max_write_bytes");
+    const long long negotiated_max_pages =
+        parse_counter(after_fuse, "negotiated_max_pages");
+    ASSERT_GE(negotiated_max_write, 4096);
+    ASSERT_GE(negotiated_max_pages, 1);
+    EXPECT_LE(negotiated_max_write, 1024 * 1024);
+    EXPECT_EQ(0, parse_counter(after_fuse, "negotiated_writeback_cache"));
+    const long long expected_write_pages =
+        std::min(64LL, std::min(negotiated_max_pages, negotiated_max_write / 4096));
+    EXPECT_EQ(expected_write_pages * 4096,
+              parse_counter(after_fuse, "effective_write_payload_limit_bytes"));
 
     expect_field(whole, "[virtiofs]\n");
     expect_field(whole, "device_queue_depth_max ");

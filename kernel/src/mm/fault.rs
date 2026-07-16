@@ -15,7 +15,7 @@ use crate::{
     mm::{
         page::{page_manager_lock, EntryFlags},
         ucontext::{AddressSpace, InnerAddressSpace, LockedVMA},
-        VirtAddr, VmFaultReason, VmFlags,
+        PhysAddr, VirtAddr, VmFaultReason, VmFlags,
     },
     process::{ProcessManager, ProcessState},
 };
@@ -23,6 +23,16 @@ use crate::{
 use crate::mm::MemoryManagementArch;
 
 use super::page::{Page, PageFlags, PageType};
+
+pub trait FaultRetryWait: core::fmt::Debug + Send + Sync {
+    fn wait(&self) -> Result<(), SystemError>;
+}
+
+#[derive(Debug)]
+pub struct VmFaultOutcome {
+    pub reason: VmFaultReason,
+    pub retry_wait: Option<Arc<dyn FaultRetryWait>>,
+}
 
 bitflags! {
     pub struct FaultFlags: u64{
@@ -48,6 +58,8 @@ bitflags! {
 pub struct PageFaultMessage<'a> {
     /// 产生缺页的VMA结构体
     vma: Arc<LockedVMA>,
+    vm_file: Option<Arc<crate::filesystem::vfs::file::File>>,
+    vm_flags: VmFlags,
     /// 缺页地址
     address: VirtAddr,
     /// 异常处理标志
@@ -66,6 +78,7 @@ pub struct PageFaultMessage<'a> {
     ///
     /// do_wp_page 等在修改 PTE 后需要走 mm-aware shootdown 的路径要依赖它（`AddressSpace::flush_tlb_range`）。
     mm: Arc<AddressSpace>,
+    retry_wait: Option<Arc<dyn FaultRetryWait>>,
 }
 
 impl<'a> PageFaultMessage<'a> {
@@ -77,12 +90,16 @@ impl<'a> PageFaultMessage<'a> {
         mm: Arc<AddressSpace>,
     ) -> Self {
         let guard = vma.lock();
+        let vm_file = guard.vm_file();
+        let vm_flags = *guard.vm_flags();
         let backing_pgoff = guard.backing_page_offset().map(|backing_page_offset| {
             ((address.data() - guard.region().start().data()) >> MMArch::PAGE_SHIFT)
                 + backing_page_offset
         });
         Self {
             vma: vma.clone(),
+            vm_file,
+            vm_flags,
             address: VirtAddr::new(crate::libs::align::page_align_down(address.data())),
             flags,
             backing_pgoff,
@@ -91,6 +108,7 @@ impl<'a> PageFaultMessage<'a> {
             mapper,
             cow_page: None,
             mm,
+            retry_wait: None,
         }
     }
 
@@ -98,6 +116,14 @@ impl<'a> PageFaultMessage<'a> {
     #[allow(dead_code)]
     pub fn vma(&self) -> Arc<LockedVMA> {
         self.vma.clone()
+    }
+
+    pub fn vm_file(&self) -> Option<&Arc<crate::filesystem::vfs::file::File>> {
+        self.vm_file.as_ref()
+    }
+
+    pub fn vm_flags(&self) -> VmFlags {
+        self.vm_flags
     }
 
     #[inline(always)]
@@ -133,10 +159,188 @@ impl<'a> PageFaultMessage<'a> {
     pub fn mm(&self) -> &Arc<AddressSpace> {
         &self.mm
     }
+
+    pub fn set_retry_wait(&mut self, wait: Arc<dyn FaultRetryWait>) {
+        self.retry_wait = Some(wait);
+    }
+
+    /// Return the currently installed raw PFN at the fault address.
+    ///
+    /// Managed pages deliberately return `None`; filesystem pfn_mkwrite/COW
+    /// implementations must not use this interface for page-cache pages.
+    pub fn external_pfn(&mut self) -> Option<PhysAddr> {
+        if !self.vma.lock().vm_flags().contains(VmFlags::VM_MIXEDMAP) {
+            return None;
+        }
+        let (paddr, _) = self.mapper.translate(self.address_aligned_down())?;
+        let mut page_manager = page_manager_lock();
+        page_manager.get(&paddr).is_none().then_some(paddr)
+    }
+
+    /// Install a validated external PFN in a VM_MIXEDMAP VMA.
+    ///
+    /// `writable` is accepted only for a writable shared VMA. Private mappings
+    /// must use `cow_external_page()` instead, so device memory can never be
+    /// exposed writable through MAP_PRIVATE.
+    pub unsafe fn map_external_pfn(&mut self, paddr: PhysAddr, writable: bool) -> VmFaultReason {
+        if !paddr.check_aligned(MMArch::PAGE_SIZE) {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        let (vm_flags, mut pte_flags) = {
+            let guard = self.vma.lock();
+            (*guard.vm_flags(), guard.flags())
+        };
+        if !vm_flags.contains(VmFlags::VM_MIXEDMAP)
+            || (writable
+                && (!vm_flags.contains(VmFlags::VM_SHARED)
+                    || !vm_flags.contains(VmFlags::VM_WRITE)))
+        {
+            return VmFaultReason::VM_FAULT_SIGSEGV;
+        }
+        pte_flags = pte_flags.set_write(writable);
+        let address = self.address_aligned_down();
+        let mm = self.mm.clone();
+        let _pt_edit = mm.page_table_edit();
+        if self.mapper.get_entry(address, 0).is_some() {
+            return VmFaultReason::VM_FAULT_NOPAGE;
+        }
+        let Some(flush) = self.mapper.map_phys(address, paddr, pte_flags) else {
+            return VmFaultReason::VM_FAULT_OOM;
+        };
+        flush.flush();
+        self.vma.lock().set_mapped(true);
+        VmFaultReason::VM_FAULT_COMPLETED
+    }
+
+    /// Upgrade an already installed external PFN after the filesystem has
+    /// successfully completed its pfn_mkwrite/layout transaction.
+    pub unsafe fn upgrade_external_pfn(&mut self, expected: PhysAddr) -> VmFaultReason {
+        let vm_flags = *self.vma.lock().vm_flags();
+        if !vm_flags.contains(VmFlags::VM_MIXEDMAP | VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
+            return VmFaultReason::VM_FAULT_SIGSEGV;
+        }
+        let address = self.address_aligned_down();
+        let mm = self.mm.clone();
+        let _pt_edit = mm.page_table_edit();
+        let Some(mut entry) = self.mapper.get_entry(address, 0) else {
+            return VmFaultReason::VM_FAULT_NOPAGE;
+        };
+        if entry.address() != Ok(expected) || entry.write() {
+            return VmFaultReason::VM_FAULT_NOPAGE;
+        }
+        let mut page_manager = page_manager_lock();
+        if page_manager.get(&expected).is_some() {
+            return VmFaultReason::VM_FAULT_NOPAGE;
+        }
+        drop(page_manager);
+        let table = self.mapper.get_table(address, 0).unwrap();
+        let index = table.index_of(address).unwrap();
+        entry.set_flags(entry.flags().set_write(true).set_dirty(true));
+        table.set_entry(index, entry);
+        mm.flush_tlb_range(
+            address,
+            VirtAddr::new(address.data() + MMArch::PAGE_SIZE),
+            MMArch::PAGE_SHIFT as u8,
+            false,
+        );
+        VmFaultReason::VM_FAULT_COMPLETED
+    }
+
+    /// Replace an optional external PFN with a private anonymous COW page.
+    /// The source bytes must come from a filesystem-validated cache-window
+    /// virtual address and cover exactly one base page.
+    pub unsafe fn cow_external_page(
+        &mut self,
+        expected: Option<PhysAddr>,
+        source: &[u8],
+    ) -> VmFaultReason {
+        if source.len() != MMArch::PAGE_SIZE {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        let (vm_flags, pte_flags, mlocked) = {
+            let guard = self.vma.lock();
+            (
+                *guard.vm_flags(),
+                guard.flags().set_write(true).set_dirty(true),
+                guard.vm_flags().contains(VmFlags::VM_LOCKED),
+            )
+        };
+        if !vm_flags.contains(VmFlags::VM_MIXEDMAP)
+            || vm_flags.contains(VmFlags::VM_SHARED)
+            || !vm_flags.contains(VmFlags::VM_WRITE)
+        {
+            return VmFaultReason::VM_FAULT_SIGSEGV;
+        }
+
+        let page = {
+            let mut page_manager = page_manager_lock();
+            let mut allocator = crate::arch::mm::LockedFrameAllocator;
+            match page_manager.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)
+            {
+                Ok(page) => page,
+                Err(_) => return VmFaultReason::VM_FAULT_OOM,
+            }
+        };
+        page.write().copy_from_slice(source);
+
+        let address = self.address_aligned_down();
+        let mm = self.mm.clone();
+        let _pt_edit = mm.page_table_edit();
+        let current = self.mapper.translate(address).map(|(paddr, _)| paddr);
+        if current != expected {
+            let mut page_manager = page_manager_lock();
+            page_manager.remove_page(&page.phys_address());
+            return VmFaultReason::VM_FAULT_NOPAGE;
+        }
+        if let Some(old) = current {
+            let mut page_manager = page_manager_lock();
+            if page_manager.get(&old).is_some() {
+                page_manager.remove_page(&page.phys_address());
+                return VmFaultReason::VM_FAULT_NOPAGE;
+            }
+        }
+
+        PageFaultHandler::attach_fault_mapped_page(&page, &self.vma, mlocked);
+        if current.is_some() {
+            let table = self.mapper.get_table(address, 0).unwrap();
+            let index = table.index_of(address).unwrap();
+            table.set_entry(
+                index,
+                super::page::PageEntry::new(page.phys_address(), pte_flags),
+            );
+            mm.flush_tlb_range(
+                address,
+                VirtAddr::new(address.data() + MMArch::PAGE_SIZE),
+                MMArch::PAGE_SHIFT as u8,
+                false,
+            );
+            // The replaced external PFN was not RSS-accounted; the new
+            // anonymous COW page is managed guest memory and must be.
+            mm.account_present_page_add();
+        } else if let Some(flush) = self
+            .mapper
+            .map_phys(address, page.phys_address(), pte_flags)
+        {
+            flush.flush();
+            mm.account_present_page_add();
+        } else {
+            PageFaultHandler::detach_fault_mapped_page(&page, &self.vma);
+            let mut page_manager = page_manager_lock();
+            page_manager.remove_page(&page.phys_address());
+            return VmFaultReason::VM_FAULT_OOM;
+        }
+        self.vma.lock().set_mapped(true);
+        VmFaultReason::VM_FAULT_COMPLETED | VmFaultReason::VM_FAULT_DONE_COW
+    }
 }
 
 /// 缺页中断处理结构体
 pub struct PageFaultHandler;
+
+enum FilemapMkwriteSize {
+    FetchFromInode,
+    Stable(usize),
+}
 
 impl PageFaultHandler {
     #[inline(always)]
@@ -183,7 +387,7 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     #[inline(never)]
-    pub unsafe fn handle_mm_fault(mut pfm: PageFaultMessage) -> VmFaultReason {
+    pub unsafe fn handle_mm_fault(mut pfm: PageFaultMessage) -> VmFaultOutcome {
         let flags = pfm.flags();
         let vma = pfm.vma();
         let current_pcb = ProcessManager::current_pcb();
@@ -197,7 +401,10 @@ impl PageFaultHandler {
             flags.contains(FaultFlags::FAULT_FLAG_INSTRUCTION),
             flags.contains(FaultFlags::FAULT_FLAG_REMOTE),
         ) {
-            return VmFaultReason::VM_FAULT_SIGSEGV;
+            return VmFaultOutcome {
+                reason: VmFaultReason::VM_FAULT_SIGSEGV,
+                retry_wait: None,
+            };
         }
 
         let guard = vma.lock();
@@ -206,10 +413,17 @@ impl PageFaultHandler {
         if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
             //TODO: 添加handle_hugetlb_fault处理大页缺页异常
         } else {
-            return Self::handle_normal_fault(&mut pfm);
+            let reason = Self::handle_normal_fault(&mut pfm);
+            return VmFaultOutcome {
+                reason,
+                retry_wait: pfm.retry_wait.take(),
+            };
         }
 
-        VmFaultReason::VM_FAULT_COMPLETED
+        VmFaultOutcome {
+            reason: VmFaultReason::VM_FAULT_COMPLETED,
+            retry_wait: pfm.retry_wait.take(),
+        }
     }
 
     /// 处理普通页缺页异常
@@ -289,6 +503,14 @@ impl PageFaultHandler {
             ret = Self::do_anonymous_page(pfm);
         } else {
             ret = Self::do_fault(pfm);
+        }
+
+        if ret.intersects(
+            VmFaultReason::VM_FAULT_ERROR
+                | VmFaultReason::VM_FAULT_NOPAGE
+                | VmFaultReason::VM_FAULT_RETRY,
+        ) {
+            return ret;
         }
 
         vma.lock().set_mapped(true);
@@ -414,8 +636,8 @@ impl PageFaultHandler {
         let _invalidate = page_cache
             .as_ref()
             .map(|page_cache| page_cache.invalidate_read());
-        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
-        let mut ret = fs.fault(pfm);
+        let file = pfm.vm_file().unwrap().clone();
+        let mut ret = file.with_io_fs(|fs| fs.fault(pfm));
 
         if unlikely(ret.intersects(
             VmFaultReason::VM_FAULT_ERROR
@@ -454,29 +676,48 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_read_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let page_cache = Self::file_page_cache(pfm);
-        let _invalidate = page_cache
-            .as_ref()
-            .map(|page_cache| page_cache.invalidate_read());
-        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let file = pfm.vm_file().unwrap().clone();
+        let fault_first = file.with_io_fs(|fs| fs.fault_before_map_pages());
+        let mut ret = VmFaultReason::empty();
+        if fault_first {
+            ret = file.with_io_fs(|fs| fs.fault(pfm));
+            if ret.contains(VmFaultReason::VM_FAULT_COMPLETED)
+                || ret.intersects(
+                    VmFaultReason::VM_FAULT_ERROR
+                        | VmFaultReason::VM_FAULT_NOPAGE
+                        | VmFaultReason::VM_FAULT_RETRY,
+                )
+            {
+                return ret;
+            }
+        }
 
-        let mut ret = Self::do_fault_around(pfm);
-        if !ret.is_empty() {
+        // VM_MIXEDMAP faults are owned by the filesystem: generic fault-around
+        // would populate page-cache pages and bypass DAX PFN validation.
+        let around = if pfm.vm_flags().contains(VmFlags::VM_MIXEDMAP) {
+            VmFaultReason::empty()
+        } else {
+            Self::do_fault_around(pfm)
+        };
+        ret |= around;
+        if !around.is_empty() {
             return ret;
         }
         if pfm.mapper.translate(pfm.address_aligned_down()).is_some() {
-            return VmFaultReason::VM_FAULT_COMPLETED;
+            return ret | VmFaultReason::VM_FAULT_COMPLETED;
         }
 
-        ret = fs.fault(pfm);
-
-        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
-            return ret;
-        }
-
-        // 出现错误类返回时，不再继续 finish_fault 以避免 unwrap/panic
-        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
-            return ret;
+        if !fault_first {
+            ret |= file.with_io_fs(|fs| fs.fault(pfm));
+            if ret.contains(VmFaultReason::VM_FAULT_COMPLETED)
+                || ret.intersects(
+                    VmFaultReason::VM_FAULT_ERROR
+                        | VmFaultReason::VM_FAULT_NOPAGE
+                        | VmFaultReason::VM_FAULT_RETRY,
+                )
+            {
+                return ret;
+            }
         }
 
         ret = ret.union(Self::finish_fault(pfm));
@@ -498,8 +739,8 @@ impl PageFaultHandler {
         let _invalidate = page_cache
             .as_ref()
             .map(|page_cache| page_cache.invalidate_read());
-        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
-        let mut ret = fs.fault(pfm);
+        let file = pfm.vm_file().unwrap().clone();
+        let mut ret = file.with_io_fs(|fs| fs.fault(pfm));
 
         if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
             return ret;
@@ -508,7 +749,7 @@ impl PageFaultHandler {
             return ret;
         }
 
-        ret = ret.union(fs.page_mkwrite(pfm));
+        ret = ret.union(file.with_io_fs(|fs| fs.page_mkwrite(pfm)));
         if Self::mkwrite_finished(ret) {
             return ret;
         }
@@ -596,7 +837,26 @@ impl PageFaultHandler {
             return VmFaultReason::VM_FAULT_NOPAGE;
         };
         let mut page_manager = page_manager_lock();
-        let old_page = page_manager.get_unwrap(&old_paddr);
+        let old_page = page_manager.get(&old_paddr);
+        if old_page.is_none() {
+            drop(page_manager);
+            if !vma.lock().vm_flags().contains(VmFlags::VM_MIXEDMAP) {
+                panic!("unmanaged PFN {old_paddr:?} installed in a non-mixed VMA");
+            }
+            let file = vma.lock().vm_file();
+            let Some(file) = file else {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            };
+            // The filesystem owns validation of the DAX mapping identity and
+            // source window. Shared mappings complete pfn_mkwrite; private
+            // mappings complete COW through PageFaultMessage's guarded helper.
+            return if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
+                file.with_io_fs(|fs| fs.page_mkwrite(pfm))
+            } else {
+                file.with_io_fs(|fs| fs.fault(pfm))
+            };
+        }
+        let old_page = old_page.unwrap();
         let map_count = old_page.read().map_count();
         drop(page_manager);
 
@@ -607,7 +867,7 @@ impl PageFaultHandler {
             };
             if let Some(file) = file {
                 pfm.set_page(old_page.clone());
-                let ret = file.inode().fs().page_mkwrite(pfm);
+                let ret = file.with_io_fs(|fs| fs.page_mkwrite(pfm));
                 if Self::mkwrite_finished(ret) {
                     return ret;
                 }
@@ -791,10 +1051,10 @@ impl PageFaultHandler {
             }
         }
 
-        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let file = pfm.vm_file().unwrap().clone();
         let start_pgoff = backing_pgoff - (pte_pgoff - from_pte);
         let end_pgoff = backing_pgoff + (to_pte - pte_pgoff);
-        fs.map_pages(pfm, start_pgoff, end_pgoff);
+        file.with_io_fs(|fs| fs.map_pages(pfm, start_pgoff, end_pgoff));
 
         VmFaultReason::empty()
     }
@@ -930,6 +1190,24 @@ impl PageFaultHandler {
     }
 
     pub unsafe fn filemap_page_mkwrite(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        Self::filemap_page_mkwrite_inner(pfm, FilemapMkwriteSize::FetchFromInode)
+    }
+
+    /// Prepare a shared writable file-backed page using an inode size which
+    /// the filesystem has already stabilized against truncate and dirty-page
+    /// admission.  Filesystems whose metadata operation can enter userspace
+    /// must use this entry point from a fault critical section.
+    pub unsafe fn filemap_page_mkwrite_with_stable_size(
+        pfm: &mut PageFaultMessage,
+        stable_size: usize,
+    ) -> VmFaultReason {
+        Self::filemap_page_mkwrite_inner(pfm, FilemapMkwriteSize::Stable(stable_size))
+    }
+
+    unsafe fn filemap_page_mkwrite_inner(
+        pfm: &mut PageFaultMessage,
+        size_source: FilemapMkwriteSize,
+    ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
@@ -977,8 +1255,15 @@ impl PageFaultHandler {
             return VmFaultReason::VM_FAULT_RETRY;
         }
 
-        if let Ok(md) = file.inode().metadata() {
-            let size = md.size.max(0) as usize;
+        let size = match size_source {
+            FilemapMkwriteSize::FetchFromInode => file
+                .inode()
+                .metadata()
+                .ok()
+                .map(|metadata| metadata.size.max(0) as usize),
+            FilemapMkwriteSize::Stable(size) => Some(size),
+        };
+        if let Some(size) = size {
             if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
                 log::warn!(
                     "filemap_page_mkwrite: SIGBUS — file size {} too small for pgoff {}",
@@ -991,7 +1276,15 @@ impl PageFaultHandler {
 
         match page_cache.manager().prepare_page_mkwrite(page_index, &page) {
             Ok(()) => {}
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => return VmFaultReason::VM_FAULT_RETRY,
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                if let Some(wait) = page_cache
+                    .manager()
+                    .page_mkwrite_retry_wait(page_index, &page)
+                {
+                    pfm.set_retry_wait(wait);
+                }
+                return VmFaultReason::VM_FAULT_RETRY;
+            }
             Err(e) => {
                 log::warn!(
                     "filemap_page_mkwrite: SIGBUS — prepare_page_mkwrite failed: {:?}",
@@ -1000,7 +1293,6 @@ impl PageFaultHandler {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
         }
-
         VmFaultReason::empty()
     }
 

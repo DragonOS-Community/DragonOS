@@ -1,5 +1,8 @@
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
-use core::mem::size_of;
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+};
 
 use log::error;
 use system_error::SystemError;
@@ -13,18 +16,142 @@ use crate::{
             FUSE_REMOVEMAPPING, FUSE_SETUPMAPPING, FUSE_SETUPMAPPING_FLAG_READ,
             FUSE_SETUPMAPPING_FLAG_WRITE,
         },
+        stats,
     },
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     mm::MemoryManagementArch,
 };
 
 pub(crate) const DAX_RANGE_SIZE: usize = 2 * 1024 * 1024;
+const DAX_FH_INODE: u64 = u64::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum DaxAdmissionState {
+    Active = 0,
+    Quiescing = 1,
+    Dead = 2,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxAdmission {
+    state: AtomicU8,
+    active: AtomicUsize,
+    wait: WaitQueue,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxAdmissionGuard {
+    admission: Arc<DaxAdmission>,
+}
+
+impl DaxAdmission {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: AtomicU8::new(DaxAdmissionState::Active as u8),
+            active: AtomicUsize::new(0),
+            wait: WaitQueue::default(),
+        })
+    }
+
+    pub(crate) fn state(&self) -> DaxAdmissionState {
+        match self.state.load(Ordering::Acquire) {
+            0 => DaxAdmissionState::Active,
+            1 => DaxAdmissionState::Quiescing,
+            _ => DaxAdmissionState::Dead,
+        }
+    }
+
+    pub(crate) fn enter(self: &Arc<Self>) -> Result<DaxAdmissionGuard, SystemError> {
+        if self.state() != DaxAdmissionState::Active {
+            return Err(SystemError::ENODEV);
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        if self.state() != DaxAdmissionState::Active {
+            self.leave();
+            return Err(SystemError::ENODEV);
+        }
+        Ok(DaxAdmissionGuard {
+            admission: self.clone(),
+        })
+    }
+
+    pub(crate) fn begin_quiesce(&self) {
+        let _ = self.state.compare_exchange(
+            DaxAdmissionState::Active as u8,
+            DaxAdmissionState::Quiescing as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.wait.wakeup_all(None);
+    }
+
+    pub(crate) fn wait_drained(&self) {
+        self.wait
+            .wait_until(|| (self.active.load(Ordering::Acquire) == 0).then_some(()));
+    }
+
+    pub(crate) fn mark_dead(&self) {
+        self.state
+            .store(DaxAdmissionState::Dead as u8, Ordering::Release);
+        self.wait.wakeup_all(None);
+    }
+
+    fn leave(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.wait.wakeup_all(None);
+        }
+    }
+}
+
+impl Drop for DaxAdmissionGuard {
+    fn drop(&mut self) {
+        self.admission.leave();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DaxMountMode {
+    InodeDefault,
     Never,
     Always,
     Inode,
+}
+
+impl DaxMountMode {
+    pub(crate) fn is_inode_mode(self) -> bool {
+        matches!(self, Self::InodeDefault | Self::Inode)
+    }
+
+    pub(crate) fn proc_option(self) -> Option<&'static str> {
+        match self {
+            Self::InodeDefault => None,
+            Self::Never => Some("dax=never"),
+            Self::Always => Some("dax=always"),
+            Self::Inode => Some("dax=inode"),
+        }
+    }
+
+    pub(crate) fn inode_enabled(
+        self,
+        connection_capable: bool,
+        inode_capability_negotiated: bool,
+        attr_dax: bool,
+        regular: bool,
+    ) -> bool {
+        if !regular || !connection_capable {
+            return false;
+        }
+        match self {
+            Self::Never => false,
+            Self::Always => true,
+            Self::InodeDefault | Self::Inode => inode_capability_negotiated && attr_dax,
+        }
+    }
+
+    pub(crate) fn attr_change_requires_dontcache(self, active: bool, attr_dax: bool) -> bool {
+        self.is_inode_mode() && active != attr_dax
+    }
 }
 
 #[derive(Debug)]
@@ -150,6 +277,18 @@ impl OwnedToken {
     pub(crate) fn owner(&self) -> DaxMappingOwner {
         self.owner
     }
+
+    pub(crate) fn matches_candidate(&self, candidate: &ReclaimCandidate) -> bool {
+        self.index == candidate.index
+            && self.generation == candidate.generation
+            && self.owner == candidate.owner
+    }
+
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.generation == other.generation
+            && self.owner == other.owner
+    }
 }
 
 impl ReclaimCandidate {
@@ -159,6 +298,10 @@ impl ReclaimCandidate {
 
     pub(crate) fn owner(&self) -> DaxMappingOwner {
         self.owner
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -330,6 +473,19 @@ impl DaxRangeAllocator {
                 None
             }
         })?
+    }
+
+    pub(crate) fn wait_available(&self) -> Result<(), SystemError> {
+        self.wait.wait_until(|| {
+            let state = self.state.lock_irqsave();
+            if state.shutdown {
+                Some(Err(SystemError::ENODEV))
+            } else if state.can_make_progress() {
+                Some(Ok(()))
+            } else {
+                None
+            }
+        })
     }
 
     pub(crate) fn assign_owner(
@@ -613,6 +769,14 @@ impl DaxRangeAllocator {
     pub(crate) fn snapshot(&self) -> DaxAllocatorSnapshot {
         self.state.lock_irqsave().snapshot()
     }
+
+    pub(crate) fn is_owned(&self, token: &OwnedToken) -> bool {
+        let state = self.state.lock_irqsave();
+        state.entries.get(token.index).is_some_and(|entry| {
+            entry.generation == token.generation
+                && matches!(entry.state, DaxRangeState::InodeOwned { owner, .. } if owner == token.owner)
+        })
+    }
 }
 
 impl FuseConn {
@@ -658,9 +822,8 @@ impl FuseConn {
     }
 
     fn send_setup_mapping(
-        &self,
+        self: &Arc<Self>,
         owner: DaxMappingOwner,
-        fh: u64,
         file_offset: u64,
         window_offset: usize,
         writable: bool,
@@ -670,7 +833,7 @@ impl FuseConn {
             return FuseDaxRequestOutcome::NeverSubmitted(error);
         }
         let input = FuseSetupMappingIn {
-            fh,
+            fh: DAX_FH_INODE,
             foffset: file_offset,
             len: DAX_RANGE_SIZE as u64,
             flags: FUSE_SETUPMAPPING_FLAG_READ
@@ -692,7 +855,10 @@ impl FuseConn {
     ) -> Result<OwnedToken, SystemError> {
         match outcome {
             FuseDaxRequestOutcome::Success => match allocator.assign_owner(reservation, owner) {
-                Ok(owned) => Ok(owned),
+                Ok(owned) => {
+                    stats::on_virtiofs_dax_mapping_created();
+                    Ok(owned)
+                }
                 Err(error) => {
                     let _ = allocator.retire_reservation(reservation);
                     Err(error)
@@ -712,30 +878,23 @@ impl FuseConn {
     }
 
     pub(crate) fn setup_dax_mapping(
-        &self,
+        self: &Arc<Self>,
         owner: DaxMappingOwner,
-        fh: u64,
         file_offset: u64,
         writable: bool,
     ) -> Result<OwnedToken, SystemError> {
         let allocator = self.dax_allocator_clone()?;
         let reservation = allocator.try_allocate()?;
-        let result = self.send_setup_mapping(
-            owner,
-            fh,
-            file_offset,
-            reservation.window_offset(),
-            writable,
-        );
+        let result =
+            self.send_setup_mapping(owner, file_offset, reservation.window_offset(), writable);
         Self::apply_setup_outcome(&allocator, &reservation, owner, result)
     }
 
     /// Send SETUPMAPPING for an existing range (used by #2080 for access upgrades).
     pub(crate) fn setup_existing_dax_mapping(
-        &self,
+        self: &Arc<Self>,
         owner: DaxMappingOwner,
         token: &OwnedToken,
-        fh: u64,
         file_offset: u64,
         writable: bool,
     ) -> Result<(), SystemError> {
@@ -744,8 +903,7 @@ impl FuseConn {
         }
         let allocator = self.dax_allocator_clone()?;
         allocator.get(token)?;
-        let outcome =
-            self.send_setup_mapping(owner, fh, file_offset, token.window_offset(), writable);
+        let outcome = self.send_setup_mapping(owner, file_offset, token.window_offset(), writable);
         let put_result = allocator.put(token);
         match outcome {
             FuseDaxRequestOutcome::Success => {
@@ -767,7 +925,7 @@ impl FuseConn {
     }
 
     pub(crate) fn remove_dax_mappings(
-        &self,
+        self: &Arc<Self>,
         owner: DaxMappingOwner,
         tokens: &[ReclaimToken],
     ) -> Result<(), SystemError> {
@@ -846,6 +1004,7 @@ impl FuseConn {
                 FuseDaxRequestOutcome::Success => {
                     for token in batch {
                         allocator.finish_reclaim(token)?;
+                        stats::on_virtiofs_dax_mapping_removed();
                     }
                 }
                 FuseDaxRequestOutcome::NeverSubmitted(error) => {
@@ -924,6 +1083,26 @@ mod tests {
         let mut out = Vec::with_capacity(max);
         allocator.reclaim_candidates(&mut out, max).unwrap();
         out
+    }
+
+    #[test]
+    fn inode_policy_matches_linux_capability_matrix() {
+        assert!(DaxMountMode::Always.inode_enabled(true, false, false, true));
+        assert!(!DaxMountMode::Always.inode_enabled(false, true, true, true));
+        assert!(!DaxMountMode::Never.inode_enabled(true, true, true, true));
+        assert!(DaxMountMode::Inode.inode_enabled(true, true, true, true));
+        assert!(!DaxMountMode::Inode.inode_enabled(true, false, true, true));
+        assert!(!DaxMountMode::InodeDefault.inode_enabled(true, true, false, true));
+        assert!(!DaxMountMode::Inode.inode_enabled(true, true, true, false));
+    }
+
+    #[test]
+    fn dontcache_compares_fixed_state_with_raw_attr_only_in_inode_modes() {
+        assert!(DaxMountMode::Inode.attr_change_requires_dontcache(false, true));
+        assert!(DaxMountMode::InodeDefault.attr_change_requires_dontcache(true, false));
+        assert!(!DaxMountMode::Inode.attr_change_requires_dontcache(true, true));
+        assert!(!DaxMountMode::Always.attr_change_requires_dontcache(true, false));
+        assert!(!DaxMountMode::Never.attr_change_requires_dontcache(false, true));
     }
 
     #[test]

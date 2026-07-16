@@ -12,6 +12,7 @@ use system_error::SystemError;
 use crate::{
     libs::{
         mutex::{Mutex, MutexGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
     },
     mm::{
@@ -113,6 +114,28 @@ pub(super) static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 /// mm with another thread group must not miss a concurrent oom_score_adj update
 /// while it is becoming visible.
 static OOM_SCORE_ADJ_LOCK: Mutex<()> = Mutex::new(());
+/// Allows concurrent fs_struct copy-and-publish operations while excluding
+/// pivot_root's topology commit and chroot_fs_refs-style migration.
+static FS_REFS_PUBLICATION_BARRIER: RwSem<()> = RwSem::new(());
+
+pub(crate) struct FsRefsReadGuard {
+    _guard: RwSemReadGuard<'static, ()>,
+}
+pub(crate) struct FsRefsWriteGuard {
+    _guard: RwSemWriteGuard<'static, ()>,
+}
+
+pub(crate) fn lock_fs_refs_copy() -> FsRefsReadGuard {
+    FsRefsReadGuard {
+        _guard: FS_REFS_PUBLICATION_BARRIER.read(),
+    }
+}
+
+pub(crate) fn lock_fs_refs_pivot() -> FsRefsWriteGuard {
+    FsRefsWriteGuard {
+        _guard: FS_REFS_PUBLICATION_BARRIER.write(),
+    }
+}
 
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
@@ -295,7 +318,7 @@ impl ProcessManager {
     /// ## Parameters
     ///
     /// - `pcb`: The PCB of the process.
-    pub fn add_pcb(pcb: Arc<ProcessControlBlock>) {
+    pub(crate) fn add_pcb(pcb: Arc<ProcessControlBlock>, _fs_refs: &FsRefsReadGuard) {
         ALL_PROCESS
             .lock_irqsave()
             .as_mut()

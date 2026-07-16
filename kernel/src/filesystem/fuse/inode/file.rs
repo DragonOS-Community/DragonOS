@@ -15,16 +15,159 @@ use crate::{
         },
         vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
     },
-    libs::mutex::Mutex,
-    mm::{readahead::FileReadaheadState, MemoryManagementArch},
+    libs::{mutex::Mutex, rwsem::RwSemWriteGuard},
+    mm::{
+        fault::FaultRetryWait,
+        readahead::{FileReadaheadState, ReadaheadControl},
+        MemoryManagementArch,
+    },
     time::PosixTimeSpec,
 };
+
+#[derive(Debug)]
+struct FuseWritebackAdmissionRetryWait {
+    node: Arc<FuseNode>,
+}
+
+impl FaultRetryWait for FuseWritebackAdmissionRetryWait {
+    fn wait(&self) -> Result<(), SystemError> {
+        drop(self.node.writeback_barrier.read());
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FuseReadaheadEvent {
+    SyncMissAtExpected,
+    AsyncBoundary,
+    RandomMiss,
+    OrdinaryHit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FuseReadaheadPlan {
+    event: FuseReadaheadEvent,
+    fill: Option<(usize, usize)>,
+    demand_end_for_wait: usize,
+}
+
+/// Advance one open file's FUSE readahead window without performing I/O.
+///
+/// The current window describes the pages whose async boundary may trigger the
+/// *next* non-overlapping window. Cache hits before that boundary never slide
+/// the window; this is the key property that prevents a saturated window from
+/// degenerating into one new READ per 4 KiB userspace read.
+fn plan_fuse_readahead(
+    state: &mut FileReadaheadState,
+    demand_start: usize,
+    demand_end: usize,
+    demand_ready: bool,
+    eof_page_exclusive: usize,
+    max_window_pages: usize,
+) -> FuseReadaheadPlan {
+    let demand_end = core::cmp::min(demand_end, eof_page_exclusive);
+    let max_window_pages = core::cmp::max(1, max_window_pages);
+    if demand_start >= demand_end {
+        return FuseReadaheadPlan {
+            event: FuseReadaheadEvent::OrdinaryHit,
+            fill: None,
+            demand_end_for_wait: demand_end,
+        };
+    }
+
+    let old_end = state.start.saturating_add(state.size);
+    let async_boundary = old_end.saturating_sub(core::cmp::min(state.async_size, state.size));
+    let crosses_async_boundary =
+        state.size != 0 && demand_start <= async_boundary && demand_end > async_boundary;
+    let follows_previous = state.prev_index >= 0
+        && (state.prev_index as usize)
+            .checked_add(1)
+            .is_some_and(|next| demand_start == next);
+    let restart_sequential_window =
+        !demand_ready && follows_previous && (demand_start >= old_end || demand_end <= state.start);
+    let event = if state.size == 0 && !demand_ready {
+        FuseReadaheadEvent::SyncMissAtExpected
+    } else if crosses_async_boundary {
+        if demand_ready {
+            FuseReadaheadEvent::AsyncBoundary
+        } else {
+            FuseReadaheadEvent::SyncMissAtExpected
+        }
+    } else if (!demand_ready && demand_start == old_end) || restart_sequential_window {
+        FuseReadaheadEvent::SyncMissAtExpected
+    } else if !demand_ready {
+        FuseReadaheadEvent::RandomMiss
+    } else {
+        FuseReadaheadEvent::OrdinaryHit
+    };
+
+    let plan = match event {
+        FuseReadaheadEvent::OrdinaryHit => FuseReadaheadPlan {
+            event,
+            fill: None,
+            demand_end_for_wait: demand_end,
+        },
+        FuseReadaheadEvent::RandomMiss => FuseReadaheadPlan {
+            event,
+            fill: Some((demand_start, demand_end)),
+            demand_end_for_wait: demand_end,
+        },
+        FuseReadaheadEvent::SyncMissAtExpected if state.size == 0 || restart_sequential_window => {
+            let demand_pages = demand_end - demand_start;
+            let window_pages = core::cmp::max(
+                demand_pages,
+                core::cmp::min(
+                    ReadaheadControl::get_init_ra_size(demand_pages, max_window_pages),
+                    max_window_pages,
+                ),
+            );
+            let window_end = core::cmp::min(
+                eof_page_exclusive,
+                demand_start.saturating_add(window_pages),
+            );
+            state.start = demand_start;
+            state.size = window_end.saturating_sub(demand_start);
+            state.async_size = state.size.saturating_sub(demand_pages);
+            FuseReadaheadPlan {
+                event,
+                fill: (demand_start < window_end).then_some((demand_start, window_end)),
+                demand_end_for_wait: demand_end,
+            }
+        }
+        FuseReadaheadEvent::SyncMissAtExpected | FuseReadaheadEvent::AsyncBoundary => {
+            let next_start = old_end;
+            let next_pages = core::cmp::max(
+                1,
+                ReadaheadControl::get_next_ra_size(state.size, max_window_pages),
+            );
+            let required_pages = demand_end.saturating_sub(next_start);
+            let window_pages = core::cmp::max(next_pages, required_pages);
+            let window_end =
+                core::cmp::min(eof_page_exclusive, next_start.saturating_add(window_pages));
+            state.start = next_start;
+            state.size = window_end.saturating_sub(next_start);
+            state.async_size = state.size;
+            let fill_start = if event == FuseReadaheadEvent::SyncMissAtExpected {
+                core::cmp::min(demand_start, next_start)
+            } else {
+                next_start
+            };
+            FuseReadaheadPlan {
+                event,
+                fill: (fill_start < window_end).then_some((fill_start, window_end)),
+                demand_end_for_wait: demand_end,
+            }
+        }
+    };
+    state.prev_index = core::cmp::min(demand_end.saturating_sub(1), i64::MAX as usize) as i64;
+    plan
+}
 
 use super::super::{
     conn::{BackgroundReadPagesCtx, FuseRequestCred},
     private_data::{
-        FuseFilePrivateData, FuseOpenContext, FuseOpenLifetime, FuseOpenPrivateData,
-        FuseWritebackHandle,
+        FuseFilePrivateData, FuseOpenContext, FuseOpenIoConfig, FuseOpenLifetime,
+        FuseOpenPrivateData, FuseWritebackHandle,
     },
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttrOut, FuseFlushIn, FuseFsyncIn, FuseOpenIn,
@@ -49,12 +192,25 @@ struct FillPagesFileCtx {
     fh: u64,
     file_flags: u32,
     lifetime: Arc<FuseOpenLifetime>,
+    io_config: FuseOpenIoConfig,
 }
 
 impl FusePageCacheBackend {
     fn new(node: Weak<FuseNode>) -> Self {
         Self { node }
     }
+}
+
+fn max_pages_for_read(max_read: usize) -> usize {
+    // Direct page-cache DMA publishes every reserved page as fully initialized.
+    // A non-page-aligned tail therefore cannot be reserved unless the request
+    // can transfer the whole page; otherwise the unread tail would be zeroed
+    // and incorrectly exposed as valid file data.
+    max_read / MMArch::PAGE_SIZE
+}
+
+fn should_defer_foreground_read_error(async_read: bool, completed_pages: usize) -> bool {
+    !async_read && completed_pages > 0
 }
 
 impl PageCacheBackend for FusePageCacheBackend {
@@ -65,6 +221,55 @@ impl PageCacheBackend for FusePageCacheBackend {
     fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let node = self.node.upgrade().ok_or(SystemError::EIO)?;
         node.writeback_page_with_handle(index, buf)
+    }
+
+    fn write_batch_pages(&self) -> Result<usize, SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        let max_pages = node.conn().max_pages();
+        let max_write = node.conn().max_write();
+        if max_pages == 0 || max_write < MMArch::PAGE_SIZE {
+            return Err(SystemError::EIO);
+        }
+        let _ = max_pages
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let pages = core::cmp::min(max_pages, max_write / MMArch::PAGE_SIZE);
+        if pages == 0 {
+            return Err(SystemError::EIO);
+        }
+        Ok(pages)
+    }
+
+    fn write_pages(&self, start_index: usize, data: &[u8]) -> Result<(), SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        match node.writeback_pages_with_handle(start_index, data) {
+            Ok(written) if written == data.len() => Ok(()),
+            Ok(_) => Err(SystemError::EIO),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        node.with_writeback_admission(claim)
+    }
+
+    fn try_with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<bool, SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        node.try_with_writeback_admission(claim)
+    }
+
+    fn stable_writeback_size(&self, _inode: &Arc<dyn IndexNode>) -> Result<usize, SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        node.cached_metadata_snapshot()
+            .ok_or(SystemError::EIO)
+            .map(|metadata| metadata.size.max(0) as usize)
     }
 
     fn npages(&self) -> usize {
@@ -89,27 +294,47 @@ impl FuseNode {
         if offset < 0 {
             return Ok(());
         }
-        let Some(page_cache) = self.cached_page_cache() else {
-            return Ok(());
+        let start = offset as usize;
+        let end_exclusive = if len <= 0 {
+            None
+        } else {
+            Some(
+                (offset as u64)
+                    .saturating_add(len as u64)
+                    .min(usize::MAX as u64) as usize,
+            )
         };
-        let start_index = (offset as usize) >> MMArch::PAGE_SHIFT;
+        let start_index = start >> MMArch::PAGE_SHIFT;
         let end_index = if len <= 0 {
             usize::MAX
         } else {
             let last = (offset as u64).saturating_add(len as u64).saturating_sub(1);
             core::cmp::min(last, usize::MAX as u64) as usize >> MMArch::PAGE_SHIFT
         };
-        let end_exclusive = end_index.checked_add(1);
+        let end_page_exclusive = end_index.checked_add(1);
+        let page_cache = self.cached_page_cache();
+        let blocker = if self.dax_active() {
+            Some(self.dax_begin_host_invalidation()?)
+        } else {
+            None
+        };
 
         // Linux unmap_mapping_pages(..., even_cows=false) preserves private
         // MAP_PRIVATE COW pages while zapping mappings backed by page cache.
-        let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
+        if let Some(cache) = page_cache.as_ref() {
+            if let Err(error) = cache.unmap_mapping_pages(start_index, end_page_exclusive) {
+                if blocker.is_some() {
+                    self.conn().abort();
+                }
+                return Err(error);
+            }
+        }
         // Remove cache entries that need no daemon I/O before acknowledging the
         // notification. Dirty/loading/writeback entries remain pinned until the
         // deferred phase has made them safe to discard.
-        {
-            let _invalidate = page_cache.invalidate_write();
-            let _ = page_cache
+        if let Some(cache) = page_cache.as_ref() {
+            let _invalidate = cache.invalidate_write();
+            let _ = cache
                 .manager()
                 .discard_clean_range_nowait(start_index, end_index);
         }
@@ -121,20 +346,79 @@ impl FuseNode {
         // used while the work is pending.
         // This may block on userspace I/O, so use the dedicated page-cache I/O
         // pool rather than the single system workqueue.
+        if page_cache.is_none() && blocker.is_none() {
+            return Ok(());
+        }
+        let node = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let dax_fail_closed = blocker.is_some();
+        let blocker = Mutex::new(blocker);
         schedule_pagecache_io(Work::new(move || {
-            // Linux invalidate_inode_pages2_range() launders dirty folios before
-            // removing clean cache pages.  Keep that ordering and best-effort
-            // behavior, but outside the unsolicited-notify call stack.
-            let _ = page_cache
-                .manager()
-                .launder_range_for_invalidate(start_index, end_index);
-            {
-                let _invalidate = page_cache.invalidate_write();
-                let _ = page_cache
-                    .manager()
-                    .discard_clean_range(start_index, end_index);
+            let result = (|| {
+                // Block buffered dirty admission while synchronizing and
+                // invalidating the ordinary page cache. The host-invalidation
+                // blocker independently prevents DAX window use/PTE publish.
+                let layout = node.dax_layout_write();
+                let mut first_error = None;
+                if page_cache.is_some() {
+                    // Match Linux invalidate_inode_pages2_range(): only the
+                    // notified pages participate in laundering. An unrelated
+                    // dirty-page error must not abort the FUSE connection.
+                    if let Err(error) =
+                        node.launder_cached_range_admitted(start_index, end_index, &layout)
+                    {
+                        first_error = Some(error);
+                    }
+                }
+                // Even when laundering retained an errored/dirty page, evict
+                // every page that was successfully cleaned. Otherwise a late
+                // batch error could leave earlier clean cache entries stale
+                // after the host notification has been acknowledged.
+                if let Err(error) = node.invalidate_page_cache_range(
+                    start,
+                    end_exclusive
+                        .and_then(|end| end.checked_sub(start))
+                        .unwrap_or(usize::MAX - start),
+                ) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                drop(layout);
+
+                if blocker.lock().is_some() {
+                    drop(node.dax_layout_write_for_host_invalidation(start, end_exclusive)?);
+                }
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+                Ok::<(), SystemError>(())
+            })();
+            if let Err(error) = result {
+                if dax_fail_closed {
+                    log::error!(
+                        "fuse: host inode invalidation failed closed node={} offset={} len={} err={:?}",
+                        node.nodeid(),
+                        offset,
+                        len,
+                        error
+                    );
+                    node.conn().abort();
+                } else {
+                    // Linux treats reverse page-cache invalidation as
+                    // best-effort and ignores invalidate_inode_pages2_range()
+                    // failures. The page-cache writeback path retains the I/O
+                    // error for later fsync reporting; it must not disconnect
+                    // an otherwise healthy non-DAX FUSE session.
+                    log::warn!(
+                        "fuse: page-cache invalidation incomplete node={} offset={} len={} err={:?}",
+                        node.nodeid(),
+                        offset,
+                        len,
+                        error
+                    );
+                }
             }
-            let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
+            blocker.lock().take();
         }));
         Ok(())
     }
@@ -142,6 +426,26 @@ impl FuseNode {
     pub(crate) fn with_writeback_admission<T>(&self, f: impl FnOnce() -> T) -> T {
         let _guard = self.writeback_barrier.read();
         f()
+    }
+
+    pub(crate) fn try_with_writeback_admission(
+        &self,
+        f: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<bool, SystemError> {
+        let Some(_guard) = self.writeback_barrier.try_read() else {
+            return Ok(false);
+        };
+        f()?;
+        Ok(true)
+    }
+
+    pub(crate) fn writeback_admission_retry_wait(&self) -> Arc<dyn FaultRetryWait> {
+        Arc::new(FuseWritebackAdmissionRetryWait {
+            node: self
+                .self_ref
+                .upgrade()
+                .expect("live FuseNode must retain its self reference"),
+        })
     }
 
     pub(crate) fn note_mmap_write(&self) {
@@ -263,6 +567,34 @@ impl FuseNode {
         Ok(())
     }
 
+    /// Invalidate page-cache state after the daemon changed the contents of a
+    /// byte range (hole punch, zero range, or host notification). Dirty data
+    /// must have been drained before this helper is called.
+    pub(super) fn invalidate_page_cache_range(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), SystemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        let end_byte = offset.checked_add(len - 1).ok_or(SystemError::EOVERFLOW)?;
+        let start_index = offset >> MMArch::PAGE_SHIFT;
+        let end_index = end_byte >> MMArch::PAGE_SHIFT;
+        let end_exclusive = end_index.checked_add(1);
+        cache.unmap_mapping_pages(start_index, end_exclusive)?;
+        {
+            let _invalidate = cache.invalidate_write();
+            cache
+                .manager()
+                .discard_clean_range(start_index, end_index)?;
+        }
+        cache.unmap_mapping_pages(start_index, end_exclusive)
+    }
+
     pub(crate) fn discard_completed_pages_beyond(
         &self,
         target: &PageCacheReadDmaReservation,
@@ -286,13 +618,25 @@ impl FuseNode {
         truncate_metadata: Option<(&Metadata, SetMetadataMask)>,
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        let old_size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
         self.resolve_pending_short_read_truncate(len)?;
         // Drain once before taking the exclusive admission barrier to reduce
         // hold time, then drain again under the barrier to close the race with
         // buffered writes and page_mkwrite.
         self.sync_dirty_cached_pages()?;
-        let _barrier = self.writeback_barrier.write();
-        self.sync_dirty_cached_pages()?;
+        let _barrier = if self.dax_active() && len != old_size {
+            if len < old_size {
+                self.dax_layout_write_for_truncate(len)?
+            } else {
+                // SETUPMAPPING covers a full DAX range. Growth only needs to
+                // serialize the daemon size change with EOF validation; it
+                // does not need O(n) REMOVEMAPPING of reusable ranges.
+                self.dax_layout_write()
+            }
+        } else {
+            self.writeback_barrier.write()
+        };
+        self.sync_dirty_cached_pages_admitted(&_barrier)?;
         let mut valid = FATTR_SIZE;
         if lock_owner.is_some() {
             valid |= FATTR_LOCKOWNER;
@@ -334,8 +678,8 @@ impl FuseNode {
                 atime = metadata.atime.tv_sec as u64;
                 atimensec = metadata.atime.tv_nsec as u32;
             }
-            // DragonOS does not currently negotiate WRITEBACK_CACHE. Match
-            // Linux FUSE by accepting the daemon-returned cmtime for truncate
+            // Under WRITEBACK_CACHE, Linux trusts the locally maintained cmtime;
+            // otherwise accept the daemon-returned values for automatic truncate
             // instead of sending a second SETATTR without the file handle.
             if mask.contains(SetMetadataMask::MTIME) && (!automatic || trust_local_cmtime) {
                 valid |= FATTR_MTIME;
@@ -372,7 +716,12 @@ impl FuseNode {
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
         let new_size = md.size.max(0) as usize;
-        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
+        self.set_cached_metadata_with_valid(
+            md,
+            out.attr_valid,
+            out.attr_valid_nsec,
+            out.attr.flags,
+        );
         self.truncate_page_cache(new_size)?;
         Ok(())
     }
@@ -418,7 +767,7 @@ impl FuseNode {
                         .store(chain_version, Ordering::Release);
                     self.pending_short_read_eof
                         .fetch_min(eof as u64, Ordering::AcqRel);
-                    self.cached_metadata_deadline_ns
+                    self.cached_metadata_deadline_ticks
                         .store(u64::MAX, Ordering::Relaxed);
                     if let Some(cache) = self.cached_page_cache() {
                         let start_page = eof / MMArch::PAGE_SIZE;
@@ -544,6 +893,60 @@ impl FuseNode {
         page_cache.manager().sync()
     }
 
+    fn stable_writeback_size(&self) -> Result<usize, SystemError> {
+        Ok(self
+            .cached_metadata_snapshot()
+            .ok_or(SystemError::EIO)?
+            .size
+            .max(0) as usize)
+    }
+
+    pub(super) fn sync_dirty_cached_pages_admitted(
+        &self,
+        _guard: &RwSemWriteGuard<'_, ()>,
+    ) -> Result<(), SystemError> {
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        page_cache
+            .manager()
+            .sync_with_stable_size(self.stable_writeback_size()?)
+    }
+
+    pub(super) fn sync_cached_range_admitted(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        _guard: &RwSemWriteGuard<'_, ()>,
+    ) -> Result<(), SystemError> {
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        page_cache.manager().sync_range_with_stable_size(
+            start_index,
+            end_index,
+            self.stable_writeback_size()?,
+        )
+    }
+
+    pub(super) fn launder_cached_range_admitted(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        _guard: &RwSemWriteGuard<'_, ()>,
+    ) -> Result<(), SystemError> {
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        page_cache
+            .manager()
+            .launder_range_for_invalidate_with_stable_size(
+                start_index,
+                end_index,
+                self.stable_writeback_size()?,
+            )
+    }
+
     pub(super) fn check_and_advance_open_wb_error(
         &self,
         data: &FuseOpenPrivateData,
@@ -563,22 +966,33 @@ impl FuseNode {
         data: &FuseOpenPrivateData,
         lock_owner: u64,
     ) -> Result<(), SystemError> {
+        let writeback_cache = self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
+        // Linux skips both data-cache writeback and protocol FLUSH for
+        // FOPEN_NOFLUSH only when writeback-cache is disabled.
+        if !writeback_cache && (data.fopen_flags & FOPEN_NOFLUSH) != 0 {
+            return Ok(());
+        }
+
         // Linux fuse_flush() drains inode writeback even when this particular
         // descriptor is read-only: another writable open may have admitted
         // dirty data for the same inode.
-        let writeback_cache = self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
-        let _barrier = writeback_cache.then(|| self.writeback_barrier.write());
-        let writeback_result = if writeback_cache {
-            self.sync_dirty_cached_pages()
-        } else {
-            Ok(())
-        };
-        let wb_error_result = self.check_and_advance_open_wb_error(data);
-
+        let barrier = self.writeback_barrier.write();
+        // Linux fuse_flush() calls write_inode_now() in both cache modes. This
+        // matters when a shared mapping dirtied a cached page while the file
+        // descriptor is being closed, even without WRITEBACK_CACHE.
+        let writeback_result = self.sync_dirty_cached_pages_admitted(&barrier);
+        // Linux leaves NOWRITE after fuse_sync_writes(), before the blocking
+        // daemon FLUSH request. WRITE-before-FLUSH is already guaranteed by
+        // the synchronous drain, so retaining the barrier would only block new
+        // dirty admission and expose a notify/daemon reverse-wait cycle.
+        drop(barrier);
         writeback_result?;
-        wb_error_result?;
+        self.check_and_advance_open_wb_error(data)?;
 
-        if data.no_open || (data.fopen_flags & FOPEN_NOFLUSH) != 0 || self.conn().no_flush() {
+        // FOPEN_NOFLUSH only suppresses FLUSH when writeback-cache is disabled.
+        // With writeback-cache Linux must still send FLUSH after draining dirty
+        // pages so daemon-side flush/lock semantics and errors are preserved.
+        if self.conn().no_flush() {
             return Ok(());
         }
 
@@ -612,7 +1026,7 @@ impl FuseNode {
         Err(SystemError::EIO)
     }
 
-    fn writeback_page_with_handle(
+    fn writeback_pages_with_handle(
         &self,
         page_index: usize,
         buf: &[u8],
@@ -672,13 +1086,29 @@ impl FuseNode {
             if out.size as usize != chunk {
                 return Err(SystemError::EIO);
             }
+            self.check_not_stale()?;
+            let reply_generation = self.generation();
+            if handle.open_context.node_generation != 0
+                && reply_generation != 0
+                && handle.open_context.node_generation != reply_generation
+            {
+                return Err(SystemError::ESTALE);
+            }
             total += chunk;
         }
 
         Ok(total)
     }
 
-    fn set_open_private_data(
+    fn writeback_page_with_handle(
+        &self,
+        page_index: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.writeback_pages_with_handle(page_index, buf)
+    }
+
+    pub(super) fn set_open_private_data(
         &self,
         data: &mut FilePrivateData,
         opcode: u32,
@@ -710,6 +1140,7 @@ impl FuseNode {
         } else {
             None
         };
+        let io_config = FuseOpenIoConfig::snapshot(&self.conn);
         *data = match opcode {
             FUSE_OPEN => FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
                 conn: conn_any,
@@ -720,7 +1151,10 @@ impl FuseNode {
                 no_open,
                 open_context,
                 writeback_handle,
-                readahead_state: Arc::new(Mutex::new(FileReadaheadState::new())),
+                io_config,
+                readahead_state: Arc::new(crate::libs::spinlock::SpinLock::new(
+                    FileReadaheadState::new(),
+                )),
                 lifetime: Arc::new(FuseOpenLifetime::new()),
             })),
             FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
@@ -732,7 +1166,10 @@ impl FuseNode {
                 no_open,
                 open_context,
                 writeback_handle: None,
-                readahead_state: Arc::new(Mutex::new(FileReadaheadState::new())),
+                io_config,
+                readahead_state: Arc::new(crate::libs::spinlock::SpinLock::new(
+                    FileReadaheadState::new(),
+                )),
                 lifetime: Arc::new(FuseOpenLifetime::new()),
             })),
             _ => return Err(SystemError::EINVAL),
@@ -740,7 +1177,7 @@ impl FuseNode {
         Ok(())
     }
 
-    fn finish_open_cache_state(
+    pub(super) fn finish_open_cache_state(
         &self,
         opcode: u32,
         flags: &FileFlags,
@@ -775,6 +1212,29 @@ impl FuseNode {
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        let atomic_dax_truncate = opcode == FUSE_OPEN
+            && flags.contains(FileFlags::O_TRUNC)
+            && self
+                .conn
+                .has_init_flag(super::super::protocol::FUSE_ATOMIC_O_TRUNC)
+            && self.dax_active();
+        if atomic_dax_truncate {
+            self.sync_dirty_cached_pages()?;
+        }
+        let dax_truncate_layout = if atomic_dax_truncate {
+            Some(self.dax_layout_write_for_all()?)
+        } else {
+            None
+        };
+        if atomic_dax_truncate {
+            // Close dirty admission between the optimistic drain and layout
+            // exclusivity before OPEN can atomically change the host file.
+            self.sync_dirty_cached_pages_admitted(
+                dax_truncate_layout
+                    .as_ref()
+                    .expect("atomic DAX truncate guard"),
+            )?;
+        }
         let file_flags = flags.bits();
         if self.conn.should_skip_open(opcode) {
             self.finish_open_cache_state(opcode, flags, FOPEN_KEEP_CACHE)?;
@@ -912,7 +1372,7 @@ impl FuseNode {
         file_flags: u32,
         lock_owner: u64,
     ) -> Result<usize, SystemError> {
-        let max_read = core::cmp::min(self.conn().max_read(), self.max_pages_bytes());
+        let max_read = self.conn().effective_read_payload_limit();
         if max_read == 0 {
             return Err(SystemError::EIO);
         }
@@ -1001,23 +1461,28 @@ impl FuseNode {
         end_page: usize,
         demand_end_page: usize,
         file_ctx: &FillPagesFileCtx,
-    ) -> Result<(usize, Option<usize>), SystemError> {
+    ) -> Result<(usize, Option<usize>, Option<SystemError>), SystemError> {
         if start_page >= end_page || file_ctx.file_size == 0 {
-            return Ok((0, None));
+            return Ok((0, None, None));
         }
 
-        let max_read = self.conn().max_read();
-        let max_pages_by_read = core::cmp::max(1, max_read >> MMArch::PAGE_SHIFT);
+        let max_read = file_ctx.io_config.max_read;
+        let max_pages_by_read = max_pages_for_read(max_read);
+        if max_pages_by_read == 0 {
+            return Err(SystemError::EIO);
+        }
         let max_pages = core::cmp::max(
             1,
-            core::cmp::min(max_pages_by_read, self.conn().max_pages()),
+            core::cmp::min(max_pages_by_read, file_ctx.io_config.max_pages),
         );
         let mut total_read = 0usize;
         let truncate_eof = None;
         let mut pending_reads = Vec::new();
-        let mut submission_error = None;
+        let mut first_error = None;
+        let mut interrupted = false;
         let observed_attr_version = self.attr_version();
         let mut submitted_requests = 0usize;
+        let async_read = file_ctx.io_config.async_read;
 
         let mut idx = start_page;
         while idx < end_page {
@@ -1054,20 +1519,26 @@ impl FuseNode {
             }
 
             let speculative = run_start >= demand_end_page;
-            let target = match page_cache
-                .manager()
-                .reserve_read_dma(run_start, run_end - run_start)
-            {
+            let track_direct_read_stats = super::super::stats::optional_read_stats_enabled();
+            let target = match page_cache.manager().reserve_read_dma(
+                run_start,
+                run_end - run_start,
+                track_direct_read_stats,
+            ) {
                 Ok(target) => Arc::new(target),
                 Err(SystemError::EEXIST) => {
+                    super::super::stats::on_readahead_reservation_conflict();
                     if speculative {
                         // The foreground read has no dependency on a conflicting
                         // speculative window. Do not inherit its latency or error.
                         break;
                     }
-                    // A concurrent reader won the reservation race. Wait for its first page to
-                    // leave Loading, then rebuild the missing run from current cache state.
-                    drop(page_cache.manager().commit_page(run_start)?);
+                    // A concurrent reader won the reservation race. Wait for an
+                    // entry that actually conflicts with this range, then
+                    // rebuild the missing run from current cache state. The
+                    // conflict can disappear before lookup; that also just
+                    // requires rediscovery, never insertion at `run_start`.
+                    let _ = page_cache.wait_read_dma_conflict(run_start, run_end - run_start)?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1084,25 +1555,37 @@ impl FuseNode {
             let Some(open_pin) = file_ctx.lifetime.try_pin() else {
                 let _ = target.rollback(SystemError::EIO);
                 if !speculative {
-                    submission_error = Some(SystemError::EIO);
+                    first_error = Some(SystemError::EIO);
                 }
                 break;
             };
-            let pending = self.conn().enqueue_background_read_pages(
-                self.nodeid,
-                fuse_pack_struct(&read_in),
-                FuseRequestCred::from_current(),
-                speculative,
-                BackgroundReadPagesCtx {
-                    destination: target.clone(),
-                    node: self.self_ref.clone(),
-                    start_page: run_start,
-                    requested: read_len,
-                    observed_size: file_ctx.file_size,
-                    observed_attr_version,
-                    open_pin,
-                },
-            );
+            let read_ctx = BackgroundReadPagesCtx {
+                destination: target.clone(),
+                node: self.self_ref.clone(),
+                start_page: run_start,
+                requested: read_len,
+                observed_size: file_ctx.file_size,
+                observed_attr_version,
+                open_pin,
+            };
+            let pending = if async_read {
+                self.conn().enqueue_background_read_pages(
+                    self.nodeid,
+                    fuse_pack_struct(&read_in),
+                    FuseRequestCred::from_current(),
+                    speculative,
+                    read_ctx,
+                )
+            } else {
+                self.conn()
+                    .enqueue_synchronous_read_pages(
+                        self.nodeid,
+                        fuse_pack_struct(&read_in),
+                        FuseRequestCred::from_current(),
+                        read_ctx,
+                    )
+                    .map(Some)
+            };
             let pending = match pending {
                 Ok(Some(pending)) => pending,
                 Ok(None) => {
@@ -1112,20 +1595,42 @@ impl FuseNode {
                 Err(error) => {
                     let _ = target.rollback(error.clone());
                     if !speculative {
-                        submission_error = Some(error);
+                        first_error = Some(error);
                     }
                     break;
                 }
             };
             submitted_requests += 1;
-            if !speculative {
+            if !async_read {
+                let (result, was_interrupted) = self.conn().wait_background_read_pages(&pending);
+                interrupted |= was_interrupted;
+                match result {
+                    Ok(FuseReadPagesReply::Direct { bytes }) if bytes <= read_len => {
+                        total_read += bytes.div_ceil(MMArch::PAGE_SIZE);
+                    }
+                    Ok(FuseReadPagesReply::Contiguous(reply)) if reply.len() <= read_len => {
+                        total_read += reply.len().div_ceil(MMArch::PAGE_SIZE);
+                    }
+                    Ok(_) => {
+                        first_error = Some(SystemError::EIO);
+                        break;
+                    }
+                    Err(error) => {
+                        if !speculative {
+                            first_error = Some(error);
+                        }
+                        break;
+                    }
+                }
+                if interrupted {
+                    break;
+                }
+            } else if !speculative {
                 pending_reads.push((read_len, pending));
             }
             idx = run_end;
         }
 
-        let mut first_error = submission_error;
-        let mut interrupted = false;
         super::super::stats::on_readahead_batch(
             end_page.saturating_sub(start_page),
             submitted_requests,
@@ -1156,13 +1661,19 @@ impl FuseNode {
         }
 
         if let Some(error) = first_error {
+            if should_defer_foreground_read_error(async_read, total_read) {
+                return Ok((total_read, truncate_eof, Some(error)));
+            }
             return Err(error);
         }
         if interrupted {
+            if should_defer_foreground_read_error(async_read, total_read) {
+                return Ok((total_read, truncate_eof, Some(SystemError::EINTR)));
+            }
             return Err(SystemError::EINTR);
         }
 
-        Ok((total_read, truncate_eof))
+        Ok((total_read, truncate_eof, None))
     }
 
     pub(super) fn read_cached_with_open(
@@ -1171,12 +1682,11 @@ impl FuseNode {
         len: usize,
         buf: &mut [u8],
         open: &FuseOpenPrivateData,
+        file_size: usize,
     ) -> Result<usize, SystemError> {
         let fh = open.fh;
         let file_flags = open.open_flags;
         let ra_state = &open.readahead_state;
-        let md = self.cached_or_fetch_metadata()?;
-        let file_size = md.size.max(0) as usize;
         self.resolve_pending_short_read_truncate(file_size)?;
         if offset >= file_size || len == 0 {
             return Ok(0);
@@ -1191,50 +1701,60 @@ impl FuseNode {
         let max_window = core::cmp::max(
             1,
             core::cmp::min(
-                self.conn().max_readahead_pages(),
+                open.io_config.max_readahead_pages,
                 FileReadaheadState::new().ra_pages,
             ),
         );
-        let demand_pages = end_page_index - start_page_index + 1;
-        let readaround_pages = {
+        let demand_end_page = end_page_index + 1;
+        let demand_ready = page_cache.is_range_ready(start_page_index, demand_end_page);
+        let plan = {
             let mut state = ra_state.lock();
-            let sequential = start_page_index == 0 || state.first_sequential(start_page_index);
-            let pages = if sequential {
-                let base = core::cmp::max(demand_pages, state.size.max(1));
-                core::cmp::min(
-                    max_window,
-                    core::cmp::max(demand_pages, base.saturating_mul(2)),
-                )
-            } else {
-                demand_pages
-            };
-            state.start = start_page_index;
-            state.size = pages;
-            state.async_size = pages.saturating_sub(demand_pages);
-            state.prev_index = end_page_index as i64;
-            pages
+            let old_end = state.start.saturating_add(state.size);
+            let old_saturated = state.size >= max_window;
+            let plan = plan_fuse_readahead(
+                &mut state,
+                start_page_index,
+                demand_end_page,
+                demand_ready,
+                last_file_page + 1,
+                max_window,
+            );
+            let new_end = plan.fill.map(|(_, end)| end).unwrap_or(old_end);
+            super::super::stats::on_readahead_window_extension(
+                new_end.saturating_sub(core::cmp::max(old_end, demand_end_page)),
+                old_saturated,
+            );
+            plan
         };
-        let prefetch_end = core::cmp::min(
-            last_file_page + 1,
-            core::cmp::max(
-                end_page_index + 1,
-                start_page_index.saturating_add(readaround_pages),
-            ),
-        );
         let file_ctx = FillPagesFileCtx {
             file_size,
             fh,
             file_flags,
             lifetime: open.lifetime.clone(),
+            io_config: open.io_config,
         };
-        let (_, mut truncate_eof) = self.fill_page_cache_range_with_open(
-            &page_cache,
-            start_page_index,
-            prefetch_end,
-            end_page_index + 1,
-            &file_ctx,
-        )?;
+        let mut truncate_eof = None;
+        let mut delayed_error = None;
+        if let Some((fill_start, fill_end)) = plan.fill {
+            let (_, observed_eof, fill_error) = self.fill_page_cache_range_with_open(
+                &page_cache,
+                fill_start,
+                fill_end,
+                plan.demand_end_for_wait,
+                &file_ctx,
+            )?;
+            truncate_eof = observed_eof;
+            delayed_error = fill_error;
+        }
         let observed_attr_version = self.attr_version();
+        // All demand READ completions are visible before this point and the
+        // invalidate read lock excludes page-cache truncation.  Snapshot i_size
+        // once for the copy loop: taking the inode metadata mutex once per page
+        // made cached 4 KiB reads orders of magnitude slower than other filesystems.
+        let mut copy_visible_size = self
+            .cached_metadata_snapshot()
+            .map(|md| md.size.max(0) as usize)
+            .unwrap_or(file_size);
 
         let mut dst_offset = 0usize;
         for page_index in start_page_index..=end_page_index {
@@ -1248,13 +1768,23 @@ impl FuseNode {
             }
 
             let mut filled_len = None;
-            let page = page_cache
-                .manager()
-                .commit_page_with(page_index, |idx, dst| {
-                    let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
-                    filled_len = Some(read_len);
-                    Ok(read_len)
-                })?;
+            let page = if let Some(page) = page_cache.get_ready_page(page_index) {
+                page
+            } else if delayed_error.is_some() {
+                // A synchronous multi-chunk READ already failed after
+                // publishing a contiguous prefix. Do not retry the failed
+                // chunk here; return the copied prefix and defer the error to
+                // a later read, as generic_file_read_iter() does.
+                break;
+            } else {
+                page_cache
+                    .manager()
+                    .commit_page_with(page_index, |idx, dst| {
+                        let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
+                        filled_len = Some(read_len);
+                        Ok(read_len)
+                    })?
+            };
 
             let mut copy_end = copy_end;
             if let Some(read_len) = filled_len {
@@ -1269,14 +1799,11 @@ impl FuseNode {
                     if should_truncate {
                         truncate_eof = Some(eof);
                     }
+                    copy_visible_size = core::cmp::min(copy_visible_size, eof);
                 }
             }
 
-            let current_size = self
-                .cached_metadata_snapshot()
-                .map(|md| md.size.max(0) as usize)
-                .unwrap_or(file_size);
-            copy_end = core::cmp::min(copy_end, current_size);
+            copy_end = core::cmp::min(copy_end, copy_visible_size);
             if copy_start >= copy_end {
                 break;
             }
@@ -1290,12 +1817,19 @@ impl FuseNode {
             }
             dst_offset += copy_len;
 
-            if (!self.conn().has_init_flag(FUSE_WRITEBACK_CACHE)
+            if (!open.io_config.writeback_cache
                 && filled_len.is_some_and(|read_len| read_len < MMArch::PAGE_SIZE))
-                || current_size <= page_end
+                || copy_visible_size <= page_end
             {
                 break;
             }
+        }
+        if self.attr_version() != observed_attr_version {
+            let latest_size = self
+                .cached_metadata_snapshot()
+                .map(|md| md.size.max(0) as usize)
+                .unwrap_or(copy_visible_size);
+            dst_offset = core::cmp::min(dst_offset, latest_size.saturating_sub(offset));
         }
         drop(_invalidate);
 
@@ -1305,6 +1839,12 @@ impl FuseNode {
                 Some(md) if md.size.max(0) as usize == eof
             ) {
                 self.truncate_page_cache(eof)?;
+            }
+        }
+
+        if dst_offset == 0 {
+            if let Some(error) = delayed_error {
+                return Err(error);
             }
         }
 
@@ -1386,13 +1926,18 @@ impl FuseNode {
         }
 
         let page_cache = self.ensure_page_cache()?;
-        let max_pages_by_read = core::cmp::max(1, self.conn().max_read() >> MMArch::PAGE_SHIFT);
-        let max_pages_by_conn = core::cmp::min(max_pages_by_read, self.conn().max_pages());
+        let _invalidate = page_cache.invalidate_read();
+        let io_config = FuseOpenIoConfig::snapshot(&self.conn);
+        let max_pages_by_read = max_pages_for_read(io_config.max_read);
+        if max_pages_by_read == 0 {
+            return Err(SystemError::EIO);
+        }
+        let max_pages_by_conn = core::cmp::min(max_pages_by_read, io_config.max_pages);
         let max_pages = core::cmp::max(
             1,
             core::cmp::min(
                 ra_state.ra_pages,
-                core::cmp::min(max_pages_by_conn, self.conn().max_readahead_pages()),
+                core::cmp::min(max_pages_by_conn, io_config.max_readahead_pages),
             ),
         );
         let pages_to_read = core::cmp::min(max_pages, core::cmp::max(req_pages, 16));
@@ -1403,14 +1948,22 @@ impl FuseNode {
             fh,
             file_flags,
             lifetime,
+            io_config,
         };
-        let (total_read, truncate_eof) = self.fill_page_cache_range_with_open(
+        let (total_read, truncate_eof, delayed_error) = self.fill_page_cache_range_with_open(
             &page_cache,
             page_index,
             end_page,
             page_index.saturating_add(req_pages),
             &file_ctx,
         )?;
+        drop(_invalidate);
+        if let Some(error) = delayed_error {
+            let demand_end = page_index.saturating_add(req_pages);
+            if !page_cache.is_range_ready(page_index, demand_end) {
+                return Err(error);
+            }
+        }
 
         if let Some(eof) = truncate_eof {
             if matches!(
@@ -1555,6 +2108,7 @@ impl FuseNode {
         len: usize,
         data: &FuseOpenPrivateData,
         discard_clean: bool,
+        _guard: &RwSemWriteGuard<'_, ()>,
     ) -> Result<(), SystemError> {
         let Some((start_page_index, end_page_index, end_page_exclusive)) =
             Self::direct_io_page_range(offset, len)?
@@ -1565,12 +2119,11 @@ impl FuseNode {
             return Ok(());
         };
 
-        page_cache
-            .manager()
-            .writeback_range(start_page_index, end_page_index)?;
-        page_cache
-            .manager()
-            .wait_writeback_range(start_page_index, end_page_index)?;
+        page_cache.manager().sync_range_with_stable_size(
+            start_page_index,
+            end_page_index,
+            self.stable_writeback_size()?,
+        )?;
         self.check_and_advance_open_wb_error(data)?;
 
         if discard_clean {
@@ -1581,5 +2134,159 @@ impl FuseNode {
                 .discard_clean_range(start_page_index, end_page_index)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod readahead_tests {
+    use super::*;
+
+    fn state(start: usize, size: usize, async_size: usize) -> FileReadaheadState {
+        FileReadaheadState {
+            start,
+            size,
+            async_size,
+            ra_pages: 128,
+            prev_index: -1,
+        }
+    }
+
+    #[test]
+    fn initial_miss_builds_one_clipped_window() {
+        let mut ra = FileReadaheadState::new();
+        let plan = plan_fuse_readahead(&mut ra, 0, 1, false, 3, 128);
+        assert_eq!(plan.event, FuseReadaheadEvent::SyncMissAtExpected);
+        assert_eq!(plan.fill, Some((0, 3)));
+        assert_eq!((ra.start, ra.size, ra.async_size), (0, 3, 2));
+    }
+
+    #[test]
+    fn ordinary_hits_do_not_slide_or_fill_the_window() {
+        let original = state(4, 16, 16);
+        let mut ra = original.clone();
+        let plan = plan_fuse_readahead(&mut ra, 2, 3, true, 1024, 128);
+        assert_eq!(plan.event, FuseReadaheadEvent::OrdinaryHit);
+        assert_eq!(plan.fill, None);
+        assert_eq!((ra.start, ra.size, ra.async_size), (4, 16, 16));
+    }
+
+    #[test]
+    fn async_boundary_advances_to_a_non_overlapping_window() {
+        let mut ra = state(0, 4, 3);
+        let plan = plan_fuse_readahead(&mut ra, 1, 2, true, 1024, 128);
+        assert_eq!(plan.event, FuseReadaheadEvent::AsyncBoundary);
+        assert_eq!(plan.fill, Some((4, 20)));
+        assert_eq!((ra.start, ra.size, ra.async_size), (4, 16, 16));
+    }
+
+    #[test]
+    fn random_access_after_async_boundary_does_not_advance_window() {
+        let mut hit = state(0, 128, 64);
+        let hit_plan = plan_fuse_readahead(&mut hit, 100, 101, true, 1024, 128);
+        assert_eq!(hit_plan.event, FuseReadaheadEvent::OrdinaryHit);
+        assert_eq!(hit_plan.fill, None);
+
+        let mut miss = state(0, 128, 64);
+        let miss_plan = plan_fuse_readahead(&mut miss, 100, 101, false, 1024, 128);
+        assert_eq!(miss_plan.event, FuseReadaheadEvent::RandomMiss);
+        assert_eq!(miss_plan.fill, Some((100, 101)));
+    }
+
+    #[test]
+    fn multi_page_read_that_contains_boundary_advances_once() {
+        let mut ra = state(0, 128, 64);
+        let plan = plan_fuse_readahead(&mut ra, 60, 68, true, 1024, 128);
+        assert_eq!(plan.event, FuseReadaheadEvent::AsyncBoundary);
+        assert_eq!(plan.fill, Some((128, 256)));
+    }
+
+    #[test]
+    fn random_miss_repairs_only_demand_without_polluting_window() {
+        let mut ra = state(4, 16, 16);
+        let plan = plan_fuse_readahead(&mut ra, 200, 202, false, 1024, 128);
+        assert_eq!(plan.event, FuseReadaheadEvent::RandomMiss);
+        assert_eq!(plan.fill, Some((200, 202)));
+        assert_eq!((ra.start, ra.size, ra.async_size), (4, 16, 16));
+    }
+
+    #[test]
+    fn second_adjacent_miss_after_random_access_restarts_a_window() {
+        let mut ra = state(4, 16, 16);
+        let first = plan_fuse_readahead(&mut ra, 200, 201, false, 1024, 128);
+        assert_eq!(first.event, FuseReadaheadEvent::RandomMiss);
+        let second = plan_fuse_readahead(&mut ra, 201, 202, false, 1024, 128);
+        assert_eq!(second.event, FuseReadaheadEvent::SyncMissAtExpected);
+        assert_eq!(second.fill, Some((201, 205)));
+        assert_eq!((ra.start, ra.size, ra.async_size), (201, 4, 3));
+    }
+
+    #[test]
+    fn same_page_retry_after_random_miss_stays_random() {
+        let mut ra = state(4, 16, 16);
+        let first = plan_fuse_readahead(&mut ra, 200, 201, false, 1024, 128);
+        assert_eq!(first.event, FuseReadaheadEvent::RandomMiss);
+        let retry = plan_fuse_readahead(&mut ra, 200, 201, false, 1024, 128);
+        assert_eq!(retry.event, FuseReadaheadEvent::RandomMiss);
+        assert_eq!(retry.fill, Some((200, 201)));
+        assert_eq!((ra.start, ra.size, ra.async_size), (4, 16, 16));
+    }
+
+    #[test]
+    fn reverse_adjacent_miss_after_random_access_stays_random() {
+        let mut ra = state(4, 16, 16);
+        let first = plan_fuse_readahead(&mut ra, 200, 201, false, 1024, 128);
+        assert_eq!(first.event, FuseReadaheadEvent::RandomMiss);
+        let reverse = plan_fuse_readahead(&mut ra, 199, 200, false, 1024, 128);
+        assert_eq!(reverse.event, FuseReadaheadEvent::RandomMiss);
+        assert_eq!(reverse.fill, Some((199, 200)));
+        assert_eq!((ra.start, ra.size, ra.async_size), (4, 16, 16));
+    }
+
+    #[test]
+    fn max_read_page_limit_only_counts_complete_dma_pages() {
+        assert_eq!(max_pages_for_read(0), 0);
+        assert_eq!(max_pages_for_read(MMArch::PAGE_SIZE - 1), 0);
+        assert_eq!(max_pages_for_read(MMArch::PAGE_SIZE), 1);
+        assert_eq!(max_pages_for_read(MMArch::PAGE_SIZE + 1), 1);
+        assert_eq!(max_pages_for_read(2 * MMArch::PAGE_SIZE), 2);
+        assert!(
+            max_pages_for_read(2 * MMArch::PAGE_SIZE - 1) * MMArch::PAGE_SIZE
+                <= 2 * MMArch::PAGE_SIZE - 1
+        );
+    }
+
+    #[test]
+    fn synchronous_foreground_error_is_deferred_after_ready_prefix() {
+        assert!(!should_defer_foreground_read_error(false, 0));
+        assert!(should_defer_foreground_read_error(false, 1));
+        assert!(should_defer_foreground_read_error(false, 17));
+    }
+
+    #[test]
+    fn asynchronous_read_error_is_never_converted_to_partial_success() {
+        assert!(!should_defer_foreground_read_error(true, 0));
+        assert!(!should_defer_foreground_read_error(true, 1));
+    }
+
+    #[test]
+    fn saturated_sequential_reads_extend_only_at_window_boundaries() {
+        let mut ra = state(0, 128, 128);
+        let mut fills = Vec::new();
+        for page in 0..256 {
+            let plan = plan_fuse_readahead(&mut ra, page, page + 1, true, 4096, 128);
+            if let Some(fill) = plan.fill {
+                fills.push(fill);
+            }
+        }
+        assert_eq!(fills, [(128, 256)]);
+    }
+
+    #[test]
+    fn eof_and_usize_boundaries_do_not_overflow() {
+        let start = usize::MAX - 2;
+        let mut ra = FileReadaheadState::new();
+        let plan = plan_fuse_readahead(&mut ra, start, usize::MAX, false, usize::MAX, usize::MAX);
+        assert_eq!(plan.fill, Some((start, usize::MAX)));
+        assert_eq!(ra.size, 2);
     }
 }

@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FUSE_TEST_LOG_PREFIX "[fuse-test] "
@@ -172,6 +173,9 @@ static inline int fuse_test_log_enabled(void) {
 #endif
 
 /* INIT flags (subset) */
+#ifndef FUSE_ASYNC_READ
+#define FUSE_ASYNC_READ (1u << 0)
+#endif
 #ifndef FUSE_INIT_EXT
 #define FUSE_INIT_EXT (1u << 30)
 #endif
@@ -716,6 +720,7 @@ struct fuse_daemon_args {
     uint32_t root_open_out_flags;
     uint32_t hello_open_out_flags;
     volatile uint32_t *dynamic_hello_open_out_flags;
+    volatile uint32_t *dynamic_open_out_flags;
     volatile unsigned char *dynamic_hello_first_byte;
     volatile size_t *dynamic_hello_read_size;
     volatile size_t *dynamic_hello_byte_offset;
@@ -732,12 +737,15 @@ struct fuse_daemon_args {
     volatile uint32_t *access_count;
     volatile uint32_t *lookup_count;
     volatile uint32_t *flush_count;
+    volatile uint32_t *write_count_at_flush;
     volatile uint32_t *last_flush_uid;
     volatile uint32_t *last_flush_gid;
     volatile uint32_t *last_flush_pid;
     volatile uint32_t *fsync_count;
     volatile uint32_t *fsyncdir_count;
     volatile uint32_t *create_count;
+    volatile uint64_t *last_create_nodeid;
+    volatile uint32_t *mknod_count;
     volatile uint32_t *rename2_count;
     volatile uint32_t *open_count;
     volatile uint32_t *opendir_count;
@@ -752,6 +760,9 @@ struct fuse_daemon_args {
     volatile uint64_t *last_setattr_fh;
     volatile uint64_t *last_setattr_size;
     volatile uint64_t *last_setattr_lock_owner;
+    // UINT64_MAX means no override.  Tests use this to model a daemon-side
+    // size shrink observed by GETATTR without issuing a local SETATTR first.
+    volatile uint64_t *getattr_size_override;
     volatile uint64_t *last_fallocate_fh;
     volatile uint64_t *last_fallocate_offset;
     volatile uint64_t *last_fallocate_length;
@@ -762,8 +773,10 @@ struct fuse_daemon_args {
     volatile uint32_t *read_count;
     volatile uint32_t *write_count;
     volatile uint32_t *last_open_in_flags;
+    volatile uint32_t *last_create_in_flags;
     volatile uint32_t *last_release_in_flags;
     volatile uint64_t *last_open_fh;
+    volatile uint64_t *last_flush_fh;
     volatile uint32_t *last_open_pid;
     volatile uint64_t *last_read_fh;
     volatile uint32_t *last_read_size;
@@ -783,7 +796,17 @@ struct fuse_daemon_args {
     volatile unsigned char *write_watch_bytes;
     volatile unsigned char *write_covers_watch;
     volatile unsigned char *backend_watch_byte;
+    unsigned char *large_write_backing;
+    size_t large_write_backing_capacity;
+    volatile uint64_t *large_write_nodeid;
     uint32_t write_trace_capacity;
+    volatile int *forced_write_errno;
+    volatile uint64_t *forced_write_offset;
+    volatile uint64_t *forced_short_write_offset;
+    volatile uint32_t *forced_short_write_size;
+    volatile uint64_t *block_write_offset;
+    volatile int *write_entered;
+    volatile int *release_write;
     volatile uint64_t *last_fsync_fh;
     volatile uint32_t *write_count_at_fsync;
     volatile uint32_t *last_write_flags_at_fsync;
@@ -812,6 +835,8 @@ struct fuse_daemon_args {
     uint64_t next_open_fh;
     uint64_t create_reuse_nodeid;
     uint64_t create_generation_override;
+    uint64_t create_open_fh_override;
+    uint32_t create_reply_mode_override;
     uint64_t link_generation_override;
     uint64_t hello_generation_override;
     const char *readdirplus_invalid_attr_name;
@@ -821,6 +846,7 @@ struct fuse_daemon_args {
     int allow_rename_replace;
     int has_hello_open_fh_override;
     int force_open_enosys;
+    int force_create_errno;
     int force_opendir_enosys;
     int force_flush_errno;
     int force_fsync_errno;
@@ -831,6 +857,17 @@ struct fuse_daemon_args {
     int block_read_until_interrupt;
     int defer_first_read_reply;
     volatile int *saw_pipelined_read;
+    pthread_mutex_t *first_read_gate_mutex;
+    pthread_cond_t *first_read_gate_cond;
+    int *first_read_captured;
+    int *first_read_gate_state;
+    int *daemon_waiting_after_first_read;
+    int *saw_read_before_first_reply;
+    int *first_read_reply_result;
+    int has_forced_read_error;
+    int forced_read_errno;
+    int forced_read_error_once;
+    uint64_t forced_read_error_offset;
     uint64_t deferred_read_unique;
     uint64_t deferred_read_offset;
     uint32_t deferred_read_size;
@@ -1033,6 +1070,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct fuse_attr_out out;
         memset(&out, 0, sizeof(out));
         simplefs_fill_attr(node, &out.attr);
+        if (a->getattr_size_override && *a->getattr_size_override != UINT64_MAX) {
+            out.attr.size = *a->getattr_size_override;
+            out.attr.blocks = (out.attr.size + 511) / 512;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
     case FUSE_OPENDIR:
@@ -1072,7 +1113,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (h->opcode == FUSE_OPEN && (in->flags & O_TRUNC)) {
             node->size = 0;
         }
-        if (h->opcode == FUSE_OPEN && h->nodeid == 2 && a->dynamic_hello_open_out_flags) {
+        if (h->opcode == FUSE_OPEN && a->dynamic_open_out_flags) {
+            node->open_out_flags = *a->dynamic_open_out_flags;
+        } else if (h->opcode == FUSE_OPEN && h->nodeid == 2 &&
+                   a->dynamic_hello_open_out_flags) {
             node->open_out_flags = *a->dynamic_hello_open_out_flags;
         }
         struct fuse_open_out out;
@@ -1138,7 +1182,22 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 a->read_sizes[read_index] = in->size;
             }
         }
+        if (a->has_forced_read_error && in->offset == a->forced_read_error_offset) {
+            int forced_errno = a->forced_read_errno ? a->forced_read_errno : EIO;
+            if (a->forced_read_error_once) {
+                a->has_forced_read_error = 0;
+            }
+            return fuse_write_reply(a->fd, h->unique, -forced_errno, NULL, 0);
+        }
         size_t effective_size = node->size;
+        const unsigned char *read_backing = node->data;
+        if (a->large_write_backing && a->large_write_nodeid &&
+            *a->large_write_nodeid == h->nodeid) {
+            effective_size = node->size < a->large_write_backing_capacity
+                                 ? node->size
+                                 : a->large_write_backing_capacity;
+            read_backing = a->large_write_backing;
+        }
         int generated_hello = h->nodeid == 2 && a->hello_generated_size_override > 0;
         if (generated_hello) {
             effective_size = a->hello_generated_size_override;
@@ -1165,6 +1224,17 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         size_t to_copy = in->size;
         if (to_copy > remain) {
             to_copy = remain;
+        }
+        if (generated_hello && a->first_read_gate_mutex && read_index == 0) {
+            pthread_mutex_lock(a->first_read_gate_mutex);
+            a->deferred_read_unique = h->unique;
+            a->deferred_read_offset = in->offset;
+            a->deferred_read_size = (uint32_t)to_copy;
+            __atomic_store_n(a->first_read_gate_state, 0, __ATOMIC_RELEASE);
+            *a->first_read_captured = 1;
+            pthread_cond_broadcast(a->first_read_gate_cond);
+            pthread_mutex_unlock(a->first_read_gate_mutex);
+            return 0;
         }
         if (generated_hello && a->defer_first_read_reply) {
             if (a->deferred_read_unique == 0) {
@@ -1214,7 +1284,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             free(generated);
             return ret;
         }
-        return fuse_write_reply(a->fd, h->unique, 0, node->data + in->offset, to_copy);
+        return fuse_write_reply(a->fd, h->unique, 0, read_backing + in->offset, to_copy);
     }
     case FUSE_READDIR:
     case FUSE_READDIRPLUS: {
@@ -1252,6 +1322,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 memset(&dp, 0, sizeof(dp));
                 dp.entry_out.nodeid = 1;
                 dp.entry_out.generation = a->fs.nodes[0].generation;
+                dp.entry_out.entry_valid = a->entry_valid_sec;
+                dp.entry_out.attr_valid = a->attr_valid_sec;
                 simplefs_fill_attr(&a->fs.nodes[0], &dp.entry_out.attr);
                 dp.dirent.ino = 1;
                 dp.dirent.off = idx + 1;
@@ -1277,7 +1349,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         uint64_t cur = idx;
         for (int i = 0; i < SIMPLEFS_MAX_NODES; i++) {
             struct simplefs_node *c = &a->fs.nodes[i];
-            if (!c->used || c->parent != h->nodeid)
+            if (!c->used || c->nodeid == h->nodeid || c->parent != h->nodeid)
                 continue;
             if (cur < child_base) {
                 cur = child_base;
@@ -1297,6 +1369,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 memset(&dp, 0, sizeof(dp));
                 dp.entry_out.nodeid = c->nodeid;
                 dp.entry_out.generation = c->generation;
+                dp.entry_out.entry_valid = a->entry_valid_sec;
+                dp.entry_out.attr_valid = a->attr_valid_sec;
                 simplefs_fill_attr(c, &dp.entry_out.attr);
                 if (a->readdirplus_invalid_attr_name &&
                     strcmp(c->name, a->readdirplus_invalid_attr_name) == 0) {
@@ -1408,9 +1482,19 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     }
-    case FUSE_FLUSH:
+    case FUSE_FLUSH: {
+        if (payload_len < sizeof(struct fuse_flush_in)) {
+            return -1;
+        }
+        const struct fuse_flush_in *in = (const struct fuse_flush_in *)payload;
+        if (a->write_count_at_flush && a->write_count) {
+            *a->write_count_at_flush = *a->write_count;
+        }
         if (a->flush_count) {
             (*a->flush_count)++;
+        }
+        if (a->last_flush_fh) {
+            *a->last_flush_fh = in->fh;
         }
         if (a->last_flush_uid) {
             *a->last_flush_uid = h->uid;
@@ -1425,6 +1509,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return fuse_write_reply(a->fd, h->unique, -a->force_flush_errno, NULL, 0);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
     case FUSE_FSYNC: {
         if (payload_len < sizeof(struct fuse_fsync_in)) {
             return -1;
@@ -1494,7 +1579,25 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!node || simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
             return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
         }
-        if (in->offset >= SIMPLEFS_DATA_MAX) {
+        unsigned char *write_backing = node->data;
+        size_t write_capacity = SIMPLEFS_DATA_MAX;
+        if (a->large_write_backing && a->large_write_nodeid &&
+            ((*a->large_write_nodeid == h->nodeid) ||
+             (*a->large_write_nodeid == 0 &&
+              in->offset + in->size > SIMPLEFS_DATA_MAX))) {
+            if (*a->large_write_nodeid == 0 && in->offset > 0) {
+                size_t prefix = (size_t)in->offset;
+                if (prefix > SIMPLEFS_DATA_MAX)
+                    prefix = SIMPLEFS_DATA_MAX;
+                if (prefix > a->large_write_backing_capacity)
+                    prefix = a->large_write_backing_capacity;
+                memcpy(a->large_write_backing, node->data, prefix);
+            }
+            *a->large_write_nodeid = h->nodeid;
+            write_backing = a->large_write_backing;
+            write_capacity = a->large_write_backing_capacity;
+        }
+        if (in->offset >= write_capacity) {
             return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
         }
         uint32_t write_index = 0;
@@ -1526,8 +1629,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             *a->last_write_pid = h->pid;
         }
         size_t to_copy = in->size;
-        if (in->offset + to_copy > SIMPLEFS_DATA_MAX) {
-            to_copy = SIMPLEFS_DATA_MAX - (size_t)in->offset;
+        if (in->offset + to_copy > write_capacity) {
+            to_copy = write_capacity - (size_t)in->offset;
         }
         unsigned char watch_byte = 0;
         int covers_watch = 0;
@@ -1557,14 +1660,36 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 a->write_covers_watch[write_index] = covers_watch ? 1 : 0;
             }
         }
-        memcpy(node->data + in->offset, data, to_copy);
+        if (a->block_write_offset && a->write_entered && a->release_write &&
+            in->offset == *a->block_write_offset && !*a->release_write) {
+            __sync_synchronize();
+            *a->write_entered = 1;
+            __sync_synchronize();
+            while (!*a->release_write && (!a->stop || !*a->stop)) {
+                usleep(1000);
+            }
+        }
+        if (a->forced_write_errno && a->forced_write_offset &&
+            *a->forced_write_errno > 0 && in->offset == *a->forced_write_offset) {
+            if (a->write_count) {
+                __sync_synchronize();
+                (*a->write_count)++;
+            }
+            return fuse_write_reply(a->fd, h->unique, -*a->forced_write_errno, NULL, 0);
+        }
+        if (a->forced_short_write_offset && a->forced_short_write_size &&
+            in->offset == *a->forced_short_write_offset &&
+            *a->forced_short_write_size < to_copy) {
+            to_copy = *a->forced_short_write_size;
+        }
+        memcpy(write_backing + in->offset, data, to_copy);
         if (node->size < in->offset + to_copy) {
             node->size = (size_t)in->offset + to_copy;
         }
         if (a->backend_watch_byte) {
             uint64_t watch = a->write_watch_offset;
-            if (watch < node->size && watch < SIMPLEFS_DATA_MAX) {
-                *a->backend_watch_byte = node->data[watch];
+            if (watch < node->size && watch < write_capacity) {
+                *a->backend_watch_byte = write_backing[watch];
             }
         }
         if (a->write_count) {
@@ -1593,6 +1718,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->create_count) {
             (*a->create_count)++;
         }
+        if (a->last_create_in_flags) {
+            *a->last_create_in_flags = in->flags;
+        }
+        if (a->force_create_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -a->force_create_errno, NULL, 0);
+        }
         struct simplefs_node *p = simplefs_find_node(&a->fs, h->nodeid);
         if (!p || !simplefs_node_is_dir(p)) {
             return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
@@ -1615,10 +1746,14 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         nnode->is_dir = 0;
         nnode->is_symlink = 0;
         nnode->mode = in->mode;
-        nnode->open_fh = nnode->nodeid;
+        nnode->open_fh = a->create_open_fh_override != 0 ? a->create_open_fh_override
+                                                        : nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = 0;
+        if (a->last_create_nodeid) {
+            *a->last_create_nodeid = nnode->nodeid;
+        }
 
         struct {
             struct fuse_entry_out entry;
@@ -1628,6 +1763,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         out.entry.nodeid = nnode->nodeid;
         out.entry.generation = nnode->generation;
         simplefs_fill_attr(nnode, &out.entry.attr);
+        if (a->create_reply_mode_override != 0) {
+            out.entry.attr.mode = a->create_reply_mode_override;
+        }
         out.open_out.fh = nnode->open_fh;
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
@@ -1750,6 +1888,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         name = (const char *)(payload + name_off);
         if (name[payload_len - name_off - 1] != '\0')
             return -1;
+        if (!is_dir && a->mknod_count) {
+            (*a->mknod_count)++;
+        }
         if (simplefs_find_child(&a->fs, h->nodeid, name)) {
             return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
         }
@@ -2011,14 +2152,22 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!node || simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
             return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
         }
-        if (in->mode != 0) {
+        const uint32_t supported = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE;
+        if ((in->mode & ~supported) != 0 ||
+            ((in->mode & FALLOC_FL_PUNCH_HOLE) != 0 &&
+             (in->mode & FALLOC_FL_KEEP_SIZE) == 0) ||
+            ((in->mode & FALLOC_FL_PUNCH_HOLE) != 0 &&
+             (in->mode & FALLOC_FL_ZERO_RANGE) != 0)) {
             return fuse_write_reply(a->fd, h->unique, -EOPNOTSUPP, NULL, 0);
         }
         if (in->offset > SIMPLEFS_DATA_MAX || in->length > SIMPLEFS_DATA_MAX ||
             in->offset + in->length > SIMPLEFS_DATA_MAX) {
             return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
         }
-        if (node->size < in->offset + in->length) {
+        if ((in->mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) != 0) {
+            memset(node->data + in->offset, 0, in->length);
+        }
+        if ((in->mode & FALLOC_FL_KEEP_SIZE) == 0 && node->size < in->offset + in->length) {
             node->size = (size_t)(in->offset + in->length);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
@@ -2090,6 +2239,101 @@ static inline void *fuse_daemon_thread(void *arg) {
             continue;
         }
         (void)fuse_handle_one(a, buf, (size_t)n);
+        if (a->first_read_gate_mutex
+            && __atomic_load_n(a->first_read_gate_state, __ATOMIC_ACQUIRE) == 0) {
+            pthread_mutex_lock(a->first_read_gate_mutex);
+            *a->daemon_waiting_after_first_read = 1;
+            pthread_cond_broadcast(a->first_read_gate_cond);
+            pthread_mutex_unlock(a->first_read_gate_mutex);
+
+            struct pollfd pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = a->fd;
+            pfd.events = POLLIN;
+            ssize_t early_n = 0;
+            struct timespec deadline;
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
+            deadline.tv_nsec += 100 * 1000 * 1000;
+            if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000 * 1000 * 1000;
+            }
+            while (__atomic_load_n(a->first_read_gate_state, __ATOMIC_ACQUIRE) == 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long long remaining_ns = (deadline.tv_sec - now.tv_sec) * 1000000000LL
+                                       + deadline.tv_nsec - now.tv_nsec;
+                if (remaining_ns <= 0)
+                    break;
+                pfd.revents = 0;
+                int poll_rc = poll(&pfd, 1, (int)((remaining_ns + 999999) / 1000000));
+                if (poll_rc == 0)
+                    break;
+                if (poll_rc < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    __atomic_store_n(a->first_read_gate_state, 4, __ATOMIC_RELEASE);
+                    *a->first_read_reply_result = -errno;
+                    break;
+                }
+                if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
+                    || (pfd.revents & POLLIN) == 0) {
+                    __atomic_store_n(a->first_read_gate_state, 4, __ATOMIC_RELEASE);
+                    *a->first_read_reply_result = -EIO;
+                    break;
+                }
+                ssize_t observed_n = read(a->fd, buf, FUSE_TEST_BUF_SIZE);
+                if (observed_n < 0 && (errno == EINTR || errno == EAGAIN))
+                    continue;
+                if (observed_n <= 0
+                    || (size_t)observed_n < sizeof(struct fuse_in_header)) {
+                    __atomic_store_n(a->first_read_gate_state, 4, __ATOMIC_RELEASE);
+                    *a->first_read_reply_result = observed_n < 0 ? -errno : -EIO;
+                    break;
+                }
+                struct fuse_in_header *observed_h = (struct fuse_in_header *)buf;
+                if ((size_t)observed_n != observed_h->len) {
+                    __atomic_store_n(a->first_read_gate_state, 4, __ATOMIC_RELEASE);
+                    *a->first_read_reply_result = -EIO;
+                    break;
+                }
+                if (observed_h->opcode == FUSE_READ) {
+                    early_n = observed_n;
+                    __atomic_store_n(a->first_read_gate_state, 1, __ATOMIC_RELEASE);
+                    *a->saw_read_before_first_reply = 1;
+                    break;
+                }
+                (void)fuse_handle_one(a, buf, (size_t)observed_n);
+            }
+
+            if (__atomic_load_n(a->first_read_gate_state, __ATOMIC_ACQUIRE) != 4) {
+                int expected = 0;
+                (void)__atomic_compare_exchange_n(a->first_read_gate_state, &expected, 2, false,
+                                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                unsigned char *data = (unsigned char *)malloc(a->deferred_read_size);
+                int reply_ret;
+                if (data) {
+                    for (size_t i = 0; i < a->deferred_read_size; ++i)
+                        data[i] = (unsigned char)(
+                            'A' + ((a->deferred_read_offset + i) % 26));
+                    reply_ret = fuse_write_reply(a->fd, a->deferred_read_unique, 0, data,
+                                                 a->deferred_read_size);
+                    free(data);
+                } else {
+                    reply_ret = fuse_write_reply(a->fd, a->deferred_read_unique, -ENOMEM, NULL, 0);
+                }
+                expected = 2;
+                (void)__atomic_compare_exchange_n(a->first_read_gate_state, &expected,
+                                                  reply_ret == 0 ? 3 : 4, false,
+                                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                *a->first_read_reply_result = reply_ret;
+            }
+            pthread_mutex_lock(a->first_read_gate_mutex);
+            pthread_cond_broadcast(a->first_read_gate_cond);
+            pthread_mutex_unlock(a->first_read_gate_mutex);
+            if (early_n > 0)
+                (void)fuse_handle_one(a, buf, (size_t)early_n);
+        }
         if (a->exit_after_init && a->init_done && *a->init_done) {
             break;
         }

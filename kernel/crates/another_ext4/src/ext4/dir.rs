@@ -33,7 +33,7 @@ impl Ext4 {
     ) -> Result<DirBlockLayout> {
         let sb = self.read_super_block_cached();
         block.validate(
-            &sb.uuid(),
+            sb.metadata_checksum_seed(),
             dir.id,
             dir.inode.generation(),
             sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM),
@@ -59,12 +59,14 @@ impl Ext4 {
         }
         match layout {
             DirBlockLayout::Leaf => {
-                block.set_checksum(&sb.uuid(), dir.id, dir.inode.generation());
+                block.set_checksum(sb.metadata_checksum_seed(), dir.id, dir.inode.generation());
                 Ok(())
             }
-            DirBlockLayout::Htree => {
-                block.set_htree_checksum(&sb.uuid(), dir.id, dir.inode.generation())
-            }
+            DirBlockLayout::Htree => block.set_htree_checksum(
+                sb.metadata_checksum_seed(),
+                dir.id,
+                dir.inode.generation(),
+            ),
         }
     }
 

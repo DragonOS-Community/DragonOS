@@ -40,19 +40,12 @@ impl SetAttr {
 }
 
 impl Ext4 {
-    fn xattr_checksum_seed(&self) -> Result<Option<u32>> {
+    fn xattr_checksum_seed(&self) -> Result<Option<MetadataChecksumSeed>> {
         let sb = self.read_super_block_cached();
         if !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
             return Ok(None);
         }
-        // A seeded-checksum filesystem must use s_checksum_seed rather than
-        // CRC32C(UUID). Writable preflight rejects it, and direct xattr paths
-        // must fail closed as well instead of writing a mismatched checksum.
-        const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
-        if sb.has_incompatible_feature(FEATURE_INCOMPAT_CSUM_SEED) {
-            return Err(Ext4Error::new(ErrCode::ENOTSUP));
-        }
-        Ok(Some(crate::ext4_defs::crc::crc32(CRC32_INIT, &sb.uuid())))
+        Ok(Some(sb.metadata_checksum_seed()))
     }
 
     fn verify_xattr_block_checksum(&self, block_id: PBlockId, block: &XattrBlock) -> Result<()> {
@@ -920,7 +913,7 @@ impl Ext4 {
                 if existing_is_dir && !(child_is_dir && parent != new_parent) {
                     credits += 1; // target parent (new parent already counted above)
                 }
-                if final_target {
+                if final_target && self.uses_journal() {
                     credits += 1; // superblock orphan head
                 }
                 let mut transaction = self.transaction_start(credits)?;
@@ -974,8 +967,20 @@ impl Ext4 {
 
                 if final_target {
                     existing_inode.inode.set_link_count(0);
-                    let mut sb = self.read_super_block_cached();
-                    self.transaction_orphan_add(&mut transaction, &mut existing_inode, &mut sb)?;
+                    if self.uses_journal() {
+                        let mut sb = self.read_super_block_cached();
+                        self.transaction_orphan_add(
+                            &mut transaction,
+                            &mut existing_inode,
+                            &mut sb,
+                        )?;
+                    } else {
+                        existing_inode.inode.set_next_orphan(0);
+                        self.transaction_stage_inode_with_csum(
+                            &mut transaction,
+                            &mut existing_inode,
+                        )?;
+                    }
                 } else {
                     existing_inode.inode.set_link_count(existing_link_cnt - 1);
                     self.transaction_stage_inode_with_csum(&mut transaction, &mut existing_inode)?;
@@ -1542,7 +1547,12 @@ mod tests {
             namespace_lock: spin::Mutex::new(()),
             metadata_mutation_barrier: crate::ext4::MetadataMutationGate::new(),
             poisoned: spin::Mutex::new(None),
-            journal: None,
+            metadata_mode: crate::ext4::MetadataMutationMode::Direct(
+                crate::ext4::journal_transaction::DirectTransactionCore::new(block_count as u64)
+                    .unwrap(),
+            ),
+            write_barrier: true,
+            direct_restore_clean: false,
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
@@ -1834,7 +1844,8 @@ mod tests {
 
     fn load_failing_test_fs() -> (Arc<FailingBlockDevice>, Ext4) {
         let block_device = Arc::new(FailingBlockDevice::new());
-        let fs = Ext4::load(block_device.clone()).unwrap();
+        let mut fs = Ext4::load(block_device.clone()).unwrap();
+        fs.initialize_direct().unwrap();
         (block_device, fs)
     }
 

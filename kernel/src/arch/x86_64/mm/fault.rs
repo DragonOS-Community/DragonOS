@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 use core::{intrinsics::unlikely, panic};
 use log::error;
+use system_error::SystemError;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
 use crate::{
@@ -330,7 +331,7 @@ impl X86_64MMArch {
 
         let mut tried_direct_reclaim = false;
 
-        loop {
+        'fault_retry: loop {
             let mut space_guard = current_address_space.write();
             let mut fault;
             loop {
@@ -487,7 +488,8 @@ impl X86_64MMArch {
                     current_address_space.clone(),
                 );
 
-                fault = PageFaultHandler::handle_mm_fault(message);
+                let outcome = PageFaultHandler::handle_mm_fault(message);
+                fault = outcome.reason;
 
                 if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                     return;
@@ -495,6 +497,32 @@ impl X86_64MMArch {
 
                 if unlikely(fault.contains(VmFaultReason::VM_FAULT_RETRY)) {
                     flags |= FaultFlags::FAULT_FLAG_TRIED;
+                    let wait = outcome.retry_wait;
+                    drop(space_guard);
+                    if let Some(wait) = wait {
+                        match wait.wait() {
+                            Ok(()) => {}
+                            Err(SystemError::EINTR | SystemError::ERESTARTSYS) => {
+                                if regs.is_from_user() {
+                                    <crate::arch::ipc::signal::X86_64SignalArch as SignalArch>::do_signal_or_restart(regs);
+                                } else {
+                                    handle_kernel_access_failed(regs);
+                                }
+                                return;
+                            }
+                            Err(SystemError::ENOMEM) => {
+                                fault = VmFaultReason::VM_FAULT_OOM;
+                                space_guard = current_address_space.write();
+                                break;
+                            }
+                            Err(_) => {
+                                fault = VmFaultReason::VM_FAULT_SIGBUS;
+                                space_guard = current_address_space.write();
+                                break;
+                            }
+                        }
+                    }
+                    continue 'fault_retry;
                 } else {
                     break;
                 }

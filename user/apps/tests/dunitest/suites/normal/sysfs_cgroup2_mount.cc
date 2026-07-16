@@ -332,6 +332,36 @@ TEST(SysfsCgroup2Mount, CubeAgentUnifiedCgroupSequenceSucceeds) {
     });
 }
 
+TEST(SysfsCgroup2Mount, AppendWritesKeepUsingPseudoFileEof) {
+    run_in_child("AppendWritesKeepUsingPseudoFileEof", [](int detail_fd) {
+        make_private_mount_namespace(detail_fd);
+        mount_sysfs_on_sys(detail_fd);
+
+        ensure_dir_recursive(detail_fd, "/sys/fs/cgroup");
+        if (mount("cgroup2",
+                  "/sys/fs/cgroup",
+                  "cgroup2",
+                  MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME,
+                  "nsdelegate") != 0) {
+            child_fail(detail_fd, "mount cgroup2 /sys/fs/cgroup");
+        }
+
+        int fd = open("/sys/fs/cgroup/cgroup.procs", O_WRONLY | O_APPEND);
+        if (fd < 0) {
+            child_fail(detail_fd, "open cgroup.procs O_APPEND");
+        }
+        static constexpr char kCurrentTask[] = "0\n";
+        for (int i = 0; i < 2; ++i) {
+            if (write(fd, kCurrentTask, sizeof(kCurrentTask) - 1) !=
+                static_cast<ssize_t>(sizeof(kCurrentTask) - 1)) {
+                close(fd);
+                child_fail(detail_fd, "write cgroup.procs O_APPEND");
+            }
+        }
+        close(fd);
+    });
+}
+
 TEST(SysfsCgroup2Mount, Cgroup2P1ControllerFilesFollowSubtreeControl) {
     run_in_child("Cgroup2P1ControllerFilesFollowSubtreeControl", [](int detail_fd) {
         make_private_mount_namespace(detail_fd);

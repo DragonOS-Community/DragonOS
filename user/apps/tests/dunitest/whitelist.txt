@@ -6,6 +6,7 @@ normal/fdatasync
 normal/getrandom_bit_distribution
 normal/ext4_xattr
 normal/ext4_inode_identity
+normal/fat_statfs
 normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock
@@ -18,6 +19,8 @@ normal/test_pivot_root
 normal/mount_reconfigure
 normal/mount_propagation
 normal/mount_move
+normal/mount_limit
+normal/mount_object_topology
 normal/overlayfs_semantics
 normal/overlayfs_mount_validation
 normal/test_fchown_o_path
@@ -30,6 +33,7 @@ normal/sched_affinity
 normal/sync_file_range
 normal/splice_concurrent_io
 normal/rcu_selftest
+normal/kthread_selftest
 normal/restart_syscall_semantics
 normal/errseq_selftest
 normal/errseq_writeback_reporting
@@ -64,6 +68,7 @@ normal/devfs_ptmx_unlink
 normal/devtmpfs_semantics
 normal/mknod_socket
 normal/pmem_block
+normal/page_cache_accounting
 normal/pipe_release_wakeup
 normal/pipe_waitqueue_wakeup
 normal/oom_killer_semantics
@@ -72,6 +77,7 @@ normal/tty_pty_hangup
 normal/cubesandbox_pty_exec_chain
 normal/eventfd_pending_signal
 normal/virtiofs_smoke
+normal/virtiofs_dax
 normal/af_packet_sockopt
 normal/af_packet_e2e
 normal/af_packet_mcast

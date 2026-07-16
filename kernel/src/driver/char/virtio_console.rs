@@ -22,7 +22,7 @@ use crate::{
         video::console::dummycon::dummy_console,
         virtio::{
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
-            transport::VirtIOTransport,
+            transport::{DeferredVirtioIrq, VirtIOTransport},
             virtio_drivers_error_to_system_error,
             virtio_impl::HalImpl,
             VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
@@ -307,15 +307,22 @@ pub fn virtio_console(
         dev_id,
         dev_parent.as_ref().map(|x| x.name())
     );
-    let device = VirtIOConsoleDevice::new(transport, dev_id.clone());
-    if device.is_none() {
+    let Some((device, deferred_irq)) = VirtIOConsoleDevice::new(transport, dev_id.clone()) else {
         return;
-    }
-
-    let device = device.unwrap();
+    };
 
     if let Some(dev_parent) = dev_parent {
         device.set_dev_parent(Some(Arc::downgrade(&dev_parent)));
+    }
+    if let Some(deferred_irq) = deferred_irq {
+        if let Err(err) = deferred_irq.install(device.dev_id().clone()) {
+            log::error!(
+                "VirtIOConsoleDevice '{:?}' setup_irq failed: {:?}",
+                device.dev_id(),
+                err
+            );
+            return;
+        }
     }
     virtio_device_manager()
         .device_add(device.clone() as Arc<dyn VirtIODevice>)
@@ -353,15 +360,21 @@ impl Debug for VirtIOConsoleDevice {
 }
 
 impl VirtIOConsoleDevice {
-    pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+    pub(crate) fn new(
+        transport: VirtIOTransport,
+        dev_id: Arc<DeviceId>,
+    ) -> Option<(Arc<Self>, Option<DeferredVirtioIrq>)> {
         // 设置中断
-        if let Err(err) = transport.setup_irq(dev_id.clone()) {
-            log::error!(
-                "VirtIOConsoleDevice '{dev_id:?}' setup_irq failed: {:?}",
-                err
-            );
-            return None;
-        }
+        let irq_setup = match transport.setup_irq(dev_id.clone()) {
+            Ok(setup) => setup,
+            Err(err) => {
+                log::error!(
+                    "VirtIOConsoleDevice '{dev_id:?}' setup_irq failed: {:?}",
+                    err
+                );
+                return None;
+            }
+        };
 
         let irq = Some(transport.irq());
         let device_inner = DragonVirtIOConsole::new(transport);
@@ -394,7 +407,7 @@ impl VirtIOConsoleDevice {
             }),
         });
 
-        Some(dev)
+        Some((dev, irq_setup.into_deferred()))
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOConsoleDevice> {

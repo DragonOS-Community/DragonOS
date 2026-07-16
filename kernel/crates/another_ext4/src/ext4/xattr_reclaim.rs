@@ -1,8 +1,7 @@
 use super::{journal_transaction::Transaction, Ext4};
-use crate::constants::*;
 use crate::ext4_defs::{
-    crc::crc32, validate_xattr_block_for_release, xattr_block_checksum, AsBytes, InodeRef,
-    SuperBlock, XattrHeader,
+    validate_xattr_block_for_release, xattr_block_checksum, AsBytes, InodeRef, SuperBlock,
+    XattrHeader,
 };
 use crate::prelude::*;
 
@@ -50,10 +49,12 @@ impl Ext4 {
         let bitmap = transaction.read(self.block_device.as_ref(), bitmap_block)?;
         if sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
             let checksum_bytes = sb.clusters_per_group() as usize / 8;
-            if !bg.verify_checksum(&sb.uuid())
-                || !bg
-                    .desc
-                    .verify_block_bitmap_csum(&sb.uuid(), &*bitmap, checksum_bytes)
+            if !bg.verify_checksum(sb.metadata_checksum_seed())
+                || !bg.desc.verify_block_bitmap_csum(
+                    sb.metadata_checksum_seed(),
+                    &*bitmap,
+                    checksum_bytes,
+                )
             {
                 return Err(Ext4Error::new(ErrCode::EIO));
             }
@@ -81,12 +82,6 @@ impl Ext4 {
             return Ok(None);
         }
         let sb = self.read_super_block_cached();
-        // EXT4_FEATURE_INCOMPAT_CSUM_SEED requires the explicit checksum-seed
-        // superblock field, which another_ext4 does not expose yet.
-        const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
-        if sb.has_incompatible_feature(FEATURE_INCOMPAT_CSUM_SEED) {
-            return Err(Ext4Error::new(ErrCode::ENOTSUP));
-        }
         self.validate_xattr_block_allocation(transaction, block_id)?;
         let image = transaction.read(self.block_device.as_ref(), block_id)?;
         let (mut header, has_ea_inode) = validate_xattr_block_for_release(&*image)
@@ -99,8 +94,7 @@ impl Ext4 {
         const FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
         let checksum_seed = if sb.has_read_only_compatible_feature(FEATURE_RO_COMPAT_METADATA_CSUM)
         {
-            // Without metadata_csum_seed Linux derives the seed from UUID.
-            let seed = crc32(CRC32_INIT, &sb.uuid());
+            let seed = sb.metadata_checksum_seed();
             let expected = xattr_block_checksum(seed, block_id, &*image)
                 .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
             if header.checksum() != expected {

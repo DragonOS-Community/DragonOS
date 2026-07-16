@@ -3,6 +3,7 @@ use super::{cred::CredOverrideGuard, metadata};
 use crate::filesystem::vfs::{
     self,
     file::{File, FileFlags, FilePrivateData},
+    mount::DentryMutationContext,
     syscall::RenameFlags,
     utils::should_remove_sgid,
     FileType, IndexNode, Metadata, SetMetadataMask, MAX_PATHLEN,
@@ -41,11 +42,25 @@ impl OpenCopyUpOutcome {
 
 impl OvlInode {
     pub(super) fn writable_upper_inode_locked(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.writable_upper_inode_locked_impl(None)
+    }
+
+    pub(super) fn writable_upper_inode_locked_with_context(
+        &self,
+        context: &DentryMutationContext<'_>,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.writable_upper_inode_locked_impl(Some(context))
+    }
+
+    fn writable_upper_inode_locked_impl(
+        &self,
+        context: Option<&DentryMutationContext<'_>>,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         if let Some(inode) = self.upper_inode.lock().clone() {
             return Ok(inode);
         }
 
-        self.copy_up_locked()?;
+        self.copy_up_locked_impl(context)?;
         self.upper_inode.lock().clone().ok_or(SystemError::EROFS)
     }
 
@@ -61,7 +76,7 @@ impl OvlInode {
 
         let fs = self.overlay_fs()?;
         let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
-        let outcome = self.copy_up_locked_with_size(copy_size)?;
+        let outcome = self.copy_up_locked_with_size(copy_size, None)?;
         if copy_size.is_none() {
             Ok(OpenCopyUpOutcome::NoTruncateRequested)
         } else if outcome == CopyUpOutcome::PublishedAfterTruncate {
@@ -72,20 +87,35 @@ impl OvlInode {
     }
 
     pub(super) fn copy_up_locked(&self) -> Result<(), SystemError> {
+        self.copy_up_locked_impl(None)
+    }
+
+    pub(super) fn copy_up_locked_with_context(
+        &self,
+        context: &DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        self.copy_up_locked_impl(Some(context))
+    }
+
+    fn copy_up_locked_impl(
+        &self,
+        context: Option<&DentryMutationContext<'_>>,
+    ) -> Result<(), SystemError> {
         let fs = self.overlay_fs()?;
         let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
-        self.copy_up_locked_with_size(None).map(|_| ())
+        self.copy_up_locked_with_size(None, context).map(|_| ())
     }
 
     pub(super) fn copy_up_locked_for_truncate(&self, len: usize) -> Result<(), SystemError> {
         let fs = self.overlay_fs()?;
         let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
-        self.copy_up_locked_with_size(Some(len)).map(|_| ())
+        self.copy_up_locked_with_size(Some(len), None).map(|_| ())
     }
 
     fn copy_up_locked_with_size(
         &self,
         copy_size: Option<usize>,
+        context: Option<&DentryMutationContext<'_>>,
     ) -> Result<CopyUpOutcome, SystemError> {
         let fs = self.overlay_fs()?;
         let caller_cred = ProcessManager::current_pcb().cred();
@@ -106,7 +136,7 @@ impl OvlInode {
         }
 
         let (parent_path, name) = self.upper_parent_path_and_name();
-        let parent_inode = self.ensure_upper_dir_path(parent_path)?;
+        let parent_inode = self.ensure_upper_dir_path(parent_path, context)?;
         // Directory copy-up and publication of this path as another object's
         // ancestor share the same exact-path commit domain.  Parent ancestor
         // guards have already been released by ensure_upper_dir_path().
@@ -152,12 +182,12 @@ impl OvlInode {
             &metadata,
             copy_size,
         ) {
-            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+            let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
             return Err(err);
         }
 
         if let Err(err) = metadata::copy_xattrs(lower_inode, &temp_inode) {
-            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+            let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
             return Err(err);
         }
 
@@ -166,7 +196,7 @@ impl OvlInode {
         // and exec can never observe a stale capability on the new upper.
         if copy_size.is_some() && metadata.file_type == FileType::File {
             if let Err(err) = metadata::remove_security_capability(&temp_inode) {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 return Err(err);
             }
         }
@@ -174,19 +204,19 @@ impl OvlInode {
         let origin = match metadata::prepare_origin(self, lower_inode, &temp_inode, &metadata) {
             Ok(origin) => origin,
             Err(err) => {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 return Err(err);
             }
         };
 
         if let Err(err) = Self::restore_copy_up_metadata(&temp_inode, &metadata) {
-            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+            let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
             return Err(err);
         }
 
         let publish_outcome = if copy_size == Some(0) && metadata.file_type == FileType::File {
             if let Err(err) = vfs::vcore::vfs_truncate(temp_inode.clone(), 0) {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 return Err(err);
             }
             CopyUpOutcome::PublishedAfterTruncate
@@ -197,11 +227,18 @@ impl OvlInode {
         let parent_metadata = match parent_inode.metadata() {
             Ok(metadata) => metadata,
             Err(err) => {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 return Err(err);
             }
         };
-        match workdir.move_to(&temp_name, &parent_inode, name, RenameFlags::NOREPLACE) {
+        match Self::move_backing(
+            &workdir,
+            &temp_name,
+            &parent_inode,
+            name,
+            RenameFlags::NOREPLACE,
+            context,
+        ) {
             Ok(()) => {
                 Self::restore_parent_timestamps(&parent_inode, &parent_metadata);
                 self.set_origin(origin);
@@ -210,14 +247,14 @@ impl OvlInode {
                 return Ok(publish_outcome);
             }
             Err(SystemError::EEXIST) => {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 // NOREPLACE can fail here only if the parent namespace changed
                 // after the absence check above.  Never bind this stale lower
                 // inode to the replacement that won the race.
                 return Err(SystemError::ESTALE);
             }
             Err(err) => {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 return Err(err);
             }
         }
@@ -230,7 +267,11 @@ impl OvlInode {
         }
     }
 
-    fn ensure_upper_dir_path(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn ensure_upper_dir_path(
+        &self,
+        path: &str,
+        context: Option<&DentryMutationContext<'_>>,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut current = self.upper_root_inode()?;
         if path.is_empty() {
             return Ok(current);
@@ -258,7 +299,8 @@ impl OvlInode {
                     current = next;
                 }
                 Err(SystemError::ENOENT) => {
-                    current = self.copy_up_dir_component(&current, component, &current_path)?;
+                    current =
+                        self.copy_up_dir_component(&current, component, &current_path, context)?;
                 }
                 Err(err) => return Err(err),
             }
@@ -291,6 +333,7 @@ impl OvlInode {
         upper_parent: &Arc<dyn IndexNode>,
         name: &str,
         lower_path: &str,
+        context: Option<&DentryMutationContext<'_>>,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let fs = self.overlay_fs()?;
         let lowers = self.lower_dir_inodes(lower_path)?;
@@ -338,19 +381,26 @@ impl OvlInode {
         let origin = match prepared {
             Ok(origin) => origin,
             Err(err) => {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 return Err(err);
             }
         };
         let publication = match fs.prepare_ancestor_publication(&lowers, &temp) {
             Ok(publication) => publication,
             Err(err) => {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 return Err(err);
             }
         };
 
-        match workdir.move_to(&temp_name, upper_parent, name, RenameFlags::NOREPLACE) {
+        match Self::move_backing(
+            &workdir,
+            &temp_name,
+            upper_parent,
+            name,
+            RenameFlags::NOREPLACE,
+            context,
+        ) {
             Ok(()) => {
                 Self::restore_parent_timestamps(upper_parent, &parent_metadata);
                 for (inode, upper) in cached_dirs.iter().zip(cached_upper_guards.iter_mut()) {
@@ -363,11 +413,11 @@ impl OvlInode {
                 Ok(temp)
             }
             Err(SystemError::EEXIST) => {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 Err(SystemError::ESTALE)
             }
             Err(err) => {
-                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 Err(err)
             }
         }
@@ -540,6 +590,22 @@ impl OvlInode {
         }
 
         Ok(())
+    }
+
+    fn move_backing(
+        source: &Arc<dyn IndexNode>,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: Option<&DentryMutationContext<'_>>,
+    ) -> Result<(), SystemError> {
+        match context {
+            Some(context) => {
+                source.move_to_with_context(old_name, target, new_name, flags, context)
+            }
+            None => source.move_to(old_name, target, new_name, flags),
+        }
     }
 
     fn read_symlink_target(lower_inode: Arc<dyn IndexNode>) -> Result<String, SystemError> {

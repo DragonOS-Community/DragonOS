@@ -76,7 +76,9 @@ impl StagedBlock {
     }
 }
 
-/// Cache changes are published only after checkpoint data is durable.
+/// Publishes metadata images after the selected backend has completed its
+/// commit point. Journal commits publish after a durable checkpoint; direct
+/// commits publish after every synchronous home-block write has succeeded.
 pub trait CachePublisher: Send + Sync {
     /// Publish already-checkpointed images to in-memory caches.
     ///
@@ -111,6 +113,60 @@ pub struct JournalTransactionCore {
     writer: AtomicBool,
     poison: AtomicU8,
     context: spin::Mutex<JournalContext>,
+}
+
+/// Synchronous nojournal transaction backend.
+///
+/// The writer bit is deliberately separate from the filesystem-wide metadata
+/// mutation gate: the gate excludes legacy direct writers, while this token
+/// owns one staged transaction within this backend.
+pub struct DirectTransactionCore {
+    writer: AtomicBool,
+    poison: AtomicU8,
+    target_blocks: u64,
+}
+
+impl DirectTransactionCore {
+    pub fn new(target_blocks: u64) -> Result<Self> {
+        if target_blocks == 0 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        Ok(Self {
+            writer: AtomicBool::new(false),
+            poison: AtomicU8::new(CLEAN),
+            target_blocks,
+        })
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poison.load(Ordering::Acquire) != CLEAN
+    }
+
+    pub fn can_shutdown(&self) -> bool {
+        !self.writer.load(Ordering::Acquire) && !self.is_poisoned()
+    }
+
+    pub fn start(&self, credits: usize) -> Result<Transaction<'_>> {
+        if credits == 0 || self.is_poisoned() {
+            return Err(Ext4Error::new(if credits == 0 {
+                ErrCode::EINVAL
+            } else {
+                ErrCode::EROFS
+            }));
+        }
+        if self
+            .writer
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(Ext4Error::new(ErrCode::EAGAIN));
+        }
+        Ok(Transaction::new(TransactionCoreRef::Direct(self), credits))
+    }
+
+    fn poison(&self) {
+        self.poison.store(POISONED, Ordering::Release);
+    }
 }
 
 impl JournalTransactionCore {
@@ -176,12 +232,7 @@ impl JournalTransactionCore {
             self.writer.store(false, Ordering::Release);
             return Err(Ext4Error::new(ErrCode::E2BIG));
         }
-        Ok(Transaction {
-            core: self,
-            credits,
-            staged: BTreeMap::new(),
-            owns_writer: true,
-        })
+        Ok(Transaction::new(TransactionCoreRef::Journal(self), credits))
     }
 
     fn poison(&self) {
@@ -189,14 +240,28 @@ impl JournalTransactionCore {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TransactionCoreRef<'a> {
+    Journal(&'a JournalTransactionCore),
+    Direct(&'a DirectTransactionCore),
+}
+
 pub struct Transaction<'a> {
-    core: &'a JournalTransactionCore,
+    core: TransactionCoreRef<'a>,
     credits: usize,
     staged: BTreeMap<PBlockId, StagedBlock>,
     owns_writer: bool,
 }
 
 impl Transaction<'_> {
+    fn new(core: TransactionCoreRef<'_>, credits: usize) -> Transaction<'_> {
+        Transaction {
+            core,
+            credits,
+            staged: BTreeMap::new(),
+            owns_writer: true,
+        }
+    }
     /// Replace the final image for `home`.  Re-staging the same home block does
     /// not consume another credit and subsequent reads observe the replacement.
     pub fn stage(&mut self, home: PBlockId, image: Box<[u8; BLOCK_SIZE]>) -> Result<()> {
@@ -259,6 +324,51 @@ impl Transaction<'_> {
             self.release_writer();
             return Ok(());
         }
+        match self.core {
+            TransactionCoreRef::Journal(_) => self.commit_journal(device, publisher),
+            TransactionCoreRef::Direct(_) => self.commit_direct(device, publisher),
+        }
+    }
+
+    fn commit_direct(
+        mut self,
+        device: &dyn BlockDevice,
+        publisher: &dyn CachePublisher,
+    ) -> core::result::Result<(), CommitError> {
+        let TransactionCoreRef::Direct(core) = self.core else {
+            unreachable!()
+        };
+        if self
+            .staged
+            .values()
+            .any(|block| block.home >= core.target_blocks)
+        {
+            return self.fail(
+                Ext4Error::new(ErrCode::EINVAL),
+                CommitFailure::BeforeCommit,
+                false,
+            );
+        }
+        // BTreeMap iteration supplies a stable physical-block order without a
+        // second allocation. It is deterministic, not crash atomic.
+        for staged in self.staged.values() {
+            if let Err(error) = write_bytes(device, staged.home, staged.bytes()) {
+                return self.fail(error, CommitFailure::CheckpointFailed, true);
+            }
+        }
+        publisher.publish(&self.staged);
+        self.release_writer();
+        Ok(())
+    }
+
+    fn commit_journal(
+        mut self,
+        device: &dyn BlockDevice,
+        publisher: &dyn CachePublisher,
+    ) -> core::result::Result<(), CommitError> {
+        let TransactionCoreRef::Journal(core) = self.core else {
+            unreachable!()
+        };
         if !device.supports_reliable_flush() {
             return self.fail(
                 Ext4Error::new(ErrCode::ENOTSUP),
@@ -269,7 +379,7 @@ impl Transaction<'_> {
 
         // Copy the small allocation state, then release the spin guard before I/O.
         let (sb, mapping, journal_blocks, target_blocks, head, sb_image) = {
-            let context = self.core.context.lock();
+            let context = core.context.lock();
             (
                 context.superblock,
                 Arc::clone(&context.logical_blocks),
@@ -382,7 +492,7 @@ impl Transaction<'_> {
             return self.fail(error, CommitFailure::TailUpdateFailed, true);
         }
         {
-            let mut context = self.core.context.lock();
+            let mut context = core.context.lock();
             context.superblock.sequence = next_sequence;
             context.superblock.start = 0;
             context.head = ring_next(&sb, commit_logical);
@@ -399,7 +509,10 @@ impl Transaction<'_> {
         poison: bool,
     ) -> core::result::Result<T, CommitError> {
         if poison {
-            self.core.poison();
+            match self.core {
+                TransactionCoreRef::Journal(core) => core.poison(),
+                TransactionCoreRef::Direct(core) => core.poison(),
+            }
         }
         self.release_writer();
         Err(CommitError { error, failure })
@@ -408,7 +521,10 @@ impl Transaction<'_> {
     fn release_writer(&mut self) {
         if self.owns_writer {
             self.owns_writer = false;
-            self.core.writer.store(false, Ordering::Release);
+            match self.core {
+                TransactionCoreRef::Journal(core) => core.writer.store(false, Ordering::Release),
+                TransactionCoreRef::Direct(core) => core.writer.store(false, Ordering::Release),
+            }
         }
     }
 }
@@ -615,6 +731,7 @@ mod tests {
         stable: spin::Mutex<BTreeMap<PBlockId, Box<[u8; BLOCK_SIZE]>>>,
         operation: AtomicUsize,
         fail_at: AtomicUsize,
+        write_order: spin::Mutex<Vec<PBlockId>>,
     }
 
     impl MemoryDevice {
@@ -624,6 +741,7 @@ mod tests {
                 stable: spin::Mutex::new(BTreeMap::new()),
                 operation: AtomicUsize::new(0),
                 fail_at: AtomicUsize::new(usize::MAX),
+                write_order: spin::Mutex::new(Vec::new()),
             }
         }
 
@@ -660,6 +778,7 @@ mod tests {
 
         fn write_block(&self, block: &Block) -> Result<()> {
             self.step()?;
+            self.write_order.lock().push(block.id);
             self.volatile.lock().insert(block.id, block.data.clone());
             Ok(())
         }
@@ -680,6 +799,66 @@ mod tests {
         fn publish(&self, blocks: &BTreeMap<PBlockId, StagedBlock>) {
             self.0.fetch_add(blocks.len(), Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn direct_commit_writes_home_blocks_in_order_then_publishes() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let mut transaction = core.start(3).unwrap();
+        transaction.stage(9, Box::new([9; BLOCK_SIZE])).unwrap();
+        transaction.stage(2, Box::new([2; BLOCK_SIZE])).unwrap();
+        transaction.stage(5, Box::new([5; BLOCK_SIZE])).unwrap();
+
+        transaction.commit(&device, &publisher).unwrap();
+
+        assert_eq!(&*device.write_order.lock(), &[2, 5, 9]);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 3);
+        assert!(!core.is_poisoned());
+        assert!(core.can_shutdown());
+    }
+
+    #[test]
+    fn direct_write_failure_never_publishes_and_poisons_backend() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(1, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let mut transaction = core.start(2).unwrap();
+        transaction.stage(2, Box::new([2; BLOCK_SIZE])).unwrap();
+        transaction.stage(5, Box::new([5; BLOCK_SIZE])).unwrap();
+
+        let error = transaction.commit(&device, &publisher).unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::CheckpointFailed);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        assert!(core.is_poisoned());
+        assert_eq!(core.start(1).err().unwrap().code(), ErrCode::EROFS);
+    }
+
+    #[test]
+    fn direct_validation_failure_releases_writer_without_poison() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(8).unwrap();
+        let mut transaction = core.start(1).unwrap();
+        transaction.stage(8, Box::new([1; BLOCK_SIZE])).unwrap();
+
+        let error = transaction.commit(&device, &publisher).unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::BeforeCommit);
+        assert!(!core.is_poisoned());
+        assert!(core.start(1).is_ok());
+    }
+
+    #[test]
+    fn direct_backend_allows_only_one_transaction_owner() {
+        let core = DirectTransactionCore::new(8).unwrap();
+        let transaction = core.start(1).unwrap();
+        assert_eq!(core.start(1).err().unwrap().code(), ErrCode::EAGAIN);
+        transaction.abort();
+        assert!(core.start(1).is_ok());
     }
 
     #[test]

@@ -86,6 +86,12 @@ bitflags! {
         const VM_ARCH_1 = 0x01000000;
         const VM_WIPEONFORK = 0x02000000;
         const VM_DONTDUMP = 0x04000000;
+        /// The VMA may contain both ordinary managed pages and raw device PFNs.
+        ///
+        /// This matches Linux VM_MIXEDMAP: raw PFNs must never enter the
+        /// page-manager/rmap/LRU paths, while private COW pages in the same VMA
+        /// remain normal managed pages.
+        const VM_MIXEDMAP = 0x10000000;
 
         const VM_LOCKED_CLEAR_MASK = !(Self::VM_LOCKED.bits | Self::VM_LOCKONFAULT.bits);
     }
@@ -122,7 +128,13 @@ impl VmFlags {
     /// VMAs which Linux mlock_fixup() leaves unlocked and unaccounted.
     #[inline]
     pub fn is_mlock_flag_unsupported(self) -> bool {
-        self.intersects(Self::VM_IO | Self::VM_DONTEXPAND | Self::VM_PFNMAP | Self::VM_HUGETLB)
+        self.intersects(
+            Self::VM_IO
+                | Self::VM_DONTEXPAND
+                | Self::VM_PFNMAP
+                | Self::VM_MIXEDMAP
+                | Self::VM_HUGETLB,
+        )
     }
 
     /// VMAs which cannot be handled by DragonOS' ordinary prefault path.
@@ -132,7 +144,7 @@ impl VmFlags {
     /// skip hugetlb until its fault path is implemented.
     #[inline]
     pub fn is_mlock_population_unsupported(self) -> bool {
-        self.intersects(Self::VM_IO | Self::VM_PFNMAP | Self::VM_HUGETLB)
+        self.intersects(Self::VM_IO | Self::VM_PFNMAP | Self::VM_MIXEDMAP | Self::VM_HUGETLB)
     }
 }
 

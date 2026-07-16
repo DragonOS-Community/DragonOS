@@ -1,5 +1,16 @@
 use super::*;
 
+/// Classification of a present user PTE in a VMA.
+///
+/// A missing `Page` is accepted only for VM_MIXEDMAP. Keeping this check in one
+/// place prevents device PFNs from accidentally reaching rmap, LRU, mlock, or
+/// the frame allocator.
+#[derive(Debug)]
+pub enum PresentPfn {
+    Managed(Arc<Page>),
+    External(PhysAddr),
+}
+
 /// A locked VMA (Virtual Memory Area)
 ///
 /// Note: benchmark to determine whether SpinLock or RwLock performs better.
@@ -27,6 +38,21 @@ impl Eq for LockedVMA {}
 
 #[allow(dead_code)]
 impl LockedVMA {
+    pub(crate) fn classify_present_pfn(
+        page_manager: &mut PageManager,
+        paddr: PhysAddr,
+        vm_flags: VmFlags,
+    ) -> PresentPfn {
+        if let Some(page) = page_manager.get(&paddr) {
+            return PresentPfn::Managed(page);
+        }
+        assert!(
+            vm_flags.contains(VmFlags::VM_MIXEDMAP),
+            "unmanaged PFN {paddr:?} installed in a non-mixed VMA"
+        );
+        PresentPfn::External(paddr)
+    }
+
     pub fn new(vma: VMA) -> Arc<Self> {
         let r = Arc::new(Self {
             id: LOCKEDVMA_ID_ALLOCATOR.lock().alloc().unwrap(),
@@ -103,11 +129,22 @@ impl LockedVMA {
         mut flusher: impl Flusher<MMArch>,
     ) -> Result<(), SystemError> {
         let mut guard = self.lock();
+        let mut page_manager = page_manager_lock();
         for page in guard.region.pages() {
-            if mapper.translate(page.virt_address()).is_some() {
+            if let Some((paddr, _)) = mapper.translate(page.virt_address()) {
+                let page_flags = if page_manager.get(&paddr).is_none()
+                    && guard.vm_flags().contains(VmFlags::VM_MIXEDMAP)
+                {
+                    // mprotect must not bypass the filesystem's pfn_mkwrite
+                    // transaction. A subsequent write fault performs the
+                    // external mapping upgrade and PTE identity revalidation.
+                    flags.set_write(false)
+                } else {
+                    flags
+                };
                 let r = unsafe {
                     mapper
-                        .remap(page.virt_address(), flags)
+                        .remap(page.virt_address(), page_flags)
                         .expect("Failed to remap")
                 };
                 flusher.consume(r);
@@ -123,7 +160,7 @@ impl LockedVMA {
     /// performs cross-core TLB shootdown first and then frees physical pages (INV-3).
     pub fn unmap(&self, mapper: &mut PageMapper, tlb: &mut MmuGather<'_>) {
         // todo: if the current VMA is associated with a file, complete the file-related logic
-        let (region, should_wakeup_writeback, mm) = {
+        let (region, should_wakeup_writeback, mm, vm_flags) = {
             let mut self_guard = self.lock();
             let region = *self_guard.region();
             let mm = self_guard.address_space().and_then(|mm| mm.upgrade());
@@ -132,7 +169,7 @@ impl LockedVMA {
                 && self_guard
                     .vm_flags()
                     .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE);
-            (region, should_wakeup_writeback, mm)
+            (region, should_wakeup_writeback, mm, *self_guard.vm_flags())
         };
 
         let mut pages_to_reclassify = Vec::new();
@@ -148,7 +185,16 @@ impl LockedVMA {
                         .expect("Failed to unmap, beacuse of some page is not mapped");
 
                 // Remove the current VMA from anon_vma
-                let page_arc = page_manager_guard.get_unwrap(&paddr);
+                let PresentPfn::Managed(page_arc) =
+                    Self::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                else {
+                    unsafe { flush.ignore() };
+                    tlb.accumulate_range(page.virt_address());
+                    if freed_tables {
+                        tlb.note_pt_table_freed();
+                    }
+                    continue;
+                };
                 {
                     let mut page_guard = page_arc.write();
                     page_guard.remove_vma(self);
@@ -212,6 +258,7 @@ impl LockedVMA {
         let mm = self_guard.address_space().and_then(|mm| mm.upgrade());
         let vma_start = self_guard.region().start();
         let backing_pgoff = self_guard.backing_page_offset();
+        let vm_flags = *self_guard.vm_flags();
         let file_page_cache = self_guard
             .vm_file()
             .and_then(|file| file.inode().page_cache());
@@ -227,7 +274,21 @@ impl LockedVMA {
                     continue;
                 };
 
-                let page_arc = page_manager_guard.get_unwrap(&paddr);
+                let PresentPfn::Managed(page_arc) =
+                    Self::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                else {
+                    // A raw mixed PFN belongs to this file VMA. CacheOnly and
+                    // EvenCow both zap it; private COW pages are managed and are
+                    // filtered below by PageType.
+                    let Some((_paddr, _, flush)) =
+                        (unsafe { mapper.unmap_phys_preserve_tables(virt) })
+                    else {
+                        continue;
+                    };
+                    unsafe { flush.ignore() };
+                    tlb.accumulate_range(virt);
+                    continue;
+                };
                 if let Some(page_cache) = file_page_cache.as_ref() {
                     let Some(base_pgoff) = backing_pgoff else {
                         continue;
@@ -389,10 +450,13 @@ impl LockedVMA {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
-                    let page = page_manager_guard.get_unwrap(&paddr);
-                    let mut page_guard = page.write();
-                    page_guard.insert_vma(before.clone(), vma_mlocked);
-                    page_guard.remove_vma(self);
+                    if let Some(page) = page_manager_guard.get(&paddr) {
+                        let mut page_guard = page.write();
+                        page_guard.insert_vma(before.clone(), vma_mlocked);
+                        page_guard.remove_vma(self);
+                    } else {
+                        assert!(guard.vm_flags().contains(VmFlags::VM_MIXEDMAP));
+                    }
                     before.lock().mapped = true;
                 }
             }
@@ -401,10 +465,13 @@ impl LockedVMA {
             let virt_iter = after.lock().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
-                    let page = page_manager_guard.get_unwrap(&paddr);
-                    let mut page_guard = page.write();
-                    page_guard.insert_vma(after.clone(), vma_mlocked);
-                    page_guard.remove_vma(self);
+                    if let Some(page) = page_manager_guard.get(&paddr) {
+                        let mut page_guard = page.write();
+                        page_guard.insert_vma(after.clone(), vma_mlocked);
+                        page_guard.remove_vma(self);
+                    } else {
+                        assert!(guard.vm_flags().contains(VmFlags::VM_MIXEDMAP));
+                    }
                     after.lock().mapped = true;
                 }
             }
@@ -784,12 +851,22 @@ impl VMA {
         } else {
             flags
         };
+        let mut page_manager = page_manager_lock();
         for page in self.region.pages() {
             // debug!("remap page {:?}", page.virt_address());
-            if mapper.translate(page.virt_address()).is_some() {
+            if let Some((paddr, _)) = mapper.translate(page.virt_address()) {
+                let external = self.vm_flags.contains(VmFlags::VM_MIXEDMAP)
+                    && page_manager.get(&paddr).is_none();
+                let page_flags = if external {
+                    // Adding PROT_WRITE must still fault through DAX
+                    // pfn_mkwrite/private COW and revalidate the PFN identity.
+                    pte_flags.set_write(false)
+                } else {
+                    pte_flags
+                };
                 let r = unsafe {
                     mapper
-                        .remap(page.virt_address(), pte_flags)
+                        .remap(page.virt_address(), page_flags)
                         .expect("Failed to remap")
                 };
                 unsafe { r.ignore() };

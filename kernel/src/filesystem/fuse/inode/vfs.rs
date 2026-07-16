@@ -1,6 +1,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{mem::size_of, sync::atomic::Ordering};
 
+use hashbrown::HashSet;
 use system_error::SystemError;
 
 use crate::{
@@ -8,12 +9,12 @@ use crate::{
     filesystem::{
         page_cache::PageCache,
         vfs::{
-            file::{FileFlags, FileMode},
+            file::{FileFlags, FileMode, PreopenedFile},
             permission::PermissionMask,
             syscall::RenameFlags,
             utils::DName,
-            FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata, SetMetadataMask,
-            XattrFlags,
+            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata,
+            SetMetadataMask, XattrFlags,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -38,6 +39,14 @@ use super::super::{
 use super::FuseNode;
 
 impl IndexNode for FuseNode {
+    fn inode_generation(&self) -> u64 {
+        self.node_incarnation()
+    }
+
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        self.try_fs()
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
@@ -86,12 +95,25 @@ impl IndexNode for FuseNode {
         };
 
         if (fopen_flags & FOPEN_DIRECT_IO) != 0
+            && !self.dax_active()
             && vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE)
         {
             return Err(SystemError::ENODEV);
         }
 
         Ok(())
+    }
+
+    fn mmap_vm_flags(
+        &self,
+        _file: &Arc<crate::filesystem::vfs::file::File>,
+        vm_flags: crate::mm::VmFlags,
+    ) -> Result<crate::mm::VmFlags, SystemError> {
+        if self.dax_active() {
+            Ok(vm_flags | crate::mm::VmFlags::VM_MIXEDMAP)
+        } else {
+            Ok(vm_flags)
+        }
     }
 
     fn mmap_file(
@@ -116,7 +138,7 @@ impl IndexNode for FuseNode {
             p.fopen_flags
         };
 
-        if (fopen_flags & FOPEN_DIRECT_IO) != 0 {
+        if (fopen_flags & FOPEN_DIRECT_IO) != 0 && !self.dax_active() {
             if vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE) {
                 return Err(SystemError::ENODEV);
             }
@@ -337,8 +359,14 @@ impl IndexNode for FuseNode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        let md = self.cached_or_fetch_metadata()?;
-        if md.file_type == FileType::SymLink {
+        // Establish the stable inode type before taking a regular-file open
+        // context. Attribute refresh belongs to buffered I/O below; Linux does
+        // not enter fuse_cache_read_iter() for DAX/direct reads.
+        let cached_md = match self.cached_metadata_snapshot() {
+            Some(md) => md,
+            None => self.cached_or_fetch_metadata()?,
+        };
+        if cached_md.file_type == FileType::SymLink {
             if offset != 0 {
                 return Ok(0);
             }
@@ -347,21 +375,52 @@ impl IndexNode for FuseNode {
             buf[..n].copy_from_slice(&payload[..n]);
             return Ok(n);
         }
-        self.ensure_regular()?;
+        if cached_md.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
         let private_data = Self::fuse_file_private_snapshot(&data)?;
         drop(data);
         let fh = private_data.fh;
         let file_flags = private_data.open_flags;
         let fopen_flags = private_data.fopen_flags;
 
+        if self.dax_active() {
+            loop {
+                match self.dax_read(offset, &mut buf[..len]) {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        if self.dax_host_invalidation_blocked() {
+                            self.dax_wait_host_invalidation_interruptible()?;
+                        } else {
+                            self.conn().reclaim_one_dax_range_interruptible()?;
+                        }
+                    }
+                    result => return result,
+                }
+            }
+        }
+
         if (fopen_flags & FOPEN_DIRECT_IO) != 0 || (file_flags & FileFlags::O_DIRECT.bits()) != 0 {
             let _barrier = self.writeback_barrier.write();
-            self.prepare_direct_io_range(offset, len, &private_data, false)?;
+            self.prepare_direct_io_range(offset, len, &private_data, false, &_barrier)?;
             let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
             return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
         }
 
-        self.read_cached_with_open(offset, len, buf, &private_data)
+        // Match Linux fuse_cache_read_iter(): AUTO_INVAL_DATA always enters
+        // attribute update (the TTL decides whether GETATTR is necessary),
+        // while the other mode updates when this read crosses cached EOF. An
+        // opened regular file supplies its current fh with FUSE_GETATTR_FH.
+        // Permission was already checked at open, so do not repeat the mount
+        // policy check on this hot path.
+        let cached_size = cached_md.size.max(0) as usize;
+        let crosses_cached_eof = offset.saturating_add(len) > cached_size;
+        let md = if !private_data.io_config.auto_inval_data && !crosses_cached_eof {
+            cached_md
+        } else {
+            self.update_cached_metadata_for_open_io(cached_md, fh)?
+        };
+
+        self.read_cached_with_open(offset, len, buf, &private_data, md.size.max(0) as usize)
     }
 
     fn write_at(
@@ -385,6 +444,22 @@ impl IndexNode for FuseNode {
         let fh = private_data.fh;
         let file_flags = private_data.open_flags;
         let fopen_flags = private_data.fopen_flags;
+        if self.dax_active() {
+            let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
+            loop {
+                match self.dax_write_or_fuse_locked(offset, &buf[..len], &private_data, lock_owner)
+                {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        if self.dax_host_invalidation_blocked() {
+                            self.dax_wait_host_invalidation_interruptible()?;
+                        } else {
+                            self.conn().reclaim_one_dax_range_interruptible()?;
+                        }
+                    }
+                    result => return result,
+                }
+            }
+        }
         let max_write = core::cmp::min(self.conn().max_write(), self.max_pages_bytes());
         if max_write == 0 {
             return Err(SystemError::EIO);
@@ -408,7 +483,15 @@ impl IndexNode for FuseNode {
         };
         let mut total_written = 0usize;
         if !cached_write {
-            self.prepare_direct_io_range(offset, len, &private_data, true)?;
+            self.prepare_direct_io_range(
+                offset,
+                len,
+                &private_data,
+                true,
+                _direct_write_guard
+                    .as_ref()
+                    .expect("direct writeback admission guard"),
+            )?;
         }
         if cached_write && self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
             while total_written < len {
@@ -523,15 +606,25 @@ impl IndexNode for FuseNode {
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        let old = self.cached_or_fetch_metadata()?;
         let writeback_cache = self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
         if writeback_cache {
             self.sync_dirty_cached_pages()?;
         }
-        let _barrier = writeback_cache.then(|| self.writeback_barrier.write());
+        let _barrier = if self.dax_active() && metadata.size != old.size {
+            Some(if metadata.size < old.size {
+                self.dax_layout_write_for_truncate(metadata.size.max(0) as usize)?
+            } else {
+                self.dax_layout_write()
+            })
+        } else {
+            writeback_cache.then(|| self.writeback_barrier.write())
+        };
         if writeback_cache {
-            self.sync_dirty_cached_pages()?;
+            self.sync_dirty_cached_pages_admitted(
+                _barrier.as_ref().expect("writeback admission guard"),
+            )?;
         }
-        let old = self.cached_or_fetch_metadata()?;
         if metadata.size > old.size {
             self.resolve_pending_short_read_truncate(metadata.size.max(0) as usize)?;
         }
@@ -585,7 +678,12 @@ impl IndexNode for FuseNode {
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
         let new_size = md.size.max(0) as usize;
-        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
+        self.set_cached_metadata_with_valid(
+            md,
+            out.attr_valid,
+            out.attr_valid_nsec,
+            out.attr.flags,
+        );
         if (valid & FATTR_SIZE) != 0 {
             self.truncate_page_cache(new_size)?;
         }
@@ -666,7 +764,14 @@ impl IndexNode for FuseNode {
         _lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        if mode != 0 {
+        const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+        const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+        const FUSE_FALLOC_SUPPORTED: u32 =
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE;
+
+        let mode_bits = mode as u32;
+        if mode < 0 || mode_bits & !FUSE_FALLOC_SUPPORTED != 0 {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         self.check_not_stale()?;
@@ -682,10 +787,25 @@ impl IndexNode for FuseNode {
         drop(data);
 
         let md = self.metadata()?;
-        if new_size > md.size.max(0) as usize {
+        let old_size = md.size.max(0) as usize;
+        let keep_size = mode_bits & FALLOC_FL_KEEP_SIZE != 0;
+        let changes_contents = mode_bits & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0;
+        if !keep_size && new_size > old_size {
             crate::filesystem::vfs::vcore::check_file_size_limit(new_size)?;
         }
-        let _barrier = self.writeback_barrier.write();
+        if changes_contents {
+            self.sync_dirty_cached_pages()?;
+        }
+        let block_faults = self.dax_active() && (!keep_size || changes_contents);
+        let _barrier = if block_faults {
+            self.dax_layout_write_for_all()?
+        } else {
+            self.writeback_barrier.write()
+        };
+        if changes_contents {
+            // Close dirty admission between the first drain and exclusivity.
+            self.sync_dirty_cached_pages_admitted(&_barrier)?;
+        }
 
         let in_arg = FuseFallocateIn {
             fh: fuse_data.fh,
@@ -699,9 +819,12 @@ impl IndexNode for FuseNode {
             .request(FUSE_FALLOCATE, self.nodeid, fuse_pack_struct(&in_arg))
         {
             Ok(_) => {
+                if changes_contents {
+                    self.invalidate_page_cache_range(offset, len)?;
+                }
                 let mut metadata = self.cached_metadata.lock();
                 if let Some(md) = metadata.as_mut() {
-                    if new_size > md.size.max(0) as usize {
+                    if !keep_size && new_size > md.size.max(0) as usize {
                         md.size = new_size as i64;
                     }
                     let now = crate::time::PosixTimeSpec::now();
@@ -710,7 +833,8 @@ impl IndexNode for FuseNode {
                     self.bump_attr_version();
                 }
                 drop(metadata);
-                self.cached_metadata_deadline_ns.store(0, Ordering::Relaxed);
+                self.cached_metadata_deadline_ticks
+                    .store(0, Ordering::Relaxed);
                 Ok(())
             }
             Err(SystemError::ENOSYS) => {
@@ -750,7 +874,7 @@ impl IndexNode for FuseNode {
         match fuse_data {
             FuseFilePrivateData::File(p) => {
                 let _barrier = self.writeback_barrier.write();
-                let sync_result = self.sync_cached_pages();
+                let sync_result = self.sync_dirty_cached_pages_admitted(&_barrier);
                 let wb_error_result = self.check_and_advance_open_wb_error(&p);
                 sync_result?;
                 wb_error_result?;
@@ -779,11 +903,9 @@ impl IndexNode for FuseNode {
 
         if let FuseFilePrivateData::File(_) = &fuse_data {
             let _barrier = self.writeback_barrier.write();
-            if let Some(page_cache) = self.cached_page_cache() {
-                let start_index = start >> MMArch::PAGE_SHIFT;
-                let end_index = end >> MMArch::PAGE_SHIFT;
-                page_cache.manager().sync_range(start_index, end_index)?;
-            }
+            let start_index = start >> MMArch::PAGE_SHIFT;
+            let end_index = end >> MMArch::PAGE_SHIFT;
+            self.sync_cached_range_admitted(start_index, end_index, &_barrier)?;
             if let FuseFilePrivateData::File(p) = fuse_data {
                 self.check_and_advance_open_wb_error(&p)?;
                 return self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync);
@@ -802,7 +924,19 @@ impl IndexNode for FuseNode {
         self.fs.upgrade().unwrap()
     }
 
+    fn try_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        self.fs.upgrade().map(|fs| fs as Arc<dyn FileSystem>)
+    }
+
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        self.list_entries()?
+            .expect("FUSE provides native directory entries")
+            .into_iter()
+            .map(|entry| String::from_utf8(entry.name).map_err(|_| SystemError::EIO))
+            .collect()
+    }
+
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
 
@@ -815,89 +949,112 @@ impl IndexNode for FuseNode {
         };
         let fh = dir_p.fh;
         let open_flags = dir_p.open_flags;
-        let mut use_readdirplus = self.conn.use_readdirplus();
+        let no_open = dir_p.no_open;
         // Linux issues uncached READDIR with a single PAGE_SIZE output page. DragonOS keeps the
         // existing larger batch when the connection supports it, but must not exceed either the
         // mount's max_read value or the negotiated max_pages descriptor bound.
         let readdir_size = self.readdir_request_size();
 
-        let mut names: Vec<String> = Vec::new();
+        let mut entries: Vec<DirectoryEntry> = Vec::new();
+        let mut requested_offsets = HashSet::new();
         let mut offset: u64 = 0;
 
-        loop {
-            let read_in = FuseReadIn {
-                fh,
-                offset,
-                size: readdir_size,
-                read_flags: 0,
-                lock_owner: 0,
-                flags: open_flags,
-                padding: 0,
-            };
-            let opcode = if use_readdirplus {
-                FUSE_READDIRPLUS
-            } else {
-                FUSE_READDIR
-            };
-            let request_epoch = self.conn.sample_attr_epoch();
-            let payload = match self
-                .conn()
-                .request(opcode, self.nodeid, fuse_pack_struct(&read_in))
-            {
-                Ok(v) => v,
-                Err(SystemError::ENOSYS) if use_readdirplus => {
-                    self.conn.disable_readdirplus();
-                    use_readdirplus = false;
-                    continue;
+        let result = (|| {
+            loop {
+                if !requested_offsets.insert(offset) {
+                    break;
                 }
-                Err(e) => return Err(e),
-            };
-            if payload.is_empty() {
-                break;
-            }
+                let mut use_readdirplus = self.use_readdirplus(offset);
+                let read_in = FuseReadIn {
+                    fh,
+                    offset,
+                    size: readdir_size,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: open_flags,
+                    padding: 0,
+                };
+                let opcode = if use_readdirplus {
+                    FUSE_READDIRPLUS
+                } else {
+                    FUSE_READDIR
+                };
+                let request_epoch = self.conn.sample_attr_epoch();
+                let payload =
+                    match self
+                        .conn()
+                        .request(opcode, self.nodeid, fuse_pack_struct(&read_in))
+                    {
+                        Ok(v) => v,
+                        Err(SystemError::ENOSYS) if use_readdirplus => {
+                            self.conn.disable_readdirplus();
+                            requested_offsets.remove(&offset);
+                            use_readdirplus = false;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                if payload.is_empty() {
+                    break;
+                }
 
-            let mut last_off: u64 = offset;
-            if use_readdirplus {
-                last_off =
-                    self.parse_readdirplus_payload(&payload, &mut names, last_off, request_epoch)?;
-            } else {
-                last_off = Self::parse_readdir_payload(&payload, &mut names, last_off)?;
-            }
+                let mut last_off: u64 = offset;
+                if use_readdirplus {
+                    last_off = self.parse_readdirplus_payload(
+                        &payload,
+                        &mut entries,
+                        last_off,
+                        request_epoch,
+                    )?;
+                } else {
+                    last_off = Self::parse_readdir_payload(&payload, &mut entries, last_off)?;
+                }
 
-            if last_off == offset {
-                // Avoid infinite loop if userspace doesn't advance offsets.
-                break;
+                if last_off == offset {
+                    // Avoid infinite loop if userspace doesn't advance offsets.
+                    break;
+                }
+                offset = last_off;
             }
-            offset = last_off;
-        }
+            Ok(Some(entries))
+        })();
 
         // RELEASEDIR (best-effort)
-        if !dir_p.no_open {
+        if !no_open {
             self.release_common(FUSE_RELEASEDIR, fh, open_flags, 0);
         }
-        Ok(names)
+        result
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.find_bytes(name.as_bytes())
+    }
+
+    fn find_bytes(&self, name: &[u8]) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
-        if name == "." {
+        if name == b"." {
             let this = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
             return Ok(this);
         }
-        if name == ".." {
+        if name == b".." {
             return self.parent();
         }
 
-        if let Some(child) = self.lookup_cached_child(name) {
-            return Ok(child);
+        let utf8_name = core::str::from_utf8(name).ok();
+        if let Some(name) = utf8_name {
+            if let Some(child) = self.lookup_cached_child(name) {
+                return Ok(child);
+            }
         }
 
         let request_epoch = self.conn.sample_attr_epoch();
-        let payload = match self.request_name(FUSE_LOOKUP, self.nodeid, name) {
+        let payload = match self.request_name_bytes(FUSE_LOOKUP, self.nodeid, name) {
             Ok(payload) => payload,
             Err(err) => {
-                self.invalidate_lookup_cache(name);
+                if let Some(name) = utf8_name {
+                    self.invalidate_lookup_cache(name);
+                }
                 return Err(err);
             }
         };
@@ -924,6 +1081,7 @@ impl IndexNode for FuseNode {
                 Some(md.clone()),
                 Some(entry.generation),
                 1,
+                entry.attr.flags,
             )?;
             consumed = true;
             Ok(child)
@@ -937,23 +1095,27 @@ impl IndexNode for FuseNode {
                 return Err(err);
             }
         };
-        child.set_dname(name);
-        child
-            .lookup_attr_flags
-            .store(entry.attr.flags, Ordering::Relaxed);
+        if let Some(name) = utf8_name {
+            child.set_dname(name);
+        }
+        child.set_lookup_attr_flags(entry.attr.flags);
         child.merge_cached_metadata_from_daemon(
             md,
             entry.attr_valid,
             entry.attr_valid_nsec,
             request_epoch,
+            entry.attr.flags,
         );
-        self.cache_lookup_child(
-            name,
-            &child,
-            entry.generation,
-            entry.entry_valid,
-            entry.entry_valid_nsec,
-        );
+        if let Some(name) = utf8_name {
+            self.cache_lookup_child(
+                name,
+                &child,
+                entry.generation,
+                entry.entry_valid,
+                entry.entry_valid_nsec,
+            );
+        }
+        self.advise_readdirplus();
         Ok(child)
     }
 
@@ -981,6 +1143,10 @@ impl IndexNode for FuseNode {
             return self.create_with_data(name, file_type, mode, 0);
         }
 
+        if self.conn().no_create() {
+            return self.create_with_data(name, file_type, mode, 0);
+        }
+
         let inarg = FuseCreateIn {
             flags: FileFlags::O_RDONLY.bits(),
             mode: (InodeMode::S_IFREG | mode).bits(),
@@ -991,7 +1157,10 @@ impl IndexNode for FuseNode {
 
         let payload = match self.conn().request(FUSE_CREATE, self.nodeid, &payload_in) {
             Ok(v) => v,
-            Err(SystemError::ENOSYS) => return self.create_with_data(name, file_type, mode, 0),
+            Err(SystemError::ENOSYS) => {
+                self.conn().mark_no_create();
+                return self.create_with_data(name, file_type, mode, 0);
+            }
             Err(e) => return Err(e),
         };
         let (entry, open_out) = Self::parse_create_reply(&payload)?;
@@ -1005,6 +1174,86 @@ impl IndexNode for FuseNode {
             );
         }
         self.create_node_from_entry(&entry, Some(name), FileType::File)
+    }
+
+    fn create_and_open(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        flags: &FileFlags,
+    ) -> Result<PreopenedFile, SystemError> {
+        self.check_not_stale()?;
+        self.ensure_dir()?;
+        if self.conn().no_create() {
+            return Err(SystemError::ENOSYS);
+        }
+
+        // Linux fuse_create_open() forwards creation flags, excluding the
+        // tty-only flag. O_CLOEXEC is per-fd state and must not reach FUSE.
+        let file_flags = flags.bits() & !FileFlags::O_CLOEXEC.bits();
+        let create_flags = file_flags & !FileFlags::O_NOCTTY.bits();
+        let inarg = FuseCreateIn {
+            flags: create_flags,
+            mode: (InodeMode::S_IFREG | mode).bits(),
+            umask: 0,
+            open_flags: 0,
+        };
+        let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
+        let payload = match self.conn().request(FUSE_CREATE, self.nodeid, &payload_in) {
+            Ok(payload) => payload,
+            Err(SystemError::ENOSYS) => {
+                self.conn().mark_no_create();
+                return Err(SystemError::ENOSYS);
+            }
+            Err(err) => return Err(err),
+        };
+        let (entry, open_out) = Self::parse_create_reply(&payload)?;
+
+        let inode = match self.create_node_from_entry(&entry, Some(name), FileType::File) {
+            Ok(inode) => inode,
+            Err(err) => {
+                if entry.nodeid != 0 {
+                    self.release_common_for_node(
+                        FUSE_RELEASE,
+                        entry.nodeid,
+                        open_out.fh,
+                        file_flags,
+                        0,
+                    );
+                }
+                return Err(err);
+            }
+        };
+        let fuse_inode = match inode.clone().downcast_arc::<FuseNode>() {
+            Some(inode) => inode,
+            None => {
+                self.release_common_for_node(
+                    FUSE_RELEASE,
+                    entry.nodeid,
+                    open_out.fh,
+                    file_flags,
+                    0,
+                );
+                return Err(SystemError::EIO);
+            }
+        };
+
+        let mut private_data = FilePrivateData::default();
+        if let Err(err) = fuse_inode.set_open_private_data(
+            &mut private_data,
+            FUSE_OPEN,
+            open_out.fh,
+            file_flags,
+            open_out.open_flags,
+            false,
+        ) {
+            self.release_common_for_node(FUSE_RELEASE, entry.nodeid, open_out.fh, file_flags, 0);
+            return Err(err);
+        }
+
+        let preopened = PreopenedFile::new(inode, private_data);
+        fuse_inode.finish_open_cache_state(FUSE_OPEN, flags, open_out.open_flags)?;
+        Ok(preopened)
     }
 
     fn create_with_data(
@@ -1093,13 +1342,16 @@ impl IndexNode for FuseNode {
                 Some(md.clone()),
                 Some(entry.generation),
                 1,
+                entry.attr.flags,
             )?;
             consumed = true;
+            child.set_lookup_attr_flags(entry.attr.flags);
             child.merge_cached_metadata_from_daemon(
                 md,
                 entry.attr_valid,
                 entry.attr_valid_nsec,
                 request_epoch,
+                entry.attr.flags,
             );
             Ok(())
         })();

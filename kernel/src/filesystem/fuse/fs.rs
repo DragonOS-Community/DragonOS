@@ -8,12 +8,12 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        FilePrivateData, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags,
-        InodeId, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
+        file::File, FilePrivateData, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode,
+        InodeFlags, InodeId, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
     },
     libs::{mutex::Mutex, rwsem::RwSem},
     mm::{
-        fault::{PageFaultHandler, PageFaultMessage},
+        fault::{FaultFlags, FaultRetryWait, PageFaultHandler, PageFaultMessage},
         VirtRegion, VmFaultReason, VmFlags,
     },
     process::ProcessManager,
@@ -26,12 +26,45 @@ use linkme::distributed_slice;
 use super::{
     conn::FuseConn,
     inode::FuseNode,
-    private_data::FuseFilePrivateData,
+    private_data::{FuseFilePrivateData, FuseOpenLifetime},
     protocol::{
         fuse_read_struct, FuseStatfsOut, FOPEN_DIRECT_IO, FUSE_ATTR_SUBMOUNT, FUSE_ROOT_ID,
         FUSE_STATFS,
     },
+    stats,
 };
+
+#[derive(Debug)]
+struct FuseMmapRetryWait {
+    file: Arc<File>,
+    node: Arc<FuseNode>,
+    page_index: usize,
+    fh: u64,
+    file_flags: u32,
+    lifetime: Arc<FuseOpenLifetime>,
+    readahead: bool,
+}
+
+impl FaultRetryWait for FuseMmapRetryWait {
+    fn wait(&self) -> Result<(), SystemError> {
+        if self.readahead {
+            let mut ra_state = self.file.get_ra_state();
+            self.node.mmap_readahead_with_open(
+                self.page_index,
+                1,
+                &mut ra_state,
+                self.fh,
+                self.file_flags,
+                self.lifetime.clone(),
+            )?;
+            self.file.set_ra_state(ra_state)
+        } else {
+            self.node
+                .fault_page_with_open(self.page_index, self.fh, self.file_flags)
+                .map(|_| ())
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct FuseMountData {
@@ -94,6 +127,21 @@ impl FuseFS {
     {
         let _lifetime = self.notify_barrier.read();
         self.live_node(nodeid).map(|node| notify(&node))
+    }
+
+    pub(crate) fn purge_lookup_aliases(&self, child: &Arc<FuseNode>) {
+        let mut parents = vec![self.root.clone()];
+        {
+            let nodes = self.nodes.lock();
+            parents.extend(nodes.values().filter_map(Weak::upgrade));
+        }
+        {
+            let retired = self.retired_nodes.lock();
+            parents.extend(retired.iter().filter_map(Weak::upgrade));
+        }
+        for parent in parents {
+            parent.purge_lookup_alias(child);
+        }
     }
 
     fn should_retire_node(
@@ -212,7 +260,7 @@ impl FuseFS {
         parent: Option<Arc<FuseNode>>,
         cached: Option<Metadata>,
     ) -> Result<Arc<FuseNode>, SystemError> {
-        self.get_or_create_node_with_generation(nodeid, parent, cached, None, 0)
+        self.get_or_create_node_with_generation(nodeid, parent, cached, None, 0, 0)
     }
 
     pub fn get_or_create_node_with_generation(
@@ -222,6 +270,7 @@ impl FuseFS {
         cached: Option<Metadata>,
         generation: Option<u64>,
         lookup_refs: u64,
+        attr_flags: u32,
     ) -> Result<Arc<FuseNode>, SystemError> {
         if nodeid == self.root.nodeid() {
             if parent.is_some() || lookup_refs != 0 {
@@ -275,6 +324,7 @@ impl FuseFS {
                 parent_nodeid,
                 parent,
                 cached,
+                attr_flags,
             );
             if let Some(gen) = generation {
                 n.set_generation(gen);
@@ -296,6 +346,7 @@ impl FuseFS {
         cached: Option<Metadata>,
         generation: Option<u64>,
         lookup_refs: u64,
+        attr_flags: u32,
     ) -> Result<Arc<FuseNode>, SystemError> {
         if nodeid == self.root.nodeid() {
             if parent.is_some() || lookup_refs != 0 {
@@ -344,6 +395,7 @@ impl FuseFS {
                 parent_nodeid,
                 parent,
                 cached,
+                attr_flags,
             );
             if let Some(gen) = generation {
                 n.set_generation(gen);
@@ -364,6 +416,7 @@ impl FuseFS {
         root_parent: Arc<FuseNode>,
         root_nodeid: u64,
         root_md: Metadata,
+        attr_flags: u32,
     ) -> Arc<Self> {
         let conn = parent.conn.clone();
         let parent_nodeid = root_parent.nodeid();
@@ -375,6 +428,7 @@ impl FuseFS {
                 parent_nodeid,
                 Some(root_parent),
                 Some(root_md),
+                attr_flags,
             ),
             super_block: parent.super_block.clone(),
             conn,
@@ -439,6 +493,15 @@ impl FuseFS {
             node.mark_stale();
         }
         for node in live_nodes.iter().chain(retired_nodes.iter()) {
+            if let Err(error) = node.dax_teardown() {
+                log::warn!(
+                    "fuse: failed to tear down DAX mappings for node {}: {:?}",
+                    node.nodeid(),
+                    error
+                );
+            }
+        }
+        for node in live_nodes.iter().chain(retired_nodes.iter()) {
             node.clear_lookup_cache_tree();
         }
         for node in live_nodes.iter().chain(retired_nodes.iter()) {
@@ -473,9 +536,8 @@ impl FuseFS {
 pub fn fuse_try_automount_submount(
     fuse_node: &Arc<FuseNode>,
     mountpoint: &Arc<crate::filesystem::vfs::mount::MountFSInode>,
-    mount_path_override: Option<Arc<crate::filesystem::vfs::mount::MountPath>>,
 ) -> Result<(), SystemError> {
-    use crate::filesystem::vfs::mount::{MountFlags, MountPath};
+    use crate::filesystem::vfs::mount::MountFlags;
 
     let attr_flags = fuse_node.lookup_attr_flags();
     if (attr_flags & FUSE_ATTR_SUBMOUNT) == 0 {
@@ -485,42 +547,32 @@ pub fn fuse_try_automount_submount(
         return Ok(());
     }
 
-    let md = mountpoint.metadata()?;
-    if mountpoint
-        .mount_fs()
-        .mountpoints()
-        .contains_key(&md.inode_id)
-    {
-        return Ok(());
-    }
+    mountpoint.serialize_automount(|| {
+        if mountpoint.mount_fs().lookup_top(mountpoint).is_some() {
+            return Ok(());
+        }
 
-    let parent_fs = fuse_node.fuse_fs().ok_or(SystemError::ENOENT)?;
-    let sub_fs = FuseFS::new_submount(&parent_fs, fuse_node.clone(), fuse_node.nodeid(), md);
-    let mount_path = match mount_path_override {
-        Some(path) => path,
-        None => {
-            let path = mountpoint.absolute_path()?;
-            if !path.starts_with('/') {
-                return Err(SystemError::EINVAL);
-            }
-            Arc::new(MountPath::from(path))
+        let md = mountpoint.metadata()?;
+        let parent_fs = fuse_node.fuse_fs().ok_or(SystemError::ENOENT)?;
+        let sub_fs = FuseFS::new_submount(
+            &parent_fs,
+            fuse_node.clone(),
+            fuse_node.nodeid(),
+            md,
+            attr_flags,
+        );
+        let submount_flags = mountpoint.mount_fs().mount_flags() | MountFlags::SUBMOUNT;
+        match mountpoint.mount_subtree_with_state_if_vacant(
+            sub_fs.clone(),
+            sub_fs.root_node(),
+            submount_flags,
+            None,
+            None,
+        ) {
+            Ok(_) | Err(SystemError::EEXIST) => Ok(()),
+            Err(error) => Err(error),
         }
-    };
-    let submount_flags = mountpoint.mount_fs().mount_flags() | MountFlags::SUBMOUNT;
-    let mount_res = mountpoint.mount_subtree_with_state(
-        sub_fs.clone(),
-        sub_fs.root_node(),
-        submount_flags,
-        None,
-        None,
-        Some(mount_path),
-    );
-    if let Err(e) = mount_res {
-        if e != SystemError::EEXIST {
-            return Err(e);
-        }
-    }
-    Ok(())
+    })
 }
 
 impl MountableFileSystem for FuseFS {
@@ -602,6 +654,7 @@ impl MountableFileSystem for FuseFS {
                 FUSE_ROOT_ID,
                 None,
                 Some(root_md),
+                0,
             ),
             super_block,
             conn: conn.clone(),
@@ -696,14 +749,15 @@ impl FileSystem for FuseFS {
         false
     }
 
+    fn fault_before_map_pages(&self) -> bool {
+        true
+    }
+
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let vma = pfm.vma();
-        let vma_guard = vma.lock();
-        let vm_flags = *vma_guard.vm_flags();
-        let Some(file) = vma_guard.vm_file() else {
+        let vm_flags = pfm.vm_flags();
+        let Some(file) = pfm.vm_file() else {
             return VmFaultReason::VM_FAULT_SIGBUS;
         };
-        drop(vma_guard);
 
         let (node, fh, file_flags, fopen_flags, lifetime) = {
             let data = file.private_data.lock();
@@ -731,6 +785,20 @@ impl FileSystem for FuseFS {
             .unwrap_or(true);
 
         if major {
+            let can_retry = pfm.flags().contains(FaultFlags::FAULT_FLAG_ALLOW_RETRY)
+                && !pfm.flags().contains(FaultFlags::FAULT_FLAG_RETRY_NOWAIT);
+            if can_retry {
+                pfm.set_retry_wait(Arc::new(FuseMmapRetryWait {
+                    file: file.clone(),
+                    node,
+                    page_index,
+                    fh,
+                    file_flags,
+                    lifetime,
+                    readahead: !pfm.flags().contains(FaultFlags::FAULT_FLAG_TRIED),
+                }));
+                return VmFaultReason::VM_FAULT_MAJOR | VmFaultReason::VM_FAULT_RETRY;
+            }
             let mut ra_state = file.get_ra_state();
             let _ = node.mmap_readahead_with_open(
                 page_index,
@@ -776,11 +844,18 @@ impl FileSystem for FuseFS {
             p.node.clone()
         };
 
-        node.with_writeback_admission(|| {
+        let mut result = VmFaultReason::VM_FAULT_SIGBUS;
+        let admitted = node.try_with_writeback_admission(&mut || {
             let Ok(_pin) = node.pin_writeback_handle() else {
-                return VmFaultReason::VM_FAULT_SIGBUS;
+                return Ok(());
             };
-            let result = PageFaultHandler::filemap_page_mkwrite(pfm);
+            let Some(metadata) = node.cached_metadata_snapshot() else {
+                return Ok(());
+            };
+            result = PageFaultHandler::filemap_page_mkwrite_with_stable_size(
+                pfm,
+                metadata.size.max(0) as usize,
+            );
             if !result.intersects(
                 VmFaultReason::VM_FAULT_SIGBUS
                     | VmFaultReason::VM_FAULT_OOM
@@ -788,8 +863,21 @@ impl FileSystem for FuseFS {
             ) {
                 node.note_mmap_write();
             }
-            result
-        })
+            Ok(())
+        });
+        match admitted {
+            Ok(true) => result,
+            Ok(false) => {
+                // Never block on a writer-preferred admission semaphore while
+                // the architecture fault path owns AddressSpace::write(). The
+                // retry waiter acquires/releases it only after the MM guard is
+                // dropped, closing the barrier<->mkclean cycle.
+                stats::on_mmap_writeback_admission_retry();
+                pfm.set_retry_wait(node.writeback_admission_retry_wait());
+                VmFaultReason::VM_FAULT_RETRY
+            }
+            Err(_) => VmFaultReason::VM_FAULT_SIGBUS,
+        }
     }
 
     fn mprotect(&self, _old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
@@ -830,6 +918,10 @@ impl FileSystem for FuseFS {
     }
 
     fn on_umount(&self) {
+        if !self.is_submount {
+            self.conn.begin_dax_quiesce();
+            self.conn.wait_dax_drained();
+        }
         self.teardown_nodes();
         if !self.is_submount {
             self.conn.on_umount();

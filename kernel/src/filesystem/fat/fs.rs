@@ -502,7 +502,10 @@ impl FileSystem for FATFileSystem {
     }
 
     fn info(&self) -> crate::filesystem::vfs::FsInfo {
-        todo!()
+        crate::filesystem::vfs::FsInfo {
+            blk_dev_id: self.gendisk.device_num().data() as usize,
+            max_name_len: FAT_MAX_NAMELEN as usize,
+        }
     }
 
     /// @brief 本函数用于实现动态转换。
@@ -1857,6 +1860,10 @@ impl LockedFATInode {
 }
 
 impl IndexNode for LockedFATInode {
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         Ok(())
     }

@@ -3,10 +3,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    filesystem::{
-        fs::FsStruct,
-        vfs::{IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES},
-    },
+    filesystem::{fs::FsStruct, vfs::IndexNode},
     process::{
         cred::Cred,
         fork::CloneFlags,
@@ -16,7 +13,7 @@ use crate::{
             net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
             uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
         },
-        ProcessControlBlock, ProcessManager,
+        FsRefsReadGuard, ProcessControlBlock, ProcessManager,
     },
 };
 use core::{fmt::Debug, intrinsics::likely};
@@ -125,10 +122,11 @@ impl ProcessManager {
     ///
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?r=&mo=3770&fi=151#151
     #[inline(never)]
-    pub fn copy_namespaces(
+    pub(crate) fn copy_namespaces(
         clone_flags: &CloneFlags,
         _parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
+        _fs_refs: &FsRefsReadGuard,
     ) -> Result<(), SystemError> {
         // log::debug!(
         //     "copy_namespaces: clone_flags={:?}, parent pid={}, child pid={}, child name={}",
@@ -178,23 +176,25 @@ impl ProcessManager {
         {
             return Err(SystemError::EINVAL);
         }
+        let child_fs = child_pcb.fs_struct();
+        let old_fs_root = child_fs.root();
+        let old_fs_pwd = child_fs.pwd();
         let new_ns = create_new_namespaces(clone_flags, child_pcb, user_ns)?;
-        // 设置新的nsproxy
+        let rebound_fs = if clone_flags.contains(CloneFlags::CLONE_NEWNS) {
+            Some((
+                new_ns.mnt_ns.project_copy_source_inode(&old_fs_root)?,
+                new_ns.mnt_ns.project_copy_source_inode(&old_fs_pwd)?,
+            ))
+        } else {
+            None
+        };
 
+        // All fallible mount/fs_struct projection completed before either
+        // object is published to the child PCB.
         child_pcb.set_nsproxy(new_ns);
-
-        // 如果创建了新的 mount namespace，需要将子进程的 fs_struct (root/pwd)
-        // 从旧 namespace 的 inode 切换到新 namespace 的根 inode。
-        // 否则子进程的路径解析和挂载操作会直接作用于父 namespace 的 mount 树，
-        // 完全破坏 mount namespace 的隔离性。
-        //
-        // 参考 Linux: fs/namespace.c copy_mnt_ns() 中遍历 mount 树时
-        //   替换 new_fs->root.mnt 和 new_fs->pwd.mnt
-        if clone_flags.contains(CloneFlags::CLONE_NEWNS) {
-            let new_root = child_pcb.nsproxy().mnt_namespace().root_inode();
-            let fs = child_pcb.fs_struct();
-            fs.set_root(new_root.clone());
-            fs.set_pwd(new_root);
+        if let Some((new_root, new_pwd)) = rebound_fs {
+            child_fs.set_root(new_root);
+            child_fs.set_pwd(new_pwd);
         }
 
         Ok(())
@@ -285,26 +285,57 @@ pub fn exec_task_namespaces() -> Result<(), SystemError> {
     let user_ns = tsk.cred().user_ns.clone();
     let new_nsproxy = create_new_namespaces(&CloneFlags::empty(), &tsk, user_ns)?;
     // todo: time_ns的逻辑
-    switch_task_namespaces(&tsk, new_nsproxy)?;
+    let fs_refs = crate::process::lock_fs_refs_copy();
+    switch_task_namespaces(&tsk, new_nsproxy, &fs_refs)?;
 
     return Ok(());
 }
 
-pub fn switch_task_namespaces(
+pub(crate) fn switch_task_namespaces(
     tsk: &Arc<ProcessControlBlock>,
     new_nsproxy: Arc<NsProxy>,
+    _fs_refs: &FsRefsReadGuard,
 ) -> Result<(), SystemError> {
+    // Check sharing before taking our temporary Arc below.  Counting after
+    // cloning the Arc would mistake this function's own reference for a
+    // CLONE_FS peer and reject an otherwise private fs_struct.
+    let fs_is_shared = tsk.fs_struct_is_shared();
     let fs = tsk.fs_struct();
-    switch_task_namespaces_with_fs(tsk, &fs, new_nsproxy)
+    switch_task_namespaces_inner(tsk, &fs, new_nsproxy, fs_is_shared, false)
 }
 
 pub(crate) fn switch_task_namespaces_with_fs(
     tsk: &Arc<ProcessControlBlock>,
     fs: &Arc<FsStruct>,
     new_nsproxy: Arc<NsProxy>,
+    _fs_refs: &FsRefsReadGuard,
+) -> Result<(), SystemError> {
+    // unshare(CLONE_NEWNS) passes either a freshly copied fs_struct or the
+    // task's proven-private one, so there is no CLONE_FS peer to reject.
+    switch_task_namespaces_inner(tsk, fs, new_nsproxy, false, true)
+}
+
+fn switch_task_namespaces_inner(
+    tsk: &Arc<ProcessControlBlock>,
+    fs: &Arc<FsStruct>,
+    new_nsproxy: Arc<NsProxy>,
+    fs_is_shared: bool,
+    project_copy_source: bool,
 ) -> Result<(), SystemError> {
     if !Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
-        prepare_fs_for_new_mntns(fs, &new_nsproxy.mnt_ns)?;
+        if fs_is_shared {
+            return Err(SystemError::EINVAL);
+        }
+        if project_copy_source {
+            prepare_fs_for_new_mntns(fs, &new_nsproxy.mnt_ns)?;
+        } else {
+            // setns installs the target namespace root as both root and cwd;
+            // it must not preserve paths merely because the target happens to
+            // have been cloned from the current namespace.
+            let root = new_nsproxy.mnt_ns.root_inode();
+            fs.set_root(root.clone());
+            fs.set_pwd(root);
+        }
     }
 
     tsk.set_nsproxy(new_nsproxy);
@@ -327,22 +358,15 @@ fn resolve_fs_paths_for_new_mntns(
     fs: &Arc<FsStruct>,
     new_mntns: &Arc<MntNamespace>,
 ) -> Result<ReboundFsPaths, SystemError> {
-    let old_root_path = fs.root().absolute_path()?;
-    let old_pwd_path = fs.pwd().absolute_path()?;
-
-    let new_root = resolve_from_namespace_root(new_mntns, &old_root_path)?;
-    let new_pwd = resolve_from_namespace_root(new_mntns, &old_pwd_path)?;
-    Ok((new_root, new_pwd))
-}
-
-fn resolve_from_namespace_root(
-    mntns: &Arc<MntNamespace>,
-    path: &str,
-) -> Result<Arc<dyn IndexNode>, SystemError> {
-    let namespace_root = mntns.root_inode();
-    if path.is_empty() || path == "/" {
-        return Ok(namespace_root);
+    let old_root = fs.root();
+    let old_pwd = fs.pwd();
+    if let (Ok(new_root), Ok(new_pwd)) = (
+        new_mntns.project_copy_source_inode(&old_root),
+        new_mntns.project_copy_source_inode(&old_pwd),
+    ) {
+        return Ok((new_root, new_pwd));
     }
 
-    namespace_root.lookup_follow_symlink(path.trim_start_matches('/'), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    let namespace_root = new_mntns.root_inode();
+    Ok((namespace_root.clone(), namespace_root))
 }

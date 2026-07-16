@@ -62,6 +62,7 @@ fn level_size(level: usize) -> Option<usize> {
 /// RAII owner for a write-back device-memory mapping in the kernel linear address space.
 #[derive(Debug)]
 pub struct DeviceLinearMapping {
+    pstart: PhysAddr,
     start: VirtAddr,
     end: VirtAddr,
     segments: Vec<MappingSegment>,
@@ -86,6 +87,7 @@ impl DeviceLinearMapping {
             .checked_add(length)
             .ok_or(SystemError::EOVERFLOW)?;
         let mut mapping = Self {
+            pstart: paddr,
             start: vaddr,
             end: VirtAddr::new(end_data),
             segments: Vec::new(),
@@ -150,6 +152,30 @@ impl DeviceLinearMapping {
 
     pub fn len(&self) -> usize {
         self.end.data() - self.start.data()
+    }
+
+    pub fn checked_paddr(&self, offset: usize, len: usize) -> Result<PhysAddr, SystemError> {
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        if end > self.len() {
+            return Err(SystemError::ERANGE);
+        }
+        self.pstart
+            .data()
+            .checked_add(offset)
+            .map(PhysAddr::new)
+            .ok_or(SystemError::EOVERFLOW)
+    }
+
+    pub fn checked_vaddr(&self, offset: usize, len: usize) -> Result<VirtAddr, SystemError> {
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        if end > self.len() {
+            return Err(SystemError::ERANGE);
+        }
+        self.start
+            .data()
+            .checked_add(offset)
+            .map(VirtAddr::new)
+            .ok_or(SystemError::EOVERFLOW)
     }
 
     pub fn reset(&mut self) {

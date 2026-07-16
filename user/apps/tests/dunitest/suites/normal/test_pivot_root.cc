@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -29,8 +30,16 @@
 #define CLONE_NEWNS 0x00020000
 #endif
 
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000
+#endif
+
 #ifndef MS_REC
 #define MS_REC 16384
+#endif
+
+#ifndef RAMFS_MAGIC
+#define RAMFS_MAGIC 0x858458f6
 #endif
 
 namespace {
@@ -506,6 +515,45 @@ void case_permission_failure() {
     child_fail("expected EPERM");
 }
 
+void case_not_dir() {
+    const char* base = "/tmp/test_pivot_root/not_dir";
+    const char* file = "/tmp/test_pivot_root/not_dir/file";
+
+    ensure_parent_tree();
+    ensure_dir(base);
+    int fd = open(file, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        child_fail("create non-directory target failed");
+    }
+    close(fd);
+
+    errno = 0;
+    if (do_pivot_root(file, base) != -1 || errno != ENOTDIR) {
+        child_fail("non-directory new_root did not return ENOTDIR");
+    }
+    errno = 0;
+    if (do_pivot_root(base, file) != -1 || errno != ENOTDIR) {
+        child_fail("non-directory put_old did not return ENOTDIR");
+    }
+    child_pass();
+}
+
+void case_not_exist() {
+    ensure_parent_tree();
+    errno = 0;
+    if (do_pivot_root("/tmp/test_pivot_root/missing/newroot",
+                      "/tmp/test_pivot_root/missing/oldroot") != -1 ||
+        errno != ENOENT) {
+        child_fail("missing new_root did not preserve ENOENT");
+    }
+    errno = 0;
+    if (do_pivot_root("/tmp", "/tmp/test_pivot_root/missing/oldroot") != -1 ||
+        errno != ENOENT) {
+        child_fail("missing put_old did not preserve ENOENT");
+    }
+    child_pass();
+}
+
 // ---- Tests for shared mount rejection ----
 
 void case_shared_mount_rejection() {
@@ -546,6 +594,102 @@ void case_shared_mount_rejection() {
     }
 
     child_fail("expected EINVAL for shared mount");
+}
+
+void case_shared_root_parent_rejected() {
+    const char* outer = "/tmp/test_pivot_root/shared_root_parent/outer";
+    const char* old_root = "/tmp/test_pivot_root/shared_root_parent/outer/root";
+    const char* new_root = "/tmp/test_pivot_root/shared_root_parent/outer/root/newroot";
+    const char* put_old =
+        "/tmp/test_pivot_root/shared_root_parent/outer/root/newroot/oldroot";
+
+    ensure_parent_tree();
+    ensure_dir("/tmp/test_pivot_root/shared_root_parent");
+    ensure_dir(outer);
+    prepare_private_mount_namespace();
+    if (mount("", outer, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+    if ((mkdir(old_root, 0755) != 0 && errno != EEXIST) ||
+        mount("", old_root, "ramfs", 0, nullptr) != 0 ||
+        (mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
+        mount("", new_root, "ramfs", 0, nullptr) != 0 ||
+        (mkdir(put_old, 0755) != 0 && errno != EEXIST)) {
+        child_fail("prepare shared root-parent layout failed");
+    }
+    // Use an explicit mount above the caller root, so this isolates Linux's
+    // root_mnt->mnt_parent check from the namespace-root representation.
+    if (mount(nullptr, outer, nullptr, MS_SHARED, nullptr) != 0) {
+        child_skip("cannot make caller-root parent shared");
+    }
+    if (chroot(old_root) != 0 || chdir("/") != 0) {
+        child_fail("chroot(old_root) failed");
+    }
+    errno = 0;
+    if (do_pivot_root("/newroot", "/newroot/oldroot") != -1 || errno != EINVAL) {
+        child_fail("shared root_mnt parent did not return EINVAL");
+    }
+    child_pass();
+}
+
+void case_shared_new_root_parent_rejected() {
+    const char* old_root = "/tmp/test_pivot_root/shared_new_parent/root";
+    const char* new_root = "/tmp/test_pivot_root/shared_new_parent/root/newroot";
+    const char* put_old = "/tmp/test_pivot_root/shared_new_parent/root/newroot/oldroot";
+
+    ensure_parent_tree();
+    ensure_dir("/tmp/test_pivot_root/shared_new_parent");
+    ensure_dir(old_root);
+    prepare_private_mount_namespace();
+    if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+    if ((mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
+        mount("", new_root, "ramfs", 0, nullptr) != 0 ||
+        (mkdir(put_old, 0755) != 0 && errno != EEXIST)) {
+        child_fail("prepare shared new-root-parent layout failed");
+    }
+    // new_mnt->parent is the caller's old-root mount.
+    if (mount(nullptr, old_root, nullptr, MS_SHARED, nullptr) != 0) {
+        child_skip("cannot make new-root parent shared");
+    }
+    if (chroot(old_root) != 0 || chdir("/") != 0) {
+        child_fail("chroot(old_root) failed");
+    }
+    errno = 0;
+    if (do_pivot_root("/newroot", "/newroot/oldroot") != -1 || errno != EINVAL) {
+        child_fail("shared new_mnt parent did not return EINVAL");
+    }
+    child_pass();
+}
+
+void case_shared_mounted_put_old_rejected() {
+    const char* old_root = "/tmp/test_pivot_root/shared_put_old/root";
+    const char* new_root = "/tmp/test_pivot_root/shared_put_old/root/newroot";
+    const char* put_old = "/tmp/test_pivot_root/shared_put_old/root/newroot/oldroot";
+
+    ensure_parent_tree();
+    ensure_dir("/tmp/test_pivot_root/shared_put_old");
+    ensure_dir(old_root);
+    prepare_private_mount_namespace();
+    if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+    if ((mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
+        mount("", new_root, "ramfs", 0, nullptr) != 0 ||
+        (mkdir(put_old, 0755) != 0 && errno != EEXIST) ||
+        mount("", put_old, "ramfs", 0, nullptr) != 0 ||
+        mount(nullptr, put_old, nullptr, MS_SHARED, nullptr) != 0) {
+        child_fail("prepare shared mounted-put-old layout failed");
+    }
+    if (chroot(old_root) != 0 || chdir("/") != 0) {
+        child_fail("chroot(old_root) failed");
+    }
+    errno = 0;
+    if (do_pivot_root("/newroot", "/newroot/oldroot") != -1 || errno != EINVAL) {
+        child_fail("shared top mount on put_old did not return EINVAL");
+    }
+    child_pass();
 }
 
 // ---- Test for mount namespace isolation (BUG-0a regression) ----
@@ -762,12 +906,17 @@ void case_namespace_root_pivot() {
     const char* old_marker = "/tmp/test_pivot_root/namespace_root_old_marker";
     const char* new_marker = "/tmp/test_pivot_root/namespace_root/newroot/new_marker";
 
+    struct statfs current_root = {};
+    if (statfs("/", &current_root) != 0) {
+        child_fail("statfs current root failed");
+    }
+    if (current_root.f_type == RAMFS_MAGIC) {
+        child_skip("initial ramfs root is intentionally unattached");
+    }
+
     ensure_parent_tree();
     ensure_dir(base);
     prepare_private_mount_namespace();
-    // Keep the new root's real parent private, then make only the caller's
-    // namespace root shared. Linux checks root_mnt->mnt_parent, not root_mnt
-    // itself, so this remains a valid namespace-root pivot.
     if (mount("", base, "ramfs", 0, nullptr) != 0) {
         child_skip(strerror(errno));
     }
@@ -782,16 +931,97 @@ void case_namespace_root_pivot() {
         (mkdir(new_marker, 0755) != 0 && errno != EEXIST)) {
         child_fail("prepare namespace-root markers failed");
     }
-    if (mount(nullptr, "/", nullptr, MS_SHARED, nullptr) != 0) {
-        child_skip("cannot make namespace root shared");
-    }
-
     if (do_pivot_root(new_root, put_old) != 0) {
-        child_fail("pivot_root from namespace root failed");
+        child_fail("pivot_root from attached namespace root failed");
     }
     if (access("/new_marker", F_OK) != 0 ||
         access("/oldroot/tmp/test_pivot_root/namespace_root_old_marker", F_OK) != 0) {
-        child_fail("namespace-root pivot published incomplete topology");
+        child_fail("namespace-root pivot did not preserve old and new roots");
+    }
+    child_pass();
+}
+
+void case_namespace_root_identity_busy() {
+    ensure_parent_tree();
+    prepare_private_mount_namespace();
+    errno = 0;
+    if (do_pivot_root("/", "/tmp") != -1 || errno != EBUSY) {
+        child_fail("namespace-root identity loop did not take EBUSY precedence");
+    }
+    child_pass();
+}
+
+void case_locked_new_root_rejected() {
+    const char* old_root = "/tmp/test_pivot_root/locked_new/root";
+    const char* new_root = "/tmp/test_pivot_root/locked_new/root/newroot";
+    const char* put_old = "/tmp/test_pivot_root/locked_new/root/newroot/oldroot";
+
+    ensure_parent_tree();
+    ensure_dir("/tmp/test_pivot_root/locked_new");
+    ensure_dir(old_root);
+    prepare_private_mount_namespace();
+    if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+    if ((mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
+        mount("", new_root, "ramfs", 0, nullptr) != 0 ||
+        (mkdir(put_old, 0755) != 0 && errno != EEXIST)) {
+        child_fail("prepare locked-new-root layout failed");
+    }
+    // A mount namespace copied into a new user namespace locks every copied
+    // mount. The already-mounted new_root must therefore be rejected.
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+        child_fail("unshare user+mount namespace failed");
+    }
+    if (chroot(old_root) != 0 || chdir("/") != 0) {
+        child_fail("chroot locked old root failed");
+    }
+    errno = 0;
+    if (do_pivot_root("/newroot", "/newroot/oldroot") != -1 || errno != EINVAL) {
+        child_fail("locked new_root did not return EINVAL");
+    }
+    child_pass();
+}
+
+void case_old_root_lock_transferred() {
+    const char* old_root = "/tmp/test_pivot_root/lock_transfer/root";
+    const char* new_root = "/tmp/test_pivot_root/lock_transfer/root/newroot";
+    const char* put_old = "/tmp/test_pivot_root/lock_transfer/root/newroot/oldroot";
+    const char* move_target = "/tmp/test_pivot_root/lock_transfer/root/newroot/move_target";
+
+    ensure_parent_tree();
+    ensure_dir("/tmp/test_pivot_root/lock_transfer");
+    ensure_dir(old_root);
+    prepare_private_mount_namespace();
+    if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+    if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
+        child_fail("mkdir(newroot) before namespace copy failed");
+    }
+    // The copied old_root is locked, while mounts created after this point
+    // are owned by the new user namespace and remain movable.
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+        child_fail("unshare user+mount namespace failed");
+    }
+    if (mount("", new_root, "ramfs", 0, nullptr) != 0 ||
+        (mkdir(put_old, 0755) != 0 && errno != EEXIST) ||
+        (mkdir(move_target, 0755) != 0 && errno != EEXIST)) {
+        child_fail("prepare unlocked pivot targets failed");
+    }
+    if (chroot(old_root) != 0 || chdir("/") != 0) {
+        child_fail("chroot(old_root) failed");
+    }
+    if (do_pivot_root("/newroot", "/newroot/oldroot") != 0) {
+        child_fail("pivot_root with locked old root failed");
+    }
+
+    errno = 0;
+    if (mount("/", "/move_target", nullptr, MS_MOVE, nullptr) != -1 || errno != EINVAL) {
+        child_fail("new root did not receive the topology lock");
+    }
+    if (umount2("/oldroot", MNT_DETACH) != 0) {
+        child_fail("old root remained locked after pivot");
     }
     child_pass();
 }
@@ -1181,8 +1411,31 @@ TEST(PivotRoot, PermissionFailure) {
     expect_case_pass_or_skip("pivot_root_permission_failure", case_permission_failure);
 }
 
+TEST(PivotRoot, NotDir) {
+    expect_case_pass_or_skip("pivot_root_not_dir", case_not_dir);
+}
+
+TEST(PivotRoot, NotExist) {
+    expect_case_pass_or_skip("pivot_root_not_exist", case_not_exist);
+}
+
 TEST(PivotRoot, SharedMountRejection) {
     expect_case_pass_or_skip("pivot_root_shared_mount_rejection", case_shared_mount_rejection);
+}
+
+TEST(PivotRoot, SharedRootParentRejected) {
+    expect_case_pass_or_skip("pivot_root_shared_root_parent_rejected",
+                             case_shared_root_parent_rejected);
+}
+
+TEST(PivotRoot, SharedNewRootParentRejected) {
+    expect_case_pass_or_skip("pivot_root_shared_new_root_parent_rejected",
+                             case_shared_new_root_parent_rejected);
+}
+
+TEST(PivotRoot, SharedMountedPutOldRejected) {
+    expect_case_pass_or_skip("pivot_root_shared_mounted_put_old_rejected",
+                             case_shared_mounted_put_old_rejected);
 }
 
 TEST(PivotRoot, MountNamespaceIsolation) {
@@ -1205,6 +1458,20 @@ TEST(PivotRoot, ChrootOrdinaryDirectoryRejected) {
 
 TEST(PivotRoot, NamespaceRootPivot) {
     expect_case_pass_or_skip("pivot_root_namespace_root", case_namespace_root_pivot);
+}
+
+TEST(PivotRoot, NamespaceRootIdentityBusy) {
+    expect_case_pass_or_skip("pivot_root_namespace_root_identity_busy",
+                             case_namespace_root_identity_busy);
+}
+
+TEST(PivotRoot, LockedNewRootRejected) {
+    expect_case_pass_or_skip("pivot_root_locked_new_root_rejected", case_locked_new_root_rejected);
+}
+
+TEST(PivotRoot, OldRootLockTransferred) {
+    expect_case_pass_or_skip("pivot_root_old_root_lock_transferred",
+                             case_old_root_lock_transferred);
 }
 
 TEST(PivotRoot, NewRootOnRootMount) {

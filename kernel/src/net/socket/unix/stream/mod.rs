@@ -400,7 +400,7 @@ impl UnixStreamSocket {
             .expect("UnixStreamSocket inner is None")
         {
             Inner::Connected(connected) => {
-                connected.readable_len(self.is_seqpacket) != 0 || connected.peer_send_shutdown()
+                connected.readable_len(self.is_seqpacket) != 0 || connected.recv_closed()
             }
             _ => false,
         }
@@ -1573,9 +1573,31 @@ impl Socket for UnixStreamSocket {
             connected.shutdown_send();
         }
 
-        // Wake any sleepers.
+        // Do not retain our inner lock while waking the peer. The peer can be
+        // shutting down the opposite endpoint concurrently and epoll wakeup
+        // may query its socket state.
+        drop(inner_guard);
+
+        // Local waiters may also need to observe a newly disabled direction.
         self.wait_queue
             .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), self.check_io_event());
+
+        // The shutdown bits live in the rings shared with the peer, but a
+        // blocked peer sleeps on its own socket wait queue. Waking only this
+        // endpoint leaves a peer read/write asleep after the condition has
+        // become final (notably SOCK_SEQPACKET read after SHUT_WR).
+        let peer = self.peer.lock().as_ref().and_then(Weak::upgrade);
+        if let Some(peer) = peer {
+            peer.wait_queue
+                .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+            let _ = EventPoll::wakeup_epoll(peer.epoll_items().as_ref(), peer.check_io_event());
+            if _how.is_both_shutdown() {
+                peer.fasync_items.send_sigio(FASYNC_POLL_HUP);
+            } else if _how.is_send_shutdown() {
+                peer.fasync_items.send_sigio(FASYNC_POLL_IN);
+            }
+        }
 
         Ok(())
     }
@@ -1584,8 +1606,11 @@ impl Socket for UnixStreamSocket {
         self.inner
             .read()
             .as_ref()
-            .expect("UnixStreamSocket inner is None")
-            .check_io_events()
+            .map(Inner::check_io_events)
+            // Concurrent close has already made the socket terminal and
+            // emitted its wakeups. Event queries racing with it must observe
+            // HUP rather than panic on the consumed Inner value.
+            .unwrap_or(EPollEventType::EPOLLHUP)
     }
 
     fn socket_inode_id(&self) -> InodeId {

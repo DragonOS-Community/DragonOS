@@ -777,6 +777,14 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         self.ring_buffer.is_send_shutdown()
     }
 
+    /// No more bytes can arrive after the receive queue is drained.
+    ///
+    /// The consumer observes this both after its owner calls `SHUT_RD` and
+    /// after the producer calls `SHUT_WR`.
+    pub fn is_read_shutdown(&self) -> bool {
+        self.is_recv_shutdown() || self.is_send_shutdown()
+    }
+
     pub fn set_recv_shutdown(&self) {
         self.ring_buffer.set_recv_shutdown()
     }

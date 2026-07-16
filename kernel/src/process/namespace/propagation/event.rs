@@ -122,19 +122,64 @@ impl CorrespondingSources {
     }
 }
 
-struct PreparedRegistrations {
+pub(crate) struct PreparedRegistrations {
     peer_groups: Vec<PreparedPeerGroupState>,
     slaves: Vec<Arc<MountFS>>,
 }
 
 impl PreparedRegistrations {
-    fn prepare(mounts: &[Arc<MountFS>]) -> Result<Self, SystemError> {
-        let peer_groups = prepare_peer_registrations(mounts)?;
+    pub(crate) fn prepare(mounts: &[Arc<MountFS>]) -> Result<Self, SystemError> {
+        Self::prepare_iter(mounts.iter())
+    }
+
+    pub(crate) fn prepare_iter<'a>(
+        mounts: impl Iterator<Item = &'a Arc<MountFS>> + Clone,
+    ) -> Result<Self, SystemError> {
+        Self::prepare_iter_with(mounts, || Ok(()))
+    }
+
+    #[cfg(test)]
+    fn prepare_with(
+        mounts: &[Arc<MountFS>],
+        before_reserve: impl FnMut() -> Result<(), SystemError>,
+    ) -> Result<Self, SystemError> {
+        Self::prepare_iter_with(mounts.iter(), before_reserve)
+    }
+
+    fn prepare_iter_with<'a>(
+        mounts: impl Iterator<Item = &'a Arc<MountFS>> + Clone,
+        mut before_reserve: impl FnMut() -> Result<(), SystemError>,
+    ) -> Result<Self, SystemError> {
+        let relevant_count = mounts
+            .clone()
+            .filter(|mount| {
+                mount.propagation().is_shared() || mount.propagation().master().is_some()
+            })
+            .count();
+        let mut relevant = Vec::new();
+        if relevant_count != 0 {
+            before_reserve()?;
+            relevant
+                .try_reserve(relevant_count)
+                .map_err(|_| SystemError::ENOMEM)?;
+            relevant.extend(mounts.filter(|mount| {
+                mount.propagation().is_shared() || mount.propagation().master().is_some()
+            }));
+        }
+
+        let peer_groups = prepare_peer_registrations(&relevant)?;
         let mut slaves = Vec::new();
-        slaves
-            .try_reserve(mounts.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        for mount in mounts {
+        let slave_count = relevant
+            .iter()
+            .filter(|mount| !mount.is_live() && mount.propagation().master().is_some())
+            .count();
+        if slave_count != 0 {
+            before_reserve()?;
+            slaves
+                .try_reserve(slave_count)
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
+        for mount in relevant {
             // Live source mounts in a move already occupy their master's
             // reverse list. Detached source/clone mounts need publication.
             if !mount.is_live() && mount.propagation().master().is_some() {
@@ -143,9 +188,12 @@ impl PreparedRegistrations {
         }
 
         let mut masters = Vec::new();
-        masters
-            .try_reserve(slaves.len())
-            .map_err(|_| SystemError::ENOMEM)?;
+        if !slaves.is_empty() {
+            before_reserve()?;
+            masters
+                .try_reserve(slaves.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
         for slave in &slaves {
             let master = slave
                 .propagation()
@@ -172,7 +220,7 @@ impl PreparedRegistrations {
         })
     }
 
-    fn commit(self) {
+    pub(crate) fn commit(self) {
         apply_prepared_peer_groups(self.peer_groups);
         for mount in self.slaves {
             register_slave_with_master(&mount);
@@ -600,7 +648,7 @@ pub(crate) fn commit_mount_propagation_locked(
                 // user-namespace boundary, while leaving the propagated root
                 // itself movable as the new visible boundary.
                 for mount in collect_subtree(&item.clone) {
-                    mount.lock_mount();
+                    mount.lock_cross_user_mount();
                 }
                 item.clone.unlock_mount();
             }

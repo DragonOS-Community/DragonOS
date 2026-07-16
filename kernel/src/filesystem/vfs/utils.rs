@@ -67,6 +67,22 @@ impl ResolvedPath {
         Self::from_existing_mount(self.inode.clone(), mount_guard)
     }
 
+    /// Infallibly derive another operation owner from this live resolved path.
+    /// This does not perform initial mount-pin admission and therefore never
+    /// acquires the global mount topology lock.
+    pub(crate) fn derive_existing_owner(&self) -> Self {
+        Self {
+            inode: self.inode.clone(),
+            mount_guard: self
+                .mount_guard
+                .as_ref()
+                .map(MountExternalGuard::derive_existing),
+            _operation_guard: self
+                ._operation_guard
+                .derive_existing(InodeRetentionKind::Operation),
+        }
+    }
+
     pub fn into_parts(
         self,
     ) -> (

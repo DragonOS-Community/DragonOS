@@ -16,7 +16,7 @@ use crate::{
         casting::DowncastArc,
         errseq::{ErrSeq, ErrSeqValue},
         mutex::{Mutex, MutexGuard},
-        rwsem::{RwSem, RwSemWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
@@ -57,8 +57,9 @@ use system_error::SystemError;
 /// detach, including propagation peers in other namespaces.
 ///
 /// Mount topology and propagation code acquires locks in this order:
-/// lifecycle -> namespace -> dentry mount gate -> parent mountpoints -> peer
-/// registry -> one mount's propagation state -> propagation group allocator.
+/// lifecycle -> namespace -> dentry mount gates (ordered by dentry ID) ->
+/// dentry topology snapshot -> parent mountpoints -> peer registry -> one
+/// mount's propagation state -> propagation group allocator.
 /// A lower layer must never acquire the lifecycle/topology layers in reverse.
 pub(crate) static MOUNT_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -67,6 +68,129 @@ lazy_static! {
     /// topology is protected separately by `MOUNT_LIFECYCLE_LOCK`; readers
     /// acquire it first when both are needed.
     static ref DENTRY_TOPOLOGY_LOCK: RwSem<()> = RwSem::new(());
+}
+
+/// Stable snapshot of both mount edges and dentry parent/name relationships.
+///
+/// Keep the field order in sync with the required release order: Rust drops
+/// fields in declaration order, so the dentry reader is released before the
+/// outer mount-lifecycle mutex.
+pub struct MountTopologyGuard {
+    _dentries: RwSemReadGuard<'static, ()>,
+    _mounts: MutexGuard<'static, ()>,
+}
+
+/// First stage of a mount-topology transaction.
+///
+/// Edge commits which also need dentry mount gates use this capability to
+/// acquire those gates before completing the dentry topology snapshot.
+pub(crate) struct MountLifecycleGuard {
+    mounts: MutexGuard<'static, ()>,
+}
+
+/// Proof that every dentry gate used by one mount-edge commit is held.
+/// The fields are private so only the gate-set helper can construct it.
+pub(crate) struct MountEdgeCommitToken {
+    dentries: [Option<DentryId>; 3],
+}
+
+impl MountEdgeCommitToken {
+    fn covers(&self, mountpoint: &MountFSInode) -> bool {
+        let id = mountpoint.dentry.id;
+        self.dentries.iter().flatten().any(|entry| *entry == id)
+    }
+}
+
+pub(crate) fn lock_mount_lifecycle() -> MountLifecycleGuard {
+    MountLifecycleGuard {
+        mounts: MOUNT_LIFECYCLE_LOCK.lock(),
+    }
+}
+
+/// Acquire the complete VFS topology snapshot in the canonical lock order.
+pub(crate) fn lock_mount_topology() -> MountTopologyGuard {
+    lock_mount_lifecycle().complete()
+}
+
+impl MountLifecycleGuard {
+    fn complete(self) -> MountTopologyGuard {
+        let dentries = DENTRY_TOPOLOGY_LOCK.read();
+        MountTopologyGuard {
+            _dentries: dentries,
+            _mounts: self.mounts,
+        }
+    }
+
+    /// Lock every dentry gate touched by an exact edge commit before taking
+    /// the dentry snapshot. Directory mutations hold the same gate while
+    /// acquiring the topology writer, so waiting for a gate under a read
+    /// snapshot would invert that order.
+    pub(crate) fn commit_mount_edges(
+        self,
+        mountpoints: [Option<Arc<MountFSInode>>; 3],
+        operation: impl FnOnce(&MountEdgeCommitToken) -> Result<(), SystemError>,
+    ) -> Result<MountTopologyGuard, SystemError> {
+        let mounts = self.mounts;
+        let dentries = mountpoints.map(|mountpoint| mountpoint.map(|inode| inode.dentry.clone()));
+        with_dentry_mount_gate_set(dentries, |token| {
+            let snapshot = DENTRY_TOPOLOGY_LOCK.read();
+            operation(token)?;
+            Ok(MountTopologyGuard {
+                _dentries: snapshot,
+                _mounts: mounts,
+            })
+        })
+    }
+}
+
+fn with_dentry_mount_gate_set<T>(
+    mut dentries: [Option<Arc<VfsDentry>>; 3],
+    operation: impl FnOnce(&MountEdgeCommitToken) -> T,
+) -> T {
+    dentries.sort_unstable_by_key(|entry| {
+        entry
+            .as_ref()
+            .map(|dentry| dentry.id.0)
+            .unwrap_or(usize::MAX)
+    });
+
+    let mut unique: [Option<Arc<VfsDentry>>; 3] = [None, None, None];
+    let mut count = 0;
+    for dentry in dentries.into_iter().flatten() {
+        if count == 0
+            || unique[count - 1]
+                .as_ref()
+                .is_none_or(|previous| previous.id != dentry.id)
+        {
+            unique[count] = Some(dentry);
+            count += 1;
+        }
+    }
+    let token = MountEdgeCommitToken {
+        dentries: unique
+            .each_ref()
+            .map(|entry| entry.as_ref().map(|dentry| dentry.id)),
+    };
+
+    match count {
+        0 => operation(&token),
+        1 => {
+            let _first = unique[0].as_ref().unwrap().mount_gate.lock();
+            operation(&token)
+        }
+        2 => {
+            let _first = unique[0].as_ref().unwrap().mount_gate.lock();
+            let _second = unique[1].as_ref().unwrap().mount_gate.lock();
+            operation(&token)
+        }
+        3 => {
+            let _first = unique[0].as_ref().unwrap().mount_gate.lock();
+            let _second = unique[1].as_ref().unwrap().mount_gate.lock();
+            let _third = unique[2].as_ref().unwrap().mount_gate.lock();
+            operation(&token)
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// Capability for one layered directory mutation to acquire the global dentry
@@ -98,8 +222,7 @@ impl DentryMutationContext<'_> {
 }
 
 pub(crate) fn with_topology_snapshot<T>(f: impl FnOnce() -> T) -> T {
-    let _mounts = MOUNT_LIFECYCLE_LOCK.lock();
-    let _dentries = DENTRY_TOPOLOGY_LOCK.read();
+    let _topology = lock_mount_topology();
     f()
 }
 
@@ -1271,11 +1394,35 @@ impl MountFS {
         self.attach_top_inner(mountpoint, mount_fs, true)
     }
 
+    pub(crate) fn attach_new_top_prelocked(
+        &self,
+        mountpoint: &Arc<MountFSInode>,
+        mount_fs: Arc<MountFS>,
+        gates: &MountEdgeCommitToken,
+    ) -> Result<(), SystemError> {
+        assert!(
+            gates.covers(mountpoint),
+            "mount-edge commit token must cover the attach dentry"
+        );
+        self.validate_attach_top(mountpoint, &mount_fs)?;
+        self.attach_top_prelocked(mountpoint, mount_fs, true)
+    }
+
     fn attach_top_inner(
         &self,
         mountpoint: &Arc<MountFSInode>,
         mount_fs: Arc<MountFS>,
         require_connected: bool,
+    ) -> Result<(), SystemError> {
+        self.validate_attach_top(mountpoint, &mount_fs)?;
+        let _gate = mountpoint.dentry.mount_gate.lock();
+        self.attach_top_prelocked(mountpoint, mount_fs, require_connected)
+    }
+
+    fn validate_attach_top(
+        &self,
+        mountpoint: &Arc<MountFSInode>,
+        mount_fs: &Arc<MountFS>,
     ) -> Result<(), SystemError> {
         if !Arc::ptr_eq(&mountpoint.mount_fs, &self.self_ref()) {
             return Err(SystemError::EINVAL);
@@ -1287,7 +1434,15 @@ impl MountFS {
         {
             return Err(SystemError::EINVAL);
         }
-        let _gate = mountpoint.dentry.mount_gate.lock();
+        Ok(())
+    }
+
+    fn attach_top_prelocked(
+        &self,
+        mountpoint: &Arc<MountFSInode>,
+        mount_fs: Arc<MountFS>,
+        require_connected: bool,
+    ) -> Result<(), SystemError> {
         if require_connected && mountpoint.is_disconnected() {
             return Err(SystemError::ENOENT);
         }
@@ -1554,7 +1709,7 @@ impl MountFS {
         let _cover_reservation = mount_fs.reserve_mount_edge(cover_mountpoint, 0)?;
         mount_fs.detach_exact_keep_slot(covered)?;
         covered.relocate_mountpoint(Some(original_mountpoint.clone()));
-        let removed = match self.replace_exact_edge(mount_fs, covered.clone()) {
+        let removed = match self.replace_exact_edge_prepared(mount_fs, covered.clone()) {
             Ok(removed) => removed,
             Err(error) => {
                 // All objects remain owned; reconstruct the tuck-under
@@ -1571,21 +1726,44 @@ impl MountFS {
 
     /// Replace one exact edge in place, preserving the parent stack's key,
     /// capacity, ordering and mount-edge count.
-    fn replace_exact_edge(
+    pub(crate) fn replace_exact_edge_prepared(
         &self,
         old: &Arc<MountFS>,
         replacement: Arc<MountFS>,
     ) -> Result<Arc<MountFS>, SystemError> {
         let mountpoint = old.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let _gate = mountpoint.dentry.mount_gate.lock();
+        self.replace_exact_edge_prepared_prelocked(old, replacement, &mountpoint)
+    }
+
+    pub(crate) fn replace_exact_edge_prepared_with_token(
+        &self,
+        old: &Arc<MountFS>,
+        replacement: Arc<MountFS>,
+        gates: &MountEdgeCommitToken,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let mountpoint = old.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        assert!(
+            gates.covers(&mountpoint),
+            "mount-edge commit token must cover the replace dentry"
+        );
+        self.replace_exact_edge_prepared_prelocked(old, replacement, &mountpoint)
+    }
+
+    fn replace_exact_edge_prepared_prelocked(
+        &self,
+        old: &Arc<MountFS>,
+        replacement: Arc<MountFS>,
+        mountpoint: &Arc<MountFSInode>,
+    ) -> Result<Arc<MountFS>, SystemError> {
         if !Arc::ptr_eq(&mountpoint.mount_fs, &self.self_ref())
             || replacement
                 .self_mountpoint()
                 .as_ref()
-                .is_none_or(|replacement_mp| !Arc::ptr_eq(replacement_mp, &mountpoint))
+                .is_none_or(|replacement_mp| !Arc::ptr_eq(replacement_mp, mountpoint))
         {
             return Err(SystemError::EINVAL);
         }
-        let _gate = mountpoint.dentry.mount_gate.lock();
         let mut mountpoints = self.mountpoints.lock();
         let stack = mountpoints
             .get_mut(&mountpoint.dentry.id)
@@ -1602,10 +1780,31 @@ impl MountFS {
         mount_fs: &Arc<MountFS>,
     ) -> Result<Arc<MountFS>, SystemError> {
         let mountpoint = mount_fs.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let _gate = mountpoint.dentry.mount_gate.lock();
+        self.detach_exact_keep_slot_prelocked(mount_fs, &mountpoint)
+    }
+
+    pub(crate) fn detach_exact_keep_slot_with_token(
+        &self,
+        mount_fs: &Arc<MountFS>,
+        gates: &MountEdgeCommitToken,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let mountpoint = mount_fs.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        assert!(
+            gates.covers(&mountpoint),
+            "mount-edge commit token must cover the detach dentry"
+        );
+        self.detach_exact_keep_slot_prelocked(mount_fs, &mountpoint)
+    }
+
+    fn detach_exact_keep_slot_prelocked(
+        &self,
+        mount_fs: &Arc<MountFS>,
+        mountpoint: &Arc<MountFSInode>,
+    ) -> Result<Arc<MountFS>, SystemError> {
         if !Arc::ptr_eq(&mountpoint.mount_fs, &self.self_ref()) {
             return Err(SystemError::EINVAL);
         }
-        let _gate = mountpoint.dentry.mount_gate.lock();
         let key = mountpoint.dentry.id;
         let mut mountpoints = self.mountpoints.lock();
         let stack = mountpoints.get_mut(&key).ok_or(SystemError::ENOENT)?;
@@ -2279,17 +2478,18 @@ impl MountFS {
     }
 
     fn derive_external_pin(&self) -> Result<MountExternalGuard, SystemError> {
-        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let mut lifecycle = self.lifecycle.lock();
         let component = match lifecycle.state {
-            MountLifecycleState::Constructing | MountLifecycleState::Detaching => {
+            MountLifecycleState::Constructing => {
                 return Err(SystemError::EBUSY);
             }
             MountLifecycleState::Detached if lifecycle.external_pins == 0 => {
                 return Err(SystemError::ESTALE);
             }
             MountLifecycleState::DetachedConnected => lifecycle.detached_component.clone(),
-            MountLifecycleState::Live | MountLifecycleState::Detached => None,
+            MountLifecycleState::Live
+            | MountLifecycleState::Detaching
+            | MountLifecycleState::Detached => None,
         };
         if component
             .as_ref()
@@ -2709,6 +2909,15 @@ impl MountExternalGuard {
     /// while lazy detach is in progress, matching Linux path_get semantics.
     pub fn derive(&self) -> Result<Self, SystemError> {
         self.mount.derive_external_pin()
+    }
+
+    /// Derive ownership from a guard that is known to remain alive for this
+    /// call. Final shutdown and detached-component cleanup both require the
+    /// existing owner count to reach zero, so failure indicates an internal
+    /// lifecycle-accounting bug rather than a recoverable pathname error.
+    pub(crate) fn derive_existing(&self) -> Self {
+        self.derive()
+            .expect("an existing mount pin must remain derivable")
     }
 }
 

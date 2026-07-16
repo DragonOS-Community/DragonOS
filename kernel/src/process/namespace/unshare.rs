@@ -7,6 +7,7 @@ use crate::{
     process::{
         cred::{ns_capable, CAPFlags, Cred},
         fork::CloneFlags,
+        lock_fs_refs_copy,
         namespace::nsproxy::{
             create_new_namespaces, switch_task_namespaces, switch_task_namespaces_with_fs, NsProxy,
         },
@@ -23,21 +24,23 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
 
     let current_pcb = ProcessManager::current_pcb();
     let mut new_cred = unshare_user_cred(flags, &current_pcb)?;
-    let new_fs = unshare_fs_struct(flags, &current_pcb)?;
+    let fs_refs = lock_fs_refs_copy();
+    let new_fs = unshare_fs_struct(flags, &current_pcb, &fs_refs)?;
     let new_nsproxy =
         unshare_nsproxy_namespaces(flags, &current_pcb, new_cred.as_ref(), new_fs.as_ref())?;
 
     if let Some(new_nsproxy) = new_nsproxy {
         if let Some(new_fs) = new_fs.as_ref() {
-            switch_task_namespaces_with_fs(&current_pcb, new_fs, new_nsproxy)?;
+            switch_task_namespaces_with_fs(&current_pcb, new_fs, new_nsproxy, &fs_refs)?;
         } else {
-            switch_task_namespaces(&current_pcb, new_nsproxy)?;
+            switch_task_namespaces(&current_pcb, new_nsproxy, &fs_refs)?;
         }
     }
 
     if let Some(new_fs) = new_fs {
-        current_pcb.set_fs_struct(new_fs);
+        current_pcb.set_fs_struct(new_fs, &fs_refs);
     }
+    drop(fs_refs);
 
     if let Some(new_cred) = new_cred.take() {
         current_pcb.set_cred(Cred::new_arc(new_cred))?;
@@ -87,6 +90,7 @@ fn unshare_user_cred(
 fn unshare_fs_struct(
     unshare_flags: CloneFlags,
     current_pcb: &Arc<crate::process::ProcessControlBlock>,
+    _fs_refs: &crate::process::FsRefsReadGuard,
 ) -> Result<Option<Arc<FsStruct>>, SystemError> {
     if !unshare_flags.contains(CloneFlags::CLONE_FS) {
         return Ok(None);

@@ -132,6 +132,14 @@ impl InodeRetentionGuard {
         inode.retain(kind)?;
         Ok(Self { inode, kind })
     }
+
+    /// Derive a new semantic owner while this owner keeps retention admission
+    /// open. `try_begin_freeing()` can close admission only when every kind has
+    /// a zero count, which is impossible while `self` is alive.
+    pub(crate) fn derive_existing(&self, kind: InodeRetentionKind) -> Self {
+        Self::new(self.inode.clone(), kind)
+            .expect("an existing inode retention owner must remain derivable")
+    }
 }
 
 impl Drop for InodeRetentionGuard {

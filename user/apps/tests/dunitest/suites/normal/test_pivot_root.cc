@@ -759,13 +759,21 @@ void case_namespace_root_pivot() {
     const char* base = "/tmp/test_pivot_root/namespace_root";
     const char* new_root = "/tmp/test_pivot_root/namespace_root/newroot";
     const char* put_old = "/tmp/test_pivot_root/namespace_root/newroot/oldroot";
-    const char* old_marker = "/tmp/test_pivot_root/namespace_root/old_marker";
+    const char* old_marker = "/tmp/test_pivot_root/namespace_root_old_marker";
     const char* new_marker = "/tmp/test_pivot_root/namespace_root/newroot/new_marker";
 
     ensure_parent_tree();
     ensure_dir(base);
-    ensure_dir(new_root);
     prepare_private_mount_namespace();
+    // Keep the new root's real parent private, then make only the caller's
+    // namespace root shared. Linux checks root_mnt->mnt_parent, not root_mnt
+    // itself, so this remains a valid namespace-root pivot.
+    if (mount("", base, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+    if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
+        child_fail("mkdir namespace-root newroot failed");
+    }
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
         child_skip(strerror(errno));
     }
@@ -774,12 +782,15 @@ void case_namespace_root_pivot() {
         (mkdir(new_marker, 0755) != 0 && errno != EEXIST)) {
         child_fail("prepare namespace-root markers failed");
     }
+    if (mount(nullptr, "/", nullptr, MS_SHARED, nullptr) != 0) {
+        child_skip("cannot make namespace root shared");
+    }
 
     if (do_pivot_root(new_root, put_old) != 0) {
         child_fail("pivot_root from namespace root failed");
     }
     if (access("/new_marker", F_OK) != 0 ||
-        access("/oldroot/tmp/test_pivot_root/namespace_root/old_marker", F_OK) != 0) {
+        access("/oldroot/tmp/test_pivot_root/namespace_root_old_marker", F_OK) != 0) {
         child_fail("namespace-root pivot published incomplete topology");
     }
     child_pass();

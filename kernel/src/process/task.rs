@@ -785,8 +785,9 @@ impl ProcessControlBlock {
     pub(super) fn exit_fs(&self) {
         let _slot_update = self.fs_slot_update_lock.lock();
         let fs = self.fs.write().take();
-        // Release the spin-based slot guard before dropping the final FsStruct
+        // Release the slot guard before dropping the final FsStruct
         // owner, whose path-pin destructors may enqueue deferred cleanup work.
+        drop(_slot_update);
         drop(fs);
     }
 

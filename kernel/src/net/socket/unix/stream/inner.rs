@@ -531,11 +531,27 @@ impl Connected {
     pub(super) fn check_io_events(&self) -> EPollEventType {
         let mut events = EPollEventType::empty();
 
-        if !self.reader.lock().is_empty() {
-            events |= EPollEventType::EPOLLIN;
+        let reader = self.reader.lock();
+        let recv_shutdown = reader.is_recv_shutdown() || reader.is_send_shutdown();
+        if !reader.is_empty() || recv_shutdown {
+            events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
         }
-        if !self.writer.lock().is_empty() {
-            events |= EPollEventType::EPOLLOUT;
+        if recv_shutdown {
+            events |= EPollEventType::EPOLLRDHUP;
+        }
+        drop(reader);
+
+        let writer = self.writer.lock();
+        let send_shutdown = writer.is_send_shutdown() || writer.is_recv_shutdown();
+        // Preserve the existing writable calculation for live sockets; this
+        // change only adds Linux's shutdown-is-writable escape from poll.
+        if !writer.is_empty() || send_shutdown {
+            events |= EPollEventType::EPOLLOUT
+                | EPollEventType::EPOLLWRNORM
+                | EPollEventType::EPOLLWRBAND;
+        }
+        if recv_shutdown && send_shutdown {
+            events |= EPollEventType::EPOLLHUP;
         }
 
         events

@@ -412,7 +412,8 @@ TEST(AfPacketSockopt, DetachFilterReturnsEnoentWhenNoFilter) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
     errno = 0;
-    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter, nullptr, 0), -1);
+    int dummy = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter, &dummy, sizeof(dummy)), -1);
     EXPECT_EQ(errno, ENOENT) << ErrnoString(errno);
 }
 

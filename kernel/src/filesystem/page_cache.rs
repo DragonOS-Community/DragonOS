@@ -56,6 +56,12 @@ static ASYNC_WRITEBACK_WAIT: WaitQueue = WaitQueue::default();
 static PAGECACHE_COMPLETION_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
 static PAGECACHE_ACCOUNTING_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
 
+// A batch large enough to dominate normal background noise verifies the
+// page-cache VM counters, including the final-drop path that regressed. The
+// tolerance avoids treating the global snapshot as an exact local oracle.
+const PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES: usize = 128;
+const PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE: i128 = 16;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum PageCacheKind {
@@ -477,18 +483,12 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Ok("status=fail stage=final_drop_loading\n".into());
     }
 
-    // A batch large enough to dominate normal background noise verifies the
-    // actual FILE_PAGES/SHMEM/DIRTY/UNEVICTABLE atomics, including the
-    // final-drop path that regressed. This is deliberately tolerant rather
-    // than an exact global snapshot oracle.
-    const WIRING_PAGES: usize = 128;
-    const WIRING_NOISE: i128 = 16;
     let before = pc_stats::snapshot();
     let wiring_cache = PageCache::new_shmem(None, None);
     wiring_cache.set_unevictable(true);
-    let mut wiring_pages = Vec::with_capacity(WIRING_PAGES);
+    let mut wiring_pages = Vec::with_capacity(PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES);
     let mut first_wiring_entry = None;
-    for index in 0..WIRING_PAGES {
+    for index in 0..PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES {
         let page = wiring_cache.get_or_create_page_zero(index)?;
         let mut inner = wiring_cache.inner.lock();
         let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
@@ -583,18 +583,21 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let dirty_drop_drift = after.file_dirty as i128 - before.file_dirty as i128;
     let unevictable_drop_drift = after.unevictable as i128 - before.unevictable as i128;
     let writeback_drop_drift = after.file_writeback as i128 - before.file_writeback as i128;
-    let insert_delta_ok = |delta: i128| (delta - WIRING_PAGES as i128).abs() <= WIRING_NOISE;
+    let insert_delta_ok = |delta: i128| {
+        (delta - PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES as i128).abs()
+            <= PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+    };
     if !insert_delta_ok(file_insert_delta)
         || !insert_delta_ok(shmem_insert_delta)
         || !insert_delta_ok(dirty_insert_delta)
         || !insert_delta_ok(unevictable_insert_delta)
         || !insert_delta_ok(writeback_insert_delta)
-        || writeback_completion_drift.abs() > WIRING_NOISE
-        || file_drop_drift.abs() > WIRING_NOISE
-        || shmem_drop_drift.abs() > WIRING_NOISE
-        || dirty_drop_drift.abs() > WIRING_NOISE
-        || unevictable_drop_drift.abs() > WIRING_NOISE
-        || writeback_drop_drift.abs() > WIRING_NOISE
+        || writeback_completion_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || file_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || shmem_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || dirty_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || unevictable_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || writeback_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
     {
         return Ok(alloc::format!(
             "status=fail stage=global_wiring file_insert_delta={file_insert_delta} shmem_insert_delta={shmem_insert_delta} dirty_insert_delta={dirty_insert_delta} unevictable_insert_delta={unevictable_insert_delta} writeback_insert_delta={writeback_insert_delta} writeback_completion_drift={writeback_completion_drift} file_drop_drift={file_drop_drift} shmem_drop_drift={shmem_drop_drift} dirty_drop_drift={dirty_drop_drift} unevictable_drop_drift={unevictable_drop_drift} writeback_drop_drift={writeback_drop_drift}\n"

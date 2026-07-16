@@ -922,7 +922,10 @@ impl Ext4FileSystem {
             eviction_wait: WaitQueue::default(),
             _mount_options: mount_options,
         });
-        EXT4_STATS_REGISTRY.lock().push(Arc::downgrade(&fs));
+        let mut stats_registry = EXT4_STATS_REGISTRY.lock();
+        stats_registry.retain(|entry| entry.strong_count() != 0);
+        stats_registry.push(Arc::downgrade(&fs));
+        drop(stats_registry);
 
         let mut guard = fs.root_inode.inner.lock();
         guard.fs_ptr = Arc::downgrade(&fs);

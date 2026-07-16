@@ -424,6 +424,21 @@ impl Transaction<'_> {
             }
         }
 
+        // The inode must never become durable before the allocation metadata
+        // that owns its blocks. Without this boundary a volatile device cache
+        // may persist the inode first and expose its blocks as free after a
+        // crash. A failed flush is still before publication, so restore every
+        // allocation home while the exclusive transaction owner is held.
+        if let Err(error) = device.flush() {
+            let rollback = self.rollback_direct_range(device, allocation_homes);
+            return match rollback {
+                Ok(()) => self.fail(error, CommitFailure::BeforeCommit, false),
+                Err(rollback_error) => {
+                    self.fail(rollback_error, CommitFailure::CheckpointFailed, true)
+                }
+            };
+        }
+
         let inode = &self.staged[&inode_home];
         if let Err(error) = write_bytes(device, inode_home, inode.bytes()) {
             return self.fail(error, CommitFailure::CommitUncertain, true);
@@ -1048,6 +1063,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(&*device.write_order.lock(), &[9, 2, 5, 7]);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(device.stable_block(9).unwrap().as_slice(), &[9; BLOCK_SIZE]);
+        assert!(device.stable_block(7).is_none());
         assert_eq!(publisher.0.load(Ordering::SeqCst), 4);
         assert!(!core.is_poisoned());
     }
@@ -1139,7 +1157,7 @@ mod tests {
     #[test]
     fn direct_range_inode_write_failure_is_uncertain_and_poisons() {
         let device = MemoryDevice::new();
-        device.fail_at.store(3, Ordering::SeqCst);
+        device.fail_at.store(4, Ordering::SeqCst);
         let publisher = Publisher(AtomicUsize::new(0));
         let core = DirectTransactionCore::new(128).unwrap();
         let transaction = staged_direct_range(&core, &device);
@@ -1149,6 +1167,48 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.failure, CommitFailure::CommitUncertain);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        assert!(core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_allocation_flush_failure_restores_all_homes() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(3, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::BeforeCommit);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+        for home in [9, 2, 5] {
+            assert_eq!(
+                device.stable_block(home).unwrap().as_slice(),
+                &[0; BLOCK_SIZE]
+            );
+        }
+        assert!(device.stable_block(7).is_none());
+        assert!(!core.is_poisoned());
+    }
+
+    #[test]
+    fn direct_range_allocation_flush_rollback_failure_poisons_backend() {
+        let device = MemoryDevice::new();
+        device.fail_at.store(3, Ordering::SeqCst);
+        device.fail_at_second.store(4, Ordering::SeqCst);
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = DirectTransactionCore::new(128).unwrap();
+        let transaction = staged_direct_range(&core, &device);
+
+        let error = transaction
+            .commit_direct_range(&device, &publisher, &[9, 2, 5], 7)
+            .unwrap_err();
+
+        assert_eq!(error.failure, CommitFailure::CheckpointFailed);
         assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
         assert!(core.is_poisoned());
     }

@@ -935,6 +935,9 @@ impl BlockDevice for VirtIOBlkDevice {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
         let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
         if buf.len() < expected {
             return Err(SystemError::EINVAL);
@@ -953,6 +956,9 @@ impl BlockDevice for VirtIOBlkDevice {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
         let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
         if buf.len() != expected {
             return Err(SystemError::EINVAL);

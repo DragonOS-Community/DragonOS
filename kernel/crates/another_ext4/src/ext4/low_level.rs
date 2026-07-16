@@ -20,6 +20,13 @@ enum DirectRangePrepare {
     Unsupported,
 }
 
+struct DirectRangePlan {
+    start_lblock: LBlockId,
+    count: u32,
+    preferred_first: Option<PBlockId>,
+    requires_merge: bool,
+}
+
 /// Attributes that can be set on an inode via `setattr`.
 #[derive(Default)]
 pub struct SetAttr {
@@ -64,14 +71,14 @@ impl Ext4 {
         self.block_device.flush()
     }
 
-    fn try_prepare_direct_range(
+    fn direct_range_plan(
         &self,
-        inode: &mut InodeRef,
+        inode: &InodeRef,
         offset: usize,
         len: usize,
-    ) -> Result<DirectRangePrepare> {
+    ) -> Result<Option<DirectRangePlan>> {
         if len == 0 {
-            return Ok(DirectRangePrepare::Handled);
+            return Ok(None);
         }
         let end = offset
             .checked_add(len)
@@ -84,12 +91,11 @@ impl Ext4 {
             .checked_sub(start_lblock)
             .and_then(|blocks| blocks.checked_add(1))
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
-        if start_lblock.checked_add(count).is_none() {
-            return Ok(DirectRangePrepare::Unsupported);
-        }
-        if (count as usize) < DIRECT_RANGE_MIN_BLOCKS || (count as usize) > DIRECT_RANGE_MAX_BLOCKS
+        if start_lblock.checked_add(count).is_none()
+            || (count as usize) < DIRECT_RANGE_MIN_BLOCKS
+            || (count as usize) > DIRECT_RANGE_MAX_BLOCKS
         {
-            return Ok(DirectRangePrepare::Unsupported);
+            return Ok(None);
         }
         let persistent_blocks = inode
             .inode
@@ -98,9 +104,29 @@ impl Ext4 {
             .map(|size| size / BLOCK_SIZE as u64)
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
         if (start_lblock as u64) < persistent_blocks {
-            return Ok(DirectRangePrepare::Unsupported);
+            return Ok(None);
         }
         let Some(shape) = self.direct_append_shape(inode, start_lblock, count)? else {
+            return Ok(None);
+        };
+        Ok(Some(DirectRangePlan {
+            start_lblock,
+            count,
+            preferred_first: shape.preferred_first,
+            requires_merge: shape.requires_merge,
+        }))
+    }
+
+    fn try_prepare_direct_range(
+        &self,
+        inode: &mut InodeRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<DirectRangePrepare> {
+        if len == 0 {
+            return Ok(DirectRangePrepare::Handled);
+        }
+        let Some(plan) = self.direct_range_plan(inode, offset, len)? else {
             return Ok(DirectRangePrepare::Unsupported);
         };
 
@@ -115,9 +141,9 @@ impl Ext4 {
         let allocation = match self.transaction_alloc_direct_range(
             &mut transaction,
             inode.id,
-            shape.preferred_first,
-            shape.requires_merge,
-            count,
+            plan.preferred_first,
+            plan.requires_merge,
+            plan.count,
         ) {
             Ok(allocation) => allocation,
             Err(error) if error.code() == ErrCode::ENOSPC => {
@@ -128,10 +154,11 @@ impl Ext4 {
         };
 
         self.prepare_stats.record_call();
-        self.prepare_stats.record_requested(count as usize);
-        self.prepare_stats.record_missing_blocks(count as usize);
+        self.prepare_stats.record_requested(plan.count as usize);
+        self.prepare_stats
+            .record_missing_blocks(plan.count as usize);
         let initialized =
-            self.initialize_direct_range(allocation.first, count as usize, zeros.as_slice());
+            self.initialize_direct_range(allocation.first, plan.count as usize, zeros.as_slice());
         if let Err(error) = initialized {
             self.prepare_stats.record_failure();
             transaction.abort();
@@ -142,7 +169,7 @@ impl Ext4 {
         }
 
         if let Err(error) =
-            self.stage_direct_append_extent(inode, start_lblock, allocation.first, count)
+            self.stage_direct_append_extent(inode, plan.start_lblock, allocation.first, plan.count)
         {
             self.prepare_stats.record_failure();
             transaction.abort();
@@ -415,6 +442,22 @@ impl Ext4 {
     ) -> Result<()> {
         self.ensure_mutable()?;
         if self.supports_direct_range_stage() {
+            // Classify the request under a compatible direct guard first.
+            // Unsupported small, overwrite, sparse, and oversized writes can
+            // continue through the legacy allocator without ever contending
+            // for the exclusive transaction snapshot gate.
+            {
+                let _metadata_guard = self.lock_direct_metadata_mutation()?;
+                let _mutation_guard =
+                    self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+                let mut inode = self.read_inode(id)?;
+                if inode.inode.mode().bits() == 0 {
+                    return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
+                }
+                if self.direct_range_plan(&inode, offset, len)?.is_none() {
+                    return self.ensure_blocks_for_write_range_locked(&mut inode, offset, len);
+                }
+            }
             let outcome = {
                 let _metadata_guard = self.lock_transactional_metadata_mutation()?;
                 let _mutation_guard =
@@ -1816,6 +1859,35 @@ mod tests {
         assert_eq!(error.code(), ErrCode::EIO);
         assert_eq!(device.writes.load(Ordering::SeqCst), 2);
         assert_eq!(device.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn direct_range_plan_filters_legacy_writes_before_transaction_gate() {
+        let fs = make_test_fs(1024);
+        let mut inode = Inode::default();
+        inode.extent_init();
+        let mut inode = InodeRef::new(2, Box::new(inode));
+
+        assert!(fs
+            .direct_range_plan(&inode, 0, (DIRECT_RANGE_MIN_BLOCKS - 1) * BLOCK_SIZE)
+            .unwrap()
+            .is_none());
+        assert!(fs
+            .direct_range_plan(&inode, 0, (DIRECT_RANGE_MAX_BLOCKS + 1) * BLOCK_SIZE)
+            .unwrap()
+            .is_none());
+        assert!(fs
+            .direct_range_plan(&inode, 0, DIRECT_RANGE_MIN_BLOCKS * BLOCK_SIZE)
+            .unwrap()
+            .is_some());
+
+        inode
+            .inode
+            .set_size((DIRECT_RANGE_MIN_BLOCKS * BLOCK_SIZE) as u64);
+        assert!(fs
+            .direct_range_plan(&inode, 0, DIRECT_RANGE_MIN_BLOCKS * BLOCK_SIZE)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

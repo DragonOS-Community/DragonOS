@@ -166,4 +166,31 @@ impl FsStruct {
     pub fn root_resolved(&self) -> Result<ResolvedPath, system_error::SystemError> {
         self.path_context.read().root.resolved()
     }
+
+    /// Linux `chroot_fs_refs()` equivalent for one fs_struct. Both comparisons
+    /// and replacements are performed under one path-context write lock.
+    pub fn replace_root_pwd(&self, old: &ResolvedPath, new: &ResolvedPath) -> bool {
+        let old_inode = old.inode();
+        let mut paths = self.path_context.write();
+        let root_hit = same_path_ref(&paths.root.inode, &old_inode);
+        let pwd_hit = same_path_ref(&paths.pwd.inode, &old_inode);
+
+        if root_hit {
+            paths.root = PinnedPath::from_resolved(new.derive_existing_owner());
+        }
+        if pwd_hit {
+            paths.pwd = PinnedPath::from_resolved(new.derive_existing_owner());
+        }
+        root_hit || pwd_hit
+    }
+}
+
+fn same_path_ref(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool {
+    let Some(left_mount) = left.clone().downcast_arc::<MountFSInode>() else {
+        return Arc::ptr_eq(left, right);
+    };
+    let Some(right_mount) = right.clone().downcast_arc::<MountFSInode>() else {
+        return false;
+    };
+    left_mount.same_path_ref(&right_mount)
 }

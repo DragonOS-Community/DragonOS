@@ -16,7 +16,7 @@ use crate::{
         casting::DowncastArc,
         errseq::{ErrSeq, ErrSeqValue},
         mutex::{Mutex, MutexGuard},
-        rwsem::{RwSem, RwSemWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
@@ -69,6 +69,26 @@ lazy_static! {
     static ref DENTRY_TOPOLOGY_LOCK: RwSem<()> = RwSem::new(());
 }
 
+/// Stable snapshot of both mount edges and dentry parent/name relationships.
+///
+/// Keep the field order in sync with the required release order: Rust drops
+/// fields in declaration order, so the dentry reader is released before the
+/// outer mount-lifecycle mutex.
+pub struct MountTopologyGuard {
+    _dentries: RwSemReadGuard<'static, ()>,
+    _mounts: MutexGuard<'static, ()>,
+}
+
+/// Acquire the complete VFS topology snapshot in the canonical lock order.
+pub(crate) fn lock_mount_topology() -> MountTopologyGuard {
+    let mounts = MOUNT_LIFECYCLE_LOCK.lock();
+    let dentries = DENTRY_TOPOLOGY_LOCK.read();
+    MountTopologyGuard {
+        _dentries: dentries,
+        _mounts: mounts,
+    }
+}
+
 /// Capability for one layered directory mutation to acquire the global dentry
 /// topology write lock exactly once.  Acquisition is deliberately lazy:
 /// layered filesystems may prepare a copy-up before the innermost backing
@@ -98,8 +118,7 @@ impl DentryMutationContext<'_> {
 }
 
 pub(crate) fn with_topology_snapshot<T>(f: impl FnOnce() -> T) -> T {
-    let _mounts = MOUNT_LIFECYCLE_LOCK.lock();
-    let _dentries = DENTRY_TOPOLOGY_LOCK.read();
+    let _topology = lock_mount_topology();
     f()
 }
 
@@ -1554,7 +1573,7 @@ impl MountFS {
         let _cover_reservation = mount_fs.reserve_mount_edge(cover_mountpoint, 0)?;
         mount_fs.detach_exact_keep_slot(covered)?;
         covered.relocate_mountpoint(Some(original_mountpoint.clone()));
-        let removed = match self.replace_exact_edge(mount_fs, covered.clone()) {
+        let removed = match self.replace_exact_edge_prepared(mount_fs, covered.clone()) {
             Ok(removed) => removed,
             Err(error) => {
                 // All objects remain owned; reconstruct the tuck-under
@@ -1571,7 +1590,7 @@ impl MountFS {
 
     /// Replace one exact edge in place, preserving the parent stack's key,
     /// capacity, ordering and mount-edge count.
-    fn replace_exact_edge(
+    pub(crate) fn replace_exact_edge_prepared(
         &self,
         old: &Arc<MountFS>,
         replacement: Arc<MountFS>,
@@ -2279,17 +2298,18 @@ impl MountFS {
     }
 
     fn derive_external_pin(&self) -> Result<MountExternalGuard, SystemError> {
-        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let mut lifecycle = self.lifecycle.lock();
         let component = match lifecycle.state {
-            MountLifecycleState::Constructing | MountLifecycleState::Detaching => {
+            MountLifecycleState::Constructing => {
                 return Err(SystemError::EBUSY);
             }
             MountLifecycleState::Detached if lifecycle.external_pins == 0 => {
                 return Err(SystemError::ESTALE);
             }
             MountLifecycleState::DetachedConnected => lifecycle.detached_component.clone(),
-            MountLifecycleState::Live | MountLifecycleState::Detached => None,
+            MountLifecycleState::Live
+            | MountLifecycleState::Detaching
+            | MountLifecycleState::Detached => None,
         };
         if component
             .as_ref()
@@ -2709,6 +2729,15 @@ impl MountExternalGuard {
     /// while lazy detach is in progress, matching Linux path_get semantics.
     pub fn derive(&self) -> Result<Self, SystemError> {
         self.mount.derive_external_pin()
+    }
+
+    /// Derive ownership from a guard that is known to remain alive for this
+    /// call. Final shutdown and detached-component cleanup both require the
+    /// existing owner count to reach zero, so failure indicates an internal
+    /// lifecycle-accounting bug rather than a recoverable pathname error.
+    pub(crate) fn derive_existing(&self) -> Self {
+        self.derive()
+            .expect("an existing mount pin must remain derivable")
     }
 }
 

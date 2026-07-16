@@ -113,6 +113,13 @@ pub(super) static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 /// mm with another thread group must not miss a concurrent oom_score_adj update
 /// while it is becoming visible.
 static OOM_SCORE_ADJ_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes publication of a task carrying a newly copied FsStruct with
+/// pivot_root's chroot_fs_refs-style scan of all published tasks.
+static FS_REFS_TASKLIST_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_fs_refs_tasklist() -> MutexGuard<'static, ()> {
+    FS_REFS_TASKLIST_LOCK.lock()
+}
 
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
@@ -296,6 +303,7 @@ impl ProcessManager {
     ///
     /// - `pcb`: The PCB of the process.
     pub fn add_pcb(pcb: Arc<ProcessControlBlock>) {
+        let _fs_refs_tasklist = lock_fs_refs_tasklist();
         ALL_PROCESS
             .lock_irqsave()
             .as_mut()

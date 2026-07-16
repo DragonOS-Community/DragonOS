@@ -26,6 +26,7 @@ use crate::{
     libs::{
         futex::futex::RobustListHead,
         lock_free_flags::LockFreeFlags,
+        mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         rwsem::RwSem,
         spinlock::{SpinLock, SpinLockGuard},
@@ -161,6 +162,9 @@ pub struct ProcessControlBlock {
 
     /// Process filesystem state.
     pub(super) fs: RwLock<Option<Arc<FsStruct>>>,
+    /// Serializes replacement/removal of `fs` with pivot_root's exact-path
+    /// migration. Ordinary readers intentionally stay off this cold-path lock.
+    fs_slot_update_lock: Mutex<()>,
 
     /// Alarm timer.
     pub(super) alarm_timer: SpinLock<Option<AlarmTimer>>,
@@ -332,6 +336,7 @@ impl ProcessControlBlock {
                 cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
                 fs: RwLock::new(Some(Arc::new(FsStruct::new()))),
+                fs_slot_update_lock: Mutex::new(()),
                 alarm_timer: SpinLock::new(None),
                 itimers: SpinLock::new(ProcessItimers::default()),
                 posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
@@ -763,6 +768,7 @@ impl ProcessControlBlock {
     }
 
     pub fn set_fs_struct(&self, fs: Arc<FsStruct>) -> Arc<FsStruct> {
+        let _slot_update = self.fs_slot_update_lock.lock();
         let mut guard = self.fs.write();
         let old = guard.replace(fs).expect("live task must have an fs_struct");
         old
@@ -773,7 +779,17 @@ impl ProcessControlBlock {
     /// This mirrors Linux `exit_fs()`: a zombie retains process metadata for
     /// wait(2), but must no longer pin its root or working-directory mounts.
     pub(super) fn exit_fs(&self) {
-        self.fs.write().take();
+        let _slot_update = self.fs_slot_update_lock.lock();
+        let fs = self.fs.write().take();
+        // Release the spin-based slot guard before dropping the final FsStruct
+        // owner, whose path-pin destructors may enqueue deferred cleanup work.
+        drop(fs);
+    }
+
+    /// Stabilize this task's fs slot across an operation that may sleep while
+    /// updating the referenced FsStruct.
+    pub(crate) fn lock_fs_slot_update(&self) -> MutexGuard<'_, ()> {
+        self.fs_slot_update_lock.lock()
     }
 
     pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {

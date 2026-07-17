@@ -23,7 +23,7 @@ use crate::{
     mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     process::{
         namespace::{
-            mnt::{mount_max, MntNamespace},
+            mnt::MntNamespace,
             propagation::{
                 abort_mount_propagation, commit_mount_propagation_locked, detach_mount_propagation,
                 ensure_subtree_shared, inherit_bind_mount_propagation,
@@ -3318,7 +3318,8 @@ impl MountFSInode {
     /// @return Arc<MountFSInode>
     pub(crate) fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let mut current = self.self_ref.upgrade().unwrap();
-        for _ in 0..mount_max() {
+        let mut fast = Some(current.clone());
+        loop {
             let Some(sub_mountfs) = current.mount_fs.lookup_top(&current) else {
                 return current;
             };
@@ -3328,10 +3329,41 @@ impl MountFSInode {
                 return current;
             }
             current = next;
-        }
 
-        log::warn!("MountFSInode::overlaid_inode: overlay depth exceeds mount-max");
-        current
+            // mount-max is an admission limit and may be lowered below the
+            // depth of an existing namespace.  Use structural cycle detection
+            // instead of truncating valid topology traversal at that value.
+            if let Some(mut cursor) = fast.take() {
+                for _ in 0..2 {
+                    let Some(sub_mountfs) = cursor.mount_fs.lookup_top(&cursor) else {
+                        return Self::finish_overlay_walk(current);
+                    };
+                    let next = sub_mountfs.mountpoint_root_inode();
+                    if Arc::ptr_eq(&next, &cursor) {
+                        return Self::finish_overlay_walk(current);
+                    }
+                    cursor = next;
+                }
+                if Arc::ptr_eq(&cursor, &current) {
+                    log::warn!("MountFSInode::overlaid_inode: mount topology cycle detected");
+                    return current;
+                }
+                fast = Some(cursor);
+            }
+        }
+    }
+
+    fn finish_overlay_walk(mut current: Arc<MountFSInode>) -> Arc<MountFSInode> {
+        loop {
+            let Some(sub_mountfs) = current.mount_fs.lookup_top(&current) else {
+                return current;
+            };
+            let next = sub_mountfs.mountpoint_root_inode();
+            if Arc::ptr_eq(&next, &current) {
+                return current;
+            }
+            current = next;
+        }
     }
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
@@ -3362,7 +3394,8 @@ impl MountFSInode {
         // Resolve `..` iteratively so a userspace directory walk cannot consume
         // one kernel stack frame per mount layer.
         let mut current = self.self_ref.upgrade().unwrap();
-        for _ in 0..mount_max() {
+        let mut fast = Some(current.clone());
+        loop {
             if current.is_mountpoint_root()? {
                 // Linux crosses from a mounted root to the parent of the mount
                 // point. The mount point may itself be another mounted root, so
@@ -3371,6 +3404,27 @@ impl MountFSInode {
                     return Ok(current);
                 };
                 current = mountpoint;
+
+                if let Some(mut cursor) = fast.take() {
+                    let mut exhausted = false;
+                    for _ in 0..2 {
+                        if !cursor.is_mountpoint_root()? {
+                            exhausted = true;
+                            break;
+                        }
+                        let Some(mountpoint) = cursor.mount_fs.self_mountpoint() else {
+                            exhausted = true;
+                            break;
+                        };
+                        cursor = mountpoint;
+                    }
+                    if !exhausted {
+                        if Arc::ptr_eq(&cursor, &current) {
+                            return Err(SystemError::ELOOP);
+                        }
+                        fast = Some(cursor);
+                    }
+                }
                 continue;
             }
 
@@ -3380,8 +3434,6 @@ impl MountFSInode {
                 None => Ok(current),
             };
         }
-
-        Err(SystemError::ELOOP)
     }
 
     fn do_absolute_path(&self) -> Result<String, SystemError> {
@@ -3753,6 +3805,16 @@ impl IndexNode for MountFSInode {
     ) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
         self.dentry.inode.set_metadata_masked(metadata, mask)
+    }
+
+    #[inline]
+    fn update_atime(
+        &self,
+        now: crate::time::PosixTimeSpec,
+        relatime: bool,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        self.dentry.inode.update_atime(now, relatime)
     }
 
     #[inline]

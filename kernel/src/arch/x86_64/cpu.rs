@@ -1,38 +1,9 @@
-use core::{
-    hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::hint::spin_loop;
 
 use raw_cpuid::CpuId;
-use x86::msr::{rdmsr, wrmsr, IA32_APIC_BASE, IA32_TSC_AUX, IA32_X2APIC_APICID};
+use x86::msr::{rdmsr, IA32_APIC_BASE, IA32_X2APIC_APICID};
 
 use crate::{arch::smp::SMP_BOOT_DATA, smp::cpu::ProcessorId};
-
-static TSC_AUX_CPU_ID_READY: AtomicBool = AtomicBool::new(false);
-static TSC_AUX_CPU_ID_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-
-/// Store the logical CPU number in the architectural per-CPU TSC_AUX MSR.
-///
-/// This is called once by each CPU while the APIC-based lookup is still in
-/// use. Fast reads are enabled globally only after every online CPU has
-/// completed this initialization.
-pub(crate) fn init_tsc_aux_cpu_id(cpu: ProcessorId) {
-    if CpuId::new()
-        .get_extended_processor_and_feature_identifiers()
-        .is_some_and(|features| features.has_rdtscp())
-    {
-        unsafe { wrmsr(IA32_TSC_AUX, cpu.data() as u64) };
-    } else {
-        TSC_AUX_CPU_ID_UNSUPPORTED.store(true, Ordering::Release);
-        TSC_AUX_CPU_ID_READY.store(false, Ordering::Release);
-    }
-}
-
-pub(crate) fn enable_tsc_aux_cpu_id() {
-    if !TSC_AUX_CPU_ID_UNSUPPORTED.load(Ordering::Acquire) {
-        TSC_AUX_CPU_ID_READY.store(true, Ordering::Release);
-    }
-}
 
 /// 获取当前CPU的逻辑编号
 #[inline]
@@ -41,17 +12,6 @@ pub fn current_cpu_id() -> ProcessorId {
         return ProcessorId::new(0);
     }
 
-    if TSC_AUX_CPU_ID_READY.load(Ordering::Acquire) {
-        let (_, cpu) = unsafe { x86::time::rdtscp() };
-        return ProcessorId::new(cpu);
-    }
-
-    current_cpu_id_slow()
-}
-
-/// APIC/CPUID based lookup used while bringing up a CPU before its TSC_AUX
-/// slot has been initialized. This must not consult the global fast-path flag.
-pub(crate) fn current_cpu_id_slow() -> ProcessorId {
     let x2apic_id = current_x2apic_physical_id();
     if let Some(apic_id) = x2apic_id {
         if let Some(cpu_id) = phys_apic_id_to_cpu_id(apic_id) {

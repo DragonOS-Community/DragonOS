@@ -80,6 +80,21 @@ pub fn check_inode_permission(
     }
 }
 
+/// Check whether the current task may suppress access-time updates for an inode.
+///
+/// Linux restricts enabling `O_NOATIME` to the inode owner or a task with
+/// `CAP_FOWNER`.  This check is separate from read permission: being allowed to
+/// read another user's file does not imply permission to hide that access from
+/// its timestamp metadata.
+pub fn check_noatime_permission(metadata: &Metadata) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    if cred.fsuid.data() == metadata.uid || cred.has_capability(CAPFlags::CAP_FOWNER) {
+        Ok(())
+    } else {
+        Err(SystemError::EPERM)
+    }
+}
+
 impl Cred {
     /// 检查具有给定凭证的进程是否有权限访问 inode。
     ///

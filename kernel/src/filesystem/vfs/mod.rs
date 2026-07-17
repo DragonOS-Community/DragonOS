@@ -164,6 +164,29 @@ pub fn merge_metadata_masked(target: &mut Metadata, requested: &Metadata, mask: 
     }
 }
 
+/// Apply Linux relatime rules and update only the inode access time.
+///
+/// Local filesystems call this while holding the lock that protects their
+/// metadata, so the decision and the single-field update form one atomic
+/// operation with respect to chmod, chown, writes, and other timestamp updates.
+pub fn update_atime_locked(metadata: &mut Metadata, now: PosixTimeSpec, relatime: bool) -> bool {
+    if metadata.flags.contains(InodeFlags::S_NOATIME) {
+        return false;
+    }
+    if relatime {
+        let recent = now.tv_sec.saturating_sub(metadata.atime.tv_sec) < 24 * 60 * 60;
+        let atime_after_mtime = (metadata.atime.tv_sec, metadata.atime.tv_nsec)
+            > (metadata.mtime.tv_sec, metadata.mtime.tv_nsec);
+        let atime_after_ctime = (metadata.atime.tv_sec, metadata.atime.tv_nsec)
+            > (metadata.ctime.tv_sec, metadata.ctime.tv_nsec);
+        if atime_after_mtime && atime_after_ctime && recent {
+            return false;
+        }
+    }
+    metadata.atime = now;
+    true
+}
+
 impl From<FileType> for InodeMode {
     fn from(val: FileType) -> Self {
         match val {
@@ -719,6 +742,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             return Ok(());
         }
         self.set_metadata(metadata)
+    }
+
+    /// Atomically evaluate atime policy and update only atime.
+    ///
+    /// Pseudo filesystems that do not maintain access timestamps may keep the
+    /// no-op default. Mutable local and protocol filesystems must override this
+    /// instead of feeding a lockless full metadata snapshot to `set_metadata`.
+    fn update_atime(&self, _now: PosixTimeSpec, _relatime: bool) -> Result<(), SystemError> {
+        Ok(())
     }
 
     /// @brief 重新设置文件的大小
@@ -1654,9 +1686,7 @@ impl dyn IndexNode {
                 // - symlink 位于路径中间（rest_path 非空）
                 // - 需要跟随最终 symlink（follow_final_symlink=true）
                 // - 或者 pathname 以 '/' 结尾（trailing_slash=true）
-                let need_follow = has_more_components
-                    || follow_final_symlink
-                    || (trailing_slash && !has_more_components);
+                let need_follow = has_more_components || follow_final_symlink || trailing_slash;
 
                 // 兼容旧语义：symlink_follows_remaining==0 表示完全不跟随 symlink。
                 // 在这种模式下，如果路径解析"需要跟随"（例如 symlink 位于中间，或末尾带 '/'），
@@ -1697,15 +1727,27 @@ impl dyn IndexNode {
                     }
                 }
 
-                let mut content = [0u8; 256];
+                // Filesystems such as procfs expose dynamic symlink targets
+                // with i_size == 0, so the inode size cannot be used as the
+                // read bound. Read once into a PATH_MAX-sized buffer: some of
+                // those implementations intentionally ignore the offset and
+                // therefore cannot be consumed in chunks.
+                let mut content = Vec::new();
+                content
+                    .try_reserve_exact(MAX_PATHLEN)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                content.resize(MAX_PATHLEN, 0);
                 // 读取符号链接
                 // TODO:We need to clarify which interfaces require private data and which do not
                 let len = inode.read_at(
                     0,
-                    256,
+                    MAX_PATHLEN,
                     &mut content,
                     Mutex::new(FilePrivateData::Unused).lock(),
                 )?;
+                if len >= MAX_PATHLEN {
+                    return Err(SystemError::ENAMETOOLONG);
+                }
 
                 // 将读到的数据转换为utf8字符串（先转为str，再转为String）
                 let link_path = String::from(

@@ -41,6 +41,7 @@ use crate::{
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
+    time::PosixTimeSpec,
 };
 
 use super::{
@@ -454,6 +455,12 @@ impl IndexNode for TtyDevice {
         let mut guard = self.inner_write();
         guard.metadata = metadata.clone();
 
+        Ok(())
+    }
+
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut guard = self.inner_write();
+        crate::filesystem::vfs::update_atime_locked(&mut guard.metadata, now, relatime);
         Ok(())
     }
 

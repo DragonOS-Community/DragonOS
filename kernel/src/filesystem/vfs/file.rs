@@ -1399,13 +1399,13 @@ impl File {
                 .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
         }
         if len > 0 {
-            self.touch_atime_after_read();
+            self.touch_atime_after_access();
         }
         Ok(len)
     }
 
     /// Best-effort equivalent of Linux file_accessed()/touch_atime().
-    fn touch_atime_after_read(&self) {
+    fn touch_atime_after_access(&self) {
         use super::mount::{MountFS, MountFlags};
 
         if self.flags().contains(FileFlags::O_NOATIME) {
@@ -1426,25 +1426,10 @@ impl File {
             return;
         }
 
-        let Ok(mut metadata) = self.inode.metadata() else {
-            return;
-        };
         let now = crate::time::PosixTimeSpec::now();
-        if mount_flags.contains(MountFlags::RELATIME) {
-            let atime_ns = metadata.atime.total_nanos();
-            let recent = now.tv_sec.saturating_sub(metadata.atime.tv_sec) < 24 * 60 * 60;
-            if atime_ns > metadata.mtime.total_nanos()
-                && atime_ns > metadata.ctime.total_nanos()
-                && recent
-            {
-                return;
-            }
-        }
-
-        metadata.atime = now;
         let _ = self
             .inode
-            .set_metadata_masked(&metadata, SetMetadataMask::ATIME);
+            .update_atime(now, mount_flags.contains(MountFlags::RELATIME));
     }
 
     pub fn do_write(
@@ -1733,17 +1718,25 @@ impl File {
     /// ## 参数
     /// - ctx 填充目录项的上下文
     pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
-        // O_PATH 文件描述符只能用于有限的操作，getdents/getdents64
-        // 在 Linux 中会返回 EBADF。提前检测并返回相同语义。
+        // O_PATH file descriptors cannot be used by getdents/getdents64.
         if self.flags().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
-        // 仅目录允许读取目录项，其它类型遵循 POSIX 语义返回 ENOTDIR。
         if self.file_type() != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
+        let result = self.read_dir_impl(ctx);
+        // Match Linux iterate_dir(): once filesystem iteration has started,
+        // reaching EOF or returning an error both count as directory access.
+        // read_dir_impl has released readdir_state before this metadata update,
+        // avoiding a cross-filesystem lock-order dependency.
+        self.touch_atime_after_access();
+        result
+    }
+
+    fn read_dir_impl(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
         let inode: &Arc<dyn IndexNode> = &self.inode;
         // POSIX 标准要求readdir应该返回. 和 ..
         // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理

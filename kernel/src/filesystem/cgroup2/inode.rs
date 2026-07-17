@@ -608,6 +608,12 @@ impl IndexNode for Cgroup2Inode {
         Ok(())
     }
 
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut inner = self.inner.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inner.metadata, now, relatime);
+        Ok(())
+    }
+
     fn create(
         &self,
         name: &str,

@@ -13,10 +13,9 @@ pub mod prio;
 pub mod syscall;
 
 use core::{
-    cell::UnsafeCell,
     intrinsics::{likely, unlikely},
     panic::Location,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -466,103 +465,6 @@ pub trait SchedArch {
     fn initial_setup_sched_local() {}
 }
 
-/// Per-CPU ownership and publication of the task currently executing.
-///
-/// The owner keeps the PCB alive while it is running. Readers serialize with
-/// publication through a raw lock before cloning the owner. This lock cannot
-/// use the scheduler-aware spinlock because current-task publication is itself
-/// part of a context switch.
-#[derive(Debug)]
-struct CurrentTask {
-    lock: AtomicBool,
-    owner: UnsafeCell<Option<Arc<ProcessControlBlock>>>,
-    local_ptr: AtomicPtr<ProcessControlBlock>,
-}
-
-// `owner` is accessed only under the raw publication lock.
-unsafe impl Sync for CurrentTask {}
-
-impl CurrentTask {
-    fn new() -> Self {
-        Self {
-            lock: AtomicBool::new(false),
-            owner: UnsafeCell::new(None),
-            local_ptr: AtomicPtr::new(core::ptr::null_mut()),
-        }
-    }
-
-    fn get(&self) -> Arc<ProcessControlBlock> {
-        // This raw publication lock deliberately does not use SpinLock: its
-        // guard restores preemption through current_pcb(), which must not run
-        // after the slot has already changed to the next task.
-        // Disable local interrupts before taking it so an interrupt-driven
-        // context switch on this CPU cannot spin on a lock held by the
-        // interrupted reader. Remote publishers may briefly spin until the
-        // clone completes.
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        self.lock_raw();
-        let current = unsafe { &*self.owner.get() }
-            .as_ref()
-            .cloned()
-            .expect("runqueue current task is initialized");
-        self.unlock_raw();
-        drop(irq_guard);
-        current
-    }
-
-    fn initialize(&mut self, pcb: Arc<ProcessControlBlock>) {
-        let ptr = Arc::as_ptr(&pcb) as *mut ProcessControlBlock;
-        *self.owner.get_mut() = Some(pcb);
-        self.local_ptr.store(ptr, Ordering::Relaxed);
-    }
-
-    fn set(&self, pcb: Arc<ProcessControlBlock>) {
-        debug_assert!(!CurrentIrqArch::is_irq_enabled());
-        self.lock_raw();
-        let slot = unsafe { &mut *self.owner.get() };
-        let old = slot.replace(pcb);
-        self.local_ptr.store(
-            Arc::as_ptr(slot.as_ref().unwrap()) as *mut ProcessControlBlock,
-            Ordering::Release,
-        );
-        self.unlock_raw();
-        // PCB destruction is not part of the publication critical section and
-        // may acquire unrelated locks. The pointer is already protected by the
-        // new slot owner at this point.
-        drop(old);
-    }
-
-    /// Fast current-task lookup for the CPU that owns this runqueue.
-    ///
-    /// The caller disables interrupts before selecting the CPU and retains
-    /// that guard through the strong-count increment. Therefore this CPU
-    /// cannot publish a replacement (or drop the slot-owned reference) in the
-    /// interval between loading the pointer and acquiring its Arc reference.
-    fn get_local(&self) -> Arc<ProcessControlBlock> {
-        debug_assert!(!CurrentIrqArch::is_irq_enabled());
-        let ptr = self.local_ptr.load(Ordering::Acquire);
-        assert!(!ptr.is_null(), "runqueue current task is initialized");
-        unsafe {
-            Arc::increment_strong_count(ptr);
-            Arc::from_raw(ptr)
-        }
-    }
-
-    fn lock_raw(&self) {
-        while self
-            .lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn unlock_raw(&self) {
-        self.lock.store(false, Ordering::Release);
-    }
-}
-
 /// ## PerCpu的运行队列，其中维护了各个调度器对应的rq
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -608,7 +510,7 @@ pub struct CpuRunQueue {
     sched_info: SchedInfo,
 
     /// 当前在运行队列上执行的进程
-    current: CurrentTask,
+    current: Weak<ProcessControlBlock>,
 
     idle: Weak<ProcessControlBlock>,
 }
@@ -641,7 +543,7 @@ impl CpuRunQueue {
             clock_idle: 0,
             cfs_tasks: LinkedList::new(),
             sched_info: SchedInfo::default(),
-            current: CurrentTask::new(),
+            current: Weak::new(),
             idle: Weak::new(),
         }
     }
@@ -946,27 +848,12 @@ impl CpuRunQueue {
 
     #[inline]
     pub fn current(&self) -> Arc<ProcessControlBlock> {
-        self.current.get()
+        self.current.upgrade().unwrap()
     }
 
     #[inline]
-    pub(crate) fn current_local(&self) -> Arc<ProcessControlBlock> {
-        self.current.get_local()
-    }
-
-    #[inline]
-    pub(crate) fn initialize_current(&mut self, pcb: Arc<ProcessControlBlock>) {
-        self.current.initialize(pcb);
-    }
-
-    /// Publish the task selected under this runqueue's lock at the final
-    /// architecture switch boundary. The caller must run on this queue's CPU
-    /// with interrupts disabled and must not perform another fallible/locking
-    /// operation before switching stacks.
-    pub(crate) unsafe fn publish_current(&self, pcb: Arc<ProcessControlBlock>) {
-        assert!(!CurrentIrqArch::is_irq_enabled());
-        assert_eq!(self.cpu, smp_get_processor_id());
-        self.current.set(pcb);
+    pub fn set_current(&mut self, pcb: Weak<ProcessControlBlock>) {
+        self.current = pcb;
     }
 
     #[inline]
@@ -1360,6 +1247,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     if likely(!Arc::ptr_eq(&prev, &next)) {
         crate::process::rseq::Rseq::on_preempt(&prev);
 
+        rq.set_current(Arc::downgrade(&next));
         compiler_fence(Ordering::SeqCst);
         account_context_switch();
         if let Some(dest_cpu) = migrate_prev_to {

@@ -768,6 +768,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let _io_guard = self.io_lock.lock();
         let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
 
         let to_ext4_time =
@@ -806,6 +807,36 @@ impl IndexNode for LockedExt4Inode {
         self.release_clean_metadata_queue_owner(&fs);
 
         Ok(())
+    }
+
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let _io_guard = self.io_lock.lock();
+        let mut metadata = self.metadata()?;
+        if !vfs::update_atime_locked(&mut metadata, now, relatime) {
+            return Ok(());
+        }
+
+        let _operation = self.begin_operation()?;
+        let (fs, inode_num) = {
+            let guard = self.inner.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let atime = now.tv_sec.max(0).min(u32::MAX as i64) as u32;
+        Self::retry_metadata_contention(|| {
+            fs.fs.setattr(
+                inode_num,
+                another_ext4::SetAttr {
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: None,
+                    atime: Some(atime),
+                    mtime: None,
+                    ctime: None,
+                    crtime: None,
+                },
+            )
+        })
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {

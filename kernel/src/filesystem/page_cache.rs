@@ -3505,7 +3505,15 @@ impl PageCache {
         kind: PageCacheKind,
     ) -> Arc<PageCache> {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
-        let accounting_backend = backend.clone();
+        // Quota accounting is a shmem concern.  Regular file backends use the
+        // same trait for I/O, but its accounting hooks are the default no-ops;
+        // retaining them here would add an unnecessary indirect call to every
+        // file-page insertion and removal while the cache lock is held.
+        let accounting_backend = if kind == PageCacheKind::Shmem {
+            backend.clone()
+        } else {
+            None
+        };
         let cache = Arc::new_cyclic(|weak| Self {
             id,
             inner: Mutex::new(InnerPageCache::new(

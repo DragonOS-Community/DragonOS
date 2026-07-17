@@ -276,10 +276,15 @@ pub fn do_sys_open(
 
 fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
     // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
+    // Linux 6.6 rejects this contradictory creation request before lookup, so
+    // the result must not depend on whether the pathname already exists.
+    if how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_DIRECTORY) {
+        return Err(SystemError::EINVAL);
+    }
     let path = path.trim();
     // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
-    let follow_symlink = !how.o_flags.contains(FileFlags::O_NOFOLLOW)
-        && !(how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_EXCL));
+    let follow_symlink = !(how.o_flags.contains(FileFlags::O_NOFOLLOW)
+        || how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_EXCL));
     // 检查空字符串路径
     if path.is_empty() {
         return Err(SystemError::ENOENT);
@@ -365,6 +370,10 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     let inode = resolved.inode();
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
+
+    if how.o_flags.contains(FileFlags::O_NOATIME) {
+        super::permission::check_noatime_permission(&metadata)?;
+    }
 
     if !how.o_flags.contains(FileFlags::O_PATH)
         && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)

@@ -1,5 +1,6 @@
 use crate::*;
 use alloc::boxed::Box;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU64, Ordering};
 /// A trait defining bitfield operations we need for tracking allocated objects within a page.
 pub(crate) trait Bitfield {
@@ -265,7 +266,7 @@ pub enum PageState {
 pub struct ObjectPage<'a> {
     /// Holds memory objects.
     #[allow(dead_code)]
-    data: [u8; OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD],
+    data: MaybeUninit<[u8; OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD]>,
 
     /// Next element in list (used by `PageList`).
     next: Rawlink<ObjectPage<'a>>,
@@ -284,11 +285,18 @@ impl<'a> ObjectPage<'a> {
     pub fn new() -> Box<ObjectPage<'a>> {
         let mut page = Box::<ObjectPage<'a>>::new_uninit();
         unsafe {
-            // ObjectPage contains an enum, raw links and atomics. Treating
-            // arbitrary uninitialized bytes as that Rust value is undefined
-            // behavior even if refill() overwrites the metadata immediately
-            // afterwards. Initialize in place to avoid a 4 KiB stack object.
-            core::ptr::write_bytes(page.as_mut_ptr().cast::<u8>(), 0, Self::SIZE);
+            // The data area is intentionally uninitialized object storage.  It
+            // is wrapped in MaybeUninit so constructing ObjectPage is sound;
+            // initialize only the allocator metadata that refill() consumes.
+            // Doing this in place avoids both a 4 KiB stack temporary and a
+            // redundant full-page clear on the slab refill hot path.
+            let raw = page.as_mut_ptr();
+            core::ptr::addr_of_mut!((*raw).next).write(Rawlink::none());
+            core::ptr::addr_of_mut!((*raw).prev).write(Rawlink::none());
+            core::ptr::addr_of_mut!((*raw).state).write(PageState::Empty);
+            core::ptr::addr_of_mut!((*raw)._state_pad).write([0; 7]);
+            core::ptr::addr_of_mut!((*raw).bitfield)
+                .write(core::array::from_fn(|_| AtomicU64::new(0)));
             page.assume_init()
         }
     }

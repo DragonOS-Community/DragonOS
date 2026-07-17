@@ -513,7 +513,19 @@ impl FileSystem for Tmpfs {
     }
 
     fn super_block(&self) -> SuperBlock {
-        self.super_block.read().clone()
+        let limit = self.size_limit.read();
+        let mut sb = self.super_block.read().clone();
+        if let Some(limit) = *limit {
+            let current = self.current_size.load(Ordering::Acquire);
+            let total_blocks = limit / TMPFS_BLOCK_SIZE;
+            let used_blocks = Self::bytes_to_blocks_ceil(current);
+            let free_blocks = total_blocks.saturating_sub(used_blocks);
+            sb.blocks = total_blocks;
+            sb.bfree = free_blocks;
+            sb.bavail = free_blocks;
+            sb.frsize = TMPFS_BLOCK_SIZE;
+        }
+        sb
     }
 
     fn support_readahead(&self) -> bool {
@@ -531,7 +543,6 @@ impl FileSystem for Tmpfs {
                 return Err(SystemError::EINVAL);
             }
             *limit = Some(new_limit);
-            self.update_superblock_free_for_limit(current, new_limit);
         }
 
         if let Some(mode) = parsed.mode {
@@ -556,17 +567,6 @@ impl Tmpfs {
     #[inline]
     fn bytes_to_blocks_ceil(bytes: u64) -> u64 {
         bytes.div_ceil(TMPFS_BLOCK_SIZE)
-    }
-
-    fn update_superblock_free_for_limit(&self, current_bytes: u64, limit: u64) {
-        let total_blocks = limit / TMPFS_BLOCK_SIZE;
-        let used_blocks = Self::bytes_to_blocks_ceil(current_bytes);
-        let free_blocks = total_blocks.saturating_sub(used_blocks);
-        let mut sb = self.super_block.write();
-        sb.blocks = total_blocks;
-        sb.bfree = free_blocks;
-        sb.bavail = free_blocks;
-        sb.frsize = TMPFS_BLOCK_SIZE;
     }
 
     pub fn new(mount_data: &TmpfsMountData) -> Arc<Self> {
@@ -638,11 +638,7 @@ impl Tmpfs {
                     Ordering::Release,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => {
-                        // 同步更新 superblock 的 free 统计，供 statfs/df 使用
-                        self.update_superblock_free_for_limit(new_total, limit);
-                        break;
-                    } // 更新成功
+                    Ok(_) => break,     // 更新成功
                     Err(_) => continue, // 被其他线程修改，重试
                 }
             }
@@ -654,7 +650,7 @@ impl Tmpfs {
     /// 使用fetch_sub确保并发安全
     fn decrease_size(&self, size: usize) {
         let size_limit = self.size_limit.read();
-        if let Some(limit) = *size_limit {
+        if size_limit.is_some() {
             let size_to_decrease = size as u64;
             loop {
                 let current = self.current_size.load(Ordering::Acquire);
@@ -664,7 +660,6 @@ impl Tmpfs {
                     .compare_exchange_weak(current, new, Ordering::Release, Ordering::Acquire)
                     .is_ok()
                 {
-                    self.update_superblock_free_for_limit(new, limit);
                     break;
                 }
             }
@@ -1068,6 +1063,12 @@ impl IndexNode for LockedTmpfsInode {
         Ok(())
     }
 
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        Ok(())
+    }
+
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _size_guard = self.1.write();
         let (old_size, new_size, page_cache) = {
@@ -1200,7 +1201,7 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let now = PosixTimeSpec::now();
-        let inline = target.len() + 1 <= SHORT_SYMLINK_LEN;
+        let inline = target.len() < SHORT_SYMLINK_LEN;
         let result = Arc::new(LockedTmpfsInode::new(TmpfsInode {
             parent: parent.self_ref.clone(),
             self_ref: Weak::default(),

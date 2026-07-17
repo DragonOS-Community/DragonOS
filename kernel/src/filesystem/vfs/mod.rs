@@ -1029,10 +1029,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
 
-    /// 获取 inode 所在的文件系统；供异步回收等可能与卸载并发的路径使用。
+    /// 获取 inode 所在的文件系统；供可选文件系统能力检查，以及异步回收等
+    /// 可能与卸载并发的路径使用。
     ///
-    /// 默认实现适用于 inode 强持有文件系统的实现。仅当 inode 与文件系统之间
-    /// 使用弱引用、且调用方允许文件系统已完成销毁时才应覆盖此方法。
+    /// `None` 表示 inode 天生不属于任何文件系统（例如匿名 socket），或 inode
+    /// 仅弱持有文件系统且文件系统已经销毁。默认实现仅适用于 `fs()` 始终有效、
+    /// 且 inode 强持有文件系统的实现。
     fn try_fs(&self) -> Option<Arc<dyn FileSystem>> {
         Some(self.fs())
     }

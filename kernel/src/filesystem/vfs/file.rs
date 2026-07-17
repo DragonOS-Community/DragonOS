@@ -1417,9 +1417,13 @@ impl File {
         {
             return;
         }
-        if self
-            .inode
-            .fs()
+        let Some(fs) = self.inode.try_fs() else {
+            // Anonymous kernel objects such as sockets are represented by an
+            // IndexNode but are not backed by a filesystem or mount. Linux
+            // does not apply file_accessed() timestamp updates to their I/O.
+            return;
+        };
+        if fs
             .downcast_arc::<MountFS>()
             .is_some_and(|mount| mount.is_readonly())
         {

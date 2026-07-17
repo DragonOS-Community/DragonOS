@@ -33,7 +33,12 @@ pub struct Termios {
     pub control_mode: ControlMode,
     pub local_mode: LocalMode,
     pub control_characters: [u8; CONTORL_CHARACTER_NUM],
+    /// Active line discipline (derived from c_line_abi).
     pub line: LineDisciplineType,
+    /// Raw ABI c_line value preserved across TCGETS/TCSETA round-trips.
+    /// Linux stores the c_line byte as-is; line discipline switching is
+    /// done via TIOCSETD, not by writing c_line in termios.
+    pub c_line_abi: u8,
     pub input_speed: u32,
     pub output_speed: u32,
 }
@@ -57,7 +62,7 @@ impl PosixTermios {
             c_cflag: termios.control_mode.bits,
             c_lflag: termios.local_mode.bits,
             c_cc: termios.control_characters,
-            c_line: termios.line as u8,
+            c_line: termios.c_line_abi,
         }
     }
 
@@ -70,6 +75,7 @@ impl PosixTermios {
             local_mode: LocalMode::from_bits_truncate(self.c_lflag),
             control_characters: self.c_cc,
             line: LineDisciplineType::from_line(self.c_line),
+            c_line_abi: self.c_line,
             input_speed: self.input_speed().unwrap_or(38400),
             output_speed: self.output_speed().unwrap_or(38400),
         }
@@ -146,6 +152,7 @@ lazy_static! {
                 | LocalMode::IEXTEN,
             control_characters: INIT_CONTORL_CHARACTERS,
             line: LineDisciplineType::NTty,
+            c_line_abi: 0,
             input_speed: 38400,
             output_speed: 38400,
         }
@@ -432,7 +439,7 @@ impl PosixTermio {
             c_oflag: termios.output_mode.bits as u16,
             c_cflag: termios.control_mode.bits as u16,
             c_lflag: termios.local_mode.bits as u16,
-            c_line: termios.line as u8,
+            c_line: termios.c_line_abi,
             c_cc: cc,
             _pad: 0,
         }
@@ -463,8 +470,7 @@ impl PosixTermio {
             ),
             control_characters: cc,
             line: LineDisciplineType::from_line(self.c_line),
-            // Speed is derived from the merged c_cflag by the caller via
-            // ControlMode::baud_rate(); termio carries no speed fields.
+            c_line_abi: self.c_line,
             input_speed: old.input_speed,
             output_speed: old.output_speed,
         }

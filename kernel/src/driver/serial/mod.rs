@@ -67,6 +67,7 @@ lazy_static! {
                 | LocalMode::IEXTEN,
             control_characters: INIT_CONTORL_CHARACTERS,
             line: LineDisciplineType::NTty,
+            c_line_abi: 0,
             input_speed: SERIAL_BAUDRATE.data(),
             output_speed: SERIAL_BAUDRATE.data(),
         }

@@ -393,6 +393,11 @@ impl TtyCore {
         arg: VirtAddr,
         opt: TtySetTermiosOpt,
     ) -> Result<usize, SystemError> {
+        // Check job control: prevent background process groups from changing
+        // terminal attributes without permission.  Matches Linux 6.6
+        // set_termios() which calls tty_check_change() before any work.
+        TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
+
         #[allow(unused_assignments)]
         // TERMIOS_TERMIO下会用到
         let mut tmp_termios = *tty.core().termios();

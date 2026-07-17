@@ -1606,6 +1606,9 @@ impl dyn IndexNode {
         };
 
         let mut symlink_follows_remaining = max_follow_times;
+        // Allocate the PATH_MAX read buffer lazily and reuse it for the whole
+        // walk. A symlink chain must not amplify allocator work per hop.
+        let mut symlink_buffer: Option<Vec<u8>> = None;
 
         // 逐级查找文件
         while !rest_path.is_empty() {
@@ -1734,17 +1737,21 @@ impl dyn IndexNode {
                 // read bound. Read once into a PATH_MAX-sized buffer: some of
                 // those implementations intentionally ignore the offset and
                 // therefore cannot be consumed in chunks.
-                let mut content = Vec::new();
-                content
-                    .try_reserve_exact(MAX_PATHLEN)
-                    .map_err(|_| SystemError::ENOMEM)?;
-                content.resize(MAX_PATHLEN, 0);
+                if symlink_buffer.is_none() {
+                    let mut buffer = Vec::new();
+                    buffer
+                        .try_reserve_exact(MAX_PATHLEN)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    buffer.resize(MAX_PATHLEN, 0);
+                    symlink_buffer = Some(buffer);
+                }
+                let content = symlink_buffer.as_mut().expect("symlink buffer initialized");
                 // 读取符号链接
                 // TODO:We need to clarify which interfaces require private data and which do not
                 let len = inode.read_at(
                     0,
                     MAX_PATHLEN,
-                    &mut content,
+                    content,
                     Mutex::new(FilePrivateData::Unused).lock(),
                 )?;
                 if len >= MAX_PATHLEN {

@@ -10,7 +10,7 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
-    process::{Command, ExitStatus},
+    process::{Child, Command, ExitStatus},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -717,25 +717,37 @@ enum TestProcessOutcome {
     TimedOut,
 }
 
+fn terminate_process_group(child: &mut Child) -> Result<()> {
+    let pgid = -(child.id() as libc::pid_t);
+    if unsafe { libc::kill(pgid, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("终止 gVisor 测试进程组失败");
+        }
+    }
+    let _ = child.kill();
+    child.wait().context("回收 gVisor 测试进程失败")?;
+    Ok(())
+}
+
 fn wait_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<TestProcessOutcome> {
     let mut child = cmd.spawn().context("启动 gVisor 测试进程失败")?;
     let started = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().context("等待 gVisor 测试进程失败")? {
-            return Ok(TestProcessOutcome::Exited(status));
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(TestProcessOutcome::Exited(status)),
+            Ok(None) => {}
+            Err(wait_error) => {
+                terminate_process_group(&mut child).with_context(|| {
+                    format!("等待 gVisor 测试进程失败后清理子进程: {wait_error}")
+                })?;
+                return Err(wait_error).context("等待 gVisor 测试进程失败");
+            }
         }
         if started.elapsed() >= timeout {
-            let pgid = -(child.id() as libc::pid_t);
-            if unsafe { libc::kill(pgid, libc::SIGKILL) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error).context("终止超时 gVisor 测试进程组失败");
-                }
-            }
-            let _ = child.kill();
-            child.wait().context("回收超时 gVisor 测试进程失败")?;
+            terminate_process_group(&mut child).context("清理超时 gVisor 测试进程失败")?;
             return Ok(TestProcessOutcome::TimedOut);
         }
         thread::sleep(Duration::from_millis(20));

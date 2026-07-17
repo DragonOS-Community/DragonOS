@@ -371,10 +371,6 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
 
-    if how.o_flags.contains(FileFlags::O_NOATIME) {
-        super::permission::check_noatime_permission(&metadata)?;
-    }
-
     if !how.o_flags.contains(FileFlags::O_PATH)
         && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)
         && inode.mount_flags().contains(MountFlags::NODEV)
@@ -382,11 +378,6 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         return Err(SystemError::EACCES);
     }
 
-    // Linux semantics: socket inodes (S_IFSOCK) cannot be opened via open(2).
-    // Users must use socket(2)/connect(2) instead. Linux returns ENXIO.
-    if file_type == FileType::Socket {
-        return Err(SystemError::ENXIO);
-    }
     // 如果路径以斜杠结尾，而目标不是目录，返回 ENOTDIR
     if path_ends_with_slash && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
@@ -419,10 +410,6 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
             return Err(SystemError::EISDIR);
         }
-        // 目录不支持 O_DIRECT
-        if how.o_flags.contains(FileFlags::O_DIRECT) {
-            return Err(SystemError::EINVAL);
-        }
     }
     // 非 O_PATH 需要检查访问权限（read/write/truncate）
     // Linux 语义：若本次 open() 触发了创建，则不应因“新 inode 的 mode”而拒绝
@@ -447,6 +434,25 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     // 如果要打开的是文件夹，而目标不是文件夹
     if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
+    }
+
+    // Linux resolves path/file-type and ordinary DAC errors before applying
+    // O_NOATIME's owner/CAP_FOWNER restriction. In particular, O_NOFOLLOW on
+    // a final symlink must report ELOOP rather than an ownership-based EPERM.
+    if how.o_flags.contains(FileFlags::O_NOATIME) {
+        super::permission::check_noatime_permission(&metadata)?;
+    }
+
+    // Linux rejects unsupported direct I/O from do_dentry_open(), after
+    // may_open() has enforced O_NOATIME ownership.
+    if file_type == FileType::Dir && how.o_flags.contains(FileFlags::O_DIRECT) {
+        return Err(SystemError::EINVAL);
+    }
+
+    // Linux reaches the socket file operation only after DAC and O_NOATIME
+    // checks; sock_no_open() then rejects pathname-based opens with ENXIO.
+    if file_type == FileType::Socket {
+        return Err(SystemError::ENXIO);
     }
 
     // 如果O_TRUNC，并且是普通文件，清空文件

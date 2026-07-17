@@ -528,6 +528,7 @@ TEST(MountReconfigure, CreatDirectoryIsAlwaysInvalid) {
 TEST(MountReconfigure, NoatimeRequiresOwnerOrCapFowner) {
     const char *target = "/tmp/test_mount_noatime_permission";
     const char *file = "/tmp/test_mount_noatime_permission/file";
+    const char *link = "/tmp/test_mount_noatime_permission/link";
 
     ensure_dir("/tmp");
     ensure_dir(target);
@@ -535,6 +536,7 @@ TEST(MountReconfigure, NoatimeRequiresOwnerOrCapFowner) {
     ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
     ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
     ASSERT_EQ(0, write_file(file)) << strerror(errno);
+    ASSERT_EQ(0, symlink("file", link)) << strerror(errno);
 
     pid_t child = fork();
     ASSERT_GE(child, 0) << strerror(errno);
@@ -550,6 +552,24 @@ TEST(MountReconfigure, NoatimeRequiresOwnerOrCapFowner) {
                 close(fd);
             }
             _exit(11);
+        }
+
+        errno = 0;
+        fd = open(link, O_RDONLY | O_NOFOLLOW | O_NOATIME);
+        if (fd >= 0 || errno != ELOOP) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            _exit(14);
+        }
+
+        errno = 0;
+        fd = open(target, O_RDONLY | O_DIRECT | O_NOATIME);
+        if (fd >= 0 || errno != EPERM) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            _exit(15);
         }
 
         fd = open(file, O_RDONLY);
@@ -569,6 +589,7 @@ TEST(MountReconfigure, NoatimeRequiresOwnerOrCapFowner) {
     ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(link);
     cleanup_mount(target);
 }
 

@@ -104,9 +104,9 @@ impl LineDisciplineType {
     pub fn from_line(line: u8) -> Self {
         match line {
             0 => Self::NTty,
-            _ => {
-                todo!()
-            }
+            // Unknown / unsupported line disciplines fall back to NTty,
+            // matching Linux behaviour (N_TTY is the default).
+            _ => Self::NTty,
         }
     }
 }

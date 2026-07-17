@@ -13,7 +13,11 @@ use crate::{
         notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
         spinlock::SpinLock,
     },
-    process::preempt::PreemptGuard,
+    process::{
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
+        preempt::PreemptGuard,
+    },
+    sched::completion::Completion,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 use system_error::SystemError;
@@ -508,20 +512,9 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
     let option_race_old_drops = Arc::new(AtomicUsize::new(0));
     let option_race_new_drops = Arc::new(AtomicUsize::new(0));
     let option_drop_drops = Arc::new(AtomicUsize::new(0));
-    let option_borrow_old_drops = Arc::new(AtomicUsize::new(0));
-    let option_borrow_new_drops = Arc::new(AtomicUsize::new(0));
-
     let option_slot = RcuOptionArcSlot::new_none();
     if option_slot.load().is_some() {
         return Err("RcuOptionArcSlot::new_none did not start empty");
-    }
-    let empty_closure_called = AtomicBool::new(false);
-    if option_slot
-        .with_read_if_present(|_| empty_closure_called.store(true, Ordering::SeqCst))
-        .is_some()
-        || empty_closure_called.load(Ordering::SeqCst)
-    {
-        return Err("RcuOptionArcSlot::with_read_if_present called the closure for None");
     }
 
     option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
@@ -559,54 +552,6 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
     }
     if option_replacement_drops.load(Ordering::SeqCst) != 1 {
         return Err("RcuOptionArcSlot replacement object was not dropped after clear");
-    }
-
-    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
-        id: 11,
-        drops: option_borrow_old_drops.clone(),
-    })));
-    let borrowed_id = option_slot.with_read_if_present(|borrowed| {
-        let old = option_slot
-            .swap(Some(Arc::new(RcuSelftestDropProbe {
-                id: 12,
-                drops: option_borrow_new_drops.clone(),
-            })))
-            .expect("borrowed optional slot unexpectedly became empty");
-        rcu_defer_drop(old);
-
-        if option_borrow_old_drops.load(Ordering::SeqCst) != 0 {
-            return 0;
-        }
-        borrowed.id
-    });
-    if borrowed_id != Some(11) {
-        return Err("RcuOptionArcSlot::with_read_if_present did not pin the old snapshot");
-    }
-    if option_slot.with_read_if_present(|value| value.id) != Some(12) {
-        return Err("RcuOptionArcSlot::with_read_if_present did not observe the replacement");
-    }
-    rcu_barrier();
-    if option_borrow_old_drops.load(Ordering::SeqCst) != 1 {
-        return Err("RcuOptionArcSlot borrowed old snapshot was not dropped after its reader");
-    }
-
-    let cleared_id = option_slot.with_read_if_present(|borrowed| {
-        let old = option_slot
-            .swap(None)
-            .expect("borrowed optional slot unexpectedly became empty before clear");
-        rcu_defer_drop(old);
-
-        if option_borrow_new_drops.load(Ordering::SeqCst) != 0 {
-            return 0;
-        }
-        borrowed.id
-    });
-    if cleared_id != Some(12) || option_slot.with_read_if_present(|_| ()).is_some() {
-        return Err("RcuOptionArcSlot::with_read_if_present clear transition was inconsistent");
-    }
-    rcu_barrier();
-    if option_borrow_new_drops.load(Ordering::SeqCst) != 1 {
-        return Err("RcuOptionArcSlot borrowed cleared snapshot was not dropped after its reader");
     }
 
     option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
@@ -676,6 +621,189 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
     drop(pinned_drop_slot);
     if option_drop_drops.load(Ordering::SeqCst) != 1 {
         return Err("RcuOptionArcSlot drop object was not released after final reader pin");
+    }
+
+    run_option_slot_cross_thread_lifecycle_selftest()?;
+
+    Ok(())
+}
+
+fn run_option_slot_cross_thread_lifecycle_selftest() -> Result<(), &'static str> {
+    let pinned_drops = Arc::new(AtomicUsize::new(0));
+    let replacement_drops = Arc::new(AtomicUsize::new(0));
+    let slot = Arc::new(RcuOptionArcSlot::new_some(Arc::new(RcuSelftestDropProbe {
+        id: 20,
+        drops: pinned_drops.clone(),
+    })));
+    let invalid_read = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let first_read = Arc::new(Completion::new());
+    let reader_gate = Arc::new(Completion::new());
+    let gated_read = Arc::new(Completion::new());
+    let overlap_entered = Arc::new(Completion::new());
+    let overlap_start = Arc::new(Completion::new());
+    let overlap_done = Arc::new(Completion::new());
+
+    let slot_reader = slot.clone();
+    let reader_gate_reader = reader_gate.clone();
+    let invalid_read_reader = invalid_read.clone();
+    let reads_reader = reads.clone();
+    let first_read_reader = first_read.clone();
+    let gated_read_reader = gated_read.clone();
+    let overlap_entered_reader = overlap_entered.clone();
+    let overlap_start_reader = overlap_start.clone();
+    let overlap_done_reader = overlap_done.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let first_snapshot = slot_reader.load();
+            if first_snapshot.as_ref().map(|value| value.id) != Some(20) {
+                invalid_read_reader.store(true, Ordering::Release);
+            }
+            reads_reader.fetch_add(1, Ordering::Release);
+            first_read_reader.complete();
+
+            if reader_gate_reader.wait_for_completion().is_err() {
+                invalid_read_reader.store(true, Ordering::Release);
+                gated_read_reader.complete();
+                overlap_entered_reader.complete();
+                overlap_done_reader.complete();
+                return 1;
+            }
+
+            if let Some(value) = slot_reader.load() {
+                if value.id != 20 && value.id != 21 {
+                    invalid_read_reader.store(true, Ordering::Release);
+                }
+            }
+            reads_reader.fetch_add(1, Ordering::Release);
+            gated_read_reader.complete();
+
+            drop(first_snapshot);
+
+            if let Some(value) = slot_reader.load() {
+                if value.id != 20 && value.id != 21 {
+                    invalid_read_reader.store(true, Ordering::Release);
+                }
+            }
+            reads_reader.fetch_add(1, Ordering::Release);
+            overlap_entered_reader.complete();
+
+            if overlap_start_reader.wait_for_completion().is_err() {
+                invalid_read_reader.store(true, Ordering::Release);
+                overlap_done_reader.complete();
+                return 1;
+            }
+
+            for _ in 0..510 {
+                if let Some(value) = slot_reader.load() {
+                    if value.id != 20 && value.id != 21 {
+                        invalid_read_reader.store(true, Ordering::Release);
+                    }
+                }
+                reads_reader.fetch_add(1, Ordering::Release);
+            }
+            overlap_done_reader.complete();
+            0
+        }),
+        (),
+    ));
+    let Some(reader) = KernelThreadMechanism::create_and_run(
+        closure,
+        "rcu-option-slot-selftest-reader".to_string(),
+    ) else {
+        return Err("RcuOptionArcSlot failed to create its lifecycle reader");
+    };
+
+    if first_read.wait_for_completion().is_err() {
+        reader_gate.complete();
+        overlap_start.complete();
+        let _ = KernelThreadMechanism::stop(&reader);
+        slot.store_deferred(None);
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuOptionArcSlot lifecycle reader did not start");
+    }
+
+    let mut created_replacements = 0usize;
+    for index in 0..128 {
+        let next = if index % 3 == 0 {
+            None
+        } else {
+            created_replacements += 1;
+            Some(Arc::new(RcuSelftestDropProbe {
+                id: 20 + index % 2,
+                drops: replacement_drops.clone(),
+            }))
+        };
+        slot.store_deferred(next);
+    }
+    rcu_barrier();
+    let pinned_survived_replacements = pinned_drops.load(Ordering::Acquire) == 0;
+
+    let reads_before_gate = reads.load(Ordering::Acquire);
+    reader_gate.complete();
+    if gated_read.wait_for_completion().is_err() {
+        overlap_start.complete();
+        let _ = KernelThreadMechanism::stop(&reader);
+        slot.store_deferred(None);
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuOptionArcSlot lifecycle reader missed its gate");
+    }
+    let reads_after_gate = reads.load(Ordering::Acquire);
+
+    if overlap_entered.wait_for_completion().is_err() {
+        overlap_start.complete();
+        let _ = KernelThreadMechanism::stop(&reader);
+        slot.store_deferred(None);
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuOptionArcSlot overlap reader did not enter");
+    }
+    overlap_start.complete();
+
+    for index in 128..256 {
+        let next = if index % 3 == 0 {
+            None
+        } else {
+            created_replacements += 1;
+            Some(Arc::new(RcuSelftestDropProbe {
+                id: 20 + index % 2,
+                drops: replacement_drops.clone(),
+            }))
+        };
+        slot.store_deferred(next);
+    }
+
+    let overlap_result = overlap_done.wait_for_completion();
+    let stop_result = KernelThreadMechanism::stop(&reader);
+    slot.store_deferred(None);
+    drop(slot);
+    rcu_barrier();
+
+    if stop_result.is_err() {
+        return Err("RcuOptionArcSlot failed to stop its lifecycle reader");
+    }
+    if overlap_result.is_err() {
+        return Err("RcuOptionArcSlot bounded overlap reader did not finish");
+    }
+    if reads_after_gate <= reads_before_gate {
+        return Err("RcuOptionArcSlot lifecycle reader missed its second load");
+    }
+    if !pinned_survived_replacements {
+        return Err("RcuOptionArcSlot dropped a cross-thread pinned snapshot");
+    }
+    if invalid_read.load(Ordering::Acquire) {
+        return Err("RcuOptionArcSlot lifecycle reader observed an invalid value");
+    }
+    if reads.load(Ordering::Acquire) != 513 {
+        return Err("RcuOptionArcSlot bounded overlap reader ran an unexpected load count");
+    }
+    if pinned_drops.load(Ordering::Acquire) != 1 {
+        return Err("RcuOptionArcSlot cross-thread pinned snapshot was not dropped exactly once");
+    }
+    if replacement_drops.load(Ordering::Acquire) != created_replacements {
+        return Err("RcuOptionArcSlot cross-thread replacements were not dropped exactly once");
     }
 
     Ok(())

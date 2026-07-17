@@ -136,7 +136,16 @@ where
         f(unsafe { &*raw })
     }
 
-    pub fn swap(&self, new: Arc<T>) -> Arc<T> {
+    /// Replaces the slot-owned reference without arranging its deferred drop.
+    ///
+    /// # Safety
+    ///
+    /// The caller must either keep the returned slot-owned `Arc` (or an
+    /// equivalent strong reference) alive until a strong reference is
+    /// submitted to `rcu_defer_drop()`, or prove that `new` points to the same
+    /// allocation and remains continuously published by the slot. Any later
+    /// removal of that allocation must still use deferred drop.
+    pub(crate) unsafe fn swap(&self, new: Arc<T>) -> Arc<T> {
         let new_raw = Arc::into_raw(new) as *mut T;
         let old_raw = self.ptr.swap(new_raw, Ordering::AcqRel);
         assert!(
@@ -151,12 +160,16 @@ where
     }
 
     pub fn store_deferred(&self, new: Arc<T>) {
-        let old = self.swap(new);
+        // SAFETY: the removed slot reference is immediately transferred to
+        // the RCU deferred-drop queue.
+        let old = unsafe { self.swap(new) };
         rcu_defer_drop(old);
     }
 
     pub fn swap_deferred(&self, new: Arc<T>) -> Arc<T> {
-        let old = self.swap(new);
+        // SAFETY: the clone submitted below keeps the removed allocation alive
+        // through a grace period even if the caller drops the returned Arc.
+        let old = unsafe { self.swap(new) };
         rcu_defer_drop(old.clone());
         old
     }
@@ -199,7 +212,20 @@ where
         }
     }
 
+    /// Pins a snapshot of the currently published value.
+    ///
+    /// A null precheck is a valid `None` snapshot and keeps the common empty
+    /// path out of RCU. A non-null precheck is only a hint: the pointer is
+    /// loaded again inside RCU before its strong count is incremented. Writers
+    /// must defer release of a removed slot-owned reference until after an RCU
+    /// grace period. Before RCU is initialized, callers rely on the existing
+    /// boot-time invariant that no concurrent writer can mutate the slot.
+    #[inline]
     pub fn load(&self) -> Option<Arc<T>> {
+        if self.ptr.load(Ordering::Acquire).is_null() {
+            return None;
+        }
+
         let _guard = rcu_read_lock();
         let raw = rcu_dereference(&self.ptr);
         if raw.is_null() {
@@ -215,40 +241,16 @@ where
         }
     }
 
-    /// Borrows the currently published value for the duration of an RCU
-    /// read-side critical section without incrementing its `Arc` strong count.
+    /// Replaces the slot-owned reference without arranging its deferred drop.
     ///
-    /// The initial null check keeps the common empty-slot path out of RCU
-    /// entirely. A writer may publish a value immediately after that check;
-    /// returning `None` is still a valid snapshot of the slot at the check's
-    /// linearization point. For a non-null observation, the pointer is loaded
-    /// again after entering RCU so a concurrently removed value is never
-    /// dereferenced without grace-period protection.
+    /// # Safety
     ///
-    /// The closure must not block or otherwise retain the borrowed reference.
-    #[inline]
-    pub fn with_read_if_present<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        if self.ptr.load(Ordering::Acquire).is_null() {
-            return None;
-        }
-
-        if !rcu_enabled() {
-            let pinned = self.load()?;
-            return Some(f(&pinned));
-        }
-
-        let _guard = rcu_read_lock();
-        let raw = rcu_dereference(&self.ptr);
-        let current = NonNull::new(raw)?;
-
-        // SAFETY: the pointer was reloaded after entering the RCU read-side
-        // section. A writer removing this slot-owned Arc must defer its drop
-        // until this section completes, and the reference cannot escape the
-        // closure's call.
-        Some(f(unsafe { current.as_ref() }))
-    }
-
-    pub fn swap(&self, new: Option<Arc<T>>) -> Option<Arc<T>> {
+    /// The caller must either keep the returned slot-owned `Arc` (or an
+    /// equivalent strong reference) alive until a strong reference is
+    /// submitted to `rcu_defer_drop()`, or prove that the replacement points
+    /// to the same allocation and remains continuously published by the slot.
+    /// Any later removal of that allocation must still use deferred drop.
+    pub(crate) unsafe fn swap(&self, new: Option<Arc<T>>) -> Option<Arc<T>> {
         let new_raw = new
             .map(|value| Arc::into_raw(value) as *mut T)
             .unwrap_or_default();
@@ -263,7 +265,9 @@ where
     }
 
     pub fn store_deferred(&self, new: Option<Arc<T>>) {
-        if let Some(old) = self.swap(new) {
+        // SAFETY: every removed slot reference is immediately transferred to
+        // the RCU deferred-drop queue.
+        if let Some(old) = unsafe { self.swap(new) } {
             rcu_defer_drop(old);
         }
     }

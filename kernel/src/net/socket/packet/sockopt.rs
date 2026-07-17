@@ -114,7 +114,10 @@ impl PacketSocket {
                     if *locked {
                         return Err(SystemError::EPERM);
                     }
-                    self.filter.swap(Some(new_filter))
+                    // SAFETY: `old_filter` keeps the removed slot reference
+                    // alive across unlock and is submitted to rcu_defer_drop
+                    // immediately below.
+                    unsafe { self.filter.swap(Some(new_filter)) }
                 };
                 if let Some(old_filter) = old_filter {
                     rcu_defer_drop(old_filter);
@@ -130,7 +133,10 @@ impl PacketSocket {
                     if *locked {
                         return Err(SystemError::EPERM);
                     }
-                    self.filter.swap(None).ok_or(SystemError::ENOENT)?
+                    // SAFETY: `old_filter` keeps the removed slot reference
+                    // alive across unlock and is submitted to rcu_defer_drop
+                    // immediately below.
+                    unsafe { self.filter.swap(None) }.ok_or(SystemError::ENOENT)?
                 };
                 rcu_defer_drop(old_filter);
                 Ok(())

@@ -20,6 +20,7 @@
 #include <net/if_arp.h>
 #include <netinet/if_ether.h>
 #include <netpacket/packet.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -58,6 +59,7 @@
 #endif
 
 inline constexpr int kSoAttachFilter = 26;
+inline constexpr int kSoDetachFilter = 27;
 
 struct TestSockFilter {
     uint16_t code;
@@ -323,6 +325,30 @@ int ProbeIfindex(const std::string& ifname) {
 int AttachFilter(int fd, TestSockFilter* filter, uint16_t len) {
     TestSockFprog program{len, filter};
     return setsockopt(fd, SOL_SOCKET, kSoAttachFilter, &program, sizeof(program));
+}
+
+struct FilterSwapStress {
+    int fd;
+    int error{0};
+};
+
+void* ReplaceAndDetachFilters(void* raw) {
+    auto* stress = static_cast<FilterSwapStress*>(raw);
+    TestSockFilter accept_all[] = {{0x06, 0, 0, 0xffffffffU}};
+    TestSockFilter drop_all[] = {{0x06, 0, 0, 0}};
+    int ignored = 0;
+    constexpr unsigned int kControlCycles = 256;
+    for (unsigned int cycle = 0; cycle < kControlCycles; ++cycle) {
+        if (AttachFilter(stress->fd, accept_all, 1) != 0 ||
+            AttachFilter(stress->fd, drop_all, 1) != 0 ||
+            setsockopt(stress->fd, SOL_SOCKET, kSoDetachFilter, &ignored,
+                       sizeof(ignored)) != 0) {
+            stress->error = errno == 0 ? EIO : errno;
+            break;
+        }
+    }
+
+    return nullptr;
 }
 
 }  // namespace
@@ -1017,6 +1043,73 @@ TEST(AfPacketE2E, ClassicFilterSnaplenAndRuntimeErrorsAreFailClosed) {
         << ErrnoString(errno);
     EXPECT_EQ(recv(arp_receiver.Get(), buffer, sizeof(buffer), MSG_TRUNC), kEthHdrLen)
         << "Linux skb_get_poff returns the network offset for ARP";
+}
+
+TEST(AfPacketE2E, FilterReplacementPreservesReceiveState) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic cBPF testing";
+
+    FdGuard receiver(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    struct sockaddr_ll bind_addr{};
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(kPrivateEtherType);
+    bind_addr.sll_ifindex = ifindex;
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)), 0)
+        << ErrnoString(errno);
+    struct timeval timeout{1, 0};
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0)
+        << ErrnoString(errno);
+
+    uint8_t local_mac[6];
+    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    uint8_t frame[96]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kPrivateEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+
+    auto send_one = [&]() {
+        return sendto(sender.Get(), frame, sizeof(frame), 0,
+                      reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+    };
+    TestSockFilter accept_all[] = {{0x06, 0, 0, 0xffffffffU}};
+    ASSERT_EQ(AttachFilter(receiver.Get(), accept_all, 1), 0) << ErrnoString(errno);
+    ASSERT_EQ(send_one(), static_cast<ssize_t>(sizeof(frame))) << ErrnoString(errno);
+    uint8_t buffer[128]{};
+    ASSERT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
+
+    FilterSwapStress stress{receiver.Get()};
+    pthread_t control{};
+    ASSERT_EQ(pthread_create(&control, nullptr, ReplaceAndDetachFilters, &stress), 0);
+    ASSERT_EQ(pthread_join(control, nullptr), 0);
+    EXPECT_EQ(stress.error, 0) << ErrnoString(stress.error);
+
+    ASSERT_EQ(AttachFilter(receiver.Get(), accept_all, 1), 0) << ErrnoString(errno);
+    ASSERT_EQ(send_one(), static_cast<ssize_t>(sizeof(frame))) << ErrnoString(errno);
+    ASSERT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), static_cast<ssize_t>(sizeof(frame)))
+        << "filter control path must remain usable after the stress phase: "
+        << ErrnoString(errno);
+
+    int ignored = 0;
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, kSoDetachFilter, &ignored, sizeof(ignored)), 0)
+        << ErrnoString(errno);
+    ASSERT_EQ(send_one(), static_cast<ssize_t>(sizeof(frame))) << ErrnoString(errno);
+    EXPECT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), static_cast<ssize_t>(sizeof(frame)))
+        << "detached socket must continue receiving after the stress phase: "
+        << ErrnoString(errno);
 }
 
 int main(int argc, char** argv) {

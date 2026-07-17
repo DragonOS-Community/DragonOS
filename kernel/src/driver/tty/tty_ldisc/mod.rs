@@ -25,6 +25,14 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
         Ok(())
     }
 
+    /// Drain pending ldisc output (opost + echo) without blocking indefinitely.
+    /// Returns `Ok(true)` when everything was drained, `Ok(false)` when
+    /// the output lock was held by a concurrent writer and drain could not
+    /// be performed.
+    fn drain_output(&self, _tty: Arc<TtyCore>) -> Result<bool, SystemError> {
+        Ok(true)
+    }
+
     /// ## tty行规程循环读取函数
     ///
     /// ### 参数

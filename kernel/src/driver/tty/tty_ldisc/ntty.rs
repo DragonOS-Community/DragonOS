@@ -1820,6 +1820,17 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         Ok(())
     }
 
+    fn drain_output(&self, tty: Arc<TtyCore>) -> Result<bool, SystemError> {
+        if let Some(_output_guard) = self.output_lock.try_lock() {
+            let drained = self.drain_opost_pending(&tty)?;
+            self.drain_echoes(&tty)?;
+            Ok(drained)
+        } else {
+            // output_lock held by a concurrent writer; cannot drain opost.
+            Ok(false)
+        }
+    }
+
     #[inline(never)]
     fn read(
         &self,

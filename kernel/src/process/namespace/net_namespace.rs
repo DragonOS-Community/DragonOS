@@ -47,6 +47,9 @@ lazy_static! {
 /// 每次创建新的网络命名空间时，都会增加这个计数器
 pub static mut NETNS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+const PACKET_SOCKET_CLEANUP_RETRY_MIN: Duration = Duration::from_millis(100);
+const PACKET_SOCKET_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(5);
+
 #[unified_init(INITCALL_SUBSYS)]
 pub fn root_net_namespace_init() -> Result<(), SystemError> {
     // 创建root网络命名空间的轮询线程
@@ -124,6 +127,13 @@ struct PacketSocketRegistryWriter {
     id_alloc: IdAllocator,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketSocketCleanupResult {
+    Complete,
+    Pending,
+    AllocationFailed,
+}
+
 impl PacketSocketRegistryWriter {
     fn new() -> Self {
         // Group ids occupy the full u16 range; 0 is a valid explicit id.
@@ -169,6 +179,8 @@ struct NetnsPoller {
     /// 用于避免唤醒丢失：当 poll 线程正在 poll 时收到的唤醒请求会设置此标志，
     /// poll 线程在进入等待前会检查此标志
     poll_pending: AtomicBool,
+    /// Topology cleanup wakes the poller without being treated as network I/O.
+    cleanup_pending: AtomicBool,
     /// # 轮询线程的 PCB（用于 stop）
     thread: RwSem<Option<Arc<ProcessControlBlock>>>,
 }
@@ -179,6 +191,7 @@ impl NetnsPoller {
             netns,
             wait_queue: WaitQueue::default(),
             poll_pending: AtomicBool::new(false),
+            cleanup_pending: AtomicBool::new(false),
             thread: RwSem::new(None),
         })
     }
@@ -213,7 +226,22 @@ impl NetnsPoller {
         }
     }
 
+    fn notify_network(&self) -> (bool, usize) {
+        let was_pending = self.poll_pending.swap(true, Ordering::AcqRel);
+        let woken = self.wait_queue.wake_all();
+        (!was_pending, woken)
+    }
+
+    /// Wake only the topology-cleanup worker. This is safe from the NAPI read
+    /// path and deliberately does not turn cleanup into an interface poll.
+    fn notify_cleanup(&self) {
+        self.cleanup_pending.store(true, Ordering::Release);
+        self.wait_queue.wake_all();
+    }
+
     fn polling(&self) {
+        let mut cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
+        let mut cleanup_retry_at = None;
         loop {
             if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
                 break;
@@ -228,12 +256,31 @@ impl NetnsPoller {
             };
 
             let nsid = netns.ns_common.nsid.data();
-            netns.cleanup_packet_sockets();
             let now_us = Instant::now().total_micros() as u64;
+            if cleanup_retry_at.is_none_or(|deadline| now_us >= deadline) {
+                match netns.cleanup_packet_sockets() {
+                    PacketSocketCleanupResult::Complete => {
+                        cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
+                        cleanup_retry_at = None;
+                    }
+                    PacketSocketCleanupResult::Pending => {
+                        cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
+                        cleanup_retry_at = None;
+                    }
+                    PacketSocketCleanupResult::AllocationFailed => {
+                        cleanup_retry_at =
+                            Some(now_us.saturating_add(cleanup_retry_delay.total_micros()));
+                        cleanup_retry_delay = Duration::from_micros(core::cmp::min(
+                            cleanup_retry_delay.total_micros().saturating_mul(2),
+                            PACKET_SOCKET_CLEANUP_RETRY_MAX.total_micros(),
+                        ));
+                    }
+                }
+            }
 
             // 处理“已到期的定时事件”：到期则 schedule NAPI 推进一次。
             // 同时计算下一次最早到期时间点，用于设置 sleep 超时。
-            let mut next_us: Option<u64> = None;
+            let mut next_us = cleanup_retry_at;
             let mut had_due = false;
             for (_, iface) in netns.device_list.read().iter() {
                 if let Some(us) = iface.common().poll_at_us() {
@@ -277,9 +324,13 @@ impl NetnsPoller {
             drop(netns);
 
             // 等待事件唤醒（IRQ/lo Tx 等）或 timeout（smoltcp timer deadline）。
-            // cond 使用 swap(false) 原子消费一次 pending，避免丢唤醒。
+            // Keep cleanup and network wake reasons separate: only the latter
+            // should schedule interface NAPI below.
             let woke_by_event = match self.wait_queue.wait_event_uninterruptible_timeout(
-                || self.poll_pending.swap(false, Ordering::AcqRel),
+                || {
+                    self.poll_pending.load(Ordering::Acquire)
+                        || self.cleanup_pending.load(Ordering::Acquire)
+                },
                 timeout,
             ) {
                 Ok(()) => true,
@@ -291,8 +342,13 @@ impl NetnsPoller {
             };
 
             if woke_by_event {
+                let network_pending = self.poll_pending.swap(false, Ordering::AcqRel);
+                self.cleanup_pending.store(false, Ordering::Release);
                 if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
                     break;
+                }
+                if !network_pending {
+                    continue;
                 }
                 let netns = match self.netns.upgrade() {
                     Some(netns) => netns,
@@ -451,8 +507,18 @@ impl NetNamespace {
             if let Some(socket) = socket.upgrade() {
                 socket.clear_fanout_membership();
             }
-            self.packet_sockets_need_cleanup
-                .store(true, Ordering::Release);
+            self.request_packet_socket_cleanup();
+        }
+    }
+
+    /// Coalesce stale-topology notifications and wake only the poller. Unlike
+    /// `wakeup_poll_thread`, this path never reads `device_list` from NAPI.
+    fn request_packet_socket_cleanup(&self) {
+        if !self
+            .packet_sockets_need_cleanup
+            .swap(true, Ordering::AcqRel)
+        {
+            self.poller.notify_cleanup();
         }
     }
 
@@ -490,12 +556,12 @@ impl NetNamespace {
         Ok(())
     }
 
-    fn cleanup_packet_sockets(&self) {
+    fn cleanup_packet_sockets(&self) -> PacketSocketCleanupResult {
         if !self
             .packet_sockets_need_cleanup
             .swap(false, Ordering::AcqRel)
         {
-            return;
+            return PacketSocketCleanupResult::Complete;
         }
         let mut writer = self.packet_sockets_writer.lock();
         let current = self.packet_sockets.load();
@@ -503,7 +569,7 @@ impl NetNamespace {
         if sockets.try_reserve_exact(current.sockets.len()).is_err() {
             self.packet_sockets_need_cleanup
                 .store(true, Ordering::Release);
-            return;
+            return PacketSocketCleanupResult::AllocationFailed;
         }
         sockets.extend(current.sockets.iter().cloned());
         sockets.retain(|entry| {
@@ -519,7 +585,7 @@ impl NetNamespace {
         {
             self.packet_sockets_need_cleanup
                 .store(true, Ordering::Release);
-            return;
+            return PacketSocketCleanupResult::AllocationFailed;
         }
         for (id, group) in writer.by_id.iter() {
             match group.try_without_dead_members() {
@@ -533,14 +599,14 @@ impl NetNamespace {
                 Err(_) => {
                     self.packet_sockets_need_cleanup
                         .store(true, Ordering::Release);
-                    return;
+                    return PacketSocketCleanupResult::AllocationFailed;
                 }
             }
         }
         let Ok(snapshot) = Self::try_packet_topology(sockets, groups) else {
             self.packet_sockets_need_cleanup
                 .store(true, Ordering::Release);
-            return;
+            return PacketSocketCleanupResult::AllocationFailed;
         };
         self.commit_packet_topology(snapshot);
         for (id, replacement) in updates {
@@ -550,6 +616,11 @@ impl NetNamespace {
             } else {
                 writer.by_id.insert(id, replacement);
             }
+        }
+        if self.packet_sockets_need_cleanup.load(Ordering::Acquire) {
+            PacketSocketCleanupResult::Pending
+        } else {
+            PacketSocketCleanupResult::Complete
         }
     }
 
@@ -563,10 +634,11 @@ impl NetNamespace {
         let snapshot = self.packet_sockets.load();
         let mut stale = false;
         for socket in snapshot.sockets.iter() {
-            if let Some(socket) = socket.upgrade() {
-                socket.deliver(ingress, frame);
-            } else {
-                stale = true;
+            match socket.upgrade() {
+                Some(socket) if socket.is_packet_registry_active() => {
+                    socket.deliver(ingress, frame);
+                }
+                Some(_) | None => stale = true,
             }
         }
         let mut protocol_cache = None;
@@ -577,8 +649,7 @@ impl NetNamespace {
             }
         }
         if stale {
-            self.packet_sockets_need_cleanup
-                .store(true, Ordering::Release);
+            self.request_packet_socket_cleanup();
         }
     }
 
@@ -885,11 +956,10 @@ impl NetNamespace {
     /// 使用原子标志确保即使 poll 线程正在执行也不会丢失唤醒请求
     pub fn wakeup_poll_thread(&self) {
         // 先设置 pending 标志，再唤醒：避免“先唤后睡/睡前漏信号”。
-        let was_pending = self.poller.poll_pending.swap(true, Ordering::AcqRel);
-        let woken = self.poller.wait_queue.wake_all();
+        let (newly_pending, woken) = self.poller.notify_network();
         // 事件驱动：对齐 Linux，尽量在事件发生后立刻 schedule NAPI（由 NAPI 线程 bounded poll 推进）。
         // 只在从“未 pending -> pending”这一跳触发一次，避免中断风暴下重复 schedule。
-        if !was_pending {
+        if newly_pending {
             for (_, iface) in self.device_list.read().iter() {
                 if let Some(napi) = iface.napi_struct() {
                     napi_schedule(napi);

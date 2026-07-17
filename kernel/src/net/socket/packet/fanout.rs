@@ -117,6 +117,13 @@ impl FanoutMember {
             },
         })
     }
+
+    #[inline]
+    fn active_socket(&self) -> Option<Arc<PacketSocket>> {
+        self.socket
+            .upgrade()
+            .filter(|socket| socket.is_packet_registry_active())
+    }
 }
 
 /// Immutable group snapshot stored inside the netns delivery topology.
@@ -223,7 +230,7 @@ impl FanoutGroup {
         self.try_with_members(members)
     }
 
-    /// Return a compacted replacement only when at least one dead Weak was
+    /// Return a compacted replacement when a dead or inactive member is
     /// observed. Healthy groups keep their original Arc and member Vec.
     pub(crate) fn try_without_dead_members(&self) -> Result<Option<Arc<Self>>, SystemError> {
         if self.members.iter().all(|member| {
@@ -268,8 +275,8 @@ impl FanoutGroup {
         .map_err(|_| SystemError::ENOMEM)
     }
 
-    /// Deliver to at most one member. Returns `true` when a dead weak member
-    /// was observed and the writer should compact the topology later.
+    /// Deliver to at most one member. Returns `true` when a dead or inactive
+    /// member was observed and the writer should compact the topology later.
     pub(crate) fn deliver(
         &self,
         ingress: PacketIngressMetadata,
@@ -327,7 +334,7 @@ impl FanoutGroup {
 
         let mut stale = false;
         if self.mode != FanoutMode::Rollover {
-            match self.members[base].socket.upgrade() {
+            match self.members[base].active_socket() {
                 Some(socket) if socket.rx_has_room() => {
                     socket.deliver(ingress, frame);
                     return false;
@@ -349,7 +356,7 @@ impl FanoutGroup {
             if self.mode != FanoutMode::Rollover && index == base {
                 continue;
             }
-            match self.members[index].socket.upgrade() {
+            match self.members[index].active_socket() {
                 Some(socket) if socket.rx_has_room() => {
                     if index != start {
                         state.cursor.store(index as u32, Ordering::Relaxed);
@@ -376,7 +383,7 @@ impl FanoutGroup {
         let mut stale = false;
         for offset in 0..self.members.len() {
             let index = (start + offset) % self.members.len();
-            if let Some(socket) = self.members[index].socket.upgrade() {
+            if let Some(socket) = self.members[index].active_socket() {
                 socket.deliver(ingress, frame);
                 return stale;
             }

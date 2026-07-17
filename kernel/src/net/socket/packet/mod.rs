@@ -123,8 +123,8 @@ pub struct PacketSocket {
     /// Control-plane PACKET_FANOUT state: bit 32 marks active membership and
     /// the low 32 bits are the Linux getsockopt encoding.
     pub(super) fanout_membership: AtomicU64,
-    /// Writer/cleanup lifecycle marker. The NAPI delivery path relies solely
-    /// on the immutable topology and does not read this control-plane bit.
+    /// Writer/cleanup lifecycle marker. The NAPI delivery path uses this bit
+    /// to reject inactive entries retained by an older topology snapshot.
     registry_active: AtomicBool,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,

@@ -225,12 +225,13 @@ fn native_u64_word(value: u64, index: usize) -> u32 {
 
 // ============ BPF 验证器 ============
 
-/// 验证 seccomp BPF 程序的合法性。
+/// Validate the legality of a seccomp BPF program.
 ///
-/// 先调用通用 `validate_cbpf` 进行结构性检查，再叠加 seccomp 专有限制：
-/// 1. LD/LDX 只允许 BPF_W 宽度（seccomp 不使用 H/B）
-/// 2. 不允许 BPF_IND 变址加载
-/// 3. BPF_ABS 偏移必须在 SeccompData 范围内且 4 字节对齐
+/// First calls the generic `validate_cbpf` for structural checks, then applies
+/// seccomp-specific restrictions:
+/// 1. LD/LDX only allow BPF_W width (seccomp does not use H/B)
+/// 2. BPF_IND indexed loads are not allowed
+/// 3. BPF_ABS offsets must be within the SeccompData range and 4-byte aligned
 fn validate_seccomp_filter(insns: &[SockFilter]) -> Result<(), SystemError> {
     classic::validate_cbpf(insns)?;
 
@@ -242,8 +243,9 @@ fn validate_seccomp_filter(insns: &[SockFilter]) -> Result<(), SystemError> {
                     return Err(SystemError::EINVAL);
                 }
             }
-            // 与 Linux seccomp_check_filter 的显式白名单一致。特别地，通用
-            // socket cBPF 接受 MOD，而 seccomp ABI 不接受 MOD K/X。
+            // Matches the explicit opcode whitelist in Linux's seccomp_check_filter.
+            // Notably, generic socket cBPF accepts MOD, but the seccomp ABI does not
+            // accept MOD K/X.
             0x06 | 0x16 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c | 0x54 | 0x5c
             | 0x44 | 0x4c | 0xa4 | 0xac | 0x64 | 0x6c | 0x74 | 0x7c | 0x84 | 0x00 | 0x01 | 0x80
             | 0x81 | 0x60 | 0x61 | 0x02 | 0x03 | 0x07 | 0x87 | 0x05 | 0x15 | 0x1d | 0x35 | 0x3d
@@ -603,13 +605,13 @@ pub fn seccomp_set_mode_filter(fprog_ptr: u64, flags: u32) -> Result<(), SystemE
     let log = (flags & SECCOMP_FILTER_FLAG_LOG) != 0;
     let tsync = (flags & SECCOMP_FILTER_FLAG_TSYNC) != 0;
 
-    // 从用户空间读取 sock_fprog 结构（16 字节）
+    // Read the sock_fprog structure from userspace (16 bytes)
     let fprog_size = core::mem::size_of::<classic::SockFprog>();
     let mut fprog_buf = [0u8; core::mem::size_of::<classic::SockFprog>()];
     let reader = UserBufferReader::new(fprog_ptr as *const u8, fprog_size, true)?;
     reader.copy_from_user_protected(&mut fprog_buf, 0)?;
 
-    // 解析并读取 filter 指令
+    // Parse and read filter instructions
     let insns = classic::read_sock_fprog(&fprog_buf)?;
 
     // 获取当前 filter 链头作为 prev

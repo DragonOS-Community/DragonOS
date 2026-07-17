@@ -1,7 +1,8 @@
-//! Classic BPF (cBPF) 解释器与验证器。
+//! Classic BPF (cBPF) interpreter and verifier.
 //!
-//! 本模块只实现 cBPF 机器模型、结构验证和输入协议。packet 与 seccomp
-//! 的字节序、逻辑偏移和 ancillary 语义由各自的输入实现负责。
+//! This module only implements the cBPF machine model, structural validation,
+//! and the input protocol. Byte order, logical offsets, and ancillary semantics
+//! for packet and seccomp are handled by their respective input implementations.
 
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -10,7 +11,7 @@ use crate::syscall::user_access::UserBufferReader;
 
 // ============ Sock Filter / Sock Fprog ============
 
-/// Classic BPF 指令（对应 Linux `struct sock_filter`，8 字节）
+/// Classic BPF instruction (corresponds to Linux `struct sock_filter`, 8 bytes)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SockFilter {
@@ -20,9 +21,9 @@ pub struct SockFilter {
     pub k: u32,
 }
 
-/// `struct sock_fprog` —— 用户空间传入的 filter 容器。
+/// `struct sock_fprog` — userspace filter container.
 ///
-/// 布局：`{ u16 len; u8 _pad[6]; u64 filter; }`（共 16 字节）。
+/// Layout: `{ u16 len; u8 _pad[6]; u64 filter; }` (16 bytes total).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SockFprog {
@@ -31,10 +32,10 @@ pub struct SockFprog {
     pub filter: u64,
 }
 
-// ============ BPF 指令常量 ============
-// 参考 Linux include/uapi/linux/filter.h
+// ============ BPF Instruction Constants ============
+// Reference: Linux include/uapi/linux/filter.h
 
-/// 指令类（code & 0x07）
+/// Instruction class (code & 0x07)
 pub const BPF_LD: u16 = 0x00;
 pub const BPF_LDX: u16 = 0x01;
 pub const BPF_ST: u16 = 0x02;
@@ -44,27 +45,27 @@ pub const BPF_JMP: u16 = 0x05;
 pub const BPF_RET: u16 = 0x06;
 pub const BPF_MISC: u16 = 0x07;
 
-/// 加载宽度（code & 0x18，仅对 LD/LDX 有意义）
+/// Load width (code & 0x18, meaningful only for LD/LDX)
 pub const BPF_W: u16 = 0x00;
 pub const BPF_H: u16 = 0x08;
 pub const BPF_B: u16 = 0x10;
 
-/// 寻址模式（code & 0xe0，仅对 LD/LDX 有意义）
+/// Addressing mode (code & 0xe0, meaningful only for LD/LDX)
 pub const BPF_IMM: u16 = 0x00;
 pub const BPF_ABS: u16 = 0x20;
 pub const BPF_IND: u16 = 0x40;
 pub const BPF_MEM: u16 = 0x60;
 pub const BPF_LEN: u16 = 0x80;
-/// BPF_MSH：仅用于 `LDX|BPF_B|BPF_MSH`，提取 IP 头长度
-/// （`x = (data[k] & 0xf) << 2`）。
+/// BPF_MSH: only used for `LDX|BPF_B|BPF_MSH`, extracts IP header length
+/// (`x = (data[k] & 0xf) << 2`).
 pub const BPF_MSH: u16 = 0xa0;
 
-/// 数据源（code & 0x08，仅对 ALU/JMP 有意义）
+/// Data source (code & 0x08, meaningful only for ALU/JMP)
 pub const BPF_K: u16 = 0x00;
 pub const BPF_X: u16 = 0x08;
 pub const BPF_A: u16 = 0x10;
 
-/// ALU 操作（code & 0xf0）
+/// ALU operation (code & 0xf0)
 pub const BPF_ADD: u16 = 0x00;
 pub const BPF_SUB: u16 = 0x10;
 pub const BPF_MUL: u16 = 0x20;
@@ -77,24 +78,24 @@ pub const BPF_NEG: u16 = 0x80;
 pub const BPF_MOD: u16 = 0x90;
 pub const BPF_XOR: u16 = 0xa0;
 
-/// JMP 操作（code & 0xf0）
+/// JMP operation (code & 0xf0)
 pub const BPF_JA: u16 = 0x00;
 pub const BPF_JEQ: u16 = 0x10;
 pub const BPF_JGT: u16 = 0x20;
 pub const BPF_JGE: u16 = 0x30;
 pub const BPF_JSET: u16 = 0x40;
 
-/// MISC 操作（code & 0xf8）
+/// MISC operation (code & 0xf8)
 pub const BPF_TAX: u16 = 0x00;
 pub const BPF_TXA: u16 = 0x80;
 
-/// BPF 程序最大指令数（Linux 限制）
+/// Maximum BPF program instruction count (Linux limit)
 pub const BPF_MAXINSNS: usize = 4096;
 
-/// BPF 记忆体大小（16 个 u32 字）
+/// BPF memory size (16 u32 words)
 pub const BPF_MEMWORDS: usize = 16;
 
-/// Linux socket filter ancillary 偏移。
+/// Linux socket filter ancillary offset.
 pub const SKF_AD_OFF: u32 = (-0x1000i32) as u32;
 pub const SKF_AD_PROTOCOL: u32 = 0;
 pub const SKF_AD_PKTTYPE: u32 = 4;
@@ -122,7 +123,7 @@ pub enum BpfWidth {
     Byte,
 }
 
-/// cBPF 的调用域输入。实现必须自行定义普通加载的字节序和负偏移语义。
+/// cBPF call-domain input. Implementations must define their own byte order and negative offset semantics for normal loads.
 pub trait ClassicBpfInput {
     fn len(&self) -> u32;
 
@@ -157,26 +158,26 @@ impl ClassicBpfInput for [u8] {
     }
 }
 
-// ============ cBPF 解释器 ============
+// ============ cBPF Interpreter ============
 
-/// 运行 classic BPF 程序。
+/// Run a classic BPF program.
 ///
-/// cBPF 寄存器模型：
-/// - A (u32): 累加器
-/// - X (u32): 索引寄存器
-/// - pc: 程序计数器
-/// - mem\[16\]: 记忆体
+/// cBPF register model:
+/// - A (u32): accumulator
+/// - X (u32): index register
+/// - pc: program counter
+/// - mem\[16\]: scratch memory
 ///
-/// # 加载语义
-/// - `BPF_LD|BPF_W/H/B|BPF_ABS`: 由 input 按调用域语义加载
-/// - `BPF_LD|*|BPF_IND`: 同上，但 offset = X + k
-/// - 越界读取（offset + size > data.len()）：立即返回 0
+/// # Load semantics
+/// - `BPF_LD|BPF_W/H/B|BPF_ABS`: loaded by input per call-domain semantics
+/// - `BPF_LD|*|BPF_IND`: same as above, but offset = X + k
+/// - Out-of-bounds read (offset + size > data.len()): immediately return 0
 /// - `BPF_LEN`: A = data.len() as u32
 ///
-/// # 返回值
-/// - 正常返回 `RET` 指令的值（返回截断长度，0 = 丢弃）
-/// - `DIV`/`MOD` 除数为 0：立即返回 0
-/// - fall-through（无 RET 结尾）：返回 0（丢弃）
+/// # Return value
+/// - Normal: value of the `RET` instruction (snap length; 0 = drop)
+/// - `DIV`/`MOD` divisor is 0: immediately return 0
+/// - Fall-through (no RET at end): return 0 (drop)
 pub fn run_cbpf<I: ClassicBpfInput + ?Sized>(insns: &[SockFilter], input: &I) -> u32 {
     let mut a: u32 = 0;
     let mut x: u32 = 0;
@@ -317,7 +318,7 @@ pub fn run_cbpf<I: ClassicBpfInput + ?Sized>(insns: &[SockFilter], input: &I) ->
         pc += 1;
     }
 
-    // fall-through：返回 0（丢弃）
+    // fall-through: return 0 (drop)
     0
 }
 
@@ -336,18 +337,18 @@ fn is_ancillary(offset: u32) -> bool {
     offset >= SKF_AD_OFF
 }
 
-// ============ cBPF 验证器 ============
+// ============ cBPF Verifier ============
 
-/// 验证 cBPF 程序的合法性（通用检查）。
+/// Validate the legality of a cBPF program (generic checks).
 ///
-/// 检查项：
-/// 1. 非空
+/// Checks:
+/// 1. Non-empty
 /// 2. len <= BPF_MAXINSNS (4096)
-/// 3. 末条指令 class == BPF_RET
-/// 4. 跳转目标 `checked_add`（溢出 → EINVAL），且 < insns.len()
-/// 5. ST/STX 的 k < BPF_MEMWORDS (16)
-/// 6. ALU|DIV|K 的 k != 0；ALU|MOD|K 的 k != 0（静态拒绝）
-/// 7. opcode class 在白名单内（LD 允许 IMM/ABS/IND/MEM/LEN；LDX 允许 IMM/MEM/LEN/MSH，其中 MSH 仅限 BPF_B 宽度）
+/// 3. Last instruction class == BPF_RET
+/// 4. Jump target `checked_add` (overflow → EINVAL), and < insns.len()
+/// 5. ST/STX k < BPF_MEMWORDS (16)
+/// 6. ALU|DIV|K k != 0; ALU|MOD|K k != 0 (statically rejected)
+/// 7. Opcode class is whitelisted (LD allows IMM/ABS/IND/MEM/LEN; LDX allows IMM/MEM/LEN/MSH, where MSH is restricted to BPF_B width)
 pub fn validate_cbpf(insns: &[SockFilter]) -> Result<(), SystemError> {
     if insns.is_empty() {
         return Err(SystemError::EINVAL);
@@ -503,14 +504,14 @@ fn check_loads_and_stores(insns: &[SockFilter]) -> Result<(), SystemError> {
     Ok(())
 }
 
-// ============ 用户空间解析 ============
+// ============ Userspace Parsing ============
 
-/// 从 optval 字节切片解析 `sock_fprog` 结构并读取 filter 指令。
+/// Parse the `sock_fprog` structure from an optval byte slice and read filter instructions.
 ///
-/// `optval` 必须精确包含一个 native `struct sock_fprog`。
-/// 内部通过 `UserBufferReader` 安全地从用户空间读取 filter 指令数组。
+/// `optval` must contain exactly one native `struct sock_fprog`.
+/// Internally uses `UserBufferReader` to safely read the filter instruction array from userspace.
 ///
-/// 返回已解析的 `Vec<SockFilter>`。
+/// Returns the parsed `Vec<SockFilter>`.
 pub(crate) fn parse_sock_fprog(optval: &[u8]) -> Result<SockFprog, SystemError> {
     let fprog_size = core::mem::size_of::<SockFprog>();
     if optval.len() != fprog_size {
@@ -543,7 +544,7 @@ pub(crate) fn read_sock_fprog(optval: &[u8]) -> Result<Vec<SockFilter>, SystemEr
     read_sock_fprog_insns(&fprog)
 }
 
-/// 从用户空间读取 filter 指令数组。
+/// Read the filter instruction array from userspace.
 fn read_filter_insns(ptr: u64, count: usize) -> Result<Vec<SockFilter>, SystemError> {
     let insn_size = core::mem::size_of::<SockFilter>();
     let byte_len = count.checked_mul(insn_size).ok_or(SystemError::EINVAL)?;

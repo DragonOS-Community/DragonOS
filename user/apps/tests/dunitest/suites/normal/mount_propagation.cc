@@ -1666,11 +1666,14 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
             if ((i & 15) == 15) {
                 sched_yield();
             }
-            // Do not let the complete stress phase outrun the observer: one
-            // uniform snapshot must land between the two unsynchronised halves.
-            if (i == 511 &&
-                (!read_exact(ready_pipe[0], &token, 1) || token != 'X')) {
-                _exit(3);
+            // Do not let the complete stress phase outrun the observer. The
+            // explicit midpoint token prevents an early, pre-stress snapshot
+            // from satisfying this hand-off.
+            if (i == 511) {
+                if (!write_exact(activity_pipe[1], "M", 1) ||
+                    !read_exact(ready_pipe[0], &token, 1) || token != 'X') {
+                    _exit(3);
+                }
             }
         }
         char done[2] = {};
@@ -1721,11 +1724,19 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
                 _exit(10);
             }
         }
+        if (!read_exact(activity_pipe[0], &token, 1) || token != 'M') {
+            _exit(9);
+        }
+        PropagationTags midpoint_tags[3] = {};
+        if (!read_propagation_snapshot(paths, 3, midpoint_tags) ||
+            !snapshot_is_uniform(midpoint_tags, 3) ||
+            !write_exact(ready_pipe[1], "X", 1)) {
+            _exit(10);
+        }
         const int flags = fcntl(activity_pipe[0], F_GETFL, 0);
         if (flags < 0 || fcntl(activity_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) {
             _exit(7);
         }
-        bool reported_stress_sample = false;
         for (;;) {
             const ssize_t status = read(activity_pipe[0], &token, 1);
             if (status == 1 && token == 'D') {
@@ -1737,12 +1748,6 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
             PropagationTags tags[3] = {};
             if (!read_propagation_snapshot(paths, 3, tags) || !snapshot_is_uniform(tags, 3)) {
                 _exit(10);
-            }
-            if (!reported_stress_sample) {
-                if (!write_exact(ready_pipe[1], "X", 1)) {
-                    _exit(10);
-                }
-                reported_stress_sample = true;
             }
         }
         _exit(0);

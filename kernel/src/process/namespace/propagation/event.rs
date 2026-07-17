@@ -514,7 +514,7 @@ pub(crate) fn prepare_mount_propagation_locked(
     mountpoint: &Arc<MountFSInode>,
     new_child: &Arc<MountFS>,
 ) -> Result<Option<PreparedPropagation>, SystemError> {
-    prepare_mount_propagation_with_counting_locked(source_mnt, mountpoint, new_child, true)
+    prepare_mount_propagation_with_counting_locked(source_mnt, mountpoint, new_child, true, None)
 }
 
 fn prepare_mount_propagation_with_counting_locked(
@@ -522,6 +522,7 @@ fn prepare_mount_propagation_with_counting_locked(
     mountpoint: &Arc<MountFSInode>,
     new_child: &Arc<MountFS>,
     count_local_tree: bool,
+    precollected_child_tree: Option<Vec<Arc<MountFS>>>,
 ) -> Result<Option<PreparedPropagation>, SystemError> {
     let source_prop = source_mnt.propagation();
     let canonical_mountpoint = source_mnt.wrapper_for_dentry(mountpoint.shared_dentry())?;
@@ -536,14 +537,26 @@ fn prepare_mount_propagation_with_counting_locked(
     let mut slave_groups = BTreeMap::new();
     let mut mounts = Vec::new();
     let mut count_reservations = Vec::new();
-    let new_child_tree = try_collect_subtree(new_child)?;
-    let new_child_mount_count = new_child_tree.len();
+    let mut new_child_tree = Some(match precollected_child_tree {
+        Some(tree) => tree,
+        None => try_collect_subtree(new_child)?,
+    });
+    let new_child_mount_count = new_child_tree
+        .as_ref()
+        .expect("new child tree remains available before reservation")
+        .len();
     if count_local_tree {
         if let Some(namespace) = source_mnt.namespace() {
             count_reservations
                 .try_reserve(1)
                 .map_err(|_| SystemError::ENOMEM)?;
-            count_reservations.push(namespace.reserve_mounts(new_child_tree)?);
+            count_reservations.push(
+                namespace.reserve_mounts(
+                    new_child_tree
+                        .take()
+                        .expect("new child tree is reserved at most once"),
+                )?,
+            );
         }
     }
     let targets = if source_prop.is_shared() {
@@ -691,7 +704,22 @@ fn prepare_mount_propagation_with_counting_locked(
             cover_reservation,
         });
     }
-    let mut registration_mounts = collect_subtree(new_child);
+    // MS_MOVE already collected this subtree while inventing propagation
+    // groups. Reuse that exact snapshot for registration instead of walking
+    // and allocating for the same tree again under the lifecycle lock.
+    let mut registration_mounts = if let Some(tree) = new_child_tree.take() {
+        tree
+    } else {
+        // The local namespace reservation owns the first snapshot on ordinary
+        // mount/bind, so its registration plan needs a separate collection.
+        match try_collect_subtree(new_child) {
+            Ok(tree) => tree,
+            Err(error) => {
+                abandon_prepared(&mounts);
+                return Err(error);
+            }
+        }
+    };
     for item in &mounts {
         registration_mounts.extend(collect_subtree(&item.clone));
     }
@@ -858,7 +886,7 @@ pub(crate) fn prepare_moved_tree_propagation_locked(
     moved_root: &Arc<MountFS>,
     moved_root_mountpoint: &Arc<MountFSInode>,
 ) -> Result<PreparedMovePropagation, SystemError> {
-    let subtree = collect_subtree(moved_root);
+    let subtree = try_collect_subtree(moved_root)?;
     let mut invented = Vec::new();
     for mount in &subtree {
         let prop = mount.propagation();
@@ -877,6 +905,7 @@ pub(crate) fn prepare_moved_tree_propagation_locked(
         moved_root_mountpoint,
         moved_root,
         false,
+        Some(subtree),
     ) {
         Ok(propagation) => propagation,
         Err(error) => {

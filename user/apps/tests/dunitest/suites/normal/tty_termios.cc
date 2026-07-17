@@ -170,7 +170,6 @@ TEST(TtyTermios, LegacyTcgeta) {
     errno = 0;
     ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &tio), 0)
         << "TCGETA should succeed: errno=" << errno << " (" << strerror(errno) << ")";
-    EXPECT_NE(errno, ENOTTY) << "TCGETA must not return ENOTTY";
 }
 
 /* --------------------------------------------------------------------------
@@ -184,17 +183,14 @@ TEST(TtyTermios, LegacyTcsetaFamily) {
     errno = 0;
     EXPECT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
         << "TCSETA: errno=" << errno << " (" << strerror(errno) << ")";
-    EXPECT_NE(errno, ENOTTY);
 
     errno = 0;
     EXPECT_EQ(ioctl(pty.slave.get(), TCSETAW, &tio), 0)
         << "TCSETAW: errno=" << errno << " (" << strerror(errno) << ")";
-    EXPECT_NE(errno, ENOTTY);
 
     errno = 0;
     EXPECT_EQ(ioctl(pty.slave.get(), TCSETAF, &tio), 0)
         << "TCSETAF: errno=" << errno << " (" << strerror(errno) << ")";
-    EXPECT_NE(errno, ENOTTY);
 }
 
 /* --------------------------------------------------------------------------

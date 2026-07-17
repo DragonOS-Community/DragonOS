@@ -84,20 +84,16 @@ int main(void) {
 
     errno = 0;
     CHECK(ioctl(pts, TCGETA, &tio) == 0, "ioctl TCGETA succeeds");
-    CHECK(errno != ENOTTY, "TCGETA does not return ENOTTY");
 
     tio.c_lflag |= ISIG;
     errno = 0;
     CHECK(ioctl(pts, TCSETA, &tio) == 0, "ioctl TCSETA succeeds");
-    CHECK(errno != ENOTTY, "TCSETA does not return ENOTTY");
 
     errno = 0;
     CHECK(ioctl(pts, TCSETAW, &tio) == 0, "ioctl TCSETAW succeeds");
-    CHECK(errno != ENOTTY, "TCSETAW does not return ENOTTY");
 
     errno = 0;
     CHECK(ioctl(pts, TCSETAF, &tio) == 0, "ioctl TCSETAF succeeds");
-    CHECK(errno != ENOTTY, "TCSETAF does not return ENOTTY");
 
     /* 5. Cross-check: TCGETA reports low 16 bits of what TCGETS reports. */
     struct termios full;

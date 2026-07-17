@@ -400,6 +400,72 @@ impl ControlMode {
     }
 }
 
+/// Number of control characters in legacy `struct termio`.
+pub const NCC: usize = 8;
+
+/// Legacy SVR4 `struct termio` — the smaller predecessor of `struct termios`.
+/// Used by ioctl commands TCGETA / TCSETA / TCSETAW / TCSETAF.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PosixTermio {
+    pub c_iflag: u16,
+    pub c_oflag: u16,
+    pub c_cflag: u16,
+    pub c_lflag: u16,
+    pub c_line: u8,
+    pub c_cc: [u8; NCC],
+}
+
+impl PosixTermio {
+    /// Convert kernel Termios → user-space termio.
+    /// Fields wider than u16 are truncated; excess c_cc slots are dropped.
+    pub fn from_kernel_termios(termios: &Termios) -> Self {
+        let mut cc = [0u8; NCC];
+        let copy_len = NCC.min(termios.control_characters.len());
+        cc[..copy_len].copy_from_slice(&termios.control_characters[..copy_len]);
+        Self {
+            c_iflag: termios.input_mode.bits as u16,
+            c_oflag: termios.output_mode.bits as u16,
+            c_cflag: termios.control_mode.bits as u16,
+            c_lflag: termios.local_mode.bits as u16,
+            c_line: termios.line as u8,
+            c_cc: cc,
+        }
+    }
+
+    /// Convert user-space termio → kernel Termios.
+    /// u16 → u32 zero-extension; missing c_cc slots default to 0.
+    /// Speed is extracted from c_cflag CBAUD/CIBAUD bits, matching
+    /// the existing PosixTermios::to_kernel_termios() pattern.
+    pub fn to_kernel_termios(self) -> Termios {
+        let mut cc = [0u8; CONTORL_CHARACTER_NUM];
+        let copy_len = NCC.min(CONTORL_CHARACTER_NUM);
+        cc[..copy_len].copy_from_slice(&self.c_cc[..copy_len]);
+
+        let cflag = ControlMode::from_bits_truncate(self.c_cflag as u32);
+        let ospeed = cflag.baud_rate().unwrap_or(38400);
+        let ispeed = {
+            let ibaud = ((self.c_cflag as u32) & ControlMode::CIBAUD.bits()) >> 16;
+            if ibaud == 0 {
+                ospeed
+            } else {
+                ControlMode::from_bits_truncate(ibaud).baud_rate().unwrap_or(ospeed)
+            }
+        };
+
+        Termios {
+            input_mode: InputMode::from_bits_truncate(self.c_iflag as u32),
+            output_mode: OutputMode::from_bits_truncate(self.c_oflag as u32),
+            control_mode: cflag,
+            local_mode: LocalMode::from_bits_truncate(self.c_lflag as u32),
+            control_characters: cc,
+            line: LineDisciplineType::from_line(self.c_line),
+            input_speed: ispeed,
+            output_speed: ospeed,
+        }
+    }
+}
+
 /// 对应termios中控制字符的索引
 pub struct ControlCharIndex;
 #[allow(dead_code)]

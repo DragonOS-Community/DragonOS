@@ -42,6 +42,7 @@ inline constexpr int kSoSndtimeoOld = 21;
 inline constexpr int kSoRcvtimeoNew = 66;
 inline constexpr int kSoSndtimeoNew = 67;
 inline constexpr int kSoAttachFilter = 26;
+inline constexpr int kSoGetFilter = kSoAttachFilter;
 inline constexpr int kSoDetachFilter = 27;
 inline constexpr int kSoLockFilter = 44;
 
@@ -417,6 +418,49 @@ TEST(AfPacketSockopt, AttachFilterAcceptsValidProgram) {
         << ErrnoString(errno);
 }
 
+TEST(AfPacketSockopt, GetFilterUsesInstructionCountAbi) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    TestSockFilter original[] = {
+        {kBpfLdWAbs, 1, 0, 12},
+        {kBpfRetK, 0, 0, 0x12345678},
+    };
+    TestSockFprog program{2, original};
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &program,
+                         sizeof(program)),
+              0)
+        << ErrnoString(errno);
+
+    socklen_t len = 0;
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoGetFilter, nullptr, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(len, 2U);
+
+    TestSockFilter result[2]{};
+    len = 1;
+    errno = 0;
+    EXPECT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoGetFilter, result, &len), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+    EXPECT_EQ(len, 1U);
+
+    len = 2;
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoGetFilter, result, &len), 0)
+        << ErrnoString(errno);
+    ASSERT_EQ(len, 2U);
+    EXPECT_EQ(std::memcmp(result, original, sizeof(original)), 0);
+}
+
+TEST(AfPacketSockopt, GetFilterReportsZeroWhenDetached) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    TestSockFilter result{0xffff, 0xff, 0xff, 0xffffffff};
+    socklen_t len = 1;
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoGetFilter, &result, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(len, 0U);
+}
+
 TEST(AfPacketSockopt, DetachFilterReturnsEnoentWhenNoFilter) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
@@ -530,6 +574,23 @@ TEST(AfPacketSockopt, AttachFilterFollowsFprogOptlenAndAccessOrdering) {
                          sizeof(oversized)),
               -1);
     EXPECT_EQ(errno, EINVAL);
+}
+
+TEST(AfPacketSockopt, FilterOptionsValidateSocketBeforeOptlen) {
+    int pipe_fds[2];
+    ASSERT_EQ(pipe(pipe_fds), 0);
+    FdGuard read_end(pipe_fds[0]);
+    FdGuard write_end(pipe_fds[1]);
+
+    for (int option : {kSoAttachFilter, kSoDetachFilter, kSoLockFilter}) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(-1, SOL_SOCKET, option, nullptr, 0), -1);
+        EXPECT_EQ(errno, EBADF) << "option=" << option << ": " << ErrnoString(errno);
+
+        errno = 0;
+        EXPECT_EQ(setsockopt(read_end.Get(), SOL_SOCKET, option, nullptr, 0), -1);
+        EXPECT_EQ(errno, ENOTSOCK) << "option=" << option << ": " << ErrnoString(errno);
+    }
 }
 
 TEST(AfPacketSockopt, DetachAndLockFollowIntegerOptlenAbi) {

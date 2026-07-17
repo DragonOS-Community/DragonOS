@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 
-use crate::bpf::classic::{self, validate_cbpf};
+use crate::bpf::classic::{self, validate_cbpf, SockFilter};
 use crate::net::socket::common::{
     parse_socket_buffer_size, parse_timeval_ticks, write_i32_getsockopt, write_timeval_ticks,
     write_u32_getsockopt, INFINITE_TIMEOUT_TICKS, SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF,
@@ -161,11 +161,38 @@ impl PacketSocket {
                 let ticks = self.socket_timeout_ticks(name)?.load(Ordering::Relaxed);
                 Ok(write_timeval_ticks(value, ticks))
             }
+            // SO_GET_FILTER shares its numeric value with SO_ATTACH_FILTER.
+            // The getsockopt ABI interprets the supplied buffer length and
+            // return value as instruction counts rather than byte counts.
+            Ok(PSO::ATTACH_FILTER) => self.get_filter(value),
             Ok(PSO::LOCK_FILTER) => Ok(write_i32_getsockopt(
                 value,
                 *self.filter_locked.lock() as i32,
             )),
             _ => Err(SystemError::ENOPROTOOPT),
         }
+    }
+
+    fn get_filter(&self, value: &mut [u8]) -> Result<usize, SystemError> {
+        let Some(filter) = self.filter.load() else {
+            return Ok(0);
+        };
+        let count = filter.len();
+        if value.is_empty() {
+            return Ok(count);
+        }
+
+        let insn_size = core::mem::size_of::<SockFilter>();
+        if value.len() / insn_size < count {
+            return Err(SystemError::EINVAL);
+        }
+
+        for (dst, insn) in value.chunks_exact_mut(insn_size).zip(filter.iter()) {
+            dst[..2].copy_from_slice(&insn.code.to_ne_bytes());
+            dst[2] = insn.jt;
+            dst[3] = insn.jf;
+            dst[4..8].copy_from_slice(&insn.k.to_ne_bytes());
+        }
+        Ok(count)
     }
 }

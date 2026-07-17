@@ -3,7 +3,6 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETSOCKOPT;
 use crate::mm::VirtAddr;
-use crate::net::socket;
 use crate::net::socket::{PIPV6, PSO, PSOL};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -44,6 +43,11 @@ impl Syscall for SysSetsockoptHandle {
         let optname = Self::optname(args);
         let optval = Self::optval(args);
         let optlen = Self::optlen(args);
+
+        // Linux resolves the descriptor before inspecting any option-specific
+        // length or user pointer. Keep the inode alive through the copy so a
+        // concurrent close cannot change which socket receives the option.
+        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
 
         // Linux 6.6 行为：IPV6_CHECKSUM 在 setsockopt 时会无视 optlen，直接按 int 读取。
         // gVisor raw_socket_test: RawSocketTest.SetIPv6ChecksumError_ReadShort
@@ -92,7 +96,12 @@ impl Syscall for SysSetsockoptHandle {
             UserBufferReader::new(optval, optlen_to_read, frame.is_from_user())?;
         let data = user_buffer_reader.read_from_user(0)?;
 
-        do_setsockopt(fd, level, optname, data)
+        let sol = PSOL::try_from(level as u32)?;
+        socket_inode
+            .as_socket()
+            .unwrap()
+            .set_option(sol, optname, data)
+            .map(|_| 0)
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -141,29 +150,3 @@ impl SysSetsockoptHandle {
 }
 
 syscall_table_macros::declare_syscall!(SYS_SETSOCKOPT, SysSetsockoptHandle);
-
-/// Internal implementation of the setsockopt operation
-///
-/// # Arguments
-/// * `fd` - File descriptor
-/// * `level` - Option level
-/// * `optname` - Option name
-/// * `optval` - Option value
-///
-/// # Returns
-/// * `Ok(usize)` - 0 on success
-/// * `Err(SystemError)` - Error code if operation fails
-pub(super) fn do_setsockopt(
-    fd: usize,
-    level: usize,
-    optname: usize,
-    optval: &[u8],
-) -> Result<usize, SystemError> {
-    let sol = socket::PSOL::try_from(level as u32)?;
-    let socket = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-    socket
-        .as_socket()
-        .unwrap()
-        .set_option(sol, optname, optval)
-        .map(|_| 0)
-}

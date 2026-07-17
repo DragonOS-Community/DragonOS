@@ -3,6 +3,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSOCKOPT;
 use crate::arch::MMArch;
+use crate::bpf::classic::{SockFilter, BPF_MAXINSNS};
 use crate::mm::MemoryManagementArch;
 use crate::net::socket::inet::stream::TcpOption;
 use crate::net::socket::{PSO, PSOL};
@@ -139,7 +140,9 @@ pub(super) fn do_getsockopt(
     let optlen_reader = UserBufferReader::new(optlen, core::mem::size_of::<u32>(), from_user)?;
     let user_len = optlen_reader.buffer_protected(0)?.read_one::<u32>(0)? as usize;
 
-    if user_len > MAX_OPTVAL_LEN {
+    let get_filter = level == PSOL::SOCKET as usize
+        && matches!(PSO::try_from(optname as u32), Ok(PSO::ATTACH_FILTER));
+    if user_len > MAX_OPTVAL_LEN && !get_filter {
         return Err(SystemError::EINVAL);
     }
 
@@ -153,6 +156,27 @@ pub(super) fn do_getsockopt(
         let opt = PSO::try_from(optname as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
 
         match opt {
+            // SO_GET_FILTER shares value 26 with SO_ATTACH_FILTER. Unlike
+            // ordinary getsockopt options, optlen is an instruction count.
+            PSO::ATTACH_FILTER => {
+                let insn_size = core::mem::size_of::<SockFilter>();
+                let capacity = user_len.min(BPF_MAXINSNS);
+                let mut kbuf = vec![0u8; capacity * insn_size];
+                let count = socket.option(level, optname, &mut kbuf)?;
+
+                if user_len != 0 && count != 0 {
+                    let bytes = count * insn_size;
+                    let mut optval_writer = UserBufferWriter::new(optval, bytes, from_user)?;
+                    optval_writer.copy_to_user_protected(&kbuf[..bytes], 0)?;
+                }
+
+                let mut optlen_writer =
+                    UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
+                optlen_writer
+                    .buffer_protected(0)?
+                    .write_one::<u32>(0, &(count as u32))?;
+                return Ok(0);
+            }
             PSO::SNDBUF => {
                 let need = core::mem::size_of::<u32>();
                 let out_len = calc_out_len(optval, user_len, need);

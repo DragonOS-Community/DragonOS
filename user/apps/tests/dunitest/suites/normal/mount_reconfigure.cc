@@ -430,6 +430,36 @@ TEST(MountReconfigure, StrictAtimeReadUpdatesAccessTime) {
     cleanup_mount(target);
 }
 
+TEST(MountReconfigure, StrictAtimeEofReadUpdatesAccessTime) {
+    const char *target = "/tmp/test_mount_strictatime_eof";
+    const char *file = "/tmp/test_mount_strictatime_eof/empty";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
+
+    int fd = open(file, O_CREAT | O_RDONLY, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    struct timespec times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+
+    char byte = 0;
+    ASSERT_EQ(0, read(fd, &byte, 1)) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_GT(st.st_atim.tv_sec, 1);
+
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+    ASSERT_EQ(0, read(fd, &byte, 0)) << strerror(errno);
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_EQ(1, st.st_atim.tv_sec);
+    close(fd);
+    unlink(file);
+    cleanup_mount(target);
+}
+
 TEST(MountReconfigure, DirectoryReadHonorsAtimeFlags) {
     const char *strict_target = "/tmp/test_mount_dir_strictatime";
     const char *strict_file = "/tmp/test_mount_dir_strictatime/file";
@@ -590,6 +620,99 @@ TEST(MountReconfigure, NoatimeRequiresOwnerOrCapFowner) {
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
     unlink(link);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, NoatimeCreateUsesCallerOwnership) {
+    const char *target = "/tmp/test_mount_noatime_create_owner";
+    const char *file = "/tmp/test_mount_noatime_create_owner/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, "mode=0777"))
+        << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(20);
+        }
+        int fd = open(file, O_CREAT | O_EXCL | O_RDONLY | O_NOATIME, 0600);
+        if (fd < 0) {
+            _exit(21);
+        }
+        struct stat st = {};
+        if (fstat(fd, &st) != 0 || st.st_uid != 1000 || st.st_gid != 1000) {
+            close(fd);
+            _exit(22);
+        }
+        close(fd);
+        fd = open(file, O_RDONLY | O_NOATIME);
+        if (fd < 0) {
+            _exit(23);
+        }
+        close(fd);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(file);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, SetgidDirectoryCreationSemantics) {
+    const char *target = "/tmp/test_mount_setgid_create";
+    const char *parent = "/tmp/test_mount_setgid_create/parent";
+    const char *file = "/tmp/test_mount_setgid_create/parent/file";
+    const char *dir = "/tmp/test_mount_setgid_create/parent/dir";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", 0, "mode=0777")) << strerror(errno);
+    ASSERT_EQ(0, mkdir(parent, 0777)) << strerror(errno);
+    ASSERT_EQ(0, chown(parent, 0, 2000)) << strerror(errno);
+    ASSERT_EQ(0, chmod(parent, 02777)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(30);
+        }
+        umask(0);
+        int fd = open(file, O_CREAT | O_EXCL | O_WRONLY, 02770);
+        if (fd < 0) {
+            _exit(31);
+        }
+        close(fd);
+        struct stat st = {};
+        if (stat(file, &st) != 0 || st.st_gid != 2000 || (st.st_mode & S_ISGID) != 0) {
+            _exit(32);
+        }
+        if (mkdir(dir, 0770) != 0) {
+            _exit(33);
+        }
+        if (stat(dir, &st) != 0 || st.st_gid != 2000 || (st.st_mode & S_ISGID) == 0) {
+            _exit(34);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(file);
+    rmdir(dir);
+    rmdir(parent);
     cleanup_mount(target);
 }
 

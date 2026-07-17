@@ -36,6 +36,44 @@ bitflags! {
     }
 }
 
+pub struct ChildInodeInit {
+    pub uid: usize,
+    pub gid: usize,
+    pub mode: InodeMode,
+}
+
+/// Compute owner and directory-SGID inheritance before publishing a child.
+pub fn child_inode_init(
+    parent: &Metadata,
+    file_type: FileType,
+    mut mode: InodeMode,
+) -> ChildInodeInit {
+    let cred = ProcessManager::current_pcb().cred();
+    let gid = if parent.mode.contains(InodeMode::S_ISGID) {
+        if file_type == FileType::Dir {
+            mode.insert(InodeMode::S_ISGID);
+        }
+        parent.gid
+    } else {
+        cred.fsgid.data()
+    };
+    // Linux vfs_prepare_mode()/mode_strip_sgid(): a caller must not create an
+    // executable setgid non-directory for a group it does not belong to.
+    let in_group = cred.fsgid.data() == gid || cred.groups.iter().any(|group| group.data() == gid);
+    if file_type != FileType::Dir
+        && mode.contains(InodeMode::S_ISGID | InodeMode::S_IXGRP)
+        && !in_group
+        && !cred.has_capability(CAPFlags::CAP_FSETID)
+    {
+        mode.remove(InodeMode::S_ISGID);
+    }
+    ChildInodeInit {
+        uid: cred.fsuid.data(),
+        gid,
+        mode,
+    }
+}
+
 /// VFS permission check wrapper that respects per-filesystem policy.
 ///
 /// This is the single entry point that should be used by VFS/pathwalk/syscalls
@@ -58,17 +96,17 @@ pub fn check_inode_permission(
             FileType::File | FileType::Dir | FileType::SymLink
         )
         && inode
-            .fs()
-            .downcast_arc::<MountFS>()
+            .try_fs()
+            .and_then(|fs| fs.downcast_arc::<MountFS>())
             .is_some_and(|mount| mount.is_readonly())
     {
         return Err(SystemError::EROFS);
     }
 
     let cred = ProcessManager::current_pcb().cred();
-    match inode.fs().permission_policy() {
-        FsPermissionPolicy::Dac => cred.inode_permission(metadata, mask.bits()),
-        FsPermissionPolicy::Remote => {
+    match inode.try_fs().map(|fs| fs.permission_policy()) {
+        None | Some(FsPermissionPolicy::Dac) => cred.inode_permission(metadata, mask.bits()),
+        Some(FsPermissionPolicy::Remote) => {
             if mask.contains(PermissionMask::MAY_EXEC)
                 && metadata.file_type == FileType::File
                 && (metadata.mode.bits() & InodeMode::S_IXUGO.bits()) == 0

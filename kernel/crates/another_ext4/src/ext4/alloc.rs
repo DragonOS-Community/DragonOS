@@ -400,9 +400,14 @@ impl Ext4 {
         self.transaction_stage_super_block(transaction, &sb)
     }
 
-    /// Create a new inode, returning the inode and its number
+    /// Create a new inode with its final owner, returning the inode and its number.
     #[inline(never)]
-    pub(super) fn create_inode(&self, mode: InodeMode) -> Result<InodeRef> {
+    pub(super) fn create_inode_with_owner(
+        &self,
+        mode: InodeMode,
+        uid: u32,
+        gid: u32,
+    ) -> Result<InodeRef> {
         self.ensure_mutable()?;
         // Allocate an inode
         let is_dir = mode.file_type() == FileType::Directory;
@@ -413,6 +418,8 @@ impl Ext4 {
             let mut inode = Box::new(Inode::default());
             inode.set_generation(generation);
             inode.set_mode(mode);
+            inode.set_uid(uid);
+            inode.set_gid(gid);
             inode.extent_init();
             let mut inode_ref = InodeRef::new(id, inode);
             self.write_inode_with_csum(&mut inode_ref)?;
@@ -443,6 +450,8 @@ impl Ext4 {
         mode: InodeMode,
         major: u32,
         minor: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<InodeRef> {
         self.ensure_mutable()?;
         // Device nodes are never directories
@@ -453,6 +462,8 @@ impl Ext4 {
             let mut inode = Box::new(Inode::default());
             inode.set_generation(generation);
             inode.set_mode(mode);
+            inode.set_uid(uid);
+            inode.set_gid(gid);
             inode.set_device(major, minor);
             let mut inode_ref = InodeRef::new(id, inode);
             self.write_inode_with_csum(&mut inode_ref)?;

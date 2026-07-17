@@ -1398,7 +1398,9 @@ impl File {
             self.offset
                 .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
         }
-        if len > 0 {
+        // Linux file_accessed() runs for every non-zero regular-file read
+        // request, including EOF. Zero-count reads returned above are exempt.
+        if len > 0 || self.file_type == FileType::File {
             self.touch_atime_after_access();
         }
         Ok(len)

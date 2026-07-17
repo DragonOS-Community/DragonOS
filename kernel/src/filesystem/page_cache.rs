@@ -418,6 +418,27 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Ok("status=fail stage=shmem_identity\n".into());
     }
 
+    // Transaction rollback must observe PG_DIRTY even while publication to
+    // the cache dirty tag/state is still pending.
+    let rollback_cache = PageCache::new_shmem(None, None);
+    let rollback_page = rollback_cache.get_or_create_page_zero(0)?;
+    rollback_page.write().add_flags(PageFlags::PG_DIRTY);
+    let discarded = rollback_cache
+        .manager
+        .discard_created_page(0, &rollback_page)?;
+    let rollback_retained = rollback_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .is_some_and(|entry| Arc::ptr_eq(&entry.page, &rollback_page));
+    let rollback_removed = rollback_cache.manager.remove_page(0)?.is_some();
+    let rollback_paddr = rollback_page.phys_address();
+    page_manager_lock().remove_page(&rollback_paddr);
+    let _ = page_reclaimer_lock().remove_page(&rollback_paddr);
+    if discarded || !rollback_retained || !rollback_removed {
+        return Ok("status=fail stage=dirty_transaction_rollback\n".into());
+    }
+
     // Loading rollback consumes membership once; a late state publication on
     // the detached entry must not revive it.
     let state_cache = PageCache::new(None, None);
@@ -3009,19 +3030,57 @@ impl PageCacheManager {
         expected_page: &Arc<Page>,
     ) -> Result<bool, SystemError> {
         let cache = self.upgrade()?;
-        let removed = {
-            let mut guard = cache.lock();
+        let (entry, state) = {
+            let guard = cache.lock();
             let Some(entry) = guard.get_entry(page_index) else {
                 return Ok(false);
             };
-            if !Arc::ptr_eq(&entry.page, expected_page) || entry.active_users() != 0 {
+            if !Arc::ptr_eq(&entry.page, expected_page)
+                || entry.active_users() != 0
+                || guard.dirty_pages.contains(&page_index)
+                || guard.writeback_pages.contains(&page_index)
+            {
                 return Ok(false);
             }
-            if entry.page.read().map_count() != 0 {
+            let state = entry.state();
+            if matches!(
+                state,
+                PageState::Loading | PageState::Dirty | PageState::Writeback | PageState::Error
+            ) {
+                return Ok(false);
+            }
+            (entry, state)
+        };
+
+        // Dirty publication uses the page -> cache lock order. Keep the page
+        // guard through the final membership check so rollback cannot slip
+        // between setting PG_DIRTY and publishing the dirty tag/state.
+        let page_guard = entry.page.read();
+        let page_discardable = !page_guard
+            .flags()
+            .intersects(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK)
+            && page_guard.map_count() == 0;
+        if !page_discardable {
+            return Ok(false);
+        }
+
+        let removed = {
+            let mut guard = cache.lock();
+            let Some(current) = guard.get_entry(page_index) else {
+                return Ok(false);
+            };
+            if !Arc::ptr_eq(&current, &entry)
+                || !Arc::ptr_eq(&current.page, expected_page)
+                || current.active_users() != 0
+                || current.state() != state
+                || guard.dirty_pages.contains(&page_index)
+                || guard.writeback_pages.contains(&page_index)
+            {
                 return Ok(false);
             }
             guard.remove_page(page_index)
         };
+        drop(page_guard);
         let Some(page) = removed else {
             return Ok(false);
         };

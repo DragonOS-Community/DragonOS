@@ -48,6 +48,12 @@ pub struct SetAttr {
     pub crtime: Option<u32>,
 }
 
+#[derive(Clone, Copy)]
+pub struct InodeOwner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
 impl SetAttr {
     /// Create a new SetAttr struct with all fields set to None.
     pub fn new() -> Self {
@@ -557,6 +563,16 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOSPC` - No space left on device
     pub fn create(&self, parent: InodeId, name: &str, mode: InodeMode) -> Result<InodeId> {
+        self.create_with_owner(parent, name, mode, InodeOwner { uid: 0, gid: 0 })
+    }
+
+    pub fn create_with_owner(
+        &self,
+        parent: InodeId,
+        name: &str,
+        mode: InodeMode,
+        owner: InodeOwner,
+    ) -> Result<InodeId> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
@@ -567,7 +583,7 @@ impl Ext4 {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
         }
         // Create child inode and link it to parent directory
-        let mut child = self.create_inode(mode)?;
+        let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
         self.link_new_inode_or_free(&mut parent, &mut child, name)?;
         // Create file handler
         Ok(child.id)
@@ -603,6 +619,25 @@ impl Ext4 {
         major: u32,
         minor: u32,
     ) -> Result<InodeId> {
+        self.mknod_with_owner(
+            parent,
+            name,
+            mode,
+            major,
+            minor,
+            InodeOwner { uid: 0, gid: 0 },
+        )
+    }
+
+    pub fn mknod_with_owner(
+        &self,
+        parent: InodeId,
+        name: &str,
+        mode: InodeMode,
+        major: u32,
+        minor: u32,
+        owner: InodeOwner,
+    ) -> Result<InodeId> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
@@ -619,7 +654,7 @@ impl Ext4 {
         }
 
         // Create device inode (uses create_device_inode which sets device number)
-        let mut child = self.create_device_inode(mode, major, minor)?;
+        let mut child = self.create_device_inode(mode, major, minor, owner.uid, owner.gid)?;
 
         // Link to parent directory
         self.link_new_inode_or_free(&mut parent_ref, &mut child, name)?;
@@ -1404,6 +1439,16 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOSPC` - no space left on device
     pub fn mkdir(&self, parent: InodeId, name: &str, mode: InodeMode) -> Result<InodeId> {
+        self.mkdir_with_owner(parent, name, mode, InodeOwner { uid: 0, gid: 0 })
+    }
+
+    pub fn mkdir_with_owner(
+        &self,
+        parent: InodeId,
+        name: &str,
+        mode: InodeMode,
+        owner: InodeOwner,
+    ) -> Result<InodeId> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
@@ -1415,7 +1460,7 @@ impl Ext4 {
         }
         // Create file/directory
         let mode = mode & InodeMode::PERM_MASK | InodeMode::DIRECTORY;
-        let mut child = self.create_inode(mode)?;
+        let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
         // Add "." entry
         let child_self = child.clone();
         if let Err(error) = self.dir_add_entry(&mut child, &child_self, ".") {

@@ -282,19 +282,42 @@ impl IndexNode for LockedExt4Inode {
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let _operation = self.begin_operation()?;
+        let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
+        let parent_metadata = self.metadata()?;
+        let init = vfs::permission::child_inode_init(&parent_metadata, file_type, mode);
         let mut guard = self.inner.lock();
         // another_ext4的高4位是文件类型，低12位是权限
-        let file_mode = InodeMode::from(file_type).union(mode);
+        let file_mode = InodeMode::from(file_type).union(init.mode);
         let file_mode = another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16);
         let fs = guard.concret_fs();
         let _reuse = fs.begin_allocation()?;
         let ext4 = &fs.fs;
 
         let id = if file_type == vfs::FileType::Dir {
-            Self::retry_metadata_contention(|| ext4.mkdir(guard.inner_inode_num, name, file_mode))?
+            Self::retry_metadata_contention(|| {
+                ext4.mkdir_with_owner(
+                    guard.inner_inode_num,
+                    name,
+                    file_mode,
+                    another_ext4::InodeOwner {
+                        uid: init.uid as u32,
+                        gid: init.gid as u32,
+                    },
+                )
+            })?
         } else {
-            Self::retry_metadata_contention(|| ext4.create(guard.inner_inode_num, name, file_mode))?
+            Self::retry_metadata_contention(|| {
+                ext4.create_with_owner(
+                    guard.inner_inode_num,
+                    name,
+                    file_mode,
+                    another_ext4::InodeOwner {
+                        uid: init.uid as u32,
+                        gid: init.gid as u32,
+                    },
+                )
+            })?
         };
 
         let dname = DName::from(name);
@@ -1110,7 +1133,10 @@ impl IndexNode for LockedExt4Inode {
             return self.create(filename, vfs::FileType::File, mode);
         }
         let _operation = self.begin_operation()?;
+        let _io = self.io_lock.lock();
         let _namespace = self.namespace_lock.lock();
+        let parent_metadata = self.metadata()?;
+        let init = vfs::permission::child_inode_init(&parent_metadata, file_type, mode);
 
         let mut guard = self.inner.lock();
         let fs = guard.concret_fs();
@@ -1123,7 +1149,7 @@ impl IndexNode for LockedExt4Inode {
         }
 
         // VFS InodeMode(u32) → another_ext4 InodeMode(u16)
-        let file_mode = another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16);
+        let file_mode = another_ext4::InodeMode::from_bits_truncate(init.mode.bits() as u16);
 
         // Create inode based on file type
         let id = if matches!(
@@ -1132,17 +1158,31 @@ impl IndexNode for LockedExt4Inode {
         ) {
             // Character/block device: use mknod to store device number in i_block
             Self::retry_metadata_contention(|| {
-                ext4.mknod(
+                ext4.mknod_with_owner(
                     inode_num,
                     filename,
                     file_mode,
                     dev_t.major().data(),
                     dev_t.minor(),
+                    another_ext4::InodeOwner {
+                        uid: init.uid as u32,
+                        gid: init.gid as u32,
+                    },
                 )
             })?
         } else {
             // FIFO, Socket, etc.: use regular create (no device number needed)
-            Self::retry_metadata_contention(|| ext4.create(inode_num, filename, file_mode))?
+            Self::retry_metadata_contention(|| {
+                ext4.create_with_owner(
+                    inode_num,
+                    filename,
+                    file_mode,
+                    another_ext4::InodeOwner {
+                        uid: init.uid as u32,
+                        gid: init.gid as u32,
+                    },
+                )
+            })?
         };
 
         // Wrap as VFS inode and cache
@@ -1172,6 +1212,16 @@ impl IndexNode for LockedExt4Inode {
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let _source_io = self.io_lock.lock();
+        let whiteout_init = if flags.contains(RenameFlags::WHITEOUT) {
+            Some(vfs::permission::child_inode_init(
+                &self.metadata()?,
+                vfs::FileType::CharDevice,
+                InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
+            ))
+        } else {
+            None
+        };
         let target_locked = target
             .clone()
             .downcast_arc::<LockedExt4Inode>()
@@ -1278,6 +1328,7 @@ impl IndexNode for LockedExt4Inode {
 
         let mut resulting_whiteout = None;
         if flags.contains(RenameFlags::WHITEOUT) {
+            let whiteout_init = whiteout_init.as_ref().ok_or(SystemError::EIO)?;
             let mut temp_name = String::new();
             let mut whiteout_inode = None;
             let source_parent = self
@@ -1293,13 +1344,17 @@ impl IndexNode for LockedExt4Inode {
                 }
                 let allocation = ext4_fs.begin_allocation()?;
                 let whiteout_num = Self::retry_metadata_contention(|| {
-                    ext4.mknod(
+                    ext4.mknod_with_owner(
                         src_inode_num,
                         &candidate,
                         another_ext4::InodeMode::CHARDEV
                             | another_ext4::InodeMode::from_bits_retain(0o600),
                         WHITEOUT_DEV.major().data(),
                         WHITEOUT_DEV.minor(),
+                        another_ext4::InodeOwner {
+                            uid: whiteout_init.uid as u32,
+                            gid: whiteout_init.gid as u32,
+                        },
                     )
                 })?;
                 whiteout_inode = match ext4_fs.publish_allocated_inode(

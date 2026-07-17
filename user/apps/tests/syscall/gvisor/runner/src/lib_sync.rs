@@ -139,7 +139,11 @@ struct RequiredTest {
 
 impl TestRunner {
     pub fn new(config: Config) -> Result<Self> {
-        let required_tests = read_required_tests(&config.required_tests_file)?;
+        let required_tests = if config.enforce_required {
+            read_required_tests(&config.required_tests_file)?
+        } else {
+            HashMap::new()
+        };
         Ok(Self {
             config,
             stats: Arc::new(TestStats::default()),
@@ -822,7 +826,10 @@ fn remove_stale_xml(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_required_tests, remove_stale_xml, wait_with_timeout, TestProcessOutcome};
+    use super::{
+        read_required_tests, remove_stale_xml, wait_with_timeout, Config, TestProcessOutcome,
+        TestRunner,
+    };
     use std::{
         fs,
         os::unix::process::CommandExt,
@@ -868,6 +875,23 @@ mod tests {
         assert!(manifest("mount_test 0\n").is_err());
         assert!(manifest("mount_test 87 invalid_skip\n").is_err());
         assert!(manifest("mount_test 87 Suite.Skip Suite.Skip\n").is_err());
+    }
+
+    #[test]
+    fn disabled_required_enforcement_does_not_read_manifest() {
+        let mut config = Config::default();
+        config.enforce_required = false;
+        config.required_tests_file = std::env::temp_dir().join(format!(
+            "missing-gvisor-required-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let runner = TestRunner::new(config).unwrap();
+        assert!(runner.required_tests.is_empty());
     }
 
     #[test]

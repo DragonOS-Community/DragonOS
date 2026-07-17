@@ -1199,6 +1199,11 @@ impl IndexNode for LockedTmpfsInode {
         if parent.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
+        let init = crate::filesystem::vfs::permission::child_inode_init(
+            &parent.metadata,
+            FileType::SymLink,
+            InodeMode::S_IRWXUGO,
+        );
 
         let now = PosixTimeSpec::now();
         let inline = target.len() < SHORT_SYMLINK_LEN;
@@ -1218,11 +1223,11 @@ impl IndexNode for LockedTmpfsInode {
                 ctime: now,
                 btime: now,
                 file_type: FileType::SymLink,
-                mode: InodeMode::S_IRWXUGO,
+                mode: init.mode,
                 flags: InodeFlags::empty(),
                 nlinks: 1,
-                uid: 0,
-                gid: 0,
+                uid: init.uid,
+                gid: init.gid,
                 raw_dev: DeviceNumber::default(),
             },
             fs: parent.fs.clone(),
@@ -1268,6 +1273,8 @@ impl IndexNode for LockedTmpfsInode {
         if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
+        let init =
+            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
 
         let now = PosixTimeSpec::now();
         let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode::new(TmpfsInode {
@@ -1286,11 +1293,11 @@ impl IndexNode for LockedTmpfsInode {
                 ctime: now,
                 btime: now,
                 file_type,
-                mode,
+                mode: init.mode,
                 flags: InodeFlags::empty(),
                 nlinks: if file_type == FileType::Dir { 2 } else { 1 },
-                uid: 0,
-                gid: 0,
+                uid: init.uid,
+                gid: init.gid,
                 raw_dev: DeviceNumber::from(data as u32),
             },
             fs: inode.fs.clone(),
@@ -1657,6 +1664,8 @@ impl IndexNode for LockedTmpfsInode {
             FileType::Socket => FileType::Socket,
             _ => return Err(SystemError::EINVAL),
         };
+        let init =
+            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
 
         let now = PosixTimeSpec::now();
         let nod = Arc::new(LockedTmpfsInode::new(TmpfsInode {
@@ -1675,10 +1684,10 @@ impl IndexNode for LockedTmpfsInode {
                 ctime: now,
                 btime: now,
                 file_type,
-                mode,
+                mode: init.mode,
                 nlinks: 1,
-                uid: 0,
-                gid: 0,
+                uid: init.uid,
+                gid: init.gid,
                 raw_dev: dev_t,
                 flags: InodeFlags::empty(),
             },

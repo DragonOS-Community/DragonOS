@@ -432,22 +432,33 @@ impl TtyCore {
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
             let ld = tty.ldisc();
-            // Flush ldisc opost + echo buffers. The returned bool indicates
-            // whether opost_pending was fully drained; a `false` means the
-            // output lock was held by a concurrent writer and the opost
-            // state could not be inspected (see drain_output docs).
-            let _ldisc_drained = ld.drain_output(tty.clone())?;
 
-            // Poll the hardware buffer with scheduler yields between
-            // iterations so device IRQs get CPU time to drain the FIFO.
-            // On PTY, chars_in_buffer() returns 0 immediately.
-            const DRAIN_RETRIES: u32 = 100;
-            for _ in 0..DRAIN_RETRIES {
-                if tty.chars_in_buffer(tty.core()) == 0 {
-                    break;
+            // Retry drain_output while output_lock is held by a concurrent
+            // writer.  Bounded to prevent indefinite stall.
+            let mut ldisc_drained = false;
+            for _ in 0..8 {
+                match ld.drain_output(tty.clone()) {
+                    Ok(true) => {
+                        ldisc_drained = true;
+                        break;
+                    }
+                    Ok(false) => {
+                        crate::sched::sched_yield();
+                    }
+                    Err(e) => return Err(e),
                 }
-                crate::sched::sched_yield();
             }
+            // Proceed even if ldisc_drained is false — documented limitation.
+            let _ = ldisc_drained;
+
+            // Event-driven wait for hardware FIFO drain via write_wq.
+            // On PTY, chars_in_buffer returns 0 immediately.
+            let write_wq = tty.core().write_wq();
+            let core_ref = tty.core();
+            let _ = write_wq.wait_event_interruptible(
+                (EPollEventType::EPOLLOUT.bits() | EPollEventType::EPOLLWRNORM.bits()) as u64,
+                || tty.chars_in_buffer(core_ref) == 0,
+            );
         }
 
         TtyCore::set_termios_next(tty, tmp_termios)?;

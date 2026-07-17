@@ -409,18 +409,17 @@ impl Ext4FileSystem {
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
     ) -> Result<Arc<LockedExt4Inode>, SystemError> {
-        self.get_or_create_inode_inner(inode_num, dname, parent, false)
+        self.get_or_create_inode_inner(inode_num, dname, parent, false, None)
     }
 
     pub(super) fn publish_allocated_inode(
         self: &Arc<Self>,
-        inode_num: u32,
+        attr: another_ext4::FileAttr,
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
-        _file_type: another_ext4::FileType,
         _reuse_guard: &RwSemReadGuard<'_, ()>,
     ) -> Result<Arc<LockedExt4Inode>, SystemError> {
-        self.get_or_create_inode_inner(inode_num, dname, parent, true)
+        self.get_or_create_inode_inner(attr.ino, dname, parent, true, Some(attr))
     }
 
     fn get_or_create_inode_inner(
@@ -429,6 +428,7 @@ impl Ext4FileSystem {
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
         reuse_guard_held: bool,
+        allocated_attr: Option<another_ext4::FileAttr>,
     ) -> Result<Arc<LockedExt4Inode>, SystemError> {
         let mut candidate = None;
         let mut admission_guard = None;
@@ -464,12 +464,22 @@ impl Ext4FileSystem {
                             if !reuse_guard_held {
                                 admission_guard = Some(self.inode_reuse_barrier.read());
                             }
-                            candidate = Some(LockedExt4Inode::new(
-                                inode_num,
-                                Arc::downgrade(self),
-                                dname.clone(),
-                                parent.clone(),
-                            )?);
+                            candidate = Some(if let Some(attr) = allocated_attr.as_ref() {
+                                LockedExt4Inode::new_with_attr(
+                                    inode_num,
+                                    Arc::downgrade(self),
+                                    dname.clone(),
+                                    parent.clone(),
+                                    attr,
+                                )?
+                            } else {
+                                LockedExt4Inode::new(
+                                    inode_num,
+                                    Arc::downgrade(self),
+                                    dname.clone(),
+                                    parent.clone(),
+                                )?
+                            });
                             continue;
                         }
                         let inode = candidate.take().expect("candidate checked above");

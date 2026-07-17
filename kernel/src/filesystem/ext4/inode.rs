@@ -321,10 +321,13 @@ impl IndexNode for LockedExt4Inode {
         let fs = guard.concret_fs();
         let _reuse = fs.begin_allocation()?;
         let ext4 = &fs.fs;
+        // Resolve the parent lifetime before publishing the on-disk name so
+        // no fallible parent lookup remains after the namespace transaction.
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
 
-        let id = if file_type == vfs::FileType::Dir {
+        let attr = if file_type == vfs::FileType::Dir {
             Self::retry_metadata_contention(|| {
-                ext4.mkdir_with_owner(
+                ext4.mkdir_with_owner_and_attr(
                     guard.inner_inode_num,
                     name,
                     file_mode,
@@ -336,7 +339,7 @@ impl IndexNode for LockedExt4Inode {
             })?
         } else {
             Self::retry_metadata_contention(|| {
-                ext4.create_with_owner(
+                ext4.create_with_owner_and_attr(
                     guard.inner_inode_num,
                     name,
                     file_mode,
@@ -349,13 +352,10 @@ impl IndexNode for LockedExt4Inode {
         };
 
         let dname = DName::from(name);
-        // 通过self_ref获取Arc<Self>，然后转换为Arc<dyn IndexNode>
-        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         let inode = fs.publish_allocated_inode(
-            id,
+            attr,
             dname.clone(),
             Some(Arc::downgrade(&self_arc)),
-            Self::disk_file_type(file_type),
             &_reuse,
         )?;
         // 更新 children 缓存
@@ -1256,6 +1256,9 @@ impl IndexNode for LockedExt4Inode {
         let _reuse = fs.begin_allocation()?;
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
+        // Resolve the parent lifetime before publishing the on-disk name so
+        // no fallible parent lookup remains after the namespace transaction.
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
 
         if ext4.getattr(inode_num)?.ftype != FileType::Directory {
             return Err(SystemError::ENOTDIR);
@@ -1265,13 +1268,13 @@ impl IndexNode for LockedExt4Inode {
         let file_mode = another_ext4::InodeMode::from_bits_truncate(init.mode.bits() as u16);
 
         // Create inode based on file type
-        let id = if matches!(
+        let attr = if matches!(
             file_type,
             vfs::FileType::CharDevice | vfs::FileType::BlockDevice
         ) {
             // Character/block device: use mknod to store device number in i_block
             Self::retry_metadata_contention(|| {
-                ext4.mknod_with_owner(
+                ext4.mknod_with_owner_and_attr(
                     inode_num,
                     filename,
                     file_mode,
@@ -1286,7 +1289,7 @@ impl IndexNode for LockedExt4Inode {
         } else {
             // FIFO, Socket, etc.: use regular create (no device number needed)
             Self::retry_metadata_contention(|| {
-                ext4.create_with_owner(
+                ext4.create_with_owner_and_attr(
                     inode_num,
                     filename,
                     file_mode,
@@ -1300,12 +1303,10 @@ impl IndexNode for LockedExt4Inode {
 
         // Wrap as VFS inode and cache
         let dname = DName::from(filename);
-        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         let inode = fs.publish_allocated_inode(
-            id,
+            attr,
             dname.clone(),
             Some(Arc::downgrade(&self_arc)),
-            Self::disk_file_type(file_type),
             &_reuse,
         )?;
         guard.children.insert(dname, inode.clone());
@@ -1456,8 +1457,8 @@ impl IndexNode for LockedExt4Inode {
                     continue;
                 }
                 let allocation = ext4_fs.begin_allocation()?;
-                let whiteout_num = Self::retry_metadata_contention(|| {
-                    ext4.mknod_with_owner(
+                let whiteout_attr = Self::retry_metadata_contention(|| {
+                    ext4.mknod_with_owner_and_attr(
                         src_inode_num,
                         &candidate,
                         another_ext4::InodeMode::CHARDEV
@@ -1471,10 +1472,9 @@ impl IndexNode for LockedExt4Inode {
                     )
                 })?;
                 whiteout_inode = match ext4_fs.publish_allocated_inode(
-                    whiteout_num,
+                    whiteout_attr,
                     DName::from(candidate.as_str()),
                     Some(Arc::downgrade(&source_parent)),
-                    FileType::CharacterDev,
                     &allocation,
                 ) {
                     Ok(inode) => Some(inode),
@@ -1691,20 +1691,6 @@ impl LockedExt4Inode {
         fs.complete_freeing(tombstone)
     }
 
-    fn disk_file_type(file_type: vfs::FileType) -> FileType {
-        match file_type {
-            vfs::FileType::Dir => FileType::Directory,
-            vfs::FileType::BlockDevice => FileType::BlockDev,
-            vfs::FileType::CharDevice
-            | vfs::FileType::FramebufferDevice
-            | vfs::FileType::KvmDevice => FileType::CharacterDev,
-            vfs::FileType::Pipe => FileType::Fifo,
-            vfs::FileType::SymLink => FileType::SymLink,
-            vfs::FileType::Socket => FileType::Socket,
-            vfs::FileType::File => FileType::RegularFile,
-        }
-    }
-
     #[inline]
     fn begin_operation(&self) -> Result<Ext4InodeOperation, SystemError> {
         self.lifecycle.begin_operation()
@@ -1834,6 +1820,17 @@ impl LockedExt4Inode {
     ) -> Result<Arc<Self>, SystemError> {
         let fs = fs_ptr.upgrade().ok_or(SystemError::EIO)?;
         let attr = fs.fs.getattr(inode_num)?;
+        Self::new_with_attr(inode_num, fs_ptr, dname, parent, &attr)
+    }
+
+    pub(super) fn new_with_attr(
+        inode_num: u32,
+        fs_ptr: Weak<super::filesystem::Ext4FileSystem>,
+        dname: DName,
+        parent: Option<Weak<LockedExt4Inode>>,
+        attr: &another_ext4::FileAttr,
+    ) -> Result<Arc<Self>, SystemError> {
+        debug_assert_eq!(inode_num, attr.ino);
         let lifecycle = Ext4InodeLifecycle::new();
         let inode = Arc::new_cyclic(|self_ref| LockedExt4Inode {
             inner: Mutex::new(Ext4Inode::new(
@@ -1841,7 +1838,7 @@ impl LockedExt4Inode {
                 fs_ptr.clone(),
                 dname,
                 parent,
-                Ext4InodeTimes::from(&attr),
+                Ext4InodeTimes::from(attr),
             )),
             io_lock: Mutex::new(()),
             size_lock: RwSem::new(()),

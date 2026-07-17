@@ -276,6 +276,10 @@ impl Ext4 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
 
+        Ok(Self::file_attr(&inode))
+    }
+
+    fn file_attr(inode: &InodeRef) -> FileAttr {
         // Get device number for device nodes
         let rdev = if inode.inode.is_device() {
             inode.inode.device()
@@ -283,8 +287,8 @@ impl Ext4 {
             (0, 0)
         };
 
-        Ok(FileAttr {
-            ino: id,
+        FileAttr {
+            ino: inode.id,
             size: inode.inode.size(),
             blocks: inode.inode.block_count(),
             atime: inode.inode.atime(),
@@ -297,7 +301,7 @@ impl Ext4 {
             uid: inode.inode.uid(),
             gid: inode.inode.gid(),
             rdev,
-        })
+        }
     }
 
     /// Set file attributes.
@@ -577,6 +581,20 @@ impl Ext4 {
         mode: InodeMode,
         owner: InodeOwner,
     ) -> Result<InodeId> {
+        Ok(self
+            .create_with_owner_and_attr(parent, name, mode, owner)?
+            .ino)
+    }
+
+    /// Create and link a file, returning the attributes from the authoritative
+    /// in-memory inode used by the namespace transaction.
+    pub fn create_with_owner_and_attr(
+        &self,
+        parent: InodeId,
+        name: &str,
+        mode: InodeMode,
+        owner: InodeOwner,
+    ) -> Result<FileAttr> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
@@ -589,8 +607,7 @@ impl Ext4 {
         // Create child inode and link it to parent directory
         let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
         self.link_new_inode_or_free(&mut parent, &mut child, name)?;
-        // Create file handler
-        Ok(child.id)
+        Ok(Self::file_attr(&child))
     }
 
     /// Create a device node (character or block device).
@@ -642,6 +659,22 @@ impl Ext4 {
         minor: u32,
         owner: InodeOwner,
     ) -> Result<InodeId> {
+        Ok(self
+            .mknod_with_owner_and_attr(parent, name, mode, major, minor, owner)?
+            .ino)
+    }
+
+    /// Create and link a device node, returning the attributes from the
+    /// authoritative in-memory inode used by the namespace transaction.
+    pub fn mknod_with_owner_and_attr(
+        &self,
+        parent: InodeId,
+        name: &str,
+        mode: InodeMode,
+        major: u32,
+        minor: u32,
+        owner: InodeOwner,
+    ) -> Result<FileAttr> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
@@ -664,7 +697,7 @@ impl Ext4 {
         self.link_new_inode_or_free(&mut parent_ref, &mut child, name)?;
 
         trace!("mknod {} ({}:{}) -> inode {}", name, major, minor, child.id);
-        Ok(child.id)
+        Ok(Self::file_attr(&child))
     }
 
     /// Read data from a file. This function will read exactly `buf.len()`
@@ -1453,6 +1486,20 @@ impl Ext4 {
         mode: InodeMode,
         owner: InodeOwner,
     ) -> Result<InodeId> {
+        Ok(self
+            .mkdir_with_owner_and_attr(parent, name, mode, owner)?
+            .ino)
+    }
+
+    /// Create and link a directory, returning the attributes from the
+    /// authoritative in-memory inode used by the namespace transaction.
+    pub fn mkdir_with_owner_and_attr(
+        &self,
+        parent: InodeId,
+        name: &str,
+        mode: InodeMode,
+        owner: InodeOwner,
+    ) -> Result<FileAttr> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
@@ -1476,7 +1523,7 @@ impl Ext4 {
         child.inode.set_link_count(1);
         // Link the new inode
         self.link_new_inode_or_free(&mut parent, &mut child, name)?;
-        Ok(child.id)
+        Ok(Self::file_attr(&child))
     }
 
     /// Look up a directory entry by name.
@@ -1753,6 +1800,39 @@ mod tests {
     use super::*;
     use crate::FileType;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn file_attr_is_derived_from_the_authoritative_in_memory_inode() {
+        let mut inode = Box::new(Inode::default());
+        inode.set_mode(InodeMode::CHARDEV | InodeMode::from_bits_retain(0o640));
+        inode.set_uid(0x12345);
+        inode.set_gid(0x23456);
+        inode.set_size(0x1_0000_0020);
+        inode.set_block_count(17);
+        inode.set_atime(11);
+        inode.set_mtime(12);
+        inode.set_ctime(13);
+        inode.set_crtime(14);
+        inode.set_link_count(2);
+        inode.set_device(259, 0x1_0002);
+        let inode = InodeRef::new(42, inode);
+
+        let attr = Ext4::file_attr(&inode);
+
+        assert_eq!(attr.ino, 42);
+        assert_eq!(attr.ftype, FileType::CharacterDev);
+        assert_eq!(attr.perm.bits(), 0o640);
+        assert_eq!(attr.uid, 0x12345);
+        assert_eq!(attr.gid, 0x23456);
+        assert_eq!(attr.size, 0x1_0000_0020);
+        assert_eq!(attr.blocks, 17);
+        assert_eq!(
+            (attr.atime, attr.mtime, attr.ctime, attr.crtime),
+            (11, 12, 13, 14)
+        );
+        assert_eq!(attr.links, 2);
+        assert_eq!(attr.rdev, (259, 0x1_0002));
+    }
 
     struct StubBlockDevice {
         sb_block: Block,

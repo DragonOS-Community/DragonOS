@@ -304,6 +304,16 @@ impl TtyCore {
                 user_writer.copy_one_to_user(&termios, 0)?;
                 return Ok(0);
             }
+            TtyIoctlCmd::TCGETA => {
+                let termio = PosixTermio::from_kernel_termios(&real_tty.core.termios());
+                let mut user_writer = UserBufferWriter::new(
+                    VirtAddr::new(arg).as_ptr::<PosixTermio>(),
+                    core::mem::size_of::<PosixTermio>(),
+                    true,
+                )?;
+                user_writer.copy_one_to_user(&termio, 0)?;
+                return Ok(0);
+            }
             TtyIoctlCmd::TCSETS => {
                 return TtyCore::core_set_termios(
                     real_tty,
@@ -325,6 +335,29 @@ impl TtyCore {
                     TtySetTermiosOpt::TERMIOS_FLUSH
                         | TtySetTermiosOpt::TERMIOS_WAIT
                         | TtySetTermiosOpt::TERMIOS_OLD,
+                );
+            }
+            TtyIoctlCmd::TCSETA => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_TERMIO,
+                );
+            }
+            TtyIoctlCmd::TCSETAW => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_TERMIO,
+                );
+            }
+            TtyIoctlCmd::TCSETAF => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_FLUSH
+                        | TtySetTermiosOpt::TERMIOS_WAIT
+                        | TtySetTermiosOpt::TERMIOS_TERMIO,
                 );
             }
             _ => {

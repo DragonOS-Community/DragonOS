@@ -433,36 +433,50 @@ impl PosixTermio {
         }
     }
 
-    /// Convert user-space termio → kernel Termios.
-    /// u16 → u32 zero-extension; missing c_cc slots default to 0.
-    /// Speed is extracted from c_cflag CBAUD/CIBAUD bits, matching
-    /// the existing PosixTermios::to_kernel_termios() pattern.
-    pub fn to_kernel_termios(self) -> Termios {
-        let mut cc = [0u8; CONTORL_CHARACTER_NUM];
-        let copy_len = NCC.min(CONTORL_CHARACTER_NUM);
-        cc[..copy_len].copy_from_slice(&self.c_cc[..copy_len]);
-
-        let cflag = ControlMode::from_bits_truncate(self.c_cflag as u32);
-        let ospeed = cflag.baud_rate().unwrap_or(38400);
-        let ispeed = {
-            let ibaud = ((self.c_cflag as u32) & ControlMode::CIBAUD.bits()) >> 16;
-            if ibaud == 0 {
-                ospeed
-            } else {
-                ControlMode::from_bits_truncate(ibaud).baud_rate().unwrap_or(ospeed)
-            }
-        };
+    /// Convert user-space termio → kernel Termios, merging with `old`.
+    ///
+    /// Matches Linux 6.6 generic `user_termio_to_kernel_termios()`:
+    /// the low 16 bits of each flag word come from the termio, the high
+    /// 16 bits are preserved from `old`. Only the first NCC control
+    /// characters are overwritten; the rest are preserved from `old`.
+    pub fn to_kernel_termios(self, old: &Termios) -> Termios {
+        let mut cc = old.control_characters;
+        cc[..NCC].copy_from_slice(&self.c_cc);
 
         Termios {
-            input_mode: InputMode::from_bits_truncate(self.c_iflag as u32),
-            output_mode: OutputMode::from_bits_truncate(self.c_oflag as u32),
-            control_mode: cflag,
-            local_mode: LocalMode::from_bits_truncate(self.c_lflag as u32),
+            input_mode: InputMode::from_bits_truncate(
+                (old.input_mode.bits & 0xffff_0000) | self.c_iflag as u32,
+            ),
+            output_mode: OutputMode::from_bits_truncate(
+                (old.output_mode.bits & 0xffff_0000) | self.c_oflag as u32,
+            ),
+            control_mode: ControlMode::from_bits_truncate(
+                (old.control_mode.bits & 0xffff_0000) | self.c_cflag as u32,
+            ),
+            local_mode: LocalMode::from_bits_truncate(
+                (old.local_mode.bits & 0xffff_0000) | self.c_lflag as u32,
+            ),
             control_characters: cc,
             line: LineDisciplineType::from_line(self.c_line),
-            input_speed: ispeed,
-            output_speed: ospeed,
+            // Speed is derived from the merged c_cflag by the caller via
+            // ControlMode::baud_rate(); termio carries no speed fields.
+            input_speed: old.input_speed,
+            output_speed: old.output_speed,
         }
+    }
+
+    /// Extract input/output speeds from a merged kernel Termios c_cflag,
+    /// mirroring how Linux `set_termios()` calls `tty_termios_baud_rate()`
+    /// after `user_termio_to_kernel_termios()`.
+    pub fn speeds_from_cflag(cflag: ControlMode) -> (u32, u32) {
+        let ospeed = cflag.baud_rate().unwrap_or(38400);
+        let ibaud = (cflag.bits() & ControlMode::CIBAUD.bits()) >> 16;
+        let ispeed = if ibaud == 0 {
+            ospeed
+        } else {
+            ControlMode::from_bits_truncate(ibaud).baud_rate().unwrap_or(ospeed)
+        };
+        (ispeed, ospeed)
     }
 }
 

@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    termios::{ControlMode, PosixTermios, Termios, TtySetTermiosOpt, WindowSize},
+    termios::{ControlMode, PosixTermio, PosixTermios, Termios, TtySetTermiosOpt, WindowSize},
     tty_driver::{TtyCorePrivateField, TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
     tty_ldisc::{
@@ -365,7 +365,20 @@ impl TtyCore {
         let mut tmp_termios = *tty.core().termios();
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
-            todo!()
+            let user_reader = UserBufferReader::new(
+                arg.as_ptr::<PosixTermio>(),
+                core::mem::size_of::<PosixTermio>(),
+                true,
+            )?;
+            let mut termio = PosixTermio::default();
+            user_reader.copy_one_from_user(&mut termio, 0)?;
+            tmp_termios = termio.to_kernel_termios(&tmp_termios);
+            // termio carries no speed fields; derive speeds from the merged
+            // c_cflag exactly as Linux set_termios() does after
+            // user_termio_to_kernel_termios().
+            let (ispeed, ospeed) = PosixTermio::speeds_from_cflag(tmp_termios.control_mode);
+            tmp_termios.input_speed = ispeed;
+            tmp_termios.output_speed = ospeed;
         } else {
             let user_reader = UserBufferReader::new(
                 arg.as_ptr::<PosixTermios>(),

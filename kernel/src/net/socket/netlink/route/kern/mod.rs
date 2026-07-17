@@ -25,6 +25,8 @@ mod neigh;
 mod route;
 mod utils;
 
+pub(crate) use link::notify_link_change;
+
 /// 负责处理 Netlink 路由相关的内核模块
 /// 每个 net namespace 都有一个独立的 NetlinkRouteKernelSocket
 #[derive(Debug)]

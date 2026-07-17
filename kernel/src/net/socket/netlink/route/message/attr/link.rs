@@ -77,6 +77,11 @@ enum LinkAttrClass {
     PROTO_DOWN_REASON = 55,
     PARENT_DEV_NAME = 56,
     PARENT_DEV_BUS_NAME = 57,
+    GRO_MAX_SIZE = 58,
+    TSO_MAX_SIZE = 59,
+    TSO_MAX_SEGS = 60,
+    /// All-multicast count: > 0 means acts ALLMULTI.
+    ALLMULTI = 61,
 }
 
 impl TryFrom<u16> for LinkAttrClass {
@@ -92,6 +97,8 @@ pub enum LinkAttr {
     Address(Vec<u8>),
     Name(CString),
     Mtu(u32),
+    Promiscuity(u32),
+    Allmulti(u32),
     TxqLen(u32),
     LinkMode(u8),
     ExtMask(RtExtFilter),
@@ -103,6 +110,8 @@ impl LinkAttr {
             LinkAttr::Address(_) => LinkAttrClass::ADDRESS,
             LinkAttr::Name(_) => LinkAttrClass::IFNAME,
             LinkAttr::Mtu(_) => LinkAttrClass::MTU,
+            LinkAttr::Promiscuity(_) => LinkAttrClass::PROMISCUITY,
+            LinkAttr::Allmulti(_) => LinkAttrClass::ALLMULTI,
             LinkAttr::TxqLen(_) => LinkAttrClass::TXQLEN,
             LinkAttr::LinkMode(_) => LinkAttrClass::LINKMODE,
             LinkAttr::ExtMask(_) => LinkAttrClass::EXT_MASK,
@@ -133,6 +142,9 @@ impl Attribute for LinkAttr {
             LinkAttr::Name(name) => name.as_bytes_with_nul(),
             LinkAttr::Mtu(mtu) => unsafe {
                 core::slice::from_raw_parts(mtu as *const u32 as *const u8, 4)
+            },
+            LinkAttr::Promiscuity(count) | LinkAttr::Allmulti(count) => unsafe {
+                core::slice::from_raw_parts(count as *const u32 as *const u8, 4)
             },
             LinkAttr::TxqLen(txq_len) => unsafe {
                 core::slice::from_raw_parts(txq_len as *const u32 as *const u8, 4)
@@ -169,6 +181,14 @@ impl Attribute for LinkAttr {
                 let data = convert_one_from_raw_buf::<u32>(buf)?;
                 Self::Mtu(*data)
             }
+            (LinkAttrClass::PROMISCUITY, 4) => {
+                let data = convert_one_from_raw_buf::<u32>(buf)?;
+                Self::Promiscuity(*data)
+            }
+            (LinkAttrClass::ALLMULTI, 4) => {
+                let data = convert_one_from_raw_buf::<u32>(buf)?;
+                Self::Allmulti(*data)
+            }
             (LinkAttrClass::TXQLEN, 4) => {
                 let data = convert_one_from_raw_buf::<u32>(buf)?;
                 Self::TxqLen(*data)
@@ -185,6 +205,8 @@ impl Attribute for LinkAttr {
             (
                 LinkAttrClass::IFNAME
                 | LinkAttrClass::MTU
+                | LinkAttrClass::PROMISCUITY
+                | LinkAttrClass::ALLMULTI
                 | LinkAttrClass::TXQLEN
                 | LinkAttrClass::LINKMODE
                 | LinkAttrClass::EXT_MASK,

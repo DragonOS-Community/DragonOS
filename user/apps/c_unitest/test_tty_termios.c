@@ -1,15 +1,13 @@
-// test_tty_termios.c — quick smoke test for TTY termios/termio ioctls.
-//
-// This file intentionally overlaps with dunitest/suites/normal/tty_termios.cc.
-// The C version is a fast, self-contained static binary for QEMU serial-console
-// smoke testing.  The C++ gtest version is the full CI regression suite.
-// Keep both: the C test catches regressions in environments where dunitest
-// (which requires gtest, a runner, and a rootfs) cannot run.
 // test_tty_termios.c — verify TCSAFLUSH / TCSADRAIN and legacy termio ioctls
 // on a valid TTY fd (PTY slave).
 //
 // Regression coverage for: "tcsetattr(0, TCSAFLUSH, &t) fails with ENOTTY"
 // and TCSETA/TCSETAW/TCSETAF/TCGETA returning ENOIOCTLCMD.
+//
+// This file intentionally overlaps with dunitest/suites/normal/tty_termios.cc.
+// The C version is a fast, self-contained static binary for QEMU smoke testing.
+// The C++ gtest version is the full CI regression suite.  Keep both: the C test
+// catches regressions in environments where dunitest cannot run.
 
 #include <errno.h>
 #include <fcntl.h>

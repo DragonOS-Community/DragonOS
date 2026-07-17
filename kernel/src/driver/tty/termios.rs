@@ -363,8 +363,6 @@ bitflags! {
 }
 
 
-/// Shift to extract input baud rate bits from c_cflag (CIBAUD = 0x100f0000).
-pub const CIBAUD_SHIFT: u32 = 16;
 
 impl ControlMode {
     /// 获取波特率
@@ -400,6 +398,8 @@ impl ControlMode {
             Self::B2000000 => Some(2000000),
             Self::B2500000 => Some(2500000),
             Self::B3000000 => Some(3000000),
+            Self::B3500000 => Some(3500000),
+            Self::B4000000 => Some(4000000),
             _ => None,
         }
     }
@@ -416,6 +416,9 @@ impl ControlMode {
 }
 
 pub const NCC: usize = 8;
+
+/// Shift to extract input baud rate bits from c_cflag (CIBAUD = 0x100f0000).
+pub const CIBAUD_SHIFT: u32 = 16;
 
 /// Default c_line ABI value (N_TTY = 0).
 pub const INIT_C_LINE_ABI: u8 = 0;

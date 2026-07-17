@@ -1,12 +1,15 @@
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 
+use crate::bpf::classic::{self, validate_cbpf, SockFilter};
 use crate::net::socket::common::{
     parse_socket_buffer_size, parse_timeval_ticks, write_i32_getsockopt, write_timeval_ticks,
     write_u32_getsockopt, INFINITE_TIMEOUT_TICKS, SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF,
     SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX,
 };
 use crate::net::socket::{PSO, PSOL};
+use crate::rcu::rcu_defer_drop;
 
 use super::{packet_option, PacketSocket};
 
@@ -93,6 +96,60 @@ impl PacketSocket {
                 timeout.store(ticks, Ordering::Relaxed);
                 Ok(())
             }
+            Ok(PSO::ATTACH_FILTER) => {
+                let fprog = classic::parse_sock_fprog(val)?;
+                // Linux checks SOCK_FILTER_LOCKED after copying the fprog
+                // header, but before validating or reading its instruction
+                // pointer. Keep the final check below to close the race with
+                // a concurrent SO_LOCK_FILTER.
+                if *self.filter_locked.lock() {
+                    return Err(SystemError::EPERM);
+                }
+                let insns = classic::read_sock_fprog_insns(&fprog)?;
+                validate_cbpf(&insns)?;
+                let new_filter = Arc::try_new(insns).map_err(|_| SystemError::ENOMEM)?;
+
+                let old_filter = {
+                    let locked = self.filter_locked.lock();
+                    if *locked {
+                        return Err(SystemError::EPERM);
+                    }
+                    // SAFETY: `old_filter` keeps the removed slot reference
+                    // alive across unlock and is submitted to rcu_defer_drop
+                    // immediately below.
+                    unsafe { self.filter.swap(Some(new_filter)) }
+                };
+                if let Some(old_filter) = old_filter {
+                    rcu_defer_drop(old_filter);
+                }
+                Ok(())
+            }
+            Ok(PSO::DETACH_FILTER) => {
+                // Linux's SOL_SOCKET path validates and reads an int even
+                // though SO_DETACH_FILTER does not use its value.
+                let _ = Self::parse_i32(val)?;
+                let old_filter = {
+                    let locked = self.filter_locked.lock();
+                    if *locked {
+                        return Err(SystemError::EPERM);
+                    }
+                    // SAFETY: `old_filter` keeps the removed slot reference
+                    // alive across unlock and is submitted to rcu_defer_drop
+                    // immediately below.
+                    unsafe { self.filter.swap(None) }.ok_or(SystemError::ENOENT)?
+                };
+                rcu_defer_drop(old_filter);
+                Ok(())
+            }
+            Ok(PSO::LOCK_FILTER) => {
+                let lock_filter = Self::parse_i32(val)? != 0;
+                let mut locked = self.filter_locked.lock();
+                if *locked && !lock_filter {
+                    return Err(SystemError::EPERM);
+                }
+                *locked = lock_filter;
+                Ok(())
+            }
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
@@ -110,7 +167,38 @@ impl PacketSocket {
                 let ticks = self.socket_timeout_ticks(name)?.load(Ordering::Relaxed);
                 Ok(write_timeval_ticks(value, ticks))
             }
+            // SO_GET_FILTER shares its numeric value with SO_ATTACH_FILTER.
+            // The getsockopt ABI interprets the supplied buffer length and
+            // return value as instruction counts rather than byte counts.
+            Ok(PSO::ATTACH_FILTER) => self.get_filter(value),
+            Ok(PSO::LOCK_FILTER) => Ok(write_i32_getsockopt(
+                value,
+                *self.filter_locked.lock() as i32,
+            )),
             _ => Err(SystemError::ENOPROTOOPT),
         }
+    }
+
+    fn get_filter(&self, value: &mut [u8]) -> Result<usize, SystemError> {
+        let Some(filter) = self.filter.load() else {
+            return Ok(0);
+        };
+        let count = filter.len();
+        if value.is_empty() {
+            return Ok(count);
+        }
+
+        let insn_size = core::mem::size_of::<SockFilter>();
+        if value.len() / insn_size < count {
+            return Err(SystemError::EINVAL);
+        }
+
+        for (dst, insn) in value.chunks_exact_mut(insn_size).zip(filter.iter()) {
+            dst[..2].copy_from_slice(&insn.code.to_ne_bytes());
+            dst[2] = insn.jt;
+            dst[3] = insn.jf;
+            dst[4..8].copy_from_slice(&insn.k.to_ne_bytes());
+        }
+        Ok(count)
     }
 }

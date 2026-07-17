@@ -11,6 +11,7 @@ use core::sync::atomic::Ordering;
 use log::warn;
 use system_error::SystemError;
 
+use crate::bpf::classic::{self, BpfWidth, ClassicBpfInput, SockFilter};
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigType, SigactionType, SignalFlags},
@@ -98,85 +99,6 @@ const AUDIT_ARCH_RISCV64: u32 = 243 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
 #[cfg(target_arch = "loongarch64")]
 const AUDIT_ARCH_LOONGARCH64: u32 = 258 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
 
-// ============ Sock Filter / Sock Fprog ============
-
-/// Classic BPF 指令（对应 Linux struct sock_filter，8 字节）
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SockFilter {
-    pub code: u16,
-    pub jt: u8,
-    pub jf: u8,
-    pub k: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SockFprog {
-    pub len: u16,
-    _pad: [u8; 6],
-    pub filter: u64,
-}
-
-// ============ BPF 指令常量 ============
-// 参考 Linux include/uapi/linux/filter.h
-
-// 指令类型
-const BPF_LD: u16 = 0x00;
-const BPF_LDX: u16 = 0x01;
-const BPF_ST: u16 = 0x02;
-const BPF_STX: u16 = 0x03;
-const BPF_ALU: u16 = 0x04;
-const BPF_JMP: u16 = 0x05;
-const BPF_RET: u16 = 0x06;
-const BPF_MISC: u16 = 0x07;
-
-// 操作数宽度
-#[allow(dead_code)]
-const BPF_W: u16 = 0x00;
-
-// 寻址模式
-const BPF_IMM: u16 = 0x00;
-const BPF_ABS: u16 = 0x20;
-const BPF_MEM: u16 = 0x60;
-const BPF_LEN: u16 = 0x80;
-
-// 数据源
-const BPF_K: u16 = 0x00;
-const BPF_X: u16 = 0x08;
-const BPF_A: u16 = 0x10;
-const BPF_RVAL_MASK: u16 = 0x18;
-
-// ALU 操作
-const BPF_ADD: u16 = 0x00;
-const BPF_SUB: u16 = 0x10;
-const BPF_MUL: u16 = 0x20;
-const BPF_DIV: u16 = 0x30;
-const BPF_OR: u16 = 0x40;
-const BPF_AND: u16 = 0x50;
-const BPF_LSH: u16 = 0x60;
-const BPF_RSH: u16 = 0x70;
-const BPF_NEG: u16 = 0x80;
-const BPF_MOD: u16 = 0x90;
-const BPF_XOR: u16 = 0xa0;
-
-// JMP 操作
-const BPF_JA: u16 = 0x00;
-const BPF_JEQ: u16 = 0x10;
-const BPF_JGT: u16 = 0x20;
-const BPF_JGE: u16 = 0x30;
-const BPF_JSET: u16 = 0x40;
-
-// MISC 操作
-const BPF_TAX: u16 = 0x00;
-const BPF_TXA: u16 = 0x80;
-
-/// BPF 程序最大指令数（Linux 限制）
-const BPF_MAXINSNS: usize = 4096;
-
-/// BPF 记忆体大小（16 个 u32 字）
-const BPF_MEMWORDS: usize = 16;
-
 // ============ Strict 模式白名单 ============
 
 /// SECCOMP_MODE_STRICT 允许的系统调用白名单 (x86_64)
@@ -249,7 +171,8 @@ impl SeccompFilter {
 
     /// 执行此过滤器
     fn run(&self, data: &SeccompData) -> u32 {
-        let result = run_cbpf(&self.insns, data);
+        let input = SeccompBpfInput(data);
+        let result = classic::run_cbpf(&self.insns, &input);
 
         // 如果启用了 log 且结果不是 ALLOW，记录日志
         if self.log && (result & SECCOMP_RET_ACTION_FULL) != SECCOMP_RET_ALLOW {
@@ -260,246 +183,72 @@ impl SeccompFilter {
     }
 }
 
-// ============ cBPF 解释器 ============
+struct SeccompBpfInput<'a>(&'a SeccompData);
 
-/// 运行 classic BPF 程序
-///
-/// cBPF 寄存器模型：
-/// - A (u32): 累加器
-/// - X (u32): 索引寄存器
-/// - pc: 程序计数器
-/// - mem[16]: 记忆体
-fn run_cbpf(insns: &[SockFilter], data: &SeccompData) -> u32 {
-    let mut a: u32 = 0;
-    let mut x: u32 = 0;
-    let mut pc: usize = 0;
-    let mut mem = [0u32; BPF_MEMWORDS];
-
-    // 将 seccomp_data 转为字节切片以支持任意偏移读取
-    let data_bytes = unsafe {
-        core::slice::from_raw_parts(data as *const SeccompData as *const u8, SECCOMP_DATA_SIZE)
-    };
-
-    while pc < insns.len() {
-        let insn = &insns[pc];
-        let class = insn.code & 0x07;
-
-        match class {
-            BPF_LD => {
-                let mode = insn.code & 0xe0;
-                match mode {
-                    BPF_IMM => a = insn.k,
-                    BPF_ABS => {
-                        let offset = insn.k as usize;
-                        if offset + 4 <= SECCOMP_DATA_SIZE {
-                            a = u32::from_ne_bytes([
-                                data_bytes[offset],
-                                data_bytes[offset + 1],
-                                data_bytes[offset + 2],
-                                data_bytes[offset + 3],
-                            ]);
-                        }
-                        // 越界读取：保持 A 不变（与 Linux 一致）
-                    }
-                    BPF_MEM => {
-                        if (insn.k as usize) < BPF_MEMWORDS {
-                            a = mem[insn.k as usize];
-                        }
-                    }
-                    BPF_LEN => a = SECCOMP_DATA_SIZE as u32,
-                    _ => {}
-                }
-                pc += 1;
-            }
-            BPF_LDX => {
-                let mode = insn.code & 0xe0;
-                match mode {
-                    BPF_IMM => x = insn.k,
-                    BPF_MEM => {
-                        if (insn.k as usize) < BPF_MEMWORDS {
-                            x = mem[insn.k as usize];
-                        }
-                    }
-                    BPF_LEN => x = SECCOMP_DATA_SIZE as u32,
-                    _ => {}
-                }
-                pc += 1;
-            }
-            BPF_ST => {
-                if (insn.k as usize) < BPF_MEMWORDS {
-                    mem[insn.k as usize] = a;
-                }
-                pc += 1;
-            }
-            BPF_STX => {
-                if (insn.k as usize) < BPF_MEMWORDS {
-                    mem[insn.k as usize] = x;
-                }
-                pc += 1;
-            }
-            BPF_ALU => {
-                let op = insn.code & 0xf0;
-                let src = insn.code & 0x08;
-                let val = if src == BPF_K { insn.k } else { x };
-                match op {
-                    BPF_ADD => a = a.wrapping_add(val),
-                    BPF_SUB => a = a.wrapping_sub(val),
-                    BPF_MUL => a = a.wrapping_mul(val),
-                    BPF_DIV => a = a.checked_div(val).unwrap_or(0),
-                    BPF_OR => a |= val,
-                    BPF_AND => a &= val,
-                    BPF_LSH => a = a.wrapping_shl(val),
-                    BPF_RSH => a = a.wrapping_shr(val),
-                    BPF_NEG => a = a.wrapping_neg(),
-                    BPF_MOD => a = a.checked_rem(val).unwrap_or(0),
-                    BPF_XOR => a ^= val,
-                    _ => {}
-                }
-                pc += 1;
-            }
-            BPF_JMP => {
-                let op = insn.code & 0xf0;
-                if op == BPF_JA {
-                    // 无条件跳转
-                    pc = pc.wrapping_add(1).wrapping_add(insn.k as usize);
-                } else {
-                    // 条件跳转
-                    let src = insn.code & 0x08;
-                    let val = if src == BPF_K { insn.k } else { x };
-                    let cond = match op {
-                        BPF_JEQ => a == val,
-                        BPF_JGT => a > val,
-                        BPF_JGE => a >= val,
-                        BPF_JSET => (a & val) != 0,
-                        _ => false,
-                    };
-                    if cond {
-                        pc += 1 + insn.jt as usize;
-                    } else {
-                        pc += 1 + insn.jf as usize;
-                    }
-                }
-            }
-            BPF_RET => {
-                let rval = insn.code & BPF_RVAL_MASK;
-                return if rval == BPF_K { insn.k } else { a };
-            }
-            BPF_MISC => {
-                let op = insn.code & 0xf8;
-                match op {
-                    BPF_TAX => x = a,
-                    BPF_TXA => a = x,
-                    _ => {}
-                }
-                pc += 1;
-            }
-            _ => {
-                pc += 1;
-            }
-        }
+impl ClassicBpfInput for SeccompBpfInput<'_> {
+    #[inline]
+    fn len(&self) -> u32 {
+        SECCOMP_DATA_SIZE as u32
     }
 
-    // 如果程序没有返回指令（不应该通过验证器），默认 KILL_THREAD
-    SECCOMP_RET_KILL_THREAD
+    fn load(&self, offset: i32, width: BpfWidth) -> Option<u32> {
+        if width != BpfWidth::Word || offset < 0 || offset & 3 != 0 {
+            return None;
+        }
+
+        let offset = offset as usize;
+        match offset {
+            0 => Some(self.0.nr as u32),
+            4 => Some(self.0.arch),
+            8 | 12 => Some(native_u64_word(
+                self.0.instruction_pointer,
+                (offset - 8) / 4,
+            )),
+            16..SECCOMP_DATA_SIZE => {
+                let relative = offset - 16;
+                let arg = *self.0.args.get(relative / 8)?;
+                Some(native_u64_word(arg, (relative % 8) / 4))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[inline]
+fn native_u64_word(value: u64, index: usize) -> u32 {
+    #[cfg(target_endian = "little")]
+    let shift = index * 32;
+    #[cfg(target_endian = "big")]
+    let shift = (1 - index) * 32;
+    (value >> shift) as u32
 }
 
 // ============ BPF 验证器 ============
 
-/// 验证 seccomp BPF 程序的合法性
+/// 验证 seccomp BPF 程序的合法性。
 ///
-/// 检查项：
-/// 1. 所有指令都在 seccomp 允许的子集内
-/// 2. 跳转目标不越界
-/// 3. BPF_LD|BPF_W|BPF_ABS 的偏移量在 seccomp_data 范围内且 4 字节对齐
-/// 4. 内存索引 < 16
+/// 先调用通用 `validate_cbpf` 进行结构性检查，再叠加 seccomp 专有限制：
+/// 1. LD/LDX 只允许 BPF_W 宽度（seccomp 不使用 H/B）
+/// 2. 不允许 BPF_IND 变址加载
+/// 3. BPF_ABS 偏移必须在 SeccompData 范围内且 4 字节对齐
 fn validate_seccomp_filter(insns: &[SockFilter]) -> Result<(), SystemError> {
-    if insns.is_empty() {
-        return Err(SystemError::EINVAL);
-    }
-    if insns.len() > BPF_MAXINSNS {
-        return Err(SystemError::EINVAL);
-    }
-    if (insns[insns.len() - 1].code & 0x07) != BPF_RET {
-        return Err(SystemError::EINVAL);
-    }
+    classic::validate_cbpf(insns)?;
 
-    for (pc, insn) in insns.iter().enumerate() {
+    for insn in insns {
         match insn.code {
-            code if code == (BPF_LD | BPF_W | BPF_ABS) => {
+            0x20 => {
                 let offset = insn.k as usize;
                 if !offset.is_multiple_of(4) || offset.saturating_add(4) > SECCOMP_DATA_SIZE {
                     return Err(SystemError::EINVAL);
                 }
             }
-            code if code == (BPF_LD | BPF_W | BPF_LEN) => {}
-            code if code == (BPF_LDX | BPF_W | BPF_LEN) => {}
-            code if code == (BPF_LD | BPF_IMM) => {}
-            code if code == (BPF_LDX | BPF_IMM) => {}
-            code if code == (BPF_LD | BPF_MEM) || code == (BPF_LDX | BPF_MEM) => {
-                if insn.k as usize >= BPF_MEMWORDS {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-            code if code == BPF_ST || code == BPF_STX => {
-                if insn.k as usize >= BPF_MEMWORDS {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-            code if code == (BPF_ALU | BPF_ADD | BPF_K)
-                || code == (BPF_ALU | BPF_ADD | BPF_X)
-                || code == (BPF_ALU | BPF_SUB | BPF_K)
-                || code == (BPF_ALU | BPF_SUB | BPF_X)
-                || code == (BPF_ALU | BPF_MUL | BPF_K)
-                || code == (BPF_ALU | BPF_MUL | BPF_X)
-                || code == (BPF_ALU | BPF_DIV | BPF_K)
-                || code == (BPF_ALU | BPF_DIV | BPF_X)
-                || code == (BPF_ALU | BPF_OR | BPF_K)
-                || code == (BPF_ALU | BPF_OR | BPF_X)
-                || code == (BPF_ALU | BPF_AND | BPF_K)
-                || code == (BPF_ALU | BPF_AND | BPF_X)
-                || code == (BPF_ALU | BPF_LSH | BPF_K)
-                || code == (BPF_ALU | BPF_LSH | BPF_X)
-                || code == (BPF_ALU | BPF_RSH | BPF_K)
-                || code == (BPF_ALU | BPF_RSH | BPF_X)
-                || code == (BPF_ALU | BPF_NEG)
-                || code == (BPF_ALU | BPF_XOR | BPF_K)
-                || code == (BPF_ALU | BPF_XOR | BPF_X) =>
-            {
-                if code == (BPF_ALU | BPF_DIV | BPF_K) && insn.k == 0 {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-            code if code == (BPF_JMP | BPF_JA) => {
-                let Some(target) = pc
-                    .checked_add(1)
-                    .and_then(|x| x.checked_add(insn.k as usize))
-                else {
-                    return Err(SystemError::EINVAL);
-                };
-                if target >= insns.len() {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-            code if code == (BPF_JMP | BPF_JEQ | BPF_K)
-                || code == (BPF_JMP | BPF_JEQ | BPF_X)
-                || code == (BPF_JMP | BPF_JGT | BPF_K)
-                || code == (BPF_JMP | BPF_JGT | BPF_X)
-                || code == (BPF_JMP | BPF_JGE | BPF_K)
-                || code == (BPF_JMP | BPF_JGE | BPF_X)
-                || code == (BPF_JMP | BPF_JSET | BPF_K)
-                || code == (BPF_JMP | BPF_JSET | BPF_X) =>
-            {
-                let jt_target = pc + 1 + insn.jt as usize;
-                let jf_target = pc + 1 + insn.jf as usize;
-                if jt_target >= insns.len() || jf_target >= insns.len() {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-            code if code == (BPF_RET | BPF_K) || code == (BPF_RET | BPF_A) => {}
-            code if code == (BPF_MISC | BPF_TAX) || code == (BPF_MISC | BPF_TXA) => {}
-            _ => {
-                return Err(SystemError::EINVAL);
-            }
+            // 与 Linux seccomp_check_filter 的显式白名单一致。特别地，通用
+            // socket cBPF 接受 MOD，而 seccomp ABI 不接受 MOD K/X。
+            0x06 | 0x16 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c | 0x54 | 0x5c
+            | 0x44 | 0x4c | 0xa4 | 0xac | 0x64 | 0x6c | 0x74 | 0x7c | 0x84 | 0x00 | 0x01 | 0x80
+            | 0x81 | 0x60 | 0x61 | 0x02 | 0x03 | 0x07 | 0x87 | 0x05 | 0x15 | 0x1d | 0x35 | 0x3d
+            | 0x25 | 0x2d | 0x45 | 0x4d => {}
+            _ => return Err(SystemError::EINVAL),
         }
     }
 
@@ -854,15 +603,14 @@ pub fn seccomp_set_mode_filter(fprog_ptr: u64, flags: u32) -> Result<(), SystemE
     let log = (flags & SECCOMP_FILTER_FLAG_LOG) != 0;
     let tsync = (flags & SECCOMP_FILTER_FLAG_TSYNC) != 0;
 
-    // 从用户空间读取 sock_fprog
-    let fprog = read_sock_fprog(fprog_ptr)?;
+    // 从用户空间读取 sock_fprog 结构（16 字节）
+    let fprog_size = core::mem::size_of::<classic::SockFprog>();
+    let mut fprog_buf = [0u8; core::mem::size_of::<classic::SockFprog>()];
+    let reader = UserBufferReader::new(fprog_ptr as *const u8, fprog_size, true)?;
+    reader.copy_from_user_protected(&mut fprog_buf, 0)?;
 
-    if fprog.len == 0 || fprog.len as usize > BPF_MAXINSNS {
-        return Err(SystemError::EINVAL);
-    }
-
-    // 从用户空间读取 filter 指令
-    let insns = read_filter_insns(fprog.filter, fprog.len as usize)?;
+    // 解析并读取 filter 指令
+    let insns = classic::read_sock_fprog(&fprog_buf)?;
 
     // 获取当前 filter 链头作为 prev
     let prev = current.seccomp_filter.lock().clone();
@@ -984,49 +732,6 @@ fn is_filter_ancestor(
     }
 
     false
-}
-
-/// 从用户空间读取 sock_fprog 结构
-fn read_sock_fprog(ptr: u64) -> Result<SockFprog, SystemError> {
-    let size = core::mem::size_of::<SockFprog>();
-    let mut buf = [0u8; core::mem::size_of::<SockFprog>()];
-
-    let reader = UserBufferReader::new(ptr as *const u8, size, true)?;
-    reader.copy_from_user_protected(&mut buf, 0)?;
-
-    let len = u16::from_ne_bytes([buf[0], buf[1]]);
-    let filter = u64::from_ne_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
-
-    Ok(SockFprog {
-        len,
-        _pad: [0u8; 6],
-        filter,
-    })
-}
-
-/// 从用户空间读取 filter 指令数组
-fn read_filter_insns(ptr: u64, count: usize) -> Result<Vec<SockFilter>, SystemError> {
-    let insn_size = core::mem::size_of::<SockFilter>();
-    let byte_len = count.checked_mul(insn_size).ok_or(SystemError::EINVAL)?;
-
-    let mut buf = alloc::vec![0u8; byte_len];
-
-    let reader = UserBufferReader::new(ptr as *const u8, byte_len, true)?;
-    reader.copy_from_user_protected(&mut buf, 0)?;
-
-    let mut insns = Vec::with_capacity(count);
-    for chunk in buf.chunks_exact(insn_size) {
-        insns.push(SockFilter {
-            code: u16::from_ne_bytes([chunk[0], chunk[1]]),
-            jt: chunk[2],
-            jf: chunk[3],
-            k: u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
-        });
-    }
-
-    Ok(insns)
 }
 
 /// fork 时复制 seccomp 状态

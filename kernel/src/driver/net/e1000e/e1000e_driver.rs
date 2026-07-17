@@ -90,9 +90,7 @@ impl phy::RxToken for E1000ERxToken {
         // 向注册的 packet socket 分发数据包
         if let Some(iface) = self.driver.iface() {
             let pkt_type = crate::net::socket::packet::classify_packet(packet, &iface);
-            if let Some(netns) = iface.net_namespace() {
-                netns.deliver_to_packet_sockets(iface.nic_id() as u32, packet, pkt_type);
-            }
+            crate::net::socket::packet::deliver_to_packet_sockets(&iface, packet, pkt_type);
         }
 
         let result = f(packet);
@@ -313,7 +311,7 @@ impl E1000EInterface {
             driver,
             common: IfaceCommon::new(
                 iface_id,
-                crate::driver::net::types::InterfaceType::EETHER,
+                crate::driver::net::types::InterfaceType::ETHER,
                 name,
                 mtu,
                 flags,

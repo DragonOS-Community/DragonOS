@@ -20,6 +20,7 @@
 #include <net/if_arp.h>
 #include <netinet/if_ether.h>
 #include <netpacket/packet.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -57,6 +58,21 @@
 #define TP_STATUS_USER 1
 #endif
 
+inline constexpr int kSoAttachFilter = 26;
+inline constexpr int kSoDetachFilter = 27;
+
+struct TestSockFilter {
+    uint16_t code;
+    uint8_t jt;
+    uint8_t jf;
+    uint32_t k;
+};
+
+struct TestSockFprog {
+    uint16_t len;
+    TestSockFilter* filter;
+};
+
 namespace {
 
 inline constexpr int kArpPktLen = 28;
@@ -65,6 +81,7 @@ inline constexpr int kArpFrameLen = kEthHdrLen + kArpPktLen;  // 42
 inline constexpr size_t kVlanFrameLen = 1518;
 inline constexpr int kEthFrameLen = 1514;
 inline constexpr uint16_t kPrivateEtherType = 0x88b5;
+inline constexpr uint16_t kVlanEtherType = 0x8100;
 
 inline constexpr const char* kLocalIp = "10.0.2.15";
 inline constexpr const char* kGateway = "10.0.2.2";
@@ -303,6 +320,35 @@ int ProbeIfindex(const std::string& ifname) {
     int idx = GetIfIndex(ctrl, ifname);
     close(ctrl);
     return idx;
+}
+
+int AttachFilter(int fd, TestSockFilter* filter, uint16_t len) {
+    TestSockFprog program{len, filter};
+    return setsockopt(fd, SOL_SOCKET, kSoAttachFilter, &program, sizeof(program));
+}
+
+struct FilterSwapStress {
+    int fd;
+    int error{0};
+};
+
+void* ReplaceAndDetachFilters(void* raw) {
+    auto* stress = static_cast<FilterSwapStress*>(raw);
+    TestSockFilter accept_all[] = {{0x06, 0, 0, 0xffffffffU}};
+    TestSockFilter drop_all[] = {{0x06, 0, 0, 0}};
+    int ignored = 0;
+    constexpr unsigned int kControlCycles = 256;
+    for (unsigned int cycle = 0; cycle < kControlCycles; ++cycle) {
+        if (AttachFilter(stress->fd, accept_all, 1) != 0 ||
+            AttachFilter(stress->fd, drop_all, 1) != 0 ||
+            setsockopt(stress->fd, SOL_SOCKET, kSoDetachFilter, &ignored,
+                       sizeof(ignored)) != 0) {
+            stress->error = errno == 0 ? EIO : errno;
+            break;
+        }
+    }
+
+    return nullptr;
 }
 
 }  // namespace
@@ -566,6 +612,60 @@ TEST(AfPacketE2E, DgramSendReturnsLayer3PayloadLen) {
         << "DGRAM sendto should return L3 payload length 28: " << ErrnoString(errno);
 }
 
+TEST(AfPacketE2E, DgramReceivesHeaderOnlyFrameWithoutFilter) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic zero-length receive testing";
+
+    FdGuard receiver(socket(AF_PACKET, SOCK_DGRAM, htons(kPrivateEtherType)));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    struct sockaddr_ll bind_addr{};
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(kPrivateEtherType);
+    bind_addr.sll_ifindex = ifindex;
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)), 0)
+        << ErrnoString(errno);
+    struct timeval timeout{1, 0};
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                         sizeof(timeout)),
+              0)
+        << ErrnoString(errno);
+
+    uint8_t local_mac[6];
+    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    uint8_t frame[kEthHdrLen]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kPrivateEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+    ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
+                     reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
+              static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
+
+    uint8_t byte = 0xaa;
+    struct sockaddr_ll from{};
+    socklen_t from_len = sizeof(from);
+    ASSERT_EQ(recvfrom(receiver.Get(), &byte, sizeof(byte), 0,
+                       reinterpret_cast<sockaddr*>(&from), &from_len),
+              0)
+        << "header-only SOCK_DGRAM packet must be queued: " << ErrnoString(errno);
+    EXPECT_EQ(byte, 0xaa);
+    EXPECT_EQ(from.sll_pkttype, PACKET_OUTGOING);
+    EXPECT_EQ(ntohs(from.sll_protocol), kPrivateEtherType);
+}
+
 // A socket created with a non-zero protocol is wildcard-bound until an explicit
 // bind. Exercise the netns registry, short-iovec MSG_TRUNC, full name length and
 // the minimum truthful PACKET_AUXDATA fields together.
@@ -710,6 +810,61 @@ TEST(AfPacketE2E, VethAcceptsFullMtuVlanFrame) {
         << ErrnoString(errno);
 }
 
+TEST(AfPacketE2E, OutgoingRawFilterPreservesInlineVlanHeader) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic outgoing VLAN testing";
+
+    uint8_t local_mac[6];
+    FdGuard receiver(MakeBoundRaw(ifname, ifindex, local_mac));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    TestSockFilter outgoing_vlan[] = {
+        {0x20, 0, 0, 0xfffff004U},  // LD W ABS SKF_AD_OFF + SKF_AD_PKTTYPE
+        {0x15, 0, 3, PACKET_OUTGOING},
+        {0x28, 0, 0, 12},  // LD H ABS Ethernet EtherType
+        {0x15, 0, 1, kVlanEtherType},
+        {0x06, 0, 0, 0xffffffffU},
+        {0x06, 0, 0, 0},
+    };
+    ASSERT_EQ(AttachFilter(receiver.Get(), outgoing_vlan, 6), 0) << ErrnoString(errno);
+
+    uint8_t frame[96]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kVlanEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kVlanEtherType);
+    frame[14] = 0x00;
+    frame[15] = 0x2a;
+    frame[16] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[17] = static_cast<uint8_t>(kPrivateEtherType);
+    std::memcpy(frame + 18, "outgoing-vlan", 13);
+
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kVlanEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+    ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
+                     reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
+              static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
+
+    uint8_t received[sizeof(frame)]{};
+    struct sockaddr_ll from{};
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(receiver.Get(), received, sizeof(received), 0,
+                         reinterpret_cast<sockaddr*>(&from), &from_len);
+    ASSERT_EQ(n, static_cast<ssize_t>(sizeof(frame))) << ErrnoString(errno);
+    EXPECT_EQ(from.sll_pkttype, PACKET_OUTGOING);
+    EXPECT_EQ(ntohs(from.sll_protocol), kVlanEtherType);
+    EXPECT_EQ(std::memcmp(received, frame, sizeof(frame)), 0);
+}
+
 TEST(AfPacketE2E, ReceiveBufferSizeControlsQueuedBytes) {
     const std::string ifname = "veth1";
     int ifindex = ProbeIfindex(ifname);
@@ -783,6 +938,178 @@ TEST(AfPacketE2E, ReceiveBufferSizeControlsQueuedBytes) {
     EXPECT_GT(small_count, 0);
     EXPECT_GT(large_count, small_count)
         << "sent=" << sent << " small=" << small_count << " large=" << large_count;
+}
+
+TEST(AfPacketE2E, ClassicFilterSnaplenAndRuntimeErrorsAreFailClosed) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic cBPF testing";
+
+    auto make_receiver = [ifindex]() {
+        int fd = socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType));
+        if (fd < 0) return fd;
+        struct sockaddr_ll bind_addr{};
+        bind_addr.sll_family = AF_PACKET;
+        bind_addr.sll_protocol = htons(kPrivateEtherType);
+        bind_addr.sll_ifindex = ifindex;
+        if (bind(fd, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
+            close(fd);
+            return -1;
+        }
+        struct timeval tv{1, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        return fd;
+    };
+
+    FdGuard receiver(make_receiver());
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    uint8_t local_mac[6];
+    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    uint8_t frame[96]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kPrivateEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+
+    auto send_one = [&]() {
+        ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
+                         reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
+                  static_cast<ssize_t>(sizeof(frame)))
+            << ErrnoString(errno);
+    };
+
+    TestSockFilter snap_to_eight[] = {{0x06, 0, 0, 8}};  // RET #8
+    ASSERT_EQ(AttachFilter(receiver.Get(), snap_to_eight, 1), 0) << ErrnoString(errno);
+    send_one();
+    uint8_t buffer[128]{};
+    EXPECT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), MSG_TRUNC), 8)
+        << "MSG_TRUNC must report filtered snaplen";
+
+    TestSockFilter oob_then_accept[] = {
+        {0x20, 0, 0, 0x7fffffffU},  // LD W ABS, runtime OOB
+        {0x06, 0, 0, 0xffffffffU},
+    };
+    ASSERT_EQ(AttachFilter(receiver.Get(), oob_then_accept, 2), 0) << ErrnoString(errno);
+    send_one();
+    errno = 0;
+    EXPECT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << ErrnoString(errno);
+
+    TestSockFilter divide_by_zero_then_accept[] = {
+        {0x01, 0, 0, 0},           // LDX IMM #0
+        {0x3c, 0, 0, 0},           // DIV X
+        {0x06, 0, 0, 0xffffffffU},
+    };
+    ASSERT_EQ(AttachFilter(receiver.Get(), divide_by_zero_then_accept, 3), 0)
+        << ErrnoString(errno);
+    send_one();
+    errno = 0;
+    EXPECT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << ErrnoString(errno);
+
+    FdGuard arp_receiver(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP)));
+    ASSERT_GE(arp_receiver.Get(), 0) << ErrnoString(errno);
+    struct sockaddr_ll arp_bind{};
+    arp_bind.sll_family = AF_PACKET;
+    arp_bind.sll_protocol = htons(ETH_P_ARP);
+    arp_bind.sll_ifindex = ifindex;
+    ASSERT_EQ(bind(arp_receiver.Get(), reinterpret_cast<sockaddr*>(&arp_bind), sizeof(arp_bind)), 0)
+        << ErrnoString(errno);
+    struct timeval timeout{1, 0};
+    ASSERT_EQ(setsockopt(arp_receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                         sizeof(timeout)),
+              0);
+    TestSockFilter pay_offset[] = {
+        {0x20, 0, 0, 0xfffff034U},  // LD W ABS SKF_AD_OFF + SKF_AD_PAY_OFFSET
+        {0x16, 0, 0, 0},            // RET A
+    };
+    ASSERT_EQ(AttachFilter(arp_receiver.Get(), pay_offset, 2), 0) << ErrnoString(errno);
+    frame[12] = static_cast<uint8_t>(ETH_P_ARP >> 8);
+    frame[13] = static_cast<uint8_t>(ETH_P_ARP);
+    dst.sll_protocol = htons(ETH_P_ARP);
+    ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
+                     reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
+              static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
+    EXPECT_EQ(recv(arp_receiver.Get(), buffer, sizeof(buffer), MSG_TRUNC), kEthHdrLen)
+        << "Linux skb_get_poff returns the network offset for ARP";
+}
+
+TEST(AfPacketE2E, FilterReplacementPreservesReceiveState) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic cBPF testing";
+
+    FdGuard receiver(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    struct sockaddr_ll bind_addr{};
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(kPrivateEtherType);
+    bind_addr.sll_ifindex = ifindex;
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)), 0)
+        << ErrnoString(errno);
+    struct timeval timeout{1, 0};
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0)
+        << ErrnoString(errno);
+
+    uint8_t local_mac[6];
+    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    uint8_t frame[96]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kPrivateEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+
+    auto send_one = [&]() {
+        return sendto(sender.Get(), frame, sizeof(frame), 0,
+                      reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+    };
+    TestSockFilter accept_all[] = {{0x06, 0, 0, 0xffffffffU}};
+    ASSERT_EQ(AttachFilter(receiver.Get(), accept_all, 1), 0) << ErrnoString(errno);
+    ASSERT_EQ(send_one(), static_cast<ssize_t>(sizeof(frame))) << ErrnoString(errno);
+    uint8_t buffer[128]{};
+    ASSERT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
+
+    FilterSwapStress stress{receiver.Get()};
+    pthread_t control{};
+    ASSERT_EQ(pthread_create(&control, nullptr, ReplaceAndDetachFilters, &stress), 0);
+    ASSERT_EQ(pthread_join(control, nullptr), 0);
+    EXPECT_EQ(stress.error, 0) << ErrnoString(stress.error);
+
+    ASSERT_EQ(AttachFilter(receiver.Get(), accept_all, 1), 0) << ErrnoString(errno);
+    ASSERT_EQ(send_one(), static_cast<ssize_t>(sizeof(frame))) << ErrnoString(errno);
+    ASSERT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), static_cast<ssize_t>(sizeof(frame)))
+        << "filter control path must remain usable after the stress phase: "
+        << ErrnoString(errno);
+
+    int ignored = 0;
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, kSoDetachFilter, &ignored, sizeof(ignored)), 0)
+        << ErrnoString(errno);
+    ASSERT_EQ(send_one(), static_cast<ssize_t>(sizeof(frame))) << ErrnoString(errno);
+    EXPECT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), static_cast<ssize_t>(sizeof(frame)))
+        << "detached socket must continue receiving after the stress phase: "
+        << ErrnoString(errno);
 }
 
 int main(int argc, char** argv) {

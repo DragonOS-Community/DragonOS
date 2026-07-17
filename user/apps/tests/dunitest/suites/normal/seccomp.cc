@@ -361,6 +361,51 @@ TEST(SeccompTest, UnalignedUserFilterPointerIsParsedSafely) {
   EXPECT_EQ(WEXITSTATUS(status), kOk);
 }
 
+TEST(SeccompTest, RejectsSocketOnlyAndModuloOpcodes) {
+  int status = ChildStatus([] {
+    RequireNoNewPrivs();
+
+    struct sock_filter mod_k[] = {
+        BPF_STMT(BPF_LD | BPF_IMM, 7),
+        BPF_STMT(BPF_ALU | BPF_MOD | BPF_K, 3),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    errno = 0;
+    if (InstallFilter(mod_k, sizeof(mod_k) / sizeof(mod_k[0])) != -1 ||
+        errno != EINVAL) {
+      _exit(3);
+    }
+
+    struct sock_filter mod_x[] = {
+        BPF_STMT(BPF_LDX | BPF_IMM, 3),
+        BPF_STMT(BPF_LD | BPF_IMM, 7),
+        BPF_STMT(BPF_ALU | BPF_MOD | BPF_X, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    errno = 0;
+    if (InstallFilter(mod_x, sizeof(mod_x) / sizeof(mod_x[0])) != -1 ||
+        errno != EINVAL) {
+      _exit(4);
+    }
+
+    struct sock_filter packet_indirect[] = {
+        BPF_STMT(BPF_LDX | BPF_IMM, 0),
+        BPF_STMT(BPF_LD | BPF_W | BPF_IND, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    errno = 0;
+    if (InstallFilter(packet_indirect,
+                      sizeof(packet_indirect) / sizeof(packet_indirect[0])) != -1 ||
+        errno != EINVAL) {
+      _exit(5);
+    }
+    _exit(kOk);
+  });
+
+  ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+  EXPECT_EQ(WEXITSTATUS(status), kOk);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

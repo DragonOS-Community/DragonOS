@@ -3,6 +3,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETSOCKOPT;
 use crate::arch::MMArch;
+use crate::bpf::classic::{SockFilter, BPF_MAXINSNS};
 use crate::mm::MemoryManagementArch;
 use crate::net::socket::inet::stream::TcpOption;
 use crate::net::socket::{PSO, PSOL};
@@ -130,6 +131,11 @@ pub(super) fn do_getsockopt(
     optlen: *mut u32,
     from_user: bool,
 ) -> Result<usize, SystemError> {
+    // Linux resolves the descriptor before reading optlen. This preserves
+    // EBADF/ENOTSOCK precedence over length-pointer failures.
+    let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+    let socket = socket_inode.as_socket().unwrap();
+
     // 参数合法性检查
     if optlen.is_null() {
         return Err(SystemError::EFAULT);
@@ -137,15 +143,19 @@ pub(super) fn do_getsockopt(
 
     // 使用 UserBufferReader 读取用户提供的缓冲区长度
     let optlen_reader = UserBufferReader::new(optlen, core::mem::size_of::<u32>(), from_user)?;
-    let user_len = optlen_reader.buffer_protected(0)?.read_one::<u32>(0)? as usize;
-
-    if user_len > MAX_OPTVAL_LEN {
+    // Linux copies socklen_t into an int and rejects negative lengths before
+    // dispatching the option. Preserve that signed 32-bit ABI here.
+    let signed_user_len = optlen_reader.buffer_protected(0)?.read_one::<u32>(0)? as i32;
+    if signed_user_len < 0 {
         return Err(SystemError::EINVAL);
     }
+    let user_len = signed_user_len as usize;
 
-    // 获取socket
-    let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-    let socket = socket_inode.as_socket().unwrap();
+    let get_filter = level == PSOL::SOCKET as usize
+        && matches!(PSO::try_from(optname as u32), Ok(PSO::ATTACH_FILTER));
+    if user_len > MAX_OPTVAL_LEN && !get_filter {
+        return Err(SystemError::EINVAL);
+    }
 
     let level = PSOL::try_from(level as u32)?;
 
@@ -153,6 +163,31 @@ pub(super) fn do_getsockopt(
         let opt = PSO::try_from(optname as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
 
         match opt {
+            // SO_GET_FILTER shares value 26 with SO_ATTACH_FILTER. Unlike
+            // ordinary getsockopt options, optlen is an instruction count.
+            PSO::ATTACH_FILTER => {
+                let insn_size = core::mem::size_of::<SockFilter>();
+                let capacity = user_len.min(BPF_MAXINSNS);
+                let byte_capacity = capacity.checked_mul(insn_size).ok_or(SystemError::ENOMEM)?;
+                let mut kbuf = Vec::new();
+                kbuf.try_reserve_exact(byte_capacity)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                kbuf.resize(byte_capacity, 0);
+                let count = socket.option(level, optname, &mut kbuf)?;
+
+                if user_len != 0 && count != 0 {
+                    let bytes = count * insn_size;
+                    let mut optval_writer = UserBufferWriter::new(optval, bytes, from_user)?;
+                    optval_writer.copy_to_user_protected(&kbuf[..bytes], 0)?;
+                }
+
+                let mut optlen_writer =
+                    UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
+                optlen_writer
+                    .buffer_protected(0)?
+                    .write_one::<u32>(0, &(count as u32))?;
+                return Ok(0);
+            }
             PSO::SNDBUF => {
                 let need = core::mem::size_of::<u32>();
                 let out_len = calc_out_len(optval, user_len, need);

@@ -379,7 +379,12 @@ TEST(MountReconfigure, NoexecRejectsExec) {
     int fd = open(target_file, O_RDONLY);
     ASSERT_GE(fd, 0) << strerror(errno);
     errno = 0;
-    void *mapping = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    void *mapping = mmap(NULL, 0, PROT_EXEC, MAP_PRIVATE, fd, 0);
+    EXPECT_EQ(MAP_FAILED, mapping);
+    EXPECT_EQ(EINVAL, errno);
+
+    errno = 0;
+    mapping = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
     EXPECT_EQ(MAP_FAILED, mapping);
     EXPECT_EQ(EPERM, errno);
 

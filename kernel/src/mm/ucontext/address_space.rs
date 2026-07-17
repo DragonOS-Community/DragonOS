@@ -523,6 +523,10 @@ impl AddressSpace {
             sysv_shm,
             fixed_noreplace_conflict_error_before_mmap_min,
         } = args;
+        let len = page_align_up(len);
+        if len == 0 {
+            return Err(SystemError::EINVAL);
+        }
         let noexec = file
             .inode()
             .mount_flags()
@@ -531,10 +535,6 @@ impl AddressSpace {
             return Err(SystemError::EPERM);
         }
         may_exec &= !noexec;
-        let len = page_align_up(len);
-        if len == 0 {
-            return Err(SystemError::EINVAL);
-        }
 
         let _force_lazy_on_page_fault_arch = allocate_at_once && MMArch::PAGE_FAULT_ENABLED;
 

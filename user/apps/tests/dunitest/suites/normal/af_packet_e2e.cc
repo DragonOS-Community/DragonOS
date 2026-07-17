@@ -586,6 +586,60 @@ TEST(AfPacketE2E, DgramSendReturnsLayer3PayloadLen) {
         << "DGRAM sendto should return L3 payload length 28: " << ErrnoString(errno);
 }
 
+TEST(AfPacketE2E, DgramReceivesHeaderOnlyFrameWithoutFilter) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic zero-length receive testing";
+
+    FdGuard receiver(socket(AF_PACKET, SOCK_DGRAM, htons(kPrivateEtherType)));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    struct sockaddr_ll bind_addr{};
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(kPrivateEtherType);
+    bind_addr.sll_ifindex = ifindex;
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)), 0)
+        << ErrnoString(errno);
+    struct timeval timeout{1, 0};
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                         sizeof(timeout)),
+              0)
+        << ErrnoString(errno);
+
+    uint8_t local_mac[6];
+    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    uint8_t frame[kEthHdrLen]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kPrivateEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+    ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
+                     reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
+              static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
+
+    uint8_t byte = 0xaa;
+    struct sockaddr_ll from{};
+    socklen_t from_len = sizeof(from);
+    ASSERT_EQ(recvfrom(receiver.Get(), &byte, sizeof(byte), 0,
+                       reinterpret_cast<sockaddr*>(&from), &from_len),
+              0)
+        << "header-only SOCK_DGRAM packet must be queued: " << ErrnoString(errno);
+    EXPECT_EQ(byte, 0xaa);
+    EXPECT_EQ(from.sll_pkttype, PACKET_OUTGOING);
+    EXPECT_EQ(ntohs(from.sll_protocol), kPrivateEtherType);
+}
+
 // A socket created with a non-zero protocol is wildcard-bound until an explicit
 // bind. Exercise the netns registry, short-iovec MSG_TRUNC, full name length and
 // the minimum truthful PACKET_AUXDATA fields together.

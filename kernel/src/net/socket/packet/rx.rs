@@ -746,11 +746,12 @@ impl PacketSocket {
         let wire_len = input.data_len();
         let filter_result = self
             .filter
-            .with_read_if_present(|prog| crate::bpf::classic::run_cbpf(prog, &input))
-            .unwrap_or_else(|| wire_len.min(u32::MAX as usize) as u32);
-        if filter_result == 0 {
-            return;
-        }
+            .with_read_if_present(|prog| crate::bpf::classic::run_cbpf(prog, &input));
+        let data_len = match filter_result {
+            Some(0) => return,
+            Some(snaplen) => wire_len.min(snaplen as usize),
+            None => wire_len,
+        };
         // Linux runs the socket filter before checking sk_rmem_alloc: a packet
         // rejected by cBPF is not counted as a receive-buffer drop. Keep this
         // cheap precheck after the filter and the atomic reservation below as
@@ -761,7 +762,6 @@ impl PacketSocket {
             self.stats_drops.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let data_len = wire_len.min(filter_result as usize);
         let metadata = PacketMetadata {
             src_mac: parsed.src,
             dst_mac: parsed.dst,

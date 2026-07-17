@@ -185,6 +185,8 @@ pub fn run_cbpf<I: ClassicBpfInput + ?Sized>(insns: &[SockFilter], input: &I) ->
 
     while pc < insns.len() {
         let insn = &insns[pc];
+        // Linux 6.6 bpf_anc_helper() recognizes ancillary offsets for all
+        // three ABS load widths and returns the full helper value unchanged.
         if is_ancillary(insn.k) && matches!(insn.code, 0x20 | 0x28 | 0x30) {
             let extension = insn.k.wrapping_sub(SKF_AD_OFF);
             if extension == SKF_AD_ALU_XOR_X {

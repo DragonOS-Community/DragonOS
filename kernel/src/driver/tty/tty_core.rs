@@ -294,7 +294,7 @@ impl TtyCore {
         };
         match cmd {
             TtyIoctlCmd::TCGETS => {
-                let termios = PosixTermios::from_kernel_termios(*real_tty.core.termios());
+                let termios = PosixTermios::from_kernel_termios(&real_tty.core.termios());
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<PosixTermios>(),
                     core::mem::size_of::<PosixTermios>(),

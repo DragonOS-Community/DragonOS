@@ -8,7 +8,7 @@ use crate::mm::VirtAddr;
 use self::serial8250::serial8250_manager;
 
 use super::tty::{
-    termios::{ControlMode, InputMode, LocalMode, OutputMode, Termios, INIT_CONTORL_CHARACTERS},
+    termios::{ControlMode, InputMode, LocalMode, OutputMode, Termios, INIT_C_LINE_ABI, INIT_CONTORL_CHARACTERS},
     tty_ldisc::LineDisciplineType,
 };
 
@@ -67,7 +67,7 @@ lazy_static! {
                 | LocalMode::IEXTEN,
             control_characters: INIT_CONTORL_CHARACTERS,
             line: LineDisciplineType::NTty,
-            c_line_abi: 0,
+            c_line_abi: INIT_C_LINE_ABI,
             input_speed: SERIAL_BAUDRATE.data(),
             output_speed: SERIAL_BAUDRATE.data(),
         }

@@ -55,7 +55,7 @@ pub struct PosixTermios {
 }
 
 impl PosixTermios {
-    pub fn from_kernel_termios(termios: Termios) -> Self {
+    pub fn from_kernel_termios(termios: &Termios) -> Self {
         Self {
             c_iflag: termios.input_mode.bits,
             c_oflag: termios.output_mode.bits,
@@ -82,17 +82,13 @@ impl PosixTermios {
     }
 
     fn output_speed(&self) -> Option<u32> {
-        let flag = ControlMode::from_bits_truncate(self.c_cflag & ControlMode::CBAUD.bits());
-        flag.baud_rate()
+        let cflag = ControlMode::from_bits_truncate(self.c_cflag & ControlMode::CBAUD.bits());
+        cflag.baud_rate()
     }
 
     fn input_speed(&self) -> Option<u32> {
-        let ibaud = (self.c_cflag & ControlMode::CIBAUD.bits()) >> 16;
-        if ibaud == 0 {
-            self.output_speed()
-        } else {
-            ControlMode::from_bits_truncate(ibaud).baud_rate()
-        }
+        let cflag = ControlMode::from_bits_truncate(self.c_cflag);
+        cflag.input_baud_rate()
     }
 }
 
@@ -152,7 +148,7 @@ lazy_static! {
                 | LocalMode::IEXTEN,
             control_characters: INIT_CONTORL_CHARACTERS,
             line: LineDisciplineType::NTty,
-            c_line_abi: 0,
+            c_line_abi: INIT_C_LINE_ABI,
             input_speed: 38400,
             output_speed: 38400,
         }
@@ -363,8 +359,12 @@ bitflags! {
         const TERMIOS_WAIT	=2;
         const TERMIOS_TERMIO	=4;
         const TERMIOS_OLD	=8;
-    }
 }
+}
+
+
+/// Shift to extract input baud rate bits from c_cflag (CIBAUD = 0x100f0000).
+pub const CIBAUD_SHIFT: u32 = 16;
 
 impl ControlMode {
     /// 获取波特率
@@ -400,15 +400,25 @@ impl ControlMode {
             Self::B2000000 => Some(2000000),
             Self::B2500000 => Some(2500000),
             Self::B3000000 => Some(3000000),
-            Self::B3500000 => Some(3500000),
-            Self::B4000000 => Some(4000000),
             _ => None,
+        }
+    }
+
+    /// Get input baud rate from CIBAUD bits, falling back to output baud rate.
+    pub fn input_baud_rate(&self) -> Option<u32> {
+        let ibaud = (self.bits() & Self::CIBAUD.bits()) >> CIBAUD_SHIFT;
+        if ibaud == 0 {
+            self.baud_rate()
+        } else {
+            ControlMode::from_bits_truncate(ibaud).baud_rate()
         }
     }
 }
 
-/// Number of control characters in legacy `struct termio`.
 pub const NCC: usize = 8;
+
+/// Default c_line ABI value (N_TTY = 0).
+pub const INIT_C_LINE_ABI: u8 = 0;
 
 /// Legacy SVR4 `struct termio` — the smaller predecessor of `struct termios`.
 /// Used by ioctl commands TCGETA / TCSETA / TCSETAW / TCSETAF.
@@ -424,7 +434,7 @@ pub struct PosixTermio {
     /// Explicit padding — eliminates the 1-byte implicit tail padding that
     /// repr(C) would otherwise insert, preventing kernel stack leak via
     /// TCGETA.  Default::default() zeros this field.
-    pub _pad: u8,
+    pub(crate) _pad: u8,
 }
 
 impl PosixTermio {
@@ -481,14 +491,7 @@ impl PosixTermio {
     /// after `user_termio_to_kernel_termios()`.
     pub fn speeds_from_cflag(cflag: ControlMode) -> (u32, u32) {
         let ospeed = cflag.baud_rate().unwrap_or(38400);
-        let ibaud = (cflag.bits() & ControlMode::CIBAUD.bits()) >> 16;
-        let ispeed = if ibaud == 0 {
-            ospeed
-        } else {
-            ControlMode::from_bits_truncate(ibaud)
-                .baud_rate()
-                .unwrap_or(ospeed)
-        };
+        let ispeed = cflag.input_baud_rate().unwrap_or(ospeed);
         (ispeed, ospeed)
     }
 }

@@ -79,6 +79,7 @@ inline constexpr int kArpFrameLen = kEthHdrLen + kArpPktLen;  // 42
 inline constexpr size_t kVlanFrameLen = 1518;
 inline constexpr int kEthFrameLen = 1514;
 inline constexpr uint16_t kPrivateEtherType = 0x88b5;
+inline constexpr uint16_t kVlanEtherType = 0x8100;
 
 inline constexpr const char* kLocalIp = "10.0.2.15";
 inline constexpr const char* kGateway = "10.0.2.2";
@@ -727,6 +728,61 @@ TEST(AfPacketE2E, VethAcceptsFullMtuVlanFrame) {
                      reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst)),
               static_cast<ssize_t>(sizeof(frame)))
         << ErrnoString(errno);
+}
+
+TEST(AfPacketE2E, OutgoingRawFilterPreservesInlineVlanHeader) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic outgoing VLAN testing";
+
+    uint8_t local_mac[6];
+    FdGuard receiver(MakeBoundRaw(ifname, ifindex, local_mac));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    TestSockFilter outgoing_vlan[] = {
+        {0x20, 0, 0, 0xfffff004U},  // LD W ABS SKF_AD_OFF + SKF_AD_PKTTYPE
+        {0x15, 0, 3, PACKET_OUTGOING},
+        {0x28, 0, 0, 12},  // LD H ABS Ethernet EtherType
+        {0x15, 0, 1, kVlanEtherType},
+        {0x06, 0, 0, 0xffffffffU},
+        {0x06, 0, 0, 0},
+    };
+    ASSERT_EQ(AttachFilter(receiver.Get(), outgoing_vlan, 6), 0) << ErrnoString(errno);
+
+    uint8_t frame[96]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kVlanEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kVlanEtherType);
+    frame[14] = 0x00;
+    frame[15] = 0x2a;
+    frame[16] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[17] = static_cast<uint8_t>(kPrivateEtherType);
+    std::memcpy(frame + 18, "outgoing-vlan", 13);
+
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kVlanEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+    ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
+                     reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
+              static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
+
+    uint8_t received[sizeof(frame)]{};
+    struct sockaddr_ll from{};
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(receiver.Get(), received, sizeof(received), 0,
+                         reinterpret_cast<sockaddr*>(&from), &from_len);
+    ASSERT_EQ(n, static_cast<ssize_t>(sizeof(frame))) << ErrnoString(errno);
+    EXPECT_EQ(from.sll_pkttype, PACKET_OUTGOING);
+    EXPECT_EQ(ntohs(from.sll_protocol), kVlanEtherType);
+    EXPECT_EQ(std::memcmp(received, frame, sizeof(frame)), 0);
 }
 
 TEST(AfPacketE2E, ReceiveBufferSizeControlsQueuedBytes) {

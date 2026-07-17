@@ -17,7 +17,7 @@ use crate::net::socket::PMSG;
 use super::uapi::{SOL_PACKET, TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID};
 use super::{
     eth_protocol, packet_option, PacketIngressMetadata, PacketMetadata, PacketSocket,
-    PacketSocketType, ReceivedPacket, SockAddrLl, TpacketAuxdata,
+    PacketSocketType, PacketType, ReceivedPacket, SockAddrLl, TpacketAuxdata,
 };
 
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -47,13 +47,15 @@ struct ParsedFrame {
     vlan: Option<(u16, u16)>,
 }
 
-/// Linux runs AF_PACKET taps after the outer inline VLAN header has been
-/// moved into skb metadata. This view models that skb layout with at most two
-/// borrowed segments and is shared by cBPF loads and the eventual queue copy.
+/// Linux receive taps run after the outer inline VLAN header has been moved
+/// into skb metadata, while outgoing taps retain an inline VLAN header. This
+/// view models both layouts with at most two borrowed segments and is shared
+/// by cBPF loads and the eventual queue copy.
 struct PacketFilterInput<'a> {
     first: &'a [u8],
     second: &'a [u8],
     data_offset: usize,
+    network_offset: usize,
     protocol: u16,
     vlan: Option<(u16, u16)>,
     ingress: PacketIngressMetadata,
@@ -67,21 +69,33 @@ impl<'a> PacketFilterInput<'a> {
         sock_type: PacketSocketType,
         ingress: PacketIngressMetadata,
     ) -> Self {
-        let (first, second) = if parsed.vlan.is_some() {
+        let normalize_vlan = parsed.vlan.is_some() && ingress.pkt_type != PacketType::Outgoing;
+        let (first, second) = if normalize_vlan {
             (&frame[..12], &frame[16..])
         } else {
             (frame, &[][..])
         };
+        let network_offset = if parsed.vlan.is_some() && !normalize_vlan {
+            ETHERNET_HEADER_LEN + 4
+        } else {
+            ETHERNET_HEADER_LEN
+        };
+        let vlan = if normalize_vlan { parsed.vlan } else { None };
         Self {
             first,
             second,
             data_offset: if sock_type == PacketSocketType::Raw {
                 0
             } else {
-                ETHERNET_HEADER_LEN
+                network_offset
             },
-            protocol: parsed.protocol,
-            vlan: parsed.vlan,
+            network_offset,
+            protocol: if normalize_vlan {
+                parsed.protocol
+            } else {
+                parsed.vlan.map_or(parsed.protocol, |(_, tpid)| tpid)
+            },
+            vlan,
             ingress,
             payload_offset_cache: Cell::new(None),
         }
@@ -133,7 +147,7 @@ impl<'a> PacketFilterInput<'a> {
         let absolute = if offset >= 0 {
             (self.data_offset as i64).checked_add(offset as i64)?
         } else if offset >= SKF_NET_OFF {
-            (ETHERNET_HEADER_LEN as i64).checked_add((offset - SKF_NET_OFF) as i64)?
+            (self.network_offset as i64).checked_add((offset - SKF_NET_OFF) as i64)?
         } else if offset >= SKF_LL_OFF {
             (offset - SKF_LL_OFF) as i64
         } else {
@@ -722,29 +736,13 @@ impl PacketSocket {
         if bound_protocol == 0 || (bound_ifindex != 0 && bound_ifindex != ingress.ifindex) {
             return;
         }
-        let Some(ParsedFrame {
-            dst,
-            src,
-            protocol,
-            vlan,
-        }) = parse_frame(frame)
-        else {
+        let Some(parsed) = parse_frame(frame) else {
             return;
         };
-        if bound_protocol != eth_protocol::ETH_P_ALL && bound_protocol != protocol {
+        let input = PacketFilterInput::new(frame, &parsed, self.sock_type, ingress);
+        if bound_protocol != eth_protocol::ETH_P_ALL && bound_protocol != input.protocol {
             return;
         }
-        let input = PacketFilterInput::new(
-            frame,
-            &ParsedFrame {
-                dst,
-                src,
-                protocol,
-                vlan,
-            },
-            self.sock_type,
-            ingress,
-        );
         let wire_len = input.data_len();
         let filter_result = self
             .filter
@@ -765,9 +763,9 @@ impl PacketSocket {
         }
         let data_len = wire_len.min(filter_result as usize);
         let metadata = PacketMetadata {
-            src_mac: src,
-            dst_mac: dst,
-            protocol,
+            src_mac: parsed.src,
+            dst_mac: parsed.dst,
+            protocol: input.protocol,
             ifindex: ingress.ifindex,
             hatype: ingress.hatype,
             pkt_type: ingress.pkt_type,
@@ -776,9 +774,9 @@ impl PacketSocket {
             // queued visible length for both RAW and DGRAM sockets.
             wire_len,
             mac_offset: 0,
-            net_offset: 14,
-            vlan_tci: vlan.map_or(0, |v| v.0),
-            vlan_tpid: vlan.map_or(0, |v| v.1),
+            net_offset: input.network_offset,
+            vlan_tci: input.vlan.map_or(0, |v| v.0),
+            vlan_tpid: input.vlan.map_or(0, |v| v.1),
         };
         let accounted_bytes = data_len.saturating_add(core::mem::size_of::<ReceivedPacket>());
         if self

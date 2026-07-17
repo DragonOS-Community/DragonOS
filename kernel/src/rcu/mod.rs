@@ -215,6 +215,39 @@ where
         }
     }
 
+    /// Borrows the currently published value for the duration of an RCU
+    /// read-side critical section without incrementing its `Arc` strong count.
+    ///
+    /// The initial null check keeps the common empty-slot path out of RCU
+    /// entirely. A writer may publish a value immediately after that check;
+    /// returning `None` is still a valid snapshot of the slot at the check's
+    /// linearization point. For a non-null observation, the pointer is loaded
+    /// again after entering RCU so a concurrently removed value is never
+    /// dereferenced without grace-period protection.
+    ///
+    /// The closure must not block or otherwise retain the borrowed reference.
+    #[inline]
+    pub fn with_read_if_present<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        if self.ptr.load(Ordering::Acquire).is_null() {
+            return None;
+        }
+
+        if !rcu_enabled() {
+            let pinned = self.load()?;
+            return Some(f(&pinned));
+        }
+
+        let _guard = rcu_read_lock();
+        let raw = rcu_dereference(&self.ptr);
+        let current = NonNull::new(raw)?;
+
+        // SAFETY: the pointer was reloaded after entering the RCU read-side
+        // section. A writer removing this slot-owned Arc must defer its drop
+        // until this section completes, and the reference cannot escape the
+        // closure's call.
+        Some(f(unsafe { current.as_ref() }))
+    }
+
     pub fn swap(&self, new: Option<Arc<T>>) -> Option<Arc<T>> {
         let new_raw = new
             .map(|value| Arc::into_raw(value) as *mut T)

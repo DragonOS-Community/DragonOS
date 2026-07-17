@@ -9,7 +9,7 @@ use crate::net::routing::Router;
 use crate::net::socket::netlink::table::{
     generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
 };
-use crate::net::socket::packet::{PacketSocket, PacketType};
+use crate::net::socket::packet::{PacketIngressMetadata, PacketSocket};
 use crate::net::socket::unix::ns::UnixAbstractTable;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
@@ -440,17 +440,12 @@ impl NetNamespace {
 
     /// Deliver an ingress frame without taking a sleeping lock or allocating a
     /// temporary registry copy in the NAPI read-side path.
-    pub fn deliver_to_packet_sockets(
-        &self,
-        ingress_ifindex: u32,
-        frame: &[u8],
-        pkt_type: PacketType,
-    ) {
+    pub(crate) fn deliver_to_packet_sockets(&self, ingress: PacketIngressMetadata, frame: &[u8]) {
         let snapshot = self.packet_sockets.load();
         let mut stale = false;
         for socket in snapshot.sockets.iter() {
             if let Some(socket) = socket.upgrade() {
-                socket.deliver(ingress_ifindex, frame, pkt_type);
+                socket.deliver(ingress, frame);
             } else {
                 stale = true;
             }

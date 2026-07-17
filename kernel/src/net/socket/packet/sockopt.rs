@@ -9,6 +9,7 @@ use crate::net::socket::common::{
     SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX,
 };
 use crate::net::socket::{PSO, PSOL};
+use crate::rcu::rcu_defer_drop;
 
 use super::{packet_option, PacketSocket};
 
@@ -96,33 +97,51 @@ impl PacketSocket {
                 Ok(())
             }
             Ok(PSO::ATTACH_FILTER) => {
-                // SO_LOCK_FILTER 后不可修改
-                if self.filter_locked.load(Ordering::Acquire) {
-                    return Err(SystemError::EINVAL);
+                let fprog = classic::parse_sock_fprog(val)?;
+                // Linux checks SOCK_FILTER_LOCKED after copying the fprog
+                // header, but before validating or reading its instruction
+                // pointer. Keep the final check below to close the race with
+                // a concurrent SO_LOCK_FILTER.
+                if *self.filter_locked.lock() {
+                    return Err(SystemError::EPERM);
                 }
-                // 从 optval 解析 sock_fprog + 读取 filter 指令
-                let insns = classic::read_sock_fprog(val)?;
-                // 通用 cBPF 验证
+                let insns = classic::read_sock_fprog_insns(&fprog)?;
                 validate_cbpf(&insns)?;
-                // 先 store filter，再置 has_filter=true（Release 序确保可见性）
-                self.filter.store_deferred(Arc::new(insns));
-                self.has_filter.store(true, Ordering::Release);
+                let new_filter = Arc::try_new(insns).map_err(|_| SystemError::ENOMEM)?;
+
+                let old_filter = {
+                    let locked = self.filter_locked.lock();
+                    if *locked {
+                        return Err(SystemError::EPERM);
+                    }
+                    self.filter.swap(Some(new_filter))
+                };
+                if let Some(old_filter) = old_filter {
+                    rcu_defer_drop(old_filter);
+                }
                 Ok(())
             }
             Ok(PSO::DETACH_FILTER) => {
-                if self.filter_locked.load(Ordering::Acquire) {
-                    return Err(SystemError::EINVAL);
-                }
-                // Linux：未安装 filter 时返回 ENOENT
-                if !self.has_filter.swap(false, Ordering::AcqRel) {
-                    return Err(SystemError::ENOENT);
-                }
-                self.filter.store_deferred(Arc::new(alloc::vec![]));
+                // Linux's SOL_SOCKET path validates and reads an int even
+                // though SO_DETACH_FILTER does not use its value.
+                let _ = Self::parse_i32(val)?;
+                let old_filter = {
+                    let locked = self.filter_locked.lock();
+                    if *locked {
+                        return Err(SystemError::EPERM);
+                    }
+                    self.filter.swap(None).ok_or(SystemError::ENOENT)?
+                };
+                rcu_defer_drop(old_filter);
                 Ok(())
             }
             Ok(PSO::LOCK_FILTER) => {
-                // 不可逆：一旦锁定不可解锁（Linux 语义）
-                self.filter_locked.store(true, Ordering::Release);
+                let lock_filter = Self::parse_i32(val)? != 0;
+                let mut locked = self.filter_locked.lock();
+                if *locked && !lock_filter {
+                    return Err(SystemError::EPERM);
+                }
+                *locked = lock_filter;
                 Ok(())
             }
             _ => Err(SystemError::ENOPROTOOPT),
@@ -142,6 +161,10 @@ impl PacketSocket {
                 let ticks = self.socket_timeout_ticks(name)?.load(Ordering::Relaxed);
                 Ok(write_timeval_ticks(value, ticks))
             }
+            Ok(PSO::LOCK_FILTER) => Ok(write_i32_getsockopt(
+                value,
+                *self.filter_locked.lock() as i32,
+            )),
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }

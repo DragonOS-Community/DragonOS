@@ -508,10 +508,20 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
     let option_race_old_drops = Arc::new(AtomicUsize::new(0));
     let option_race_new_drops = Arc::new(AtomicUsize::new(0));
     let option_drop_drops = Arc::new(AtomicUsize::new(0));
+    let option_borrow_old_drops = Arc::new(AtomicUsize::new(0));
+    let option_borrow_new_drops = Arc::new(AtomicUsize::new(0));
 
     let option_slot = RcuOptionArcSlot::new_none();
     if option_slot.load().is_some() {
         return Err("RcuOptionArcSlot::new_none did not start empty");
+    }
+    let empty_closure_called = AtomicBool::new(false);
+    if option_slot
+        .with_read_if_present(|_| empty_closure_called.store(true, Ordering::SeqCst))
+        .is_some()
+        || empty_closure_called.load(Ordering::SeqCst)
+    {
+        return Err("RcuOptionArcSlot::with_read_if_present called the closure for None");
     }
 
     option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
@@ -549,6 +559,54 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
     }
     if option_replacement_drops.load(Ordering::SeqCst) != 1 {
         return Err("RcuOptionArcSlot replacement object was not dropped after clear");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 11,
+        drops: option_borrow_old_drops.clone(),
+    })));
+    let borrowed_id = option_slot.with_read_if_present(|borrowed| {
+        let old = option_slot
+            .swap(Some(Arc::new(RcuSelftestDropProbe {
+                id: 12,
+                drops: option_borrow_new_drops.clone(),
+            })))
+            .expect("borrowed optional slot unexpectedly became empty");
+        rcu_defer_drop(old);
+
+        if option_borrow_old_drops.load(Ordering::SeqCst) != 0 {
+            return 0;
+        }
+        borrowed.id
+    });
+    if borrowed_id != Some(11) {
+        return Err("RcuOptionArcSlot::with_read_if_present did not pin the old snapshot");
+    }
+    if option_slot.with_read_if_present(|value| value.id) != Some(12) {
+        return Err("RcuOptionArcSlot::with_read_if_present did not observe the replacement");
+    }
+    rcu_barrier();
+    if option_borrow_old_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot borrowed old snapshot was not dropped after its reader");
+    }
+
+    let cleared_id = option_slot.with_read_if_present(|borrowed| {
+        let old = option_slot
+            .swap(None)
+            .expect("borrowed optional slot unexpectedly became empty before clear");
+        rcu_defer_drop(old);
+
+        if option_borrow_new_drops.load(Ordering::SeqCst) != 0 {
+            return 0;
+        }
+        borrowed.id
+    });
+    if cleared_id != Some(12) || option_slot.with_read_if_present(|_| ()).is_some() {
+        return Err("RcuOptionArcSlot::with_read_if_present clear transition was inconsistent");
+    }
+    rcu_barrier();
+    if option_borrow_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot borrowed cleared snapshot was not dropped after its reader");
     }
 
     option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {

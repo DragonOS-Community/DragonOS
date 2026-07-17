@@ -6,7 +6,7 @@ use crate::driver::net::Iface;
 use crate::filesystem::epoll::EPollEventType;
 use crate::net::socket::endpoint::{Endpoint, LinkLayerEndpoint};
 
-use super::{PacketSocket, PacketType};
+use super::{PacketIngressMetadata, PacketSocket};
 
 /// Lock-free, coherent `(ifindex, protocol)` receive-filter snapshot.
 #[derive(Debug)]
@@ -91,7 +91,7 @@ impl PacketSocket {
         ll.protocol = protocol;
         if let Some(iface) = self.bound_iface.read().as_ref() {
             ll.addr[..6].copy_from_slice(iface.mac().as_bytes());
-            ll.hatype = 1;
+            ll.hatype = iface.type_() as u16;
             ll.halen = 6;
         }
         Ok(Endpoint::LinkLayer(ll))
@@ -108,7 +108,7 @@ impl PacketSocket {
     }
 
     /// Registry delivery entry: the ingress interface is authoritative metadata.
-    pub(crate) fn deliver(&self, ingress_ifindex: u32, frame: &[u8], pkt_type: PacketType) {
-        self.deliver_from_iface(ingress_ifindex, frame, pkt_type);
+    pub(crate) fn deliver(&self, ingress: PacketIngressMetadata, frame: &[u8]) {
+        self.deliver_from_iface(ingress, frame);
     }
 }

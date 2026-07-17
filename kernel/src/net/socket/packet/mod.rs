@@ -23,7 +23,7 @@ use crate::net::socket::{Socket, PMSG, PSOCK, PSOL};
 use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
-use crate::rcu::RcuArcSlot;
+use crate::rcu::RcuOptionArcSlot;
 
 #[allow(unused_imports)]
 pub use uapi::{
@@ -41,6 +41,27 @@ pub enum PacketSocketType {
     Dgram,
 }
 
+/// Metadata captured at the packet-tap boundary. Keeping this structure
+/// `Copy` lets the NAPI receive path pass device information to every packet
+/// socket without consulting the sleepable netdevice registry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PacketIngressMetadata {
+    pub ifindex: u32,
+    pub hatype: u16,
+    pub pkt_type: PacketType,
+}
+
+impl PacketIngressMetadata {
+    #[inline]
+    fn from_iface(iface: &Arc<dyn Iface>, pkt_type: PacketType) -> Self {
+        Self {
+            ifindex: iface.nic_id() as u32,
+            hatype: iface.type_() as u16,
+            pkt_type,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PacketMetadata {
     pub src_mac: [u8; 6],
@@ -48,6 +69,7 @@ pub struct PacketMetadata {
     pub dst_mac: [u8; 6],
     pub protocol: u16,
     pub ifindex: u32,
+    pub hatype: u16,
     pub pkt_type: PacketType,
     pub wire_len: usize,
     #[allow(dead_code)]
@@ -91,12 +113,10 @@ pub struct PacketSocket {
     open_files: AtomicUsize,
     pub(super) self_ref: Weak<Self>,
     pub(super) netns: Arc<NetNamespace>,
-    /// BPF filter 快路径标记：false 时跳过 filter 评估（零开销）
-    pub(super) has_filter: AtomicBool,
-    /// cBPF filter 程序（RcuArcSlot 无锁读取，匹配 AF_PACKET 收包路径设计）
-    pub(super) filter: RcuArcSlot<Vec<SockFilter>>,
-    /// SO_LOCK_FILTER：一旦置 true 不可再修改 filter
-    pub(super) filter_locked: AtomicBool,
+    /// cBPF filter 程序；空指针是“未安装”的唯一事实来源。
+    pub(super) filter: RcuOptionArcSlot<Vec<SockFilter>>,
+    /// 串行化 SO_ATTACH_FILTER、SO_DETACH_FILTER 与 SO_LOCK_FILTER。
+    pub(super) filter_locked: Mutex<bool>,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
 }
@@ -136,9 +156,8 @@ impl PacketSocket {
             self_ref: me.clone(),
             netns,
             epoll_items: EPollItems::default(),
-            has_filter: AtomicBool::new(false),
-            filter: RcuArcSlot::new(Arc::new(Vec::new())),
-            filter_locked: AtomicBool::new(false),
+            filter: RcuOptionArcSlot::new_none(),
+            filter_locked: Mutex::new(false),
             fasync_items: FAsyncItems::default(),
         });
         socket.netns.register_packet_socket(socket.self_ref.clone());
@@ -184,7 +203,7 @@ pub fn classify_packet(frame: &[u8], iface: &Arc<dyn Iface>) -> PacketType {
 /// Common AF_PACKET tap for Ethernet netdevices.
 pub fn deliver_to_packet_sockets(iface: &Arc<dyn Iface>, frame: &[u8], pkt_type: PacketType) {
     if let Some(netns) = iface.net_namespace() {
-        netns.deliver_to_packet_sockets(iface.nic_id() as u32, frame, pkt_type);
+        netns.deliver_to_packet_sockets(PacketIngressMetadata::from_iface(iface, pkt_type), frame);
     }
 }
 

@@ -11,9 +11,7 @@ use core::sync::atomic::Ordering;
 use log::warn;
 use system_error::SystemError;
 
-use crate::bpf::classic::{
-    self, validate_cbpf, SockFilter, BPF_ABS, BPF_IND, BPF_LD, BPF_LDX, BPF_W,
-};
+use crate::bpf::classic::{self, BpfWidth, ClassicBpfInput, SockFilter};
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigType, SigactionType, SignalFlags},
@@ -173,8 +171,8 @@ impl SeccompFilter {
 
     /// 执行此过滤器
     fn run(&self, data: &SeccompData) -> u32 {
-        let data_bytes = seccomp_data_to_bytes(data);
-        let result = classic::run_cbpf(&self.insns, &data_bytes);
+        let input = SeccompBpfInput(data);
+        let result = classic::run_cbpf(&self.insns, &input);
 
         // 如果启用了 log 且结果不是 ALLOW，记录日志
         if self.log && (result & SECCOMP_RET_ACTION_FULL) != SECCOMP_RET_ALLOW {
@@ -185,33 +183,44 @@ impl SeccompFilter {
     }
 }
 
-// ============ Seccomp Data 序列化 ============
+struct SeccompBpfInput<'a>(&'a SeccompData);
 
-/// 将 `SeccompData` 序列化为 cBPF 解释器期望的大端字节缓冲区。
-///
-/// `bpf::classic::run_cbpf` 使用 `from_be_bytes` 加载数据（与 Linux
-/// `get_unaligned_be32` 一致），因此将每个字段以大端序写入。
-/// 对于 u64 字段，按主机结构体中的 u32 字顺序拆分后各自转大端，
-/// 确保从任意偏移加载 u32 的结果与原 `from_ne_bytes` 语义一致。
-fn seccomp_data_to_bytes(data: &SeccompData) -> [u8; SECCOMP_DATA_SIZE] {
-    let mut buf = [0u8; SECCOMP_DATA_SIZE];
-    buf[0..4].copy_from_slice(&(data.nr as u32).to_be_bytes());
-    buf[4..8].copy_from_slice(&data.arch.to_be_bytes());
-    write_u64_words(&mut buf[8..16], data.instruction_pointer);
-    for i in 0..6 {
-        write_u64_words(&mut buf[16 + i * 8..24 + i * 8], data.args[i]);
+impl ClassicBpfInput for SeccompBpfInput<'_> {
+    #[inline]
+    fn len(&self) -> u32 {
+        SECCOMP_DATA_SIZE as u32
     }
-    buf
+
+    fn load(&self, offset: i32, width: BpfWidth) -> Option<u32> {
+        if width != BpfWidth::Word || offset < 0 || offset & 3 != 0 {
+            return None;
+        }
+
+        let offset = offset as usize;
+        match offset {
+            0 => Some(self.0.nr as u32),
+            4 => Some(self.0.arch),
+            8 | 12 => Some(native_u64_word(
+                self.0.instruction_pointer,
+                (offset - 8) / 4,
+            )),
+            16..SECCOMP_DATA_SIZE => {
+                let relative = offset - 16;
+                let arg = *self.0.args.get(relative / 8)?;
+                Some(native_u64_word(arg, (relative % 8) / 4))
+            }
+            _ => None,
+        }
+    }
 }
 
-/// 将 u64 按主机原生字顺序拆分为两个 u32 字，各自以大端写入。
 #[inline]
-fn write_u64_words(buf: &mut [u8], val: u64) {
-    let raw = val.to_ne_bytes();
-    let w0 = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
-    let w1 = u32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]);
-    buf[0..4].copy_from_slice(&w0.to_be_bytes());
-    buf[4..8].copy_from_slice(&w1.to_be_bytes());
+fn native_u64_word(value: u64, index: usize) -> u32 {
+    #[cfg(target_endian = "little")]
+    let shift = index * 32;
+    #[cfg(target_endian = "big")]
+    let shift = (1 - index) * 32;
+    (value >> shift) as u32
 }
 
 // ============ BPF 验证器 ============
@@ -223,32 +232,23 @@ fn write_u64_words(buf: &mut [u8], val: u64) {
 /// 2. 不允许 BPF_IND 变址加载
 /// 3. BPF_ABS 偏移必须在 SeccompData 范围内且 4 字节对齐
 fn validate_seccomp_filter(insns: &[SockFilter]) -> Result<(), SystemError> {
-    // 通用检查：非空、长度上限、末条 RET、跳转目标、mem 边界、div/mod k!=0
-    validate_cbpf(insns)?;
+    classic::validate_cbpf(insns)?;
 
     for insn in insns {
-        let class = insn.code & 0x07;
-        if class == BPF_LD || class == BPF_LDX {
-            let mode = insn.code & 0xe0;
-            let size = insn.code & 0x18;
-
-            // seccomp 不允许 BPF_IND
-            if mode == BPF_IND {
-                return Err(SystemError::EINVAL);
-            }
-
-            // seccomp 只允许 BPF_W 加载（ABS 模式）
-            if mode == BPF_ABS && size != BPF_W {
-                return Err(SystemError::EINVAL);
-            }
-
-            // ABS 偏移必须在 SeccompData 范围内且 4 字节对齐
-            if mode == BPF_ABS {
+        match insn.code {
+            0x20 => {
                 let offset = insn.k as usize;
                 if !offset.is_multiple_of(4) || offset.saturating_add(4) > SECCOMP_DATA_SIZE {
                     return Err(SystemError::EINVAL);
                 }
             }
+            // 与 Linux seccomp_check_filter 的显式白名单一致。特别地，通用
+            // socket cBPF 接受 MOD，而 seccomp ABI 不接受 MOD K/X。
+            0x06 | 0x16 | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c | 0x54 | 0x5c
+            | 0x44 | 0x4c | 0xa4 | 0xac | 0x64 | 0x6c | 0x74 | 0x7c | 0x84 | 0x00 | 0x01 | 0x80
+            | 0x81 | 0x60 | 0x61 | 0x02 | 0x03 | 0x07 | 0x87 | 0x05 | 0x15 | 0x1d | 0x35 | 0x3d
+            | 0x25 | 0x2d | 0x45 | 0x4d => {}
+            _ => return Err(SystemError::EINVAL),
         }
     }
 

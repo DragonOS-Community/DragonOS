@@ -1,12 +1,7 @@
 //! Classic BPF (cBPF) 解释器与验证器。
 //!
-//! 本模块从 `process/seccomp.rs` 提取，泛化为接收 `&[u8]` 数据输入，
-//! 同时服务于 seccomp 系统调用过滤和 AF_PACKET 包过滤。
-//!
-//! 数据加载语义：BPF_W / BPF_H 使用 **大端（网络字节序）** 读取，
-//! 与 Linux `bpf_internal_load_pointer_positive_helper` 中的
-//! `get_unaligned_be16` / `get_unaligned_be32` 一致。
-//! seccomp 调用方需将 `SeccompData` 的每个字段以大端序写入字节缓冲区。
+//! 本模块只实现 cBPF 机器模型、结构验证和输入协议。packet 与 seccomp
+//! 的字节序、逻辑偏移和 ancillary 语义由各自的输入实现负责。
 
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -69,9 +64,6 @@ pub const BPF_K: u16 = 0x00;
 pub const BPF_X: u16 = 0x08;
 pub const BPF_A: u16 = 0x10;
 
-/// RET 返回值掩码
-pub const BPF_RVAL_MASK: u16 = 0x18;
-
 /// ALU 操作（code & 0xf0）
 pub const BPF_ADD: u16 = 0x00;
 pub const BPF_SUB: u16 = 0x10;
@@ -102,6 +94,69 @@ pub const BPF_MAXINSNS: usize = 4096;
 /// BPF 记忆体大小（16 个 u32 字）
 pub const BPF_MEMWORDS: usize = 16;
 
+/// Linux socket filter ancillary 偏移。
+pub const SKF_AD_OFF: u32 = (-0x1000i32) as u32;
+pub const SKF_AD_PROTOCOL: u32 = 0;
+pub const SKF_AD_PKTTYPE: u32 = 4;
+pub const SKF_AD_IFINDEX: u32 = 8;
+pub const SKF_AD_NLATTR: u32 = 12;
+pub const SKF_AD_NLATTR_NEST: u32 = 16;
+pub const SKF_AD_MARK: u32 = 20;
+pub const SKF_AD_QUEUE: u32 = 24;
+pub const SKF_AD_HATYPE: u32 = 28;
+pub const SKF_AD_RXHASH: u32 = 32;
+pub const SKF_AD_CPU: u32 = 36;
+pub const SKF_AD_ALU_XOR_X: u32 = 40;
+pub const SKF_AD_VLAN_TAG: u32 = 44;
+pub const SKF_AD_VLAN_TAG_PRESENT: u32 = 48;
+pub const SKF_AD_PAY_OFFSET: u32 = 52;
+pub const SKF_AD_RANDOM: u32 = 56;
+pub const SKF_AD_VLAN_TPID: u32 = 60;
+pub const SKF_NET_OFF: i32 = -0x100000;
+pub const SKF_LL_OFF: i32 = -0x200000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpfWidth {
+    Word,
+    Half,
+    Byte,
+}
+
+/// cBPF 的调用域输入。实现必须自行定义普通加载的字节序和负偏移语义。
+pub trait ClassicBpfInput {
+    fn len(&self) -> u32;
+
+    fn load(&self, offset: i32, width: BpfWidth) -> Option<u32>;
+
+    fn load_ancillary(&self, extension: u32, accumulator: u32, index: u32) -> Option<u32> {
+        let _ = (extension, accumulator, index);
+        None
+    }
+}
+
+impl ClassicBpfInput for [u8] {
+    #[inline]
+    fn len(&self) -> u32 {
+        self.len().min(u32::MAX as usize) as u32
+    }
+
+    #[inline]
+    fn load(&self, offset: i32, width: BpfWidth) -> Option<u32> {
+        let offset = usize::try_from(offset).ok()?;
+        match width {
+            BpfWidth::Word => {
+                let bytes = self.get(offset..offset.checked_add(4)?)?;
+                Some(u32::from_be_bytes(bytes.try_into().ok()?))
+            }
+            BpfWidth::Half => {
+                let bytes = self.get(offset..offset.checked_add(2)?)?;
+                Some(u16::from_be_bytes(bytes.try_into().ok()?) as u32)
+            }
+            BpfWidth::Byte => self.get(offset).copied().map(u32::from),
+        }
+    }
+}
+
 // ============ cBPF 解释器 ============
 
 /// 运行 classic BPF 程序。
@@ -113,18 +168,16 @@ pub const BPF_MEMWORDS: usize = 16;
 /// - mem\[16\]: 记忆体
 ///
 /// # 加载语义
-/// - `BPF_LD|BPF_W|BPF_ABS`: 读 `data[k..k+4]` → u32（**大端**）
-/// - `BPF_LD|BPF_H|BPF_ABS`: 读 `data[k..k+2]` → u16（**大端**）
-/// - `BPF_LD|BPF_B|BPF_ABS`: 读 `data[k..k+1]` → u8
+/// - `BPF_LD|BPF_W/H/B|BPF_ABS`: 由 input 按调用域语义加载
 /// - `BPF_LD|*|BPF_IND`: 同上，但 offset = X + k
-/// - 越界读取（offset + size > data.len()）：A = 0
+/// - 越界读取（offset + size > data.len()）：立即返回 0
 /// - `BPF_LEN`: A = data.len() as u32
 ///
 /// # 返回值
 /// - 正常返回 `RET` 指令的值（返回截断长度，0 = 丢弃）
-/// - `DIV`/`MOD` 除数为 0：A = 0（继续执行）
+/// - `DIV`/`MOD` 除数为 0：立即返回 0
 /// - fall-through（无 RET 结尾）：返回 0（丢弃）
-pub fn run_cbpf(insns: &[SockFilter], data: &[u8]) -> u32 {
+pub fn run_cbpf<I: ClassicBpfInput + ?Sized>(insns: &[SockFilter], input: &I) -> u32 {
     let mut a: u32 = 0;
     let mut x: u32 = 0;
     let mut pc: usize = 0;
@@ -132,159 +185,153 @@ pub fn run_cbpf(insns: &[SockFilter], data: &[u8]) -> u32 {
 
     while pc < insns.len() {
         let insn = &insns[pc];
-        let class = insn.code & 0x07;
-
-        match class {
-            BPF_LD => {
-                let mode = insn.code & 0xe0;
-                match mode {
-                    BPF_IMM => a = insn.k,
-                    BPF_ABS | BPF_IND => {
-                        let base = if mode == BPF_ABS {
-                            insn.k as usize
-                        } else {
-                            (x as usize).wrapping_add(insn.k as usize)
-                        };
-                        a = load_packet(data, base, insn.code);
-                    }
-                    BPF_MEM => {
-                        if (insn.k as usize) < BPF_MEMWORDS {
-                            a = mem[insn.k as usize];
-                        }
-                    }
-                    BPF_LEN => a = data.len() as u32,
-                    _ => {}
-                }
-                pc += 1;
+        if is_ancillary(insn.k) && matches!(insn.code, 0x20 | 0x28 | 0x30) {
+            let extension = insn.k.wrapping_sub(SKF_AD_OFF);
+            if extension == SKF_AD_ALU_XOR_X {
+                a ^= x;
+            } else {
+                a = match input.load_ancillary(extension, a, x) {
+                    Some(value) => value,
+                    None => return 0,
+                };
             }
-            BPF_LDX => {
-                let mode = insn.code & 0xe0;
-                match mode {
-                    BPF_IMM => x = insn.k,
-                    BPF_MEM => {
-                        if (insn.k as usize) < BPF_MEMWORDS {
-                            x = mem[insn.k as usize];
-                        }
-                    }
-                    BPF_LEN => x = data.len() as u32,
-                    // 提取 IP 头长度：x = (data[k] & 0xf) << 2；越界时 x = 0
-                    BPF_MSH => {
-                        x = data
-                            .get(insn.k as usize)
-                            .map(|&b| ((b & 0xf) as u32) << 2)
-                            .unwrap_or(0);
-                    }
-                    _ => {}
-                }
-                pc += 1;
-            }
-            BPF_ST => {
-                if (insn.k as usize) < BPF_MEMWORDS {
-                    mem[insn.k as usize] = a;
-                }
-                pc += 1;
-            }
-            BPF_STX => {
-                if (insn.k as usize) < BPF_MEMWORDS {
-                    mem[insn.k as usize] = x;
-                }
-                pc += 1;
-            }
-            BPF_ALU => {
-                let op = insn.code & 0xf0;
-                let src = insn.code & 0x08;
-                let val = if src == BPF_K { insn.k } else { x };
-                match op {
-                    BPF_ADD => a = a.wrapping_add(val),
-                    BPF_SUB => a = a.wrapping_sub(val),
-                    BPF_MUL => a = a.wrapping_mul(val),
-                    BPF_DIV => a = a.checked_div(val).unwrap_or(0),
-                    BPF_OR => a |= val,
-                    BPF_AND => a &= val,
-                    BPF_LSH => a = a.wrapping_shl(val),
-                    BPF_RSH => a = a.wrapping_shr(val),
-                    BPF_NEG => a = a.wrapping_neg(),
-                    BPF_MOD => a = a.checked_rem(val).unwrap_or(0),
-                    BPF_XOR => a ^= val,
-                    _ => {}
-                }
-                pc += 1;
-            }
-            BPF_JMP => {
-                let op = insn.code & 0xf0;
-                if op == BPF_JA {
-                    pc = match pc
-                        .checked_add(1)
-                        .and_then(|v| v.checked_add(insn.k as usize))
-                    {
-                        Some(target) => target,
-                        None => return 0,
-                    };
-                } else {
-                    let src = insn.code & 0x08;
-                    let val = if src == BPF_K { insn.k } else { x };
-                    let cond = match op {
-                        BPF_JEQ => a == val,
-                        BPF_JGT => a > val,
-                        BPF_JGE => a >= val,
-                        BPF_JSET => (a & val) != 0,
-                        _ => false,
-                    };
-                    if cond {
-                        pc += 1 + insn.jt as usize;
-                    } else {
-                        pc += 1 + insn.jf as usize;
-                    }
-                }
-            }
-            BPF_RET => {
-                let rval = insn.code & BPF_RVAL_MASK;
-                return if rval == BPF_K { insn.k } else { a };
-            }
-            BPF_MISC => {
-                let op = insn.code & 0xf8;
-                match op {
-                    BPF_TAX => x = a,
-                    BPF_TXA => a = x,
-                    _ => {}
-                }
-                pc += 1;
-            }
-            _ => {
-                pc += 1;
-            }
+            pc += 1;
+            continue;
         }
+
+        match insn.code {
+            0x00 => a = insn.k, // LD IMM
+            0x01 => x = insn.k, // LDX IMM
+            0x20 | 0x28 | 0x30 => {
+                a = match input.load(insn.k as i32, width(insn.code)) {
+                    Some(value) => value,
+                    None => return 0,
+                };
+            }
+            0x40 | 0x48 | 0x50 => {
+                let offset = x.wrapping_add(insn.k) as i32;
+                a = match input.load(offset, width(insn.code)) {
+                    Some(value) => value,
+                    None => return 0,
+                };
+            }
+            0x60 => {
+                a = match mem.get(insn.k as usize) {
+                    Some(value) => *value,
+                    None => return 0,
+                }
+            }
+            0x61 => {
+                x = match mem.get(insn.k as usize) {
+                    Some(value) => *value,
+                    None => return 0,
+                }
+            }
+            0x80 => a = input.len(),
+            0x81 => x = input.len(),
+            0xb1 => {
+                x = match input.load(insn.k as i32, BpfWidth::Byte) {
+                    Some(value) => (value & 0xf) << 2,
+                    None => return 0,
+                };
+            }
+            0x02 => match mem.get_mut(insn.k as usize) {
+                Some(slot) => *slot = a,
+                None => return 0,
+            },
+            0x03 => match mem.get_mut(insn.k as usize) {
+                Some(slot) => *slot = x,
+                None => return 0,
+            },
+            0x04 => a = a.wrapping_add(insn.k),
+            0x0c => a = a.wrapping_add(x),
+            0x14 => a = a.wrapping_sub(insn.k),
+            0x1c => a = a.wrapping_sub(x),
+            0x24 => a = a.wrapping_mul(insn.k),
+            0x2c => a = a.wrapping_mul(x),
+            0x34 => {
+                if insn.k == 0 {
+                    return 0;
+                }
+                a /= insn.k;
+            }
+            0x3c => {
+                if x == 0 {
+                    return 0;
+                }
+                a /= x;
+            }
+            0x44 => a |= insn.k,
+            0x4c => a |= x,
+            0x54 => a &= insn.k,
+            0x5c => a &= x,
+            0x64 => a = a.wrapping_shl(insn.k),
+            0x6c => a = a.wrapping_shl(x & 31),
+            0x74 => a = a.wrapping_shr(insn.k),
+            0x7c => a = a.wrapping_shr(x & 31),
+            0x84 => a = a.wrapping_neg(),
+            0x94 => {
+                if insn.k == 0 {
+                    return 0;
+                }
+                a %= insn.k;
+            }
+            0x9c => {
+                if x == 0 {
+                    return 0;
+                }
+                a %= x;
+            }
+            0xa4 => a ^= insn.k,
+            0xac => a ^= x,
+            0x05 => {
+                pc = match pc
+                    .checked_add(1)
+                    .and_then(|next| next.checked_add(insn.k as usize))
+                {
+                    Some(target) => target,
+                    None => return 0,
+                };
+                continue;
+            }
+            0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d | 0x45 | 0x4d => {
+                let value = if insn.code & BPF_X == 0 { insn.k } else { x };
+                let branch = match insn.code & 0xf0 {
+                    BPF_JEQ => a == value,
+                    BPF_JGT => a > value,
+                    BPF_JGE => a >= value,
+                    BPF_JSET => a & value != 0,
+                    _ => return 0,
+                };
+                pc += 1 + usize::from(if branch { insn.jt } else { insn.jf });
+                continue;
+            }
+            0x06 => return insn.k,
+            0x16 => return a,
+            0x07 => x = a,
+            0x87 => a = x,
+            _ => return 0,
+        }
+        pc += 1;
     }
 
     // fall-through：返回 0（丢弃）
     0
 }
 
-/// 按 size 字段从 packet 数据加载一个 u32 值。
-///
-/// 越界时返回 0。大端读取，与 Linux
-/// `get_unaligned_be16` / `get_unaligned_be32` 一致。
 #[inline]
-fn load_packet(data: &[u8], offset: usize, code: u16) -> u32 {
-    let size_code = code & 0x18;
-    match size_code {
-        BPF_W => {
-            if let Some(slice) = data.get(offset..offset + 4) {
-                u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]])
-            } else {
-                0
-            }
-        }
-        BPF_H => {
-            if let Some(slice) = data.get(offset..offset + 2) {
-                u16::from_be_bytes([slice[0], slice[1]]) as u32
-            } else {
-                0
-            }
-        }
-        BPF_B => data.get(offset).map(|&b| b as u32).unwrap_or(0),
-        _ => 0,
+fn width(code: u16) -> BpfWidth {
+    match code & 0x18 {
+        BPF_W => BpfWidth::Word,
+        BPF_H => BpfWidth::Half,
+        BPF_B => BpfWidth::Byte,
+        _ => unreachable!(),
     }
+}
+
+#[inline]
+fn is_ancillary(offset: u32) -> bool {
+    offset >= SKF_AD_OFF
 }
 
 // ============ cBPF 验证器 ============
@@ -306,117 +353,148 @@ pub fn validate_cbpf(insns: &[SockFilter]) -> Result<(), SystemError> {
     if insns.len() > BPF_MAXINSNS {
         return Err(SystemError::EINVAL);
     }
-    if (insns[insns.len() - 1].code & 0x07) != BPF_RET {
+    if !matches!(insns[insns.len() - 1].code, 0x06 | 0x16) {
         return Err(SystemError::EINVAL);
     }
 
     for (pc, insn) in insns.iter().enumerate() {
-        let class = insn.code & 0x07;
-        match class {
-            BPF_LD => {
-                let mode = insn.code & 0xe0;
-                match mode {
-                    BPF_IMM | BPF_ABS | BPF_IND | BPF_LEN => {}
-                    BPF_MEM => {
-                        if insn.k as usize >= BPF_MEMWORDS {
-                            return Err(SystemError::EINVAL);
-                        }
-                    }
-                    _ => return Err(SystemError::EINVAL),
-                }
+        if !code_allowed(insn.code) {
+            return Err(SystemError::EINVAL);
+        }
+
+        match insn.code {
+            0x34 | 0x94 if insn.k == 0 => return Err(SystemError::EINVAL),
+            0x64 | 0x74 if insn.k >= 32 => return Err(SystemError::EINVAL),
+            0x60 | 0x61 | 0x02 | 0x03 if insn.k as usize >= BPF_MEMWORDS => {
+                return Err(SystemError::EINVAL);
             }
-            BPF_LDX => {
-                let mode = insn.code & 0xe0;
-                match mode {
-                    BPF_IMM | BPF_LEN => {}
-                    BPF_MEM => {
-                        if insn.k as usize >= BPF_MEMWORDS {
-                            return Err(SystemError::EINVAL);
-                        }
-                    }
-                    // BPF_MSH 仅允许 BPF_B 宽度（提取 IP 头 IHL 字段）
-                    BPF_MSH => {
-                        if insn.code & 0x18 != BPF_B {
-                            return Err(SystemError::EINVAL);
-                        }
-                    }
-                    _ => return Err(SystemError::EINVAL),
-                }
-            }
-            BPF_ST | BPF_STX => {
-                if insn.k as usize >= BPF_MEMWORDS {
+            0x05 => {
+                if insn.k >= (insns.len() - pc - 1) as u32 {
                     return Err(SystemError::EINVAL);
                 }
             }
-            BPF_ALU => {
-                let op = insn.code & 0xf0;
-                let src = insn.code & 0x08;
-                match op {
-                    BPF_ADD | BPF_SUB | BPF_MUL | BPF_OR | BPF_AND | BPF_LSH | BPF_RSH
-                    | BPF_NEG | BPF_XOR => {}
-                    BPF_DIV | BPF_MOD => {
-                        if src == BPF_K && insn.k == 0 {
-                            return Err(SystemError::EINVAL);
-                        }
-                    }
-                    _ => return Err(SystemError::EINVAL),
-                }
-                // 源只允许 K 或 X
-                if src != BPF_K && src != BPF_X {
+            0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d | 0x45 | 0x4d => {
+                if pc + insn.jt as usize + 1 >= insns.len()
+                    || pc + insn.jf as usize + 1 >= insns.len()
+                {
                     return Err(SystemError::EINVAL);
                 }
             }
-            BPF_JMP => {
-                let op = insn.code & 0xf0;
-                if op == BPF_JA {
-                    let Some(target) = pc
-                        .checked_add(1)
-                        .and_then(|v| v.checked_add(insn.k as usize))
-                    else {
-                        return Err(SystemError::EINVAL);
-                    };
-                    if target >= insns.len() {
-                        return Err(SystemError::EINVAL);
-                    }
-                } else {
-                    match op {
-                        BPF_JEQ | BPF_JGT | BPF_JGE | BPF_JSET => {}
-                        _ => return Err(SystemError::EINVAL),
-                    }
-                    let src = insn.code & 0x08;
-                    if src != BPF_K && src != BPF_X {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let Some(jt_target) = pc
-                        .checked_add(1)
-                        .and_then(|v| v.checked_add(insn.jt as usize))
-                    else {
-                        return Err(SystemError::EINVAL);
-                    };
-                    let Some(jf_target) = pc
-                        .checked_add(1)
-                        .and_then(|v| v.checked_add(insn.jf as usize))
-                    else {
-                        return Err(SystemError::EINVAL);
-                    };
-                    if jt_target >= insns.len() || jf_target >= insns.len() {
-                        return Err(SystemError::EINVAL);
-                    }
-                }
+            0x20 | 0x28 | 0x30 if is_ancillary(insn.k) && !known_ancillary(insn.k) => {
+                return Err(SystemError::EINVAL);
             }
-            BPF_RET => {
-                let rval = insn.code & BPF_RVAL_MASK;
-                if rval != BPF_K && rval != BPF_A {
-                    return Err(SystemError::EINVAL);
-                }
+            _ => {}
+        }
+    }
+
+    check_loads_and_stores(insns)
+}
+
+#[inline]
+fn code_allowed(code: u16) -> bool {
+    const ALLOWED: &[u16] = &[
+        BPF_ALU | BPF_ADD | BPF_K,
+        BPF_ALU | BPF_ADD | BPF_X,
+        BPF_ALU | BPF_SUB | BPF_K,
+        BPF_ALU | BPF_SUB | BPF_X,
+        BPF_ALU | BPF_MUL | BPF_K,
+        BPF_ALU | BPF_MUL | BPF_X,
+        BPF_ALU | BPF_DIV | BPF_K,
+        BPF_ALU | BPF_DIV | BPF_X,
+        BPF_ALU | BPF_MOD | BPF_K,
+        BPF_ALU | BPF_MOD | BPF_X,
+        BPF_ALU | BPF_AND | BPF_K,
+        BPF_ALU | BPF_AND | BPF_X,
+        BPF_ALU | BPF_OR | BPF_K,
+        BPF_ALU | BPF_OR | BPF_X,
+        BPF_ALU | BPF_XOR | BPF_K,
+        BPF_ALU | BPF_XOR | BPF_X,
+        BPF_ALU | BPF_LSH | BPF_K,
+        BPF_ALU | BPF_LSH | BPF_X,
+        BPF_ALU | BPF_RSH | BPF_K,
+        BPF_ALU | BPF_RSH | BPF_X,
+        BPF_ALU | BPF_NEG,
+        BPF_LD | BPF_W | BPF_ABS,
+        BPF_LD | BPF_H | BPF_ABS,
+        BPF_LD | BPF_B | BPF_ABS,
+        BPF_LD | BPF_W | BPF_LEN,
+        BPF_LD | BPF_W | BPF_IND,
+        BPF_LD | BPF_H | BPF_IND,
+        BPF_LD | BPF_B | BPF_IND,
+        BPF_LD | BPF_IMM,
+        BPF_LD | BPF_MEM,
+        BPF_LDX | BPF_W | BPF_LEN,
+        BPF_LDX | BPF_B | BPF_MSH,
+        BPF_LDX | BPF_IMM,
+        BPF_LDX | BPF_MEM,
+        BPF_ST,
+        BPF_STX,
+        BPF_MISC | BPF_TAX,
+        BPF_MISC | BPF_TXA,
+        BPF_RET | BPF_K,
+        BPF_RET | BPF_A,
+        BPF_JMP | BPF_JA,
+        BPF_JMP | BPF_JEQ | BPF_K,
+        BPF_JMP | BPF_JEQ | BPF_X,
+        BPF_JMP | BPF_JGE | BPF_K,
+        BPF_JMP | BPF_JGE | BPF_X,
+        BPF_JMP | BPF_JGT | BPF_K,
+        BPF_JMP | BPF_JGT | BPF_X,
+        BPF_JMP | BPF_JSET | BPF_K,
+        BPF_JMP | BPF_JSET | BPF_X,
+    ];
+
+    ALLOWED.contains(&code)
+}
+
+#[inline]
+fn known_ancillary(offset: u32) -> bool {
+    matches!(
+        offset.wrapping_sub(SKF_AD_OFF),
+        SKF_AD_PROTOCOL
+            | SKF_AD_PKTTYPE
+            | SKF_AD_IFINDEX
+            | SKF_AD_NLATTR
+            | SKF_AD_NLATTR_NEST
+            | SKF_AD_MARK
+            | SKF_AD_QUEUE
+            | SKF_AD_HATYPE
+            | SKF_AD_RXHASH
+            | SKF_AD_CPU
+            | SKF_AD_ALU_XOR_X
+            | SKF_AD_VLAN_TAG
+            | SKF_AD_VLAN_TAG_PRESENT
+            | SKF_AD_PAY_OFFSET
+            | SKF_AD_RANDOM
+            | SKF_AD_VLAN_TPID
+    )
+}
+
+fn check_loads_and_stores(insns: &[SockFilter]) -> Result<(), SystemError> {
+    let mut masks = Vec::new();
+    masks
+        .try_reserve_exact(insns.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    masks.resize(insns.len(), u16::MAX);
+    let mut memvalid = 0u16;
+
+    for (pc, insn) in insns.iter().enumerate() {
+        memvalid &= masks[pc];
+        match insn.code {
+            0x02 | 0x03 => memvalid |= 1 << insn.k,
+            0x60 | 0x61 if memvalid & (1 << insn.k) == 0 => {
+                return Err(SystemError::EINVAL);
             }
-            BPF_MISC => {
-                let op = insn.code & 0xf8;
-                if op != BPF_TAX && op != BPF_TXA {
-                    return Err(SystemError::EINVAL);
-                }
+            0x05 => {
+                masks[pc + 1 + insn.k as usize] &= memvalid;
+                memvalid = u16::MAX;
             }
-            _ => return Err(SystemError::EINVAL),
+            0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d | 0x45 | 0x4d => {
+                masks[pc + 1 + insn.jt as usize] &= memvalid;
+                masks[pc + 1 + insn.jf as usize] &= memvalid;
+                memvalid = u16::MAX;
+            }
+            _ => {}
         }
     }
 
@@ -427,13 +505,13 @@ pub fn validate_cbpf(insns: &[SockFilter]) -> Result<(), SystemError> {
 
 /// 从 optval 字节切片解析 `sock_fprog` 结构并读取 filter 指令。
 ///
-/// `optval` 应包含 `struct sock_fprog` 的原始字节（至少 16 字节）。
+/// `optval` 必须精确包含一个 native `struct sock_fprog`。
 /// 内部通过 `UserBufferReader` 安全地从用户空间读取 filter 指令数组。
 ///
 /// 返回已解析的 `Vec<SockFilter>`。
-pub(crate) fn read_sock_fprog(optval: &[u8]) -> Result<Vec<SockFilter>, SystemError> {
+pub(crate) fn parse_sock_fprog(optval: &[u8]) -> Result<SockFprog, SystemError> {
     let fprog_size = core::mem::size_of::<SockFprog>();
-    if optval.len() < fprog_size {
+    if optval.len() != fprog_size {
         return Err(SystemError::EINVAL);
     }
 
@@ -443,11 +521,24 @@ pub(crate) fn read_sock_fprog(optval: &[u8]) -> Result<Vec<SockFilter>, SystemEr
         optval[15],
     ]);
 
-    if len == 0 || len as usize > BPF_MAXINSNS {
+    Ok(SockFprog {
+        len,
+        _pad: [0; 6],
+        filter,
+    })
+}
+
+pub(crate) fn read_sock_fprog_insns(fprog: &SockFprog) -> Result<Vec<SockFilter>, SystemError> {
+    if fprog.len == 0 || fprog.len as usize > BPF_MAXINSNS {
         return Err(SystemError::EINVAL);
     }
 
-    read_filter_insns(filter, len as usize)
+    read_filter_insns(fprog.filter, fprog.len as usize)
+}
+
+pub(crate) fn read_sock_fprog(optval: &[u8]) -> Result<Vec<SockFilter>, SystemError> {
+    let fprog = parse_sock_fprog(optval)?;
+    read_sock_fprog_insns(&fprog)
 }
 
 /// 从用户空间读取 filter 指令数组。
@@ -455,11 +546,17 @@ fn read_filter_insns(ptr: u64, count: usize) -> Result<Vec<SockFilter>, SystemEr
     let insn_size = core::mem::size_of::<SockFilter>();
     let byte_len = count.checked_mul(insn_size).ok_or(SystemError::EINVAL)?;
 
-    let mut buf = alloc::vec![0u8; byte_len];
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(byte_len)
+        .map_err(|_| SystemError::ENOMEM)?;
+    buf.resize(byte_len, 0);
     let reader = UserBufferReader::new(ptr as *const u8, byte_len, true)?;
     reader.copy_from_user_protected(&mut buf, 0)?;
 
-    let mut insns = Vec::with_capacity(count);
+    let mut insns = Vec::new();
+    insns
+        .try_reserve_exact(count)
+        .map_err(|_| SystemError::ENOMEM)?;
     for chunk in buf.chunks_exact(insn_size) {
         insns.push(SockFilter {
             code: u16::from_ne_bytes([chunk[0], chunk[1]]),

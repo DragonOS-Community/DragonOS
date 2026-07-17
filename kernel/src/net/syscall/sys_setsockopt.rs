@@ -4,7 +4,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETSOCKOPT;
 use crate::mm::VirtAddr;
 use crate::net::socket;
-use crate::net::socket::{PIPV6, PSOL};
+use crate::net::socket::{PIPV6, PSO, PSOL};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -50,6 +50,33 @@ impl Syscall for SysSetsockoptHandle {
         let mut optlen_to_read = optlen;
         if level == PSOL::IPV6 as usize && optname == PIPV6::CHECKSUM as usize {
             optlen_to_read = core::mem::size_of::<i32>();
+        }
+        // Linux validates the integer length before touching optval, then
+        // consumes only the leading int even when a longer buffer is supplied.
+        let filter_int_option = level == PSOL::SOCKET as usize
+            && matches!(
+                PSO::try_from(optname as u32),
+                Ok(PSO::DETACH_FILTER | PSO::LOCK_FILTER)
+            );
+        if filter_int_option {
+            if optlen < core::mem::size_of::<i32>() {
+                return Err(SystemError::EINVAL);
+            }
+            optlen_to_read = core::mem::size_of::<i32>();
+        }
+        // Linux's generic SOL_SOCKET path first reads an int. For a malformed
+        // SO_ATTACH_FILTER length, preserve that access/error ordering, then
+        // pass a four-byte slice so the fprog parser returns EINVAL. Only the
+        // exact native layout causes the full structure to be read.
+        let attach_filter = level == PSOL::SOCKET as usize
+            && matches!(PSO::try_from(optname as u32), Ok(PSO::ATTACH_FILTER));
+        if attach_filter {
+            if optlen < core::mem::size_of::<i32>() {
+                return Err(SystemError::EINVAL);
+            }
+            if optlen != core::mem::size_of::<crate::bpf::classic::SockFprog>() {
+                optlen_to_read = core::mem::size_of::<i32>();
+            }
         }
 
         // Verify optval address validity if from user space

@@ -301,9 +301,7 @@ impl RxToken for VethRxToken {
         // 向注册的 packet socket 分发数据包
         if let Some(iface) = self.driver.iface() {
             let pkt_type = crate::net::socket::packet::classify_packet(packet, &iface);
-            if let Some(netns) = iface.net_namespace() {
-                netns.deliver_to_packet_sockets(iface.nic_id() as u32, packet, pkt_type);
-            }
+            crate::net::socket::packet::deliver_to_packet_sockets(&iface, packet, pkt_type);
         }
 
         f(packet)
@@ -405,7 +403,7 @@ impl VethInterface {
             driver: driver.clone(),
             common: IfaceCommon::new(
                 iface_id,
-                super::types::InterfaceType::EETHER,
+                super::types::InterfaceType::ETHER,
                 driver.name(),
                 mtu,
                 flags,

@@ -43,6 +43,15 @@ inline constexpr int kSoRcvtimeoNew = 66;
 inline constexpr int kSoSndtimeoNew = 67;
 inline constexpr int kSoAttachFilter = 26;
 inline constexpr int kSoDetachFilter = 27;
+inline constexpr int kSoLockFilter = 44;
+
+// Classic BPF encodings used here are kept local because DragonOS musl may
+// not ship linux/filter.h in every test image.
+inline constexpr uint16_t kBpfLdWAbs = 0x20;
+inline constexpr uint16_t kBpfLdWInd = 0x40;
+inline constexpr uint16_t kBpfLdMem = 0x60;
+inline constexpr uint16_t kBpfLshK = 0x64;
+inline constexpr uint16_t kBpfRetK = 0x06;
 
 struct TestSockFilter {
     uint16_t code;
@@ -414,6 +423,139 @@ TEST(AfPacketSockopt, DetachFilterReturnsEnoentWhenNoFilter) {
     errno = 0;
     int dummy = 0;
     EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter, &dummy, sizeof(dummy)), -1);
+    EXPECT_EQ(errno, ENOENT) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, ValidatorRejectsMalformedAndUnsafePrograms) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    auto rejected = [&](TestSockFilter* insns, uint16_t len) {
+        TestSockFprog program{len, insns};
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &program,
+                             sizeof(program)),
+                  -1);
+        EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+    };
+
+    TestSockFilter unknown_size[] = {{static_cast<uint16_t>(kBpfRetK | 0x08), 0, 0, 1}};
+    rejected(unknown_size, 1);
+
+    TestSockFilter oversized_shift[] = {
+        {kBpfLshK, 0, 0, 32},
+        {kBpfRetK, 0, 0, 1},
+    };
+    rejected(oversized_shift, 2);
+
+    TestSockFilter uninitialized_mem[] = {
+        {kBpfLdMem, 0, 0, 0},
+        {kBpfRetK, 0, 0, 1},
+    };
+    rejected(uninitialized_mem, 2);
+
+    TestSockFilter runtime_negative_offset[] = {
+        {kBpfLdWInd, 0, 0, 0xffffffffU},
+        {kBpfRetK, 0, 0, 1},
+    };
+    // Linux reserves negative ABS offsets for known SKF_AD_* extensions, but
+    // an IND offset can still wrap negative at runtime and must fail closed.
+    TestSockFprog negative_program{2, runtime_negative_offset};
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &negative_program,
+                         sizeof(negative_program)),
+              0)
+        << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, FilterLockUsesValboolAndIsIrreversible) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    TestSockFilter accept_all{kBpfRetK, 0, 0, 0xffffffffU};
+    TestSockFprog program{1, &accept_all};
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &program,
+                         sizeof(program)),
+              0)
+        << ErrnoString(errno);
+
+    int zero = 0;
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoLockFilter, &zero, sizeof(zero)), 0)
+        << "LOCK_FILTER=0 must not lock: " << ErrnoString(errno);
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter, &zero, sizeof(zero)), 0)
+        << ErrnoString(errno);
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &program,
+                         sizeof(program)),
+              0)
+        << ErrnoString(errno);
+
+    int one = 1;
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoLockFilter, &one, sizeof(one)), 0)
+        << ErrnoString(errno);
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter, &zero, sizeof(zero)), -1);
+    EXPECT_EQ(errno, EPERM);
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoLockFilter, &zero, sizeof(zero)), -1);
+    EXPECT_EQ(errno, EPERM);
+
+    TestSockFprog inaccessible_program{
+        1, reinterpret_cast<TestSockFilter*>(UINTPTR_MAX)};
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &inaccessible_program,
+                         sizeof(inaccessible_program)),
+              -1);
+    EXPECT_EQ(errno, EPERM) << "filter lock must be checked before reading instructions";
+}
+
+TEST(AfPacketSockopt, AttachFilterFollowsFprogOptlenAndAccessOrdering) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    for (socklen_t len = 0; len < sizeof(int); ++len) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter,
+                             reinterpret_cast<const void*>(UINTPTR_MAX), len),
+                  -1);
+        EXPECT_EQ(errno, EINVAL) << "short optlen must win over bad pointer, len=" << len;
+    }
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter,
+                         reinterpret_cast<const void*>(UINTPTR_MAX), sizeof(TestSockFprog) + 1),
+              -1);
+    EXPECT_EQ(errno, EFAULT) << "SOL_SOCKET must read the leading int before rejecting size";
+
+    alignas(TestSockFprog) uint8_t oversized[sizeof(TestSockFprog) + 1]{};
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, oversized,
+                         sizeof(oversized)),
+              -1);
+    EXPECT_EQ(errno, EINVAL);
+}
+
+TEST(AfPacketSockopt, DetachAndLockFollowIntegerOptlenAbi) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    int value = 0;
+    for (socklen_t len = 0; len < sizeof(value); ++len) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter, &value, len), -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << len;
+
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter,
+                             reinterpret_cast<const void*>(1), len),
+                  -1);
+        EXPECT_EQ(errno, EINVAL) << "short optlen must win over bad pointer, len=" << len;
+    }
+
+    struct {
+        int value;
+        int ignored;
+    } long_value{0, 0x12345678};
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoDetachFilter, &long_value,
+                         sizeof(long_value)),
+              -1);
     EXPECT_EQ(errno, ENOENT) << ErrnoString(errno);
 }
 

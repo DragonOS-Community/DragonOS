@@ -1,0 +1,4 @@
+# Focused conformance binaries that must never report a skipped gtest case.
+normal/test_pivot_root
+normal/mount_propagation
+normal/open_dangling_symlink

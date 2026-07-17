@@ -282,7 +282,15 @@ pub struct ObjectPage<'a> {
 }
 impl<'a> ObjectPage<'a> {
     pub fn new() -> Box<ObjectPage<'a>> {
-        unsafe { Box::new_uninit().assume_init() }
+        let mut page = Box::<ObjectPage<'a>>::new_uninit();
+        unsafe {
+            // ObjectPage contains an enum, raw links and atomics. Treating
+            // arbitrary uninitialized bytes as that Rust value is undefined
+            // behavior even if refill() overwrites the metadata immediately
+            // afterwards. Initialize in place to avoid a 4 KiB stack object.
+            core::ptr::write_bytes(page.as_mut_ptr().cast::<u8>(), 0, Self::SIZE);
+            page.assume_init()
+        }
     }
 }
 

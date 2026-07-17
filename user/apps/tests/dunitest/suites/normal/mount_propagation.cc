@@ -380,9 +380,7 @@ protected:
         snprintf(root_, sizeof(root_), "/tmp/mount_propagation_%d", getpid());
         ASSERT_EQ(0, ensure_dir(root_)) << strerror(errno);
 
-        if (unshare(CLONE_NEWNS) != 0) {
-            GTEST_SKIP() << "unshare(CLONE_NEWNS): " << strerror(errno);
-        }
+        ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
         ASSERT_EQ(0, mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr))
             << strerror(errno);
     }

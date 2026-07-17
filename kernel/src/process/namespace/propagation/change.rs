@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::{
@@ -419,10 +419,17 @@ impl PreparedPropagationRemoval {
         let mut graph = PropagationGraph::new(targets.len(), &mut before_reserve)?;
         let mut target_ids = Vec::new();
         reserve_vec(&mut target_ids, targets.len(), &mut before_reserve)?;
+        let mut target_id_set = HashSet::new();
+        if !targets.is_empty() {
+            before_reserve()?;
+            target_id_set
+                .try_reserve(targets.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
         let mut removals = Vec::new();
         reserve_vec(&mut removals, targets.len(), &mut before_reserve)?;
         for target in targets {
-            if target_ids.contains(&target.mount_id()) {
+            if !target_id_set.insert(target.mount_id()) {
                 continue;
             }
             graph.capture_component(target.clone(), &mut before_reserve)?;
@@ -435,9 +442,73 @@ impl PreparedPropagationRemoval {
                 graph.capture_group(propagation.peer_group_id(), target, &mut before_reserve)?;
             }
         }
+
+        // Removing an entire standalone peer group has no make-slave
+        // reparenting work: every member ends private and the registry group
+        // disappears. Running the general one-at-a-time simulation would
+        // repeatedly search and retain the shrinking member vector, which is
+        // quadratic for mount-max sized groups. Keep groups with an external
+        // master/slave edge, or with any surviving peer, on the general path.
+        let mut standalone_groups = Vec::new();
+        reserve_vec(
+            &mut standalone_groups,
+            graph.groups.len(),
+            &mut before_reserve,
+        )?;
+        for (group_id, group) in &graph.groups {
+            if !group.members.is_empty()
+                && group.members.iter().all(|member| {
+                    target_id_set.contains(member)
+                        && graph
+                            .nodes
+                            .get(member)
+                            .is_some_and(|node| node.master.is_none() && node.slaves.is_empty())
+                })
+            {
+                standalone_groups.push(*group_id);
+            }
+        }
+        let mut handled = HashSet::new();
+        if !target_ids.is_empty() {
+            before_reserve()?;
+            handled
+                .try_reserve(target_ids.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
+        for group_id in standalone_groups {
+            let members = core::mem::take(
+                &mut graph
+                    .groups
+                    .get_mut(&group_id)
+                    .expect("captured standalone peer group")
+                    .members,
+            );
+            for member in members {
+                let node = graph
+                    .nodes
+                    .get_mut(&member)
+                    .expect("captured peer group member");
+                node.flags
+                    .remove(PropagationFlags::SHARED | PropagationFlags::UNBINDABLE);
+                node.peer_group = None;
+                handled.insert(member);
+            }
+        }
+        let mut complex_targets = Vec::new();
+        reserve_vec(
+            &mut complex_targets,
+            target_ids.len().saturating_sub(handled.len()),
+            &mut before_reserve,
+        )?;
+        complex_targets.extend(
+            target_ids
+                .iter()
+                .copied()
+                .filter(|target| !handled.contains(target)),
+        );
         let mut alloc_group = PropagationGroup::alloc;
         graph.simulate_change(
-            &target_ids,
+            &complex_targets,
             PropagationType::Private,
             &mut alloc_group,
             &mut before_reserve,

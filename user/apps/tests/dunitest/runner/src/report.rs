@@ -114,6 +114,28 @@ fn write_text_report(results_dir: &Path, summary: &Summary) -> Result<()> {
     Ok(())
 }
 
+fn write_json_report(results_dir: &Path, summary: &Summary) -> Result<()> {
+    let file = results_dir.join("summary.json");
+    let content =
+        serde_json::to_string_pretty(summary).with_context(|| "序列化 summary.json 失败")?;
+    fs::write(&file, content).with_context(|| format!("写入失败: {}", file.display()))?;
+    Ok(())
+}
+
+fn write_failed_cases(results_dir: &Path, summary: &Summary) -> Result<()> {
+    let file = results_dir.join("failed_cases.txt");
+    let mut f = File::create(&file).with_context(|| format!("创建文件失败: {}", file.display()))?;
+    for c in &summary.cases {
+        match c.status {
+            CaseStatus::Failed | CaseStatus::Timeout => {
+                writeln!(f, "{}", c.name)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,26 +242,4 @@ mod tests {
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.timeout, 1);
     }
-}
-
-fn write_json_report(results_dir: &Path, summary: &Summary) -> Result<()> {
-    let file = results_dir.join("summary.json");
-    let content =
-        serde_json::to_string_pretty(summary).with_context(|| "序列化 summary.json 失败")?;
-    fs::write(&file, content).with_context(|| format!("写入失败: {}", file.display()))?;
-    Ok(())
-}
-
-fn write_failed_cases(results_dir: &Path, summary: &Summary) -> Result<()> {
-    let file = results_dir.join("failed_cases.txt");
-    let mut f = File::create(&file).with_context(|| format!("创建文件失败: {}", file.display()))?;
-    for c in &summary.cases {
-        match c.status {
-            CaseStatus::Failed | CaseStatus::Timeout => {
-                writeln!(f, "{}", c.name)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }

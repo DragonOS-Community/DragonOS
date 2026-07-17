@@ -254,7 +254,7 @@ impl FileSystem for ProcFS {
     }
 
     fn name(&self) -> &str {
-        "procfs"
+        "proc"
     }
 
     fn super_block(&self) -> SuperBlock {

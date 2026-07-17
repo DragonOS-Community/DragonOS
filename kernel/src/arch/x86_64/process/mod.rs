@@ -3,14 +3,13 @@
 use core::{
     arch::asm,
     intrinsics::unlikely,
-    mem::ManuallyDrop,
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
 use kdepends::memoffset::offset_of;
-use log::{error, info, warn};
+use log::{info, warn};
 use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
@@ -302,25 +301,14 @@ impl ArchPCBInfo {
 impl ProcessControlBlock {
     /// 获取当前进程的pcb
     pub fn arch_current_pcb() -> Arc<Self> {
-        // 获取栈指针
-        let ptr = VirtAddr::new(x86::current::registers::rsp() as usize);
-
-        let stack_base = VirtAddr::new(ptr.data() & (!(KernelStack::ALIGN - 1)));
-
-        // 从内核栈的最低地址处取出pcb的地址
-        let p = stack_base.data() as *const *const ProcessControlBlock;
-        if unlikely((unsafe { *p }).is_null()) {
-            error!("p={:p}", p);
-            panic!("current_pcb is null");
-        }
-        unsafe {
-            // 为了防止内核栈的pcb weak 指针被释放，这里需要将其包装一下
-            let weak_wrapper: ManuallyDrop<Weak<ProcessControlBlock>> =
-                ManuallyDrop::new(Weak::from_raw(*p));
-
-            let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade().unwrap();
-            return new_arc;
-        }
+        // Pin execution to this CPU before selecting its runqueue. The current
+        // slot uses a raw publication lock so this remains usable from context
+        // switch and interrupt paths without scheduler-lock recursion.
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let cpu = crate::smp::core::smp_get_processor_id().data() as usize;
+        let current = crate::sched::cpu_rq(cpu).current_local();
+        drop(irq_guard);
+        current
     }
 }
 
@@ -418,6 +406,7 @@ impl ProcessManager {
     /// - `next`：下一个进程的pcb
     pub unsafe fn switch_process(prev: Arc<ProcessControlBlock>, next: Arc<ProcessControlBlock>) {
         assert!(!CurrentIrqArch::is_irq_enabled());
+        let cpu = crate::smp::core::smp_get_processor_id();
 
         // 保存浮点寄存器
         prev.arch_info_irqsave().save_fp_state();
@@ -437,7 +426,6 @@ impl ProcessManager {
         let prev_active_mm = prev_user_vm
             .clone()
             .or_else(crate::mm::tlb::tlb_state_loaded_mm);
-        let cpu = crate::smp::core::smp_get_processor_id();
         compiler_fence(Ordering::SeqCst);
 
         // INV-1: before loading a different user mm, mark this CPU active in the
@@ -478,8 +466,8 @@ impl ProcessManager {
         (*prev_arch).rip = switch_back as usize;
 
         // 恢复当前的 preempt count*2
-        ProcessManager::current_pcb().preempt_enable();
-        ProcessManager::current_pcb().preempt_enable();
+        prev.preempt_enable();
+        prev.preempt_enable();
 
         // 切换tss
         TSSManager::current_tss().set_rsp(
@@ -488,9 +476,13 @@ impl ProcessManager {
         );
         TSSManager::invalidate_io_bitmap();
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
-        PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
+        PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next.clone());
         // debug!("switch tss ok");
         compiler_fence(Ordering::SeqCst);
+        // All switch preparation above still executes on `prev` and may use
+        // preemption-aware locks. Publish `next` only at the final no-lock,
+        // interrupts-disabled boundary immediately before changing stacks.
+        crate::sched::cpu_rq(cpu.data() as usize).publish_current(next);
         // 正式切换上下文
         switch_to_inner(prev_arch, next_arch);
     }

@@ -11,12 +11,16 @@ fi
 RUNNER="$BASE_DIR/dunitest-runner"
 BIN_DIR="$BASE_DIR/bin"
 RESULTS="$BASE_DIR/results"
+WHITELIST="$BASE_DIR/whitelist.txt"
+NO_SKIP="$BASE_DIR/no_skip.txt"
+
+RUNNER_ARGS="--bin-dir $BIN_DIR --results-dir $RESULTS --whitelist $WHITELIST --no-skip $NO_SKIP"
 
 echo "[dunit] start running tests..."
 if [ "${DUNITEST_PATTERN:-}" != "" ]; then
-    "$RUNNER" --bin-dir "$BIN_DIR" --results-dir "$RESULTS" --pattern "$DUNITEST_PATTERN"
+    "$RUNNER" $RUNNER_ARGS --pattern "$DUNITEST_PATTERN"
 else
-    "$RUNNER" --bin-dir "$BIN_DIR" --results-dir "$RESULTS"
+    "$RUNNER" $RUNNER_ARGS
 fi
 status=$?
 echo "[dunit] 测试完成, status=$status"

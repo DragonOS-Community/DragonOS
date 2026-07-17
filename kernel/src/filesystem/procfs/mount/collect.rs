@@ -39,6 +39,7 @@ pub(crate) fn collect_visible_mounts(
         return Ok((Vec::new(), "/".to_string()));
     }
     let root_mount = root.mount_fs();
+    let mount_namespace = target.nsproxy().mnt_ns.clone();
     let mut mounts = Vec::new();
     let mount_root = root_mount
         .root_inode()
@@ -52,6 +53,11 @@ pub(crate) fn collect_visible_mounts(
         let parent_mount_id = root_mount
             .self_mountpoint()
             .map(|mountpoint| mountpoint.mount_fs().mount_id().into())
+            .or_else(|| {
+                Arc::ptr_eq(&root_mount, &mount_namespace.root_mntfs())
+                    .then(|| mount_namespace.root_parent_mount_id().map(|id| id.data()))
+                    .flatten()
+            })
             .unwrap_or_else(|| root_mount.mount_id().into());
         mounts.push((
             mountpoint_display,

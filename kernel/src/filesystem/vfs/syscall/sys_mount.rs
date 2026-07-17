@@ -485,10 +485,18 @@ fn do_new_mount(
     mount_flags: MountFlags,
 ) -> Result<Arc<MountFS>, SystemError> {
     let fs_type_str = filesystemtype.ok_or(SystemError::EINVAL)?;
-    let source = source.ok_or(SystemError::EINVAL)?;
-    let fs = produce_fs(&fs_type_str, data.as_deref(), &source, mount_flags).inspect_err(|e| {
+    // Linux accepts a NULL source for nodev filesystems and reports it as
+    // "none" in mountinfo. Keep an explicitly supplied empty string distinct.
+    let fs = produce_fs(
+        &fs_type_str,
+        data.as_deref(),
+        source.as_deref().unwrap_or(""),
+        mount_flags,
+    )
+    .inspect_err(|e| {
         log::warn!("Failed to produce filesystem: {:?}", e);
     })?;
+    let source = source.unwrap_or_else(|| String::from("none"));
 
     let new_mount_res: Result<Arc<MountFS>, SystemError> =
         if let Some(mnt_inode) = target_inode.clone().downcast_arc::<MountFSInode>() {
@@ -516,7 +524,11 @@ fn do_new_mount(
             }
             Ok(prepared)
         } else {
-            target_inode.mount(fs, mount_flags)
+            // A pathname usable as a mountpoint in this namespace resolves to
+            // a MountFSInode. A bare inode can be reached through an internal
+            // pseudo-filesystem magic link (for example /proc/self/fd/N), but
+            // it is not attached to the caller's mount namespace.
+            Err(SystemError::EINVAL)
         };
 
     let new_mount = new_mount_res?;

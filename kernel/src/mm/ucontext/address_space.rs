@@ -516,13 +516,21 @@ impl AddressSpace {
             len,
             prot_flags,
             map_flags,
-            may_exec,
+            mut may_exec,
             offset,
             round_to_min,
             allocate_at_once,
             sysv_shm,
             fixed_noreplace_conflict_error_before_mmap_min,
         } = args;
+        let noexec = file
+            .inode()
+            .mount_flags()
+            .contains(crate::filesystem::vfs::mount::MountFlags::NOEXEC);
+        if noexec && prot_flags.contains(ProtFlags::PROT_EXEC) {
+            return Err(SystemError::EPERM);
+        }
+        may_exec &= !noexec;
         let len = page_align_up(len);
         if len == 0 {
             return Err(SystemError::EINVAL);

@@ -101,6 +101,7 @@ install: build
 	@mkdir -p $(INSTALL_DIR)/fixtures
 	@cp --sparse=always -f $(EXT4_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
+	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh
 	@chmod +x $(INSTALL_DIR)/run_tests.sh
 	@echo "安装完成"

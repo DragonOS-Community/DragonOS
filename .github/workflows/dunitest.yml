@@ -41,3 +41,11 @@ jobs:
           DISK_SAVE_MODE: "1"
         run: |
           make test-dunit
+
+      - name: Preserve dunitest serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunitest-serial-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: serial_opt.txt
+          if-no-files-found: error

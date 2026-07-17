@@ -86,7 +86,8 @@ unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
 }
 
 unsafe extern "C" fn smp_ap_start_stage1() -> ! {
-    let id = smp_get_processor_id();
+    let id = crate::arch::x86_64::cpu::current_cpu_id_slow();
+    crate::arch::x86_64::cpu::init_tsc_aux_cpu_id(id);
     debug!("smp_ap_start_stage1: id: {}\n", id.data());
     X86_64MMArch::init_current_cpu_nxe();
 
@@ -323,6 +324,7 @@ impl SmpCpuManager {
     #[allow(static_mut_refs)]
     pub fn arch_init(_boot_cpu: ProcessorId) {
         assert!(smp_get_processor_id().data() == 0);
+        crate::arch::x86_64::cpu::init_tsc_aux_cpu_id(ProcessorId::new(0));
         // 写入APU_START_CR3，这个值会在AP处理器启动时设置到CR3寄存器
         // 直接使用 table_paddr() 方法，无需获取锁
         let addr = IDLE_PROCESS_ADDRESS_SPACE().table_paddr();

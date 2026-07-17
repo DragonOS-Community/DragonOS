@@ -233,6 +233,8 @@ impl SmpCpuManager {
             }
         }
 
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::cpu::enable_tsc_aux_cpu_id();
         info!("All non-boot CPUs have been brought up");
     }
 

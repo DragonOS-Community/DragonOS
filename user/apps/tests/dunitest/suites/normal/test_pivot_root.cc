@@ -10,7 +10,6 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
-#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -38,13 +37,8 @@
 #define MS_REC 16384
 #endif
 
-#ifndef RAMFS_MAGIC
-#define RAMFS_MAGIC 0x858458f6
-#endif
-
 namespace {
 
-constexpr int kSkipExitCode = 77;
 int g_child_status_fd = -1;
 
 using PivotRootCaseFn = void (*)();
@@ -59,11 +53,6 @@ void write_child_status(const char* kind, const char* reason) {
 
 [[noreturn]] void child_pass() {
     _exit(0);
-}
-
-[[noreturn]] void child_skip(const char* reason) {
-    write_child_status("SKIP", reason);
-    _exit(kSkipExitCode);
 }
 
 [[noreturn]] void child_fail(const char* reason) {
@@ -95,11 +84,11 @@ long do_pivot_root(const char* new_root, const char* put_old) {
 
 void prepare_private_mount_namespace() {
     if (unshare(CLONE_NEWNS) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 }
 
@@ -115,7 +104,7 @@ std::string read_all_from_fd(int fd) {
     return out;
 }
 
-void expect_case_pass_or_skip(const char* case_name, PivotRootCaseFn fn) {
+void expect_case_pass(const char* case_name, PivotRootCaseFn fn) {
     int pipefd[2] = {-1, -1};
     ASSERT_EQ(0, pipe(pipefd)) << case_name << ": pipe failed: errno=" << errno << " ("
                                << strerror(errno) << ")";
@@ -142,12 +131,7 @@ void expect_case_pass_or_skip(const char* case_name, PivotRootCaseFn fn) {
 
     ASSERT_TRUE(WIFEXITED(status)) << case_name << ": child terminated abnormally";
 
-    const int exit_code = WEXITSTATUS(status);
-    if (exit_code == kSkipExitCode) {
-        GTEST_SKIP() << case_name << ": " << detail;
-    }
-
-    EXPECT_EQ(0, exit_code) << case_name << ": " << detail;
+    EXPECT_EQ(0, WEXITSTATUS(status)) << case_name << ": " << detail;
 }
 
 void case_success_path() {
@@ -164,13 +148,13 @@ void case_success_path() {
     prepare_private_mount_namespace();
 
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
     }
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mkdir(oldroot_abs, 0755) != 0 && errno != EEXIST) {
@@ -224,13 +208,13 @@ void case_dot_dot_path() {
     prepare_private_mount_namespace();
 
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
     }
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mkdir(bin_dir, 0755) != 0 && errno != EEXIST) {
@@ -316,13 +300,13 @@ void case_dot_dot_rslave_detach() {
     prepare_private_mount_namespace();
 
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
     }
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mkdir(bin_dir, 0755) != 0 && errno != EEXIST) {
@@ -396,13 +380,13 @@ void case_new_root_not_mountpoint() {
     prepare_private_mount_namespace();
 
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(containing_mount, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(containing mount) failed");
     }
     if (mount("", containing_mount, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if ((mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
         (mkdir(oldroot_abs, 0755) != 0 && errno != EEXIST)) {
@@ -431,17 +415,17 @@ void case_put_old_outside_new_root() {
     prepare_private_mount_namespace();
 
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if ((mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
         (mkdir(outside, 0755) != 0 && errno != EEXIST)) {
         child_fail("mkdir reachability layout failed");
     }
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mount("", outside, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mkdir(inside, 0755) != 0 && errno != EEXIST) {
@@ -468,7 +452,7 @@ void case_busy_target() {
     prepare_private_mount_namespace();
 
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mkdir(oldroot_abs, 0755) != 0 && errno != EEXIST) {
@@ -495,7 +479,7 @@ void case_permission_failure() {
     prepare_private_mount_namespace();
 
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mkdir(oldroot_abs, 0755) != 0 && errno != EEXIST) {
@@ -505,7 +489,7 @@ void case_permission_failure() {
 
     if (seteuid(65534) != 0) {
         cleanup_mount(new_root);
-        child_skip("seteuid failed");
+        child_fail("seteuid failed");
     }
 
     if (do_pivot_root(new_root, oldroot_abs) == -1 && errno == EPERM) {
@@ -566,14 +550,14 @@ void case_shared_mount_rejection() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
     }
 
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mkdir(oldroot_abs, 0755) != 0 && errno != EEXIST) {
@@ -583,7 +567,7 @@ void case_shared_mount_rejection() {
     // put_old resolves on new_root, so making this mount shared exercises
     // Linux's IS_MNT_SHARED(old_mnt) rejection without an unattached root.
     if (mount(nullptr, new_root, nullptr, MS_SHARED, nullptr) != 0) {
-        child_skip("cannot make put_old mount shared");
+        child_fail("cannot make put_old mount shared");
     }
     if (chroot(old_root) != 0 || chdir("/") != 0) {
         child_fail("chroot(old_root) failed");
@@ -608,7 +592,7 @@ void case_shared_root_parent_rejected() {
     ensure_dir(outer);
     prepare_private_mount_namespace();
     if (mount("", outer, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if ((mkdir(old_root, 0755) != 0 && errno != EEXIST) ||
         mount("", old_root, "ramfs", 0, nullptr) != 0 ||
@@ -620,7 +604,7 @@ void case_shared_root_parent_rejected() {
     // Use an explicit mount above the caller root, so this isolates Linux's
     // root_mnt->mnt_parent check from the namespace-root representation.
     if (mount(nullptr, outer, nullptr, MS_SHARED, nullptr) != 0) {
-        child_skip("cannot make caller-root parent shared");
+        child_fail("cannot make caller-root parent shared");
     }
     if (chroot(old_root) != 0 || chdir("/") != 0) {
         child_fail("chroot(old_root) failed");
@@ -642,7 +626,7 @@ void case_shared_new_root_parent_rejected() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if ((mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
         mount("", new_root, "ramfs", 0, nullptr) != 0 ||
@@ -651,7 +635,7 @@ void case_shared_new_root_parent_rejected() {
     }
     // new_mnt->parent is the caller's old-root mount.
     if (mount(nullptr, old_root, nullptr, MS_SHARED, nullptr) != 0) {
-        child_skip("cannot make new-root parent shared");
+        child_fail("cannot make new-root parent shared");
     }
     if (chroot(old_root) != 0 || chdir("/") != 0) {
         child_fail("chroot(old_root) failed");
@@ -673,7 +657,7 @@ void case_shared_mounted_put_old_rejected() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if ((mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
         mount("", new_root, "ramfs", 0, nullptr) != 0 ||
@@ -746,7 +730,7 @@ void case_mount_namespace_isolation() {
 
     int code = WEXITSTATUS(status);
     if (code == 77) {
-        child_skip("child could not set up namespace");
+        child_fail("child could not set up namespace");
     }
     if (code == 2) {
         child_fail("child could not see its own marker");
@@ -779,13 +763,13 @@ void case_double_pivot() {
     prepare_private_mount_namespace();
 
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
     }
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
 
     if (mkdir(oldroot_abs, 0755) != 0 && errno != EEXIST) {
@@ -842,7 +826,7 @@ void case_chroot_mount_root() {
     ensure_dir(sandbox);
     prepare_private_mount_namespace();
     if (mount("", sandbox, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
@@ -875,7 +859,7 @@ void case_chroot_ordinary_directory_rejected() {
     ensure_dir(sandbox);
     prepare_private_mount_namespace();
     if (mount("", sandbox, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(jail, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(jail) failed");
@@ -906,25 +890,17 @@ void case_namespace_root_pivot() {
     const char* old_marker = "/tmp/test_pivot_root/namespace_root_old_marker";
     const char* new_marker = "/tmp/test_pivot_root/namespace_root/newroot/new_marker";
 
-    struct statfs current_root = {};
-    if (statfs("/", &current_root) != 0) {
-        child_fail("statfs current root failed");
-    }
-    if (current_root.f_type == RAMFS_MAGIC) {
-        child_skip("initial ramfs root is intentionally unattached");
-    }
-
     ensure_parent_tree();
     ensure_dir(base);
     prepare_private_mount_namespace();
     if (mount("", base, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir namespace-root newroot failed");
     }
     if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if ((mkdir(put_old, 0755) != 0 && errno != EEXIST) ||
         (mkdir(old_marker, 0755) != 0 && errno != EEXIST) ||
@@ -961,7 +937,7 @@ void case_locked_new_root_rejected() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if ((mkdir(new_root, 0755) != 0 && errno != EEXIST) ||
         mount("", new_root, "ramfs", 0, nullptr) != 0 ||
@@ -994,7 +970,7 @@ void case_old_root_lock_transferred() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) before namespace copy failed");
@@ -1036,7 +1012,7 @@ void case_new_root_on_root_mount() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
@@ -1066,7 +1042,7 @@ void case_unreachable_new_root() {
     ensure_dir(outside_root);
     prepare_private_mount_namespace();
     if (mount("", outside_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(old_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(root) failed");
@@ -1111,7 +1087,7 @@ void case_nested_pivot_preserves_upper_sibling() {
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0 ||
         mount("", sibling, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
@@ -1163,7 +1139,7 @@ void case_private_stacked_put_old() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
@@ -1175,7 +1151,7 @@ void case_private_stacked_put_old() {
         child_fail("mkdir(oldroot) failed");
     }
     if (mount("", put_old, "ramfs", 0, nullptr) != 0) {
-        child_skip("private put_old mount is unavailable");
+        child_fail("private put_old mount is unavailable");
     }
     if (mkdir(covered_marker, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir covered marker failed");
@@ -1215,7 +1191,7 @@ void case_cross_process_exact_fs_refs() {
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0 ||
         mount("", sibling, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
@@ -1319,7 +1295,7 @@ void case_symlink_to_mounted_new_root() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(newroot) failed");
@@ -1357,7 +1333,7 @@ void case_self_bind_alias_new_root() {
     ensure_dir(old_root);
     prepare_private_mount_namespace();
     if (mount("", old_root, "ramfs", 0, nullptr) != 0) {
-        child_skip(strerror(errno));
+        child_fail(strerror(errno));
     }
     if (mkdir(candidate, 0755) != 0 && errno != EEXIST) {
         child_fail("mkdir(bind candidate) failed");
@@ -1369,7 +1345,7 @@ void case_self_bind_alias_new_root() {
     // A self-bind gives the same backing dentry a distinct mount identity,
     // making an ordinary directory a legal pivot_root new_root.
     if (mount(candidate, candidate, nullptr, MS_BIND, nullptr) != 0) {
-        child_skip("self-bind mount is unavailable");
+        child_fail("self-bind mount is unavailable");
     }
     if (chroot(old_root) != 0 || chdir("/") != 0) {
         child_fail("chroot(old_root) failed");
@@ -1384,125 +1360,125 @@ void case_self_bind_alias_new_root() {
 }
 
 TEST(PivotRoot, SuccessPath) {
-    expect_case_pass_or_skip("pivot_root_success", case_success_path);
+    expect_case_pass("pivot_root_success", case_success_path);
 }
 
 TEST(PivotRoot, DotDotPath) {
-    expect_case_pass_or_skip("pivot_root_dot_dot", case_dot_dot_path);
+    expect_case_pass("pivot_root_dot_dot", case_dot_dot_path);
 }
 
 TEST(PivotRoot, DotDotRslaveDetach) {
-    expect_case_pass_or_skip("pivot_root_dot_dot_rslave_detach", case_dot_dot_rslave_detach);
+    expect_case_pass("pivot_root_dot_dot_rslave_detach", case_dot_dot_rslave_detach);
 }
 
 TEST(PivotRoot, NewRootNotMountpoint) {
-    expect_case_pass_or_skip("pivot_root_new_root_not_mountpoint", case_new_root_not_mountpoint);
+    expect_case_pass("pivot_root_new_root_not_mountpoint", case_new_root_not_mountpoint);
 }
 
 TEST(PivotRoot, PutOldOutsideNewRoot) {
-    expect_case_pass_or_skip("pivot_root_put_old_outside_new_root", case_put_old_outside_new_root);
+    expect_case_pass("pivot_root_put_old_outside_new_root", case_put_old_outside_new_root);
 }
 
 TEST(PivotRoot, BusyTarget) {
-    expect_case_pass_or_skip("pivot_root_busy_target", case_busy_target);
+    expect_case_pass("pivot_root_busy_target", case_busy_target);
 }
 
 TEST(PivotRoot, PermissionFailure) {
-    expect_case_pass_or_skip("pivot_root_permission_failure", case_permission_failure);
+    expect_case_pass("pivot_root_permission_failure", case_permission_failure);
 }
 
 TEST(PivotRoot, NotDir) {
-    expect_case_pass_or_skip("pivot_root_not_dir", case_not_dir);
+    expect_case_pass("pivot_root_not_dir", case_not_dir);
 }
 
 TEST(PivotRoot, NotExist) {
-    expect_case_pass_or_skip("pivot_root_not_exist", case_not_exist);
+    expect_case_pass("pivot_root_not_exist", case_not_exist);
 }
 
 TEST(PivotRoot, SharedMountRejection) {
-    expect_case_pass_or_skip("pivot_root_shared_mount_rejection", case_shared_mount_rejection);
+    expect_case_pass("pivot_root_shared_mount_rejection", case_shared_mount_rejection);
 }
 
 TEST(PivotRoot, SharedRootParentRejected) {
-    expect_case_pass_or_skip("pivot_root_shared_root_parent_rejected",
+    expect_case_pass("pivot_root_shared_root_parent_rejected",
                              case_shared_root_parent_rejected);
 }
 
 TEST(PivotRoot, SharedNewRootParentRejected) {
-    expect_case_pass_or_skip("pivot_root_shared_new_root_parent_rejected",
+    expect_case_pass("pivot_root_shared_new_root_parent_rejected",
                              case_shared_new_root_parent_rejected);
 }
 
 TEST(PivotRoot, SharedMountedPutOldRejected) {
-    expect_case_pass_or_skip("pivot_root_shared_mounted_put_old_rejected",
+    expect_case_pass("pivot_root_shared_mounted_put_old_rejected",
                              case_shared_mounted_put_old_rejected);
 }
 
 TEST(PivotRoot, MountNamespaceIsolation) {
-    expect_case_pass_or_skip("pivot_root_mount_namespace_isolation",
+    expect_case_pass("pivot_root_mount_namespace_isolation",
                              case_mount_namespace_isolation);
 }
 
 TEST(PivotRoot, DoublePivot) {
-    expect_case_pass_or_skip("pivot_root_double_pivot", case_double_pivot);
+    expect_case_pass("pivot_root_double_pivot", case_double_pivot);
 }
 
 TEST(PivotRoot, ChrootMountRoot) {
-    expect_case_pass_or_skip("pivot_root_chroot_mount_root", case_chroot_mount_root);
+    expect_case_pass("pivot_root_chroot_mount_root", case_chroot_mount_root);
 }
 
 TEST(PivotRoot, ChrootOrdinaryDirectoryRejected) {
-    expect_case_pass_or_skip("pivot_root_chroot_ordinary_directory_rejected",
+    expect_case_pass("pivot_root_chroot_ordinary_directory_rejected",
                              case_chroot_ordinary_directory_rejected);
 }
 
 TEST(PivotRoot, NamespaceRootPivot) {
-    expect_case_pass_or_skip("pivot_root_namespace_root", case_namespace_root_pivot);
+    expect_case_pass("pivot_root_namespace_root", case_namespace_root_pivot);
 }
 
 TEST(PivotRoot, NamespaceRootIdentityBusy) {
-    expect_case_pass_or_skip("pivot_root_namespace_root_identity_busy",
+    expect_case_pass("pivot_root_namespace_root_identity_busy",
                              case_namespace_root_identity_busy);
 }
 
 TEST(PivotRoot, LockedNewRootRejected) {
-    expect_case_pass_or_skip("pivot_root_locked_new_root_rejected", case_locked_new_root_rejected);
+    expect_case_pass("pivot_root_locked_new_root_rejected", case_locked_new_root_rejected);
 }
 
 TEST(PivotRoot, OldRootLockTransferred) {
-    expect_case_pass_or_skip("pivot_root_old_root_lock_transferred",
+    expect_case_pass("pivot_root_old_root_lock_transferred",
                              case_old_root_lock_transferred);
 }
 
 TEST(PivotRoot, NewRootOnRootMount) {
-    expect_case_pass_or_skip("pivot_root_new_root_on_root_mount", case_new_root_on_root_mount);
+    expect_case_pass("pivot_root_new_root_on_root_mount", case_new_root_on_root_mount);
 }
 
 TEST(PivotRoot, UnreachableNewRoot) {
-    expect_case_pass_or_skip("pivot_root_unreachable_new_root", case_unreachable_new_root);
+    expect_case_pass("pivot_root_unreachable_new_root", case_unreachable_new_root);
 }
 
 TEST(PivotRoot, NestedPivotPreservesUpperSibling) {
-    expect_case_pass_or_skip("pivot_root_nested_preserves_upper_sibling",
+    expect_case_pass("pivot_root_nested_preserves_upper_sibling",
                              case_nested_pivot_preserves_upper_sibling);
 }
 
 TEST(PivotRoot, PrivateStackedPutOld) {
-    expect_case_pass_or_skip("pivot_root_private_stacked_put_old", case_private_stacked_put_old);
+    expect_case_pass("pivot_root_private_stacked_put_old", case_private_stacked_put_old);
 }
 
 TEST(PivotRoot, CrossProcessExactFsRefs) {
-    expect_case_pass_or_skip("pivot_root_cross_process_exact_fs_refs",
+    expect_case_pass("pivot_root_cross_process_exact_fs_refs",
                              case_cross_process_exact_fs_refs);
 }
 
 TEST(PivotRoot, SymlinkToMountedNewRoot) {
-    expect_case_pass_or_skip("pivot_root_symlink_to_mounted_new_root",
+    expect_case_pass("pivot_root_symlink_to_mounted_new_root",
                              case_symlink_to_mounted_new_root);
 }
 
 TEST(PivotRoot, SelfBindAliasNewRoot) {
-    expect_case_pass_or_skip("pivot_root_self_bind_alias_new_root",
+    expect_case_pass("pivot_root_self_bind_alias_new_root",
                              case_self_bind_alias_new_root);
 }
 

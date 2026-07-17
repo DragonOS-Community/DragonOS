@@ -23,7 +23,7 @@ use crate::{
     mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     process::{
         namespace::{
-            mnt::MntNamespace,
+            mnt::{mount_max, MntNamespace},
             propagation::{
                 abort_mount_propagation, commit_mount_propagation_locked, detach_mount_propagation,
                 ensure_subtree_shared, inherit_bind_mount_propagation,
@@ -436,8 +436,7 @@ pub(crate) fn append_comma_options(base: &mut String, extra: String) {
 // MountId type
 int_like!(MountId, usize);
 
-static MOUNT_ID_ALLOCATOR: Mutex<IdAllocator> =
-    Mutex::new(IdAllocator::new(0, usize::MAX).unwrap());
+static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
 
 static NEXT_DENTRY_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -452,13 +451,10 @@ lazy_static! {
 
 impl MountId {
     fn alloc() -> Self {
-        let id = MOUNT_ID_ALLOCATOR.lock().alloc().unwrap();
-
+        let id = NEXT_MOUNT_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("mount ID space exhausted");
         MountId(id)
-    }
-
-    unsafe fn free(&mut self) {
-        MOUNT_ID_ALLOCATOR.lock().free(self.0);
     }
 }
 
@@ -1486,7 +1482,27 @@ impl MountFS {
         {
             return Err(SystemError::EINVAL);
         }
-        let _gate = mountpoint.dentry.mount_gate.lock();
+        with_dentry_mount_gate_set(
+            [
+                Some(mountpoint.dentry.clone()),
+                Some(cover_mountpoint.dentry.clone()),
+                None,
+            ],
+            |gates| self.attach_beneath_prelocked(mountpoint, mount_fs, cover_mountpoint, gates),
+        )
+    }
+
+    fn attach_beneath_prelocked(
+        &self,
+        mountpoint: &Arc<MountFSInode>,
+        mount_fs: Arc<MountFS>,
+        cover_mountpoint: &Arc<MountFSInode>,
+        gates: &MountEdgeCommitToken,
+    ) -> Result<(), SystemError> {
+        assert!(
+            gates.covers(mountpoint) && gates.covers(cover_mountpoint),
+            "tuck-under commit token must cover both mount edges"
+        );
         let mut mountpoints = self.mountpoints.lock();
         let stack = mountpoints.entry(mountpoint.dentry.id).or_default();
         if stack.iter().any(|child| Arc::ptr_eq(child, &mount_fs)) {
@@ -1506,7 +1522,8 @@ impl MountFS {
         // Linux mnt_set_mountpoint_beneath(): the propagated mount takes the
         // original edge and the previous topper is reparented onto its root.
         covered.relocate_mountpoint(Some(cover_mountpoint.clone()));
-        if let Err(error) = mount_fs.attach_top(cover_mountpoint, covered.clone()) {
+        if let Err(error) = mount_fs.attach_top_prelocked(cover_mountpoint, covered.clone(), false)
+        {
             covered.relocate_mountpoint(Some(mountpoint.clone()));
             let mut mountpoints = self.mountpoints.lock();
             let stack = mountpoints
@@ -2891,15 +2908,6 @@ pub fn record_writeback_error_for_fs(inner_fs: &Arc<dyn FileSystem>, error: Syst
     }
 }
 
-impl Drop for MountFS {
-    fn drop(&mut self) {
-        // Release MountId
-        unsafe {
-            self.mount_id.free();
-        }
-    }
-}
-
 impl MountExternalGuard {
     pub fn mount(&self) -> Arc<MountFS> {
         self.mount.clone()
@@ -3310,7 +3318,7 @@ impl MountFSInode {
     /// @return Arc<MountFSInode>
     pub(crate) fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let mut current = self.self_ref.upgrade().unwrap();
-        for _ in 0..1024 {
+        for _ in 0..mount_max() {
             let Some(sub_mountfs) = current.mount_fs.lookup_top(&current) else {
                 return current;
             };
@@ -3322,7 +3330,7 @@ impl MountFSInode {
             current = next;
         }
 
-        log::warn!("MountFSInode::overlaid_inode: overlay depth exceeds 1024");
+        log::warn!("MountFSInode::overlaid_inode: overlay depth exceeds mount-max");
         current
     }
 
@@ -3350,27 +3358,30 @@ impl MountFSInode {
     }
 
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
-        if self.is_mountpoint_root()? {
-            // The current inode is the root inode of its filesystem
-            match self.mount_fs.self_mountpoint() {
-                Some(inode) => {
-                    // `inode` is the mount point inode in the “parent mount tree”.
-                    // Linux semantics: going up (..) from the root of a mounted filesystem should
-                    // return to the parent directory of the mount point, and subsequent path traversal
-                    // should occur on the parent mount (inode.mount_fs).
-                    //
-                    // Here we directly reuse the mount point inode's do_parent() to ensure mount_fs is switched correctly.
-                    return inode.do_parent();
-                }
-                None => {
-                    return Ok(self.self_ref.upgrade().unwrap());
-                }
+        // A propagation transaction can construct a very deep stack of mounts.
+        // Resolve `..` iteratively so a userspace directory walk cannot consume
+        // one kernel stack frame per mount layer.
+        let mut current = self.self_ref.upgrade().unwrap();
+        for _ in 0..mount_max() {
+            if current.is_mountpoint_root()? {
+                // Linux crosses from a mounted root to the parent of the mount
+                // point. The mount point may itself be another mounted root, so
+                // keep walking until a real dentry parent is reached.
+                let Some(mountpoint) = current.mount_fs.self_mountpoint() else {
+                    return Ok(current);
+                };
+                current = mountpoint;
+                continue;
             }
+
+            let parent = current.dentry.state.lock().parent.clone();
+            return match parent {
+                Some(parent) => current.mount_fs.wrapper_for_dentry(parent),
+                None => Ok(current),
+            };
         }
-        if let Some(parent) = self.dentry.state.lock().parent.clone() {
-            return self.mount_fs.wrapper_for_dentry(parent);
-        }
-        Ok(self.self_ref.upgrade().unwrap())
+
+        Err(SystemError::ELOOP)
     }
 
     fn do_absolute_path(&self) -> Result<String, SystemError> {

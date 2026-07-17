@@ -12,6 +12,7 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef CLONE_NEWNS
@@ -149,6 +150,10 @@ TEST(MountReconfigure, BindRemountReadonly) {
         cleanup_mount(source);
         FAIL() << strerror(errno);
     }
+
+    errno = 0;
+    EXPECT_EQ(-1, access(target, W_OK));
+    EXPECT_EQ(EROFS, errno);
 
     snprintf(dst_file, sizeof(dst_file), "%s/readonly.txt", target);
     fd = open(dst_file, O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -350,6 +355,21 @@ TEST(MountReconfigure, NoexecRejectsExec) {
         FAIL() << strerror(errno);
     }
 
+    int fd = open(target_file, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    errno = 0;
+    void *mapping = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    EXPECT_EQ(MAP_FAILED, mapping);
+    EXPECT_EQ(EPERM, errno);
+
+    mapping = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, mprotect(mapping, 4096, PROT_READ | PROT_EXEC));
+    EXPECT_EQ(EACCES, errno);
+    EXPECT_EQ(0, munmap(mapping, 4096)) << strerror(errno);
+    close(fd);
+
     char *const argv[] = {target_file, nullptr};
     char *const envp[] = {nullptr};
     errno = 0;
@@ -361,6 +381,32 @@ TEST(MountReconfigure, NoexecRejectsExec) {
     rmdir(target);
     rmdir(source);
     rmdir(root);
+}
+
+TEST(MountReconfigure, StrictAtimeReadUpdatesAccessTime) {
+    const char *target = "/tmp/test_mount_strictatime_read";
+    const char *file = "/tmp/test_mount_strictatime_read/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+
+    struct timespec times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+
+    int fd = open(file, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    char byte;
+    ASSERT_EQ(1, read(fd, &byte, 1)) << strerror(errno);
+    close(fd);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(file, &st)) << strerror(errno);
+    EXPECT_GT(st.st_atim.tv_sec, 1);
+    cleanup_mount(target);
 }
 
 TEST(MountReconfigure, BindRemountReadonlyDoesNotChangeSourceSuperblock) {

@@ -52,7 +52,6 @@ impl ProcessManager {
             };
 
             let idle_pcb = ProcessControlBlock::new_idle(i, kstack);
-
             assert!(idle_pcb.basic().user_vm().is_none());
             unsafe {
                 idle_pcb
@@ -71,7 +70,7 @@ impl ProcessManager {
             pi_guard.set_cpus_allowed(CpuMask::from_cpu(ProcessorId::new(i)));
             idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
 
-            rq.set_current(Arc::downgrade(&idle_pcb));
+            rq.initialize_current(idle_pcb.clone());
             rq.set_idle(Arc::downgrade(&idle_pcb));
             IDLE_CPUS.set(ProcessorId::new(i));
 

@@ -1397,6 +1397,15 @@ impl DowncastArc for dyn IndexNode {
     }
 }
 
+enum PathWalkOutcome {
+    Found(Arc<dyn IndexNode>, Option<utils::ResolvedPath>),
+    MissingFinal {
+        ownership: Option<utils::ResolvedPath>,
+        name: String,
+        must_be_dir: bool,
+    },
+}
+
 impl dyn IndexNode {
     /// @brief 将当前Inode转换为一个具体的结构体（类型由T指定）
     /// 如果类型正确，则返回Some,否则返回None
@@ -1452,8 +1461,16 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.do_lookup_follow_symlink_owned(path, max_follow_times, follow_final_symlink, None)
-            .map(|(inode, _)| inode)
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            None,
+            false,
+        )? {
+            PathWalkOutcome::Found(inode, _) => Ok(inode),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+        }
     }
 
     /// Path walk variant that transfers a mount/operation pin at every mount
@@ -1465,14 +1482,50 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
     ) -> Result<utils::ResolvedPath, SystemError> {
-        self.do_lookup_follow_symlink_owned(
+        match self.do_lookup_follow_symlink_owned(
             path,
             max_follow_times,
             follow_final_symlink,
             Some(start.derive()?),
-        )?
-        .1
-        .ok_or(SystemError::ESTALE)
+            false,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+        }
+    }
+
+    /// Resolve a path while retaining the real parent of a missing final
+    /// component after all required symlinks have been expanded.
+    pub fn lookup_follow_symlink_or_missing_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+    ) -> Result<utils::OwnedLookupOutcome, SystemError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            true,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership
+                .map(utils::OwnedLookupOutcome::Found)
+                .ok_or(SystemError::ESTALE),
+            PathWalkOutcome::MissingFinal {
+                ownership,
+                name,
+                must_be_dir,
+                ..
+            } => ownership
+                .map(|parent| utils::OwnedLookupOutcome::MissingFinal {
+                    parent,
+                    name,
+                    must_be_dir,
+                })
+                .ok_or(SystemError::ESTALE),
+        }
     }
 
     fn do_lookup_follow_symlink_owned(
@@ -1481,7 +1534,8 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
         mut ownership: Option<utils::ResolvedPath>,
-    ) -> Result<(Arc<dyn IndexNode>, Option<utils::ResolvedPath>), SystemError> {
+        return_missing_final: bool,
+    ) -> Result<PathWalkOutcome, SystemError> {
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -1497,7 +1551,7 @@ impl dyn IndexNode {
             .as_ref()
             .map(|path| path.inode())
             .unwrap_or_else(|| fs_struct.root());
-        let trailing_slash = path.ends_with('/');
+        let mut trailing_slash = path.ends_with('/');
 
         // 处理绝对路径
         // result: 上一个被找到的inode
@@ -1559,18 +1613,38 @@ impl dyn IndexNode {
                 }
             }
 
-            let inode = result.find(&name)?;
-            if ownership.is_some() {
+            let has_more_components = rest_path.split('/').any(|component| !component.is_empty());
+            // Keep the current directory owner aside until we know whether
+            // this component exists.  It is both the owner returned for a
+            // missing final component and the base restored for a relative
+            // symlink target.
+            let parent_ownership = ownership.take();
+            let inode = match result.find(&name) {
+                Ok(inode) => inode,
+                Err(error)
+                    if return_missing_final
+                        && error == SystemError::ENOENT
+                        && !has_more_components =>
+                {
+                    return Ok(PathWalkOutcome::MissingFinal {
+                        ownership: parent_ownership,
+                        name,
+                        must_be_dir: trailing_slash,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            if parent_ownership.is_some() {
                 ownership = Some(utils::ResolvedPath::new(inode.clone())?);
             }
             let file_type = inode.metadata()?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
-            if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
+            if !has_more_components && !follow_final_symlink && file_type == FileType::SymLink {
                 // Linux 语义：若 pathname 以 '/' 结尾，则必须解析为目录，
                 // 此时即使请求"不跟随最终 symlink"，也不能返回 symlink 本身。
                 if !trailing_slash {
                     // 返回符号链接本身
-                    return Ok((inode, ownership));
+                    return Ok(PathWalkOutcome::Found(inode, ownership));
                 }
             }
 
@@ -1580,9 +1654,9 @@ impl dyn IndexNode {
                 // - symlink 位于路径中间（rest_path 非空）
                 // - 需要跟随最终 symlink（follow_final_symlink=true）
                 // - 或者 pathname 以 '/' 结尾（trailing_slash=true）
-                let need_follow = !rest_path.is_empty()
+                let need_follow = has_more_components
                     || follow_final_symlink
-                    || (trailing_slash && rest_path.is_empty());
+                    || (trailing_slash && !has_more_components);
 
                 // 兼容旧语义：symlink_follows_remaining==0 表示完全不跟随 symlink。
                 // 在这种模式下，如果路径解析"需要跟随"（例如 symlink 位于中间，或末尾带 '/'），
@@ -1615,7 +1689,7 @@ impl dyn IndexNode {
                         ownership = Some(utils::ResolvedPath::new(target_inode.clone())?);
                     }
                     if rest_path.is_empty() {
-                        return Ok((target_inode, ownership));
+                        return Ok(PathWalkOutcome::Found(target_inode, ownership));
                     } else {
                         // 将 result 设为 magic link 的目标 inode，继续迭代
                         result = target_inode;
@@ -1644,6 +1718,10 @@ impl dyn IndexNode {
                 } else {
                     link_path + "/" + &rest_path
                 };
+                // A slash required by the unresolved suffix (for example the
+                // original `link/`) remains authoritative after expansion;
+                // the symlink target may add the same requirement as well.
+                trailing_slash |= new_path.ends_with('/');
 
                 // 处理 symlink 目标为绝对路径或相对路径
                 // 绝对路径：从进程 root 开始
@@ -1660,6 +1738,7 @@ impl dyn IndexNode {
                     }
                     rest_path = String::from(rest);
                 } else {
+                    ownership = parent_ownership;
                     rest_path = new_path;
                 }
 
@@ -1674,7 +1753,7 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
-        return Ok((result, ownership));
+        return Ok(PathWalkOutcome::Found(result, ownership));
     }
 }
 
@@ -2254,7 +2333,9 @@ pub fn produce_fs(
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);
-            Err(SystemError::EINVAL)
+            // Linux get_fs_type() reports ENODEV when no filesystem driver is
+            // registered for the requested type.
+            Err(SystemError::ENODEV)
         }
     }
 }

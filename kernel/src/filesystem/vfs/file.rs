@@ -1398,7 +1398,53 @@ impl File {
             self.offset
                 .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
         }
+        if len > 0 {
+            self.touch_atime_after_read();
+        }
         Ok(len)
+    }
+
+    /// Best-effort equivalent of Linux file_accessed()/touch_atime().
+    fn touch_atime_after_read(&self) {
+        use super::mount::{MountFS, MountFlags};
+
+        if self.flags().contains(FileFlags::O_NOATIME) {
+            return;
+        }
+        let mount_flags = self.inode.mount_flags();
+        if mount_flags.contains(MountFlags::NOATIME)
+            || (self.file_type == FileType::Dir && mount_flags.contains(MountFlags::NODIRATIME))
+        {
+            return;
+        }
+        if self
+            .inode
+            .fs()
+            .downcast_arc::<MountFS>()
+            .is_some_and(|mount| mount.is_readonly())
+        {
+            return;
+        }
+
+        let Ok(mut metadata) = self.inode.metadata() else {
+            return;
+        };
+        let now = crate::time::PosixTimeSpec::now();
+        if mount_flags.contains(MountFlags::RELATIME) {
+            let atime_ns = metadata.atime.total_nanos();
+            let recent = now.tv_sec.saturating_sub(metadata.atime.tv_sec) < 24 * 60 * 60;
+            if atime_ns > metadata.mtime.total_nanos()
+                && atime_ns > metadata.ctime.total_nanos()
+                && recent
+            {
+                return;
+            }
+        }
+
+        metadata.atime = now;
+        let _ = self
+            .inode
+            .set_metadata_masked(&metadata, SetMetadataMask::ATIME);
     }
 
     pub fn do_write(

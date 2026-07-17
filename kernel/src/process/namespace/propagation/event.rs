@@ -68,15 +68,15 @@ fn try_collect_subtree(root: &Arc<MountFS>) -> Result<Vec<Arc<MountFS>>, SystemE
 }
 
 pub(super) struct CorrespondingSources {
-    mounts: BTreeMap<usize, Arc<MountFS>>,
-    peer_groups: BTreeMap<usize, Arc<MountFS>>,
+    mounts: HashMap<usize, Arc<MountFS>>,
+    peer_groups: HashMap<usize, Arc<MountFS>>,
 }
 
 impl CorrespondingSources {
     pub(super) fn new() -> Self {
         Self {
-            mounts: BTreeMap::new(),
-            peer_groups: BTreeMap::new(),
+            mounts: HashMap::new(),
+            peer_groups: HashMap::new(),
         }
     }
 
@@ -93,19 +93,25 @@ impl CorrespondingSources {
         }
     }
 
+    fn try_reserve(&mut self, additional: usize) -> Result<(), SystemError> {
+        self.mounts
+            .try_reserve(additional)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.peer_groups
+            .try_reserve(additional)
+            .map_err(|_| SystemError::ENOMEM)
+    }
+
     pub(super) fn nearest(
         &self,
         target: &Arc<MountFS>,
     ) -> Result<Option<Arc<MountFS>>, SystemError> {
         // Linux `propagate_one()` retains `last_source` when a narrow peer is
         // uncovered. Match that layer before walking to the next master.
-        let mut visited = HashSet::new();
-        visited.insert(target.mount_id().data());
         let mut master = target.propagation().master();
+        let mut tortoise = master.clone();
+        let mut hare = master.clone();
         while let Some(candidate) = master {
-            if !visited.insert(candidate.mount_id().data()) {
-                return Err(SystemError::ELOOP);
-            }
             if let Some(source) = self.mounts.get(&candidate.mount_id().data()) {
                 return Ok(Some(source.clone()));
             }
@@ -117,8 +123,86 @@ impl CorrespondingSources {
                 }
             }
             master = propagation.master();
+            tortoise = tortoise.and_then(|mount| mount.propagation().master());
+            hare = hare
+                .and_then(|mount| mount.propagation().master())
+                .and_then(|mount| mount.propagation().master());
+            if tortoise
+                .as_ref()
+                .zip(hare.as_ref())
+                .is_some_and(|(slow, fast)| Arc::ptr_eq(slow, fast))
+            {
+                return Err(SystemError::ELOOP);
+            }
         }
         Ok(None)
+    }
+}
+
+/// Allocation-light mirror of CorrespondingSources used only for admission.
+/// It records reachability identities rather than retaining one Arc child per
+/// propagation target.
+struct CorrespondingPresence {
+    mounts: HashSet<usize>,
+    peer_groups: HashSet<usize>,
+}
+
+impl CorrespondingPresence {
+    fn new(target_count: usize) -> Result<Self, SystemError> {
+        let capacity = target_count.checked_add(1).ok_or(SystemError::ENOMEM)?;
+        let mut mounts = HashSet::new();
+        mounts
+            .try_reserve(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut peer_groups = HashSet::new();
+        peer_groups
+            .try_reserve(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self {
+            mounts,
+            peer_groups,
+        })
+    }
+
+    fn insert(&mut self, parent: &Arc<MountFS>) {
+        self.mounts.insert(parent.mount_id().data());
+        let propagation = parent.propagation();
+        let group_id = propagation.peer_group_id();
+        if propagation.is_shared() && group_id.is_valid() {
+            self.peer_groups.insert(group_id.data());
+        }
+    }
+
+    fn has_nearest(&self, target: &Arc<MountFS>) -> Result<bool, SystemError> {
+        let mut master = target.propagation().master();
+        let mut tortoise = master.clone();
+        let mut hare = master.clone();
+        while let Some(candidate) = master {
+            if self.mounts.contains(&candidate.mount_id().data()) {
+                return Ok(true);
+            }
+            let propagation = candidate.propagation();
+            let group_id = propagation.peer_group_id();
+            if propagation.is_shared()
+                && group_id.is_valid()
+                && self.peer_groups.contains(&group_id.data())
+            {
+                return Ok(true);
+            }
+            master = propagation.master();
+            tortoise = tortoise.and_then(|mount| mount.propagation().master());
+            hare = hare
+                .and_then(|mount| mount.propagation().master())
+                .and_then(|mount| mount.propagation().master());
+            if tortoise
+                .as_ref()
+                .zip(hare.as_ref())
+                .is_some_and(|(slow, fast)| Arc::ptr_eq(slow, fast))
+            {
+                return Err(SystemError::ELOOP);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -452,21 +536,65 @@ fn prepare_mount_propagation_with_counting_locked(
     let mut slave_groups = BTreeMap::new();
     let mut mounts = Vec::new();
     let mut count_reservations = Vec::new();
+    let new_child_tree = try_collect_subtree(new_child)?;
+    let new_child_mount_count = new_child_tree.len();
     if count_local_tree {
         if let Some(namespace) = source_mnt.namespace() {
             count_reservations
                 .try_reserve(1)
                 .map_err(|_| SystemError::ENOMEM)?;
-            count_reservations.push(namespace.reserve_mounts(try_collect_subtree(new_child)?)?);
+            count_reservations.push(namespace.reserve_mounts(new_child_tree)?);
         }
     }
-    let mut propagated_sources = CorrespondingSources::new();
-    propagated_sources.insert(source_mnt, new_child.clone());
     let targets = if source_prop.is_shared() {
         propagation_targets(source_mnt)
     } else {
         Vec::new()
     };
+    let mut propagated_sources = CorrespondingSources::new();
+    propagated_sources.try_reserve(targets.len().saturating_add(1))?;
+    propagated_sources.insert(source_mnt, new_child.clone());
+
+    // Compute the complete admission cost before allocating detached clones.
+    // Simulate exactly which slave targets have a nearest propagated source;
+    // insertion order, peer-group fallback and coverage checks match the
+    // commit loop below, without retaining one Arc child per target.
+    // This is Linux count_mounts()'s pre-clone admission principle and avoids
+    // constructing tens of thousands of doomed peer/slave copies at ENOSPC.
+    let mut planned_sources = CorrespondingPresence::new(targets.len())?;
+    planned_sources.insert(source_mnt);
+    let mut propagation_capacity = HashMap::new();
+    propagation_capacity
+        .try_reserve(targets.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for target in &targets {
+        if matches!(target.kind, PropagationTargetKind::Slave)
+            && !planned_sources.has_nearest(&target.mount)?
+        {
+            continue;
+        }
+        match target.mount.wrapper_for_dentry(source_dentry.clone()) {
+            Ok(_) => {}
+            Err(SystemError::EXDEV) => continue,
+            Err(error) => return Err(error),
+        }
+        planned_sources.insert(&target.mount);
+        let Some(namespace) = target.mount.namespace() else {
+            continue;
+        };
+        let key = Arc::as_ptr(&namespace) as usize;
+        let entry = propagation_capacity
+            .entry(key)
+            .or_insert((namespace, 0usize));
+        entry.1 = entry
+            .1
+            .checked_add(new_child_mount_count)
+            .ok_or(SystemError::ENOSPC)?;
+    }
+    for (_, (namespace, amount)) in propagation_capacity {
+        namespace.ensure_mount_capacity(amount)?;
+    }
+
     for target in targets {
         let PropagationTarget {
             mount: target_parent,
@@ -816,7 +944,12 @@ pub(crate) fn propagate_umount_sources(
     sources: &[Arc<MountFS>],
     lazy: bool,
 ) -> Result<(), SystemError> {
+    let mut source_ids = HashSet::new();
+    source_ids
+        .try_reserve(sources.len())
+        .map_err(|_| SystemError::ENOMEM)?;
     for source in sources {
+        source_ids.insert(source.mount_id().data());
         let mountpoint = source.self_mountpoint().ok_or(SystemError::EINVAL)?;
         if !mountpoint
             .mount_fs()
@@ -849,7 +982,12 @@ pub(crate) fn propagate_umount_sources(
     // whole set before the first mutation, then every detach below is an
     // invariant-preserving exact-object operation.
     for target in &prepared {
-        if !target.parent.is_live()
+        // A complete subtree detach marks every local source Detaching before
+        // the propagation transaction starts. A propagated edge may therefore
+        // be parented by another source in this same batch. That is stable and
+        // expected; only a non-live parent outside the batch proves that the
+        // prepared topology changed concurrently.
+        if (!target.parent.is_live() && !source_ids.contains(&target.parent.mount_id().data()))
             || target
                 .parent
                 .lookup_top(&target.mountpoint)
@@ -868,6 +1006,69 @@ pub(crate) fn propagate_umount_sources(
             return Err(SystemError::EBUSY);
         }
     }
+    // Source scan depth is not a topology order: propagation can discover a
+    // child and its parent from the same source layer. Build the exact commit
+    // dependency graph from MountFS parent edges so every removable child is
+    // detached before its removable parent. This is Linux umount_list()'s
+    // children-first property expressed without relying on discovery order.
+    let mut disconnect_by_id = HashMap::new();
+    disconnect_by_id
+        .try_reserve(prepared.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for (index, target) in prepared.iter().enumerate() {
+        if target.disconnect {
+            disconnect_by_id.insert(target.child.mount_id().data(), index);
+        }
+    }
+    let mut remaining_children = Vec::new();
+    remaining_children
+        .try_reserve(prepared.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    remaining_children.resize(prepared.len(), 0usize);
+    let mut parent_of = Vec::new();
+    parent_of
+        .try_reserve(prepared.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    parent_of.resize(prepared.len(), None);
+    for (index, target) in prepared.iter().enumerate() {
+        if !target.disconnect {
+            continue;
+        }
+        if let Some(parent_index) = disconnect_by_id
+            .get(&target.parent.mount_id().data())
+            .copied()
+        {
+            remaining_children[parent_index] = remaining_children[parent_index]
+                .checked_add(1)
+                .ok_or(SystemError::ENOMEM)?;
+            parent_of[index] = Some(parent_index);
+        }
+    }
+    let mut ready = VecDeque::new();
+    ready
+        .try_reserve(disconnect_by_id.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for index in disconnect_by_id.values().copied() {
+        if remaining_children[index] == 0 {
+            ready.push_back(index);
+        }
+    }
+    let mut commit_order = Vec::new();
+    commit_order
+        .try_reserve(disconnect_by_id.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    while let Some(index) = ready.pop_front() {
+        commit_order.push(index);
+        if let Some(parent_index) = parent_of[index] {
+            remaining_children[parent_index] -= 1;
+            if remaining_children[parent_index] == 0 {
+                ready.push_back(parent_index);
+            }
+        }
+    }
+    if commit_order.len() != disconnect_by_id.len() {
+        return Err(SystemError::ELOOP);
+    }
     // Linux propagate_mount_unlock() clears MNT_LOCKED only from the exact
     // corresponding propagation roots before gathering them for umount.  The
     // protected descendants remain locked and, for lazy detach, connected to
@@ -877,40 +1078,27 @@ pub(crate) fn propagate_umount_sources(
             target.child.unlock_mount();
         }
     }
-    let max_depth = prepared
-        .iter()
-        .map(|target| target.depth)
-        .max()
-        .unwrap_or(0);
-    for depth in (0..=max_depth).rev() {
-        for target in prepared
-            .iter_mut()
-            .filter(|target| target.disconnect && target.depth == depth)
-        {
-            let reservation = target
-                .reservation
-                .as_ref()
-                .expect("removable propagated umount target has a reservation");
-            target
-                .parent
-                .detach_exact_restoring_root_children(
-                    &target.child,
-                    core::mem::take(&mut target.root_children_commit),
-                    reservation,
-                )
-                .expect("validated propagated umount edge commit cannot fail");
-        }
+    for index in commit_order.iter().copied() {
+        let target = &mut prepared[index];
+        let reservation = target
+            .reservation
+            .as_ref()
+            .expect("removable propagated umount target has a reservation");
+        target
+            .parent
+            .detach_exact_restoring_root_children(
+                &target.child,
+                core::mem::take(&mut target.root_children_commit),
+                reservation,
+            )
+            .expect("validated propagated umount edge commit cannot fail");
     }
     graph.commit_locked();
-    for depth in (0..=max_depth).rev() {
-        for target in prepared
-            .iter()
-            .filter(|target| target.disconnect && target.depth == depth)
-        {
-            target.child.set_self_mountpoint(None);
-            MountFS::finish_disconnected_umount(&target.child, lazy)
-                .expect("detached prepared propagation root has valid teardown topology");
-        }
+    for index in commit_order {
+        let target = &prepared[index];
+        target.child.set_self_mountpoint(None);
+        MountFS::finish_disconnected_umount(&target.child, lazy)
+            .expect("detached prepared propagation root has valid teardown topology");
     }
     Ok(())
 }
@@ -942,6 +1130,18 @@ fn prepare_propagated_umount_targets(
         .try_reserve(sources.len())
         .map_err(|_| SystemError::ENOMEM)?;
     for (depth, source) in sources.iter().rev().enumerate() {
+        // The first source at one propagated edge discovers the corresponding
+        // child on every peer/slave parent. A subtree umount then encounters
+        // those children again in `sources`; repeating propagation_targets()
+        // for each one rescans the same peer group quadratically. Preserve the
+        // per-source root/depth contribution while reusing the object-identity
+        // candidate established by the first discovery.
+        if let Some(index) = candidate_by_id.get(&source.mount_id().data()).copied() {
+            let existing = &mut result[index];
+            existing.unlock_root |= depth == 0;
+            existing.depth = existing.depth.min(depth);
+            continue;
+        }
         let source_mountpoint = source.self_mountpoint().ok_or(SystemError::EINVAL)?;
         let parent = source_mountpoint.mount_fs();
         if !parent.propagation().is_shared() {

@@ -5,7 +5,8 @@
 
 use super::Metadata;
 use crate::{
-    filesystem::vfs::{FileType, InodeMode},
+    filesystem::vfs::{mount::MountFS, FileType, InodeMode},
+    libs::casting::DowncastArc,
     process::cred::{CAPFlags, Cred},
     process::ProcessManager,
 };
@@ -49,6 +50,21 @@ pub fn check_inode_permission(
     metadata: &Metadata,
     mask: PermissionMask,
 ) -> Result<(), SystemError> {
+    // Match Linux sb_permission(): a read-only mount rejects write access to
+    // filesystem objects before DAC/capability overrides are considered.
+    if mask.contains(PermissionMask::MAY_WRITE)
+        && matches!(
+            metadata.file_type,
+            FileType::File | FileType::Dir | FileType::SymLink
+        )
+        && inode
+            .fs()
+            .downcast_arc::<MountFS>()
+            .is_some_and(|mount| mount.is_readonly())
+    {
+        return Err(SystemError::EROFS);
+    }
+
     let cred = ProcessManager::current_pcb().cred();
     match inode.fs().permission_policy() {
         FsPermissionPolicy::Dac => cred.inode_permission(metadata, mask.bits()),

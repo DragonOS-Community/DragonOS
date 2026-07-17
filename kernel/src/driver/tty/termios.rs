@@ -474,7 +474,9 @@ impl PosixTermio {
         let ispeed = if ibaud == 0 {
             ospeed
         } else {
-            ControlMode::from_bits_truncate(ibaud).baud_rate().unwrap_or(ospeed)
+            ControlMode::from_bits_truncate(ibaud)
+                .baud_rate()
+                .unwrap_or(ospeed)
         };
         (ispeed, ospeed)
     }

@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -432,6 +433,15 @@ TEST(AfPacketSockopt, GetFilterUsesInstructionCountAbi) {
               0)
         << ErrnoString(errno);
 
+    TestSockFilter unchanged{0xffff, 0xff, 0xff, 0xffffffff};
+    socklen_t negative_len = static_cast<socklen_t>(-1);
+    errno = 0;
+    EXPECT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoGetFilter, &unchanged, &negative_len),
+              -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+    EXPECT_EQ(negative_len, static_cast<socklen_t>(-1));
+    EXPECT_EQ(unchanged.code, 0xffff);
+
     socklen_t len = 0;
     ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoGetFilter, nullptr, &len), 0)
         << ErrnoString(errno);
@@ -591,6 +601,48 @@ TEST(AfPacketSockopt, FilterOptionsValidateSocketBeforeOptlen) {
         EXPECT_EQ(setsockopt(read_end.Get(), SOL_SOCKET, option, nullptr, 0), -1);
         EXPECT_EQ(errno, ENOTSOCK) << "option=" << option << ": " << ErrnoString(errno);
     }
+
+    errno = 0;
+    EXPECT_EQ(getsockopt(-1, SOL_SOCKET, kSoGetFilter, nullptr, nullptr), -1);
+    EXPECT_EQ(errno, EBADF) << ErrnoString(errno);
+
+    errno = 0;
+    EXPECT_EQ(getsockopt(read_end.Get(), SOL_SOCKET, kSoGetFilter, nullptr, nullptr), -1);
+    EXPECT_EQ(errno, ENOTSOCK) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, FilterOptlenUsesSignedIntSyscallAbi) {
+    FdGuard negative_len(MakeRawFd());
+    ASSERT_GE(negative_len.Get(), 0);
+    int one = 1;
+    errno = 0;
+    EXPECT_EQ(syscall(SYS_setsockopt, negative_len.Get(), SOL_SOCKET, kSoLockFilter,
+                      &one, 0xffffffffUL),
+              -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+
+    TestSockFilter accept_all{kBpfRetK, 0, 0, 0xffffffffU};
+    TestSockFprog program{1, &accept_all};
+    EXPECT_EQ(setsockopt(negative_len.Get(), SOL_SOCKET, kSoAttachFilter, &program,
+                         sizeof(program)),
+              0)
+        << "rejected negative optlen must not lock the filter: " << ErrnoString(errno);
+
+    FdGuard high_bits(MakeRawFd());
+    ASSERT_GE(high_bits.Get(), 0);
+    EXPECT_EQ(syscall(SYS_setsockopt, high_bits.Get(), SOL_SOCKET, kSoLockFilter,
+                      &one, 0x100000004ULL),
+              0)
+        << "Linux truncates syscall scalar arguments to the low 32-bit int: "
+        << ErrnoString(errno);
+
+    FdGuard short_low_bits(MakeRawFd());
+    ASSERT_GE(short_low_bits.Get(), 0);
+    errno = 0;
+    EXPECT_EQ(syscall(SYS_setsockopt, short_low_bits.Get(), SOL_SOCKET,
+                      kSoLockFilter, &one, 0x100000003ULL),
+              -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
 }
 
 TEST(AfPacketSockopt, DetachAndLockFollowIntegerOptlenAbi) {

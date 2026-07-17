@@ -42,12 +42,21 @@ impl Syscall for SysSetsockoptHandle {
         let level = Self::level(args);
         let optname = Self::optname(args);
         let optval = Self::optval(args);
-        let optlen = Self::optlen(args);
+        let raw_optlen = Self::optlen(args);
 
         // Linux resolves the descriptor before inspecting any option-specific
         // length or user pointer. Keep the inode alive through the copy so a
         // concurrent close cannot change which socket receives the option.
         let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+
+        // The syscall ABI declares optlen as a 32-bit signed int. Scalar
+        // register arguments are truncated to the low 32 bits; negative
+        // lengths are rejected before inspecting optval.
+        let signed_optlen = raw_optlen as u32 as i32;
+        if signed_optlen < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let optlen = signed_optlen as usize;
 
         // Linux 6.6 行为：IPV6_CHECKSUM 在 setsockopt 时会无视 optlen，直接按 int 读取。
         // gVisor raw_socket_test: RawSocketTest.SetIPv6ChecksumError_ReadShort

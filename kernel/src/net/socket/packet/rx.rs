@@ -746,7 +746,8 @@ impl PacketSocket {
         let wire_len = input.data_len();
         let filter_result = self
             .filter
-            .with_read_if_present(|prog| crate::bpf::classic::run_cbpf(prog, &input));
+            .load()
+            .map(|prog| crate::bpf::classic::run_cbpf(&prog, &input));
         let data_len = match filter_result {
             Some(0) => return,
             Some(snaplen) => wire_len.min(snaplen as usize),

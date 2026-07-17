@@ -131,6 +131,11 @@ pub(super) fn do_getsockopt(
     optlen: *mut u32,
     from_user: bool,
 ) -> Result<usize, SystemError> {
+    // Linux resolves the descriptor before reading optlen. This preserves
+    // EBADF/ENOTSOCK precedence over length-pointer failures.
+    let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+    let socket = socket_inode.as_socket().unwrap();
+
     // 参数合法性检查
     if optlen.is_null() {
         return Err(SystemError::EFAULT);
@@ -138,17 +143,19 @@ pub(super) fn do_getsockopt(
 
     // 使用 UserBufferReader 读取用户提供的缓冲区长度
     let optlen_reader = UserBufferReader::new(optlen, core::mem::size_of::<u32>(), from_user)?;
-    let user_len = optlen_reader.buffer_protected(0)?.read_one::<u32>(0)? as usize;
+    // Linux copies socklen_t into an int and rejects negative lengths before
+    // dispatching the option. Preserve that signed 32-bit ABI here.
+    let signed_user_len = optlen_reader.buffer_protected(0)?.read_one::<u32>(0)? as i32;
+    if signed_user_len < 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let user_len = signed_user_len as usize;
 
     let get_filter = level == PSOL::SOCKET as usize
         && matches!(PSO::try_from(optname as u32), Ok(PSO::ATTACH_FILTER));
     if user_len > MAX_OPTVAL_LEN && !get_filter {
         return Err(SystemError::EINVAL);
     }
-
-    // 获取socket
-    let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-    let socket = socket_inode.as_socket().unwrap();
 
     let level = PSOL::try_from(level as u32)?;
 
@@ -161,7 +168,11 @@ pub(super) fn do_getsockopt(
             PSO::ATTACH_FILTER => {
                 let insn_size = core::mem::size_of::<SockFilter>();
                 let capacity = user_len.min(BPF_MAXINSNS);
-                let mut kbuf = vec![0u8; capacity * insn_size];
+                let byte_capacity = capacity.checked_mul(insn_size).ok_or(SystemError::ENOMEM)?;
+                let mut kbuf = Vec::new();
+                kbuf.try_reserve_exact(byte_capacity)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                kbuf.resize(byte_capacity, 0);
                 let count = socket.option(level, optname, &mut kbuf)?;
 
                 if user_len != 0 && count != 0 {

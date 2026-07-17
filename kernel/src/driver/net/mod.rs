@@ -251,6 +251,20 @@ fn register_netdevice(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
     return Ok(());
 }
 
+#[derive(Debug)]
+struct ReceiveModeState {
+    configured_flags: u32,
+    packet_promiscuity: u32,
+    packet_allmulti: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinkFlagsSnapshot {
+    pub configured: InterfaceFlags,
+    pub promiscuity: u32,
+    pub allmulti: u32,
+}
+
 pub struct IfaceCommon {
     iface_id: usize,
     name: RwLock<String>,
@@ -279,6 +293,8 @@ pub struct IfaceCommon {
     /// TCP listener/backlog 语义辅助（Linux-like 丢 SYN 等）。
     tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog,
     ipv4_multicast_refcnt: Mutex<Vec<(smoltcp::wire::Ipv4Address, usize)>>,
+    /// Serializes configured receive-mode flags with AF_PACKET references.
+    receive_mode: Mutex<ReceiveModeState>,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -323,6 +339,11 @@ impl IfaceCommon {
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
             tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
             ipv4_multicast_refcnt: Mutex::new(Vec::new()),
+            receive_mode: Mutex::new(ReceiveModeState {
+                configured_flags: flags.bits(),
+                packet_promiscuity: 0,
+                packet_allmulti: 0,
+            }),
         }
     }
 
@@ -668,11 +689,46 @@ impl IfaceCommon {
     }
 
     pub fn flags(&self) -> InterfaceFlags {
-        InterfaceFlags::from_bits_truncate(self.flags.load(Ordering::Relaxed))
+        InterfaceFlags::from_bits_truncate(self.flags.load(Ordering::Acquire))
     }
 
-    pub fn set_flags(&self, flags: InterfaceFlags) {
-        self.flags.store(flags.bits(), Ordering::Relaxed);
+    pub fn update_configured_flags(
+        &self,
+        requested: InterfaceFlags,
+        change_mask: InterfaceFlags,
+    ) -> Result<InterfaceFlags, SystemError> {
+        let mut state = self.receive_mode.lock();
+        let configured = (state.configured_flags & !change_mask.bits())
+            | (requested.bits() & change_mask.bits());
+
+        Self::total_receive_mode_count(
+            state.packet_promiscuity,
+            configured & InterfaceFlags::PROMISC.bits() != 0,
+        )?;
+        Self::total_receive_mode_count(
+            state.packet_allmulti,
+            configured & InterfaceFlags::ALLMULTI.bits() != 0,
+        )?;
+
+        state.configured_flags = configured;
+        self.publish_effective_flags(&state);
+        Ok(InterfaceFlags::from_bits_truncate(configured))
+    }
+
+    pub fn link_flags_snapshot(&self) -> Result<LinkFlagsSnapshot, SystemError> {
+        let state = self.receive_mode.lock();
+        let configured = InterfaceFlags::from_bits_truncate(state.configured_flags);
+        Ok(LinkFlagsSnapshot {
+            configured,
+            promiscuity: Self::total_receive_mode_count(
+                state.packet_promiscuity,
+                configured.contains(InterfaceFlags::PROMISC),
+            )?,
+            allmulti: Self::total_receive_mode_count(
+                state.packet_allmulti,
+                configured.contains(InterfaceFlags::ALLMULTI),
+            )?,
+        })
     }
 
     pub fn type_(&self) -> InterfaceType {
@@ -754,5 +810,56 @@ impl IfaceCommon {
         let before = neighbors.len();
         neighbors.retain(|existing| existing.ip_addr != ip_addr);
         neighbors.len() != before
+    }
+
+    pub fn adjust_promiscuity(&self, inc: i32) -> Result<(), SystemError> {
+        self.adjust_receive_mode(InterfaceFlags::PROMISC, inc)
+    }
+
+    pub fn adjust_allmulti(&self, inc: i32) -> Result<(), SystemError> {
+        self.adjust_receive_mode(InterfaceFlags::ALLMULTI, inc)
+    }
+
+    fn adjust_receive_mode(&self, flag: InterfaceFlags, inc: i32) -> Result<(), SystemError> {
+        let mut state = self.receive_mode.lock();
+        let old = if flag == InterfaceFlags::PROMISC {
+            state.packet_promiscuity
+        } else if flag == InterfaceFlags::ALLMULTI {
+            state.packet_allmulti
+        } else {
+            return Err(SystemError::EINVAL);
+        };
+        let new = match inc {
+            1 => old.checked_add(1).ok_or(SystemError::EOVERFLOW)?,
+            -1 => old.checked_sub(1).ok_or(SystemError::EINVAL)?,
+            _ => return Err(SystemError::EINVAL),
+        };
+        let configured = state.configured_flags & flag.bits() != 0;
+        Self::total_receive_mode_count(new, configured)?;
+
+        if flag == InterfaceFlags::PROMISC {
+            state.packet_promiscuity = new;
+        } else {
+            state.packet_allmulti = new;
+        }
+        self.publish_effective_flags(&state);
+        Ok(())
+    }
+
+    fn total_receive_mode_count(packet: u32, configured: bool) -> Result<u32, SystemError> {
+        packet
+            .checked_add(u32::from(configured))
+            .ok_or(SystemError::EOVERFLOW)
+    }
+
+    fn publish_effective_flags(&self, state: &ReceiveModeState) {
+        let mut effective = state.configured_flags;
+        if state.packet_promiscuity != 0 {
+            effective |= InterfaceFlags::PROMISC.bits();
+        }
+        if state.packet_allmulti != 0 {
+            effective |= InterfaceFlags::ALLMULTI.bits();
+        }
+        self.flags.store(effective, Ordering::Release);
     }
 }

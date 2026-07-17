@@ -1,6 +1,7 @@
 //! AF_PACKET sockets.
 
 mod binding;
+mod mreq;
 mod rx;
 mod sockopt;
 mod tx;
@@ -109,6 +110,7 @@ pub struct PacketSocket {
     pub(super) send_timeout_ticks: AtomicU64,
     pub(super) recv_timeout_ticks: AtomicU64,
     pub(super) wait_queue: WaitQueue,
+    memberships: Mutex<mreq::PacketMembershipState>,
     inode_id: InodeId,
     open_files: AtomicUsize,
     pub(super) self_ref: Weak<Self>,
@@ -151,6 +153,7 @@ impl PacketSocket {
             send_timeout_ticks: AtomicU64::new(crate::net::socket::common::INFINITE_TIMEOUT_TICKS),
             recv_timeout_ticks: AtomicU64::new(crate::net::socket::common::INFINITE_TIMEOUT_TICKS),
             wait_queue: WaitQueue::default(),
+            memberships: Mutex::new(mreq::PacketMembershipState::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
             self_ref: me.clone(),

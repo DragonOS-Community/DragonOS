@@ -431,7 +431,23 @@ impl TtyCore {
         }
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
-            // TODO
+            let ld = tty.ldisc();
+            // Flush ldisc opost + echo buffers. The returned bool indicates
+            // whether opost_pending was fully drained; a `false` means the
+            // output lock was held by a concurrent writer and the opost
+            // state could not be inspected (see drain_output docs).
+            let _ldisc_drained = ld.drain_output(tty.clone())?;
+
+            // Poll the hardware buffer with scheduler yields between
+            // iterations so device IRQs get CPU time to drain the FIFO.
+            // On PTY, chars_in_buffer() returns 0 immediately.
+            const DRAIN_RETRIES: u32 = 100;
+            for _ in 0..DRAIN_RETRIES {
+                if tty.chars_in_buffer(tty.core()) == 0 {
+                    break;
+                }
+                crate::sched::sched_yield();
+            }
         }
 
         TtyCore::set_termios_next(tty, tmp_termios)?;

@@ -113,9 +113,9 @@ pub struct PacketSocket {
     open_files: AtomicUsize,
     pub(super) self_ref: Weak<Self>,
     pub(super) netns: Arc<NetNamespace>,
-    /// cBPF filter 程序；空指针是“未安装”的唯一事实来源。
+    /// cBPF filter program; an empty slot is the single source of truth for “not installed”.
     pub(super) filter: RcuOptionArcSlot<Vec<SockFilter>>,
-    /// 串行化 SO_ATTACH_FILTER、SO_DETACH_FILTER 与 SO_LOCK_FILTER。
+    /// Serializes SO_ATTACH_FILTER, SO_DETACH_FILTER, and SO_LOCK_FILTER.
     pub(super) filter_locked: Mutex<bool>,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,

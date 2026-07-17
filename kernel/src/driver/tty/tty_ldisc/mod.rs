@@ -106,7 +106,10 @@ impl LineDisciplineType {
             0 => Self::NTty,
             // Unknown / unsupported line disciplines fall back to NTty,
             // matching Linux behaviour (N_TTY is the default).
-            _ => Self::NTty,
+            _ => {
+                log::debug!("LineDisciplineType::from_line: unknown line discipline {}, falling back to NTty", line);
+                Self::NTty
+            }
         }
     }
 }

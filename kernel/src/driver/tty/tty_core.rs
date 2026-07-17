@@ -440,8 +440,11 @@ impl TtyCore {
 
             // Retry drain_output while output_lock is held by a concurrent
             // writer.  Bounded to prevent indefinite stall.
+            // TODO: use wait_event on output_lock release instead of fixed retries
+            //       (tracked at issue/TERMIOS_WAIT_drain).
+            const DRAIN_RETRIES: u32 = 32;
             let mut ldisc_drained = false;
-            for _ in 0..8 {
+            for _ in 0..DRAIN_RETRIES {
                 match ld.drain_output(tty.clone()) {
                     Ok(true) => {
                         ldisc_drained = true;
@@ -453,11 +456,21 @@ impl TtyCore {
                     Err(e) => return Err(e),
                 }
             }
-            // Proceed even if ldisc_drained is false — documented limitation.
-            let _ = ldisc_drained;
+            if !ldisc_drained {
+                log::debug!(
+                    "TERMIOS_WAIT: output_lock held for {} retries, proceeding without full ldisc drain",
+                    DRAIN_RETRIES
+                );
+            }
 
             // Event-driven wait for hardware FIFO drain via write_wq.
             // On PTY, chars_in_buffer returns 0 immediately.
+            //
+            // Return value ignored intentionally: Linux tty_wait_until_sent()
+            // does not propagate errors to the tcsetattr caller either.
+            // A signal-interrupted wait still leaves the drain in a
+            // best-effort state; the caller gets the new termios regardless.
+            // TODO: add wait_event_interruptible_timeout for hung-hardware scenarios.
             let write_wq = tty.core().write_wq();
             let core_ref = tty.core();
             let _ = write_wq.wait_event_interruptible(

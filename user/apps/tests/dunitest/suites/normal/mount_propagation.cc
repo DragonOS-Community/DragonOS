@@ -342,7 +342,19 @@ bool wait_children_until(pid_t* children, size_t count, int timeout_seconds) {
             int status = 0;
             const pid_t result = waitpid(children[i], &status, WNOHANG);
             if (result == children[i]) {
-                ok = ok && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+                const bool child_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+                if (!child_ok) {
+                    if (WIFEXITED(status)) {
+                        fprintf(stderr, "child[%zu] exited with status %d\n", i,
+                                WEXITSTATUS(status));
+                    } else if (WIFSIGNALED(status)) {
+                        fprintf(stderr, "child[%zu] terminated by signal %d\n", i,
+                                WTERMSIG(status));
+                    } else {
+                        fprintf(stderr, "child[%zu] returned wait status %#x\n", i, status);
+                    }
+                }
+                ok = ok && child_ok;
                 children[i] = -1;
                 --remaining;
             } else if (result < 0 && errno != EINTR) {
@@ -1631,8 +1643,19 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
             !write_exact(activity_pipe[1], "A", 1)) {
             _exit(2);
         }
-        if (!read_exact(ready_pipe[0], &token, 1) ||
-            !write_exact(worker_activity_pipe[1], "AA", 2)) {
+        if (!read_exact(ready_pipe[0], &token, 1) || token != 'O') {
+            _exit(3);
+        }
+        const unsigned long phases[] = {MS_SHARED, MS_PRIVATE};
+        const char phase_tokens[] = {'S', 'P'};
+        for (size_t i = 0; i < 2; ++i) {
+            if (mount(nullptr, base, nullptr, MS_REC | phases[i], nullptr) != 0 ||
+                !write_exact(activity_pipe[1], &phase_tokens[i], 1) ||
+                !read_exact(ready_pipe[0], &token, 1) || token != phase_tokens[i]) {
+                _exit(3);
+            }
+        }
+        if (!write_exact(worker_activity_pipe[1], "AA", 2)) {
             _exit(3);
         }
         for (int i = 0; i < 1024; ++i) {
@@ -1642,6 +1665,12 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
             }
             if ((i & 15) == 15) {
                 sched_yield();
+            }
+            // Do not let the complete stress phase outrun the observer: one
+            // uniform snapshot must land between the two unsynchronised halves.
+            if (i == 511 &&
+                (!read_exact(ready_pipe[0], &token, 1) || token != 'X')) {
+                _exit(3);
             }
         }
         char done[2] = {};
@@ -1674,17 +1703,29 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
         if (!read_exact(activity_pipe[0], &token, 1) || token != 'A') {
             _exit(6);
         }
-        const int flags = fcntl(activity_pipe[0], F_GETFL, 0);
-        if (flags < 0 || fcntl(activity_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) {
-            _exit(7);
-        }
         if (!write_exact(ready_pipe[1], "O", 1)) {
             _exit(8);
         }
         const char* paths[] = {base, child, grandchild};
-        int samples = 0;
-        bool saw_shared = false;
-        bool saw_private = false;
+        // Prove both allowed states deterministically before the unsynchronised
+        // stress phase. sched_yield() is not a hand-off guarantee, so relying
+        // on the observer to happen to see both transient states is flaky.
+        const char phase_tokens[] = {'S', 'P'};
+        const bool phase_is_shared[] = {true, false};
+        for (size_t i = 0; i < 2; ++i) {
+            PropagationTags tags[3] = {};
+            if (!read_exact(activity_pipe[0], &token, 1) || token != phase_tokens[i] ||
+                !read_propagation_snapshot(paths, 3, tags) || !snapshot_is_uniform(tags, 3) ||
+                (tags[0].shared > 0) != phase_is_shared[i] ||
+                !write_exact(ready_pipe[1], &token, 1)) {
+                _exit(10);
+            }
+        }
+        const int flags = fcntl(activity_pipe[0], F_GETFL, 0);
+        if (flags < 0 || fcntl(activity_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+            _exit(7);
+        }
+        bool reported_stress_sample = false;
         for (;;) {
             const ssize_t status = read(activity_pipe[0], &token, 1);
             if (status == 1 && token == 'D') {
@@ -1697,12 +1738,12 @@ TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespa
             if (!read_propagation_snapshot(paths, 3, tags) || !snapshot_is_uniform(tags, 3)) {
                 _exit(10);
             }
-            ++samples;
-            saw_shared = saw_shared || tags[0].shared > 0;
-            saw_private = saw_private || tags[0].shared < 0;
-        }
-        if (samples == 0 || !saw_shared || !saw_private) {
-            _exit(11);
+            if (!reported_stress_sample) {
+                if (!write_exact(ready_pipe[1], "X", 1)) {
+                    _exit(10);
+                }
+                reported_stress_sample = true;
+            }
         }
         _exit(0);
     }

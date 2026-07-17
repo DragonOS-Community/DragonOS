@@ -456,6 +456,12 @@ impl MountId {
             .expect("mount ID space exhausted");
         MountId(id)
     }
+
+    /// Allocate an ID for a mount object represented only by namespace
+    /// metadata, such as DragonOS's hidden initial-root anchor.
+    pub(crate) fn alloc_conceptual() -> Self {
+        Self::alloc()
+    }
 }
 
 /// @brief Mount filesystem
@@ -3318,6 +3324,24 @@ impl MountFSInode {
     /// @return Arc<MountFSInode>
     pub(crate) fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let mut current = self.self_ref.upgrade().unwrap();
+        // Nearly every lookup crosses at most a handful of mount layers. Keep
+        // that hot path single-pass and reserve Floyd's extra topology reads
+        // for an already pathological depth. This is not a semantic limit:
+        // the cycle-safe walk below still follows every valid layer.
+        for _ in 0..1024 {
+            let Some(sub_mountfs) = current.mount_fs.lookup_top(&current) else {
+                return current;
+            };
+            let next = sub_mountfs.mountpoint_root_inode();
+            if Arc::ptr_eq(&next, &current) {
+                return current;
+            }
+            current = next;
+        }
+        Self::overlaid_inode_cycle_safe(current)
+    }
+
+    fn overlaid_inode_cycle_safe(mut current: Arc<MountFSInode>) -> Arc<MountFSInode> {
         let mut fast = Some(current.clone());
         loop {
             let Some(sub_mountfs) = current.mount_fs.lookup_top(&current) else {

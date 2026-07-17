@@ -716,7 +716,12 @@ impl MntNamespace {
             inner: RwSem::new(InnerMntNamespace {
                 _dead: false,
                 root_mountfs: new_root_mntfs,
-                root_parent_mount_id: inner.root_parent_mount_id,
+                // Linux copy_tree() clones the hidden parent together with the
+                // visible root, so the copied namespace must not expose the
+                // source namespace's parent mount identity in mountinfo.
+                root_parent_mount_id: inner
+                    .root_parent_mount_id
+                    .map(|_| MountId::alloc_conceptual()),
                 // Linux copy_mnt_ns() initializes the copied namespace's
                 // existing mount count directly. mount-max only admits new
                 // mount trees; it must not reject cloning existing topology.
@@ -1152,7 +1157,10 @@ mod tests {
         let attached_copy = attached
             .copy_mnt_ns(&CloneFlags::CLONE_NEWNS, INIT_USER_NAMESPACE.clone())
             .unwrap();
-        assert!(attached_copy.inner.read().root_parent_mount_id.is_some());
+        let attached_parent = attached.inner.read().root_parent_mount_id.unwrap();
+        let copied_parent = attached_copy.inner.read().root_parent_mount_id.unwrap();
+        assert_ne!(attached_parent, copied_parent);
+        assert_ne!(copied_parent, attached_copy.root_mntfs().mount_id());
     }
 
     #[test]

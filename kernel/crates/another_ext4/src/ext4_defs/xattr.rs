@@ -350,6 +350,7 @@ impl XattrBlock {
     /// Initialize a xattr block, write a `XattrHeader` to the
     /// beginning of the block.
     pub fn init(&mut self) {
+        self.0.data.fill(0);
         let header = XattrHeader::new();
         self.0.write_offset_as(0, &header);
     }

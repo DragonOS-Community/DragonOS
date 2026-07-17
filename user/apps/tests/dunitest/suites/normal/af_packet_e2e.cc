@@ -54,6 +54,12 @@
 #ifndef PACKET_AUXDATA
 #define PACKET_AUXDATA 8
 #endif
+#ifndef PACKET_FANOUT
+#define PACKET_FANOUT 18
+#endif
+#ifndef PACKET_FANOUT_LB
+#define PACKET_FANOUT_LB 1
+#endif
 #ifndef TP_STATUS_USER
 #define TP_STATUS_USER 1
 #endif
@@ -1110,6 +1116,78 @@ TEST(AfPacketE2E, FilterReplacementPreservesReceiveState) {
     EXPECT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), static_cast<ssize_t>(sizeof(frame)))
         << "detached socket must continue receiving after the stress phase: "
         << ErrnoString(errno);
+}
+
+TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic fanout testing";
+
+    auto make_receiver = [ifindex]() {
+        int fd = socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType));
+        if (fd < 0) return fd;
+        struct sockaddr_ll addr{};
+        addr.sll_family = AF_PACKET;
+        addr.sll_protocol = htons(kPrivateEtherType);
+        addr.sll_ifindex = ifindex;
+        if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            close(fd);
+            return -1;
+        }
+        return fd;
+    };
+
+    FdGuard first(make_receiver());
+    FdGuard second(make_receiver());
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(first.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(second.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    int fanout = (PACKET_FANOUT_LB << 16) | 0x5a31;
+    ASSERT_EQ(setsockopt(first.Get(), SOL_PACKET, PACKET_FANOUT, &fanout, sizeof(fanout)), 0)
+        << ErrnoString(errno);
+    ASSERT_EQ(setsockopt(second.Get(), SOL_PACKET, PACKET_FANOUT, &fanout, sizeof(fanout)), 0)
+        << ErrnoString(errno);
+
+    uint8_t local_mac[6];
+    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    uint8_t frame[96]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kPrivateEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+
+    constexpr int kFrames = 16;
+    for (int sequence = 0; sequence < kFrames; ++sequence) {
+        std::memcpy(frame + kEthHdrLen, &sequence, sizeof(sequence));
+        ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
+                         reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
+                  static_cast<ssize_t>(sizeof(frame)))
+            << ErrnoString(errno);
+    }
+
+    auto drain = [](int fd) {
+        uint8_t buffer[128];
+        int count = 0;
+        while (recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT) > 0) ++count;
+        return count;
+    };
+    const int first_count = drain(first.Get());
+    const int second_count = drain(second.Get());
+    EXPECT_EQ(first_count + second_count, kFrames)
+        << "fanout must not broadcast or drop: first=" << first_count
+        << " second=" << second_count;
+    EXPECT_EQ(first_count, kFrames / 2);
+    EXPECT_EQ(second_count, kFrames / 2);
 }
 
 int main(int argc, char** argv) {

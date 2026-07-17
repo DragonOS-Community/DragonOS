@@ -49,6 +49,9 @@ impl PacketSocket {
             return Err(SystemError::ENODEV);
         }
         let _guard = self.bind_lock.lock();
+        if self.has_fanout_group() {
+            return Err(SystemError::EINVAL);
+        }
         let (old_index, old_protocol) = self.binding.load();
         let protocol = if requested_protocol == 0 {
             old_protocol
@@ -80,9 +83,6 @@ impl PacketSocket {
         let _guard = self.bind_lock.lock();
         self.revert_all_memberships();
         self.netns.unregister_packet_socket(&self.self_ref);
-        // Drop fanout membership after leaving the broadcast registry so the
-        // socket never receives both a broadcast and a group delivery.
-        self.leave_fanout();
         *self.bound_iface.write() = None;
         self.binding.store(0, 0);
         Ok(())

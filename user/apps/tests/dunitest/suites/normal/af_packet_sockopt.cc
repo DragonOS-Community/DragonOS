@@ -77,6 +77,12 @@ struct TestSockAddrLl {
     uint8_t sll_addr[8];
 };
 
+struct TestFanoutArgs {
+    uint32_t id_type_flags;
+    uint32_t max_num_members;
+};
+static_assert(sizeof(TestFanoutArgs) == 8);
+
 // SOL_PACKET level socket options (matching Linux if_packet.h)
 #ifndef PACKET_ADD_MEMBERSHIP
 #define PACKET_ADD_MEMBERSHIP 1
@@ -110,6 +116,30 @@ struct TestSockAddrLl {
 #endif
 #ifndef PACKET_TIMESTAMP
 #define PACKET_TIMESTAMP 17
+#endif
+#ifndef PACKET_FANOUT
+#define PACKET_FANOUT 18
+#endif
+#ifndef PACKET_FANOUT_DATA
+#define PACKET_FANOUT_DATA 22
+#endif
+#ifndef PACKET_FANOUT_HASH
+#define PACKET_FANOUT_HASH 0
+#endif
+#ifndef PACKET_FANOUT_LB
+#define PACKET_FANOUT_LB 1
+#endif
+#ifndef PACKET_FANOUT_ROLLOVER
+#define PACKET_FANOUT_ROLLOVER 3
+#endif
+#ifndef PACKET_FANOUT_FLAG_ROLLOVER
+#define PACKET_FANOUT_FLAG_ROLLOVER 0x1000
+#endif
+#ifndef PACKET_FANOUT_FLAG_UNIQUEID
+#define PACKET_FANOUT_FLAG_UNIQUEID 0x2000
+#endif
+#ifndef PACKET_FANOUT_FLAG_IGNORE_OUTGOING
+#define PACKET_FANOUT_FLAG_IGNORE_OUTGOING 0x4000
 #endif
 #ifndef PACKET_QDISC_BYPASS
 #define PACKET_QDISC_BYPASS 20
@@ -906,6 +936,133 @@ TEST(AfPacketSockopt, RecvmsgDoesNotReturnEnosys) {
     }
     EXPECT_NE(errno, ENOSYS) << "recvmsg returned ENOSYS (feature not implemented)";
     // EAGAIN/EWOULDBLOCK is normal (no data)
+}
+
+TEST(AfPacketSockopt, FanoutRequiresExactLegacyIntegerLength) {
+    const uint8_t value[9]{};
+    for (socklen_t len : {0U, 1U, 3U, 5U, 7U, 9U}) {
+        FdGuard fd(MakeRawFd());
+        ASSERT_GE(fd.Get(), 0);
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_FANOUT, value, len), -1)
+            << "len=" << len;
+        EXPECT_EQ(errno, EINVAL) << "len=" << len << ": " << ErrnoString(errno);
+    }
+}
+
+TEST(AfPacketSockopt, FanoutArgsControlsGroupCapacity) {
+    constexpr uint32_t kRaw = (PACKET_FANOUT_LB << 16) | 0x5a20;
+    FdGuard first(MakeRawFd());
+    FdGuard second(MakeRawFd());
+    FdGuard third(MakeRawFd());
+    ASSERT_GE(first.Get(), 0);
+    ASSERT_GE(second.Get(), 0);
+    ASSERT_GE(third.Get(), 0);
+
+    TestFanoutArgs args{kRaw, 2};
+    ASSERT_EQ(setsockopt(first.Get(), SOL_PACKET, PACKET_FANOUT, &args, sizeof(args)), 0)
+        << ErrnoString(errno);
+    // Linux permits a legacy (max=0) join to a group created with an explicit
+    // capacity; a non-zero mismatch is rejected.
+    int legacy = static_cast<int>(kRaw);
+    ASSERT_EQ(setsockopt(second.Get(), SOL_PACKET, PACKET_FANOUT, &legacy, sizeof(legacy)), 0)
+        << ErrnoString(errno);
+
+    args.max_num_members = 3;
+    errno = 0;
+    EXPECT_EQ(setsockopt(third.Get(), SOL_PACKET, PACKET_FANOUT, &args, sizeof(args)), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+
+    args.max_num_members = 2;
+    errno = 0;
+    EXPECT_EQ(setsockopt(third.Get(), SOL_PACKET, PACKET_FANOUT, &args, sizeof(args)), -1);
+    EXPECT_EQ(errno, ENOSPC) << ErrnoString(errno);
+
+    args.id_type_flags = (PACKET_FANOUT_LB << 16) | 0x5a25;
+    args.max_num_members = 65537;
+    errno = 0;
+    EXPECT_EQ(setsockopt(third.Get(), SOL_PACKET, PACKET_FANOUT, &args, sizeof(args)), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, FanoutControlSemanticsMatchLinux) {
+    constexpr int kGroup = 0x5a21;
+    FdGuard first(MakeRawFd());
+    FdGuard second(MakeRawFd());
+    ASSERT_GE(first.Get(), 0);
+    ASSERT_GE(second.Get(), 0);
+
+    int value = (PACKET_FANOUT_LB << 16) | kGroup;
+    ASSERT_EQ(SetIntOpt(first.Get(), PACKET_FANOUT, value), 0) << ErrnoString(errno);
+    int got = -1;
+    ASSERT_EQ(GetIntOpt(first.Get(), PACKET_FANOUT, &got), 0) << ErrnoString(errno);
+    EXPECT_EQ(got, value);
+
+    errno = 0;
+    EXPECT_EQ(SetIntOpt(first.Get(), PACKET_FANOUT, value), -1);
+    EXPECT_EQ(errno, EALREADY) << ErrnoString(errno);
+
+    int mismatched = (PACKET_FANOUT_HASH << 16) | kGroup;
+    errno = 0;
+    EXPECT_EQ(SetIntOpt(second.Get(), PACKET_FANOUT, mismatched), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+    ASSERT_EQ(SetIntOpt(second.Get(), PACKET_FANOUT, value), 0) << ErrnoString(errno);
+
+    TestSockAddrLl bind_addr{};
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(kEthPAll);
+    errno = 0;
+    EXPECT_EQ(bind(first.Get(), reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, FanoutRejectsInactiveAndDualRollover) {
+    FdGuard inactive(socket(AF_PACKET, SOCK_RAW, 0));
+    ASSERT_GE(inactive.Get(), 0) << ErrnoString(errno);
+    int hash = (PACKET_FANOUT_HASH << 16) | 0x5a22;
+    errno = 0;
+    EXPECT_EQ(SetIntOpt(inactive.Get(), PACKET_FANOUT, hash), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+
+    FdGuard active(MakeRawFd());
+    ASSERT_GE(active.Get(), 0);
+    int dual = ((PACKET_FANOUT_ROLLOVER | PACKET_FANOUT_FLAG_ROLLOVER) << 16) | 0x5a23;
+    errno = 0;
+    EXPECT_EQ(SetIntOpt(active.Get(), PACKET_FANOUT, dual), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, FanoutUniqueIdIsAllocationOnly) {
+    FdGuard first(MakeRawFd());
+    FdGuard second(MakeRawFd());
+    ASSERT_GE(first.Get(), 0);
+    ASSERT_GE(second.Get(), 0);
+
+    int request = (PACKET_FANOUT_HASH | PACKET_FANOUT_FLAG_UNIQUEID) << 16;
+    ASSERT_EQ(SetIntOpt(first.Get(), PACKET_FANOUT, request), 0) << ErrnoString(errno);
+    int assigned = -1;
+    ASSERT_EQ(GetIntOpt(first.Get(), PACKET_FANOUT, &assigned), 0) << ErrnoString(errno);
+    EXPECT_EQ((assigned >> 16) & PACKET_FANOUT_FLAG_UNIQUEID, 0);
+    ASSERT_EQ(SetIntOpt(second.Get(), PACKET_FANOUT, assigned), 0) << ErrnoString(errno);
+
+    FdGuard invalid(MakeRawFd());
+    int invalid_request = request | 7;
+    errno = 0;
+    EXPECT_EQ(SetIntOpt(invalid.Get(), PACKET_FANOUT, invalid_request), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, FanoutIgnoreOutgoingAndDataValidation) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    int value = ((PACKET_FANOUT_HASH | PACKET_FANOUT_FLAG_IGNORE_OUTGOING) << 16) | 0x5a24;
+    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_FANOUT, value), 0) << ErrnoString(errno);
+    int got = 0;
+    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_FANOUT, &got), 0) << ErrnoString(errno);
+    EXPECT_EQ(got, value);
+    errno = 0;
+    EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_FANOUT_DATA, 0), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
 }
 
 int main(int argc, char** argv) {

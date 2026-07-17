@@ -1,49 +1,41 @@
 //! AF_PACKET `PACKET_FANOUT` group demultiplexing.
 //!
-//! A fanout group fans matching ingress frames out to exactly one of its member
-//! sockets, selected by the group's distribution algorithm (HASH/LB/CPU/RND/
-//! ROLLOVER). Members are registered with the owning `NetNamespace` and use the
-//! same RCU copy-on-write publication pattern as the broadcast packet-socket
-//! registry, so the NAPI deliver path stays lock-free on the read side.
+//! The owning network namespace publishes the complete plain-socket and
+//! fanout-group topology in one RCU snapshot.  Group snapshots are immutable;
+//! write-side membership changes create a replacement snapshot while sharing
+//! the small amount of algorithm runtime state.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
-use system_error::SystemError;
+use core::cmp::Ordering as CmpOrdering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use jhash::jhash2;
+use system_error::SystemError;
 
-use crate::libs::mutex::Mutex;
-use crate::rcu::RcuArcSlot;
-
-use super::rx::l2_ethertype_l3_offset;
+use super::rx::packet_protocol;
 use super::uapi::{eth_protocol, fanout_flag, fanout_mode};
-use super::{PacketIngressMetadata, PacketSocket, PacketSocketType};
+use super::{PacketIngressMetadata, PacketSocket, PacketType};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+pub(crate) const LEGACY_FANOUT_MAX_MEMBERS: usize = 256;
+pub(crate) const FANOUT_MAX_MEMBERS: usize = 1 << 16;
 
-/// Supported fanout distribution algorithms.
-///
-/// QM(5)/CBPF(6)/EBPF(7) require NIC RSS queue mapping / BPF infrastructure
-/// that DragonOS does not yet provide, so `FanoutMode::from_raw` rejects them.
+/// One process-wide secret, matching Linux's use of a shared boot-random
+/// secret for `__skb_get_hash_symmetric()` rather than a per-group seed.
+static FLOW_HASH_SEED: AtomicU32 = AtomicU32::new(0);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FanoutMode {
-    /// 0 — flow hash of the L3/L4 4-tuple modulo the member count.
     Hash,
-    /// 1 — round-robin via an atomic counter.
     Lb,
-    /// 2 — receiving CPU id modulo the member count.
     Cpu,
-    /// 3 — start from the round-robin base and roll over filled members.
     Rollover,
-    /// 4 — uniformly random member selection.
     Rnd,
 }
 
 impl FanoutMode {
-    /// Parse the low 7 bits of `type_flags`. Returns `EINVAL` for unsupported
-    /// modes (QM/CBPF/EBPF).
     fn from_raw(raw: u32) -> Result<Self, SystemError> {
         match raw {
             fanout_mode::PACKET_FANOUT_HASH => Ok(Self::Hash),
@@ -51,7 +43,6 @@ impl FanoutMode {
             fanout_mode::PACKET_FANOUT_CPU => Ok(Self::Cpu),
             fanout_mode::PACKET_FANOUT_ROLLOVER => Ok(Self::Rollover),
             fanout_mode::PACKET_FANOUT_RND => Ok(Self::Rnd),
-            // PACKET_FANOUT_QM / CBPF / EBPF are unsupported.
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -67,306 +58,553 @@ impl FanoutMode {
     }
 }
 
-/// Join-time parameter bundle for `NetNamespace::fanout_group_join`.
-///
-/// Grouping these values keeps that entry point under clippy's
-/// `too_many_arguments` threshold while letting the packet module hand the
-/// netns a single, self-describing value.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FanoutJoinParams {
-    /// Explicit group id requested by the socket (ignored when `unique`).
     pub id_req: u16,
-    /// `true` for `PACKET_FANOUT_FLAG_UNIQUEID`: allocate a fresh group.
     pub unique: bool,
-    /// Distribution algorithm for the group.
     pub mode: FanoutMode,
-    /// Raw `PACKET_FANOUT_FLAG_*` bits requested by the creator.
+    /// Persistent group flags. `UNIQUEID` is removed while parsing because it
+    /// is an allocation request, not group identity.
     pub flags: u16,
-    /// Joining socket's type / binding filter — enforced on every join.
-    pub sock_type: PacketSocketType,
     pub bound_ifindex: u32,
     pub bound_protocol: u16,
+    /// Zero selects the legacy 256-member limit. Non-zero values come from
+    /// Linux's 8-byte `fanout_args` ABI and are part of group identity.
+    pub max_num_members: u32,
 }
 
-/// RCU-published member list of a fanout group (mirrors the broadcast
-/// `PacketSocketRegistrySnapshot` COW pattern).
-#[derive(Debug, Default)]
-struct FanoutMemberSnapshot {
-    members: Vec<Weak<PacketSocket>>,
+#[derive(Debug)]
+struct FanoutRuntime {
+    rr_counter: AtomicU32,
 }
 
-/// A fanout group: an ordered set of sockets sharing a distribution algorithm.
-///
-/// All members are guaranteed (at join time) to share the same socket type and
-/// `(ifindex, protocol)` receive filter, so any demux choice yields identical
-/// `deliver_from_iface` filtering.
+impl FanoutRuntime {
+    fn try_new() -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Self {
+            rr_counter: AtomicU32::new(0),
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
+}
+
+/// Linux associates rollover history with the initially selected packet
+/// socket. Keep a separate cursor per primary member so HASH/LB/CPU/RND flows
+/// do not perturb one another's fallback start.
+#[derive(Debug)]
+struct MemberRolloverState {
+    cursor: AtomicU32,
+}
+
+#[derive(Debug, Clone)]
+struct FanoutMember {
+    socket: Weak<PacketSocket>,
+    rollover: Option<Arc<MemberRolloverState>>,
+}
+
+impl FanoutMember {
+    fn try_new(socket: Weak<PacketSocket>, rollover: bool) -> Result<Self, SystemError> {
+        Ok(Self {
+            socket,
+            rollover: if rollover {
+                Some(
+                    Arc::try_new(MemberRolloverState {
+                        cursor: AtomicU32::new(0),
+                    })
+                    .map_err(|_| SystemError::ENOMEM)?,
+                )
+            } else {
+                None
+            },
+        })
+    }
+}
+
+/// Immutable group snapshot stored inside the netns delivery topology.
 #[derive(Debug)]
 pub(crate) struct FanoutGroup {
     pub id: u16,
     pub mode: FanoutMode,
-    /// Raw `PACKET_FANOUT_FLAG_*` bits requested by the creator.
     pub flags: u16,
-    /// Creator's socket type / binding filter — enforced on every join.
-    sock_type: PacketSocketType,
     bound_ifindex: u32,
     bound_protocol: u16,
-    /// Random HASH-mode seed to avoid flow polarization across groups.
-    hash_seed: u32,
-    /// Member list, RCU COW (mirrors `NetNamespace::packet_sockets`).
-    members: RcuArcSlot<FanoutMemberSnapshot>,
-    /// Serializes copy-on-write member-list updates.
-    members_writer: Mutex<()>,
-    /// LB / ROLLOVER round-robin counter (atomic, multi-core safe).
-    rr_counter: core::sync::atomic::AtomicU32,
+    max_num_members: usize,
+    runtime: Arc<FanoutRuntime>,
+    members: Vec<FanoutMember>,
 }
 
 impl FanoutGroup {
-    pub(crate) fn new(id: u16, params: FanoutJoinParams) -> Arc<Self> {
-        // A per-group random seed prevents flows from polarizing onto the same
-        // member across groups that happen to share a hash function.
-        let hash_seed = crate::arch::rand::rand() as u32;
-        Arc::new(Self {
+    pub(crate) fn try_new(
+        id: u16,
+        params: FanoutJoinParams,
+        socket: Weak<PacketSocket>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let rollover = params.mode == FanoutMode::Rollover
+            || params.flags & fanout_flag::PACKET_FANOUT_FLAG_ROLLOVER != 0;
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        members.push(FanoutMember::try_new(socket, rollover)?);
+        Arc::try_new(Self {
             id,
             mode: params.mode,
             flags: params.flags,
-            sock_type: params.sock_type,
             bound_ifindex: params.bound_ifindex,
             bound_protocol: params.bound_protocol,
-            hash_seed,
-            members: RcuArcSlot::new(Arc::new(FanoutMemberSnapshot::default())),
-            members_writer: Mutex::new(()),
-            rr_counter: core::sync::atomic::AtomicU32::new(0),
+            max_num_members: if params.max_num_members == 0 {
+                LEGACY_FANOUT_MAX_MEMBERS
+            } else {
+                params.max_num_members as usize
+            },
+            runtime: FanoutRuntime::try_new()?,
+            members,
         })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
-    /// Whether a joining socket matches this group's creator profile.
-    pub(crate) fn matches(
+    pub(crate) fn matches(&self, params: FanoutJoinParams) -> bool {
+        self.mode == params.mode
+            && self.flags == params.flags
+            && self.bound_ifindex == params.bound_ifindex
+            && self.bound_protocol == params.bound_protocol
+            && (params.max_num_members == 0
+                || self.max_num_members == params.max_num_members as usize)
+    }
+
+    pub(crate) fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    pub(crate) fn max_num_members(&self) -> usize {
+        self.max_num_members
+    }
+
+    pub(crate) fn try_with_member(
         &self,
-        sock_type: PacketSocketType,
-        bound_ifindex: u32,
-        bound_protocol: u16,
-    ) -> bool {
-        self.sock_type == sock_type
-            && self.bound_ifindex == bound_ifindex
-            && self.bound_protocol == bound_protocol
+        socket: Weak<PacketSocket>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(self.members.len().saturating_add(1))
+            .map_err(|_| SystemError::ENOMEM)?;
+        members.extend(self.members.iter().cloned());
+        let rollover = self.mode == FanoutMode::Rollover
+            || self.flags & fanout_flag::PACKET_FANOUT_FLAG_ROLLOVER != 0;
+        members.push(FanoutMember::try_new(socket, rollover)?);
+        Arc::try_new(Self {
+            id: self.id,
+            mode: self.mode,
+            flags: self.flags,
+            bound_ifindex: self.bound_ifindex,
+            bound_protocol: self.bound_protocol,
+            max_num_members: self.max_num_members,
+            runtime: self.runtime.clone(),
+            members,
+        })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
-    /// Publish a new member-list snapshot containing `socket` (RCU COW).
-    pub(crate) fn add_member(&self, socket: Weak<PacketSocket>) {
-        let _guard = self.members_writer.lock();
-        let current = self.members.load();
-        let mut members = current.members.clone();
-        // Drop already-dead weak refs while we hold the write-side clone.
-        members.retain(|entry| entry.strong_count() != 0);
-        if !members.iter().any(|entry| Weak::ptr_eq(entry, &socket)) {
-            members.push(socket);
-        }
-        self.members
-            .store_deferred(Arc::new(FanoutMemberSnapshot { members }));
-    }
-
-    /// Publish a new member-list snapshot without `socket` (RCU COW).
-    pub(crate) fn remove_member(&self, socket: &Weak<PacketSocket>) {
-        let _guard = self.members_writer.lock();
-        let current = self.members.load();
-        let mut members = current.members.clone();
-        members.retain(|entry| entry.strong_count() != 0 && !Weak::ptr_eq(entry, socket));
-        self.members
-            .store_deferred(Arc::new(FanoutMemberSnapshot { members }));
-    }
-
-    /// Count live members. Called only under the netns `fanout_groups_writer`
-    /// lock, which blocks concurrent `add_member`/`remove_member`, so the RCU
-    /// snapshot read here is stable for the empty-group teardown decision.
-    pub(crate) fn live_count(&self) -> usize {
-        let current = self.members.load();
-        current
-            .members
+    pub(crate) fn try_without_member(
+        &self,
+        socket: &Weak<PacketSocket>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(self.members.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        members.extend(self.members.iter().cloned());
+        if let Some(index) = members
             .iter()
-            .filter(|entry| entry.strong_count() != 0)
-            .count()
+            .position(|entry| Weak::ptr_eq(&entry.socket, socket))
+        {
+            // Linux also fills a removed slot with the final member.
+            members.swap_remove(index);
+        }
+        self.try_with_members(members)
     }
 
-    /// Deliver one copy of the frame to a single member selected by the
-    /// distribution algorithm. Returns `true` when the member list contained
-    /// dead weak refs (lazy cleanup hint for the netns).
+    /// Return a compacted replacement only when at least one dead Weak was
+    /// observed. Healthy groups keep their original Arc and member Vec.
+    pub(crate) fn try_without_dead_members(&self) -> Result<Option<Arc<Self>>, SystemError> {
+        if self.members.iter().all(|member| {
+            member
+                .socket
+                .upgrade()
+                .is_some_and(|socket| socket.is_packet_registry_active())
+        }) {
+            return Ok(None);
+        }
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(self.members.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        members.extend(self.members.iter().cloned());
+        let mut index = 0;
+        while index < members.len() {
+            if !members[index]
+                .socket
+                .upgrade()
+                .is_some_and(|socket| socket.is_packet_registry_active())
+            {
+                members.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        self.try_with_members(members).map(Some)
+    }
+
+    fn try_with_members(&self, members: Vec<FanoutMember>) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Self {
+            id: self.id,
+            mode: self.mode,
+            flags: self.flags,
+            bound_ifindex: self.bound_ifindex,
+            bound_protocol: self.bound_protocol,
+            max_num_members: self.max_num_members,
+            runtime: self.runtime.clone(),
+            members,
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
+
+    /// Deliver to at most one member. Returns `true` when a dead weak member
+    /// was observed and the writer should compact the topology later.
     pub(crate) fn deliver(
         &self,
         ingress: PacketIngressMetadata,
         frame: &[u8],
+        protocol_cache: &mut Option<Option<u16>>,
+        flow_hash_cache: &mut Option<u32>,
     ) -> bool {
-        let snapshot = self.members.load();
-
-        // First pass: count live members without any heap allocation.
-        let mut stale = false;
-        let mut live_count = 0usize;
-        for entry in snapshot.members.iter() {
-            if entry.strong_count() != 0 {
-                live_count += 1;
-            } else {
-                stale = true;
-            }
-        }
-        if live_count == 0 {
-            return stale;
+        if self.members.is_empty()
+            || (self.bound_ifindex != 0 && self.bound_ifindex != ingress.ifindex)
+            || (self.flags & fanout_flag::PACKET_FANOUT_FLAG_IGNORE_OUTGOING != 0
+                && ingress.pkt_type == PacketType::Outgoing)
+        {
+            return false;
         }
 
-        let base = match self.mode {
-            FanoutMode::Hash => flow_hash(frame, self.hash_seed) as usize % live_count,
-            FanoutMode::Lb | FanoutMode::Rollover => {
-                self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize % live_count
-            }
-            FanoutMode::Cpu => crate::arch::cpu::current_cpu_id().data() as usize % live_count,
-            FanoutMode::Rnd => crate::arch::rand::rand() % live_count,
-        };
-        // ROLLOVER semantics: mode == Rollover always rolls over filled
-        // backlogs; FLAG_ROLLOVER layers the same fallback onto other modes.
-        let rollover = self.mode == FanoutMode::Rollover
-            || (self.flags & fanout_flag::PACKET_FANOUT_FLAG_ROLLOVER != 0);
-
-        // Second pass: find and deliver to the selected socket, rolling over
-        // filled backlogs. Each candidate is upgraded lazily —
-        // strong_count()!=0 guarantees upgrade() succeeds, so no heap
-        // allocation occurs.
-        for offset in 0..live_count {
-            let target = (base + offset) % live_count;
-            let Some(socket) = nth_live_member(&snapshot.members, target) else {
-                continue;
+        let needs_protocol =
+            self.bound_protocol != eth_protocol::ETH_P_ALL || self.mode == FanoutMode::Hash;
+        let protocol = if needs_protocol {
+            let Some(protocol) =
+                *protocol_cache.get_or_insert_with(|| packet_protocol(frame, ingress.pkt_type))
+            else {
+                return false;
             };
-            if !rollover || socket.rx_has_room() {
+            if self.bound_protocol != eth_protocol::ETH_P_ALL && self.bound_protocol != protocol {
+                return false;
+            }
+            protocol
+        } else {
+            eth_protocol::ETH_P_ALL
+        };
+
+        let count = self.members.len();
+        let base = match self.mode {
+            FanoutMode::Hash => {
+                let hash = *flow_hash_cache.get_or_insert_with(|| flow_hash(frame, protocol));
+                hash as usize % count
+            }
+            FanoutMode::Lb => {
+                self.runtime
+                    .rr_counter
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1) as usize
+                    % count
+            }
+            FanoutMode::Cpu => crate::smp::core::smp_get_processor_id().data() as usize % count,
+            FanoutMode::Rollover => 0,
+            FanoutMode::Rnd => random_below(count),
+        };
+
+        let rollover = self.mode == FanoutMode::Rollover
+            || self.flags & fanout_flag::PACKET_FANOUT_FLAG_ROLLOVER != 0;
+        if !rollover {
+            return self.deliver_first_live_from(base, ingress, frame);
+        }
+
+        let mut stale = false;
+        if self.mode != FanoutMode::Rollover {
+            match self.members[base].socket.upgrade() {
+                Some(socket) if socket.rx_has_room() => {
+                    socket.deliver(ingress, frame);
+                    return false;
+                }
+                Some(_) => {}
+                None => stale = true,
+            }
+        }
+
+        let state = self.members[base]
+            .rollover
+            .as_ref()
+            .expect("rollover member state");
+        let start = state.cursor.load(Ordering::Relaxed) as usize % count;
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            // Linux's FLAG_ROLLOVER path records the failed primary as
+            // `po_skip`; do not reselect it during the fallback scan.
+            if self.mode != FanoutMode::Rollover && index == base {
+                continue;
+            }
+            match self.members[index].socket.upgrade() {
+                Some(socket) if socket.rx_has_room() => {
+                    if index != start {
+                        state.cursor.store(index as u32, Ordering::Relaxed);
+                    }
+                    socket.deliver(ingress, frame);
+                    return stale;
+                }
+                Some(_) => {}
+                None => stale = true,
+            }
+        }
+
+        // Linux returns the initially selected member when every queue is
+        // full; the socket receive path then records the single final drop.
+        stale | self.deliver_first_live_from(base, ingress, frame)
+    }
+
+    fn deliver_first_live_from(
+        &self,
+        start: usize,
+        ingress: PacketIngressMetadata,
+        frame: &[u8],
+    ) -> bool {
+        let mut stale = false;
+        for offset in 0..self.members.len() {
+            let index = (start + offset) % self.members.len();
+            if let Some(socket) = self.members[index].socket.upgrade() {
                 socket.deliver(ingress, frame);
                 return stale;
             }
-        }
-        // All members full (only reachable on the rollover path): hand the
-        // frame to `base` so `deliver_from_iface` records the drop statistic.
-        if let Some(socket) = nth_live_member(&snapshot.members, base) {
-            socket.deliver(ingress, frame);
+            stale = true;
         }
         stale
     }
 }
 
-/// Upgrade the `target`-th live member (0-indexed among live entries) of a
-/// fanout snapshot. `strong_count()!=0` guarantees `upgrade()` succeeds, so
-/// this performs no heap allocation.
-fn nth_live_member(members: &[Weak<PacketSocket>], target: usize) -> Option<Arc<PacketSocket>> {
-    let mut seen = 0usize;
-    for entry in members {
-        if entry.strong_count() == 0 {
-            continue;
-        }
-        if seen == target {
-            return entry.upgrade();
-        }
-        seen += 1;
+fn hash_seed() -> u32 {
+    let current = FLOW_HASH_SEED.load(Ordering::Acquire);
+    if current != 0 {
+        return current;
     }
-    None
+    let generated = (crate::arch::rand::rand() as u32) | 1;
+    match FLOW_HASH_SEED.compare_exchange(0, generated, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => generated,
+        Err(installed) => installed,
+    }
 }
 
-/// Compute a flow hash over the L3/L4 4-tuple for HASH-mode demux.
-///
-/// Non-IP frames hash to 0 (all land on the base member — degraded but
-/// lossless). VLAN tags are skipped so tagged and untagged frames of the same
-/// flow hash identically.
-fn flow_hash(frame: &[u8], seed: u32) -> u32 {
-    let Some((ether, l3_off)) = l2_ethertype_l3_offset(frame) else {
-        return 0;
-    };
-    let l3 = if frame.len() > l3_off {
-        &frame[l3_off..]
-    } else {
-        return 0;
-    };
+fn random_below(upper: usize) -> usize {
+    debug_assert!(upper != 0);
+    let max_acceptable = usize::MAX - (usize::MAX % upper + 1) % upper;
+    loop {
+        let value = crate::arch::rand::rand();
+        if value <= max_acceptable {
+            return value % upper;
+        }
+    }
+}
 
-    if ether == eth_protocol::ETH_P_IP {
-        // IPv4
-        if l3.len() < 20 {
-            return 0;
+/// Linux-compatible symmetric flow-key subset: basic protocol, IP protocol,
+/// addresses and ports. Address and port pairs are canonicalized separately.
+fn flow_hash(frame: &[u8], protocol: u16) -> u32 {
+    let seed = hash_seed();
+    let Some((l3_protocol, l3_offset)) = l3_protocol_offset(frame) else {
+        return jhash2(&[protocol as u32], seed);
+    };
+    if l3_protocol == eth_protocol::ETH_P_IP {
+        return ipv4_flow_hash(
+            frame.get(l3_offset..).unwrap_or_default(),
+            l3_protocol,
+            seed,
+        );
+    }
+    if l3_protocol == eth_protocol::ETH_P_IPV6 {
+        return ipv6_flow_hash(
+            frame.get(l3_offset..).unwrap_or_default(),
+            l3_protocol,
+            seed,
+        );
+    }
+    jhash2(&[l3_protocol as u32], seed)
+}
+
+fn l3_protocol_offset(frame: &[u8]) -> Option<(u16, usize)> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let mut protocol = u16::from_be_bytes([frame[12], frame[13]]);
+    let mut offset = 14usize;
+    // Linux's flow dissector walks stacked 802.1Q/802.1ad headers. Keep the
+    // same useful QinQ behavior with an explicit bound for hostile frames.
+    for _ in 0..8 {
+        if protocol != 0x8100 && protocol != 0x88a8 {
+            return Some((protocol, offset));
         }
-        if l3[0] >> 4 != 4 {
-            return 0;
-        }
-        let ihl = (l3[0] as usize & 0xf) * 4;
-        if ihl < 20 || l3.len() < ihl {
-            return 0;
-        }
-        let src = u32::from_be_bytes([l3[12], l3[13], l3[14], l3[15]]);
-        let dst = u32::from_be_bytes([l3[16], l3[17], l3[18], l3[19]]);
-        let proto = l3[9];
-        let (sp, dp) = l4_ports(&l3[ihl..], proto);
-        let words = [src, dst, sp as u32, dp as u32];
-        jhash2(&words, seed)
-    } else if ether == eth_protocol::ETH_P_IPV6 {
-        // IPv6
-        if l3.len() < 40 {
-            return 0;
-        }
-        let mut src = [0u32; 4];
-        let mut dst = [0u32; 4];
-        for i in 0..4 {
-            src[i] =
-                u32::from_be_bytes([l3[8 + i * 4], l3[9 + i * 4], l3[10 + i * 4], l3[11 + i * 4]]);
-            dst[i] = u32::from_be_bytes([
-                l3[24 + i * 4],
-                l3[25 + i * 4],
-                l3[26 + i * 4],
-                l3[27 + i * 4],
-            ]);
-        }
-        let next_header = l3[6];
-        let (sp, dp) = l4_ports(&l3[40..], next_header);
-        let words = [
-            src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], sp as u32, dp as u32,
-        ];
-        jhash2(&words, seed)
+        let header = frame.get(offset..offset.checked_add(4)?)?;
+        protocol = u16::from_be_bytes([header[2], header[3]]);
+        offset += 4;
+    }
+    Some((protocol, offset))
+}
+
+fn ipv4_flow_hash(l3: &[u8], basic_protocol: u16, seed: u32) -> u32 {
+    if l3.len() < 20 || l3[0] >> 4 != 4 {
+        return jhash2(&[basic_protocol as u32], seed);
+    }
+    let ihl = usize::from(l3[0] & 0x0f) * 4;
+    if ihl < 20 || l3.len() < ihl {
+        return jhash2(&[basic_protocol as u32], seed);
+    }
+    let mut src = u32::from_be_bytes([l3[12], l3[13], l3[14], l3[15]]);
+    let mut dst = u32::from_be_bytes([l3[16], l3[17], l3[18], l3[19]]);
+    if dst < src {
+        core::mem::swap(&mut src, &mut dst);
+    }
+    let ip_protocol = l3[9];
+    let fragment = u16::from_be_bytes([l3[6], l3[7]]);
+    // Linux's symmetric dissector does not request first-fragment parsing:
+    // MF or a non-zero offset therefore suppresses L4 ports.
+    let ports = if fragment & 0x3fff == 0 {
+        canonical_ports(l3.get(ihl..).unwrap_or_default(), ip_protocol)
     } else {
         0
-    }
+    };
+    jhash2(
+        &[basic_protocol as u32, ip_protocol as u32, src, dst, ports],
+        seed,
+    )
 }
 
-/// Extract the source/destination ports from an L4 segment for TCP/UDP.
-fn l4_ports(l4: &[u8], proto: u8) -> (u16, u16) {
-    if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) && l4.len() >= 4 {
-        let sp = u16::from_be_bytes([l4[0], l4[1]]);
-        let dp = u16::from_be_bytes([l4[2], l4[3]]);
-        (sp, dp)
-    } else {
-        (0, 0)
+fn ipv6_flow_hash(l3: &[u8], basic_protocol: u16, seed: u32) -> u32 {
+    if l3.len() < 40 || l3[0] >> 4 != 6 {
+        return jhash2(&[basic_protocol as u32], seed);
     }
+    let mut src = [0u32; 4];
+    let mut dst = [0u32; 4];
+    for index in 0..4 {
+        let src_off = 8 + index * 4;
+        let dst_off = 24 + index * 4;
+        src[index] = u32::from_be_bytes(l3[src_off..src_off + 4].try_into().unwrap());
+        dst[index] = u32::from_be_bytes(l3[dst_off..dst_off + 4].try_into().unwrap());
+    }
+    if compare_words(&dst, &src) == CmpOrdering::Less {
+        core::mem::swap(&mut src, &mut dst);
+    }
+    let (ip_protocol, transport_offset, has_ports) = ipv6_transport(l3);
+    let ports = if has_ports {
+        canonical_ports(l3.get(transport_offset..).unwrap_or_default(), ip_protocol)
+    } else {
+        0
+    };
+    let words = [
+        basic_protocol as u32,
+        ip_protocol as u32,
+        src[0],
+        src[1],
+        src[2],
+        src[3],
+        dst[0],
+        dst[1],
+        dst[2],
+        dst[3],
+        ports,
+    ];
+    jhash2(&words, seed)
+}
+
+fn ipv6_transport(l3: &[u8]) -> (u8, usize, bool) {
+    let mut next = l3[6];
+    let mut offset = 40usize;
+    for _ in 0..8 {
+        match next {
+            0 | 43 | 60 => {
+                let Some(header) = l3.get(offset..offset.saturating_add(2)) else {
+                    return (next, offset, false);
+                };
+                next = header[0];
+                offset = match offset.checked_add((usize::from(header[1]) + 1) * 8) {
+                    Some(value) if value <= l3.len() => value,
+                    _ => return (next, offset, false),
+                };
+            }
+            44 => {
+                let Some(header) = l3.get(offset..offset.saturating_add(8)) else {
+                    return (next, offset, false);
+                };
+                next = header[0];
+                offset += 8;
+                // Every IPv6 Fragment Header, including an atomic fragment,
+                // sets FLOW_DIS_IS_FRAGMENT and suppresses port extraction.
+                return (next, offset, false);
+            }
+            _ => return (next, offset, true),
+        }
+    }
+    (next, offset, false)
+}
+
+fn canonical_ports(l4: &[u8], protocol: u8) -> u32 {
+    if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) || l4.len() < 4 {
+        return 0;
+    }
+    let mut src = u16::from_be_bytes([l4[0], l4[1]]);
+    let mut dst = u16::from_be_bytes([l4[2], l4[3]]);
+    if dst < src {
+        core::mem::swap(&mut src, &mut dst);
+    }
+    (u32::from(src) << 16) | u32::from(dst)
+}
+
+fn compare_words(left: &[u32; 4], right: &[u32; 4]) -> CmpOrdering {
+    for index in 0..4 {
+        match left[index].cmp(&right[index]) {
+            CmpOrdering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    CmpOrdering::Equal
 }
 
 impl PacketSocket {
-    /// `setsockopt(SOL_PACKET, PACKET_FANOUT, val)` entry point.
-    ///
-    /// Parses the option value, validates mode/flags, then delegates the
-    /// locked registry work — including the already-joined (`EBUSY`) check —
-    /// to the owning netns so that the check, "publish member", and "set
-    /// fanout field" all happen atomically under the netns writer lock.
-    pub(crate) fn join_fanout(&self, val: i32) -> Result<(), SystemError> {
-        let v = val as u32;
-        let id_req = (v & 0xffff) as u16;
-        let type_flags = v >> 16;
-        let mode = FanoutMode::from_raw(type_flags & 0x7f)?;
-        let flags = (type_flags & !0x7f) as u16;
+    pub(crate) fn join_fanout(&self, raw: u32, max_num_members: u32) -> Result<(), SystemError> {
+        let id_req = raw as u16;
+        let type_flags = raw >> 16;
+        let mode = FanoutMode::from_raw(type_flags & 0xff)?;
+        let mut flags = (type_flags & !0xff) as u16;
 
-        // Only ROLLOVER and UNIQUEID flags are supported. DEFRAG/IGNORE_OUTGOING
-        // need infrastructure DragonOS lacks; reject explicitly rather than
-        // silently ignoring them.
-        const ALLOWED_FLAGS: u16 =
-            fanout_flag::PACKET_FANOUT_FLAG_ROLLOVER | fanout_flag::PACKET_FANOUT_FLAG_UNIQUEID;
-        if flags & !ALLOWED_FLAGS != 0 {
+        const ALLOWED_FLAGS: u16 = fanout_flag::PACKET_FANOUT_FLAG_ROLLOVER
+            | fanout_flag::PACKET_FANOUT_FLAG_UNIQUEID
+            | fanout_flag::PACKET_FANOUT_FLAG_IGNORE_OUTGOING;
+        if flags & !ALLOWED_FLAGS != 0
+            || (mode == FanoutMode::Rollover
+                && flags & fanout_flag::PACKET_FANOUT_FLAG_ROLLOVER != 0)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        if max_num_members as usize > FANOUT_MAX_MEMBERS {
             return Err(SystemError::EINVAL);
         }
 
         let unique = flags & fanout_flag::PACKET_FANOUT_FLAG_UNIQUEID != 0;
-        let Some(socket) = self.self_ref.upgrade() else {
+        if unique && id_req != 0 {
             return Err(SystemError::EINVAL);
-        };
-        // Extract the join profile here (inside the packet module, where the
-        // fields are visible) and hand the values to the netns.
-        let sock_type = self.sock_type;
+        }
+        flags &= !fanout_flag::PACKET_FANOUT_FLAG_UNIQUEID;
+
+        let _guard = self.bind_lock.lock();
+        if self.has_fanout_group() {
+            return Err(SystemError::EALREADY);
+        }
         let (bound_ifindex, bound_protocol) = self.binding.load();
+        if bound_protocol == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let socket = self.self_ref.upgrade().ok_or(SystemError::EINVAL)?;
         self.netns.fanout_group_join(
             &socket,
             FanoutJoinParams {
@@ -374,71 +612,41 @@ impl PacketSocket {
                 unique,
                 mode,
                 flags,
-                sock_type,
                 bound_ifindex,
                 bound_protocol,
+                max_num_members,
             },
         )
     }
 
-    /// Leave the current fanout group (invoked from `close_binding`).
-    ///
-    /// Delegates entirely to the owning netns, which acquires
-    /// `fanout_groups_writer` *before* taking the socket's `fanout` write lock.
-    /// This keeps the lock order identical to the join path
-    /// (`fanout_groups_writer → fanout.write()`), avoiding the ABBA deadlock
-    /// that would arise if the leave path cleared `fanout` first.
-    pub(crate) fn leave_fanout(&self) {
-        self.netns.fanout_group_leave(&self.self_ref);
-    }
-
-    /// `true` if this socket currently belongs to a fanout group. Used by the
-    /// broadcast deliver path to skip sockets handled by their group.
-    pub(crate) fn is_fanout_member(&self) -> bool {
-        self.fanout_active.load(Ordering::Acquire)
-    }
-
-    /// Record group membership. Called by the netns join path while it holds
-    /// the `fanout_groups_writer` lock, so member publication and field update
-    /// are atomic from a concurrent join/leave viewpoint.
-    pub(crate) fn set_fanout_group(&self, group: Arc<FanoutGroup>) {
-        *self.fanout.write() = Some(group);
-        self.fanout_active.store(true, Ordering::Release);
-    }
-
-    /// Whether this socket currently holds a fanout group reference.
-    /// Checked by the netns join path under the `fanout_groups_writer` lock
-    /// for the already-joined (`EBUSY`) test.
     pub(crate) fn has_fanout_group(&self) -> bool {
-        self.fanout.read().is_some()
+        self.fanout_membership.load(Ordering::Acquire) >> 32 != 0
     }
 
-    /// Take and clear the fanout group membership, deactivating the socket.
-    /// Called by the netns leave path *after* acquiring `fanout_groups_writer`,
-    /// so the clear and the registry mutation share the same lock order as
-    /// the join path (`fanout_groups_writer → fanout.write()`).
-    pub(crate) fn clear_fanout_group(&self) -> Option<Arc<FanoutGroup>> {
-        let group = self.fanout.write().take();
-        if group.is_some() {
-            self.fanout_active.store(false, Ordering::Release);
-        }
-        group
+    pub(crate) fn set_fanout_membership(&self, value: u32) {
+        self.fanout_membership
+            .store((1u64 << 32) | u64::from(value), Ordering::Release);
     }
 
-    /// Current fanout membership encoded as `(id | (type_flags << 16))`, or
-    /// `None` if the socket has not joined a group.
+    pub(crate) fn clear_fanout_membership(&self) {
+        self.fanout_membership.store(0, Ordering::Release);
+    }
+
     pub(crate) fn fanout_getsockopt_value(&self) -> Option<u32> {
-        let group = self.fanout.read();
-        let group = group.as_ref()?;
-        let type_flags = group.mode.as_raw() | group.flags as u32;
-        Some(group.id as u32 | (type_flags << 16))
+        let membership = self.fanout_membership.load(Ordering::Acquire);
+        (membership >> 32 != 0).then_some(membership as u32)
     }
 
-    /// `true` when the receive buffer still has room for another frame. Mirrors
-    /// the admission check in `deliver_from_iface` (rx.rs) so the ROLLOVER
-    /// fallback can skip a backlogged member identically.
+    pub(crate) fn fanout_group_id(&self) -> Option<u16> {
+        self.fanout_getsockopt_value().map(|value| value as u16)
+    }
+
     pub(super) fn rx_has_room(&self) -> bool {
         self.rx_buffer_bytes.load(Ordering::Acquire)
             < self.recv_buffer_bytes.load(Ordering::Relaxed)
     }
+}
+
+pub(crate) fn membership_value(group: &FanoutGroup) -> u32 {
+    u32::from(group.id) | ((group.mode.as_raw() | u32::from(group.flags)) << 16)
 }

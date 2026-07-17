@@ -743,6 +743,20 @@ fn parse_frame(frame: &[u8]) -> Option<ParsedFrame> {
     })
 }
 
+/// Protocol as observed by the AF_PACKET hook. Incoming VLAN frames expose
+/// the inner protocol after VLAN normalization; outgoing taps retain the
+/// inline VLAN header and therefore expose the outer TPID.
+pub(crate) fn packet_protocol(frame: &[u8], pkt_type: PacketType) -> Option<u16> {
+    let parsed = parse_frame(frame)?;
+    Some(
+        if parsed.vlan.is_some() && pkt_type != PacketType::Outgoing {
+            parsed.protocol
+        } else {
+            parsed.vlan.map_or(parsed.protocol, |(_, tpid)| tpid)
+        },
+    )
+}
+
 impl PacketSocket {
     pub(super) fn deliver_from_iface(&self, ingress: PacketIngressMetadata, frame: &[u8]) {
         let (bound_ifindex, bound_protocol) = self.binding.load();

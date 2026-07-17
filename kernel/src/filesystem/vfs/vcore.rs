@@ -27,7 +27,7 @@ use crate::{
     ipc::kill::send_signal_to_pid,
     libs::mutex::MutexGuard,
     process::{
-        cred::CAPFlags,
+        cred::{CAPFlags, Cred},
         namespace::mnt::{mnt_namespace_init, RootMountAttachment},
         resource::RLimitID,
         ProcessManager,
@@ -783,11 +783,19 @@ where
     do_resize(&inode, &md, mask)
 }
 
-fn prepare_write_side_effect_metadata(
-    mut md: Metadata,
+pub(crate) fn prepare_write_side_effect_metadata(
+    md: Metadata,
     new_size: usize,
 ) -> (Metadata, SetMetadataMask) {
     let cred = ProcessManager::current_pcb().cred();
+    prepare_write_side_effect_metadata_with_cred(md, new_size, &cred)
+}
+
+pub(crate) fn prepare_write_side_effect_metadata_with_cred(
+    mut md: Metadata,
+    new_size: usize,
+    cred: &Arc<Cred>,
+) -> (Metadata, SetMetadataMask) {
     let now = crate::time::PosixTimeSpec::now();
     md.size = new_size as i64;
     md.mtime = now;
@@ -802,7 +810,7 @@ fn prepare_write_side_effect_metadata(
         let original_mode = md.mode;
         md.mode.remove(InodeMode::S_ISUID);
 
-        if should_remove_sgid(md.mode, md.gid, &cred) {
+        if should_remove_sgid(md.mode, md.gid, cred) {
             md.mode.remove(InodeMode::S_ISGID);
         }
 

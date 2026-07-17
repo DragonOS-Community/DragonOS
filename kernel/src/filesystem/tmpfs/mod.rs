@@ -20,6 +20,7 @@ use crate::{
     libs::casting::DowncastArc,
     libs::mutex::{Mutex, MutexGuard},
     mm::MemoryManagementArch,
+    process::ProcessManager,
     time::PosixTimeSpec,
 };
 
@@ -1173,10 +1174,22 @@ impl IndexNode for LockedTmpfsInode {
             }
         }
 
+        // Match Linux shmem_fallocate(): only after every page has been
+        // allocated successfully, apply the same write-side metadata effects
+        // as a regular file modification.  Build the update from the latest
+        // metadata while holding the inode lock so concurrent chmod/chown
+        // changes cannot be overwritten by a stale pre-allocation snapshot.
+        let cred = ProcessManager::current_pcb().cred();
         let mut inode = self.0.lock();
-        if end > inode.metadata.size as usize {
-            inode.metadata.size = end as i64;
-        }
+        let new_size = core::cmp::max(inode.metadata.size.max(0) as usize, end);
+        let (metadata, mask) =
+            crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                inode.metadata.clone(),
+                new_size,
+                &cred,
+            );
+        inode.metadata.size = metadata.size;
+        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
         let _ = lock_owner;
         Ok(())
     }

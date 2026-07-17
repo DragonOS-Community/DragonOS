@@ -582,33 +582,56 @@ impl Ext4FileSystem {
         inode: &Arc<LockedExt4Inode>,
         dirty: InodeDirtyState,
     ) -> Result<(), SystemError> {
+        Self::mark_inode_dirty_with(inode, dirty, |_| {})
+    }
+
+    pub(super) fn mark_inode_atime_dirty(
+        inode: &Arc<LockedExt4Inode>,
+        atime: u32,
+    ) -> Result<(), SystemError> {
+        Self::mark_inode_dirty_with(inode, InodeDirtyState::ATIME_DIRTY, |guard| {
+            guard.cached_atime = Some(atime);
+        })
+    }
+
+    fn mark_inode_dirty_with<F>(
+        inode: &Arc<LockedExt4Inode>,
+        dirty: InodeDirtyState,
+        update_cached_metadata: F,
+    ) -> Result<(), SystemError>
+    where
+        F: FnOnce(&mut super::inode::Ext4Inode),
+    {
         let _operation = inode.lifecycle().begin_operation()?;
         // Acquire a prospective queue ownership before publishing dirty state.
         // If the inode is already queued, the existing AsyncWork owner prevents
         // this temporary retain/release pair from creating a false-zero edge.
         inode.retain(InodeRetentionKind::AsyncWork)?;
-        let (fs, should_queue) = {
+        let queue_fs = {
             let mut guard = inode.inner.lock();
-            guard.dirty_state.insert(dirty);
             let should_queue = !guard
                 .dirty_state
                 .intersects(InodeDirtyState::QUEUED | InodeDirtyState::WRITEBACK);
+            let queue_fs = if should_queue {
+                let Some(fs) = guard.fs_ptr.upgrade() else {
+                    drop(guard);
+                    inode.release(InodeRetentionKind::AsyncWork);
+                    return Err(SystemError::EIO);
+                };
+                Some(fs)
+            } else {
+                None
+            };
+            update_cached_metadata(&mut guard);
+            guard.dirty_state.insert(dirty);
             if should_queue {
                 guard.dirty_state.insert(InodeDirtyState::QUEUED);
             }
-            (guard.fs_ptr.upgrade(), should_queue)
+            queue_fs
         };
 
-        if should_queue {
-            if let Some(fs) = fs {
-                fs.dirty_inodes.lock().push(inode.clone());
-            } else {
-                let mut guard = inode.inner.lock();
-                guard.dirty_state.remove(InodeDirtyState::QUEUED);
-                drop(guard);
-                inode.release(InodeRetentionKind::AsyncWork);
-                return Err(SystemError::EIO);
-            }
+        if let Some(fs) = queue_fs {
+            fs.dirty_inodes.lock().push(inode.clone());
         } else {
             inode.release(InodeRetentionKind::AsyncWork);
         }
@@ -629,11 +652,9 @@ impl Ext4FileSystem {
 
             let mut guard = inode.inner.lock();
             if !guard.dirty_state.contains(InodeDirtyState::QUEUED)
-                || guard.dirty_state.intersects(
-                    InodeDirtyState::SIZE_DIRTY
-                        | InodeDirtyState::MTIME_DIRTY
-                        | InodeDirtyState::WRITEBACK,
-                )
+                || guard
+                    .dirty_state
+                    .intersects(InodeDirtyState::PERSISTENT_DIRTY | InodeDirtyState::WRITEBACK)
             {
                 return;
             }
@@ -653,7 +674,7 @@ impl Ext4FileSystem {
                 let mut guard = inode.inner.lock();
                 if guard
                     .dirty_state
-                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
+                    .intersects(InodeDirtyState::PERSISTENT_DIRTY)
                 {
                     guard.dirty_state.insert(InodeDirtyState::QUEUED);
                     drop(guard);
@@ -689,7 +710,7 @@ impl Ext4FileSystem {
                 let mut guard = inode.inner.lock();
                 let has_dirty = guard
                     .dirty_state
-                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+                    .intersects(InodeDirtyState::PERSISTENT_DIRTY);
                 if !has_dirty {
                     guard
                         .dirty_state
@@ -716,8 +737,7 @@ impl Ext4FileSystem {
                     let page_cache = {
                         let mut guard = inode.inner.lock();
                         guard.dirty_state.remove(
-                            InodeDirtyState::SIZE_DIRTY
-                                | InodeDirtyState::MTIME_DIRTY
+                            InodeDirtyState::PERSISTENT_DIRTY
                                 | InodeDirtyState::QUEUED
                                 | InodeDirtyState::WRITEBACK,
                         );
@@ -740,12 +760,12 @@ impl Ext4FileSystem {
             let result = {
                 let _operation = operation;
                 let _io_guard = inode.io_lock.lock();
-                let (fs, inode_num, snapshot_dirty, cached_size, cached_mtime) = {
+                let (fs, inode_num, snapshot_dirty, cached_size, cached_atime, cached_mtime) = {
                     let mut guard = inode.inner.lock();
                     guard.dirty_state.remove(InodeDirtyState::QUEUED);
                     let snapshot_dirty = guard
                         .dirty_state
-                        .intersection(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+                        .intersection(InodeDirtyState::PERSISTENT_DIRTY);
                     if snapshot_dirty.is_empty() {
                         guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
                         release_async_owner = true;
@@ -758,6 +778,7 @@ impl Ext4FileSystem {
                         guard.inner_inode_num,
                         snapshot_dirty,
                         guard.cached_file_size,
+                        guard.cached_atime,
                         guard.cached_mtime,
                     )
                 };
@@ -784,8 +805,13 @@ impl Ext4FileSystem {
                             } else {
                                 None
                             };
+                            let atime = if snapshot_dirty.contains(InodeDirtyState::ATIME_DIRTY) {
+                                cached_atime
+                            } else {
+                                None
+                            };
                             LockedExt4Inode::retry_metadata_contention(|| {
-                                fs.fs.commit_inode_metadata(inode_num, size, mtime)
+                                fs.fs.commit_inode_metadata(inode_num, size, atime, mtime)
                             })
                         })
                     } else {
@@ -804,11 +830,16 @@ impl Ext4FileSystem {
                         {
                             guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
                         }
+                        if snapshot_dirty.contains(InodeDirtyState::ATIME_DIRTY)
+                            && guard.cached_atime == cached_atime
+                        {
+                            guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
+                        }
                     }
                     guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
                     if guard
                         .dirty_state
-                        .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
+                        .intersects(InodeDirtyState::PERSISTENT_DIRTY)
                     {
                         guard.dirty_state.insert(InodeDirtyState::QUEUED);
                         should_requeue = true;
@@ -896,6 +927,7 @@ impl Ext4FileSystem {
                     special_node: None,
                     cached_file_size: None,
                     cached_mtime: None,
+                    cached_atime: None,
                     dirty_state: super::inode::InodeDirtyState::empty(),
                 }),
                 io_lock: Mutex::new(()),

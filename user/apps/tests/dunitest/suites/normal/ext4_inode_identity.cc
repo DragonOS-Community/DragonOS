@@ -355,6 +355,38 @@ TEST(Ext4InodeIdentity, DeletedFdSupportsTruncateAndFallocate) {
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
+TEST(Ext4InodeIdentity, ReadAtimeIsImmediatelyVisibleAndPersistsAfterFsync) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/read_atime";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    constexpr char kData[] = "atime";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kData, sizeof(kData) - 1));
+    const timespec old_times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, futimens(fd, old_times)) << strerror(errno);
+
+    char byte = 0;
+    ASSERT_EQ(1, pread(fd, &byte, 1, 0)) << strerror(errno);
+    EXPECT_EQ(kData[0], byte);
+
+    struct stat cached {};
+    ASSERT_EQ(0, fstat(fd, &cached)) << strerror(errno);
+    EXPECT_GT(cached.st_atim.tv_sec, old_times[0].tv_sec);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    struct stat persisted {};
+    ASSERT_EQ(0, stat(path.c_str(), &persisted)) << strerror(errno);
+    EXPECT_EQ(cached.st_atim.tv_sec, persisted.st_atim.tv_sec);
+    EXPECT_EQ(cached.st_atim.tv_nsec, persisted.st_atim.tv_nsec);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
 TEST(Ext4InodeIdentity, DirtySharedMappingSurvivesUnlinkAndFdClose) {
     LoopExt4 fs;
     ASSERT_NO_FATAL_FAILURE(fs.SetUp());

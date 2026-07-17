@@ -9,6 +9,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <string>
@@ -92,6 +93,10 @@ off_t FileSize(int fd) {
     return st.st_size;
 }
 
+bool TimespecAfter(const timespec& lhs, const timespec& rhs) {
+    return lhs.tv_sec > rhs.tv_sec || (lhs.tv_sec == rhs.tv_sec && lhs.tv_nsec > rhs.tv_nsec);
+}
+
 class ScopedSignalIgnore {
   public:
     explicit ScopedSignalIgnore(int signal) : signal_(signal) {
@@ -165,6 +170,55 @@ TEST(FallocateSemantics, Mode0DoesNotShrink) {
     EXPECT_EQ(4096, FileSize(file.fd()));
 }
 
+TEST(FallocateSemantics, SuccessfulMode0UpdatesWriteSideMetadata) {
+    TempFile file;
+    ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
+
+    const timespec old_times[2] = {{1, 0}, {1, 0}};
+    ASSERT_EQ(0, futimens(file.fd(), old_times)) << strerror(errno);
+
+    struct stat before {};
+    ASSERT_EQ(0, fstat(file.fd(), &before)) << strerror(errno);
+    sleep(1);
+
+    ASSERT_EQ(0, RawFallocate(file.fd(), 0, 0, 4096)) << strerror(errno);
+
+    struct stat after {};
+    ASSERT_EQ(0, fstat(file.fd(), &after)) << strerror(errno);
+    EXPECT_EQ(4096, after.st_size);
+    EXPECT_TRUE(TimespecAfter(after.st_mtim, before.st_mtim));
+    EXPECT_TRUE(TimespecAfter(after.st_ctim, before.st_ctim));
+}
+
+TEST(FallocateSemantics, SuccessfulMode0ClearsSetidForUnprivilegedCaller) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to create an unprivileged child";
+    }
+
+    TempFile file;
+    ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
+    ASSERT_EQ(0, fchmod(file.fd(), 06755)) << strerror(errno);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0 ||
+            RawFallocate(file.fd(), 0, 0, 4096) != 0) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+
+    struct stat after {};
+    ASSERT_EQ(0, fstat(file.fd(), &after)) << strerror(errno);
+    EXPECT_EQ(static_cast<mode_t>(0), after.st_mode & (S_ISUID | S_ISGID));
+}
+
 TEST(FallocateSemantics, UnsupportedKeepSizeRemainsUnsupported) {
     TempFile file;
     ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
@@ -197,10 +251,20 @@ TEST(FallocateSemantics, RlimitFsizeBlocksGrowth) {
     ScopedRlimit limit(RLIMIT_FSIZE, 64);
     ASSERT_TRUE(limit.valid()) << "setrlimit failed: " << strerror(errno);
 
+    struct stat before {};
+    ASSERT_EQ(0, fstat(file.fd(), &before)) << strerror(errno);
+
     errno = 0;
     EXPECT_EQ(-1, RawFallocate(file.fd(), 0, 0, 128));
     EXPECT_EQ(EFBIG, errno) << "unexpected errno=" << errno << " (" << strerror(errno) << ")";
-    EXPECT_EQ(0, FileSize(file.fd()));
+
+    struct stat after {};
+    ASSERT_EQ(0, fstat(file.fd(), &after)) << strerror(errno);
+    EXPECT_EQ(before.st_size, after.st_size);
+    EXPECT_EQ(before.st_mtim.tv_sec, after.st_mtim.tv_sec);
+    EXPECT_EQ(before.st_mtim.tv_nsec, after.st_mtim.tv_nsec);
+    EXPECT_EQ(before.st_ctim.tv_sec, after.st_ctim.tv_sec);
+    EXPECT_EQ(before.st_ctim.tv_nsec, after.st_ctim.tv_nsec);
 }
 
 int main(int argc, char** argv) {

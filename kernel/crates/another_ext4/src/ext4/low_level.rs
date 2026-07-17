@@ -492,6 +492,7 @@ impl Ext4 {
         &self,
         id: InodeId,
         size: Option<u64>,
+        atime: Option<u32>,
         mtime: Option<u32>,
     ) -> Result<()> {
         self.ensure_mutable()?;
@@ -503,6 +504,9 @@ impl Ext4 {
         }
         if let Some(size) = size {
             inode.inode.set_size(size);
+        }
+        if let Some(atime) = atime {
+            inode.inode.set_atime(atime);
         }
         if let Some(mtime) = mtime {
             inode.inode.set_mtime(mtime);
@@ -516,7 +520,7 @@ impl Ext4 {
     ///
     /// Call this after successful page-cache write to finalise the new file size.
     pub fn commit_inode_size(&self, id: InodeId, size: u64, mtime: Option<u32>) -> Result<()> {
-        self.commit_inode_metadata(id, Some(size), mtime)
+        self.commit_inode_metadata(id, Some(size), None, mtime)
     }
 
     /// Link a newly created inode into `parent`.

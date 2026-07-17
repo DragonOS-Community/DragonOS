@@ -48,6 +48,22 @@ pub fn child_inode_init(
     file_type: FileType,
     mut mode: InodeMode,
 ) -> ChildInodeInit {
+    // Filesystems such as procfs create backing ramfs nodes before the process
+    // manager has installed an idle task. Those kernel-owned bootstrap
+    // creations run with the initial root credential rather than a current
+    // task credential.
+    if !ProcessManager::initialized() {
+        let gid = if parent.mode.contains(InodeMode::S_ISGID) {
+            if file_type == FileType::Dir {
+                mode.insert(InodeMode::S_ISGID);
+            }
+            parent.gid
+        } else {
+            0
+        };
+        return ChildInodeInit { uid: 0, gid, mode };
+    }
+
     let cred = ProcessManager::current_pcb().cred();
     let gid = if parent.mode.contains(InodeMode::S_ISGID) {
         if file_type == FileType::Dir {

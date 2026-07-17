@@ -1212,6 +1212,21 @@ impl IndexNode for LockedTmpfsInode {
         if parent.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
+        // Revalidate local DAC while holding the same lock that protects the
+        // parent metadata and publishes the child. This is the tmpfs analogue
+        // of Linux holding the parent inode lock across may_create()+symlink.
+        if parent.metadata.flags.contains(InodeFlags::S_IMMUTABLE) {
+            return Err(SystemError::EPERM);
+        }
+        if ProcessManager::initialized() {
+            let cred = ProcessManager::current_pcb().cred();
+            cred.inode_permission(
+                &parent.metadata,
+                (crate::filesystem::vfs::permission::PermissionMask::MAY_WRITE
+                    | crate::filesystem::vfs::permission::PermissionMask::MAY_EXEC)
+                    .bits(),
+            )?;
+        }
         let init = crate::filesystem::vfs::permission::child_inode_init(
             &parent.metadata,
             FileType::SymLink,

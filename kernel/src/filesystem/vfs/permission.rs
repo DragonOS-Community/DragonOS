@@ -118,6 +118,11 @@ pub fn check_inode_permission(
     {
         return Err(SystemError::EROFS);
     }
+    if mask.contains(PermissionMask::MAY_WRITE)
+        && metadata.flags.contains(super::InodeFlags::S_IMMUTABLE)
+    {
+        return Err(SystemError::EPERM);
+    }
 
     let cred = ProcessManager::current_pcb().cred();
     match inode.try_fs().map(|fs| fs.permission_policy()) {

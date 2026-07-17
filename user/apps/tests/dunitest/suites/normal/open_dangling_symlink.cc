@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <string>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
@@ -49,6 +50,60 @@ TEST_F(OpenDanglingSymlinkTest, CreatesRelativeTargetAfterFollowingFinalSymlink)
     ASSERT_EQ(0, lstat(Path("link").c_str(), &link_st));
     EXPECT_TRUE(S_ISLNK(link_st.st_mode));
     ExpectRegularFile(Path("target"));
+}
+
+TEST_F(OpenDanglingSymlinkTest, EmptyTargetIsRejectedByBothSyscalls) {
+    errno = 0;
+    EXPECT_EQ(-1, symlink("", Path("link").c_str()));
+    EXPECT_EQ(ENOENT, errno);
+
+    int dirfd = open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(dirfd, 0) << std::strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, symlinkat("", dirfd, "link"));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(0, close(dirfd));
+
+    struct stat st = {};
+    errno = 0;
+    EXPECT_EQ(-1, lstat(Path("link").c_str(), &st));
+    EXPECT_EQ(ENOENT, errno);
+}
+
+TEST_F(OpenDanglingSymlinkTest, TrailingSlashDoesNotCreateFinalComponent) {
+    errno = 0;
+    EXPECT_EQ(-1, symlink("target", (Path("link") + "/").c_str()));
+    EXPECT_EQ(ENOENT, errno);
+
+    struct stat st = {};
+    errno = 0;
+    EXPECT_EQ(-1, lstat(Path("link").c_str(), &st));
+    EXPECT_EQ(ENOENT, errno);
+}
+
+TEST_F(OpenDanglingSymlinkTest, CreationRequiresParentWritePermission) {
+    ASSERT_EQ(0, chmod(dir_.c_str(), 0555)) << std::strerror(errno);
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << std::strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(2);
+        }
+        errno = 0;
+        int result = symlink("target", Path("link").c_str());
+        _exit(result == -1 && errno == EACCES ? 0 : 1);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << std::strerror(errno);
+    EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    ASSERT_EQ(0, chmod(dir_.c_str(), 0700)) << std::strerror(errno);
+
+    struct stat st = {};
+    errno = 0;
+    EXPECT_EQ(-1, lstat(Path("link").c_str(), &st));
+    EXPECT_EQ(ENOENT, errno);
 }
 
 TEST_F(OpenDanglingSymlinkTest, CreatesAbsoluteTarget) {

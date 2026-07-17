@@ -173,18 +173,38 @@ pub fn update_atime_locked(metadata: &mut Metadata, now: PosixTimeSpec, relatime
     if metadata.flags.contains(InodeFlags::S_NOATIME) {
         return false;
     }
+    if !should_update_atime(
+        metadata.atime,
+        metadata.mtime,
+        metadata.ctime,
+        now,
+        relatime,
+    ) {
+        return false;
+    }
+    metadata.atime = now;
+    true
+}
+
+/// Evaluate Linux strictatime/relatime policy from authoritative in-memory
+/// inode timestamps. Filesystems with a native inode cache can use this helper
+/// without constructing a full metadata snapshot or reading the disk inode.
+pub fn should_update_atime(
+    atime: PosixTimeSpec,
+    mtime: PosixTimeSpec,
+    ctime: PosixTimeSpec,
+    now: PosixTimeSpec,
+    relatime: bool,
+) -> bool {
     if relatime {
-        let recent = now.tv_sec.saturating_sub(metadata.atime.tv_sec) < 24 * 60 * 60;
-        let atime_after_mtime = (metadata.atime.tv_sec, metadata.atime.tv_nsec)
-            > (metadata.mtime.tv_sec, metadata.mtime.tv_nsec);
-        let atime_after_ctime = (metadata.atime.tv_sec, metadata.atime.tv_nsec)
-            > (metadata.ctime.tv_sec, metadata.ctime.tv_nsec);
+        let recent = now.tv_sec.saturating_sub(atime.tv_sec) < 24 * 60 * 60;
+        let atime_after_mtime = (atime.tv_sec, atime.tv_nsec) > (mtime.tv_sec, mtime.tv_nsec);
+        let atime_after_ctime = (atime.tv_sec, atime.tv_nsec) > (ctime.tv_sec, ctime.tv_nsec);
         if atime_after_mtime && atime_after_ctime && recent {
             return false;
         }
     }
-    metadata.atime = now;
-    true
+    atime != now
 }
 
 impl From<FileType> for InodeMode {

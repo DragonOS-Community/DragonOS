@@ -3,6 +3,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::vfs::{
         fcntl::AtFlags,
+        permission::{check_inode_permission, PermissionMask},
         utils::{rsplit_path, user_path_at},
         FileType, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
@@ -20,10 +21,10 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     // - `from`（目标字符串）不要求存在，也不应被解析/规范化
     // - 仅需解析并校验 `to` 的父目录存在且为目录，且 `to` 本身不存在
     //
-    // TODO: 添加权限检查，确保进程拥有目标路径的权限（父目录 W+X）
-    if to.is_empty() {
+    if from.is_empty() || to.is_empty() {
         return Err(SystemError::ENOENT);
     }
+    let trailing_slash = to.ends_with('/');
 
     let pcb = ProcessManager::current_pcb();
 
@@ -45,9 +46,24 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
         None => new_begin_inode,
     };
 
-    if new_parent.metadata()?.file_type != FileType::Dir {
+    let parent_metadata = new_parent.metadata()?;
+    if parent_metadata.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
+
+    // Linux filename_create()/may_create() checks search permission before
+    // exposing whether the destination exists, but an existing destination
+    // takes precedence over a missing write permission.
+    check_inode_permission(&new_parent, &parent_metadata, PermissionMask::MAY_EXEC)?;
+    match new_parent.find(new_name) {
+        Ok(_) => return Err(SystemError::EEXIST),
+        Err(SystemError::ENOENT) => {}
+        Err(error) => return Err(error),
+    }
+    if trailing_slash {
+        return Err(SystemError::ENOENT);
+    }
+    check_inode_permission(&new_parent, &parent_metadata, PermissionMask::MAY_WRITE)?;
 
     new_parent.symlink(new_name, from)?;
 

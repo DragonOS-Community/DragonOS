@@ -2,7 +2,9 @@ use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
     exception::workqueue::{Work, WorkQueue},
     filesystem::{
-        ext4::inode::{Ext4Inode, Ext4InodeLifecycle, Ext4InodeLifecycleState, InodeDirtyState},
+        ext4::inode::{
+            Ext4Inode, Ext4InodeLifecycle, Ext4InodeLifecycleState, Ext4InodeTimes, InodeDirtyState,
+        },
         vfs::{
             self,
             fcntl::AtFlags,
@@ -407,7 +409,7 @@ impl Ext4FileSystem {
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
     ) -> Result<Arc<LockedExt4Inode>, SystemError> {
-        self.get_or_create_inode_inner(inode_num, dname, parent, false, None)
+        self.get_or_create_inode_inner(inode_num, dname, parent, false)
     }
 
     pub(super) fn publish_allocated_inode(
@@ -415,10 +417,10 @@ impl Ext4FileSystem {
         inode_num: u32,
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
-        file_type: another_ext4::FileType,
+        _file_type: another_ext4::FileType,
         _reuse_guard: &RwSemReadGuard<'_, ()>,
     ) -> Result<Arc<LockedExt4Inode>, SystemError> {
-        self.get_or_create_inode_inner(inode_num, dname, parent, true, Some(file_type))
+        self.get_or_create_inode_inner(inode_num, dname, parent, true)
     }
 
     fn get_or_create_inode_inner(
@@ -427,7 +429,6 @@ impl Ext4FileSystem {
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
         reuse_guard_held: bool,
-        known_file_type: Option<another_ext4::FileType>,
     ) -> Result<Arc<LockedExt4Inode>, SystemError> {
         let mut candidate = None;
         let mut admission_guard = None;
@@ -468,7 +469,6 @@ impl Ext4FileSystem {
                                 Arc::downgrade(self),
                                 dname.clone(),
                                 parent.clone(),
-                                known_file_type,
                             )?);
                             continue;
                         }
@@ -588,10 +588,27 @@ impl Ext4FileSystem {
     pub(super) fn mark_inode_atime_dirty(
         inode: &Arc<LockedExt4Inode>,
         atime: u32,
+        relatime: bool,
     ) -> Result<(), SystemError> {
-        Self::mark_inode_dirty_with(inode, InodeDirtyState::ATIME_DIRTY, |guard| {
-            guard.cached_atime = Some(atime);
-        })
+        let now = crate::time::PosixTimeSpec::new(atime.into(), 0);
+        Self::mark_inode_dirty_if(
+            inode,
+            InodeDirtyState::ATIME_DIRTY,
+            |guard| {
+                let times = guard.cached_times;
+                vfs::should_update_atime(
+                    crate::time::PosixTimeSpec::new(times.atime.into(), 0),
+                    crate::time::PosixTimeSpec::new(times.mtime.into(), 0),
+                    crate::time::PosixTimeSpec::new(times.ctime.into(), 0),
+                    now,
+                    relatime,
+                )
+            },
+            |guard| {
+                guard.cached_times.atime = atime;
+                guard.cached_atime_version = guard.cached_atime_version.wrapping_add(1);
+            },
+        )
     }
 
     fn mark_inode_dirty_with<F>(
@@ -602,6 +619,19 @@ impl Ext4FileSystem {
     where
         F: FnOnce(&mut super::inode::Ext4Inode),
     {
+        Self::mark_inode_dirty_if(inode, dirty, |_| true, update_cached_metadata)
+    }
+
+    fn mark_inode_dirty_if<P, F>(
+        inode: &Arc<LockedExt4Inode>,
+        dirty: InodeDirtyState,
+        should_update: P,
+        update_cached_metadata: F,
+    ) -> Result<(), SystemError>
+    where
+        P: FnOnce(&super::inode::Ext4Inode) -> bool,
+        F: FnOnce(&mut super::inode::Ext4Inode),
+    {
         let _operation = inode.lifecycle().begin_operation()?;
         // Acquire a prospective queue ownership before publishing dirty state.
         // If the inode is already queued, the existing AsyncWork owner prevents
@@ -609,6 +639,11 @@ impl Ext4FileSystem {
         inode.retain(InodeRetentionKind::AsyncWork)?;
         let queue_fs = {
             let mut guard = inode.inner.lock();
+            if !should_update(&guard) {
+                drop(guard);
+                inode.release(InodeRetentionKind::AsyncWork);
+                return Ok(());
+            }
             let should_queue = !guard
                 .dirty_state
                 .intersects(InodeDirtyState::QUEUED | InodeDirtyState::WRITEBACK);
@@ -760,7 +795,15 @@ impl Ext4FileSystem {
             let result = {
                 let _operation = operation;
                 let _io_guard = inode.io_lock.lock();
-                let (fs, inode_num, snapshot_dirty, cached_size, cached_atime, cached_mtime) = {
+                let (
+                    fs,
+                    inode_num,
+                    snapshot_dirty,
+                    cached_size,
+                    cached_times,
+                    cached_atime_version,
+                    cached_mtime_version,
+                ) = {
                     let mut guard = inode.inner.lock();
                     guard.dirty_state.remove(InodeDirtyState::QUEUED);
                     let snapshot_dirty = guard
@@ -778,8 +821,9 @@ impl Ext4FileSystem {
                         guard.inner_inode_num,
                         snapshot_dirty,
                         guard.cached_file_size,
-                        guard.cached_atime,
-                        guard.cached_mtime,
+                        guard.cached_times,
+                        guard.cached_atime_version,
+                        guard.cached_mtime_version,
                     )
                 };
 
@@ -801,12 +845,12 @@ impl Ext4FileSystem {
                         };
                         size.and_then(|size| {
                             let mtime = if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY) {
-                                cached_mtime
+                                Some(cached_times.mtime)
                             } else {
                                 None
                             };
                             let atime = if snapshot_dirty.contains(InodeDirtyState::ATIME_DIRTY) {
-                                cached_atime
+                                Some(cached_times.atime)
                             } else {
                                 None
                             };
@@ -826,12 +870,12 @@ impl Ext4FileSystem {
                             guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
                         }
                         if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY)
-                            && guard.cached_mtime == cached_mtime
+                            && guard.cached_mtime_version == cached_mtime_version
                         {
                             guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
                         }
                         if snapshot_dirty.contains(InodeDirtyState::ATIME_DIRTY)
-                            && guard.cached_atime == cached_atime
+                            && guard.cached_atime_version == cached_atime_version
                         {
                             guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
                         }
@@ -913,6 +957,7 @@ impl Ext4FileSystem {
                 mount_options.write_barrier,
             )?
         };
+        let root_attr = fs.getattr(another_ext4::EXT4_ROOT_INO)?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| LockedExt4Inode {
                 inner: Mutex::new(Ext4Inode {
@@ -926,8 +971,9 @@ impl Ext4FileSystem {
                     self_ref: self_ref.clone(),
                     special_node: None,
                     cached_file_size: None,
-                    cached_mtime: None,
-                    cached_atime: None,
+                    cached_times: Ext4InodeTimes::from(&root_attr),
+                    cached_atime_version: 0,
+                    cached_mtime_version: 0,
                     dirty_state: super::inode::InodeDirtyState::empty(),
                 }),
                 io_lock: Mutex::new(()),

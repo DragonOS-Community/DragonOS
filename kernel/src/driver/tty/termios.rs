@@ -414,6 +414,10 @@ pub struct PosixTermio {
     pub c_lflag: u16,
     pub c_line: u8,
     pub c_cc: [u8; NCC],
+    /// Explicit padding — eliminates the 1-byte implicit tail padding that
+    /// repr(C) would otherwise insert, preventing kernel stack leak via
+    /// TCGETA.  Default::default() zeros this field.
+    pub _pad: u8,
 }
 
 impl PosixTermio {
@@ -430,6 +434,7 @@ impl PosixTermio {
             c_lflag: termios.local_mode.bits as u16,
             c_line: termios.line as u8,
             c_cc: cc,
+            _pad: 0,
         }
     }
 

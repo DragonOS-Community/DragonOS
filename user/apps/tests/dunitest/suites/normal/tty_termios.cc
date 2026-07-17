@@ -130,7 +130,9 @@ TEST(TtyTermios, TcSanowRoundTrip) {
 }
 
 /* --------------------------------------------------------------------------
- * tcsetattr TCSADRAIN — must not fail with ENOTTY
+ * tcsetattr TCSADRAIN — must not fail with ENOTTY.
+ * TODO: add a stress test where master writes data → slave TCSADRAIN
+ * → verify drain actually waited for output to complete.
  * -------------------------------------------------------------------------- */
 TEST(TtyTermios, TcsadrainSucceeds) {
     auto pty = OpenRawPty();

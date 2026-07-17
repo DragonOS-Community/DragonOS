@@ -1,3 +1,10 @@
+// test_tty_termios.c — quick smoke test for TTY termios/termio ioctls.
+//
+// This file intentionally overlaps with dunitest/suites/normal/tty_termios.cc.
+// The C version is a fast, self-contained static binary for QEMU serial-console
+// smoke testing.  The C++ gtest version is the full CI regression suite.
+// Keep both: the C test catches regressions in environments where dunitest
+// (which requires gtest, a runner, and a rootfs) cannot run.
 // test_tty_termios.c — verify TCSAFLUSH / TCSADRAIN and legacy termio ioctls
 // on a valid TTY fd (PTY slave).
 //
@@ -70,7 +77,9 @@ int main(void) {
     CHECK(tcgetattr(pts, &back) == 0, "tcgetattr after TCSANOW");
     CHECK((back.c_lflag & (ICANON | ECHO)) == 0, "TCSANOW settings survive");
 
-    /* 2. tcsetattr TCSADRAIN — must not fail with ENOTTY. */
+    /* 2. tcsetattr TCSADRAIN — must not fail with ENOTTY.
+     * TODO: add a stress test where master writes data → slave TCSADRAIN
+     * → verify drain actually waited for output to complete. */
     CHECK(tcsetattr(pts, TCSADRAIN, &t) == 0, "tcsetattr TCSADRAIN succeeds");
 
     /* 3. tcsetattr TCSAFLUSH — the dpkg/apt regression. */

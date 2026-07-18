@@ -209,15 +209,32 @@ impl TtyCore {
         *self.core.port.write() = Some(port);
     }
 
-    pub fn tty_start(&self) {
-        let mut flow = self.core.flow.lock_irqsave();
+    fn tty_start_locked(&self, flow: &mut TtyFlowState) -> bool {
         if !flow.stopped || flow.tco_stopped {
-            return;
+            return false;
         }
 
         flow.stopped = false;
         let _ = self.start(self.core());
+        true
+    }
+
+    pub fn tty_start(&self) {
+        let mut flow = self.core.flow.lock_irqsave();
+        if !self.tty_start_locked(&mut flow) {
+            return;
+        }
+
         self.tty_wakeup();
+    }
+
+    /// Starts output without waking writers or invoking the line discipline.
+    ///
+    /// A caller that observes `true` must call [`Self::tty_wakeup`] after
+    /// releasing any line-discipline locks it holds.
+    pub(crate) fn tty_start_without_wakeup(&self) -> bool {
+        let mut flow = self.core.flow.lock_irqsave();
+        self.tty_start_locked(&mut flow)
     }
 
     pub fn tty_stop(&self) {

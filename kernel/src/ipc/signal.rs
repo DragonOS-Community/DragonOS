@@ -1285,6 +1285,9 @@ impl RestartFn for RestartFnNanosleep {
                 Ok(()) => return Ok(0),
                 Err(SystemError::ERESTARTSYS) => {
                     let remaining = calc_remaining(deadline, &ktime_now(*clockid));
+                    if remaining.is_empty() {
+                        return Ok(0);
+                    }
                     write_nanosleep_remaining(*rmtp, &remaining)?;
                 }
                 Err(e) => return Err(e),

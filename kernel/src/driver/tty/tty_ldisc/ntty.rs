@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, vec::Vec};
-use core::{intrinsics::likely, ops::BitXor};
+use core::{intrinsics::likely, mem, ops::BitXor};
 
 use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 
@@ -276,6 +276,7 @@ pub struct NTtyData {
     read_flags: static_bitmap!(NTTY_BUFSIZE),
     char_map: static_bitmap!(256),
 
+    deferred_tty_wakeup: bool,
     tty: Weak<TtyCore>,
 }
 
@@ -309,9 +310,14 @@ impl NTtyData {
             echo_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
             read_flags: StaticBitmap::new(),
             char_map: StaticBitmap::new(),
+            deferred_tty_wakeup: false,
             tty: Weak::default(),
             no_room: false,
         }
+    }
+
+    fn take_deferred_tty_wakeup(&mut self) -> bool {
+        mem::take(&mut self.deferred_tty_wakeup)
     }
 
     fn opost_pending_bytes(&self) -> &[u8] {
@@ -458,9 +464,15 @@ impl NTtyData {
             }
 
             if let Some(flags) = flags {
-                self.receive_buf(tty.clone(), &buf[offset..], Some(&flags[offset..]), n);
+                self.receive_buf(
+                    tty.clone(),
+                    &*termios,
+                    &buf[offset..],
+                    Some(&flags[offset..]),
+                    n,
+                );
             } else {
-                self.receive_buf(tty.clone(), &buf[offset..], flags, n);
+                self.receive_buf(tty.clone(), &*termios, &buf[offset..], flags, n);
             }
 
             offset += n;
@@ -482,14 +494,11 @@ impl NTtyData {
     pub fn receive_buf(
         &mut self,
         tty: Arc<TtyCore>,
+        termios: &Termios,
         buf: &[u8],
         flags: Option<&[u8]>,
         count: usize,
     ) {
-        // Use one coherent snapshot for the whole receive batch. Reacquiring
-        // the RwLock in nested helpers can self-deadlock when a writer queues
-        // between recursive read acquisitions.
-        let termios = *tty.core().termios();
         let preops = termios.input_mode.contains(InputMode::ISTRIP)
             || termios.input_mode.contains(InputMode::IUCLC)
             || termios.local_mode.contains(LocalMode::IEXTEN);
@@ -504,7 +513,7 @@ impl NTtyData {
             todo!()
         } else {
             if look_ahead > 0 {
-                self.receive_buf_standard(tty.clone(), &termios, buf, flags, look_ahead, true);
+                self.receive_buf_standard(tty.clone(), termios, buf, flags, look_ahead, true);
             }
 
             if count > look_ahead {
@@ -512,7 +521,7 @@ impl NTtyData {
                 let remaining_flags = flags.map(|f| &f[look_ahead..]);
                 self.receive_buf_standard(
                     tty.clone(),
-                    &termios,
+                    termios,
                     remaining,
                     remaining_flags,
                     count - look_ahead,
@@ -521,7 +530,7 @@ impl NTtyData {
             }
 
             // 刷新echo
-            self.flush_echoes(tty.clone());
+            self.flush_echoes(termios);
 
             tty.flush_chars(tty.core());
         }
@@ -579,8 +588,7 @@ impl NTtyData {
         }
     }
 
-    pub fn flush_echoes(&mut self, tty: Arc<TtyCore>) {
-        let termios = tty.core().termios();
+    pub fn flush_echoes(&mut self, termios: &Termios) {
         if !termios.local_mode.contains(LocalMode::ECHO)
             && !termios.local_mode.contains(LocalMode::ECHONL)
             || self.echo_commit == self.echo_head
@@ -687,16 +695,15 @@ impl NTtyData {
             }
         }
 
-        let flow = tty.core().flow_irqsave();
-        if flow.stopped
-            && !flow.tco_stopped
-            && termios.input_mode.contains(InputMode::IXON)
+        if termios.input_mode.contains(InputMode::IXON)
             && termios.input_mode.contains(InputMode::IXANY)
         {
-            tty.tty_start();
-            self.process_echoes(tty.clone());
+            let started = tty.tty_start_without_wakeup();
+            self.deferred_tty_wakeup |= started;
+            if started {
+                self.process_echoes(tty.clone());
+            }
         }
-        drop(flow);
 
         if c == b'\r' {
             if termios.input_mode.contains(InputMode::IGNCR) {
@@ -1010,7 +1017,7 @@ impl NTtyData {
         }
 
         if termios.control_characters[ControlCharIndex::VSTART] == c {
-            tty.tty_start();
+            self.deferred_tty_wakeup |= tty.tty_start_without_wakeup();
             self.process_echoes(tty.clone());
             return true;
         } else {
@@ -1023,7 +1030,7 @@ impl NTtyData {
     fn recv_sig_char(&mut self, tty: Arc<TtyCore>, termios: &Termios, signal: Signal, c: u8) {
         self.input_signal(tty.clone(), termios, signal);
         if termios.input_mode.contains(InputMode::IXON) {
-            tty.tty_start();
+            self.deferred_tty_wakeup |= tty.tty_start_without_wakeup();
         }
 
         if termios.local_mode.contains(LocalMode::ECHO) {
@@ -2576,7 +2583,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     ) -> Result<usize, SystemError> {
         let mut ldata = self.disc_data();
         let ret = ldata.receive_buf_common(tty.clone(), buf, flags, count, false);
+        let deferred_tty_wakeup = ldata.take_deferred_tty_wakeup();
         drop(ldata);
+        if deferred_tty_wakeup {
+            tty.tty_wakeup();
+        }
         if let Some(_output_guard) = self.output_lock.try_lock() {
             self.drain_echoes(&tty)?;
         }
@@ -2592,7 +2603,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     ) -> Result<usize, SystemError> {
         let mut ldata = self.disc_data();
         let ret = ldata.receive_buf_common(tty.clone(), buf, flags, count, true);
+        let deferred_tty_wakeup = ldata.take_deferred_tty_wakeup();
         drop(ldata);
+        if deferred_tty_wakeup {
+            tty.tty_wakeup();
+        }
         if let Some(_output_guard) = self.output_lock.try_lock() {
             self.drain_echoes(&tty)?;
         }

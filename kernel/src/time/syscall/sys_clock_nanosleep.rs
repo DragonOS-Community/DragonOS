@@ -90,7 +90,18 @@ impl SysClockNanosleep {
                 if remain.tv_sec == 0 && remain.tv_nsec == 0 {
                     return Ok(());
                 }
-                nanosleep(remain).map(|_| ())
+                match nanosleep(remain) {
+                    Ok(()) => Ok(()),
+                    Err(SystemError::ERESTARTSYS) => {
+                        let remain = Self::calc_remaining(deadline, &Self::ktime_now(clockid));
+                        if remain.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(SystemError::ERESTARTSYS)
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
             }
         }
     }

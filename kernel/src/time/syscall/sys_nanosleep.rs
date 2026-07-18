@@ -54,12 +54,16 @@ impl Syscall for SysNanosleep {
             Err(error) => return Err(error),
         }
 
+        let remaining = deadline.saturating_sub_timespec(&monotonic_now());
+        if remaining.is_empty() {
+            return Ok(0);
+        }
+
         let rmtp = if Self::rm_time(args).is_null() {
             None
         } else {
             Some(VirtAddr::new(Self::rm_time(args) as usize))
         };
-        let remaining = deadline.saturating_sub_timespec(&monotonic_now());
         if let Some(rmtp) = rmtp {
             let mut writer = UserBufferWriter::new(
                 rmtp.as_ptr::<PosixTimeSpec>(),

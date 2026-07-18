@@ -118,7 +118,7 @@ impl PosixTimeSpec {
     /// Convert a valid non-negative timespec to nanoseconds using Linux's
     /// `ktime_set()` saturation boundary.
     #[inline]
-    pub fn to_ktime_ns(&self) -> u64 {
+    pub fn to_ktime_ns(self) -> u64 {
         (self.tv_sec.max(0) as u128)
             .saturating_mul(NSEC_PER_SEC as u128)
             .saturating_add(self.tv_nsec.max(0) as u128)

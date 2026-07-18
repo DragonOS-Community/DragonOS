@@ -420,9 +420,17 @@ class SerialTransport:
                 f"cannot connect to QEMU serial socket {path}; configure the general "
                 "DRAGONOS_QEMU_SERIAL_SOCKET interface before running calibration: {error}"
             ) from error
-        self.sock.setblocking(False)
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.sock, selectors.EVENT_READ)
+        selector = None
+        try:
+            self.sock.setblocking(False)
+            selector = selectors.DefaultSelector()
+            selector.register(self.sock, selectors.EVENT_READ)
+        except Exception:
+            if selector is not None:
+                selector.close()
+            self.sock.close()
+            raise
+        self.selector = selector
         self.buffer = bytearray()
         self.transcript_bytes = 0
 

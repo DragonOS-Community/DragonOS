@@ -366,6 +366,33 @@ pub(crate) fn run_timekeeping_selftests() -> (usize, usize, String) {
     drop(early_state);
     report.case("settimeofday_early_forward_only", early_ok);
 
+    let suspended_clock = FakeClock::new("suspended-wall", u64::MAX, 1, 0, u64::MAX);
+    suspended_clock.set_cycle(100);
+    let suspended_keeper = Timekeeper::new();
+    let suspended_setup_ok = suspended_keeper
+        .timekeeper_setup_internals(suspended_clock.clone() as Arc<dyn Clocksource>)
+        .is_ok();
+    suspended_clock.set_cycle(150);
+    suspended_keeper.inner.write_irqsave().boottime_offset_ns = 100;
+    let realtime_before_boottime_ok = validate_settimeofday(PosixTimeSpec {
+        tv_sec: 0,
+        tv_nsec: 120,
+    })
+    .and_then(|requested| {
+        settimeofday_locked(&mut suspended_keeper.inner.write_irqsave(), requested)
+    })
+    .is_ok();
+    let suspended_state = suspended_keeper.inner.read_irqsave();
+    report.case(
+        "settimeofday_allows_realtime_before_boottime",
+        suspended_setup_ok
+            && realtime_before_boottime_ok
+            && suspended_state.realtime_ns() == 120
+            && suspended_state.monotonic_ns() == 50
+            && suspended_state.boottime_ns() == 150,
+    );
+    drop(suspended_state);
+
     let reads_before_bad_format = wall_clock.reads();
     let bad_format_ok = validate_settimeofday(PosixTimeSpec {
         tv_sec: -1,

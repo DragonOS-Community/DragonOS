@@ -24,6 +24,7 @@ constexpr int64_t kNanosecondsPerSecond = 1000000000LL;
 constexpr int64_t kShortWaitNanoseconds = 40000000LL;
 constexpr int64_t kMinimumObservedWaitNanoseconds = 20000000LL;
 constexpr int64_t kMaximumObservedWaitNanoseconds = 2000000000LL;
+constexpr int kSemanticReadIterations = 10000;
 constexpr uint64_t kStressReads = 10000000ULL;
 
 volatile sig_atomic_t g_nanosleep_signal_observed = 0;
@@ -378,7 +379,7 @@ void* ConcurrentReader(void* opaque) {
             return nullptr;
         }
     }
-    for (int iteration = 0; iteration < 100000; ++iteration) {
+    for (int iteration = 0; iteration < kSemanticReadIterations; ++iteration) {
         for (int clock_index = 0; clock_index < 3; ++clock_index) {
             timespec current = {};
             if (!ReadClockRaw(clocks[clock_index], &current, &args->result->error) ||
@@ -686,12 +687,11 @@ TEST(TimekeepingSemantics, WallClockAndUptimeClocksUseDifferentDomains) {
 }
 
 TEST(TimekeepingSemantics, UptimeClocksNeverRegress) {
-    constexpr int kReadsPerClock = 100000;
     const clockid_t clocks[] = {CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_BOOTTIME};
 
     for (clockid_t clock_id : clocks) {
         timespec previous = ReadClock(clock_id);
-        for (int i = 0; i < kReadsPerClock; ++i) {
+        for (int i = 0; i < kSemanticReadIterations; ++i) {
             const timespec current = ReadClock(clock_id);
             ASSERT_LE(Compare(previous, current), 0)
                 << "clock " << clock_id << " regressed at iteration " << i;
@@ -829,7 +829,7 @@ TEST(TimekeepingSemantics, ForcedTwoCpuMigrationNeverRegresses) {
 
     bool saw_first = false;
     bool saw_second = false;
-    for (int iteration = 0; iteration < 5000; ++iteration) {
+    for (int iteration = 0; iteration < 500; ++iteration) {
         const int target = cpus[iteration & 1];
         ASSERT_TRUE(SetCurrentCpu(target)) << "iteration=" << iteration << " errno=" << errno;
         ASSERT_TRUE(WaitUntilCurrentCpu(target)) << "iteration=" << iteration

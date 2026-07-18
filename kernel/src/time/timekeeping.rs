@@ -398,7 +398,9 @@ fn settimeofday_locked(tk: &mut TimekeeperData, requested: i128) -> Result<(), S
     let realtime_offset = requested
         .checked_sub(monotonic)
         .ok_or(SystemError::EOVERFLOW)?;
-    if realtime_offset < tk.boottime_offset_ns as i128 {
+    // Linux rejects only wall-clock values earlier than CLOCK_MONOTONIC.
+    // CLOCK_BOOTTIME may legitimately be ahead after suspend.
+    if realtime_offset < 0 {
         return Err(SystemError::EINVAL);
     }
     // Prove all derived public values are representable before publishing the

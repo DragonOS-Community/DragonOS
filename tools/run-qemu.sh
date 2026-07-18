@@ -908,7 +908,7 @@ if [ $flag_can_run -eq 1 ]; then
         echo "[错误] DRAGONOS_QEMU_ARGV_FILE 必须是父目录已存在且目标不存在的绝对路径"
         return 1
       fi
-      python3 - "${DRAGONOS_QEMU_ARGV_FILE}" "${cmd[@]}" <<'PY'
+      if ! python3 - "${DRAGONOS_QEMU_ARGV_FILE}" "${cmd[@]}" <<'PY'
 import json
 import pathlib
 import sys
@@ -918,6 +918,10 @@ with path.open("x", encoding="utf-8") as output:
     json.dump(sys.argv[2:], output, ensure_ascii=True, indent=2)
     output.write("\n")
 PY
+      then
+        echo "[错误] 无法可靠记录 QEMU argv，终止启动"
+        return 1
+      fi
     fi
     printf '[QEMU] 执行: sudo ' >&2
     printf '%q ' "${cmd[@]}" >&2

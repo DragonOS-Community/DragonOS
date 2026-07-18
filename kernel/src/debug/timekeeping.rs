@@ -10,7 +10,7 @@ use crate::{
         vfs::{InodeMode, PollStatus},
     },
     libs::rwlock::run_rwlock_selftests,
-    time::timekeeping::run_timekeeping_selftests,
+    time::{clocksource::run_clocksource_selftests, timekeeping::run_timekeeping_selftests},
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -92,16 +92,17 @@ impl KernFSCallback for TimekeepingSelftestCallback {
 
 fn run_selftests() -> String {
     let (timekeeping_passed, timekeeping_failed, timekeeping_body) = run_timekeeping_selftests();
+    let (clocksource_passed, clocksource_failed, clocksource_body) = run_clocksource_selftests();
     let (rwlock_passed, rwlock_failed, rwlock_body) = run_rwlock_selftests();
     #[cfg(target_arch = "x86_64")]
     let (kvm_passed, kvm_failed, kvm_body) = run_kvm_clock_allocator_selftests();
     #[cfg(not(target_arch = "x86_64"))]
     let (kvm_passed, kvm_failed, kvm_body) = (0, 0, String::new());
-    let passed = timekeeping_passed + rwlock_passed + kvm_passed;
-    let failed = timekeeping_failed + rwlock_failed + kvm_failed;
+    let passed = timekeeping_passed + clocksource_passed + rwlock_passed + kvm_passed;
+    let failed = timekeeping_failed + clocksource_failed + rwlock_failed + kvm_failed;
     let status = if failed == 0 { "ok" } else { "fail" };
     format!(
-        "status={status}\n{timekeeping_body}{rwlock_body}{kvm_body}summary_pass={passed}\nsummary_fail={failed}\n"
+        "status={status}\n{timekeeping_body}{clocksource_body}{rwlock_body}{kvm_body}summary_pass={passed}\nsummary_fail={failed}\n"
     )
 }
 

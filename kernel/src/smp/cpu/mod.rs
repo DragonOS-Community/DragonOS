@@ -116,13 +116,27 @@ impl CpuHpCpuState {
         self.state.store(state as u32, Ordering::Release);
     }
 
+    /// Update BSP-owned control state before publishing a bring-up request.
+    ///
     /// # Safety
     ///
-    /// Only the BSP/hotplug coordinator may access this object, and bring-up
+    /// Only the BSP/hotplug coordinator may call this method, and bring-up
     /// transactions for one CPU must remain serialized.
     #[inline]
-    unsafe fn bsp_control_mut(&self) -> &mut CpuHpControl {
-        unsafe { &mut *self.control.get() }
+    unsafe fn configure_bringup(&self, target_state: CpuHpState, bringup: bool) {
+        let control = unsafe { &mut *self.control.get() };
+        control.target_state = target_state;
+        control.bringup = bringup;
+    }
+
+    /// Read BSP-owned control state while the coordinator owns the transaction.
+    ///
+    /// # Safety
+    ///
+    /// Only the BSP/hotplug coordinator may call this method.
+    #[inline]
+    unsafe fn bringup(&self) -> bool {
+        unsafe { (*self.control.get()).bringup }
     }
 }
 
@@ -287,11 +301,7 @@ impl SmpCpuManager {
     ) -> Result<(), SystemError> {
         let cpu_state = self.cpuhp_state(cpu_id);
         let prev_state = cpu_state.state();
-        unsafe {
-            let control = cpu_state.bsp_control_mut();
-            control.target_state = target_state;
-            control.bringup = true;
-        }
+        unsafe { cpu_state.configure_bringup(target_state, true) };
         cpu_state.publish_state(CpuHpState::Starting);
 
         if let Err(e) = self.do_cpuhp_kick_ap(cpu_id) {
@@ -301,18 +311,12 @@ impl SmpCpuManager {
             } else {
                 prev_state
             });
-            unsafe {
-                let control = cpu_state.bsp_control_mut();
-                control.target_state = prev_state;
-                control.bringup = false;
-            }
+            unsafe { cpu_state.configure_bringup(prev_state, false) };
             return Err(e);
         }
 
         cpu_state.publish_state(target_state);
-        unsafe {
-            cpu_state.bsp_control_mut().bringup = false;
-        }
+        unsafe { cpu_state.configure_bringup(target_state, false) };
 
         Ok(())
     }
@@ -324,7 +328,7 @@ impl SmpCpuManager {
         if target_cpu_id != cpu_id {
             return Err(SystemError::EINVAL);
         }
-        let bringup = unsafe { cpu_state.bsp_control_mut().bringup };
+        let bringup = unsafe { cpu_state.bringup() };
         cpu_state
             .bringup_result
             .store(AP_BRINGUP_RESULT_PENDING, Ordering::Release);

@@ -265,6 +265,26 @@ class ProtocolTests(unittest.TestCase):
             transport.close()
             right.close()
 
+    def test_transport_init_failure_closes_partial_resources(self) -> None:
+        transcript = io.BytesIO()
+
+        sock = mock.Mock()
+        sock.setblocking.side_effect = RuntimeError("setblocking failed")
+        with mock.patch.object(calibrate.socket, "socket", return_value=sock):
+            with self.assertRaisesRegex(RuntimeError, "setblocking failed"):
+                calibrate.SerialTransport(Path("serial.sock"), transcript)
+        sock.close.assert_called_once_with()
+
+        sock = mock.Mock()
+        selector = mock.Mock()
+        selector.register.side_effect = RuntimeError("register failed")
+        with mock.patch.object(calibrate.socket, "socket", return_value=sock), \
+                mock.patch.object(calibrate.selectors, "DefaultSelector", return_value=selector):
+            with self.assertRaisesRegex(RuntimeError, "register failed"):
+                calibrate.SerialTransport(Path("serial.sock"), transcript)
+        selector.close.assert_called_once_with()
+        sock.close.assert_called_once_with()
+
     def test_prompt_wait_retries_and_accepts_ansi_prompt_without_newline(self) -> None:
         left, right = socket.socketpair()
         transport = calibrate.SerialTransport.__new__(calibrate.SerialTransport)

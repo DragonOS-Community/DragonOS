@@ -667,6 +667,10 @@ impl dyn Clocksource {
         // 将时钟源加入到监视队列中
         let previous_watchdog = CLOCKSOURCE_WATCHDOG.lock_irqsave().watchdog.clone();
         if let Err(error) = self.clocksource_enqueue_watchdog() {
+            // enqueue_watchdog may have published list membership and a new
+            // reference before resetting every sample. Roll the complete
+            // watchdog transaction back, not only the main registry entry.
+            rollback_watchdog_registration(&this, previous_watchdog.clone());
             remove_clocksource_identity(&mut CLOCKSOURCE_LIST.lock(), &this);
             let _ = self.update_clocksource_data(ClocksourceUpdate::RestoreBeforeRegistration(
                 original_data.clone(),
@@ -873,21 +877,20 @@ impl dyn Clocksource {
     /// ## 参数
     ///
     /// * `rating` - 指定的时钟精度
-    fn clocksource_change_rating(&self, rating: i32) {
-        let _control_guard = CLOCKSOURCE_CONTROL_LOCK.lock_irqsave();
+    ///
+    /// Reorder a registered source while the caller holds
+    /// `CLOCKSOURCE_CONTROL_LOCK`.
+    fn clocksource_change_rating_locked(&self, rating: i32) -> Result<(), SystemError> {
         // 将时钟源从链表中弹出
         self.clocksource_dequeue();
-        self.update_clocksource_data(ClocksourceUpdate::SetRating(rating))
-            .expect("clocksource_change_rating:updata clocksource failed");
+        if let Err(error) = self.update_clocksource_data(ClocksourceUpdate::SetRating(rating)) {
+            // Preserve registry membership if a driver rejects the update.
+            self.clocksource_enqueue();
+            return Err(error);
+        }
         // 插入时钟源到时钟源链表中
         self.clocksource_enqueue();
-        // 检查是否有更好的时钟源
-        if let Err(error) = clocksource_select_locked() {
-            warn!(
-                "clocksource rating change could not switch source: {:?}",
-                error
-            );
-        }
+        Ok(())
     }
 }
 
@@ -1125,6 +1128,10 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
 }
 
 fn __clocksource_watchdog_kthread() {
+    // Registration and removal use control -> watchdog -> list. Keep the
+    // unstable-source cleanup in the same transaction so unregister cannot
+    // remove a source after it leaves WATCHDOG_LIST and before it is rerated.
+    let _control_guard = CLOCKSOURCE_CONTROL_LOCK.lock_irqsave();
     let mut watchdog = CLOCKSOURCE_WATCHDOG.lock_irqsave();
     let mut wd_list = WATCHDOG_LIST.lock_irqsave();
     let del_clocks = remove_unstable_clocksources(&mut wd_list);
@@ -1151,7 +1158,15 @@ fn __clocksource_watchdog_kthread() {
     drop(watchdog);
     // 将不稳定的时钟源精度都设置为最低，然后删除unstable标记
     for clock in del_clocks.iter() {
-        clock.clocksource_change_rating(0);
+        if let Err(error) = clock.clocksource_change_rating_locked(0) {
+            warn!("clocksource unstable rating update failed: {:?}", error);
+        }
+    }
+    if let Err(error) = clocksource_select_locked() {
+        warn!(
+            "clocksource unstable cleanup could not switch source: {:?}",
+            error
+        );
     }
 }
 
@@ -1275,8 +1290,6 @@ pub fn init_watchdog_kthread() -> Result<(), SystemError> {
 }
 
 #[path = "clocksource_selftest.rs"]
-#[allow(dead_code)]
 mod selftest;
 
-#[allow(unused_imports)]
 pub(crate) use selftest::run_clocksource_selftests;

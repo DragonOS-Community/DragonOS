@@ -1828,6 +1828,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         // mid-flight (see tty-termios-drain-bugs.md B1).
         let _output_guard = self.output_lock.lock();
         let drained = self.drain_opost_pending(&tty)?;
+        // drain_echoes manages DO_WRITE_WAKEUP via has_output_wakeup_pending(),
+        // which currently checks both opost and echo state.  If the check is
+        // ever decoupled (opost-only), DO_WRITE_WAKEUP set by drain_opost_pending
+        // above could be spuriously cleared — merge the flag management here.
         let echo_drained = self.drain_echoes(&tty)?;
         Ok(drained && echo_drained)
     }
@@ -2548,6 +2552,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         Ok(event.bits() as usize)
     }
 
+    /// Write wakeup: drain pending opost/echo output when hardware FIFO has room.
+    ///
+    /// Echo drain errors are intentionally logged rather than propagated —
+    /// this is a best-effort echo path; the caller at `tty_core.rs` already
+    /// discards the `write_wakeup` return value with `let _ = …`.
     fn write_wakeup(&self, tty: &TtyCore) -> Result<(), SystemError> {
         if let Some(_output_guard) = self.output_lock.try_lock() {
             if self.drain_opost_pending(tty)? {

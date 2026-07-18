@@ -85,7 +85,7 @@ int main(void) {
     CHECK(tcsetattr(pts, TCSANOW, &t) == 0, "tcsetattr TCSANOW");
     struct termios back;
     CHECK(tcgetattr(pts, &back) == 0, "tcgetattr after TCSANOW");
-    CHECK((back.c_lflag & (ICANON | ECHO)) == 0, "TCSANOW settings survive");
+    CHECK_NOERR((back.c_lflag & (ICANON | ECHO)) == 0, "TCSANOW settings survive");
 
     /* 2. tcsetattr TCSADRAIN — must not fail with ENOTTY.
      * TODO: add a stress test where master writes data → slave TCSADRAIN
@@ -95,7 +95,7 @@ int main(void) {
     /* 3. tcsetattr TCSAFLUSH — the dpkg/apt regression. */
     CHECK(tcsetattr(pts, TCSAFLUSH, &t) == 0, "tcsetattr TCSAFLUSH succeeds");
     CHECK(tcgetattr(pts, &back) == 0, "tcgetattr after TCSAFLUSH");
-    CHECK((back.c_lflag & (ICANON | ECHO)) == 0, "TCSAFLUSH settings survive");
+    CHECK_NOERR((back.c_lflag & (ICANON | ECHO)) == 0, "TCSAFLUSH settings survive");
 
     /* 4. Legacy termio ioctls — must not return ENOTTY. */
     struct termio_compat tio;
@@ -107,13 +107,35 @@ int main(void) {
     tio.c_lflag |= ISIG;
     errno = 0;
     CHECK(ioctl(pts, TCSETA, &tio) == 0, "ioctl TCSETA succeeds");
+    /* Verify TCSETA was applied by reading back via TCGETA. */
+    {
+        struct termio_compat rdback;
+        memset(&rdback, 0, sizeof(rdback));
+        CHECK(ioctl(pts, TCGETA, &rdback) == 0, "TCGETA after TCSETA");
+        CHECK_NOERR((rdback.c_lflag & ISIG) != 0, "TCSETA ISIG flag applied");
+    }
 
+    tio.c_lflag &= ~(unsigned short)ISIG;
     errno = 0;
     CHECK(ioctl(pts, TCSETAW, &tio) == 0, "ioctl TCSETAW succeeds");
+    /* Verify TCSETAW was applied. */
+    {
+        struct termio_compat rdback;
+        memset(&rdback, 0, sizeof(rdback));
+        CHECK(ioctl(pts, TCGETA, &rdback) == 0, "TCGETA after TCSETAW");
+        CHECK_NOERR((rdback.c_lflag & ISIG) == 0, "TCSETAW cleared ISIG");
+    }
 
+    tio.c_lflag |= ISIG;
     errno = 0;
     CHECK(ioctl(pts, TCSETAF, &tio) == 0, "ioctl TCSETAF succeeds");
-
+    /* Verify TCSETAF was applied. */
+    {
+        struct termio_compat rdback;
+        memset(&rdback, 0, sizeof(rdback));
+        CHECK(ioctl(pts, TCGETA, &rdback) == 0, "TCGETA after TCSETAF");
+        CHECK_NOERR((rdback.c_lflag & ISIG) != 0, "TCSETAF ISIG flag applied");
+    }
     /* 5. Cross-check: TCGETA reports low 16 bits of what TCGETS reports. */
     struct termios full = {};
     memset(&tio, 0, sizeof(tio));
@@ -121,6 +143,8 @@ int main(void) {
     CHECK(ioctl(pts, TCGETA, &tio) == 0, "TCGETA for cross-check");
     CHECK_NOERR((full.c_lflag & 0xffff) == tio.c_lflag, "termio c_lflag is low 16 bits");
     CHECK_NOERR((full.c_iflag & 0xffff) == tio.c_iflag, "termio c_iflag is low 16 bits");
+    CHECK_NOERR((full.c_cflag & 0xffff) == tio.c_cflag, "termio c_cflag is low 16 bits");
+    CHECK_NOERR((full.c_oflag & 0xffff) == tio.c_oflag, "termio c_oflag is low 16 bits");
 
     /* c_line round-trip: verify that a non-zero c_line value set
      * through TCSETA is preserved when read back via TCGETA.  The

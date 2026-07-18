@@ -464,6 +464,10 @@ impl PosixTermio {
     /// the low 16 bits of each flag word come from the termio, the high
     /// 16 bits are preserved from `old`. Only the first NCC control
     /// characters are overwritten; the rest are preserved from `old`.
+    ///
+    /// `self._pad` is intentionally ignored — it exists solely to prevent
+    /// kernel stack data leaks to userspace via TCGETA reads.
+    /// User-supplied `_pad` values from TCGETA ioctl are harmless.
     pub fn to_kernel_termios(self, old: &Termios) -> Termios {
         let mut cc = old.control_characters;
         cc[..NCC].copy_from_slice(&self.c_cc);

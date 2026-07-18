@@ -92,7 +92,7 @@ PtyPair OpenRawPty() {
     struct termios term = {};
     if (tcgetattr(pair.slave.get(), &term) < 0) {
         ADD_FAILURE() << "tcgetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
-        return pair;
+        return {};
     }
 
     term.c_iflag = 0;
@@ -182,17 +182,38 @@ TEST(TtyTermios, LegacyTcsetaFamily) {
     ASSERT_GE(pty.slave.get(), 0);
 
     TermioCompat tio = {};
+    tio.c_lflag |= ISIG;
     errno = 0;
     EXPECT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
         << "TCSETA: errno=" << errno << " (" << strerror(errno) << ")";
+    /* Verify TCSETA was applied. */
+    {
+        TermioCompat rdback = {};
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &rdback), 0);
+        EXPECT_NE(rdback.c_lflag & ISIG, 0u) << "TCSETA ISIG flag applied";
+    }
 
+    tio.c_lflag &= ~static_cast<unsigned short>(ISIG);
     errno = 0;
     EXPECT_EQ(ioctl(pty.slave.get(), TCSETAW, &tio), 0)
         << "TCSETAW: errno=" << errno << " (" << strerror(errno) << ")";
+    /* Verify TCSETAW was applied. */
+    {
+        TermioCompat rdback = {};
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &rdback), 0);
+        EXPECT_EQ(rdback.c_lflag & ISIG, 0u) << "TCSETAW cleared ISIG";
+    }
 
+    tio.c_lflag |= ISIG;
     errno = 0;
     EXPECT_EQ(ioctl(pty.slave.get(), TCSETAF, &tio), 0)
         << "TCSETAF: errno=" << errno << " (" << strerror(errno) << ")";
+    /* Verify TCSETAF was applied. */
+    {
+        TermioCompat rdback = {};
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &rdback), 0);
+        EXPECT_NE(rdback.c_lflag & ISIG, 0u) << "TCSETAF ISIG flag applied";
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -212,12 +233,16 @@ TEST(TtyTermios, TermioLow16Bits) {
         << "termio c_lflag should be low 16 bits of termios c_lflag";
     EXPECT_EQ(full.c_iflag & 0xffff, tio.c_iflag)
         << "termio c_iflag should be low 16 bits of termios c_iflag";
+    EXPECT_EQ(full.c_cflag & 0xffff, tio.c_cflag)
+        << "termio c_cflag should be low 16 bits of termios c_cflag";
+    EXPECT_EQ(full.c_oflag & 0xffff, tio.c_oflag)
+        << "termio c_oflag should be low 16 bits of termios c_oflag";
 }
 
 /* --------------------------------------------------------------------------
  * c_line round-trip: non-zero c_line survives TCSETA → TCGETA
  * -------------------------------------------------------------------------- */
-TEST(TtyTermios, CLinelRoundtrip) {
+TEST(TtyTermios, CLineRoundtrip) {
     auto pty = OpenRawPty();
     ASSERT_GE(pty.slave.get(), 0);
 

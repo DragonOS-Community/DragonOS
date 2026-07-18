@@ -39,6 +39,20 @@ impl Report {
     }
 }
 
+/// Acquire a writer that has already registered its ticket.
+///
+/// This mirrors the preemption ownership contract of the public try-lock
+/// helpers: a successful guard owns the disable and restores it on drop,
+/// while a failed attempt must restore preemption before returning.
+fn try_write_registered<T>(lock: &RwLock<T>) -> Option<RwLockWriteGuard<'_, T>> {
+    ProcessManager::preempt_disable();
+    let writer = lock.inner_try_write_registered();
+    if writer.is_none() {
+        ProcessManager::preempt_enable();
+    }
+    writer
+}
+
 fn concurrent_reader_flood_writer_progress() -> bool {
     const READER_THREADS: usize = 2;
     const READS_PER_THREAD: usize = 16_384;
@@ -223,6 +237,16 @@ pub(crate) fn run_rwlock_selftests() -> (usize, usize, String) {
     let state_restored = ProcessManager::current_pcb().preempt_count() == preempt_before
         && CurrentIrqArch::is_irq_enabled() == irq_before;
 
+    let no_pending_writer = RwLock::new(());
+    let failed_registered_writer = try_write_registered(&no_pending_writer);
+    let registered_failure_restored = failed_registered_writer.is_none()
+        && ProcessManager::current_pcb().preempt_count() == preempt_before;
+    drop(failed_registered_writer);
+    report.case(
+        "registered_writer_failure_restores_preempt",
+        registered_failure_restored,
+    );
+
     // Merely disabling preemption must not masquerade as interrupt context.
     ProcessManager::preempt_disable();
     let nested_preempt = ProcessManager::current_pcb().preempt_count();
@@ -242,8 +266,7 @@ pub(crate) fn run_rwlock_selftests() -> (usize, usize, String) {
     drop(hardirq);
     ProcessManager::preempt_enable();
 
-    ProcessManager::preempt_disable();
-    let writer = lock.inner_try_write_registered();
+    let writer = try_write_registered(&lock);
     let writer_acquired = writer.is_some();
     lock.finish_writer_turn(ticket);
     drop(writer);
@@ -274,8 +297,7 @@ pub(crate) fn run_rwlock_selftests() -> (usize, usize, String) {
                     let preserved = transitions.has_waiting_writer();
                     let ok = *reader == 2 && transitions.writer_count() == 0;
                     drop(reader);
-                    ProcessManager::preempt_disable();
-                    let queued_writer = transitions.inner_try_write_registered();
+                    let queued_writer = try_write_registered(&transitions);
                     let acquired = queued_writer.is_some();
                     transitions.finish_writer_turn(queued);
                     drop(queued_writer);
@@ -305,8 +327,7 @@ pub(crate) fn run_rwlock_selftests() -> (usize, usize, String) {
             let upgradeable = writer.downgrade_to_upgradeable();
             let preserved = downgrade_with_pending.has_waiting_writer();
             drop(upgradeable);
-            ProcessManager::preempt_disable();
-            let queued_writer = downgrade_with_pending.inner_try_write_registered();
+            let queued_writer = try_write_registered(&downgrade_with_pending);
             let acquired = queued_writer.is_some();
             downgrade_with_pending.finish_writer_turn(queued);
             drop(queued_writer);

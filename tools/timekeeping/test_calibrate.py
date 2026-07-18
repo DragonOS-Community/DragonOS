@@ -269,6 +269,14 @@ class ProtocolTests(unittest.TestCase):
         transcript = io.BytesIO()
 
         sock = mock.Mock()
+        sock.connect.side_effect = OSError(111, "connection refused")
+        with mock.patch.object(calibrate.socket, "socket", return_value=sock):
+            with self.assertRaisesRegex(
+                    calibrate.CalibrationError, "connection refused"):
+                calibrate.SerialTransport(Path("serial.sock"), transcript)
+        sock.close.assert_called_once_with()
+
+        sock = mock.Mock()
         sock.setblocking.side_effect = RuntimeError("setblocking failed")
         with mock.patch.object(calibrate.socket, "socket", return_value=sock):
             with self.assertRaisesRegex(RuntimeError, "setblocking failed"):

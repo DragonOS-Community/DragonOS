@@ -418,7 +418,7 @@ class SerialTransport:
             self.sock.close()
             raise CalibrationError(
                 f"cannot connect to QEMU serial socket {path}; configure the general "
-                "DRAGONOS_QEMU_SERIAL_SOCKET interface before running calibration: {error}"
+                f"DRAGONOS_QEMU_SERIAL_SOCKET interface before running calibration: {error}"
             ) from error
         selector = None
         try:

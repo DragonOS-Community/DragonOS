@@ -436,8 +436,7 @@ pub(crate) fn append_comma_options(base: &mut String, extra: String) {
 // MountId type
 int_like!(MountId, usize);
 
-static MOUNT_ID_ALLOCATOR: Mutex<IdAllocator> =
-    Mutex::new(IdAllocator::new(0, usize::MAX).unwrap());
+static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
 
 static NEXT_DENTRY_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -452,13 +451,16 @@ lazy_static! {
 
 impl MountId {
     fn alloc() -> Self {
-        let id = MOUNT_ID_ALLOCATOR.lock().alloc().unwrap();
-
+        let id = NEXT_MOUNT_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("mount ID space exhausted");
         MountId(id)
     }
 
-    unsafe fn free(&mut self) {
-        MOUNT_ID_ALLOCATOR.lock().free(self.0);
+    /// Allocate an ID for a mount object represented only by namespace
+    /// metadata, such as DragonOS's hidden initial-root anchor.
+    pub(crate) fn alloc_conceptual() -> Self {
+        Self::alloc()
     }
 }
 
@@ -1486,7 +1488,27 @@ impl MountFS {
         {
             return Err(SystemError::EINVAL);
         }
-        let _gate = mountpoint.dentry.mount_gate.lock();
+        with_dentry_mount_gate_set(
+            [
+                Some(mountpoint.dentry.clone()),
+                Some(cover_mountpoint.dentry.clone()),
+                None,
+            ],
+            |gates| self.attach_beneath_prelocked(mountpoint, mount_fs, cover_mountpoint, gates),
+        )
+    }
+
+    fn attach_beneath_prelocked(
+        &self,
+        mountpoint: &Arc<MountFSInode>,
+        mount_fs: Arc<MountFS>,
+        cover_mountpoint: &Arc<MountFSInode>,
+        gates: &MountEdgeCommitToken,
+    ) -> Result<(), SystemError> {
+        assert!(
+            gates.covers(mountpoint) && gates.covers(cover_mountpoint),
+            "tuck-under commit token must cover both mount edges"
+        );
         let mut mountpoints = self.mountpoints.lock();
         let stack = mountpoints.entry(mountpoint.dentry.id).or_default();
         if stack.iter().any(|child| Arc::ptr_eq(child, &mount_fs)) {
@@ -1506,7 +1528,8 @@ impl MountFS {
         // Linux mnt_set_mountpoint_beneath(): the propagated mount takes the
         // original edge and the previous topper is reparented onto its root.
         covered.relocate_mountpoint(Some(cover_mountpoint.clone()));
-        if let Err(error) = mount_fs.attach_top(cover_mountpoint, covered.clone()) {
+        if let Err(error) = mount_fs.attach_top_prelocked(cover_mountpoint, covered.clone(), false)
+        {
             covered.relocate_mountpoint(Some(mountpoint.clone()));
             let mut mountpoints = self.mountpoints.lock();
             let stack = mountpoints
@@ -2891,15 +2914,6 @@ pub fn record_writeback_error_for_fs(inner_fs: &Arc<dyn FileSystem>, error: Syst
     }
 }
 
-impl Drop for MountFS {
-    fn drop(&mut self) {
-        // Release MountId
-        unsafe {
-            self.mount_id.free();
-        }
-    }
-}
-
 impl MountExternalGuard {
     pub fn mount(&self) -> Arc<MountFS> {
         self.mount.clone()
@@ -3310,7 +3324,26 @@ impl MountFSInode {
     /// @return Arc<MountFSInode>
     pub(crate) fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let mut current = self.self_ref.upgrade().unwrap();
+        // Nearly every lookup crosses at most a handful of mount layers. Keep
+        // that hot path single-pass and reserve Floyd's extra topology reads
+        // for an already pathological depth. This is not a semantic limit:
+        // the cycle-safe walk below still follows every valid layer.
         for _ in 0..1024 {
+            let Some(sub_mountfs) = current.mount_fs.lookup_top(&current) else {
+                return current;
+            };
+            let next = sub_mountfs.mountpoint_root_inode();
+            if Arc::ptr_eq(&next, &current) {
+                return current;
+            }
+            current = next;
+        }
+        Self::overlaid_inode_cycle_safe(current)
+    }
+
+    fn overlaid_inode_cycle_safe(mut current: Arc<MountFSInode>) -> Arc<MountFSInode> {
+        let mut fast = Some(current.clone());
+        loop {
             let Some(sub_mountfs) = current.mount_fs.lookup_top(&current) else {
                 return current;
             };
@@ -3320,10 +3353,41 @@ impl MountFSInode {
                 return current;
             }
             current = next;
-        }
 
-        log::warn!("MountFSInode::overlaid_inode: overlay depth exceeds 1024");
-        current
+            // mount-max is an admission limit and may be lowered below the
+            // depth of an existing namespace.  Use structural cycle detection
+            // instead of truncating valid topology traversal at that value.
+            if let Some(mut cursor) = fast.take() {
+                for _ in 0..2 {
+                    let Some(sub_mountfs) = cursor.mount_fs.lookup_top(&cursor) else {
+                        return Self::finish_overlay_walk(current);
+                    };
+                    let next = sub_mountfs.mountpoint_root_inode();
+                    if Arc::ptr_eq(&next, &cursor) {
+                        return Self::finish_overlay_walk(current);
+                    }
+                    cursor = next;
+                }
+                if Arc::ptr_eq(&cursor, &current) {
+                    log::warn!("MountFSInode::overlaid_inode: mount topology cycle detected");
+                    return current;
+                }
+                fast = Some(cursor);
+            }
+        }
+    }
+
+    fn finish_overlay_walk(mut current: Arc<MountFSInode>) -> Arc<MountFSInode> {
+        loop {
+            let Some(sub_mountfs) = current.mount_fs.lookup_top(&current) else {
+                return current;
+            };
+            let next = sub_mountfs.mountpoint_root_inode();
+            if Arc::ptr_eq(&next, &current) {
+                return current;
+            }
+            current = next;
+        }
     }
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
@@ -3350,27 +3414,50 @@ impl MountFSInode {
     }
 
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
-        if self.is_mountpoint_root()? {
-            // The current inode is the root inode of its filesystem
-            match self.mount_fs.self_mountpoint() {
-                Some(inode) => {
-                    // `inode` is the mount point inode in the “parent mount tree”.
-                    // Linux semantics: going up (..) from the root of a mounted filesystem should
-                    // return to the parent directory of the mount point, and subsequent path traversal
-                    // should occur on the parent mount (inode.mount_fs).
-                    //
-                    // Here we directly reuse the mount point inode's do_parent() to ensure mount_fs is switched correctly.
-                    return inode.do_parent();
+        // A propagation transaction can construct a very deep stack of mounts.
+        // Resolve `..` iteratively so a userspace directory walk cannot consume
+        // one kernel stack frame per mount layer.
+        let mut current = self.self_ref.upgrade().unwrap();
+        let mut fast = Some(current.clone());
+        loop {
+            if current.is_mountpoint_root()? {
+                // Linux crosses from a mounted root to the parent of the mount
+                // point. The mount point may itself be another mounted root, so
+                // keep walking until a real dentry parent is reached.
+                let Some(mountpoint) = current.mount_fs.self_mountpoint() else {
+                    return Ok(current);
+                };
+                current = mountpoint;
+
+                if let Some(mut cursor) = fast.take() {
+                    let mut exhausted = false;
+                    for _ in 0..2 {
+                        if !cursor.is_mountpoint_root()? {
+                            exhausted = true;
+                            break;
+                        }
+                        let Some(mountpoint) = cursor.mount_fs.self_mountpoint() else {
+                            exhausted = true;
+                            break;
+                        };
+                        cursor = mountpoint;
+                    }
+                    if !exhausted {
+                        if Arc::ptr_eq(&cursor, &current) {
+                            return Err(SystemError::ELOOP);
+                        }
+                        fast = Some(cursor);
+                    }
                 }
-                None => {
-                    return Ok(self.self_ref.upgrade().unwrap());
-                }
+                continue;
             }
+
+            let parent = current.dentry.state.lock().parent.clone();
+            return match parent {
+                Some(parent) => current.mount_fs.wrapper_for_dentry(parent),
+                None => Ok(current),
+            };
         }
-        if let Some(parent) = self.dentry.state.lock().parent.clone() {
-            return self.mount_fs.wrapper_for_dentry(parent);
-        }
-        Ok(self.self_ref.upgrade().unwrap())
     }
 
     fn do_absolute_path(&self) -> Result<String, SystemError> {
@@ -3742,6 +3829,16 @@ impl IndexNode for MountFSInode {
     ) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
         self.dentry.inode.set_metadata_masked(metadata, mask)
+    }
+
+    #[inline]
+    fn update_atime(
+        &self,
+        now: crate::time::PosixTimeSpec,
+        relatime: bool,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        self.dentry.inode.update_atime(now, relatime)
     }
 
     #[inline]

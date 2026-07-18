@@ -119,6 +119,12 @@ impl IndexNode for LockedNullInode {
         return Ok(());
     }
 
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        Ok(())
+    }
+
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写
     fn read_at(
         &self,

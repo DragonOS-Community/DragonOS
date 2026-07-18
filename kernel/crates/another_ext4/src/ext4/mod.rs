@@ -17,7 +17,7 @@ mod orphan;
 mod rw;
 mod xattr_reclaim;
 
-pub use low_level::SetAttr;
+pub use low_level::{InodeOwner, SetAttr};
 
 /// Simple fixed-size inode cache.
 /// When full, the entire cache is cleared (simple but effective for common workloads).

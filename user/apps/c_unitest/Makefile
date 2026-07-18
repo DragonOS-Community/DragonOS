@@ -8,7 +8,10 @@ endif
 CC=$(CROSS_COMPILE)gcc
 CFLAGS := -Wall -O2 -static -lpthread
 
-SRCS := $(wildcard *.c)
+# These two legacy programs contain unsupported-as-PASS paths. Their Linux
+# conformance coverage is maintained by dunitest and the upstream gVisor suite.
+RETIRED_FALSE_POSITIVE_SRCS := test_mount_propagation.c test_pivot_root.c
+SRCS := $(filter-out $(RETIRED_FALSE_POSITIVE_SRCS),$(wildcard *.c))
 BINS := $(SRCS:.c=)
 
 all: $(BINS)
@@ -24,6 +27,6 @@ install: all
 	mv $(BINS) $(DADK_CURRENT_BUILD_DIR)/
 
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) $(RETIRED_FALSE_POSITIVE_SRCS:.c=)
 
 .PHONY: all install clean

@@ -164,6 +164,49 @@ pub fn merge_metadata_masked(target: &mut Metadata, requested: &Metadata, mask: 
     }
 }
 
+/// Apply Linux relatime rules and update only the inode access time.
+///
+/// Local filesystems call this while holding the lock that protects their
+/// metadata, so the decision and the single-field update form one atomic
+/// operation with respect to chmod, chown, writes, and other timestamp updates.
+pub fn update_atime_locked(metadata: &mut Metadata, now: PosixTimeSpec, relatime: bool) -> bool {
+    if metadata.flags.contains(InodeFlags::S_NOATIME) {
+        return false;
+    }
+    if !should_update_atime(
+        metadata.atime,
+        metadata.mtime,
+        metadata.ctime,
+        now,
+        relatime,
+    ) {
+        return false;
+    }
+    metadata.atime = now;
+    true
+}
+
+/// Evaluate Linux strictatime/relatime policy from authoritative in-memory
+/// inode timestamps. Filesystems with a native inode cache can use this helper
+/// without constructing a full metadata snapshot or reading the disk inode.
+pub fn should_update_atime(
+    atime: PosixTimeSpec,
+    mtime: PosixTimeSpec,
+    ctime: PosixTimeSpec,
+    now: PosixTimeSpec,
+    relatime: bool,
+) -> bool {
+    if relatime {
+        let recent = now.tv_sec.saturating_sub(atime.tv_sec) < 24 * 60 * 60;
+        let atime_after_mtime = (atime.tv_sec, atime.tv_nsec) > (mtime.tv_sec, mtime.tv_nsec);
+        let atime_after_ctime = (atime.tv_sec, atime.tv_nsec) > (ctime.tv_sec, ctime.tv_nsec);
+        if atime_after_mtime && atime_after_ctime && recent {
+            return false;
+        }
+    }
+    atime != now
+}
+
 impl From<FileType> for InodeMode {
     fn from(val: FileType) -> Self {
         match val {
@@ -721,6 +764,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         self.set_metadata(metadata)
     }
 
+    /// Atomically evaluate atime policy and update only atime.
+    ///
+    /// Pseudo filesystems that do not maintain access timestamps may keep the
+    /// no-op default. Mutable local and protocol filesystems must override this
+    /// instead of feeding a lockless full metadata snapshot to `set_metadata`.
+    fn update_atime(&self, _now: PosixTimeSpec, _relatime: bool) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// @brief 重新设置文件的大小
     ///
     /// 如果文件大小增加，则文件内容不变，但是文件的空洞部分会被填充为0
@@ -997,10 +1049,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
 
-    /// 获取 inode 所在的文件系统；供异步回收等可能与卸载并发的路径使用。
+    /// 获取 inode 所在的文件系统；供可选文件系统能力检查，以及异步回收等
+    /// 可能与卸载并发的路径使用。
     ///
-    /// 默认实现适用于 inode 强持有文件系统的实现。仅当 inode 与文件系统之间
-    /// 使用弱引用、且调用方允许文件系统已完成销毁时才应覆盖此方法。
+    /// `None` 表示 inode 天生不属于任何文件系统（例如匿名 socket），或 inode
+    /// 仅弱持有文件系统且文件系统已经销毁。默认实现仅适用于 `fs()` 始终有效、
+    /// 且 inode 强持有文件系统的实现。
     fn try_fs(&self) -> Option<Arc<dyn FileSystem>> {
         Some(self.fs())
     }
@@ -1397,6 +1451,15 @@ impl DowncastArc for dyn IndexNode {
     }
 }
 
+enum PathWalkOutcome {
+    Found(Arc<dyn IndexNode>, Option<utils::ResolvedPath>),
+    MissingFinal {
+        ownership: Option<utils::ResolvedPath>,
+        name: String,
+        must_be_dir: bool,
+    },
+}
+
 impl dyn IndexNode {
     /// @brief 将当前Inode转换为一个具体的结构体（类型由T指定）
     /// 如果类型正确，则返回Some,否则返回None
@@ -1452,8 +1515,16 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.do_lookup_follow_symlink_owned(path, max_follow_times, follow_final_symlink, None)
-            .map(|(inode, _)| inode)
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            None,
+            false,
+        )? {
+            PathWalkOutcome::Found(inode, _) => Ok(inode),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+        }
     }
 
     /// Path walk variant that transfers a mount/operation pin at every mount
@@ -1465,14 +1536,50 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
     ) -> Result<utils::ResolvedPath, SystemError> {
-        self.do_lookup_follow_symlink_owned(
+        match self.do_lookup_follow_symlink_owned(
             path,
             max_follow_times,
             follow_final_symlink,
             Some(start.derive()?),
-        )?
-        .1
-        .ok_or(SystemError::ESTALE)
+            false,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+        }
+    }
+
+    /// Resolve a path while retaining the real parent of a missing final
+    /// component after all required symlinks have been expanded.
+    pub fn lookup_follow_symlink_or_missing_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+    ) -> Result<utils::OwnedLookupOutcome, SystemError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            true,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership
+                .map(utils::OwnedLookupOutcome::Found)
+                .ok_or(SystemError::ESTALE),
+            PathWalkOutcome::MissingFinal {
+                ownership,
+                name,
+                must_be_dir,
+                ..
+            } => ownership
+                .map(|parent| utils::OwnedLookupOutcome::MissingFinal {
+                    parent,
+                    name,
+                    must_be_dir,
+                })
+                .ok_or(SystemError::ESTALE),
+        }
     }
 
     fn do_lookup_follow_symlink_owned(
@@ -1481,7 +1588,8 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
         mut ownership: Option<utils::ResolvedPath>,
-    ) -> Result<(Arc<dyn IndexNode>, Option<utils::ResolvedPath>), SystemError> {
+        return_missing_final: bool,
+    ) -> Result<PathWalkOutcome, SystemError> {
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -1497,7 +1605,7 @@ impl dyn IndexNode {
             .as_ref()
             .map(|path| path.inode())
             .unwrap_or_else(|| fs_struct.root());
-        let trailing_slash = path.ends_with('/');
+        let mut trailing_slash = path.ends_with('/');
 
         // 处理绝对路径
         // result: 上一个被找到的inode
@@ -1518,6 +1626,9 @@ impl dyn IndexNode {
         };
 
         let mut symlink_follows_remaining = max_follow_times;
+        // Allocate the PATH_MAX read buffer lazily and reuse it for the whole
+        // walk. A symlink chain must not amplify allocator work per hop.
+        let mut symlink_buffer: Option<Vec<u8>> = None;
 
         // 逐级查找文件
         while !rest_path.is_empty() {
@@ -1559,18 +1670,38 @@ impl dyn IndexNode {
                 }
             }
 
-            let inode = result.find(&name)?;
-            if ownership.is_some() {
+            let has_more_components = rest_path.split('/').any(|component| !component.is_empty());
+            // Keep the current directory owner aside until we know whether
+            // this component exists.  It is both the owner returned for a
+            // missing final component and the base restored for a relative
+            // symlink target.
+            let parent_ownership = ownership.take();
+            let inode = match result.find(&name) {
+                Ok(inode) => inode,
+                Err(error)
+                    if return_missing_final
+                        && error == SystemError::ENOENT
+                        && !has_more_components =>
+                {
+                    return Ok(PathWalkOutcome::MissingFinal {
+                        ownership: parent_ownership,
+                        name,
+                        must_be_dir: trailing_slash,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            if parent_ownership.is_some() {
                 ownership = Some(utils::ResolvedPath::new(inode.clone())?);
             }
             let file_type = inode.metadata()?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
-            if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
+            if !has_more_components && !follow_final_symlink && file_type == FileType::SymLink {
                 // Linux 语义：若 pathname 以 '/' 结尾，则必须解析为目录，
                 // 此时即使请求"不跟随最终 symlink"，也不能返回 symlink 本身。
                 if !trailing_slash {
                     // 返回符号链接本身
-                    return Ok((inode, ownership));
+                    return Ok(PathWalkOutcome::Found(inode, ownership));
                 }
             }
 
@@ -1580,9 +1711,7 @@ impl dyn IndexNode {
                 // - symlink 位于路径中间（rest_path 非空）
                 // - 需要跟随最终 symlink（follow_final_symlink=true）
                 // - 或者 pathname 以 '/' 结尾（trailing_slash=true）
-                let need_follow = !rest_path.is_empty()
-                    || follow_final_symlink
-                    || (trailing_slash && rest_path.is_empty());
+                let need_follow = has_more_components || follow_final_symlink || trailing_slash;
 
                 // 兼容旧语义：symlink_follows_remaining==0 表示完全不跟随 symlink。
                 // 在这种模式下，如果路径解析"需要跟随"（例如 symlink 位于中间，或末尾带 '/'），
@@ -1615,7 +1744,7 @@ impl dyn IndexNode {
                         ownership = Some(utils::ResolvedPath::new(target_inode.clone())?);
                     }
                     if rest_path.is_empty() {
-                        return Ok((target_inode, ownership));
+                        return Ok(PathWalkOutcome::Found(target_inode, ownership));
                     } else {
                         // 将 result 设为 magic link 的目标 inode，继续迭代
                         result = target_inode;
@@ -1623,15 +1752,31 @@ impl dyn IndexNode {
                     }
                 }
 
-                let mut content = [0u8; 256];
+                // Filesystems such as procfs expose dynamic symlink targets
+                // with i_size == 0, so the inode size cannot be used as the
+                // read bound. Read once into a PATH_MAX-sized buffer: some of
+                // those implementations intentionally ignore the offset and
+                // therefore cannot be consumed in chunks.
+                if symlink_buffer.is_none() {
+                    let mut buffer = Vec::new();
+                    buffer
+                        .try_reserve_exact(MAX_PATHLEN)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    buffer.resize(MAX_PATHLEN, 0);
+                    symlink_buffer = Some(buffer);
+                }
+                let content = symlink_buffer.as_mut().expect("symlink buffer initialized");
                 // 读取符号链接
                 // TODO:We need to clarify which interfaces require private data and which do not
                 let len = inode.read_at(
                     0,
-                    256,
-                    &mut content,
+                    MAX_PATHLEN,
+                    content,
                     Mutex::new(FilePrivateData::Unused).lock(),
                 )?;
+                if len >= MAX_PATHLEN {
+                    return Err(SystemError::ENAMETOOLONG);
+                }
 
                 // 将读到的数据转换为utf8字符串（先转为str，再转为String）
                 let link_path = String::from(
@@ -1644,6 +1789,10 @@ impl dyn IndexNode {
                 } else {
                     link_path + "/" + &rest_path
                 };
+                // A slash required by the unresolved suffix (for example the
+                // original `link/`) remains authoritative after expansion;
+                // the symlink target may add the same requirement as well.
+                trailing_slash |= new_path.ends_with('/');
 
                 // 处理 symlink 目标为绝对路径或相对路径
                 // 绝对路径：从进程 root 开始
@@ -1660,6 +1809,7 @@ impl dyn IndexNode {
                     }
                     rest_path = String::from(rest);
                 } else {
+                    ownership = parent_ownership;
                     rest_path = new_path;
                 }
 
@@ -1674,7 +1824,7 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
-        return Ok((result, ownership));
+        return Ok(PathWalkOutcome::Found(result, ownership));
     }
 }
 
@@ -2254,7 +2404,9 @@ pub fn produce_fs(
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);
-            Err(SystemError::EINVAL)
+            // Linux get_fs_type() reports ENODEV when no filesystem driver is
+            // registered for the requested type.
+            Err(SystemError::ENODEV)
         }
     }
 }

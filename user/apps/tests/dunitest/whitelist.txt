@@ -18,6 +18,7 @@ normal/fuse_stats_debugfs
 normal/test_pivot_root
 normal/mount_reconfigure
 normal/mount_propagation
+normal/open_dangling_symlink
 normal/mount_move
 normal/mount_limit
 normal/mount_object_topology

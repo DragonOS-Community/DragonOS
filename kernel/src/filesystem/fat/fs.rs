@@ -2104,6 +2104,11 @@ impl IndexNode for LockedFATInode {
         inode.metadata.gid = metadata.gid;
         Ok(())
     }
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let inode = &mut self.0.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        Ok(())
+    }
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _size_guard = self.1.write();
         //检查是否超过fat支持的最大容量

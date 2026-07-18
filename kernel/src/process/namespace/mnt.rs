@@ -1,7 +1,7 @@
 use crate::{
     filesystem::vfs::{
         mount::{
-            lock_mount_lifecycle, MountFSInode, MountFlags, MountTopologyGuard,
+            lock_mount_lifecycle, MountFSInode, MountFlags, MountId, MountTopologyGuard,
             MOUNT_LIFECYCLE_LOCK,
         },
         FileSystem, IndexNode, MountFS,
@@ -64,7 +64,7 @@ struct MountCountState {
 }
 
 impl MountCountState {
-    fn reserve(&mut self, amount: u32, limit: u32) -> Result<(), SystemError> {
+    fn ensure_capacity(&self, amount: u32, limit: u32) -> Result<(), SystemError> {
         let used = self
             .mounts
             .checked_add(self.pending_mounts)
@@ -73,6 +73,11 @@ impl MountCountState {
         if amount > remaining {
             return Err(SystemError::ENOSPC);
         }
+        Ok(())
+    }
+
+    fn reserve(&mut self, amount: u32, limit: u32) -> Result<(), SystemError> {
+        self.ensure_capacity(amount, limit)?;
         self.pending_mounts = self
             .pending_mounts
             .checked_add(amount)
@@ -142,14 +147,15 @@ pub(crate) enum RootMountAttachment {
 pub struct InnerMntNamespace {
     _dead: bool,
     root_mountfs: Arc<MountFS>,
-    /// Whether the current root has Linux's parent mount attachment.
+    /// Identity of the hidden parent attachment of the namespace root.
     ///
     /// DragonOS removes the boot rootfs object when the real root is
     /// installed, so that hidden parent edge cannot be represented by
     /// `MountFS::self_mountpoint`. Keep its semantic state explicitly: the
     /// initial rootfs is unattached and cannot be pivoted, while the real boot
-    /// root and namespace copies remain attached to that conceptual boundary.
-    root_attached: bool,
+    /// root and namespace copies retain the old rootfs mount ID as the
+    /// conceptual parent exposed by mountinfo.
+    root_parent_mount_id: Option<MountId>,
     mount_count: MountCountState,
     /// Exact old-mount to copied-mount projection used to rebind fs_struct
     /// root/pwd after CLONE_NEWNS. This is object identity, never a pathname.
@@ -232,7 +238,7 @@ impl MntNamespace {
             _user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: RwSem::new(InnerMntNamespace {
                 root_mountfs: ramfs.clone(),
-                root_attached: false,
+                root_parent_mount_id: None,
                 mount_count: MountCountState::default(),
                 copy_sources: Vec::new(),
                 _dead: false,
@@ -264,7 +270,8 @@ impl MntNamespace {
         let mut inner_guard = self.inner.write();
         new_root.set_namespace(self.self_ref.clone());
         let old_root = core::mem::replace(&mut inner_guard.root_mountfs, new_root);
-        inner_guard.root_attached = attachment == RootMountAttachment::Attached;
+        inner_guard.root_parent_mount_id =
+            (attachment == RootMountAttachment::Attached).then_some(old_root.mount_id());
         assert!(
             old_root.take_namespace_accounted(&self.self_ref),
             "the old namespace root must own one committed mount slot"
@@ -353,7 +360,7 @@ impl MntNamespace {
             if Arc::ptr_eq(&new_root, &old_root) || Arc::ptr_eq(&put_old_mnt, &old_root) {
                 return Err(SystemError::EBUSY);
             }
-            if old_is_namespace_root && !namespace_inner.root_attached {
+            if old_is_namespace_root && namespace_inner.root_parent_mount_id.is_none() {
                 return Err(SystemError::EINVAL);
             }
             let old_root_mountpoint = old_root_mountpoint.as_ref();
@@ -709,7 +716,12 @@ impl MntNamespace {
             inner: RwSem::new(InnerMntNamespace {
                 _dead: false,
                 root_mountfs: new_root_mntfs,
-                root_attached: inner.root_attached,
+                // Linux copy_tree() clones the hidden parent together with the
+                // visible root, so the copied namespace must not expose the
+                // source namespace's parent mount identity in mountinfo.
+                root_parent_mount_id: inner
+                    .root_parent_mount_id
+                    .map(|_| MountId::alloc_conceptual()),
                 // Linux copy_mnt_ns() initializes the copied namespace's
                 // existing mount count directly. mount-max only admits new
                 // mount trees; it must not reject cloning existing topology.
@@ -741,6 +753,13 @@ impl MntNamespace {
 
     pub fn root_mntfs(&self) -> Arc<MountFS> {
         Self::root_mntfs_locked(&self.inner.read())
+    }
+
+    /// Return the (possibly invisible) parent mount ID of an attached namespace
+    /// root. Linux exposes this ID in mountinfo even when the parent is outside
+    /// the process's visible root.
+    pub(crate) fn root_parent_mount_id(&self) -> Option<MountId> {
+        self.inner.read().root_parent_mount_id
     }
 
     /// Get the root inode of this mount namespace
@@ -898,6 +917,18 @@ impl MntNamespace {
             self.inner.write().mount_count.release(1);
         }
         Some(mntfs.clone())
+    }
+
+    /// Fail early when a known lower bound cannot fit in this namespace.
+    ///
+    /// This is only a preflight optimization; the later reservation remains
+    /// authoritative and closes any race with a concurrent limit change.
+    pub(crate) fn ensure_mount_capacity(&self, amount: usize) -> Result<(), SystemError> {
+        let amount = u32::try_from(amount).map_err(|_| SystemError::ENOSPC)?;
+        self.inner
+            .read()
+            .mount_count
+            .ensure_capacity(amount, mount_max())
     }
 
     pub(crate) fn reserve_mounts(
@@ -1110,7 +1141,7 @@ mod tests {
             .self_mountpoint()
             .as_ref()
             .is_some_and(|mountpoint| Arc::ptr_eq(mountpoint, &new_root.mountpoint_root_inode())));
-        assert!(namespace.inner.read().root_attached);
+        assert!(namespace.inner.read().root_parent_mount_id.is_some());
     }
 
     #[test]
@@ -1119,14 +1150,17 @@ mod tests {
         let initial_copy = initial
             .copy_mnt_ns(&CloneFlags::CLONE_NEWNS, INIT_USER_NAMESPACE.clone())
             .unwrap();
-        assert!(!initial_copy.inner.read().root_attached);
+        assert!(initial_copy.inner.read().root_parent_mount_id.is_none());
 
         let attached = MntNamespace::new_root();
         install_attached_root(&attached);
         let attached_copy = attached
             .copy_mnt_ns(&CloneFlags::CLONE_NEWNS, INIT_USER_NAMESPACE.clone())
             .unwrap();
-        assert!(attached_copy.inner.read().root_attached);
+        let attached_parent = attached.inner.read().root_parent_mount_id.unwrap();
+        let copied_parent = attached_copy.inner.read().root_parent_mount_id.unwrap();
+        assert_ne!(attached_parent, copied_parent);
+        assert_ne!(copied_parent, attached_copy.root_mntfs().mount_id());
     }
 
     #[test]

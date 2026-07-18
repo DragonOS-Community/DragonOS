@@ -510,6 +510,12 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        Ok(())
+    }
+
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type == FileType::File {
@@ -550,6 +556,8 @@ impl IndexNode for LockedRamFSInode {
         if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
+        let init =
+            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
 
         // 创建inode
         let result: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(Mutex::new(RamFSInode {
@@ -568,12 +576,12 @@ impl IndexNode for LockedRamFSInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type,
-                mode,
+                mode: init.mode,
                 flags: InodeFlags::empty(),
                 // 目录需要包含 "." 自引用，因此初始为2
                 nlinks: if file_type == FileType::Dir { 2 } else { 1 },
-                uid: 0,
-                gid: 0,
+                uid: init.uid,
+                gid: init.gid,
                 raw_dev: DeviceNumber::from(data as u32),
             },
             fs: inode.fs.clone(),
@@ -892,6 +900,8 @@ impl IndexNode for LockedRamFSInode {
             FileType::Socket => FileType::Socket,
             _ => return Err(SystemError::EINVAL),
         };
+        let init =
+            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
 
         let nod = Arc::new(LockedRamFSInode(Mutex::new(RamFSInode {
             parent: inode.self_ref.clone(),
@@ -909,10 +919,10 @@ impl IndexNode for LockedRamFSInode {
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
                 file_type,
-                mode,
+                mode: init.mode,
                 nlinks: 1,
-                uid: 0,
-                gid: 0,
+                uid: init.uid,
+                gid: init.gid,
                 raw_dev: dev_t,
                 flags: InodeFlags::empty(),
             },

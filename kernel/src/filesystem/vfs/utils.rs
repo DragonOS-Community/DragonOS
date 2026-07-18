@@ -25,6 +25,21 @@ pub struct ResolvedPath {
     _operation_guard: InodeRetentionGuard,
 }
 
+/// Result of a pathname walk that may stop at a missing final component.
+///
+/// `MissingFinal` retains the resolved parent, including its mount ownership,
+/// so create-style operations act on the final pathname after symlink
+/// expansion instead of reparsing the original userspace string.
+#[derive(Debug)]
+pub enum OwnedLookupOutcome {
+    Found(ResolvedPath),
+    MissingFinal {
+        parent: ResolvedPath,
+        name: String,
+        must_be_dir: bool,
+    },
+}
+
 impl ResolvedPath {
     pub fn new(inode: Arc<dyn IndexNode>) -> Result<Self, SystemError> {
         let mount_guard = inode

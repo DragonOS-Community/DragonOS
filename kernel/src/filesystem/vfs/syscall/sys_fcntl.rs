@@ -187,6 +187,12 @@ impl SysFcntlHandle {
                     {
                         return Err(SystemError::EPERM);
                     }
+                    if new_flags.contains(FileFlags::O_NOATIME)
+                        && !current_flags.contains(FileFlags::O_NOATIME)
+                    {
+                        let metadata = file.inode().metadata()?;
+                        crate::filesystem::vfs::permission::check_noatime_permission(&metadata)?;
+                    }
                     let old_fasync = current_flags.contains(FileFlags::FASYNC);
                     let new_fasync = new_flags.contains(FileFlags::FASYNC);
                     file.set_flags(new_flags)?;

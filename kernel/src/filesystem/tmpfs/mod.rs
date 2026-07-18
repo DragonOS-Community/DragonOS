@@ -1,8 +1,9 @@
 use core::any::Any;
+use core::fmt::Write;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::filesystem::page_cache::{PageCache, PageCacheBackend, PageCachePagePin};
+use crate::filesystem::page_cache::{PageCache, PageCacheBackend};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwsem::RwSem;
@@ -19,6 +20,7 @@ use crate::{
     libs::casting::DowncastArc,
     libs::mutex::{Mutex, MutexGuard},
     mm::MemoryManagementArch,
+    process::ProcessManager,
     time::PosixTimeSpec,
 };
 
@@ -51,11 +53,12 @@ const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0);
 #[derive(Debug)]
 struct TmpfsPageCacheBackend {
     inode: Weak<dyn IndexNode>,
+    fs: Weak<Tmpfs>,
 }
 
 impl TmpfsPageCacheBackend {
-    fn new(inode: Weak<dyn IndexNode>) -> Self {
-        Self { inode }
+    fn new(inode: Weak<dyn IndexNode>, fs: Weak<Tmpfs>) -> Self {
+        Self { inode, fs }
     }
 }
 
@@ -83,6 +86,19 @@ impl PageCacheBackend for TmpfsPageCacheBackend {
                 }
             }
             Err(_) => 0,
+        }
+    }
+
+    fn reserve_page(&self) -> Result<(), SystemError> {
+        self.fs
+            .upgrade()
+            .ok_or(SystemError::EIO)?
+            .increase_size(MMArch::PAGE_SIZE as u64)
+    }
+
+    fn release_page(&self) {
+        if let Some(fs) = self.fs.upgrade() {
+            fs.decrease_size(MMArch::PAGE_SIZE);
         }
     }
 }
@@ -276,6 +292,7 @@ fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), Syste
         },
         fs: dir.fs.clone(),
         special_node: None,
+        inline_symlink: None,
         name: name.clone(),
     }));
     whiteout.0.lock().self_ref = Arc::downgrade(&whiteout);
@@ -298,6 +315,7 @@ pub struct Tmpfs {
     super_block: RwSem<SuperBlock>,
     size_limit: RwSem<Option<u64>>,
     current_size: AtomicU64,
+    mount_mode: RwSem<InodeMode>,
 }
 
 #[derive(Debug)]
@@ -344,6 +362,7 @@ pub struct TmpfsInode {
     metadata: Metadata,
     fs: Weak<Tmpfs>,
     special_node: Option<SpecialNodeData>,
+    inline_symlink: Option<String>,
     name: DName,
 }
 
@@ -374,6 +393,7 @@ impl TmpfsInode {
             },
             fs: Weak::default(),
             special_node: None,
+            inline_symlink: None,
             name: Default::default(),
         }
     }
@@ -409,7 +429,14 @@ impl TmpfsMountData {
                         (&v_lower[..], 1u64)
                     };
                     let base = num_str.parse::<u64>().map_err(|_| SystemError::EINVAL)?;
-                    size_bytes = Some(base.saturating_mul(mul));
+                    let bytes = base.checked_mul(mul).ok_or(SystemError::EINVAL)?;
+                    let rounded = bytes
+                        .checked_add(MMArch::PAGE_SIZE as u64 - 1)
+                        .ok_or(SystemError::EINVAL)?
+                        & !(MMArch::PAGE_SIZE as u64 - 1);
+                    size_bytes = Some(rounded);
+                } else {
+                    return Err(SystemError::EINVAL);
                 }
             }
         }
@@ -474,8 +501,32 @@ impl FileSystem for Tmpfs {
         "tmpfs"
     }
 
+    fn proc_show_mount_options(
+        &self,
+        _mount: &super::vfs::mount::MountFS,
+        out: &mut dyn Write,
+    ) -> Result<(), SystemError> {
+        let mode = *self.mount_mode.read();
+        if mode != InodeMode::S_IRWXUGO {
+            write!(out, "mode={:03o}", mode.bits() & 0o7777).map_err(|_| SystemError::EINVAL)?;
+        }
+        Ok(())
+    }
+
     fn super_block(&self) -> SuperBlock {
-        self.super_block.read().clone()
+        let limit = self.size_limit.read();
+        let mut sb = self.super_block.read().clone();
+        if let Some(limit) = *limit {
+            let current = self.current_size.load(Ordering::Acquire);
+            let total_blocks = limit / TMPFS_BLOCK_SIZE;
+            let used_blocks = Self::bytes_to_blocks_ceil(current);
+            let free_blocks = total_blocks.saturating_sub(used_blocks);
+            sb.blocks = total_blocks;
+            sb.bfree = free_blocks;
+            sb.bavail = free_blocks;
+            sb.frsize = TMPFS_BLOCK_SIZE;
+        }
+        sb
     }
 
     fn support_readahead(&self) -> bool {
@@ -487,17 +538,18 @@ impl FileSystem for Tmpfs {
         let parsed = TmpfsMountData::parse(request.raw_data)?;
 
         if let Some(new_limit) = parsed.size_bytes {
+            let mut limit = self.size_limit.write();
             let current = self.current_size.load(Ordering::Acquire);
             if new_limit < current {
                 return Err(SystemError::EINVAL);
             }
-            *self.size_limit.write() = Some(new_limit);
-            self.update_superblock_free(current);
+            *limit = Some(new_limit);
         }
 
         if let Some(mode) = parsed.mode {
             let mut root = self.root_inode.0.lock();
             root.metadata.mode = mode;
+            *self.mount_mode.write() = mode;
         }
 
         Ok(request.sb_flags & request.sb_flags_mask)
@@ -516,21 +568,6 @@ impl Tmpfs {
     #[inline]
     fn bytes_to_blocks_ceil(bytes: u64) -> u64 {
         bytes.div_ceil(TMPFS_BLOCK_SIZE)
-    }
-
-    fn update_superblock_free(&self, current_bytes: u64) {
-        // 只在启用 size_limit 时输出可用容量；否则保持现有行为（0-sized）。
-        let Some(limit) = *self.size_limit.read() else {
-            return;
-        };
-        let total_blocks = limit / TMPFS_BLOCK_SIZE;
-        let used_blocks = Self::bytes_to_blocks_ceil(current_bytes);
-        let free_blocks = total_blocks.saturating_sub(used_blocks);
-        let mut sb = self.super_block.write();
-        sb.blocks = total_blocks;
-        sb.bfree = free_blocks;
-        sb.bavail = free_blocks;
-        sb.frsize = TMPFS_BLOCK_SIZE;
     }
 
     pub fn new(mount_data: &TmpfsMountData) -> Arc<Self> {
@@ -563,6 +600,7 @@ impl Tmpfs {
             super_block: RwSem::new(sb),
             size_limit: RwSem::new(size_limit),
             current_size: AtomicU64::new(0),
+            mount_mode: RwSem::new(mode.unwrap_or(InodeMode::S_IRWXUGO)),
         });
 
         let mut root_guard: MutexGuard<TmpfsInode> = result.root_inode.0.lock();
@@ -583,7 +621,8 @@ impl Tmpfs {
     /// 返回Ok(())如果更新成功，Err(SystemError::ENOSPC)如果超过限制
     /// 使用compare_exchange_weak循环确保并发安全
     fn increase_size(&self, size_diff: u64) -> Result<(), SystemError> {
-        if let Some(limit) = *self.size_limit.read() {
+        let size_limit = self.size_limit.read();
+        if let Some(limit) = *size_limit {
             // 使用compare_exchange_weak循环确保原子性
             loop {
                 let current = self.current_size.load(Ordering::Acquire);
@@ -600,11 +639,7 @@ impl Tmpfs {
                     Ordering::Release,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => {
-                        // 同步更新 superblock 的 free 统计，供 statfs/df 使用
-                        self.update_superblock_free(new_total);
-                        break;
-                    } // 更新成功
+                    Ok(_) => break,     // 更新成功
                     Err(_) => continue, // 被其他线程修改，重试
                 }
             }
@@ -615,15 +650,29 @@ impl Tmpfs {
     /// 原子地减少文件系统当前使用的大小（用于文件删除或缩小）
     /// 使用fetch_sub确保并发安全
     fn decrease_size(&self, size: usize) {
-        if self.size_limit.read().is_some() {
+        let size_limit = self.size_limit.read();
+        if size_limit.is_some() {
             let size_to_decrease = size as u64;
-            // 使用fetch_sub原子地减少大小
-            let prev = self
-                .current_size
-                .fetch_sub(size_to_decrease, Ordering::Release);
-            let new = prev.saturating_sub(size_to_decrease);
-            self.update_superblock_free(new);
+            loop {
+                let current = self.current_size.load(Ordering::Acquire);
+                let new = current.saturating_sub(size_to_decrease);
+                if self
+                    .current_size
+                    .compare_exchange_weak(current, new, Ordering::Release, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
         }
+    }
+
+    fn available_pages(&self) -> Option<usize> {
+        let size_limit = self.size_limit.read();
+        (*size_limit).map(|limit| {
+            let current = self.current_size.load(Ordering::Acquire);
+            (limit.saturating_sub(current) / MMArch::PAGE_SIZE as u64) as usize
+        })
     }
 
     fn create_unlinked_shmem_inode(
@@ -672,12 +721,16 @@ impl Tmpfs {
             },
             fs: Arc::downgrade(self),
             special_node: None,
+            inline_symlink: None,
             name,
         }));
 
         result.0.lock().self_ref = Arc::downgrade(&result);
         let inode_dyn: Arc<dyn IndexNode> = result.clone();
-        let backend = Arc::new(TmpfsPageCacheBackend::new(Arc::downgrade(&inode_dyn)));
+        let backend = Arc::new(TmpfsPageCacheBackend::new(
+            Arc::downgrade(&inode_dyn),
+            Arc::downgrade(self),
+        ));
         let pc = PageCache::new_shmem(Some(Arc::downgrade(&inode_dyn)), Some(backend));
         result.0.lock().page_cache = Some(pc.clone());
 
@@ -817,6 +870,18 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::EISDIR);
         }
         let file_size = inode.metadata.size as usize;
+        if let Some(target) = inode.inline_symlink.clone() {
+            drop(inode);
+            let read_len = if offset < target.len() {
+                core::cmp::min(target.len() - offset, len)
+            } else {
+                0
+            };
+            if read_len > 0 {
+                buf[..read_len].copy_from_slice(&target.as_bytes()[offset..offset + read_len]);
+            }
+            return Ok(read_len);
+        }
         let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
         drop(inode);
 
@@ -837,7 +902,7 @@ impl IndexNode for LockedTmpfsInode {
         // 1) 持有 page_cache 锁：只做“取页/建页 + 收集引用”，绝不触碰用户缓冲区
         // 2) 释放 page_cache 锁：再把页内容拷贝到用户缓冲区（并做 prefault）
         struct ReadItem {
-            page: Arc<Page>,
+            page: Option<Arc<Page>>,
             page_offset: usize,
             sub_len: usize,
         }
@@ -854,8 +919,9 @@ impl IndexNode for LockedTmpfsInode {
                 continue;
             }
 
-            // tmpfs: 缺页即创建零页
-            let page = page_cache.manager().commit_overwrite(page_index)?;
+            // Reading a sparse tmpfs hole returns zeroes without allocating a
+            // page or consuming the mount's block quota.
+            let page = page_cache.manager().peek_page(page_index);
 
             items.push(ReadItem {
                 page,
@@ -876,11 +942,15 @@ impl IndexNode for LockedTmpfsInode {
             let v = volatile_read!(buf[dst_off + it.sub_len - 1]);
             volatile_write!(buf[dst_off + it.sub_len - 1], v);
 
-            let page_guard = it.page.read();
-            unsafe {
-                buf[dst_off..dst_off + it.sub_len].copy_from_slice(
-                    &page_guard.as_slice()[it.page_offset..it.page_offset + it.sub_len],
-                );
+            if let Some(page) = it.page {
+                let page_guard = page.read();
+                unsafe {
+                    buf[dst_off..dst_off + it.sub_len].copy_from_slice(
+                        &page_guard.as_slice()[it.page_offset..it.page_offset + it.sub_len],
+                    );
+                }
+            } else {
+                buf[dst_off..dst_off + it.sub_len].fill(0);
             }
             dst_off += it.sub_len;
         }
@@ -910,36 +980,12 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::EISDIR);
         }
         let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
-        let old_size = inode.metadata.size as usize;
         let write_end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
-        let new_size = write_end.max(old_size);
-        let size_diff = new_size.saturating_sub(old_size) as u64;
-
-        // 获取文件系统引用
-        let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
-        let tmpfs = fs
-            .as_any_ref()
-            .downcast_ref::<Tmpfs>()
-            .ok_or(SystemError::EIO)?;
-
-        // 先预留空间，失败直接返回；后续 page-cache/拷贝失败时必须回滚本次预留。
-        if size_diff > 0 {
-            tmpfs.increase_size(size_diff)?;
-        }
-
         drop(inode);
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let end_page_index = (write_end - 1) >> MMArch::PAGE_SHIFT;
-        // 两阶段写入：同样避免在持有 page_cache 锁时触碰用户缓冲区（SelfRead）。
-        struct WriteItem {
-            pin: PageCachePagePin,
-            page_index: usize,
-            page_offset: usize,
-            sub_len: usize,
-        }
-
-        let mut items: Vec<WriteItem> = Vec::new();
+        let mut written = 0usize;
         for page_index in start_page_index..=end_page_index {
             let page_start = page_index * MMArch::PAGE_SIZE;
             let page_end = page_start + MMArch::PAGE_SIZE;
@@ -954,66 +1000,43 @@ impl IndexNode for LockedTmpfsInode {
             let pin = match page_cache.manager().commit_overwrite_pinned(page_index) {
                 Ok(pin) => pin,
                 Err(err) => {
-                    if size_diff > 0 {
-                        tmpfs.decrease_size(size_diff as usize);
+                    if written == 0 {
+                        return Err(err);
                     }
-                    return Err(err);
+                    break;
                 }
             };
 
-            items.push(WriteItem {
-                pin,
-                page_index,
-                page_offset: write_start - page_start,
-                sub_len: page_write_len,
-            });
-        }
-
-        let mut src_off = 0usize;
-        for it in items {
-            if it.sub_len == 0 {
-                continue;
-            }
-
             // prefault 用户缓冲区，避免后续在持页锁时缺页
-            volatile_read!(buf[src_off]);
-            volatile_read!(buf[src_off + it.sub_len - 1]);
+            volatile_read!(buf[written]);
+            volatile_read!(buf[written + page_write_len - 1]);
 
-            let page = it.pin.page();
+            let page = pin.page();
             let mut page_guard = page.write();
             unsafe {
-                page_guard.as_slice_mut()[it.page_offset..it.page_offset + it.sub_len]
-                    .copy_from_slice(&buf[src_off..src_off + it.sub_len]);
+                let page_offset = write_start - page_start;
+                page_guard.as_slice_mut()[page_offset..page_offset + page_write_len]
+                    .copy_from_slice(&buf[written..written + page_write_len]);
             }
             page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
-            if let Err(err) = page_cache.manager().update_page(it.page_index) {
-                if size_diff > 0 {
-                    tmpfs.decrease_size(size_diff as usize);
+            drop(page_guard);
+            if let Err(err) = page_cache.manager().update_page(page_index) {
+                if written == 0 {
+                    return Err(err);
                 }
-                return Err(err);
+                break;
             }
-            src_off += it.sub_len;
+            written += page_write_len;
         }
 
-        // 更新文件大小并按当前 inode size 结算本次预留，避免并发扩容写重复 charge。
+        // Quota is charged by page-cache membership. Logical size advances
+        // only through the prefix which was actually copied.
         let mut inode = self.0.lock();
-        let committed_size = inode.metadata.size as usize;
-        let actual_growth = new_size.saturating_sub(committed_size);
-        if actual_growth > size_diff as usize {
-            let extra = actual_growth - size_diff as usize;
-            if let Err(err) = tmpfs.increase_size(extra as u64) {
-                if size_diff > 0 {
-                    tmpfs.decrease_size(size_diff as usize);
-                }
-                return Err(err);
-            }
-        } else if (size_diff as usize) > actual_growth {
-            tmpfs.decrease_size(size_diff as usize - actual_growth);
+        let committed_end = offset + written;
+        if committed_end > inode.metadata.size as usize {
+            inode.metadata.size = committed_end as i64;
         }
-        if new_size > committed_size {
-            inode.metadata.size = new_size as i64;
-        }
-        Ok(len)
+        Ok(written)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -1041,9 +1064,15 @@ impl IndexNode for LockedTmpfsInode {
         Ok(())
     }
 
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        Ok(())
+    }
+
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _size_guard = self.1.write();
-        let (old_size, new_size, page_cache, fs) = {
+        let (old_size, new_size, page_cache) = {
             let mut inode = self.0.lock();
             if inode.metadata.file_type != FileType::File {
                 return Err(SystemError::EINVAL);
@@ -1052,35 +1081,17 @@ impl IndexNode for LockedTmpfsInode {
             let old_size = inode.metadata.size as usize;
             let new_size = len;
 
-            // 获取文件系统引用
-            let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
-            let tmpfs = fs
-                .as_any_ref()
-                .downcast_ref::<Tmpfs>()
-                .ok_or(SystemError::EIO)?;
-
-            let growth = new_size.saturating_sub(old_size);
-            if growth > 0 {
-                tmpfs.increase_size(growth as u64)?;
-            }
-
             // Linux truncate_setsize() writes the new i_size before truncating page cache.
             // Drop the inode lock before page-cache unmap/truncate so page faults do not
             // form an inode-lock/MM-lock ABBA with the truncate path.
             inode.metadata.size = len as i64;
-            (old_size, new_size, inode.page_cache.clone(), fs)
+            (old_size, new_size, inode.page_cache.clone())
         };
 
         if new_size < old_size {
             if let Some(pc) = page_cache {
                 pc.manager().resize(len)?;
             }
-
-            let tmpfs = fs
-                .as_any_ref()
-                .downcast_ref::<Tmpfs>()
-                .ok_or(SystemError::EIO)?;
-            tmpfs.decrease_size(old_size - new_size);
         }
 
         Ok(())
@@ -1095,7 +1106,186 @@ impl IndexNode for LockedTmpfsInode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         drop(data);
-        crate::filesystem::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
+        if mode != 0 {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if len == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+        if end > isize::MAX as usize {
+            return Err(SystemError::EFBIG);
+        }
+        crate::filesystem::vfs::vcore::check_file_size_limit(end)?;
+
+        let _size_guard = self.1.write();
+        let (page_cache, fs) = {
+            let inode = self.0.lock();
+            (
+                inode.page_cache.clone().ok_or(SystemError::EIO)?,
+                inode.fs.upgrade().ok_or(SystemError::EIO)?,
+            )
+        };
+        let first = offset >> MMArch::PAGE_SHIFT;
+        let last = (end - 1) >> MMArch::PAGE_SHIFT;
+        let mut created: Vec<(usize, Arc<Page>)> = Vec::new();
+        let missing_pages = page_cache.manager().missing_pages_in_range(first, last)?;
+        if fs
+            .available_pages()
+            .is_some_and(|available| missing_pages > available)
+        {
+            return Err(SystemError::ENOSPC);
+        }
+        created
+            .try_reserve_exact(missing_pages)
+            .map_err(|_| SystemError::ENOMEM)?;
+
+        for page_index in first..=last {
+            match page_cache
+                .manager()
+                .commit_overwrite_pinned_with_status(page_index)
+            {
+                Ok((pin, was_created)) => {
+                    if was_created {
+                        if created.len() == created.capacity() && created.try_reserve(1).is_err() {
+                            let current_page = pin.page();
+                            drop(pin);
+                            let _ = page_cache
+                                .manager()
+                                .discard_created_page(page_index, &current_page);
+                            for (created_index, created_page) in created.into_iter().rev() {
+                                let _ = page_cache
+                                    .manager()
+                                    .discard_created_page(created_index, &created_page);
+                            }
+                            return Err(SystemError::ENOMEM);
+                        }
+                        created.push((page_index, pin.page()));
+                    }
+                }
+                Err(error) => {
+                    for (created_index, created_page) in created.into_iter().rev() {
+                        let _ = page_cache
+                            .manager()
+                            .discard_created_page(created_index, &created_page);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        // Match Linux shmem_fallocate(): only after every page has been
+        // allocated successfully, apply the same write-side metadata effects
+        // as a regular file modification.  Build the update from the latest
+        // metadata while holding the inode lock so concurrent chmod/chown
+        // changes cannot be overwritten by a stale pre-allocation snapshot.
+        let cred = ProcessManager::current_pcb().cred();
+        let mut inode = self.0.lock();
+        let new_size = core::cmp::max(inode.metadata.size.max(0) as usize, end);
+        let (metadata, mask) =
+            crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                inode.metadata.clone(),
+                new_size,
+                &cred,
+            );
+        inode.metadata.size = metadata.size;
+        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
+        let _ = lock_owner;
+        Ok(())
+    }
+
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        const SHORT_SYMLINK_LEN: usize = 128;
+
+        if target
+            .len()
+            .checked_add(1)
+            .ok_or(SystemError::ENAMETOOLONG)?
+            > MMArch::PAGE_SIZE
+        {
+            return Err(SystemError::ENAMETOOLONG);
+        }
+
+        let name = DName::from(name);
+        let mut parent = self.0.lock();
+        tmpfs_require_live_dir(&parent)?;
+        if parent.children.contains_key(&name) {
+            return Err(SystemError::EEXIST);
+        }
+        // Revalidate local DAC while holding the same lock that protects the
+        // parent metadata and publishes the child. This is the tmpfs analogue
+        // of Linux holding the parent inode lock across may_create()+symlink.
+        if parent.metadata.flags.contains(InodeFlags::S_IMMUTABLE) {
+            return Err(SystemError::EPERM);
+        }
+        if ProcessManager::initialized() {
+            let cred = ProcessManager::current_pcb().cred();
+            cred.inode_permission(
+                &parent.metadata,
+                (crate::filesystem::vfs::permission::PermissionMask::MAY_WRITE
+                    | crate::filesystem::vfs::permission::PermissionMask::MAY_EXEC)
+                    .bits(),
+            )?;
+        }
+        let init = crate::filesystem::vfs::permission::child_inode_init(
+            &parent.metadata,
+            FileType::SymLink,
+            InodeMode::S_IRWXUGO,
+        );
+
+        let now = PosixTimeSpec::now();
+        let inline = target.len() < SHORT_SYMLINK_LEN;
+        let result = Arc::new(LockedTmpfsInode::new(TmpfsInode {
+            parent: parent.self_ref.clone(),
+            self_ref: Weak::default(),
+            children: BTreeMap::new(),
+            page_cache: None,
+            metadata: Metadata {
+                dev_id: 0,
+                inode_id: generate_inode_id(),
+                size: target.len() as i64,
+                blk_size: TMPFS_BLOCK_SIZE as usize,
+                blocks: if inline { 0 } else { 1 },
+                atime: now,
+                mtime: now,
+                ctime: now,
+                btime: now,
+                file_type: FileType::SymLink,
+                mode: init.mode,
+                flags: InodeFlags::empty(),
+                nlinks: 1,
+                uid: init.uid,
+                gid: init.gid,
+                raw_dev: DeviceNumber::default(),
+            },
+            fs: parent.fs.clone(),
+            special_node: None,
+            inline_symlink: inline.then(|| target.to_string()),
+            name: name.clone(),
+        }));
+        result.0.lock().self_ref = Arc::downgrade(&result);
+
+        if !inline {
+            let inode_dyn: Arc<dyn IndexNode> = result.clone();
+            let backend = Arc::new(TmpfsPageCacheBackend::new(
+                Arc::downgrade(&inode_dyn),
+                parent.fs.clone(),
+            ));
+            let page_cache = PageCache::new_shmem(Some(Arc::downgrade(&inode_dyn)), Some(backend));
+            result.0.lock().page_cache = Some(page_cache.clone());
+            let page = page_cache.manager().commit_overwrite(0)?;
+            let mut page_guard = page.write();
+            unsafe {
+                page_guard.as_slice_mut()[..target.len()].copy_from_slice(target.as_bytes());
+            }
+            page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
+            drop(page_guard);
+            page_cache.manager().update_page(0)?;
+        }
+
+        parent.children.insert(name, result.clone());
+        tmpfs_touch_dir(&mut parent, now);
+        Ok(result)
     }
 
     fn create_with_data(
@@ -1111,6 +1301,8 @@ impl IndexNode for LockedTmpfsInode {
         if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
+        let init =
+            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
 
         let now = PosixTimeSpec::now();
         let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode::new(TmpfsInode {
@@ -1129,15 +1321,16 @@ impl IndexNode for LockedTmpfsInode {
                 ctime: now,
                 btime: now,
                 file_type,
-                mode,
+                mode: init.mode,
                 flags: InodeFlags::empty(),
                 nlinks: if file_type == FileType::Dir { 2 } else { 1 },
-                uid: 0,
-                gid: 0,
+                uid: init.uid,
+                gid: init.gid,
                 raw_dev: DeviceNumber::from(data as u32),
             },
             fs: inode.fs.clone(),
             special_node: None,
+            inline_symlink: None,
             name: name.clone(),
         }));
 
@@ -1148,7 +1341,8 @@ impl IndexNode for LockedTmpfsInode {
         // 因此 symlink 也必须有 page_cache 后端，否则会在 write_at/read_at 返回 EIO。
         if file_type == FileType::File || file_type == FileType::SymLink {
             let backend = Arc::new(TmpfsPageCacheBackend::new(
-                Arc::downgrade(&result) as Weak<dyn IndexNode>
+                Arc::downgrade(&result) as Weak<dyn IndexNode>,
+                inode.fs.clone(),
             ));
             let pc = PageCache::new_shmem(
                 Some(Arc::downgrade(&result) as Weak<dyn IndexNode>),
@@ -1206,14 +1400,6 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::EPERM);
         }
 
-        // 获取文件大小，用于减少current_size
-        let file_size = deleted_inode.metadata.size as usize;
-        let fs = deleted_inode.fs.upgrade().ok_or(SystemError::EIO)?;
-        let tmpfs = fs
-            .as_any_ref()
-            .downcast_ref::<Tmpfs>()
-            .ok_or(SystemError::EIO)?;
-
         drop(deleted_inode);
 
         let mut deleted_guard = to_delete.0.lock();
@@ -1223,17 +1409,12 @@ impl IndexNode for LockedTmpfsInode {
             .checked_sub(1)
             .expect("tempfs nlinks underflow: filesystem corruption detected");
 
-        let should_free = deleted_guard.metadata.nlinks == 0;
         let now = PosixTimeSpec::now();
         deleted_guard.metadata.ctime = now;
         drop(deleted_guard);
 
         inode.children.remove(&name);
         tmpfs_touch_dir(&mut inode, now);
-
-        if should_free {
-            tmpfs.decrease_size(file_size);
-        }
 
         Ok(())
     }
@@ -1261,14 +1442,6 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::ENOTEMPTY);
         }
 
-        // 目录的大小通常是0（不包含数据），但为了完整性，我们也处理
-        let dir_size = deleted_inode.metadata.size as usize;
-        let fs = deleted_inode.fs.upgrade().ok_or(SystemError::EIO)?;
-        let tmpfs = fs
-            .as_any_ref()
-            .downcast_ref::<Tmpfs>()
-            .ok_or(SystemError::EIO)?;
-
         drop(deleted_inode);
         let now = PosixTimeSpec::now();
         let mut deleted_inode = to_delete.0.lock();
@@ -1278,9 +1451,6 @@ impl IndexNode for LockedTmpfsInode {
         inode.children.remove(&name);
         inode.metadata.nlinks -= 1;
         tmpfs_touch_dir(&mut inode, now);
-
-        // 减少文件系统使用的大小（目录通常大小为0）
-        tmpfs.decrease_size(dir_size);
 
         Ok(())
     }
@@ -1522,6 +1692,8 @@ impl IndexNode for LockedTmpfsInode {
             FileType::Socket => FileType::Socket,
             _ => return Err(SystemError::EINVAL),
         };
+        let init =
+            crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
 
         let now = PosixTimeSpec::now();
         let nod = Arc::new(LockedTmpfsInode::new(TmpfsInode {
@@ -1540,15 +1712,16 @@ impl IndexNode for LockedTmpfsInode {
                 ctime: now,
                 btime: now,
                 file_type,
-                mode,
+                mode: init.mode,
                 nlinks: 1,
-                uid: 0,
-                gid: 0,
+                uid: init.uid,
+                gid: init.gid,
                 raw_dev: dev_t,
                 flags: InodeFlags::empty(),
             },
             fs: inode.fs.clone(),
             special_node: None,
+            inline_symlink: None,
             name: filename.clone(),
         }));
 

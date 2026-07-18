@@ -15,6 +15,7 @@ chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 env_logger = "0.10"
 libc = "0.2"
+quick-xml = "0.39"
 
 [profile.release]
 lto = true

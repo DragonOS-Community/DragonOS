@@ -306,6 +306,10 @@ pub struct FuseNode {
     dax_pte_epoch: AtomicU64,
     cached_metadata_deadline_ticks: AtomicU64,
     attr_version: AtomicU64,
+    /// Serializes SETATTR requests and publication of their returned attrs.
+    /// FUSE daemons may process requests concurrently, so without this lock an
+    /// older reply can overwrite a newer inode metadata snapshot in the cache.
+    setattr_lock: Mutex<()>,
     /// Version chain produced while short READ replies from one metadata
     /// snapshot monotonically converge on the lowest observed EOF.
     short_read_source_attr_version: AtomicU64,
@@ -388,6 +392,7 @@ impl FuseNode {
             dax_pte_epoch: AtomicU64::new(0),
             cached_metadata_deadline_ticks: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             attr_version: AtomicU64::new(initial_attr_epoch),
+            setattr_lock: Mutex::new(()),
             short_read_source_attr_version: AtomicU64::new(0),
             short_read_chain_attr_version: AtomicU64::new(0),
             pending_short_read_eof: AtomicU64::new(u64::MAX),

@@ -3,7 +3,7 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use ida::IdAllocator;
 use system_error::SystemError;
 
@@ -490,18 +490,27 @@ pub(super) fn prepare_peer_registrations(
         let mut before_reserve = || Ok(());
         let current = try_snapshot_peer_group(group_id, &mut before_reserve)?;
         let mut members = Vec::new();
+        let final_capacity = current
+            .len()
+            .checked_add(index - start)
+            .ok_or(SystemError::ENOMEM)?;
         members
-            .try_reserve(current.len() + index - start)
+            .try_reserve(final_capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        // A shared bind can add tens of thousands of peers in one
+        // transaction. Deduplicating by scanning the growing vector makes
+        // this preflight quadratic and can hold the mount lifecycle lock for
+        // minutes. Mount IDs are the stable object identity within a boot, so
+        // keep publication order while using an O(1) membership index.
+        let mut member_ids = HashSet::new();
+        member_ids
+            .try_reserve(final_capacity)
             .map_err(|_| SystemError::ENOMEM)?;
         for member in current
             .iter()
             .chain(additions[start..index].iter().map(|(_, mount)| mount))
         {
-            if members.iter().any(|existing: &Weak<MountFS>| {
-                existing
-                    .upgrade()
-                    .is_some_and(|existing| Arc::ptr_eq(&existing, member))
-            }) {
+            if !member_ids.insert(member.mount_id().data()) {
                 continue;
             }
             members.push(Arc::downgrade(member));

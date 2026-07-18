@@ -53,10 +53,6 @@ pub enum ErrCode {
     ENODATA = 61,
     /// Not supported.
     ENOTSUP = 95,
-    /// Link failed.
-    ELINKFAIL = 97,
-    /// Inode alloc failed.
-    EALLOCFAIL = 98,
 }
 
 /// error used in this crate

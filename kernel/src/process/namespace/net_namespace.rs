@@ -9,7 +9,9 @@ use crate::net::routing::Router;
 use crate::net::socket::netlink::table::{
     generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
 };
-use crate::net::socket::packet::{PacketIngressMetadata, PacketSocket};
+use crate::net::socket::packet::{
+    membership_value, FanoutGroup, FanoutJoinParams, PacketIngressMetadata, PacketSocket,
+};
 use crate::net::socket::unix::ns::UnixAbstractTable;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
@@ -31,6 +33,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hashbrown::HashMap;
+use ida::IdAllocator;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -43,6 +46,9 @@ lazy_static! {
 /// 用于生成唯一的网络命名空间ID
 /// 每次创建新的网络命名空间时，都会增加这个计数器
 pub static mut NETNS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+const PACKET_SOCKET_CLEANUP_RETRY_MIN: Duration = Duration::from_millis(100);
+const PACKET_SOCKET_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[unified_init(INITCALL_SUBSYS)]
 pub fn root_net_namespace_init() -> Result<(), SystemError> {
@@ -81,8 +87,8 @@ pub struct NetNamespace {
     device_list: RwSem<BTreeMap<usize, Arc<dyn Iface>>>,
     /// Lock-free read-side snapshot for AF_PACKET delivery from NAPI context.
     packet_sockets: RcuArcSlot<PacketSocketRegistrySnapshot>,
-    /// Serializes copy-on-write registry updates in process context.
-    packet_sockets_writer: Mutex<()>,
+    /// Serializes all plain/fanout topology updates and owns group IDs.
+    packet_sockets_writer: Mutex<PacketSocketRegistryWriter>,
     packet_sockets_need_cleanup: AtomicBool,
     ///当前网络命名空间下的桥接设备列表
     bridge_list: RwSem<BTreeMap<String, Arc<BridgeDriver>>>,
@@ -108,6 +114,35 @@ pub struct NetNamespace {
 #[derive(Debug, Default)]
 struct PacketSocketRegistrySnapshot {
     sockets: Vec<Weak<PacketSocket>>,
+    groups: Vec<Arc<FanoutGroup>>,
+    live_receiver_count: usize,
+}
+
+#[derive(Debug)]
+struct PacketSocketRegistryWriter {
+    /// Authoritative `group id -> group` index used by the write path.
+    by_id: HashMap<u16, Arc<FanoutGroup>>,
+    /// Group id allocator. Reserves both UNIQUEID-allocated ids and explicit
+    /// ids so the two namespaces can never collide.
+    id_alloc: IdAllocator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketSocketCleanupResult {
+    Complete,
+    Pending,
+    AllocationFailed,
+}
+
+impl PacketSocketRegistryWriter {
+    fn new() -> Self {
+        // Group ids occupy the full u16 range; 0 is a valid explicit id.
+        Self {
+            by_id: HashMap::new(),
+            id_alloc: IdAllocator::new(0, u16::MAX as usize + 1)
+                .expect("fanout group id allocator"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +179,8 @@ struct NetnsPoller {
     /// 用于避免唤醒丢失：当 poll 线程正在 poll 时收到的唤醒请求会设置此标志，
     /// poll 线程在进入等待前会检查此标志
     poll_pending: AtomicBool,
+    /// Topology cleanup wakes the poller without being treated as network I/O.
+    cleanup_pending: AtomicBool,
     /// # 轮询线程的 PCB（用于 stop）
     thread: RwSem<Option<Arc<ProcessControlBlock>>>,
 }
@@ -154,6 +191,7 @@ impl NetnsPoller {
             netns,
             wait_queue: WaitQueue::default(),
             poll_pending: AtomicBool::new(false),
+            cleanup_pending: AtomicBool::new(false),
             thread: RwSem::new(None),
         })
     }
@@ -188,7 +226,22 @@ impl NetnsPoller {
         }
     }
 
+    fn notify_network(&self) -> (bool, usize) {
+        let was_pending = self.poll_pending.swap(true, Ordering::AcqRel);
+        let woken = self.wait_queue.wake_all();
+        (!was_pending, woken)
+    }
+
+    /// Wake only the topology-cleanup worker. This is safe from the NAPI read
+    /// path and deliberately does not turn cleanup into an interface poll.
+    fn notify_cleanup(&self) {
+        self.cleanup_pending.store(true, Ordering::Release);
+        self.wait_queue.wake_all();
+    }
+
     fn polling(&self) {
+        let mut cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
+        let mut cleanup_retry_at = None;
         loop {
             if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
                 break;
@@ -203,12 +256,31 @@ impl NetnsPoller {
             };
 
             let nsid = netns.ns_common.nsid.data();
-            netns.cleanup_packet_sockets();
             let now_us = Instant::now().total_micros() as u64;
+            if cleanup_retry_at.is_none_or(|deadline| now_us >= deadline) {
+                match netns.cleanup_packet_sockets() {
+                    PacketSocketCleanupResult::Complete => {
+                        cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
+                        cleanup_retry_at = None;
+                    }
+                    PacketSocketCleanupResult::Pending => {
+                        cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
+                        cleanup_retry_at = None;
+                    }
+                    PacketSocketCleanupResult::AllocationFailed => {
+                        cleanup_retry_at =
+                            Some(now_us.saturating_add(cleanup_retry_delay.total_micros()));
+                        cleanup_retry_delay = Duration::from_micros(core::cmp::min(
+                            cleanup_retry_delay.total_micros().saturating_mul(2),
+                            PACKET_SOCKET_CLEANUP_RETRY_MAX.total_micros(),
+                        ));
+                    }
+                }
+            }
 
             // 处理“已到期的定时事件”：到期则 schedule NAPI 推进一次。
             // 同时计算下一次最早到期时间点，用于设置 sleep 超时。
-            let mut next_us: Option<u64> = None;
+            let mut next_us = cleanup_retry_at;
             let mut had_due = false;
             for (_, iface) in netns.device_list.read().iter() {
                 if let Some(us) = iface.common().poll_at_us() {
@@ -252,9 +324,13 @@ impl NetnsPoller {
             drop(netns);
 
             // 等待事件唤醒（IRQ/lo Tx 等）或 timeout（smoltcp timer deadline）。
-            // cond 使用 swap(false) 原子消费一次 pending，避免丢唤醒。
+            // Keep cleanup and network wake reasons separate: only the latter
+            // should schedule interface NAPI below.
             let woke_by_event = match self.wait_queue.wait_event_uninterruptible_timeout(
-                || self.poll_pending.swap(false, Ordering::AcqRel),
+                || {
+                    self.poll_pending.load(Ordering::Acquire)
+                        || self.cleanup_pending.load(Ordering::Acquire)
+                },
                 timeout,
             ) {
                 Ok(()) => true,
@@ -266,8 +342,13 @@ impl NetnsPoller {
             };
 
             if woke_by_event {
+                let network_pending = self.poll_pending.swap(false, Ordering::AcqRel);
+                self.cleanup_pending.store(false, Ordering::Release);
                 if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
                     break;
+                }
+                if !network_pending {
+                    continue;
                 }
                 let netns = match self.netns.upgrade() {
                     Some(netns) => netns,
@@ -313,7 +394,7 @@ impl NetNamespace {
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
-            packet_sockets_writer: Mutex::new(()),
+            packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
@@ -352,7 +433,7 @@ impl NetNamespace {
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
-            packet_sockets_writer: Mutex::new(()),
+            packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
@@ -398,70 +479,377 @@ impl NetNamespace {
         self.device_list.read()
     }
 
-    pub fn register_packet_socket(&self, socket: Weak<PacketSocket>) {
-        let _guard = self.packet_sockets_writer.lock();
+    pub fn register_packet_socket(&self, socket: Weak<PacketSocket>) -> Result<(), SystemError> {
+        let writer = self.packet_sockets_writer.lock();
         let current = self.packet_sockets.load();
-        let mut sockets = current.sockets.clone();
-        sockets.retain(|entry| entry.strong_count() != 0);
+        let mut sockets = Vec::new();
+        sockets
+            .try_reserve_exact(current.sockets.len().saturating_add(1))
+            .map_err(|_| SystemError::ENOMEM)?;
+        sockets.extend(current.sockets.iter().cloned());
+        sockets.retain(|entry| entry.upgrade().is_some());
         if !sockets.iter().any(|entry| Weak::ptr_eq(entry, &socket)) {
             sockets.push(socket);
         }
-        self.packet_sockets
-            .store_deferred(Arc::new(PacketSocketRegistrySnapshot { sockets }));
-        self.packet_sockets_need_cleanup
-            .store(false, Ordering::Release);
+        let snapshot = self.prepare_packet_topology_update(&writer, sockets, None)?;
+        self.commit_packet_topology(snapshot);
+        Ok(())
     }
 
     pub fn unregister_packet_socket(&self, socket: &Weak<PacketSocket>) {
-        let _guard = self.packet_sockets_writer.lock();
-        let current = self.packet_sockets.load();
-        let mut sockets = current.sockets.clone();
-        sockets.retain(|entry| entry.strong_count() != 0 && !Weak::ptr_eq(entry, socket));
-        self.packet_sockets
-            .store_deferred(Arc::new(PacketSocketRegistrySnapshot { sockets }));
-        self.packet_sockets_need_cleanup
-            .store(false, Ordering::Release);
+        if let Some(socket) = socket.upgrade() {
+            socket.deactivate_packet_registry();
+        }
+        if self.try_unregister_packet_socket(socket).is_err() {
+            // close(2) cannot be retried after the fd is detached. Keep the
+            // old RCU snapshot valid, mark this member orphaned, and let the
+            // fallible poller cleanup retry without failing the close path.
+            if let Some(socket) = socket.upgrade() {
+                socket.clear_fanout_membership();
+            }
+            self.request_packet_socket_cleanup();
+        }
     }
 
-    fn cleanup_packet_sockets(&self) {
+    /// Coalesce stale-topology notifications and wake only the poller. Unlike
+    /// `wakeup_poll_thread`, this path never reads `device_list` from NAPI.
+    fn request_packet_socket_cleanup(&self) {
+        if !self
+            .packet_sockets_need_cleanup
+            .swap(true, Ordering::AcqRel)
+        {
+            self.poller.notify_cleanup();
+        }
+    }
+
+    fn try_unregister_packet_socket(&self, socket: &Weak<PacketSocket>) -> Result<(), SystemError> {
+        let socket_arc = socket.upgrade();
+        let group_id = socket_arc
+            .as_ref()
+            .and_then(|socket| socket.fanout_group_id());
+        let mut writer = self.packet_sockets_writer.lock();
+        let current = self.packet_sockets.load();
+        let mut sockets = Vec::new();
+        sockets
+            .try_reserve_exact(current.sockets.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        sockets.extend(current.sockets.iter().cloned());
+        sockets.retain(|entry| entry.upgrade().is_some() && !Weak::ptr_eq(entry, socket));
+
+        let update = match group_id.and_then(|id| writer.by_id.get(&id).map(|group| (id, group))) {
+            Some((id, group)) => Some((id, group.try_without_member(socket)?)),
+            None => None,
+        };
+        let snapshot = self.prepare_packet_topology_update(&writer, sockets, update.as_ref())?;
+        self.commit_packet_topology(snapshot);
+        if let Some((id, replacement)) = update {
+            if replacement.member_count() == 0 {
+                writer.by_id.remove(&id);
+                writer.id_alloc.free(id as usize);
+            } else {
+                writer.by_id.insert(id, replacement);
+            }
+        }
+        if let Some(socket) = socket_arc {
+            socket.clear_fanout_membership();
+        }
+        Ok(())
+    }
+
+    fn cleanup_packet_sockets(&self) -> PacketSocketCleanupResult {
         if !self
             .packet_sockets_need_cleanup
             .swap(false, Ordering::AcqRel)
         {
-            return;
+            return PacketSocketCleanupResult::Complete;
         }
-        let _guard = self.packet_sockets_writer.lock();
+        let mut writer = self.packet_sockets_writer.lock();
         let current = self.packet_sockets.load();
-        let mut sockets = current.sockets.clone();
-        sockets.retain(|entry| entry.strong_count() != 0);
-        self.packet_sockets
-            .store_deferred(Arc::new(PacketSocketRegistrySnapshot { sockets }));
+        let mut sockets = Vec::new();
+        if sockets.try_reserve_exact(current.sockets.len()).is_err() {
+            self.packet_sockets_need_cleanup
+                .store(true, Ordering::Release);
+            return PacketSocketCleanupResult::AllocationFailed;
+        }
+        sockets.extend(current.sockets.iter().cloned());
+        sockets.retain(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|socket| socket.is_packet_registry_active())
+        });
+
+        let mut groups = Vec::new();
+        let mut updates = Vec::new();
+        if groups.try_reserve_exact(writer.by_id.len()).is_err()
+            || updates.try_reserve_exact(writer.by_id.len()).is_err()
+        {
+            self.packet_sockets_need_cleanup
+                .store(true, Ordering::Release);
+            return PacketSocketCleanupResult::AllocationFailed;
+        }
+        for (id, group) in writer.by_id.iter() {
+            match group.try_without_dead_members() {
+                Ok(Some(cleaned)) => {
+                    if cleaned.member_count() != 0 {
+                        groups.push(cleaned.clone());
+                    }
+                    updates.push((*id, cleaned));
+                }
+                Ok(None) => groups.push(group.clone()),
+                Err(_) => {
+                    self.packet_sockets_need_cleanup
+                        .store(true, Ordering::Release);
+                    return PacketSocketCleanupResult::AllocationFailed;
+                }
+            }
+        }
+        let Ok(snapshot) = Self::try_packet_topology(sockets, groups) else {
+            self.packet_sockets_need_cleanup
+                .store(true, Ordering::Release);
+            return PacketSocketCleanupResult::AllocationFailed;
+        };
+        self.commit_packet_topology(snapshot);
+        for (id, replacement) in updates {
+            if replacement.member_count() == 0 {
+                writer.by_id.remove(&id);
+                writer.id_alloc.free(id as usize);
+            } else {
+                writer.by_id.insert(id, replacement);
+            }
+        }
+        if self.packet_sockets_need_cleanup.load(Ordering::Acquire) {
+            PacketSocketCleanupResult::Pending
+        } else {
+            PacketSocketCleanupResult::Complete
+        }
     }
 
     /// Deliver an ingress frame without taking a sleeping lock or allocating a
     /// temporary registry copy in the NAPI read-side path.
+    ///
+    /// The single snapshot contains both plain sockets and immutable fanout
+    /// groups, so a join/close transition cannot expose a socket in both (or
+    /// neither) topology to one reader.
     pub(crate) fn deliver_to_packet_sockets(&self, ingress: PacketIngressMetadata, frame: &[u8]) {
         let snapshot = self.packet_sockets.load();
         let mut stale = false;
         for socket in snapshot.sockets.iter() {
-            if let Some(socket) = socket.upgrade() {
-                socket.deliver(ingress, frame);
-            } else {
+            match socket.upgrade() {
+                Some(socket) if socket.is_packet_registry_active() => {
+                    socket.deliver(ingress, frame);
+                }
+                Some(_) | None => stale = true,
+            }
+        }
+        let mut protocol_cache = None;
+        let mut flow_hash_cache = None;
+        for group in snapshot.groups.iter() {
+            if group.deliver(ingress, frame, &mut protocol_cache, &mut flow_hash_cache) {
                 stale = true;
             }
         }
         if stale {
-            self.packet_sockets_need_cleanup
-                .store(true, Ordering::Release);
+            self.request_packet_socket_cleanup();
         }
     }
 
     pub fn has_packet_sockets(&self) -> bool {
-        self.packet_sockets
-            .load()
+        self.packet_sockets.load().live_receiver_count != 0
+    }
+
+    /// Join (creating if necessary) a fanout group.
+    ///
+    /// Move `socket` from the plain list into a group with one RCU publication.
+    /// The caller holds the socket bind lock, fixing the global lock order at
+    /// `bind_lock -> packet_sockets_writer`.
+    pub(crate) fn fanout_group_join(
+        &self,
+        socket: &Arc<PacketSocket>,
+        params: FanoutJoinParams,
+    ) -> Result<(), SystemError> {
+        let mut writer = self.packet_sockets_writer.lock();
+        if socket.has_fanout_group() {
+            return Err(SystemError::EALREADY);
+        }
+        let socket_ref = socket.self_ref();
+        let current = self.packet_sockets.load();
+        if !current
             .sockets
             .iter()
-            .any(|socket| socket.strong_count() != 0)
+            .any(|entry| Weak::ptr_eq(entry, &socket_ref))
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut reserved_new_id = None;
+        let group: Arc<FanoutGroup> = if params.unique {
+            writer
+                .by_id
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+            let new_id = writer.id_alloc.alloc().ok_or(SystemError::ENOMEM)? as u16;
+            reserved_new_id = Some(new_id);
+            let group = match FanoutGroup::try_new(new_id, params, socket_ref.clone()) {
+                Ok(group) => group,
+                Err(err) => {
+                    writer.id_alloc.free(new_id as usize);
+                    return Err(err);
+                }
+            };
+            group
+        } else {
+            match writer.by_id.get(&params.id_req).cloned() {
+                Some(mut existing) => {
+                    if let Some(compacted) = existing.try_without_dead_members()? {
+                        existing = compacted;
+                    }
+                    if existing.member_count() == 0 {
+                        FanoutGroup::try_new(params.id_req, params, socket_ref.clone())?
+                    } else {
+                        if !existing.matches(params) {
+                            return Err(SystemError::EINVAL);
+                        }
+                        if existing.member_count() >= existing.max_num_members() {
+                            return Err(SystemError::ENOSPC);
+                        }
+                        existing.try_with_member(socket_ref.clone())?
+                    }
+                }
+                None => {
+                    writer
+                        .by_id
+                        .try_reserve(1)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    if writer
+                        .id_alloc
+                        .alloc_specific(params.id_req as usize)
+                        .is_none()
+                    {
+                        return Err(SystemError::EINVAL);
+                    }
+                    reserved_new_id = Some(params.id_req);
+                    match FanoutGroup::try_new(params.id_req, params, socket_ref.clone()) {
+                        Ok(group) => group,
+                        Err(err) => {
+                            writer.id_alloc.free(params.id_req as usize);
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        };
+
+        let prepared = match self.prepare_fanout_join_snapshot(
+            &writer,
+            &current,
+            &socket_ref,
+            group.clone(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                if let Some(id) = reserved_new_id {
+                    writer.id_alloc.free(id as usize);
+                }
+                return Err(err);
+            }
+        };
+        self.commit_packet_topology(prepared);
+        writer.by_id.insert(group.id, group.clone());
+        socket.set_fanout_membership(membership_value(&group));
+        Ok(())
+    }
+
+    fn prepare_fanout_join_snapshot(
+        &self,
+        writer: &PacketSocketRegistryWriter,
+        current: &PacketSocketRegistrySnapshot,
+        socket: &Weak<PacketSocket>,
+        replacement: Arc<FanoutGroup>,
+    ) -> Result<Arc<PacketSocketRegistrySnapshot>, SystemError> {
+        let mut sockets = Vec::new();
+        sockets
+            .try_reserve_exact(current.sockets.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        sockets.extend(
+            current
+                .sockets
+                .iter()
+                .filter(|entry| !Weak::ptr_eq(entry, socket))
+                .cloned(),
+        );
+
+        let additional = usize::from(!writer.by_id.contains_key(&replacement.id));
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(writer.by_id.len().saturating_add(additional))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut replaced = false;
+        for (id, group) in writer.by_id.iter() {
+            if *id == replacement.id {
+                groups.push(replacement.clone());
+                replaced = true;
+            } else {
+                groups.push(group.clone());
+            }
+        }
+        if !replaced {
+            groups.push(replacement);
+        }
+        let live_receiver_count = sockets.len()
+            + groups
+                .iter()
+                .map(|group| group.member_count())
+                .sum::<usize>();
+        Arc::try_new(PacketSocketRegistrySnapshot {
+            sockets,
+            groups,
+            live_receiver_count,
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
+
+    fn prepare_packet_topology_update(
+        &self,
+        writer: &PacketSocketRegistryWriter,
+        sockets: Vec<Weak<PacketSocket>>,
+        update: Option<&(u16, Arc<FanoutGroup>)>,
+    ) -> Result<Arc<PacketSocketRegistrySnapshot>, SystemError> {
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(writer.by_id.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for (id, group) in writer.by_id.iter() {
+            match update {
+                Some((update_id, replacement)) if id == update_id => {
+                    if replacement.member_count() != 0 {
+                        groups.push(replacement.clone());
+                    }
+                }
+                _ => groups.push(group.clone()),
+            }
+        }
+        Self::try_packet_topology(sockets, groups)
+    }
+
+    fn try_packet_topology(
+        sockets: Vec<Weak<PacketSocket>>,
+        groups: Vec<Arc<FanoutGroup>>,
+    ) -> Result<Arc<PacketSocketRegistrySnapshot>, SystemError> {
+        let live_receiver_count = sockets.len()
+            + groups
+                .iter()
+                .map(|group| group.member_count())
+                .sum::<usize>();
+        Arc::try_new(PacketSocketRegistrySnapshot {
+            sockets,
+            groups,
+            live_receiver_count,
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
+
+    fn commit_packet_topology(&self, snapshot: Arc<PacketSocketRegistrySnapshot>) {
+        self.packet_sockets.store_deferred(snapshot);
     }
 
     #[inline]
@@ -568,11 +956,10 @@ impl NetNamespace {
     /// 使用原子标志确保即使 poll 线程正在执行也不会丢失唤醒请求
     pub fn wakeup_poll_thread(&self) {
         // 先设置 pending 标志，再唤醒：避免“先唤后睡/睡前漏信号”。
-        let was_pending = self.poller.poll_pending.swap(true, Ordering::AcqRel);
-        let woken = self.poller.wait_queue.wake_all();
+        let (newly_pending, woken) = self.poller.notify_network();
         // 事件驱动：对齐 Linux，尽量在事件发生后立刻 schedule NAPI（由 NAPI 线程 bounded poll 推进）。
         // 只在从“未 pending -> pending”这一跳触发一次，避免中断风暴下重复 schedule。
-        if !was_pending {
+        if newly_pending {
             for (_, iface) in self.device_list.read().iter() {
                 if let Some(napi) = iface.napi_struct() {
                     napi_schedule(napi);

@@ -49,6 +49,9 @@ impl PacketSocket {
             return Err(SystemError::ENODEV);
         }
         let _guard = self.bind_lock.lock();
+        if self.has_fanout_group() {
+            return Err(SystemError::EINVAL);
+        }
         let (old_index, old_protocol) = self.binding.load();
         let protocol = if requested_protocol == 0 {
             old_protocol

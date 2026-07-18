@@ -57,6 +57,12 @@ inline constexpr int kEthPAll = 0x0003;
 #ifndef PACKET_DROP_MEMBERSHIP
 #define PACKET_DROP_MEMBERSHIP 2
 #endif
+#ifndef PACKET_FANOUT
+#define PACKET_FANOUT 18
+#endif
+#ifndef PACKET_FANOUT_LB
+#define PACKET_FANOUT_LB 1
+#endif
 
 // mr_type constants for packet_mreq (corresponding to Linux if_packet.h)
 #ifndef PACKET_MR_PROMISC
@@ -547,6 +553,39 @@ TEST(AfPacketMcast, DuplicateMembershipAndCloseUseOneDeviceReference) {
     EXPECT_EQ(first_drop->promiscuity, first->promiscuity);
 
     fd.Reset();
+    auto closed = GetLinkSnapshot(route_fd.Get(), ifindex, ++seq);
+    ASSERT_TRUE(closed.has_value());
+    EXPECT_EQ(closed->promiscuity, baseline->promiscuity);
+}
+
+TEST(AfPacketMcast, FanoutCloseReleasesPromiscMembership) {
+    FdGuard packet_fd;
+    int ifindex = SetupMcastEnv(&packet_fd);
+    if (ifindex == -1) GTEST_SKIP() << "No usable NIC found";
+    ASSERT_NE(ifindex, -2) << ErrnoString(errno);
+    FdGuard route_fd(OpenRouteSocket());
+    ASSERT_GE(route_fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 150;
+    auto baseline = GetLinkSnapshot(route_fd.Get(), ifindex, ++seq);
+    ASSERT_TRUE(baseline.has_value());
+
+    PacketMreq mreq{};
+    mreq.mr_ifindex = ifindex;
+    mreq.mr_type = PACKET_MR_PROMISC;
+    ASSERT_EQ(setsockopt(packet_fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq,
+                         sizeof(mreq)),
+              0)
+        << ErrnoString(errno);
+
+    constexpr int kFanoutGroup = 0x5a30;
+    int fanout = (PACKET_FANOUT_LB << 16) | kFanoutGroup;
+    ASSERT_EQ(setsockopt(packet_fd.Get(), SOL_PACKET, PACKET_FANOUT, &fanout, sizeof(fanout)), 0)
+        << ErrnoString(errno);
+    auto active = GetLinkSnapshot(route_fd.Get(), ifindex, ++seq);
+    ASSERT_TRUE(active.has_value());
+    EXPECT_EQ(active->promiscuity, baseline->promiscuity + 1);
+
+    packet_fd.Reset();
     auto closed = GetLinkSnapshot(route_fd.Get(), ifindex, ++seq);
     ASSERT_TRUE(closed.has_value());
     EXPECT_EQ(closed->promiscuity, baseline->promiscuity);

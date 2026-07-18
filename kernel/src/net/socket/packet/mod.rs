@@ -1,6 +1,6 @@
 //! AF_PACKET sockets.
-
 mod binding;
+mod fanout;
 mod mreq;
 mod rx;
 mod sockopt;
@@ -26,10 +26,11 @@ use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::rcu::RcuOptionArcSlot;
 
+pub(crate) use fanout::{membership_value, FanoutGroup, FanoutJoinParams};
 #[allow(unused_imports)]
 pub use uapi::{
-    eth_protocol, packet_mreq_type, packet_option, PacketMreq, PacketType, SockAddrLl,
-    TpacketAuxdata,
+    eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,
+    PacketType, SockAddrLl, TpacketAuxdata,
 };
 
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
@@ -119,6 +120,12 @@ pub struct PacketSocket {
     pub(super) filter: RcuOptionArcSlot<Vec<SockFilter>>,
     /// Serializes SO_ATTACH_FILTER, SO_DETACH_FILTER, and SO_LOCK_FILTER.
     pub(super) filter_locked: Mutex<bool>,
+    /// Control-plane PACKET_FANOUT state: bit 32 marks active membership and
+    /// the low 32 bits are the Linux getsockopt encoding.
+    pub(super) fanout_membership: AtomicU64,
+    /// Writer/cleanup lifecycle marker. The NAPI delivery path uses this bit
+    /// to reject inactive entries retained by an older topology snapshot.
+    registry_active: AtomicBool,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
 }
@@ -158,16 +165,28 @@ impl PacketSocket {
             open_files: AtomicUsize::new(0),
             self_ref: me.clone(),
             netns,
+            fanout_membership: AtomicU64::new(0),
+            registry_active: AtomicBool::new(true),
             epoll_items: EPollItems::default(),
             filter: RcuOptionArcSlot::new_none(),
             filter_locked: Mutex::new(false),
             fasync_items: FAsyncItems::default(),
         });
-        socket.netns.register_packet_socket(socket.self_ref.clone());
+        socket
+            .netns
+            .register_packet_socket(socket.self_ref.clone())?;
         Ok(socket)
     }
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_packet_registry_active(&self) -> bool {
+        self.registry_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn deactivate_packet_registry(&self) {
+        self.registry_active.store(false, Ordering::Release);
     }
     /// Returns the configured receive timeout in scheduler ticks, or None for infinite wait.
     pub(super) fn recv_timeout_ticks(&self) -> Option<u64> {

@@ -701,33 +701,60 @@ impl ClassicBpfInput for PacketFilterInput<'_> {
     }
 }
 
+/// Parse the L3 ethertype and its byte offset within an Ethernet-II frame.
+///
+/// Handles 802.1Q (0x8100) and 802.1ad (0x88a8) VLAN tags by skipping the
+/// 4-byte tag to read the inner ethertype. Returns `None` if the frame is
+/// too short for a valid header.
+pub(super) fn l2_ethertype_l3_offset(frame: &[u8]) -> Option<(u16, usize)> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let outer = u16::from_be_bytes([frame[12], frame[13]]);
+    if outer == 0x8100 || outer == 0x88a8 {
+        if frame.len() < 18 {
+            return None;
+        }
+        Some((u16::from_be_bytes([frame[16], frame[17]]), 18))
+    } else {
+        Some((outer, 14))
+    }
+}
+
 fn parse_frame(frame: &[u8]) -> Option<ParsedFrame> {
     if frame.len() < 14 {
         return None;
     }
     let dst = frame[0..6].try_into().ok()?;
     let src = frame[6..12].try_into().ok()?;
-    let outer = u16::from_be_bytes([frame[12], frame[13]]);
-    if outer == 0x8100 || outer == 0x88a8 {
-        if frame.len() < 18 {
-            return None;
-        }
+    let (protocol, l3_off) = l2_ethertype_l3_offset(frame)?;
+    let vlan = if l3_off == 18 {
         let tci = u16::from_be_bytes([frame[14], frame[15]]);
-        let protocol = u16::from_be_bytes([frame[16], frame[17]]);
-        Some(ParsedFrame {
-            dst,
-            src,
-            protocol,
-            vlan: Some((tci, outer)),
-        })
+        let tpid = u16::from_be_bytes([frame[12], frame[13]]);
+        Some((tci, tpid))
     } else {
-        Some(ParsedFrame {
-            dst,
-            src,
-            protocol: outer,
-            vlan: None,
-        })
-    }
+        None
+    };
+    Some(ParsedFrame {
+        dst,
+        src,
+        protocol,
+        vlan,
+    })
+}
+
+/// Protocol as observed by the AF_PACKET hook. Incoming VLAN frames expose
+/// the inner protocol after VLAN normalization; outgoing taps retain the
+/// inline VLAN header and therefore expose the outer TPID.
+pub(crate) fn packet_protocol(frame: &[u8], pkt_type: PacketType) -> Option<u16> {
+    let parsed = parse_frame(frame)?;
+    Some(
+        if parsed.vlan.is_some() && pkt_type != PacketType::Outgoing {
+            parsed.protocol
+        } else {
+            parsed.vlan.map_or(parsed.protocol, |(_, tpid)| tpid)
+        },
+    )
 }
 
 impl PacketSocket {

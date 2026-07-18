@@ -28,6 +28,23 @@ impl PacketSocket {
         }
         Ok(i32::from_ne_bytes(value[..4].try_into().unwrap()))
     }
+
+    fn parse_fanout(value: &[u8]) -> Result<(u32, u32), SystemError> {
+        if value.len() != core::mem::size_of::<u32>()
+            && value.len() != 2 * core::mem::size_of::<u32>()
+        {
+            return Err(SystemError::EINVAL);
+        }
+        // Linux lays out the first four bytes so that native u32 decoding is
+        // always `id | type_flags << 16`, including big-endian targets.
+        let raw = u32::from_ne_bytes(value[..4].try_into().unwrap());
+        let max_num_members = if value.len() == 8 {
+            u32::from_ne_bytes(value[4..8].try_into().unwrap())
+        } else {
+            0
+        };
+        Ok((raw, max_num_members))
+    }
     pub(super) fn packet_option(
         &self,
         level: PSOL,
@@ -51,6 +68,11 @@ impl PacketSocket {
                     value,
                     self.options.read().auxdata as i32,
                 )),
+                packet_option::PACKET_FANOUT => {
+                    // Linux packet_getsockopt: an unjoined socket reports 0.
+                    let val = self.fanout_getsockopt_value().unwrap_or(0) as i32;
+                    Ok(write_i32_getsockopt(value, val))
+                }
                 _ => Err(SystemError::ENOPROTOOPT),
             },
             _ => Err(SystemError::ENOPROTOOPT),
@@ -71,6 +93,11 @@ impl PacketSocket {
                     self.options.write().auxdata = Self::parse_i32(value)? != 0;
                     Ok(())
                 }
+                packet_option::PACKET_FANOUT => {
+                    let (raw, max_num_members) = Self::parse_fanout(value)?;
+                    self.join_fanout(raw, max_num_members)
+                }
+                packet_option::PACKET_FANOUT_DATA => Err(SystemError::EINVAL),
                 _ => Ok(()),
             },
             // Preserve backward compatibility: unknown levels are silently accepted.

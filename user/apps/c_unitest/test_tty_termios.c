@@ -77,7 +77,7 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    struct termios t;
+    struct termios t = {};
 
     /* 1. tcgetattr + tcsetattr(TCSANOW) round-trip. */
     CHECK(tcgetattr(pts, &t) == 0, "tcgetattr on PTY slave");

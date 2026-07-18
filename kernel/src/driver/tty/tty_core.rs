@@ -466,12 +466,25 @@ impl TtyCore {
             )?;
         }
 
+        // Known limitation: a TOCTOU window exists between the final drain
+        // wait above and set_termios_next below. A concurrent writer can
+        // submit new output to the ldisc opost queue during this window,
+        // and the subsequent TERMIOS_FLUSH only flushes the input side
+        // (flush_buffer), so that output escapes drain+flush and gets
+        // transmitted under the new termios settings. Linux mitigates
+        // this by holding termios_rwsem for write across the entire
+        // set_termios call, but concurrent write() faces the same race
+        // there. This is an accepted design trade-off in DragonOS's
+        // non-blocking architecture.
+
         // TCSAFLUSH semantics: flush must happen AFTER drain so that
         // any input arriving during the drain is also discarded.
         // See tty-termios-drain-bugs.md B4.
         if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
             let ld = tty.ldisc();
-            let _ = ld.flush_buffer(tty.clone());
+            if let Err(e) = ld.flush_buffer(tty.clone()) {
+                log::warn!("flush_buffer failed during TCSAFLUSH: {:?}", e);
+            }
         }
 
         TtyCore::set_termios_next(tty, tmp_termios)?;

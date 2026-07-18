@@ -238,7 +238,7 @@ cfg_content='set timeout=15
     set default=0
     insmod efi_gop
     menuentry "DragonOS" {
-    multiboot2 /boot/kernel.elf init=/bin/dragonreach
+    multiboot2 /boot/kernel.elf init=/bin/busybox init
 }'
 # 增加insmod efi_gop防止32位uefi启动报错
 echo "echo '${cfg_content}' >  ${boot_folder}/grub/grub.cfg" | sh

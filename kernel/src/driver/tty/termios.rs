@@ -404,7 +404,7 @@ impl ControlMode {
 
     /// Get input baud rate from CIBAUD bits, falling back to output baud rate.
     pub fn input_baud_rate(&self) -> Option<u32> {
-        let ibaud = (self.bits() & Self::CIBAUD.bits()) >> CIBAUD_SHIFT;
+        let ibaud = (self.bits() & Self::CIBAUD.bits()) >> 16;
         if ibaud == 0 {
             self.baud_rate()
         } else {
@@ -414,9 +414,6 @@ impl ControlMode {
 }
 
 pub const NCC: usize = 8;
-
-/// Shift to extract input baud rate bits from c_cflag (CIBAUD = 0x100f0000).
-pub const CIBAUD_SHIFT: u32 = 16;
 
 /// Default c_line ABI value (N_TTY = 0).
 pub const INIT_C_LINE_ABI: u8 = 0;
@@ -432,11 +429,16 @@ pub struct PosixTermio {
     pub c_lflag: u16,
     pub c_line: u8,
     pub c_cc: [u8; NCC],
-    /// Explicit padding — eliminates the 1-byte implicit tail padding that
-    /// repr(C) would otherwise insert, preventing kernel stack leak via
-    /// TCGETA.  Default::default() zeros this field.
+    /// Explicit padding in place of repr(C) implicit tail padding.
+    /// Essential: `Default::default()` zeros this field, preventing kernel
+    /// stack data leak to userspace via TCGETA.
     pub(crate) _pad: u8,
 }
+
+// Compile-time guard: sizeof(PosixTermio) must be 18 to match C struct
+// termio on all supported ABIs.  If this fails on a new architecture,
+// the _pad field and/or repr alignment need adjustment.
+const _: () = assert!(core::mem::size_of::<PosixTermio>() == 18);
 
 impl PosixTermio {
     /// Convert kernel Termios → user-space termio.
@@ -466,6 +468,11 @@ impl PosixTermio {
         let mut cc = old.control_characters;
         cc[..NCC].copy_from_slice(&self.c_cc);
 
+        let control_mode = ControlMode::from_bits_truncate(
+            (old.control_mode.bits & 0xffff_0000) | self.c_cflag as u32,
+        );
+        let (input_speed, output_speed) = Self::speeds_from_cflag(control_mode);
+
         Termios {
             input_mode: InputMode::from_bits_truncate(
                 (old.input_mode.bits & 0xffff_0000) | self.c_iflag as u32,
@@ -473,17 +480,15 @@ impl PosixTermio {
             output_mode: OutputMode::from_bits_truncate(
                 (old.output_mode.bits & 0xffff_0000) | self.c_oflag as u32,
             ),
-            control_mode: ControlMode::from_bits_truncate(
-                (old.control_mode.bits & 0xffff_0000) | self.c_cflag as u32,
-            ),
+            control_mode,
             local_mode: LocalMode::from_bits_truncate(
                 (old.local_mode.bits & 0xffff_0000) | self.c_lflag as u32,
             ),
             control_characters: cc,
             line: LineDisciplineType::from_line(self.c_line),
             c_line_abi: self.c_line,
-            input_speed: old.input_speed,
-            output_speed: old.output_speed,
+            input_speed,
+            output_speed,
         }
     }
 

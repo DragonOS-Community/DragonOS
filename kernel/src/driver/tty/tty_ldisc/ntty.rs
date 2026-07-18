@@ -136,14 +136,14 @@ impl NTtyLinediscipline {
         }
     }
 
-    fn drain_echoes(&self, tty: &TtyCore) -> Result<(), SystemError> {
+    fn drain_echoes(&self, tty: &TtyCore) -> Result<bool, SystemError> {
         let core = tty.core();
         loop {
             while let Some(bytes) = { self.disc_data().echo_pending_bytes() } {
                 let written = tty.write(core, &bytes, bytes.len())?;
                 if written == 0 {
                     core.flags_write().insert(TtyFlag::DO_WRITE_WAKEUP);
-                    return Ok(());
+                    return Ok(false);
                 }
                 {
                     let mut guard = self.disc_data();
@@ -173,7 +173,7 @@ impl NTtyLinediscipline {
                             guard.set_echo_pending_step(step, sent);
                         }
                         core.flags_write().insert(TtyFlag::DO_WRITE_WAKEUP);
-                        return Ok(());
+                        return Ok(false);
                     }
                     sent += written;
                 }
@@ -189,7 +189,7 @@ impl NTtyLinediscipline {
         } else {
             core.flags_write().remove(TtyFlag::DO_WRITE_WAKEUP);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn packet_status_pending(core: &TtyCoreData, packet: bool) -> bool {
@@ -1821,14 +1821,15 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     }
 
     fn drain_output(&self, tty: Arc<TtyCore>) -> Result<bool, SystemError> {
-        if let Some(_output_guard) = self.output_lock.try_lock() {
-            let drained = self.drain_opost_pending(&tty)?;
-            self.drain_echoes(&tty)?;
-            Ok(drained)
-        } else {
-            // output_lock held by a concurrent writer; cannot drain opost.
-            Ok(false)
-        }
+        // Block on output_lock — a concurrent writer will release it once
+        // its output is submitted to the hardware, at which point we can
+        // drain the remaining opost/echo backlog.  Without blocking,
+        // TCSADRAIN can silently switch termios while a writer is still
+        // mid-flight (see tty-termios-drain-bugs.md B1).
+        let _output_guard = self.output_lock.lock();
+        let drained = self.drain_opost_pending(&tty)?;
+        let echo_drained = self.drain_echoes(&tty)?;
+        Ok(drained && echo_drained)
     }
 
     #[inline(never)]
@@ -2078,7 +2079,17 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let mut output_guard = Some(self.output_lock.lock());
 
         self.disc_data().process_echoes(tty.clone());
-        self.drain_echoes(&tty)?;
+        // Echo drain is best-effort in the write path; Ok(false) means
+        // the hardware FIFO was full and draining will be retried by
+        // write_wakeup once the FIFO has room (DO_WRITE_WAKEUP is set).
+        // Known limitation: this can add latency to echo output during
+        // heavy writes, but the alternative (retry loop here) risks
+        // starving the write path.
+        match self.drain_echoes(&tty) {
+            Ok(false) => log::debug!("drain_echoes incomplete in write (FIFO full)"),
+            Err(e) => log::debug!("drain_echoes failed in write: {:?}", e),
+            Ok(true) => {}
+        }
 
         let mut offset = 0;
         loop {
@@ -2540,7 +2551,9 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     fn write_wakeup(&self, tty: &TtyCore) -> Result<(), SystemError> {
         if let Some(_output_guard) = self.output_lock.try_lock() {
             if self.drain_opost_pending(tty)? {
-                self.drain_echoes(tty)?;
+                if let Err(e) = self.drain_echoes(tty) {
+                    log::debug!("drain_echoes failed in write_wakeup: {:?}", e);
+                }
             }
         }
         Ok(())
@@ -2588,7 +2601,9 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let ret = ldata.receive_buf_common(tty.clone(), buf, flags, count, false);
         drop(ldata);
         if let Some(_output_guard) = self.output_lock.try_lock() {
-            self.drain_echoes(&tty)?;
+            if let Err(e) = self.drain_echoes(&tty) {
+                log::debug!("drain_echoes failed in receive_buf: {:?}", e);
+            }
         }
         ret
     }
@@ -2604,7 +2619,9 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let ret = ldata.receive_buf_common(tty.clone(), buf, flags, count, true);
         drop(ldata);
         if let Some(_output_guard) = self.output_lock.try_lock() {
-            self.drain_echoes(&tty)?;
+            if let Err(e) = self.drain_echoes(&tty) {
+                log::debug!("drain_echoes failed in receive_buf2: {:?}", e);
+            }
         }
         ret
     }

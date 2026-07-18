@@ -367,6 +367,9 @@ impl TtyCore {
     }
 
     pub fn tty_perform_flush(tty: Arc<TtyCore>, arg: usize) -> Result<usize, SystemError> {
+        // Job control check for TCFLSH ioctl.  This is a separate path
+        // from core_set_termios (termios ioctls); the two are never
+        // invoked concurrently for the same operation.
         TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
 
         match arg {
@@ -396,6 +399,8 @@ impl TtyCore {
         // Check job control: prevent background process groups from changing
         // terminal attributes without permission.  Matches Linux 6.6
         // set_termios() which calls tty_check_change() before any work.
+        // This path is separate from tty_perform_flush (TCFLSH ioctl);
+        // the two never overlap in a single operation.
         TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
 
         #[allow(unused_assignments)]
@@ -411,12 +416,6 @@ impl TtyCore {
             let mut termio = PosixTermio::default();
             user_reader.copy_one_from_user(&mut termio, 0)?;
             tmp_termios = termio.to_kernel_termios(&tmp_termios);
-            // termio carries no speed fields; derive speeds from the merged
-            // c_cflag exactly as Linux set_termios() does after
-            // user_termio_to_kernel_termios().
-            let (ispeed, ospeed) = PosixTermio::speeds_from_cflag(tmp_termios.control_mode);
-            tmp_termios.input_speed = ispeed;
-            tmp_termios.output_speed = ospeed;
         } else {
             let user_reader = UserBufferReader::new(
                 arg.as_ptr::<PosixTermios>(),
@@ -430,53 +429,49 @@ impl TtyCore {
             tmp_termios = term.to_kernel_termios();
         }
 
+        if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
+            let ld = tty.ldisc();
+            let write_wq = tty.core().write_wq();
+            let core_ref = tty.core();
+
+            // Drain N_TTY output-processing and echo backlog.
+            // drain_output blocks on output_lock; when the hardware FIFO
+            // is full, drain_output returns Ok(false) — loop until both
+            // ldisc queues are fully drained.
+            //
+            // On PTY, chars_in_buffer always returns 0, so the
+            // wait_event_interruptible below returns immediately.
+            // The loop still converges: drain_output serialises via
+            // output_lock, and the PTY master consumes data
+            // asynchronously so the next drain_output pass sees an
+            // empty FIFO.
+            loop {
+                if ld.drain_output(tty.clone())? {
+                    break;
+                }
+                // Hardware FIFO was full — wait for it to drain before
+                // re-draining ldisc.  Signal-interrupted waits propagate
+                // ERESTARTSYS so that Ctrl+C does not silently apply the
+                // new termios (matches Linux behaviour).
+                write_wq.wait_event_interruptible(
+                    (EPollEventType::EPOLLOUT.bits() | EPollEventType::EPOLLWRNORM.bits()) as u64,
+                    || tty.chars_in_buffer(core_ref) == 0,
+                )?;
+            }
+            // Final wait: ensure all hardware FIFOs are empty.
+            // Returns immediately on PTY (chars_in_buffer == 0).
+            write_wq.wait_event_interruptible(
+                (EPollEventType::EPOLLOUT.bits() | EPollEventType::EPOLLWRNORM.bits()) as u64,
+                || tty.chars_in_buffer(core_ref) == 0,
+            )?;
+        }
+
+        // TCSAFLUSH semantics: flush must happen AFTER drain so that
+        // any input arriving during the drain is also discarded.
+        // See tty-termios-drain-bugs.md B4.
         if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
             let ld = tty.ldisc();
             let _ = ld.flush_buffer(tty.clone());
-        }
-
-        if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
-            let ld = tty.ldisc();
-
-            // Retry drain_output while output_lock is held by a concurrent
-            // writer.  Bounded to prevent indefinite stall.
-            // TODO: use wait_event on output_lock release instead of fixed retries
-            //       (tracked at issue/TERMIOS_WAIT_drain).
-            const DRAIN_RETRIES: u32 = 32;
-            let mut ldisc_drained = false;
-            for _ in 0..DRAIN_RETRIES {
-                match ld.drain_output(tty.clone()) {
-                    Ok(true) => {
-                        ldisc_drained = true;
-                        break;
-                    }
-                    Ok(false) => {
-                        crate::sched::sched_yield();
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            if !ldisc_drained {
-                log::debug!(
-                    "TERMIOS_WAIT: output_lock held for {} retries, proceeding without full ldisc drain",
-                    DRAIN_RETRIES
-                );
-            }
-
-            // Event-driven wait for hardware FIFO drain via write_wq.
-            // On PTY, chars_in_buffer returns 0 immediately.
-            //
-            // Return value ignored intentionally: Linux tty_wait_until_sent()
-            // does not propagate errors to the tcsetattr caller either.
-            // A signal-interrupted wait still leaves the drain in a
-            // best-effort state; the caller gets the new termios regardless.
-            // TODO: add wait_event_interruptible_timeout for hung-hardware scenarios.
-            let write_wq = tty.core().write_wq();
-            let core_ref = tty.core();
-            let _ = write_wq.wait_event_interruptible(
-                (EPollEventType::EPOLLOUT.bits() | EPollEventType::EPOLLWRNORM.bits()) as u64,
-                || tty.chars_in_buffer(core_ref) == 0,
-            );
         }
 
         TtyCore::set_termios_next(tty, tmp_termios)?;

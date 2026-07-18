@@ -25,10 +25,20 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
         Ok(())
     }
 
-    /// Drain pending ldisc output (opost + echo) without blocking indefinitely.
+    /// Drain pending ldisc output (opost + echo), blocking until complete.
+    ///
     /// Returns `Ok(true)` when everything was drained, `Ok(false)` when
-    /// the output lock was held by a concurrent writer and drain could not
-    /// be performed.
+    /// output could not be fully drained (e.g. hardware FIFO full).
+    ///
+    /// Callers MUST loop on `Ok(false)`: wait for hardware write readiness,
+    /// then call `drain_output` again until it returns `Ok(true)`.  See
+    /// `core_set_termios` for the canonical retry pattern.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(true)`.  **Line disciplines that have their own output
+    /// queues (opost / echo) MUST override this method.**  The default
+    /// causes TCSADRAIN to silently skip draining for undiscovered ldiscs.
     fn drain_output(&self, _tty: Arc<TtyCore>) -> Result<bool, SystemError> {
         Ok(true)
     }
@@ -101,13 +111,19 @@ pub enum LineDisciplineType {
 }
 
 impl LineDisciplineType {
+    /// Convert a raw c_line ABI byte to a LineDisciplineType.
+    ///
+    /// NOTE: this accepts u8 rather than LineDisciplineType, so adding
+    /// new enum variants (e.g. `Ppp = 1`) will NOT trigger a compiler
+    /// error here.  When extending the enum, update this match arm
+    /// to map the new variant(s).
     pub fn from_line(line: u8) -> Self {
         match line {
             0 => Self::NTty,
             // Unknown / unsupported line disciplines fall back to NTty,
             // matching Linux behaviour (N_TTY is the default).
             _ => {
-                log::debug!("LineDisciplineType::from_line: unknown line discipline {}, falling back to NTty", line);
+                log::warn!("LineDisciplineType::from_line: unknown line discipline {}, falling back to NTty", line);
                 Self::NTty
             }
         }

@@ -25,6 +25,7 @@ struct TermioCompat {
     unsigned short c_lflag;
     unsigned char c_line;
     unsigned char c_cc[kNcc];
+    unsigned char _pad = 0;  /* match kernel PosixTermio layout */
 };
 
 #ifndef TCGETA
@@ -126,7 +127,6 @@ TEST(TtyTermios, TcSanowRoundTrip) {
     ASSERT_EQ(tcgetattr(pty.slave.get(), &back), 0) << strerror(errno);
     EXPECT_EQ(back.c_lflag & (ICANON | ECHO), 0u)
         << "TCSANOW settings should survive";
-    t.c_lflag = orig;
 }
 
 /* --------------------------------------------------------------------------
@@ -215,6 +215,24 @@ TEST(TtyTermios, TermioLow16Bits) {
 }
 
 /* --------------------------------------------------------------------------
+ * c_line round-trip: non-zero c_line survives TCSETA → TCGETA
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, CLinelRoundtrip) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    TermioCompat tio = {};
+    tio.c_line = 42;
+    ASSERT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
+        << "TCSETA with c_line=42";
+
+    TermioCompat tio2 = {};
+    ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &tio2), 0);
+    EXPECT_EQ(tio2.c_line, 42u)
+        << "c_line should survive termio round-trip";
+}
+
+/* --------------------------------------------------------------------------
  * Merge semantics: high 16 bits of c_cflag survive a TCSETA call
  * -------------------------------------------------------------------------- */
 TEST(TtyTermios, TermioMergeHighBits) {
@@ -227,6 +245,11 @@ TEST(TtyTermios, TermioMergeHighBits) {
 
     TermioCompat tio = {};
     ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &tio), 0);
+    /* Set a flag bit we know is currently clear so the subsequent
+     * clear of that bit is a real operation, not a no-op. */
+    tio.c_lflag |= ECHO;
+    ASSERT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
+        << "TCSETA set ECHO before merge check";
     tio.c_lflag &= ~static_cast<unsigned short>(ECHO); /* flip a low-16-bit flag */
 
     ASSERT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
@@ -251,9 +274,10 @@ TEST(TtyTermios, NonTtyFails) {
     }
     errno = 0;
     int rc = tcsetattr(fd, TCSANOW, &t);
+    int saved_errno = errno;
     close(fd);
     EXPECT_EQ(rc, -1) << "tcsetattr on non-TTY fd should fail";
-    EXPECT_NE(errno, 0) << "tcsetattr on non-TTY fd should set errno";
+    EXPECT_NE(saved_errno, 0) << "tcsetattr on non-TTY fd should set errno";
 }
 
 }  // namespace

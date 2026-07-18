@@ -504,14 +504,7 @@ impl NTtyData {
             todo!()
         } else {
             if look_ahead > 0 {
-                self.receive_buf_standard(
-                    tty.clone(),
-                    &termios,
-                    buf,
-                    flags,
-                    look_ahead,
-                    true,
-                );
+                self.receive_buf_standard(tty.clone(), &termios, buf, flags, look_ahead, true);
             }
 
             if count > look_ahead {
@@ -1027,13 +1020,7 @@ impl NTtyData {
     }
 
     /// ## 接收到信号字符时的处理
-    fn recv_sig_char(
-        &mut self,
-        tty: Arc<TtyCore>,
-        termios: &Termios,
-        signal: Signal,
-        c: u8,
-    ) {
+    fn recv_sig_char(&mut self, tty: Arc<TtyCore>, termios: &Termios, signal: Signal, c: u8) {
         self.input_signal(tty.clone(), termios, signal);
         if termios.input_mode.contains(InputMode::IXON) {
             tty.tty_start();
@@ -1048,12 +1035,7 @@ impl NTtyData {
     }
 
     /// ## 处理输入信号
-    pub fn input_signal(
-        &mut self,
-        tty: Arc<TtyCore>,
-        termios: &Termios,
-        signal: Signal,
-    ) {
+    pub fn input_signal(&mut self, tty: Arc<TtyCore>, termios: &Termios, signal: Signal) {
         // 先处理信号
         let ctrl_info = tty.core().contorl_info_irqsave();
         let pg = ctrl_info.pgid.clone();

@@ -95,7 +95,6 @@ impl<T> SpinLock<T> {
     /// 注意：该接口不关硬中断；若同一把锁也会在 hardirq 获取，则必须用 `lock_irqsave()`。
     pub fn lock_bh(&self) -> SpinLockBhGuard<'_, T> {
         let bh = local_bh_disable();
-        // `local_bh_disable()` 不禁用抢占，由 `lock()` 来禁用
         let guard = self.lock();
         SpinLockBhGuard { bh, guard }
     }

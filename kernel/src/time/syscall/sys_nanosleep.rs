@@ -1,8 +1,13 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_NANOSLEEP;
+use crate::ipc::signal::{RestartBlock, RestartBlockData, RestartFnNanosleep};
+use crate::mm::VirtAddr;
+use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use crate::time::sleep::nanosleep;
+use crate::time::syscall::PosixClockID;
+use crate::time::timekeeping::monotonic_now;
 use crate::time::PosixTimeSpec;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -30,30 +35,43 @@ impl Syscall for SysNanosleep {
             core::mem::size_of::<PosixTimeSpec>(),
             true,
         )?;
-        let rm_time_ptr = Self::rm_time(args);
-        let mut rm_time_writer = if !rm_time_ptr.is_null() {
-            Some(UserBufferWriter::new(
-                rm_time_ptr,
-                core::mem::size_of::<PosixTimeSpec>(),
-                true,
-            )?)
-        } else {
-            None
-        };
-
         let sleep_time = sleep_time_reader.read_one_from_user::<PosixTimeSpec>(0)?;
 
         let slt_spec = PosixTimeSpec {
             tv_sec: sleep_time.tv_sec,
             tv_nsec: sleep_time.tv_nsec,
         };
-        let r = nanosleep(slt_spec)?;
-        if let Some(ref mut rm_time) = rm_time_writer {
-            // 如果rm_time不为null，则将剩余时间写入rm_time
-            rm_time.copy_one_to_user(&r, 0)?;
+        if !slt_spec.is_valid_timeout() {
+            return Err(SystemError::EINVAL);
         }
 
-        return Ok(0);
+        let deadline = monotonic_now().saturating_add_ktime(&slt_spec);
+        // Linux only writes `rem` when the sleep is interrupted. A successful
+        // nanosleep must leave the user buffer untouched.
+        match nanosleep(slt_spec) {
+            Ok(()) => return Ok(0),
+            Err(SystemError::ERESTARTSYS) => {}
+            Err(error) => return Err(error),
+        }
+
+        let rmtp = if Self::rm_time(args).is_null() {
+            None
+        } else {
+            Some(VirtAddr::new(Self::rm_time(args) as usize))
+        };
+        let remaining = deadline.saturating_sub_timespec(&monotonic_now());
+        if let Some(rmtp) = rmtp {
+            let mut writer = UserBufferWriter::new(
+                rmtp.as_ptr::<PosixTimeSpec>(),
+                core::mem::size_of::<PosixTimeSpec>(),
+                true,
+            )?;
+            writer.copy_one_to_user(&remaining, 0)?;
+        }
+
+        let data = RestartBlockData::new_nanosleep(deadline, PosixClockID::Monotonic, rmtp);
+        let restart = RestartBlock::new(&RestartFnNanosleep, data);
+        ProcessManager::current_pcb().set_restart_fn(Some(restart))
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

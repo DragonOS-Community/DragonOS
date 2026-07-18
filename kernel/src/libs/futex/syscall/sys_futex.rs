@@ -205,28 +205,23 @@ pub(super) fn do_futex(
             // 这里将绝对截止时间转换为相对剩余时间，past 则立即 ETIMEDOUT。
             let adjusted_timeout = if let Some(deadline) = timeout {
                 // 校验 timespec 合法性
-                if deadline.tv_nsec < 0 || deadline.tv_nsec >= 1_000_000_000 {
+                if !deadline.is_valid_timeout() {
                     return Err(SystemError::EINVAL);
                 }
 
-                // 选择时钟：若带 FUTEX_CLOCK_REALTIME 则使用 realtime；否则使用 monotonic（当前实现等价）
-                let now = crate::time::timekeeping::getnstimeofday();
+                let now = if flags.contains(FutexFlag::FLAGS_CLOCKRT) {
+                    crate::time::timekeeping::realtime_now()
+                } else {
+                    crate::time::timekeeping::monotonic_now()
+                };
 
                 // 计算剩余时间 = deadline - now，若 <=0 则立即超时
-                let mut sec = deadline.tv_sec - now.tv_sec;
-                let mut nsec = deadline.tv_nsec - now.tv_nsec;
-                if nsec < 0 {
-                    nsec += 1_000_000_000;
-                    sec -= 1;
-                }
-                if sec < 0 || (sec == 0 && nsec == 0) {
+                let remaining = deadline.saturating_sub_timespec(&now);
+                if remaining.is_empty() {
                     return Err(SystemError::ETIMEDOUT);
                 }
 
-                Some(PosixTimeSpec {
-                    tv_sec: sec,
-                    tv_nsec: nsec,
-                })
+                Some(remaining)
             } else {
                 None
             };

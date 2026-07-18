@@ -1,4 +1,7 @@
-use core::sync::atomic::AtomicU32;
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicI32, AtomicU32, Ordering},
+};
 
 use alloc::{sync::Arc, vec::Vec};
 use log::{debug, error, info};
@@ -16,6 +19,9 @@ use super::{core::smp_get_processor_id, SMPArch};
 
 int_like!(ProcessorId, AtomicProcessorId, u32, AtomicU32);
 
+const AP_BRINGUP_RESULT_PENDING: i32 = 0;
+const AP_BRINGUP_RESULT_SUCCESS: i32 = 1;
+
 impl ProcessorId {
     pub const INVALID: ProcessorId = ProcessorId::new(u32::MAX);
 }
@@ -32,41 +38,59 @@ pub fn smp_cpu_manager() -> &'static SmpCpuManager {
     unsafe { SMP_CPU_MANAGER.as_ref().unwrap() }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuHpState {
-    /// 启动阈值
-    ThresholdBringUp = 0,
-
     /// 该CPU是离线的
-    Offline,
+    Offline = 0,
+
+    /// BSP 已经发起启动，但 AP 尚未完成初始化。
+    Starting,
 
     /// 该CPU是在线的
     Online,
+
+    /// AP 已经运行并在初始化失败后进入终止 park，不能按 Offline 重试。
+    FailedParked,
+}
+
+struct CpuHpControl {
+    /// BSP 期望达到的目标状态。
+    target_state: CpuHpState,
+    /// 当前是否为启动流程。
+    bringup: bool,
 }
 
 /// Per-Cpu Cpu的热插拔状态
 pub struct CpuHpCpuState {
-    /// 当前状态
-    state: CpuHpState,
-    /// 目标状态
-    target_state: CpuHpState,
+    /// 跨 CPU 发布的生命周期状态。
+    state: AtomicU32,
     /// 指向热插拔的线程的PCB
     thread: Option<Arc<ProcessControlBlock>>,
-
-    /// 当前是否为启动流程
-    bringup: bool,
+    /// 仅由 BSP/hotplug coordinator 访问的普通控制字段。
+    control: UnsafeCell<CpuHpControl>,
     /// 启动完成的信号
     comp_done_up: Completion,
+    /// AP 初始化结果。AP 仅发布该原子消息，普通热插拔状态仍由 BSP 独占更新。
+    bringup_result: AtomicI32,
 }
+
+// SAFETY: `state`, `bringup_result` and `comp_done_up` provide their own
+// synchronization. `control` is private and is only accessed by the single
+// BSP hotplug coordinator; APs never read or write it.
+unsafe impl Sync for CpuHpCpuState {}
 
 impl CpuHpCpuState {
     const fn new() -> Self {
         Self {
-            state: CpuHpState::Offline,
-            target_state: CpuHpState::Offline,
+            state: AtomicU32::new(CpuHpState::Offline as u32),
             thread: None,
-            bringup: false,
+            control: UnsafeCell::new(CpuHpControl {
+                target_state: CpuHpState::Offline,
+                bringup: false,
+            }),
             comp_done_up: Completion::new(),
+            bringup_result: AtomicI32::new(AP_BRINGUP_RESULT_PENDING),
         }
     }
 
@@ -77,8 +101,28 @@ impl CpuHpCpuState {
 
     #[inline]
     #[allow(dead_code)]
-    pub const fn state(&self) -> CpuHpState {
-        self.state
+    pub fn state(&self) -> CpuHpState {
+        match self.state.load(Ordering::Acquire) {
+            value if value == CpuHpState::Offline as u32 => CpuHpState::Offline,
+            value if value == CpuHpState::Starting as u32 => CpuHpState::Starting,
+            value if value == CpuHpState::Online as u32 => CpuHpState::Online,
+            value if value == CpuHpState::FailedParked as u32 => CpuHpState::FailedParked,
+            _ => CpuHpState::FailedParked,
+        }
+    }
+
+    #[inline]
+    fn publish_state(&self, state: CpuHpState) {
+        self.state.store(state as u32, Ordering::Release);
+    }
+
+    /// # Safety
+    ///
+    /// Only the BSP/hotplug coordinator may access this object, and bring-up
+    /// transactions for one CPU must remain serialized.
+    #[inline]
+    unsafe fn bsp_control_mut(&self) -> &mut CpuHpControl {
+        unsafe { &mut *self.control.get() }
     }
 }
 
@@ -175,42 +219,19 @@ impl SmpCpuManager {
         unsafe { self.cpuhp_state.force_get(cpu_id) }
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn cpuhp_state_mut(&self, cpu_id: ProcessorId) -> &mut CpuHpCpuState {
-        unsafe { self.cpuhp_state.force_get_mut(cpu_id) }
-    }
-
-    /// 设置CPU的状态, 返回旧的状态
-    pub unsafe fn set_cpuhp_state(
-        &self,
-        cpu_id: ProcessorId,
-        target_state: CpuHpState,
-    ) -> CpuHpState {
-        let p = self.cpuhp_state.force_get_mut(cpu_id);
-        let old_state = p.state;
-
-        let bringup = target_state > p.state;
-        p.target_state = target_state;
-        p.bringup = bringup;
-
-        return old_state;
-    }
-
     pub fn set_online_cpu(&self, cpu_id: ProcessorId, is_online: bool) {
         let target_state = if is_online {
             CpuHpState::Online
         } else {
             CpuHpState::Offline
         };
-
-        unsafe { self.set_cpuhp_state(cpu_id, target_state) };
-        self.cpuhp_state_mut(cpu_id).state = target_state;
+        self.cpuhp_state(cpu_id).publish_state(target_state);
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn is_online_cpu(&self, cpu_id: ProcessorId) -> bool {
-        self.cpuhp_state(cpu_id).state == CpuHpState::Online
+        self.cpuhp_state(cpu_id).state.load(Ordering::Acquire) == CpuHpState::Online as u32
     }
 
     /// 获取出现在系统中的CPU
@@ -241,25 +262,22 @@ impl SmpCpuManager {
             return Err(SystemError::EINVAL);
         }
 
-        let cpu_state = self.cpuhp_state(cpu_id).state;
+        let cpu_state = self.cpuhp_state(cpu_id).state();
         debug!(
             "cpu_up: cpu_id: {}, cpu_state: {:?}, target_state: {:?}",
             cpu_id.data(),
             cpu_state,
             target_state
         );
-        // 如果CPU的状态已经达到或者超过目标状态，则直接返回
-        if cpu_state >= target_state {
-            return Ok(());
+        match cpu_state {
+            CpuHpState::Online if target_state == CpuHpState::Online => return Ok(()),
+            CpuHpState::Offline => {}
+            CpuHpState::Starting | CpuHpState::FailedParked | CpuHpState::Online => {
+                return Err(SystemError::EBUSY)
+            }
         }
 
-        unsafe { self.set_cpuhp_state(cpu_id, target_state) };
-        let cpu_state = self.cpuhp_state(cpu_id).state;
-        if cpu_state > CpuHpState::ThresholdBringUp {
-            self.cpuhp_kick_ap(cpu_id, target_state)?;
-        }
-
-        return Ok(());
+        self.cpuhp_kick_ap(cpu_id, target_state)
     }
 
     fn cpuhp_kick_ap(
@@ -267,61 +285,95 @@ impl SmpCpuManager {
         cpu_id: ProcessorId,
         target_state: CpuHpState,
     ) -> Result<(), SystemError> {
-        let prev_state = unsafe { self.set_cpuhp_state(cpu_id, target_state) };
-        let hpstate = self.cpuhp_state_mut(cpu_id);
-        if let Err(e) = self.do_cpuhp_kick_ap(hpstate) {
-            self.cpuhp_reset_state(hpstate, prev_state);
-            self.do_cpuhp_kick_ap(hpstate).ok();
+        let cpu_state = self.cpuhp_state(cpu_id);
+        let prev_state = cpu_state.state();
+        unsafe {
+            let control = cpu_state.bsp_control_mut();
+            control.target_state = target_state;
+            control.bringup = true;
+        }
+        cpu_state.publish_state(CpuHpState::Starting);
 
+        if let Err(e) = self.do_cpuhp_kick_ap(cpu_id) {
+            let ap_parked = cpu_state.bringup_result.load(Ordering::Acquire) < 0;
+            cpu_state.publish_state(if ap_parked {
+                CpuHpState::FailedParked
+            } else {
+                prev_state
+            });
+            unsafe {
+                let control = cpu_state.bsp_control_mut();
+                control.target_state = prev_state;
+                control.bringup = false;
+            }
             return Err(e);
         }
 
-        return Ok(());
+        cpu_state.publish_state(target_state);
+        unsafe {
+            cpu_state.bsp_control_mut().bringup = false;
+        }
+
+        Ok(())
     }
 
-    fn do_cpuhp_kick_ap(&self, cpu_state: &mut CpuHpCpuState) -> Result<(), SystemError> {
+    fn do_cpuhp_kick_ap(&self, cpu_id: ProcessorId) -> Result<(), SystemError> {
+        let cpu_state = self.cpuhp_state(cpu_id);
         let pcb = cpu_state.thread.as_ref().ok_or(SystemError::EINVAL)?;
-        let cpu_id = pcb.sched_info().on_cpu().ok_or(SystemError::EINVAL)?;
+        let target_cpu_id = pcb.sched_info().on_cpu().ok_or(SystemError::EINVAL)?;
+        if target_cpu_id != cpu_id {
+            return Err(SystemError::EINVAL);
+        }
+        let bringup = unsafe { cpu_state.bsp_control_mut().bringup };
+        cpu_state
+            .bringup_result
+            .store(AP_BRINGUP_RESULT_PENDING, Ordering::Release);
 
         // todo: 等待CPU启动完成
 
-        ProcessManager::wakeup(cpu_state.thread.as_ref().unwrap())?;
+        ProcessManager::wakeup(pcb)?;
 
         CurrentSMPArch::start_cpu(cpu_id, cpu_state)?;
         assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
-        self.wait_for_ap_thread(cpu_state, cpu_state.bringup);
+        self.wait_for_ap_thread(cpu_id, bringup)?;
 
         return Ok(());
     }
 
-    fn wait_for_ap_thread(&self, cpu_state: &mut CpuHpCpuState, bringup: bool) {
+    fn wait_for_ap_thread(&self, cpu_id: ProcessorId, bringup: bool) -> Result<(), SystemError> {
         if bringup {
-            cpu_state
-                .comp_done_up
-                .wait_for_completion()
-                .expect("failed to wait ap thread");
+            let cpu_state = self.cpuhp_state(cpu_id);
+            cpu_state.comp_done_up.wait_for_completion()?;
+            match cpu_state.bringup_result.load(Ordering::Acquire) {
+                AP_BRINGUP_RESULT_SUCCESS => {}
+                error if error < 0 => {
+                    return Err(match SystemError::from_posix_errno(error) {
+                        Some(error) => error,
+                        None => SystemError::EIO,
+                    });
+                }
+                _ => return Err(SystemError::EIO),
+            }
         } else {
             todo!("wait_for_ap_thread")
         }
+        Ok(())
     }
 
     /// 完成AP的启动
-    pub fn complete_ap_thread(&self, bringup: bool) {
+    pub fn complete_ap_thread(&self, bringup: bool, result: Result<(), SystemError>) {
         let cpu_id = smp_get_processor_id();
-        let cpu_state = self.cpuhp_state_mut(cpu_id);
+        let cpu_state = self.cpuhp_state(cpu_id);
         if bringup {
-            cpu_state.state = cpu_state.target_state;
+            let encoded = match result {
+                Ok(()) => AP_BRINGUP_RESULT_SUCCESS,
+                Err(error) => error.to_posix_errno(),
+            };
+            cpu_state.bringup_result.store(encoded, Ordering::Release);
             cpu_state.comp_done_up.complete();
         } else {
             todo!("complete_ap_thread")
         }
-    }
-
-    fn cpuhp_reset_state(&self, st: &mut CpuHpCpuState, prev_state: CpuHpState) {
-        let bringup = !st.bringup;
-        st.target_state = prev_state;
-
-        st.bringup = bringup;
     }
 }
 

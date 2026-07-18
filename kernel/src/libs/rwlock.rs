@@ -4,7 +4,7 @@ use core::{
     hint::spin_loop,
     mem::{self, ManuallyDrop},
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use system_error::SystemError;
@@ -12,39 +12,78 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::bottom_half::{local_bh_disable, LocalBhDisableGuard},
-    exception::{InterruptArch, IrqFlagsGuard},
+    exception::{in_interrupt, InterruptArch, IrqFlagsGuard},
     process::ProcessManager,
 };
 
 ///RwLock读写锁
 /// @brief READER位占据从右往左数第三个比特位
-const READER: u32 = 1 << 2;
+const READER: u64 = 1 << 2;
 
 /// @brief UPGRADED位占据从右到左数第二个比特位
-const UPGRADED: u32 = 1 << 1;
+const UPGRADED: u64 = 1 << 1;
 
 /// @brief WRITER位占据最右边的比特位
-const WRITER: u32 = 1;
+const WRITER: u64 = 1;
 
-const READER_BIT: u32 = 2;
+const OWNER_MASK: u64 = WRITER | UPGRADED;
+const READER_MASK: u64 = (1u64 << 32) - READER;
+const ACTIVE_MASK: u64 = OWNER_MASK | READER_MASK;
+const PENDING_WRITER_ONE: u64 = 1u64 << 32;
+const PENDING_WRITER_MASK: u64 = !((1u64 << 32) - 1);
+const MAX_READERS: u64 = READER_MASK / READER;
 
 /// @brief 读写锁的基本数据结构
-/// @param lock 32位原子变量,最右边的两位从左到右分别是UPGRADED,WRITER (标志位)
-///             剩下的bit位存储READER数量(除了MSB)
+/// @param lock 64位原子变量。低32位保存所有者和读者状态，高32位保存等待写者数量。
 ///             对于标志位,0代表无, 1代表有
 ///             对于剩下的比特位表征READER的数量的多少
 ///             lock的MSB必须为0,否则溢出
 #[derive(Debug)]
 pub struct RwLock<T> {
-    lock: AtomicU32,
+    lock: AtomicU64,
+    writer_tickets: WriterTickets,
     data: UnsafeCell<T>,
+}
+
+/// FIFO admission state for blocking writers. Keeping ticket arithmetic in a
+/// small production helper makes wrap-around and pending semantics testable
+/// without exposing lock internals or creating a test-only control path.
+#[derive(Debug)]
+struct WriterTickets {
+    next: AtomicU32,
+    serving: AtomicU32,
+}
+
+impl WriterTickets {
+    const fn new() -> Self {
+        Self {
+            next: AtomicU32::new(0),
+            serving: AtomicU32::new(0),
+        }
+    }
+
+    #[inline]
+    fn issue(&self) -> u32 {
+        self.next.fetch_add(1, Ordering::AcqRel)
+    }
+
+    #[inline]
+    fn is_turn(&self, ticket: u32) -> bool {
+        self.serving.load(Ordering::Acquire) == ticket
+    }
+
+    #[inline]
+    fn finish(&self, ticket: u32) {
+        debug_assert_eq!(self.serving.load(Ordering::Relaxed), ticket);
+        self.serving.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// @brief  READER守卫的数据结构
 /// @param lock 是对RwLock的lock属性值的只读引用
 pub struct RwLockReadGuard<'a, T: 'a> {
     data: *const T,
-    lock: &'a AtomicU32,
+    lock: &'a AtomicU64,
     irq_guard: Option<IrqFlagsGuard>,
 }
 
@@ -69,14 +108,14 @@ pub struct RwLockWriteGuard<'a, T: 'a> {
 
 /// `*_bh` 风格的读锁守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
 pub struct RwLockReadBhGuard<'a, T: 'a> {
-    bh: LocalBhDisableGuard,
     guard: RwLockReadGuard<'a, T>,
+    bh: LocalBhDisableGuard,
 }
 
 /// `*_bh` 风格的写锁守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
 pub struct RwLockWriteBhGuard<'a, T: 'a> {
-    bh: LocalBhDisableGuard,
     guard: RwLockWriteGuard<'a, T>,
+    bh: LocalBhDisableGuard,
 }
 
 unsafe impl<T: Send> Send for RwLock<T> {}
@@ -88,7 +127,8 @@ impl<T> RwLock<T> {
     /// @brief  RwLock的初始化
     pub const fn new(data: T) -> Self {
         return RwLock {
-            lock: AtomicU32::new(0),
+            lock: AtomicU64::new(0),
+            writer_tickets: WriterTickets::new(),
             data: UnsafeCell::new(data),
         };
     }
@@ -111,48 +151,86 @@ impl<T> RwLock<T> {
 
     #[allow(dead_code)]
     #[inline]
-    /// @brief 获取实时的读者数并尝试加1,如果增加值成功则返回增加1后的读者数,否则panic
-    fn current_reader(&self) -> Result<u32, SystemError> {
-        const MAX_READERS: u32 = u32::MAX >> READER_BIT >> 1; //右移3位
-
-        let value = self.lock.fetch_add(READER, Ordering::Acquire);
-        //value二进制形式的MSB不能为1, 否则导致溢出
-
-        if value > MAX_READERS << READER_BIT {
-            self.lock.fetch_sub(READER, Ordering::Release);
-            //panic!("Too many lock readers, cannot safely proceed");
-            return Err(SystemError::EOVERFLOW);
-        } else {
-            return Ok(value);
+    /// @brief 尝试原子注册读者；owner、reader 与 pending writer 使用同一状态快照判定。
+    fn current_reader(&self, bypass_waiting_writer: bool) -> Result<(), SystemError> {
+        let mut state = self.lock.load(Ordering::Relaxed);
+        loop {
+            if state & OWNER_MASK != 0
+                || (!bypass_waiting_writer && state & PENDING_WRITER_MASK != 0)
+            {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            if state & READER_MASK == MAX_READERS * READER {
+                return Err(SystemError::EOVERFLOW);
+            }
+            state = match self.lock.compare_exchange_weak(
+                state,
+                state + READER,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => actual,
+            };
         }
+    }
+
+    #[inline]
+    fn has_waiting_writer(&self) -> bool {
+        self.lock.load(Ordering::Acquire) & PENDING_WRITER_MASK != 0
+    }
+
+    /// Whether this reader executes in an actual hardirq or softirq callback.
+    #[inline]
+    fn interrupt_reader() -> bool {
+        in_interrupt()
+    }
+
+    #[inline]
+    fn register_waiting_writer(&self) -> Result<u32, SystemError> {
+        // Publish pending before issuing the FIFO ticket. A stalled registrant
+        // may conservatively block readers, but every issued ticket is backed
+        // by an already-visible pending count. This prevents the head writer
+        // from observing its turn before reader admission has been closed.
+        self.lock
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |state| {
+                (state & PENDING_WRITER_MASK != PENDING_WRITER_MASK)
+                    .then_some(state + PENDING_WRITER_ONE)
+            })
+            .map_err(|_| SystemError::EOVERFLOW)?;
+        Ok(self.writer_tickets.issue())
+    }
+
+    #[inline]
+    fn writer_turn(&self, ticket: u32) -> bool {
+        self.writer_tickets.is_turn(ticket)
+    }
+
+    #[inline]
+    fn finish_writer_turn(&self, ticket: u32) {
+        self.writer_tickets.finish(ticket)
     }
 
     #[allow(dead_code)]
     #[inline]
     /// @brief 尝试获取READER守卫
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
+        // Like Linux qrwlock's interrupt slowpath, an interrupt-context
+        // reader must not wait behind a queued writer: the interrupted outer
+        // reader may be the reader that writer is waiting for.  DragonOS uses
+        // an explicit hardirq/softirq predicate; merely disabling preemption
+        // does not qualify for this exception.
         ProcessManager::preempt_disable();
-        let r = self.inner_try_read();
+        let bypass_waiting_writer = Self::interrupt_reader();
+        let r = self.inner_try_read(bypass_waiting_writer);
         if r.is_none() {
             ProcessManager::preempt_enable();
         }
         return r;
     }
 
-    fn inner_try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
-        let reader_value = self.current_reader();
-        //得到自增后的reader_value, 包括了尝试获得READER守卫的进程
-
-        let value = if let Ok(rv) = reader_value {
-            rv
-        } else {
-            return None;
-        };
-
-        //判断有没有writer和upgrader
-        //注意, 若upgrader存在,已经存在的读者继续占有锁,但新读者不允许获得锁
-        if value & (WRITER | UPGRADED) != 0 {
-            self.lock.fetch_sub(READER, Ordering::Release);
+    fn inner_try_read(&self, bypass_waiting_writer: bool) -> Option<RwLockReadGuard<'_, T>> {
+        if self.current_reader(bypass_waiting_writer).is_err() {
             return None;
         } else {
             return Some(RwLockReadGuard {
@@ -181,8 +259,9 @@ impl<T> RwLock<T> {
     pub fn read_irqsave(&self) -> RwLockReadGuard<'_, T> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::preempt_disable();
+        let bypass_waiting_writer = Self::interrupt_reader();
         loop {
-            match self.inner_try_read() {
+            match self.inner_try_read(bypass_waiting_writer) {
                 Some(mut guard) => {
                     guard.irq_guard = Some(irq_guard);
                     return guard;
@@ -204,10 +283,13 @@ impl<T> RwLock<T> {
     /// 尝试关闭中断并获取读者守卫
     pub fn try_read_irqsave(&self) -> Option<RwLockReadGuard<'_, T>> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        if let Some(mut guard) = self.try_read() {
+        ProcessManager::preempt_disable();
+        let bypass_waiting_writer = Self::interrupt_reader();
+        if let Some(mut guard) = self.inner_try_read(bypass_waiting_writer) {
             guard.irq_guard = Some(irq_guard);
             return Some(guard);
         } else {
+            ProcessManager::preempt_enable();
             return None;
         }
     }
@@ -217,14 +299,14 @@ impl<T> RwLock<T> {
     /// @brief 获取读者+UPGRADER的数量, 不能保证能否获得同步值
     pub fn reader_count(&self) -> u32 {
         let state = self.lock.load(Ordering::Relaxed);
-        return state / READER + (state & UPGRADED) / UPGRADED;
+        return ((state & READER_MASK) / READER + u64::from(state & UPGRADED != 0)) as u32;
     }
 
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取写者数量,不能保证能否获得同步值
     pub fn writer_count(&self) -> u32 {
-        return (self.lock.load(Ordering::Relaxed) & WRITER) / WRITER;
+        return u32::from(self.lock.load(Ordering::Relaxed) & WRITER != 0);
     }
 
     #[allow(dead_code)]
@@ -258,19 +340,39 @@ impl<T> RwLock<T> {
 
     #[allow(dead_code)]
     fn inner_try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
-        let res: bool = self
-            .lock
+        self.lock
             .compare_exchange(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok();
-        //只有lock大小为0的时候能获得写者守卫
-        if res {
-            return Some(RwLockWriteGuard {
+            .ok()
+            .map(|_| RwLockWriteGuard {
                 data: unsafe { &mut *self.data.get() },
                 inner: self,
                 irq_guard: None,
-            });
-        } else {
-            return None;
+            })
+    }
+
+    #[inline]
+    fn inner_try_write_registered(&self) -> Option<RwLockWriteGuard<'_, T>> {
+        let mut state = self.lock.load(Ordering::Relaxed);
+        loop {
+            if state & ACTIVE_MASK != 0 || state & PENDING_WRITER_MASK == 0 {
+                return None;
+            }
+            let new_state = (state - PENDING_WRITER_ONE) | WRITER;
+            state = match self.lock.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(RwLockWriteGuard {
+                        data: unsafe { &mut *self.data.get() },
+                        inner: self,
+                        irq_guard: None,
+                    })
+                }
+                Err(actual) => actual,
+            };
         }
     }
 
@@ -278,9 +380,22 @@ impl<T> RwLock<T> {
     #[inline]
     /// @brief 获得WRITER守卫
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+        ProcessManager::preempt_disable();
+        let ticket = self
+            .register_waiting_writer()
+            .expect("too many pending RwLock writers");
         loop {
-            match self.try_write() {
-                Some(guard) => return guard,
+            if !self.writer_turn(ticket) {
+                spin_loop();
+                continue;
+            }
+            match self.inner_try_write_registered() {
+                Some(guard) => {
+                    // Keep the writer announced until WRITER is visible, so
+                    // readers cannot enter through a zero-count window.
+                    self.finish_writer_turn(ticket);
+                    return guard;
+                }
                 None => spin_loop(),
             }
         }
@@ -294,9 +409,17 @@ impl<T> RwLock<T> {
     pub fn write_irqsave(&self) -> RwLockWriteGuard<'_, T> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         ProcessManager::preempt_disable();
+        let ticket = self
+            .register_waiting_writer()
+            .expect("too many pending RwLock writers");
         loop {
-            match self.inner_try_write() {
+            if !self.writer_turn(ticket) {
+                spin_loop();
+                continue;
+            }
+            match self.inner_try_write_registered() {
                 Some(mut guard) => {
+                    self.finish_writer_turn(ticket);
                     guard.irq_guard = Some(irq_guard);
                     return guard;
                 }
@@ -333,17 +456,31 @@ impl<T> RwLock<T> {
     }
 
     fn inner_try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<'_, T>> {
-        // 获得UPGRADER守卫不需要查看读者位
-        // 如果获得读者锁失败,不需要撤回fetch_or的原子操作
-        if self.lock.fetch_or(UPGRADED, Ordering::Acquire) & (WRITER | UPGRADED) == 0 {
-            return Some(RwLockUpgradableGuard {
-                inner: self,
-                data: unsafe { &mut *self.data.get() },
-                irq_guard: None,
-            });
-        } else {
-            return None;
+        // 获得UPGRADER守卫不需要查看读者位。使用CAS避免失败的尝试污染
+        // WRITER状态中的UPGRADED位。
+        let mut state = self.lock.load(Ordering::Relaxed);
+        loop {
+            if state & (WRITER | UPGRADED | PENDING_WRITER_MASK) != 0
+                || state & READER_MASK == MAX_READERS * READER
+            {
+                return None;
+            }
+            state = match self.lock.compare_exchange_weak(
+                state,
+                state | UPGRADED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => actual,
+            };
         }
+
+        return Some(RwLockUpgradableGuard {
+            inner: self,
+            data: self.data.get().cast_const(),
+            irq_guard: None,
+        });
     }
 
     #[allow(dead_code)]
@@ -381,7 +518,7 @@ impl<T> RwLock<T> {
     //extremely unsafe behavior
     /// @brief 强制减少READER数
     pub unsafe fn force_read_decrement(&self) {
-        debug_assert!(self.lock.load(Ordering::Relaxed) & !WRITER > 0);
+        debug_assert!(self.lock.load(Ordering::Relaxed) & READER_MASK > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
     }
 
@@ -390,7 +527,7 @@ impl<T> RwLock<T> {
     //extremely unsafe behavior
     /// @brief 强制给WRITER解锁
     pub unsafe fn force_write_unlock(&self) {
-        debug_assert_eq!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED), 0);
+        debug_assert_eq!(self.lock.load(Ordering::Relaxed) & ACTIVE_MASK, WRITER);
         self.lock.fetch_and(!(WRITER | UPGRADED), Ordering::Release);
     }
 
@@ -469,15 +606,25 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
     #[inline]
     /// @brief 尝试将UPGRADER守卫升级为WRITER守卫
     pub fn try_upgrade(mut self) -> Result<RwLockWriteGuard<'rwlock, T>, Self> {
-        let res = self.inner.lock.compare_exchange(
-            UPGRADED,
-            WRITER,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        );
-        //当且仅当只有UPGRADED守卫时可以升级
+        let mut state = self.inner.lock.load(Ordering::Relaxed);
+        let res = loop {
+            if state & ACTIVE_MASK != UPGRADED {
+                break false;
+            }
+            let new_state = (state & PENDING_WRITER_MASK) | WRITER;
+            state = match self.inner.lock.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break true,
+                Err(actual) => actual,
+            };
+        };
+        // 当且仅当只有UPGRADED所有者（可另有pending writer）时可以升级。
 
-        if res.is_ok() {
+        if res {
             let inner = self.inner;
             let irq_guard = self.irq_guard.take();
             mem::forget(self);
@@ -510,15 +657,31 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
     #[inline]
     /// @brief UPGRADER降级为READER
     pub fn downgrade(mut self) -> RwLockReadGuard<'rwlock, T> {
-        while self.inner.current_reader().is_err() {
-            spin_loop();
-        }
-
         let inner: &RwLock<T> = self.inner;
         let irq_guard = self.irq_guard.take();
 
-        // 手动清除 UPGRADED 位（UpgradableGuard::drop 会做这件事）
-        inner.lock.fetch_and(!UPGRADED, Ordering::Release);
+        // Convert the owned UPGRADED bit into a reader atomically.  This
+        // conversion is allowed even when another writer is pending because
+        // it does not admit a new lock owner.
+        let mut state = inner.lock.load(Ordering::Relaxed);
+        loop {
+            debug_assert_eq!(state & (WRITER | UPGRADED), UPGRADED);
+            assert_ne!(
+                state & READER_MASK,
+                MAX_READERS * READER,
+                "RwLock reader count overflow during upgrader downgrade"
+            );
+            let new_state = (state - UPGRADED) + READER;
+            state = match inner.lock.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => actual,
+            };
+        }
 
         // forget self 以跳过 UpgradableGuard::drop 中的 preempt_enable
         // 新的 ReadGuard 接管 preempt_count 所有权
@@ -569,17 +732,25 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
     #[inline]
     /// @brief 将WRITER降级为READER
     pub fn downgrade(mut self) -> RwLockReadGuard<'rwlock, T> {
-        while self.inner.current_reader().is_err() {
-            spin_loop();
-        }
-
         let inner = self.inner;
         let irq_guard = self.irq_guard.take();
 
-        // 手动清除 WRITER | UPGRADED 位（WriteGuard::drop 会做这件事）
-        inner
-            .lock
-            .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+        // No reader can coexist with WRITER, so this is a single atomic state
+        // transition.  Pending writers remain announced in their own counter.
+        let mut state = inner.lock.load(Ordering::Relaxed);
+        loop {
+            assert_eq!(state & ACTIVE_MASK, WRITER, "invalid RwLock writer state");
+            let new_state = (state & PENDING_WRITER_MASK) | READER;
+            state = match inner.lock.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => actual,
+            };
+        }
 
         // forget self 以跳过 WriteGuard::drop 中的 preempt_enable
         // 新的 ReadGuard 接管 preempt_count 所有权
@@ -601,7 +772,20 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
             WRITER
         );
 
-        self.inner.lock.store(UPGRADED, Ordering::Release);
+        let mut state = self.inner.lock.load(Ordering::Relaxed);
+        loop {
+            assert_eq!(state & ACTIVE_MASK, WRITER, "invalid RwLock writer state");
+            let new_state = (state & PENDING_WRITER_MASK) | UPGRADED;
+            state = match self.inner.lock.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => actual,
+            };
+        }
 
         let inner = self.inner;
 
@@ -648,7 +832,7 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
 
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
+        debug_assert!(self.lock.load(Ordering::Relaxed) & READER_MASK > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
         // 先恢复中断，再启用抢占
         self.irq_guard.take();
@@ -680,3 +864,8 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
         ProcessManager::preempt_enable();
     }
 }
+
+#[path = "rwlock_selftest.rs"]
+mod selftest;
+
+pub(crate) use selftest::run_rwlock_selftests;

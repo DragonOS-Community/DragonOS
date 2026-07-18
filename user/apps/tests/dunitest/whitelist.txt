@@ -37,6 +37,8 @@ normal/rcu_selftest
 normal/kthread_selftest
 normal/restart_syscall_semantics
 normal/errseq_selftest
+normal/timekeeping_semantics
+normal/timekeeping_selftest
 normal/errseq_writeback_reporting
 normal/test_tlb_shootdown
 normal/pid_namespace_fork

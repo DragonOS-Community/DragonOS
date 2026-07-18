@@ -8,7 +8,6 @@ use crate::{
     exception::InterruptArch,
     process::ProcessManager,
     sched::{schedule, SchedMode},
-    time::timekeeping::getnstimeofday,
 };
 
 use super::{
@@ -20,11 +19,11 @@ use super::{
 ///
 /// @param sleep_time 指定休眠的时间
 ///
-/// @return Ok(TimeSpec) 剩余休眠时间
+/// @return Ok(()) 正常完成
 ///
 /// @return Err(SystemError) 错误码
-pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError> {
-    if sleep_time.tv_nsec < 0 || sleep_time.tv_nsec >= 1000000000 {
+pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<(), SystemError> {
+    if !sleep_time.is_valid_timeout() {
         return Err(SystemError::EINVAL);
     }
     // 对于小于500us的时间，使用spin/rdtsc来进行定时
@@ -33,19 +32,14 @@ pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError
         while CurrentTimeArch::get_cycles() < expired_tsc {
             spin_loop()
         }
-        return Ok(PosixTimeSpec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        });
+        return Ok(());
     }
 
-    let total_sleep_time_us: u64 =
-        sleep_time.tv_sec as u64 * 1000000 + sleep_time.tv_nsec as u64 / 1000;
+    let total_sleep_time_us = sleep_time.to_ktime_ns().div_ceil(1000);
     // 创建定时器
     let handler: Box<WakeUpHelper> = WakeUpHelper::new(ProcessManager::current_pcb());
     let timer: Arc<Timer> = Timer::new(handler, next_n_us_timer_jiffies(total_sleep_time_us));
 
-    let start_time = getnstimeofday();
     timer.activate();
 
     // Linux 语义：等待可能出现伪唤醒；只有在收到未被屏蔽的信号时才中断。
@@ -71,8 +65,5 @@ pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError
         }
     }
 
-    let end_time = getnstimeofday();
-    let real_sleep_time = end_time - start_time;
-    let rm_time: PosixTimeSpec = (sleep_time - real_sleep_time.into()).into();
-    Ok(rm_time)
+    Ok(())
 }

@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use log::debug;
+use log::{debug, warn};
 use system_error::SystemError;
 use x86::dtables::DescriptorTablePointer;
 
@@ -115,13 +115,45 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
     // 3.如果 kvm-clock 和 HPET 都不可用，则回退到 ACPI PM Timer
     // 4.最后初始化 TSC 管理器 （既可以通过 kvm-clock 提供的 pvclock 确定 TSC 频率，也可以通过其他方法确定 TSC 频率）
     let kvmclock_ok = kvm_clock::kvmclock_init();
-    let ret = hpet_init();
-    if ret.is_ok() {
-        hpet_instance().hpet_enable().expect("hpet enable failed");
-    } else if !kvmclock_ok {
-        init_acpi_pm_clocksource().expect("acpi_pm_timer inits failed");
+    let hpet_ok = match hpet_init() {
+        Ok(()) => match hpet_instance().hpet_enable() {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    "HPET enable failed, retaining fallback clocksource: {:?}",
+                    error
+                );
+                false
+            }
+        },
+        Err(error) => {
+            warn!(
+                "HPET init failed, retaining fallback clocksource: {:?}",
+                error
+            );
+            false
+        }
+    };
+    if !kvmclock_ok && !hpet_ok {
+        if let Err(error) = init_acpi_pm_clocksource() {
+            // jiffies is already registered and installed by timekeeping_init.
+            warn!(
+                "ACPI PM timer unavailable, continuing with jiffies: {:?}",
+                error
+            );
+        }
     }
-    TSCManager::init().expect("tsc init failed");
+    if let Err(error) = TSCManager::init() {
+        if TSCManager::cpu_khz() == 0 {
+            // The scheduler clock and APIC timer still require CPU_KHZ even
+            // when POSIX timekeeping can remain on jiffies.
+            return Err(error);
+        }
+        warn!(
+            "TSC clocksource unavailable, continuing with registered clocksource: {:?}",
+            error
+        );
+    }
 
     return Ok(());
 }

@@ -7,7 +7,7 @@ use core::{
 use crate::arch::CurrentTimeArch;
 use crate::time::syscall::PosixTimeval;
 
-use self::timekeeping::getnstimeofday;
+use self::timekeeping::{getnstimeofday, monotonic_now};
 
 pub mod clocksource;
 pub mod jiffies;
@@ -57,6 +57,12 @@ pub struct PosixTimeSpec {
 }
 
 impl PosixTimeSpec {
+    /// Largest non-negative time representable by Linux's signed 64-bit ktime.
+    pub const KTIME_MAX: Self = Self {
+        tv_sec: i64::MAX / NSEC_PER_SEC as i64,
+        tv_nsec: i64::MAX % NSEC_PER_SEC as i64,
+    };
+
     #[allow(dead_code)]
     pub fn new(sec: i64, nsec: i64) -> PosixTimeSpec {
         return PosixTimeSpec {
@@ -98,7 +104,40 @@ impl PosixTimeSpec {
 
     /// 换算成纳秒
     pub fn total_nanos(&self) -> i64 {
-        self.tv_sec * NSEC_PER_SEC as i64 + self.tv_nsec
+        self.tv_sec
+            .saturating_mul(NSEC_PER_SEC as i64)
+            .saturating_add(self.tv_nsec)
+    }
+
+    /// Validate a non-negative POSIX timeout value.
+    #[inline]
+    pub fn is_valid_timeout(&self) -> bool {
+        self.tv_sec >= 0 && (0..NSEC_PER_SEC as i64).contains(&self.tv_nsec)
+    }
+
+    /// Convert a valid non-negative timespec to nanoseconds using Linux's
+    /// `ktime_set()` saturation boundary.
+    #[inline]
+    pub fn to_ktime_ns(&self) -> u64 {
+        (self.tv_sec.max(0) as u128)
+            .saturating_mul(NSEC_PER_SEC as u128)
+            .saturating_add(self.tv_nsec.max(0) as u128)
+            .min(i64::MAX as u128) as u64
+    }
+
+    /// Add two non-negative timespecs and saturate at `KTIME_MAX`.
+    #[inline]
+    pub fn saturating_add_ktime(&self, rhs: &Self) -> Self {
+        let total = (self.to_ktime_ns() as u128)
+            .saturating_add(rhs.to_ktime_ns() as u128)
+            .min(i64::MAX as u128) as u64;
+        Self::from_ns(total)
+    }
+
+    /// Return `self - rhs`, clamped to zero, without signed overflow.
+    #[inline]
+    pub fn saturating_sub_timespec(&self, rhs: &Self) -> Self {
+        Self::from_ns(self.to_ktime_ns().saturating_sub(rhs.to_ktime_ns()))
     }
 
     /// 从纳秒创建 PosixTimeSpec
@@ -266,7 +305,7 @@ impl Instant {
 
     /// Create a new `Instant` from the current time
     pub fn now() -> Instant {
-        let tm = getnstimeofday();
+        let tm = monotonic_now();
         Self::from_micros(tm.tv_sec * 1000000 + tm.tv_nsec / 1000)
     }
 

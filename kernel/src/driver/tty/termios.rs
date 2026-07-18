@@ -362,8 +362,6 @@ bitflags! {
 }
 }
 
-
-
 impl ControlMode {
     /// 获取波特率
     pub fn baud_rate(&self) -> Option<u32> {

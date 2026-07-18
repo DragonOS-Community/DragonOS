@@ -8,7 +8,10 @@ use crate::mm::VirtAddr;
 use self::serial8250::serial8250_manager;
 
 use super::tty::{
-    termios::{ControlMode, InputMode, LocalMode, OutputMode, Termios, INIT_C_LINE_ABI, INIT_CONTORL_CHARACTERS},
+    termios::{
+        ControlMode, InputMode, LocalMode, OutputMode, Termios, INIT_CONTORL_CHARACTERS,
+        INIT_C_LINE_ABI,
+    },
     tty_ldisc::LineDisciplineType,
 };
 

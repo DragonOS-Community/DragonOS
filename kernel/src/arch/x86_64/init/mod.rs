@@ -27,6 +27,7 @@ use super::{
 mod boot;
 mod multiboot2;
 mod pvh;
+mod rsdp;
 
 mod boot_params;
 

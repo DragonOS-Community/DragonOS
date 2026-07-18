@@ -9,8 +9,7 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     driver::{
-        acpi::rsdp::find_rsdp_in_bios, serial::serial8250::send_to_default_serial8250_port,
-        video::fbdev::base::BootTimeScreenInfo,
+        serial::serial8250::send_to_default_serial8250_port, video::fbdev::base::BootTimeScreenInfo,
     },
     init::{
         boot::{register_boot_callbacks, BootCallbacks, BootloaderAcpiArg},
@@ -22,15 +21,9 @@ use crate::{
 
 mod param;
 
-static START_INFO: Lazy<HvmStartInfo> = Lazy::new();
+use super::rsdp::{cache_bios_rsdp_result, cached_bios_rsdp};
 
-/// RSDP physical address discovered during early init (before mm_init).
-///
-/// Like Linux, the BIOS-area RSDP scan runs in the early boot stage while the
-/// bootstrap page table is still active and `EarlyIoRemap` may be used. The
-/// result is cached here and consumed later by `init_acpi_args`, which runs
-/// after mm_init and must not touch `EarlyIoRemap`.
-static EARLY_RSDP_PADDR: Lazy<Option<PhysAddr>> = Lazy::new();
+static START_INFO: Lazy<HvmStartInfo> = Lazy::new();
 
 struct PvhBootCallback;
 
@@ -54,9 +47,9 @@ impl BootCallbacks for PvhBootCallback {
             return Ok(BootloaderAcpiArg::Rsdp(rsdp_paddr));
         }
 
-        // rsdp_paddr not provided by the bootloader: use the address discovered
-        // during the early BIOS-area scan (see EARLY_RSDP_PADDR / early_init_memory_blocks).
-        if let Some(paddr) = EARLY_RSDP_PADDR.try_get().copied().flatten() {
+        // The bootloader did not provide an RSDP. Consume the shared x86
+        // early-discovery result without touching EarlyIoRemap after mm_init.
+        if let Some(paddr) = cached_bios_rsdp()? {
             log::info!("pvh: found RSDP at {:#x}", paddr.data());
             return Ok(BootloaderAcpiArg::Rsdp(paddr));
         }
@@ -153,12 +146,9 @@ impl BootCallbacks for PvhBootCallback {
         // be used safely (this mirrors Linux, which scans the RSDP in setup_arch
         // via early_memremap). If the bootloader already provided rsdp_paddr we
         // skip the scan. The result is cached for init_acpi_args.
-        let early_rsdp = if start_info.rsdp_paddr != 0 {
-            None
-        } else {
-            find_rsdp_in_bios()
-        };
-        EARLY_RSDP_PADDR.init(early_rsdp);
+        if start_info.rsdp_paddr == 0 {
+            cache_bios_rsdp_result();
+        }
 
         Ok(())
     }

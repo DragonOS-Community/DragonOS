@@ -275,7 +275,7 @@ pub struct IfaceCommon {
     /// 存smoltcp网卡的套接字集
     sockets: Mutex<smoltcp::iface::SocketSet<'static>>,
     /// 存 kernel wrap smoltcp socket 的集合
-    bounds: RwLock<Vec<Arc<dyn InetSocket>>>,
+    bounds: RwLock<Arc<Vec<Arc<dyn InetSocket>>>>,
     /// 端口管理器
     port_manager: PortManager,
     /// 下次需要推进协议栈的时间点（单位：微秒时间戳，0 表示无定时事件）
@@ -325,7 +325,7 @@ impl IfaceCommon {
             name: RwLock::new(name),
             smol_iface: Mutex::new(iface),
             sockets: Mutex::new(smoltcp::iface::SocketSet::new(Vec::new())),
-            bounds: RwLock::new(Vec::new()),
+            bounds: RwLock::new(Arc::new(Vec::new())),
             port_manager: PortManager::default(),
             poll_at_us: core::sync::atomic::AtomicU64::new(0),
             net_namespace: RwLock::new(Weak::new()),
@@ -593,11 +593,12 @@ impl IfaceCommon {
 
     // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
     pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
-        self.bounds.write().push(socket);
+        Arc::make_mut(&mut *self.bounds.write()).push(socket);
     }
 
     pub fn unbind_socket(&self, socket: Arc<dyn InetSocket>) {
         let mut bounds = self.bounds.write();
+        let bounds = Arc::make_mut(&mut *bounds);
         if let Some(index) = bounds.iter().position(|s| Arc::ptr_eq(s, &socket)) {
             bounds.remove(index);
             // log::debug!("unbind socket success");
@@ -614,8 +615,11 @@ impl IfaceCommon {
         // Use a single read-side critical section. A size pass followed by a copy pass
         // can be forced behind the stream of close-side writers between acquisitions,
         // delaying network progress long enough for poll waiters to time out.
+        // Clone only the outer Arc while IRQs are disabled.  Mutations use
+        // Arc::make_mut(), so this remains a coherent snapshot without an
+        // O(n) allocation in the polling hot path.
         let sockets = self.bounds.read_irqsave().clone();
-        for sock in sockets {
+        for sock in sockets.iter() {
             sock.notify();
             let _woke = sock.wait_queue().wakeup(Some(ProcessState::Blocked(true)));
         }

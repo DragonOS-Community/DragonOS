@@ -486,21 +486,32 @@ impl NTtyData {
         flags: Option<&[u8]>,
         count: usize,
     ) {
-        let termios = tty.core().termios();
+        // Use one coherent snapshot for the whole receive batch. Reacquiring
+        // the RwLock in nested helpers can self-deadlock when a writer queues
+        // between recursive read acquisitions.
+        let termios = *tty.core().termios();
         let preops = termios.input_mode.contains(InputMode::ISTRIP)
             || termios.input_mode.contains(InputMode::IUCLC)
             || termios.local_mode.contains(LocalMode::IEXTEN);
+        let extproc = termios.local_mode.contains(LocalMode::EXTPROC);
 
         let look_ahead = self.lookahead_count.min(count);
         if self.real_raw {
             self.receive_buf_real_raw(buf, count);
-        } else if self.raw || (termios.local_mode.contains(LocalMode::EXTPROC) && !preops) {
+        } else if self.raw || (extproc && !preops) {
             self.receive_buf_raw(buf, flags, count);
-        } else if tty.core().is_closing() && !termios.local_mode.contains(LocalMode::EXTPROC) {
+        } else if tty.core().is_closing() && !extproc {
             todo!()
         } else {
             if look_ahead > 0 {
-                self.receive_buf_standard(tty.clone(), buf, flags, look_ahead, true);
+                self.receive_buf_standard(
+                    tty.clone(),
+                    &termios,
+                    buf,
+                    flags,
+                    look_ahead,
+                    true,
+                );
             }
 
             if count > look_ahead {
@@ -508,6 +519,7 @@ impl NTtyData {
                 let remaining_flags = flags.map(|f| &f[look_ahead..]);
                 self.receive_buf_standard(
                     tty.clone(),
+                    &termios,
                     remaining,
                     remaining_flags,
                     count - look_ahead,
@@ -523,7 +535,7 @@ impl NTtyData {
 
         self.lookahead_count -= look_ahead;
 
-        if self.icanon && !termios.local_mode.contains(LocalMode::EXTPROC) {
+        if self.icanon && !extproc {
             return;
         }
 
@@ -589,12 +601,12 @@ impl NTtyData {
     pub fn receive_buf_standard(
         &mut self,
         tty: Arc<TtyCore>,
+        termios: &Termios,
         buf: &[u8],
         flags: Option<&[u8]>,
         mut count: usize,
         lookahead_done: bool,
     ) {
-        let termios = tty.core().termios();
         if flags.is_some() {
             todo!("ntty recv buf flags todo");
         }
@@ -618,7 +630,7 @@ impl NTtyData {
                     && termios.local_mode.contains(LocalMode::IEXTEN)
                 {
                     c = (c as char).to_ascii_lowercase() as u8;
-                    self.receive_char(c, tty.clone())
+                    self.receive_char(c, tty.clone(), termios)
                 }
 
                 continue;
@@ -641,9 +653,9 @@ impl NTtyData {
 
             if ((c as usize) < self.char_map.len()) && self.char_map.get(c as usize).unwrap() {
                 // 特殊字符
-                self.receive_special_char(c, tty.clone(), lookahead_done);
+                self.receive_special_char(c, tty.clone(), termios, lookahead_done);
             } else {
-                self.receive_char(c, tty.clone());
+                self.receive_char(c, tty.clone(), termios);
             }
 
             count -= 1;
@@ -651,9 +663,14 @@ impl NTtyData {
     }
 
     #[inline(never)]
-    pub fn receive_special_char(&mut self, mut c: u8, tty: Arc<TtyCore>, lookahead_done: bool) {
-        let is_flow_ctrl = self.is_flow_ctrl_char(tty.clone(), c, lookahead_done);
-        let termios = tty.core().termios();
+    pub fn receive_special_char(
+        &mut self,
+        mut c: u8,
+        tty: Arc<TtyCore>,
+        termios: &Termios,
+        lookahead_done: bool,
+    ) {
+        let is_flow_ctrl = self.is_flow_ctrl_char(tty.clone(), termios, c, lookahead_done);
 
         // 启用软件流控，并且该字符已经当做软件流控字符处理
         if termios.input_mode.contains(InputMode::IXON) && is_flow_ctrl {
@@ -662,17 +679,17 @@ impl NTtyData {
 
         if termios.local_mode.contains(LocalMode::ISIG) {
             if c == termios.control_characters[ControlCharIndex::VINTR] {
-                self.recv_sig_char(tty.clone(), &termios, Signal::SIGINT, c);
+                self.recv_sig_char(tty.clone(), termios, Signal::SIGINT, c);
                 return;
             }
 
             if c == termios.control_characters[ControlCharIndex::VQUIT] {
-                self.recv_sig_char(tty.clone(), &termios, Signal::SIGQUIT, c);
+                self.recv_sig_char(tty.clone(), termios, Signal::SIGQUIT, c);
                 return;
             }
 
             if c == termios.control_characters[ControlCharIndex::VSUSP] {
-                self.recv_sig_char(tty.clone(), &termios, Signal::SIGTSTP, c);
+                self.recv_sig_char(tty.clone(), termios, Signal::SIGTSTP, c);
                 return;
             }
         }
@@ -708,7 +725,7 @@ impl NTtyData {
                 || (c == termios.control_characters[ControlCharIndex::VWERASE]
                     && termios.local_mode.contains(LocalMode::IEXTEN))
             {
-                self.eraser(c, &termios);
+                self.eraser(c, termios);
                 self.commit_echoes(tty.clone());
                 return;
             }
@@ -732,10 +749,10 @@ impl NTtyData {
             {
                 let mut tail = self.canon_head;
                 self.finish_erasing();
-                self.echo_char(c, &termios);
+                self.echo_char(c, termios);
                 self.echo_char_raw(b'\n');
                 while ntty_buf_mask(tail) != ntty_buf_mask(self.read_head) {
-                    self.echo_char(self.read_buf[ntty_buf_mask(tail)], &termios);
+                    self.echo_char(self.read_buf[ntty_buf_mask(tail)], termios);
                     tail += 1;
                 }
                 self.commit_echoes(tty.clone());
@@ -778,7 +795,7 @@ impl NTtyData {
                         self.add_echo_byte(EchoOperation::Start.to_u8());
                         self.add_echo_byte(EchoOperation::SetCanonCol.to_u8());
                     }
-                    self.echo_char(c, &termios);
+                    self.echo_char(c, termios);
                     self.commit_echoes(tty.clone());
                 }
 
@@ -805,7 +822,7 @@ impl NTtyData {
                     self.add_echo_byte(EchoOperation::Start.to_u8());
                     self.add_echo_byte(EchoOperation::SetCanonCol.to_u8());
                 }
-                self.echo_char(c, &termios);
+                self.echo_char(c, termios);
             }
 
             self.commit_echoes(tty.clone());
@@ -822,7 +839,7 @@ impl NTtyData {
 
     /// ## ntty默认eraser function
     #[inline(never)]
-    fn eraser(&mut self, mut c: u8, termios: &RwLockReadGuard<Termios>) {
+    fn eraser(&mut self, mut c: u8, termios: &Termios) {
         if self.read_head == self.canon_head {
             return;
         }
@@ -977,14 +994,18 @@ impl NTtyData {
 
     /// ## 多字节字符检测
     /// 检测是否为多字节字符的后续字节
-    fn is_continuation(c: u8, termios: &RwLockReadGuard<Termios>) -> bool {
+    fn is_continuation(c: u8, termios: &Termios) -> bool {
         return termios.input_mode.contains(InputMode::IUTF8) && (c & 0xc0) == 0x80;
     }
 
     /// ## 该字符是否已经当做流控字符处理
-    pub fn is_flow_ctrl_char(&mut self, tty: Arc<TtyCore>, c: u8, lookahead_done: bool) -> bool {
-        let termios = tty.core().termios();
-
+    pub fn is_flow_ctrl_char(
+        &mut self,
+        tty: Arc<TtyCore>,
+        termios: &Termios,
+        c: u8,
+        lookahead_done: bool,
+    ) -> bool {
         if !(termios.control_characters[ControlCharIndex::VSTART] == c
             || termios.control_characters[ControlCharIndex::VSTOP] == c)
         {
@@ -1009,7 +1030,7 @@ impl NTtyData {
     fn recv_sig_char(
         &mut self,
         tty: Arc<TtyCore>,
-        termios: &RwLockReadGuard<Termios>,
+        termios: &Termios,
         signal: Signal,
         c: u8,
     ) {
@@ -1030,7 +1051,7 @@ impl NTtyData {
     pub fn input_signal(
         &mut self,
         tty: Arc<TtyCore>,
-        termios: &RwLockReadGuard<Termios>,
+        termios: &Termios,
         signal: Signal,
     ) {
         // 先处理信号
@@ -1074,9 +1095,7 @@ impl NTtyData {
         }
     }
 
-    pub fn receive_char(&mut self, c: u8, tty: Arc<TtyCore>) {
-        let termios = tty.core().termios();
-
+    pub fn receive_char(&mut self, c: u8, tty: Arc<TtyCore>, termios: &Termios) {
         if termios.local_mode.contains(LocalMode::ECHO) {
             if self.erasing {
                 self.add_echo_byte(b'/');
@@ -1088,17 +1107,17 @@ impl NTtyData {
                 self.add_echo_byte(EchoOperation::SetCanonCol.to_u8());
             }
 
-            self.echo_char(c, &termios);
+            self.echo_char(c, termios);
             self.commit_echoes(tty.clone());
         }
 
-        if c == 0o377 && tty.core().termios().input_mode.contains(InputMode::PARMRK) {
+        if c == 0o377 && termios.input_mode.contains(InputMode::PARMRK) {
             self.add_read_byte(c);
         }
         self.add_read_byte(c);
     }
 
-    pub fn echo_char(&mut self, c: u8, termios: &RwLockReadGuard<Termios>) {
+    pub fn echo_char(&mut self, c: u8, termios: &Termios) {
         if c == EchoOperation::Start.to_u8() {
             self.add_echo_byte(EchoOperation::Start.to_u8());
             self.add_echo_byte(EchoOperation::Start.to_u8());

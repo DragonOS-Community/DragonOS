@@ -466,13 +466,13 @@ impl NTtyData {
             if let Some(flags) = flags {
                 self.receive_buf(
                     tty.clone(),
-                    &*termios,
+                    &termios,
                     &buf[offset..],
                     Some(&flags[offset..]),
                     n,
                 );
             } else {
-                self.receive_buf(tty.clone(), &*termios, &buf[offset..], flags, n);
+                self.receive_buf(tty.clone(), &termios, &buf[offset..], flags, n);
             }
 
             offset += n;

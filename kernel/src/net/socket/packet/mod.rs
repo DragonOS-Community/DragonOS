@@ -27,8 +27,8 @@ use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::rcu::RcuOptionArcSlot;
 
-pub use ring::{RingWriteResult, TpacketVersion};
 pub(crate) use fanout::{membership_value, FanoutGroup, FanoutJoinParams};
+pub use ring::{RingWriteResult, TpacketVersion};
 #[allow(unused_imports)]
 pub use uapi::{
     eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,

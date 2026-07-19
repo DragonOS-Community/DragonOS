@@ -291,11 +291,10 @@ TEST(AfPacketSockopt, PacketVersionAcceptsValidRejectsInvalid) {
     errno = 0;
     EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, 999), -1);
     EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
-    // No getsockopt handler for PACKET_VERSION → ENOPROTOOPT
-    int got = 0;
-    errno = 0;
-    EXPECT_EQ(GetIntOpt(fd.Get(), PACKET_VERSION, &got), -1);
-    EXPECT_EQ(errno, ENOPROTOOPT) << ErrnoString(errno);
+    // getsockopt(PACKET_VERSION) returns the current version (Linux behavior)
+    int got = -1;
+    EXPECT_EQ(GetIntOpt(fd.Get(), PACKET_VERSION, &got), 0);
+    EXPECT_EQ(got, TPACKET_V2);
 }
 
 // ===== Test 15: PACKET_STATISTICS returns 8-byte struct =====

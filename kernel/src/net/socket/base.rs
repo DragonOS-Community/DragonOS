@@ -24,10 +24,6 @@ use super::{
     posix::{PMSG, PSOL},
 };
 
-/// # `Socket` methods
-/// ## Reference
-/// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
-
 /// Layout information for mmap-backed sockets (e.g. AF_PACKET TPACKET rings).
 ///
 /// Returned by [`Socket::mmap_layout`] to supply everything the mmap page-fault
@@ -40,6 +36,10 @@ pub struct SocketMmapLayout {
     /// Logical size of the mapped region in bytes (for `filemap_fault` bounds check).
     pub size: usize,
 }
+
+/// # `Socket` methods
+/// ## Reference
+/// - [Posix standard](https://pubs.opengion.org/onlinepubs/9699919799/)
 
 pub trait Socket: PollableInode + IndexNode {
     /// Open-file refcount for this socket.

@@ -48,6 +48,10 @@ impl IndexNode for FuseNode {
         self.try_fs()
     }
 
+    fn supports_post_write_sync(&self, file_type: FileType) -> bool {
+        file_type == FileType::File
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }

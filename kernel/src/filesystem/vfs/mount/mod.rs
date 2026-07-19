@@ -3611,6 +3611,10 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.adjust_file_mode_after_open(data, mode)
     }
 
+    fn supports_post_write_sync(&self, file_type: FileType) -> bool {
+        self.dentry.inode.supports_post_write_sync(file_type)
+    }
+
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
         return self.dentry.inode.mmap(start, len, offset);
     }

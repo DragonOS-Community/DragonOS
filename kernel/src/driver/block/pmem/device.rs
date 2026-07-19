@@ -30,7 +30,10 @@ use crate::{
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
-        vfs::{utils::DName, FilePrivateData, IndexNode, InodeFlags, InodeId, InodeMode, Metadata},
+        vfs::{
+            utils::DName, FilePrivateData, FileType, IndexNode, InodeFlags, InodeId, InodeMode,
+            Metadata,
+        },
     },
     libs::{
         align::{page_align_down, page_align_up},
@@ -220,6 +223,18 @@ impl IndexNode for PmemBlockDevice {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn supports_post_write_sync(&self, file_type: FileType) -> bool {
+        file_type == FileType::BlockDevice
+    }
+
+    fn sync_file(
+        &self,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        <Self as BlockDevice>::sync(self)
     }
 
     fn read_at(

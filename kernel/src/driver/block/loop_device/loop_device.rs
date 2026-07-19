@@ -1010,6 +1010,18 @@ impl IndexNode for LoopDevice {
         self
     }
 
+    fn supports_post_write_sync(&self, file_type: FileType) -> bool {
+        file_type == FileType::BlockDevice
+    }
+
+    fn sync_file(
+        &self,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        <Self as BlockDevice>::sync(self)
+    }
+
     fn read_at(
         &self,
         offset: usize,

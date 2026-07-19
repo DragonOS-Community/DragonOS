@@ -280,6 +280,10 @@ impl IndexNode for LockedExt4Inode {
         Some(self.fs())
     }
 
+    fn supports_post_write_sync(&self, file_type: vfs::FileType) -> bool {
+        file_type == vfs::FileType::File
+    }
+
     fn retention_state(&self) -> Option<&InodeRetentionState> {
         Some(&self.retention)
     }

@@ -117,7 +117,10 @@ impl Syscall for SysClockNanosleep {
         let clockid = PosixClockID::try_from(Self::which_clock(args))?;
         match clockid {
             Realtime | Monotonic | Boottime | ProcessCPUTimeID => {}
-            ThreadCPUTimeID => return Err(SystemError::EINVAL),
+            // CLOCK_THREAD_CPUTIME_ID is a valid POSIX clock but Linux has no
+            // clock_nanosleep operation for it, so this is EOPNOTSUPP rather
+            // than EINVAL.
+            ThreadCPUTimeID => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
             _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
         }
         let flags = Self::flags(args);

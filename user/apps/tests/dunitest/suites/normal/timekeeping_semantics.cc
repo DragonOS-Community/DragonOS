@@ -747,6 +747,15 @@ TEST(TimekeepingSemantics, ClockNanosleepRejectsUnsupportedClockDomains) {
     EXPECT_EQ(EOPNOTSUPP, clock_nanosleep(CLOCK_MONOTONIC_COARSE, 0, &request, nullptr));
 }
 
+TEST(TimekeepingSemantics, RawClockNanosleepThreadCpuClockIsUnsupported) {
+    const timespec request = {.tv_sec = 0, .tv_nsec = 1};
+    errno = 0;
+    const long result = syscall(SYS_clock_nanosleep, CLOCK_THREAD_CPUTIME_ID, 0, &request,
+                                nullptr);
+    EXPECT_EQ(-1, result);
+    EXPECT_EQ(EOPNOTSUPP, errno);
+}
+
 TEST(TimekeepingSemantics, SuccessfulNanosleepLeavesRemainingUntouched) {
     const timespec request = {.tv_sec = 0, .tv_nsec = 1000000};
     timespec remaining = {.tv_sec = 123, .tv_nsec = 456};

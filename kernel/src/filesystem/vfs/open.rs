@@ -8,7 +8,8 @@ use super::{
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{
-        rsplit_path, should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, ResolvedPath,
+        should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, OwnedLookupOutcome,
+        ResolvedPath,
     },
     vcore::{check_parent_dir_permission_inode, vfs_truncate},
     FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
@@ -275,8 +276,15 @@ pub fn do_sys_open(
 
 fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
     // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
+    // Linux 6.6 rejects this contradictory creation request before lookup, so
+    // the result must not depend on whether the pathname already exists.
+    if how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_DIRECTORY) {
+        return Err(SystemError::EINVAL);
+    }
     let path = path.trim();
-    let follow_symlink = !how.o_flags.contains(FileFlags::O_NOFOLLOW);
+    // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
+    let follow_symlink = !(how.o_flags.contains(FileFlags::O_NOFOLLOW)
+        || how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_EXCL));
     // 检查空字符串路径
     if path.is_empty() {
         return Err(SystemError::ENOENT);
@@ -287,7 +295,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
 
     let (start_path, path) = user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
     let inode_begin = start_path.inode();
-    let resolved = inode_begin.lookup_follow_symlink_owned(
+    let resolved = inode_begin.lookup_follow_symlink_or_missing_owned(
         &start_path,
         &path,
         VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -296,32 +304,26 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     let mut created = false;
     let mut preopened: Option<PreopenedFile> = None;
     let resolved = match resolved {
-        Ok(resolved) => resolved,
-        Err(errno) => {
+        Ok(OwnedLookupOutcome::Found(resolved)) => resolved,
+        Ok(OwnedLookupOutcome::MissingFinal {
+            parent: parent_resolved,
+            name: filename,
+            must_be_dir,
+        }) => {
             // 文件不存在，且需要创建
             if how.o_flags.contains(FileFlags::O_CREAT)
                 && !how.o_flags.contains(FileFlags::O_DIRECTORY)
-                && errno == SystemError::ENOENT
             {
-                // 如果路径以斜杠结尾，不能创建普通文件
-                if path_ends_with_slash {
+                // A trailing slash may come from the expanded symlink target,
+                // not only from the original userspace pathname.
+                if must_be_dir {
                     return Err(SystemError::EISDIR);
                 }
 
-                let (filename, parent_path) = rsplit_path(&path);
                 // 检查文件名长度
                 if filename.len() > crate::filesystem::vfs::NAME_MAX {
                     return Err(SystemError::ENAMETOOLONG);
                 }
-                // Resolve and retain the actual parent mount across permission
-                // checks and create. The original start_path alone is not
-                // sufficient when parent_path crosses a mount boundary.
-                let parent_resolved = inode_begin.lookup_follow_symlink_owned(
-                    &start_path,
-                    parent_path.unwrap_or(""),
-                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
-                    true,
-                )?;
                 let parent_inode = parent_resolved.inode();
                 let parent_md = parent_inode.metadata()?;
                 // 父节点必须是目录
@@ -343,14 +345,14 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                     create_flags.remove(FileFlags::O_TRUNC);
                 }
                 let inode: Arc<dyn IndexNode> =
-                    match parent_inode.create_and_open(filename, create_mode, &create_flags) {
+                    match parent_inode.create_and_open(&filename, create_mode, &create_flags) {
                         Ok(opened) => {
                             let inode = opened.inode();
                             preopened = Some(opened);
                             inode
                         }
                         Err(SystemError::ENOSYS) => {
-                            parent_inode.create(filename, FileType::File, create_mode)?
+                            parent_inode.create(&filename, FileType::File, create_mode)?
                         }
                         Err(err) => return Err(err),
                     };
@@ -359,10 +361,10 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 drop(parent_resolved);
                 created_path
             } else {
-                // 不需要创建文件，因此返回错误码
-                return Err(errno);
+                return Err(SystemError::ENOENT);
             }
         }
+        Err(errno) => return Err(errno),
     };
     drop(start_path);
     let inode = resolved.inode();
@@ -376,18 +378,6 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         return Err(SystemError::EACCES);
     }
 
-    if how.o_flags.contains(FileFlags::O_NOFOLLOW)
-        && !how.o_flags.contains(FileFlags::O_PATH)
-        && file_type == FileType::SymLink
-    {
-        return Err(SystemError::ELOOP);
-    }
-
-    // Linux semantics: socket inodes (S_IFSOCK) cannot be opened via open(2).
-    // Users must use socket(2)/connect(2) instead. Linux returns ENXIO.
-    if file_type == FileType::Socket {
-        return Err(SystemError::ENXIO);
-    }
     // 如果路径以斜杠结尾，而目标不是目录，返回 ENOTDIR
     if path_ends_with_slash && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
@@ -398,6 +388,12 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         && !created
     {
         return Err(SystemError::EEXIST);
+    }
+    if how.o_flags.contains(FileFlags::O_NOFOLLOW)
+        && !how.o_flags.contains(FileFlags::O_PATH)
+        && file_type == FileType::SymLink
+    {
+        return Err(SystemError::ELOOP);
     }
     // 对已存在的目录使用 O_CREAT 视为错误
     if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
@@ -413,10 +409,6 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         let acc_mode = how.o_flags.access_flags();
         if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
             return Err(SystemError::EISDIR);
-        }
-        // 目录不支持 O_DIRECT
-        if how.o_flags.contains(FileFlags::O_DIRECT) {
-            return Err(SystemError::EINVAL);
         }
     }
     // 非 O_PATH 需要检查访问权限（read/write/truncate）
@@ -442,6 +434,25 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     // 如果要打开的是文件夹，而目标不是文件夹
     if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
+    }
+
+    // Linux resolves path/file-type and ordinary DAC errors before applying
+    // O_NOATIME's owner/CAP_FOWNER restriction. In particular, O_NOFOLLOW on
+    // a final symlink must report ELOOP rather than an ownership-based EPERM.
+    if how.o_flags.contains(FileFlags::O_NOATIME) {
+        super::permission::check_noatime_permission(&metadata)?;
+    }
+
+    // Linux rejects unsupported direct I/O from do_dentry_open(), after
+    // may_open() has enforced O_NOATIME ownership.
+    if file_type == FileType::Dir && how.o_flags.contains(FileFlags::O_DIRECT) {
+        return Err(SystemError::EINVAL);
+    }
+
+    // Linux reaches the socket file operation only after DAC and O_NOATIME
+    // checks; sock_no_open() then rejects pathname-based opens with ENXIO.
+    if file_type == FileType::Socket {
+        return Err(SystemError::ENXIO);
     }
 
     // 如果O_TRUNC，并且是普通文件，清空文件

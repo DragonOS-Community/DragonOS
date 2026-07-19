@@ -58,6 +58,7 @@ let
     # This prevents rebuilds when files in ./runner change.
     src = lib.sourceByRegex ./. [
       "^whitelist\.txt$"
+      "^required_tests\.txt$"
       "^blocklists"
       "^blocklists/.*"
       "^run_tests\.sh$"
@@ -71,6 +72,7 @@ let
       mkdir -p $out/${installDir}
 
       install -m644 whitelist.txt $out/${installDir}/
+      install -m644 required_tests.txt $out/${installDir}/
       cp -r blocklists $out/${installDir}/
       install -m755 run_tests.sh $out/${installDir}/
 

@@ -1,16 +1,14 @@
 use alloc::vec::Vec;
 use core::ptr::NonNull;
+use system_error::SystemError;
 
-use crate::arch::mm::kernel_page_flags;
 use crate::arch::MMArch;
 use crate::libs::spinlock::SpinLock;
-use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::EntryFlags;
 use crate::mm::{
     allocator::page_frame::{
         allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
     },
-    MemoryManagementArch, PhysAddr, VirtAddr,
+    MemoryManagementArch, PhysAddr,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +40,7 @@ impl Default for DmaAllocOptions {
     fn default() -> Self {
         Self {
             direction: DmaDirection::Bidirectional,
-            cache_policy: DmaCachePolicy::Uncached,
+            cache_policy: DmaCachePolicy::Cached,
             zeroed: true,
             dma_mask: None,
             use_pool: true,
@@ -63,8 +61,6 @@ pub struct DmaBuffer {
     vaddr: NonNull<u8>,
     len: usize,
     page_count: PageFrameCount,
-    #[allow(dead_code)]
-    cache_policy: DmaCachePolicy,
     pool_pages: Option<usize>,
 }
 
@@ -73,12 +69,23 @@ unsafe impl Sync for DmaBuffer {}
 
 impl DmaBuffer {
     pub fn alloc_bytes(size: usize, options: DmaAllocOptions) -> Self {
-        dma_allocator().alloc_bytes(size, options)
+        Self::try_alloc_bytes(size, options).expect("dma alloc bytes failed")
+    }
+
+    /// Allocate a physically contiguous DMA buffer without turning memory
+    /// pressure or invalid sizing into a kernel panic.
+    pub fn try_alloc_bytes(size: usize, options: DmaAllocOptions) -> Result<Self, SystemError> {
+        dma_allocator().try_alloc_bytes(size, options)
     }
 
     #[allow(dead_code)]
     pub fn alloc_pages(pages: usize, options: DmaAllocOptions) -> Self {
-        dma_allocator().alloc_pages(pages, options)
+        Self::try_alloc_pages(pages, options).expect("dma alloc pages failed")
+    }
+
+    #[allow(dead_code)]
+    pub fn try_alloc_pages(pages: usize, options: DmaAllocOptions) -> Result<Self, SystemError> {
+        dma_allocator().try_alloc_pages(pages, options)
     }
 
     #[allow(dead_code)]
@@ -124,9 +131,7 @@ impl Drop for DmaBuffer {
         {
             return;
         }
-        unsafe {
-            dma_dealloc_pages_raw(self.paddr, self.vaddr, self.page_count.data());
-        }
+        unsafe { dma_dealloc_pages_raw(self.paddr, self.vaddr, self.page_count.data()) };
     }
 }
 
@@ -180,24 +185,39 @@ impl DmaAllocator {
         Self { pools }
     }
 
-    pub fn alloc_bytes(&self, size: usize, options: DmaAllocOptions) -> DmaBuffer {
-        let page_count = page_count_from_bytes(size);
-        self.alloc_with_pages(page_count, size, options)
+    pub fn try_alloc_bytes(
+        &self,
+        size: usize,
+        options: DmaAllocOptions,
+    ) -> Result<DmaBuffer, SystemError> {
+        let page_count = page_count_from_bytes(size).ok_or(SystemError::ENOMEM)?;
+        self.try_alloc_with_pages(page_count, size, options)
     }
 
     #[allow(dead_code)]
-    pub fn alloc_pages(&self, pages: usize, options: DmaAllocOptions) -> DmaBuffer {
-        let page_count = page_count_from_pages(pages);
-        let size = pages * MMArch::PAGE_SIZE;
-        self.alloc_with_pages(page_count, size, options)
+    pub fn try_alloc_pages(
+        &self,
+        pages: usize,
+        options: DmaAllocOptions,
+    ) -> Result<DmaBuffer, SystemError> {
+        let page_count = page_count_from_pages(pages).ok_or(SystemError::ENOMEM)?;
+        let size = pages
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::ENOMEM)?;
+        self.try_alloc_with_pages(page_count, size, options)
     }
 
-    fn alloc_with_pages(
+    fn try_alloc_with_pages(
         &self,
         page_count: PageFrameCount,
         len: usize,
         options: DmaAllocOptions,
-    ) -> DmaBuffer {
+    ) -> Result<DmaBuffer, SystemError> {
+        // DragonOS currently supports coherent DMA mappings only. Keep RAM in
+        // its normal write-back direct mapping, as Linux does for coherent
+        // devices; changing PAT/cacheability requires architecture-specific
+        // cache maintenance and cannot be emulated by rewriting PTE flags.
+        validate_cache_policy(options.cache_policy)?;
         let pool_pages = self.pool_pages_for(page_count.data(), options.use_pool);
         let raw = if let Some(pages) = pool_pages {
             if let Some(raw) = self.take_from_pool(pages) {
@@ -206,48 +226,47 @@ impl DmaAllocator {
                 }
                 raw
             } else {
-                self.alloc_raw(page_count, &options)
+                self.try_alloc_raw(page_count, &options)?
             }
         } else {
-            self.alloc_raw(page_count, &options)
+            self.try_alloc_raw(page_count, &options)?
         };
-        DmaBuffer {
+        Ok(DmaBuffer {
             paddr: raw.paddr.data(),
             vaddr: raw.vaddr,
             len,
             page_count: raw.page_count,
-            cache_policy: options.cache_policy,
             pool_pages,
-        }
+        })
     }
 
-    fn alloc_raw(&self, page_count: PageFrameCount, options: &DmaAllocOptions) -> DmaRawAllocation {
-        let (paddr, count) = unsafe { allocate_page_frames(page_count) }
-            .unwrap_or_else(|| panic!("dma alloc pages failed"));
-        let virt = unsafe { MMArch::phys_2_virt(paddr).unwrap() };
+    fn try_alloc_raw(
+        &self,
+        page_count: PageFrameCount,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, SystemError> {
+        validate_cache_policy(options.cache_policy)?;
+        let (paddr, count) =
+            unsafe { allocate_page_frames(page_count) }.ok_or(SystemError::ENOMEM)?;
+        let virt = match unsafe { MMArch::phys_2_virt(paddr) } {
+            Some(virt) => virt,
+            None => {
+                unsafe {
+                    deallocate_page_frames(PhysPageFrame::new(paddr), count);
+                }
+                return Err(SystemError::ENOMEM);
+            }
+        };
         if options.zeroed {
             unsafe {
                 core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
             }
         }
-        let dma_flags: EntryFlags<MMArch> = match options.cache_policy {
-            DmaCachePolicy::Uncached => EntryFlags::mmio_flags(),
-            DmaCachePolicy::WriteCombined => EntryFlags::mmio_flags(),
-            DmaCachePolicy::Cached => EntryFlags::mmio_flags(),
-        };
-        let mut kernel_mapper = KernelMapper::lock();
-        let kernel_mapper = kernel_mapper.as_mut().unwrap();
-        let flusher = unsafe {
-            kernel_mapper
-                .remap(virt, dma_flags)
-                .expect("dma remap failed")
-        };
-        flusher.flush();
-        DmaRawAllocation {
+        Ok(DmaRawAllocation {
             paddr,
             vaddr: NonNull::new(virt.data() as *mut u8).unwrap(),
             page_count: count,
-        }
+        })
     }
 
     fn zero_raw(&self, alloc: &DmaRawAllocation) {
@@ -295,32 +314,39 @@ impl DmaAllocator {
 
 pub fn dma_alloc_pages_raw(pages: usize, mut options: DmaAllocOptions) -> (usize, NonNull<u8>) {
     options.use_pool = false;
-    let page_count = page_count_from_pages(pages);
-    let raw = dma_allocator().alloc_raw(page_count, &options);
+    let page_count = page_count_from_pages(pages).expect("invalid dma page count");
+    let raw = dma_allocator()
+        .try_alloc_raw(page_count, &options)
+        .expect("dma alloc pages failed");
     (raw.paddr.data(), raw.vaddr)
 }
 
 pub unsafe fn dma_dealloc_pages_raw(paddr: usize, vaddr: NonNull<u8>, pages: usize) -> i32 {
-    let page_count = page_count_from_pages(pages);
-    let vaddr = VirtAddr::new(vaddr.as_ptr() as usize);
-    let mut kernel_mapper = KernelMapper::lock();
-    let kernel_mapper = kernel_mapper.as_mut().unwrap();
-    let flusher = kernel_mapper
-        .remap(vaddr, kernel_page_flags(vaddr))
-        .expect("dma remap failed");
-    flusher.flush();
+    let page_count = page_count_from_pages(pages).expect("invalid dma deallocation page count");
+    debug_assert_eq!(
+        unsafe { MMArch::phys_2_virt(PhysAddr::new(paddr)) }.map(|addr| addr.data()),
+        Some(vaddr.as_ptr() as usize)
+    );
     unsafe {
         deallocate_page_frames(PhysPageFrame::new(PhysAddr::new(paddr)), page_count);
     }
     0
 }
 
-fn page_count_from_pages(pages: usize) -> PageFrameCount {
-    let pages = pages.max(1);
-    PageFrameCount::new(pages.next_power_of_two())
+fn validate_cache_policy(cache_policy: DmaCachePolicy) -> Result<(), SystemError> {
+    if cache_policy == DmaCachePolicy::Cached {
+        Ok(())
+    } else {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
 }
 
-fn page_count_from_bytes(size: usize) -> PageFrameCount {
+fn page_count_from_pages(pages: usize) -> Option<PageFrameCount> {
+    let pages = pages.max(1);
+    Some(PageFrameCount::new(pages.checked_next_power_of_two()?))
+}
+
+fn page_count_from_bytes(size: usize) -> Option<PageFrameCount> {
     let pages = size.div_ceil(MMArch::PAGE_SIZE).max(1);
     page_count_from_pages(pages)
 }

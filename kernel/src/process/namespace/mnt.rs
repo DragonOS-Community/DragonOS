@@ -1,7 +1,7 @@
 use crate::{
     filesystem::vfs::{
         mount::{
-            lock_mount_lifecycle, MountFSInode, MountFlags, MountTopologyGuard,
+            lock_mount_lifecycle, MountFSInode, MountFlags, MountId, MountTopologyGuard,
             MOUNT_LIFECYCLE_LOCK,
         },
         FileSystem, IndexNode, MountFS,
@@ -35,6 +35,16 @@ static MOUNT_MAX: AtomicU32 = AtomicU32::new(DEFAULT_MOUNT_MAX);
 static FAIL_COPY_REGISTRATION_PREPARE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+const FAIL_PIVOT_PREPARE_NONE: u8 = 0;
+#[cfg(test)]
+const FAIL_PIVOT_PREPARE_NEW_EDGE: u8 = 1;
+#[cfg(test)]
+const FAIL_PIVOT_PREPARE_PUT_OLD_EDGE: u8 = 2;
+#[cfg(test)]
+static FAIL_PIVOT_PREPARE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(FAIL_PIVOT_PREPARE_NONE);
+
 pub fn mount_max() -> u32 {
     MOUNT_MAX.load(Ordering::Relaxed)
 }
@@ -54,7 +64,7 @@ struct MountCountState {
 }
 
 impl MountCountState {
-    fn reserve(&mut self, amount: u32, limit: u32) -> Result<(), SystemError> {
+    fn ensure_capacity(&self, amount: u32, limit: u32) -> Result<(), SystemError> {
         let used = self
             .mounts
             .checked_add(self.pending_mounts)
@@ -63,6 +73,11 @@ impl MountCountState {
         if amount > remaining {
             return Err(SystemError::ENOSPC);
         }
+        Ok(())
+    }
+
+    fn reserve(&mut self, amount: u32, limit: u32) -> Result<(), SystemError> {
+        self.ensure_capacity(amount, limit)?;
         self.pending_mounts = self
             .pending_mounts
             .checked_add(amount)
@@ -121,9 +136,26 @@ pub struct MntNamespace {
     inner: RwSem<InnerMntNamespace>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootMountAttachment {
+    /// Linux's initial rootfs has no parent and cannot be pivoted.
+    Unattached,
+    /// The visible root is mounted on the hidden initial rootfs anchor.
+    Attached,
+}
+
 pub struct InnerMntNamespace {
     _dead: bool,
     root_mountfs: Arc<MountFS>,
+    /// Identity of the hidden parent attachment of the namespace root.
+    ///
+    /// DragonOS removes the boot rootfs object when the real root is
+    /// installed, so that hidden parent edge cannot be represented by
+    /// `MountFS::self_mountpoint`. Keep its semantic state explicitly: the
+    /// initial rootfs is unattached and cannot be pivoted, while the real boot
+    /// root and namespace copies retain the old rootfs mount ID as the
+    /// conceptual parent exposed by mountinfo.
+    root_parent_mount_id: Option<MountId>,
     mount_count: MountCountState,
     /// Exact old-mount to copied-mount projection used to rebind fs_struct
     /// root/pwd after CLONE_NEWNS. This is object identity, never a pathname.
@@ -206,6 +238,7 @@ impl MntNamespace {
             _user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: RwSem::new(InnerMntNamespace {
                 root_mountfs: ramfs.clone(),
+                root_parent_mount_id: None,
                 mount_count: MountCountState::default(),
                 copy_sources: Vec::new(),
                 _dead: false,
@@ -229,10 +262,16 @@ impl MntNamespace {
     /// Forcibly replace the root mount filesystem of this MountNamespace.
     ///
     /// This method is only for use during DragonOS initialization.
-    pub fn force_change_root_mountfs(&self, new_root: Arc<MountFS>) {
+    pub(crate) fn force_change_root_mountfs(
+        &self,
+        new_root: Arc<MountFS>,
+        attachment: RootMountAttachment,
+    ) {
         let mut inner_guard = self.inner.write();
         new_root.set_namespace(self.self_ref.clone());
         let old_root = core::mem::replace(&mut inner_guard.root_mountfs, new_root);
+        inner_guard.root_parent_mount_id =
+            (attachment == RootMountAttachment::Attached).then_some(old_root.mount_id());
         assert!(
             old_root.take_namespace_accounted(&self.self_ref),
             "the old namespace root must own one committed mount slot"
@@ -265,27 +304,24 @@ impl MntNamespace {
         let old_root = old_root_path.mount_fs();
         let new_root = new_root_path.mount_fs();
         let put_old_mnt = put_old_mountpoint.mount_fs();
-        // Namespace publication precedes dentry gates in the canonical order.
-        // Keeping this writer across the commit also pins the namespace root
-        // identity until the final publication step.
+        // The namespace writer precedes dentry gates in the canonical order.
+        // Keeping it across the edge commit also pins the namespace root
+        // identity throughout admission and mutation.
         let mut namespace_inner = self.inner.write();
         let namespace_root = namespace_inner.root_mountfs.clone();
         let old_is_namespace_root = Arc::ptr_eq(&old_root, &namespace_root);
-        // DragonOS represents the namespace root without a visible parent
-        // edge. Attached caller roots use their exact parent below; the
-        // namespace-root branch instead publishes through root_mountfs.
         let old_root_mountpoint = old_root.self_mountpoint();
         let root_parent = old_root_mountpoint
             .as_ref()
             .map(|mountpoint| mountpoint.mount_fs())
             .unwrap_or_else(|| old_root.clone());
-        if !old_is_namespace_root && old_root_mountpoint.is_none() {
-            return Err(SystemError::EINVAL);
-        }
-        let new_root_mountpoint = new_root.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        let new_root_parent = new_root_mountpoint.mount_fs();
+        let new_root_mountpoint = new_root.self_mountpoint();
+        let new_root_parent = new_root_mountpoint
+            .as_ref()
+            .map(|mountpoint| mountpoint.mount_fs())
+            .unwrap_or_else(|| new_root.clone());
         let gates = [
-            Some(new_root_mountpoint.clone()),
+            new_root_mountpoint.clone(),
             if old_is_namespace_root {
                 None
             } else {
@@ -315,10 +351,6 @@ impl MntNamespace {
                 || !new_root.is_belongs_to_mntns(&namespace)
                 || new_root.is_locked()
                 || !Arc::ptr_eq(&namespace_inner.root_mountfs, &namespace_root)
-                || new_root
-                    .self_mountpoint()
-                    .as_ref()
-                    .is_none_or(|mountpoint| !Arc::ptr_eq(mountpoint, &new_root_mountpoint))
             {
                 return Err(SystemError::EINVAL);
             }
@@ -328,8 +360,33 @@ impl MntNamespace {
             if Arc::ptr_eq(&new_root, &old_root) || Arc::ptr_eq(&put_old_mnt, &old_root) {
                 return Err(SystemError::EBUSY);
             }
+            if old_is_namespace_root && namespace_inner.root_parent_mount_id.is_none() {
+                return Err(SystemError::EINVAL);
+            }
+            let old_root_mountpoint = old_root_mountpoint.as_ref();
+            if !old_is_namespace_root && old_root_mountpoint.is_none() {
+                return Err(SystemError::EINVAL);
+            }
+            let Some(new_root_mountpoint) = new_root_mountpoint.as_ref() else {
+                return Err(SystemError::EINVAL);
+            };
             if !old_root_path.same_path_ref(&old_root.mountpoint_root_inode())
                 || !new_root_path.same_path_ref(&new_root.mountpoint_root_inode())
+                || (!old_is_namespace_root
+                    && old_root
+                        .self_mountpoint()
+                        .as_ref()
+                        .is_none_or(|mountpoint| {
+                            !Arc::ptr_eq(
+                                mountpoint,
+                                old_root_mountpoint
+                                    .expect("validated attached root must retain its mountpoint"),
+                            )
+                        }))
+                || new_root
+                    .self_mountpoint()
+                    .as_ref()
+                    .is_none_or(|mountpoint| !Arc::ptr_eq(mountpoint, new_root_mountpoint))
                 || put_old_mountpoint
                     .relative_path_from_snapshot(&new_root_path)?
                     .is_none()
@@ -343,7 +400,31 @@ impl MntNamespace {
             // Prepare every allocation before changing an edge. The
             // reservations keep the original new-root key alive and
             // guarantee one put-old slot.
-            let _new_edge = new_root_parent.reserve_mount_edge(&new_root_mountpoint, 0)?;
+            #[cfg(test)]
+            if FAIL_PIVOT_PREPARE
+                .compare_exchange(
+                    FAIL_PIVOT_PREPARE_NEW_EDGE,
+                    FAIL_PIVOT_PREPARE_NONE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Err(SystemError::ENOMEM);
+            }
+            let _new_edge = new_root_parent.reserve_mount_edge(new_root_mountpoint, 0)?;
+            #[cfg(test)]
+            if FAIL_PIVOT_PREPARE
+                .compare_exchange(
+                    FAIL_PIVOT_PREPARE_PUT_OLD_EDGE,
+                    FAIL_PIVOT_PREPARE_NONE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Err(SystemError::ENOMEM);
+            }
             let _put_old_edge = put_old_mnt.reserve_mount_edge(&put_old_mountpoint, 1)?;
 
             new_root_parent
@@ -353,8 +434,7 @@ impl MntNamespace {
                 new_root.relocate_mountpoint(None);
             } else {
                 let old_root_mountpoint = old_root_mountpoint
-                    .as_ref()
-                    .expect("validated attached caller root must keep its mountpoint");
+                    .expect("validated attached root must retain its mountpoint");
                 new_root.relocate_mountpoint(Some(old_root_mountpoint.clone()));
                 root_parent
                     .replace_exact_edge_prepared_with_token(&old_root, new_root.clone(), gate_token)
@@ -636,6 +716,12 @@ impl MntNamespace {
             inner: RwSem::new(InnerMntNamespace {
                 _dead: false,
                 root_mountfs: new_root_mntfs,
+                // Linux copy_tree() clones the hidden parent together with the
+                // visible root, so the copied namespace must not expose the
+                // source namespace's parent mount identity in mountinfo.
+                root_parent_mount_id: inner
+                    .root_parent_mount_id
+                    .map(|_| MountId::alloc_conceptual()),
                 // Linux copy_mnt_ns() initializes the copied namespace's
                 // existing mount count directly. mount-max only admits new
                 // mount trees; it must not reject cloning existing topology.
@@ -667,6 +753,13 @@ impl MntNamespace {
 
     pub fn root_mntfs(&self) -> Arc<MountFS> {
         Self::root_mntfs_locked(&self.inner.read())
+    }
+
+    /// Return the (possibly invisible) parent mount ID of an attached namespace
+    /// root. Linux exposes this ID in mountinfo even when the parent is outside
+    /// the process's visible root.
+    pub(crate) fn root_parent_mount_id(&self) -> Option<MountId> {
+        self.inner.read().root_parent_mount_id
     }
 
     /// Get the root inode of this mount namespace
@@ -826,6 +919,18 @@ impl MntNamespace {
         Some(mntfs.clone())
     }
 
+    /// Fail early when a known lower bound cannot fit in this namespace.
+    ///
+    /// This is only a preflight optimization; the later reservation remains
+    /// authoritative and closes any race with a concurrent limit change.
+    pub(crate) fn ensure_mount_capacity(&self, amount: usize) -> Result<(), SystemError> {
+        let amount = u32::try_from(amount).map_err(|_| SystemError::ENOSPC)?;
+        self.inner
+            .read()
+            .mount_count
+            .ensure_capacity(amount, mount_max())
+    }
+
     pub(crate) fn reserve_mounts(
         &self,
         mut mounts: Vec<Arc<MountFS>>,
@@ -885,10 +990,71 @@ impl ProcessManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filesystem::ramfs::RamFS;
     use crate::process::namespace::{
         propagation::{get_peers, register_peer},
         user_namespace::INIT_USER_NAMESPACE,
     };
+
+    fn new_private_mount(mountpoint: Arc<MountFSInode>) -> Arc<MountFS> {
+        MountFS::new(
+            RamFS::new(),
+            None,
+            Some(mountpoint),
+            MountPropagation::new_private(),
+            None,
+            MountFlags::empty(),
+            None,
+        )
+    }
+
+    fn install_attached_root(namespace: &Arc<MntNamespace>) -> Arc<MountFS> {
+        let root = MountFS::new(
+            RamFS::new(),
+            None,
+            None,
+            MountPropagation::new_private(),
+            Some(namespace),
+            MountFlags::empty(),
+            None,
+        );
+        root.activate().unwrap();
+        namespace.force_change_root_mountfs(root.clone(), RootMountAttachment::Attached);
+        root
+    }
+
+    fn assert_failed_pivot_unchanged(
+        namespace: &Arc<MntNamespace>,
+        namespace_root: &Arc<MountFS>,
+        old_root: &Arc<MountFS>,
+        new_root: &Arc<MountFS>,
+        old_root_mountpoint: &Arc<MountFSInode>,
+        new_root_mountpoint: &Arc<MountFSInode>,
+    ) {
+        assert!(Arc::ptr_eq(&namespace.root_mntfs(), namespace_root));
+        assert_eq!(namespace.inner.read().mount_count.mounts, 3);
+        assert!(namespace_root
+            .children_at(old_root_mountpoint)
+            .iter()
+            .any(|mount| Arc::ptr_eq(mount, old_root)));
+        assert!(old_root
+            .children_at(new_root_mountpoint)
+            .iter()
+            .any(|mount| Arc::ptr_eq(mount, new_root)));
+        assert!(new_root
+            .children_at(&new_root.mountpoint_root_inode())
+            .is_empty());
+        assert!(old_root
+            .self_mountpoint()
+            .as_ref()
+            .is_some_and(|mountpoint| Arc::ptr_eq(mountpoint, old_root_mountpoint)));
+        assert!(new_root
+            .self_mountpoint()
+            .as_ref()
+            .is_some_and(|mountpoint| Arc::ptr_eq(mountpoint, new_root_mountpoint)));
+        assert!(old_root.is_locked());
+        assert!(!new_root.is_locked());
+    }
 
     #[test]
     fn registration_prepare_failure_cleans_namespace_copy() {
@@ -915,6 +1081,136 @@ mod tests {
         );
         assert!(root.is_live());
         assert!(root.is_belongs_to_mntns(&namespace));
+    }
+
+    #[test]
+    fn initial_rootfs_pivot_is_rejected() {
+        let namespace = MntNamespace::new_root();
+        let root = namespace.root_mntfs();
+        let new_root_mountpoint = root.mountpoint_root_inode();
+        let new_root = new_private_mount(new_root_mountpoint.clone());
+        {
+            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+            namespace
+                .add_mount(Some(&root), Some(&new_root_mountpoint), new_root.clone())
+                .unwrap();
+        }
+
+        let result = namespace.pivot_root(
+            root.mountpoint_root_inode(),
+            new_root.mountpoint_root_inode(),
+            new_root.mountpoint_root_inode(),
+        );
+
+        assert!(matches!(result, Err(SystemError::EINVAL)));
+        assert!(Arc::ptr_eq(&namespace.root_mntfs(), &root));
+        assert!(root
+            .children_at(&new_root_mountpoint)
+            .iter()
+            .any(|mount| Arc::ptr_eq(mount, &new_root)));
+    }
+
+    #[test]
+    fn attached_namespace_root_can_be_pivoted() {
+        let namespace = MntNamespace::new_root();
+        let old_root = install_attached_root(&namespace);
+        let new_root_mountpoint = old_root.mountpoint_root_inode();
+        let new_root = new_private_mount(new_root_mountpoint.clone());
+        {
+            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+            namespace
+                .add_mount(
+                    Some(&old_root),
+                    Some(&new_root_mountpoint),
+                    new_root.clone(),
+                )
+                .unwrap();
+        }
+
+        namespace
+            .pivot_root(
+                old_root.mountpoint_root_inode(),
+                new_root.mountpoint_root_inode(),
+                new_root.mountpoint_root_inode(),
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&namespace.root_mntfs(), &new_root));
+        assert!(new_root.self_mountpoint().is_none());
+        assert!(old_root
+            .self_mountpoint()
+            .as_ref()
+            .is_some_and(|mountpoint| Arc::ptr_eq(mountpoint, &new_root.mountpoint_root_inode())));
+        assert!(namespace.inner.read().root_parent_mount_id.is_some());
+    }
+
+    #[test]
+    fn namespace_copy_preserves_root_attachment() {
+        let initial = MntNamespace::new_root();
+        let initial_copy = initial
+            .copy_mnt_ns(&CloneFlags::CLONE_NEWNS, INIT_USER_NAMESPACE.clone())
+            .unwrap();
+        assert!(initial_copy.inner.read().root_parent_mount_id.is_none());
+
+        let attached = MntNamespace::new_root();
+        install_attached_root(&attached);
+        let attached_copy = attached
+            .copy_mnt_ns(&CloneFlags::CLONE_NEWNS, INIT_USER_NAMESPACE.clone())
+            .unwrap();
+        let attached_parent = attached.inner.read().root_parent_mount_id.unwrap();
+        let copied_parent = attached_copy.inner.read().root_parent_mount_id.unwrap();
+        assert_ne!(attached_parent, copied_parent);
+        assert_ne!(copied_parent, attached_copy.root_mntfs().mount_id());
+    }
+
+    #[test]
+    fn pivot_prepare_failures_leave_topology_and_locks_unchanged() {
+        let namespace = MntNamespace::new_root();
+        let namespace_root = namespace.root_mntfs();
+        let old_root_mountpoint = namespace_root.mountpoint_root_inode();
+        let old_root = new_private_mount(old_root_mountpoint.clone());
+        let new_root_mountpoint = old_root.mountpoint_root_inode();
+        let new_root = new_private_mount(new_root_mountpoint.clone());
+        {
+            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+            namespace
+                .add_mount(
+                    Some(&namespace_root),
+                    Some(&old_root_mountpoint),
+                    old_root.clone(),
+                )
+                .unwrap();
+            namespace
+                .add_mount(
+                    Some(&old_root),
+                    Some(&new_root_mountpoint),
+                    new_root.clone(),
+                )
+                .unwrap();
+        }
+        old_root.lock_mount();
+
+        for failure_point in [FAIL_PIVOT_PREPARE_NEW_EDGE, FAIL_PIVOT_PREPARE_PUT_OLD_EDGE] {
+            FAIL_PIVOT_PREPARE.store(failure_point, Ordering::Release);
+            let result = namespace.pivot_root(
+                old_root.mountpoint_root_inode(),
+                new_root.mountpoint_root_inode(),
+                new_root.mountpoint_root_inode(),
+            );
+            assert!(matches!(result, Err(SystemError::ENOMEM)));
+            assert_eq!(
+                FAIL_PIVOT_PREPARE.load(Ordering::Acquire),
+                FAIL_PIVOT_PREPARE_NONE
+            );
+            assert_failed_pivot_unchanged(
+                &namespace,
+                &namespace_root,
+                &old_root,
+                &new_root,
+                &old_root_mountpoint,
+                &new_root_mountpoint,
+            );
+        }
     }
 }
 

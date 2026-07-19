@@ -618,6 +618,7 @@ impl FuseNode {
         truncate_metadata: Option<(&Metadata, SetMetadataMask)>,
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        let _setattr_guard = self.setattr_lock.lock();
         let old_size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
         self.resolve_pending_short_read_truncate(len)?;
         // Drain once before taking the exclusive admission barrier to reduce

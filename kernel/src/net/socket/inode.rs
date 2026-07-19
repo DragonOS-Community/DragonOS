@@ -378,6 +378,10 @@ impl<T: Socket + 'static> IndexNode for T {
         }
     }
 
+    fn try_fs(&self) -> Option<Arc<dyn crate::filesystem::vfs::FileSystem>> {
+        None
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }

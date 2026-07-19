@@ -3,8 +3,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETSOCKOPT;
 use crate::mm::VirtAddr;
-use crate::net::socket;
-use crate::net::socket::{PIPV6, PSOL};
+use crate::net::socket::{PIPV6, PSO, PSOL};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -43,13 +42,54 @@ impl Syscall for SysSetsockoptHandle {
         let level = Self::level(args);
         let optname = Self::optname(args);
         let optval = Self::optval(args);
-        let optlen = Self::optlen(args);
+        let raw_optlen = Self::optlen(args);
+
+        // Linux resolves the descriptor before inspecting any option-specific
+        // length or user pointer. Keep the inode alive through the copy so a
+        // concurrent close cannot change which socket receives the option.
+        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
+
+        // The syscall ABI declares optlen as a 32-bit signed int. Scalar
+        // register arguments are truncated to the low 32 bits; negative
+        // lengths are rejected before inspecting optval.
+        let signed_optlen = raw_optlen as u32 as i32;
+        if signed_optlen < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let optlen = signed_optlen as usize;
 
         // Linux 6.6 行为：IPV6_CHECKSUM 在 setsockopt 时会无视 optlen，直接按 int 读取。
         // gVisor raw_socket_test: RawSocketTest.SetIPv6ChecksumError_ReadShort
         let mut optlen_to_read = optlen;
         if level == PSOL::IPV6 as usize && optname == PIPV6::CHECKSUM as usize {
             optlen_to_read = core::mem::size_of::<i32>();
+        }
+        // Linux validates the integer length before touching optval, then
+        // consumes only the leading int even when a longer buffer is supplied.
+        let filter_int_option = level == PSOL::SOCKET as usize
+            && matches!(
+                PSO::try_from(optname as u32),
+                Ok(PSO::DETACH_FILTER | PSO::LOCK_FILTER)
+            );
+        if filter_int_option {
+            if optlen < core::mem::size_of::<i32>() {
+                return Err(SystemError::EINVAL);
+            }
+            optlen_to_read = core::mem::size_of::<i32>();
+        }
+        // Linux's generic SOL_SOCKET path first reads an int. For a malformed
+        // SO_ATTACH_FILTER length, preserve that access/error ordering, then
+        // pass a four-byte slice so the fprog parser returns EINVAL. Only the
+        // exact native layout causes the full structure to be read.
+        let attach_filter = level == PSOL::SOCKET as usize
+            && matches!(PSO::try_from(optname as u32), Ok(PSO::ATTACH_FILTER));
+        if attach_filter {
+            if optlen < core::mem::size_of::<i32>() {
+                return Err(SystemError::EINVAL);
+            }
+            if optlen != core::mem::size_of::<crate::bpf::classic::SockFprog>() {
+                optlen_to_read = core::mem::size_of::<i32>();
+            }
         }
 
         // Verify optval address validity if from user space
@@ -65,7 +105,12 @@ impl Syscall for SysSetsockoptHandle {
             UserBufferReader::new(optval, optlen_to_read, frame.is_from_user())?;
         let data = user_buffer_reader.read_from_user(0)?;
 
-        do_setsockopt(fd, level, optname, data)
+        let sol = PSOL::try_from(level as u32)?;
+        socket_inode
+            .as_socket()
+            .unwrap()
+            .set_option(sol, optname, data)
+            .map(|_| 0)
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -114,29 +159,3 @@ impl SysSetsockoptHandle {
 }
 
 syscall_table_macros::declare_syscall!(SYS_SETSOCKOPT, SysSetsockoptHandle);
-
-/// Internal implementation of the setsockopt operation
-///
-/// # Arguments
-/// * `fd` - File descriptor
-/// * `level` - Option level
-/// * `optname` - Option name
-/// * `optval` - Option value
-///
-/// # Returns
-/// * `Ok(usize)` - 0 on success
-/// * `Err(SystemError)` - Error code if operation fails
-pub(super) fn do_setsockopt(
-    fd: usize,
-    level: usize,
-    optname: usize,
-    optval: &[u8],
-) -> Result<usize, SystemError> {
-    let sol = socket::PSOL::try_from(level as u32)?;
-    let socket = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-    socket
-        .as_socket()
-        .unwrap()
-        .set_option(sol, optname, optval)
-        .map(|_| 0)
-}

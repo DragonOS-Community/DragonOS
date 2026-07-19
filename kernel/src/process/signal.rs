@@ -34,7 +34,11 @@ impl ProcessControlBlock {
     pub fn replace_sighand(&self, new: Arc<SigHand>) {
         self.with_task_lock_irqsave(|| {
             new.attach_task_ref();
-            let old = self.sighand.swap(new.clone());
+            // SAFETY: task_lock serializes sighand writers. If old and new
+            // share an allocation, the replacement slot reference publishes
+            // it continuously. Otherwise `old` keeps the removed allocation
+            // alive until it is submitted to rcu_defer_drop below.
+            let old = unsafe { self.sighand.swap(new.clone()) };
             if Arc::ptr_eq(&old, &new) {
                 new.detach_task_ref();
                 return;

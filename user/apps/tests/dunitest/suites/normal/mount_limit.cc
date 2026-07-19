@@ -400,6 +400,30 @@ TEST_F(MountLimitTest, NamespaceCopyIgnoresLoweredLimitAndCreatorsRespectIt) {
     EXPECT_EQ(before + 1, mount_count());
 }
 
+TEST_F(MountLimitTest, LoweredLimitDoesNotTruncateExistingTopologyWalk) {
+    const std::string target = dir("/a");
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_EQ(0, mount("none", target.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    }
+    const std::string marker = target + "/top";
+    int fd = open(marker.c_str(), O_CREAT | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    close(fd);
+
+    ASSERT_EQ(0, write_mount_max(1)) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, stat(marker.c_str(), &st)) << strerror(errno);
+
+    char old_cwd[PATH_MAX] = {};
+    ASSERT_NE(nullptr, getcwd(old_cwd, sizeof(old_cwd))) << strerror(errno);
+    ASSERT_EQ(0, chdir(target.c_str())) << strerror(errno);
+    ASSERT_EQ(0, chdir("..")) << strerror(errno);
+    char parent[PATH_MAX] = {};
+    ASSERT_NE(nullptr, getcwd(parent, sizeof(parent))) << strerror(errno);
+    EXPECT_EQ(root_, parent);
+    ASSERT_EQ(0, chdir(old_cwd)) << strerror(errno);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

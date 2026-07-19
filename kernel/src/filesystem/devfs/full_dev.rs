@@ -111,6 +111,12 @@ impl IndexNode for LockedFullInode {
         return Ok(());
     }
 
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        Ok(())
+    }
+
     fn read_at(
         &self,
         _offset: usize,

@@ -53,3 +53,7 @@ pub fn create_netlink_socket(
 
     Ok(inode)
 }
+
+pub(crate) fn notify_link_change(iface: &Arc<dyn crate::driver::net::Iface>) {
+    route::kern::notify_link_change(iface);
+}

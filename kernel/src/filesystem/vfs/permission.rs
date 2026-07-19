@@ -5,7 +5,8 @@
 
 use super::Metadata;
 use crate::{
-    filesystem::vfs::{FileType, InodeMode},
+    filesystem::vfs::{mount::MountFS, FileType, InodeMode},
+    libs::casting::DowncastArc,
     process::cred::{CAPFlags, Cred},
     process::ProcessManager,
 };
@@ -35,6 +36,60 @@ bitflags! {
     }
 }
 
+pub struct ChildInodeInit {
+    pub uid: usize,
+    pub gid: usize,
+    pub mode: InodeMode,
+}
+
+/// Compute owner and directory-SGID inheritance before publishing a child.
+pub fn child_inode_init(
+    parent: &Metadata,
+    file_type: FileType,
+    mut mode: InodeMode,
+) -> ChildInodeInit {
+    // Filesystems such as procfs create backing ramfs nodes before the process
+    // manager has installed an idle task. Those kernel-owned bootstrap
+    // creations run with the initial root credential rather than a current
+    // task credential.
+    if !ProcessManager::initialized() {
+        let gid = if parent.mode.contains(InodeMode::S_ISGID) {
+            if file_type == FileType::Dir {
+                mode.insert(InodeMode::S_ISGID);
+            }
+            parent.gid
+        } else {
+            0
+        };
+        return ChildInodeInit { uid: 0, gid, mode };
+    }
+
+    let cred = ProcessManager::current_pcb().cred();
+    let gid = if parent.mode.contains(InodeMode::S_ISGID) {
+        if file_type == FileType::Dir {
+            mode.insert(InodeMode::S_ISGID);
+        }
+        parent.gid
+    } else {
+        cred.fsgid.data()
+    };
+    // Linux vfs_prepare_mode()/mode_strip_sgid(): a caller must not create an
+    // executable setgid non-directory for a group it does not belong to.
+    let in_group = cred.fsgid.data() == gid || cred.groups.iter().any(|group| group.data() == gid);
+    if file_type != FileType::Dir
+        && mode.contains(InodeMode::S_ISGID | InodeMode::S_IXGRP)
+        && !in_group
+        && !cred.has_capability(CAPFlags::CAP_FSETID)
+    {
+        mode.remove(InodeMode::S_ISGID);
+    }
+    ChildInodeInit {
+        uid: cred.fsuid.data(),
+        gid,
+        mode,
+    }
+}
+
 /// VFS permission check wrapper that respects per-filesystem policy.
 ///
 /// This is the single entry point that should be used by VFS/pathwalk/syscalls
@@ -49,10 +104,30 @@ pub fn check_inode_permission(
     metadata: &Metadata,
     mask: PermissionMask,
 ) -> Result<(), SystemError> {
+    // Match Linux sb_permission(): a read-only mount rejects write access to
+    // filesystem objects before DAC/capability overrides are considered.
+    if mask.contains(PermissionMask::MAY_WRITE)
+        && matches!(
+            metadata.file_type,
+            FileType::File | FileType::Dir | FileType::SymLink
+        )
+        && inode
+            .try_fs()
+            .and_then(|fs| fs.downcast_arc::<MountFS>())
+            .is_some_and(|mount| mount.is_readonly())
+    {
+        return Err(SystemError::EROFS);
+    }
+    if mask.contains(PermissionMask::MAY_WRITE)
+        && metadata.flags.contains(super::InodeFlags::S_IMMUTABLE)
+    {
+        return Err(SystemError::EPERM);
+    }
+
     let cred = ProcessManager::current_pcb().cred();
-    match inode.fs().permission_policy() {
-        FsPermissionPolicy::Dac => cred.inode_permission(metadata, mask.bits()),
-        FsPermissionPolicy::Remote => {
+    match inode.try_fs().map(|fs| fs.permission_policy()) {
+        None | Some(FsPermissionPolicy::Dac) => cred.inode_permission(metadata, mask.bits()),
+        Some(FsPermissionPolicy::Remote) => {
             if mask.contains(PermissionMask::MAY_EXEC)
                 && metadata.file_type == FileType::File
                 && (metadata.mode.bits() & InodeMode::S_IXUGO.bits()) == 0
@@ -61,6 +136,21 @@ pub fn check_inode_permission(
             }
             Ok(())
         }
+    }
+}
+
+/// Check whether the current task may suppress access-time updates for an inode.
+///
+/// Linux restricts enabling `O_NOATIME` to the inode owner or a task with
+/// `CAP_FOWNER`.  This check is separate from read permission: being allowed to
+/// read another user's file does not imply permission to hide that access from
+/// its timestamp metadata.
+pub fn check_noatime_permission(metadata: &Metadata) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    if cred.fsuid.data() == metadata.uid || cred.has_capability(CAPFlags::CAP_FOWNER) {
+        Ok(())
+    } else {
+        Err(SystemError::EPERM)
     }
 }
 

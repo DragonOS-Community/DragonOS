@@ -1,6 +1,7 @@
 //! AF_PACKET sockets.
-
 mod binding;
+mod fanout;
+mod mreq;
 mod ring;
 mod rx;
 mod sockopt;
@@ -13,6 +14,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use system_error::SystemError;
 
+use crate::bpf::classic::SockFilter;
 use crate::driver::net::Iface;
 use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
@@ -23,9 +25,15 @@ use crate::net::socket::{Socket, PMSG, PSOCK, PSOL};
 use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
+use crate::rcu::RcuOptionArcSlot;
 
 pub use ring::{RingWriteResult, TpacketVersion};
-pub use uapi::{eth_protocol, packet_option, PacketType, SockAddrLl, TpacketAuxdata};
+pub(crate) use fanout::{membership_value, FanoutGroup, FanoutJoinParams};
+#[allow(unused_imports)]
+pub use uapi::{
+    eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,
+    PacketType, SockAddrLl, TpacketAuxdata,
+};
 
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;
@@ -37,12 +45,39 @@ pub enum PacketSocketType {
     Dgram,
 }
 
+/// Metadata captured at the packet-tap boundary. Keeping this structure
+/// `Copy` lets the NAPI receive path pass device information to every packet
+/// socket without consulting the sleepable netdevice registry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PacketIngressMetadata {
+    pub ifindex: u32,
+    pub hatype: u16,
+    pub pkt_type: PacketType,
+}
+
+impl PacketIngressMetadata {
+    #[inline]
+    fn from_iface(iface: &Arc<dyn Iface>, pkt_type: PacketType) -> Self {
+        Self {
+            ifindex: iface.nic_id() as u32,
+            hatype: iface.type_() as u16,
+            pkt_type,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PacketMetadata {
     pub src_mac: [u8; 6],
+    #[allow(dead_code)]
+    pub dst_mac: [u8; 6],
     pub protocol: u16,
     pub ifindex: u32,
+    pub hatype: u16,
     pub pkt_type: PacketType,
+    pub wire_len: usize,
+    #[allow(dead_code)]
+    pub mac_offset: usize,
     pub net_offset: usize,
     pub vlan_tci: u16,
     pub vlan_tpid: u16,
@@ -78,10 +113,21 @@ pub struct PacketSocket {
     pub(super) send_timeout_ticks: AtomicU64,
     pub(super) recv_timeout_ticks: AtomicU64,
     pub(super) wait_queue: WaitQueue,
+    memberships: Mutex<mreq::PacketMembershipState>,
     inode_id: InodeId,
     open_files: AtomicUsize,
     pub(super) self_ref: Weak<Self>,
     pub(super) netns: Arc<NetNamespace>,
+    /// cBPF filter program; an empty slot is the single source of truth for “not installed”.
+    pub(super) filter: RcuOptionArcSlot<Vec<SockFilter>>,
+    /// Serializes SO_ATTACH_FILTER, SO_DETACH_FILTER, and SO_LOCK_FILTER.
+    pub(super) filter_locked: Mutex<bool>,
+    /// Control-plane PACKET_FANOUT state: bit 32 marks active membership and
+    /// the low 32 bits are the Linux getsockopt encoding.
+    pub(super) fanout_membership: AtomicU64,
+    /// Writer/cleanup lifecycle marker. The NAPI delivery path uses this bit
+    /// to reject inactive entries retained by an older topology snapshot.
+    registry_active: AtomicBool,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
     pub(super) rx_ring: Mutex<Option<Arc<Mutex<ring::PacketRing>>>>,
@@ -119,21 +165,36 @@ impl PacketSocket {
             send_timeout_ticks: AtomicU64::new(crate::net::socket::common::INFINITE_TIMEOUT_TICKS),
             recv_timeout_ticks: AtomicU64::new(crate::net::socket::common::INFINITE_TIMEOUT_TICKS),
             wait_queue: WaitQueue::default(),
+            memberships: Mutex::new(mreq::PacketMembershipState::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
             self_ref: me.clone(),
             netns,
+            fanout_membership: AtomicU64::new(0),
+            registry_active: AtomicBool::new(true),
             epoll_items: EPollItems::default(),
+            filter: RcuOptionArcSlot::new_none(),
+            filter_locked: Mutex::new(false),
             fasync_items: FAsyncItems::default(),
             rx_ring: Mutex::new(None),
             tpacket_version: Mutex::new(ring::TpacketVersion::V1),
             tp_reserve: AtomicU32::new(0),
         });
-        socket.netns.register_packet_socket(socket.self_ref.clone());
+        socket
+            .netns
+            .register_packet_socket(socket.self_ref.clone())?;
         Ok(socket)
     }
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_packet_registry_active(&self) -> bool {
+        self.registry_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn deactivate_packet_registry(&self) {
+        self.registry_active.store(false, Ordering::Release);
     }
     /// Returns the configured receive timeout in scheduler ticks, or None for infinite wait.
     pub(super) fn recv_timeout_ticks(&self) -> Option<u64> {
@@ -172,7 +233,7 @@ pub fn classify_packet(frame: &[u8], iface: &Arc<dyn Iface>) -> PacketType {
 /// Common AF_PACKET tap for Ethernet netdevices.
 pub fn deliver_to_packet_sockets(iface: &Arc<dyn Iface>, frame: &[u8], pkt_type: PacketType) {
     if let Some(netns) = iface.net_namespace() {
-        netns.deliver_to_packet_sockets(iface.nic_id() as u32, frame, pkt_type);
+        netns.deliver_to_packet_sockets(PacketIngressMetadata::from_iface(iface, pkt_type), frame);
     }
 }
 

@@ -1,18 +1,34 @@
-use anyhow::Result;
+use crate::gtest_xml::parse_gtest_xml;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader, Write},
-    os::unix::process::CommandExt,
+    os::unix::{
+        fs::PermissionsExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
+
+macro_rules! safe_println {
+    ($($arg:tt)*) => {{
+        // Rust's println!/eprintln! panic when DragonOS returns a transient
+        // console error. Test result collection must remain fail-closed and
+        // continue to the next binary even when diagnostic output is lost.
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        let _ = writeln!(lock, $($arg)*);
+    }};
+}
 
 /// 测试统计信息
 #[derive(Debug, Default)]
@@ -60,6 +76,7 @@ pub struct Config {
     pub use_blocklist: bool,
     pub use_whitelist: bool,
     pub whitelist_file: PathBuf,
+    pub required_tests_file: PathBuf,
     pub tests_dir: PathBuf,
     pub blocklists_dir: PathBuf,
     pub results_dir: PathBuf,
@@ -67,6 +84,7 @@ pub struct Config {
     pub extra_blocklist_dirs: Vec<PathBuf>,
     pub test_patterns: Vec<String>,
     pub output_to_stdout: bool, // 是否输出到控制台而不是文件
+    pub enforce_required: bool,
 }
 
 impl Default for Config {
@@ -79,6 +97,7 @@ impl Default for Config {
             use_blocklist: true,
             use_whitelist: true,
             whitelist_file: script_dir.join("whitelist.txt"),
+            required_tests_file: script_dir.join("required_tests.txt"),
             tests_dir: script_dir.join("tests"),
             blocklists_dir: script_dir.join("blocklists"),
             results_dir: script_dir.join("results"),
@@ -89,6 +108,7 @@ impl Default for Config {
             extra_blocklist_dirs: Vec::new(),
             test_patterns: Vec::new(),
             output_to_stdout: true,
+            enforce_required: true,
         }
     }
 }
@@ -96,11 +116,11 @@ impl Default for Config {
 /// 颜色输出辅助函数（简化版）
 pub fn print_colored(color: &str, prefix: &str, msg: &str) {
     match color {
-        "green" => println!("\x1b[32m[{}]\x1b[0m {}", prefix, msg),
-        "yellow" => println!("\x1b[33m[{}]\x1b[0m {}", prefix, msg),
-        "red" => eprintln!("\x1b[31m[{}]\x1b[0m {}", prefix, msg),
-        "blue" => println!("\x1b[34m[{}]\x1b[0m {}", prefix, msg),
-        _ => println!("[{}] {}", prefix, msg),
+        "green" => safe_println!("\x1b[32m[{}]\x1b[0m {}", prefix, msg),
+        "yellow" => safe_println!("\x1b[33m[{}]\x1b[0m {}", prefix, msg),
+        "red" => safe_println!("\x1b[31m[{}]\x1b[0m {}", prefix, msg),
+        "blue" => safe_println!("\x1b[34m[{}]\x1b[0m {}", prefix, msg),
+        _ => safe_println!("[{}] {}", prefix, msg),
     }
 }
 
@@ -108,14 +128,27 @@ pub fn print_colored(color: &str, prefix: &str, msg: &str) {
 pub struct TestRunner {
     pub config: Config,
     pub stats: Arc<TestStats>,
+    required_tests: HashMap<String, RequiredTest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredTest {
+    case_count: usize,
+    allowed_skips: HashSet<String>,
 }
 
 impl TestRunner {
-    pub fn new(config: Config) -> Self {
-        Self {
+    pub fn new(config: Config) -> Result<Self> {
+        let required_tests = if config.enforce_required {
+            read_required_tests(&config.required_tests_file)?
+        } else {
+            HashMap::new()
+        };
+        Ok(Self {
             config,
             stats: Arc::new(TestStats::default()),
-        }
+            required_tests,
+        })
     }
 
     /// 打印信息日志
@@ -190,18 +223,6 @@ impl TestRunner {
         Ok(tests)
     }
 
-    /// 检查测试是否在白名单中
-    fn is_test_whitelisted(&self, test_name: &str) -> bool {
-        if !self.config.use_whitelist {
-            return true;
-        }
-
-        match self.get_whitelist_tests() {
-            Ok(whitelist) => whitelist.contains(test_name),
-            Err(_) => false,
-        }
-    }
-
     /// 获取测试的blocklist
     fn get_test_blocklist(&self, test_name: &str) -> Vec<String> {
         if !self.config.use_blocklist {
@@ -264,17 +285,29 @@ impl TestRunner {
         }
 
         // 应用白名单过滤
+        let all_test_names: HashSet<_> = all_tests.iter().cloned().collect();
         let mut candidate_tests = Vec::new();
         if self.config.use_whitelist {
+            let whitelist = self.get_whitelist_tests()?;
             for test in &all_tests {
-                if self.is_test_whitelisted(test) {
+                if whitelist.contains(test) {
                     candidate_tests.push(test.clone());
                 }
             }
 
-            if candidate_tests.is_empty() {
-                self.print_warn("没有测试通过白名单过滤");
-                return Ok(Vec::new());
+            for stale in whitelist.difference(&all_test_names) {
+                if !self.required_tests.contains_key(stale) {
+                    self.print_warn(&format!("白名单测试在发布包中不存在，已忽略: {}", stale));
+                }
+            }
+
+            if self.config.enforce_required {
+                for required in self.required_tests.keys() {
+                    if !whitelist.contains(required) {
+                        anyhow::bail!("required 测试未进入默认白名单: {}", required);
+                    }
+                    self.validate_required_binary(required)?;
+                }
             }
 
             if self.config.verbose {
@@ -288,31 +321,53 @@ impl TestRunner {
         }
 
         // 如果没有指定模式，返回候选测试
-        if self.config.test_patterns.is_empty() {
-            candidate_tests.sort();
-            return Ok(candidate_tests);
-        }
+        let mut result = if self.config.test_patterns.is_empty() {
+            candidate_tests
+        } else {
+            let mut filtered_tests = HashSet::new();
+            for pattern in &self.config.test_patterns {
+                for test in &candidate_tests {
+                    if test == pattern {
+                        filtered_tests.insert(test.clone());
+                    }
+                }
+            }
+            filtered_tests.into_iter().collect()
+        };
 
-        // 根据模式过滤测试
-        let mut filtered_tests = HashSet::new();
-        for pattern in &self.config.test_patterns {
-            for test in &candidate_tests {
-                if test == pattern {
-                    filtered_tests.insert(test.clone());
+        result.sort();
+        if result.is_empty() {
+            anyhow::bail!("没有找到匹配的测试用例");
+        }
+        if self.config.enforce_required {
+            let selected: HashSet<_> = result.iter().cloned().collect();
+            for required in self.required_tests.keys() {
+                if !selected.contains(required) {
+                    anyhow::bail!("默认执行列表缺少 required 测试: {}", required);
                 }
             }
         }
-
-        let mut result: Vec<_> = filtered_tests.into_iter().collect();
-        result.sort();
         Ok(result)
+    }
+
+    fn validate_required_binary(&self, test_name: &str) -> Result<()> {
+        let path = self.config.tests_dir.join(test_name);
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("required 测试不存在: {}", path.display()))?;
+        if !metadata.is_file() {
+            anyhow::bail!("required 测试不是普通文件: {}", path.display());
+        }
+        if metadata.permissions().mode() & 0o111 == 0 {
+            anyhow::bail!("required 测试不可执行: {}", path.display());
+        }
+        Ok(())
     }
 
     /// 运行单个测试
     pub fn run_single_test(&self, test_name: &str) -> Result<bool> {
-        println!("[DEBUG] 开始运行测试: {}", test_name);
+        safe_println!("[DEBUG] 开始运行测试: {}", test_name);
         let test_path = self.config.tests_dir.join(test_name);
-        println!("[DEBUG] 测试路径: {:?}", test_path);
+        safe_println!("[DEBUG] 测试路径: {:?}", test_path);
 
         if !test_path.exists() || !test_path.is_file() {
             self.print_warn(&format!("测试不存在或不可执行: {}", test_name));
@@ -323,12 +378,18 @@ impl TestRunner {
 
         // 获取blocklist
         let blocked_subtests = self.get_test_blocklist(test_name);
+        if self.required_tests.contains_key(test_name) && !blocked_subtests.is_empty() {
+            anyhow::bail!("required 测试禁止 blocklist: {}", test_name);
+        }
 
-        println!("[DEBUG] 工作目录: {:?}", self.config.tests_dir);
-        println!("[DEBUG] TEST_TMPDIR: {:?}", self.config.temp_dir);
-        println!("[DEBUG] 直接执行: {:?}", test_path);
+        let xml_path = self.config.results_dir.join(format!("{}.xml", test_name));
+        remove_stale_xml(&xml_path)?;
+
+        safe_println!("[DEBUG] 工作目录: {:?}", self.config.tests_dir);
+        safe_println!("[DEBUG] TEST_TMPDIR: {:?}", self.config.temp_dir);
+        safe_println!("[DEBUG] 直接执行: {:?}", test_path);
         if !blocked_subtests.is_empty() {
-            println!("[DEBUG] gtest_filter: -{}", blocked_subtests.join(":"));
+            safe_println!("[DEBUG] gtest_filter: -{}", blocked_subtests.join(":"));
         }
 
         // 根据配置决定输出方式
@@ -367,110 +428,129 @@ impl TestRunner {
         // 构造并执行命令（不使用 shell，不捕获输出，不创建管道）
         let start_time = Instant::now();
         let mut cmd = Command::new(&test_path);
+        cmd.arg(format!("--gtest_output=xml:{}", xml_path.display()));
         if !blocked_subtests.is_empty() {
             cmd.arg(format!("--gtest_filter=-{}", blocked_subtests.join(":")));
         }
-        // Run each test binary in a fresh network namespace to avoid sysctl leakage.
+        // Run each test binary in its own process group so timeout cleanup also
+        // terminates descendants. Network tests additionally get a fresh
+        // namespace to avoid sysctl leakage.
         let name_lc = test_name.to_ascii_lowercase();
-        if name_lc.contains("socket") || name_lc.contains("net") {
-            unsafe {
-                cmd.pre_exec(|| {
+        let isolate_network = name_lc.contains("socket") || name_lc.contains("net");
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if isolate_network {
                     let ret = libc::unshare(libc::CLONE_NEWNET);
                     if ret != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    Ok(())
-                });
-            }
+                }
+                Ok(())
+            });
         }
 
-        let status = cmd
-            .current_dir(&self.config.tests_dir)
+        cmd.current_dir(&self.config.tests_dir)
             .env("TEST_TMPDIR", &self.config.temp_dir)
             .stdout(stdout)
-            .stderr(stderr)
-            .status();
+            .stderr(stderr);
+        let status = wait_with_timeout(&mut cmd, Duration::from_secs(self.config.timeout));
 
         // 清理临时目录
         let _ = fs::remove_dir_all(&self.config.temp_dir);
         let _ = fs::create_dir_all(&self.config.temp_dir);
 
         let duration = start_time.elapsed();
-        match status {
-            Ok(s) if s.success() => {
-                self.print_info(&format!(
-                    "✓ {} 通过 ({:.2}s)",
-                    test_name,
-                    duration.as_secs_f64()
-                ));
-                // 只在批量测试时读取文件内容
-                if !self.config.output_to_stdout {
-                    let output_file = self
-                        .config
-                        .results_dir
-                        .join(format!("{}.output", test_name));
-                    if let Ok(content) = fs::read_to_string(&output_file) {
-                        let tail: String = content
-                            .lines()
-                            .rev()
-                            .take(10)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .map(|s| format!("{}\n", s))
-                            .collect();
-                        if !tail.is_empty() {
-                            println!("[DEBUG] 输出尾部: \n{}", tail);
-                        }
-                    }
-                }
-                Ok(true)
-            }
-            Ok(s) => {
+        let process_ok = match status {
+            Ok(TestProcessOutcome::Exited(ref status)) if status.success() => true,
+            Ok(TestProcessOutcome::Exited(ref status)) => {
                 self.print_error(&format!(
-                    "✗ {} 失败 ({:.2}s), 退出码: {:?}",
+                    "✗ {} 进程失败 ({:.2}s), 退出码: {:?}, 信号: {:?}",
                     test_name,
                     duration.as_secs_f64(),
-                    s.code()
+                    status.code(),
+                    status.signal()
                 ));
-                // 只在批量测试时读取文件内容
-                if !self.config.output_to_stdout {
-                    let output_file = self
-                        .config
-                        .results_dir
-                        .join(format!("{}.output", test_name));
-                    if let Ok(content) = fs::read_to_string(&output_file) {
-                        let tail: String = content
-                            .lines()
-                            .rev()
-                            .take(20)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .map(|s| format!("{}\n", s))
-                            .collect();
-                        if !tail.is_empty() {
-                            println!("[DEBUG] 错误输出尾部: \n{}", tail);
-                        }
+                false
+            }
+            Ok(TestProcessOutcome::TimedOut) => {
+                self.print_error(&format!(
+                    "✗ {} 超时 ({:.2}s), 上限: {} 秒",
+                    test_name,
+                    duration.as_secs_f64(),
+                    self.config.timeout
+                ));
+                false
+            }
+            Err(ref error) => {
+                self.print_error(&format!("✗ {} 执行错误: {}", test_name, error));
+                false
+            }
+        };
+
+        let xml_ok = match fs::symlink_metadata(&xml_path) {
+            Ok(metadata) if metadata.file_type().is_file() => match parse_gtest_xml(&xml_path) {
+                Ok(report) => {
+                    safe_println!(
+                        "[GTEST_XML] binary={} total={} failures={} errors={} disabled={} skipped={}",
+                        test_name,
+                        report.total,
+                        report.failures,
+                        report.errors,
+                        report.disabled,
+                        report.skipped
+                    );
+                    match self.required_tests.get(test_name) {
+                        Some(required) => match report.validate_required(
+                            test_name,
+                            required.case_count,
+                            &required.allowed_skips,
+                        ) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                self.print_error(&format!("required 结果不合格: {:#}", error));
+                                false
+                            }
+                        },
+                        None => true,
                     }
                 }
-                Ok(false)
+                Err(error) => {
+                    self.print_error(&format!("gtest XML 无效: {:#}", error));
+                    false
+                }
+            },
+            Ok(_) => {
+                self.print_error(&format!("gtest XML 不是普通文件: {}", xml_path.display()));
+                false
             }
-            Err(e) => {
-                self.print_error(&format!("✗ {} 执行错误: {}", test_name, e));
-                Ok(false)
+            Err(error) => {
+                self.print_error(&format!(
+                    "本轮未生成 gtest XML: {}: {}",
+                    xml_path.display(),
+                    error
+                ));
+                false
             }
+        };
+
+        if process_ok && xml_ok {
+            self.print_info(&format!(
+                "✓ {} 通过 ({:.2}s)",
+                test_name,
+                duration.as_secs_f64()
+            ));
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
     /// 运行所有测试
     pub fn run_all_tests(&self) -> Result<()> {
         let test_list = self.get_test_list()?;
-
-        if test_list.is_empty() {
-            self.print_warn("没有找到匹配的测试用例");
-            return Ok(());
-        }
 
         self.print_info(&format!("准备运行 {} 个测试用例", test_list.len()));
 
@@ -497,7 +577,7 @@ impl TestRunner {
                 }
             }
 
-            println!("---");
+            safe_println!("---");
         }
 
         Ok(())
@@ -537,7 +617,7 @@ impl TestRunner {
         );
 
         file.write_all(report.as_bytes())?;
-        println!("{}", report);
+        safe_println!("{}", report);
 
         if failed > 0 {
             let failed_cases_file = self.config.results_dir.join("failed_cases.txt");
@@ -545,7 +625,7 @@ impl TestRunner {
                 let failed_content = fs::read_to_string(&failed_cases_file)?;
                 let failed_section = format!("失败的测试用例:\n{}", failed_content);
                 file.write_all(failed_section.as_bytes())?;
-                println!("{}", failed_section);
+                safe_println!("{}", failed_section);
             }
         }
 
@@ -593,6 +673,7 @@ impl TestRunner {
         }
 
         if self.config.use_whitelist {
+            let whitelist = self.get_whitelist_tests()?;
             self.print_info(&format!(
                 "白名单模式 - 可运行的测试用例 (来自: {:?}):",
                 self.config.whitelist_file
@@ -609,7 +690,7 @@ impl TestRunner {
                     let file_name = entry.file_name();
                     let file_name_str = file_name.to_string_lossy();
                     if file_name_str.ends_with("_test") {
-                        if self.is_test_whitelisted(&file_name_str) {
+                        if whitelist.contains(file_name_str.as_ref()) {
                             log::info!("  \x1b[32m✓\x1b[0m {} (在白名单中)", file_name_str);
                         } else {
                             log::info!("  \x1b[33m○\x1b[0m {} (不在白名单中)", file_name_str);
@@ -632,5 +713,217 @@ impl TestRunner {
         }
 
         Ok(())
+    }
+}
+
+enum TestProcessOutcome {
+    Exited(ExitStatus),
+    TimedOut,
+}
+
+fn terminate_process_group(child: &mut Child) -> Result<()> {
+    let pgid = -(child.id() as libc::pid_t);
+    if unsafe { libc::kill(pgid, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("终止 gVisor 测试进程组失败");
+        }
+    }
+    let _ = child.kill();
+    child.wait().context("回收 gVisor 测试进程失败")?;
+    Ok(())
+}
+
+fn wait_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<TestProcessOutcome> {
+    let mut child = cmd.spawn().context("启动 gVisor 测试进程失败")?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(TestProcessOutcome::Exited(status)),
+            Ok(None) => {}
+            Err(wait_error) => {
+                terminate_process_group(&mut child).with_context(|| {
+                    format!("等待 gVisor 测试进程失败后清理子进程: {wait_error}")
+                })?;
+                return Err(wait_error).context("等待 gVisor 测试进程失败");
+            }
+        }
+        if started.elapsed() >= timeout {
+            terminate_process_group(&mut child).context("清理超时 gVisor 测试进程失败")?;
+            return Ok(TestProcessOutcome::TimedOut);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn read_required_tests(path: &Path) -> Result<HashMap<String, RequiredTest>> {
+    let file = File::open(path)
+        .with_context(|| format!("required 测试清单不存在或不可读: {}", path.display()))?;
+    let mut required = HashMap::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| format!("读取 required 清单第 {} 行失败", index + 1))?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 2 {
+            anyhow::bail!(
+                "required 清单第 {} 行必须是: binary case_count [allowed_skip ...]",
+                index + 1
+            );
+        }
+        let name = fields[0];
+        if !name.ends_with("_test")
+            || name.contains('/')
+            || name.contains('\\')
+            || name == "."
+            || name == ".."
+        {
+            anyhow::bail!("required 清单第 {} 行包含非法二进制名: {}", index + 1, name);
+        }
+        let count = fields[1]
+            .parse::<usize>()
+            .with_context(|| format!("required 清单第 {} 行用例数非法", index + 1))?;
+        if count == 0 {
+            anyhow::bail!("required 清单第 {} 行用例数不能为 0", index + 1);
+        }
+        let mut allowed_skips = HashSet::new();
+        for allowed in &fields[2..] {
+            if !allowed.contains('.') || !allowed_skips.insert((*allowed).to_string()) {
+                anyhow::bail!(
+                    "required 清单第 {} 行包含非法或重复 allowed_skip: {}",
+                    index + 1,
+                    allowed
+                );
+            }
+        }
+        let spec = RequiredTest {
+            case_count: count,
+            allowed_skips,
+        };
+        if required.insert(name.to_string(), spec).is_some() {
+            anyhow::bail!("required 清单包含重复二进制: {}", name);
+        }
+    }
+    if required.is_empty() {
+        anyhow::bail!("required 测试清单为空: {}", path.display());
+    }
+    Ok(required)
+}
+
+fn remove_stale_xml(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("无法删除旧 gtest XML: {}", path.display()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        read_required_tests, remove_stale_xml, wait_with_timeout, Config, TestProcessOutcome,
+        TestRunner,
+    };
+    use std::{
+        fs,
+        os::unix::process::CommandExt,
+        process::Command,
+        time::Duration,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn manifest(
+        content: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, super::RequiredTest>> {
+        let path = std::env::temp_dir().join(format!(
+            "gvisor-required-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, content).unwrap();
+        let result = read_required_tests(&path);
+        let _ = fs::remove_file(path);
+        result
+    }
+
+    #[test]
+    fn parses_required_manifest() {
+        let required =
+            manifest("# pinned\nmount_test 87\npivot_root_test 19 PivotRootTest.OnRootFS\n")
+                .unwrap();
+        assert_eq!(required["mount_test"].case_count, 87);
+        assert!(required["mount_test"].allowed_skips.is_empty());
+        assert_eq!(required["pivot_root_test"].case_count, 19);
+        assert!(required["pivot_root_test"]
+            .allowed_skips
+            .contains("PivotRootTest.OnRootFS"));
+    }
+
+    #[test]
+    fn rejects_duplicate_or_path_entries() {
+        assert!(manifest("mount_test 87\nmount_test 1\n").is_err());
+        assert!(manifest("../mount_test 87\n").is_err());
+        assert!(manifest("mount_test 0\n").is_err());
+        assert!(manifest("mount_test 87 invalid_skip\n").is_err());
+        assert!(manifest("mount_test 87 Suite.Skip Suite.Skip\n").is_err());
+    }
+
+    #[test]
+    fn disabled_required_enforcement_does_not_read_manifest() {
+        let mut config = Config::default();
+        config.enforce_required = false;
+        config.required_tests_file = std::env::temp_dir().join(format!(
+            "missing-gvisor-required-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let runner = TestRunner::new(config).unwrap();
+        assert!(runner.required_tests.is_empty());
+    }
+
+    #[test]
+    fn removes_stale_xml_before_a_new_run() {
+        let path = std::env::temp_dir().join(format!(
+            "gvisor-stale-{}-{}.xml",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "<old-success />").unwrap();
+        remove_stale_xml(&path).unwrap();
+        assert!(!path.exists());
+        remove_stale_xml(&path).unwrap();
+    }
+
+    #[test]
+    fn timeout_kills_the_test_process_group() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 5"]);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let outcome = wait_with_timeout(&mut cmd, Duration::from_millis(50)).unwrap();
+        assert!(matches!(outcome, TestProcessOutcome::TimedOut));
     }
 }

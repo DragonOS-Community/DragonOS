@@ -2,7 +2,9 @@ use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
     exception::workqueue::{Work, WorkQueue},
     filesystem::{
-        ext4::inode::{Ext4Inode, Ext4InodeLifecycle, Ext4InodeLifecycleState, InodeDirtyState},
+        ext4::inode::{
+            Ext4Inode, Ext4InodeLifecycle, Ext4InodeLifecycleState, Ext4InodeTimes, InodeDirtyState,
+        },
         vfs::{
             self,
             fcntl::AtFlags,
@@ -28,9 +30,11 @@ use crate::{
 };
 use alloc::{
     collections::BTreeMap,
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::fmt::Write;
 use kdepends::another_ext4;
 use lazy_static::lazy_static;
 use linkme::distributed_slice;
@@ -54,6 +58,39 @@ struct Ext4EvictionQueueState {
 
 lazy_static! {
     static ref EXT4_EVICTION_WQ: Arc<WorkQueue> = WorkQueue::new("ext4_evict");
+    static ref EXT4_STATS_REGISTRY: SpinLock<Vec<Weak<Ext4FileSystem>>> = SpinLock::new(Vec::new());
+}
+
+pub(crate) fn prepare_stats_report() -> String {
+    let mut report = String::new();
+    let mut registry = EXT4_STATS_REGISTRY.lock();
+    registry.retain(|entry| entry.strong_count() != 0);
+    for entry in registry.iter().filter_map(Weak::upgrade) {
+        let snapshot = entry.fs.prepare_stats_snapshot();
+        let _ = writeln!(
+            report,
+            "device={} generation={} enabled={} journal={} reliable_flush={} write_barrier={} calls={} requested_blocks={} mapped_blocks={} missing_blocks={} failures={} elapsed_cycles={} bitmap_io={} gdt_io={} superblock_io={} inode_io={} extent_io={} zero_io={}",
+            entry.raw_dev.data(),
+            snapshot.generation,
+            snapshot.enabled as usize,
+            entry.fs.uses_journal() as usize,
+            entry.fs.supports_reliable_flush() as usize,
+            entry._mount_options.write_barrier as usize,
+            snapshot.calls,
+            snapshot.requested_blocks,
+            snapshot.mapped_blocks,
+            snapshot.missing_blocks,
+            snapshot.failures,
+            snapshot.elapsed_cycles,
+            snapshot.bitmap_io,
+            snapshot.gdt_io,
+            snapshot.superblock_io,
+            snapshot.inode_io,
+            snapshot.extent_io,
+            snapshot.zero_io,
+        );
+    }
+    report
 }
 
 #[must_use]
@@ -377,13 +414,12 @@ impl Ext4FileSystem {
 
     pub(super) fn publish_allocated_inode(
         self: &Arc<Self>,
-        inode_num: u32,
+        attr: another_ext4::FileAttr,
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
-        file_type: another_ext4::FileType,
         _reuse_guard: &RwSemReadGuard<'_, ()>,
     ) -> Result<Arc<LockedExt4Inode>, SystemError> {
-        self.get_or_create_inode_inner(inode_num, dname, parent, true, Some(file_type))
+        self.get_or_create_inode_inner(attr.ino, dname, parent, true, Some(attr))
     }
 
     fn get_or_create_inode_inner(
@@ -392,7 +428,7 @@ impl Ext4FileSystem {
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
         reuse_guard_held: bool,
-        known_file_type: Option<another_ext4::FileType>,
+        allocated_attr: Option<another_ext4::FileAttr>,
     ) -> Result<Arc<LockedExt4Inode>, SystemError> {
         let mut candidate = None;
         let mut admission_guard = None;
@@ -428,13 +464,22 @@ impl Ext4FileSystem {
                             if !reuse_guard_held {
                                 admission_guard = Some(self.inode_reuse_barrier.read());
                             }
-                            candidate = Some(LockedExt4Inode::new(
-                                inode_num,
-                                Arc::downgrade(self),
-                                dname.clone(),
-                                parent.clone(),
-                                known_file_type,
-                            )?);
+                            candidate = Some(if let Some(attr) = allocated_attr.as_ref() {
+                                LockedExt4Inode::new_with_attr(
+                                    inode_num,
+                                    Arc::downgrade(self),
+                                    dname.clone(),
+                                    parent.clone(),
+                                    attr,
+                                )?
+                            } else {
+                                LockedExt4Inode::new(
+                                    inode_num,
+                                    Arc::downgrade(self),
+                                    dname.clone(),
+                                    parent.clone(),
+                                )?
+                            });
                             continue;
                         }
                         let inode = candidate.take().expect("candidate checked above");
@@ -547,33 +592,91 @@ impl Ext4FileSystem {
         inode: &Arc<LockedExt4Inode>,
         dirty: InodeDirtyState,
     ) -> Result<(), SystemError> {
+        Self::mark_inode_dirty_with(inode, dirty, |_| {})
+    }
+
+    pub(super) fn mark_inode_atime_dirty(
+        inode: &Arc<LockedExt4Inode>,
+        atime: u32,
+        relatime: bool,
+    ) -> Result<(), SystemError> {
+        let now = crate::time::PosixTimeSpec::new(atime.into(), 0);
+        Self::mark_inode_dirty_if(
+            inode,
+            InodeDirtyState::ATIME_DIRTY,
+            |guard| {
+                let times = guard.cached_times;
+                vfs::should_update_atime(
+                    crate::time::PosixTimeSpec::new(times.atime.into(), 0),
+                    crate::time::PosixTimeSpec::new(times.mtime.into(), 0),
+                    crate::time::PosixTimeSpec::new(times.ctime.into(), 0),
+                    now,
+                    relatime,
+                )
+            },
+            |guard| {
+                guard.cached_times.atime = atime;
+                guard.cached_atime_version = guard.cached_atime_version.wrapping_add(1);
+            },
+        )
+    }
+
+    fn mark_inode_dirty_with<F>(
+        inode: &Arc<LockedExt4Inode>,
+        dirty: InodeDirtyState,
+        update_cached_metadata: F,
+    ) -> Result<(), SystemError>
+    where
+        F: FnOnce(&mut super::inode::Ext4Inode),
+    {
+        Self::mark_inode_dirty_if(inode, dirty, |_| true, update_cached_metadata)
+    }
+
+    fn mark_inode_dirty_if<P, F>(
+        inode: &Arc<LockedExt4Inode>,
+        dirty: InodeDirtyState,
+        should_update: P,
+        update_cached_metadata: F,
+    ) -> Result<(), SystemError>
+    where
+        P: FnOnce(&super::inode::Ext4Inode) -> bool,
+        F: FnOnce(&mut super::inode::Ext4Inode),
+    {
         let _operation = inode.lifecycle().begin_operation()?;
         // Acquire a prospective queue ownership before publishing dirty state.
         // If the inode is already queued, the existing AsyncWork owner prevents
         // this temporary retain/release pair from creating a false-zero edge.
         inode.retain(InodeRetentionKind::AsyncWork)?;
-        let (fs, should_queue) = {
+        let queue_fs = {
             let mut guard = inode.inner.lock();
-            guard.dirty_state.insert(dirty);
+            if !should_update(&guard) {
+                drop(guard);
+                inode.release(InodeRetentionKind::AsyncWork);
+                return Ok(());
+            }
             let should_queue = !guard
                 .dirty_state
                 .intersects(InodeDirtyState::QUEUED | InodeDirtyState::WRITEBACK);
+            let queue_fs = if should_queue {
+                let Some(fs) = guard.fs_ptr.upgrade() else {
+                    drop(guard);
+                    inode.release(InodeRetentionKind::AsyncWork);
+                    return Err(SystemError::EIO);
+                };
+                Some(fs)
+            } else {
+                None
+            };
+            update_cached_metadata(&mut guard);
+            guard.dirty_state.insert(dirty);
             if should_queue {
                 guard.dirty_state.insert(InodeDirtyState::QUEUED);
             }
-            (guard.fs_ptr.upgrade(), should_queue)
+            queue_fs
         };
 
-        if should_queue {
-            if let Some(fs) = fs {
-                fs.dirty_inodes.lock().push(inode.clone());
-            } else {
-                let mut guard = inode.inner.lock();
-                guard.dirty_state.remove(InodeDirtyState::QUEUED);
-                drop(guard);
-                inode.release(InodeRetentionKind::AsyncWork);
-                return Err(SystemError::EIO);
-            }
+        if let Some(fs) = queue_fs {
+            fs.dirty_inodes.lock().push(inode.clone());
         } else {
             inode.release(InodeRetentionKind::AsyncWork);
         }
@@ -594,11 +697,9 @@ impl Ext4FileSystem {
 
             let mut guard = inode.inner.lock();
             if !guard.dirty_state.contains(InodeDirtyState::QUEUED)
-                || guard.dirty_state.intersects(
-                    InodeDirtyState::SIZE_DIRTY
-                        | InodeDirtyState::MTIME_DIRTY
-                        | InodeDirtyState::WRITEBACK,
-                )
+                || guard
+                    .dirty_state
+                    .intersects(InodeDirtyState::PERSISTENT_DIRTY | InodeDirtyState::WRITEBACK)
             {
                 return;
             }
@@ -618,7 +719,7 @@ impl Ext4FileSystem {
                 let mut guard = inode.inner.lock();
                 if guard
                     .dirty_state
-                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
+                    .intersects(InodeDirtyState::PERSISTENT_DIRTY)
                 {
                     guard.dirty_state.insert(InodeDirtyState::QUEUED);
                     drop(guard);
@@ -654,7 +755,7 @@ impl Ext4FileSystem {
                 let mut guard = inode.inner.lock();
                 let has_dirty = guard
                     .dirty_state
-                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+                    .intersects(InodeDirtyState::PERSISTENT_DIRTY);
                 if !has_dirty {
                     guard
                         .dirty_state
@@ -681,8 +782,7 @@ impl Ext4FileSystem {
                     let page_cache = {
                         let mut guard = inode.inner.lock();
                         guard.dirty_state.remove(
-                            InodeDirtyState::SIZE_DIRTY
-                                | InodeDirtyState::MTIME_DIRTY
+                            InodeDirtyState::PERSISTENT_DIRTY
                                 | InodeDirtyState::QUEUED
                                 | InodeDirtyState::WRITEBACK,
                         );
@@ -705,12 +805,20 @@ impl Ext4FileSystem {
             let result = {
                 let _operation = operation;
                 let _io_guard = inode.io_lock.lock();
-                let (fs, inode_num, snapshot_dirty, cached_size, cached_mtime) = {
+                let (
+                    fs,
+                    inode_num,
+                    snapshot_dirty,
+                    cached_size,
+                    cached_times,
+                    cached_atime_version,
+                    cached_mtime_version,
+                ) = {
                     let mut guard = inode.inner.lock();
                     guard.dirty_state.remove(InodeDirtyState::QUEUED);
                     let snapshot_dirty = guard
                         .dirty_state
-                        .intersection(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+                        .intersection(InodeDirtyState::PERSISTENT_DIRTY);
                     if snapshot_dirty.is_empty() {
                         guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
                         release_async_owner = true;
@@ -723,7 +831,9 @@ impl Ext4FileSystem {
                         guard.inner_inode_num,
                         snapshot_dirty,
                         guard.cached_file_size,
-                        guard.cached_mtime,
+                        guard.cached_times,
+                        guard.cached_atime_version,
+                        guard.cached_mtime_version,
                     )
                 };
 
@@ -745,12 +855,17 @@ impl Ext4FileSystem {
                         };
                         size.and_then(|size| {
                             let mtime = if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY) {
-                                cached_mtime
+                                Some(cached_times.mtime)
+                            } else {
+                                None
+                            };
+                            let atime = if snapshot_dirty.contains(InodeDirtyState::ATIME_DIRTY) {
+                                Some(cached_times.atime)
                             } else {
                                 None
                             };
                             LockedExt4Inode::retry_metadata_contention(|| {
-                                fs.fs.commit_inode_metadata(inode_num, size, mtime)
+                                fs.fs.commit_inode_metadata(inode_num, size, atime, mtime)
                             })
                         })
                     } else {
@@ -765,15 +880,20 @@ impl Ext4FileSystem {
                             guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
                         }
                         if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY)
-                            && guard.cached_mtime == cached_mtime
+                            && guard.cached_mtime_version == cached_mtime_version
                         {
                             guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                        }
+                        if snapshot_dirty.contains(InodeDirtyState::ATIME_DIRTY)
+                            && guard.cached_atime_version == cached_atime_version
+                        {
+                            guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
                         }
                     }
                     guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
                     if guard
                         .dirty_state
-                        .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
+                        .intersects(InodeDirtyState::PERSISTENT_DIRTY)
                     {
                         guard.dirty_state.insert(InodeDirtyState::QUEUED);
                         should_requeue = true;
@@ -847,6 +967,7 @@ impl Ext4FileSystem {
                 mount_options.write_barrier,
             )?
         };
+        let root_attr = fs.getattr(another_ext4::EXT4_ROOT_INO)?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| LockedExt4Inode {
                 inner: Mutex::new(Ext4Inode {
@@ -860,7 +981,9 @@ impl Ext4FileSystem {
                     self_ref: self_ref.clone(),
                     special_node: None,
                     cached_file_size: None,
-                    cached_mtime: None,
+                    cached_times: Ext4InodeTimes::from(&root_attr),
+                    cached_atime_version: 0,
+                    cached_mtime_version: 0,
                     dirty_state: super::inode::InodeDirtyState::empty(),
                 }),
                 io_lock: Mutex::new(()),
@@ -887,6 +1010,10 @@ impl Ext4FileSystem {
             eviction_wait: WaitQueue::default(),
             _mount_options: mount_options,
         });
+        let mut stats_registry = EXT4_STATS_REGISTRY.lock();
+        stats_registry.retain(|entry| entry.strong_count() != 0);
+        stats_registry.push(Arc::downgrade(&fs));
+        drop(stats_registry);
 
         let mut guard = fs.root_inode.inner.lock();
         guard.fs_ptr = Arc::downgrade(&fs);

@@ -516,7 +516,7 @@ impl AddressSpace {
             len,
             prot_flags,
             map_flags,
-            may_exec,
+            mut may_exec,
             offset,
             round_to_min,
             allocate_at_once,
@@ -527,6 +527,14 @@ impl AddressSpace {
         if len == 0 {
             return Err(SystemError::EINVAL);
         }
+        let noexec = file
+            .inode()
+            .mount_flags()
+            .contains(crate::filesystem::vfs::mount::MountFlags::NOEXEC);
+        if noexec && prot_flags.contains(ProtFlags::PROT_EXEC) {
+            return Err(SystemError::EPERM);
+        }
+        may_exec &= !noexec;
 
         let _force_lazy_on_page_fault_arch = allocate_at_once && MMArch::PAGE_FAULT_ENABLED;
 

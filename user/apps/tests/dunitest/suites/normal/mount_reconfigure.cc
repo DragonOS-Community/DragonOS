@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
+#include <string>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/mman.h>
@@ -11,7 +15,9 @@
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef CLONE_NEWNS
@@ -105,6 +111,22 @@ static bool mount_has_option(const char *mountpoint, const char *option) {
     return found;
 }
 
+struct AtimeReaderContext {
+    int fd;
+    std::atomic<bool> stop;
+};
+
+static void *atime_reader(void *opaque) {
+    auto *context = static_cast<AtimeReaderContext *>(opaque);
+    char byte;
+    while (!context->stop.load(std::memory_order_relaxed)) {
+        if (pread(context->fd, &byte, 1, 0) != 1) {
+            return reinterpret_cast<void *>(1);
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 TEST(MountReconfigure, BindRemountReadonly) {
@@ -149,6 +171,10 @@ TEST(MountReconfigure, BindRemountReadonly) {
         cleanup_mount(source);
         FAIL() << strerror(errno);
     }
+
+    errno = 0;
+    EXPECT_EQ(-1, access(target, W_OK));
+    EXPECT_EQ(EROFS, errno);
 
     snprintf(dst_file, sizeof(dst_file), "%s/readonly.txt", target);
     fd = open(dst_file, O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -350,6 +376,26 @@ TEST(MountReconfigure, NoexecRejectsExec) {
         FAIL() << strerror(errno);
     }
 
+    int fd = open(target_file, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    errno = 0;
+    void *mapping = mmap(NULL, 0, PROT_EXEC, MAP_PRIVATE, fd, 0);
+    EXPECT_EQ(MAP_FAILED, mapping);
+    EXPECT_EQ(EINVAL, errno);
+
+    errno = 0;
+    mapping = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    EXPECT_EQ(MAP_FAILED, mapping);
+    EXPECT_EQ(EPERM, errno);
+
+    mapping = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, mprotect(mapping, 4096, PROT_READ | PROT_EXEC));
+    EXPECT_EQ(EACCES, errno);
+    EXPECT_EQ(0, munmap(mapping, 4096)) << strerror(errno);
+    close(fd);
+
     char *const argv[] = {target_file, nullptr};
     char *const envp[] = {nullptr};
     errno = 0;
@@ -361,6 +407,406 @@ TEST(MountReconfigure, NoexecRejectsExec) {
     rmdir(target);
     rmdir(source);
     rmdir(root);
+}
+
+TEST(MountReconfigure, StrictAtimeReadUpdatesAccessTime) {
+    const char *target = "/tmp/test_mount_strictatime_read";
+    const char *file = "/tmp/test_mount_strictatime_read/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+
+    struct timespec times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+
+    int fd = open(file, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    char byte;
+    ASSERT_EQ(1, read(fd, &byte, 1)) << strerror(errno);
+    close(fd);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(file, &st)) << strerror(errno);
+    EXPECT_GT(st.st_atim.tv_sec, 1);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, StrictAtimeEofReadUpdatesAccessTime) {
+    const char *target = "/tmp/test_mount_strictatime_eof";
+    const char *file = "/tmp/test_mount_strictatime_eof/empty";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
+
+    int fd = open(file, O_CREAT | O_RDONLY, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    struct timespec times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+
+    char byte = 0;
+    ASSERT_EQ(0, read(fd, &byte, 1)) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_GT(st.st_atim.tv_sec, 1);
+
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+    ASSERT_EQ(0, read(fd, &byte, 0)) << strerror(errno);
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_EQ(1, st.st_atim.tv_sec);
+    close(fd);
+    unlink(file);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, DirectoryReadHonorsAtimeFlags) {
+    const char *strict_target = "/tmp/test_mount_dir_strictatime";
+    const char *strict_file = "/tmp/test_mount_dir_strictatime/file";
+    const char *nodir_target = "/tmp/test_mount_dir_nodiratime";
+    const char *nodir_file = "/tmp/test_mount_dir_nodiratime/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(strict_target);
+    ensure_dir(nodir_target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", strict_target, "tmpfs", MS_STRICTATIME, NULL))
+        << strerror(errno);
+    ASSERT_EQ(0,
+              mount("tmpfs", nodir_target, "tmpfs", MS_STRICTATIME | MS_NODIRATIME, NULL))
+        << strerror(errno);
+    ASSERT_EQ(0, write_file(strict_file)) << strerror(errno);
+    ASSERT_EQ(0, write_file(nodir_file)) << strerror(errno);
+
+    struct timespec times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, strict_target, times, 0)) << strerror(errno);
+    ASSERT_EQ(0, utimensat(AT_FDCWD, nodir_target, times, 0)) << strerror(errno);
+
+    auto read_directory = [](const char *path) {
+        DIR *dir = opendir(path);
+        if (dir == nullptr) {
+            return -1;
+        }
+        while (readdir(dir) != nullptr) {
+        }
+        return closedir(dir);
+    };
+    ASSERT_EQ(0, read_directory(strict_target)) << strerror(errno);
+    ASSERT_EQ(0, read_directory(nodir_target)) << strerror(errno);
+
+    struct stat strict_st = {};
+    struct stat nodir_st = {};
+    ASSERT_EQ(0, stat(strict_target, &strict_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(nodir_target, &nodir_st)) << strerror(errno);
+    EXPECT_GT(strict_st.st_atim.tv_sec, 1);
+    EXPECT_EQ(1, nodir_st.st_atim.tv_sec);
+
+    unlink(strict_file);
+    unlink(nodir_file);
+    cleanup_mount(strict_target);
+    cleanup_mount(nodir_target);
+}
+
+TEST(MountReconfigure, FollowsTmpfsSymlinkLongerThan256Bytes) {
+    const char *target = "/tmp/test_mount_long_symlink";
+    const char *file = "/tmp/test_mount_long_symlink/file";
+    const char *link = "/tmp/test_mount_long_symlink/link";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", 0, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+
+    std::string link_target;
+    for (int i = 0; i < 130; ++i) {
+        link_target += "./";
+    }
+    link_target += "file";
+    ASSERT_GT(link_target.size(), 256UL);
+    ASSERT_EQ(0, symlink(link_target.c_str(), link)) << strerror(errno);
+
+    int fd = open(link, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    char byte = 0;
+    ASSERT_EQ(1, read(fd, &byte, 1)) << strerror(errno);
+    EXPECT_EQ('x', byte);
+    close(fd);
+    unlink(link);
+    unlink(file);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, CreatDirectoryIsAlwaysInvalid) {
+    const char *target = "/tmp/test_mount_creat_directory";
+    const char *missing = "/tmp/test_mount_creat_directory/missing";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+
+    errno = 0;
+    EXPECT_EQ(-1, open(target, O_RDONLY | O_CREAT | O_DIRECTORY, 0600));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, open(missing, O_RDONLY | O_CREAT | O_DIRECTORY, 0600));
+    EXPECT_EQ(EINVAL, errno);
+    rmdir(target);
+}
+
+TEST(MountReconfigure, NoatimeRequiresOwnerOrCapFowner) {
+    const char *target = "/tmp/test_mount_noatime_permission";
+    const char *file = "/tmp/test_mount_noatime_permission/file";
+    const char *link = "/tmp/test_mount_noatime_permission/link";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+    ASSERT_EQ(0, symlink("file", link)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setuid(1000) != 0) {
+            _exit(10);
+        }
+
+        errno = 0;
+        int fd = open(file, O_RDONLY | O_NOATIME);
+        if (fd >= 0 || errno != EPERM) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            _exit(11);
+        }
+
+        errno = 0;
+        fd = open(link, O_RDONLY | O_NOFOLLOW | O_NOATIME);
+        if (fd >= 0 || errno != ELOOP) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            _exit(14);
+        }
+
+        errno = 0;
+        fd = open(target, O_RDONLY | O_DIRECT | O_NOATIME);
+        if (fd >= 0 || errno != EPERM) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            _exit(15);
+        }
+
+        fd = open(file, O_RDONLY);
+        if (fd < 0) {
+            _exit(12);
+        }
+        errno = 0;
+        if (fcntl(fd, F_SETFL, O_NOATIME) != -1 || errno != EPERM) {
+            close(fd);
+            _exit(13);
+        }
+        close(fd);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(link);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, NoatimeCreateUsesCallerOwnership) {
+    const char *target = "/tmp/test_mount_noatime_create_owner";
+    const char *file = "/tmp/test_mount_noatime_create_owner/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, "mode=0777"))
+        << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(20);
+        }
+        int fd = open(file, O_CREAT | O_EXCL | O_RDONLY | O_NOATIME, 0600);
+        if (fd < 0) {
+            _exit(21);
+        }
+        struct stat st = {};
+        if (fstat(fd, &st) != 0 || st.st_uid != 1000 || st.st_gid != 1000) {
+            close(fd);
+            _exit(22);
+        }
+        close(fd);
+        fd = open(file, O_RDONLY | O_NOATIME);
+        if (fd < 0) {
+            _exit(23);
+        }
+        close(fd);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(file);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, SetgidDirectoryCreationSemantics) {
+    const char *target = "/tmp/test_mount_setgid_create";
+    const char *parent = "/tmp/test_mount_setgid_create/parent";
+    const char *file = "/tmp/test_mount_setgid_create/parent/file";
+    const char *dir = "/tmp/test_mount_setgid_create/parent/dir";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", 0, "mode=0777")) << strerror(errno);
+    ASSERT_EQ(0, mkdir(parent, 0777)) << strerror(errno);
+    ASSERT_EQ(0, chown(parent, 0, 2000)) << strerror(errno);
+    ASSERT_EQ(0, chmod(parent, 02777)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(30);
+        }
+        umask(0);
+        int fd = open(file, O_CREAT | O_EXCL | O_WRONLY, 02770);
+        if (fd < 0) {
+            _exit(31);
+        }
+        close(fd);
+        struct stat st = {};
+        if (stat(file, &st) != 0 || st.st_gid != 2000 || (st.st_mode & S_ISGID) != 0) {
+            _exit(32);
+        }
+        if (mkdir(dir, 0770) != 0) {
+            _exit(33);
+        }
+        if (stat(dir, &st) != 0 || st.st_gid != 2000 || (st.st_mode & S_ISGID) == 0) {
+            _exit(34);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(file);
+    rmdir(dir);
+    rmdir(parent);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, AtimeUpdateDoesNotOverwriteConcurrentMetadata) {
+    const char *target = "/tmp/test_mount_atime_atomic";
+    const char *file = "/tmp/test_mount_atime_atomic/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, "size=1m"))
+        << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+
+    int fd = open(file, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    AtimeReaderContext context = {fd, false};
+    pthread_t reader;
+    ASSERT_EQ(0, pthread_create(&reader, nullptr, atime_reader, &context));
+
+    for (int i = 0; i < 2000; ++i) {
+        ASSERT_EQ(0, chmod(file, (i & 1) ? 0613 : 0642)) << strerror(errno);
+        struct timespec times[2] = {{100 + i, 0}, {200 + i, 0}};
+        ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+    }
+
+    const mode_t final_mode = 0613;
+    const time_t final_mtime = 123456;
+    ASSERT_EQ(0, chmod(file, final_mode)) << strerror(errno);
+    struct timespec final_times[2] = {{1, 0}, {final_mtime, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, final_times, 0)) << strerror(errno);
+    usleep(20000);
+    context.stop.store(true, std::memory_order_relaxed);
+    void *thread_result = nullptr;
+    ASSERT_EQ(0, pthread_join(reader, &thread_result));
+    ASSERT_EQ(nullptr, thread_result);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(file, &st)) << strerror(errno);
+    EXPECT_EQ(final_mode, st.st_mode & 0777);
+    EXPECT_EQ(final_mtime, st.st_mtim.tv_sec);
+    EXPECT_GT(st.st_atim.tv_sec, 1);
+
+    close(fd);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, TmpfsStatfsTracksPageQuotaWithoutCachedFreeBlocks) {
+    const char *target = "/tmp/test_tmpfs_statfs_quota";
+    const char *file = "/tmp/test_tmpfs_statfs_quota/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", 0, "size=16k")) << strerror(errno);
+
+    struct statfs before = {};
+    ASSERT_EQ(0, statfs(target, &before)) << strerror(errno);
+    ASSERT_EQ(4UL, before.f_blocks);
+    ASSERT_EQ(4UL, before.f_bfree);
+
+    int fd = open(file, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, posix_fallocate(fd, 0, 8192));
+
+    struct statfs allocated = {};
+    ASSERT_EQ(0, statfs(target, &allocated)) << strerror(errno);
+    EXPECT_EQ(4UL, allocated.f_blocks);
+    EXPECT_EQ(2UL, allocated.f_bfree);
+
+    errno = 0;
+    EXPECT_EQ(-1, mount("tmpfs", target, "tmpfs", MS_REMOUNT, "size=4k"));
+    EXPECT_EQ(EINVAL, errno);
+
+    struct statfs rejected = {};
+    ASSERT_EQ(0, statfs(target, &rejected)) << strerror(errno);
+    EXPECT_EQ(4UL, rejected.f_blocks);
+    EXPECT_EQ(2UL, rejected.f_bfree);
+
+    ASSERT_EQ(0, ftruncate(fd, 0)) << strerror(errno);
+    struct statfs released = {};
+    ASSERT_EQ(0, statfs(target, &released)) << strerror(errno);
+    EXPECT_EQ(4UL, released.f_bfree);
+
+    close(fd);
+    unlink(file);
+    cleanup_mount(target);
 }
 
 TEST(MountReconfigure, BindRemountReadonlyDoesNotChangeSourceSuperblock) {

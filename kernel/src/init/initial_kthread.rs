@@ -24,8 +24,7 @@ use crate::{
 
 use super::{cmdline::kenrel_cmdline_param_manager, initcall::do_initcalls};
 
-const INIT_PROC_TRYLIST: [(&str, Option<&str>); 6] = [
-    ("/bin/dragonreach", None),
+const INIT_PROC_TRYLIST: [(&str, Option<&str>); 5] = [
     ("/bin/busybox", Some("init")),
     ("/bin/init", None),
     ("/sbin/init", None),

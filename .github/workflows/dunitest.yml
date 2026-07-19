@@ -17,7 +17,8 @@ jobs:
   dunitest:
     name: Dunitest
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Allow the 30-minute guest test budget plus build, cleanup, and diagnostics.
+    timeout-minutes: 50
     container:
       image: dragonos/dragonos-dev:v1.23
       options: --privileged -v /dev:/dev
@@ -41,3 +42,11 @@ jobs:
           DISK_SAVE_MODE: "1"
         run: |
           make test-dunit
+
+      - name: Preserve dunitest serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunitest-serial-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: serial_opt.txt
+          if-no-files-found: error

@@ -14,6 +14,8 @@ pause_test
 
 # 文件系统相关测试
 chroot_test
+mount_test
+pivot_root_test
 creat_test
 dup_test
 fuse_test

@@ -434,6 +434,17 @@ impl IndexNode for OvlInode {
         super::metadata::set_metadata_masked(self, metadata, mask)
     }
 
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        // Match ovl_update_time(): reading a lower-only inode must not copy it
+        // up merely to persist atime. If an upper inode already exists, let its
+        // native synchronization domain evaluate and update the timestamp.
+        let upper = self.upper_inode.lock().clone();
+        if let Some(upper) = upper {
+            upper.update_atime(now, relatime)?;
+        }
+        Ok(())
+    }
+
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         super::metadata::resize_with_lock_owner(self, len, 0)
     }

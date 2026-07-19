@@ -18,6 +18,7 @@ normal/fuse_stats_debugfs
 normal/test_pivot_root
 normal/mount_reconfigure
 normal/mount_propagation
+normal/open_dangling_symlink
 normal/mount_move
 normal/mount_limit
 normal/mount_object_topology
@@ -44,6 +45,7 @@ normal/tcp_bind_semantics
 normal/tcp_close_semantics
 normal/udp_ipv6_send_semantics
 normal/socket_getsockopt_semantics
+normal/unix_socket_shutdown
 fuse/fuse_core
 fuse/fuse_extended
 normal/test_procfs_link

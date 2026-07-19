@@ -119,6 +119,35 @@ impl PageCacheCompletionSelftestState {
 }
 
 #[derive(Debug, Default)]
+struct PageCacheQuotaSelftestBackend {
+    reserved: AtomicUsize,
+    released: AtomicUsize,
+}
+
+impl PageCacheBackend for PageCacheQuotaSelftestBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+
+    fn npages(&self) -> usize {
+        0
+    }
+
+    fn reserve_page(&self) -> Result<(), SystemError> {
+        self.reserved.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn release_page(&self) {
+        self.released.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Default)]
 struct FileVmaIndex {
     vmas: HashMap<usize, Weak<LockedVMA>>,
 }
@@ -337,6 +366,21 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         ));
     }
 
+    // Filesystem quota follows exact cache membership, including removal.
+    let quota_backend = Arc::new(PageCacheQuotaSelftestBackend::default());
+    let quota_cache = PageCache::new_shmem(None, Some(quota_backend.clone()));
+    let quota_page = quota_cache.get_or_create_page_zero(0)?;
+    let quota_removed = quota_cache.manager.remove_page(0)?.is_some();
+    let quota_ok = quota_removed
+        && quota_backend.reserved.load(Ordering::Acquire) == 1
+        && quota_backend.released.load(Ordering::Acquire) == 1;
+    let quota_paddr = quota_page.phys_address();
+    page_manager_lock().remove_page(&quota_paddr);
+    let _ = page_reclaimer_lock().remove_page(&quota_paddr);
+    if !quota_ok {
+        return Ok("status=fail stage=filesystem_quota_membership\n".into());
+    }
+
     // Ordinary file membership: insert, explicit remove, and duplicate remove.
     let file_cache = PageCache::new(None, None);
     let file_page = file_cache.get_or_create_page_zero(0)?;
@@ -374,6 +418,27 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Ok("status=fail stage=shmem_identity\n".into());
     }
 
+    // Transaction rollback must observe PG_DIRTY even while publication to
+    // the cache dirty tag/state is still pending.
+    let rollback_cache = PageCache::new_shmem(None, None);
+    let rollback_page = rollback_cache.get_or_create_page_zero(0)?;
+    rollback_page.write().add_flags(PageFlags::PG_DIRTY);
+    let discarded = rollback_cache
+        .manager
+        .discard_created_page(0, &rollback_page)?;
+    let rollback_retained = rollback_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .is_some_and(|entry| Arc::ptr_eq(&entry.page, &rollback_page));
+    let rollback_removed = rollback_cache.manager.remove_page(0)?.is_some();
+    let rollback_paddr = rollback_page.phys_address();
+    page_manager_lock().remove_page(&rollback_paddr);
+    let _ = page_reclaimer_lock().remove_page(&rollback_paddr);
+    if discarded || !rollback_retained || !rollback_removed {
+        return Ok("status=fail stage=dirty_transaction_rollback\n".into());
+    }
+
     // Loading rollback consumes membership once; a late state publication on
     // the detached entry must not revive it.
     let state_cache = PageCache::new(None, None);
@@ -382,7 +447,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     state_cache
         .inner
         .lock()
-        .insert_entry(0, loading_entry.clone());
+        .insert_entry(0, loading_entry.clone())?;
     let loading_removed = state_cache.inner.lock().remove_page(0).is_some();
     loading_entry.account_state_transition(PageState::Loading, PageState::UpToDate);
     loading_entry.set_state(PageState::UpToDate);
@@ -472,7 +537,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let drop_page = drop_cache.allocate_page(Arc::downgrade(&drop_cache), 0)?;
     let drop_paddr = drop_page.phys_address();
     let drop_entry = Arc::new(PageEntry::new(drop_page, PageState::Loading));
-    drop_cache.inner.lock().insert_entry(0, drop_entry.clone());
+    drop_cache
+        .inner
+        .lock()
+        .insert_entry(0, drop_entry.clone())?;
     drop(drop_cache);
     drop_entry.account_state_transition(PageState::Loading, PageState::UpToDate);
     drop_entry.set_state(PageState::UpToDate);
@@ -731,6 +799,14 @@ pub trait PageCacheBackend: Send + Sync + core::fmt::Debug {
     fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError>;
     fn npages(&self) -> usize;
 
+    /// Reserve one filesystem block before publishing a new cache page.
+    fn reserve_page(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Release the reservation owned by one removed cache page.
+    fn release_page(&self) {}
+
     /// Maximum number of consecutive pages which are useful in one backend
     /// write request.  Backends are single-page by default.
     fn write_batch_pages(&self) -> Result<usize, SystemError> {
@@ -946,6 +1022,7 @@ pub struct InnerPageCache {
     dirty_preparations: usize,
     kind: PageCacheKind,
     page_cache_ref: Weak<PageCache>,
+    accounting_backend: Option<Arc<dyn PageCacheBackend>>,
 }
 
 /// 描述一次从页缓存到目标缓冲区的拷贝
@@ -1544,7 +1621,11 @@ impl PageCacheManager {
             return Err(SystemError::EEXIST);
         }
         for item in &items {
-            inner.insert_entry(item.descriptor.page_index, item.entry.clone());
+            if let Err(error) = inner.insert_entry(item.descriptor.page_index, item.entry.clone()) {
+                drop(inner);
+                PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
+                return Err(error);
+            }
         }
         drop(inner);
         for item in &items {
@@ -1602,6 +1683,27 @@ impl PageCacheManager {
         page_index: usize,
     ) -> Result<PageCachePagePin, SystemError> {
         self.upgrade()?.get_or_create_page_zero_pinned(page_index)
+    }
+
+    pub fn commit_overwrite_pinned_with_status(
+        &self,
+        page_index: usize,
+    ) -> Result<(PageCachePagePin, bool), SystemError> {
+        self.upgrade()?
+            .get_or_create_page_zero_pinned_with_status(page_index)
+    }
+
+    /// Count cache holes in an inclusive page-index range from one locked
+    /// membership snapshot. This is used only for fallible transaction
+    /// metadata sizing; the later per-page insertion remains authoritative.
+    pub fn missing_pages_in_range(&self, first: usize, last: usize) -> Result<usize, SystemError> {
+        let cache = self.upgrade()?;
+        let total = last
+            .checked_sub(first)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(SystemError::ENOMEM)?;
+        let present = cache.lock().page_indices.range(first..=last).count();
+        total.checked_sub(present).ok_or(SystemError::EIO)
     }
 
     pub fn prefetch_page(&self, page_index: usize) -> Result<(), SystemError> {
@@ -2915,6 +3017,78 @@ impl PageCacheManager {
         Ok(removed)
     }
 
+    /// Roll back a page newly inserted by a transactional cache operation.
+    ///
+    /// Identity and liveness are checked while the cache membership lock is
+    /// held. If another user has acquired or mapped the page, it is no longer
+    /// safe to treat it as transaction-private and the rollback leaves it in
+    /// place. A successful removal also retires the page from the global page
+    /// manager and reclaimer; callers must not reproduce that lifecycle logic.
+    pub fn discard_created_page(
+        &self,
+        page_index: usize,
+        expected_page: &Arc<Page>,
+    ) -> Result<bool, SystemError> {
+        let cache = self.upgrade()?;
+        let (entry, state) = {
+            let guard = cache.lock();
+            let Some(entry) = guard.get_entry(page_index) else {
+                return Ok(false);
+            };
+            if !Arc::ptr_eq(&entry.page, expected_page)
+                || entry.active_users() != 0
+                || guard.dirty_pages.contains(&page_index)
+                || guard.writeback_pages.contains(&page_index)
+            {
+                return Ok(false);
+            }
+            let state = entry.state();
+            if matches!(
+                state,
+                PageState::Loading | PageState::Dirty | PageState::Writeback | PageState::Error
+            ) {
+                return Ok(false);
+            }
+            (entry, state)
+        };
+
+        // Dirty publication uses the page -> cache lock order. Keep the page
+        // guard through the final membership check so rollback cannot slip
+        // between setting PG_DIRTY and publishing the dirty tag/state.
+        let page_guard = entry.page.read();
+        let page_discardable = !page_guard
+            .flags()
+            .intersects(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK)
+            && page_guard.map_count() == 0;
+        if !page_discardable {
+            return Ok(false);
+        }
+
+        let removed = {
+            let mut guard = cache.lock();
+            let Some(current) = guard.get_entry(page_index) else {
+                return Ok(false);
+            };
+            if !Arc::ptr_eq(&current, &entry)
+                || !Arc::ptr_eq(&current.page, expected_page)
+                || current.active_users() != 0
+                || current.state() != state
+                || guard.dirty_pages.contains(&page_index)
+                || guard.writeback_pages.contains(&page_index)
+            {
+                return Ok(false);
+            }
+            guard.remove_page(page_index)
+        };
+        drop(page_guard);
+        let Some(page) = removed else {
+            return Ok(false);
+        };
+        cache.discard_unlinked_page(&page);
+        drop(cache.detach_dirty_retention_if_idle());
+        Ok(true)
+    }
+
     pub fn remove_clean_page_for_reclaim(
         &self,
         page_index: usize,
@@ -3271,7 +3445,12 @@ impl PageCachePagePin {
 }
 
 impl InnerPageCache {
-    fn new(page_cache_ref: Weak<PageCache>, id: usize, kind: PageCacheKind) -> InnerPageCache {
+    fn new(
+        page_cache_ref: Weak<PageCache>,
+        id: usize,
+        kind: PageCacheKind,
+        accounting_backend: Option<Arc<dyn PageCacheBackend>>,
+    ) -> InnerPageCache {
         Self {
             id,
             pages: HashMap::new(),
@@ -3282,6 +3461,7 @@ impl InnerPageCache {
             dirty_preparations: 0,
             kind,
             page_cache_ref,
+            accounting_backend,
         }
     }
 
@@ -3295,6 +3475,9 @@ impl InnerPageCache {
         self.dirty_pages.remove(&offset);
         self.writeback_pages.remove(&offset);
         entry.account_remove();
+        if let Some(backend) = self.accounting_backend.as_ref() {
+            backend.release_page();
+        }
         Some(entry.page.clone())
     }
 
@@ -3302,19 +3485,23 @@ impl InnerPageCache {
         self.pages.get(&offset).cloned()
     }
 
-    fn insert_entry(&mut self, offset: usize, entry: Arc<PageEntry>) {
+    fn insert_entry(&mut self, offset: usize, entry: Arc<PageEntry>) -> Result<(), SystemError> {
         let mapping_unevictable = self
             .page_cache_ref
             .upgrade()
             .is_some_and(|cache| cache.mapping_unevictable());
         match self.pages.entry(offset) {
             Entry::Vacant(slot) => {
+                if let Some(backend) = self.accounting_backend.as_ref() {
+                    backend.reserve_page()?;
+                }
                 entry.account_insert(self.kind, mapping_unevictable);
                 slot.insert(entry);
             }
             Entry::Occupied(_) => panic!("page-cache insert requires a vacant slot"),
         }
         self.page_indices.insert(offset);
+        Ok(())
     }
 
     fn is_page_ready(&self, offset: usize) -> bool {
@@ -3340,6 +3527,9 @@ impl Drop for InnerPageCache {
         let mut page_manager = page_manager_lock();
         for entry in self.pages.values() {
             entry.account_remove();
+            if let Some(backend) = self.accounting_backend.as_ref() {
+                backend.release_page();
+            }
             page_manager.remove_page(&entry.page.phys_address());
         }
         drop(page_manager);
@@ -3374,9 +3564,23 @@ impl PageCache {
         kind: PageCacheKind,
     ) -> Arc<PageCache> {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
+        // Quota accounting is a shmem concern.  Regular file backends use the
+        // same trait for I/O, but its accounting hooks are the default no-ops;
+        // retaining them here would add an unnecessary indirect call to every
+        // file-page insertion and removal while the cache lock is held.
+        let accounting_backend = if kind == PageCacheKind::Shmem {
+            backend.clone()
+        } else {
+            None
+        };
         let cache = Arc::new_cyclic(|weak| Self {
             id,
-            inner: Mutex::new(InnerPageCache::new(weak.clone(), id, kind)),
+            inner: Mutex::new(InnerPageCache::new(
+                weak.clone(),
+                id,
+                kind,
+                accounting_backend,
+            )),
             inode: {
                 let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
                 if let Some(inode) = inode {
@@ -4166,6 +4370,15 @@ impl PageCache {
         page_index: usize,
         populate_backend: bool,
     ) -> Result<Arc<PageEntry>, SystemError> {
+        self.get_or_create_entry_with_status(page_index, populate_backend)
+            .map(|(entry, _created)| entry)
+    }
+
+    fn get_or_create_entry_with_status(
+        &self,
+        page_index: usize,
+        populate_backend: bool,
+    ) -> Result<(Arc<PageEntry>, bool), SystemError> {
         let mut page_cache_ref = None;
         let mut existing_entry = None;
         {
@@ -4180,13 +4393,13 @@ impl PageCache {
         if let Some(entry) = existing_entry {
             let state = entry.state();
             if state.is_ready() {
-                return Ok(entry);
+                return Ok((entry, false));
             }
             if state == PageState::Error {
                 return Err(SystemError::EIO);
             }
             let _ = entry.wait_ready()?;
-            return Ok(entry);
+            return Ok((entry, false));
         }
 
         let (entry, need_populate) = {
@@ -4205,7 +4418,11 @@ impl PageCache {
                     (entry, false)
                 } else {
                     let entry = Arc::new(PageEntry::new(page, PageState::Loading));
-                    guard.insert_entry(page_index, entry.clone());
+                    if let Err(error) = guard.insert_entry(page_index, entry.clone()) {
+                        drop(guard);
+                        self.discard_unlinked_page(&entry.page);
+                        return Err(error);
+                    }
                     (entry, true)
                 }
             }
@@ -4214,13 +4431,13 @@ impl PageCache {
         if !need_populate {
             let state = entry.state();
             if state.is_ready() {
-                return Ok(entry);
+                return Ok((entry, false));
             }
             if state == PageState::Error {
                 return Err(SystemError::EIO);
             }
             let _ = entry.wait_ready()?;
-            return Ok(entry);
+            return Ok((entry, false));
         }
         self.reconcile_entry_unevictable_for_insert(&entry);
 
@@ -4234,7 +4451,7 @@ impl PageCache {
             Ok(()) => {
                 entry.set_state(PageState::UpToDate);
                 entry.wait_queue.wake_all();
-                Ok(entry)
+                Ok((entry, true))
             }
             Err(e) => {
                 entry.set_state(PageState::Error);
@@ -4362,7 +4579,11 @@ impl PageCache {
                 return Ok(());
             }
             let entry = Arc::new(PageEntry::new(page, PageState::Loading));
-            guard.insert_entry(page_index, entry.clone());
+            if let Err(error) = guard.insert_entry(page_index, entry.clone()) {
+                drop(guard);
+                self.discard_unlinked_page(&entry.page);
+                return Err(error);
+            }
             entry
         };
         self.reconcile_entry_unevictable_for_insert(&entry);
@@ -4516,7 +4737,11 @@ impl PageCache {
                     (entry, false)
                 } else {
                     let entry = Arc::new(PageEntry::new(page, PageState::Loading));
-                    guard.insert_entry(page_index, entry.clone());
+                    if let Err(error) = guard.insert_entry(page_index, entry.clone()) {
+                        drop(guard);
+                        self.discard_unlinked_page(&entry.page);
+                        return Err(error);
+                    }
                     (entry, true)
                 }
             }
@@ -4618,7 +4843,11 @@ impl PageCache {
                 if guard.get_entry(page_index).is_some() {
                     false
                 } else {
-                    guard.insert_entry(page_index, entry.clone());
+                    if let Err(error) = guard.insert_entry(page_index, entry.clone()) {
+                        drop(guard);
+                        self.discard_unlinked_page(&entry.page);
+                        return Err(error);
+                    }
                     true
                 }
             };
@@ -4670,6 +4899,24 @@ impl PageCache {
         self.get_or_create_page_pinned(page_index, false)
     }
 
+    pub fn get_or_create_page_zero_pinned_with_status(
+        &self,
+        page_index: usize,
+    ) -> Result<(PageCachePagePin, bool), SystemError> {
+        loop {
+            let (entry, created) = self.get_or_create_entry_with_status(page_index, false)?;
+            let guard = self.inner.lock();
+            let Some(current) = guard.get_entry(page_index) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&current, &entry) || !entry.state().is_ready() {
+                continue;
+            }
+            let pin = entry.pin();
+            return Ok((PageCachePagePin::new(entry.page.clone(), pin), created));
+        }
+    }
+
     fn get_or_create_page_pinned(
         &self,
         page_index: usize,
@@ -4690,6 +4937,15 @@ impl PageCache {
     }
 
     fn ensure_dirty_retention_locked(&self, inner: &mut InnerPageCache) -> Result<(), SystemError> {
+        // Shmem pages have no asynchronous backing-store writeback. The inode
+        // already owns the mapping, so retaining the inode from the mapping's
+        // dirty state would form a permanent inode -> page cache -> inode cycle.
+        // In particular, an unlinked tmpfs inode would never release its page
+        // reservations. Ordinary file mappings still need this guard while
+        // dirty/writeback work can outlive the caller.
+        if self.is_shmem() {
+            return Ok(());
+        }
         if inner.dirty_retention.is_some() {
             return Ok(());
         }
@@ -4852,8 +5108,14 @@ impl PageCache {
             self.discard_unlinked_page(&entry.page);
             return Err(SystemError::EEXIST);
         }
-        guard.insert_entry(page_index, entry);
-        Ok(())
+        match guard.insert_entry(page_index, entry.clone()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                drop(guard);
+                self.discard_unlinked_page(&entry.page);
+                Err(error)
+            }
+        }
     }
 
     pub fn read_pages(&self, start_page_index: usize, page_num: usize) -> Result<(), SystemError> {

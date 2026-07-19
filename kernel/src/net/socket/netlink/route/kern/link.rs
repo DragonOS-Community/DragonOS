@@ -134,6 +134,7 @@ fn iface_to_link_message(
     msg_type: CSegmentType,
     iface: &Arc<dyn Iface>,
 ) -> Result<LinkSegment, SystemError> {
+    let flags = iface.common().link_flags_snapshot()?;
     let header = CMsgSegHdr {
         len: 0,
         type_: msg_type as _,
@@ -146,7 +147,7 @@ fn iface_to_link_message(
         family: AddressFamily::Unspecified,
         type_: iface.type_(),
         index: NonZero::new(iface.nic_id() as u32),
-        flags: iface.flags(),
+        flags: flags.configured,
         change: LinkMessageFlags::empty(),
         pad: None,
     };
@@ -155,9 +156,29 @@ fn iface_to_link_message(
         LinkAttr::Address(iface.mac().as_bytes().to_vec()),
         LinkAttr::Name(CString::new(iface.name()).map_err(|_| SystemError::EINVAL)?),
         LinkAttr::Mtu(iface.mtu() as u32),
+        LinkAttr::Promiscuity(flags.promiscuity),
+        LinkAttr::Allmulti(flags.allmulti),
     ];
 
     Ok(LinkSegment::new(header, link_message, attrs))
+}
+
+pub(crate) fn notify_link_change(iface: &Arc<dyn Iface>) {
+    let Some(netns) = iface.net_namespace() else {
+        return;
+    };
+    let segment = iface_to_link_message(
+        &kernel_notify_header(CSegmentType::NEWLINK),
+        CSegmentType::NEWLINK,
+        iface,
+    );
+    match segment {
+        Ok(segment) => multicast_notify(netns, RTMGRP_LINK, RouteNlSegment::NewLink(segment)),
+        Err(err) => log::warn!(
+            "netlink route: failed to build link notification: {:?}",
+            err
+        ),
+    }
 }
 
 pub(super) fn do_del_link(
@@ -188,15 +209,11 @@ pub(super) fn do_set_link(
         }
     }
 
-    let current_flags = iface.flags();
     let change_mask = InterfaceFlags::from_bits_truncate(request_segment.body().change.bits());
     let requested_flags = InterfaceFlags::from_bits_truncate(request_segment.body().flags.bits());
-    let new_flags = InterfaceFlags::from_bits_truncate(
-        (current_flags.bits() & !change_mask.bits())
-            | (requested_flags.bits() & change_mask.bits()),
-    );
-
-    iface.common().set_flags(new_flags);
+    let new_flags = iface
+        .common()
+        .update_configured_flags(requested_flags, change_mask)?;
 
     if change_mask.contains(InterfaceFlags::UP) {
         let operstate = if new_flags.contains(InterfaceFlags::UP) {
@@ -215,15 +232,7 @@ pub(super) fn do_set_link(
         iface.common().set_mtu(mtu as usize);
     }
 
-    multicast_notify(
-        netns,
-        RTMGRP_LINK,
-        RouteNlSegment::NewLink(iface_to_link_message(
-            &kernel_notify_header(CSegmentType::NEWLINK),
-            CSegmentType::NEWLINK,
-            &iface,
-        )?),
-    );
+    notify_link_change(&iface);
 
     Ok(Vec::new())
 }
@@ -298,7 +307,11 @@ fn validate_setlink_request(
                     updates.mtu = Some(*mtu);
                 }
             }
-            LinkAttr::TxqLen(_) | LinkAttr::LinkMode(_) | LinkAttr::ExtMask(_) => {}
+            LinkAttr::Allmulti(_) => return Err(SystemError::EINVAL),
+            LinkAttr::Promiscuity(_)
+            | LinkAttr::TxqLen(_)
+            | LinkAttr::LinkMode(_)
+            | LinkAttr::ExtMask(_) => {}
             _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
         }
     }

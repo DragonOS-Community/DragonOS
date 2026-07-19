@@ -61,6 +61,7 @@ let
       "^suites/.*"
       "^Makefile$"
       "^whitelist\\.txt$"
+      "^no_skip\\.txt$"
       "^scripts$"
       "^scripts/run_tests\\.sh$"
     ];
@@ -90,6 +91,7 @@ let
       cp -r bin $out/${installDir}/
       cp -r build/fixtures $out/${installDir}/
       install -m644 whitelist.txt $out/${installDir}/
+      install -m644 no_skip.txt $out/${installDir}/
       install -m755 scripts/run_tests.sh $out/${installDir}/
 
       runHook postInstall

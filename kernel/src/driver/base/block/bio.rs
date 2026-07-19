@@ -38,6 +38,7 @@ struct InnerBioRequest {
     complete_callbacks: Vec<BioCompleteCallback>,
     /// virtio-drivers返回的token，用于中断时匹配
     token: Option<u16>,
+    stats_submit_cycle: usize,
 }
 
 type BioCompleteCallback = Box<dyn Fn(Result<usize, SystemError>) + Send + Sync>;
@@ -45,8 +46,15 @@ type BioCompleteCallback = Box<dyn Fn(Result<usize, SystemError>) + Send + Sync>
 impl BioRequest {
     /// 创建一个读请求
     pub fn new_read(lba_start: BlockId, count: usize) -> Arc<Self> {
-        let buffer = DmaBuffer::alloc_bytes(count * LBA_SIZE, Default::default());
-        Arc::new(Self {
+        Self::try_new_read(lba_start, count).expect("bio read allocation failed")
+    }
+
+    /// Create a read request without panicking when the DMA buffer cannot be
+    /// allocated or the request size overflows.
+    pub fn try_new_read(lba_start: BlockId, count: usize) -> Result<Arc<Self>, SystemError> {
+        let len = Self::validate_request(lba_start, count)?;
+        let buffer = DmaBuffer::try_alloc_bytes(len, Default::default())?;
+        Ok(Arc::new(Self {
             inner: SpinLock::new(InnerBioRequest {
                 bio_type: BioType::Read,
                 lba_start,
@@ -57,17 +65,31 @@ impl BioRequest {
                 result: None,
                 complete_callbacks: Vec::new(),
                 token: None,
+                stats_submit_cycle: 0,
             }),
-        })
+        }))
     }
 
     /// 创建一个写请求
     pub fn new_write(lba_start: BlockId, count: usize, data: &[u8]) -> Arc<Self> {
-        let mut buffer = DmaBuffer::alloc_bytes(count * LBA_SIZE, Default::default());
-        let copy_len = data.len().min(buffer.len());
-        buffer.as_mut_slice()[..copy_len].copy_from_slice(&data[..copy_len]);
+        Self::try_new_write(lba_start, count, data).expect("bio write allocation failed")
+    }
 
-        Arc::new(Self {
+    /// Create a write request with exact-length validation and fallible DMA
+    /// allocation. A mismatched payload is never silently truncated or padded.
+    pub fn try_new_write(
+        lba_start: BlockId,
+        count: usize,
+        data: &[u8],
+    ) -> Result<Arc<Self>, SystemError> {
+        let len = Self::validate_request(lba_start, count)?;
+        if data.len() != len {
+            return Err(SystemError::EINVAL);
+        }
+        let mut buffer = DmaBuffer::try_alloc_bytes(len, Default::default())?;
+        buffer.as_mut_slice().copy_from_slice(data);
+
+        Ok(Arc::new(Self {
             inner: SpinLock::new(InnerBioRequest {
                 bio_type: BioType::Write,
                 lba_start,
@@ -78,8 +100,9 @@ impl BioRequest {
                 result: None,
                 complete_callbacks: Vec::new(),
                 token: None,
+                stats_submit_cycle: 0,
             }),
-        })
+        }))
     }
 
     /// Create a new flush request.
@@ -95,6 +118,7 @@ impl BioRequest {
                 result: None,
                 complete_callbacks: Vec::new(),
                 token: None,
+                stats_submit_cycle: 0,
             }),
         })
     }
@@ -142,6 +166,14 @@ impl BioRequest {
     /// 获取扇区数
     pub fn count(&self) -> usize {
         self.inner.lock_irqsave().count
+    }
+
+    pub fn set_stats_submit_cycle(&self, cycle: usize) {
+        self.inner.lock_irqsave().stats_submit_cycle = cycle;
+    }
+
+    pub fn stats_submit_cycle(&self) -> usize {
+        self.inner.lock_irqsave().stats_submit_cycle
     }
 
     /// 获取token
@@ -194,9 +226,42 @@ impl BioRequest {
         // 获取结果
         let inner = self.inner.lock_irqsave();
         match inner.result.as_ref() {
-            Some(Ok(_)) => Ok(inner.buffer.to_vec()),
+            Some(Ok(completed)) if *completed == Self::expected_len(&inner) => {
+                Ok(inner.buffer.to_vec())
+            }
+            Some(Ok(_)) => Err(SystemError::EIO),
             Some(Err(e)) => Err(e.clone()),
             None => Err(SystemError::EIO),
+        }
+    }
+
+    /// Wait for completion without copying the DMA payload. This is the
+    /// completion path for writes and flushes.
+    pub fn wait_status(&self) -> Result<usize, SystemError> {
+        let completion = self.inner.lock_irqsave().completion.clone();
+        completion.wait_for_completion()?;
+
+        let inner = self.inner.lock_irqsave();
+        match inner.result.as_ref() {
+            Some(Ok(completed)) if *completed == Self::expected_len(&inner) => Ok(*completed),
+            Some(Ok(_)) => Err(SystemError::EIO),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err(SystemError::EIO),
+        }
+    }
+
+    fn validate_request(lba_start: BlockId, count: usize) -> Result<usize, SystemError> {
+        if count == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        lba_start.checked_add(count).ok_or(SystemError::EOVERFLOW)?;
+        count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)
+    }
+
+    fn expected_len(inner: &InnerBioRequest) -> usize {
+        match inner.bio_type {
+            BioType::Read | BioType::Write => inner.count * LBA_SIZE,
+            BioType::Flush => 0,
         }
     }
 }

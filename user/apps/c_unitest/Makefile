@@ -8,7 +8,10 @@ endif
 CC=$(CROSS_COMPILE)gcc
 CFLAGS := -Wall -O2 -static -lpthread
 
-SRCS := $(wildcard *.c)
+# These two legacy programs contain unsupported-as-PASS paths. Their Linux
+# conformance coverage is maintained by dunitest and the upstream gVisor suite.
+RETIRED_FALSE_POSITIVE_SRCS := test_mount_propagation.c test_pivot_root.c
+SRCS := $(filter-out $(RETIRED_FALSE_POSITIVE_SRCS),$(wildcard *.c))
 BINS := $(SRCS:.c=)
 
 # 含有自己 Makefile 的子目录
@@ -32,7 +35,7 @@ install: all
 	done
 
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) $(RETIRED_FALSE_POSITIVE_SRCS:.c=)
 	@for dir in $(SUBDIRS); do $(MAKE) -C $$dir clean ARCH=$(ARCH); done
 
 .PHONY: all install clean

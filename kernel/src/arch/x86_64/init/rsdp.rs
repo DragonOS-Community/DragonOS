@@ -102,11 +102,8 @@ fn scan_rsdp_in_buf(
     Ok(None)
 }
 
-/// Map and scan one physical search window, then unmap it exactly once.
-fn scan_physical_window(
-    phys_base: usize,
-    scan_len: usize,
-) -> Result<Option<PhysAddr>, SystemError> {
+/// Map and scan one bounded chunk, then unmap it exactly once.
+fn scan_physical_chunk(phys_base: usize, scan_len: usize) -> Result<Option<PhysAddr>, SystemError> {
     let map_len = scan_len
         .checked_add(RSDP_MAX_TRAILING_BYTES)
         .ok_or(SystemError::EINVAL)?;
@@ -127,6 +124,35 @@ fn scan_physical_window(
     // precedence over a found/not-found scan result.
     unmap_result?;
     scan_result
+}
+
+/// Scan one physical search window with page-sized temporary mappings.
+///
+/// Each chunk maps the 35 trailing bytes required to validate an ACPI 2.0+
+/// RSDP whose start lies at the end of the chunk. Since x86 pages are a
+/// multiple of the 16-byte RSDP alignment, splitting the candidate range at
+/// page boundaries neither skips nor duplicates candidate starts. Limiting
+/// each mapping prevents a persistent early framebuffer mapping from making
+/// the 128 KiB BIOS window require a comparably large contiguous FIXMAP run.
+fn scan_physical_window(
+    phys_base: usize,
+    scan_len: usize,
+) -> Result<Option<PhysAddr>, SystemError> {
+    debug_assert_eq!(MMArch::PAGE_SIZE % RSDP_SCAN_STEP, 0);
+
+    let mut scanned = 0usize;
+    while scanned < scan_len {
+        let chunk_len = core::cmp::min(MMArch::PAGE_SIZE, scan_len - scanned);
+        let chunk_phys = phys_base.checked_add(scanned).ok_or(SystemError::EINVAL)?;
+
+        if let Some(rsdp) = scan_physical_chunk(chunk_phys, chunk_len)? {
+            return Ok(Some(rsdp));
+        }
+
+        scanned = scanned.checked_add(chunk_len).ok_or(SystemError::EINVAL)?;
+    }
+
+    Ok(None)
 }
 
 fn read_ebda_base() -> Result<usize, SystemError> {

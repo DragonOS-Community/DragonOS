@@ -20,9 +20,11 @@ use crate::{
     process::{
         pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
     },
+    syscall::user_access::UserBufferWriter,
     time::{
-        sleep::nanosleep, syscall::PosixClockID, timekeeping::getnstimeofday, Instant,
-        PosixTimeSpec,
+        sleep::nanosleep,
+        syscall::{posix_clock_now, PosixClockID},
+        Instant, PosixTimeSpec,
     },
 };
 
@@ -1171,6 +1173,7 @@ pub enum RestartBlockData {
     Nanosleep {
         deadline: crate::time::PosixTimeSpec,
         clockid: crate::time::syscall::PosixClockID,
+        rmtp: Option<VirtAddr>,
     },
     // todo: futex_wait
     FutexWait(),
@@ -1188,8 +1191,13 @@ impl RestartBlockData {
     pub fn new_nanosleep(
         deadline: crate::time::PosixTimeSpec,
         clockid: crate::time::syscall::PosixClockID,
+        rmtp: Option<VirtAddr>,
     ) -> Self {
-        Self::Nanosleep { deadline, clockid }
+        Self::Nanosleep {
+            deadline,
+            clockid,
+            rmtp,
+        }
     }
 }
 
@@ -1201,38 +1209,26 @@ pub struct PollRestartBlockData {
 }
 
 fn ktime_now(clockid: PosixClockID) -> PosixTimeSpec {
-    match clockid {
-        PosixClockID::Realtime => getnstimeofday(),
-        PosixClockID::Monotonic | PosixClockID::Boottime => getnstimeofday(),
-        PosixClockID::ProcessCPUTimeID => {
-            let pcb = ProcessManager::current_pcb();
-            PosixTimeSpec::from_ns(pcb.process_cputime_ns())
-        }
-        PosixClockID::ThreadCPUTimeID => {
-            let pcb = ProcessManager::current_pcb();
-            PosixTimeSpec::from_ns(pcb.thread_cputime_ns())
-        }
-        _ => getnstimeofday(),
-    }
+    posix_clock_now(clockid)
 }
 
 fn calc_remaining(deadline: &PosixTimeSpec, now: &PosixTimeSpec) -> PosixTimeSpec {
-    let mut sec = deadline.tv_sec - now.tv_sec;
-    let mut nsec = deadline.tv_nsec - now.tv_nsec;
-    if nsec < 0 {
-        sec -= 1;
-        nsec += 1_000_000_000;
+    deadline.saturating_sub_timespec(now)
+}
+
+fn write_nanosleep_remaining(
+    rmtp: Option<VirtAddr>,
+    remaining: &PosixTimeSpec,
+) -> Result<(), SystemError> {
+    if let Some(rmtp) = rmtp {
+        let mut writer = UserBufferWriter::new(
+            rmtp.as_ptr::<PosixTimeSpec>(),
+            core::mem::size_of::<PosixTimeSpec>(),
+            true,
+        )?;
+        writer.copy_one_to_user(remaining, 0)?;
     }
-    if sec < 0 {
-        return PosixTimeSpec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-    }
-    PosixTimeSpec {
-        tv_sec: sec,
-        tv_nsec: nsec,
-    }
+    Ok(())
 }
 
 /// Nanosleep 的重启函数：根据保存的 deadline/clockid 继续等待或重启
@@ -1241,8 +1237,13 @@ pub struct RestartFnNanosleep;
 
 impl RestartFn for RestartFnNanosleep {
     fn call(&self, data: &mut RestartBlockData) -> Result<usize, SystemError> {
-        if let RestartBlockData::Nanosleep { deadline, clockid } = data {
-            if deadline.tv_sec < 0 {
+        if let RestartBlockData::Nanosleep {
+            deadline,
+            clockid,
+            rmtp,
+        } = data
+        {
+            if !deadline.is_valid_timeout() || *clockid == PosixClockID::ThreadCPUTimeID {
                 return Err(SystemError::EINVAL);
             }
             let deadline_ns = (deadline.tv_sec as u64)
@@ -1268,31 +1269,27 @@ impl RestartFn for RestartFnNanosleep {
                         )
                     }
                 }
-                PosixClockID::ThreadCPUTimeID => {
-                    let pcb = ProcessManager::current_pcb();
-                    if pcb.thread_cputime_ns() >= deadline_ns {
-                        Ok(())
-                    } else {
-                        pcb.cputime_wait_queue().wait_event_interruptible(
-                            || pcb.thread_cputime_ns() >= deadline_ns,
-                            None::<fn()>,
-                        )
-                    }
-                }
+                PosixClockID::ThreadCPUTimeID => return Err(SystemError::EINVAL),
                 _ => {
                     let now = ktime_now(*clockid);
                     let remain = calc_remaining(deadline, &now);
                     if remain.tv_sec == 0 && remain.tv_nsec == 0 {
                         Ok(())
                     } else {
-                        nanosleep(remain).map(|_| ())
+                        nanosleep(remain)
                     }
                 }
             };
 
             match wait_res {
                 Ok(()) => return Ok(0),
-                Err(SystemError::ERESTARTSYS) => {}
+                Err(SystemError::ERESTARTSYS) => {
+                    let remaining = calc_remaining(deadline, &ktime_now(*clockid));
+                    if remaining.is_empty() {
+                        return Ok(0);
+                    }
+                    write_nanosleep_remaining(*rmtp, &remaining)?;
+                }
                 Err(e) => return Err(e),
             }
             let rb = RestartBlock::new(&RestartFnNanosleep, data.clone());

@@ -14,7 +14,9 @@ use crate::syscall::{
     table::{FormattedSyscallParam, Syscall},
     user_access::{UserBufferReader, UserBufferWriter},
 };
-use crate::time::{jiffies::NSEC_PER_JIFFY, timer::schedule_timeout, PosixTimeSpec};
+use crate::time::{
+    jiffies::NSEC_PER_JIFFY, timekeeping::monotonic_now, timer::schedule_timeout, PosixTimeSpec,
+};
 use alloc::vec::Vec;
 use core::mem::size_of;
 use syscall_table_macros::declare_syscall;
@@ -149,14 +151,14 @@ pub fn do_kernel_rt_sigtimedwait(
         // 第五步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
         // 计算剩余等待时间
         let remaining_time = if let Some(deadline) = deadline {
-            let now = PosixTimeSpec::now();
-            let remaining = deadline.total_nanos() - now.total_nanos();
-            if remaining <= 0 {
+            let now = monotonic_now();
+            let remaining = deadline.to_ktime_ns().saturating_sub(now.to_ktime_ns());
+            if remaining == 0 {
                 drop(preempt_guard);
                 restore_sigtimedwait_mask();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            remaining / (NSEC_PER_JIFFY as i64)
+            (remaining / NSEC_PER_JIFFY as u64).min(i64::MAX as u64) as i64
         } else {
             i64::MAX
         };
@@ -238,21 +240,18 @@ fn has_pending_awaited_signal(awaited: &SigSet) -> bool {
 
 /// 计算超时截止时间
 fn compute_deadline(timeout: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError> {
-    if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
+    if !timeout.is_valid_timeout() {
         return Err(SystemError::EINVAL);
     }
 
-    let now = PosixTimeSpec::now();
-    Ok(PosixTimeSpec {
-        tv_sec: now.tv_sec + timeout.tv_sec,
-        tv_nsec: now.tv_nsec + timeout.tv_nsec,
-    })
+    let now = monotonic_now();
+    Ok(now.saturating_add_ktime(&timeout))
 }
 
 /// 检查是否超时
 fn is_timeout_expired(deadline: PosixTimeSpec) -> bool {
-    let now = PosixTimeSpec::now();
-    now.total_nanos() >= deadline.total_nanos()
+    let now = monotonic_now();
+    now.to_ktime_ns() >= deadline.to_ktime_ns()
 }
 
 /// 将 PosixSigInfo 拷贝到用户空间

@@ -3,7 +3,7 @@ use core::{
     intrinsics::unlikely,
     mem::{self, MaybeUninit},
     ptr::null_mut,
-    sync::atomic::{compiler_fence, fence, AtomicI16, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicI16, AtomicPtr, AtomicU64, Ordering},
 };
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -26,38 +26,43 @@ use crate::{
 const MAX_SOFTIRQ_NUM: u64 = 64;
 const MAX_SOFTIRQ_RESTART: i32 = 20;
 
-static mut __CPU_PENDING: Option<Box<[VecStatus; PerCpu::MAX_CPU_NUM as usize]>> = None;
-static mut __SORTIRQ_VECTORS: *mut Softirq = null_mut();
+static SOFTIRQ_VECTORS: AtomicPtr<Softirq> = AtomicPtr::new(null_mut());
 
 #[inline(never)]
 pub fn softirq_init() -> Result<(), SystemError> {
     info!("Initializing softirq...");
-    unsafe {
-        __SORTIRQ_VECTORS = Box::leak(Box::new(Softirq::new()));
-        __CPU_PENDING = Some(Box::new(
-            [VecStatus::default(); PerCpu::MAX_CPU_NUM as usize],
-        ));
-        let cpu_pending = __CPU_PENDING.as_mut().unwrap();
-        for i in 0..PerCpu::MAX_CPU_NUM {
-            cpu_pending[i as usize] = VecStatus::default();
-        }
+    let softirq = Box::into_raw(Box::new(Softirq::new()));
+    if SOFTIRQ_VECTORS
+        .compare_exchange(null_mut(), softirq, Ordering::Release, Ordering::Acquire)
+        .is_err()
+    {
+        unsafe { drop(Box::from_raw(softirq)) };
+        return Err(SystemError::EBUSY);
     }
     info!("Softirq initialized.");
     return Ok(());
 }
 
 #[inline(always)]
-pub fn softirq_vectors() -> &'static mut Softirq {
-    unsafe {
-        return __SORTIRQ_VECTORS.as_mut().unwrap();
-    }
+pub fn softirq_vectors() -> &'static Softirq {
+    let softirq = SOFTIRQ_VECTORS.load(Ordering::Acquire);
+    assert!(!softirq.is_null(), "softirq used before initialization");
+    unsafe { &*softirq }
 }
 
-#[inline(always)]
-fn cpu_pending(cpu_id: ProcessorId) -> &'static mut VecStatus {
-    unsafe {
-        return &mut __CPU_PENDING.as_mut().unwrap()[cpu_id.data() as usize];
-    }
+/// Returns whether the current CPU is executing a softirq callback.
+///
+/// Unlike `preempt_count`, this does not classify an arbitrary preempt-disabled
+/// task as interrupt context. It is also safe before softirq initialization.
+#[inline]
+pub fn in_softirq() -> bool {
+    let softirq = SOFTIRQ_VECTORS.load(Ordering::Acquire);
+    !softirq.is_null()
+        && unsafe { &*softirq }
+            .cpu_running_count()
+            .get()
+            .load(Ordering::Relaxed)
+            > 0
 }
 
 /// 软中断向量号码
@@ -99,6 +104,10 @@ pub trait SoftirqVec: Send + Sync + Debug {
 #[derive(Debug)]
 pub struct Softirq {
     table: RwLock<[Option<Arc<dyn SoftirqVec>>; MAX_SOFTIRQ_NUM as usize]>,
+    /// Per-CPU pending vector. IRQ exclusion gives the local read/clear
+    /// transaction its ordering; atomics avoid manufacturing aliased mutable
+    /// references to a global array across CPUs.
+    cpu_pending: PerCpuVar<AtomicU64>,
     /// 软中断嵌套层数（per cpu）
     cpu_running_count: PerCpuVar<AtomicI16>,
 }
@@ -121,14 +130,27 @@ impl Softirq {
         percpu_count.resize_with(PerCpu::MAX_CPU_NUM as usize, || AtomicI16::new(0));
         let cpu_running_count = PerCpuVar::new(percpu_count).unwrap();
 
+        let mut pending = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
+        pending.resize_with(PerCpu::MAX_CPU_NUM as usize, || AtomicU64::new(0));
+        let cpu_pending = PerCpuVar::new(pending).unwrap();
+
         return Softirq {
             table: RwLock::new(data),
+            cpu_pending,
             cpu_running_count,
         };
     }
 
     fn cpu_running_count(&self) -> &PerCpuVar<AtomicI16> {
         return &self.cpu_running_count;
+    }
+
+    #[inline]
+    fn pending_for(&self, cpu_id: ProcessorId) -> &AtomicU64 {
+        // `cpu_id` comes from the architecture CPU-id provider and PerCpuVar
+        // was initialized for the same CPU set.  The returned value is atomic,
+        // so exposing a shared reference across CPUs does not create aliases.
+        unsafe { self.cpu_pending.force_get(cpu_id) }
     }
 
     /// @brief 注册软中断向量
@@ -176,12 +198,15 @@ impl Softirq {
         // self.running.lock().set(VecStatus::from(softirq_num), false);
         // 将对应CPU的pending置0
         compiler_fence(Ordering::SeqCst);
-        cpu_pending(smp_get_processor_id()).set(VecStatus::from(softirq_num), false);
+        self.pending_for(smp_get_processor_id())
+            .fetch_and(!VecStatus::from(softirq_num).bits(), Ordering::SeqCst);
         compiler_fence(Ordering::SeqCst);
     }
 
     #[inline(never)]
-    pub fn do_softirq(&self) {
+    fn do_softirq(&self) {
+        ProcessManager::preempt_disable();
+        let _preempt_guard = SoftirqPreemptGuard;
         if self.cpu_running_count().get().load(Ordering::SeqCst) >= Self::MAX_RUNNING_PER_CPU {
             // 当前CPU的软中断嵌套层数已经达到最大值，不再执行
             return;
@@ -192,17 +217,13 @@ impl Softirq {
         // non-zero preempt count even though local IRQs may be enabled below.
         // This prevents a timer IRQ nested inside task-context softirq handling
         // from scheduling away before the softirq handler returns.
-        ProcessManager::preempt_disable();
-        let _preempt_guard = SoftirqPreemptGuard;
-
         // TODO pcb的flags未修改
         let end = clock() + 500 * 2;
         let cpu_id = smp_get_processor_id();
         let mut max_restart = MAX_SOFTIRQ_RESTART;
         loop {
             compiler_fence(Ordering::SeqCst);
-            let pending = cpu_pending(cpu_id).bits;
-            cpu_pending(cpu_id).bits = 0;
+            let pending = self.pending_for(cpu_id).swap(0, Ordering::SeqCst);
             compiler_fence(Ordering::SeqCst);
 
             unsafe { CurrentIrqArch::interrupt_enable() };
@@ -236,17 +257,14 @@ impl Softirq {
             unsafe { CurrentIrqArch::interrupt_disable() };
             max_restart -= 1;
             compiler_fence(Ordering::SeqCst);
-            if cpu_pending(cpu_id).is_empty() {
-                compiler_fence(Ordering::SeqCst);
-                if clock() < end && max_restart > 0 {
-                    continue;
-                } else {
-                    break;
-                }
-            } else {
-                // TODO：当有softirqd时 唤醒它
-                break;
+            let has_pending = self.pending_for(cpu_id).load(Ordering::SeqCst) != 0;
+            compiler_fence(Ordering::SeqCst);
+            if has_pending && clock() < end && max_restart > 0 {
+                continue;
             }
+            // Pending work left after the time/restart budget remains set for
+            // the next IRQ exit (or a future softirqd implementation).
+            break;
         }
     }
 
@@ -254,7 +272,8 @@ impl Softirq {
         let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let processor_id = smp_get_processor_id();
 
-        cpu_pending(processor_id).insert(VecStatus::from(softirq_num));
+        self.pending_for(processor_id)
+            .fetch_or(VecStatus::from(softirq_num).bits(), Ordering::SeqCst);
 
         compiler_fence(Ordering::SeqCst);
 
@@ -265,7 +284,8 @@ impl Softirq {
     #[allow(dead_code)]
     pub unsafe fn clear_softirq_pending(&self, softirq_num: SoftirqNumber) {
         compiler_fence(Ordering::SeqCst);
-        cpu_pending(smp_get_processor_id()).remove(VecStatus::from(softirq_num));
+        self.pending_for(smp_get_processor_id())
+            .fetch_and(!VecStatus::from(softirq_num).bits(), Ordering::SeqCst);
         compiler_fence(Ordering::SeqCst);
     }
 }
@@ -275,19 +295,22 @@ impl Softirq {
 /// 当进入作用域时，会自动将cpu_running_count加1，
 /// 当退出作用域时，会自动将cpu_running_count减1
 struct RunningCountGuard<'a> {
-    cpu_running_count: &'a PerCpuVar<AtomicI16>,
+    cpu_running_count: &'a AtomicI16,
 }
 
 impl<'a> RunningCountGuard<'a> {
     fn new(cpu_running_count: &'a PerCpuVar<AtomicI16>) -> RunningCountGuard<'a> {
-        cpu_running_count.get().fetch_add(1, Ordering::SeqCst);
-        return RunningCountGuard { cpu_running_count };
+        let local_count = cpu_running_count.get();
+        local_count.fetch_add(1, Ordering::SeqCst);
+        return RunningCountGuard {
+            cpu_running_count: local_count,
+        };
     }
 }
 
 impl Drop for RunningCountGuard<'_> {
     fn drop(&mut self) {
-        self.cpu_running_count.get().fetch_sub(1, Ordering::SeqCst);
+        self.cpu_running_count.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -304,7 +327,11 @@ impl Drop for SoftirqPreemptGuard {
 /// 如果本 CPU BH 被禁用，则直接返回，保留 pending 让 `LocalBhDisableGuard` 的 drop
 /// 或未来某次 IRQ 退出点补跑。
 #[inline(never)]
-pub fn do_softirq() {
+/// Run pending softirqs for the current CPU.
+///
+/// Callers must enter with local IRQs disabled.  Handlers may temporarily
+/// enable IRQs, but this function always returns with them disabled.
+pub(crate) fn do_softirq() {
     // BH disabled => 不执行 softirq（避免进程态持锁被打断后在 softirq 再取锁死锁）
     if bottom_half::is_local_bh_disabled() {
         return;

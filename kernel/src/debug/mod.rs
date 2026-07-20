@@ -10,5 +10,6 @@ pub mod page_cache;
 pub mod panic;
 pub mod rcu;
 pub mod sysfs;
+pub mod timekeeping;
 pub mod traceback;
 pub mod tracing;

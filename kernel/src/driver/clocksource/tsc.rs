@@ -9,7 +9,10 @@ use crate::{
     arch::{driver::tsc::TSCManager, CurrentTimeArch},
     libs::spinlock::SpinLock,
     time::{
-        clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum},
+        clocksource::{
+            Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, ClocksourceUpdate,
+            CycleNum,
+        },
         TimeArch,
     },
 };
@@ -38,6 +41,7 @@ impl TscClocksource {
             mask: ClocksourceMask::new(u64::MAX),
             mult: 0,
             shift: 0,
+            max_cycles: Default::default(),
             max_idle_ns: Default::default(),
             flags: ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS
                 | ClocksourceFlags::CLOCK_SOURCE_MUST_VERIFY,
@@ -45,7 +49,6 @@ impl TscClocksource {
             cs_last: CycleNum::new(0),
             uncertainty_margin: 0,
             maxadj: 0,
-            cycle_last: CycleNum::new(0),
         };
         let tsc = Arc::new(TscClocksource(SpinLock::new(InnerTscClocksource {
             data,
@@ -71,20 +74,8 @@ impl Clocksource for TscClocksource {
         self.0.lock_irqsave().self_ref.upgrade().unwrap()
     }
 
-    fn update_clocksource_data(&self, data: ClocksourceData) -> Result<(), SystemError> {
-        let d = &mut self.0.lock_irqsave().data;
-        d.set_name(data.name);
-        d.set_rating(data.rating);
-        d.set_mask(data.mask);
-        d.set_mult(data.mult);
-        d.set_shift(data.shift);
-        d.set_max_idle_ns(data.max_idle_ns);
-        d.set_flags(data.flags);
-        d.watchdog_last = data.watchdog_last;
-        d.cs_last = data.cs_last;
-        d.set_uncertainty_margin(data.uncertainty_margin);
-        d.set_maxadj(data.maxadj);
-        d.cycle_last = data.cycle_last;
+    fn update_clocksource_data(&self, update: ClocksourceUpdate) -> Result<(), SystemError> {
+        update.apply(&mut self.0.lock_irqsave().data);
         Ok(())
     }
 }

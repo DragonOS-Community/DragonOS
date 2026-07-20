@@ -121,7 +121,7 @@ fn dhcp_query() -> Result<(), SystemError> {
             tv_sec: 0,
             tv_nsec: 50,
         };
-        let _ = nanosleep(sleep_time)?;
+        nanosleep(sleep_time)?;
     }
 
     return Err(SystemError::ETIMEDOUT);

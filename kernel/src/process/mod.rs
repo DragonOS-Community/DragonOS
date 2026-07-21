@@ -24,6 +24,7 @@ pub mod signal;
 pub mod stdio;
 pub mod syscall;
 pub mod timer;
+pub mod trace;
 pub mod utils;
 pub mod wait;
 

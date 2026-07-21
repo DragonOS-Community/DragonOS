@@ -1,3 +1,4 @@
+use super::trace::trace_sched_process_exec;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
@@ -128,6 +129,11 @@ fn do_execve_internal(
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
+    // 捕获 sched_process_exec 的 old_pid：必须在 load_binary_file_with_context 之前，
+    // 因为该函数内的 begin_new_exec → de_thread 会在「非 leader 线程 execve」时
+    // 交换 current 与旧 thread-group leader 的 raw_pid（对齐 Linux fs/exec.c:1770）。
+    let old_pid = ProcessManager::current_pcb().raw_pid().data() as i32;
+
     // 尝试加载二进制文件
     let load_result = load_binary_file_with_context(&mut param, &ctx);
 
@@ -214,6 +220,11 @@ fn do_execve_internal(
             let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
             let exec_ret = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr);
             if exec_ret.is_ok() {
+                // sched_process_exec：arch_do_execve 成功、用户态寄存器就绪后触发，
+                // 对齐 Linux fs/exec.c:1803（trace 在 start_thread 之后、所有失败点之后）。
+                let pid = pcb.raw_pid().data() as i32;
+                trace_sched_process_exec(pcb.basic().name(), pid, old_pid);
+
                 if let Some(completion) = vfork_done {
                     completion.complete_all();
                 }

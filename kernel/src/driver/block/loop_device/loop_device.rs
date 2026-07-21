@@ -1342,6 +1342,8 @@ impl BlockDevice for LoopDevice {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
+        let _io_guard = IoGuard::new(self)?;
+
         let inode = self.inner().file_inode.clone().ok_or(SystemError::ENODEV)?;
         inode.sync()?;
         inode.fs().sync_fs(true)

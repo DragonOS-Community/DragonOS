@@ -124,6 +124,29 @@ private:
     pid_t child_ = -1;
 };
 
+class ScopedSignalAction {
+public:
+    explicit ScopedSignalAction(int signal) : signal_(signal) {}
+    ScopedSignalAction(const ScopedSignalAction&) = delete;
+    ScopedSignalAction& operator=(const ScopedSignalAction&) = delete;
+
+    ~ScopedSignalAction() {
+        if (installed_) {
+            sigaction(signal_, &old_action_, nullptr);
+        }
+    }
+
+    bool Install(const struct sigaction& action) {
+        installed_ = sigaction(signal_, &action, &old_action_) == 0;
+        return installed_;
+    }
+
+private:
+    int signal_;
+    bool installed_ = false;
+    struct sigaction old_action_ {};
+};
+
 bool WriteAll(int fd, const char* data, size_t len) {
     size_t written = 0;
     while (written < len) {
@@ -214,10 +237,10 @@ TEST(PipeWaitqueueWakeup, ZeroLengthIoHasNoEndpointSideEffects) {
     EXPECT_EQ(0, read(fds[0], &byte, 0)) << strerror(errno);
 
     struct sigaction action {};
-    struct sigaction old_action {};
     action.sa_handler = SigpipeHandler;
     sigemptyset(&action.sa_mask);
-    ASSERT_EQ(0, sigaction(SIGPIPE, &action, &old_action)) << strerror(errno);
+    ScopedSignalAction sigpipe_guard(SIGPIPE);
+    ASSERT_TRUE(sigpipe_guard.Install(action)) << strerror(errno);
     g_sigpipe_count = 0;
 
     ASSERT_EQ(0, close(fds[0])) << strerror(errno);
@@ -225,7 +248,6 @@ TEST(PipeWaitqueueWakeup, ZeroLengthIoHasNoEndpointSideEffects) {
     EXPECT_EQ(0, write(fds[1], &byte, 0)) << strerror(errno);
     EXPECT_EQ(0, g_sigpipe_count);
 
-    ASSERT_EQ(0, sigaction(SIGPIPE, &old_action, nullptr)) << strerror(errno);
     close(fds[1]);
 }
 
@@ -238,10 +260,10 @@ TEST(PipeWaitqueueWakeup, NonblockingWriteWithoutReaderRaisesSigpipe) {
     ASSERT_EQ(0, fcntl(fds[1], F_SETFL, flags | O_NONBLOCK)) << strerror(errno);
 
     struct sigaction action {};
-    struct sigaction old_action {};
     action.sa_handler = SigpipeHandler;
     sigemptyset(&action.sa_mask);
-    ASSERT_EQ(0, sigaction(SIGPIPE, &action, &old_action)) << strerror(errno);
+    ScopedSignalAction sigpipe_guard(SIGPIPE);
+    ASSERT_TRUE(sigpipe_guard.Install(action)) << strerror(errno);
     g_sigpipe_count = 0;
 
     ASSERT_EQ(0, close(fds[0])) << strerror(errno);
@@ -251,7 +273,6 @@ TEST(PipeWaitqueueWakeup, NonblockingWriteWithoutReaderRaisesSigpipe) {
     EXPECT_EQ(EPIPE, errno);
     EXPECT_EQ(1, g_sigpipe_count);
 
-    ASSERT_EQ(0, sigaction(SIGPIPE, &old_action, nullptr)) << strerror(errno);
     close(fds[1]);
 }
 
@@ -358,6 +379,61 @@ TEST(PipeWaitqueueWakeup, EligibleWriterIsNotBlockedBehindLargerWriter) {
     close(data[1]);
 }
 
+TEST(PipeWaitqueueWakeup, HomogeneousWritersPassBatonAfterPartialDrain) {
+    int data[2] = {-1, -1};
+    int ready[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(data)) << strerror(errno);
+    ASSERT_EQ(0, pipe(ready)) << strerror(errno);
+    ASSERT_EQ(4096, fcntl(data[1], F_SETPIPE_SZ, 4096)) << strerror(errno);
+    ASSERT_TRUE(FillPipeExactly(data[1], 4096)) << strerror(errno);
+
+    pid_t writers[2] = {-1, -1};
+    ChildProcessGuard writer_guards[2];
+    for (size_t i = 0; i < 2; ++i) {
+        writers[i] = fork();
+        ASSERT_GE(writers[i], 0) << strerror(errno);
+        writer_guards[i].Reset(writers[i]);
+        if (writers[i] == 0) {
+            close(data[0]);
+            close(ready[0]);
+            const char marker = static_cast<char>('0' + i);
+            if (!WriteAll(ready[1], &marker, 1)) {
+                _exit(2);
+            }
+            close(ready[1]);
+            const char byte = static_cast<char>('a' + i);
+            _exit(write(data[1], &byte, 1) == 1 ? 0 : 3);
+        }
+    }
+
+    close(ready[1]);
+    ASSERT_TRUE(ReadExactly(ready[0], 2)) << strerror(errno);
+    close(ready[0]);
+    for (pid_t writer : writers) {
+        if (!WaitForSleepingProcess(writer)) {
+            writer_guards[0].Cleanup();
+            writer_guards[1].Cleanup();
+            FAIL() << "homogeneous writer did not enter the pipe wait path";
+        }
+    }
+
+    char drained[2] = {};
+    ASSERT_EQ(2, read(data[0], drained, sizeof(drained))) << strerror(errno);
+
+    for (size_t i = 0; i < 2; ++i) {
+        int status = 0;
+        if (!WaitForChild(writers[i], &status)) {
+            FAIL() << "writer baton did not advance every eligible writer";
+        }
+        writer_guards[i].Release();
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(0, WEXITSTATUS(status));
+    }
+
+    close(data[0]);
+    close(data[1]);
+}
+
 TEST(PipeWaitqueueWakeup, PartialWriteNotifiesEpollBeforeWriterSleeps) {
     int data[2] = {-1, -1};
     int ready[2] = {-1, -1};
@@ -427,10 +503,10 @@ TEST(PipeWaitqueueWakeup, PartialWritePublishesSigioAndReturnsPartialAfterReader
     ASSERT_EQ(4096, fcntl(data[1], F_SETPIPE_SZ, 4096)) << strerror(errno);
 
     struct sigaction sigio_action {};
-    struct sigaction old_sigio_action {};
     sigio_action.sa_handler = SigioHandler;
     sigemptyset(&sigio_action.sa_mask);
-    ASSERT_EQ(0, sigaction(SIGIO, &sigio_action, &old_sigio_action)) << strerror(errno);
+    ScopedSignalAction sigio_guard(SIGIO);
+    ASSERT_TRUE(sigio_guard.Install(sigio_action)) << strerror(errno);
     g_sigio_count = 0;
     ASSERT_EQ(0, fcntl(data[0], F_SETOWN, getpid())) << strerror(errno);
     const int read_flags = fcntl(data[0], F_GETFL);
@@ -482,7 +558,6 @@ TEST(PipeWaitqueueWakeup, PartialWritePublishesSigioAndReturnsPartialAfterReader
     writer_guard.Release();
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
-    ASSERT_EQ(0, sigaction(SIGIO, &old_sigio_action, nullptr)) << strerror(errno);
 }
 
 TEST(PipeWaitqueueWakeup, PipeToPipeSpliceWakesSourceWriterAndDestinationReader) {
@@ -561,10 +636,12 @@ TEST(PipeWaitqueueWakeup, TeeReturnsPartialWithoutConsumingSource) {
     int destination[2] = {-1, -1};
     int ready[2] = {-1, -1};
     int release_reader[2] = {-1, -1};
+    int tee_result[2] = {-1, -1};
     ASSERT_EQ(0, pipe(source)) << strerror(errno);
     ASSERT_EQ(0, pipe(destination)) << strerror(errno);
     ASSERT_EQ(0, pipe(ready)) << strerror(errno);
     ASSERT_EQ(0, pipe(release_reader)) << strerror(errno);
+    ASSERT_EQ(0, pipe(tee_result)) << strerror(errno);
     ASSERT_EQ(8192, fcntl(source[1], F_SETPIPE_SZ, 8192)) << strerror(errno);
     ASSERT_EQ(4096, fcntl(destination[1], F_SETPIPE_SZ, 4096)) << strerror(errno);
     std::vector<char> payload(8192, 't');
@@ -579,6 +656,8 @@ TEST(PipeWaitqueueWakeup, TeeReturnsPartialWithoutConsumingSource) {
         close(destination[1]);
         close(ready[0]);
         close(release_reader[1]);
+        close(tee_result[0]);
+        close(tee_result[1]);
         const char marker = 'T';
         if (!WriteAll(ready[1], &marker, 1)) {
             _exit(2);
@@ -603,7 +682,39 @@ TEST(PipeWaitqueueWakeup, TeeReturnsPartialWithoutConsumingSource) {
         FAIL() << "tee destination reader did not block";
     }
 
-    const ssize_t copied = tee(source[0], destination[1], payload.size(), 0);
+    struct TeeResult {
+        ssize_t copied;
+        int error;
+    };
+    pid_t tee_worker = fork();
+    ASSERT_GE(tee_worker, 0) << strerror(errno);
+    ChildProcessGuard tee_worker_guard(tee_worker);
+    if (tee_worker == 0) {
+        close(tee_result[0]);
+        errno = 0;
+        TeeResult result {};
+        result.copied = tee(source[0], destination[1], payload.size(), 0);
+        result.error = errno;
+        const bool reported = WriteAll(tee_result[1], reinterpret_cast<const char*>(&result),
+                                       sizeof(result));
+        _exit(reported ? 0 : 5);
+    }
+
+    close(tee_result[1]);
+    int tee_status = 0;
+    if (!WaitForChild(tee_worker, &tee_status)) {
+        FAIL() << "blocking tee did not return after making partial progress";
+    }
+    tee_worker_guard.Release();
+    ASSERT_TRUE(WIFEXITED(tee_status));
+    ASSERT_EQ(0, WEXITSTATUS(tee_status));
+    TeeResult result {};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(result)),
+              read(tee_result[0], &result, sizeof(result)))
+        << strerror(errno);
+    close(tee_result[0]);
+    errno = result.error;
+    const ssize_t copied = result.copied;
     EXPECT_GT(copied, 0);
     EXPECT_LT(copied, static_cast<ssize_t>(payload.size()));
 

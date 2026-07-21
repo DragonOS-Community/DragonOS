@@ -261,7 +261,7 @@ fn splice_file_to_pipe(
     }
     let wanted = trusted_read_limit.unwrap_or(limit);
 
-    let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+    let (space, wake_next_writer) = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
         let space = pipe_inode.writable_len();
         if space == 0 && pipe_inode.has_readers() {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -273,12 +273,16 @@ fn splice_file_to_pipe(
         {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
-        space
+        (space, false)
     } else if trusted_read_limit.is_some() {
         pipe_inode.wait_writable_for_splice(wanted)?
     } else {
         pipe_inode.wait_writable_any_for_splice()?
     };
+
+    // The returned space is an observation, not a reservation. Do not hold an
+    // exclusive writer wakeup baton across a potentially blocking input read.
+    pipe_inode.finish_writer_wait(wake_next_writer);
 
     let buf_size = if trusted_read_limit.is_some() && space == 0 {
         wanted
@@ -290,11 +294,14 @@ fn splice_file_to_pipe(
     // 从文件读取
     // 为了满足 Linux 语义：若后续写入 pipe 被信号中断且未写入任何字节，
     // 则不应推进输入文件的 file position。
-    let (read_len, advance_file_pos) = if let Some(off) = offset {
-        (file.pread(off, buf_size, &mut buffer)?, false)
+    let read_result = if let Some(off) = offset {
+        file.pread(off, buf_size, &mut buffer)
+            .map(|read_len| (read_len, false))
     } else {
-        (file.read_noadv(buf_size, &mut buffer)?, true)
+        file.read_noadv(buf_size, &mut buffer)
+            .map(|read_len| (read_len, true))
     };
+    let (read_len, advance_file_pos) = read_result?;
 
     if read_len == 0 {
         return Ok(0);
@@ -306,7 +313,7 @@ fn splice_file_to_pipe(
     let written = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
         pipe_inode.write_from_splice_nonblock(&buffer)
     } else {
-        pipe.write(buffer.len(), &buffer)
+        pipe_inode.write_from_splice_blocking(&buffer)
     };
 
     match written {

@@ -22,6 +22,7 @@ use crate::{
     syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -49,6 +50,118 @@ enum WakeMode {
     None,
     One,
     All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipeWriterWake {
+    None,
+    One(usize),
+    All,
+}
+
+#[derive(Debug, Default)]
+struct PipeWriteWaiters {
+    any_space: usize,
+    atomic: BTreeMap<usize, usize>,
+    /// Next class key considered for round-robin selection. Key 0 denotes
+    /// any-space writers; atomic classes use their required byte count.
+    next_class: usize,
+}
+
+impl PipeWriteWaiters {
+    fn register(&mut self, required: Option<usize>) -> usize {
+        match required {
+            Some(required) => {
+                debug_assert!((1..=PIPE_BUF).contains(&required));
+                let count = self.atomic.entry(required).or_insert(0);
+                *count = count
+                    .checked_add(1)
+                    .expect("pipe atomic writer wait-intent count overflowed");
+                required
+            }
+            None => {
+                self.any_space = self
+                    .any_space
+                    .checked_add(1)
+                    .expect("pipe writer wait-intent count overflowed");
+                0
+            }
+        }
+    }
+
+    fn unregister(&mut self, required: Option<usize>) {
+        match required {
+            Some(required) => {
+                let count = self
+                    .atomic
+                    .get_mut(&required)
+                    .expect("missing pipe atomic writer wait intent");
+                *count = count
+                    .checked_sub(1)
+                    .expect("pipe atomic writer wait-intent count underflowed");
+                if *count == 0 {
+                    self.atomic.remove(&required);
+                }
+            }
+            None => {
+                self.any_space = self
+                    .any_space
+                    .checked_sub(1)
+                    .expect("pipe writer wait-intent count underflowed");
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.any_space == 0 && self.atomic.is_empty()
+    }
+
+    fn class_count(&self) -> usize {
+        self.atomic.len() + usize::from(self.any_space > 0)
+    }
+
+    /// Select one currently eligible writer class. Tagged waiters let the
+    /// pipe-private policy skip writers whose free-space predicate is false.
+    fn wake_action(&mut self, available: usize, has_readers: bool) -> PipeWriterWake {
+        if self.is_empty() {
+            return PipeWriterWake::None;
+        }
+        if !has_readers {
+            return PipeWriterWake::All;
+        }
+        if available == 0 {
+            return PipeWriterWake::None;
+        }
+
+        let atomic_start = self.next_class.max(1);
+        let atomic_after_cursor = if atomic_start <= available {
+            self.atomic
+                .range(atomic_start..=available)
+                .next()
+                .map(|(required, _)| *required)
+        } else {
+            None
+        };
+        let selected = if self.next_class == 0 && self.any_space > 0 {
+            Some(0)
+        } else if let Some(atomic) = atomic_after_cursor {
+            Some(atomic)
+        } else if self.any_space > 0 {
+            Some(0)
+        } else {
+            self.atomic
+                .first_key_value()
+                .filter(|(required, _)| **required <= available)
+                .map(|(required, _)| *required)
+        };
+
+        if let Some(key) = selected {
+            self.next_class = if key >= PIPE_BUF { 0 } else { key + 1 };
+            PipeWriterWake::One(key)
+        } else {
+            PipeWriterWake::None
+        }
+    }
 }
 
 // FIONREAD: 获取管道中可读的字节数
@@ -142,11 +255,9 @@ pub struct InnerPipeInode {
     metadata: Metadata,
     reader: u32,
     writer: u32,
-    /// Writers that have committed to sleeping for pipe space.
-    ///
-    /// This is protected by `LockedPipeInode::inner` and is used only to
-    /// choose between an exclusive wakeup and a broadcast after space grows.
-    write_wait_intents: usize,
+    /// Pipe-space predicates published by writers before they sleep.
+    /// Protected by `LockedPipeInode::inner`.
+    write_waiters: PipeWriteWaiters,
     had_reader: bool,
     /// 是否为命名管道（FIFO）
     /// 只有 FIFO 才需要在 open 时阻塞等待另一端
@@ -300,12 +411,10 @@ impl InnerPipeInode {
 
 impl LockedPipeInode {
     #[inline]
-    fn writer_wake_mode(inner: &InnerPipeInode) -> WakeMode {
-        match inner.write_wait_intents {
-            0 => WakeMode::None,
-            1 => WakeMode::One,
-            _ => WakeMode::All,
-        }
+    fn writer_wake_action(inner: &mut InnerPipeInode) -> PipeWriterWake {
+        let used = inner.valid_cnt.max(0) as usize;
+        let available = inner.buf_size.saturating_sub(used);
+        inner.write_waiters.wake_action(available, inner.reader > 0)
     }
 
     #[inline]
@@ -322,9 +431,47 @@ impl LockedPipeInode {
     }
 
     #[inline]
-    fn wake_pipe_waiters(&self, readers: WakeMode, writers: WakeMode) {
+    fn wake_writers(&self, mut action: PipeWriterWake) {
+        match action {
+            PipeWriterWake::None => {}
+            PipeWriterWake::All => {
+                self.write_wait_queue
+                    .wakeup_all(Some(ProcessState::Blocked(true)));
+            }
+            PipeWriterWake::One(_) => {
+                // Include the already-selected action: its class can disappear
+                // between selection and the tagged wakeup.
+                let max_attempts = self.inner.lock().write_waiters.class_count() + 1;
+                for attempt in 0..max_attempts {
+                    match action {
+                        PipeWriterWake::None => return,
+                        PipeWriterWake::All => {
+                            self.write_wait_queue
+                                .wakeup_all(Some(ProcessState::Blocked(true)));
+                            return;
+                        }
+                        PipeWriterWake::One(class) => {
+                            if self.write_wait_queue.wake_one_tagged(class) {
+                                return;
+                            }
+                        }
+                    }
+                    if attempt + 1 == max_attempts {
+                        return;
+                    }
+                    action = {
+                        let mut inner = self.inner.lock();
+                        Self::writer_wake_action(&mut inner)
+                    };
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn wake_pipe_waiters(&self, readers: WakeMode, writers: PipeWriterWake) {
         Self::wake_waiters(&self.read_wait_queue, readers);
-        Self::wake_waiters(&self.write_wait_queue, writers);
+        self.wake_writers(writers);
     }
 
     fn send_sigpipe() {
@@ -408,7 +555,7 @@ impl LockedPipeInode {
             },
             reader: 0,
             writer: 0,
-            write_wait_intents: 0,
+            write_waiters: PipeWriteWaiters::default(),
             is_fifo: false, // 默认为匿名管道
             r_counter: 0,   // 初始化读端计数器
             w_counter: 0,   // 初始化写端计数器
@@ -483,28 +630,20 @@ impl LockedPipeInode {
     where
         F: FnOnce(),
     {
-        guard.write_wait_intents = guard
-            .write_wait_intents
-            .checked_add(1)
-            .expect("pipe writer wait-intent count overflowed");
+        let waiter_class = guard.write_waiters.register(required);
         drop(guard);
 
         before_wait();
         let result = if let Some(need) = required {
-            wq_wait_event_interruptible!(
-                self.write_wait_queue,
-                self.writeable_len_at_least(need),
-                {}
-            )
+            self.write_wait_queue
+                .wait_event_interruptible_tagged(waiter_class, || self.writeable_len_at_least(need))
         } else {
-            wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {})
+            self.write_wait_queue
+                .wait_event_interruptible_tagged(waiter_class, || self.writeable())
         };
 
         let mut guard = self.inner.lock();
-        guard.write_wait_intents = guard
-            .write_wait_intents
-            .checked_sub(1)
-            .expect("pipe writer wait-intent count underflowed");
+        guard.write_waiters.unregister(required);
         let result = result.map_err(|_| SystemError::ERESTARTSYS);
         (guard, result)
     }
@@ -608,11 +747,11 @@ impl LockedPipeInode {
         inner.buf_size = new_size;
         inner.metadata.size = new_size as i64;
 
-        let writer_wake = Self::writer_wake_mode(&inner);
+        let writer_wake = Self::writer_wake_action(&mut inner);
         let pollflag = inner.poll_both_ends();
         drop(inner);
 
-        Self::wake_waiters(&self.write_wait_queue, writer_wake);
+        self.wake_writers(writer_wake);
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
 
         Ok(new_size)
@@ -650,6 +789,181 @@ impl LockedPipeInode {
         }
         inner_guard.write_pos = (inner_guard.write_pos + to_write as i32) % buf_size as i32;
         inner_guard.valid_cnt += to_write as i32;
+    }
+
+    pub(crate) fn finish_writer_wait(&self, wake_next_writer: bool) {
+        if !wake_next_writer {
+            return;
+        }
+
+        let writer_wake = {
+            let mut inner = self.inner.lock();
+            Self::writer_wake_action(&mut inner)
+        };
+        self.wake_writers(writer_wake);
+    }
+
+    /// Preserve exclusive reader-wakeup progress when a selected waiter exits
+    /// without consuming data (for example, because a signal interrupted it).
+    fn finish_interrupted_reader_wait(&self) {
+        let reader_wake = {
+            let inner = self.inner.lock();
+            if inner.valid_cnt > 0 && inner.splice_hold == 0 {
+                WakeMode::One
+            } else if inner.valid_cnt == 0 && inner.writer == 0 {
+                WakeMode::All
+            } else {
+                WakeMode::None
+            }
+        };
+        Self::wake_waiters(&self.read_wait_queue, reader_wake);
+    }
+
+    fn wait_for_readable_event(&self) -> Result<(), SystemError> {
+        let result = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
+        if result.is_err() {
+            self.finish_interrupted_reader_wait();
+        }
+        result
+    }
+
+    fn write_with_flags(
+        &self,
+        len: usize,
+        buf: &[u8],
+        flags: FileFlags,
+    ) -> Result<usize, SystemError> {
+        if buf.len() < len {
+            return Err(SystemError::EINVAL);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let mut inner_guard = self.inner.lock();
+        let atomic_write = len <= PIPE_BUF;
+
+        if inner_guard.reader == 0 {
+            drop(inner_guard);
+            Self::send_sigpipe();
+            return Err(SystemError::EPIPE);
+        }
+
+        if inner_guard.data.is_empty() {
+            let buf_size = inner_guard.buf_size;
+            inner_guard.data = vec![0u8; buf_size];
+        }
+
+        let mut total_written: usize = 0;
+        let mut wake_next_writer = false;
+        let mut reader_wake = WakeMode::None;
+        let mut progress_pending = false;
+
+        while total_written < len {
+            if inner_guard.reader == 0 {
+                let pollflag = progress_pending.then(|| inner_guard.poll_both_ends());
+                let writer_wake =
+                    wake_next_writer.then(|| Self::writer_wake_action(&mut inner_guard));
+                drop(inner_guard);
+                if let Some(pollflag) = pollflag {
+                    self.publish_write_progress(reader_wake, pollflag);
+                }
+                if let Some(writer_wake) = writer_wake {
+                    self.wake_writers(writer_wake);
+                }
+                Self::send_sigpipe();
+                return if total_written > 0 {
+                    Ok(total_written)
+                } else {
+                    Err(SystemError::EPIPE)
+                };
+            }
+
+            let remaining = len - total_written;
+            let buf_size = inner_guard.buf_size;
+            let available_space = buf_size - inner_guard.valid_cnt as usize;
+            let need_wait = if atomic_write && total_written == 0 {
+                available_space < len
+            } else {
+                available_space == 0
+            };
+
+            if need_wait {
+                let pending_poll = progress_pending.then(|| inner_guard.poll_both_ends());
+                let pending_reader_wake = reader_wake;
+                progress_pending = false;
+                reader_wake = WakeMode::None;
+
+                if flags.contains(FileFlags::O_NONBLOCK) {
+                    let writer_wake =
+                        wake_next_writer.then(|| Self::writer_wake_action(&mut inner_guard));
+                    drop(inner_guard);
+                    if let Some(pollflag) = pending_poll {
+                        self.publish_write_progress(pending_reader_wake, pollflag);
+                    }
+                    if let Some(writer_wake) = writer_wake {
+                        self.wake_writers(writer_wake);
+                    }
+                    if total_written > 0 {
+                        return Ok(total_written);
+                    }
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+
+                let required = (atomic_write && total_written == 0).then_some(len);
+                let (guard, wait_result) = self.wait_for_write_space(inner_guard, required, || {
+                    if let Some(pollflag) = pending_poll {
+                        self.publish_write_progress(pending_reader_wake, pollflag);
+                    }
+                });
+                inner_guard = guard;
+                wake_next_writer = true;
+
+                if let Err(err) = wait_result {
+                    let writer_wake = Self::writer_wake_action(&mut inner_guard);
+                    drop(inner_guard);
+                    self.wake_writers(writer_wake);
+                    return if total_written > 0 {
+                        Ok(total_written)
+                    } else {
+                        Err(err)
+                    };
+                }
+                continue;
+            }
+
+            let to_write = core::cmp::min(remaining, available_space);
+            let was_readable = inner_guard.valid_cnt > 0 && inner_guard.splice_hold == 0;
+            Self::write_bytes(
+                &mut inner_guard,
+                &buf[total_written..total_written + to_write],
+                to_write,
+            );
+            total_written += to_write;
+            progress_pending = true;
+            if !was_readable && inner_guard.splice_hold == 0 {
+                reader_wake = WakeMode::One;
+            }
+        }
+
+        let pollflag = inner_guard.poll_both_ends();
+        let writer_wake = wake_next_writer.then(|| Self::writer_wake_action(&mut inner_guard));
+        drop(inner_guard);
+        if progress_pending {
+            self.publish_write_progress(reader_wake, pollflag);
+        }
+        if let Some(writer_wake) = writer_wake {
+            self.wake_writers(writer_wake);
+        }
+
+        Ok(total_written)
+    }
+
+    pub(crate) fn write_from_splice_blocking(&self, buf: &[u8]) -> Result<usize, SystemError> {
+        // The syscall layer has already folded the output pipe's O_NONBLOCK
+        // state into SPLICE_F_NONBLOCK. Reaching this helper therefore means
+        // this particular splice operation is blocking.
+        self.write_with_flags(buf.len(), buf, FileFlags::empty())
     }
 
     /// Nonblocking write helper for splice(2) paths that must ignore the pipe FD's O_NONBLOCK flag.
@@ -712,14 +1026,17 @@ impl LockedPipeInode {
     /// The caller must pass the maximum number of bytes it can actually read
     /// from the input file for this splice attempt. DragonOS pipes are byte-ring
     /// based, so requests up to PIPE_BUF wait for the complete readable chunk;
-    /// larger requests wait for any space and may complete partially.
-    pub fn wait_writable_for_splice(&self, len: usize) -> Result<usize, SystemError> {
+    /// larger requests wait for any space and may complete partially. The
+    /// boolean return value tells the caller to pass the writer baton after it
+    /// has consumed the reserved space (or abandoned the operation).
+    pub fn wait_writable_for_splice(&self, len: usize) -> Result<(usize, bool), SystemError> {
         if len == 0 {
-            return Ok(0);
+            return Ok((0, false));
         }
 
         let need_atomic = len <= PIPE_BUF;
         let mut guard = self.inner.lock();
+        let mut wake_next_writer = false;
         loop {
             if guard.reader == 0 {
                 drop(guard);
@@ -730,13 +1047,20 @@ impl LockedPipeInode {
             let used = guard.valid_cnt.max(0) as usize;
             let space = guard.buf_size.saturating_sub(used);
             if (need_atomic && space >= len) || (!need_atomic && space > 0) {
-                return Ok(if need_atomic { len } else { len.min(space) });
+                let writable = if need_atomic { len } else { len.min(space) };
+                return Ok((writable, wake_next_writer));
             }
 
             let required = need_atomic.then_some(len);
             let (next_guard, wait_result) = self.wait_for_write_space(guard, required, || {});
             guard = next_guard;
-            wait_result?;
+            wake_next_writer = true;
+            if let Err(err) = wait_result {
+                let writer_wake = Self::writer_wake_action(&mut guard);
+                drop(guard);
+                self.wake_writers(writer_wake);
+                return Err(err);
+            }
         }
     }
 
@@ -744,9 +1068,12 @@ impl LockedPipeInode {
     ///
     /// This matches Linux `wait_for_space()` for inputs whose exact readable
     /// length is not known before calling into the file. The caller can then
-    /// cap the read by the returned byte space.
-    pub fn wait_writable_any_for_splice(&self) -> Result<usize, SystemError> {
+    /// cap the read by the returned byte space. The boolean return value tells
+    /// the caller to pass the writer baton after it has consumed the reserved
+    /// space (or abandoned the operation).
+    pub fn wait_writable_any_for_splice(&self) -> Result<(usize, bool), SystemError> {
         let mut guard = self.inner.lock();
+        let mut wake_next_writer = false;
         loop {
             if guard.reader == 0 {
                 drop(guard);
@@ -757,12 +1084,18 @@ impl LockedPipeInode {
             let used = guard.valid_cnt.max(0) as usize;
             let space = guard.buf_size.saturating_sub(used);
             if space > 0 {
-                return Ok(space);
+                return Ok((space, wake_next_writer));
             }
 
             let (next_guard, wait_result) = self.wait_for_write_space(guard, None, || {});
             guard = next_guard;
-            wait_result?;
+            wake_next_writer = true;
+            if let Err(err) = wait_result {
+                let writer_wake = Self::writer_wake_action(&mut guard);
+                drop(guard);
+                self.wake_writers(writer_wake);
+                return Err(err);
+            }
         }
     }
 
@@ -827,7 +1160,7 @@ impl LockedPipeInode {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 drop(guard);
-                wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})?;
+                self.wait_for_readable_event()?;
                 did_wait = true;
                 continue;
             }
@@ -837,7 +1170,7 @@ impl LockedPipeInode {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 drop(guard);
-                wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})?;
+                self.wait_for_readable_event()?;
                 did_wait = true;
                 continue;
             }
@@ -891,9 +1224,9 @@ impl LockedPipeInode {
             WakeMode::None
         };
         let writer_wake = if consume > 0 {
-            Self::writer_wake_mode(&guard)
+            Self::writer_wake_action(&mut guard)
         } else {
-            WakeMode::None
+            PipeWriterWake::None
         };
         let pollflag = guard.poll_both_ends();
         drop(guard);
@@ -939,23 +1272,25 @@ impl LockedPipeInode {
             if nonblock {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})?;
+            self.wait_for_readable_event()?;
             did_wait = true;
         }
     }
 
     /// Helper: Wait until the pipe is writable (has space).
     /// Returns:
-    /// - Ok(()): Space is available.
+    /// - Ok(waited): Space is available; `waited` requests a post-transfer
+    ///   writer-baton wakeup.
     /// - Err(e): Interrupted, EAGAIN, or EPIPE (no readers).
-    fn wait_writable(&self, nonblock: bool) -> Result<(), SystemError> {
+    fn wait_writable(&self, nonblock: bool) -> Result<bool, SystemError> {
         let mut guard = self.inner.lock();
+        let mut wake_next_writer = false;
         loop {
             let space = guard
                 .buf_size
                 .saturating_sub(guard.valid_cnt.max(0) as usize);
             if space > 0 {
-                return Ok(());
+                return Ok(wake_next_writer);
             }
             if guard.reader == 0 {
                 drop(guard);
@@ -967,7 +1302,13 @@ impl LockedPipeInode {
             }
             let (next_guard, wait_result) = self.wait_for_write_space(guard, None, || {});
             guard = next_guard;
-            wait_result?;
+            wake_next_writer = true;
+            if let Err(err) = wait_result {
+                let writer_wake = Self::writer_wake_action(&mut guard);
+                drop(guard);
+                self.wake_writers(writer_wake);
+                return Err(err);
+            }
         }
     }
 
@@ -1039,9 +1380,9 @@ impl LockedPipeInode {
             WakeMode::None
         };
         let src_writer_wake = if consume {
-            Self::writer_wake_mode(&in_guard)
+            Self::writer_wake_action(&mut in_guard)
         } else {
-            WakeMode::None
+            PipeWriterWake::None
         };
         let dst_reader_wake = if !out_was_readable && out_guard.splice_hold == 0 {
             WakeMode::One
@@ -1092,10 +1433,12 @@ impl LockedPipeInode {
             }
 
             // Wait for output space
-            out.wait_writable(nonblock)?;
+            let wake_next_writer = out.wait_writable(nonblock)?;
 
             // Try transfer
-            let copied = Self::transfer_chunk(self, out, len, true, |_| 0)?;
+            let transfer = Self::transfer_chunk(self, out, len, true, |_| 0);
+            out.finish_writer_wait(wake_next_writer);
+            let copied = transfer?;
             if copied > 0 {
                 return Ok(copied);
             }
@@ -1154,6 +1497,7 @@ impl LockedPipeInode {
                     Err(SystemError::EPIPE)
                 };
             }
+            let mut wake_next_writer = false;
             if out_space == 0 {
                 if nonblock || total > 0 {
                     if total > 0 {
@@ -1162,10 +1506,10 @@ impl LockedPipeInode {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 // force blocking wait
-                out.wait_writable(false)?;
+                wake_next_writer = out.wait_writable(false)?;
             }
 
-            let copied = match Self::transfer_chunk(self, out, len - total, false, |in_guard| {
+            let transfer = Self::transfer_chunk(self, out, len - total, false, |in_guard| {
                 if in_avail_snapshot.is_none() {
                     in_avail_snapshot = Some(in_guard.valid_cnt.max(0) as usize);
                     in_read_pos_snapshot = Some(in_guard.read_pos.max(0) as usize);
@@ -1193,7 +1537,9 @@ impl LockedPipeInode {
                     }
                 }
                 skip
-            }) {
+            });
+            out.finish_writer_wait(wake_next_writer);
+            let copied = match transfer {
                 Ok(copied) => copied,
                 Err(SystemError::EPIPE) if total > 0 => return Ok(total),
                 Err(err) => return Err(err),
@@ -1229,7 +1575,46 @@ impl LockedPipeInode {
 
 #[cfg(test)]
 mod tests {
-    use super::{LockedPipeInode, PIPE_MIN_SIZE};
+    use super::{LockedPipeInode, PipeWriteWaiters, PipeWriterWake, PIPE_MIN_SIZE};
+
+    #[test]
+    fn writer_wake_action_targets_one_homogeneous_class() {
+        let mut waiters = PipeWriteWaiters::default();
+        let first_class = waiters.register(Some(4));
+        let second_class = waiters.register(Some(4));
+        assert_eq!(first_class, second_class);
+
+        assert!(matches!(waiters.wake_action(3, true), PipeWriterWake::None));
+        let PipeWriterWake::One(selected) = waiters.wake_action(4, true) else {
+            panic!("eligible writer class was not selected");
+        };
+        assert_eq!(selected, first_class);
+
+        waiters.unregister(Some(4));
+        waiters.unregister(Some(4));
+        assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn writer_wake_action_skips_ineligible_classes() {
+        let mut waiters = PipeWriteWaiters::default();
+        let any_class = waiters.register(None);
+        let atomic_class = waiters.register(Some(4));
+
+        let PipeWriterWake::One(selected) = waiters.wake_action(1, true) else {
+            panic!("any-space writer class was not selected");
+        };
+        assert_eq!(selected, any_class);
+        assert_ne!(selected, atomic_class);
+
+        assert_eq!(
+            waiters.wake_action(4, true),
+            PipeWriterWake::One(atomic_class)
+        );
+        assert_eq!(waiters.wake_action(1, true), PipeWriterWake::One(any_class));
+
+        assert_eq!(waiters.wake_action(0, false), PipeWriterWake::All);
+    }
 
     #[test]
     fn tee_adjusted_skip_no_consumption() {
@@ -1403,7 +1788,7 @@ impl IndexNode for LockedPipeInode {
             }
 
             drop(inner_guard);
-            wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})?;
+            self.wait_for_readable_event()?;
             did_wait = true;
 
             inner_guard = self.inner.lock();
@@ -1438,7 +1823,7 @@ impl IndexNode for LockedPipeInode {
         } else {
             WakeMode::None
         };
-        let writer_wake = Self::writer_wake_mode(&inner_guard);
+        let writer_wake = Self::writer_wake_action(&mut inner_guard);
         let pollflag = inner_guard.poll_both_ends();
         drop(inner_guard);
         self.wake_pipe_waiters(reader_wake, writer_wake);
@@ -1639,11 +2024,16 @@ impl IndexNode for LockedPipeInode {
         } else {
             EPollEventType::empty()
         };
+        let writer_wake = if release_notify {
+            Self::writer_wake_action(&mut guard)
+        } else {
+            PipeWriterWake::None
+        };
         drop(guard);
 
         if release_notify {
             self.read_wait_queue.wakeup_all(None);
-            self.write_wait_queue.wakeup_all(None);
+            self.wake_writers(writer_wake);
             let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
             self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
             self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
@@ -1665,114 +2055,8 @@ impl IndexNode for LockedPipeInode {
         } else {
             return Err(SystemError::EBADF);
         }
-
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-
         drop(data);
-        if len == 0 {
-            return Ok(0);
-        }
-
-        let mut inner_guard = self.inner.lock();
-        let atomic_write = len <= PIPE_BUF;
-
-        if inner_guard.reader == 0 {
-            drop(inner_guard);
-            Self::send_sigpipe();
-            return Err(SystemError::EPIPE);
-        }
-
-        if inner_guard.data.is_empty() {
-            let buf_size = inner_guard.buf_size;
-            inner_guard.data = vec![0u8; buf_size];
-        }
-
-        let mut total_written: usize = 0;
-        let mut reader_wake = WakeMode::None;
-        let mut progress_pending = false;
-
-        while total_written < len {
-            if inner_guard.reader == 0 {
-                let pollflag = progress_pending.then(|| inner_guard.poll_both_ends());
-                drop(inner_guard);
-                if let Some(pollflag) = pollflag {
-                    self.publish_write_progress(reader_wake, pollflag);
-                }
-                Self::send_sigpipe();
-                return if total_written > 0 {
-                    Ok(total_written)
-                } else {
-                    Err(SystemError::EPIPE)
-                };
-            }
-
-            let remaining = len - total_written;
-            let buf_size = inner_guard.buf_size;
-            let available_space = buf_size - inner_guard.valid_cnt as usize;
-            let need_wait = if atomic_write && total_written == 0 {
-                available_space < len
-            } else {
-                available_space == 0
-            };
-
-            if need_wait {
-                let pending_poll = progress_pending.then(|| inner_guard.poll_both_ends());
-                let pending_reader_wake = reader_wake;
-                progress_pending = false;
-                reader_wake = WakeMode::None;
-
-                if flags.contains(FileFlags::O_NONBLOCK) {
-                    drop(inner_guard);
-                    if let Some(pollflag) = pending_poll {
-                        self.publish_write_progress(pending_reader_wake, pollflag);
-                    }
-                    if total_written > 0 {
-                        return Ok(total_written);
-                    }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-
-                let required = (atomic_write && total_written == 0).then_some(len);
-                let (guard, wait_result) = self.wait_for_write_space(inner_guard, required, || {
-                    if let Some(pollflag) = pending_poll {
-                        self.publish_write_progress(pending_reader_wake, pollflag);
-                    }
-                });
-                inner_guard = guard;
-
-                if let Err(err) = wait_result {
-                    return if total_written > 0 {
-                        Ok(total_written)
-                    } else {
-                        Err(err)
-                    };
-                }
-                continue;
-            }
-
-            let to_write = core::cmp::min(remaining, available_space);
-            let was_readable = inner_guard.valid_cnt > 0 && inner_guard.splice_hold == 0;
-            Self::write_bytes(
-                &mut inner_guard,
-                &buf[total_written..total_written + to_write],
-                to_write,
-            );
-            total_written += to_write;
-            progress_pending = true;
-            if !was_readable && inner_guard.splice_hold == 0 {
-                reader_wake = WakeMode::One;
-            }
-        }
-
-        let pollflag = inner_guard.poll_both_ends();
-        drop(inner_guard);
-        if progress_pending {
-            self.publish_write_progress(reader_wake, pollflag);
-        }
-
-        Ok(total_written)
+        self.write_with_flags(len, buf, flags)
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

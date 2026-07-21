@@ -14,7 +14,7 @@ use core::{
 
 use alloc::{
     boxed::Box,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     rc::Rc,
     sync::{Arc, Weak},
     vec::Vec,
@@ -43,10 +43,14 @@ enum WaitSignalMode {
     Killable,
 }
 
+const DEFAULT_WAIT_TAG: usize = usize::MAX;
+const EMPTY_TAG_CACHE_LIMIT: usize = 8;
+
 #[derive(Debug)]
 struct InnerWaitQueue {
     dead: bool,
-    waiters: VecDeque<Arc<Waker>>,
+    waiters: BTreeMap<usize, VecDeque<Arc<Waker>>>,
+    empty_tag_count: usize,
 }
 
 /// 等待队列：基于一次性 Waiter/Waker，避免唤醒丢失
@@ -66,6 +70,7 @@ pub struct Waiter {
 #[derive(Debug)]
 pub struct Waker {
     state: AtomicU8,
+    tag: usize,
     target: Weak<ProcessControlBlock>,
 }
 
@@ -83,20 +88,38 @@ impl WaitQueue {
         if guard.dead {
             return Err(SystemError::ECHILD);
         }
-        guard.waiters.push_back(waker);
+        if waker.tag != DEFAULT_WAIT_TAG
+            && guard
+                .waiters
+                .get(&waker.tag)
+                .is_some_and(VecDeque::is_empty)
+        {
+            guard.empty_tag_count -= 1;
+        }
+        guard.waiters.entry(waker.tag).or_default().push_back(waker);
         self.num_waiters.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     pub fn remove_waker(&self, target: &Arc<Waker>) {
         let mut guard = self.inner.lock_irqsave();
-        let before = guard.waiters.len();
-        guard.waiters.retain(|w| !Arc::ptr_eq(w, target));
-        let removed = before - guard.waiters.len();
+        let (removed, became_empty) = if let Some(waiters) = guard.waiters.get_mut(&target.tag) {
+            let before = waiters.len();
+            waiters.retain(|w| !Arc::ptr_eq(w, target));
+            let removed = before - waiters.len();
+            (removed, removed > 0 && waiters.is_empty())
+        } else {
+            (0, false)
+        };
         if removed > 0 {
             self.num_waiters
                 .fetch_sub(removed as u32, Ordering::Release);
         }
+        let evicted = became_empty
+            .then(|| guard.cache_or_evict_empty_tag(target.tag))
+            .flatten();
+        drop(guard);
+        drop(evicted);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -255,17 +278,41 @@ impl WaitQueue {
     /// - This ensures no wakeup is lost between check and sleep
     fn wait_until_impl<F, R, B>(
         &self,
-        mut cond: F,
+        cond: F,
         mode: WaitSignalMode,
         timeout: Option<Duration>,
         timeout_ticks: Option<u64>,
-        mut before_sleep: Option<B>,
+        before_sleep: Option<B>,
         is_io: bool,
     ) -> Result<R, SystemError>
     where
         F: FnMut() -> Option<R>,
         B: FnMut(),
     {
+        self.wait_until_impl_tagged(
+            cond,
+            mode,
+            timeout,
+            timeout_ticks,
+            before_sleep,
+            (is_io, DEFAULT_WAIT_TAG),
+        )
+    }
+
+    fn wait_until_impl_tagged<F, R, B>(
+        &self,
+        mut cond: F,
+        mode: WaitSignalMode,
+        timeout: Option<Duration>,
+        timeout_ticks: Option<u64>,
+        mut before_sleep: Option<B>,
+        wait_class: (bool, usize),
+    ) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Option<R>,
+        B: FnMut(),
+    {
+        let (is_io, tag) = wait_class;
         // Fast path: check condition first
         if let Some(res) = cond() {
             return Ok(res);
@@ -278,7 +325,7 @@ impl WaitQueue {
             .or_else(|| timeout.map(|duration| next_n_us_timer_jiffies(duration.total_micros())));
 
         // Create only ONE waiter/waker pair (key difference from old implementation)
-        let (waiter, waker) = Waiter::new_pair();
+        let (waiter, waker) = Waiter::new_pair_tagged(tag);
 
         fn cancel_or_timeout<F, R>(
             cond: &mut F,
@@ -410,6 +457,30 @@ impl WaitQueue {
             None,
             before_sleep,
             false,
+        )
+    }
+
+    /// Wait interruptibly while publishing a caller-defined class tag on the
+    /// waiter. The tag lets a wakeup source select one eligible class without
+    /// disturbing unrelated waiters on the same queue.
+    pub fn wait_event_interruptible_tagged<F>(
+        &self,
+        tag: usize,
+        mut cond: F,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        if tag == DEFAULT_WAIT_TAG {
+            return Err(SystemError::EINVAL);
+        }
+        self.wait_until_impl_tagged(
+            || if cond() { Some(()) } else { None },
+            WaitSignalMode::Interruptible,
+            None,
+            None,
+            None::<fn()>,
+            (false, tag),
         )
     }
 
@@ -578,15 +649,53 @@ impl WaitQueue {
         loop {
             let next = {
                 let mut guard = self.inner.lock_irqsave();
-                let waker = guard.waiters.pop_front();
+                let tagged_waker = guard
+                    .waiters
+                    .iter_mut()
+                    .find_map(|(tag, waiters)| waiters.pop_front().map(|waker| (*tag, waker)));
+                let waker = tagged_waker.as_ref().map(|(_, waker)| waker);
                 if waker.is_some() {
                     self.num_waiters.fetch_sub(1, Ordering::Release);
                 }
-                waker
+                let evicted = tagged_waker
+                    .as_ref()
+                    .filter(|(tag, _)| guard.waiters.get(tag).is_some_and(VecDeque::is_empty))
+                    .and_then(|(tag, _)| guard.cache_or_evict_empty_tag(*tag));
+                drop(guard);
+                drop(evicted);
+                tagged_waker.map(|(_, waker)| waker)
             };
 
             let Some(waker) = next else { return false };
             if waker.wake() {
+                return true;
+            }
+        }
+    }
+
+    /// Wake the first live waiter in an exact caller-defined class.
+    pub fn wake_one_tagged(&self, tag: usize) -> bool {
+        if tag == DEFAULT_WAIT_TAG {
+            return false;
+        }
+        loop {
+            let next = {
+                let mut guard = self.inner.lock_irqsave();
+                let waker = guard.waiters.get_mut(&tag).and_then(VecDeque::pop_front);
+                let Some(waker) = waker else { return false };
+                self.num_waiters.fetch_sub(1, Ordering::Release);
+                let evicted = guard
+                    .waiters
+                    .get(&tag)
+                    .is_some_and(VecDeque::is_empty)
+                    .then(|| guard.cache_or_evict_empty_tag(tag))
+                    .flatten();
+                drop(guard);
+                drop(evicted);
+                waker
+            };
+
+            if next.wake() {
                 return true;
             }
         }
@@ -602,18 +711,20 @@ impl WaitQueue {
             return 0;
         }
 
-        let mut drained = VecDeque::new();
+        let drained;
         {
             let mut guard = self.inner.lock_irqsave();
-            mem::swap(&mut guard.waiters, &mut drained);
+            drained = mem::take(&mut guard.waiters);
+            guard.empty_tag_count = 0;
             self.num_waiters.store(0, Ordering::Release);
         }
 
-        let wakers = drained;
         let mut woken = 0;
-        for w in wakers {
-            if w.wake() {
-                woken += 1;
+        for (_, wakers) in drained {
+            for waker in wakers {
+                if waker.wake() {
+                    woken += 1;
+                }
             }
         }
         woken
@@ -621,16 +732,19 @@ impl WaitQueue {
 
     /// 标记等待队列失效，清空并唤醒剩余等待者
     pub fn mark_dead(&self) {
-        let mut drained = VecDeque::new();
+        let drained;
         {
             let mut guard = self.inner.lock_irqsave();
             guard.dead = true;
-            mem::swap(&mut guard.waiters, &mut drained);
+            drained = mem::take(&mut guard.waiters);
+            guard.empty_tag_count = 0;
             self.num_waiters.store(0, Ordering::Release);
         }
-        for w in drained {
-            w.wake();
-            w.close();
+        for (_, wakers) in drained {
+            for waker in wakers {
+                waker.wake();
+                waker.close();
+            }
         }
     }
 
@@ -696,14 +810,32 @@ impl WaitQueue {
 impl InnerWaitQueue {
     pub const INIT: InnerWaitQueue = InnerWaitQueue {
         dead: false,
-        waiters: VecDeque::new(),
+        waiters: BTreeMap::new(),
+        empty_tag_count: 0,
     };
+
+    fn cache_or_evict_empty_tag(&mut self, tag: usize) -> Option<VecDeque<Arc<Waker>>> {
+        if tag == DEFAULT_WAIT_TAG {
+            return None;
+        }
+        if self.empty_tag_count < EMPTY_TAG_CACHE_LIMIT {
+            self.empty_tag_count += 1;
+            None
+        } else {
+            self.waiters.remove(&tag)
+        }
+    }
 }
 
 impl Waiter {
     pub fn new_pair() -> (Self, Arc<Waker>) {
+        Self::new_pair_tagged(DEFAULT_WAIT_TAG)
+    }
+
+    fn new_pair_tagged(tag: usize) -> (Self, Arc<Waker>) {
         let waker = Arc::new(Waker {
             state: AtomicU8::new(Waker::STATE_IDLE),
+            tag,
             target: Arc::downgrade(&ProcessManager::current_pcb()),
         });
         let waiter = Waiter {

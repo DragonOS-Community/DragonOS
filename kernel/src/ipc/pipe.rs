@@ -1,5 +1,5 @@
 use crate::filesystem::vfs::syscall::SpliceFlags;
-use crate::libs::mutex::MutexGuard;
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::{
     arch::{ipc::signal::Signal, MMArch},
     filesystem::{
@@ -228,6 +228,12 @@ impl PipeFsPrivateData {
 /// @brief 管道文件i节点(锁)
 #[derive(Debug)]
 pub struct LockedPipeInode {
+    /// Serializes writes and output-side splice operations for this pipe.
+    ///
+    /// Lock order is `writer_transaction` -> `inner`. A blocking writer drops
+    /// this mutex only after publishing its wait predicate under `inner`, then
+    /// reacquires it before rechecking or committing data.
+    writer_transaction: Mutex<()>,
     inner: SpinLock<InnerPipeInode>,
     read_wait_queue: WaitQueue,
     write_wait_queue: WaitQueue,
@@ -236,6 +242,42 @@ pub struct LockedPipeInode {
     epitems: LockedEPItemLinkedList,
     read_fasync_items: FAsyncItems,
     write_fasync_items: FAsyncItems,
+}
+
+/// A serialized writer transaction. Dropping it releases the writer mutex
+/// before passing the exclusive writer-wakeup baton.
+pub(crate) struct PipeWriterTransaction<'a> {
+    pipe: &'a LockedPipeInode,
+    guard: Option<MutexGuard<'a, ()>>,
+    pass_baton: bool,
+}
+
+impl PipeWriterTransaction<'_> {
+    fn release_for_wait(&mut self) {
+        drop(self.guard.take());
+    }
+
+    fn reacquire_after_wait(&mut self) {
+        debug_assert!(self.guard.is_none());
+        self.guard = Some(self.pipe.writer_transaction.lock());
+    }
+
+    fn pass_baton_if_waiters_remain(&mut self, inner: &InnerPipeInode) {
+        self.pass_baton |= !inner.write_waiters.is_empty();
+    }
+}
+
+impl Drop for PipeWriterTransaction<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if self.pass_baton {
+            let writer_wake = {
+                let mut inner = self.pipe.inner.lock();
+                LockedPipeInode::writer_wake_action(&mut inner)
+            };
+            self.pipe.wake_writers(writer_wake);
+        }
+    }
 }
 
 /// @brief 管道文件i节点(无锁)
@@ -411,6 +453,15 @@ impl InnerPipeInode {
 
 impl LockedPipeInode {
     #[inline]
+    pub(crate) fn begin_writer_transaction(&self) -> PipeWriterTransaction<'_> {
+        PipeWriterTransaction {
+            pipe: self,
+            guard: Some(self.writer_transaction.lock()),
+            pass_baton: false,
+        }
+    }
+
+    #[inline]
     fn writer_wake_action(inner: &mut InnerPipeInode) -> PipeWriterWake {
         let used = inner.valid_cnt.max(0) as usize;
         let available = inner.buf_size.saturating_sub(used);
@@ -561,6 +612,7 @@ impl LockedPipeInode {
             w_counter: 0,   // 初始化写端计数器
         };
         let result = Arc::new(Self {
+            writer_transaction: Mutex::new(()),
             inner: SpinLock::new(inner),
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
@@ -622,6 +674,7 @@ impl LockedPipeInode {
         &'a self,
         mut guard: crate::libs::spinlock::SpinLockGuard<'a, InnerPipeInode>,
         required: Option<usize>,
+        transaction: &mut PipeWriterTransaction<'a>,
         before_wait: F,
     ) -> (
         crate::libs::spinlock::SpinLockGuard<'a, InnerPipeInode>,
@@ -634,6 +687,7 @@ impl LockedPipeInode {
         drop(guard);
 
         before_wait();
+        transaction.release_for_wait();
         let result = if let Some(need) = required {
             self.write_wait_queue
                 .wait_event_interruptible_tagged(waiter_class, || self.writeable_len_at_least(need))
@@ -642,8 +696,10 @@ impl LockedPipeInode {
                 .wait_event_interruptible_tagged(waiter_class, || self.writeable())
         };
 
+        transaction.reacquire_after_wait();
         let mut guard = self.inner.lock();
         guard.write_waiters.unregister(required);
+        transaction.pass_baton_if_waiters_remain(&guard);
         let result = result.map_err(|_| SystemError::ERESTARTSYS);
         (guard, result)
     }
@@ -697,6 +753,7 @@ impl LockedPipeInode {
         // 确保不大于最大值
         let new_size = new_size.min(PIPE_MAX_SIZE);
 
+        let transaction = self.begin_writer_transaction();
         let mut inner = self.inner.lock();
 
         // 如果新大小小于当前数据量，返回 EBUSY
@@ -750,6 +807,7 @@ impl LockedPipeInode {
         let writer_wake = Self::writer_wake_action(&mut inner);
         let pollflag = inner.poll_both_ends();
         drop(inner);
+        drop(transaction);
 
         self.wake_writers(writer_wake);
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
@@ -791,18 +849,6 @@ impl LockedPipeInode {
         inner_guard.valid_cnt += to_write as i32;
     }
 
-    pub(crate) fn finish_writer_wait(&self, wake_next_writer: bool) {
-        if !wake_next_writer {
-            return;
-        }
-
-        let writer_wake = {
-            let mut inner = self.inner.lock();
-            Self::writer_wake_action(&mut inner)
-        };
-        self.wake_writers(writer_wake);
-    }
-
     /// Preserve exclusive reader-wakeup progress when a selected waiter exits
     /// without consuming data (for example, because a signal interrupted it).
     fn finish_interrupted_reader_wait(&self) {
@@ -840,6 +886,7 @@ impl LockedPipeInode {
             return Ok(0);
         }
 
+        let mut transaction = self.begin_writer_transaction();
         let mut inner_guard = self.inner.lock();
         let atomic_write = len <= PIPE_BUF;
 
@@ -855,21 +902,15 @@ impl LockedPipeInode {
         }
 
         let mut total_written: usize = 0;
-        let mut wake_next_writer = false;
         let mut reader_wake = WakeMode::None;
         let mut progress_pending = false;
 
         while total_written < len {
             if inner_guard.reader == 0 {
                 let pollflag = progress_pending.then(|| inner_guard.poll_both_ends());
-                let writer_wake =
-                    wake_next_writer.then(|| Self::writer_wake_action(&mut inner_guard));
                 drop(inner_guard);
                 if let Some(pollflag) = pollflag {
                     self.publish_write_progress(reader_wake, pollflag);
-                }
-                if let Some(writer_wake) = writer_wake {
-                    self.wake_writers(writer_wake);
                 }
                 Self::send_sigpipe();
                 return if total_written > 0 {
@@ -895,14 +936,9 @@ impl LockedPipeInode {
                 reader_wake = WakeMode::None;
 
                 if flags.contains(FileFlags::O_NONBLOCK) {
-                    let writer_wake =
-                        wake_next_writer.then(|| Self::writer_wake_action(&mut inner_guard));
                     drop(inner_guard);
                     if let Some(pollflag) = pending_poll {
                         self.publish_write_progress(pending_reader_wake, pollflag);
-                    }
-                    if let Some(writer_wake) = writer_wake {
-                        self.wake_writers(writer_wake);
                     }
                     if total_written > 0 {
                         return Ok(total_written);
@@ -911,18 +947,16 @@ impl LockedPipeInode {
                 }
 
                 let required = (atomic_write && total_written == 0).then_some(len);
-                let (guard, wait_result) = self.wait_for_write_space(inner_guard, required, || {
-                    if let Some(pollflag) = pending_poll {
-                        self.publish_write_progress(pending_reader_wake, pollflag);
-                    }
-                });
+                let (guard, wait_result) =
+                    self.wait_for_write_space(inner_guard, required, &mut transaction, || {
+                        if let Some(pollflag) = pending_poll {
+                            self.publish_write_progress(pending_reader_wake, pollflag);
+                        }
+                    });
                 inner_guard = guard;
-                wake_next_writer = true;
 
                 if let Err(err) = wait_result {
-                    let writer_wake = Self::writer_wake_action(&mut inner_guard);
                     drop(inner_guard);
-                    self.wake_writers(writer_wake);
                     return if total_written > 0 {
                         Ok(total_written)
                     } else {
@@ -940,6 +974,7 @@ impl LockedPipeInode {
                 to_write,
             );
             total_written += to_write;
+            transaction.pass_baton_if_waiters_remain(&inner_guard);
             progress_pending = true;
             if !was_readable && inner_guard.splice_hold == 0 {
                 reader_wake = WakeMode::One;
@@ -947,28 +982,24 @@ impl LockedPipeInode {
         }
 
         let pollflag = inner_guard.poll_both_ends();
-        let writer_wake = wake_next_writer.then(|| Self::writer_wake_action(&mut inner_guard));
         drop(inner_guard);
         if progress_pending {
             self.publish_write_progress(reader_wake, pollflag);
-        }
-        if let Some(writer_wake) = writer_wake {
-            self.wake_writers(writer_wake);
         }
 
         Ok(total_written)
     }
 
-    pub(crate) fn write_from_splice_blocking(&self, buf: &[u8]) -> Result<usize, SystemError> {
-        // The syscall layer has already folded the output pipe's O_NONBLOCK
-        // state into SPLICE_F_NONBLOCK. Reaching this helper therefore means
-        // this particular splice operation is blocking.
-        self.write_with_flags(buf.len(), buf, FileFlags::empty())
-    }
-
-    /// Nonblocking write helper for splice(2) paths that must ignore the pipe FD's O_NONBLOCK flag.
-    /// This never sleeps; it returns EAGAIN when no space is available.
-    pub fn write_from_splice_nonblock(&self, buf: &[u8]) -> Result<usize, SystemError> {
+    /// Commit file data to this pipe while holding its writer transaction.
+    /// Space and reader presence were checked before the input read; close,
+    /// resize, and competing writers take the same transaction mutex, so this
+    /// commit never needs to drop the transaction and wait.
+    pub(crate) fn write_from_splice_locked(
+        &self,
+        transaction: &mut PipeWriterTransaction<'_>,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        debug_assert!(core::ptr::eq(transaction.pipe, self));
         let len = buf.len();
         if len == 0 {
             return Ok(0);
@@ -1013,6 +1044,7 @@ impl LockedPipeInode {
         };
 
         let pollflag = inner_guard.poll_both_ends();
+        transaction.pass_baton_if_waiters_remain(&inner_guard);
         drop(inner_guard);
         Self::wake_waiters(&self.read_wait_queue, reader_wake);
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
@@ -1027,16 +1059,20 @@ impl LockedPipeInode {
     /// from the input file for this splice attempt. DragonOS pipes are byte-ring
     /// based, so requests up to PIPE_BUF wait for the complete readable chunk;
     /// larger requests wait for any space and may complete partially. The
-    /// boolean return value tells the caller to pass the writer baton after it
-    /// has consumed the reserved space (or abandoned the operation).
-    pub fn wait_writable_for_splice(&self, len: usize) -> Result<(usize, bool), SystemError> {
+    /// caller retains `transaction`, so the returned capacity remains valid
+    /// through the input read and non-waiting commit.
+    pub(crate) fn wait_writable_for_splice<'a>(
+        &'a self,
+        transaction: &mut PipeWriterTransaction<'a>,
+        len: usize,
+    ) -> Result<usize, SystemError> {
+        debug_assert!(core::ptr::eq(transaction.pipe, self));
         if len == 0 {
-            return Ok((0, false));
+            return Ok(0);
         }
 
         let need_atomic = len <= PIPE_BUF;
         let mut guard = self.inner.lock();
-        let mut wake_next_writer = false;
         loop {
             if guard.reader == 0 {
                 drop(guard);
@@ -1048,17 +1084,15 @@ impl LockedPipeInode {
             let space = guard.buf_size.saturating_sub(used);
             if (need_atomic && space >= len) || (!need_atomic && space > 0) {
                 let writable = if need_atomic { len } else { len.min(space) };
-                return Ok((writable, wake_next_writer));
+                return Ok(writable);
             }
 
             let required = need_atomic.then_some(len);
-            let (next_guard, wait_result) = self.wait_for_write_space(guard, required, || {});
+            let (next_guard, wait_result) =
+                self.wait_for_write_space(guard, required, transaction, || {});
             guard = next_guard;
-            wake_next_writer = true;
             if let Err(err) = wait_result {
-                let writer_wake = Self::writer_wake_action(&mut guard);
                 drop(guard);
-                self.wake_writers(writer_wake);
                 return Err(err);
             }
         }
@@ -1068,12 +1102,14 @@ impl LockedPipeInode {
     ///
     /// This matches Linux `wait_for_space()` for inputs whose exact readable
     /// length is not known before calling into the file. The caller can then
-    /// cap the read by the returned byte space. The boolean return value tells
-    /// the caller to pass the writer baton after it has consumed the reserved
-    /// space (or abandoned the operation).
-    pub fn wait_writable_any_for_splice(&self) -> Result<(usize, bool), SystemError> {
+    /// cap the read by the returned byte space while retaining the writer
+    /// transaction through the input read and non-waiting commit.
+    pub(crate) fn wait_writable_any_for_splice<'a>(
+        &'a self,
+        transaction: &mut PipeWriterTransaction<'a>,
+    ) -> Result<usize, SystemError> {
+        debug_assert!(core::ptr::eq(transaction.pipe, self));
         let mut guard = self.inner.lock();
-        let mut wake_next_writer = false;
         loop {
             if guard.reader == 0 {
                 drop(guard);
@@ -1084,19 +1120,53 @@ impl LockedPipeInode {
             let used = guard.valid_cnt.max(0) as usize;
             let space = guard.buf_size.saturating_sub(used);
             if space > 0 {
-                return Ok((space, wake_next_writer));
+                return Ok(space);
             }
 
-            let (next_guard, wait_result) = self.wait_for_write_space(guard, None, || {});
+            let (next_guard, wait_result) =
+                self.wait_for_write_space(guard, None, transaction, || {});
             guard = next_guard;
-            wake_next_writer = true;
             if let Err(err) = wait_result {
-                let writer_wake = Self::writer_wake_action(&mut guard);
                 drop(guard);
-                self.wake_writers(writer_wake);
                 return Err(err);
             }
         }
+    }
+
+    /// Check file->pipe splice output conditions without sleeping while the
+    /// writer transaction is held. This check happens before consuming input.
+    pub(crate) fn writable_for_splice_nonblock(
+        &self,
+        transaction: &PipeWriterTransaction<'_>,
+        wanted: Option<usize>,
+    ) -> Result<usize, SystemError> {
+        debug_assert!(core::ptr::eq(transaction.pipe, self));
+        let guard = self.inner.lock();
+        if guard.reader == 0 {
+            drop(guard);
+            Self::send_sigpipe();
+            return Err(SystemError::EPIPE);
+        }
+        let used = guard.valid_cnt.max(0) as usize;
+        let space = guard.buf_size.saturating_sub(used);
+        if space == 0 || wanted.is_some_and(|len| len <= PIPE_BUF && space < len) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        Ok(wanted.map_or(space, |len| len.min(space)))
+    }
+
+    /// Validate the output endpoint before file->pipe splice consumes input.
+    pub(crate) fn ensure_splice_readers(
+        &self,
+        transaction: &PipeWriterTransaction<'_>,
+    ) -> Result<(), SystemError> {
+        debug_assert!(core::ptr::eq(transaction.pipe, self));
+        let has_readers = self.inner.lock().reader > 0;
+        if !has_readers {
+            Self::send_sigpipe();
+            return Err(SystemError::EPIPE);
+        }
+        Ok(())
     }
 
     /// 从管道中“窥视”最多 `len` 字节数据到 `buf`，但不消耗管道数据。
@@ -1279,34 +1349,36 @@ impl LockedPipeInode {
 
     /// Helper: Wait until the pipe is writable (has space).
     /// Returns:
-    /// - Ok(waited): Space is available; `waited` requests a post-transfer
-    ///   writer-baton wakeup.
+    /// - Ok(()): Space is available while the destination writer transaction
+    ///   remains held.
     /// - Err(e): Interrupted, EAGAIN, or EPIPE (no readers).
-    fn wait_writable(&self, nonblock: bool) -> Result<bool, SystemError> {
+    fn wait_writable<'a>(
+        &'a self,
+        transaction: &mut PipeWriterTransaction<'a>,
+        nonblock: bool,
+    ) -> Result<(), SystemError> {
+        debug_assert!(core::ptr::eq(transaction.pipe, self));
         let mut guard = self.inner.lock();
-        let mut wake_next_writer = false;
         loop {
-            let space = guard
-                .buf_size
-                .saturating_sub(guard.valid_cnt.max(0) as usize);
-            if space > 0 {
-                return Ok(wake_next_writer);
-            }
             if guard.reader == 0 {
                 drop(guard);
                 Self::send_sigpipe();
                 return Err(SystemError::EPIPE);
             }
+            let space = guard
+                .buf_size
+                .saturating_sub(guard.valid_cnt.max(0) as usize);
+            if space > 0 {
+                return Ok(());
+            }
             if nonblock {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            let (next_guard, wait_result) = self.wait_for_write_space(guard, None, || {});
+            let (next_guard, wait_result) =
+                self.wait_for_write_space(guard, None, transaction, || {});
             guard = next_guard;
-            wake_next_writer = true;
             if let Err(err) = wait_result {
-                let writer_wake = Self::writer_wake_action(&mut guard);
                 drop(guard);
-                self.wake_writers(writer_wake);
                 return Err(err);
             }
         }
@@ -1321,6 +1393,7 @@ impl LockedPipeInode {
     fn transfer_chunk<F>(
         src: &LockedPipeInode,
         dst: &LockedPipeInode,
+        transaction: &mut PipeWriterTransaction<'_>,
         len: usize,
         consume: bool,
         skip_calculator: F,
@@ -1328,6 +1401,7 @@ impl LockedPipeInode {
     where
         F: FnOnce(&InnerPipeInode) -> usize,
     {
+        debug_assert!(core::ptr::eq(transaction.pipe, dst));
         // Lock both pipes
         let (mut in_guard, mut out_guard) = Self::lock_two(src, dst);
 
@@ -1392,6 +1466,7 @@ impl LockedPipeInode {
 
         let in_poll = consume.then(|| in_guard.poll_both_ends());
         let out_poll = out_guard.poll_both_ends();
+        transaction.pass_baton_if_waiters_remain(&out_guard);
         drop(in_guard);
         drop(out_guard);
 
@@ -1432,13 +1507,14 @@ impl LockedPipeInode {
                 return Ok(0); // EOF
             }
 
-            // Wait for output space
-            let wake_next_writer = out.wait_writable(nonblock)?;
+            // Serialize only the destination writer side. The source pipe is
+            // protected by its inner lock during the actual transfer, avoiding
+            // writer-mutex ABBA between opposite-direction splices.
+            let mut transaction = out.begin_writer_transaction();
+            out.wait_writable(&mut transaction, nonblock)?;
 
             // Try transfer
-            let transfer = Self::transfer_chunk(self, out, len, true, |_| 0);
-            out.finish_writer_wait(wake_next_writer);
-            let copied = transfer?;
+            let copied = Self::transfer_chunk(self, out, &mut transaction, len, true, |_| 0)?;
             if copied > 0 {
                 return Ok(copied);
             }
@@ -1484,6 +1560,7 @@ impl LockedPipeInode {
 
             // Check output space
             // tee has special nonblock handling: return total if > 0
+            let mut transaction = out.begin_writer_transaction();
             let (out_space, out_has_readers) = {
                 let guard = out.inner.lock();
                 let used = guard.valid_cnt.max(0) as usize;
@@ -1497,7 +1574,6 @@ impl LockedPipeInode {
                     Err(SystemError::EPIPE)
                 };
             }
-            let mut wake_next_writer = false;
             if out_space == 0 {
                 if nonblock || total > 0 {
                     if total > 0 {
@@ -1506,39 +1582,45 @@ impl LockedPipeInode {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 // force blocking wait
-                wake_next_writer = out.wait_writable(false)?;
+                out.wait_writable(&mut transaction, false)?;
             }
 
-            let transfer = Self::transfer_chunk(self, out, len - total, false, |in_guard| {
-                if in_avail_snapshot.is_none() {
-                    in_avail_snapshot = Some(in_guard.valid_cnt.max(0) as usize);
-                    in_read_pos_snapshot = Some(in_guard.read_pos.max(0) as usize);
-                    in_buf_size_snapshot = Some(in_guard.buf_size);
-                }
-
-                let snapshot = in_avail_snapshot.unwrap();
-                if total >= snapshot {
-                    return usize::MAX; // Signal to skip everything
-                }
-
-                let mut skip = total;
-                if let (Some(start_read_pos), Some(start_buf_size)) =
-                    (in_read_pos_snapshot, in_buf_size_snapshot)
-                {
-                    if start_buf_size == in_guard.buf_size {
-                        let cur_read_pos = in_guard.read_pos.max(0) as usize;
-                        skip = Self::tee_adjusted_skip(
-                            start_read_pos,
-                            cur_read_pos,
-                            start_buf_size,
-                            snapshot,
-                            total,
-                        );
+            let transfer = Self::transfer_chunk(
+                self,
+                out,
+                &mut transaction,
+                len - total,
+                false,
+                |in_guard| {
+                    if in_avail_snapshot.is_none() {
+                        in_avail_snapshot = Some(in_guard.valid_cnt.max(0) as usize);
+                        in_read_pos_snapshot = Some(in_guard.read_pos.max(0) as usize);
+                        in_buf_size_snapshot = Some(in_guard.buf_size);
                     }
-                }
-                skip
-            });
-            out.finish_writer_wait(wake_next_writer);
+
+                    let snapshot = in_avail_snapshot.unwrap();
+                    if total >= snapshot {
+                        return usize::MAX; // Signal to skip everything
+                    }
+
+                    let mut skip = total;
+                    if let (Some(start_read_pos), Some(start_buf_size)) =
+                        (in_read_pos_snapshot, in_buf_size_snapshot)
+                    {
+                        if start_buf_size == in_guard.buf_size {
+                            let cur_read_pos = in_guard.read_pos.max(0) as usize;
+                            skip = Self::tee_adjusted_skip(
+                                start_read_pos,
+                                cur_read_pos,
+                                start_buf_size,
+                                snapshot,
+                                total,
+                            );
+                        }
+                    }
+                    skip
+                },
+            );
             let copied = match transfer {
                 Ok(copied) => copied,
                 Err(SystemError::EPIPE) if total > 0 => return Ok(total),
@@ -1661,8 +1743,9 @@ mod tests {
             Ok(4)
         );
         assert_eq!(&held, b"held");
+        let mut transaction = dst.begin_writer_transaction();
         assert_eq!(
-            LockedPipeInode::transfer_chunk(&src, &dst, 4, true, |_| 0),
+            LockedPipeInode::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
             Ok(0)
         );
         {
@@ -1673,7 +1756,7 @@ mod tests {
 
         src.splice_finish_hold(0);
         assert_eq!(
-            LockedPipeInode::transfer_chunk(&src, &dst, 4, true, |_| 0),
+            LockedPipeInode::transfer_chunk(&src, &dst, &mut transaction, 4, true, |_| 0),
             Ok(4)
         );
         assert_eq!(src.inner.lock().valid_cnt, 0);
@@ -1997,6 +2080,7 @@ impl IndexNode for LockedPipeInode {
             return Ok(());
         }
 
+        let transaction = self.begin_writer_transaction();
         let mut guard = self.inner.lock();
         match accflags {
             FileFlags::O_RDONLY => {
@@ -2030,6 +2114,7 @@ impl IndexNode for LockedPipeInode {
             PipeWriterWake::None
         };
         drop(guard);
+        drop(transaction);
 
         if release_notify {
             self.read_wait_queue.wakeup_all(None);

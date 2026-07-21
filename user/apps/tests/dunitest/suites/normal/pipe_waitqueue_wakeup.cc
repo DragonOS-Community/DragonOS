@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/wait.h>
@@ -198,6 +199,39 @@ bool ReadExactly(int fd, size_t len) {
     return true;
 }
 
+bool ReadAllInto(int fd, char* data, size_t len) {
+    size_t read_bytes = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (read_bytes < len) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        pollfd wait_fd {};
+        wait_fd.fd = fd;
+        wait_fd.events = POLLIN | POLLHUP;
+        const int ready = poll(&wait_fd, 1, static_cast<int>(std::max<int64_t>(1, remaining)));
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ready <= 0) {
+            return false;
+        }
+        const ssize_t n = read(fd, data + read_bytes, len - read_bytes);
+        if (n > 0) {
+            read_bytes += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool FillPipeExactly(int write_fd, size_t capacity) {
     const int old_flags = fcntl(write_fd, F_GETFL);
     if (old_flags < 0 || fcntl(write_fd, F_SETFL, old_flags | O_NONBLOCK) != 0) {
@@ -274,6 +308,40 @@ TEST(PipeWaitqueueWakeup, NonblockingWriteWithoutReaderRaisesSigpipe) {
     EXPECT_EQ(1, g_sigpipe_count);
 
     close(fds[1]);
+}
+
+TEST(PipeWaitqueueWakeup, NonblockingSocketSpliceWithoutReaderDoesNotConsumeInput) {
+    int source[2] = {-1, -1};
+    int destination[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, source)) << strerror(errno);
+    ASSERT_EQ(0, pipe(destination)) << strerror(errno);
+
+    const char payload[] = "splice-input";
+    ASSERT_TRUE(WriteAll(source[1], payload, sizeof(payload))) << strerror(errno);
+
+    struct sigaction action {};
+    action.sa_handler = SigpipeHandler;
+    sigemptyset(&action.sa_mask);
+    ScopedSignalAction sigpipe_guard(SIGPIPE);
+    ASSERT_TRUE(sigpipe_guard.Install(action)) << strerror(errno);
+    g_sigpipe_count = 0;
+
+    ASSERT_EQ(0, close(destination[0])) << strerror(errno);
+    destination[0] = -1;
+    errno = 0;
+    EXPECT_EQ(-1, splice(source[0], nullptr, destination[1], nullptr, sizeof(payload),
+                         SPLICE_F_NONBLOCK));
+    EXPECT_EQ(EPIPE, errno);
+    EXPECT_EQ(1, g_sigpipe_count);
+
+    char received[sizeof(payload)] = {};
+    ASSERT_TRUE(ReadAllInto(source[0], received, sizeof(received))) << strerror(errno);
+    EXPECT_EQ(0, memcmp(payload, received, sizeof(payload)))
+        << "failed splice consumed stream input before reporting EPIPE";
+
+    close(source[0]);
+    close(source[1]);
+    close(destination[1]);
 }
 
 TEST(PipeWaitqueueWakeup, EligibleWriterIsNotBlockedBehindLargerWriter) {
@@ -624,6 +692,114 @@ TEST(PipeWaitqueueWakeup, PipeToPipeSpliceWakesSourceWriterAndDestinationReader)
     EXPECT_EQ(0, WEXITSTATUS(writer_status));
     ASSERT_TRUE(WIFEXITED(reader_status));
     EXPECT_EQ(0, WEXITSTATUS(reader_status));
+
+    close(source[0]);
+    close(source[1]);
+    close(destination[0]);
+    close(destination[1]);
+}
+
+TEST(PipeWaitqueueWakeup, BlockingSocketSpliceKeepsObservedPipeSpace) {
+    int source[2] = {-1, -1};
+    int destination[2] = {-1, -1};
+    int splice_ready[2] = {-1, -1};
+    int writer_ready[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, source)) << strerror(errno);
+    ASSERT_EQ(0, pipe(destination)) << strerror(errno);
+    ASSERT_EQ(0, pipe(splice_ready)) << strerror(errno);
+    ASSERT_EQ(0, pipe(writer_ready)) << strerror(errno);
+    ASSERT_EQ(4096, fcntl(destination[1], F_SETPIPE_SZ, 4096)) << strerror(errno);
+    ASSERT_TRUE(FillPipeExactly(destination[1], 4096)) << strerror(errno);
+
+    pid_t splice_worker = fork();
+    ASSERT_GE(splice_worker, 0) << strerror(errno);
+    ChildProcessGuard splice_guard(splice_worker);
+    if (splice_worker == 0) {
+        close(source[1]);
+        close(destination[0]);
+        close(splice_ready[0]);
+        close(writer_ready[0]);
+        close(writer_ready[1]);
+        const char marker = 'S';
+        if (!WriteAll(splice_ready[1], &marker, 1)) {
+            _exit(2);
+        }
+        close(splice_ready[1]);
+        const ssize_t copied =
+            splice(source[0], nullptr, destination[1], nullptr, 4096, 0);
+        _exit(copied == 4096 ? 0 : 3);
+    }
+
+    close(splice_ready[1]);
+    char marker = 0;
+    ASSERT_EQ(1, read(splice_ready[0], &marker, 1)) << strerror(errno);
+    ASSERT_EQ('S', marker);
+    close(splice_ready[0]);
+    if (!WaitForSleepingProcess(splice_worker)) {
+        FAIL() << "splice worker did not wait for destination space";
+    }
+
+    pid_t writer = fork();
+    ASSERT_GE(writer, 0) << strerror(errno);
+    ChildProcessGuard writer_guard(writer);
+    if (writer == 0) {
+        close(source[0]);
+        close(source[1]);
+        close(destination[0]);
+        close(splice_ready[0]);
+        close(splice_ready[1]);
+        close(writer_ready[0]);
+        const char ready = 'W';
+        if (!WriteAll(writer_ready[1], &ready, 1)) {
+            _exit(4);
+        }
+        close(writer_ready[1]);
+        const char byte = 'w';
+        _exit(write(destination[1], &byte, 1) == 1 ? 0 : 5);
+    }
+
+    close(writer_ready[1]);
+    marker = 0;
+    ASSERT_EQ(1, read(writer_ready[0], &marker, 1)) << strerror(errno);
+    ASSERT_EQ('W', marker);
+    close(writer_ready[0]);
+    if (!WaitForSleepingProcess(writer)) {
+        FAIL() << "competing writer did not wait for destination space";
+    }
+
+    std::vector<char> drained(4096);
+    ASSERT_TRUE(ReadAllInto(destination[0], drained.data(), drained.size())) << strerror(errno);
+
+    int writer_status = 0;
+    if (WaitForChild(writer, &writer_status, 20)) {
+        writer_guard.Release();
+        FAIL() << "competing writer stole space owned by the blocked splice";
+    }
+
+    std::vector<char> payload(4096, 's');
+    ASSERT_TRUE(WriteAll(source[1], payload.data(), payload.size())) << strerror(errno);
+
+    int splice_status = 0;
+    if (!WaitForChild(splice_worker, &splice_status)) {
+        FAIL() << "splice did not commit after input became readable";
+    }
+    splice_guard.Release();
+    ASSERT_TRUE(WIFEXITED(splice_status));
+    ASSERT_EQ(0, WEXITSTATUS(splice_status));
+
+    std::vector<char> copied(4096);
+    ASSERT_TRUE(ReadAllInto(destination[0], copied.data(), copied.size())) << strerror(errno);
+    EXPECT_EQ(payload, copied);
+
+    if (!WaitForChild(writer, &writer_status)) {
+        FAIL() << "competing writer did not proceed after splice data was drained";
+    }
+    writer_guard.Release();
+    ASSERT_TRUE(WIFEXITED(writer_status));
+    ASSERT_EQ(0, WEXITSTATUS(writer_status));
+    char writer_byte = 0;
+    ASSERT_EQ(1, read(destination[0], &writer_byte, 1)) << strerror(errno);
+    EXPECT_EQ('w', writer_byte);
 
     close(source[0]);
     close(source[1]);

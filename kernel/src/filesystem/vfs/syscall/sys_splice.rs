@@ -3,7 +3,7 @@ use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::FileFlags;
 use crate::filesystem::vfs::{file::File, syscall::SpliceFlags, FileType};
 use crate::ipc::kill::send_signal_to_pid;
-use crate::ipc::pipe::{LockedPipeInode, PIPE_BUF};
+use crate::ipc::pipe::LockedPipeInode;
 use crate::process::resource::RLimitID;
 use crate::process::ProcessManager;
 use crate::syscall::table::Syscall;
@@ -256,33 +256,20 @@ fn splice_file_to_pipe(
 
     let limit = len.min(4096);
     let trusted_read_limit = splice_trusted_file_read_limit(file, offset, limit);
+    let mut transaction = pipe_inode.begin_writer_transaction();
+    pipe_inode.ensure_splice_readers(&transaction)?;
     if trusted_read_limit == Some(0) {
         return Ok(0);
     }
     let wanted = trusted_read_limit.unwrap_or(limit);
 
-    let (space, wake_next_writer) = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-        let space = pipe_inode.writable_len();
-        if space == 0 && pipe_inode.has_readers() {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        if trusted_read_limit.is_some()
-            && wanted <= PIPE_BUF
-            && space < wanted
-            && pipe_inode.has_readers()
-        {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        (space, false)
+    let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+        pipe_inode.writable_for_splice_nonblock(&transaction, trusted_read_limit.map(|_| wanted))?
     } else if trusted_read_limit.is_some() {
-        pipe_inode.wait_writable_for_splice(wanted)?
+        pipe_inode.wait_writable_for_splice(&mut transaction, wanted)?
     } else {
-        pipe_inode.wait_writable_any_for_splice()?
+        pipe_inode.wait_writable_any_for_splice(&mut transaction)?
     };
-
-    // The returned space is an observation, not a reservation. Do not hold an
-    // exclusive writer wakeup baton across a potentially blocking input read.
-    pipe_inode.finish_writer_wait(wake_next_writer);
 
     let buf_size = if trusted_read_limit.is_some() && space == 0 {
         wanted
@@ -310,11 +297,7 @@ fn splice_file_to_pipe(
     buffer.truncate(read_len);
 
     // 写入 pipe
-    let written = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-        pipe_inode.write_from_splice_nonblock(&buffer)
-    } else {
-        pipe_inode.write_from_splice_blocking(&buffer)
-    };
+    let written = pipe_inode.write_from_splice_locked(&mut transaction, &buffer);
 
     match written {
         Ok(write_len) => {

@@ -871,15 +871,25 @@ impl TtyOperation for Unix98PtyDriverInner {
     }
 
     fn flush_buffer(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
-        let Some(to) = tty.link() else {
-            return Ok(());
-        };
+        let to = tty.link();
 
         if let Some(hook_arc) = tty.private_fields() {
             if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
                 hook.clear_pending_from(tty.driver().tty_driver_sub_type())?;
+                // clear_pending_from() can satisfy a concurrent drain wait in
+                // exactly the same way as normal queue delivery.  Wake the
+                // source endpoint after making the zero-backlog state visible.
+                if let Some(to) = to.as_ref() {
+                    PtyDevPtsLink::wake_source_writer(to);
+                } else {
+                    tty.write_wq().wakeup_all();
+                }
             }
         }
+
+        let Some(to) = to else {
+            return Ok(());
+        };
 
         if to.core().contorl_info_irqsave().packet {
             tty.contorl_info_irqsave()

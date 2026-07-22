@@ -76,6 +76,18 @@ private:
     int fd_ = -1;
 };
 
+class TermiosRestorer {
+public:
+    TermiosRestorer(int fd, const struct termios& term) : fd_(fd), term_(term) {}
+    TermiosRestorer(const TermiosRestorer&) = delete;
+    TermiosRestorer& operator=(const TermiosRestorer&) = delete;
+    ~TermiosRestorer() { tcsetattr(fd_, TCSANOW, &term_); }
+
+private:
+    int fd_;
+    struct termios term_;
+};
+
 struct PtyPair {
     UniqueFd master;
     UniqueFd slave;
@@ -435,6 +447,49 @@ TEST(TtyTermios, TermioMergeHighBits) {
         << "TCSETA should preserve high 16 bits of c_cflag";
     EXPECT_EQ(full.c_lflag & ECHO, 0u)
         << "TCSETA should apply low-16-bit change";
+}
+
+/* --------------------------------------------------------------------------
+ * Serial8250 termios must reach the UART hardware callback. Before the
+ * regression fix the default ENOSYS callback made the TTY core restore all
+ * hardware-related c_cflag bits even though tcsetattr/ioctl returned success.
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, Serial8250AppliesModernAndLegacySettings) {
+    UniqueFd serial(open("/dev/ttyS0", O_RDWR | O_NOCTTY));
+    if (serial.get() < 0) {
+        GTEST_SKIP() << "cannot open /dev/ttyS0: " << strerror(errno);
+        return;
+    }
+
+    struct termios original = {};
+    ASSERT_EQ(tcgetattr(serial.get(), &original), 0) << strerror(errno);
+    TermiosRestorer restore(serial.get(), original);
+
+    struct termios modern = original;
+    modern.c_cflag &= ~(CSIZE | CSTOPB | PARODD);
+    modern.c_cflag |= CS7 | PARENB;
+    ASSERT_EQ(cfsetispeed(&modern, B9600), 0);
+    ASSERT_EQ(cfsetospeed(&modern, B9600), 0);
+    ASSERT_EQ(tcsetattr(serial.get(), TCSANOW, &modern), 0) << strerror(errno);
+
+    struct termios modern_back = {};
+    ASSERT_EQ(tcgetattr(serial.get(), &modern_back), 0) << strerror(errno);
+    EXPECT_EQ(cfgetospeed(&modern_back), static_cast<speed_t>(B9600));
+    EXPECT_EQ(modern_back.c_cflag & CSIZE, static_cast<tcflag_t>(CS7));
+    EXPECT_NE(modern_back.c_cflag & PARENB, 0u);
+    EXPECT_EQ(modern_back.c_cflag & PARODD, 0u);
+
+    TermioCompat legacy = {};
+    ASSERT_EQ(ioctl(serial.get(), TCGETA, &legacy), 0) << strerror(errno);
+    legacy.c_cflag &= ~static_cast<unsigned short>(CBAUD | CSIZE | PARENB | PARODD);
+    legacy.c_cflag |= static_cast<unsigned short>(B19200 | CS8);
+    ASSERT_EQ(ioctl(serial.get(), TCSETA, &legacy), 0) << strerror(errno);
+
+    struct termios legacy_back = {};
+    ASSERT_EQ(tcgetattr(serial.get(), &legacy_back), 0) << strerror(errno);
+    EXPECT_EQ(cfgetospeed(&legacy_back), static_cast<speed_t>(B19200));
+    EXPECT_EQ(legacy_back.c_cflag & CSIZE, static_cast<tcflag_t>(CS8));
+    EXPECT_EQ(legacy_back.c_cflag & PARENB, 0u);
 }
 
 /* --------------------------------------------------------------------------

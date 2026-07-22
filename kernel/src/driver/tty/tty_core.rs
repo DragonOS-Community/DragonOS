@@ -409,7 +409,7 @@ impl TtyCore {
 
         #[allow(unused_assignments)]
         // TERMIOS_TERMIO下会用到
-        let mut tmp_termios = *tty.core().termios();
+        let mut tmp_termios = tty.core().committed_termios_snapshot();
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
             let user_reader = UserBufferReader::new(

@@ -22,7 +22,7 @@ use crate::{
         tty::{
             console::ConsoleSwitch,
             kthread::{enqueue_tty_rx_byte_to_target_from_irq, TtyInputTarget},
-            termios::WindowSize,
+            termios::{ControlMode, Termios, WindowSize},
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
             tty_port::TtyInputByteResult,
@@ -39,6 +39,7 @@ use crate::{
     },
     libs::{rwsem::RwSem, spinlock::SpinLock},
     process::ProcessManager,
+    sched::sched_yield,
     time::{sleep::nanosleep, Duration, Instant, PosixTimeSpec},
 };
 use system_error::SystemError;
@@ -138,6 +139,8 @@ pub struct Serial8250PIOPort {
     rx_paused: AtomicBool,
     rx_state: SpinLock<Serial8250RxState>,
     tx_state: SpinLock<Serial8250TxState>,
+    /// Serializes the DLAB register-alias window against runtime UART I/O.
+    hw_lock: SpinLock<()>,
     console_owner: AtomicUsize,
     inner: RwSem<Serial8250PIOPortInner>,
 }
@@ -147,6 +150,7 @@ struct Serial8250RxState {
     input_target: Option<TtyInputTarget>,
     ier: u8,
     irq_registered: bool,
+    receiver_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -174,6 +178,7 @@ impl Serial8250RxState {
             input_target: None,
             ier: 0,
             irq_registered: false,
+            receiver_enabled: true,
         }
     }
 }
@@ -189,6 +194,7 @@ impl Serial8250PIOPort {
             rx_paused: AtomicBool::new(false),
             rx_state: SpinLock::new(Serial8250RxState::new()),
             tx_state: SpinLock::new(Serial8250TxState::new()),
+            hw_lock: SpinLock::new(()),
             console_owner: AtomicUsize::new(SERIAL_8250_CONSOLE_OWNER_NONE),
             inner: RwSem::new(Serial8250PIOPortInner::new()),
         };
@@ -248,9 +254,10 @@ impl Serial8250PIOPort {
     }
 
     const fn check_baudrate(&self, baudrate: &BaudRate) -> Result<(), SystemError> {
-        // 错误的比特率
-        if baudrate.data() > Self::SERIAL8250PIO_MAX_BAUD_RATE.data()
-            || Self::SERIAL8250PIO_MAX_BAUD_RATE.data() % baudrate.data() != 0
+        let baud = baudrate.data();
+        if baud == 0
+            || baud > Self::SERIAL8250PIO_MAX_BAUD_RATE.data()
+            || Self::SERIAL8250PIO_MAX_BAUD_RATE.data().div_ceil(baud) > u16::MAX as u32
         {
             return Err(SystemError::EINVAL);
         }
@@ -274,10 +281,11 @@ impl Serial8250PIOPort {
 
     /// 读取一个字节，如果没有数据则返回None
     fn read_one_byte(&self) -> Option<u8> {
-        if !self.serial_received() {
+        let _guard = self.hw_lock.lock_irqsave();
+        if self.serial_in_raw(5) & 1 == 0 {
             return None;
         }
-        return Some(self.serial_in(0) as u8);
+        Some(self.serial_in_raw(0) as u8)
     }
 
     fn set_input_target(&self, target: Option<TtyInputTarget>) {
@@ -351,15 +359,17 @@ impl Serial8250PIOPort {
             // THRE must be sampled after taking tx_state: both process and
             // IRQ contexts can pump this port, and a pre-lock sample becomes
             // stale as soon as another context fills the FIFO.
-            if self.is_transmit_empty() {
+            let _hw_guard = self.hw_lock.lock_irqsave();
+            if self.serial_in_raw(5) & 0x20 != 0 {
                 while sent < self.tx_fifo_size.load(Ordering::Acquire) {
                     let Some(byte) = queue.pop_front() else {
                         break;
                     };
-                    self.serial_out(0, byte.into());
+                    self.serial_out_raw(0, byte.into());
                     sent += 1;
                 }
             }
+            drop(_hw_guard);
             let pending = !queue.is_empty();
             let pending_after = queue.len();
             let should_wake = pending_before != 0
@@ -628,18 +638,29 @@ impl Serial8250PIOPort {
 
     fn pump_rx(&self) -> Result<(), SystemError> {
         let mut rx_state = self.rx_state.lock_irqsave();
-        let Some(target) = rx_state.input_target.as_ref() else {
+        let Some(target) = rx_state.input_target.clone() else {
             self.rx_paused.store(false, Ordering::Release);
             self.set_rx_interrupt_enabled_locked(&mut rx_state, false);
             return Ok(());
         };
+
+        if !rx_state.receiver_enabled {
+            for _ in 0..SERIAL_8250_RX_IRQ_LIMIT {
+                if self.read_one_byte().is_none() {
+                    break;
+                }
+            }
+            self.rx_paused.store(false, Ordering::Release);
+            self.set_rx_interrupt_enabled_locked(&mut rx_state, true);
+            return Ok(());
+        }
 
         // Linux serial8250_rx_chars also keeps a 256-byte bound to avoid
         // unbounded RX IRQ/softirq CPU occupation.
         let mut received = 0;
         for _ in 0..SERIAL_8250_RX_IRQ_LIMIT {
             let mut producer = || self.read_one_byte();
-            match enqueue_tty_rx_byte_to_target_from_irq(target, &mut producer) {
+            match enqueue_tty_rx_byte_to_target_from_irq(&target, &mut producer) {
                 TtyInputByteResult::Enqueued => {
                     received += 1;
                     self.rx_paused.store(false, Ordering::Release);
@@ -668,6 +689,152 @@ impl Serial8250PIOPort {
         }
         tx_state.tty = tty;
     }
+
+    fn line_control(control_mode: ControlMode) -> u8 {
+        let mut lcr = match control_mode.intersection(ControlMode::CSIZE) {
+            ControlMode::CS5 => 0,
+            ControlMode::CS6 => 1,
+            ControlMode::CS7 => 2,
+            _ => 3,
+        };
+        if control_mode.contains(ControlMode::CSTOPB) {
+            lcr |= 1 << 2;
+        }
+        if control_mode.contains(ControlMode::PARENB) {
+            lcr |= 1 << 3;
+            if !control_mode.contains(ControlMode::PARODD) {
+                lcr |= 1 << 4;
+            }
+        }
+        lcr
+    }
+
+    fn baud_control_mode(baud: u32) -> Option<ControlMode> {
+        Some(match baud {
+            0 => ControlMode::B0,
+            50 => ControlMode::B50,
+            75 => ControlMode::B75,
+            110 => ControlMode::B110,
+            134 => ControlMode::B134,
+            150 => ControlMode::B150,
+            200 => ControlMode::B200,
+            300 => ControlMode::B300,
+            600 => ControlMode::B600,
+            1200 => ControlMode::B1200,
+            1800 => ControlMode::B1800,
+            2400 => ControlMode::B2400,
+            4800 => ControlMode::B4800,
+            9600 => ControlMode::B9600,
+            19200 => ControlMode::B19200,
+            38400 => ControlMode::B38400,
+            57600 => ControlMode::B57600,
+            115200 => ControlMode::B115200,
+            _ => return None,
+        })
+    }
+
+    fn encode_baud_rate(termios: &mut Termios, baud: u32) {
+        let Some(flag) = Self::baud_control_mode(baud) else {
+            return;
+        };
+        let explicit_input_baud = termios.control_mode.intersects(ControlMode::CIBAUD);
+        termios
+            .control_mode
+            .remove(ControlMode::CBAUD | ControlMode::CIBAUD);
+        termios.control_mode.insert(flag);
+        if explicit_input_baud {
+            termios
+                .control_mode
+                .insert(ControlMode::from_bits_truncate(flag.bits() << 16));
+        }
+        termios.input_speed = baud;
+        termios.output_speed = baud;
+    }
+
+    /// Apply the 8250 line settings as one register transaction.
+    ///
+    /// DLAB aliases offsets 0/1 with THR/RBR/IER. The established lock order
+    /// is tx_state -> rx_state -> hw_lock, matching the TX and console paths.
+    fn apply_line_settings(
+        &self,
+        control_mode: ControlMode,
+        requested_baud: u32,
+        fallback_baud: u32,
+    ) -> Result<u32, SystemError> {
+        let visible_baud = if requested_baud == 0 {
+            0
+        } else if requested_baud <= Self::SERIAL8250PIO_MAX_BAUD_RATE.data() {
+            requested_baud
+        } else {
+            if fallback_baud <= Self::SERIAL8250PIO_MAX_BAUD_RATE.data() {
+                fallback_baud
+            } else {
+                Self::SERIAL8250PIO_MAX_BAUD_RATE.data()
+            }
+        };
+        // Linux programs a safe divisor while B0 controls hangup via MCR.
+        let hardware_baud = BaudRate::new(if visible_baud == 0 {
+            9600
+        } else {
+            visible_baud
+        });
+        self.check_baudrate(&hardware_baud)?;
+
+        // Runtime and emergency console paths release tx_state while polling
+        // the UART, but keep console_active set for their whole transaction.
+        let _tx_state = loop {
+            let guard = self.tx_state.lock_irqsave();
+            if !guard.console_active {
+                break guard;
+            }
+            drop(guard);
+            sched_yield();
+        };
+        let mut rx_state = self.rx_state.lock_irqsave();
+        rx_state.receiver_enabled = control_mode.contains(ControlMode::CREAD);
+        let _hw_guard = self.hw_lock.lock_irqsave();
+        let port = self.iobase as u16;
+        let lcr = Self::line_control(control_mode);
+
+        unsafe {
+            // Stop UART interrupts before offset 1 becomes DLM.
+            CurrentPortIOArch::out8(port + 1, 0);
+            let divisor = self.divisor(hardware_baud).0;
+            CurrentPortIOArch::out8(port + 3, lcr | 0x80);
+            CurrentPortIOArch::out8(port, (divisor & 0xff) as u8);
+            CurrentPortIOArch::out8(port + 1, ((divisor >> 8) & 0xff) as u8);
+            CurrentPortIOArch::out8(port + 3, lcr);
+
+            // Only B0 transitions change DTR/RTS; ordinary format changes
+            // preserve independently managed modem-control state.
+            let mcr = CurrentPortIOArch::in8(port + 4);
+            let mcr = if fallback_baud != 0 && visible_baud == 0 {
+                mcr & !0x03
+            } else if fallback_baud == 0 && visible_baud != 0 {
+                mcr | 0x03
+            } else {
+                mcr
+            };
+            CurrentPortIOArch::out8(port + 4, mcr);
+            let ier = if rx_state.irq_registered {
+                rx_state.ier
+            } else {
+                0
+            };
+            CurrentPortIOArch::out8(port + 1, ier);
+        }
+
+        self.baudrate.store(hardware_baud, Ordering::Release);
+        Ok(visible_baud)
+    }
+
+    fn serial_in_raw(&self, offset: u32) -> u32 {
+        unsafe { CurrentPortIOArch::in8(self.iobase as u16 + offset as u16).into() }
+    }
+
+    fn serial_out_raw(&self, offset: u32, value: u32) {
+        unsafe { CurrentPortIOArch::out8(self.iobase as u16 + offset as u16, value as u8) }
+    }
 }
 
 impl Serial8250Port for Serial8250PIOPort {
@@ -682,16 +849,18 @@ impl Serial8250Port for Serial8250PIOPort {
 
 impl UartPort for Serial8250PIOPort {
     fn serial_in(&self, offset: u32) -> u32 {
-        unsafe { CurrentPortIOArch::in8(self.iobase as u16 + offset as u16).into() }
+        let _guard = self.hw_lock.lock_irqsave();
+        self.serial_in_raw(offset)
     }
 
     fn serial_out(&self, offset: u32, value: u32) {
         // warning: pio的串口只能写入8位，因此这里丢弃高24位
-        unsafe { CurrentPortIOArch::out8(self.iobase as u16 + offset as u16, value as u8) }
+        let _guard = self.hw_lock.lock_irqsave();
+        self.serial_out_raw(offset, value)
     }
 
     fn divisor(&self, baud: BaudRate) -> (u32, DivisorFraction) {
-        let divisor = Self::SERIAL8250PIO_MAX_BAUD_RATE.data() / baud.data();
+        let divisor = (Self::SERIAL8250PIO_MAX_BAUD_RATE.data() + baud.data() / 2) / baud.data();
         return (divisor, DivisorFraction::new(0));
     }
 
@@ -856,6 +1025,33 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
 
         while !port.is_transmitter_idle() && Instant::now() < deadline {
             nanosleep(PosixTimeSpec::new(0, 1_000_000))?;
+        }
+        Ok(())
+    }
+
+    fn set_termios(&self, tty: Arc<TtyCore>, old_termios: Termios) -> Result<(), SystemError> {
+        let index = tty.core().index();
+        let port =
+            unsafe { PIO_PORTS.get(index).and_then(Option::as_ref) }.ok_or(SystemError::ENODEV)?;
+        let termios = *tty.core().termios();
+        let applied_baud = port.apply_line_settings(
+            termios.control_mode,
+            termios.output_speed,
+            old_termios.output_speed,
+        )?;
+        if !termios.control_mode.contains(ControlMode::CREAD) {
+            // A full TTY input queue may have paused RX and masked its IRQ.
+            // Drain already-received bytes now so CREAD-off data cannot be
+            // delivered after the receiver is enabled again.
+            port.pump_rx()?;
+        }
+
+        // Linux falls back to the previous supported baud when a request is
+        // outside the hardware range. Keep the cached hardware fields aligned
+        // with the divisor selected above. B0 intentionally remains zero.
+        if applied_baud != termios.output_speed {
+            let mut current = tty.core().termios_write();
+            Serial8250PIOPort::encode_baud_rate(&mut current, applied_baud);
         }
         Ok(())
     }

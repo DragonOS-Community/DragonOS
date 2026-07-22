@@ -8,6 +8,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::{SigChildCode, Signal},
     driver::tty::tty_core::TtyCore,
+    ipc::sighand::ReapTransition,
     ipc::signal_types::SignalFlags,
     process::{namespace::user_namespace::map_id_up, pid::PidType, ptrace, wait::WaitSelector},
     syscall::user_access::UserBufferWriter,
@@ -17,7 +18,7 @@ use super::{
     abi::WaitOption,
     dec_visible_thread_count,
     resource::{RUsage, RUsageWho},
-    ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
+    ProcessControlBlock, ProcessFlags, ProcessManager, RawPid, PTRACE_RELATION_LOCK,
 };
 
 const DEFAULT_OVERFLOW_UID: u32 = 65534;
@@ -46,14 +47,7 @@ fn wstatus_to_waitid_exit_info(raw_wstatus: i32) -> (i32, i32) {
 
 /// mt-exec: de_thread 正在接管旧线程组时，禁止 wait 路径提前回收其他线程。
 fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
-    if !child_pcb.sighand().flags_contains(SignalFlags::GROUP_EXEC) {
-        return false;
-    }
-    let exec_task = child_pcb.sighand().group_exec_task();
-    exec_task
-        .as_ref()
-        .map(|t| !Arc::ptr_eq(t, child_pcb))
-        .unwrap_or(true)
+    child_pcb.sighand().reap_blocked_by_group_exec(child_pcb)
 }
 
 fn delay_group_leader(child_pcb: &Arc<ProcessControlBlock>) -> bool {
@@ -463,9 +457,27 @@ fn report_wait_event(
     relation: WaitRelation,
     kwo: &mut KernelWaitOption,
 ) -> CandidateDecision {
-    if !relation_is_eligible(child_pcb, relation, kwo.options)
-        || !child_matches_wait_options(child_pcb, kwo.options, relation)
-    {
+    if !relation_is_eligible(child_pcb, relation, kwo.options) {
+        return CandidateDecision::Ineligible;
+    }
+    // A TGID lookup can select the old leader immediately before de_thread
+    // publishes exit_signal = -1.  It is no longer the natural-child leader,
+    // but the same PID may already resolve to the promoted exec task.  Retry
+    // instead of turning this transient identity snapshot into ECHILD.
+    if relation == WaitRelation::Natural && !child_pcb.is_thread_group_leader() {
+        return CandidateDecision::Pending { can_change: true };
+    }
+    if !child_matches_wait_options(child_pcb, kwo.options, relation) {
+        // de_thread changes the old leader from a SIGCHLD child to a detached
+        // thread while transferring the visible TGID to the exec task.  The
+        // PID lookup and this exit_signal load are not covered by Linux's
+        // tasklist_lock in DragonOS, so a waiter can transiently select the
+        // old leader and then observe its post-handoff exit_signal.  Keep the
+        // candidate retryable until the explicit group-exec transaction is
+        // complete; the next scan will resolve the promoted leader.
+        if relation == WaitRelation::Natural && reap_blocked_by_group_exec(child_pcb) {
+            return CandidateDecision::Pending { can_change: true };
+        }
         return CandidateDecision::Ineligible;
     }
 
@@ -479,14 +491,50 @@ fn report_wait_event(
     // A zombie leader with live subthreads is still an eligible child even when
     // the caller did not request WEXITED; otherwise waitid(WSTOPPED|WNOHANG)
     // would incorrectly report ECHILD while the thread group can still change.
-    let delayed_zombie =
-        is_zombie && (delay_group_leader(child_pcb) || reap_blocked_by_group_exec(child_pcb));
+    let delayed_zombie = is_zombie
+        && (delay_group_leader(child_pcb)
+            || match relation {
+                WaitRelation::Natural => child_pcb.sighand().natural_reap_blocked(child_pcb),
+                WaitRelation::Ptraced => reap_blocked_by_group_exec(child_pcb),
+            });
     if is_zombie && !delayed_zombie && kwo.options.contains(WaitOption::WEXITED) {
         let Some(raw_wstatus) = state.raw_wstatus().map(|status| status as i32) else {
             return CandidateDecision::Pending { can_change: false };
         };
-        if !kwo.options.contains(WaitOption::WNOWAIT) && !child_pcb.try_mark_dead_from_zombie() {
-            return CandidateDecision::Ineligible;
+        let consume = !kwo.options.contains(WaitOption::WNOWAIT);
+        match relation {
+            WaitRelation::Natural => {
+                let transition = child_pcb
+                    .sighand()
+                    .try_reap_natural_child(child_pcb, consume);
+                let expected = if consume {
+                    ReapTransition::Reaped
+                } else {
+                    ReapTransition::Reportable
+                };
+                if transition == ReapTransition::Blocked {
+                    return CandidateDecision::Pending { can_change: true };
+                }
+                if transition != expected {
+                    return CandidateDecision::Ineligible;
+                }
+            }
+            WaitRelation::Ptraced => {
+                let transition = child_pcb
+                    .sighand()
+                    .try_reap_ptraced_child(child_pcb, consume);
+                let expected = if consume {
+                    ReapTransition::Reaped
+                } else {
+                    ReapTransition::Reportable
+                };
+                if transition == ReapTransition::Blocked {
+                    return CandidateDecision::Pending { can_change: true };
+                }
+                if transition != expected {
+                    return CandidateDecision::Ineligible;
+                }
+            }
         }
 
         let pid = wait_visible_pid(child_pcb);
@@ -496,7 +544,7 @@ fn report_wait_event(
         kwo.ret_status = raw_wstatus;
         kwo.ret_info = Some(waitid_info(child_pcb, status, cause));
 
-        if !kwo.options.contains(WaitOption::WNOWAIT) {
+        if consume {
             account_reaped_child_rusage(&child_rusage);
             unsafe { ProcessManager::release(child_pcb.raw_pid()) };
         }
@@ -631,7 +679,6 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
             let check_child = |kwo: &mut KernelWaitOption| -> Result<Option<usize>, SystemError> {
                 let natural_child = pid.thread_group_leader_task();
                 let ptrace_child = pid.pid_task(PidType::PID);
-
                 let mut candidates = Vec::new();
                 if let Some(child_pcb) = natural_child {
                     push_wait_candidate(&mut candidates, child_pcb, WaitRelation::Natural);
@@ -818,16 +865,11 @@ impl ProcessControlBlock {
         self.flags().insert(ProcessFlags::PID_UNHASHED);
 
         let sighand = self.sighand();
-        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
-            let this = self.self_ref.upgrade();
-            let exec_task = sighand.group_exec_task();
-            let should_clear = exec_task
-                .as_ref()
-                .and_then(|t| this.as_ref().map(|me| Arc::ptr_eq(t, me)))
-                .unwrap_or(false);
-            if should_clear {
-                sighand.finish_group_exec();
-            }
+        if let Some(this) = self.self_ref.upgrade() {
+            // Pending transactions may be canceled by their owner. A committed
+            // old-leader handoff must never be cleared from an exit cleanup
+            // path; de_thread completes it uninterruptibly.
+            let _ = sighand.try_cancel_group_exec(&this);
         }
 
         let group_dead = self.is_thread_group_leader();
@@ -862,17 +904,48 @@ impl ProcessControlBlock {
 
         // 从线程组中移除。非组长线程离开 group_tasks 后，线程组 rusage 仍需保留其 CPU 时间。
         let thread_group_leader = self.threads_read_irqsave().group_leader();
+        let mut notify_leader = None;
         if let Some(leader) = thread_group_leader {
-            let mut leader_threads = leader.threads_write_irqsave();
             if !group_dead {
-                if let Some(rusage) = self.get_rusage(RUsageWho::RusageThread) {
-                    leader.add_exited_thread_group_rusage(&rusage);
+                let sighand = self.sighand();
+                // Match exit_notify's lock order. A ptrace attach/detach cannot
+                // race between the last-sibling observation and natural-parent
+                // notification ownership being claimed.
+                let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+                let leader_is_ptraced = ptrace::ptracer_of_locked(&leader).is_some();
+                let (wake_pidfd, token) =
+                    sighand.try_claim_natural_parent_notify_with(&leader, || {
+                        let mut leader_threads = leader.threads_write_irqsave();
+                        if let Some(rusage) = self.get_rusage(RUsageWho::RusageThread) {
+                            leader.add_exited_thread_group_rusage(&rusage);
+                        }
+                        leader_threads.group_tasks.retain(|pcb| {
+                            pcb.upgrade().is_some() && !Weak::ptr_eq(pcb, &self.self_ref)
+                        });
+                        let empty = leader_threads.group_tasks.is_empty();
+                        (true, !leader_is_ptraced && empty && leader.is_zombie())
+                    });
+                drop(_relation_guard);
+
+                if wake_pidfd {
+                    if let Some(pid) = leader.task_pid_ptr(PidType::PID) {
+                        pid.wake_pidfd_pollers();
+                    }
                 }
+
+                notify_leader = token.map(|token| (leader.clone(), token));
             }
-            leader_threads
-                .group_tasks
-                .retain(|pcb| !Weak::ptr_eq(pcb, &self.self_ref));
-            leader.pid().wake_pidfd_pollers();
+        }
+
+        self.mark_identity_unhash_complete();
+        if !group_dead {
+            if let Some(me) = self.self_ref.upgrade() {
+                self.sighand().complete_group_exec_task(&me);
+            }
+        }
+
+        if let Some((leader, token)) = notify_leader {
+            ProcessManager::notify_natural_parent_owned(&leader, token);
         }
     }
 

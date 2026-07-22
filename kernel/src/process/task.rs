@@ -1,4 +1,6 @@
-use core::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    fence, AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 
 use alloc::{
     ffi::CString,
@@ -22,7 +24,10 @@ use crate::{
         fs::FsStruct,
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
-    ipc::{sighand::SigHand, signal::RestartBlock},
+    ipc::{
+        sighand::{NaturalParentNotifyPhase, SigHand},
+        signal::RestartBlock,
+    },
     libs::{
         futex::futex::RobustListHead,
         lock_free_flags::LockFreeFlags,
@@ -98,6 +103,20 @@ pub struct ProcessControlBlock {
     pub(super) sig_altstack: RwLock<SigStackArch>,
     /// Exit state (Running / Zombie / Dead).
     pub(super) exit_state: AtomicU8,
+    /// `exit_notify()` has finished all producer-side work for this task.
+    ///
+    /// This is separate from `exit_state`: publishing Zombie does not imply
+    /// that pidfd or parent/tracer notification work has completed.
+    exit_notify_complete: AtomicBool,
+    /// Release/unhash has finished all identity-sensitive operations.
+    identity_unhash_complete: AtomicBool,
+    /// Group-exec transaction generation that currently accounts this task.
+    /// Zero means that no transaction owns a completion token for the task.
+    group_exec_generation: AtomicU64,
+    /// Per-leader natural-parent exit notification state. `CLONE_SIGHAND`
+    /// may share SigHand between distinct thread groups, so this state cannot
+    /// live in SigHand's single shared slot.
+    natural_parent_notify_phase: AtomicU8,
 
     /// Linux task_struct::exit_signal semantics:
     /// - -1: Non-thread-group leader (CLONE_THREAD);
@@ -315,6 +334,10 @@ impl ProcessControlBlock {
                 sighand: RcuArcSlot::new(initial_sighand.clone()),
                 sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_state: AtomicU8::new(ExitState::Running as u8),
+                exit_notify_complete: AtomicBool::new(false),
+                identity_unhash_complete: AtomicBool::new(false),
+                group_exec_generation: AtomicU64::new(0),
+                natural_parent_notify_phase: AtomicU8::new(NaturalParentNotifyPhase::Idle as u8),
                 exit_signal: AtomicI32::new(Signal::SIGCHLD as i32),
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
 
@@ -1049,6 +1072,10 @@ impl ProcessControlBlock {
         // reaper, and moving children form one tasklist-lock-like transaction.
         let mut result = Vec::new();
         let mut seen = Vec::new();
+        // All members of a thread group share the active PID namespace. A
+        // concurrently exiting sibling may already have detached its PID, so
+        // derive the namespace once from the still-attached exit notifier.
+        let owner_ns = exiting.active_pid_ns();
 
         let mut push_reparent_child =
             |child: Arc<ProcessControlBlock>, result: &mut Vec<Arc<ProcessControlBlock>>| {
@@ -1060,7 +1087,6 @@ impl ProcessControlBlock {
             };
 
         for owner in ProcessManager::thread_group_tasks_snapshot(exiting.clone()) {
-            let owner_ns = owner.active_pid_ns();
             let pids_to_rehome: Vec<RawPid> = if Arc::ptr_eq(&owner, exiting) {
                 let mut children = owner.children.write_irqsave();
                 core::mem::take(&mut *children)
@@ -1443,6 +1469,87 @@ impl ProcessControlBlock {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Publish completion of `exit_notify()` after all producer-side effects.
+    #[inline(always)]
+    pub fn mark_exit_notify_complete(&self) {
+        self.exit_notify_complete.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn exit_notify_complete(&self) -> bool {
+        self.exit_notify_complete.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn natural_parent_notify_phase(&self) -> NaturalParentNotifyPhase {
+        match self.natural_parent_notify_phase.load(Ordering::Acquire) {
+            value if value == NaturalParentNotifyPhase::Idle as u8 => {
+                NaturalParentNotifyPhase::Idle
+            }
+            value if value == NaturalParentNotifyPhase::Pending as u8 => {
+                NaturalParentNotifyPhase::Pending
+            }
+            value if value == NaturalParentNotifyPhase::Done as u8 => {
+                NaturalParentNotifyPhase::Done
+            }
+            _ => panic!("invalid natural-parent notification phase"),
+        }
+    }
+
+    pub(crate) fn try_claim_natural_parent_notify(&self) -> bool {
+        self.natural_parent_notify_phase
+            .compare_exchange(
+                NaturalParentNotifyPhase::Idle as u8,
+                NaturalParentNotifyPhase::Pending as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn complete_natural_parent_notify(&self) -> bool {
+        self.natural_parent_notify_phase
+            .compare_exchange(
+                NaturalParentNotifyPhase::Pending as u8,
+                NaturalParentNotifyPhase::Done as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Publish the tail of release/unhash after PID and thread-group identity
+    /// structures no longer reference this task as a live member.
+    #[inline(always)]
+    pub fn mark_identity_unhash_complete(&self) {
+        self.identity_unhash_complete.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn identity_unhash_complete(&self) -> bool {
+        self.identity_unhash_complete.load(Ordering::Acquire)
+    }
+
+    /// Assign this task to a group-exec transaction. The caller serializes
+    /// assignment with completion using `SigHand::inner`.
+    #[inline(always)]
+    pub fn assign_group_exec_generation(&self, generation: u64) {
+        debug_assert_ne!(generation, 0);
+        self.group_exec_generation
+            .store(generation, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn group_exec_generation(&self) -> u64 {
+        self.group_exec_generation.load(Ordering::Acquire)
+    }
+
+    /// Consume the task's single completion token. This must be called while
+    /// holding the associated `SigHand::inner` write lock.
+    #[inline(always)]
+    pub(crate) fn take_group_exec_generation(&self) -> u64 {
+        self.group_exec_generation.swap(0, Ordering::AcqRel)
     }
 
     pub fn mark_exiting(&self) {

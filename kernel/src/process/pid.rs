@@ -305,13 +305,17 @@ impl ProcessControlBlock {
         self.pid.store(pid, Ordering::Release);
     }
 
-    pub(super) fn exchange_tid_with(
+    pub(super) fn exchange_tid_with<F>(
         self: &Arc<Self>,
         other: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        if Arc::ptr_eq(self, other) {
-            return Err(SystemError::EINVAL);
-        }
+        commit_outer_identity: F,
+    ) where
+        F: FnOnce(),
+    {
+        assert!(
+            !Arc::ptr_eq(self, other),
+            "cannot exchange one task's PID identity with itself"
+        );
 
         let (first_task, second_task) = order_pcbs(self, other);
         let mut first_link = first_task.pid_links[PidType::PID as usize].pid.write();
@@ -320,11 +324,30 @@ impl ProcessControlBlock {
         let mut first_thread_pid = first_task.thread_pid.write();
         let mut second_thread_pid = second_task.thread_pid.write();
 
-        let first_pid = first_thread_pid.clone().ok_or(SystemError::EINVAL)?;
-        let second_pid = second_thread_pid.clone().ok_or(SystemError::EINVAL)?;
-        if Arc::ptr_eq(&first_pid, &second_pid) {
-            return Err(SystemError::EINVAL);
-        }
+        let first_pid = first_thread_pid
+            .clone()
+            .expect("PID identity exchange requires first task thread_pid");
+        let second_pid = second_thread_pid
+            .clone()
+            .expect("PID identity exchange requires second task thread_pid");
+        assert!(
+            !Arc::ptr_eq(&first_pid, &second_pid),
+            "PID identity exchange requires distinct struct Pid objects"
+        );
+        assert!(
+            first_link
+                .as_ref()
+                .map(|pid| Arc::ptr_eq(pid, &first_pid))
+                .unwrap_or(false),
+            "first task's PID link does not match thread_pid"
+        );
+        assert!(
+            second_link
+                .as_ref()
+                .map(|pid| Arc::ptr_eq(pid, &second_pid))
+                .unwrap_or(false),
+            "second task's PID link does not match thread_pid"
+        );
 
         let (first_pid_lock, second_pid_lock) = order_pids(&first_pid, &second_pid);
         let mut first_tasks = first_pid_lock.tasks[PidType::PID as usize].lock();
@@ -336,13 +359,25 @@ impl ProcessControlBlock {
             (second_task, first_task)
         };
 
-        replace_task_in_pid_tasks(&mut first_tasks, first_task_for_pid, second_task_for_pid)?;
-        replace_task_in_pid_tasks(&mut second_tasks, second_task_for_pid, first_task_for_pid)?;
+        // Locate both entries before changing either list.  Once the first
+        // replacement is visible this operation is the committed half of an
+        // exec identity transaction and must no longer fail.
+        let first_index = find_task_in_pid_tasks(&first_tasks, first_task_for_pid)
+            .expect("first task missing from validated struct Pid task list");
+        let second_index = find_task_in_pid_tasks(&second_tasks, second_task_for_pid)
+            .expect("second task missing from validated struct Pid task list");
+
+        first_tasks[first_index] = Arc::downgrade(second_task_for_pid);
+        second_tasks[second_index] = Arc::downgrade(first_task_for_pid);
 
         core::mem::swap(&mut *first_link, &mut *second_link);
         core::mem::swap(&mut *first_thread_pid, &mut *second_thread_pid);
 
-        Ok(())
+        // Keep every PCB/Pid identity guard alive while the caller commits
+        // raw-PID lookup and ptrace indices. Readers can then observe either
+        // the complete old identity or the complete new identity, never a
+        // Pid.tasks-only half commit.
+        commit_outer_identity();
     }
 }
 
@@ -365,18 +400,13 @@ fn order_pids<'a>(left: &'a Arc<Pid>, right: &'a Arc<Pid>) -> (&'a Arc<Pid>, &'a
     }
 }
 
-fn replace_task_in_pid_tasks(
-    tasks: &mut [Weak<ProcessControlBlock>],
-    old_task: &Arc<ProcessControlBlock>,
-    new_task: &Arc<ProcessControlBlock>,
-) -> Result<(), SystemError> {
-    for weak in tasks.iter_mut() {
-        if Weak::ptr_eq(weak, &old_task.self_ref) {
-            *weak = Arc::downgrade(new_task);
-            return Ok(());
-        }
-    }
-    Err(SystemError::ESRCH)
+fn find_task_in_pid_tasks(
+    tasks: &[Weak<ProcessControlBlock>],
+    task: &Arc<ProcessControlBlock>,
+) -> Option<usize> {
+    tasks
+        .iter()
+        .position(|candidate| Weak::ptr_eq(candidate, &task.self_ref))
 }
 
 /// 连接任务和PID的桥梁结构体

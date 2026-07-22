@@ -648,6 +648,7 @@ impl FusePendingState {
         })?
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_result_with_kind(
         &self,
     ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {

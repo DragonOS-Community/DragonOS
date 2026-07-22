@@ -37,6 +37,7 @@ use crate::{
         tasklet::{tasklet_schedule, Tasklet, TaskletData},
         InterruptArch, IrqNumber,
     },
+    filesystem::epoll::EPollEventType,
     libs::{rwsem::RwSem, spinlock::SpinLock},
     process::ProcessManager,
     sched::sched_yield,
@@ -57,6 +58,9 @@ const SERIAL_8250_TX_QUEUE_SIZE: usize = 4096;
 const SERIAL_8250_FIFO_SIZE: usize = 16;
 const SERIAL_8250_TX_WAKEUP_CHARS: usize = 256;
 const SERIAL_8250_CONSOLE_OWNER_NONE: usize = usize::MAX;
+/// Linux tty_port_init() defaults closing_wait to 30 seconds. The software
+/// queue and the physical transmitter share this single close-time budget.
+const SERIAL_8250_CLOSE_WAIT: Duration = Duration::from_secs(30);
 
 lazy_static! {
     static ref SERIAL_8250_RX_RETRY_TASKLET: Arc<Tasklet> =
@@ -134,6 +138,7 @@ pub(super) fn serial8250_pio_port_early_init() -> Result<(), SystemError> {
 pub struct Serial8250PIOPort {
     iobase: Serial8250PortBase,
     baudrate: AtomicBaudRate,
+    frame_time_us: AtomicUsize,
     initialized: AtomicBool,
     tx_fifo_size: AtomicUsize,
     rx_paused: AtomicBool,
@@ -189,6 +194,10 @@ impl Serial8250PIOPort {
         let r = Self {
             iobase,
             baudrate: AtomicBaudRate::new(baudrate),
+            // The early console starts in the conventional 8N1 format.
+            frame_time_us: AtomicUsize::new(
+                10_000_000usize.div_ceil(baudrate.data().max(1) as usize),
+            ),
             initialized: AtomicBool::new(false),
             tx_fifo_size: AtomicUsize::new(1),
             rx_paused: AtomicBool::new(false),
@@ -566,10 +575,9 @@ impl Serial8250PIOPort {
     }
 
     fn tx_batch_timeout(&self) -> Duration {
-        let baud = self.baudrate.load(Ordering::Acquire).data().max(1) as u64;
-        let char_time_us = 10_000_000u64.div_ceil(baud);
+        let frame_time_us = self.frame_time_us.load(Ordering::Acquire) as u64;
         Duration::from_micros(
-            (char_time_us * self.tx_fifo_size.load(Ordering::Acquire) as u64 * 2).max(2_000),
+            (frame_time_us * self.tx_fifo_size.load(Ordering::Acquire) as u64 * 2).max(2_000),
         )
     }
 
@@ -584,20 +592,31 @@ impl Serial8250PIOPort {
         true
     }
 
-    fn wait_for_tx_queue_empty(&self) -> Result<bool, SystemError> {
-        let pending = self.tx_pending();
-        if pending == 0 {
-            return Ok(true);
+    fn wait_for_tx_queue_empty_until(
+        &self,
+        tty: &TtyCoreData,
+        deadline: Instant,
+    ) -> Result<bool, SystemError> {
+        let remaining = deadline.saturating_sub(Instant::now());
+        if remaining == Duration::ZERO {
+            return Ok(self.tx_pending() == 0);
         }
-        let baud = self.baudrate.load(Ordering::Acquire).data().max(1) as u64;
-        let char_time_us = 10_000_000u64.div_ceil(baud);
-        let deadline =
-            Instant::now() + Duration::from_micros((char_time_us * pending as u64 * 2).max(2_000));
-        while self.tx_pending() != 0 {
-            if Instant::now() >= deadline {
+        let events = (EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as u64;
+        tty.write_wq()
+            .wait_event_interruptible_timeout(events, || self.tx_pending() == 0, remaining)
+            .map(|_| true)
+    }
+
+    fn wait_for_transmitter_idle_until(&self, deadline: Instant) -> Result<bool, SystemError> {
+        let poll_interval_us =
+            (self.frame_time_us.load(Ordering::Acquire) as u64).clamp(1_000, 100_000);
+        while !self.is_transmitter_idle() {
+            let remaining_us = deadline.saturating_sub(Instant::now()).total_micros();
+            if remaining_us == 0 {
                 return Ok(false);
             }
-            nanosleep(PosixTimeSpec::new(0, 1_000_000))?;
+            let sleep_us = poll_interval_us.min(remaining_us);
+            nanosleep(PosixTimeSpec::new(0, sleep_us as i64 * 1_000))?;
         }
         Ok(true)
     }
@@ -707,6 +726,23 @@ impl Serial8250PIOPort {
             }
         }
         lcr
+    }
+
+    fn frame_time_us(control_mode: ControlMode, baudrate: BaudRate) -> usize {
+        let data_bits = match control_mode.intersection(ControlMode::CSIZE) {
+            ControlMode::CS5 => 5,
+            ControlMode::CS6 => 6,
+            ControlMode::CS7 => 7,
+            _ => 8,
+        };
+        let parity_bits = usize::from(control_mode.contains(ControlMode::PARENB));
+        let stop_bits = if control_mode.contains(ControlMode::CSTOPB) {
+            2
+        } else {
+            1
+        };
+        let frame_bits = 1 + data_bits + parity_bits + stop_bits;
+        (frame_bits * 1_000_000).div_ceil(baudrate.data().max(1) as usize)
     }
 
     fn baud_control_mode(baud: u32) -> Option<ControlMode> {
@@ -825,6 +861,10 @@ impl Serial8250PIOPort {
         }
 
         self.baudrate.store(hardware_baud, Ordering::Release);
+        self.frame_time_us.store(
+            Self::frame_time_us(control_mode, hardware_baud),
+            Ordering::Release,
+        );
         Ok(visible_baud)
     }
 
@@ -1013,19 +1053,10 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
             return Err(SystemError::ENODEV);
         }
         let port = unsafe { PIO_PORTS[index].as_ref() }.ok_or(SystemError::ENODEV)?;
-        let baud = port.baudrate.load(Ordering::Acquire).data().max(1) as u64;
-        // 8N1 is ten bits per character. Linux bounds uart_wait_until_sent
-        // to twice the FIFO transmission time when hardware flow control is
-        // disabled.
-        let char_time_us = 10_000_000u64.div_ceil(baud);
-        let timeout = Duration::from_micros(
-            (char_time_us * (port.tx_fifo_size.load(Ordering::Acquire) as u64) * 2).max(2_000),
-        );
-        let deadline = Instant::now() + timeout;
-
-        while !port.is_transmitter_idle() && Instant::now() < deadline {
-            nanosleep(PosixTimeSpec::new(0, 1_000_000))?;
-        }
+        // Linux bounds uart_wait_until_sent to twice the FIFO transmission
+        // time when hardware flow control is disabled.
+        let deadline = Instant::now() + port.tx_batch_timeout();
+        port.wait_for_transmitter_idle_until(deadline)?;
         Ok(())
     }
 
@@ -1068,13 +1099,19 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
         let index = tty.core().index();
         let port =
             unsafe { PIO_PORTS.get(index).and_then(Option::as_ref) }.ok_or(SystemError::ENODEV)?;
-        if !port.wait_for_tx_queue_empty().unwrap_or(false) {
+        let close_deadline = Instant::now() + SERIAL_8250_CLOSE_WAIT;
+        let queue_drained = port
+            .wait_for_tx_queue_empty_until(tty.core(), close_deadline)
+            .unwrap_or(false);
+        let physical_deadline = close_deadline.min(Instant::now() + port.tx_batch_timeout());
+        let transmitter_idle = queue_drained
+            && port
+                .wait_for_transmitter_idle_until(physical_deadline)
+                .unwrap_or(false);
+        if !transmitter_idle {
             // A failed/stalled UART must not leak bytes into the next open.
             port.clear_tx();
         }
-        // Linux completes close cleanup even when a signal interrupts the
-        // best-effort physical drain.
-        let _ = self.wait_until_sent(tty.core());
         tty.ldisc().flush_buffer(tty.clone())?;
         Ok(())
     }

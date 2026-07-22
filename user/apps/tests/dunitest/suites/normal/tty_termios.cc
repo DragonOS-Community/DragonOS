@@ -493,7 +493,7 @@ TEST(TtyTermios, Serial8250AppliesModernAndLegacySettings) {
 }
 
 /* --------------------------------------------------------------------------
- * tcsetattr on non-TTY fd must fail (any error, not crash)
+ * tcsetattr on a non-TTY fd must fail with Linux's ENOTTY.
  * -------------------------------------------------------------------------- */
 TEST(TtyTermios, NonTtyFails) {
     struct termios t = {};
@@ -507,7 +507,8 @@ TEST(TtyTermios, NonTtyFails) {
     int saved_errno = errno;
     close(fd);
     EXPECT_EQ(rc, -1) << "tcsetattr on non-TTY fd should fail";
-    EXPECT_NE(saved_errno, 0) << "tcsetattr on non-TTY fd should set errno";
+    EXPECT_EQ(saved_errno, ENOTTY)
+        << "tcsetattr on non-TTY fd should report ENOTTY";
 }
 
 }  // namespace

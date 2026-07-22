@@ -175,13 +175,13 @@ int main(void) {
           "TCSETA preserves high 16 bits of c_cflag");
     CHECK_NOERR((full.c_lflag & ECHO) == 0, "TCSETA applied low-16-bit change");
 
-    /* 7. tcsetattr on a non-TTY fd must fail. The exact errno depends on
-     * the underlying device (ENOTTY, ENOSYS, EINVAL are all valid). */
+    /* 7. Linux reports ENOTTY for a termios ioctl on a non-TTY fd. */
     int nullfd = open("/dev/null", O_RDWR);
     if (nullfd >= 0) {
         errno = 0;
         int rc = tcsetattr(nullfd, TCSANOW, &t);
-        CHECK(rc == -1 && errno != 0, "tcsetattr on /dev/null fails");
+        CHECK(rc == -1 && errno == ENOTTY,
+              "tcsetattr on /dev/null fails with ENOTTY");
         close(nullfd);
     } else {
         printf("skip: cannot open /dev/null (errno=%d: %s)\n", errno, strerror(errno));

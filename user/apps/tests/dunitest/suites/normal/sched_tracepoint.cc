@@ -114,13 +114,13 @@ TEST(SchedProcessExecTp, EventFilesExist) {
     std::string enable = read_all(file);
     EXPECT_NE(std::string::npos, enable.find("0")) << "enable not '0' by default: " << enable;
 
-    // id 应为数字。
+    // id 应为非负整数（DragonOS tracepoint id 从 0 开始递增分配）。
     snprintf(file, sizeof(file), "%s/id", base);
     std::string id = read_all(file);
     EXPECT_FALSE(id.empty());
     char* end = nullptr;
     long idval = strtol(id.c_str(), &end, 10);
-    EXPECT_GT(idval, 0) << "invalid id: " << id;
+    EXPECT_GE(idval, 0) << "invalid id: " << id;
 
     EXPECT_EQ(0, umount(root)) << strerror(errno);
     EXPECT_EQ(0, rmdir(root)) << strerror(errno);

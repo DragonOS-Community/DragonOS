@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acpi"
 version = "5.0.0"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git?rev=282df2af7b#282df2af7b9edee629af391005c2a6b89e73f88c"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git?rev=1bbdc9767ac72725fa7bdbc53260b5b6baa2bce1#1bbdc9767ac72725fa7bdbc53260b5b6baa2bce1"
 dependencies = [
  "bit_field",
  "bitflags 2.9.1",
@@ -42,7 +42,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "aml"
 version = "0.16.4"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git?rev=282df2af7b#282df2af7b9edee629af391005c2a6b89e73f88c"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git?rev=1bbdc9767ac72725fa7bdbc53260b5b6baa2bce1#1bbdc9767ac72725fa7bdbc53260b5b6baa2bce1"
 dependencies = [
  "bit_field",
  "bitvec",

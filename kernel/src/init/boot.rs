@@ -193,20 +193,22 @@ pub fn boot_callbacks() -> &'static dyn BootCallbacks {
     *p
 }
 
-pub(super) fn boot_callback_except_early() {
-    let mut boot_params = boot_params().write();
-    boot_params.bootloader_name = boot_callbacks()
+pub(super) fn boot_callback_except_early() -> Result<(), SystemError> {
+    let bootloader_name = boot_callbacks()
         .init_bootloader_name()
         .expect("Failed to init bootloader name");
-    boot_params.acpi = boot_callbacks()
-        .init_acpi_args()
-        .unwrap_or(BootloaderAcpiArg::NotProvided);
+    let acpi = boot_callbacks().init_acpi_args()?;
+
+    let mut boot_params = boot_params().write();
+    boot_params.bootloader_name = bootloader_name;
+    boot_params.acpi = acpi;
+    Ok(())
 }
 
 /// ACPI information from the bootloader.
 #[derive(Copy, Clone, Debug)]
 pub enum BootloaderAcpiArg {
-    /// The bootloader does not provide one, a manual search is needed.
+    /// No ACPI root-table argument is available to the ACPI manager.
     NotProvided,
     /// Physical address of the RSDP.
     #[allow(dead_code)]

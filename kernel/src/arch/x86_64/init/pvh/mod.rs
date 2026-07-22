@@ -21,6 +21,8 @@ use crate::{
 
 mod param;
 
+use super::rsdp::{cache_bios_rsdp_result, cached_bios_rsdp};
+
 static START_INFO: Lazy<HvmStartInfo> = Lazy::new();
 
 struct PvhBootCallback;
@@ -31,12 +33,29 @@ impl BootCallbacks for PvhBootCallback {
     }
 
     fn init_acpi_args(&self) -> Result<BootloaderAcpiArg, SystemError> {
-        let rsdp_paddr = PhysAddr::new(START_INFO.get().rsdp_paddr as usize);
+        let si = START_INFO.get();
+        log::info!(
+            "pvh: HvmStartInfo: magic={:#010x} version={} flags={:#x} nr_modules={} rsdp_paddr={:#x} memmap_paddr={:#x} memmap_entries={}",
+            si.magic, si.version, si.flags, si.nr_modules,
+            si.rsdp_paddr, si.memmap_paddr, si.memmap_entries
+        );
+
+        let rsdp_paddr = PhysAddr::new(si.rsdp_paddr as usize);
+
+        // if RSDP has been provided
         if rsdp_paddr.data() != 0 {
-            Ok(BootloaderAcpiArg::Rsdp(rsdp_paddr))
-        } else {
-            Ok(BootloaderAcpiArg::NotProvided)
+            return Ok(BootloaderAcpiArg::Rsdp(rsdp_paddr));
         }
+
+        // The bootloader did not provide an RSDP. Consume the shared x86
+        // early-discovery result without touching EarlyIoRemap after mm_init.
+        if let Some(paddr) = cached_bios_rsdp()? {
+            log::info!("pvh: found RSDP at {:#x}", paddr.data());
+            return Ok(BootloaderAcpiArg::Rsdp(paddr));
+        }
+
+        log::warn!("pvh: RSDP not found");
+        Ok(BootloaderAcpiArg::NotProvided)
     }
 
     fn init_kernel_cmdline(&self) -> Result<(), SystemError> {
@@ -86,7 +105,7 @@ impl BootCallbacks for PvhBootCallback {
 
                 total_mem_size += size;
                 match typ {
-                    param::E820Type::Ram => {
+                    E820Type::Ram => {
                         usable_mem_size += size;
                         mem_block_manager()
                             .add_block(start, size)
@@ -121,6 +140,16 @@ impl BootCallbacks for PvhBootCallback {
             total_mem_size,
             usable_mem_size
         );
+
+        // Discover the RSDP here, in the early boot stage: the bootstrap page
+        // table is still active and mm_init has not run yet, so EarlyIoRemap may
+        // be used safely (this mirrors Linux, which scans the RSDP in setup_arch
+        // via early_memremap). If the bootloader already provided rsdp_paddr we
+        // skip the scan. The result is cached for init_acpi_args.
+        if start_info.rsdp_paddr == 0 {
+            cache_bios_rsdp_result();
+        }
+
         Ok(())
     }
 

@@ -40,7 +40,6 @@ pub struct SocketMmapLayout {
 /// # `Socket` methods
 /// ## Reference
 /// - [Posix standard](https://pubs.opengion.org/onlinepubs/9699919799/)
-
 pub trait Socket: PollableInode + IndexNode {
     /// Open-file refcount for this socket.
     ///

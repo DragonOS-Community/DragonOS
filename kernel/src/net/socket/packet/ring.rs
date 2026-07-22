@@ -377,8 +377,8 @@ impl PacketRing {
             *(dst.add(sll_off + 2) as *mut u16) = meta.protocol.to_be(); // sll_protocol
             *(dst.add(sll_off + 4) as *mut i32) = meta.ifindex as i32; // sll_ifindex
             *(dst.add(sll_off + 8) as *mut u16) = 1u16.to_be(); // sll_hatype = ARPHRD_ETHER
-            *(dst.add(sll_off + 10) as *mut u8) = meta.pkt_type as u8; // sll_pkttype
-            *(dst.add(sll_off + 11) as *mut u8) = 6; // sll_halen
+            *dst.add(sll_off + 10) = meta.pkt_type as u8; // sll_pkttype
+            *dst.add(sll_off + 11) = 6; // sll_halen
             core::ptr::copy_nonoverlapping(meta.src_mac.as_ptr(), dst.add(sll_off + 12), 6);
 
             // Copy packet data into the data region (starting at data_off).
@@ -436,7 +436,7 @@ pub fn validate_ring_config(
     let frame_nr = req.tp_frame_nr as usize;
 
     // block_size > 0, page-aligned.
-    if block_size == 0 || block_size % PAGE_SIZE != 0 {
+    if block_size == 0 || !block_size.is_multiple_of(PAGE_SIZE) {
         return Err(SystemError::EINVAL);
     }
     // Overflow guard: ensure block_nr * block_size does not overflow and is
@@ -450,7 +450,7 @@ pub fn validate_ring_config(
     }
     // frame_size >= hdrlen + reserve, and 16-byte aligned.
     let min_frame_size = hdrlen + reserve;
-    if frame_size < min_frame_size || frame_size % tpacket_align(1) != 0 {
+    if frame_size < min_frame_size || !frame_size.is_multiple_of(tpacket_align(1)) {
         return Err(SystemError::EINVAL);
     }
     // frames_per_block > 0.

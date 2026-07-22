@@ -6,8 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <pty.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -109,6 +111,35 @@ PtyPair OpenRawPty() {
     return pair;
 }
 
+struct TcsetattrThreadArgs {
+    int fd = -1;
+    int action = TCSANOW;
+    struct termios term = {};
+    std::atomic<bool> started{false};
+    std::atomic<bool> done{false};
+    int rc = -1;
+    int saved_errno = 0;
+};
+
+void* TcsetattrThread(void* opaque) {
+    auto* args = static_cast<TcsetattrThreadArgs*>(opaque);
+    args->started.store(true, std::memory_order_release);
+    args->rc = tcsetattr(args->fd, args->action, &args->term);
+    args->saved_errno = errno;
+    args->done.store(true, std::memory_order_release);
+    return nullptr;
+}
+
+bool WaitForFlag(const std::atomic<bool>& flag, int timeout_ms) {
+    for (int elapsed = 0; elapsed < timeout_ms; ++elapsed) {
+        if (flag.load(std::memory_order_acquire)) {
+            return true;
+        }
+        usleep(1000);
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
 /* --------------------------------------------------------------------------
  * tcgetattr + tcsetattr(TCSANOW) round-trip
  * -------------------------------------------------------------------------- */
@@ -141,6 +172,125 @@ TEST(TtyTermios, TcsadrainSucceeds) {
     struct termios t = {};
     ASSERT_EQ(tcgetattr(pty.slave.get(), &t), 0) << strerror(errno);
     EXPECT_EQ(tcsetattr(pty.slave.get(), TCSADRAIN, &t), 0) << strerror(errno);
+}
+
+/*
+ * DragonOS N_TTY can retain an echo step when the PTY bridge has no room.
+ * TCSADRAIN must wait for that ldisc-owned output to be submitted, but it
+ * must not wait for the master application to consume the entire PTY input.
+ */
+TEST(TtyTermios, TcsadrainWaitsForRetainedEchoOnly) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios t = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &t), 0) << strerror(errno);
+    t.c_iflag = 0;
+    t.c_oflag = 0;
+    t.c_lflag = ECHO | ECHOCTL;
+    ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &t), 0) << strerror(errno);
+
+    int slave_flags = fcntl(pty.slave.get(), F_GETFL, 0);
+    ASSERT_GE(slave_flags, 0);
+    ASSERT_EQ(fcntl(pty.slave.get(), F_SETFL, slave_flags | O_NONBLOCK), 0);
+
+    char fill[1024];
+    memset(fill, 'x', sizeof(fill));
+    size_t accepted = 0;
+    for (;;) {
+        ssize_t n = write(pty.slave.get(), fill, sizeof(fill));
+        if (n > 0) {
+            accepted += static_cast<size_t>(n);
+            continue;
+        }
+        ASSERT_EQ(n, -1);
+        ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+        break;
+    }
+    ASSERT_GT(accepted, 0u);
+
+    const char control = 0x01;  // ECHOCTL renders this as "^A" (two bytes).
+    ASSERT_EQ(write(pty.master.get(), &control, 1), 1) << strerror(errno);
+
+    // RX delivery and echo generation run asynchronously. Observe the byte on
+    // the slave before starting tcsetattr so the test cannot pass merely
+    // because the drain raced ahead of the retained echo step.
+    char received = 0;
+    bool input_delivered = false;
+    for (int i = 0; i < 1000; ++i) {
+        ssize_t n = read(pty.slave.get(), &received, 1);
+        if (n == 1) {
+            input_delivered = true;
+            break;
+        }
+        ASSERT_EQ(n, -1);
+        ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+        usleep(1000);
+    }
+    ASSERT_TRUE(input_delivered) << "PTY input delivery timed out";
+    ASSERT_EQ(received, control);
+
+    int master_flags = fcntl(pty.master.get(), F_GETFL, 0);
+    ASSERT_GE(master_flags, 0);
+    ASSERT_EQ(fcntl(pty.master.get(), F_SETFL, master_flags | O_NONBLOCK), 0);
+
+    TcsetattrThreadArgs args;
+    args.fd = pty.slave.get();
+    args.action = TCSADRAIN;
+    args.term = t;
+    pthread_t waiter;
+    ASSERT_EQ(pthread_create(&waiter, nullptr, TcsetattrThread, &args), 0);
+    if (!WaitForFlag(args.started, 1000)) {
+        ADD_FAILURE() << "tcsetattr thread did not start";
+        pty.master.reset();
+        pthread_join(waiter, nullptr);
+        return;
+    }
+
+    // With no room for the retained two-byte echo step, the ioctl must not
+    // report completion. This catches the old bool drain / always-true wait.
+    EXPECT_FALSE(WaitForFlag(args.done, 20));
+
+    char echo_room[2];
+    for (size_t freed = 0; freed < sizeof(echo_room); ++freed) {
+        bool got_byte = false;
+        for (int i = 0; i < 1000; ++i) {
+            ssize_t n = read(pty.master.get(), &echo_room[freed], 1);
+            if (n == 1) {
+                got_byte = true;
+                break;
+            }
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                ADD_FAILURE() << "master read failed: " << strerror(errno);
+                break;
+            }
+            usleep(1000);
+        }
+        if (!got_byte) {
+            ADD_FAILURE() << "failed to free echo byte " << freed;
+            pty.master.reset();
+            pthread_join(waiter, nullptr);
+            return;
+        }
+        if (freed == 0) {
+            EXPECT_FALSE(WaitForFlag(args.done, 20));
+        }
+    }
+    EXPECT_TRUE(WaitForFlag(args.done, 1000));
+
+    if (!args.done.load(std::memory_order_acquire)) {
+        // Closing the peer guarantees a bounded cleanup path even on failure.
+        pty.master.reset();
+    }
+    ASSERT_EQ(pthread_join(waiter, nullptr), 0);
+    ASSERT_TRUE(args.done.load(std::memory_order_acquire));
+    EXPECT_EQ(args.rc, 0) << "errno=" << args.saved_errno << " ("
+                          << strerror(args.saved_errno) << ")";
+
+    // TCSADRAIN waits for the retained echo to be accepted by the PTY driver,
+    // not for the peer to consume the already accepted backlog.
+    char backlog = 0;
+    EXPECT_EQ(read(pty.master.get(), &backlog, 1), 1);
 }
 
 /* --------------------------------------------------------------------------

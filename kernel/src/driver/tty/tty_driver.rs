@@ -529,6 +529,11 @@ pub trait TtyOperation: Sync + Send + Debug {
         0
     }
 
+    /// Wait until bytes accepted by the driver have physically left the device.
+    fn wait_until_sent(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn set_termios(&self, _tty: Arc<TtyCore>, _old_termios: Termios) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }

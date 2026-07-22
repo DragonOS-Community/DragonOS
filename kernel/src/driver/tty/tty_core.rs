@@ -18,11 +18,12 @@ use crate::{
     },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::{EventWaitQueue, WaitQueue},
     },
     mm::VirtAddr,
-    process::{pid::Pid, ProcessControlBlock},
+    process::{pid::Pid, ProcessControlBlock, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -32,7 +33,7 @@ use super::{
     tty_job_control::TtyJobCtrlManager,
     tty_ldisc::{
         ntty::{NTtyData, NTtyLinediscipline},
-        TtyLineDiscipline,
+        TtyLdiscDrainResult, TtyLineDiscipline,
     },
     tty_port::TtyPort,
     virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, DrawRegion},
@@ -131,6 +132,7 @@ impl TtyCore {
         let core = TtyCoreData {
             tty_driver: driver,
             termios: RwLock::new(termios),
+            termios_rwsem: RwSem::new(()),
             name,
             flags: RwLock::new(TtyFlag::empty()),
             count: AtomicUsize::new(0),
@@ -294,7 +296,8 @@ impl TtyCore {
         };
         match cmd {
             TtyIoctlCmd::TCGETS => {
-                let termios = PosixTermios::from_kernel_termios(&real_tty.core.termios());
+                let snapshot = real_tty.core.committed_termios_snapshot();
+                let termios = PosixTermios::from_kernel_termios(&snapshot);
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<PosixTermios>(),
                     core::mem::size_of::<PosixTermios>(),
@@ -305,7 +308,8 @@ impl TtyCore {
                 return Ok(0);
             }
             TtyIoctlCmd::TCGETA => {
-                let termio = PosixTermio::from_kernel_termios(&real_tty.core.termios());
+                let snapshot = real_tty.core.committed_termios_snapshot();
+                let termio = PosixTermio::from_kernel_termios(&snapshot);
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<PosixTermio>(),
                     core::mem::size_of::<PosixTermio>(),
@@ -429,69 +433,96 @@ impl TtyCore {
             tmp_termios = term.to_kernel_termios();
         }
 
-        if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
-            let ld = tty.ldisc();
-            let write_wq = tty.core().write_wq();
-            let core_ref = tty.core();
+        if opt.intersects(TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_FLUSH) {
+            let events = (EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as u64;
 
-            // Drain N_TTY output-processing and echo backlog.
-            // drain_output blocks on output_lock; when the hardware FIFO
-            // is full, drain_output returns Ok(false) — loop until both
-            // ldisc queues are fully drained.
-            //
-            // On PTY, chars_in_buffer always returns 0, so the
-            // wait_event_interruptible below returns immediately.
-            // The loop still converges: drain_output serialises via
-            // output_lock, and the PTY master consumes data
-            // asynchronously so the next drain_output pass sees an
-            // empty FIFO.
             loop {
-                if ld.drain_output(tty.clone())? {
-                    break;
+                let write_guard = tty.core().write_lock().lock_interruptible(false)?;
+                let termios_guard = tty.core().termios_write_lock_interruptible()?;
+
+                if Self::output_terminal_error(tty.core()) {
+                    return Err(SystemError::EIO);
                 }
-                // Hardware FIFO was full — wait for it to drain before
-                // re-draining ldisc.  Signal-interrupted waits propagate
-                // ERESTARTSYS so that Ctrl+C does not silently apply the
-                // new termios (matches Linux behaviour).
-                write_wq.wait_event_interruptible(
-                    (EPollEventType::EPOLLOUT.bits() | EPollEventType::EPOLLWRNORM.bits()) as u64,
-                    || tty.chars_in_buffer(core_ref) == 0,
-                )?;
+
+                match tty.ldisc().drain_output(tty.clone())? {
+                    TtyLdiscDrainResult::Drained => {}
+                    TtyLdiscDrainResult::NeedWriteRoom(required) => {
+                        let required = required.max(1);
+                        drop(termios_guard);
+                        drop(write_guard);
+                        tty.core().write_wq().wait_event_interruptible(events, || {
+                            Self::output_terminal_error(tty.core())
+                                || tty.write_room(tty.core()) >= required
+                                || !tty.ldisc().output_pending()
+                        })?;
+                        if Self::output_terminal_error(tty.core()) {
+                            return Err(SystemError::EIO);
+                        }
+                        continue;
+                    }
+                }
+
+                if tty.chars_in_buffer(tty.core()) != 0 {
+                    drop(termios_guard);
+                    drop(write_guard);
+                    tty.core().write_wq().wait_event_interruptible(events, || {
+                        Self::output_terminal_error(tty.core())
+                            || tty.chars_in_buffer(tty.core()) == 0
+                    })?;
+                    if Self::output_terminal_error(tty.core()) {
+                        return Err(SystemError::EIO);
+                    }
+                    continue;
+                }
+
+                // Linux flushes input and waits for the physical transmitter
+                // before tty_set_termios() takes termios_rwsem for the short
+                // attribute transaction. Keeping the write side of the
+                // semaphore across either operation can deadlock synchronous
+                // input producers and unnecessarily stalls RX at low baud.
+                drop(termios_guard);
+
+                // Linux performs input flush after the output-drain recheck.
+                if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
+                    tty.ldisc().flush_buffer(tty.clone())?;
+                }
+
+                if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
+                    tty.wait_until_sent(tty.core())?;
+                    let current = ProcessManager::current_pcb();
+                    if current.has_pending_signal_fast() && current.has_pending_not_masked_signal()
+                    {
+                        return Err(SystemError::ERESTARTSYS);
+                    }
+                    if Self::output_terminal_error(tty.core()) {
+                        return Err(SystemError::EIO);
+                    }
+                }
+
+                let termios_guard = tty.core().termios_write_lock_interruptible()?;
+                let result = Self::set_termios_locked(tty.clone(), tmp_termios);
+                drop(termios_guard);
+                drop(write_guard);
+                Self::retry_deferred_output(&tty);
+                result?;
+                return Ok(0);
             }
-            // Final wait: ensure all hardware FIFOs are empty.
-            // Returns immediately on PTY (chars_in_buffer == 0).
-            write_wq.wait_event_interruptible(
-                (EPollEventType::EPOLLOUT.bits() | EPollEventType::EPOLLWRNORM.bits()) as u64,
-                || tty.chars_in_buffer(core_ref) == 0,
-            )?;
         }
 
-        // Known limitation: a TOCTOU window exists between the final drain
-        // wait above and set_termios_next below. A concurrent writer can
-        // submit new output to the ldisc opost queue during this window,
-        // and the subsequent TERMIOS_FLUSH only flushes the input side
-        // (flush_buffer), so that output escapes drain+flush and gets
-        // transmitted under the new termios settings. Linux mitigates
-        // this by holding termios_rwsem for write across the entire
-        // set_termios call, but concurrent write() faces the same race
-        // there. This is an accepted design trade-off in DragonOS's
-        // non-blocking architecture.
-
-        // TCSAFLUSH semantics: flush must happen AFTER drain so that
-        // any input arriving during the drain is also discarded.
-        // See tty-termios-drain-bugs.md B4.
-        if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
-            let ld = tty.ldisc();
-            if let Err(e) = ld.flush_buffer(tty.clone()) {
-                log::warn!("flush_buffer failed during TCSAFLUSH: {:?}", e);
-            }
-        }
-
-        TtyCore::set_termios_next(tty, tmp_termios)?;
+        Self::set_termios_next(tty, tmp_termios)?;
         Ok(0)
     }
 
     fn set_termios_next(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
+        let termios_guard = tty.core().termios_write_lock_interruptible()?;
+        let result = Self::set_termios_locked(tty.clone(), new_termios);
+        drop(termios_guard);
+        Self::retry_deferred_output(&tty);
+        result
+    }
+
+    /// Apply termios while the caller holds `termios_write_lock_interruptible()`.
+    fn set_termios_locked(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
         let mut termios = tty.core().termios_write();
 
         let old_termios = *termios;
@@ -515,6 +546,19 @@ impl TtyCore {
         ld.set_termios(tty, Some(old_termios)).ok();
 
         Ok(())
+    }
+
+    fn output_terminal_error(core: &TtyCoreData) -> bool {
+        let flags = core.flags();
+        flags.intersects(TtyFlag::IO_ERROR | TtyFlag::HUPPED | TtyFlag::HUPPING)
+            || (flags.contains(TtyFlag::OTHER_CLOSED)
+                && core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster)
+    }
+
+    fn retry_deferred_output(tty: &Arc<TtyCore>) {
+        if tty.core().flags().contains(TtyFlag::DO_WRITE_WAKEUP) {
+            tty.tty_wakeup();
+        }
     }
 
     pub fn tty_do_resize(&self, windowsize: WindowSize) -> Result<(), SystemError> {
@@ -569,6 +613,8 @@ pub struct TtyFlowState {
 pub struct TtyCoreData {
     tty_driver: Arc<TtyDriver>,
     termios: RwLock<Termios>,
+    /// Serializes termios users with the update + driver/ldisc notification transaction.
+    termios_rwsem: RwSem<()>,
     name: String,
     flags: RwLock<TtyFlag>,
     /// 在初始化时即确定不会更改，所以这里不用加锁
@@ -653,6 +699,37 @@ impl TtyCoreData {
     #[inline]
     pub fn termios_write(&self) -> RwLockWriteGuard<'_, Termios> {
         self.termios.write_irqsave()
+    }
+
+    /// Snapshot only a fully committed termios transaction.
+    pub fn committed_termios_snapshot(&self) -> Termios {
+        let _guard = self.termios_read_lock();
+        *self.termios()
+    }
+
+    #[inline]
+    pub fn termios_read_lock(&self) -> RwSemReadGuard<'_, ()> {
+        self.termios_rwsem.read()
+    }
+
+    #[inline]
+    pub fn termios_read_lock_interruptible(&self) -> Result<RwSemReadGuard<'_, ()>, SystemError> {
+        self.termios_rwsem.read_interruptible()
+    }
+
+    #[inline]
+    pub fn termios_try_read_lock(&self) -> Option<RwSemReadGuard<'_, ()>> {
+        self.termios_rwsem.try_read()
+    }
+
+    #[inline]
+    pub fn termios_write_lock_interruptible(&self) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.termios_rwsem.write_interruptible()
+    }
+
+    #[inline]
+    pub fn termios_write_lock(&self) -> RwSemWriteGuard<'_, ()> {
+        self.termios_rwsem.write()
     }
 
     #[inline]
@@ -893,6 +970,11 @@ impl TtyOperation for TtyCore {
     #[inline]
     fn chars_in_buffer(&self, tty: &TtyCoreData) -> usize {
         return tty.tty_driver.driver_funcs().chars_in_buffer(tty);
+    }
+
+    #[inline]
+    fn wait_until_sent(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
+        tty.tty_driver.driver_funcs().wait_until_sent(tty)
     }
 
     #[inline]

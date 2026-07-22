@@ -12,6 +12,12 @@ use super::{
 
 pub mod ntty;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtyLdiscDrainResult {
+    Drained,
+    NeedWriteRoom(usize),
+}
+
 pub trait TtyLineDiscipline: Sync + Send + Debug {
     fn open(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
@@ -27,20 +33,27 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
 
     /// Drain pending ldisc output (opost + echo), blocking until complete.
     ///
-    /// Returns `Ok(true)` when everything was drained, `Ok(false)` when
-    /// output could not be fully drained (e.g. hardware FIFO full).
+    /// Returns the exact minimum driver write room needed to make progress.
     ///
-    /// Callers MUST loop on `Ok(false)`: wait for hardware write readiness,
-    /// then call `drain_output` again until it returns `Ok(true)`.  See
+    /// Callers MUST loop on `NeedWriteRoom`: wait for the requested room,
+    /// then call `drain_output` again until it returns `Drained`.  See
     /// `core_set_termios` for the canonical retry pattern.
     ///
     /// # Default implementation
     ///
-    /// Returns `Ok(true)`.  **Line disciplines that have their own output
+    /// Returns `Drained`.  **Line disciplines that have their own output
     /// queues (opost / echo) MUST override this method.**  The default
     /// causes TCSADRAIN to silently skip draining for undiscovered ldiscs.
-    fn drain_output(&self, _tty: Arc<TtyCore>) -> Result<bool, SystemError> {
-        Ok(true)
+    fn drain_output(&self, _tty: Arc<TtyCore>) -> Result<TtyLdiscDrainResult, SystemError> {
+        Ok(TtyLdiscDrainResult::Drained)
+    }
+
+    /// Whether this line discipline still owns output that has not yet been
+    /// accepted by the driver. This must not sleep: wait-queue predicates use
+    /// it to notice progress made by `write_wakeup` even when that callback
+    /// consumes all newly available driver room.
+    fn output_pending(&self) -> bool {
+        false
     }
 
     /// ## tty行规程循环读取函数
@@ -99,6 +112,19 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
         count: usize,
     ) -> Result<usize, SystemError>;
 
+    /// Receive input while the caller already holds this TTY's termios read
+    /// semaphore. PTY uses this to lock the peer before marking a direction
+    /// as actively draining, avoiding nested reader acquisition.
+    fn receive_buf2_termios_locked(
+        &self,
+        tty: Arc<TtyCore>,
+        buf: &[u8],
+        flags: Option<&[u8]>,
+        count: usize,
+    ) -> Result<usize, SystemError> {
+        self.receive_buf2(tty, buf, flags, count)
+    }
+
     /// ## 唤醒线路写者
     fn write_wakeup(&self, _tty: &TtyCore) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
@@ -122,10 +148,7 @@ impl LineDisciplineType {
             0 => Self::NTty,
             // Unknown / unsupported line disciplines fall back to NTty,
             // matching Linux behaviour (N_TTY is the default).
-            _ => {
-                log::warn!("LineDisciplineType::from_line: unknown line discipline {}, falling back to NTty", line);
-                Self::NTty
-            }
+            _ => Self::NTty,
         }
     }
 }

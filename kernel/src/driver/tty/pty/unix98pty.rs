@@ -15,8 +15,11 @@ use crate::{
         termios::{ControlCharIndex, ControlMode, InputMode, LocalMode, Termios},
         tty_core::{TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
         tty_device::{TtyDevice, TtyFilePrivateData},
-        tty_driver::{TtyDriver, TtyDriverPrivateData, TtyDriverSubType, TtyOperation},
+        tty_driver::{
+            TtyCorePrivateField, TtyDriver, TtyDriverPrivateData, TtyDriverSubType, TtyOperation,
+        },
     },
+    exception::workqueue::{Work, WorkQueue},
     filesystem::{
         devpts::DevPtsFs,
         epoll::{event_poll::EventPoll, EPollEventType},
@@ -33,6 +36,14 @@ use crate::{
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
 };
+
+lazy_static! {
+    static ref PTY_DRAIN_WQ: Arc<WorkQueue> = WorkQueue::new("pty-drain");
+}
+
+pub(super) fn pty_drain_workqueue_init() {
+    lazy_static::initialize(&PTY_DRAIN_WQ);
+}
 
 use super::{ptm_driver, pts_driver, PtyCommon};
 
@@ -73,6 +84,8 @@ struct PtyDevPtsLink {
     slave_to_master_draining: AtomicBool,
     master_to_slave_drain_requested: AtomicBool,
     slave_to_master_drain_requested: AtomicBool,
+    master_to_slave_drain_scheduled: AtomicBool,
+    slave_to_master_drain_scheduled: AtomicBool,
     master_to_slave_discarding: AtomicBool,
     slave_to_master_discarding: AtomicBool,
     master_to_slave_flushing: AtomicBool,
@@ -98,6 +111,7 @@ struct DrainResult {
     delivered: usize,
     freed_backlog: usize,
     still_pending: bool,
+    yielded: bool,
 }
 
 #[derive(Debug)]
@@ -213,6 +227,8 @@ impl PtyDevPtsLink {
             slave_to_master_draining: AtomicBool::new(false),
             master_to_slave_drain_requested: AtomicBool::new(false),
             slave_to_master_drain_requested: AtomicBool::new(false),
+            master_to_slave_drain_scheduled: AtomicBool::new(false),
+            slave_to_master_drain_scheduled: AtomicBool::new(false),
             master_to_slave_discarding: AtomicBool::new(false),
             slave_to_master_discarding: AtomicBool::new(false),
             master_to_slave_flushing: AtomicBool::new(false),
@@ -224,6 +240,14 @@ impl PtyDevPtsLink {
         match subtype {
             TtyDriverSubType::PtyMaster => Some(&self.master_to_slave),
             TtyDriverSubType::PtySlave => Some(&self.slave_to_master),
+            _ => None,
+        }
+    }
+
+    fn drain_scheduled_for_source(&self, subtype: TtyDriverSubType) -> Option<&AtomicBool> {
+        match subtype {
+            TtyDriverSubType::PtyMaster => Some(&self.master_to_slave_drain_scheduled),
+            TtyDriverSubType::PtySlave => Some(&self.slave_to_master_drain_scheduled),
             _ => None,
         }
     }
@@ -372,6 +396,7 @@ impl PtyDevPtsLink {
 
     fn write_to_peer(
         &self,
+        owner: Arc<dyn TtyCorePrivateField>,
         subtype: TtyDriverSubType,
         to: Arc<TtyCore>,
         buf: &[u8],
@@ -398,10 +423,18 @@ impl PtyDevPtsLink {
             break queue_guard.push_slice(&buf[..nr]);
         };
 
+        // Preserve the existing in-order fast path when the peer termios state
+        // is stable. If a peer termios writer is active, never block while the
+        // source endpoint may hold its own termios/output locks: defer delivery
+        // to the workqueue and break the cross-endpoint ABBA dependency.
+        let Some(_peer_termios_guard) = to.core().termios_try_read_lock() else {
+            Self::schedule_peer_drain(owner, subtype, to);
+            return Ok(accepted);
+        };
+
         if accepted == 0 {
-            let result = self.drain_to_peer(subtype, to.clone())?;
+            let result = self.drain_to_peer_termios_locked(subtype, to.clone(), usize::MAX)?;
             if result.freed_backlog != 0 {
-                // Space became available in this PTY direction.
                 Self::wake_source_writer(&to);
             }
             accepted = loop {
@@ -420,7 +453,7 @@ impl PtyDevPtsLink {
         }
 
         if accepted != 0 {
-            let result = self.drain_to_peer(subtype, to.clone())?;
+            let result = self.drain_to_peer_termios_locked(subtype, to.clone(), usize::MAX)?;
             if result.freed_backlog != 0 {
                 Self::wake_source_writer(&to);
             }
@@ -428,10 +461,78 @@ impl PtyDevPtsLink {
         Ok(accepted)
     }
 
+    fn schedule_peer_drain(
+        owner: Arc<dyn TtyCorePrivateField>,
+        subtype: TtyDriverSubType,
+        to: Arc<TtyCore>,
+    ) {
+        let Some(hook) = owner.as_any().downcast_ref::<PtyDevPtsLink>() else {
+            return;
+        };
+        let Some(scheduled) = hook.drain_scheduled_for_source(subtype) else {
+            return;
+        };
+        if scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        PTY_DRAIN_WQ.enqueue(Work::new(move || {
+            let Some(hook) = owner.as_any().downcast_ref::<PtyDevPtsLink>() else {
+                return;
+            };
+            let Some(scheduled) = hook.drain_scheduled_for_source(subtype) else {
+                return;
+            };
+
+            let result = hook.drain_to_peer_budgeted(subtype, to.clone(), 16);
+            if let Ok(result) = result.as_ref() {
+                if result.freed_backlog != 0 {
+                    Self::wake_source_writer(&to);
+                }
+            }
+
+            scheduled.store(false, Ordering::Release);
+            let should_retry = result
+                .as_ref()
+                .map(|result| result.yielded || !result.still_pending)
+                .unwrap_or(false)
+                && hook
+                    .queue_for_source(subtype)
+                    .map(|queue| !queue.lock_irqsave().is_empty())
+                    .unwrap_or(false);
+            if should_retry {
+                Self::schedule_peer_drain(owner.clone(), subtype, to.clone());
+            }
+        }));
+    }
+
     fn drain_to_peer(
         &self,
         subtype: TtyDriverSubType,
         to: Arc<TtyCore>,
+    ) -> Result<DrainResult, SystemError> {
+        let _termios_guard = to.core().termios_read_lock();
+        self.drain_to_peer_termios_locked(subtype, to.clone(), usize::MAX)
+    }
+
+    fn drain_to_peer_budgeted(
+        &self,
+        subtype: TtyDriverSubType,
+        to: Arc<TtyCore>,
+        max_chunks: usize,
+    ) -> Result<DrainResult, SystemError> {
+        let _termios_guard = to.core().termios_read_lock();
+        self.drain_to_peer_termios_locked(subtype, to.clone(), max_chunks)
+    }
+
+    fn drain_to_peer_termios_locked(
+        &self,
+        subtype: TtyDriverSubType,
+        to: Arc<TtyCore>,
+        max_chunks: usize,
     ) -> Result<DrainResult, SystemError> {
         let Some(queue) = self.queue_for_source(subtype) else {
             return Err(SystemError::ENODEV);
@@ -456,6 +557,7 @@ impl PtyDevPtsLink {
             return Ok(result);
         }
 
+        let mut chunks = 0;
         loop {
             if flushing.load(Ordering::Acquire) {
                 let _ = self.discard_requested_prefix(queue);
@@ -512,20 +614,18 @@ impl PtyDevPtsLink {
                 continue;
             }
 
-            let delivered =
-                match to
-                    .core()
-                    .port()
-                    .unwrap()
-                    .receive_buf(&chunk[..chunk_len], &[], chunk_len)
-                {
-                    Ok(delivered) => delivered,
-                    Err(err) => {
-                        let _ = self.discard_requested_prefix(queue);
-                        draining.store(false, Ordering::Release);
-                        return Err(err);
-                    }
-                };
+            let delivered = match to.core().port().unwrap().receive_buf_termios_locked(
+                &chunk[..chunk_len],
+                &[],
+                chunk_len,
+            ) {
+                Ok(delivered) => delivered,
+                Err(err) => {
+                    let _ = self.discard_requested_prefix(queue);
+                    draining.store(false, Ordering::Release);
+                    return Err(err);
+                }
+            };
             queue.lock_irqsave().advance_front(delivered);
             result.delivered += delivered;
             result.freed_backlog += delivered;
@@ -547,6 +647,13 @@ impl PtyDevPtsLink {
             }
             if delivered < chunk_len {
                 result.still_pending = true;
+                draining.store(false, Ordering::Release);
+                break;
+            }
+            chunks += 1;
+            if chunks >= max_chunks && !queue.lock_irqsave().is_empty() {
+                result.still_pending = true;
+                result.yielded = true;
                 draining.store(false, Ordering::Release);
                 break;
             }
@@ -736,7 +843,13 @@ impl TtyOperation for Unix98PtyDriverInner {
 
         if let Some(hook_arc) = tty.private_fields() {
             if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
-                return hook.write_to_peer(tty.driver().tty_driver_sub_type(), to, buf, nr);
+                return hook.write_to_peer(
+                    hook_arc.clone(),
+                    tty.driver().tty_driver_sub_type(),
+                    to,
+                    buf,
+                    nr,
+                );
             }
         }
 

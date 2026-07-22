@@ -2,16 +2,17 @@
 
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
+    collections::VecDeque,
     string::ToString,
     sync::{Arc, Weak},
 };
 
 use crate::{
-    arch::{driver::apic::ioapic::IoApic, io::PortIOArch, CurrentPortIOArch},
+    arch::{driver::apic::ioapic::IoApic, io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
     driver::{
         base::device::{
             device_number::{DeviceNumber, Major},
@@ -34,9 +35,11 @@ use crate::{
         irqdesc::{IrqHandleFlags, IrqHandler, IrqReturn},
         manage::irq_manager,
         tasklet::{tasklet_schedule, Tasklet, TaskletData},
-        IrqNumber,
+        InterruptArch, IrqNumber,
     },
     libs::{rwsem::RwSem, spinlock::SpinLock},
+    process::ProcessManager,
+    time::{sleep::nanosleep, Duration, Instant, PosixTimeSpec},
 };
 use system_error::SystemError;
 
@@ -48,6 +51,11 @@ static mut PIO_PORTS: [Option<Serial8250PIOPort>; 8] =
 const SERIAL_8250_PIO_IRQ: IrqNumber = IrqNumber::new(IoApic::VECTOR_BASE as u32 + 4);
 const SERIAL_8250_RX_IRQ_LIMIT: usize = 256;
 const SERIAL_8250_IER_RX_AVAILABLE: u8 = 0x01;
+const SERIAL_8250_IER_TX_EMPTY: u8 = 0x02;
+const SERIAL_8250_TX_QUEUE_SIZE: usize = 4096;
+const SERIAL_8250_FIFO_SIZE: usize = 16;
+const SERIAL_8250_TX_WAKEUP_CHARS: usize = 256;
+const SERIAL_8250_CONSOLE_OWNER_NONE: usize = usize::MAX;
 
 lazy_static! {
     static ref SERIAL_8250_RX_RETRY_TASKLET: Arc<Tasklet> =
@@ -126,8 +134,11 @@ pub struct Serial8250PIOPort {
     iobase: Serial8250PortBase,
     baudrate: AtomicBaudRate,
     initialized: AtomicBool,
+    tx_fifo_size: AtomicUsize,
     rx_paused: AtomicBool,
     rx_state: SpinLock<Serial8250RxState>,
+    tx_state: SpinLock<Serial8250TxState>,
+    console_owner: AtomicUsize,
     inner: RwSem<Serial8250PIOPortInner>,
 }
 
@@ -136,6 +147,25 @@ struct Serial8250RxState {
     input_target: Option<TtyInputTarget>,
     ier: u8,
     irq_registered: bool,
+}
+
+#[derive(Debug)]
+struct Serial8250TxState {
+    queue: Option<VecDeque<u8>>,
+    tty: Weak<TtyCore>,
+    console_active: bool,
+}
+
+impl Serial8250TxState {
+    fn new() -> Self {
+        Self {
+            // The PIO ports are constructed before the heap is available.
+            // Allocate the process-context TX queue later during TTY install.
+            queue: None,
+            tty: Weak::new(),
+            console_active: false,
+        }
+    }
 }
 
 impl Serial8250RxState {
@@ -155,8 +185,11 @@ impl Serial8250PIOPort {
             iobase,
             baudrate: AtomicBaudRate::new(baudrate),
             initialized: AtomicBool::new(false),
+            tx_fifo_size: AtomicUsize::new(1),
             rx_paused: AtomicBool::new(false),
             rx_state: SpinLock::new(Serial8250RxState::new()),
+            tx_state: SpinLock::new(Serial8250TxState::new()),
+            console_owner: AtomicUsize::new(SERIAL_8250_CONSOLE_OWNER_NONE),
             inner: RwSem::new(Serial8250PIOPortInner::new()),
         };
 
@@ -181,6 +214,14 @@ impl Serial8250PIOPort {
                 .unwrap(); // Set baud rate
 
             CurrentPortIOArch::out8(port + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
+                                                     // IIR[7:6] == 11b is the 16550A FIFO-enabled indication.  Older
+                                                     // 8250/16450-compatible hardware only guarantees one THR byte.
+            let fifo_size = if CurrentPortIOArch::in8(port + 2) & 0xC0 == 0xC0 {
+                SERIAL_8250_FIFO_SIZE
+            } else {
+                1
+            };
+            self.tx_fifo_size.store(fifo_size, Ordering::Release);
             CurrentPortIOArch::out8(port + 4, 0x08); // IRQs enabled, RTS/DSR clear (现代计算机上一般都不需要hardware flow control，因此不需要置位RTS/DSR)
             CurrentPortIOArch::out8(port + 4, 0x1E); // Set in loopback mode, test the serial chip
             CurrentPortIOArch::out8(port, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
@@ -226,19 +267,9 @@ impl Serial8250PIOPort {
         self.serial_in(5) & 0x20 != 0
     }
 
-    /// 发送字节
-    ///
-    /// ## 参数
-    ///
-    /// - `s`：待发送的字节
-    fn send_bytes(&self, s: &[u8]) {
-        while !self.is_transmit_empty() {
-            spin_loop();
-        }
-
-        for c in s {
-            self.serial_out(0, (*c).into());
-        }
+    /// Both the transmitter FIFO and shift register are empty.
+    fn is_transmitter_idle(&self) -> bool {
+        self.serial_in(5) & 0x40 != 0
     }
 
     /// 读取一个字节，如果没有数据则返回None
@@ -256,6 +287,309 @@ impl Serial8250PIOPort {
     fn set_rx_interrupt_enabled(&self, enabled: bool) {
         let mut rx_state = self.rx_state.lock_irqsave();
         self.set_rx_interrupt_enabled_locked(&mut rx_state, enabled);
+    }
+
+    fn set_tx_interrupt_enabled(&self, enabled: bool) {
+        let mut rx_state = self.rx_state.lock_irqsave();
+        if enabled {
+            rx_state.ier |= SERIAL_8250_IER_TX_EMPTY;
+        } else {
+            rx_state.ier &= !SERIAL_8250_IER_TX_EMPTY;
+        }
+        self.sync_ier_locked(&rx_state);
+    }
+
+    fn enqueue_tx(&self, buf: &[u8]) -> usize {
+        let accepted = {
+            let mut tx_state = self.tx_state.lock_irqsave();
+            let Some(queue) = tx_state.queue.as_mut() else {
+                return 0;
+            };
+            let room = SERIAL_8250_TX_QUEUE_SIZE.saturating_sub(queue.len());
+            let accepted = room.min(buf.len());
+            queue.extend(&buf[..accepted]);
+            accepted
+        };
+        if accepted != 0 {
+            self.pump_tx();
+        } else if self.tx_room() == 0 {
+            self.set_tx_interrupt_enabled(true);
+        }
+        accepted
+    }
+
+    fn tx_room(&self) -> usize {
+        self.tx_state
+            .lock_irqsave()
+            .queue
+            .as_ref()
+            .map(|queue| SERIAL_8250_TX_QUEUE_SIZE.saturating_sub(queue.len()))
+            .unwrap_or(0)
+    }
+
+    fn tx_pending(&self) -> usize {
+        self.tx_state
+            .lock_irqsave()
+            .queue
+            .as_ref()
+            .map(VecDeque::len)
+            .unwrap_or(0)
+    }
+
+    fn pump_tx(&self) {
+        let (sent, should_wake, tty) = {
+            let mut tx_state = self.tx_state.lock_irqsave();
+            if tx_state.console_active {
+                return;
+            }
+            let tty = tx_state.tty.upgrade();
+            let Some(queue) = tx_state.queue.as_mut() else {
+                return;
+            };
+            let pending_before = queue.len();
+            let mut sent = 0;
+            // THRE must be sampled after taking tx_state: both process and
+            // IRQ contexts can pump this port, and a pre-lock sample becomes
+            // stale as soon as another context fills the FIFO.
+            if self.is_transmit_empty() {
+                while sent < self.tx_fifo_size.load(Ordering::Acquire) {
+                    let Some(byte) = queue.pop_front() else {
+                        break;
+                    };
+                    self.serial_out(0, byte.into());
+                    sent += 1;
+                }
+            }
+            let pending = !queue.is_empty();
+            let pending_after = queue.len();
+            let should_wake = pending_before != 0
+                && (pending_after == 0
+                    || (pending_before >= SERIAL_8250_TX_WAKEUP_CHARS
+                        && pending_after < SERIAL_8250_TX_WAKEUP_CHARS));
+            // Commit IER from the same queue snapshot before enqueue/clear can
+            // mutate it, otherwise a stale disable can strand new bytes.
+            self.set_tx_interrupt_enabled(pending);
+            (sent, should_wake, tty)
+        };
+
+        if sent != 0 && should_wake {
+            if let Some(tty) = tty {
+                tty.tty_wakeup();
+            }
+        }
+    }
+
+    fn clear_tx(&self) {
+        let mut tx_state = self.tx_state.lock_irqsave();
+        if let Some(queue) = tx_state.queue.as_mut() {
+            queue.clear();
+        }
+        self.set_tx_interrupt_enabled(false);
+    }
+
+    fn submit_runtime_output(&self, s: &[u8]) {
+        // This is the legacy, no-return-value console/debug interface: unlike
+        // the TTY write callback it cannot report a short write.  Serialize it
+        // with the runtime queue, drain older TTY bytes first, then submit the
+        // whole message by polling.  Console output is intentionally
+        // synchronous; ordinary userspace TTY output remains IRQ-driven.
+        let early_guard = self.tx_state.lock_irqsave();
+        if early_guard.queue.is_none() {
+            // Timers and the interrupt pipeline are not available yet.
+            for byte in s {
+                while !self.is_transmit_empty() {
+                    spin_loop();
+                }
+                self.serial_out(0, (*byte).into());
+            }
+            return;
+        }
+        drop(early_guard);
+
+        // A PCB address is stable across migration and is also visible from a
+        // nested IRQ/exception on behalf of that task. Keep the Arc alive so
+        // the token cannot be reused while this submission owns the UART.
+        let current = ProcessManager::current_pcb();
+        let owner_token = Arc::as_ptr(&current) as usize;
+        if current.preempt_count() != 0 || !CurrentIrqArch::is_irq_enabled() {
+            match self.console_owner.compare_exchange(
+                SERIAL_8250_CONSOLE_OWNER_NONE,
+                owner_token,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.submit_emergency_output(s);
+                    self.console_owner
+                        .store(SERIAL_8250_CONSOLE_OWNER_NONE, Ordering::Release);
+                }
+                Err(owner) if owner == owner_token => self.submit_emergency_output(s),
+                Err(_) => {}
+            }
+            return;
+        }
+        loop {
+            match self.console_owner.compare_exchange(
+                SERIAL_8250_CONSOLE_OWNER_NONE,
+                owner_token,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(owner) if owner == owner_token => {
+                    self.submit_emergency_output(s);
+                    return;
+                }
+                Err(_) => {
+                    // Process-context callers may wait without pinning a CPU.
+                    if nanosleep(PosixTimeSpec::new(0, 1_000_000)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let (mut older_remaining, tty) = {
+            let mut tx_state = self.tx_state.lock_irqsave();
+            tx_state.console_active = true;
+            let pending = tx_state.queue.as_ref().map(VecDeque::len).unwrap_or(0);
+            let tty = tx_state.tty.upgrade();
+            self.set_tx_interrupt_enabled(false);
+            (pending, tty)
+        };
+        let timeout = self.tx_batch_timeout();
+        let mut healthy = true;
+
+        while older_remaining != 0 {
+            if !self.wait_for_thre(timeout) {
+                healthy = false;
+                break;
+            }
+            let mut tx_state = self.tx_state.lock_irqsave();
+            let Some(queue) = tx_state.queue.as_mut() else {
+                older_remaining = 0;
+                break;
+            };
+            let count = older_remaining
+                .min(self.tx_fifo_size.load(Ordering::Acquire))
+                .min(queue.len());
+            for _ in 0..count {
+                self.serial_out(0, queue.pop_front().unwrap().into());
+            }
+            older_remaining -= count;
+            if count == 0 {
+                break;
+            }
+        }
+
+        let mut offset = 0;
+        while healthy && offset < s.len() {
+            if !self.wait_for_thre(timeout) {
+                healthy = false;
+                break;
+            }
+            let count = (s.len() - offset).min(self.tx_fifo_size.load(Ordering::Acquire));
+            for byte in &s[offset..offset + count] {
+                self.serial_out(0, (*byte).into());
+            }
+            offset += count;
+        }
+
+        {
+            let mut tx_state = self.tx_state.lock_irqsave();
+            tx_state.console_active = false;
+            let pending = tx_state
+                .queue
+                .as_ref()
+                .map(|queue| !queue.is_empty())
+                .unwrap_or(false);
+            self.set_tx_interrupt_enabled(pending);
+        }
+        if older_remaining == 0 {
+            if let Some(tty) = tty {
+                tty.tty_wakeup();
+            }
+        }
+        if healthy {
+            self.pump_tx();
+        }
+        self.console_owner
+            .store(SERIAL_8250_CONSOLE_OWNER_NONE, Ordering::Release);
+        drop(current);
+    }
+
+    fn submit_emergency_output(&self, s: &[u8]) {
+        let Ok(mut tx_state) = self.tx_state.try_lock_irqsave() else {
+            return;
+        };
+        let inherited_console_active = tx_state.console_active;
+        tx_state.console_active = true;
+        self.set_tx_interrupt_enabled(false);
+        drop(tx_state);
+
+        let timeout = self.tx_batch_timeout();
+        if !self.wait_for_thre(timeout) {
+            let mut tx_state = self.tx_state.lock_irqsave();
+            tx_state.console_active = inherited_console_active;
+            let pending = tx_state
+                .queue
+                .as_ref()
+                .map(|queue| !queue.is_empty())
+                .unwrap_or(false);
+            self.set_tx_interrupt_enabled(pending && !inherited_console_active);
+            return;
+        }
+        // Atomic diagnostics get one bounded FIFO batch. Longer output is
+        // intentionally truncated rather than extending IRQ/exception time.
+        let count = s.len().min(self.tx_fifo_size.load(Ordering::Acquire));
+        for byte in &s[..count] {
+            self.serial_out(0, (*byte).into());
+        }
+
+        let mut tx_state = self.tx_state.lock_irqsave();
+        tx_state.console_active = inherited_console_active;
+        let pending = tx_state
+            .queue
+            .as_ref()
+            .map(|queue| !queue.is_empty())
+            .unwrap_or(false);
+        self.set_tx_interrupt_enabled(pending && !inherited_console_active);
+    }
+
+    fn tx_batch_timeout(&self) -> Duration {
+        let baud = self.baudrate.load(Ordering::Acquire).data().max(1) as u64;
+        let char_time_us = 10_000_000u64.div_ceil(baud);
+        Duration::from_micros(
+            (char_time_us * self.tx_fifo_size.load(Ordering::Acquire) as u64 * 2).max(2_000),
+        )
+    }
+
+    fn wait_for_thre(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.is_transmit_empty() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            spin_loop();
+        }
+        true
+    }
+
+    fn wait_for_tx_queue_empty(&self) -> Result<bool, SystemError> {
+        let pending = self.tx_pending();
+        if pending == 0 {
+            return Ok(true);
+        }
+        let baud = self.baudrate.load(Ordering::Acquire).data().max(1) as u64;
+        let char_time_us = 10_000_000u64.div_ceil(baud);
+        let deadline =
+            Instant::now() + Duration::from_micros((char_time_us * pending as u64 * 2).max(2_000));
+        while self.tx_pending() != 0 {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            nanosleep(PosixTimeSpec::new(0, 1_000_000))?;
+        }
+        Ok(true)
     }
 
     fn set_rx_interrupt_enabled_locked(&self, rx_state: &mut Serial8250RxState, enabled: bool) {
@@ -326,6 +660,14 @@ impl Serial8250PIOPort {
         }
         Ok(())
     }
+
+    fn set_tx_tty(&self, tty: Weak<TtyCore>) {
+        let mut tx_state = self.tx_state.lock_irqsave();
+        if tx_state.queue.is_none() {
+            tx_state.queue = Some(VecDeque::with_capacity(SERIAL_8250_TX_QUEUE_SIZE));
+        }
+        tx_state.tty = tty;
+    }
 }
 
 impl Serial8250Port for Serial8250PIOPort {
@@ -385,7 +727,9 @@ impl UartPort for Serial8250PIOPort {
     }
 
     fn handle_irq(&self) -> Result<(), SystemError> {
-        self.pump_rx()
+        self.pump_rx()?;
+        self.pump_tx();
+        Ok(())
     }
 
     fn iobase(&self) -> Option<usize> {
@@ -436,7 +780,7 @@ pub enum Serial8250PortBase {
 /// 临时函数，用于向COM1发送数据
 pub fn send_to_default_serial8250_pio_port(s: &[u8]) {
     if let Some(port) = unsafe { PIO_PORTS[0].as_ref() } {
-        port.send_bytes(s);
+        port.submit_runtime_output(s);
     }
 }
 
@@ -475,12 +819,46 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
             return Err(SystemError::ENODEV);
         }
         let pio_port = unsafe { PIO_PORTS[index].as_ref() }.ok_or(SystemError::ENODEV)?;
-        pio_port.send_bytes(&buf[..nr]);
+        Ok(pio_port.enqueue_tx(&buf[..nr]))
+    }
 
-        Ok(nr)
+    fn write_room(&self, tty: &TtyCoreData) -> usize {
+        let index = tty.index();
+        unsafe { PIO_PORTS.get(index).and_then(Option::as_ref) }
+            .map(Serial8250PIOPort::tx_room)
+            .unwrap_or(0)
+    }
+
+    fn chars_in_buffer(&self, tty: &TtyCoreData) -> usize {
+        let index = tty.index();
+        unsafe { PIO_PORTS.get(index).and_then(Option::as_ref) }
+            .map(Serial8250PIOPort::tx_pending)
+            .unwrap_or(0)
     }
 
     fn flush_chars(&self, _tty: &TtyCoreData) {}
+
+    fn wait_until_sent(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
+        let index = tty.index();
+        if index >= unsafe { PIO_PORTS.len() } {
+            return Err(SystemError::ENODEV);
+        }
+        let port = unsafe { PIO_PORTS[index].as_ref() }.ok_or(SystemError::ENODEV)?;
+        let baud = port.baudrate.load(Ordering::Acquire).data().max(1) as u64;
+        // 8N1 is ten bits per character. Linux bounds uart_wait_until_sent
+        // to twice the FIFO transmission time when hardware flow control is
+        // disabled.
+        let char_time_us = 10_000_000u64.div_ceil(baud);
+        let timeout = Duration::from_micros(
+            (char_time_us * (port.tx_fifo_size.load(Ordering::Acquire) as u64) * 2).max(2_000),
+        );
+        let deadline = Instant::now() + timeout;
+
+        while !port.is_transmitter_idle() && Instant::now() < deadline {
+            nanosleep(PosixTimeSpec::new(0, 1_000_000))?;
+        }
+        Ok(())
+    }
 
     fn put_char(&self, tty: &TtyCoreData, ch: u8) -> Result<(), SystemError> {
         self.write(tty, &[ch], 1).map(|_| ())
@@ -491,6 +869,16 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        let index = tty.core().index();
+        let port =
+            unsafe { PIO_PORTS.get(index).and_then(Option::as_ref) }.ok_or(SystemError::ENODEV)?;
+        if !port.wait_for_tx_queue_empty().unwrap_or(false) {
+            // A failed/stalled UART must not leak bytes into the next open.
+            port.clear_tx();
+        }
+        // Linux completes close cleanup even when a signal interrupts the
+        // best-effort physical drain.
+        let _ = self.wait_until_sent(tty.core());
         tty.ldisc().flush_buffer(tty.clone())?;
         Ok(())
     }
@@ -519,12 +907,14 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
         let vc = VirtConsole::new(Some(vc_data));
         let port = unsafe { PIO_PORTS[tty_index].as_ref() }.ok_or(SystemError::ENODEV)?;
         let vc_index = vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
-        self.do_install(driver, tty, vc.clone()).inspect_err(|_| {
-            vc_manager().free(vc_index);
-            port.set_input_target(None);
-            port.rx_paused.store(false, Ordering::Release);
-            port.set_rx_interrupt_enabled(false);
-        })?;
+        self.do_install(driver, tty.clone(), vc.clone())
+            .inspect_err(|_| {
+                vc_manager().free(vc_index);
+                port.set_input_target(None);
+                port.rx_paused.store(false, Ordering::Release);
+                port.set_rx_interrupt_enabled(false);
+            })?;
+        port.set_tx_tty(Arc::downgrade(&tty));
         let irq_registered = {
             let mut rx_state = port.rx_state.lock_irqsave();
             rx_state.input_target = Some(TtyInputTarget::new(vc_index, vc.port()));
@@ -535,6 +925,15 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
             retry_serial8250_pio_input();
         }
 
+        Ok(())
+    }
+
+    fn flush_buffer(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
+        let index = tty.index();
+        let port =
+            unsafe { PIO_PORTS.get(index).and_then(Option::as_ref) }.ok_or(SystemError::ENODEV)?;
+        port.clear_tx();
+        tty.write_wq().wakeup_all();
         Ok(())
     }
 }

@@ -104,6 +104,13 @@ pub struct FATFileSystem {
     root_inode: Arc<LockedFATInode>,
     /// FAT表查询缓存（LRU）
     fat_cache: Mutex<LruCache<ClusterID, ClusterID>>,
+    /// Serialize FAT chain allocation and release.
+    ///
+    /// Selecting a free cluster and publishing it in the FAT must be one
+    /// filesystem-wide transaction.  Per-inode locking is insufficient
+    /// because writeback for different files can run concurrently and select
+    /// the same free entry.  This mirrors Linux's `msdos_sb_info::fat_lock`.
+    fat_lock: Mutex<()>,
     /// 目录项扇区读-改-写串行化锁。
     ///
     /// FAT 的 `ShortDirEntry`/`LongDirEntry` 只占 32 字节，而底层 gendisk 的写入粒度是
@@ -772,6 +779,7 @@ impl FATFileSystem {
             fat_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(FAT_LRU_CACHE_SIZE).unwrap(),
             )),
+            fat_lock: Mutex::new(()),
             dirent_io_lock: Mutex::new(()),
         });
 
@@ -1044,6 +1052,7 @@ impl FATFileSystem {
     /// @return Ok(Cluster) 新获取的空闲簇
     /// @return Err(SystemError) 错误码
     pub fn allocate_cluster(&self, prev_cluster: Option<Cluster>) -> Result<Cluster, SystemError> {
+        let _fat_guard = self.fat_lock.lock();
         let end_cluster: Cluster = self.max_cluster_number();
         let start_cluster: Cluster = match self.bpb.fat_type {
             FATType::FAT32(_) => {
@@ -1080,6 +1089,11 @@ impl FATFileSystem {
             // debug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
             self.set_entry(prev_cluster, FATEntry::Next(free_cluster))?;
         }
+        // The cluster is now reserved and linked, so another allocator cannot
+        // select it.  Do not serialize data-area zeroing behind the FAT
+        // metadata lock; callers already hold the owning inode lock until this
+        // initialization completes.
+        drop(_fat_guard);
         // 清空新获取的这个簇
         self.zero_cluster(free_cluster)?;
         return Ok(free_cluster);
@@ -1089,17 +1103,15 @@ impl FATFileSystem {
     ///
     /// @param start_cluster 簇链的第一个簇
     pub fn deallocate_cluster_chain(&self, start_cluster: Cluster) -> Result<(), SystemError> {
+        let _fat_guard = self.fat_lock.lock();
         let clusters: Vec<Cluster> = self.clusters(start_cluster);
         for c in clusters {
-            self.deallocate_cluster(c)?;
+            self.deallocate_cluster_locked(c)?;
         }
         return Ok(());
     }
 
-    /// @brief 释放簇
-    ///
-    /// @param 要释放的簇
-    pub fn deallocate_cluster(&self, cluster: Cluster) -> Result<(), SystemError> {
+    fn deallocate_cluster_locked(&self, cluster: Cluster) -> Result<(), SystemError> {
         let entry: FATEntry = self.get_fat_entry(cluster)?;
         // 如果不是坏簇
         if entry != FATEntry::Bad {

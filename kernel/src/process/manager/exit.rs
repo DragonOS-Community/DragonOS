@@ -14,23 +14,32 @@ use crate::{
     },
     driver::tty::tty_job_control::TtyJobCtrlManager,
     exception::InterruptArch,
-    ipc::sighand::{NaturalParentNotifyToken, ReapTransition},
+    ipc::{
+        sighand::{NaturalParentNotifyToken, ReapTransition},
+        signal_types::{SigCode, SigInfo, SigType},
+    },
     libs::futex::{
         constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
         futex::{Futex, RobustListHead},
     },
     mm::IDLE_PROCESS_ADDRESS_SPACE,
     process::{
+        exit::wstatus_to_waitid_exit_info,
         kthread::KernelThreadMechanism,
+        namespace::user_namespace::map_id_up,
         pid::{Pid, PidType},
-        ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
+        ptrace,
+        resource::RUsageWho,
+        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
     },
-    sched::{SchedMode, __schedule_with_current},
+    sched::{cputime::ns_to_clock_t, SchedMode, __schedule_with_current},
     smp::core::smp_get_processor_id,
     syscall::user_access::clear_user_protected,
 };
 
 impl ProcessManager {
+    const DEFAULT_OVERFLOW_UID: u32 = 65534;
+
     /// Notify the parent process after a child process exits.
     #[inline(never)]
     fn exit_notify(current: &Arc<ProcessControlBlock>) {
@@ -169,6 +178,44 @@ impl ProcessManager {
         }
     }
 
+    fn child_exit_siginfo(
+        child: &Arc<ProcessControlBlock>,
+        parent: &Arc<ProcessControlBlock>,
+        signal: Signal,
+    ) -> SigInfo {
+        let raw_status = child
+            .sched_info()
+            .state()
+            .raw_wstatus()
+            .expect("natural-parent exit notification requires an exited child")
+            as i32;
+        let (status, code) = wstatus_to_waitid_exit_info(raw_status);
+        let pid = child
+            .task_pid_nr_ns(PidType::PID, Some(parent.active_pid_ns()))
+            .unwrap_or(RawPid::new(0));
+        let child_uid =
+            u32::try_from(child.cred().uid.data()).unwrap_or(Self::DEFAULT_OVERFLOW_UID);
+        let parent_user_ns = parent.cred().user_ns.clone();
+        let uid = map_id_up(&parent_user_ns.inner.lock().uid_map, child_uid)
+            .unwrap_or(Self::DEFAULT_OVERFLOW_UID);
+        let rusage = child.get_rusage(RUsageWho::RUsageSelf).unwrap_or_default();
+        let utime = i64::try_from(ns_to_clock_t(rusage.ru_utime.to_ns())).unwrap_or(i64::MAX);
+        let stime = i64::try_from(ns_to_clock_t(rusage.ru_stime.to_ns())).unwrap_or(i64::MAX);
+
+        SigInfo::new(
+            signal,
+            0,
+            SigCode::Raw(code),
+            SigType::SigChild {
+                pid,
+                uid,
+                status,
+                utime,
+                stime,
+            },
+        )
+    }
+
     /// Complete the unique natural-parent notification transaction. Signal
     /// delivery and an optional owner-authorized autoreap happen while the
     /// phase is Pending; Done is then published before the final parent wake.
@@ -193,8 +240,10 @@ impl ProcessManager {
         let autoreap = exit_signal == Signal::SIGCHLD as i32 && (ignored || no_cldwait);
 
         if exit_signal > 0 && !(autoreap && ignored) {
+            let signal = Signal::from(exit_signal);
+            let mut info = Self::child_exit_siginfo(child, &parent, signal);
             if let Err(e) =
-                crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::from(exit_signal))
+                signal.send_signal_info_to_pcb(Some(&mut info), parent.clone(), PidType::TGID)
             {
                 warn!(
                     "failed to send exit signal for {:?} to parent {:?}: {:?}",

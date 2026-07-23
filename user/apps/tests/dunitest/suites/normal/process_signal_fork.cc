@@ -12,7 +12,9 @@ TEST(ProcessSignalFork, PosixForkAndJobControlUnavailableOnWindows) {
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -89,6 +91,90 @@ private:
     pid_t child_;
 };
 
+class SignalMaskGuard {
+public:
+    explicit SignalMaskGuard(const sigset_t& blocked) : valid_(false) {
+        valid_ = sigprocmask(SIG_BLOCK, &blocked, &old_mask_) == 0;
+    }
+    SignalMaskGuard(const SignalMaskGuard&) = delete;
+    SignalMaskGuard& operator=(const SignalMaskGuard&) = delete;
+
+    ~SignalMaskGuard() {
+        if (valid_) {
+            sigprocmask(SIG_SETMASK, &old_mask_, nullptr);
+        }
+    }
+
+    bool valid() const { return valid_; }
+
+private:
+    sigset_t old_mask_ {};
+    bool valid_;
+};
+
+struct LastThreadExitArgs {
+    int ready_fd;
+    pid_t leader_tid;
+};
+
+bool PinCurrentTaskToOneAllowedCpu() {
+    cpu_set_t available;
+    CPU_ZERO(&available);
+    if (sched_getaffinity(0, sizeof(available), &available) != 0) {
+        return false;
+    }
+
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &available)) {
+            continue;
+        }
+        cpu_set_t target;
+        CPU_ZERO(&target);
+        CPU_SET(cpu, &target);
+        return sched_setaffinity(0, sizeof(target), &target) == 0;
+    }
+    errno = EINVAL;
+    return false;
+}
+
+char ReadProcTaskState(pid_t tgid, pid_t tid) {
+    char path[128] {};
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", tgid, tid);
+    FILE* stat_file = fopen(path, "r");
+    if (stat_file == nullptr) {
+        return '\0';
+    }
+
+    char line[1024] {};
+    char state = '\0';
+    if (fgets(line, sizeof(line), stat_file) != nullptr) {
+        char* comm_end = strrchr(line, ')');
+        if (comm_end != nullptr && comm_end[1] == ' ') {
+            state = comm_end[2];
+        }
+    }
+    fclose(stat_file);
+    return state;
+}
+
+void* ExitAfterLeaderThread(void* raw_args) {
+    auto* args = static_cast<LastThreadExitArgs*>(raw_args);
+    const int ready_fd = args->ready_fd;
+    const pid_t leader_tid = args->leader_tid;
+    WriteIntOrExit(ready_fd, static_cast<int>(syscall(SYS_gettid)));
+
+    for (int i = 0; i < 5000; ++i) {
+        if (ReadProcTaskState(leader_tid, leader_tid) == 'Z') {
+            if (getuid() == 0 && syscall(SYS_setuid, 1234) != 0) {
+                _exit(124);
+            }
+            return nullptr;
+        }
+        SleepForMillis(1);
+    }
+    _exit(123);
+}
+
 void* PauseForeverThread(void*) {
     for (;;) {
         pause();
@@ -120,6 +206,60 @@ void RunMultithreadedSignalChild(int ready_fd) {
 }
 
 }  // namespace
+
+TEST(ProcessSignalFork, SigchldInfoUsesGroupLeaderWhenLastNonleaderExits) {
+    const uid_t leader_uid = getuid();
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    SignalMaskGuard mask_guard(blocked);
+    ASSERT_TRUE(mask_guard.valid()) << "sigprocmask failed: errno=" << errno << " ("
+                                    << strerror(errno) << ")";
+
+    int ready_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready_pipe)) << "pipe failed: " << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        close(ready_pipe[0]);
+        if (!PinCurrentTaskToOneAllowedCpu()) {
+            _exit(120);
+        }
+        LastThreadExitArgs args {ready_pipe[1], getpid()};
+        pthread_t worker {};
+        if (pthread_create(&worker, nullptr, ExitAfterLeaderThread, &args) != 0) {
+            _exit(121);
+        }
+        syscall(SYS_exit, 0);
+        _exit(122);
+    }
+    ChildProcessGuard child_guard(child);
+
+    close(ready_pipe[1]);
+    int worker_tid = -1;
+    ASSERT_TRUE(ReadInt(ready_pipe[0], &worker_tid)) << "worker did not report its tid";
+    close(ready_pipe[0]);
+    ASSERT_GT(worker_tid, 0);
+    ASSERT_NE(worker_tid, child);
+
+    siginfo_t info {};
+    timespec timeout {};
+    timeout.tv_sec = 5;
+    ASSERT_EQ(SIGCHLD, sigtimedwait(&blocked, &info, &timeout))
+        << "sigtimedwait failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(child, info.si_pid);
+    EXPECT_NE(worker_tid, info.si_pid);
+    EXPECT_EQ(leader_uid, info.si_uid);
+    EXPECT_EQ(CLD_EXITED, info.si_code);
+    EXPECT_EQ(0, info.si_status);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    child_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
 
 TEST(ProcessSignalFork, StopContinueRaceDoesNotLeaveChildStuck) {
     pid_t child = fork();

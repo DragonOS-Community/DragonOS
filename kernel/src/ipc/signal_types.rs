@@ -572,6 +572,26 @@ impl SigInfo {
                     },
                 },
             },
+            SigType::SigChild {
+                pid,
+                uid,
+                status,
+                utime,
+                stime,
+            } => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: self.sig_code.as_i32(),
+                _sifields: PosixSiginfoFields {
+                    _sigchld: PosixSiginfoSigchld {
+                        si_pid: pid.data() as i32,
+                        si_uid: uid,
+                        si_status: status,
+                        si_utime: utime,
+                        si_stime: stime,
+                    },
+                },
+            },
             SigType::Alarm(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
@@ -679,6 +699,14 @@ pub enum SigType {
         uid: u32,
         sigval: PosixSigval,
     },
+    /// Kernel-generated child state notification (CLD_*).
+    SigChild {
+        pid: RawPid,
+        uid: u32,
+        status: i32,
+        utime: i64,
+        stime: i64,
+    },
     Alarm(RawPid),
     /// POSIX interval timer 发送的信号（SI_TIMER）。
     /// - `timerid`: 对应用户态 `siginfo_t::si_timerid`
@@ -708,7 +736,6 @@ pub enum SigType {
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
-    // SigChild,
     // SigFault,
     // SigSys,
 }

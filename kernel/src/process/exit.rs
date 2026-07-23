@@ -31,7 +31,7 @@ fn wstatus_to_waitid_status(raw_wstatus: i32) -> i32 {
 }
 
 #[inline(always)]
-fn wstatus_to_waitid_exit_info(raw_wstatus: i32) -> (i32, i32) {
+pub(crate) fn wstatus_to_waitid_exit_info(raw_wstatus: i32) -> (i32, i32) {
     let signal = raw_wstatus & 0x7f;
     if signal == 0 {
         (

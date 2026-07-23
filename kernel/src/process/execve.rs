@@ -226,11 +226,15 @@ fn do_execve_internal(
                 // 先把 comm 复制到栈缓冲并释放 basic 读锁：trace 默认回调内部的
                 // trace_cmdline_push 会再次获取 basic 读锁，持锁重入有 deadlock 风险。
                 let mut comm_buf = [0u8; 16];
-                let comm_len;
+                let mut comm_len;
                 {
                     let basic_guard = pcb.basic();
                     let name = basic_guard.name();
                     comm_len = name.as_bytes().len().min(15);
+                    // 回退到 UTF-8 字符边界，避免在多字节字符中间截断导致 from_utf8 失败。
+                    while comm_len > 0 && !name.is_char_boundary(comm_len) {
+                        comm_len -= 1;
+                    }
                     comm_buf[..comm_len].copy_from_slice(&name.as_bytes()[..comm_len]);
                 }
                 let comm = core::str::from_utf8(&comm_buf[..comm_len]).unwrap_or("");

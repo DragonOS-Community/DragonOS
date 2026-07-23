@@ -37,7 +37,7 @@ use crate::{
         tasklet::{tasklet_schedule, Tasklet, TaskletData},
         InterruptArch, IrqNumber,
     },
-    filesystem::epoll::EPollEventType,
+    filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     libs::{rwsem::RwSem, spinlock::SpinLock},
     process::ProcessManager,
     sched::sched_yield,
@@ -1274,7 +1274,13 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
         let port =
             unsafe { PIO_PORTS.get(index).and_then(Option::as_ref) }.ok_or(SystemError::ENODEV)?;
         port.clear_tx();
+        // Match Linux uart_flush_buffer(): releasing the software TX queue is
+        // a write-readiness transition. Do not call tty_wakeup() here because
+        // signal-character flush can enter with the N_TTY data lock held, and
+        // its synchronous write_wakeup callback would re-enter that lock.
         tty.write_wq().wakeup_all();
+        let events = EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
+        let _ = EventPoll::wakeup_epoll(tty.epitems(), events);
         Ok(())
     }
 }

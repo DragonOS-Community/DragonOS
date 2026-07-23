@@ -189,6 +189,14 @@ impl ProcessManager {
             .raw_wstatus()
             .expect("natural-parent exit notification requires an exited child")
             as i32;
+        // Preserve Linux's observable group-exit status even though DragonOS
+        // stores the last task's local do_exit() argument separately (for
+        // example, de_thread() may return EAGAIN after SIGKILL committed).
+        let raw_status = child
+            .sighand()
+            .group_exit_code_if_set()
+            .map(|status| status as i32)
+            .unwrap_or(raw_status);
         let (status, code) = wstatus_to_waitid_exit_info(raw_status);
         let pid = child
             .task_pid_nr_ns(PidType::PID, Some(parent.active_pid_ns()))

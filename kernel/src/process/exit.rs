@@ -498,9 +498,16 @@ fn report_wait_event(
                 WaitRelation::Ptraced => reap_blocked_by_group_exec(child_pcb),
             });
     if is_zombie && !delayed_zombie && kwo.options.contains(WaitOption::WEXITED) {
-        let Some(raw_wstatus) = state.raw_wstatus().map(|status| status as i32) else {
+        let Some(task_wstatus) = state.raw_wstatus().map(|status| status as i32) else {
             return CandidateDecision::Pending { can_change: false };
         };
+        // Linux wait_task_zombie() exposes signal->group_exit_code after
+        // SIGNAL_GROUP_EXIT for both natural and ptrace zombie waits.
+        let raw_wstatus = child_pcb
+            .sighand()
+            .group_exit_code_if_set()
+            .map(|status| status as i32)
+            .unwrap_or(task_wstatus);
         let consume = !kwo.options.contains(WaitOption::WNOWAIT);
         match relation {
             WaitRelation::Natural => {

@@ -66,6 +66,29 @@ bool ReadInt(int fd, int* value) {
     return n == static_cast<ssize_t>(sizeof(*value));
 }
 
+void KillAndReap(pid_t child) {
+    if (child <= 0) {
+        return;
+    }
+    kill(child, SIGKILL);
+    while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+    }
+}
+
+class ChildProcessGuard {
+public:
+    explicit ChildProcessGuard(pid_t child) : child_(child) {}
+    ChildProcessGuard(const ChildProcessGuard&) = delete;
+    ChildProcessGuard& operator=(const ChildProcessGuard&) = delete;
+
+    ~ChildProcessGuard() { KillAndReap(child_); }
+
+    void Release() { child_ = -1; }
+
+private:
+    pid_t child_;
+};
+
 void* PauseForeverThread(void*) {
     for (;;) {
         pause();
@@ -256,6 +279,7 @@ TEST(ProcessSignalFork, ThreadCreationPreservesInheritedGroupAndSingleDelivery) 
             pause();
         }
     }
+    ChildProcessGuard helper_guard(helper);
     ASSERT_TRUE(ReadByte(helper_ready[0])) << "helper did not become ready";
 
     pid_t child = fork();
@@ -309,6 +333,7 @@ TEST(ProcessSignalFork, ThreadCreationPreservesInheritedGroupAndSingleDelivery) 
         }
         _exit(0);
     }
+    ChildProcessGuard child_guard(child);
 
     ASSERT_EQ(0, setpgid(child, helper))
         << "setpgid failed: errno=" << errno << " (" << strerror(errno) << ")";
@@ -316,9 +341,11 @@ TEST(ProcessSignalFork, ThreadCreationPreservesInheritedGroupAndSingleDelivery) 
 
     int status = 0;
     ASSERT_EQ(child, waitpid(child, &status, 0));
+    child_guard.Release();
     ASSERT_EQ(0, kill(helper, SIGKILL));
     int helper_status = 0;
     ASSERT_EQ(helper, waitpid(helper, &helper_status, 0));
+    helper_guard.Release();
     ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
     EXPECT_EQ(0, WEXITSTATUS(status));
 }

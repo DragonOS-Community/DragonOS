@@ -79,8 +79,7 @@ pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, System
     // group them by their stable TGID identity. TGID grouping also covers the
     // brief old/new leader overlap during de_thread().
     let mut thread_groups: BTreeMap<usize, Arc<ProcessControlBlock>> = BTreeMap::new();
-    let physical_tasks: Vec<Arc<ProcessControlBlock>> =
-        pgid.tasks_iter(PidType::PGID).collect();
+    let physical_tasks: Vec<Arc<ProcessControlBlock>> = pgid.tasks_iter(PidType::PGID).collect();
     for task in physical_tasks {
         if !task.is_thread_group_leader() {
             continue;

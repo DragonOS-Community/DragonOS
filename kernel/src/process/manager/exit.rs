@@ -540,22 +540,28 @@ impl ProcessManager {
             ProcessManager::exit_ptrace(pcb);
             ProcessManager::ptrace_unlink_tracee(pcb);
 
-            let parent_child_vpid = pcb.real_parent_pcb().and_then(|parent| {
-                // A concurrently exiting parent may already have unhashed its
-                // PID before this nonleader is autoreaped. Its children list
-                // has then been consumed by the adoption transaction, so
-                // there is no attached namespace/list entry left to clean.
-                let parent_ns = parent
-                    .task_pid_ptr(PidType::PID)
-                    .and_then(|pid| pid.try_ns_of_pid())?;
-                pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns))
-                    .map(|vpid| (parent, vpid))
-            });
+            {
+                // Pair parent discovery with children-index removal under the
+                // same tasklist-like transaction used by reparent/de_thread.
+                // Otherwise a concurrent identity handoff can move the list
+                // entry after this release selected the former parent.
+                let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+                let parent_child_vpid = pcb.real_parent_pcb().and_then(|parent| {
+                    // A concurrently exiting parent may already have unhashed
+                    // its PID before this nonleader is autoreaped. Its children
+                    // list has then been consumed by the adoption transaction,
+                    // so no attached namespace/list entry remains to clean.
+                    let parent_ns = parent
+                        .task_pid_ptr(PidType::PID)
+                        .and_then(|pid| pid.try_ns_of_pid())?;
+                    pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns))
+                        .map(|vpid| (parent, vpid))
+                });
 
-            // Remove from the parent's children list.
-            if let Some((parent, vpid)) = parent_child_vpid {
-                let mut children = parent.children.write();
-                children.retain(|&p| p != vpid);
+                if let Some((parent, vpid)) = parent_child_vpid {
+                    let mut children = parent.children.write();
+                    children.retain(|&p| p != vpid);
+                }
             }
 
             // Revoke the old PCB's global numeric lookup before __exit_signal()

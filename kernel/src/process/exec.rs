@@ -510,9 +510,12 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         }
         drop(membership_guard);
 
-        // Transfer the old leader's children list to the new leader.
-        let moved_children = {
-            let leader_pid_ns = leader.active_pid_ns();
+        // Transfer the old leader's children list and parent links as one
+        // tasklist-like transaction. A concurrent release must observe both
+        // the new owner and its index entry, or neither.
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        let leader_pid_ns = leader.active_pid_ns();
+        let moved_child_pids = {
             let (first, second) =
                 if (Arc::as_ptr(&current) as usize) <= (Arc::as_ptr(leader) as usize) {
                     (current.clone(), leader.clone())
@@ -532,12 +535,13 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
                 first_children.extend(moved.iter().copied());
                 moved
             }
+        };
+        let moved_children = moved_child_pids
             .into_iter()
             .filter_map(|pid| ProcessManager::find_task_by_pid_ns(pid, &leader_pid_ns))
-            .collect::<Vec<_>>()
-        };
+            .collect::<Vec<_>>();
         for child in moved_children {
-            ProcessControlBlock::reparent_child_links_from_thread_group(
+            ProcessControlBlock::reparent_child_links_from_thread_group_locked(
                 &child,
                 current.tgid,
                 &current,
@@ -546,13 +550,13 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
         // Inherit parent process relationships from the old leader.
         {
-            let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
             let leader_parent = leader.real_parent_pcb.read_irqsave().clone();
             *current.parent_pcb.write_irqsave() = leader_parent.clone();
             *current.real_parent_pcb.write_irqsave() = leader_parent.clone();
             *current.wait_parent_pcb.write_irqsave() = leader_parent.clone();
             *current.fork_parent_pcb.write_irqsave() = leader_parent;
         }
+        drop(_relation_guard);
 
         // log::info!("de_thread: reparented current to old leader's parent");
 

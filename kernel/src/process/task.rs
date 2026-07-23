@@ -1013,14 +1013,6 @@ impl ProcessControlBlock {
         }
     }
 
-    pub(crate) fn reparent_child_to(
-        child: &Arc<ProcessControlBlock>,
-        new_parent: &Arc<ProcessControlBlock>,
-    ) {
-        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
-        ProcessControlBlock::reparent_child_to_locked(child, new_parent);
-    }
-
     fn reparent_child_to_locked(
         child: &Arc<ProcessControlBlock>,
         new_parent: &Arc<ProcessControlBlock>,
@@ -1045,7 +1037,12 @@ impl ProcessControlBlock {
         }
     }
 
-    pub(crate) fn reparent_child_links_from_thread_group(
+    /// Update a child's parent links during a thread-group identity handoff.
+    ///
+    /// The caller must hold `PTRACE_RELATION_LOCK`, DragonOS's tasklist-like
+    /// relationship lock, so the parent pointers and the owning `children`
+    /// index change as one transaction with concurrent release/reparent.
+    pub(crate) fn reparent_child_links_from_thread_group_locked(
         child: &Arc<ProcessControlBlock>,
         old_tgid: RawPid,
         new_parent: &Arc<ProcessControlBlock>,
@@ -1067,7 +1064,7 @@ impl ProcessControlBlock {
                 .unwrap_or(false);
 
         if should_reparent {
-            ProcessControlBlock::reparent_child_to(child, new_parent);
+            ProcessControlBlock::reparent_child_to_locked(child, new_parent);
         }
     }
 

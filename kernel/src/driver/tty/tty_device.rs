@@ -31,6 +31,7 @@ use crate::{
         epoll::{EPollEventType, EPollItem},
         kernfs::KernFSInode,
         vfs::{
+            fasync::FAsyncItem,
             file::{File, FileFlags},
             utils::DName,
             FilePrivateData, FileType, IndexNode, InodeMode, Metadata, PollableInode,
@@ -52,6 +53,7 @@ use super::{
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriverManager, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
+    tty_ldisc::TtyLdiscFileContext,
     virtual_terminal::vty_init,
 };
 
@@ -151,13 +153,12 @@ impl TtyDevice {
         &self.name
     }
 
-    fn tty_core(private_data: &FilePrivateData) -> Result<Arc<TtyCore>, SystemError> {
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
-            (tty_priv.tty.clone(), tty_priv.flags)
+    fn tty_file(private_data: &FilePrivateData) -> Result<&TtyFilePrivateData, SystemError> {
+        if let FilePrivateData::Tty(tty_priv) = private_data {
+            Ok(tty_priv)
         } else {
-            return Err(SystemError::EIO);
-        };
-        Ok(tty)
+            Err(SystemError::EIO)
+        }
     }
 
     /// tty_open_current_tty - get locked tty of current task
@@ -194,7 +195,18 @@ impl Debug for TtyDevice {
 
 impl PollableInode for TtyDevice {
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let tty = TtyDevice::tty_core(private_data)?;
+        let tty_file = TtyDevice::tty_file(private_data)?;
+        if tty_file.is_hung_up() {
+            return Ok((EPollEventType::EPOLLIN
+                | EPollEventType::EPOLLOUT
+                | EPollEventType::EPOLLERR
+                | EPollEventType::EPOLLHUP
+                | EPollEventType::EPOLLRDNORM
+                | EPollEventType::EPOLLWRNORM)
+                .bits() as usize);
+        }
+
+        let tty = tty_file.tty();
         tty.ldisc().poll(tty)
     }
 
@@ -203,7 +215,15 @@ impl PollableInode for TtyDevice {
         epitem: Arc<EPollItem>,
         private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let tty = TtyDevice::tty_core(private_data)?;
+        let tty_file = TtyDevice::tty_file(private_data)?;
+        if tty_file.is_hung_up() {
+            // hung_up_tty_poll() is permanently ready and does not register
+            // a wait queue. epoll observes the fixed mask immediately after
+            // this callback.
+            return Ok(());
+        }
+
+        let tty = tty_file.tty();
         let core = tty.core();
         core.add_epitem(epitem);
         Ok(())
@@ -214,9 +234,50 @@ impl PollableInode for TtyDevice {
         epitem: &Arc<EPollItem>,
         private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let tty = TtyDevice::tty_core(private_data)?;
+        let tty_file = TtyDevice::tty_file(private_data)?;
+        let hung_up = tty_file.is_hung_up();
+        let tty = tty_file.tty();
         let core = tty.core();
-        core.remove_epitem(epitem)
+        match core.remove_epitem(epitem) {
+            Err(SystemError::ENOENT) if hung_up => Ok(()),
+            result => result,
+        }
+    }
+
+    fn add_fasync(
+        &self,
+        fasync_item: FAsyncItem,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let tty_file = Self::tty_file(private_data)?;
+        tty_file
+            .tty()
+            .core()
+            .add_fasync(tty_file.hangup_generation, fasync_item)
+    }
+
+    fn remove_fasync(
+        &self,
+        file: &Weak<File>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        Self::tty_file(private_data)?
+            .tty()
+            .core()
+            .remove_fasync(file);
+        Ok(())
+    }
+
+    fn release_fasync(
+        &self,
+        file: &File,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        Self::tty_file(private_data)?
+            .tty()
+            .core()
+            .remove_fasync_file(file);
+        Ok(())
     }
 }
 
@@ -257,11 +318,13 @@ impl IndexNode for TtyDevice {
         }
 
         let tty = tty.unwrap();
+        let hangup_generation = tty.core().file_open_hangup_generation();
 
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
             flags: *mode,
+            hangup_generation,
         });
 
         tty.core().contorl_info_irqsave().clear_dead_session();
@@ -275,6 +338,11 @@ impl IndexNode for TtyDevice {
             }
             return Err(err);
         }
+
+        // A successful open after a completed hangup is a normal tty file in
+        // Linux. Do not clear a hangup which raced with this open: its
+        // generation change marks this file as one of the hung-up instances.
+        tty.core().finish_file_open(hangup_generation);
 
         let driver = tty.core().driver();
         // 考虑 O_NOCTTY：显式指定则不设置控制终端；pty master 也不会成为控制终端。
@@ -307,10 +375,14 @@ impl IndexNode for TtyDevice {
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.flags)
-        } else {
-            return Err(SystemError::EIO);
+        let tty_file = Self::tty_file(&data)?;
+        if tty_file.is_hung_up() {
+            return Ok(0);
+        }
+        let tty = tty_file.tty();
+        let file_context = TtyLdiscFileContext {
+            flags: tty_file.flags,
+            hangup_generation: tty_file.hangup_generation,
         };
 
         drop(data);
@@ -326,7 +398,14 @@ impl IndexNode for TtyDevice {
 
         loop {
             let mut size = (len - offset).min(buf.len() - offset);
-            size = ld.read(tty.clone(), &mut buf[offset..], size, &mut cookie, 0, flags)?;
+            size = ld.read(
+                tty.clone(),
+                &mut buf[offset..],
+                size,
+                &mut cookie,
+                0,
+                file_context,
+            )?;
             // 本次迭代未读取到数据，可能是EOF或暂时无数据可读
             if size == 0 {
                 break;
@@ -356,17 +435,21 @@ impl IndexNode for TtyDevice {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
-        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.flags)
-        } else {
+        let tty_file = Self::tty_file(&data)?;
+        if tty_file.is_hung_up() {
             return Err(SystemError::EIO);
+        }
+        let tty = tty_file.tty();
+        let file_context = TtyLdiscFileContext {
+            flags: tty_file.flags,
+            hangup_generation: tty_file.hangup_generation,
         };
         drop(data);
         let ld = tty.ldisc();
         let core = tty.core();
         let write_guard = core
             .write_lock()
-            .lock_interruptible(flags.contains(FileFlags::O_NONBLOCK))?;
+            .lock_interruptible(file_context.flags.contains(FileFlags::O_NONBLOCK))?;
         let mut chunk = 2048;
         if core.flags().contains(TtyFlag::NO_WRITE_SPLIT) {
             chunk = 65536;
@@ -381,7 +464,7 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = match ld.write(tty.clone(), &buf[written..], size, flags) {
+            let ret = match ld.write(tty.clone(), &buf[written..], size, file_context) {
                 Ok(ret) => ret,
                 Err(err) => {
                     if written != 0 {
@@ -492,14 +575,24 @@ impl IndexNode for TtyDevice {
         arg: usize,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.flags)
-        } else {
-            return Err(SystemError::EIO);
-        };
+        let tty_file = Self::tty_file(&data)?;
+        let hung_up = tty_file.is_hung_up();
+        let tty = tty_file.tty();
 
         // Drop the lock early: tty ioctl paths may block.
         drop(data);
+
+        // Linux replaces only the file instances which existed at hangup
+        // with hung_up_tty_fops. A later successful reopen must remain usable.
+        // Check the original file endpoint before PTY master mode ioctls
+        // redirect to the slave.
+        if hung_up {
+            return if cmd == TtyIoctlCmd::TIOCSPGRP {
+                Err(SystemError::ENOTTY)
+            } else {
+                Err(SystemError::EIO)
+            };
+        }
 
         match cmd {
             TtyIoctlCmd::TIOCSETD
@@ -773,11 +866,16 @@ impl CharDevice for TtyDevice {
 pub struct TtyFilePrivateData {
     pub tty: Arc<TtyCore>,
     pub flags: FileFlags,
+    pub hangup_generation: usize,
 }
 
 impl TtyFilePrivateData {
     pub fn tty(&self) -> Arc<TtyCore> {
         self.tty.clone()
+    }
+
+    pub fn is_hung_up(&self) -> bool {
+        self.hangup_generation != self.tty.core().hangup_generation()
     }
 }
 

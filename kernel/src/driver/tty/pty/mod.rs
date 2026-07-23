@@ -10,7 +10,7 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
-use self::unix98pty::{Unix98PtyDriverInner, NR_UNIX98_PTY_MAX};
+use self::unix98pty::{pty_drain_workqueue_init, Unix98PtyDriverInner, NR_UNIX98_PTY_MAX};
 
 use super::{
     termios::{ControlMode, InputMode, LocalMode, OutputMode, TTY_STD_TERMIOS},
@@ -177,6 +177,7 @@ impl PtyCommon {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn pty_init() -> Result<(), SystemError> {
+    pty_drain_workqueue_init();
     let mut ptm_driver = TtyDriver::new(
         NR_UNIX98_PTY_MAX,
         "ptm",

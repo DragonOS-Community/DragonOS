@@ -167,6 +167,7 @@ struct Serial8250TxState {
     queue: Option<VecDeque<u8>>,
     tty: Weak<TtyCore>,
     console_active: bool,
+    flush_generation: usize,
 }
 
 impl Serial8250TxState {
@@ -177,6 +178,7 @@ impl Serial8250TxState {
             queue: None,
             tty: Weak::new(),
             console_active: false,
+            flush_generation: 0,
         }
     }
 }
@@ -407,6 +409,7 @@ impl Serial8250PIOPort {
         if let Some(queue) = tx_state.queue.as_mut() {
             queue.clear();
         }
+        tx_state.flush_generation = tx_state.flush_generation.wrapping_add(1);
         self.set_tx_interrupt_enabled(false);
     }
 
@@ -415,6 +418,7 @@ impl Serial8250PIOPort {
         if let Some(queue) = tx_state.queue.as_mut() {
             queue.clear();
         }
+        tx_state.flush_generation = tx_state.flush_generation.wrapping_add(1);
         self.set_tx_interrupt_enabled(false);
 
         // Linux's ordinary uart_flush_buffer() leaves bytes already accepted
@@ -507,13 +511,14 @@ impl Serial8250PIOPort {
                 }
             }
         }
-        let (mut older_remaining, tty) = {
+        let (mut older_remaining, flush_generation, tty) = {
             let mut tx_state = self.tx_state.lock_irqsave();
             tx_state.console_active = true;
             let pending = tx_state.queue.as_ref().map(VecDeque::len).unwrap_or(0);
+            let flush_generation = tx_state.flush_generation;
             let tty = tx_state.tty.upgrade();
             self.set_tx_interrupt_enabled(false);
-            (pending, tty)
+            (pending, flush_generation, tty)
         };
         let timeout = self.tx_batch_timeout();
         let mut healthy = true;
@@ -524,6 +529,10 @@ impl Serial8250PIOPort {
                 break;
             }
             let mut tx_state = self.tx_state.lock_irqsave();
+            if tx_state.flush_generation != flush_generation {
+                older_remaining = 0;
+                break;
+            }
             let Some(queue) = tx_state.queue.as_mut() else {
                 older_remaining = 0;
                 break;
@@ -531,6 +540,10 @@ impl Serial8250PIOPort {
             let count = older_remaining
                 .min(self.tx_fifo_size.load(Ordering::Acquire))
                 .min(queue.len());
+            if count == 0 {
+                older_remaining = 0;
+                break;
+            }
             let _hw_guard = self.hw_lock.lock_irqsave();
             let sent = if self.serial_in_raw(5) & 0x20 == 0 {
                 0
@@ -588,58 +601,52 @@ impl Serial8250PIOPort {
         let Ok(mut tx_state) = self.tx_state.try_lock_irqsave() else {
             return;
         };
-        let inherited_console_active = tx_state.console_active;
-        tx_state.console_active = true;
-        self.set_tx_interrupt_enabled(false);
-        drop(tx_state);
-
-        let Ok(_hw_guard) = self.hw_lock.try_lock_irqsave() else {
-            let mut tx_state = self.tx_state.lock_irqsave();
-            tx_state.console_active = inherited_console_active;
-            let pending = tx_state
-                .queue
-                .as_ref()
-                .map(|queue| !queue.is_empty())
-                .unwrap_or(false);
-            self.set_tx_interrupt_enabled(pending && !inherited_console_active);
+        let Ok(mut rx_state) = self.rx_state.try_lock_irqsave() else {
             return;
         };
+        let Ok(_hw_guard) = self.hw_lock.try_lock_irqsave() else {
+            return;
+        };
+
+        let inherited_console_active = tx_state.console_active;
+        tx_state.console_active = true;
+        rx_state.ier &= !SERIAL_8250_IER_TX_EMPTY;
+        self.sync_ier_hw_locked(&rx_state);
+
         // Emergency output may run with interrupts or preemption disabled.
         // Keep this independent of the configured baud rate: at B50 the
         // ordinary FIFO-sized timeout would otherwise grow to several
         // seconds. Linux's 8250 console likewise bounds an LSR wait to 10 ms.
         let deadline = Instant::now() + SERIAL_8250_EMERGENCY_TIMEOUT;
+        let mut ready = true;
         while self.serial_in_raw(5) & 0x20 == 0 {
             if Instant::now() >= deadline {
-                drop(_hw_guard);
-                let mut tx_state = self.tx_state.lock_irqsave();
-                tx_state.console_active = inherited_console_active;
-                let pending = tx_state
-                    .queue
-                    .as_ref()
-                    .map(|queue| !queue.is_empty())
-                    .unwrap_or(false);
-                self.set_tx_interrupt_enabled(pending && !inherited_console_active);
-                return;
+                ready = false;
+                break;
             }
             spin_loop();
         }
         // Atomic diagnostics get one bounded FIFO batch. Longer output is
         // intentionally truncated rather than extending IRQ/exception time.
-        let count = s.len().min(self.tx_fifo_size.load(Ordering::Acquire));
-        for byte in &s[..count] {
-            self.serial_out_raw(0, (*byte).into());
+        if ready {
+            let count = s.len().min(self.tx_fifo_size.load(Ordering::Acquire));
+            for byte in &s[..count] {
+                self.serial_out_raw(0, (*byte).into());
+            }
         }
-        drop(_hw_guard);
 
-        let mut tx_state = self.tx_state.lock_irqsave();
         tx_state.console_active = inherited_console_active;
         let pending = tx_state
             .queue
             .as_ref()
             .map(|queue| !queue.is_empty())
             .unwrap_or(false);
-        self.set_tx_interrupt_enabled(pending && !inherited_console_active);
+        if pending && !inherited_console_active {
+            rx_state.ier |= SERIAL_8250_IER_TX_EMPTY;
+        } else {
+            rx_state.ier &= !SERIAL_8250_IER_TX_EMPTY;
+        }
+        self.sync_ier_hw_locked(&rx_state);
     }
 
     fn tx_batch_timeout(&self) -> Duration {
@@ -699,12 +706,18 @@ impl Serial8250PIOPort {
     }
 
     fn sync_ier_locked(&self, rx_state: &Serial8250RxState) {
+        let _hw_guard = self.hw_lock.lock_irqsave();
+        self.sync_ier_hw_locked(rx_state);
+    }
+
+    /// Synchronize IER while the caller holds `hw_lock`.
+    fn sync_ier_hw_locked(&self, rx_state: &Serial8250RxState) {
         let ier = if rx_state.irq_registered {
             rx_state.ier
         } else {
             0
         };
-        self.serial_out(1, ier.into());
+        self.serial_out_raw(1, ier.into());
     }
 
     fn mark_rx_irq_registered(&self) {
@@ -884,8 +897,9 @@ impl Serial8250PIOPort {
         });
         self.check_baudrate(&hardware_baud)?;
 
-        // Runtime and emergency console paths release tx_state while polling
-        // the UART, but keep console_active set for their whole transaction.
+        // The runtime console releases tx_state while polling but keeps
+        // console_active set for the whole transaction. Emergency output
+        // holds a fully try-locked tx_state/rx_state/hw_lock tuple instead.
         let _tx_state = loop {
             let guard = self.tx_state.lock_irqsave();
             if !guard.console_active {

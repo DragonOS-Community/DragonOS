@@ -223,7 +223,18 @@ fn do_execve_internal(
                 // sched_process_exec：arch_do_execve 成功、用户态寄存器就绪后触发，
                 // 对齐 Linux fs/exec.c:1803（trace 在 start_thread 之后、所有失败点之后）。
                 let pid = pcb.raw_pid().data() as i32;
-                trace_sched_process_exec(pcb.basic().name(), pid, old_pid);
+                // 先把 comm 复制到栈缓冲并释放 basic 读锁：trace 默认回调内部的
+                // trace_cmdline_push 会再次获取 basic 读锁，持锁重入有 deadlock 风险。
+                let mut comm_buf = [0u8; 16];
+                let comm_len;
+                {
+                    let basic_guard = pcb.basic();
+                    let name = basic_guard.name();
+                    comm_len = name.as_bytes().len().min(15);
+                    comm_buf[..comm_len].copy_from_slice(&name.as_bytes()[..comm_len]);
+                }
+                let comm = core::str::from_utf8(&comm_buf[..comm_len]).unwrap_or("");
+                trace_sched_process_exec(comm, pid, old_pid);
 
                 if let Some(completion) = vfork_done {
                     completion.complete_all();

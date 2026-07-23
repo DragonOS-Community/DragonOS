@@ -1,6 +1,6 @@
 use crate::arch::ipc::signal::Signal;
 use crate::arch::syscall::nr::SYS_FCNTL;
-use crate::filesystem::vfs::fasync::set_file_fasync;
+use crate::filesystem::vfs::fasync::{set_file_fasync, FAsyncHandlerPolicy};
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::InodeFlags;
 use crate::ipc::pipe::LockedPipeInode;
@@ -189,10 +189,10 @@ impl SysFcntlHandle {
                     }
                     let old_fasync = current_flags.contains(FileFlags::FASYNC);
                     let new_fasync = new_flags.contains(FileFlags::FASYNC);
-                    file.set_flags(new_flags)?;
                     if old_fasync != new_fasync {
-                        set_file_fasync(&file, fd, new_fasync)?;
+                        set_file_fasync(&file, fd, new_fasync, FAsyncHandlerPolicy::Optional)?;
                     }
+                    file.set_flags(new_flags)?;
 
                     // Keep socket object nonblocking state in sync with file flags.
                     // Some socket implementations consult an internal AtomicBool rather than

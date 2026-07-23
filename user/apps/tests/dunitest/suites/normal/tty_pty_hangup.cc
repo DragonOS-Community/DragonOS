@@ -1114,7 +1114,8 @@ TEST(TtyPtyHangup, MasterCloseMakesSlaveObserveHangup) {
     pair.master.reset();
 
     short revents = PollEvents(pair.slave.get());
-    EXPECT_NE(0, revents & POLLHUP);
+    constexpr short kHungUpEvents = POLLIN | POLLOUT | POLLERR | POLLHUP;
+    EXPECT_EQ(kHungUpEvents, revents);
 
     char ch = 0;
     errno = 0;
@@ -1124,6 +1125,19 @@ TEST(TtyPtyHangup, MasterCloseMakesSlaveObserveHangup) {
     EXPECT_EQ(-1, write(pair.slave.get(), "x", 1));
     EXPECT_EQ(EIO, errno) << "slave write after master close errno=" << errno << " ("
                           << strerror(errno) << ")";
+
+    int async = 1;
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(pair.slave.get(), FIOASYNC, &async));
+    EXPECT_EQ(ENOTTY, errno) << "slave FIOASYNC after master close errno=" << errno << " ("
+                            << strerror(errno) << ")";
+
+    int flags = fcntl(pair.slave.get(), F_GETFL);
+    ASSERT_GE(flags, 0);
+    errno = 0;
+    EXPECT_EQ(-1, fcntl(pair.slave.get(), F_SETFL, flags | O_ASYNC));
+    EXPECT_EQ(ENOTTY, errno) << "slave F_SETFL(O_ASYNC) after master close errno=" << errno << " ("
+                            << strerror(errno) << ")";
 }
 
 TEST(TtyPtyHangup, ChildExitDrainsSlaveOutputBeforeMasterEio) {

@@ -218,25 +218,48 @@ impl FAsyncItems {
     }
 }
 
-pub fn set_file_fasync(file: &Arc<File>, fd: i32, enabled: bool) -> Result<(), SystemError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FAsyncHandlerPolicy {
+    Optional,
+    Required,
+}
+
+pub fn set_file_fasync(
+    file: &Arc<File>,
+    fd: i32,
+    enabled: bool,
+    handler_policy: FAsyncHandlerPolicy,
+) -> Result<(), SystemError> {
     let mut flags = file.flags();
+    if flags.contains(FileFlags::FASYNC) == enabled {
+        return Ok(());
+    }
+
+    let inode = file.inode();
+    if let Ok(pollable) = inode.as_pollable_inode() {
+        let private_data = file.private_data.lock();
+        let result = if enabled {
+            let item = FAsyncItem::new(Arc::downgrade(file), fd);
+            pollable.add_fasync(item, &private_data)
+        } else {
+            pollable.remove_fasync(&Arc::downgrade(file), &private_data)
+        };
+        if let Err(err) = result {
+            if err != SystemError::ENOSYS {
+                return Err(err);
+            }
+            if handler_policy == FAsyncHandlerPolicy::Required {
+                return Err(SystemError::ENOTTY);
+            }
+        }
+    } else if handler_policy == FAsyncHandlerPolicy::Required {
+        return Err(SystemError::ENOTTY);
+    }
+
     if enabled {
         flags.insert(FileFlags::FASYNC);
     } else {
         flags.remove(FileFlags::FASYNC);
     }
-
-    file.set_flags(flags)?;
-
-    if let Ok(pollable) = file.inode().as_pollable_inode() {
-        let private_data = file.private_data.lock();
-        if enabled {
-            let item = FAsyncItem::new(Arc::downgrade(file), fd);
-            let _ = pollable.add_fasync(item, &private_data);
-        } else {
-            let _ = pollable.remove_fasync(&Arc::downgrade(file), &private_data);
-        }
-    }
-
-    Ok(())
+    file.set_flags(flags)
 }

@@ -216,9 +216,11 @@ impl ProcessManager {
         )
     }
 
-    /// Complete the unique natural-parent notification transaction. Signal
-    /// delivery and an optional owner-authorized autoreap happen while the
-    /// phase is Pending; Done is then published before the final parent wake.
+    /// Complete the unique natural-parent notification transaction. Build the
+    /// child snapshot while identity is stable, perform an optional
+    /// owner-authorized autoreap, and publish Done before signal delivery. A
+    /// SIGCHLD handler may call wait immediately, so the signal must never
+    /// expose the intermediate Pending phase.
     pub(crate) fn notify_natural_parent_owned(
         child: &Arc<ProcessControlBlock>,
         token: NaturalParentNotifyToken,
@@ -239,9 +241,32 @@ impl ProcessManager {
             .unwrap_or(false);
         let autoreap = exit_signal == Signal::SIGCHLD as i32 && (ignored || no_cldwait);
 
-        if exit_signal > 0 && !(autoreap && ignored) {
+        // Snapshot every field before autoreap can unhash the child's PID.
+        let notification = if exit_signal > 0 && !(autoreap && ignored) {
             let signal = Signal::from(exit_signal);
-            let mut info = Self::child_exit_siginfo(child, &parent, signal);
+            Some((signal, Self::child_exit_siginfo(child, &parent, signal)))
+        } else {
+            None
+        };
+
+        if autoreap {
+            let transition = child
+                .sighand()
+                .try_reap_natural_child_as_notify_owner(child, &token);
+            assert_eq!(
+                transition,
+                ReapTransition::Reaped,
+                "natural-parent notification owner failed to autoreap"
+            );
+            unsafe { ProcessManager::release(child.raw_pid()) };
+        }
+
+        assert!(
+            child.sighand().complete_natural_parent_notify(token),
+            "natural-parent notification ownership changed"
+        );
+
+        if let Some((signal, mut info)) = notification {
             if let Err(e) =
                 signal.send_signal_info_to_pcb(Some(&mut info), parent.clone(), PidType::TGID)
             {
@@ -254,19 +279,6 @@ impl ProcessManager {
             }
         }
 
-        if autoreap
-            && child
-                .sighand()
-                .try_reap_natural_child_as_notify_owner(child, &token)
-                == ReapTransition::Reaped
-        {
-            unsafe { ProcessManager::release(child.raw_pid()) };
-        }
-
-        assert!(
-            child.sighand().complete_natural_parent_notify(token),
-            "natural-parent notification ownership changed"
-        );
         ProcessManager::wake_wait_parent(&parent);
 
         if child.is_kthread() {

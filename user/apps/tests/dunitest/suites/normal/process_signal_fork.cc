@@ -112,6 +112,45 @@ private:
     bool valid_;
 };
 
+class SignalActionGuard {
+public:
+    SignalActionGuard(int signal, const struct sigaction& action) : signal_(signal), valid_(false) {
+        valid_ = sigaction(signal_, &action, &old_action_) == 0;
+    }
+    SignalActionGuard(const SignalActionGuard&) = delete;
+    SignalActionGuard& operator=(const SignalActionGuard&) = delete;
+
+    ~SignalActionGuard() {
+        if (valid_) {
+            sigaction(signal_, &old_action_, nullptr);
+        }
+    }
+
+    bool valid() const { return valid_; }
+
+private:
+    struct sigaction old_action_ {};
+    int signal_;
+    bool valid_;
+};
+
+volatile sig_atomic_t sigchld_expected_pid = -1;
+volatile sig_atomic_t sigchld_wait_result = -2;
+volatile sig_atomic_t sigchld_wait_errno = 0;
+volatile sig_atomic_t sigchld_wait_status = 0;
+volatile sig_atomic_t sigchld_handler_calls = 0;
+
+void ReapExpectedChildFromSigchld(int) {
+    const int saved_errno = errno;
+    int status = 0;
+    const pid_t result = waitpid(static_cast<pid_t>(sigchld_expected_pid), &status, WNOHANG);
+    sigchld_wait_result = static_cast<sig_atomic_t>(result);
+    sigchld_wait_errno = result < 0 ? errno : 0;
+    sigchld_wait_status = status;
+    ++sigchld_handler_calls;
+    errno = saved_errno;
+}
+
 struct LastThreadExitArgs {
     int ready_fd;
     pid_t leader_tid;
@@ -206,6 +245,64 @@ void RunMultithreadedSignalChild(int ready_fd) {
 }
 
 }  // namespace
+
+TEST(ProcessSignalFork, SigchldHandlerCanImmediatelyReapExitedChild) {
+    struct sigaction action {};
+    action.sa_handler = ReapExpectedChildFromSigchld;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    SignalActionGuard action_guard(SIGCHLD, action);
+    ASSERT_TRUE(action_guard.valid()) << "sigaction failed: errno=" << errno << " ("
+                                     << strerror(errno) << ")";
+
+    int gate[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(gate)) << "pipe failed: " << strerror(errno);
+
+    const pid_t child = fork();
+    if (child < 0) {
+        const int fork_errno = errno;
+        close(gate[0]);
+        close(gate[1]);
+        FAIL() << "fork failed: errno=" << fork_errno << " (" << strerror(fork_errno) << ")";
+        return;
+    }
+    if (child == 0) {
+        close(gate[1]);
+        char value = 0;
+        if (read(gate[0], &value, sizeof(value)) != static_cast<ssize_t>(sizeof(value))) {
+            _exit(120);
+        }
+        _exit(42);
+    }
+    ChildProcessGuard child_guard(child);
+
+    close(gate[0]);
+    sigchld_expected_pid = child;
+    sigchld_wait_result = -2;
+    sigchld_wait_errno = 0;
+    sigchld_wait_status = 0;
+    sigchld_handler_calls = 0;
+    const char gate_value = 'X';
+    const ssize_t gate_write = write(gate[1], &gate_value, sizeof(gate_value));
+    const int gate_errno = errno;
+    close(gate[1]);
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(gate_value)), gate_write)
+        << "write(gate) failed: errno=" << gate_errno << " (" << strerror(gate_errno) << ")";
+
+    for (int i = 0; i < 500 && sigchld_handler_calls == 0; ++i) {
+        SleepForMillis(1);
+    }
+
+    ASSERT_GT(sigchld_handler_calls, 0) << "SIGCHLD handler was not invoked";
+    EXPECT_EQ(child, static_cast<pid_t>(sigchld_wait_result))
+        << "waitpid(WNOHANG) in SIGCHLD handler did not observe the published exit; errno="
+        << sigchld_wait_errno;
+    if (sigchld_wait_result == child) {
+        child_guard.Release();
+        ASSERT_TRUE(WIFEXITED(sigchld_wait_status)) << "child status=" << sigchld_wait_status;
+        EXPECT_EQ(42, WEXITSTATUS(sigchld_wait_status));
+    }
+}
 
 TEST(ProcessSignalFork, SigchldInfoUsesGroupLeaderWhenLastNonleaderExits) {
     const uid_t leader_uid = getuid();

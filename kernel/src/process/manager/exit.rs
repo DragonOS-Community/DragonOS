@@ -15,7 +15,6 @@ use crate::{
     driver::tty::tty_job_control::TtyJobCtrlManager,
     exception::InterruptArch,
     ipc::sighand::{NaturalParentNotifyToken, ReapTransition},
-    ipc::signal_types::{SigCode, SigInfo, SigType},
     libs::futex::{
         constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
         futex::{Futex, RobustListHead},
@@ -476,20 +475,7 @@ impl ProcessManager {
                     if task.flags().contains(ProcessFlags::EXITING) {
                         return;
                     }
-                    let mut info = SigInfo::new(
-                        Signal::SIGKILL,
-                        0,
-                        SigCode::Kernel,
-                        SigType::Kill {
-                            pid: RawPid::new(0),
-                            uid: 0,
-                        },
-                    );
-                    let _ = Signal::SIGKILL.send_signal_info_to_pcb(
-                        Some(&mut info),
-                        task,
-                        PidType::PID,
-                    );
+                    Signal::queue_private_sigkill_to_thread(&task);
                 };
 
                 // Obtain the full thread list from the thread group leader's

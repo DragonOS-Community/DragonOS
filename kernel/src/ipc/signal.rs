@@ -466,9 +466,7 @@ impl Signal {
             return;
         };
 
-        if !is_thread_target
-            && self.start_fatal_group_exit_if_needed(pcb.clone(), target_pcb.clone())
-        {
+        if self.start_fatal_group_exit_if_needed(pcb.clone(), target_pcb.clone()) {
             return;
         }
 
@@ -495,7 +493,7 @@ impl Signal {
 
         let tasks = ProcessManager::thread_group_tasks_snapshot(target);
         for task in tasks {
-            Self::queue_group_kill_to_thread(&task);
+            Self::queue_private_sigkill_to_thread(&task);
         }
 
         true
@@ -525,7 +523,13 @@ impl Signal {
         true
     }
 
-    fn queue_group_kill_to_thread(task: &Arc<ProcessControlBlock>) {
+    /// Queue the private SIGKILL used after the kernel has already committed
+    /// to tearing down sibling threads for group-exit or de_thread().
+    ///
+    /// Unlike normal signal delivery, this must not run complete_signal()
+    /// again: during de_thread() the exec owner is intentionally preserved,
+    /// while during group-exit the shared exit state is already committed.
+    pub(crate) fn queue_private_sigkill_to_thread(task: &Arc<ProcessControlBlock>) {
         if task.flags().contains(ProcessFlags::EXITING) || task.is_zombie() || task.is_dead() {
             return;
         }

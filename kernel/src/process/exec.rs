@@ -402,7 +402,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     }
 
     for task in kill_list {
-        let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
+        Signal::queue_private_sigkill_to_thread(&task);
     }
 
     let pending_wait = sighand.wait_group_exec_event_killable(

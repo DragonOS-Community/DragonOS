@@ -1010,6 +1010,18 @@ impl IndexNode for LoopDevice {
         self
     }
 
+    fn supports_post_write_sync(&self, file_type: FileType) -> bool {
+        file_type == FileType::BlockDevice
+    }
+
+    fn sync_file(
+        &self,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        <Self as BlockDevice>::sync(self)
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -1330,6 +1342,8 @@ impl BlockDevice for LoopDevice {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
+        let _io_guard = IoGuard::new(self)?;
+
         let inode = self.inner().file_inode.clone().ok_or(SystemError::ENODEV)?;
         inode.sync()?;
         inode.fs().sync_fs(true)

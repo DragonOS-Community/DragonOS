@@ -587,6 +587,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// protocol flags.
     fn adjust_file_mode_after_open(&self, _data: &FilePrivateData, _mode: &mut FileMode) {}
 
+    /// Whether the VFS write path should apply Linux `generic_write_sync()`
+    /// semantics after a successful positive-length write.
+    ///
+    /// This is intentionally opt-in: many pseudo files are reported as regular
+    /// files but their Linux write paths do not perform generic write syncing.
+    fn supports_post_write_sync(&self, _file_type: FileType) -> bool {
+        false
+    }
+
     /// @brief 关闭文件
     ///
     /// @return 成功：Ok()

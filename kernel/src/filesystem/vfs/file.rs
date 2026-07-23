@@ -205,10 +205,6 @@ struct WriteConfig {
     update_offset: bool,
     /// 偏移量更新方式
     offset_update: OffsetUpdate,
-    /// 文件标志
-    flags: FileFlags,
-    /// inode 标志
-    inode_flags: InodeFlags,
 }
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
 #[derive(Clone)]
@@ -828,9 +824,16 @@ impl File {
 
     fn maybe_sync_after_write(
         &self,
+        file_type: FileType,
+        start: usize,
+        written_len: usize,
         flags: FileFlags,
         inode_flags: InodeFlags,
     ) -> Result<(), SystemError> {
+        if written_len == 0 || !self.inode.supports_post_write_sync(file_type) {
+            return Ok(());
+        }
+
         // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
         let need_data_sync = flags.contains(FileFlags::O_DSYNC);
         // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
@@ -840,12 +843,15 @@ impl File {
         let inode_sync = inode_flags.contains(InodeFlags::S_SYNC);
 
         if need_data_sync || inode_sync {
-            if need_metadata_sync || inode_sync {
-                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.inode.sync_file(false, self.private_data.lock())?;
+            let end = start.saturating_add(written_len).saturating_sub(1);
+            if need_metadata_sync {
+                // O_SYNC: 完整同步（数据 + 元数据）
+                self.inode
+                    .sync_file_range(start, end, false, self.private_data.lock())?;
             } else {
-                // O_DSYNC: 仅数据同步
-                self.inode.sync_file(true, self.private_data.lock())?;
+                // O_DSYNC 或 S_SYNC: datasync；完整同步只由 O_SYNC 决定。
+                self.inode
+                    .sync_file_range(start, end, true, self.private_data.lock())?;
             }
         }
         Ok(())
@@ -919,7 +925,6 @@ impl File {
             }
         }
 
-        self.maybe_sync_after_write(config.flags, config.inode_flags)?;
         Ok(written_len)
     }
     /// @brief 创建一个新的文件对象
@@ -1484,31 +1489,32 @@ impl File {
                     WriteConfig {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
-                        flags,
-                        inode_flags,
                     },
                 )
+                .map(|written_len| (actual_offset, written_len))
             };
-            return match self.append_lock_domain.as_ref() {
+            let (actual_offset, written_len) = match self.append_lock_domain.as_ref() {
                 Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
                 None => append_write(),
-            };
+            }?;
+            self.maybe_sync_after_write(file_type, actual_offset, written_len, flags, inode_flags)?;
+            return Ok(written_len);
         }
 
         let actual_offset = offset;
         let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-        self.write_at_and_finalize(
+        let written_len = self.write_at_and_finalize(
             actual_offset,
             actual_len,
             buf,
             WriteConfig {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
-                flags,
-                inode_flags,
             },
-        )
+        )?;
+        self.maybe_sync_after_write(file_type, actual_offset, written_len, flags, inode_flags)?;
+        Ok(written_len)
     }
 
     pub fn do_write_user(
@@ -1553,31 +1559,32 @@ impl File {
                     WriteConfig {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
-                        flags,
-                        inode_flags,
                     },
                 )
+                .map(|written_len| (actual_offset, written_len))
             };
-            return match self.append_lock_domain.as_ref() {
+            let (actual_offset, written_len) = match self.append_lock_domain.as_ref() {
                 Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
                 None => append_write(),
-            };
+            }?;
+            self.maybe_sync_after_write(file_type, actual_offset, written_len, flags, inode_flags)?;
+            return Ok(written_len);
         }
 
         let actual_offset = offset;
         let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-        self.write_user_at_and_finalize(
+        let written_len = self.write_user_at_and_finalize(
             actual_offset,
             actual_len,
             reader,
             WriteConfig {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
-                flags,
-                inode_flags,
             },
-        )
+        )?;
+        self.maybe_sync_after_write(file_type, actual_offset, written_len, flags, inode_flags)?;
+        Ok(written_len)
     }
 
     /// Write to the file from a userspace buffer.

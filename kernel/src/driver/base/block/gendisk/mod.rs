@@ -16,7 +16,7 @@ use crate::{
     driver::{base::device::device_number::DeviceNumber, block::loop_device::LoopDevice},
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
-        vfs::{utils::DName, IndexNode, InodeMode, Metadata},
+        vfs::{utils::DName, FilePrivateData, FileType, IndexNode, InodeMode, Metadata},
     },
     libs::{mutex::MutexGuard, rwlock::RwLock},
 };
@@ -217,6 +217,18 @@ impl IndexNode for GenDisk {
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
+    }
+
+    fn supports_post_write_sync(&self, file_type: FileType) -> bool {
+        file_type == FileType::BlockDevice
+    }
+
+    fn sync_file(
+        &self,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.sync()
     }
 
     fn read_at(

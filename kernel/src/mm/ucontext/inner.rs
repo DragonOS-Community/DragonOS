@@ -441,7 +441,7 @@ impl InnerAddressSpace {
                     match LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
                     {
                         PresentPfn::Managed(page) => Some(page),
-                        PresentPfn::External(_) => None,
+                        PresentPfn::External => None,
                     }
                 };
                 let Some(page) = page else {

@@ -10,12 +10,9 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::{
-        base::device::{
-            device_number::{DeviceNumber, Major},
-            device_register, IdTable,
-        },
-        serial::serial8250::send_to_default_serial8250_port,
+    driver::base::device::{
+        device_number::{DeviceNumber, Major},
+        device_register, IdTable,
     },
     filesystem::devfs::{devfs_register, devfs_unregister},
     init::initcall::INITCALL_LATE,
@@ -436,7 +433,6 @@ impl TtyOperation for TtyConsoleDriverInner {
         // if String::from_utf8_lossy(buf) == "Hello world!\n" {
         //     loop {}
         // }
-        send_to_default_serial8250_port(buf);
         let ret = tty.do_write(buf, nr);
         self.flush_chars(tty);
         ret

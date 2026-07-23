@@ -19,7 +19,7 @@ use crate::{
 use alloc::sync::Arc;
 use system_error::SystemError;
 
-use super::file::{File, FileFlags};
+use super::file::File;
 
 pub const FASYNC_POLL_IN: i64 = 0x00000001 | 0x00000040;
 pub const FASYNC_POLL_OUT: i64 = 0x00000004 | 0x00000100 | 0x00000200;
@@ -77,8 +77,11 @@ pub struct FAsyncItem {
 }
 
 impl FAsyncItem {
-    pub fn new(file: Weak<File>, fd: i32) -> Self {
-        Self { file, fd }
+    pub fn new(file: &Arc<File>, fd: i32) -> Self {
+        Self {
+            file: Arc::downgrade(file),
+            fd,
+        }
     }
 
     /// Get the file reference
@@ -132,6 +135,7 @@ impl FAsyncItems {
     /// Add a FAsyncItem
     pub fn add(&self, item: FAsyncItem) {
         let mut guard = self.items.lock();
+        guard.retain(FAsyncItem::is_alive);
         for old_item in guard.iter_mut() {
             if Weak::ptr_eq(old_item.file_weak(), item.file_weak()) {
                 old_item.set_fd(item.fd());
@@ -147,10 +151,28 @@ impl FAsyncItems {
         guard.retain(|item| !Weak::ptr_eq(item.file_weak(), file));
     }
 
-    /// Clear all items
-    #[allow(dead_code)]
+    /// Remove a registration while the last strong File reference is being
+    /// dropped and a new Weak cannot be constructed.
+    pub fn remove_file(&self, file: &File) {
+        let file_ptr = file as *const File;
+        self.items
+            .lock()
+            .retain(|item| item.file_weak().as_ptr() != file_ptr);
+    }
+
+    /// Remove every registration and clear FASYNC on each live open file
+    /// description. Drain the list before taking per-file fasync locks to
+    /// preserve the update path's fasync-lock -> item-list lock order.
     pub fn clear(&self) {
-        self.items.lock().clear();
+        let items = {
+            let mut guard = self.items.lock();
+            core::mem::take(&mut *guard)
+        };
+        for item in items {
+            if let Some(file) = item.file() {
+                file.clear_fasync_flag();
+            }
+        }
     }
 
     /// Send SIGIO to all registered file owners
@@ -218,25 +240,42 @@ impl FAsyncItems {
     }
 }
 
-pub fn set_file_fasync(file: &Arc<File>, fd: i32, enabled: bool) -> Result<(), SystemError> {
-    let mut flags = file.flags();
-    if enabled {
-        flags.insert(FileFlags::FASYNC);
-    } else {
-        flags.remove(FileFlags::FASYNC);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FAsyncHandlerPolicy {
+    Optional,
+    Required,
+}
 
-    file.set_flags(flags)?;
-
-    if let Ok(pollable) = file.inode().as_pollable_inode() {
-        let private_data = file.private_data.lock();
-        if enabled {
-            let item = FAsyncItem::new(Arc::downgrade(file), fd);
-            let _ = pollable.add_fasync(item, &private_data);
+pub fn set_file_fasync(
+    file: &Arc<File>,
+    fd: i32,
+    enabled: bool,
+    handler_policy: FAsyncHandlerPolicy,
+) -> Result<(), SystemError> {
+    file.update_fasync_flag(enabled, || {
+        if let Ok(pollable) = file.inode().as_pollable_inode() {
+            let private_data = file.private_data.lock();
+            let result = if enabled {
+                let item = FAsyncItem::new(file, fd);
+                pollable.add_fasync(item, &private_data)
+            } else {
+                pollable.remove_fasync(&Arc::downgrade(file), &private_data)
+            };
+            if let Err(err) = result {
+                if err != SystemError::ENOSYS {
+                    return Err(err);
+                }
+                if handler_policy == FAsyncHandlerPolicy::Required {
+                    return Err(SystemError::ENOTTY);
+                }
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        } else if handler_policy == FAsyncHandlerPolicy::Required {
+            Err(SystemError::ENOTTY)
         } else {
-            let _ = pollable.remove_fasync(&Arc::downgrade(file), &private_data);
+            Ok(false)
         }
-    }
-
-    Ok(())
+    })
 }

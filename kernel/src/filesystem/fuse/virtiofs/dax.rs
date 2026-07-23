@@ -241,6 +241,7 @@ impl AllocationToken {
         self.index * DAX_RANGE_SIZE
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         DAX_RANGE_SIZE
     }
@@ -270,6 +271,7 @@ impl OwnedToken {
         self.index * DAX_RANGE_SIZE
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         DAX_RANGE_SIZE
     }
@@ -292,16 +294,13 @@ impl OwnedToken {
 }
 
 impl ReclaimCandidate {
+    #[cfg(test)]
     pub(crate) fn window_offset(&self) -> usize {
         self.index * DAX_RANGE_SIZE
     }
 
     pub(crate) fn owner(&self) -> DaxMappingOwner {
         self.owner
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
     }
 }
 
@@ -314,6 +313,7 @@ impl ReclaimToken {
         DAX_RANGE_SIZE
     }
 
+    #[cfg(test)]
     pub(crate) fn owner(&self) -> DaxMappingOwner {
         self.owner
     }
@@ -753,6 +753,7 @@ impl DaxRangeAllocator {
         cleaned
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_shutdown(&self) -> Result<(), SystemError> {
         let mut state = self.state.lock_irqsave();
         let snapshot = state.snapshot();

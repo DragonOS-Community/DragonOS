@@ -425,6 +425,15 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
         // Default implementation: not supported
         Err(SystemError::ENOSYS)
     }
+
+    /// Remove fasync state during final open-file-description release.
+    fn release_fasync(
+        &self,
+        _file: &file::File,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
@@ -1042,8 +1051,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: usize,
         _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        // Match Linux vfs_ioctl(): a file without an ioctl handler does not
+        // support the command. sys_ioctl translates this internal error to
+        // the userspace-visible ENOTTY.
+        Err(SystemError::ENOIOCTLCMD)
     }
 
     /// @brief 获取inode所在的文件系统的指针

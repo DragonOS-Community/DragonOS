@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -1114,7 +1115,8 @@ TEST(TtyPtyHangup, MasterCloseMakesSlaveObserveHangup) {
     pair.master.reset();
 
     short revents = PollEvents(pair.slave.get());
-    EXPECT_NE(0, revents & POLLHUP);
+    constexpr short kHungUpEvents = POLLIN | POLLOUT | POLLERR | POLLHUP;
+    EXPECT_EQ(kHungUpEvents, revents);
 
     char ch = 0;
     errno = 0;
@@ -1124,6 +1126,90 @@ TEST(TtyPtyHangup, MasterCloseMakesSlaveObserveHangup) {
     EXPECT_EQ(-1, write(pair.slave.get(), "x", 1));
     EXPECT_EQ(EIO, errno) << "slave write after master close errno=" << errno << " ("
                           << strerror(errno) << ")";
+
+    int async = 1;
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(pair.slave.get(), FIOASYNC, &async));
+    EXPECT_EQ(ENOTTY, errno) << "slave FIOASYNC after master close errno=" << errno << " ("
+                            << strerror(errno) << ")";
+
+    int flags = fcntl(pair.slave.get(), F_GETFL);
+    ASSERT_GE(flags, 0);
+    errno = 0;
+    EXPECT_EQ(-1, fcntl(pair.slave.get(), F_SETFL, flags | O_ASYNC));
+    EXPECT_EQ(ENOTTY, errno) << "slave F_SETFL(O_ASYNC) after master close errno=" << errno << " ("
+                            << strerror(errno) << ")";
+}
+
+TEST(TtyPtyHangup, HangupClearsAsyncState) {
+    PtyPair pair = OpenRawPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    int flags = fcntl(pair.slave.get(), F_GETFL);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(0, fcntl(pair.slave.get(), F_SETFL, flags | O_ASYNC));
+    ASSERT_NE(0, fcntl(pair.slave.get(), F_GETFL) & O_ASYNC);
+
+    pair.master.reset();
+
+    flags = fcntl(pair.slave.get(), F_GETFL);
+    ASSERT_GE(flags, 0);
+    EXPECT_EQ(0, flags & O_ASYNC);
+
+    int async = 0;
+    EXPECT_EQ(0, ioctl(pair.slave.get(), FIOASYNC, &async));
+    EXPECT_EQ(0, fcntl(pair.slave.get(), F_SETFL, flags & ~O_ASYNC));
+}
+
+struct AsyncFlagRaceArgs {
+    int fd;
+    int async_flags;
+    std::atomic<bool> stop{false};
+    std::atomic<int> unexpected_errno{0};
+};
+
+void* ToggleNonblockAcrossHangup(void* opaque) {
+    auto* args = static_cast<AsyncFlagRaceArgs*>(opaque);
+    bool nonblock = false;
+    while (!args->stop.load(std::memory_order_acquire)) {
+        nonblock = !nonblock;
+        int flags = args->async_flags;
+        if (nonblock) {
+            flags |= O_NONBLOCK;
+        } else {
+            flags &= ~O_NONBLOCK;
+        }
+        if (fcntl(args->fd, F_SETFL, flags) < 0 && errno != ENOTTY) {
+            args->unexpected_errno.store(errno, std::memory_order_release);
+            break;
+        }
+    }
+    return nullptr;
+}
+
+TEST(TtyPtyHangup, ConcurrentStatusFlagUpdateCannotRestoreAsync) {
+    PtyPair pair = OpenRawPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    int flags = fcntl(pair.slave.get(), F_GETFL);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(0, fcntl(pair.slave.get(), F_SETFL, flags | O_ASYNC));
+
+    AsyncFlagRaceArgs args{pair.slave.get(), flags | O_ASYNC};
+    pthread_t updater;
+    ASSERT_EQ(0, pthread_create(&updater, nullptr, ToggleNonblockAcrossHangup, &args));
+    usleep(1000);
+    pair.master.reset();
+    usleep(1000);
+    args.stop.store(true, std::memory_order_release);
+    ASSERT_EQ(0, pthread_join(updater, nullptr));
+
+    EXPECT_EQ(0, args.unexpected_errno.load(std::memory_order_acquire));
+    flags = fcntl(pair.slave.get(), F_GETFL);
+    ASSERT_GE(flags, 0);
+    EXPECT_EQ(0, flags & O_ASYNC);
 }
 
 TEST(TtyPtyHangup, ChildExitDrainsSlaveOutputBeforeMasterEio) {

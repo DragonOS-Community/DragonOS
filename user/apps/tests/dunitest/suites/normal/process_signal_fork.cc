@@ -73,6 +73,15 @@ void* PauseForeverThread(void*) {
     return nullptr;
 }
 
+void* ReadyPauseThread(void* arg) {
+    int ready_fd = *static_cast<int*>(arg);
+    WriteByteOrExit(ready_fd, 'R');
+    for (;;) {
+        pause();
+    }
+    return nullptr;
+}
+
 void RunMultithreadedSignalChild(int ready_fd) {
     pthread_t threads[3] {};
     for (pthread_t& thread : threads) {
@@ -173,6 +182,55 @@ TEST(ProcessSignalFork, ProcessDirectedSigkillKillsStoppedChildWithPendingStopEv
 
     ASSERT_TRUE(WIFSIGNALED(status)) << "child status=" << status;
     EXPECT_EQ(SIGKILL, WTERMSIG(status));
+}
+
+TEST(ProcessSignalFork, ProcessGroupSignalIsDeliveredOncePerThreadGroup) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        if (setsid() < 0) {
+            _exit(120);
+        }
+
+        const int signal = SIGRTMIN;
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, signal);
+        if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0) {
+            _exit(121);
+        }
+
+        int ready_pipe[2] = {-1, -1};
+        if (pipe(ready_pipe) != 0) {
+            _exit(122);
+        }
+        pthread_t thread {};
+        if (pthread_create(&thread, nullptr, ReadyPauseThread, &ready_pipe[1]) != 0
+            || !ReadByte(ready_pipe[0])) {
+            _exit(123);
+        }
+
+        if (kill(0, signal) != 0) {
+            _exit(124);
+        }
+
+        timespec timeout {};
+        timeout.tv_nsec = 10 * 1000 * 1000;
+        if (sigtimedwait(&blocked, nullptr, &timeout) != signal) {
+            _exit(125);
+        }
+        errno = 0;
+        if (sigtimedwait(&blocked, nullptr, &timeout) != -1 || errno != EAGAIN) {
+            _exit(126);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 TEST(ProcessSignalFork, ProcessDirectedSigkillKillsMultithreadedChild) {

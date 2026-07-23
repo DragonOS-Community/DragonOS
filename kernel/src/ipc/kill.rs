@@ -3,6 +3,7 @@ use crate::ipc::syscall::sys_kill::check_signal_permission_pcb_with_sig;
 use crate::process::pid::{Pid, PidType};
 use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
 use crate::{arch::ipc::signal::Signal, ipc::signal_types::SigCode};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::compiler_fence;
@@ -73,8 +74,28 @@ pub fn send_signal_to_pcb(
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=kill_pgrp#1921
 #[inline(never)]
 pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, SystemError> {
-    // 先收集进程组中的所有进程，避免在持有锁时调用复杂操作
-    let tasks: Vec<Arc<ProcessControlBlock>> = pgid.tasks_iter(PidType::PGID).collect();
+    // Linux only links thread-group leaders into PIDTYPE_PGID. DragonOS
+    // currently links every thread, so only use physical leader entries and
+    // group them by their stable TGID identity. TGID grouping also covers the
+    // brief old/new leader overlap during de_thread().
+    let mut thread_groups: BTreeMap<usize, Arc<ProcessControlBlock>> = BTreeMap::new();
+    let physical_tasks: Vec<Arc<ProcessControlBlock>> =
+        pgid.tasks_iter(PidType::PGID).collect();
+    for task in physical_tasks {
+        if !task.is_thread_group_leader() {
+            continue;
+        }
+        let Some(tgid) = task.task_pid_ptr(PidType::TGID) else {
+            continue;
+        };
+        let representative = thread_groups
+            .entry(Arc::as_ptr(&tgid) as usize)
+            .or_insert_with(|| task.clone());
+        if !representative.is_live_thread_group_member() && task.is_live_thread_group_member() {
+            *representative = task;
+        }
+    }
+    let tasks: Vec<Arc<ProcessControlBlock>> = thread_groups.into_values().collect();
 
     // 如果进程组中没有任何进程，返回 ESRCH
     if tasks.is_empty() {

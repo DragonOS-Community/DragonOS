@@ -710,6 +710,11 @@ impl TtyCoreData {
         self.hangup_generation.load(Ordering::Acquire)
     }
 
+    #[inline]
+    pub fn file_hung_up(&self, file_hangup_generation: usize) -> bool {
+        self.hangup_generation() != file_hangup_generation
+    }
+
     /// Snapshot the generation assigned to a newly opening file.
     ///
     /// A file which races with an in-progress hangup belongs to the generation

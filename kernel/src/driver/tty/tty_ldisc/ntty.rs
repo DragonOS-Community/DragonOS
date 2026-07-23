@@ -1889,15 +1889,18 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         len: usize,
         cookie: &mut bool,
         _offset: usize,
-        flags: FileFlags,
+        file_context: super::TtyLdiscFileContext,
     ) -> Result<usize, system_error::SystemError> {
         let core = tty.core();
+        if core.file_hung_up(file_context.hangup_generation) {
+            return Ok(0);
+        }
         if !*cookie {
             TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTIN)?;
         }
         let mut termios_guard = Some(core.termios_read_lock());
         let mut ldata;
-        if flags.contains(FileFlags::O_NONBLOCK) {
+        if file_context.flags.contains(FileFlags::O_NONBLOCK) {
             let ret = self.disc_data_try_lock();
             if ret.is_err() {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -1968,6 +1971,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let tail = ldata.read_tail;
         drop(ldata);
         while nr != 0 {
+            if core.file_hung_up(file_context.hangup_generation) {
+                break;
+            }
+
             // todo: 处理packet模式
             if packet {
                 let link = core.link().unwrap();
@@ -2007,14 +2014,20 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 {
                     let flags = core.flags();
                     if flags.contains(TtyFlag::OTHER_CLOSED) {
-                        if flags.contains(TtyFlag::HUPPED) || flags.contains(TtyFlag::HUPPING) {
+                        if core.file_hung_up(file_context.hangup_generation)
+                            || flags.contains(TtyFlag::HUPPED)
+                            || flags.contains(TtyFlag::HUPPING)
+                        {
                             break;
                         }
                         ret = Err(SystemError::EIO);
                         break;
                     }
 
-                    if flags.contains(TtyFlag::HUPPED) || flags.contains(TtyFlag::HUPPING) {
+                    if core.file_hung_up(file_context.hangup_generation)
+                        || flags.contains(TtyFlag::HUPPED)
+                        || flags.contains(TtyFlag::HUPPING)
+                    {
                         break;
                     }
                 }
@@ -2023,7 +2036,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     break;
                 }
 
-                if flags.contains(FileFlags::O_NONBLOCK)
+                if file_context.flags.contains(FileFlags::O_NONBLOCK)
                     || core.flags().contains(TtyFlag::LDISC_CHANGING)
                 {
                     ret = Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -2043,6 +2056,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     ldata.input_available(core.termios(), false)
                         || Self::packet_status_pending(core, packet)
                         || core.flags().contains(TtyFlag::OTHER_CLOSED)
+                        || core.file_hung_up(file_context.hangup_generation)
                         || core.flags().contains(TtyFlag::HUPPED)
                         || core.flags().contains(TtyFlag::HUPPING)
                         || core.flags().contains(TtyFlag::LDISC_CHANGING)
@@ -2126,7 +2140,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         tty: Arc<TtyCore>,
         buf: &[u8],
         len: usize,
-        _flags: FileFlags,
+        file_context: super::TtyLdiscFileContext,
     ) -> Result<usize, system_error::SystemError> {
         let mut nr = len;
         let mut out_buf = Vec::with_capacity(NTTY_BUFSIZE);
@@ -2140,6 +2154,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let mut termios = *core.termios();
 
         let mut output_guard = Some(self.output_lock.lock());
+
+        if core.file_hung_up(file_context.hangup_generation) {
+            return Err(SystemError::EIO);
+        }
 
         self.disc_data().process_echoes(tty.clone());
         // Echo drain is best-effort in the write path; Ok(false) means
@@ -2160,7 +2178,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 }
                 return Err(SystemError::ERESTARTSYS);
             }
-            if core.flags().contains(TtyFlag::HUPPED)
+            if core.file_hung_up(file_context.hangup_generation)
+                || core.flags().contains(TtyFlag::HUPPED)
                 || (core.flags().contains(TtyFlag::OTHER_CLOSED)
                     && core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster)
                 || core.flags().contains(TtyFlag::HUPPING)
@@ -2281,7 +2300,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 break;
             }
 
-            if _flags.contains(FileFlags::O_NONBLOCK)
+            if file_context.flags.contains(FileFlags::O_NONBLOCK)
                 || core.flags().contains(TtyFlag::LDISC_CHANGING)
             {
                 if offset != 0 {
@@ -2301,7 +2320,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             let wait_result = core.write_wq().wait_event_interruptible(
                 EPollEventType::EPOLLOUT.bits() as u64,
                 || {
-                    if core.flags().contains(TtyFlag::HUPPED)
+                    if core.file_hung_up(file_context.hangup_generation)
+                        || core.flags().contains(TtyFlag::HUPPED)
                         || (core.flags().contains(TtyFlag::OTHER_CLOSED)
                             && core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster)
                         || core.flags().contains(TtyFlag::HUPPING)

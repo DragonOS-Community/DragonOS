@@ -52,6 +52,7 @@ use super::{
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriverManager, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
+    tty_ldisc::TtyLdiscFileContext,
     virtual_terminal::vty_init,
 };
 
@@ -367,7 +368,11 @@ impl IndexNode for TtyDevice {
         if tty_file.is_hung_up() {
             return Ok(0);
         }
-        let (tty, flags) = (tty_file.tty(), tty_file.flags);
+        let tty = tty_file.tty();
+        let file_context = TtyLdiscFileContext {
+            flags: tty_file.flags,
+            hangup_generation: tty_file.hangup_generation,
+        };
 
         drop(data);
 
@@ -382,7 +387,14 @@ impl IndexNode for TtyDevice {
 
         loop {
             let mut size = (len - offset).min(buf.len() - offset);
-            size = ld.read(tty.clone(), &mut buf[offset..], size, &mut cookie, 0, flags)?;
+            size = ld.read(
+                tty.clone(),
+                &mut buf[offset..],
+                size,
+                &mut cookie,
+                0,
+                file_context,
+            )?;
             // 本次迭代未读取到数据，可能是EOF或暂时无数据可读
             if size == 0 {
                 break;
@@ -416,13 +428,17 @@ impl IndexNode for TtyDevice {
         if tty_file.is_hung_up() {
             return Err(SystemError::EIO);
         }
-        let (tty, flags) = (tty_file.tty(), tty_file.flags);
+        let tty = tty_file.tty();
+        let file_context = TtyLdiscFileContext {
+            flags: tty_file.flags,
+            hangup_generation: tty_file.hangup_generation,
+        };
         drop(data);
         let ld = tty.ldisc();
         let core = tty.core();
         let write_guard = core
             .write_lock()
-            .lock_interruptible(flags.contains(FileFlags::O_NONBLOCK))?;
+            .lock_interruptible(file_context.flags.contains(FileFlags::O_NONBLOCK))?;
         let mut chunk = 2048;
         if core.flags().contains(TtyFlag::NO_WRITE_SPLIT) {
             chunk = 65536;
@@ -437,7 +453,7 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = match ld.write(tty.clone(), &buf[written..], size, flags) {
+            let ret = match ld.write(tty.clone(), &buf[written..], size, file_context) {
                 Ok(ret) => ret,
                 Err(err) => {
                     if written != 0 {

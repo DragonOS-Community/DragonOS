@@ -54,6 +54,9 @@ const SERIAL_8250_PIO_IRQ: IrqNumber = IrqNumber::new(IoApic::VECTOR_BASE as u32
 const SERIAL_8250_RX_IRQ_LIMIT: usize = 256;
 const SERIAL_8250_IER_RX_AVAILABLE: u8 = 0x01;
 const SERIAL_8250_IER_TX_EMPTY: u8 = 0x02;
+const SERIAL_8250_FCR_ENABLE_FIFO: u8 = 0x01;
+const SERIAL_8250_FCR_CLEAR_XMIT: u8 = 0x04;
+const SERIAL_8250_FCR_TRIGGER_14: u8 = 0xc0;
 const SERIAL_8250_TX_QUEUE_SIZE: usize = 4096;
 const SERIAL_8250_FIFO_SIZE: usize = 16;
 const SERIAL_8250_TX_WAKEUP_CHARS: usize = 256;
@@ -406,6 +409,42 @@ impl Serial8250PIOPort {
         self.set_tx_interrupt_enabled(false);
     }
 
+    fn abort_tx(&self) {
+        let mut tx_state = self.tx_state.lock_irqsave();
+        if let Some(queue) = tx_state.queue.as_mut() {
+            queue.clear();
+        }
+        self.set_tx_interrupt_enabled(false);
+
+        // Linux's ordinary uart_flush_buffer() leaves bytes already accepted
+        // by a PIO 8250 alone. A close-time abort is different: Linux follows
+        // it with 8250 shutdown, which resets the hardware FIFOs before a
+        // later open. DragonOS has no separate shutdown callback yet, so do
+        // the transmit-only reset here without discarding pending RX data.
+        if self.tx_fifo_size.load(Ordering::Acquire) > 1 {
+            let _hw_guard = self.hw_lock.lock_irqsave();
+            self.serial_out_raw(
+                2,
+                (SERIAL_8250_FCR_ENABLE_FIFO
+                    | SERIAL_8250_FCR_CLEAR_XMIT
+                    | SERIAL_8250_FCR_TRIGGER_14)
+                    .into(),
+            );
+        }
+    }
+
+    fn write_fifo_if_ready(&self, bytes: &[u8]) -> usize {
+        let _hw_guard = self.hw_lock.lock_irqsave();
+        if self.serial_in_raw(5) & 0x20 == 0 {
+            return 0;
+        }
+        let count = bytes.len().min(self.tx_fifo_size.load(Ordering::Acquire));
+        for byte in &bytes[..count] {
+            self.serial_out_raw(0, (*byte).into());
+        }
+        count
+    }
+
     fn submit_runtime_output(&self, s: &[u8]) {
         // This is the legacy, no-return-value console/debug interface: unlike
         // the TTY write callback it cannot report a short write.  Serialize it
@@ -491,12 +530,20 @@ impl Serial8250PIOPort {
             let count = older_remaining
                 .min(self.tx_fifo_size.load(Ordering::Acquire))
                 .min(queue.len());
-            for _ in 0..count {
-                self.serial_out(0, queue.pop_front().unwrap().into());
-            }
-            older_remaining -= count;
-            if count == 0 {
-                break;
+            let _hw_guard = self.hw_lock.lock_irqsave();
+            let sent = if self.serial_in_raw(5) & 0x20 == 0 {
+                0
+            } else {
+                for _ in 0..count {
+                    self.serial_out_raw(0, queue.pop_front().unwrap().into());
+                }
+                count
+            };
+            drop(_hw_guard);
+            older_remaining -= sent;
+            if sent == 0 {
+                drop(tx_state);
+                continue;
             }
         }
 
@@ -506,11 +553,11 @@ impl Serial8250PIOPort {
                 healthy = false;
                 break;
             }
-            let count = (s.len() - offset).min(self.tx_fifo_size.load(Ordering::Acquire));
-            for byte in &s[offset..offset + count] {
-                self.serial_out(0, (*byte).into());
+            let sent = self.write_fifo_if_ready(&s[offset..]);
+            if sent == 0 {
+                continue;
             }
-            offset += count;
+            offset += sent;
         }
 
         {
@@ -545,8 +592,7 @@ impl Serial8250PIOPort {
         self.set_tx_interrupt_enabled(false);
         drop(tx_state);
 
-        let timeout = self.tx_batch_timeout();
-        if !self.wait_for_thre(timeout) {
+        let Ok(_hw_guard) = self.hw_lock.try_lock_irqsave() else {
             let mut tx_state = self.tx_state.lock_irqsave();
             tx_state.console_active = inherited_console_active;
             let pending = tx_state
@@ -556,13 +602,30 @@ impl Serial8250PIOPort {
                 .unwrap_or(false);
             self.set_tx_interrupt_enabled(pending && !inherited_console_active);
             return;
+        };
+        let deadline = Instant::now() + self.tx_batch_timeout();
+        while self.serial_in_raw(5) & 0x20 == 0 {
+            if Instant::now() >= deadline {
+                drop(_hw_guard);
+                let mut tx_state = self.tx_state.lock_irqsave();
+                tx_state.console_active = inherited_console_active;
+                let pending = tx_state
+                    .queue
+                    .as_ref()
+                    .map(|queue| !queue.is_empty())
+                    .unwrap_or(false);
+                self.set_tx_interrupt_enabled(pending && !inherited_console_active);
+                return;
+            }
+            spin_loop();
         }
         // Atomic diagnostics get one bounded FIFO batch. Longer output is
         // intentionally truncated rather than extending IRQ/exception time.
         let count = s.len().min(self.tx_fifo_size.load(Ordering::Acquire));
         for byte in &s[..count] {
-            self.serial_out(0, (*byte).into());
+            self.serial_out_raw(0, (*byte).into());
         }
+        drop(_hw_guard);
 
         let mut tx_state = self.tx_state.lock_irqsave();
         tx_state.console_active = inherited_console_active;
@@ -1110,7 +1173,7 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
                 .unwrap_or(false);
         if !transmitter_idle {
             // A failed/stalled UART must not leak bytes into the next open.
-            port.clear_tx();
+            port.abort_tx();
         }
         tty.ldisc().flush_buffer(tty.clone())?;
         Ok(())

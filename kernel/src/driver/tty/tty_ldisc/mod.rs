@@ -18,6 +18,12 @@ pub enum TtyLdiscDrainResult {
     NeedWriteRoom(usize),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TtyLdiscFileContext {
+    pub flags: FileFlags,
+    pub hangup_generation: usize,
+}
+
 pub trait TtyLineDiscipline: Sync + Send + Debug {
     fn open(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
@@ -71,14 +77,14 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
         len: usize,
         cookie: &mut bool,
         offset: usize,
-        flags: FileFlags,
+        file_context: TtyLdiscFileContext,
     ) -> Result<usize, SystemError>;
     fn write(
         &self,
         tty: Arc<TtyCore>,
         buf: &[u8],
         len: usize,
-        flags: FileFlags,
+        file_context: TtyLdiscFileContext,
     ) -> Result<usize, SystemError>;
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError>;
 

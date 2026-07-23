@@ -382,6 +382,15 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
         // Default implementation: not supported
         Err(SystemError::ENOSYS)
     }
+
+    /// Remove fasync state during final open-file-description release.
+    fn release_fasync(
+        &self,
+        _file: &file::File,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {

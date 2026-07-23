@@ -1174,6 +1174,26 @@ impl PollableInode for LockedPipeInode {
         }
         Ok(())
     }
+
+    fn release_fasync(
+        &self,
+        file: &crate::filesystem::vfs::file::File,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        if let FilePrivateData::Pipefs(pipe_data) = private_data {
+            let flags = pipe_data.flags;
+            if !flags.is_write_only() {
+                self.read_fasync_items.remove_file(file);
+            }
+            if !flags.is_read_only() {
+                self.write_fasync_items.remove_file(file);
+            }
+        } else {
+            self.read_fasync_items.remove_file(file);
+            self.write_fasync_items.remove_file(file);
+        }
+        Ok(())
+    }
 }
 
 impl IndexNode for LockedPipeInode {

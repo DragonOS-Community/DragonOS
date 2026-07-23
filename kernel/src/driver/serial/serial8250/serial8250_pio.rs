@@ -50,7 +50,11 @@ use super::{Serial8250ISADevices, Serial8250ISADriver, Serial8250Manager, Serial
 static mut PIO_PORTS: [Option<Serial8250PIOPort>; 8] =
     [None, None, None, None, None, None, None, None];
 
-const SERIAL_8250_PIO_IRQ: IrqNumber = IrqNumber::new(IoApic::VECTOR_BASE as u32 + 4);
+const SERIAL_8250_PIO_IRQS: [IrqNumber; 2] = [
+    IrqNumber::new(IoApic::VECTOR_BASE as u32 + 3),
+    IrqNumber::new(IoApic::VECTOR_BASE as u32 + 4),
+];
+const SERIAL_8250_IRQ_PASS_LIMIT: usize = 256;
 const SERIAL_8250_RX_IRQ_LIMIT: usize = 256;
 const SERIAL_8250_IER_RX_AVAILABLE: u8 = 0x01;
 const SERIAL_8250_IER_TX_EMPTY: u8 = 0x02;
@@ -292,6 +296,15 @@ impl Serial8250PIOPort {
     /// Both the transmitter FIFO and shift register are empty.
     fn is_transmitter_idle(&self) -> bool {
         self.serial_in(5) & 0x40 != 0
+    }
+
+    fn has_pending_interrupt(&self) -> bool {
+        let _guard = self.hw_lock.lock_irqsave();
+        self.serial_in_raw(2) & 0x01 == 0
+    }
+
+    fn irq(&self) -> Option<IrqNumber> {
+        self.iobase.legacy_irq()
     }
 
     /// 读取一个字节，如果没有数据则返回None
@@ -1068,6 +1081,19 @@ pub enum Serial8250PortBase {
     COM8 = 0x4e8,
 }
 
+impl Serial8250PortBase {
+    /// Linux's fixed x86 legacy table defines IRQ resources only for the
+    /// first four ISA UARTs. Additional base addresses require platform
+    /// firmware or explicit configuration and must not guess an IRQ.
+    const fn legacy_irq(self) -> Option<IrqNumber> {
+        match self {
+            Self::COM1 | Self::COM3 => Some(IrqNumber::new(IoApic::VECTOR_BASE as u32 + 4)),
+            Self::COM2 | Self::COM4 => Some(IrqNumber::new(IoApic::VECTOR_BASE as u32 + 3)),
+            Self::COM5 | Self::COM6 | Self::COM7 | Self::COM8 => None,
+        }
+    }
+}
+
 /// 临时函数，用于向COM1发送数据
 pub fn send_to_default_serial8250_pio_port(s: &[u8]) {
     if let Some(port) = unsafe { PIO_PORTS[0].as_ref() } {
@@ -1260,40 +1286,89 @@ pub(super) fn serial_8250_pio_register_tty_devices() -> Result<(), SystemError> 
     ))
     .ok_or(SystemError::ENODEV)?;
 
-    for (i, port) in unsafe { PIO_PORTS.iter() }.enumerate() {
-        if let Some(port) = port {
-            let core = driver.init_tty_device(Some(i)).inspect_err(|_| {
-                log::error!(
-                    "failed to init tty device for serial 8250 pio port {}, port iobase: {:?}",
-                    i,
-                    port.iobase
-                );
-            })?;
-            core.resize( core.clone(), WindowSize::DEFAULT)
-                .inspect_err(|_| {
-                    log::error!(
-                        "failed to resize tty device for serial 8250 pio port {}, port iobase: {:?}",
-                        i,
-                        port.iobase
-                    );
-                })?;
+    let mut registered_irqs = [false; SERIAL_8250_PIO_IRQS.len()];
+    for (slot, irq) in SERIAL_8250_PIO_IRQS.iter().copied().enumerate() {
+        let has_port = unsafe { PIO_PORTS.iter() }
+            .flatten()
+            .any(|port| port.irq() == Some(irq));
+        if !has_port {
+            continue;
         }
-    }
-
-    irq_manager()
-        .request_irq(
-            SERIAL_8250_PIO_IRQ,
+        match irq_manager().request_irq(
+            irq,
             "serial8250_pio".to_string(),
             &Serial8250IrqHandler,
             IrqHandleFlags::IRQF_SHARED | IrqHandleFlags::IRQF_TRIGGER_RISING,
-            Some(DeviceId::new(Some("serial8250_pio"), None).unwrap()),
-        )
-        .inspect_err(|e| {
-            log::error!("failed to request irq for serial 8250 pio: {:?}", e);
-        })?;
+            DeviceId::new(Some("serial8250_pio"), None),
+        ) {
+            Ok(()) => registered_irqs[slot] = true,
+            Err(err) => {
+                log::error!("failed to request serial 8250 PIO irq {:?}: {:?}", irq, err);
+            }
+        }
+    }
 
-    for port in unsafe { PIO_PORTS.iter() }.flatten() {
-        port.mark_rx_irq_registered();
+    let irq_is_registered = |irq: IrqNumber| {
+        SERIAL_8250_PIO_IRQS
+            .iter()
+            .position(|candidate| *candidate == irq)
+            .is_some_and(|slot| registered_irqs[slot])
+    };
+    let mut registered_ports = 0;
+    for (i, port) in unsafe { PIO_PORTS.iter() }.enumerate() {
+        if let Some(port) = port {
+            let Some(irq) = port.irq() else {
+                log::warn!(
+                    "serial 8250 PIO port {:?} has no enumerated IRQ resource; skipping tty registration",
+                    port.iobase
+                );
+                continue;
+            };
+            if !irq_is_registered(irq) {
+                log::error!(
+                    "serial 8250 PIO port {:?} cannot be registered without IRQ {:?}",
+                    port.iobase,
+                    irq
+                );
+                continue;
+            }
+            let core = match driver.init_tty_device(Some(i)) {
+                Ok(core) => core,
+                Err(err) => {
+                    log::error!(
+                        "failed to init tty device for serial 8250 pio port {}, port iobase: {:?}: {:?}",
+                        i,
+                        port.iobase,
+                        err
+                    );
+                    continue;
+                }
+            };
+            if let Err(err) = core.resize(core.clone(), WindowSize::DEFAULT) {
+                // The TTY already exists and cannot currently be rolled back.
+                // Keep its IRQ route usable and retain the driver's default
+                // size instead of abandoning this and every later port.
+                log::error!(
+                    "failed to resize tty device for serial 8250 pio port {}, port iobase: {:?}: {:?}",
+                    i,
+                    port.iobase,
+                    err
+                );
+            }
+            port.mark_rx_irq_registered();
+            registered_ports += 1;
+        }
+    }
+
+    if registered_ports == 0 && unsafe { PIO_PORTS.iter().any(Option::is_some) } {
+        // free_irq() is not implemented yet. Once any request succeeded,
+        // report this one-shot boot registration as complete instead of
+        // inviting a retry that would duplicate the installed IRQ action.
+        if registered_irqs.iter().any(|registered| *registered) {
+            log::error!("no serial 8250 PIO TTY could be initialized");
+            return Ok(());
+        }
+        return Err(SystemError::ENODEV);
     }
     retry_serial8250_pio_input();
 
@@ -1306,14 +1381,40 @@ struct Serial8250IrqHandler;
 impl IrqHandler for Serial8250IrqHandler {
     fn handle(
         &self,
-        _irq: IrqNumber,
+        irq: IrqNumber,
         _static_data: Option<&dyn IrqHandlerData>,
         _dynamic_data: Option<Arc<dyn IrqHandlerData>>,
     ) -> Result<IrqReturn, SystemError> {
-        for port in unsafe { PIO_PORTS.iter() }.flatten() {
-            port.handle_irq()?;
+        let mut handled = false;
+        for _ in 0..SERIAL_8250_IRQ_PASS_LIMIT {
+            let mut pending_in_pass = false;
+            for port in unsafe { PIO_PORTS.iter() }
+                .flatten()
+                .filter(|port| port.irq() == Some(irq))
+            {
+                if !port.has_pending_interrupt() {
+                    continue;
+                }
+                pending_in_pass = true;
+                handled = true;
+                if let Err(err) = port.handle_irq() {
+                    log::error!(
+                        "failed to service serial 8250 PIO port {:?} on irq {:?}: {:?}",
+                        port.iobase,
+                        irq,
+                        err
+                    );
+                }
+            }
+            if !pending_in_pass {
+                break;
+            }
         }
 
-        Ok(IrqReturn::Handled)
+        Ok(if handled {
+            IrqReturn::Handled
+        } else {
+            IrqReturn::NotHandled
+        })
     }
 }

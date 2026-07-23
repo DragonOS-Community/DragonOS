@@ -16,6 +16,7 @@ use crate::{
         event_poll::{EventPoll, LockedEPItemLinkedList},
         EPollEventType, EPollItem,
     },
+    filesystem::vfs::fasync::{FAsyncItem, FAsyncItems},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
@@ -149,6 +150,7 @@ impl TtyCore {
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
             epitems: LockedEPItemLinkedList::default(),
+            fasync_items: FAsyncItems::new(),
             device_number,
             privete_fields: SpinLock::new(None),
         };
@@ -252,6 +254,10 @@ impl TtyCore {
             flags.insert(TtyFlag::HUPPING);
             tty.core().hangup_generation.fetch_add(1, Ordering::AcqRel);
         }
+        // Linux removes fasync registrations before replacing existing tty
+        // file operations with hung_up_tty_fops. This also clears O_ASYNC on
+        // every pre-hangup open file description.
+        tty.core().fasync_items.clear();
 
         let (sid, pgid) = {
             let ctrl = tty.core().contorl_info_irqsave();
@@ -659,6 +665,8 @@ pub struct TtyCoreData {
     link: RwLock<Weak<TtyCore>>,
     /// epitems
     epitems: LockedEPItemLinkedList,
+    /// Open file descriptions registered for asynchronous TTY notification.
+    fasync_items: FAsyncItems,
     /// 设备号
     device_number: DeviceNumber,
 
@@ -738,6 +746,29 @@ impl TtyCoreData {
         if self.hangup_generation.load(Ordering::Acquire) == file_hangup_generation {
             flags.remove(TtyFlag::HUPPED);
         }
+    }
+
+    pub fn add_fasync(
+        &self,
+        file_hangup_generation: usize,
+        item: FAsyncItem,
+    ) -> Result<(), SystemError> {
+        let flags = self.flags.read_irqsave();
+        if flags.contains(TtyFlag::HUPPING)
+            || self.hangup_generation.load(Ordering::Acquire) != file_hangup_generation
+        {
+            return Err(SystemError::ENOTTY);
+        }
+        self.fasync_items.add(item);
+        Ok(())
+    }
+
+    pub fn remove_fasync(&self, file: &Weak<crate::filesystem::vfs::file::File>) {
+        self.fasync_items.remove(file);
+    }
+
+    pub fn remove_fasync_file(&self, file: &crate::filesystem::vfs::file::File) {
+        self.fasync_items.remove_file(file);
     }
 
     pub fn private_fields(&self) -> Option<Arc<dyn TtyCorePrivateField>> {

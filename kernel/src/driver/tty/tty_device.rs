@@ -245,28 +245,38 @@ impl PollableInode for TtyDevice {
 
     fn add_fasync(
         &self,
-        _fasync_item: FAsyncItem,
+        fasync_item: FAsyncItem,
         private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        if Self::tty_file(private_data)?.is_hung_up() {
-            Err(SystemError::ENOTTY)
-        } else {
-            // Preserve the existing TTY FIOASYNC behavior until TTY SIGIO
-            // delivery is implemented.
-            Ok(())
-        }
+        let tty_file = Self::tty_file(private_data)?;
+        tty_file
+            .tty()
+            .core()
+            .add_fasync(tty_file.hangup_generation, fasync_item)
     }
 
     fn remove_fasync(
         &self,
-        _file: &Weak<File>,
+        file: &Weak<File>,
         private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        if Self::tty_file(private_data)?.is_hung_up() {
-            Err(SystemError::ENOTTY)
-        } else {
-            Ok(())
-        }
+        Self::tty_file(private_data)?
+            .tty()
+            .core()
+            .remove_fasync(file);
+        Ok(())
+    }
+
+    fn release_fasync(
+        &self,
+        file: &File,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        Self::tty_file(private_data)?
+            .tty()
+            .core()
+            .remove_fasync_file(file);
+        Ok(())
     }
 }
 

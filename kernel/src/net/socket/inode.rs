@@ -462,4 +462,9 @@ impl<T: Socket + 'static> PollableInode for T {
         self.fasync_items().remove(file);
         Ok(())
     }
+
+    fn release_fasync(&self, file: &File, _: &FilePrivateData) -> Result<(), SystemError> {
+        self.fasync_items().remove_file(file);
+        Ok(())
+    }
 }

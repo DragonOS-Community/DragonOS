@@ -584,6 +584,8 @@ pub struct File {
     offset: AtomicUsize,
     /// 文件的打开模式
     flags: RwSem<FileFlags>,
+    /// Serializes fasync registration with lifecycle-driven flag removal.
+    fasync_lock: Mutex<()>,
     /// 文件的访问模式
     mode: RwSem<FileMode>,
     /// 文件类型
@@ -1123,6 +1125,7 @@ impl File {
             io_fs,
             offset: AtomicUsize::new(0),
             flags: RwSem::new(flags),
+            fasync_lock: Mutex::new(()),
             mode: RwSem::new(mode),
             file_type,
             readdir_state: Mutex::new(ReaddirState::default()),
@@ -1849,6 +1852,7 @@ impl File {
             io_fs: self.io_fs.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
             flags: RwSem::new(flags),
+            fasync_lock: Mutex::new(()),
             mode: RwSem::new(mode),
             file_type: self.file_type,
             readdir_state: Mutex::new(self.readdir_state.lock().clone()),
@@ -1935,6 +1939,11 @@ impl File {
         // todo: 是否需要调用inode的open方法，以更新private data（假如它与flags有关的话）?
         // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
 
+        // Preserve lifecycle-driven FASYNC changes while merging the other
+        // status flags. This lock is also held by fasync registration and TTY
+        // hangup cleanup.
+        let _fasync_guard = self.fasync_lock.lock();
+
         // 访问模式不可修改
         let old_flags = self.flags();
         let old_accflags = old_flags.access_flags();
@@ -1959,17 +1968,37 @@ impl File {
         return Ok(());
     }
 
-    /// Commit the handler-owned FASYNC status bit.
+    /// Serialize a fasync registration update with the corresponding status
+    /// bit commit.
     ///
-    /// Linux excludes FASYNC from the generic SETFL mask: the fasync handler
-    /// owns this bit and updates it only after registration succeeds.
-    pub(crate) fn set_fasync_flag(&self, enabled: bool) {
-        let mut flags = self.flags.write();
-        if enabled {
-            flags.insert(FileFlags::FASYNC);
-        } else {
-            flags.remove(FileFlags::FASYNC);
+    /// Keeping the dedicated fasync lock across the inode callback lets inode
+    /// lifecycle paths (notably TTY hangup) clear a registered item and its
+    /// FASYNC bit without racing a delayed post-callback commit.
+    pub(crate) fn update_fasync_flag<F>(&self, enabled: bool, update: F) -> Result<(), SystemError>
+    where
+        F: FnOnce() -> Result<bool, SystemError>,
+    {
+        let _guard = self.fasync_lock.lock();
+        if self.flags().contains(FileFlags::FASYNC) == enabled {
+            return Ok(());
         }
+
+        if update()? {
+            let mut flags = self.flags.write();
+            if enabled {
+                flags.insert(FileFlags::FASYNC);
+            } else {
+                flags.remove(FileFlags::FASYNC);
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear the handler-owned FASYNC status bit during inode teardown.
+    pub(crate) fn clear_fasync_flag(&self) {
+        let _guard = self.fasync_lock.lock();
+        let mut flags = self.flags.write();
+        flags.remove(FileFlags::FASYNC);
     }
 
     /// @brief 重新设置文件的大小
@@ -2126,6 +2155,13 @@ impl Drop for File {
         for epitem in epitems {
             EventPoll::release_file_epitem(&epitem);
             let _ = self.remove_epitem(&epitem);
+        }
+
+        if self.flags().contains(FileFlags::FASYNC) {
+            if let Ok(pollable) = self.inode.as_pollable_inode() {
+                let private_data = self.private_data.lock();
+                let _ = pollable.release_fasync(self, &private_data);
+            }
         }
 
         super::flock::release_all_for_file(self);

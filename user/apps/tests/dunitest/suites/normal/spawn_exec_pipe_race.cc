@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -155,6 +156,7 @@ void* SiblingExecThread(void*) {
 
 struct FatalExecArgs {
   int tid_fd;
+  int release_fd;
 };
 
 void* FatalSiblingExecThread(void* opaque) {
@@ -163,7 +165,17 @@ void* FatalSiblingExecThread(void* opaque) {
   if (write(args->tid_fd, &tid, sizeof(tid)) != sizeof(tid)) {
     _exit(5);
   }
-  return SiblingExecThread(nullptr);
+
+  char ready_fd[16];
+  char release_fd[16];
+  snprintf(ready_fd, sizeof(ready_fd), "%d", args->tid_fd);
+  snprintf(release_fd, sizeof(release_fd), "%d", args->release_fd);
+  char arg0[] = "/proc/self/exe";
+  char* const argv[] = {arg0, const_cast<char*>(kExecBlockMode), ready_fd,
+                        release_fd, nullptr};
+  char* const envp[] = {nullptr};
+  execve("/proc/self/exe", argv, envp);
+  _exit(errno);
 }
 
 struct BlockingExecArgs {
@@ -434,15 +446,24 @@ TEST(SpawnExecPipeRace, FatalSignalDuringSiblingExecKeepsWaitOwnership) {
   for (int i = 0; i < kFatalIterations; ++i) {
     ChildCleanup cleanup;
     int tid_pipe[2] = {-1, -1};
+    int release_pipe[2] = {-1, -1};
     ASSERT_EQ(0, pipe(tid_pipe)) << "iter=" << i << ": " << strerror(errno);
     cleanup.ready_read = tid_pipe[0];
     cleanup.ready_write = tid_pipe[1];
+    ASSERT_EQ(0, pipe(release_pipe))
+        << "iter=" << i << ": " << strerror(errno);
+    cleanup.release_read = release_pipe[0];
+    cleanup.release_write = release_pipe[1];
 
     pid_t child = fork();
     ASSERT_GE(child, 0) << "iter=" << i << ": " << strerror(errno);
     if (child == 0) {
       close(tid_pipe[0]);
-      FatalExecArgs args = {.tid_fd = tid_pipe[1]};
+      close(release_pipe[1]);
+      FatalExecArgs args = {
+          .tid_fd = tid_pipe[1],
+          .release_fd = release_pipe[0],
+      };
       pthread_t thread;
       if (pthread_create(&thread, nullptr, FatalSiblingExecThread, &args) != 0) {
         _exit(6);
@@ -455,6 +476,8 @@ TEST(SpawnExecPipeRace, FatalSignalDuringSiblingExecKeepsWaitOwnership) {
 
     close(tid_pipe[1]);
     cleanup.ready_write = -1;
+    close(release_pipe[0]);
+    cleanup.release_read = -1;
     pid_t exec_tid = -1;
     ASSERT_EQ(static_cast<ssize_t>(sizeof(exec_tid)),
               read(tid_pipe[0], &exec_tid, sizeof(exec_tid)))
@@ -471,17 +494,60 @@ TEST(SpawnExecPipeRace, FatalSignalDuringSiblingExecKeepsWaitOwnership) {
     errno = 0;
     int kill_result = static_cast<int>(
         syscall(SYS_tgkill, child, exec_tid, SIGKILL));
-    ASSERT_TRUE(kill_result == 0 || errno == ESRCH)
-        << "iter=" << i << ": " << strerror(errno);
+    const int kill_errno = errno;
+    ASSERT_TRUE(kill_result == 0 ||
+                (kill_result == -1 && kill_errno == ESRCH))
+        << "iter=" << i << ": " << strerror(kill_errno);
+
+    bool target_retired = kill_result == -1;
+    if (target_retired) {
+      close(release_pipe[1]);
+      cleanup.release_write = -1;
+    }
 
     int status = 0;
-    ASSERT_TRUE(WaitForChildExit(child, &status, 5000))
+    bool child_exited = false;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(5000);
+    while (std::chrono::steady_clock::now() < deadline) {
+      pid_t waited = waitpid(child, &status, WNOHANG);
+      if (waited == -1 && errno == EINTR) {
+        continue;
+      }
+      ASSERT_TRUE(waited == 0 || waited == child)
+          << "iter=" << i << ": " << strerror(errno);
+      if (waited == child) {
+        child_exited = true;
+        break;
+      }
+
+      if (!target_retired) {
+        errno = 0;
+        int probe_result = static_cast<int>(
+            syscall(SYS_tgkill, child, exec_tid, 0));
+        const int probe_errno = errno;
+        ASSERT_TRUE(probe_result == 0 ||
+                    (probe_result == -1 && probe_errno == ESRCH))
+            << "iter=" << i << ": " << strerror(probe_errno);
+        if (probe_result == -1) {
+          target_retired = true;
+          close(release_pipe[1]);
+          cleanup.release_write = -1;
+        }
+      }
+      SleepForMillis(10);
+    }
+
+    ASSERT_TRUE(child_exited)
         << "fatal sibling exec was not waitable at iter=" << i;
     cleanup.child = -1;
-    ASSERT_TRUE(WIFSIGNALED(status) ||
-                (WIFEXITED(status) &&
-                 (WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == EAGAIN)))
-        << "unexpected child status=" << status << " at iter=" << i;
+    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) {
+      continue;
+    }
+    ASSERT_TRUE(target_retired && WIFEXITED(status) &&
+                WEXITSTATUS(status) == 3)
+        << "thread-targeted SIGKILL was lost: child status=" << status
+        << " at iter=" << i;
   }
 }
 

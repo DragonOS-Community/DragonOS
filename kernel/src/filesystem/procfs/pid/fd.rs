@@ -48,7 +48,7 @@ impl DirOps for FdDirOps {
         let fd = name.parse::<i32>().map_err(|_| SystemError::ENOENT)?;
 
         // 获取进程引用
-        let process = self.get_process().ok_or(SystemError::ESRCH)?;
+        let process = self.get_process().ok_or(SystemError::ENOENT)?;
 
         // 检查文件描述符是否存在，并立即释放fd_table锁
         {
@@ -60,7 +60,7 @@ impl DirOps for FdDirOps {
                 .basic()
                 .try_fd_table()
                 .clone()
-                .ok_or(SystemError::ESRCH)?;
+                .ok_or(SystemError::ENOENT)?;
             let fd_table_guard = fd_table.read();
 
             if fd_table_guard.get_file_by_fd(fd).is_none() {
@@ -111,6 +111,10 @@ impl DirOps for FdDirOps {
         }
         // 写锁在这里自动释放
     }
+
+    fn validate_child(&self, child: &dyn IndexNode) -> bool {
+        child.special_node().is_some()
+    }
 }
 
 /// /proc/[pid]/fd/[fd] 符号链接的 SymOps 实现
@@ -139,7 +143,7 @@ impl SymOps for FdSymOps {
         let process = self
             .target
             .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+            .ok_or(SystemError::ENOENT)?;
 
         // 先获取文件对象的 clone，然后立即释放 fd_table 锁
         // 避免在持有锁时调用可能获取其他锁的方法（如 absolute_path）
@@ -148,18 +152,18 @@ impl SymOps for FdSymOps {
                 .basic()
                 .try_fd_table()
                 .clone()
-                .ok_or(SystemError::ESRCH)?;
+                .ok_or(SystemError::ENOENT)?;
             let fd_table_guard = fd_table.read();
 
             fd_table_guard
                 .get_file_by_fd(self.fd)
-                .ok_or(SystemError::EBADF)?
+                .ok_or(SystemError::ENOENT)?
         }; // fd_table 锁在这里被释放
 
         // 获取进程的 chroot 根路径
         let root_prefix = process
             .try_fs_struct()
-            .ok_or(SystemError::ESRCH)?
+            .ok_or(SystemError::ENOENT)?
             .root()
             .absolute_path()
             .unwrap_or_default();

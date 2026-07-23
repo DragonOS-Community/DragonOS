@@ -183,7 +183,7 @@ impl BlockDevManager {
         {
             let mut meta_inner = blk_meta.inner();
             // 检查是否重复
-            if meta_inner.gendisks.intersects(gendisk.range()) {
+            if meta_inner.gendisks.intersects(&gendisk.range()) {
                 return Err(SystemError::EEXIST);
             }
 

@@ -5,7 +5,7 @@
 use crate::filesystem::{
     procfs::{
         pid::ProcPidTarget,
-        template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
+        template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFile, ProcFileBuilder},
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
@@ -47,7 +47,7 @@ impl DirOps for FdInfoDirOps {
         let fd = name.parse::<i32>().map_err(|_| SystemError::ENOENT)?;
 
         // 获取进程引用
-        let process = self.get_process().ok_or(SystemError::ESRCH)?;
+        let process = self.get_process().ok_or(SystemError::ENOENT)?;
 
         // 检查文件描述符是否存在
         {
@@ -58,7 +58,7 @@ impl DirOps for FdInfoDirOps {
                 .basic()
                 .try_fd_table()
                 .clone()
-                .ok_or(SystemError::ESRCH)?;
+                .ok_or(SystemError::ENOENT)?;
             let fd_table_guard = fd_table.read();
 
             if fd_table_guard.get_file_by_fd(fd).is_none() {
@@ -104,37 +104,54 @@ impl DirOps for FdInfoDirOps {
             }
         }
     }
+
+    fn validate_child(&self, child: &dyn IndexNode) -> bool {
+        child
+            .downcast_ref::<ProcFile<FdInfoFileOps>>()
+            .is_some_and(|file| file.ops().is_current())
+    }
 }
 
 /// /proc/[pid]/fdinfo/[fd] 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct FdInfoFileOps {
-    /// 存储 PID，在需要时动态查找进程
-    // pid: RawPid,
-    // fd: i32,
-    // 暂时不用参数
-    phantom: core::marker::PhantomData<()>,
+    target: ProcPidTarget,
+    fd: i32,
 }
 
 impl FdInfoFileOps {
     pub fn new_inode(
-        _target: ProcPidTarget,
-        _fd: i32,
+        target: ProcPidTarget,
+        fd: i32,
         parent: Weak<dyn IndexNode>,
     ) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(
-            Self {
-                phantom: core::marker::PhantomData,
-            },
-            InodeMode::S_IRUGO,
-        )
-        .parent(parent)
-        .build()
-        .unwrap()
+        ProcFileBuilder::new(Self { target, fd }, InodeMode::S_IRUGO)
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+
+    fn is_current(&self) -> bool {
+        let Some(process) = self.target.thread_group_leader() else {
+            return false;
+        };
+        let Some(fd_table) = process.basic().try_fd_table().clone() else {
+            return false;
+        };
+        let fd_table_guard = fd_table.read();
+        fd_table_guard.get_file_by_fd(self.fd).is_some()
     }
 }
 
 impl FileOps for FdInfoFileOps {
+    fn open(&self, _data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            Err(SystemError::ENOENT)
+        }
+    }
+
     fn read_at(
         &self,
         _offset: usize,
@@ -142,6 +159,10 @@ impl FileOps for FdInfoFileOps {
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Ok(0)
+        if self.is_current() {
+            Ok(0)
+        } else {
+            Err(SystemError::ENOENT)
+        }
     }
 }

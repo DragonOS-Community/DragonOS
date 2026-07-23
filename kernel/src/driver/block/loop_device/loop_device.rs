@@ -1218,11 +1218,7 @@ impl BlockDevice for LoopDevice {
 
     fn disk_range(&self) -> GeneralBlockRange {
         let inner = self.inner();
-        let blocks = if inner.file_size == 0 {
-            0
-        } else {
-            inner.file_size.saturating_add(LBA_SIZE - 1) / LBA_SIZE
-        };
+        let blocks = inner.file_size / LBA_SIZE;
         drop(inner);
         GeneralBlockRange::new(0, blocks).unwrap_or(GeneralBlockRange {
             lba_start: 0,

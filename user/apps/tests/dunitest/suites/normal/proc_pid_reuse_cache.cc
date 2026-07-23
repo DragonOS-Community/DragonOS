@@ -31,6 +31,15 @@ bool read_text_file(const char* path, std::string* out) {
     return n >= 0;
 }
 
+bool wait_for_zombie(pid_t child) {
+    siginfo_t info = {};
+    int result = -1;
+    do {
+        result = waitid(P_PID, child, &info, WEXITED | WNOWAIT);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 && info.si_pid == child;
+}
+
 pid_t fork_waiting_child(int* release_fd) {
     int pipefd[2] = {-1, -1};
     if (pipe(pipefd) != 0) {
@@ -114,6 +123,59 @@ TEST(ProcPidReuseCache, NumericProcDirRefreshesAfterPidReuse) {
     EXPECT_NE(std::string::npos, status.find(pid_line)) << status_path << " content:\n" << status;
 
     release_child(reused, reused_release);
+}
+
+TEST(ProcPidReuseCache, ZombieFdEntriesDisappearWithEnoent) {
+    int release_fd = -1;
+    const pid_t child = fork_waiting_child(&release_fd);
+    ASSERT_GT(child, 0);
+
+    char fd_path[64] = {};
+    snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/0", child);
+    char link_target[64] = {};
+    EXPECT_GE(readlink(fd_path, link_target, sizeof(link_target)), 0);
+
+    char fdinfo_path[64] = {};
+    snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%d/fdinfo/0", child);
+    const int live_fdinfo = open(fdinfo_path, O_RDONLY);
+    EXPECT_GE(live_fdinfo, 0);
+
+    const char byte = 'x';
+    EXPECT_EQ(1, write(release_fd, &byte, 1));
+    close(release_fd);
+
+    const bool became_zombie = wait_for_zombie(child);
+    if (became_zombie) {
+        errno = 0;
+        EXPECT_EQ(-1, readlink(fd_path, link_target, sizeof(link_target)));
+        EXPECT_EQ(ENOENT, errno);
+
+        errno = 0;
+        const int fdinfo = open(fdinfo_path, O_RDONLY);
+        EXPECT_EQ(-1, fdinfo);
+        EXPECT_EQ(ENOENT, errno);
+        if (fdinfo >= 0) {
+            close(fdinfo);
+        }
+
+        if (live_fdinfo >= 0) {
+            char byte = {};
+            errno = 0;
+            EXPECT_EQ(-1, read(live_fdinfo, &byte, sizeof(byte)));
+            EXPECT_EQ(ENOENT, errno);
+        }
+    }
+    if (live_fdinfo >= 0) {
+        close(live_fdinfo);
+    }
+
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    EXPECT_EQ(child, waited);
+    ASSERT_TRUE(became_zombie) << "child did not become observable as a zombie";
 }
 
 int main(int argc, char** argv) {

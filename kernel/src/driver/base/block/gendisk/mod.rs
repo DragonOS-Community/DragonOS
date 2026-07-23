@@ -179,8 +179,20 @@ impl GenDisk {
     }
 
     #[inline]
-    pub fn range(&self) -> &GeneralBlockRange {
-        &self.range
+    pub fn range(&self) -> GeneralBlockRange {
+        // A whole-disk node represents the current capacity of its backing
+        // block device.  This is especially important for loop devices: their
+        // GenDisk is registered while unbound and gains capacity only after
+        // LOOP_SET_FD.  Partitions, in contrast, keep the fixed range parsed
+        // from their partition table.
+        if self.idx.is_none() {
+            self.bdev
+                .upgrade()
+                .map(|bdev| bdev.disk_range())
+                .unwrap_or(self.range)
+        } else {
+            self.range
+        }
     }
 
     #[inline]
@@ -257,7 +269,8 @@ impl IndexNode for GenDisk {
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         let mut meta = self.metadata.clone();
-        let blocks = self.range.lba_end.saturating_sub(self.range.lba_start);
+        let range = self.range();
+        let blocks = range.lba_end.saturating_sub(range.lba_start);
         let size_in_bytes = blocks.saturating_mul(LBA_SIZE);
 
         meta.size = i64::try_from(size_in_bytes).unwrap_or(i64::MAX);
@@ -346,7 +359,7 @@ impl GenDiskMap {
 
     pub fn intersects(&self, range: &GeneralBlockRange) -> bool {
         for (_, v) in self.iter() {
-            if range.intersects_with(&v.range).is_some() {
+            if range.intersects_with(&v.range()).is_some() {
                 return true;
             }
         }

@@ -60,6 +60,7 @@ const SERIAL_8250_FCR_TRIGGER_14: u8 = 0xc0;
 const SERIAL_8250_TX_QUEUE_SIZE: usize = 4096;
 const SERIAL_8250_FIFO_SIZE: usize = 16;
 const SERIAL_8250_TX_WAKEUP_CHARS: usize = 256;
+const SERIAL_8250_EMERGENCY_TIMEOUT: Duration = Duration::from_millis(10);
 const SERIAL_8250_CONSOLE_OWNER_NONE: usize = usize::MAX;
 /// Linux tty_port_init() defaults closing_wait to 30 seconds. The software
 /// queue and the physical transmitter share this single close-time budget.
@@ -603,7 +604,11 @@ impl Serial8250PIOPort {
             self.set_tx_interrupt_enabled(pending && !inherited_console_active);
             return;
         };
-        let deadline = Instant::now() + self.tx_batch_timeout();
+        // Emergency output may run with interrupts or preemption disabled.
+        // Keep this independent of the configured baud rate: at B50 the
+        // ordinary FIFO-sized timeout would otherwise grow to several
+        // seconds. Linux's 8250 console likewise bounds an LSR wait to 10 ms.
+        let deadline = Instant::now() + SERIAL_8250_EMERGENCY_TIMEOUT;
         while self.serial_in_raw(5) & 0x20 == 0 {
             if Instant::now() >= deadline {
                 drop(_hw_guard);

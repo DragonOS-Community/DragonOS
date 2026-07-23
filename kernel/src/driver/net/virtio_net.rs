@@ -1004,33 +1004,48 @@ impl VirtIONicDeviceInner {
     }
 }
 
-pub struct VirtioNetToken {
+pub struct VirtioNetRxToken {
     driver: VirtIONicDeviceInner,
     rx_buffer: Option<RxDmaBuffer>,
+}
+
+pub struct VirtioNetTxToken {
+    driver: VirtIONicDeviceInner,
     tx_buffer: Option<TxDmaBuffer>,
 }
 
-impl VirtioNetToken {
-    fn new(
-        driver: VirtIONicDeviceInner,
-        rx_buffer: Option<RxDmaBuffer>,
-        tx_buffer: Option<TxDmaBuffer>,
-    ) -> Self {
+impl VirtioNetRxToken {
+    fn new(driver: VirtIONicDeviceInner, rx_buffer: RxDmaBuffer) -> Self {
         Self {
             driver,
-            rx_buffer,
-            tx_buffer,
+            rx_buffer: Some(rx_buffer),
+        }
+    }
+}
+
+impl VirtioNetTxToken {
+    fn deferred(driver: VirtIONicDeviceInner) -> Self {
+        Self {
+            driver,
+            tx_buffer: None,
+        }
+    }
+
+    fn reserved(driver: VirtIONicDeviceInner, tx_buffer: TxDmaBuffer) -> Self {
+        Self {
+            driver,
+            tx_buffer: Some(tx_buffer),
         }
     }
 }
 
 impl phy::Device for VirtIONicDeviceInner {
     type RxToken<'a>
-        = VirtioNetToken
+        = VirtioNetRxToken
     where
         Self: 'a;
     type TxToken<'a>
-        = VirtioNetToken
+        = VirtioNetTxToken
     where
         Self: 'a;
 
@@ -1039,18 +1054,13 @@ impl phy::Device for VirtIONicDeviceInner {
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut driver = self.inner.lock_irqsave();
-        let tx_buffer = driver.reserve_tx()?;
         match driver.receive() {
             Ok(Some(rx_buffer)) => Some((
-                VirtioNetToken::new(self.clone(), Some(rx_buffer), None),
-                VirtioNetToken::new(self.clone(), None, Some(tx_buffer)),
+                VirtioNetRxToken::new(self.clone(), rx_buffer),
+                VirtioNetTxToken::deferred(self.clone()),
             )),
-            Ok(None) => {
-                driver.release_tx(tx_buffer);
-                None
-            }
+            Ok(None) => None,
             Err(err) => {
-                driver.release_tx(tx_buffer);
                 error!("VirtIO receive failed: {err:?}");
                 None
             }
@@ -1059,7 +1069,7 @@ impl phy::Device for VirtIONicDeviceInner {
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         let buffer = self.inner.lock_irqsave().reserve_tx()?;
-        Some(VirtioNetToken::new(self.clone(), None, Some(buffer)))
+        Some(VirtioNetTxToken::reserved(self.clone(), buffer))
     }
 
     fn capabilities(&self) -> phy::DeviceCapabilities {
@@ -1076,21 +1086,28 @@ impl phy::Device for VirtIONicDeviceInner {
     }
 }
 
-impl phy::TxToken for VirtioNetToken {
+impl phy::TxToken for VirtioNetTxToken {
     fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let buffer = self
-            .tx_buffer
-            .take()
-            .expect("virtio TxToken consumed without a reserved DMA slot");
-        let (result, _) = self.driver.submit_frame(buffer, len, f);
+        if let Some(buffer) = self.tx_buffer.take() {
+            let (result, _) = self.driver.submit_frame(buffer, len, f);
+            return result;
+        }
+
+        // The token paired with an RX packet is intentionally lazy: RX must
+        // continue to make progress even while the TX queue is saturated.
+        // Allocate response storage only if smoltcp actually emits a reply,
+        // then make a best-effort reservation after the RX packet is consumed.
+        let mut frame = alloc::vec![0; len];
+        let result = f(&mut frame);
+        let _ = self.driver.try_raw_transmit(&frame);
         result
     }
 }
 
-impl phy::RxToken for VirtioNetToken {
+impl phy::RxToken for VirtioNetRxToken {
     fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -1112,15 +1129,20 @@ impl phy::RxToken for VirtioNetToken {
     }
 }
 
-impl Drop for VirtioNetToken {
+impl Drop for VirtioNetRxToken {
     fn drop(&mut self) {
-        if let Some(buffer) = self.tx_buffer.take() {
-            self.driver.inner.lock_irqsave().release_tx(buffer);
-        }
         if let Some(buffer) = self.rx_buffer.take() {
             if let Err(err) = self.driver.inner.lock_irqsave().recycle_rx(buffer) {
                 error!("virtio-net failed to recycle dropped RX token: {err:?}");
             }
+        }
+    }
+}
+
+impl Drop for VirtioNetTxToken {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.tx_buffer.take() {
+            self.driver.inner.lock_irqsave().release_tx(buffer);
         }
     }
 }

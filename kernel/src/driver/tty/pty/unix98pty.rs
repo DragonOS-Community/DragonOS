@@ -285,6 +285,12 @@ impl PtyDevPtsLink {
             .unwrap_or(0)
     }
 
+    fn pending_bytes_from(&self, subtype: TtyDriverSubType) -> usize {
+        self.queue_for_source(subtype)
+            .map(|queue| queue.lock_irqsave().len)
+            .unwrap_or(0)
+    }
+
     fn clear_pending_from(&self, subtype: TtyDriverSubType) -> Result<(), SystemError> {
         let Some(queue) = self.queue_for_source(subtype) else {
             return Err(SystemError::ENODEV);
@@ -868,6 +874,16 @@ impl TtyOperation for Unix98PtyDriverInner {
         }
 
         PTY_BUFFER_LIMIT
+    }
+
+    fn chars_in_buffer(&self, tty: &TtyCoreData) -> usize {
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                return hook.pending_bytes_from(tty.driver().tty_driver_sub_type());
+            }
+        }
+
+        0
     }
 
     fn flush_buffer(&self, tty: &TtyCoreData) -> Result<(), SystemError> {

@@ -187,6 +187,75 @@ TEST(TtyTermios, TcsadrainSucceeds) {
 }
 
 /*
+ * DragonOS keeps bytes that the peer N_TTY buffer cannot yet accept in a
+ * driver-owned PTY queue. TCSADRAIN must wait for that queue to empty, but it
+ * need not wait for the peer application to consume bytes already delivered
+ * to N_TTY.
+ */
+TEST(TtyTermios, TcsadrainWaitsForPtyDriverBacklog) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios t = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &t), 0) << strerror(errno);
+
+    int slave_flags = fcntl(pty.slave.get(), F_GETFL, 0);
+    ASSERT_GE(slave_flags, 0);
+    ASSERT_EQ(fcntl(pty.slave.get(), F_SETFL, slave_flags | O_NONBLOCK), 0);
+
+    char fill[1024];
+    memset(fill, 'q', sizeof(fill));
+    size_t accepted = 0;
+    for (;;) {
+        ssize_t n = write(pty.slave.get(), fill, sizeof(fill));
+        if (n > 0) {
+            accepted += static_cast<size_t>(n);
+            continue;
+        }
+        ASSERT_EQ(n, -1);
+        ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+        break;
+    }
+    ASSERT_GT(accepted, 0u);
+
+    int master_flags = fcntl(pty.master.get(), F_GETFL, 0);
+    ASSERT_GE(master_flags, 0);
+    ASSERT_EQ(fcntl(pty.master.get(), F_SETFL, master_flags | O_NONBLOCK), 0);
+
+    TcsetattrThreadArgs args;
+    args.fd = pty.slave.get();
+    args.action = TCSADRAIN;
+    args.term = t;
+    pthread_t waiter;
+    ASSERT_EQ(pthread_create(&waiter, nullptr, TcsetattrThread, &args), 0);
+    ASSERT_TRUE(WaitForFlag(args.started, 1000));
+
+    EXPECT_FALSE(WaitForFlag(args.done, 20))
+        << "TCSADRAIN completed with bytes still queued in the PTY driver";
+
+    char drain[1024];
+    for (int i = 0; i < 2000 && !args.done.load(std::memory_order_acquire); ++i) {
+        ssize_t n = read(pty.master.get(), drain, sizeof(drain));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+            } else {
+                ADD_FAILURE() << "master read failed: " << strerror(errno);
+                break;
+            }
+        }
+    }
+
+    if (!args.done.load(std::memory_order_acquire)) {
+        pty.master.reset();
+    }
+    ASSERT_EQ(pthread_join(waiter, nullptr), 0);
+    ASSERT_TRUE(args.done.load(std::memory_order_acquire));
+    EXPECT_EQ(args.rc, 0) << "errno=" << args.saved_errno << " ("
+                          << strerror(args.saved_errno) << ")";
+}
+
+/*
  * DragonOS N_TTY can retain an echo step when the PTY bridge has no room.
  * TCSADRAIN must wait for that ldisc-owned output to be submitted, but it
  * must not wait for the master application to consume the entire PTY input.
@@ -206,20 +275,21 @@ TEST(TtyTermios, TcsadrainWaitsForRetainedEchoOnly) {
     ASSERT_GE(slave_flags, 0);
     ASSERT_EQ(fcntl(pty.slave.get(), F_SETFL, slave_flags | O_NONBLOCK), 0);
 
-    char fill[1024];
+    // Fill only the peer N_TTY buffer. Writing until EAGAIN would also fill
+    // the driver-owned PtyByteQueue and turn this into a duplicate of the
+    // dedicated PTY backlog test above.
+    char fill[4095];
     memset(fill, 'x', sizeof(fill));
     size_t accepted = 0;
-    for (;;) {
-        ssize_t n = write(pty.slave.get(), fill, sizeof(fill));
+    while (accepted < sizeof(fill)) {
+        ssize_t n = write(pty.slave.get(), &fill[accepted], sizeof(fill) - accepted);
         if (n > 0) {
             accepted += static_cast<size_t>(n);
             continue;
         }
-        ASSERT_EQ(n, -1);
-        ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
-        break;
+        ASSERT_GT(n, 0) << strerror(errno);
     }
-    ASSERT_GT(accepted, 0u);
+    ASSERT_EQ(accepted, sizeof(fill));
 
     const char control = 0x01;  // ECHOCTL renders this as "^A" (two bytes).
     ASSERT_EQ(write(pty.master.get(), &control, 1), 1) << strerror(errno);

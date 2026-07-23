@@ -230,7 +230,7 @@ fn do_execve_internal(
                 {
                     let basic_guard = pcb.basic();
                     let name = basic_guard.name();
-                    comm_len = name.as_bytes().len().min(15);
+                    comm_len = name.len().min(15);
                     // 回退到 UTF-8 字符边界，避免在多字节字符中间截断导致 from_utf8 失败。
                     while comm_len > 0 && !name.is_char_boundary(comm_len) {
                         comm_len -= 1;

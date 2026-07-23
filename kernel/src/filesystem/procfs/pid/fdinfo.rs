@@ -51,7 +51,14 @@ impl DirOps for FdInfoDirOps {
 
         // 检查文件描述符是否存在
         {
-            let fd_table = process.fd_table();
+            // The process may have reached exit_files() after the proc target
+            // was resolved. A disappearing fd table is normal procfs churn,
+            // not an invariant which may be unwrapped.
+            let fd_table = process
+                .basic()
+                .try_fd_table()
+                .clone()
+                .ok_or(SystemError::ESRCH)?;
             let fd_table_guard = fd_table.read();
 
             if fd_table_guard.get_file_by_fd(fd).is_none() {
@@ -81,8 +88,10 @@ impl DirOps for FdInfoDirOps {
 
         // 获取进程的所有文件描述符
         if let Some(process) = self.get_process() {
+            let Some(fd_table) = process.basic().try_fd_table().clone() else {
+                return;
+            };
             let fds: Vec<i32> = {
-                let fd_table = process.fd_table();
                 let fd_table_guard = fd_table.read();
                 fd_table_guard.iter().map(|(fd, _)| fd).collect()
             };

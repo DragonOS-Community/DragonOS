@@ -21,7 +21,7 @@ use crate::{
         ucontext::AddressSpace,
     },
     process::{ProcessControlBlock, RawPid},
-    sched::{cpu_rq, enqueue_task_on_cpu, WakeupFlags},
+    sched::{cpu_rq, enqueue_task_on_cpu, select_task_rq, OnRq, WakeupFlags},
     smp::{core::smp_get_processor_id, cpu::ProcessorId, kick_cpu},
     syscall::user_access::write_one_to_user_protected,
 };
@@ -399,6 +399,12 @@ impl ProcessManager {
         prev_pcb.arch_info.force_unlock();
         fence(Ordering::SeqCst);
 
+        // The old CPU no longer uses prev_pcb's architecture context or
+        // kernel stack. Publish that fact only after releasing arch_info so a
+        // remote ttwu may safely enqueue and run the task on another CPU.
+        prev_pcb.sched_info().finish_running();
+        fence(Ordering::SeqCst);
+
         next_pcb.arch_info.force_unlock();
         fence(Ordering::SeqCst);
 
@@ -411,8 +417,27 @@ impl ProcessManager {
 
         if let Some(dest_cpu) = migrate_prev_to {
             debug_assert!(!Arc::ptr_eq(&prev_pcb, &next_pcb));
-            prev_pcb.sched_info().set_on_cpu(None);
-            enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
+            // The pending target may have been consumed by schedule just
+            // before a concurrent sched_setaffinity publishes a newer mask.
+            // Revalidate placement after switch-out, under pi_lock, and keep
+            // that lock through enqueue. A later affinity update will then
+            // either observe this legal placement or migrate it again.
+            let pi_guard = prev_pcb.sched_info().pi_lock_irqsave();
+            // stop_task() can win after schedule dequeues prev but before this
+            // tail obtains pi_lock. Likewise, wakeup_stop() can enqueue it
+            // after finish_running() and before this check. Only a still
+            // runnable, still off-rq task belongs to this migration owner;
+            // otherwise leave the stopped or already-enqueued state intact.
+            let still_owns_migration = prev_pcb.sched_info().state().is_runnable()
+                && *prev_pcb.sched_info().on_rq.lock_irqsave() == OnRq::None;
+            if still_owns_migration {
+                let allowed = pi_guard.cpus_allowed.clone();
+                let dest_cpu =
+                    select_task_rq(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, &allowed);
+                prev_pcb.sched_info().set_on_cpu(None);
+                enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
+            }
+            drop(pi_guard);
         }
 
         let set_child_tid = next_pcb.thread.write_irqsave().set_child_tid.take();

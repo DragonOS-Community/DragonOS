@@ -52,7 +52,15 @@ impl DirOps for FdDirOps {
 
         // 检查文件描述符是否存在，并立即释放fd_table锁
         {
-            let fd_table = process.fd_table();
+            // A process can become a zombie after ProcPidTarget resolved it.
+            // exit_files() has already removed its descriptor table in that
+            // state, so /proc/<pid>/fd must report a disappearing entry rather
+            // than calling ProcessControlBlock::fd_table(), which unwraps.
+            let fd_table = process
+                .basic()
+                .try_fd_table()
+                .clone()
+                .ok_or(SystemError::ESRCH)?;
             let fd_table_guard = fd_table.read();
 
             if fd_table_guard.get_file_by_fd(fd).is_none() {
@@ -83,8 +91,10 @@ impl DirOps for FdDirOps {
         // 获取进程的所有文件描述符
         if let Some(process) = self.get_process() {
             // 先收集所有的fd，避免在持有锁时做复杂操作
+            let Some(fd_table) = process.basic().try_fd_table().clone() else {
+                return;
+            };
             let fds: Vec<i32> = {
-                let fd_table = process.fd_table();
                 let fd_table_guard = fd_table.read();
                 fd_table_guard.iter().map(|(fd, _)| fd).collect()
             };
@@ -134,7 +144,11 @@ impl SymOps for FdSymOps {
         // 先获取文件对象的 clone，然后立即释放 fd_table 锁
         // 避免在持有锁时调用可能获取其他锁的方法（如 absolute_path）
         let file = {
-            let fd_table = process.fd_table();
+            let fd_table = process
+                .basic()
+                .try_fd_table()
+                .clone()
+                .ok_or(SystemError::ESRCH)?;
             let fd_table_guard = fd_table.read();
 
             fd_table_guard
@@ -194,7 +208,7 @@ impl SymOps for FdSymOps {
 
         // 获取文件对象
         let file = {
-            let fd_table = process.fd_table();
+            let fd_table = process.basic().try_fd_table().clone()?;
             let fd_table_guard = fd_table.read();
             fd_table_guard.get_file_by_fd(self.fd)?
         };

@@ -468,6 +468,7 @@ dependencies = [
  "bit_field",
  "bitfield-struct",
  "bitflags 1.3.2",
+ "bitflags 2.9.1",
  "bitmap",
  "cfg-if",
  "cpio_reader",
@@ -493,6 +494,7 @@ dependencies = [
  "loongArch64",
  "lru",
  "multiboot2",
+ "napi-state",
  "num",
  "num-derive",
  "num-traits 0.2.15",
@@ -1018,6 +1020,10 @@ dependencies = [
  "derive_more",
  "ptr_meta",
 ]
+
+[[package]]
+name = "napi-state"
+version = "0.1.0"
 
 [[package]]
 name = "nom"
@@ -1873,7 +1879,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "virtio-drivers"
 version = "0.7.2"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers?rev=89f6a402d494cf615cadfd851c9f017f31acac81#89f6a402d494cf615cadfd851c9f017f31acac81"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers?rev=82d783c935084a67c2e0a3bead0266a66aed80fd#82d783c935084a67c2e0a3bead0266a66aed80fd"
 dependencies = [
  "bitflags 2.9.1",
  "log",

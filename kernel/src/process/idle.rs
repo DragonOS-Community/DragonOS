@@ -70,6 +70,10 @@ impl ProcessManager {
             // 在双锁保护下设置 cpus_allowed 和 task_cpu
             pi_guard.set_cpus_allowed(CpuMask::from_cpu(ProcessorId::new(i)));
             idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
+            assert!(
+                idle_pcb.sched_info().try_mark_running(),
+                "idle task must acquire its initial CPU ownership exactly once"
+            );
 
             rq.set_current(Arc::downgrade(&idle_pcb));
             rq.set_idle(Arc::downgrade(&idle_pcb));

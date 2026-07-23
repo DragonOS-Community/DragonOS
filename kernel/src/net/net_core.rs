@@ -44,7 +44,8 @@ fn dhcp_query() -> Result<(), SystemError> {
         sockets().remove(dhcp_handle);
     });
 
-    const DHCP_TRY_ROUND: u8 = 10;
+    const DHCP_RETRY_INTERVAL_NS: i64 = 50_000_000;
+    const DHCP_TRY_ROUND: u16 = 200;
     for i in 0..DHCP_TRY_ROUND {
         log::debug!("DHCP try round: {}", i);
         net_face.poll();
@@ -119,7 +120,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 
         let sleep_time = PosixTimeSpec {
             tv_sec: 0,
-            tv_nsec: 50,
+            tv_nsec: DHCP_RETRY_INTERVAL_NS,
         };
         nanosleep(sleep_time)?;
     }

@@ -29,6 +29,9 @@ pub(super) struct ExtentTail {
 pub(super) struct DirectAppendShape {
     pub preferred_first: Option<PBlockId>,
     pub requires_merge: bool,
+    /// Physical home of the right-most extent leaf. `None` denotes the
+    /// inline extent root stored in the inode-table entry.
+    pub leaf_home: Option<PBlockId>,
 }
 
 impl Ext4 {
@@ -44,25 +47,74 @@ impl Ext4 {
         let root = inode.inode.extent_root();
         let header = root.header();
         self.validate_extent_node(inode.id, &root)?;
-        if header.depth() != 0
-            || header.max_entries_count() as usize != root.entry_capacity()
+        if header.max_entries_count() as usize != root.entry_capacity()
             || header.entries_count() as usize > root.entry_capacity()
         {
             return Ok(None);
         }
-        let entries = header.entries_count() as usize;
+        let mut entries = header.entries_count() as usize;
         if entries == 0 {
-            return Ok((start_lblock == 0).then_some(DirectAppendShape {
-                preferred_first: None,
-                requires_merge: false,
-            }));
+            return Ok(
+                (header.depth() == 0 && start_lblock == 0).then_some(DirectAppendShape {
+                    preferred_first: None,
+                    requires_merge: false,
+                    leaf_home: None,
+                }),
+            );
         }
-        let last = root.extent_at(entries - 1);
+
+        let mut leaf_block = None;
+        let leaf_home = if header.depth() == 0 {
+            None
+        } else {
+            // Range staging for an external leaf is journal-only.  The
+            // nojournal backend has a special publication order for an
+            // inline-root update and cannot safely publish another metadata
+            // home without a more general undo protocol.
+            if !self.uses_journal() {
+                return Ok(None);
+            }
+            let mut expected_depth = header.depth();
+            let mut home = root.extent_index_at(entries - 1).leaf();
+            loop {
+                let block = self.read_extent_block(inode, home)?;
+                let node = ExtentNode::from_bytes(&block.data[..]);
+                self.validate_extent_node(inode.id, &node)?;
+                if node.header().depth() + 1 != expected_depth {
+                    return Err(format_error!(
+                        ErrCode::EIO,
+                        "extent depth mismatch on inode {} at block {}",
+                        inode.id,
+                        home
+                    ));
+                }
+                entries = node.header().entries_count() as usize;
+                if entries == 0 {
+                    return Err(format_error!(
+                        ErrCode::EIO,
+                        "empty reachable extent node on inode {} at block {}",
+                        inode.id,
+                        home
+                    ));
+                }
+                expected_depth = node.header().depth();
+                if expected_depth == 0 {
+                    leaf_block = Some(block);
+                    break Some(home);
+                }
+                home = node.extent_index_at(entries - 1).leaf();
+            }
+        };
+        let leaf = leaf_block
+            .as_ref()
+            .map(|block| ExtentNode::from_bytes(&block.data[..]));
+        let node = leaf.as_ref().unwrap_or(&root);
+        let last = node.extent_at(entries - 1);
         if last.is_unwritten() {
             return Ok(None);
         }
         for index in 0..entries {
-            let extent = root.extent_at(index);
+            let extent = node.extent_at(index);
             self.validate_data_blocks(extent.start_pblock(), extent.block_count() as u64)?;
         }
         let next_lblock = last
@@ -78,13 +130,14 @@ impl Ext4 {
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
         let candidate = Extent::new(start_lblock, preferred_first, count as u16);
         let can_merge = Extent::can_append(last, &candidate);
-        let root_full = entries == header.max_entries_count() as usize;
-        if root_full && !can_merge {
+        let leaf_full = entries == node.header().max_entries_count() as usize;
+        if leaf_full && !can_merge {
             return Ok(None);
         }
         Ok(Some(DirectAppendShape {
             preferred_first: Some(preferred_first),
-            requires_merge: root_full,
+            requires_merge: leaf_full,
+            leaf_home,
         }))
     }
 
@@ -122,6 +175,67 @@ impl Ext4 {
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
         inode.inode.set_fs_block_count(blocks);
         Ok(())
+    }
+
+    /// Stage a contiguous append in either the inline extent root or the
+    /// existing right-most external leaf.
+    ///
+    /// This deliberately does not split a full leaf.  The general extent
+    /// insertion path already owns that operation; after it creates a new
+    /// right-most leaf, later sequential writes can re-enter this batched
+    /// transaction path.
+    pub(super) fn stage_journaled_append_extent(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: &mut InodeRef,
+        leaf_home: Option<PBlockId>,
+        start_lblock: LBlockId,
+        start_pblock: PBlockId,
+        count: u32,
+    ) -> Result<()> {
+        if let Some(home) = leaf_home {
+            {
+                let image = transaction.read(self.block_device.as_ref(), home)?;
+                self.verify_transaction_extent_block(inode, &*image)?;
+                let node = ExtentNode::from_bytes(&*image);
+                self.validate_extent_node(inode.id, &node)?;
+                if node.header().depth() != 0 || node.header().entries_count() == 0 {
+                    return Err(format_error!(
+                        ErrCode::EIO,
+                        "invalid append leaf on inode {} at block {}",
+                        inode.id,
+                        home
+                    ));
+                }
+            }
+            let seed = self.read_super_block_cached().metadata_checksum_seed();
+            let image = self.transaction_block_for_update(transaction, home)?;
+            let new_extent = Extent::new(start_lblock, start_pblock, count as u16);
+            {
+                let mut node = ExtentNodeMut::from_bytes(image);
+                let entries = node.header().entries_count() as usize;
+                let last = *node.extent_at(entries - 1);
+                if Extent::can_append(&last, &new_extent) {
+                    node.extent_mut_at(entries - 1)
+                        .set_block_count(last.block_count() + count);
+                } else if node.insert_extent(&new_extent, entries).is_err() {
+                    return Err(format_error!(
+                        ErrCode::ENOTSUP,
+                        "External extent leaf requires a split"
+                    ));
+                }
+            }
+            Self::set_extent_block_checksum(seed, inode, image);
+            let blocks = inode
+                .inode
+                .fs_block_count()
+                .checked_add(count as u64)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+            inode.inode.set_fs_block_count(blocks);
+            Ok(())
+        } else {
+            self.stage_direct_append_extent(inode, start_lblock, start_pblock, count)
+        }
     }
 
     fn verify_extent_block_checksum(&self, inode_ref: &InodeRef, image: &[u8]) -> Result<()> {

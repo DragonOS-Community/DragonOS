@@ -44,7 +44,6 @@ impl ProcessManager {
 
         pcb.debug_assert_fork_cpu_binding();
 
-        let mut schedule_dequeue_race = false;
         if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
             if let Some(target_cpu) = pcb.sched_info().on_cpu() {
                 let rq = cpu_rq(target_cpu.data() as usize);
@@ -61,24 +60,19 @@ impl ProcessManager {
                     }
                     return Ok(());
                 }
-
-                // DragonOS currently tracks task_cpu, but not Linux's
-                // separate p->on_cpu "still switching out" flag. If schedule()
-                // won the race and just dequeued this task, keep the wakeup on
-                // the previous rq instead of migrating it to another CPU where
-                // the same PCB/kernel stack could run before the old CPU
-                // finishes switch_process().
-                schedule_dequeue_race = true;
             }
         }
 
         let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+        // Linux ttwu waits for p->on_cpu after observing an off-rq task. The
+        // old CPU may already have dequeued this task but still be executing
+        // switch_process() on its kernel stack. Enqueuing it remotely before
+        // the switch tail completes lets two CPUs restore and overwrite the
+        // same saved stack/context.
+        pcb.sched_info().wait_until_not_running();
+
         let allowed = pi_guard.cpus_allowed.clone();
-        let target_cpu = if schedule_dequeue_race {
-            prev_cpu
-        } else {
-            select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed)
-        };
+        let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
 
         if was_uninterruptible || pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
             let prev_rq = cpu_rq(prev_cpu.data() as usize);
@@ -247,7 +241,7 @@ impl ProcessManager {
             };
         }
 
-        let _pi_guard = pcb.sched_info().pi_lock_irqsave();
+        let pi_guard = pcb.sched_info().pi_lock_irqsave();
         let state = pcb.sched_info().state();
         if !state.is_stopped() {
             return if state.is_runnable() {
@@ -260,37 +254,38 @@ impl ProcessManager {
         pcb.sched_info().set_state(ProcessState::Runnable);
         fence(Ordering::SeqCst);
 
-        // TODO: select_task_rq load balancing.
-        // let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
-        // let allowed = pi_guard.cpus_allowed.clone();
-        // let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
-        let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
-        let update_clock = target_cpu == smp_get_processor_id();
-        let rq = cpu_rq(target_cpu.data() as usize);
-
-        let should_enqueue = {
+        let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+        // A current task may be marked stopped and then resumed before its
+        // remote CPU reaches schedule(). It is still queued on prev_cpu in
+        // that window, so inspect and wake it under that rq lock; selecting a
+        // different rq first would attempt to dequeue it from the wrong queue.
+        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+            let rq = cpu_rq(prev_cpu.data() as usize);
             let (rq, _rq_guard) = rq.self_lock();
-            match *pcb.sched_info().on_rq.lock_irqsave() {
-                OnRq::Queued => {
-                    let is_current = Arc::ptr_eq(&rq.current(), pcb);
-                    if !is_current {
-                        if update_clock {
-                            rq.update_rq_clock();
-                            rq.check_preempt_current(pcb, WakeupFlags::empty());
-                        } else {
-                            rq.check_preempt_remote(pcb, WakeupFlags::empty());
-                        }
-                    } else if !update_clock {
-                        kick_cpu(target_cpu).ok();
+            if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+                let local = prev_cpu == smp_get_processor_id();
+                if !Arc::ptr_eq(&rq.current(), pcb) {
+                    if local {
+                        rq.update_rq_clock();
+                        rq.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
+                    } else {
+                        rq.check_preempt_remote(pcb, WakeupFlags::WF_TTWU);
                     }
-                    false
+                } else if !local {
+                    kick_cpu(prev_cpu).ok();
                 }
-                OnRq::None => true,
-                OnRq::Migrating => false,
+                return Ok(());
             }
-        };
+        }
 
-        if should_enqueue {
+        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::None {
+            // An off-rq stopped task retains its previous task_cpu for
+            // accounting, but sched_setaffinity may have changed its legal
+            // placement while it slept. Select again under pi_lock exactly
+            // like ordinary ttwu.
+            pcb.sched_info().wait_until_not_running();
+            let allowed = pi_guard.cpus_allowed.clone();
+            let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
             enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::empty(), false);
         }
 

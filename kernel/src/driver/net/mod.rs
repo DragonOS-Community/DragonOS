@@ -93,14 +93,19 @@ pub trait Iface: crate::driver::base::device::Device {
     /// # `poll_napi`
     /// NAPI（类似 Linux softirq/ksoftirqd）使用的 bounded poll。
     ///
-    /// ## 返回值语义（对齐 NAPI）
-    /// - `true`：还有工作没做完（例如 ingress backlog 超过 budget），应继续留在 poll_list
-    /// - `false`：本次已处理完，可 complete
-    ///
-    /// 默认实现退化为一次普通 poll（兼容旧驱动）；具体网卡应覆盖实现以保证 bounded work。
+    /// 返回本次实际处理量，以及是否需要立即再次 poll。
+    fn poll_napi(&self, budget: usize) -> napi::NapiPollResult;
+
+    /// Called after this NAPI instance acquires `SCHED`, before it is published.
+    /// Devices with interrupt mitigation may mask callbacks here.
     #[inline]
-    fn poll_napi(&self, _budget: usize) -> bool {
-        self.poll()
+    fn napi_poll_begin(&self) {}
+
+    /// Complete one NAPI ownership cycle. Devices may override this to pair
+    /// callback re-enabling with the `SCHED/MISSED` transition.
+    #[inline]
+    fn napi_complete(&self, napi: Arc<napi::NapiStruct>) {
+        napi::napi_complete(napi);
     }
 
     /// # `raw_transmit`
@@ -511,7 +516,7 @@ impl IfaceCommon {
     /// NAPI 使用的 bounded poll：最多处理 `budget` 个 ingress 包，然后推进一次 egress。
     ///
     /// 返回值语义：是否仍有 ingress backlog 需要继续 poll（即 budget 用尽且仍在处理包）。
-    pub fn poll_napi<D>(&self, device: &mut D, budget: usize) -> bool
+    pub fn poll_napi<D>(&self, device: &mut D, budget: usize) -> napi::NapiPollResult
     where
         D: smoltcp::phy::Device + ?Sized,
     {
@@ -570,8 +575,11 @@ impl IfaceCommon {
         // - 但仍有 ACK / window update / 后续 egress 需要立即发送；
         // - NAPI 线程却错误睡眠，直到下一次外部事件才继续推进，
         //   导致 send done 后 recv 端偶发卡住。
-        (had_packet && processed == budget)
-            || matches!(poll_at, Some(instant) if instant <= timestamp)
+        napi::NapiPollResult::new(
+            processed,
+            (had_packet && processed == budget)
+                || matches!(poll_at, Some(instant) if instant <= timestamp),
+        )
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {

@@ -580,11 +580,12 @@ impl Iface for LoopbackInterface {
         progressed || self.driver.has_pending_rx()
     }
 
-    fn poll_napi(&self, budget: usize) -> bool {
+    fn poll_napi(&self, budget: usize) -> super::napi::NapiPollResult {
         // 与普通 poll 相同：若 egress 刚把包送回 lo 队列，则 NAPI 也必须继续自驱动。
         let mut driver = self.driver.clone();
-        let has_work_left = self.common.poll_napi(&mut driver, budget);
-        has_work_left || self.driver.has_pending_rx()
+        let mut result = self.common.poll_napi(&mut driver, budget);
+        result.poll_again |= self.driver.has_pending_rx();
+        result
     }
 
     fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {

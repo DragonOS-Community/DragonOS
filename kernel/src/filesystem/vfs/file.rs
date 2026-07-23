@@ -1948,8 +1948,7 @@ impl File {
         const SETFL_MASK: u32 = FileFlags::O_APPEND.bits()
             | FileFlags::O_NONBLOCK.bits()
             | FileFlags::O_DIRECT.bits()
-            | FileFlags::O_NOATIME.bits()
-            | FileFlags::FASYNC.bits();
+            | FileFlags::O_NOATIME.bits();
 
         let new_bits = (new_flags.bits() & SETFL_MASK) | (old_flags.bits() & !SETFL_MASK);
         new_flags = FileFlags::from_bits_truncate(new_bits);
@@ -1958,6 +1957,19 @@ impl File {
         // 更新文件的打开模式
         *self.flags.write() = new_flags;
         return Ok(());
+    }
+
+    /// Commit the handler-owned FASYNC status bit.
+    ///
+    /// Linux excludes FASYNC from the generic SETFL mask: the fasync handler
+    /// owns this bit and updates it only after registration succeeds.
+    pub(crate) fn set_fasync_flag(&self, enabled: bool) {
+        let mut flags = self.flags.write();
+        if enabled {
+            flags.insert(FileFlags::FASYNC);
+        } else {
+            flags.remove(FileFlags::FASYNC);
+        }
     }
 
     /// @brief 重新设置文件的大小

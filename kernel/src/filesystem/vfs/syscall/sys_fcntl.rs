@@ -189,10 +189,28 @@ impl SysFcntlHandle {
                     }
                     let old_fasync = current_flags.contains(FileFlags::FASYNC);
                     let new_fasync = new_flags.contains(FileFlags::FASYNC);
-                    if old_fasync != new_fasync {
-                        set_file_fasync(&file, fd, new_fasync, FAsyncHandlerPolicy::Optional)?;
+
+                    // Apply every potentially failing non-FASYNC flag update
+                    // before invoking the fasync handler. Linux likewise
+                    // validates flags first and lets the handler own FASYNC.
+                    let mut non_fasync_flags = new_flags;
+                    if old_fasync {
+                        non_fasync_flags.insert(FileFlags::FASYNC);
+                    } else {
+                        non_fasync_flags.remove(FileFlags::FASYNC);
                     }
-                    file.set_flags(new_flags)?;
+                    file.set_flags(non_fasync_flags)?;
+
+                    if old_fasync != new_fasync {
+                        if let Err(err) =
+                            set_file_fasync(&file, fd, new_fasync, FAsyncHandlerPolicy::Optional)
+                        {
+                            // A failed fasync transition must not commit the
+                            // other status flags from this F_SETFL request.
+                            file.set_flags(current_flags)?;
+                            return Err(err);
+                        }
+                    }
 
                     // Keep socket object nonblocking state in sync with file flags.
                     // Some socket implementations consult an internal AtomicBool rather than

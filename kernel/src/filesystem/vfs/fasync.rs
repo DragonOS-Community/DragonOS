@@ -230,13 +230,12 @@ pub fn set_file_fasync(
     enabled: bool,
     handler_policy: FAsyncHandlerPolicy,
 ) -> Result<(), SystemError> {
-    let mut flags = file.flags();
+    let flags = file.flags();
     if flags.contains(FileFlags::FASYNC) == enabled {
         return Ok(());
     }
 
-    let inode = file.inode();
-    if let Ok(pollable) = inode.as_pollable_inode() {
+    let handler_succeeded = if let Ok(pollable) = file.inode().as_pollable_inode() {
         let private_data = file.private_data.lock();
         let result = if enabled {
             let item = FAsyncItem::new(Arc::downgrade(file), fd);
@@ -251,15 +250,18 @@ pub fn set_file_fasync(
             if handler_policy == FAsyncHandlerPolicy::Required {
                 return Err(SystemError::ENOTTY);
             }
+            false
+        } else {
+            true
         }
     } else if handler_policy == FAsyncHandlerPolicy::Required {
         return Err(SystemError::ENOTTY);
-    }
-
-    if enabled {
-        flags.insert(FileFlags::FASYNC);
     } else {
-        flags.remove(FileFlags::FASYNC);
+        false
+    };
+
+    if handler_succeeded {
+        file.set_fasync_flag(enabled);
     }
-    file.set_flags(flags)
+    Ok(())
 }

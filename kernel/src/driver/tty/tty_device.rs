@@ -256,11 +256,13 @@ impl IndexNode for TtyDevice {
         }
 
         let tty = tty.unwrap();
+        let hangup_generation = tty.core().file_open_hangup_generation();
 
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
             flags: *mode,
+            hangup_generation,
         });
 
         tty.core().contorl_info_irqsave().clear_dead_session();
@@ -274,6 +276,11 @@ impl IndexNode for TtyDevice {
             }
             return Err(err);
         }
+
+        // A successful open after a completed hangup is a normal tty file in
+        // Linux. Do not clear a hangup which raced with this open: its
+        // generation change marks this file as one of the hung-up instances.
+        tty.core().finish_file_open(hangup_generation);
 
         let driver = tty.core().driver();
         // 考虑 O_NOCTTY：显式指定则不设置控制终端；pty master 也不会成为控制终端。
@@ -485,14 +492,26 @@ impl IndexNode for TtyDevice {
         arg: usize,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.flags)
+        let (tty, file_hangup_generation) = if let FilePrivateData::Tty(tty_priv) = &*data {
+            (tty_priv.tty(), tty_priv.hangup_generation)
         } else {
             return Err(SystemError::EIO);
         };
 
         // Drop the lock early: tty ioctl paths may block.
         drop(data);
+
+        // Linux replaces only the file instances which existed at hangup
+        // with hung_up_tty_fops. A later successful reopen must remain usable.
+        // Check the original file endpoint before PTY master mode ioctls
+        // redirect to the slave.
+        if file_hangup_generation != tty.core().hangup_generation() {
+            return if cmd == TtyIoctlCmd::TIOCSPGRP {
+                Err(SystemError::ENOTTY)
+            } else {
+                Err(SystemError::EIO)
+            };
+        }
 
         match cmd {
             TtyIoctlCmd::TIOCSETD
@@ -766,6 +785,7 @@ impl CharDevice for TtyDevice {
 pub struct TtyFilePrivateData {
     pub tty: Arc<TtyCore>,
     pub flags: FileFlags,
+    pub hangup_generation: usize,
 }
 
 impl TtyFilePrivateData {

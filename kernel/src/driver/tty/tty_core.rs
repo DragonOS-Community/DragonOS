@@ -145,6 +145,7 @@ impl TtyCore {
             vc_index: AtomicUsize::new(usize::MAX),
             ctrl: SpinLock::new(TtyControlInfo::default()),
             closing: AtomicBool::new(false),
+            hangup_generation: AtomicUsize::new(0),
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
             epitems: LockedEPItemLinkedList::default(),
@@ -245,10 +246,11 @@ impl TtyCore {
     pub fn tty_vhangup(tty: Arc<TtyCore>) {
         {
             let mut flags = tty.core().flags_write();
-            if flags.contains(TtyFlag::HUPPED) {
+            if flags.intersects(TtyFlag::HUPPED | TtyFlag::HUPPING) {
                 return;
             }
             flags.insert(TtyFlag::HUPPING);
+            tty.core().hangup_generation.fetch_add(1, Ordering::AcqRel);
         }
 
         let (sid, pgid) = {
@@ -647,6 +649,10 @@ pub struct TtyCoreData {
     ctrl: SpinLock<TtyControlInfo>,
     /// 是否正在关闭
     closing: AtomicBool,
+    /// Incremented when a hangup starts so file instances opened before that
+    /// point retain Linux's hung_up_tty_fops semantics independently of later
+    /// reopens.
+    hangup_generation: AtomicUsize,
     /// 流控状态
     flow: SpinLock<TtyFlowState>,
     /// 链接tty
@@ -697,6 +703,36 @@ impl TtyCoreData {
     #[inline]
     pub fn flags_write(&self) -> RwLockWriteGuard<'_, TtyFlag> {
         self.flags.write_irqsave()
+    }
+
+    #[inline]
+    pub fn hangup_generation(&self) -> usize {
+        self.hangup_generation.load(Ordering::Acquire)
+    }
+
+    /// Snapshot the generation assigned to a newly opening file.
+    ///
+    /// A file which races with an in-progress hangup belongs to the generation
+    /// being hung up. Holding the flags read lock pairs this decision with the
+    /// generation increment performed under the flags write lock.
+    pub fn file_open_hangup_generation(&self) -> usize {
+        let flags = self.flags.read_irqsave();
+        let generation = self.hangup_generation.load(Ordering::Acquire);
+        if flags.contains(TtyFlag::HUPPING) {
+            generation.wrapping_sub(1)
+        } else {
+            generation
+        }
+    }
+
+    /// Clear a completed pre-open hangup only if no newer hangup raced with
+    /// this open. The generation comparison and flag update share the same
+    /// critical section as tty_vhangup's generation increment.
+    pub fn finish_file_open(&self, file_hangup_generation: usize) {
+        let mut flags = self.flags.write_irqsave();
+        if self.hangup_generation.load(Ordering::Acquire) == file_hangup_generation {
+            flags.remove(TtyFlag::HUPPED);
+        }
     }
 
     pub fn private_fields(&self) -> Option<Arc<dyn TtyCorePrivateField>> {

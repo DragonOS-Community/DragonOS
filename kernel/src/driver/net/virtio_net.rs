@@ -69,9 +69,10 @@ static mut VIRTIO_NET_DRIVER: Option<Arc<VirtIONetDriver>> = None;
 const VIRTIO_NET_BASENAME: &str = "virtio_net";
 const VIRTIO_NET_QUEUE_SIZE: usize = 64;
 const VIRTIO_NET_BUFFER_SIZE: usize = 4096;
+const VIRTIO_NET_IP_MTU: usize = 1500;
 // smoltcp expects the complete Ethernet frame size here. Without
 // VIRTIO_NET_F_MTU, Linux exposes the standard 1500-byte IP MTU.
-const VIRTIO_NET_MAX_FRAME_SIZE: usize = 1500 + 14;
+const VIRTIO_NET_MAX_FRAME_SIZE: usize = VIRTIO_NET_IP_MTU + 14;
 const VIRTIO_NET_RX_QUEUE: u16 = 0;
 const VIRTIO_NET_TX_QUEUE: u16 = 1;
 
@@ -795,8 +796,6 @@ struct InnerVirtIOInterface {
 
 impl VirtioInterface {
     pub fn new(mut device_inner: VirtIONicDeviceInner) -> Arc<Self> {
-        use smoltcp::phy::Device;
-
         let iface_id = generate_iface_id();
         let mut iface_config = iface::Config::new(wire::HardwareAddress::Ethernet(
             wire::EthernetAddress(device_inner.inner.lock_irqsave().mac_address()),
@@ -811,8 +810,6 @@ impl VirtioInterface {
             | InterfaceFlags::MULTICAST
             | InterfaceFlags::LOWER_UP;
         let iface_name = format!("eth{}", iface_id);
-        let mtu = device_inner.capabilities().max_transmission_unit;
-
         let iface = Arc::new(VirtioInterface {
             device_inner,
             locked_kobj_state: LockedKObjectState::default(),
@@ -820,7 +817,7 @@ impl VirtioInterface {
                 iface_id,
                 crate::driver::net::types::InterfaceType::ETHER,
                 iface_name,
-                mtu,
+                VIRTIO_NET_IP_MTU,
                 flags,
                 iface,
             ),

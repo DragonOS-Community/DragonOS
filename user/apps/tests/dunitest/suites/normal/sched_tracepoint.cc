@@ -120,6 +120,10 @@ TEST(SchedProcessExecTp, EventFilesExist) {
     EXPECT_FALSE(id.empty());
     char* end = nullptr;
     long idval = strtol(id.c_str(), &end, 10);
+    // 确认整个字符串都是数字（允许尾部换行），而非仅前缀可解析。
+    ASSERT_NE(end, id.c_str()) << "id not numeric: " << id;
+    while (end != nullptr && (*end == '\n' || *end == '\r' || *end == ' ')) ++end;
+    EXPECT_EQ(end != nullptr && *end == '\0', true) << "id has trailing garbage: " << id;
     EXPECT_GE(idval, 0) << "invalid id: " << id;
 
     EXPECT_EQ(0, umount(root)) << strerror(errno);

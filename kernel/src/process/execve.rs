@@ -1,3 +1,4 @@
+use super::trace::trace_sched_process_exec;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
@@ -128,6 +129,11 @@ fn do_execve_internal(
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
+    // 捕获 sched_process_exec 的 old_pid：必须在 load_binary_file_with_context 之前，
+    // 因为该函数内的 begin_new_exec → de_thread 会在「非 leader 线程 execve」时
+    // 交换 current 与旧 thread-group leader 的 raw_pid（对齐 Linux fs/exec.c:1770）。
+    let old_pid = ProcessManager::current_pcb().raw_pid().data() as i32;
+
     // 尝试加载二进制文件
     let load_result = load_binary_file_with_context(&mut param, &ctx);
 
@@ -214,6 +220,26 @@ fn do_execve_internal(
             let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
             let exec_ret = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr);
             if exec_ret.is_ok() {
+                // sched_process_exec：arch_do_execve 成功、用户态寄存器就绪后触发，
+                // 对齐 Linux fs/exec.c:1803（trace 在 start_thread 之后、所有失败点之后）。
+                let pid = pcb.raw_pid().data() as i32;
+                // 先把 comm 复制到栈缓冲并释放 basic 读锁：trace 默认回调内部的
+                // trace_cmdline_push 会再次获取 basic 读锁，持锁重入有 deadlock 风险。
+                let mut comm_buf = [0u8; 16];
+                let mut comm_len;
+                {
+                    let basic_guard = pcb.basic();
+                    let name = basic_guard.name();
+                    comm_len = name.len().min(15);
+                    // 回退到 UTF-8 字符边界，避免在多字节字符中间截断导致 from_utf8 失败。
+                    while comm_len > 0 && !name.is_char_boundary(comm_len) {
+                        comm_len -= 1;
+                    }
+                    comm_buf[..comm_len].copy_from_slice(&name.as_bytes()[..comm_len]);
+                }
+                let comm = core::str::from_utf8(&comm_buf[..comm_len]).unwrap_or("");
+                trace_sched_process_exec(comm, pid, old_pid);
+
                 if let Some(completion) = vfork_done {
                     completion.complete_all();
                 }

@@ -85,3 +85,4 @@ normal/virtiofs_dax
 normal/af_packet_sockopt
 normal/af_packet_e2e
 normal/af_packet_mcast
+normal/sched_tracepoint

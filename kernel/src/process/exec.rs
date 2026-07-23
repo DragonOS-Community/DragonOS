@@ -457,6 +457,12 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         );
         assert!(leader.is_zombie(), "old exec leader must be zombie");
 
+        // Linux keeps these values in the shared signal_struct, so de_thread()
+        // naturally preserves them. DragonOS stores them on the leader PCB and
+        // must transfer the accumulated history before changing leader identity.
+        current.inherit_exited_thread_group_cputime_from(leader);
+        current.inherit_thread_group_rusage_from(leader);
+
         ProcessManager::exchange_tid_and_raw_pids(&current, leader);
 
         current

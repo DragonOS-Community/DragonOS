@@ -916,6 +916,7 @@ impl ProcessControlBlock {
                 let (wake_pidfd, token) =
                     sighand.try_claim_natural_parent_notify_with(&leader, || {
                         let mut leader_threads = leader.threads_write_irqsave();
+                        leader.add_exited_thread_group_cputime(self.thread_cputime_ns());
                         if let Some(rusage) = self.get_rusage(RUsageWho::RusageThread) {
                             leader.add_exited_thread_group_rusage(&rusage);
                         }

@@ -193,6 +193,11 @@ pub struct ProcessControlBlock {
 
     /// CPU time accounting.
     pub(super) cpu_time: Arc<ProcessCpuTime>,
+    /// Raw CPU time accumulated from threads that have left this thread group.
+    ///
+    /// This remains in nanoseconds for CLOCK_PROCESS_CPUTIME_ID.  The separate
+    /// rusage accumulator uses timeval precision for the userspace ABI.
+    pub(super) exited_thread_group_cputime_ns: SpinLock<u64>,
     /// Thread-group-level resource accumulation for exited threads. Aligns with
     /// Linux signal_struct's exited thread statistics.
     pub(super) exited_thread_group_rusage: SpinLock<RUsage>,
@@ -364,6 +369,7 @@ impl ProcessControlBlock {
                 itimers: SpinLock::new(ProcessItimers::default()),
                 posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
                 cpu_time: Arc::new(ProcessCpuTime::default()),
+                exited_thread_group_cputime_ns: SpinLock::new(0),
                 exited_thread_group_rusage: SpinLock::new(RUsage::default()),
                 children_rusage: SpinLock::new(RUsage::default()),
                 robust_list: RwLock::new(None),

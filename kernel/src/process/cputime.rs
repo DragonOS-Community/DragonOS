@@ -72,14 +72,35 @@ impl ProcessControlBlock {
             return self.thread_cputime_ns();
         }
 
-        let mut total = leader.thread_cputime_ns();
         let ti = leader.threads_read_irqsave();
+        // Exit accounts a thread under this same membership lock before
+        // removing it from group_tasks.  A reader therefore observes the
+        // thread either here or in the exited total, never in both/neither.
+        let mut total = *leader.exited_thread_group_cputime_ns.lock();
+        total = total.saturating_add(leader.thread_cputime_ns());
         for t in &ti.group_tasks {
             if let Some(p) = t.upgrade() {
                 total = total.saturating_add(p.thread_cputime_ns());
             }
         }
         total
+    }
+
+    pub(crate) fn add_exited_thread_group_cputime(&self, ns: u64) {
+        let mut total = self.exited_thread_group_cputime_ns.lock();
+        *total = total.saturating_add(ns);
+    }
+
+    /// Preserve signal_struct-like CPU history when non-leader exec promotes
+    /// this task to thread-group leader.  The group-exec handoff has already
+    /// quiesced every other member, so queries still select `old_leader` before
+    /// the identity swap and select `self` afterwards.
+    pub(crate) fn inherit_exited_thread_group_cputime_from(
+        &self,
+        old_leader: &ProcessControlBlock,
+    ) {
+        let inherited = *old_leader.exited_thread_group_cputime_ns.lock();
+        self.add_exited_thread_group_cputime(inherited);
     }
 
     #[inline(always)]

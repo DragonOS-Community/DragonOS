@@ -242,6 +242,18 @@ impl ProcessControlBlock {
         leader.children_rusage.lock().add_assign_saturating(rusage);
     }
 
+    /// Preserve signal_struct-like group statistics across a non-leader exec
+    /// leader handoff. All other group members are quiesced before this runs.
+    pub(crate) fn inherit_thread_group_rusage_from(&self, old_leader: &ProcessControlBlock) {
+        let exited = *old_leader.exited_thread_group_rusage.lock();
+        self.exited_thread_group_rusage
+            .lock()
+            .add_assign_saturating(&exited);
+
+        let children = *old_leader.children_rusage.lock();
+        self.children_rusage.lock().add_assign_saturating(&children);
+    }
+
     /// 获取进程资源使用情况
     pub fn get_rusage(&self, who: RUsageWho) -> Option<RUsage> {
         match who {

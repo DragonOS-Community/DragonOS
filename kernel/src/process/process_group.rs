@@ -21,6 +21,7 @@ impl ProcessManager {
         pgrp: &Arc<Pid>,
         ignored_pcb: Option<&Arc<ProcessControlBlock>>,
     ) -> bool {
+        let _membership_guard = crate::process::pid::pid_membership_lock();
         for pcb in pgrp.tasks_iter(PidType::PGID) {
             let real_parent = pcb.real_parent_pcb().unwrap();
             if ignored_pcb.is_some() && Arc::ptr_eq(&pcb, ignored_pcb.unwrap()) {

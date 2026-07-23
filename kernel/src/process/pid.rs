@@ -15,6 +15,16 @@ use system_error::SystemError;
 use super::namespace::pid_namespace::PidNamespace;
 use super::{ProcessControlBlock, RawPid};
 
+/// Serializes logical and physical PGID/SID membership transactions.
+///
+/// This is the DragonOS equivalent of the Linux tasklist lock coverage used by
+/// setpgid(), setsid(), de_thread(), exit unhashing, and process-group lookup.
+static PID_MEMBERSHIP_LOCK: SpinLock<()> = SpinLock::new(());
+
+pub(crate) fn pid_membership_lock() -> SpinLockGuard<'static, ()> {
+    PID_MEMBERSHIP_LOCK.lock_irqsave()
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -566,6 +576,56 @@ impl ProcessControlBlock {
         }
     }
 
+    /// Transfer one physical non-thread PID link without changing the logical
+    /// identity stored in the shared signal state.
+    ///
+    /// Linux uses transfer_pid() during de_thread() so PGID/SID indices keep
+    /// exactly one entry for the thread group while its leader PCB changes.
+    ///
+    /// The caller must hold PID_MEMBERSHIP_LOCK.
+    pub(super) fn transfer_pid_link_to_locked(
+        self: &Arc<Self>,
+        target: &Arc<ProcessControlBlock>,
+        pid_type: PidType,
+    ) {
+        assert!(
+            matches!(pid_type, PidType::PGID | PidType::SID),
+            "only leader-owned PGID/SID links may be transferred"
+        );
+        assert!(
+            !Arc::ptr_eq(self, target),
+            "cannot transfer a PID link to the same task"
+        );
+
+        let (first, second) = order_pcbs(self, target);
+        let mut first_link = first.pid_links[pid_type as usize].pid.write();
+        let mut second_link = second.pid_links[pid_type as usize].pid.write();
+        let (source_link, target_link) = if Arc::ptr_eq(first, self) {
+            (&mut first_link, &mut second_link)
+        } else {
+            (&mut second_link, &mut first_link)
+        };
+
+        let pid = source_link
+            .as_ref()
+            .cloned()
+            .expect("source task is missing its leader-owned PID link");
+        assert!(
+            target_link.is_none(),
+            "target task already owns the transferred PID link"
+        );
+
+        let mut tasks = pid.tasks[pid_type as usize].lock();
+        let source_index = find_task_in_pid_tasks(&tasks, self)
+            .expect("source task is missing from the struct Pid task list");
+        assert!(
+            find_task_in_pid_tasks(&tasks, target).is_none(),
+            "target task is already present in the struct Pid task list"
+        );
+        tasks[source_index] = Arc::downgrade(target);
+        **target_link = source_link.take();
+    }
+
     pub fn task_pid_ptr(&self, pid_type: PidType) -> Option<Arc<Pid>> {
         if pid_type == PidType::PID {
             return self.thread_pid.read().clone();
@@ -628,10 +688,18 @@ impl ProcessControlBlock {
     }
 
     pub(super) fn detach_pid(&self, pid_type: PidType) {
+        let _membership_guard =
+            matches!(pid_type, PidType::PGID | PidType::SID).then(pid_membership_lock);
         self.__change_pid(pid_type, None);
     }
 
-    pub(super) fn change_pid(&self, pid_type: PidType, new_pid: Arc<Pid>) {
+    /// Change a leader-owned PID identity while the caller holds
+    /// PID_MEMBERSHIP_LOCK across validation and commit.
+    pub(super) fn change_pid_locked(&self, pid_type: PidType, new_pid: Arc<Pid>) {
+        assert!(
+            matches!(pid_type, PidType::PGID | PidType::SID),
+            "only leader-owned PGID/SID identities use the membership transaction"
+        );
         self.__change_pid(pid_type, Some(new_pid));
         self.attach_pid(pid_type);
     }

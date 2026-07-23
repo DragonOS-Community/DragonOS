@@ -463,12 +463,38 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         current.inherit_exited_thread_group_cputime_from(leader);
         current.inherit_thread_group_rusage_from(leader);
 
+        let membership_guard = crate::process::pid::pid_membership_lock();
         ProcessManager::exchange_tid_and_raw_pids(&current, leader);
 
         current
             .exit_signal
             .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
+
+        // PGID/SID physical indices contain leaders only. Transfer both links
+        // after promoting the new leader and before demoting the old one, so a
+        // concurrent group lookup always has a valid representative.
+        leader.transfer_pid_link_to_locked(&current, PidType::PGID);
+        leader.transfer_pid_link_to_locked(&current, PidType::SID);
         leader.exit_signal.store(-1, Ordering::SeqCst);
+
+        // Session-leader ownership is process-wide in Linux, but DragonOS
+        // currently stores the marker on the leader PCB. Move it together
+        // with the leader identity so job-control checks keep observing the
+        // same process after a non-leader exec.
+        let (leader_is_session_leader, leader_tty) = {
+            let mut leader_signal = leader.sig_info_mut();
+            let state = (leader_signal.is_session_leader, leader_signal.tty());
+            leader_signal.is_session_leader = false;
+            leader_signal.set_tty(None);
+            state
+        };
+        if leader_is_session_leader {
+            let mut current_signal = current.sig_info_mut();
+            current_signal.is_session_leader = true;
+            if current_signal.tty().is_none() {
+                current_signal.set_tty(leader_tty);
+            }
+        }
 
         // Promote the current thread to thread-group leader and clear
         // group_tasks (no other threads remain).
@@ -482,6 +508,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             leader_ti.group_leader = Arc::downgrade(&current);
             leader_ti.group_tasks.clear();
         }
+        drop(membership_guard);
 
         // Transfer the old leader's children list to the new leader.
         let moved_children = {
@@ -547,11 +574,10 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             // remove the newly published child under the same map key.
             unsafe { ProcessManager::release(leader.raw_pid()) };
 
-            // Every DragonOS thread owns TGID/PGID/SID task links. The
-            // generic release path sees the migrated old leader as a
-            // non-leader and only detaches PID, so remove its remaining links
-            // explicitly. `leader` remains alive through this Arc.
-            leader.detach_exec_leader_non_pid_links();
+            // DragonOS still indexes TGID by every thread. The generic release
+            // path sees the migrated old leader as a nonleader and only
+            // detaches PID, so remove its remaining TGID link explicitly.
+            leader.detach_pid(PidType::TGID);
         }
     } else {
         current

@@ -141,6 +141,7 @@ impl TtyCore {
             read_wq: EventWaitQueue::new(),
             write_wq: EventWaitQueue::new(),
             write_lock: TtySleepLock::new(),
+            job_control_lock: TtySleepLock::new(),
             port: RwLock::new(None),
             index,
             vc_index: AtomicUsize::new(usize::MAX),
@@ -263,6 +264,7 @@ impl TtyCore {
     }
 
     pub fn tty_vhangup(tty: Arc<TtyCore>) {
+        let _job_control_guard = tty.core().job_control_lock().lock();
         {
             let mut flags = tty.core().flags_write();
             if flags.intersects(TtyFlag::HUPPED | TtyFlag::HUPPING) {
@@ -276,10 +278,7 @@ impl TtyCore {
         // every pre-hangup open file description.
         tty.core().fasync_items.clear();
 
-        let (sid, pgid) = {
-            let ctrl = tty.core().contorl_info_irqsave();
-            (ctrl.session.clone(), ctrl.pgid.clone())
-        };
+        let pgid = TtyJobCtrlManager::remove_session_tty_job_locked(&tty, None);
 
         if let Some(pgrp) = pgid {
             let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
@@ -290,12 +289,7 @@ impl TtyCore {
 
         {
             let mut ctrl = tty.core().contorl_info_irqsave();
-            ctrl.session = None;
-            ctrl.pgid = None;
             ctrl.pktstatus = TtyPacketStatus::empty();
-        }
-        if let Some(sid) = sid {
-            TtyJobCtrlManager::session_clear_tty(sid);
         }
 
         {
@@ -666,6 +660,8 @@ pub struct TtyCoreData {
     write_wq: EventWaitQueue,
     /// 串行化整个 tty write 调用，等价于 Linux tty->atomic_write_lock。
     write_lock: TtySleepLock,
+    /// Serializes controlling-session changes with hangup.
+    job_control_lock: TtySleepLock,
     /// 端口
     port: RwLock<Option<Arc<dyn TtyPort>>>,
     /// 前台进程
@@ -873,6 +869,11 @@ impl TtyCoreData {
 
     pub fn write_lock(&self) -> &TtySleepLock {
         &self.write_lock
+    }
+
+    #[inline]
+    pub fn job_control_lock(&self) -> &TtySleepLock {
+        &self.job_control_lock
     }
 
     #[inline]
@@ -1102,7 +1103,7 @@ impl TtyOperation for TtyCore {
             // );
             let r = self.core().tty_driver.driver_funcs().close(tty.clone());
             // 如果计数为0或者无效，表示tty已经关闭
-            TtyJobCtrlManager::remove_session_tty(&tty);
+            let _ = TtyJobCtrlManager::remove_session_tty(&tty);
             return r;
         }
         Ok(())

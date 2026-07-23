@@ -233,6 +233,96 @@ TEST(ProcessSignalFork, ProcessGroupSignalIsDeliveredOncePerThreadGroup) {
     EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
+TEST(ProcessSignalFork, ThreadCreationPreservesInheritedGroupAndSingleDelivery) {
+    int helper_ready[2] = {-1, -1};
+    int child_gate[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(helper_ready)) << "pipe failed: " << strerror(errno);
+    ASSERT_EQ(0, pipe(child_gate)) << "pipe failed: " << strerror(errno);
+
+    pid_t helper = fork();
+    ASSERT_GE(helper, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (helper == 0) {
+        if (setpgid(0, 0) != 0) {
+            _exit(127);
+        }
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGRTMIN);
+        if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0) {
+            _exit(128);
+        }
+        WriteByteOrExit(helper_ready[1], 'R');
+        for (;;) {
+            pause();
+        }
+    }
+    ASSERT_TRUE(ReadByte(helper_ready[0])) << "helper did not become ready";
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        if (!ReadByte(child_gate[0])) {
+            _exit(129);
+        }
+        const pid_t process_group = getpgrp();
+        const pid_t session = getsid(0);
+        if (process_group != helper || session < 0) {
+            _exit(130);
+        }
+
+        const int signal = SIGRTMIN;
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, signal);
+        if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0) {
+            _exit(131);
+        }
+
+        int ready_pipe[2] = {-1, -1};
+        if (pipe(ready_pipe) != 0) {
+            _exit(132);
+        }
+        pthread_t thread {};
+        if (pthread_create(&thread, nullptr, ReadyPauseThread, &ready_pipe[1]) != 0
+            || !ReadByte(ready_pipe[0])) {
+            _exit(133);
+        }
+
+        if (getpgrp() != process_group) {
+            _exit(134);
+        }
+        if (getsid(0) != session) {
+            _exit(135);
+        }
+        if (kill(0, signal) != 0) {
+            _exit(136);
+        }
+
+        timespec timeout {};
+        timeout.tv_nsec = 10 * 1000 * 1000;
+        if (sigtimedwait(&blocked, nullptr, &timeout) != signal) {
+            _exit(137);
+        }
+        errno = 0;
+        if (sigtimedwait(&blocked, nullptr, &timeout) != -1 || errno != EAGAIN) {
+            _exit(138);
+        }
+        _exit(0);
+    }
+
+    ASSERT_EQ(0, setpgid(child, helper))
+        << "setpgid failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_EQ(1, write(child_gate[1], "G", 1));
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_EQ(0, kill(helper, SIGKILL));
+    int helper_status = 0;
+    ASSERT_EQ(helper, waitpid(helper, &helper_status, 0));
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
 TEST(ProcessSignalFork, ProcessDirectedSigkillKillsMultithreadedChild) {
     int ready_pipe[2] = {-1, -1};
     ASSERT_EQ(0, pipe(ready_pipe)) << "pipe failed: " << strerror(errno);

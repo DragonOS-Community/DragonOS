@@ -887,6 +887,10 @@ impl ProcessControlBlock {
         } else {
             // todo: 通知那些等待当前线程组退出的进程
         }
+        // PGID/SID unhashing takes PID_MEMBERSHIP_LOCK. Release the per-PCB
+        // signal-info lock first to preserve the global membership -> sig_info
+        // lock order used by fork(), setpgid(), setsid(), and tty cleanup.
+        drop(sig_guard);
         self.__unhash_process(group_dead);
 
         drop(tty);
@@ -948,16 +952,5 @@ impl ProcessControlBlock {
         if let Some((leader, token)) = notify_leader {
             ProcessManager::notify_natural_parent_owned(&leader, token);
         }
-    }
-
-    /// Remove the old leader's non-PID links after non-leader exec migration.
-    ///
-    /// DragonOS attaches TGID/PGID/SID links to every thread. The generic release
-    /// path observes the migrated old leader as a non-leader and therefore only
-    /// detaches PID; Linux instead transfers these leader links in de_thread().
-    pub(super) fn detach_exec_leader_non_pid_links(&self) {
-        self.detach_pid(PidType::TGID);
-        self.detach_pid(PidType::PGID);
-        self.detach_pid(PidType::SID);
     }
 }

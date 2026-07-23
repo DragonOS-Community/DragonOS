@@ -126,6 +126,41 @@ impl ProcessManager {
         sighand.complete_group_exec_leader_exit(current);
     }
 
+    /// Return the stable thread-group leader and whether `current`, which has
+    /// already published EXITING, is the last live task in the group.
+    ///
+    /// The caller must hold PID_MEMBERSHIP_LOCK across both mark_exiting() and
+    /// this scan, so concurrent exits cannot both miss the unique last task.
+    fn thread_group_last_live_task(
+        current: &Arc<ProcessControlBlock>,
+    ) -> (Arc<ProcessControlBlock>, bool) {
+        let leader = current
+            .threads_read_irqsave()
+            .group_leader()
+            .unwrap_or_else(|| current.clone());
+        let leader_threads = leader.threads_read_irqsave();
+        let is_live = |task: &Arc<ProcessControlBlock>| {
+            !task.flags().contains(ProcessFlags::EXITING)
+                && !task.is_exited()
+                && !task.is_zombie()
+                && !task.is_dead()
+        };
+
+        if !Arc::ptr_eq(&leader, current) && is_live(&leader) {
+            return (leader.clone(), false);
+        }
+        for weak in &leader_threads.group_tasks {
+            let Some(task) = weak.upgrade() else {
+                continue;
+            };
+            if !Arc::ptr_eq(&task, current) && is_live(&task) {
+                return (leader.clone(), false);
+            }
+        }
+        drop(leader_threads);
+        (leader, true)
+    }
+
     fn notify_ptrace_parent(tracer: Option<(Arc<ProcessControlBlock>, i32)>) {
         if let Some((tracer, signal)) = tracer {
             if signal > 0 {
@@ -244,7 +279,11 @@ impl ProcessManager {
         // log::debug!("[exit: {}]", raw_pid.data());
         {
             let pcb = current_pcb.clone();
-            pcb.mark_exiting();
+            let (group_leader, group_dead) = {
+                let _membership_guard = crate::process::pid::pid_membership_lock();
+                pcb.mark_exiting();
+                Self::thread_group_last_live_task(&pcb)
+            };
             pid = pcb.pid();
             if pid.is_child_reaper() {
                 pid.ns_of_pid().disable_pid_allocation();
@@ -331,32 +370,25 @@ impl ProcessManager {
             pcb.exit_fs();
             pcb.exit_timers();
 
-            let (current_tty, is_session_leader, sid) = {
-                let siginfo = pcb.sig_info_irqsave();
-                (siginfo.tty(), siginfo.is_session_leader, pcb.task_session())
-            };
-            if let Some(tty) = current_tty {
-                if is_session_leader {
-                    let tty_pgrp = tty.core().contorl_info_irqsave().pgid.clone();
-                    if let Some(pgrp) = tty_pgrp {
-                        let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
-                    }
-                    TtyJobCtrlManager::remove_session_tty(&tty);
-                    if let Some(sid) = sid {
-                        TtyJobCtrlManager::session_clear_tty(sid);
+            if group_dead {
+                let (current_tty, is_session_leader, sid) = {
+                    let siginfo = group_leader.sig_info_irqsave();
+                    (siginfo.tty(), siginfo.is_session_leader, pcb.task_session())
+                };
+                if let Some(tty) = current_tty {
+                    if is_session_leader {
+                        let tty_pgrp = sid.as_ref().and_then(|sid| {
+                            TtyJobCtrlManager::remove_session_tty_if_owner(&tty, sid)
+                        });
+                        if let Some(pgrp) = tty_pgrp {
+                            let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
+                        }
                     } else {
-                        pcb.sig_info_mut().set_tty(None);
+                        group_leader.sig_info_mut().set_tty(None);
                     }
                 } else {
-                    let mut g = tty.core().contorl_info_irqsave();
-                    if g.pgid == Some(pid) {
-                        g.pgid = None;
-                    }
-                    drop(g);
-                    pcb.sig_info_mut().set_tty(None);
+                    group_leader.sig_info_mut().set_tty(None);
                 }
-            } else {
-                pcb.sig_info_mut().set_tty(None);
             }
 
             // Linux semantics: a zombie must not appear in cgroup.procs.
@@ -433,7 +465,6 @@ impl ProcessManager {
             //    shared sighand. If another thread has already set it, reuse
             //    the existing exit code.
             let sighand = current_pcb.sighand();
-            current_pcb.mark_exiting();
             final_exit_code = sighand.start_group_exit(exit_code);
 
             // 2. Send SIGKILL to other threads in the same thread group,

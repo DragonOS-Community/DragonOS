@@ -228,7 +228,12 @@ TEST(TtyTermios, TcsadrainWaitsForPtyDriverBacklog) {
     args.term = t;
     pthread_t waiter;
     ASSERT_EQ(pthread_create(&waiter, nullptr, TcsetattrThread, &args), 0);
-    ASSERT_TRUE(WaitForFlag(args.started, 1000));
+    if (!WaitForFlag(args.started, 1000)) {
+        ADD_FAILURE() << "tcsetattr thread did not start";
+        pty.master.reset();
+        pthread_join(waiter, nullptr);
+        return;
+    }
 
     EXPECT_FALSE(WaitForFlag(args.done, 20))
         << "TCSADRAIN completed with bytes still queued in the PTY driver";
@@ -253,6 +258,55 @@ TEST(TtyTermios, TcsadrainWaitsForPtyDriverBacklog) {
     ASSERT_TRUE(args.done.load(std::memory_order_acquire));
     EXPECT_EQ(args.rc, 0) << "errno=" << args.saved_errno << " ("
                           << strerror(args.saved_errno) << ")";
+}
+
+TEST(TtyTermios, PtyMasterDrainActionsSucceedAfterSlaveClose) {
+    for (int action : {TCSADRAIN, TCSAFLUSH}) {
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.master.get(), 0);
+        ASSERT_GE(pty.slave.get(), 0);
+
+        struct termios t = {};
+        ASSERT_EQ(tcgetattr(pty.master.get(), &t), 0) << strerror(errno);
+
+        int slave_flags = fcntl(pty.slave.get(), F_GETFL, 0);
+        ASSERT_GE(slave_flags, 0);
+        ASSERT_EQ(fcntl(pty.slave.get(), F_SETFL, slave_flags | O_NONBLOCK), 0);
+
+        char fill[1024];
+        memset(fill, 'z', sizeof(fill));
+        bool saturated = false;
+        for (int i = 0; i < 1024; ++i) {
+            ssize_t n = write(pty.slave.get(), fill, sizeof(fill));
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                saturated = true;
+                break;
+            }
+            ASSERT_GT(n, 0) << strerror(errno);
+        }
+        ASSERT_TRUE(saturated);
+        pty.slave.reset();
+
+        TcsetattrThreadArgs args;
+        args.fd = pty.master.get();
+        args.action = action;
+        args.term = t;
+        pthread_t waiter;
+        ASSERT_EQ(pthread_create(&waiter, nullptr, TcsetattrThread, &args), 0);
+        if (!WaitForFlag(args.started, 1000)) {
+            ADD_FAILURE() << "tcsetattr thread did not start";
+            pty.master.reset();
+            pthread_join(waiter, nullptr);
+            return;
+        }
+        if (!WaitForFlag(args.done, 1000)) {
+            ADD_FAILURE() << "PTY master drain action hung after slave close";
+            pty.master.reset();
+        }
+        ASSERT_EQ(pthread_join(waiter, nullptr), 0);
+        EXPECT_EQ(args.rc, 0) << "action=" << action << " errno=" << args.saved_errno
+                              << " (" << strerror(args.saved_errno) << ")";
+    }
 }
 
 /*

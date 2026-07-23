@@ -287,9 +287,9 @@ impl TtyCore {
 
     pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
         let core = tty.core();
-        let real_tty = if core.driver().tty_driver_type() == TtyDriverType::Pty
-            && core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster
-        {
+        let redirected_from_pty_master = core.driver().tty_driver_type() == TtyDriverType::Pty
+            && core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster;
+        let real_tty = if redirected_from_pty_master {
             core.link().unwrap()
         } else {
             tty
@@ -323,6 +323,7 @@ impl TtyCore {
                     real_tty,
                     VirtAddr::new(arg),
                     TtySetTermiosOpt::TERMIOS_OLD,
+                    redirected_from_pty_master,
                 );
             }
             TtyIoctlCmd::TCSETSW => {
@@ -330,6 +331,7 @@ impl TtyCore {
                     real_tty,
                     VirtAddr::new(arg),
                     TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_OLD,
+                    redirected_from_pty_master,
                 );
             }
             TtyIoctlCmd::TCSETSF => {
@@ -339,6 +341,7 @@ impl TtyCore {
                     TtySetTermiosOpt::TERMIOS_FLUSH
                         | TtySetTermiosOpt::TERMIOS_WAIT
                         | TtySetTermiosOpt::TERMIOS_OLD,
+                    redirected_from_pty_master,
                 );
             }
             TtyIoctlCmd::TCSETA => {
@@ -346,6 +349,7 @@ impl TtyCore {
                     real_tty,
                     VirtAddr::new(arg),
                     TtySetTermiosOpt::TERMIOS_TERMIO,
+                    redirected_from_pty_master,
                 );
             }
             TtyIoctlCmd::TCSETAW => {
@@ -353,6 +357,7 @@ impl TtyCore {
                     real_tty,
                     VirtAddr::new(arg),
                     TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_TERMIO,
+                    redirected_from_pty_master,
                 );
             }
             TtyIoctlCmd::TCSETAF => {
@@ -362,6 +367,7 @@ impl TtyCore {
                     TtySetTermiosOpt::TERMIOS_FLUSH
                         | TtySetTermiosOpt::TERMIOS_WAIT
                         | TtySetTermiosOpt::TERMIOS_TERMIO,
+                    redirected_from_pty_master,
                 );
             }
             _ => {
@@ -399,6 +405,7 @@ impl TtyCore {
         tty: Arc<TtyCore>,
         arg: VirtAddr,
         opt: TtySetTermiosOpt,
+        redirected_from_pty_master: bool,
     ) -> Result<usize, SystemError> {
         // Check job control: prevent background process groups from changing
         // terminal attributes without permission.  Matches Linux 6.6
@@ -440,39 +447,44 @@ impl TtyCore {
                 let write_guard = tty.core().write_lock().lock_interruptible(false)?;
                 let termios_guard = tty.core().termios_write_lock_interruptible()?;
 
-                if Self::output_terminal_error(tty.core()) {
+                let output_closed = Self::output_terminal_closed(tty.core());
+                if output_closed && !redirected_from_pty_master {
                     return Err(SystemError::EIO);
                 }
 
-                match tty.ldisc().drain_output(tty.clone())? {
-                    TtyLdiscDrainResult::Drained => {}
-                    TtyLdiscDrainResult::NeedWriteRoom(required) => {
-                        let required = required.max(1);
+                if !output_closed {
+                    match tty.ldisc().drain_output(tty.clone())? {
+                        TtyLdiscDrainResult::Drained => {}
+                        TtyLdiscDrainResult::NeedWriteRoom(required) => {
+                            let required = required.max(1);
+                            drop(termios_guard);
+                            drop(write_guard);
+                            tty.core().write_wq().wait_event_interruptible(events, || {
+                                Self::output_terminal_closed(tty.core())
+                                    || tty.write_room(tty.core()) >= required
+                                    || !tty.ldisc().output_pending()
+                            })?;
+                            if Self::output_terminal_closed(tty.core())
+                                && !redirected_from_pty_master
+                            {
+                                return Err(SystemError::EIO);
+                            }
+                            continue;
+                        }
+                    }
+
+                    if tty.chars_in_buffer(tty.core()) != 0 {
                         drop(termios_guard);
                         drop(write_guard);
                         tty.core().write_wq().wait_event_interruptible(events, || {
-                            Self::output_terminal_error(tty.core())
-                                || tty.write_room(tty.core()) >= required
-                                || !tty.ldisc().output_pending()
+                            Self::output_terminal_closed(tty.core())
+                                || tty.chars_in_buffer(tty.core()) == 0
                         })?;
-                        if Self::output_terminal_error(tty.core()) {
+                        if Self::output_terminal_closed(tty.core()) && !redirected_from_pty_master {
                             return Err(SystemError::EIO);
                         }
                         continue;
                     }
-                }
-
-                if tty.chars_in_buffer(tty.core()) != 0 {
-                    drop(termios_guard);
-                    drop(write_guard);
-                    tty.core().write_wq().wait_event_interruptible(events, || {
-                        Self::output_terminal_error(tty.core())
-                            || tty.chars_in_buffer(tty.core()) == 0
-                    })?;
-                    if Self::output_terminal_error(tty.core()) {
-                        return Err(SystemError::EIO);
-                    }
-                    continue;
                 }
 
                 // Linux flushes input and waits for the physical transmitter
@@ -487,14 +499,14 @@ impl TtyCore {
                     tty.ldisc().flush_buffer(tty.clone())?;
                 }
 
-                if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
+                if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) && !output_closed {
                     tty.wait_until_sent(tty.core())?;
                     let current = ProcessManager::current_pcb();
                     if current.has_pending_signal_fast() && current.has_pending_not_masked_signal()
                     {
                         return Err(SystemError::ERESTARTSYS);
                     }
-                    if Self::output_terminal_error(tty.core()) {
+                    if Self::output_terminal_closed(tty.core()) && !redirected_from_pty_master {
                         return Err(SystemError::EIO);
                     }
                 }
@@ -548,7 +560,7 @@ impl TtyCore {
         Ok(())
     }
 
-    fn output_terminal_error(core: &TtyCoreData) -> bool {
+    fn output_terminal_closed(core: &TtyCoreData) -> bool {
         let flags = core.flags();
         flags.intersects(TtyFlag::IO_ERROR | TtyFlag::HUPPED | TtyFlag::HUPPING)
             || (flags.contains(TtyFlag::OTHER_CLOSED)

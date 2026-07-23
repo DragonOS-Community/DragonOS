@@ -2603,10 +2603,20 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             event.insert(EPollEventType::EPOLLHUP);
         }
 
-        if !core.write_lock().is_locked()
-            && core.driver().driver_funcs().chars_in_buffer(core) < 256
-            && core.driver().driver_funcs().write_room(core) > 0
-        {
+        let driver = core.driver();
+        let subtype = driver.tty_driver_sub_type();
+        let write_room = driver.driver_funcs().write_room(core);
+        // Linux PTYs have no driver-owned transmit queue, so their
+        // chars_in_buffer() is always zero and POLLOUT follows peer receive
+        // room. DragonOS has an asynchronous PTY bridge queue which must be
+        // counted for TCSADRAIN, but already queued bytes must not suppress
+        // writability after the peer frees actual queue room.
+        let below_wakeup_threshold = matches!(
+            subtype,
+            TtyDriverSubType::PtyMaster | TtyDriverSubType::PtySlave
+        ) || driver.driver_funcs().chars_in_buffer(core) < 256;
+
+        if !core.write_lock().is_locked() && below_wakeup_threshold && write_room > 0 {
             event.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
         }
 

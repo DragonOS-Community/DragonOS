@@ -44,8 +44,8 @@ use super::{
 use super::{
     private_data::FuseOpenPrivateData,
     virtiofs::dax::{
-        DaxAdmissionGuard, DaxAdmissionState, DaxMappingOwner, DaxRangeAllocator, OwnedToken,
-        ReclaimCandidate, ReclaimToken, DAX_RANGE_SIZE,
+        DaxAdmissionGuard, DaxAdmissionState, DaxRangeAllocator, OwnedToken, ReclaimCandidate,
+        ReclaimToken, DAX_RANGE_SIZE,
     },
 };
 
@@ -201,10 +201,6 @@ impl DaxMappingTree {
 }
 
 impl DaxMapping {
-    pub(crate) fn file_offset(&self) -> u64 {
-        self.file_offset
-    }
-
     pub(crate) fn window_offset(&self) -> usize {
         self.token.window_offset()
     }
@@ -212,17 +208,9 @@ impl DaxMapping {
     pub(crate) fn writable(&self) -> bool {
         self.writable.load(Ordering::Acquire)
     }
-
-    pub(crate) fn owner(&self) -> DaxMappingOwner {
-        self.token.owner()
-    }
 }
 
 impl DaxAccessGuard {
-    pub(crate) fn mapping(&self) -> &Arc<DaxMapping> {
-        &self.mapping
-    }
-
     fn checked_window_offset(&self, offset: usize, len: usize) -> Result<usize, SystemError> {
         let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
         if end > DAX_RANGE_SIZE {
@@ -968,14 +956,6 @@ impl FuseNode {
             }
         }
         result
-    }
-
-    pub(crate) fn dax_mapping_for_offset(&self, offset: u64) -> Option<Arc<DaxMapping>> {
-        self.dax_mappings
-            .read()
-            .mappings
-            .get(&Self::dax_aligned_offset(offset))
-            .cloned()
     }
 
     pub(crate) fn dax_file_size(&self) -> Result<usize, SystemError> {

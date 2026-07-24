@@ -134,41 +134,6 @@ impl ProcessManager {
         sighand.complete_group_exec_leader_exit(current);
     }
 
-    /// Return the stable thread-group leader and whether `current`, which has
-    /// already published EXITING, is the last live task in the group.
-    ///
-    /// The caller must hold PID_MEMBERSHIP_LOCK across both mark_exiting() and
-    /// this scan, so concurrent exits cannot both miss the unique last task.
-    fn thread_group_last_live_task(
-        current: &Arc<ProcessControlBlock>,
-    ) -> (Arc<ProcessControlBlock>, bool) {
-        let leader = current
-            .threads_read_irqsave()
-            .group_leader()
-            .unwrap_or_else(|| current.clone());
-        let leader_threads = leader.threads_read_irqsave();
-        let is_live = |task: &Arc<ProcessControlBlock>| {
-            !task.flags().contains(ProcessFlags::EXITING)
-                && !task.is_exited()
-                && !task.is_zombie()
-                && !task.is_dead()
-        };
-
-        if !Arc::ptr_eq(&leader, current) && is_live(&leader) {
-            return (leader.clone(), false);
-        }
-        for weak in &leader_threads.group_tasks {
-            let Some(task) = weak.upgrade() else {
-                continue;
-            };
-            if !Arc::ptr_eq(&task, current) && is_live(&task) {
-                return (leader.clone(), false);
-            }
-        }
-        drop(leader_threads);
-        (leader, true)
-    }
-
     fn notify_ptrace_parent(tracer: Option<(Arc<ProcessControlBlock>, i32)>) {
         if let Some((tracer, signal)) = tracer {
             if signal > 0 {
@@ -364,7 +329,17 @@ impl ProcessManager {
             let (group_leader, group_dead) = {
                 let _membership_guard = crate::process::pid::pid_membership_lock();
                 pcb.mark_exiting();
-                Self::thread_group_last_live_task(&pcb)
+                let thread = pcb.threads_read_irqsave();
+                let group_leader = thread.group_leader().unwrap_or_else(|| pcb.clone());
+                let live = thread.thread_group_live.clone();
+                drop(thread);
+                // Match Linux signal_struct::live: every successfully
+                // published thread contributes once and consumes its token on
+                // first entering do_exit(). The unique 1 -> 0 transition owns
+                // thread-group finalization without scanning group_tasks.
+                let previous = live.fetch_sub(1, Ordering::AcqRel);
+                assert_ne!(previous, 0, "thread-group live count underflow");
+                (group_leader, previous == 1)
             };
             pid = pcb.pid();
             if pid.is_child_reaper() {

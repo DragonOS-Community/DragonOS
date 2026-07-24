@@ -826,8 +826,14 @@ impl ProcessManager {
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            pcb.thread.write_irqsave().group_leader =
-                current_pcb.thread.read_irqsave().group_leader.clone();
+            let current_thread = current_pcb.thread.read_irqsave();
+            let group_leader = current_thread.group_leader.clone();
+            let thread_group_live = current_thread.thread_group_live.clone();
+            drop(current_thread);
+            let mut child_thread = pcb.thread.write_irqsave();
+            child_thread.group_leader = group_leader;
+            child_thread.thread_group_live = thread_group_live;
+            drop(child_thread);
             unsafe {
                 let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
                 (*ptr).tgid = current_pcb.tgid;
@@ -922,6 +928,11 @@ impl ProcessManager {
                 let inherited_tty = current_pcb.sig_info_irqsave().tty();
                 pcb.sig_info_mut().set_tty(inherited_tty);
                 current_pcb.sighand().with_group_exec_check(|| {
+                    let live = pcb
+                        .threads_read_irqsave()
+                        .thread_group_live
+                        .fetch_add(1, Ordering::Relaxed);
+                    assert_ne!(live, 0, "cannot publish a thread into a dead group");
                     pcb.attach_pid(PidType::PID);
                     pcb.task_join_group_stop();
                     group_leader

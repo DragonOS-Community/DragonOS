@@ -133,6 +133,7 @@ mkdir -p ${mount_folder}/proc
 mkdir -p ${mount_folder}/usr
 mkdir -p ${mount_folder}/root
 mkdir -p ${mount_folder}/tmp
+mkdir -p ${mount_folder}/var/tmp
 
 is_vfat_target() {
     [ "$FS_TYPE" = "vfat" ] || [ "$FS_TYPE" = "fat32" ]

@@ -19,6 +19,10 @@ TEST(ProcessSignalFork, PosixForkAndJobControlUnavailableOnWindows) {
 #include <time.h>
 #include <unistd.h>
 
+#ifndef PTRACE_TRACEME
+#define PTRACE_TRACEME 0
+#endif
+
 namespace {
 
 void SleepForMillis(long millis) {
@@ -356,6 +360,44 @@ TEST(ProcessSignalFork, SigchldInfoUsesGroupLeaderWhenLastNonleaderExits) {
     child_guard.Release();
     ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
     EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(ProcessSignalFork, PtraceExitSignalCarriesChildSiginfo) {
+    const uid_t expected_uid = getuid();
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    SignalMaskGuard mask_guard(blocked);
+    ASSERT_TRUE(mask_guard.valid()) << "sigprocmask failed: errno=" << errno << " ("
+                                    << strerror(errno) << ")";
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+            _exit(120);
+        }
+        _exit(47);
+    }
+    ChildProcessGuard child_guard(child);
+
+    siginfo_t info {};
+    timespec timeout {};
+    timeout.tv_sec = 5;
+    ASSERT_EQ(SIGCHLD, sigtimedwait(&blocked, &info, &timeout))
+        << "sigtimedwait failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(child, info.si_pid);
+    EXPECT_EQ(expected_uid, info.si_uid);
+    EXPECT_EQ(CLD_EXITED, info.si_code);
+    EXPECT_EQ(47, info.si_status);
+    EXPECT_GE(info.si_utime, 0);
+    EXPECT_GE(info.si_stime, 0);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    child_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(47, WEXITSTATUS(status));
 }
 
 TEST(ProcessSignalFork, StopContinueRaceDoesNotLeaveChildStuck) {

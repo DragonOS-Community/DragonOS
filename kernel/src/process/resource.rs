@@ -229,6 +229,20 @@ impl ProcessControlBlock {
         usage
     }
 
+    /// CPU/resource usage reported with an exit notification.
+    ///
+    /// Match Linux's `task_cputime(tsk) + tsk->signal->{u,s}time`: include the
+    /// exiting task and already released siblings, but not siblings that are
+    /// still alive. `exit_notify()` runs before `__exit_signal()` accounts the
+    /// current task into `exited_thread_group_rusage`, so the current task is
+    /// not counted twice.
+    pub(crate) fn exit_notification_rusage(&self) -> RUsage {
+        let leader = self.leader_for_rusage();
+        let mut usage = *leader.exited_thread_group_rusage.lock();
+        usage.add_assign_saturating(&self.task_rusage());
+        usage
+    }
+
     pub fn add_exited_thread_group_rusage(&self, rusage: &RUsage) {
         let leader = self.leader_for_rusage();
         leader

@@ -28,14 +28,38 @@ use crate::{
         kthread::KernelThreadMechanism,
         namespace::user_namespace::map_id_up,
         pid::{Pid, PidType},
-        ptrace,
-        resource::RUsageWho,
-        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
+        ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
     },
     sched::{cputime::ns_to_clock_t, SchedMode, __schedule_with_current},
     smp::core::smp_get_processor_id,
     syscall::user_access::clear_user_protected,
 };
+
+struct ChildExitSiginfoSnapshot {
+    code: i32,
+    pid: RawPid,
+    uid: u32,
+    status: i32,
+    utime: i64,
+    stime: i64,
+}
+
+impl ChildExitSiginfoSnapshot {
+    fn into_siginfo(self, signal: Signal) -> SigInfo {
+        SigInfo::new(
+            signal,
+            0,
+            SigCode::Raw(self.code),
+            SigType::SigChild {
+                pid: self.pid,
+                uid: self.uid,
+                status: self.status,
+                utime: self.utime,
+                stime: self.stime,
+            },
+        )
+    }
+}
 
 impl ProcessManager {
     const DEFAULT_OVERFLOW_UID: u32 = 65534;
@@ -49,11 +73,23 @@ impl ProcessManager {
         // A claimed old leader must retain all hashed identity until the exec
         // owner swaps it. In particular it is never autoreaped here.
         if claimed_exec_leader {
-            current.set_exit_state_zombie();
+            let ptrace_notification = {
+                let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+                let tracer = ptrace::ptracer_of_locked(current);
+                let snapshot = tracer
+                    .as_ref()
+                    .map(|tracer| Self::child_exit_siginfo_snapshot(current, tracer));
+                current.set_exit_state_zombie();
+                tracer.map(|tracer| {
+                    (
+                        tracer,
+                        Signal::SIGCHLD as i32,
+                        snapshot.expect("ptrace tracer requires an exit siginfo snapshot"),
+                    )
+                })
+            };
             Self::wake_pidfd_pollers_for_task_exit(current);
-            Self::notify_ptrace_parent(
-                ptrace::ptracer_of(current).map(|tracer| (tracer, Signal::SIGCHLD as i32)),
-            );
+            Self::notify_ptrace_parent(ptrace_notification);
             current.mark_exit_notify_complete();
             let completed = sighand.complete_group_exec_leader_exit(current);
             debug_assert!(completed);
@@ -75,6 +111,13 @@ impl ProcessManager {
                 // cannot lose the transition either.
                 let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
                 let tracer = ptrace::ptracer_of_locked(current);
+                // A polling tracer may reap and unhash the child as soon as
+                // Zombie becomes visible. Freeze every child-derived field
+                // before publishing Zombie; signal delivery must consume only
+                // this immutable snapshot.
+                let ptrace_snapshot = tracer
+                    .as_ref()
+                    .map(|tracer| Self::child_exit_siginfo_snapshot(current, tracer));
                 let leader = current.is_thread_group_leader();
                 let (group_empty, natural_token) = if leader {
                     // Publish Zombie and inspect group emptiness under the same
@@ -107,7 +150,11 @@ impl ProcessManager {
                     } else {
                         Signal::SIGCHLD as i32
                     };
-                    (tracer, signal)
+                    (
+                        tracer,
+                        signal,
+                        ptrace_snapshot.expect("ptrace tracer requires an exit siginfo snapshot"),
+                    )
                 });
                 (ptrace_notification, natural_token, autoreap_nonleader)
             };
@@ -134,20 +181,31 @@ impl ProcessManager {
         sighand.complete_group_exec_leader_exit(current);
     }
 
-    fn notify_ptrace_parent(tracer: Option<(Arc<ProcessControlBlock>, i32)>) {
-        if let Some((tracer, signal)) = tracer {
+    fn notify_ptrace_parent(
+        tracer: Option<(Arc<ProcessControlBlock>, i32, ChildExitSiginfoSnapshot)>,
+    ) {
+        if let Some((tracer, signal, snapshot)) = tracer {
             if signal > 0 {
-                let _ = crate::ipc::kill::send_signal_to_pcb(tracer.clone(), Signal::from(signal));
+                let signal = Signal::from(signal);
+                let mut info = snapshot.into_siginfo(signal);
+                if let Err(e) =
+                    signal.send_signal_info_to_pcb(Some(&mut info), tracer.clone(), PidType::TGID)
+                {
+                    warn!(
+                        "failed to send ptrace exit signal to tracer {:?}: {:?}",
+                        tracer.raw_pid(),
+                        e
+                    );
+                }
             }
             ProcessManager::wake_wait_parent(&tracer);
         }
     }
 
-    fn child_exit_siginfo(
+    fn child_exit_siginfo_snapshot(
         child: &Arc<ProcessControlBlock>,
         parent: &Arc<ProcessControlBlock>,
-        signal: Signal,
-    ) -> SigInfo {
+    ) -> ChildExitSiginfoSnapshot {
         let raw_status = child
             .sched_info()
             .state()
@@ -171,22 +229,18 @@ impl ProcessManager {
         let parent_user_ns = parent.cred().user_ns.clone();
         let uid = map_id_up(&parent_user_ns.inner.lock().uid_map, child_uid)
             .unwrap_or(Self::DEFAULT_OVERFLOW_UID);
-        let rusage = child.get_rusage(RUsageWho::RUsageSelf).unwrap_or_default();
+        let rusage = child.exit_notification_rusage();
         let utime = i64::try_from(ns_to_clock_t(rusage.ru_utime.to_ns())).unwrap_or(i64::MAX);
         let stime = i64::try_from(ns_to_clock_t(rusage.ru_stime.to_ns())).unwrap_or(i64::MAX);
 
-        SigInfo::new(
-            signal,
-            0,
-            SigCode::Raw(code),
-            SigType::SigChild {
-                pid,
-                uid,
-                status,
-                utime,
-                stime,
-            },
-        )
+        ChildExitSiginfoSnapshot {
+            code,
+            pid,
+            uid,
+            status,
+            utime,
+            stime,
+        }
     }
 
     /// Complete the unique natural-parent notification transaction. Build the
@@ -217,7 +271,10 @@ impl ProcessManager {
         // Snapshot every field before autoreap can unhash the child's PID.
         let notification = if exit_signal > 0 && !(autoreap && ignored) {
             let signal = Signal::from(exit_signal);
-            Some((signal, Self::child_exit_siginfo(child, &parent, signal)))
+            Some((
+                signal,
+                Self::child_exit_siginfo_snapshot(child, &parent).into_siginfo(signal),
+            ))
         } else {
             None
         };

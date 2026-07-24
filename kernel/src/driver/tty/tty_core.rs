@@ -1095,15 +1095,21 @@ impl TtyOperation for TtyCore {
         let subtype = tty.core().driver().tty_driver_sub_type();
         let is_pty_slave_last = cnt == 1 && subtype == TtyDriverSubType::PtySlave;
         let is_pty_master_last = cnt == 1 && subtype == TtyDriverSubType::PtyMaster;
-        if !self.core().count_valid() || is_pty_slave_last || is_pty_master_last {
+        let final_release = !self.core().count_valid();
+        if final_release || is_pty_slave_last || is_pty_master_last {
             // log::debug!(
             //     "TtyCore close: ref count: {}, tty: {}",
             //     cnt,
             //     tty.core().name()
             // );
             let r = self.core().tty_driver.driver_funcs().close(tty.clone());
-            // 如果计数为0或者无效，表示tty已经关闭
-            let _ = TtyJobCtrlManager::remove_session_tty(&tty);
+            // Linux pty_close() runs when the last user fd closes even though
+            // the peer keeps the tty structure count at one. The controlling
+            // session remains attached in that case and may reopen /dev/tty;
+            // only a true final structure release clears it here.
+            if final_release {
+                let _ = TtyJobCtrlManager::remove_session_tty(&tty);
+            }
             return r;
         }
         Ok(())

@@ -229,6 +229,20 @@ impl ProcessControlBlock {
         usage
     }
 
+    /// CPU/resource usage reported with an exit notification.
+    ///
+    /// Match Linux's `task_cputime(tsk) + tsk->signal->{u,s}time`: include the
+    /// exiting task and already released siblings, but not siblings that are
+    /// still alive. `exit_notify()` runs before `__exit_signal()` accounts the
+    /// current task into `exited_thread_group_rusage`, so the current task is
+    /// not counted twice.
+    pub(crate) fn exit_notification_rusage(&self) -> RUsage {
+        let leader = self.leader_for_rusage();
+        let mut usage = *leader.exited_thread_group_rusage.lock();
+        usage.add_assign_saturating(&self.task_rusage());
+        usage
+    }
+
     pub fn add_exited_thread_group_rusage(&self, rusage: &RUsage) {
         let leader = self.leader_for_rusage();
         leader
@@ -240,6 +254,18 @@ impl ProcessControlBlock {
     pub fn add_child_rusage(&self, rusage: &RUsage) {
         let leader = self.leader_for_rusage();
         leader.children_rusage.lock().add_assign_saturating(rusage);
+    }
+
+    /// Preserve signal_struct-like group statistics across a non-leader exec
+    /// leader handoff. All other group members are quiesced before this runs.
+    pub(crate) fn inherit_thread_group_rusage_from(&self, old_leader: &ProcessControlBlock) {
+        let exited = *old_leader.exited_thread_group_rusage.lock();
+        self.exited_thread_group_rusage
+            .lock()
+            .add_assign_saturating(&exited);
+
+        let children = *old_leader.children_rusage.lock();
+        self.children_rusage.lock().add_assign_saturating(&children);
     }
 
     /// 获取进程资源使用情况

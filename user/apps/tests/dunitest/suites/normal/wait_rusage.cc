@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <new>
+#include <memory>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -64,6 +65,24 @@ namespace {
 
 constexpr size_t kCloneStackSize = 1024 * 1024;
 constexpr uid_t kWaitidChildUid = 1234;
+
+volatile sig_atomic_t g_ptrace_clone_exit_signal = 0;
+
+void RecordPtraceCloneExitSignal(int) { ++g_ptrace_clone_exit_signal; }
+
+int PtraceCloneExit(void*) {
+  if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+    return 2;
+  }
+  return 0;
+}
+
+struct ScopedSignalAction {
+  int signal;
+  struct sigaction old_action;
+
+  ~ScopedSignalAction() { sigaction(signal, &old_action, nullptr); }
+};
 
 bool ReadExact(int fd, void* buf, size_t len) {
   char* cursor = static_cast<char*>(buf);
@@ -882,6 +901,31 @@ TEST(WaitRusage, PtraceTracemeChildIsWaitableWithWclone) {
   errno = 0;
   EXPECT_EQ(-1, wait4(child, nullptr, WNOHANG, nullptr));
   EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(WaitRusage, PtraceTracemeClonePreservesExitSignal) {
+  struct sigaction action {};
+  action.sa_handler = RecordPtraceCloneExitSignal;
+  sigemptyset(&action.sa_mask);
+  struct sigaction old_action {};
+  ASSERT_EQ(0, sigaction(SIGUSR1, &action, &old_action)) << strerror(errno);
+  ScopedSignalAction restore = {.signal = SIGUSR1, .old_action = old_action};
+  g_ptrace_clone_exit_signal = 0;
+
+  auto stack = std::make_unique<char[]>(kCloneStackSize);
+  pid_t child = clone(PtraceCloneExit, stack.get() + kCloneStackSize, SIGUSR1,
+                      nullptr);
+  ASSERT_GT(child, 0) << strerror(errno);
+
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = wait4(child, &status, __WCLONE, nullptr);
+  } while (waited < 0 && errno == EINTR);
+  ASSERT_EQ(child, waited) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+  EXPECT_EQ(1, g_ptrace_clone_exit_signal);
 }
 
 TEST(WaitRusage, RepeatedPtraceTracemeFailsWithEperm) {

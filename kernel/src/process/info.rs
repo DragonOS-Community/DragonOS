@@ -3,6 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::sync::atomic::AtomicUsize;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
@@ -49,6 +50,12 @@ pub struct ThreadInfo {
     /// When the current thread is the group leader, this field stores the
     /// PCBs of all threads in the group.
     pub(super) group_tasks: Vec<Weak<ProcessControlBlock>>,
+    /// Number of published tasks that have not entered the exit path.
+    ///
+    /// This is shared by exactly one thread group. It must not live in
+    /// `SigHand`, because CLONE_SIGHAND may share that object across distinct
+    /// thread groups.
+    pub(super) thread_group_live: Arc<AtomicUsize>,
 }
 
 impl Default for ThreadInfo {
@@ -65,6 +72,7 @@ impl ThreadInfo {
             vfork_done: None,
             group_leader: Weak::default(),
             group_tasks: Vec::new(),
+            thread_group_live: Arc::new(AtomicUsize::new(1)),
         }
     }
 

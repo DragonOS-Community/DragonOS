@@ -347,22 +347,13 @@ impl IndexNode for TtyDevice {
         let driver = tty.core().driver();
         // 考虑 O_NOCTTY：显式指定则不设置控制终端；pty master 也不会成为控制终端。
         if !(mode.contains(FileFlags::O_NOCTTY)
+            || mode.is_write_only()
             || (driver.tty_driver_type() == TtyDriverType::Pty
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
         {
-            let pcb = ProcessManager::current_pcb();
-            let pcb_tty = pcb.sig_info_irqsave().tty();
-            let is_session_leader = pcb.sig_info_irqsave().is_session_leader;
-            let tty_session_is_none = tty.core().contorl_info_irqsave().session.is_none();
-            // Linux tty_open_proc_set_tty 语义：必须是会话首进程、尚无 controlling tty、
-            // tty 当前未被会话占用，且本次 open 具备读权限（不是 O_WRONLY）。
-            if is_session_leader
-                && pcb_tty.is_none()
-                && tty_session_is_none
-                && !mode.is_write_only()
-            {
-                TtyJobCtrlManager::proc_set_tty(tty);
-            }
+            // The helper revalidates and commits the controlling-tty state as
+            // one membership/tty/signal transaction.
+            TtyJobCtrlManager::proc_set_tty(tty);
         }
 
         Ok(())

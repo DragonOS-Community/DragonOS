@@ -431,6 +431,26 @@ impl Signal {
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // 根据信号类型选择添加到线程级 pending 还是进程级 shared_pending
         let is_thread_target = matches!(pt, PidType::PID);
+        let target_pcb = if is_thread_target {
+            if self.wants_signal(pcb.clone()) {
+                Some(pcb.clone())
+            } else {
+                None
+            }
+        } else {
+            self.select_group_signal_target(pcb.clone())
+        };
+
+        // Linux commits SIGNAL_GROUP_EXIT and its shared exit code under the
+        // sighand lock before making a fatal signal observable to de_thread().
+        // Otherwise the exec owner can see private SIGKILL pending, cancel
+        // exec, and win the race to publish EAGAIN as the group exit status.
+        if let Some(target_pcb) = target_pcb.as_ref() {
+            if self.start_fatal_group_exit_if_needed(pcb.clone(), target_pcb.clone()) {
+                return;
+            }
+        }
+
         if is_thread_target {
             // 线程级信号：添加到线程的 sig_pending
             pcb.sig_info_mut()
@@ -449,28 +469,12 @@ impl Signal {
         // 若目标进程存在 signalfd 监听该信号，需要唤醒其等待者/epoll。
         crate::ipc::signalfd::notify_signalfd_for_pcb(&pcb, *self);
 
-        let target_pcb = if is_thread_target {
-            if self.wants_signal(pcb.clone()) {
-                Some(pcb.clone())
-            } else {
-                None
-            }
-        } else {
-            self.select_group_signal_target(pcb.clone())
-        };
-
         let Some(target_pcb) = target_pcb else {
             if is_thread_target {
                 pcb.recalc_sigpending();
             }
             return;
         };
-
-        if !is_thread_target
-            && self.start_fatal_group_exit_if_needed(pcb.clone(), target_pcb.clone())
-        {
-            return;
-        }
 
         target_pcb.recalc_sigpending();
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -495,7 +499,7 @@ impl Signal {
 
         let tasks = ProcessManager::thread_group_tasks_snapshot(target);
         for task in tasks {
-            Self::queue_group_kill_to_thread(&task);
+            Self::queue_private_sigkill_to_thread(&task);
         }
 
         true
@@ -525,7 +529,13 @@ impl Signal {
         true
     }
 
-    fn queue_group_kill_to_thread(task: &Arc<ProcessControlBlock>) {
+    /// Queue the private SIGKILL used after the kernel has already committed
+    /// to tearing down sibling threads for group-exit or de_thread().
+    ///
+    /// Unlike normal signal delivery, this must not run complete_signal()
+    /// again: during de_thread() the exec owner is intentionally preserved,
+    /// while during group-exit the shared exit state is already committed.
+    pub(crate) fn queue_private_sigkill_to_thread(task: &Arc<ProcessControlBlock>) {
         if task.flags().contains(ProcessFlags::EXITING) || task.is_zombie() || task.is_dead() {
             return;
         }

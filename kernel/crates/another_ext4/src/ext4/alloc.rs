@@ -10,6 +10,23 @@ pub(super) struct RangeAllocation {
     pub allocation_homes: [PBlockId; 3],
 }
 
+// Range allocation runs under the transaction writer gate.  Keep the
+// speculative search short so a fragmented filesystem cannot turn a single
+// sequential write into a volume-wide metadata read.
+const TRANSACTION_RANGE_MAX_GROUP_PROBES: u32 = 4;
+
+fn transaction_range_probe_limit(block_group_count: u32, require_preferred: bool) -> u32 {
+    // An exact-adjacency request can only succeed in its preferred group.  A
+    // failed probe is therefore a fast-path miss, not a reason to scan other
+    // groups while holding the transaction gate.
+    let limit = if require_preferred {
+        1
+    } else {
+        TRANSACTION_RANGE_MAX_GROUP_PROBES
+    };
+    core::cmp::min(block_group_count, limit)
+}
+
 fn extent_tail_batch_limit(
     first_data_block: PBlockId,
     blocks_per_group: PBlockId,
@@ -105,12 +122,11 @@ impl Ext4 {
             .unwrap_or(preferred_inode_group);
         let count_usize = count as usize;
 
-        // A fragmented preferred group must not turn a perfectly valid
-        // multi-block allocation into the per-block legacy path.  Scan every
-        // group once, starting at the inode-local preference, exactly as the
-        // single-block allocator ultimately searches the whole filesystem.
-        // The free-block count rejects full groups before reading a bitmap.
-        for offset in 0..bg_count {
+        // This is a speculative fast path.  Bound its metadata I/O under the
+        // transaction writer gate; on a miss the caller aborts the
+        // transaction and uses the legacy allocator.  Exact-adjacency probes
+        // need only inspect the preferred group.
+        for offset in 0..transaction_range_probe_limit(bg_count, require_preferred) {
             let bgid = ((preferred_group as u64 + offset as u64) % bg_count as u64) as BlockGroupId;
             let blocks_in_group = Self::block_group_block_count(&sb, bgid);
             if blocks_in_group < count_usize {
@@ -1277,8 +1293,25 @@ impl Ext4 {
 }
 
 #[cfg(test)]
-mod reclaim_tests {
-    use super::{extent_tail_batch_limit, linked_orphan_tail_remove_limit};
+mod allocation_tests {
+    use super::{
+        extent_tail_batch_limit, linked_orphan_tail_remove_limit, transaction_range_probe_limit,
+        TRANSACTION_RANGE_MAX_GROUP_PROBES,
+    };
+
+    #[test]
+    fn transactional_range_probes_are_bounded_and_exact_requests_are_local() {
+        assert_eq!(transaction_range_probe_limit(0, false), 0);
+        assert_eq!(transaction_range_probe_limit(1, false), 1);
+        assert_eq!(
+            transaction_range_probe_limit(128, false),
+            TRANSACTION_RANGE_MAX_GROUP_PROBES
+        );
+
+        assert_eq!(transaction_range_probe_limit(0, true), 0);
+        assert_eq!(transaction_range_probe_limit(1, true), 1);
+        assert_eq!(transaction_range_probe_limit(128, true), 1);
+    }
 
     #[test]
     fn extent_reclaim_batch_never_crosses_a_block_group() {

@@ -273,6 +273,15 @@ impl ProcessManager {
             child.sighand().complete_natural_parent_notify(token),
             "natural-parent notification ownership changed"
         );
+        // Reparenting is serialized by PTRACE_RELATION_LOCK. If it completed
+        // before this snapshot, wake the new wait owner after publishing Done;
+        // if it happens later, the reparent path wakes after Done is visible
+        // to the waiter. This closes the Pending -> reparent lost-wakeup
+        // window without holding the relation lock across signal delivery.
+        let completion_parent = {
+            let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+            child.real_parent_pcb()
+        };
 
         if let Some((signal, mut info)) = notification {
             if let Err(e) =
@@ -288,6 +297,11 @@ impl ProcessManager {
         }
 
         ProcessManager::wake_wait_parent(&parent);
+        if let Some(completion_parent) = completion_parent {
+            if !Arc::ptr_eq(&completion_parent, &parent) {
+                ProcessManager::wake_wait_parent(&completion_parent);
+            }
+        }
 
         if child.is_kthread() {
             KernelThreadMechanism::notify_daemon();

@@ -1,0 +1,4 @@
+build/
+*tar.gz
+!patches/
+!patches/*.patch

@@ -11,7 +11,10 @@ use crate::net::socket::common::{
 use crate::net::socket::{PSO, PSOL};
 use crate::rcu::rcu_defer_drop;
 
+use super::ring::PacketRing;
+use super::uapi::tpacket_version;
 use super::{packet_option, PacketSocket};
+use crate::libs::mutex::Mutex;
 
 impl PacketSocket {
     fn socket_timeout_ticks(&self, name: usize) -> Result<&AtomicU64, SystemError> {
@@ -58,9 +61,9 @@ impl PacketSocket {
                     if value.len() < 8 {
                         return Err(SystemError::EINVAL);
                     }
-                    let accepted = self.stats_packets.swap(0, Ordering::Relaxed);
+                    let packets = self.stats_packets.swap(0, Ordering::Relaxed);
                     let drops = self.stats_drops.swap(0, Ordering::Relaxed);
-                    value[..4].copy_from_slice(&accepted.wrapping_add(drops).to_ne_bytes());
+                    value[..4].copy_from_slice(&packets.to_ne_bytes());
                     value[4..8].copy_from_slice(&drops.to_ne_bytes());
                     Ok(8)
                 }
@@ -68,6 +71,17 @@ impl PacketSocket {
                     value,
                     self.options.read().auxdata as i32,
                 )),
+                packet_option::PACKET_VERSION => {
+                    let v = match *self.tpacket_version.lock() {
+                        super::TpacketVersion::V1 => tpacket_version::TPACKET_V1,
+                        super::TpacketVersion::V2 => tpacket_version::TPACKET_V2,
+                    };
+                    Ok(write_i32_getsockopt(value, v))
+                }
+                packet_option::PACKET_HDRLEN => {
+                    let hdrlen = self.tpacket_version.lock().hdrlen() as i32;
+                    Ok(write_i32_getsockopt(value, hdrlen))
+                }
                 packet_option::PACKET_FANOUT => {
                     // Linux packet_getsockopt: an unjoined socket reports 0.
                     let val = self.fanout_getsockopt_value().unwrap_or(0) as i32;
@@ -91,6 +105,52 @@ impl PacketSocket {
                 packet_option::PACKET_DROP_MEMBERSHIP => self.drop_membership(value),
                 packet_option::PACKET_AUXDATA => {
                     self.options.write().auxdata = Self::parse_i32(value)? != 0;
+                    Ok(())
+                }
+                packet_option::PACKET_VERSION => {
+                    let v = Self::parse_i32(value)?;
+                    let new_version = match v {
+                        tpacket_version::TPACKET_V1 => super::TpacketVersion::V1,
+                        tpacket_version::TPACKET_V2 => super::TpacketVersion::V2,
+                        _ => return Err(SystemError::EINVAL),
+                    };
+                    if self.rx_ring.lock().is_some() {
+                        return Err(SystemError::EBUSY);
+                    }
+                    *self.tpacket_version.lock() = new_version;
+                    Ok(())
+                }
+                packet_option::PACKET_RESERVE => {
+                    let v = Self::parse_i32(value)? as u32;
+                    if self.rx_ring.lock().is_some() {
+                        return Err(SystemError::EBUSY);
+                    }
+                    self.tp_reserve.store(v, Ordering::Relaxed);
+                    Ok(())
+                }
+                packet_option::PACKET_RX_RING => {
+                    if value.len() < 16 {
+                        return Err(SystemError::EINVAL);
+                    }
+                    if self.rx_ring.lock().is_some() {
+                        return Err(SystemError::EBUSY);
+                    }
+                    let req = super::uapi::TpacketReq {
+                        tp_block_size: u32::from_ne_bytes(value[0..4].try_into().unwrap()),
+                        tp_block_nr: u32::from_ne_bytes(value[4..8].try_into().unwrap()),
+                        tp_frame_size: u32::from_ne_bytes(value[8..12].try_into().unwrap()),
+                        tp_frame_nr: u32::from_ne_bytes(value[12..16].try_into().unwrap()),
+                    };
+                    let version = *self.tpacket_version.lock();
+                    let reserve = self.tp_reserve.load(Ordering::Relaxed) as usize;
+                    let config =
+                        super::ring::validate_ring_config(&req, version.hdrlen(), reserve)?;
+                    let (ring, _pc) = PacketRing::setup(config, version, self.sock_type, reserve)?;
+                    *self.rx_ring.lock() = Some(Arc::new(Mutex::new(ring)));
+                    Ok(())
+                }
+                packet_option::PACKET_COPY_THRESH => {
+                    let _ = Self::parse_i32(value)?;
                     Ok(())
                 }
                 packet_option::PACKET_FANOUT => {

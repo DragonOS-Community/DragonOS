@@ -304,7 +304,9 @@ TEST(AfPacketSockopt, AuxdataDisableRoundtrip) {
 TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
-    const int options[] = {PACKET_COPY_THRESH, PACKET_ORIGDEV, PACKET_VERSION,
+    // PACKET_VERSION is now a validated option (accepts V1/V2, rejects others).
+    // PACKET_RESERVE is now stored (set succeeds, but no getter → ENOPROTOOPT on get).
+    const int options[] = {PACKET_COPY_THRESH, PACKET_ORIGDEV,
                            PACKET_RESERVE, PACKET_VNET_HDR, PACKET_TX_TIMESTAMP,
                            PACKET_TIMESTAMP, PACKET_QDISC_BYPASS, 9999};
     for (int option : options) {
@@ -315,6 +317,26 @@ TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
         EXPECT_EQ(GetIntOpt(fd.Get(), option, &got), -1) << "option=" << option;
         EXPECT_EQ(errno, ENOPROTOOPT) << "option=" << option << ": " << ErrnoString(errno);
     }
+}
+
+// PACKET_VERSION is now a validated setsockopt: accepts TPACKET_V1/V2,
+// rejects out-of-range values with EINVAL (matching Linux 6.6 behavior).
+TEST(AfPacketSockopt, PacketVersionAcceptsValidRejectsInvalid) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    // Valid versions succeed
+    EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, TPACKET_V1), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, TPACKET_V2), 0)
+        << ErrnoString(errno);
+    // Invalid version returns EINVAL
+    errno = 0;
+    EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, 999), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+    // getsockopt(PACKET_VERSION) returns the current version (Linux behavior)
+    int got = -1;
+    EXPECT_EQ(GetIntOpt(fd.Get(), PACKET_VERSION, &got), 0);
+    EXPECT_EQ(got, TPACKET_V2);
 }
 
 // ===== Test 15: PACKET_STATISTICS returns 8-byte struct =====

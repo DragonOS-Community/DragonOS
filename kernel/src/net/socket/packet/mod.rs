@@ -2,6 +2,7 @@
 mod binding;
 mod fanout;
 mod mreq;
+mod ring;
 mod rx;
 mod sockopt;
 mod tx;
@@ -27,6 +28,7 @@ use crate::process::ProcessManager;
 use crate::rcu::RcuOptionArcSlot;
 
 pub(crate) use fanout::{membership_value, FanoutGroup, FanoutJoinParams};
+pub use ring::{RingWriteResult, TpacketVersion};
 #[allow(unused_imports)]
 pub use uapi::{
     eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,
@@ -128,6 +130,9 @@ pub struct PacketSocket {
     registry_active: AtomicBool,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
+    pub(super) rx_ring: Mutex<Option<Arc<Mutex<ring::PacketRing>>>>,
+    pub(super) tpacket_version: Mutex<ring::TpacketVersion>,
+    pub(super) tp_reserve: AtomicU32,
 }
 
 impl PacketSocket {
@@ -171,6 +176,9 @@ impl PacketSocket {
             filter: RcuOptionArcSlot::new_none(),
             filter_locked: Mutex::new(false),
             fasync_items: FAsyncItems::default(),
+            rx_ring: Mutex::new(None),
+            tpacket_version: Mutex::new(ring::TpacketVersion::V1),
+            tp_reserve: AtomicU32::new(0),
         });
         socket
             .netns
@@ -334,5 +342,16 @@ impl Socket for PacketSocket {
     }
     fn set_option(&self, l: PSOL, n: usize, v: &[u8]) -> Result<(), SystemError> {
         self.set_packet_option(l, n, v)
+    }
+    fn mmap_layout(&self) -> Option<crate::net::socket::base::SocketMmapLayout> {
+        let ring_outer = self.rx_ring.lock();
+        ring_outer.as_ref().map(|r| {
+            let inner = r.lock();
+            crate::net::socket::base::SocketMmapLayout {
+                page_cache: inner.page_cache().clone(),
+                fs: Arc::new(ring::PacketFakeFs),
+                size: inner.total_size(),
+            }
+        })
     }
 }

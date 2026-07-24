@@ -353,9 +353,26 @@ impl<T: Socket + 'static> IndexNode for T {
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         Ok(())
     }
+    fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        super::base::Socket::mmap_layout(self).map(|l| l.page_cache)
+    }
+
+    /// Reject mmap when no ring buffer is set up or when the requested
+    /// `[offset, offset+len)` range exceeds the ring buffer size, so the
+    /// page-fault path never reaches the `unreachable!()` in `fs()`.
+    fn mmap(&self, _start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
+        let layout = super::base::Socket::mmap_layout(self).ok_or(SystemError::EINVAL)?;
+        if offset.checked_add(len).is_none_or(|end| end > layout.size) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(())
+    }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        unreachable!("Socket does not have a file system")
+        match super::base::Socket::mmap_layout(self) {
+            Some(layout) => layout.fs,
+            None => unreachable!("Socket does not have a file system"),
+        }
     }
 
     fn try_fs(&self) -> Option<Arc<dyn crate::filesystem::vfs::FileSystem>> {
@@ -378,6 +395,9 @@ impl<T: Socket + 'static> IndexNode for T {
         let mut md = Metadata::new(FileType::Socket, InodeMode::from_bits_truncate(0o755));
         md.inode_id = self.socket_inode_id();
         md.mode |= InodeMode::S_IFSOCK;
+        if let Some(layout) = super::base::Socket::mmap_layout(self) {
+            md.size = layout.size as i64;
+        }
         Ok(md)
     }
 

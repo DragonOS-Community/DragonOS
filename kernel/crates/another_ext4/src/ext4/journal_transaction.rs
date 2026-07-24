@@ -306,6 +306,15 @@ impl Transaction<'_> {
         Ok(())
     }
 
+    /// Credits which are still available for previously untouched home blocks.
+    ///
+    /// Batched operations use this only to stop at a restartable boundary
+    /// before beginning their next logical mutation. Re-staging an existing
+    /// home remains free and the transaction is still the final authority.
+    pub(super) fn remaining_credits(&self) -> usize {
+        self.credits.saturating_sub(self.staged.len())
+    }
+
     /// Return the transaction-private final image of `home` for mutation.
     ///
     /// The first access snapshots the device block and consumes one credit;

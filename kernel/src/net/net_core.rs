@@ -3,12 +3,27 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::Operstate,
-    process::namespace::net_namespace::INIT_NET_NAMESPACE,
+    process::{
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
+        namespace::net_namespace::INIT_NET_NAMESPACE,
+    },
     time::{sleep::nanosleep, PosixTimeSpec},
 };
 
 pub fn net_init() -> Result<(), SystemError> {
-    dhcp_query()
+    KernelThreadMechanism::create_and_run(
+        KernelThreadClosure::StaticEmptyClosure((&(dhcp_worker as fn() -> i32), ())),
+        "dhcpv4".into(),
+    )
+    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    Ok(())
+}
+
+fn dhcp_worker() -> i32 {
+    if let Err(err) = dhcp_query() {
+        log::warn!("DHCP worker stopped without a lease: {err:?}");
+    }
+    0
 }
 
 fn dhcp_query() -> Result<(), SystemError> {
@@ -44,7 +59,8 @@ fn dhcp_query() -> Result<(), SystemError> {
         sockets().remove(dhcp_handle);
     });
 
-    const DHCP_TRY_ROUND: u8 = 10;
+    const DHCP_RETRY_INTERVAL_NS: i64 = 50_000_000;
+    const DHCP_TRY_ROUND: u16 = 200;
     for i in 0..DHCP_TRY_ROUND {
         log::debug!("DHCP try round: {}", i);
         net_face.poll();
@@ -119,7 +135,7 @@ fn dhcp_query() -> Result<(), SystemError> {
 
         let sleep_time = PosixTimeSpec {
             tv_sec: 0,
-            tv_nsec: 50,
+            tv_nsec: DHCP_RETRY_INTERVAL_NS,
         };
         nanosleep(sleep_time)?;
     }

@@ -7,6 +7,7 @@ normal/getrandom_bit_distribution
 normal/ext4_xattr
 normal/ext4_inode_identity
 normal/fat_statfs
+normal/fat_concurrent_allocation
 normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock
@@ -85,4 +86,5 @@ normal/virtiofs_dax
 normal/af_packet_sockopt
 normal/af_packet_e2e
 normal/af_packet_mcast
+normal/rtnetlink_link_semantics
 normal/tty_termios

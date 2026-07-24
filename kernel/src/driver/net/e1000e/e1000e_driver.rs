@@ -431,7 +431,7 @@ impl Iface for E1000EInterface {
         self.common.poll(&mut driver)
     }
 
-    fn poll_napi(&self, budget: usize) -> bool {
+    fn poll_napi(&self, budget: usize) -> crate::driver::net::napi::NapiPollResult {
         let mut driver = self.driver.clone();
         self.common.poll_napi(&mut driver, budget)
     }

@@ -5,10 +5,11 @@ use crate::libs::wait_queue::WaitQueue;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
 use crate::process::ProcessState;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::AtomicU32;
+use napi_state::CompleteState;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -42,28 +43,39 @@ impl NapiStruct {
         })
     }
 
-    pub fn poll(&self) -> bool {
-        // log::info!("NAPI instance {} polling", self.napi_id);
-        // 获取网卡的强引用
+    fn poll(&self, budget: usize) -> Option<(Arc<dyn Iface>, NapiPollResult)> {
         if let Some(iface) = self.net_device.upgrade() {
             if !iface.flags().contains(InterfaceFlags::UP) {
-                return false;
+                return Some((iface, NapiPollResult::idle()));
             }
-            // Linux NAPI 语义：每次 poll 处理有限工作量（budget/weight），避免无界处理导致 DoS/长时间关中断。
-            // smoltcp 的 Interface::poll() 会在一次调用内处理 device 队列中所有包，因此这里必须走 bounded poll。
-            //
-            // 返回值语义：
-            // - true：还有工作没做完（例如仍有 ingress 包未处理或需要立即继续 poll），保留在 poll_list 继续处理
-            // - false：本次已处理完，可 complete
-            return iface.poll_napi(self.weight);
+            let result = iface.poll_napi(budget);
+            return Some((iface, result));
         } else {
             log::error!(
                 "NAPI instance {}: associated net device is gone",
                 self.napi_id
             );
         }
+        None
+    }
+}
 
-        false
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NapiPollResult {
+    pub work_done: usize,
+    pub poll_again: bool,
+}
+
+impl NapiPollResult {
+    pub const fn new(work_done: usize, poll_again: bool) -> Self {
+        Self {
+            work_done,
+            poll_again,
+        }
+    }
+
+    pub const fn idle() -> Self {
+        Self::new(0, false)
     }
 }
 
@@ -119,99 +131,122 @@ pub fn napi_init() -> Result<(), SystemError> {
 }
 
 fn net_rx_action() {
+    const NET_RX_PACKET_BUDGET: usize = 300;
+    const NET_RX_POLL_BUDGET: usize = 64;
+    const NET_RX_TIME_BUDGET_US: i64 = 2_000;
+
     loop {
-        // 这里直接将全局的NAPI管理器的napi_list取出，清空全局的列表，避免占用锁时间过长
         let mut inner = GLOBAL_NAPI_MANAGER.inner();
-        let mut poll_list = inner.napi_list.clone();
-        inner.napi_list.clear();
+        let mut active = core::mem::take(&mut inner.napi_list);
         drop(inner);
 
-        // log::info!("NAPI softirq processing {} instances", poll_list.len());
+        let started_at = crate::time::Instant::now().total_micros();
+        let mut packets_left = NET_RX_PACKET_BUDGET;
+        let mut polls_left = NET_RX_POLL_BUDGET;
+        let mut repoll = VecDeque::new();
 
-        while let Some(napi) = poll_list.pop() {
-            let has_work_left = napi.poll();
-            // log::info!("yes");
+        while let Some(napi) = active.pop_front() {
+            let elapsed = crate::time::Instant::now().total_micros() - started_at;
+            if polls_left == 0 || packets_left == 0 || elapsed >= NET_RX_TIME_BUDGET_US {
+                active.push_front(napi);
+                break;
+            }
 
-            if has_work_left {
-                poll_list.push(napi);
-            } else {
+            let budget = core::cmp::min(napi.weight, packets_left);
+            polls_left -= 1;
+
+            let Some((iface, result)) = napi.poll(budget) else {
+                // A registered NAPI must not outlive its interface. Clear the state to avoid
+                // retaining an owner forever; device teardown is responsible for stopping DMA.
                 napi_complete(napi);
+                continue;
+            };
+
+            debug_assert!(result.work_done <= budget);
+            packets_left = packets_left.saturating_sub(core::cmp::min(result.work_done, budget));
+
+            if result.poll_again || result.work_done >= budget {
+                repoll.push_back(napi);
+            } else {
+                iface.napi_complete(napi);
             }
         }
 
-        // log::info!("napi softirq iteration complete")
+        let mut inner = GLOBAL_NAPI_MANAGER.inner();
+        // Fair merge order: work which did not get a turn, newly scheduled work, then busy repolls.
+        active.append(&mut inner.napi_list);
+        active.append(&mut repoll);
+        inner.napi_list = active;
 
-        // 若 budget 用尽后仍有 backlog，必须继续自驱动处理，不能依赖新的外部唤醒。
-        // 否则 loopback/TCP 大流量场景下，发送端已经结束后不会再触发 napi_schedule()，
-        // 剩余包会永久滞留在 backlog 中，接收端 read()/recv() 就会偶发卡死。
-        if !poll_list.is_empty() {
-            let mut inner = GLOBAL_NAPI_MANAGER.inner();
-            inner.napi_list.extend(poll_list);
-            inner.has_pending_signal.store(true, Ordering::SeqCst);
-            drop(inner);
-            continue;
-        }
-
-        // 关键竞态：
-        // `poll()` / `poll_egress()` 期间，loopback Tx 可能再次调用 `napi_schedule()`，
-        // 把“新产生的 ingress 工作”塞回全局 `napi_list`。
-        //
-        // 由于本轮处理的是循环开始时快照出的 `poll_list`，如果这里不重新检查全局列表，
-        // 就可能出现：
-        // 1) 当前本地 `poll_list` 已空；
-        // 2) 但全局 `napi_list` 已被并发加入了新工作；
-        // 3) 当前线程仍把 `has_pending_signal` 清零并睡眠。
-        //
-        // 对 loopback/TCP 大包发送，这会把“send 过程中产生的后续本地收包”永久遗落，
-        // 直到下一次外部网络事件才被重新推进，从而表现为 recv() 偶发永久卡住。
-        let inner = GLOBAL_NAPI_MANAGER.inner();
         if !inner.napi_list.is_empty() {
-            inner.has_pending_signal.store(true, Ordering::SeqCst);
+            inner.has_pending_signal = true;
             drop(inner);
+            crate::sched::sched_yield();
             continue;
         }
 
-        // 只有确认全局队列也为空时，才真正进入睡眠。
-        inner.has_pending_signal.store(false, Ordering::SeqCst);
+        inner.has_pending_signal = false;
         drop(inner);
 
         let _ = wq_wait_event_interruptible!(
             GLOBAL_NAPI_MANAGER.wait_queue(),
-            GLOBAL_NAPI_MANAGER
-                .inner()
-                .has_pending_signal
-                .load(Ordering::SeqCst),
+            GLOBAL_NAPI_MANAGER.inner().has_pending_signal,
             {}
         );
     }
 }
 
-/// 标记这个napi任务已经完成
-pub fn napi_complete(napi: Arc<NapiStruct>) {
-    napi.state
-        .fetch_and(!NapiState::SCHED.bits(), Ordering::SeqCst);
+pub(crate) fn napi_complete_state(napi: &NapiStruct) -> CompleteState {
+    napi_state::complete(&napi.state)
 }
 
-/// 标记这个napi任务加入处理队列，已被调度
-pub fn napi_schedule(napi: Arc<NapiStruct>) {
-    let current_state = NapiState::from_bits_truncate(
-        napi.state
-            .fetch_or(NapiState::SCHED.bits(), Ordering::SeqCst),
-    );
-
-    if !current_state.contains(NapiState::SCHED) {
-        let new_state = current_state.union(NapiState::SCHED);
-        // log::info!("NAPI instance {} scheduled", napi.napi_id);
-        napi.state.store(new_state.bits(), Ordering::SeqCst);
+/// Complete a NAPI instance which has no device-specific callback handshake.
+pub fn napi_complete(napi: Arc<NapiStruct>) {
+    if napi_complete_state(&napi) == CompleteState::Missed {
+        __napi_schedule(napi);
     }
+}
 
+/// Permanently stop scheduling a NAPI instance whose device can no longer be
+/// polled. This must be a single atomic transition: completing twice can race
+/// a scheduler and orphan its newly acquired owner.
+pub(crate) fn napi_disable(napi: &NapiStruct) {
+    napi_state::disable(&napi.state);
+}
+
+pub(crate) fn napi_schedule_prep(napi: &NapiStruct) -> bool {
+    napi_state::schedule_prep(&napi.state)
+}
+
+pub(crate) fn __napi_schedule(napi: Arc<NapiStruct>) {
+    debug_assert_ne!(
+        napi.state.load(core::sync::atomic::Ordering::Relaxed) & napi_state::SCHED,
+        0
+    );
     let mut inner = GLOBAL_NAPI_MANAGER.inner();
-    inner.napi_list.push(napi);
-    inner.has_pending_signal.store(true, Ordering::SeqCst);
+    inner.napi_list.push_back(napi);
+    inner.has_pending_signal = true;
+    drop(inner);
 
     GLOBAL_NAPI_MANAGER.wakeup();
+}
 
-    // softirq_vectors().raise_softirq(SoftirqNumber::NetReceive);
+/// Acquire a NAPI owner, let the device mask callbacks, then publish it once.
+pub fn napi_schedule(napi: Arc<NapiStruct>) {
+    if !napi_schedule_prep(&napi) {
+        return;
+    }
+
+    let Some(iface) = napi.net_device.upgrade() else {
+        log::error!(
+            "NAPI instance {} scheduled after its interface was removed",
+            napi.napi_id
+        );
+        napi_disable(&napi);
+        return;
+    };
+    iface.napi_poll_begin();
+    __napi_schedule(napi);
 }
 
 pub struct NapiManager {
@@ -222,8 +257,8 @@ pub struct NapiManager {
 impl NapiManager {
     pub fn new() -> Arc<Self> {
         let inner = SpinLock::new(NapiManagerInner {
-            has_pending_signal: AtomicBool::new(false),
-            napi_list: Vec::new(),
+            has_pending_signal: false,
+            napi_list: VecDeque::new(),
         });
         Arc::new(Self {
             inner,
@@ -247,8 +282,8 @@ impl NapiManager {
 }
 
 pub struct NapiManagerInner {
-    has_pending_signal: AtomicBool,
-    napi_list: Vec<Arc<NapiStruct>>,
+    has_pending_signal: bool,
+    napi_list: VecDeque<Arc<NapiStruct>>,
 }
 
 // 下面的是软中断的做法，无法唤醒，做个记录

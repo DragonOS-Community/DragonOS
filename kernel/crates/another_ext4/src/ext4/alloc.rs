@@ -4,14 +4,28 @@ use crate::ext4_defs::*;
 use crate::format_error;
 use crate::prelude::*;
 use crate::return_error;
-use core::cmp::min;
 
-pub(super) struct DirectRangeAllocation {
+pub(super) struct RangeAllocation {
     pub first: PBlockId,
     pub allocation_homes: [PBlockId; 3],
 }
 
-const DIRECT_RANGE_MAX_GROUP_PROBES: u32 = 4;
+// Range allocation runs under the transaction writer gate.  Keep the
+// speculative search short so a fragmented filesystem cannot turn a single
+// sequential write into a volume-wide metadata read.
+const TRANSACTION_RANGE_MAX_GROUP_PROBES: u32 = 4;
+
+fn transaction_range_probe_limit(block_group_count: u32, require_preferred: bool) -> u32 {
+    // An exact-adjacency request can only succeed in its preferred group.  A
+    // failed probe is therefore a fast-path miss, not a reason to scan other
+    // groups while holding the transaction gate.
+    let limit = if require_preferred {
+        1
+    } else {
+        TRANSACTION_RANGE_MAX_GROUP_PROBES
+    };
+    core::cmp::min(block_group_count, limit)
+}
 
 fn extent_tail_batch_limit(
     first_data_block: PBlockId,
@@ -83,14 +97,14 @@ impl Ext4 {
     /// any cache or disk metadata.  The caller owns the filesystem-wide
     /// transactional metadata gate, so no direct allocator can race the
     /// transaction-private bitmap snapshot while zero I/O is in progress.
-    pub(super) fn transaction_alloc_direct_range(
+    pub(super) fn transaction_alloc_range(
         &self,
         transaction: &mut super::journal_transaction::Transaction<'_>,
         inode_id: InodeId,
         preferred_first: Option<PBlockId>,
         require_preferred: bool,
         count: u32,
-    ) -> Result<DirectRangeAllocation> {
+    ) -> Result<RangeAllocation> {
         if count == 0 {
             return_error!(ErrCode::EINVAL, "Cannot allocate an empty block range");
         }
@@ -108,7 +122,11 @@ impl Ext4 {
             .unwrap_or(preferred_inode_group);
         let count_usize = count as usize;
 
-        for offset in 0..min(bg_count, DIRECT_RANGE_MAX_GROUP_PROBES) {
+        // This is a speculative fast path.  Bound its metadata I/O under the
+        // transaction writer gate; on a miss the caller aborts the
+        // transaction and uses the legacy allocator.  Exact-adjacency probes
+        // need only inspect the preferred group.
+        for offset in 0..transaction_range_probe_limit(bg_count, require_preferred) {
             let bgid = ((preferred_group as u64 + offset as u64) % bg_count as u64) as BlockGroupId;
             let blocks_in_group = Self::block_group_block_count(&sb, bgid);
             if blocks_in_group < count_usize {
@@ -180,7 +198,7 @@ impl Ext4 {
                 self.prepare_stats.record_bitmap_io();
                 let mut bitmap = Bitmap::new(image, blocks_in_group);
                 if (bit..bit + count_usize).any(|index| !bitmap.is_bit_clear(index)) {
-                    return_error!(ErrCode::EIO, "Direct range changed during planning");
+                    return_error!(ErrCode::EIO, "Range allocation changed during planning");
                 }
                 for index in bit..bit + count_usize {
                     bitmap.set_bit(index);
@@ -200,7 +218,7 @@ impl Ext4 {
             self.transaction_stage_super_block(transaction, &sb)?;
             self.prepare_stats.record_superblock_io();
             let (gdt_home, _) = self.block_group_disk_pos(bgid)?;
-            return Ok(DirectRangeAllocation {
+            return Ok(RangeAllocation {
                 first,
                 allocation_homes: [bitmap_home, gdt_home, 0],
             });
@@ -706,57 +724,96 @@ impl Ext4 {
                 break;
             }
 
-            let mut transaction = self.transaction_start(32)?;
-            let Some(tail) = self.extent_tail(&transaction, &inode)? else {
-                break;
-            };
-            let extent_end = tail
-                .start_pblock
-                .checked_add(tail.block_count as PBlockId)
-                .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent physical range"))?;
-            if tail.start_pblock == 0
-                || extent_end > self.read_super_block_cached().block_count()
-                || self.journal_owns_block_range(tail.start_pblock, extent_end)
-            {
-                return_error!(
-                    ErrCode::EIO,
-                    "Orphan extent overlaps invalid or journal-owned blocks"
-                );
-            }
-            // transaction_dealloc_block_range deliberately accepts one block
-            // group only. Trim the right edge at that boundary so bitmap and
-            // counters stay a compact, independently restartable unit.
             let sb = self.read_super_block_cached();
             let blocks_per_group = sb.blocks_per_group() as PBlockId;
-            let remove_limit = extent_tail_batch_limit(
-                sb.first_data_block() as PBlockId,
-                blocks_per_group,
-                tail.start_pblock,
-                tail.block_count,
-            )
-            .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent tail"))?;
-            let removed = self
-                .extent_remove_tail_in_transaction(&mut transaction, &mut inode, remove_limit)?
-                .ok_or_else(|| format_error!(ErrCode::EIO, "Extent tail disappeared"))?;
-            self.transaction_dealloc_block_range(
-                &mut transaction,
-                removed.start_pblock,
-                removed.block_count,
-            )?;
-            for metadata in removed.metadata_blocks.iter().copied() {
-                self.transaction_dealloc_block_range(&mut transaction, metadata, 1)?;
+            let first_data_block = sb.first_data_block() as PBlockId;
+            let mut transaction = self.transaction_start(32)?;
+            let mut batch_group = None;
+            let mut removals = 0usize;
+
+            // Sequential range allocation can create hundreds of extents in
+            // one block group.  Committing each tail entry independently turns
+            // unlink/failed-download cleanup into hundreds of synchronous JBD2
+            // barriers.  Bitmap/GDT/superblock and the right-most extent leaf
+            // are read-your-writes transaction images, so remove all adjacent
+            // tail entries from the same allocation group in one commit.
+            while removals < 64 {
+                // One removal can detach an extent-tree right spine of at most
+                // five blocks. In the adversarial layout every detached
+                // metadata block belongs to a different allocation group:
+                // data bitmap/GDT (2), five metadata bitmap/GDT pairs (10),
+                // one surviving parent (1), the shared superblock (1), and
+                // the final inode-table image (1). Do not begin another
+                // mutation unless all 15 possible new homes still fit. This
+                // avoids a repeatable E2BIG orphan-reclaim failure while
+                // retaining large batches for the common shared-home case.
+                const NEXT_REMOVAL_CREDIT_RESERVE: usize = 15;
+                if removals != 0 && transaction.remaining_credits() < NEXT_REMOVAL_CREDIT_RESERVE {
+                    break;
+                }
+                let Some(tail) = self.extent_tail(&transaction, &inode)? else {
+                    break;
+                };
+                let extent_end = tail
+                    .start_pblock
+                    .checked_add(tail.block_count as PBlockId)
+                    .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent physical range"))?;
+                if tail.start_pblock == 0
+                    || extent_end > sb.block_count()
+                    || self.journal_owns_block_range(tail.start_pblock, extent_end)
+                {
+                    return_error!(
+                        ErrCode::EIO,
+                        "Orphan extent overlaps invalid or journal-owned blocks"
+                    );
+                }
+                let remove_limit = extent_tail_batch_limit(
+                    first_data_block,
+                    blocks_per_group,
+                    tail.start_pblock,
+                    tail.block_count,
+                )
+                .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent tail"))?;
+                let removed_first = extent_end
+                    .checked_sub(remove_limit as PBlockId)
+                    .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent tail range"))?;
+                let group = removed_first
+                    .checked_sub(first_data_block)
+                    .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent block group"))?
+                    / blocks_per_group;
+                if batch_group.is_some_and(|current| current != group) {
+                    break;
+                }
+                batch_group = Some(group);
+
+                let removed = self
+                    .extent_remove_tail_in_transaction(&mut transaction, &mut inode, remove_limit)?
+                    .ok_or_else(|| format_error!(ErrCode::EIO, "Extent tail disappeared"))?;
+                self.transaction_dealloc_block_range(
+                    &mut transaction,
+                    removed.start_pblock,
+                    removed.block_count,
+                )?;
+                for metadata in removed.metadata_blocks.iter().copied() {
+                    self.transaction_dealloc_block_range(&mut transaction, metadata, 1)?;
+                }
+                let released = removed.block_count as u64 + removed.metadata_blocks.len() as u64;
+                let remaining = inode
+                    .inode
+                    .fs_block_count()
+                    .checked_sub(released)
+                    .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid inode block count"))?;
+                inode.inode.set_fs_block_count(remaining);
+                inode.inode.set_size(core::cmp::min(
+                    inode.inode.size(),
+                    removed.start_lblock as u64 * BLOCK_SIZE as u64,
+                ));
+                removals += 1;
             }
-            let released = removed.block_count as u64 + removed.metadata_blocks.len() as u64;
-            let remaining = inode
-                .inode
-                .fs_block_count()
-                .checked_sub(released)
-                .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid inode block count"))?;
-            inode.inode.set_fs_block_count(remaining);
-            inode.inode.set_size(core::cmp::min(
-                inode.inode.size(),
-                removed.start_lblock as u64 * BLOCK_SIZE as u64,
-            ));
+            if removals == 0 {
+                transaction.abort();
+                break;
+            }
             self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
             self.commit_reclaim_transaction(transaction)?;
         }
@@ -1236,8 +1293,25 @@ impl Ext4 {
 }
 
 #[cfg(test)]
-mod reclaim_tests {
-    use super::{extent_tail_batch_limit, linked_orphan_tail_remove_limit};
+mod allocation_tests {
+    use super::{
+        extent_tail_batch_limit, linked_orphan_tail_remove_limit, transaction_range_probe_limit,
+        TRANSACTION_RANGE_MAX_GROUP_PROBES,
+    };
+
+    #[test]
+    fn transactional_range_probes_are_bounded_and_exact_requests_are_local() {
+        assert_eq!(transaction_range_probe_limit(0, false), 0);
+        assert_eq!(transaction_range_probe_limit(1, false), 1);
+        assert_eq!(
+            transaction_range_probe_limit(128, false),
+            TRANSACTION_RANGE_MAX_GROUP_PROBES
+        );
+
+        assert_eq!(transaction_range_probe_limit(0, true), 0);
+        assert_eq!(transaction_range_probe_limit(1, true), 1);
+        assert_eq!(transaction_range_probe_limit(128, true), 1);
+    }
 
     #[test]
     fn extent_reclaim_batch_never_crosses_a_block_group() {

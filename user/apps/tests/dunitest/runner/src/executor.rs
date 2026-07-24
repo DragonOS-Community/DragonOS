@@ -283,7 +283,8 @@ fn parse_gtest_counts(log_path: &Path) -> Result<(usize, usize, usize, usize)> {
     for line in content.lines() {
         let s = line.trim();
 
-        if s.starts_with("[==========]") && s.contains(" tests from ") && s.contains(" ran.") {
+        let has_test_count = s.contains(" tests from ") || s.contains(" test from ");
+        if s.starts_with("[==========]") && has_test_count && s.contains(" ran.") {
             if let Some(v) = first_usize_token(s) {
                 total = v;
             }
@@ -742,6 +743,15 @@ exit 0
         let result = run_test(&spec, &results, false).unwrap();
 
         assert!(matches!(result.status, CaseStatus::Passed));
+        assert_eq!(
+            (
+                result.gtest_total,
+                result.gtest_passed,
+                result.gtest_failed,
+                result.gtest_skipped
+            ),
+            (1, 1, 0, 0)
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "success path did not clean descendant pipe holders"

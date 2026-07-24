@@ -62,6 +62,10 @@ impl<F: FileOps> ProcFile<F> {
             common,
         })
     }
+
+    pub(crate) fn ops(&self) -> &F {
+        &self.inner
+    }
 }
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作

@@ -790,10 +790,6 @@ impl IndexNode for LockedTmpfsInode {
         Some(self.fs())
     }
 
-    fn supports_post_write_sync(&self, file_type: FileType) -> bool {
-        file_type == FileType::File
-    }
-
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         Ok(())
     }

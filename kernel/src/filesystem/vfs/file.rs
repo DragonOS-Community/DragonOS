@@ -10,7 +10,7 @@ use system_error::SystemError;
 use super::{
     append_lock::{with_inode_append_lock, AppendLockKey},
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
-    mount::{MountExternalGuard, MountFSInode},
+    mount::{MountExternalGuard, MountFSInode, MountFlags},
     utils::should_remove_sgid,
     DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask,
     SpecialNodeData,
@@ -824,6 +824,13 @@ impl File {
         Ok(len.min(limit.saturating_sub(offset)))
     }
 
+    fn combined_mount_flags(&self) -> MountFlags {
+        match self.inode.clone().downcast_arc::<MountFSInode>() {
+            Some(mnt_inode) => mnt_inode.mount_fs().combined_flags(),
+            None => self.inode.mount_flags(),
+        }
+    }
+
     fn maybe_sync_after_write(
         &self,
         file_type: FileType,
@@ -832,7 +839,7 @@ impl File {
         flags: FileFlags,
         inode_flags: InodeFlags,
     ) -> Result<(), SystemError> {
-        if written_len == 0 || !self.inode.supports_post_write_sync(file_type) {
+        if written_len == 0 {
             return Ok(());
         }
 
@@ -843,14 +850,23 @@ impl File {
 
         // inode 级别的 S_SYNC 标志
         let inode_sync = inode_flags.contains(InodeFlags::S_SYNC);
+        // Linux IS_SYNC(inode) 同时包含 inode S_SYNC 与 superblock/mount sync 语义。
+        let mount_sync = self
+            .combined_mount_flags()
+            .contains(MountFlags::SYNCHRONOUS);
 
-        if need_data_sync || inode_sync {
-            let end = start.saturating_add(written_len).saturating_sub(1);
-            // O_SYNC requests full metadata sync. O_DSYNC and inode S_SYNC
-            // use datasync, matching generic_write_sync().
-            self.sync_range_and_check_wb_error(start, end, !need_metadata_sync)?;
+        if !(need_data_sync || inode_sync || mount_sync) {
+            return Ok(());
         }
-        Ok(())
+
+        if !self.inode.supports_post_write_sync(file_type) {
+            return Ok(());
+        }
+
+        let end = start.saturating_add(written_len).saturating_sub(1);
+        // Linux generic_write_sync() 只有 IOCB_SYNC 才请求完整 metadata sync；
+        // O_DSYNC、S_SYNC 与 SB_SYNCHRONOUS 都按 datasync 处理。
+        self.sync_range_and_check_wb_error(start, end, !need_metadata_sync)
     }
 
     #[inline(never)]

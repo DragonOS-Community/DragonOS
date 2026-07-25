@@ -1,10 +1,15 @@
-use super::{pid::Pid, ProcessControlBlock, ProcessManager, RawPid};
+use super::{
+    pid::{pid_membership_lock, Pid},
+    ProcessControlBlock, ProcessManager, RawPid,
+};
 use crate::{driver::tty::tty_job_control::TtyJobCtrlManager, process::pid::PidType};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sys.c#1225
 pub(super) fn ksys_setsid() -> Result<RawPid, SystemError> {
+    // Serialize leader validation and both membership changes with de_thread().
+    let _membership_guard = pid_membership_lock();
     let pcb = ProcessManager::current_pcb();
     let group_leader = pcb
         .threads_read_irqsave()
@@ -58,10 +63,10 @@ fn set_special_pids(current_session_group_leader: &Arc<ProcessControlBlock>, sid
     //     sid.pid_vnr().data()
     // );
     if change_sid {
-        current_session_group_leader.change_pid(PidType::SID, sid.clone());
+        current_session_group_leader.change_pid_locked(PidType::SID, sid.clone());
     }
     if change_pgrp {
-        current_session_group_leader.change_pid(PidType::PGID, sid.clone());
+        current_session_group_leader.change_pid_locked(PidType::PGID, sid.clone());
     }
 
     // log::debug!(

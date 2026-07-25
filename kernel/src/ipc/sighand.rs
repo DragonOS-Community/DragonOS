@@ -20,6 +20,44 @@ use crate::{
 
 use super::signal_types::Sigaction;
 
+/// Producer state for the old leader of a non-leader exec transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupExecLeaderPhase {
+    Pending,
+    Exiting,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupExecCancelResult {
+    Canceled,
+    Committed,
+    NotOwner,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NaturalParentNotifyPhase {
+    Idle,
+    Pending,
+    Done,
+}
+
+/// Non-copyable proof that a caller owns the one natural-parent notification
+/// transaction for a particular leader.
+#[derive(Debug)]
+pub struct NaturalParentNotifyToken {
+    owner: Weak<ProcessControlBlock>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReapTransition {
+    Blocked,
+    NotZombie,
+    Reportable,
+    Reaped,
+}
+
 pub struct SigHand {
     inner: RwLock<InnerSigHand>,
     group_exec_wait_queue: WaitQueue,
@@ -60,6 +98,12 @@ pub struct InnerSigHand {
     pub group_exec_task: Option<Weak<ProcessControlBlock>>,
     /// 线程组 exec（de-thread）等待计数（仿照 Linux 的 signal_struct::notify_count）
     pub group_exec_notify_count: isize,
+    /// Stable old leader and its producer state for non-leader exec.
+    group_exec_old_leader: Option<Weak<ProcessControlBlock>>,
+    group_exec_leader_phase: Option<GroupExecLeaderPhase>,
+    /// Monotonically increasing transaction generation. Zero is reserved for
+    /// the absence of a per-task token.
+    group_exec_generation: u64,
     /// The mm selected by the OOM killer for this thread group.
     ///
     /// The reserve entitlement is not decided by this metadata alone. Callers
@@ -153,6 +197,19 @@ impl SigHand {
             .wait_event_killable(cond, before_sleep)
     }
 
+    pub fn wait_group_exec_event_uninterruptible<F, B>(
+        &self,
+        cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.group_exec_wait_queue()
+            .wait_event_uninterruptible(cond, before_sleep)
+    }
+
     pub fn reset_handlers(&self) {
         self.inner_mut().handlers = default_sighandlers();
     }
@@ -181,9 +238,11 @@ impl SigHand {
         let other_guard = other.inner();
         let mut self_guard = self.inner_mut();
         self_guard.flags = other_guard.flags;
+        // Group-exec is a transaction owned by the original shared sighand;
+        // copying only its flag would create an active state without owner,
+        // generation, phase, or pending tokens.
+        self_guard.flags.remove(SignalFlags::GROUP_EXEC);
         self_guard.group_exit_code = other_guard.group_exit_code;
-        self_guard.group_exec_task = other_guard.group_exec_task.clone();
-        self_guard.group_exec_notify_count = other_guard.group_exec_notify_count;
         self_guard.pids = other_guard.pids.clone();
     }
 
@@ -430,45 +489,213 @@ impl SigHand {
         g.stop_signal = sig;
     }
 
-    /// 尝试开始线程组 exec（去线程化）流程。
+    /// Start group exec and collect the transaction's ordinary sibling tokens
+    /// under the same lock that completion uses.
     ///
-    /// - 若已经有 GROUP_EXIT 或 GROUP_EXEC 在进行中，则返回 EAGAIN。
-    /// - 否则设置 GROUP_EXEC 并返回 Ok。
-    pub fn try_start_group_exec(&self) -> Result<(), SystemError> {
+    /// The callback may acquire thread-info locks, establishing the fixed
+    /// `SigHand -> thread-info` order. It must assign `generation` to every
+    /// identity-incomplete ordinary sibling and return that count.
+    pub fn start_group_exec_transaction<F, R>(
+        &self,
+        owner: &Arc<ProcessControlBlock>,
+        old_leader: Option<&Arc<ProcessControlBlock>>,
+        collect: F,
+    ) -> Result<R, SystemError>
+    where
+        F: FnOnce(u64) -> (R, usize),
+    {
         let mut g = self.inner_mut();
         if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
-        g.flags.insert(SignalFlags::GROUP_EXEC);
-        Ok(())
-    }
 
-    /// 在与 GROUP_EXEC/GROUP_EXIT 相同的锁下，设置 exec 标志并记录执行者。
-    pub fn start_group_exec(&self, task: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        let mut g = self.inner_mut();
-        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+        debug_assert!(old_leader
+            .map(|leader| !Arc::ptr_eq(leader, owner))
+            .unwrap_or(true));
+        if old_leader
+            .map(|leader| {
+                leader.is_dead() || (leader.exit_notify_complete() && !leader.is_zombie())
+            })
+            .unwrap_or(false)
+        {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
+        let mut generation = g.group_exec_generation.wrapping_add(1);
+        if generation == 0 {
+            generation = 1;
+        }
+        let (result, pending) = collect(generation);
+
         g.flags.insert(SignalFlags::GROUP_EXEC);
-        g.group_exec_task = Some(Arc::downgrade(task));
-        g.group_exec_notify_count = 0;
-        Ok(())
+        g.group_exec_task = Some(Arc::downgrade(owner));
+        g.group_exec_old_leader = old_leader.map(Arc::downgrade);
+        g.group_exec_leader_phase = old_leader.map(|leader| {
+            if leader.exit_notify_complete() {
+                GroupExecLeaderPhase::Ready
+            } else {
+                GroupExecLeaderPhase::Pending
+            }
+        });
+        g.group_exec_generation = generation;
+        g.group_exec_notify_count = pending as isize;
+        let leader_ready = g.group_exec_leader_phase == Some(GroupExecLeaderPhase::Ready);
+        drop(g);
+
+        if leader_ready {
+            self.group_exec_wait_queue().wakeup_all(None);
+        }
+        Ok(result)
     }
 
-    /// 结束线程组 exec 状态。
-    pub fn finish_group_exec(&self) {
+    /// Finish only the caller's transaction. A non-leader exec can finish only
+    /// after the old-leader producer reached Ready.
+    pub fn finish_group_exec_owned(&self, owner: &Arc<ProcessControlBlock>) -> bool {
         let mut g = self.inner_mut();
-        g.flags.remove(SignalFlags::GROUP_EXEC);
-        g.group_exec_task = None;
-        g.group_exec_notify_count = 0;
+        if !Self::weak_matches(&g.group_exec_task, owner)
+            || g.group_exec_notify_count != 0
+            || matches!(
+                g.group_exec_leader_phase,
+                Some(GroupExecLeaderPhase::Pending | GroupExecLeaderPhase::Exiting)
+            )
+        {
+            return false;
+        }
+        Self::clear_group_exec_locked(&mut g);
         drop(g);
         self.group_exec_wait_queue().wakeup_all(None);
+        true
     }
 
-    /// 记录当前 exec 线程（去线程化执行者）。
-    pub fn set_group_exec_task(&self, task: &Arc<ProcessControlBlock>) {
+    /// Cancel before the old leader commits its dedicated exit. Once Exiting
+    /// has been claimed, the identity handoff must complete uninterruptibly.
+    pub fn try_cancel_group_exec(&self, owner: &Arc<ProcessControlBlock>) -> GroupExecCancelResult {
         let mut g = self.inner_mut();
-        g.group_exec_task = Some(Arc::downgrade(task));
+        if !g.flags.contains(SignalFlags::GROUP_EXEC)
+            || !Self::weak_matches(&g.group_exec_task, owner)
+        {
+            return GroupExecCancelResult::NotOwner;
+        }
+        if matches!(
+            g.group_exec_leader_phase,
+            Some(GroupExecLeaderPhase::Exiting | GroupExecLeaderPhase::Ready)
+        ) {
+            return GroupExecCancelResult::Committed;
+        }
+
+        Self::clear_group_exec_locked(&mut g);
+        drop(g);
+        self.group_exec_wait_queue().wakeup_all(None);
+        GroupExecCancelResult::Canceled
+    }
+
+    /// Atomically claim the old leader's dedicated producer path.
+    pub fn claim_group_exec_leader_exit(&self, candidate: &Arc<ProcessControlBlock>) -> bool {
+        let mut g = self.inner_mut();
+        if !g.flags.contains(SignalFlags::GROUP_EXEC)
+            || !Self::weak_matches(&g.group_exec_old_leader, candidate)
+            || g.group_exec_leader_phase != Some(GroupExecLeaderPhase::Pending)
+        {
+            return false;
+        }
+        g.group_exec_leader_phase = Some(GroupExecLeaderPhase::Exiting);
+        true
+    }
+
+    /// Publish producer completion before waking the exec waiter. This also
+    /// covers a leader that entered ordinary exit before group exec started.
+    pub fn complete_group_exec_leader_exit(&self, candidate: &Arc<ProcessControlBlock>) -> bool {
+        if !candidate.exit_notify_complete() {
+            return false;
+        }
+        let mut g = self.inner_mut();
+        if !g.flags.contains(SignalFlags::GROUP_EXEC)
+            || !Self::weak_matches(&g.group_exec_old_leader, candidate)
+            || !matches!(
+                g.group_exec_leader_phase,
+                Some(GroupExecLeaderPhase::Pending | GroupExecLeaderPhase::Exiting)
+            )
+        {
+            return false;
+        }
+        g.group_exec_leader_phase = Some(GroupExecLeaderPhase::Ready);
+        drop(g);
+        self.group_exec_wait_queue().wakeup_all(None);
+        true
+    }
+
+    pub fn group_exec_leader_phase(
+        &self,
+        owner: &Arc<ProcessControlBlock>,
+    ) -> Option<GroupExecLeaderPhase> {
+        let g = self.inner();
+        Self::weak_matches(&g.group_exec_task, owner).then_some(g.group_exec_leader_phase)?
+    }
+
+    pub fn group_exec_pending_complete(&self, owner: &Arc<ProcessControlBlock>) -> bool {
+        let g = self.inner();
+        Self::weak_matches(&g.group_exec_task, owner) && g.group_exec_notify_count == 0
+    }
+
+    pub fn group_exec_handoff_ready(&self, owner: &Arc<ProcessControlBlock>) -> bool {
+        let g = self.inner();
+        Self::weak_matches(&g.group_exec_task, owner)
+            && g.group_exec_notify_count == 0
+            && matches!(
+                g.group_exec_leader_phase,
+                None | Some(GroupExecLeaderPhase::Ready)
+            )
+    }
+
+    pub fn group_exec_committed(&self, owner: &Arc<ProcessControlBlock>) -> bool {
+        let g = self.inner();
+        Self::weak_matches(&g.group_exec_task, owner)
+            && matches!(
+                g.group_exec_leader_phase,
+                Some(GroupExecLeaderPhase::Exiting | GroupExecLeaderPhase::Ready)
+            )
+    }
+
+    /// Complete one ordinary sibling's identity-unhash token in O(1).
+    pub fn complete_group_exec_task(&self, candidate: &Arc<ProcessControlBlock>) -> bool {
+        if !candidate.identity_unhash_complete() {
+            return false;
+        }
+        let mut g = self.inner_mut();
+        let generation = candidate.take_group_exec_generation();
+        if generation == 0
+            || !g.flags.contains(SignalFlags::GROUP_EXEC)
+            || generation != g.group_exec_generation
+        {
+            return false;
+        }
+        assert!(
+            g.group_exec_notify_count > 0,
+            "group-exec pending count underflow"
+        );
+        g.group_exec_notify_count -= 1;
+        let ready = g.group_exec_notify_count == 0;
+        drop(g);
+        if ready {
+            self.group_exec_wait_queue().wakeup_all(None);
+        }
+        true
+    }
+
+    fn weak_matches(
+        weak: &Option<Weak<ProcessControlBlock>>,
+        task: &Arc<ProcessControlBlock>,
+    ) -> bool {
+        weak.as_ref()
+            .map(|candidate| Weak::ptr_eq(candidate, &Arc::downgrade(task)))
+            .unwrap_or(false)
+    }
+
+    fn clear_group_exec_locked(g: &mut InnerSigHand) {
+        g.flags.remove(SignalFlags::GROUP_EXEC);
+        g.group_exec_task = None;
+        g.group_exec_old_leader = None;
+        g.group_exec_leader_phase = None;
+        g.group_exec_notify_count = 0;
     }
 
     /// 在与 GROUP_EXEC/GROUP_EXIT 相同的锁下执行关键区，避免并发插入线程组。
@@ -490,29 +717,152 @@ impl SigHand {
         self.inner().group_exec_task.as_ref()?.upgrade()
     }
 
-    pub fn group_exec_notify_count(&self) -> isize {
-        self.inner().group_exec_notify_count
+    /// Claim the leader's natural-parent notification responsibility while
+    /// holding the same lock used by group-exec/reap arbitration. `eligible`
+    /// may acquire the leader thread-info lock (`SigHand -> thread-info`).
+    pub fn try_claim_natural_parent_notify<F>(
+        &self,
+        candidate: &Arc<ProcessControlBlock>,
+        eligible: F,
+    ) -> Option<NaturalParentNotifyToken>
+    where
+        F: FnOnce() -> bool,
+    {
+        self.try_claim_natural_parent_notify_with(candidate, || ((), eligible()))
+            .1
     }
 
-    pub fn set_group_exec_notify_count(&self, count: isize) {
-        let mut g = self.inner_mut();
-        g.group_exec_notify_count = count;
+    /// Variant for the last-sibling unhash path. `transition` always runs
+    /// while the sighand lock is held, so it can remove the sibling under the
+    /// nested leader thread-info lock and return whether that removal made a
+    /// Zombie leader eligible for natural-parent notification.
+    pub fn try_claim_natural_parent_notify_with<F, R>(
+        &self,
+        candidate: &Arc<ProcessControlBlock>,
+        transition: F,
+    ) -> (R, Option<NaturalParentNotifyToken>)
+    where
+        F: FnOnce() -> (R, bool),
+    {
+        let g = self.inner_mut();
+        let (result, eligible) = transition();
+        if !candidate.is_thread_group_leader()
+            || (g.flags.contains(SignalFlags::GROUP_EXEC)
+                && Self::weak_matches(&g.group_exec_old_leader, candidate))
+            || !eligible
+        {
+            return (result, None);
+        }
+        let owner = Arc::downgrade(candidate);
+        let token = candidate
+            .try_claim_natural_parent_notify()
+            .then_some(NaturalParentNotifyToken { owner });
+        (result, token)
     }
 
-    pub fn dec_group_exec_notify_count_and_wake(&self) {
-        let mut g = self.inner_mut();
-        if g.group_exec_notify_count > 0 {
-            g.group_exec_notify_count -= 1;
-            if g.group_exec_notify_count == 0 {
-                drop(g);
-                self.group_exec_wait_queue().wakeup_all(None);
-                return;
-            }
+    pub fn complete_natural_parent_notify(&self, token: NaturalParentNotifyToken) -> bool {
+        token
+            .owner
+            .upgrade()
+            .map(|owner| owner.complete_natural_parent_notify())
+            .unwrap_or(false)
+    }
+
+    /// Stable report/reap decision for natural-parent wait and autoreap.
+    pub fn try_reap_natural_child(
+        &self,
+        candidate: &Arc<ProcessControlBlock>,
+        consume: bool,
+    ) -> ReapTransition {
+        self.try_reap_natural_child_inner(candidate, consume, None)
+    }
+
+    /// Read-only fast probe used by wait scans before attempting a consuming
+    /// transition. The consuming helper rechecks these barriers under the
+    /// write lock, so a concurrent transaction cannot slip through a TOCTOU
+    /// window.
+    pub fn natural_reap_blocked(&self, candidate: &Arc<ProcessControlBlock>) -> bool {
+        let g = self.inner();
+        (g.flags.contains(SignalFlags::GROUP_EXEC)
+            && Self::weak_matches(&g.group_exec_old_leader, candidate))
+            || candidate.natural_parent_notify_phase() == NaturalParentNotifyPhase::Pending
+    }
+
+    /// Stable ptrace report/reap decision. Group-exec arbitration and the
+    /// optional Zombie -> Dead transition share one SigHand critical section.
+    pub fn try_reap_ptraced_child(
+        &self,
+        candidate: &Arc<ProcessControlBlock>,
+        consume: bool,
+    ) -> ReapTransition {
+        let g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXEC)
+            && Self::weak_matches(&g.group_exec_old_leader, candidate)
+        {
+            return ReapTransition::Blocked;
+        }
+        if !candidate.is_zombie() {
+            return ReapTransition::NotZombie;
+        }
+        if !consume {
+            return ReapTransition::Reportable;
+        }
+        if candidate.try_mark_dead_from_zombie() {
+            ReapTransition::Reaped
+        } else {
+            ReapTransition::NotZombie
         }
     }
 
-    pub fn wake_group_exec_waiters(&self) {
-        self.group_exec_wait_queue().wakeup_all(None);
+    /// Autoreap used by the unique natural-parent notification owner. The
+    /// token bypasses only its own Pending barrier, never a group-exec barrier.
+    pub fn try_reap_natural_child_as_notify_owner(
+        &self,
+        candidate: &Arc<ProcessControlBlock>,
+        token: &NaturalParentNotifyToken,
+    ) -> ReapTransition {
+        self.try_reap_natural_child_inner(candidate, true, Some(token))
+    }
+
+    fn try_reap_natural_child_inner(
+        &self,
+        candidate: &Arc<ProcessControlBlock>,
+        consume: bool,
+        token: Option<&NaturalParentNotifyToken>,
+    ) -> ReapTransition {
+        let g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXEC)
+            && Self::weak_matches(&g.group_exec_old_leader, candidate)
+        {
+            return ReapTransition::Blocked;
+        }
+
+        if candidate.natural_parent_notify_phase() == NaturalParentNotifyPhase::Pending {
+            let owns_notification = token
+                .map(|token| Weak::ptr_eq(&token.owner, &Arc::downgrade(candidate)))
+                .unwrap_or(false);
+            if !owns_notification {
+                return ReapTransition::Blocked;
+            }
+        }
+
+        if !candidate.is_zombie() {
+            return ReapTransition::NotZombie;
+        }
+        if !consume {
+            return ReapTransition::Reportable;
+        }
+        if candidate.try_mark_dead_from_zombie() {
+            ReapTransition::Reaped
+        } else {
+            ReapTransition::NotZombie
+        }
+    }
+
+    pub fn reap_blocked_by_group_exec(&self, candidate: &Arc<ProcessControlBlock>) -> bool {
+        let g = self.inner();
+        g.flags.contains(SignalFlags::GROUP_EXEC)
+            && Self::weak_matches(&g.group_exec_old_leader, candidate)
     }
 
     /// 若当前线程组已经处于 group-exit 状态，则返回统一的退出码；否则返回 None
@@ -597,6 +947,9 @@ impl Default for InnerSigHand {
             stop_signal: Signal::SIGSTOP,
             group_exec_task: None,
             group_exec_notify_count: 0,
+            group_exec_old_leader: None,
+            group_exec_leader_phase: None,
+            group_exec_generation: 0,
             oom_tgid: None,
             oom_mm_id: None,
             oom_mm: None,

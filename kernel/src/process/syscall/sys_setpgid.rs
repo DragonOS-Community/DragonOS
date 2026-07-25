@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETPGID;
-use crate::process::pid::PidType;
+use crate::process::pid::{pid_membership_lock, PidType};
 use crate::process::Pgid;
 use crate::process::ProcessFlags;
 use crate::process::ProcessManager;
@@ -54,6 +54,9 @@ impl Syscall for SysSetPgid {
             pgid = pid;
         }
 
+        // Match Linux tasklist-lock coverage: the selected leader and its
+        // physical PGID link must not change between validation and commit.
+        let _membership_guard = pid_membership_lock();
         let p = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
         if !p.is_thread_group_leader() {
             return Err(SystemError::EINVAL);
@@ -102,7 +105,7 @@ impl Syscall for SysSetPgid {
         let pp = p.task_pgrp().unwrap();
 
         if !Arc::ptr_eq(&pp, &pgrp) {
-            p.change_pid(PidType::PGID, pgrp);
+            p.change_pid_locked(PidType::PGID, pgrp);
         }
 
         return Ok(0);

@@ -814,6 +814,13 @@ impl TtyOperation for Unix98PtyDriverInner {
         if subtype == TtyDriverSubType::PtySlave {
             if let Some(hook_arc) = tty.private_fields() {
                 if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                    // Pin the master before publishing this in-flight slave
+                    // open. The link is weak, so the last master file could
+                    // otherwise drop it between begin_slave_open() and
+                    // pty_common_open(), leaking ENODEV from the latter.
+                    // A concurrent master close is reported as EIO below,
+                    // matching Linux pts open semantics.
+                    let _master = tty.link().ok_or(SystemError::EIO)?;
                     hook.begin_slave_open()?;
                     return match PtyCommon::pty_common_open(tty) {
                         Ok(()) => {

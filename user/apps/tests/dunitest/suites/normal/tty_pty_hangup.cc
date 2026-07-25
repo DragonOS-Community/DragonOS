@@ -633,6 +633,65 @@ TEST(TtyPtyHangup, SlaveCanReopenWhileMasterAliveAfterLastSlaveClose) {
     EXPECT_EQ('r', ch);
 }
 
+TEST(TtyPtyHangup, ControllingSlaveCanReopenDevTtyAfterLastFdClose) {
+    PtyPair pair = OpenRawPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    int gate[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(gate)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        close(gate[1]);
+        close(pair.master.release());
+        if (setsid() < 0) {
+            _exit(1);
+        }
+        if (ioctl(pair.slave.get(), TIOCSCTTY, 0) < 0) {
+            _exit(2);
+        }
+
+        char token = 0;
+        if (read(gate[0], &token, sizeof(token)) != sizeof(token)) {
+            _exit(3);
+        }
+        close(gate[0]);
+        pair.slave.reset();
+
+        int tty_fd = open("/dev/tty", O_RDWR | O_NOCTTY);
+        if (tty_fd < 0) {
+            _exit(4);
+        }
+        pid_t foreground = tcgetpgrp(tty_fd);
+        pid_t sid = -1;
+        if (foreground != getpgrp() || ioctl(tty_fd, TIOCGSID, &sid) < 0 ||
+            sid != getsid(0)) {
+            close(tty_fd);
+            _exit(5);
+        }
+        close(tty_fd);
+        _exit(0);
+    }
+
+    close(gate[0]);
+    pair.slave.reset();
+    char token = 'R';
+    ssize_t gate_write = -1;
+    do {
+        gate_write = write(gate[1], &token, sizeof(token));
+    } while (gate_write < 0 && errno == EINTR);
+    int gate_errno = errno;
+    close(gate[1]);
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(token)), gate_write) << strerror(gate_errno);
+
+    int status = 0;
+    ASSERT_TRUE(WaitForChild(child, &status));
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    ASSERT_EQ(0, WEXITSTATUS(status)) << "child status=" << status;
+}
+
 TEST(TtyPtyHangup, ReopenedSlaveKeepsIndexReservedAfterMasterClose) {
     char first_name[128] = {};
     PtyPair pair = OpenRawPty(first_name);

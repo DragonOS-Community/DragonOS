@@ -7,7 +7,6 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use log::{debug, error, info};
-use system_error::SystemError;
 
 use crate::{
     libs::{
@@ -83,14 +82,15 @@ fn exchange_raw_pids_locked(
     map: &mut HashMap<RawPid, Arc<ProcessControlBlock>>,
     left: &Arc<ProcessControlBlock>,
     right: &Arc<ProcessControlBlock>,
-) -> Result<(), SystemError> {
+) {
     let left_pid = left.raw_pid();
     let right_pid = right.raw_pid();
-    if left_pid == right_pid {
-        return Err(SystemError::EINVAL);
-    }
-    let left_entry = map.remove(&left_pid).ok_or(SystemError::ESRCH)?;
-    let right_entry = map.remove(&right_pid).ok_or(SystemError::ESRCH)?;
+    let left_entry = map
+        .remove(&left_pid)
+        .expect("validated left PID disappeared during identity exchange");
+    let right_entry = map
+        .remove(&right_pid)
+        .expect("validated right PID disappeared during identity exchange");
 
     unsafe {
         left.force_set_raw_pid(right_pid);
@@ -99,7 +99,6 @@ fn exchange_raw_pids_locked(
 
     map.insert(right_pid, left_entry);
     map.insert(left_pid, right_entry);
-    Ok(())
 }
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
@@ -329,31 +328,55 @@ impl ProcessManager {
     pub(crate) fn exchange_tid_and_raw_pids(
         left: &Arc<ProcessControlBlock>,
         right: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
-        let mut all_proc = all_process().lock_irqsave();
-        let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
+    ) {
+        // Keep this order aligned with fork/release publication: ptrace
+        // relations, cgroup accounting, global raw-PID lookup, then the
+        // ordered per-task and struct-Pid locks acquired by exchange_tid_with.
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
         let left_old_pid = left.raw_pid();
         let right_old_pid = right.raw_pid();
-        if left_old_pid == right_old_pid {
-            return Err(SystemError::EINVAL);
-        }
-        if !map.contains_key(&left_old_pid) || !map.contains_key(&right_old_pid) {
-            return Err(SystemError::ESRCH);
-        }
+        let ptrace_plan = crate::process::ptrace::prepare_tracee_pid_exchange_locked(
+            left,
+            right,
+            left_old_pid,
+            right_old_pid,
+        );
+        let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+        let mut all_proc = all_process().lock_irqsave();
+        let map = all_proc
+            .as_mut()
+            .expect("PID identity exchange requires initialized process map");
+        assert_ne!(
+            left_old_pid, right_old_pid,
+            "PID identity exchange requires distinct raw PIDs"
+        );
+        assert!(
+            map.get(&left_old_pid)
+                .map(|entry| Arc::ptr_eq(entry, left))
+                .unwrap_or(false),
+            "left raw PID does not resolve to the expected task"
+        );
+        assert!(
+            map.get(&right_old_pid)
+                .map(|entry| Arc::ptr_eq(entry, right))
+                .unwrap_or(false),
+            "right raw PID does not resolve to the expected task"
+        );
 
         let left_cgroup = left.task_cgroup_node();
         let right_cgroup = right.task_cgroup_node();
         let left_alive = !left.is_exited();
         let right_alive = !right.is_exited();
 
-        left.exchange_tid_with(right)?;
-        exchange_raw_pids_locked(map, left, right)?;
+        left.exchange_tid_with(right, || {
+            exchange_raw_pids_locked(map, left, right);
+            crate::process::ptrace::commit_tracee_pid_exchange_locked(ptrace_plan);
+        });
 
         // cgroup.procs only shows tasks that are still alive; when exec
         // detaches threads and swaps pids, only rename the visible members.
         if Arc::ptr_eq(&left_cgroup, &right_cgroup) && left_alive && right_alive {
-            return Ok(());
+            return;
         }
         if left_alive {
             left_cgroup.rename_task(left_old_pid, left.raw_pid());
@@ -361,8 +384,6 @@ impl ProcessManager {
         if right_alive {
             right_cgroup.rename_task(right_old_pid, right.raw_pid());
         }
-
-        Ok(())
     }
 
     /// ### Returns the PIDs of all processes.

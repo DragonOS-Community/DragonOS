@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Test: tcp_loopback_connect_lat
 # Binary: lat_connect
 # Description: TCP loopback connection latency test
@@ -6,9 +6,9 @@
 set -e
 
 # 加载环境变量
-SCTIPDIR=$(cd $(dirname ${BASH_SOURCE[0]}) > /dev/null && pwd)
-ENV_PATH="${SCTIPDIR}/../env.sh"
-source ${ENV_PATH}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ENV_PATH="$SCRIPT_DIR/../env.sh"
+. "$ENV_PATH"
 
 SERVER_PID=""
 

@@ -1,0 +1,11 @@
+# Extraction/metadata for signal_catch_lat
+CATEGORY=signal
+BINARY=lat_sig
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_sig catch prints "Signal handler overhead: <N> microseconds".
+SEARCH_PATTERN=Signal handler
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Signal catch/handler overhead via lat_sig catch

@@ -1,0 +1,27 @@
+# LMbench 基准测试白名单
+# 每行一个测例名(对应 test_cases/<name>.sh,不带路径/后缀)
+# 以 # 开头为注释,空行忽略。runner 只跑此列表中的测例。
+#
+# 第一版 MVP:代表性子集,覆盖各主要类别,先验证闭环稳定,再一次性扩到全部 47 个。
+
+# memory
+mem_copy_bw
+
+# process
+process_fork_lat
+
+# ipc
+pipe_lat
+unix_lat
+
+# vfs
+vfs_open_lat
+
+# network
+tcp_loopback_lat
+
+# signal
+signal_catch_lat
+
+# filesystem
+ext4_create_delete_files_10k_ops

@@ -1,8 +1,17 @@
 use crate::{
     arch::{CurrentTimeArch, MMArch},
     driver::base::device::device_number::{DeviceNumber, Major},
+    exception::workqueue::{schedule_work, Work},
     filesystem::{
-        page_cache::{AsyncPageCacheBackend, PageCache},
+        page_cache::{
+            AsyncPageCacheBackend, PageCache, PageCacheBackend, PageCacheDirtyCertificate,
+            PageCacheExpectedDirtyTransition, PageCacheWritebackAdmissionOrder,
+            PageCacheWritebackBindResult, PageCacheWritebackCancellationContext,
+            PageCacheWritebackDescriptor, PageCacheWritebackDispatchOutcome,
+            PageCacheWritebackProgress, PageCacheWritebackProgressOutcome,
+            PageCacheWritebackProtocol, PageCacheWritebackSnapshotPhase,
+            PageCacheWritebackSubmission, PageCacheWritebackSubmitResult,
+        },
         vfs::{
             self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
             IndexNode, InodeFlags, InodeId, InodeMode, InodeRetentionState, SetMetadataMask,
@@ -24,13 +33,17 @@ use crate::{
     time::{PosixTimeSpec, TimeArch},
 };
 use alloc::{
+    boxed::Box,
     collections::BTreeMap,
     format,
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::fmt::Debug;
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use kdepends::another_ext4::{self, FileType};
 use num::ToPrimitive;
 use system_error::SystemError;
@@ -52,10 +65,13 @@ bitflags! {
         const QUEUED        = 1 << 3;
         /// 该 inode 正在执行元数据写回。
         const WRITEBACK     = 1 << 4;
+        /// ctime 变更未刷盘。它与 mtime 使用独立版本，避免同秒 ABA。
+        const CTIME_DIRTY   = 1 << 5;
         /// 需要持久化的缓存元数据集合。
         const PERSISTENT_DIRTY = Self::SIZE_DIRTY.bits()
             | Self::MTIME_DIRTY.bits()
-            | Self::ATIME_DIRTY.bits();
+            | Self::ATIME_DIRTY.bits()
+            | Self::CTIME_DIRTY.bits();
     }
 }
 
@@ -167,6 +183,7 @@ impl Ext4InodeLifecycle {
 }
 
 #[must_use]
+#[derive(Debug)]
 pub(super) struct Ext4InodeOperation {
     lifecycle: Arc<Ext4InodeLifecycle>,
     owner: RawPid,
@@ -177,6 +194,20 @@ pub(super) struct Ext4InodeOperation {
 pub(super) struct Ext4MmapWriteGuard<'a> {
     _operation: Ext4InodeOperation,
     _size_guard: RwSemReadGuard<'a, ()>,
+}
+
+pub(super) struct ProductionDelallocAdmissionGuard<'a> {
+    inode: &'a LockedExt4Inode,
+}
+
+impl Drop for ProductionDelallocAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        let _io = self.inode.io_lock.lock();
+        let mut guard = self.inode.inner.lock();
+        debug_assert!(guard.delalloc.production.admission_closed != 0);
+        guard.delalloc.production.admission_closed =
+            guard.delalloc.production.admission_closed.saturating_sub(1);
+    }
 }
 
 impl Drop for Ext4InodeOperation {
@@ -224,6 +255,260 @@ impl From<&another_ext4::FileAttr> for Ext4InodeTimes {
     }
 }
 
+struct Ext4FrozenMetadata {
+    fs: Arc<Ext4FileSystem>,
+    inode_num: u32,
+    dirty: InodeDirtyState,
+    cached_size: Option<u64>,
+    cached_times: Ext4InodeTimes,
+    atime_version: u64,
+    mtime_version: u64,
+    ctime_version: u64,
+}
+
+/// Inode-local state for production delayed-allocation writeback.
+#[derive(Debug, Default)]
+struct DelallocInodeState {
+    production: ProductionDelallocState,
+}
+
+#[derive(Debug)]
+struct ProductionDelallocState {
+    entries: BTreeMap<usize, ProductionDelallocEntry>,
+    next_sequence: u64,
+    next_claim_incarnation: u64,
+    admission_closed: usize,
+    queue_operation: Option<Ext4InodeOperation>,
+}
+
+impl Default for ProductionDelallocState {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            next_sequence: 1,
+            next_claim_incarnation: 0,
+            admission_closed: 0,
+            queue_operation: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProductionDelallocEntry {
+    sequence: u64,
+    state: ProductionDelallocEntryState,
+}
+
+#[derive(Debug)]
+enum ProductionDelallocEntryState {
+    Prepared(ProductionDelallocPending),
+    Ready(ProductionDelallocPending),
+    Claimed {
+        claim_incarnation: u64,
+        certificate: PageCacheDirtyCertificate,
+        durable_eof: u64,
+    },
+}
+
+#[derive(Debug)]
+struct ProductionDelallocPending {
+    reservation: another_ext4::DelallocAppendBlockReservation,
+    certificate: Option<PageCacheDirtyCertificate>,
+    offset: usize,
+    durable_eof: u64,
+    mtime: u32,
+    ctime: u32,
+    mtime_version: u64,
+    ctime_version: u64,
+}
+
+impl ProductionDelallocState {
+    fn head(&self) -> Option<(&usize, &ProductionDelallocEntry)> {
+        self.entries.first_key_value()
+    }
+
+    fn take_head(&mut self) -> Option<(usize, ProductionDelallocEntry)> {
+        let offset = *self.entries.first_key_value()?.0;
+        self.entries.remove_entry(&offset)
+    }
+
+    fn restore_head(&mut self, offset: usize, entry: ProductionDelallocEntry) {
+        assert!(self.entries.insert(offset, entry).is_none());
+    }
+}
+
+type DelallocProgressCallback = Arc<dyn Fn(PageCacheWritebackProgressOutcome) + Send + Sync>;
+
+pub(super) struct Ext4DelallocProgress {
+    sequence: AtomicU64,
+    demand: AtomicBool,
+    work_scheduled: AtomicBool,
+    terminal_error: Mutex<Option<SystemError>>,
+    wait_queue: WaitQueue,
+    callbacks: Mutex<Vec<DelallocProgressCallback>>,
+}
+
+impl Debug for Ext4DelallocProgress {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("Ext4DelallocProgress(..)")
+    }
+}
+
+impl Ext4DelallocProgress {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sequence: AtomicU64::new(1),
+            demand: AtomicBool::new(false),
+            work_scheduled: AtomicBool::new(false),
+            terminal_error: Mutex::new(None),
+            wait_queue: WaitQueue::default(),
+            callbacks: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn ticket(
+        self: &Arc<Self>,
+        inode: Weak<LockedExt4Inode>,
+    ) -> Arc<dyn PageCacheWritebackProgress> {
+        Arc::new(Ext4DelallocProgressTicket {
+            progress: self.clone(),
+            inode,
+            observed: self.sequence.load(Ordering::Acquire),
+        })
+    }
+
+    fn publish(&self, outcome: PageCacheWritebackProgressOutcome) {
+        if let PageCacheWritebackProgressOutcome::Failed(error) = &outcome {
+            *self.terminal_error.lock() = Some(error.clone());
+        }
+        self.sequence.fetch_add(1, Ordering::AcqRel);
+        self.wait_queue.wake_all();
+        let callbacks = core::mem::take(&mut *self.callbacks.lock());
+        for callback in callbacks {
+            callback(outcome.clone());
+        }
+    }
+
+    fn schedule_if_demanded(progress: &Arc<Self>, inode: &Weak<LockedExt4Inode>) {
+        if !progress.demand.load(Ordering::Acquire)
+            || progress
+                .work_scheduled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+
+        let progress = progress.clone();
+        let inode = inode.clone();
+        schedule_work(Work::new(move || {
+            // Consume only the demand observed by this invocation. A
+            // concurrent arm() sets it again and is handed off below.
+            progress.demand.store(false, Ordering::Release);
+            let outcome =
+                inode
+                    .upgrade()
+                    .map_or(Ok(PageCacheWritebackDispatchOutcome::Idle), |inode| {
+                        let head = {
+                            let guard = inode.inner.lock();
+                            guard
+                                .delalloc
+                                .production
+                                .head()
+                                .map(|(_, head)| match &head.state {
+                                    ProductionDelallocEntryState::Prepared(pending)
+                                    | ProductionDelallocEntryState::Ready(pending) => (
+                                        guard.page_cache.clone(),
+                                        pending.offset / MMArch::PAGE_SIZE,
+                                    ),
+                                    ProductionDelallocEntryState::Claimed {
+                                        certificate, ..
+                                    } => (guard.page_cache.clone(), certificate.page_index()),
+                                })
+                        };
+                        let Some((Some(page_cache), page_index)) = head else {
+                            return Ok(PageCacheWritebackDispatchOutcome::Idle);
+                        };
+                        page_cache
+                            .manager()
+                            .dispatch_writeback_once(page_index, page_index)
+                    });
+
+            match outcome {
+                Ok(PageCacheWritebackDispatchOutcome::Progress) => {
+                    // The successful delayed submission publishes the exact
+                    // queue transition itself.
+                }
+                Ok(PageCacheWritebackDispatchOutcome::Deferred) => {
+                    // EAGAIN left the same head Ready. This producer must make
+                    // another non-blocking attempt; it must never wait on the
+                    // ticket whose progress it owns.
+                    progress.demand.store(true, Ordering::Release);
+                }
+                Ok(PageCacheWritebackDispatchOutcome::Idle) => {
+                    // Truncate/unlink or a racing consumer removed the head.
+                    // This is cancellation/revalidation, not a sticky I/O
+                    // failure.
+                    progress.publish(PageCacheWritebackProgressOutcome::Cancelled);
+                }
+                Err(error) => {
+                    progress.publish(PageCacheWritebackProgressOutcome::Failed(error));
+                }
+            }
+
+            progress.work_scheduled.store(false, Ordering::Release);
+            // Lost-wakeup handoff: arm-before-clear leaves demand set and this
+            // side schedules it; arm-after-clear wins the CAS on its own.
+            Self::schedule_if_demanded(&progress, &inode);
+        }));
+    }
+}
+
+struct Ext4DelallocProgressTicket {
+    progress: Arc<Ext4DelallocProgress>,
+    inode: Weak<LockedExt4Inode>,
+    observed: u64,
+}
+
+impl Debug for Ext4DelallocProgressTicket {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("Ext4DelallocProgressTicket(..)")
+    }
+}
+
+impl Ext4DelallocProgressTicket {
+    fn outcome_if_changed(&self) -> Option<PageCacheWritebackProgressOutcome> {
+        if let Some(error) = self.progress.terminal_error.lock().clone() {
+            return Some(PageCacheWritebackProgressOutcome::Failed(error));
+        }
+        (self.progress.sequence.load(Ordering::Acquire) != self.observed)
+            .then_some(PageCacheWritebackProgressOutcome::Progress)
+    }
+}
+
+impl PageCacheWritebackProgress for Ext4DelallocProgressTicket {
+    fn arm(&self) {
+        self.progress.demand.store(true, Ordering::Release);
+        Ext4DelallocProgress::schedule_if_demanded(&self.progress, &self.inode);
+    }
+
+    fn wait_for_progress(&self) -> PageCacheWritebackProgressOutcome {
+        self.progress
+            .wait_queue
+            .wait_until(|| self.outcome_if_changed())
+    }
+
+    fn register_retry(&self, retry: DelallocProgressCallback) {
+        let mut callbacks = self.progress.callbacks.lock();
+        if let Some(outcome) = self.outcome_if_changed() {
+            drop(callbacks);
+            retry(outcome);
+        } else {
+            callbacks.push(retry);
+        }
+    }
+}
+
 pub struct Ext4Inode {
     // 对应another_ext4里面的inode号，用于在ext4文件系统中查找相应的inode
     pub(super) inner_inode_num: u32,
@@ -257,6 +542,16 @@ pub struct Ext4Inode {
     /// updates mtime after releasing io_lock, so setters/writeback use this
     /// sequence to avoid same-second ABA and lost dirty state.
     pub(super) cached_mtime_version: u64,
+    /// Monotonic sequence for ctime cache mutations.
+    pub(super) cached_ctime_version: u64,
+    /// Highest timestamp versions known to have crossed the lower metadata
+    /// commit boundary. Frozen fsync snapshots compare against these
+    /// frontiers, never against a newer merely-cached value.
+    pub(super) durable_atime_version: u64,
+    pub(super) durable_mtime_version: u64,
+    pub(super) durable_ctime_version: u64,
+    /// Production delayed-allocation reservation and writeback queue.
+    delalloc: DelallocInodeState,
     /// 脏状态标志位，对应 Linux `inode->i_state & I_DIRTY_*`。
     pub(super) dirty_state: InodeDirtyState,
 }
@@ -265,6 +560,9 @@ pub struct Ext4Inode {
 pub struct LockedExt4Inode {
     pub(super) inner: Mutex<Ext4Inode>,
     pub(super) io_lock: Mutex<()>,
+    /// Orders timestamp publication by VFS version across delayed mapper
+    /// transactions and frozen fsync metadata commits.
+    pub(super) metadata_commit_lock: Mutex<()>,
     pub(super) size_lock: RwSem<()>,
     pub(super) namespace_lock: Mutex<()>,
     pub(super) lifecycle: Arc<Ext4InodeLifecycle>,
@@ -273,6 +571,528 @@ pub struct LockedExt4Inode {
     pub(super) eviction_scheduled: SpinLock<bool>,
     pub(super) retention_callback_self: Weak<LockedExt4Inode>,
     pub(super) eviction_filesystem: SpinLock<Weak<Ext4FileSystem>>,
+    pub(super) delalloc_progress: Arc<Ext4DelallocProgress>,
+    pub(super) delalloc_pool: Mutex<Option<another_ext4::DelallocExtentNodePool>>,
+}
+
+#[derive(Debug)]
+struct Ext4PageCacheBackend {
+    inode: Weak<LockedExt4Inode>,
+}
+
+impl Ext4PageCacheBackend {
+    fn new(inode: Weak<LockedExt4Inode>) -> Self {
+        Self { inode }
+    }
+
+    fn inode(&self) -> Result<Arc<LockedExt4Inode>, SystemError> {
+        self.inode.upgrade().ok_or(SystemError::ESTALE)
+    }
+}
+
+struct Ext4EagerSubmission {
+    inode: Arc<LockedExt4Inode>,
+    _operation: Ext4InodeOperation,
+}
+
+struct Ext4DelayedSubmission {
+    inode: Arc<LockedExt4Inode>,
+    fs: Arc<Ext4FileSystem>,
+    pending: Option<ProductionDelallocPending>,
+    sequence: u64,
+    claim_incarnation: u64,
+    progress: Arc<Ext4DelallocProgress>,
+}
+
+impl Ext4DelayedSubmission {
+    fn restore_pending(
+        inode: &LockedExt4Inode,
+        pending: ProductionDelallocPending,
+        expected_sequence: u64,
+        claim_incarnation: u64,
+    ) -> core::ops::ControlFlow<ProductionDelallocPending> {
+        let mut guard = inode.inner.lock();
+        let offset = pending.offset;
+        match guard.delalloc.production.take_head() {
+            Some((
+                entry_offset,
+                ProductionDelallocEntry {
+                    sequence,
+                    state:
+                        ProductionDelallocEntryState::Claimed {
+                            claim_incarnation: current_incarnation,
+                            certificate,
+                            ..
+                        },
+                },
+            )) if entry_offset == offset
+                && sequence == expected_sequence
+                && current_incarnation == claim_incarnation
+                && Some(certificate) == pending.certificate =>
+            {
+                guard.delalloc.production.restore_head(
+                    offset,
+                    ProductionDelallocEntry {
+                        sequence,
+                        state: ProductionDelallocEntryState::Ready(pending),
+                    },
+                );
+                core::ops::ControlFlow::Continue(())
+            }
+            Some((offset, entry)) => {
+                guard.delalloc.production.restore_head(offset, entry);
+                core::ops::ControlFlow::Break(pending)
+            }
+            None => core::ops::ControlFlow::Break(pending),
+        }
+    }
+
+    fn restore_ready(&mut self, admission_held: bool) -> Result<(), SystemError> {
+        let pending = self.pending.take().ok_or(SystemError::EIO)?;
+        let result = if admission_held {
+            Self::restore_pending(&self.inode, pending, self.sequence, self.claim_incarnation)
+        } else {
+            let _io = self.inode.io_lock.lock();
+            Self::restore_pending(&self.inode, pending, self.sequence, self.claim_incarnation)
+        };
+        if let core::ops::ControlFlow::Break(pending) = result {
+            // Keep exact capability ownership in this submission so the
+            // terminal path can consume it after fail-stop.
+            self.pending = Some(pending);
+            return Err(SystemError::EIO);
+        }
+        Ok(())
+    }
+
+    fn finish_completed(&mut self) -> Result<(), SystemError> {
+        let pending = self.pending.take().ok_or(SystemError::EIO)?;
+        let empty_cleanup = {
+            let _io = self.inode.io_lock.lock();
+            let mut guard = self.inode.inner.lock();
+            match guard.delalloc.production.take_head() {
+                Some((
+                    _,
+                    ProductionDelallocEntry {
+                        sequence,
+                        state:
+                            ProductionDelallocEntryState::Claimed {
+                                claim_incarnation,
+                                certificate,
+                                ..
+                            },
+                    },
+                )) if sequence == self.sequence
+                    && claim_incarnation == self.claim_incarnation
+                    && Some(certificate) == pending.certificate => {}
+                head => {
+                    // The lower transaction has already published and
+                    // consumed the reservation.  Restoring any head here
+                    // would create a claim with no remaining owner.
+                    if let Some((offset, entry)) = head {
+                        guard.delalloc.production.restore_head(offset, entry);
+                    }
+                    drop(guard);
+                    self.fs.fail_stop_lifecycle();
+                    return Err(SystemError::EIO);
+                }
+            }
+            if guard.delalloc.production.entries.is_empty() {
+                let owner = guard
+                    .delalloc
+                    .production
+                    .queue_operation
+                    .take()
+                    .ok_or(SystemError::EIO)?;
+                Some((guard.inner_inode_num, owner))
+            } else {
+                None
+            }
+        };
+        if let Some((inode_num, owner)) = empty_cleanup {
+            let authority = self
+                .fs
+                .delalloc_mapper_authority
+                .as_ref()
+                .ok_or(SystemError::EIO)?;
+            self.inode
+                .release_empty_delalloc_pool(&self.fs, authority)?;
+            self.fs.unregister_delalloc_inode(inode_num);
+            drop(owner);
+        }
+        drop(pending);
+        Ok(())
+    }
+
+    fn finish_terminal(&mut self) {
+        let mut pending = self.pending.take();
+        let mut idle = Vec::new();
+        let (inode_num, owner) = {
+            let _io = self.inode.io_lock.lock();
+            let mut guard = self.inode.inner.lock();
+            for (_, entry) in core::mem::take(&mut guard.delalloc.production.entries) {
+                match entry.state {
+                    ProductionDelallocEntryState::Prepared(pending)
+                    | ProductionDelallocEntryState::Ready(pending) => idle.push(pending),
+                    ProductionDelallocEntryState::Claimed { .. } => {}
+                }
+            }
+            (
+                guard.inner_inode_num,
+                guard.delalloc.production.queue_operation.take(),
+            )
+        };
+        self.fs.fail_stop_lifecycle();
+        if let (Some(authority), Some(pending)) =
+            (self.fs.delalloc_mapper_authority.as_ref(), pending.as_mut())
+        {
+            let _terminalized = self
+                .fs
+                .fs
+                .terminalize_delalloc_append_block_authorized_after_fail_stop(
+                    authority,
+                    &mut pending.reservation,
+                );
+        }
+        if let Some(authority) = self.fs.delalloc_mapper_authority.as_ref() {
+            for mut pending in idle {
+                let _ = self
+                    .fs
+                    .fs
+                    .terminalize_delalloc_append_block_authorized_after_fail_stop(
+                        authority,
+                        &mut pending.reservation,
+                    );
+            }
+            if let Some(mut pool) = self.inode.delalloc_pool.lock().take() {
+                let _ = self
+                    .fs
+                    .fs
+                    .terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(
+                        authority, &mut pool,
+                    );
+            }
+        }
+        self.fs.unregister_delalloc_inode(inode_num);
+        drop(owner);
+        drop(pending);
+    }
+}
+
+impl PageCacheWritebackSubmission for Ext4EagerSubmission {
+    fn submit(
+        self: Box<Self>,
+        descriptor: &PageCacheWritebackDescriptor,
+        data: &[u8],
+    ) -> Result<PageCacheWritebackSubmitResult, SystemError> {
+        let offset = descriptor
+            .first_index()
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let written = self.inode.write_sync(offset, data)?;
+        if written != data.len() {
+            return Err(SystemError::EIO);
+        }
+        Ok(PageCacheWritebackSubmitResult::Completed)
+    }
+
+    fn cancel(self: Box<Self>, _context: PageCacheWritebackCancellationContext) {}
+}
+
+impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
+    fn submit(
+        mut self: Box<Self>,
+        descriptor: &PageCacheWritebackDescriptor,
+        data: &[u8],
+    ) -> Result<PageCacheWritebackSubmitResult, SystemError> {
+        let pending = self.pending.as_mut().ok_or(SystemError::EIO)?;
+        let entry_visible = pending
+            .durable_eof
+            .checked_sub(pending.offset as u64)
+            .and_then(|visible| usize::try_from(visible).ok())
+            .filter(|visible| *visible != 0 && *visible <= MMArch::PAGE_SIZE);
+        if descriptor.first_index() != pending.offset / MMArch::PAGE_SIZE
+            || descriptor.last_index() != descriptor.first_index()
+            || descriptor.valid_bytes() != data.len()
+            || entry_visible.is_none()
+            || data.len() < entry_visible.unwrap_or(usize::MAX)
+            || data.len() > MMArch::PAGE_SIZE
+            || descriptor.dirty_certificate() != pending.certificate
+        {
+            self.finish_terminal();
+            return Err(SystemError::EIO);
+        }
+        let entry_visible = entry_visible.unwrap();
+        let authority = self
+            .fs
+            .delalloc_mapper_authority
+            .as_ref()
+            .ok_or(SystemError::EROFS)?;
+        let outcome = {
+            let _metadata_commit = self.inode.metadata_commit_lock.lock();
+            let mut pool_slot = self.inode.delalloc_pool.lock();
+            let pool = pool_slot.as_mut().ok_or(SystemError::EIO)?;
+            let outcome = self
+                .fs
+                .fs
+                .submit_delalloc_append_block_authorized_with_pool(
+                    authority,
+                    &mut pending.reservation,
+                    another_ext4::DelallocAppendBlockPublication {
+                        payload: &data[..entry_visible],
+                        durable_eof: pending.durable_eof,
+                        mtime: Some(pending.mtime),
+                        ctime: Some(pending.ctime),
+                    },
+                    Some(pool),
+                );
+            if matches!(
+                outcome,
+                another_ext4::DelallocAppendBlockSubmitOutcome::Completed
+            ) {
+                let mut guard = self.inode.inner.lock();
+                guard.durable_mtime_version =
+                    guard.durable_mtime_version.max(pending.mtime_version);
+                guard.durable_ctime_version =
+                    guard.durable_ctime_version.max(pending.ctime_version);
+            }
+            outcome
+        };
+        match outcome {
+            another_ext4::DelallocAppendBlockSubmitOutcome::Completed => {
+                self.finish_completed()?;
+                self.progress
+                    .publish(PageCacheWritebackProgressOutcome::Progress);
+                Ok(PageCacheWritebackSubmitResult::Completed)
+            }
+            another_ext4::DelallocAppendBlockSubmitOutcome::RetryableNotPublished(
+                another_ext4::ErrCode::EAGAIN,
+            ) => {
+                self.restore_ready(false)?;
+                Ok(PageCacheWritebackSubmitResult::Deferred(
+                    self.progress.ticket(Arc::downgrade(&self.inode)),
+                ))
+            }
+            another_ext4::DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error) => {
+                self.restore_ready(false)?;
+                Err(another_ext4::Ext4Error::new(error).into())
+            }
+            another_ext4::DelallocAppendBlockSubmitOutcome::Terminal(_) => {
+                self.finish_terminal();
+                self.progress
+                    .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
+                Err(SystemError::EIO)
+            }
+        }
+    }
+
+    fn cancel(mut self: Box<Self>, context: PageCacheWritebackCancellationContext) {
+        let admission_held = matches!(
+            context,
+            PageCacheWritebackCancellationContext::BeforeSubmitWithAdmission
+        );
+        if self.restore_ready(admission_held).is_err() {
+            self.finish_terminal();
+            self.progress
+                .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
+        } else {
+            self.progress
+                .publish(PageCacheWritebackProgressOutcome::Progress);
+        }
+    }
+}
+
+impl PageCacheBackend for Ext4PageCacheBackend {
+    fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let offset = index
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        self.inode()?.read_sync(offset, buf)
+    }
+
+    fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let offset = index
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        self.inode()?.write_sync(offset, buf)
+    }
+
+    fn npages(&self) -> usize {
+        self.inode
+            .upgrade()
+            .and_then(|inode| inode.inner.lock().cached_file_size)
+            .unwrap_or(0)
+            .div_ceil(MMArch::PAGE_SIZE as u64) as usize
+    }
+
+    fn write_batch_pages(&self) -> Result<usize, SystemError> {
+        Ok(1)
+    }
+
+    fn writeback_admission_order(&self) -> PageCacheWritebackAdmissionOrder {
+        PageCacheWritebackAdmissionOrder::InvalidateBeforeAdmission
+    }
+
+    fn writeback_snapshot_phase(&self) -> PageCacheWritebackSnapshotPhase {
+        PageCacheWritebackSnapshotPhase::AfterAdmission
+    }
+
+    fn with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        let inode = self.inode()?;
+        let _operation = inode.begin_operation()?;
+        let _size = inode.size_lock.read();
+        let _io = inode.io_lock.lock();
+        claim()
+    }
+
+    fn try_with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<bool, SystemError> {
+        let inode = self.inode()?;
+        let _operation = inode.begin_operation()?;
+        let Some(_size) = inode.size_lock.try_read() else {
+            return Ok(false);
+        };
+        let Ok(_io) = inode.io_lock.try_lock() else {
+            return Ok(false);
+        };
+        claim()?;
+        Ok(true)
+    }
+
+    fn stable_writeback_size(&self, _inode: &Arc<dyn IndexNode>) -> Result<usize, SystemError> {
+        self.inode()?
+            .inner
+            .lock()
+            .cached_file_size
+            .map(|size| size as usize)
+            .ok_or(SystemError::EIO)
+    }
+
+    fn try_stable_writeback_size(
+        &self,
+        _inode: &Arc<dyn IndexNode>,
+    ) -> Result<Option<usize>, SystemError> {
+        let inode = self.inode()?;
+        let Ok(guard) = inode.inner.try_lock() else {
+            return Ok(None);
+        };
+        Ok(guard.cached_file_size.map(|size| size as usize))
+    }
+
+    fn writeback_submission_protocol(&self) -> PageCacheWritebackProtocol {
+        PageCacheWritebackProtocol::Token
+    }
+
+    fn bind_writeback_submission(
+        &self,
+        descriptor: &PageCacheWritebackDescriptor,
+    ) -> Result<PageCacheWritebackBindResult, SystemError> {
+        let inode = self.inode()?;
+        let certificate = descriptor.dirty_certificate().ok_or(SystemError::EIO)?;
+        let descriptor_offset = descriptor
+            .first_index()
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let mut guard = inode.inner.lock();
+        match guard.delalloc.production.take_head() {
+            Some((
+                offset,
+                ProductionDelallocEntry {
+                    sequence,
+                    state: ProductionDelallocEntryState::Ready(pending),
+                },
+            )) if pending.certificate == Some(certificate)
+                && offset == descriptor_offset
+                && descriptor.first_index() == pending.offset / MMArch::PAGE_SIZE
+                && descriptor.last_index() == descriptor.first_index() =>
+            {
+                let Some(incarnation) = guard
+                    .delalloc
+                    .production
+                    .next_claim_incarnation
+                    .checked_add(1)
+                else {
+                    guard.delalloc.production.restore_head(
+                        offset,
+                        ProductionDelallocEntry {
+                            sequence,
+                            state: ProductionDelallocEntryState::Ready(pending),
+                        },
+                    );
+                    return Err(SystemError::EOVERFLOW);
+                };
+                guard.delalloc.production.next_claim_incarnation = incarnation;
+                guard.delalloc.production.restore_head(
+                    offset,
+                    ProductionDelallocEntry {
+                        sequence,
+                        state: ProductionDelallocEntryState::Claimed {
+                            claim_incarnation: incarnation,
+                            certificate,
+                            durable_eof: pending.durable_eof,
+                        },
+                    },
+                );
+                let fs = guard.concret_fs();
+                drop(guard);
+                let progress = inode.delalloc_progress.clone();
+                Ok(PageCacheWritebackBindResult::Submission(Box::new(
+                    Ext4DelayedSubmission {
+                        inode,
+                        fs,
+                        pending: Some(pending),
+                        sequence,
+                        claim_incarnation: incarnation,
+                        progress,
+                    },
+                )))
+            }
+            Some((head_offset, head)) => {
+                guard.delalloc.production.restore_head(head_offset, head);
+                if let Some(entry) = guard.delalloc.production.entries.get(&descriptor_offset) {
+                    let matches_certificate = match &entry.state {
+                        ProductionDelallocEntryState::Ready(pending)
+                        | ProductionDelallocEntryState::Prepared(pending) => {
+                            pending.certificate == Some(certificate)
+                        }
+                        ProductionDelallocEntryState::Claimed {
+                            certificate: claimed,
+                            ..
+                        } => *claimed == certificate,
+                    };
+                    if !matches_certificate {
+                        return Err(SystemError::EIO);
+                    }
+                    drop(guard);
+                    return Ok(PageCacheWritebackBindResult::Deferred(
+                        inode.delalloc_progress.ticket(Arc::downgrade(&inode)),
+                    ));
+                }
+                drop(guard);
+                let operation = inode.begin_operation()?;
+                Ok(PageCacheWritebackBindResult::Submission(Box::new(
+                    Ext4EagerSubmission {
+                        inode,
+                        _operation: operation,
+                    },
+                )))
+            }
+            None => {
+                drop(guard);
+                let operation = inode.begin_operation()?;
+                Ok(PageCacheWritebackBindResult::Submission(Box::new(
+                    Ext4EagerSubmission {
+                        inode,
+                        _operation: operation,
+                    },
+                )))
+            }
+        }
+    }
 }
 
 impl IndexNode for LockedExt4Inode {
@@ -414,11 +1234,16 @@ impl IndexNode for LockedExt4Inode {
             let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
-        match fs.fs.getattr(inode_num)?.ftype {
+        let file_type = Self::retry_metadata_contention(|| fs.fs.getattr(inode_num))?.ftype;
+        match file_type {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            FileType::RegularFile => fs.fs.read(inode_num, offset, buf).map_err(From::from),
-            FileType::SymLink => fs.fs.readlink(inode_num, offset, buf).map_err(From::from),
+            FileType::RegularFile => {
+                Self::retry_metadata_contention(|| fs.fs.read(inode_num, offset, buf))
+            }
+            FileType::SymLink => {
+                Self::retry_metadata_contention(|| fs.fs.readlink(inode_num, offset, buf))
+            }
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -431,6 +1256,8 @@ impl IndexNode for LockedExt4Inode {
         _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
         self.read_sync(offset, &mut buf[0..len])
     }
 
@@ -458,6 +1285,56 @@ impl IndexNode for LockedExt4Inode {
         };
 
         if let Some(page_cache) = page_cache {
+            let mut delayed_written = 0usize;
+            while delayed_written < buf.len() {
+                let segment_offset = offset
+                    .checked_add(delayed_written)
+                    .ok_or(SystemError::EFBIG)?;
+                let page_remaining = MMArch::PAGE_SIZE - (segment_offset & (MMArch::PAGE_SIZE - 1));
+                let segment_len = core::cmp::min(page_remaining, buf.len() - delayed_written);
+                let merged = match self.try_merge_delalloc_tail_segment(
+                    &page_cache,
+                    segment_offset,
+                    &buf[delayed_written..delayed_written + segment_len],
+                ) {
+                    Ok(result) => result,
+                    Err(_) if delayed_written != 0 => return Ok(delayed_written),
+                    Err(error) => return Err(error),
+                };
+                if let Some(written) = merged {
+                    delayed_written = delayed_written
+                        .checked_add(written)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    continue;
+                }
+                let admitted = match self.try_write_delalloc_new_page_segment(
+                    &page_cache,
+                    segment_offset,
+                    &buf[delayed_written..delayed_written + segment_len],
+                ) {
+                    Ok(result) => result,
+                    Err(_) if delayed_written != 0 => return Ok(delayed_written),
+                    Err(error) => return Err(error),
+                };
+                if let Some(written) = admitted {
+                    delayed_written = delayed_written
+                        .checked_add(written)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    continue;
+                }
+                if delayed_written != 0 {
+                    return Ok(delayed_written);
+                }
+                let has_head = !self.inner.lock().delalloc.production.entries.is_empty();
+                if !has_head {
+                    break;
+                }
+                self.drain_delalloc_before_eager()?;
+                break;
+            }
+            if delayed_written != 0 {
+                return Ok(delayed_written);
+            }
             let _invalidate = page_cache.invalidate_write();
             let _size_guard = self.size_lock.read();
             let _io_guard = self.io_lock.lock();
@@ -468,7 +1345,8 @@ impl IndexNode for LockedExt4Inode {
                 match cached_size {
                     Some(size) => size,
                     None => {
-                        let size = fs.fs.getattr(inode_num)?.size;
+                        let size =
+                            Self::retry_metadata_contention(|| fs.fs.getattr(inode_num))?.size;
                         self.inner.lock().cached_file_size = Some(size);
                         size
                     }
@@ -489,6 +1367,23 @@ impl IndexNode for LockedExt4Inode {
                 log::warn!("Failed to get current time, using 0");
                 0
             });
+            // `io_lock` serializes every mtime/ctime publisher in this inode.
+            // Exhaustion must be rejected before lower metadata or PageCache
+            // data becomes visible; a post-publication EOVERFLOW cannot be
+            // rolled back as a normal buffered-write error.
+            let (mtime_version, ctime_version) = {
+                let guard = self.inner.lock();
+                (
+                    guard
+                        .cached_mtime_version
+                        .checked_add(1)
+                        .ok_or(SystemError::EOVERFLOW)?,
+                    guard
+                        .cached_ctime_version
+                        .checked_add(1)
+                        .ok_or(SystemError::EOVERFLOW)?,
+                )
+            };
             let stats_start = fs
                 .fs
                 .prepare_stats_enabled()
@@ -518,12 +1413,16 @@ impl IndexNode for LockedExt4Inode {
                     let mut guard = self.inner.lock();
                     guard.cached_file_size = Some(current_file_size);
                     guard.cached_times.mtime = time;
-                    guard.cached_mtime_version = guard.cached_mtime_version.wrapping_add(1);
+                    guard.cached_times.ctime = time;
+                    guard.cached_mtime_version = mtime_version;
+                    guard.cached_ctime_version = ctime_version;
                     guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
                 };
                 Ext4FileSystem::mark_inode_dirty(
                     &self_arc,
-                    InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY,
+                    InodeDirtyState::SIZE_DIRTY
+                        | InodeDirtyState::MTIME_DIRTY
+                        | InodeDirtyState::CTIME_DIRTY,
                 )?;
             }
 
@@ -536,12 +1435,16 @@ impl IndexNode for LockedExt4Inode {
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
         let _io_guard = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
         let (fs, inode_num) = {
             let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
-        match fs.fs.getattr(inode_num)?.ftype {
+        let file_type = Self::retry_metadata_contention(|| fs.fs.getattr(inode_num))?.ftype;
+        match file_type {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
             // Use write_data_only: blocks are pre-allocated by prepare_buffered_write() in write_at().
@@ -766,20 +1669,38 @@ impl IndexNode for LockedExt4Inode {
 
     fn sync(&self) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        if let Some(page_cache) = self.page_cache() {
-            page_cache.manager().sync()?;
-        }
-        self.flush_metadata(false)?;
+        let snapshot = if let Some(page_cache) = self.page_cache() {
+            let (snapshot, range) =
+                page_cache
+                    .manager()
+                    .start_writeback_range_with_freeze(0, usize::MAX, || {
+                        self.freeze_metadata(false)
+                    })?;
+            range.wait_for_completion()?;
+            snapshot
+        } else {
+            self.freeze_metadata(false)?
+        };
+        self.flush_frozen_metadata(snapshot)?;
         let fs = self.inner.lock().concret_fs();
         fs.finish_sync_durability_boundary()
     }
 
     fn datasync(&self) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        if let Some(page_cache) = self.page_cache() {
-            page_cache.manager().sync()?;
-        }
-        self.flush_metadata(true)?;
+        let snapshot = if let Some(page_cache) = self.page_cache() {
+            let (snapshot, range) =
+                page_cache
+                    .manager()
+                    .start_writeback_range_with_freeze(0, usize::MAX, || {
+                        self.freeze_metadata(true)
+                    })?;
+            range.wait_for_completion()?;
+            snapshot
+        } else {
+            self.freeze_metadata(true)?
+        };
+        self.flush_frozen_metadata(snapshot)?;
         let fs = self.inner.lock().concret_fs();
         fs.finish_sync_durability_boundary()
     }
@@ -800,14 +1721,20 @@ impl IndexNode for LockedExt4Inode {
         _data: PrivateData,
     ) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        if let Some(page_cache) = self.page_cache() {
+        let snapshot = if let Some(page_cache) = self.page_cache() {
             let start_index = start >> MMArch::PAGE_SHIFT;
             let end_index = end >> MMArch::PAGE_SHIFT;
-            page_cache
-                .manager()
-                .writeback_range(start_index, end_index)?;
-        }
-        self.flush_metadata(datasync)?;
+            let (snapshot, range) = page_cache.manager().start_writeback_range_with_freeze(
+                start_index,
+                end_index,
+                || self.freeze_metadata(datasync),
+            )?;
+            range.wait_for_completion()?;
+            snapshot
+        } else {
+            self.freeze_metadata(datasync)?
+        };
+        self.flush_frozen_metadata(snapshot)?;
         let fs = self.inner.lock().concret_fs();
         fs.finish_sync_durability_boundary()
     }
@@ -822,21 +1749,34 @@ impl IndexNode for LockedExt4Inode {
 
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
         let _io_guard = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
         let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
 
         let to_ext4_time =
             |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
 
-        let (fs, inode_num, before_atime_version, before_mtime_version) = {
+        let (fs, inode_num, before_atime_version, before_mtime_version, before_ctime_version) = {
             let guard = self.inner.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
                 guard.cached_atime_version,
                 guard.cached_mtime_version,
+                guard.cached_ctime_version,
             )
         };
+        let next_atime_version = before_atime_version
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let next_mtime_version = before_mtime_version
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let next_ctime_version = before_ctime_version
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
         let ext4 = &fs.fs;
         Self::retry_metadata_contention(|| {
             ext4.setattr(
@@ -860,15 +1800,22 @@ impl IndexNode for LockedExt4Inode {
             guard.cached_file_size = Some(metadata.size as u64);
             if guard.cached_atime_version == before_atime_version {
                 guard.cached_times.atime = to_ext4_time(&metadata.atime);
-                guard.cached_atime_version = guard.cached_atime_version.wrapping_add(1);
+                guard.cached_atime_version = next_atime_version;
+                guard.durable_atime_version = guard.cached_atime_version;
                 guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
             }
             if guard.cached_mtime_version == before_mtime_version {
                 guard.cached_times.mtime = to_ext4_time(&metadata.mtime);
-                guard.cached_mtime_version = guard.cached_mtime_version.wrapping_add(1);
+                guard.cached_mtime_version = next_mtime_version;
+                guard.durable_mtime_version = guard.cached_mtime_version;
                 guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
             }
-            guard.cached_times.ctime = to_ext4_time(&metadata.ctime);
+            if guard.cached_ctime_version == before_ctime_version {
+                guard.cached_times.ctime = to_ext4_time(&metadata.ctime);
+                guard.cached_ctime_version = next_ctime_version;
+                guard.durable_ctime_version = guard.cached_ctime_version;
+                guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
+            }
             guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
         }
         self.release_clean_metadata_queue_owner(&fs);
@@ -886,16 +1833,20 @@ impl IndexNode for LockedExt4Inode {
         }
 
         let _operation = self.begin_operation()?;
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
         let _io_guard = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
         let to_ext4_time =
             |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
-        let (fs, inode_num, before_atime_version, before_mtime_version) = {
+        let (fs, inode_num, before_atime_version, before_mtime_version, before_ctime_version) = {
             let guard = self.inner.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
                 guard.cached_atime_version,
                 guard.cached_mtime_version,
+                guard.cached_ctime_version,
             )
         };
         let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
@@ -908,6 +1859,27 @@ impl IndexNode for LockedExt4Inode {
         let ctime = mask
             .contains(SetMetadataMask::CTIME)
             .then(|| to_ext4_time(&metadata.ctime));
+        let next_atime_version = atime
+            .map(|_| {
+                before_atime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)
+            })
+            .transpose()?;
+        let next_mtime_version = mtime
+            .map(|_| {
+                before_mtime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)
+            })
+            .transpose()?;
+        let next_ctime_version = ctime
+            .map(|_| {
+                before_ctime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)
+            })
+            .transpose()?;
 
         Self::retry_metadata_contention(|| {
             fs.fs.setattr(
@@ -935,22 +1907,29 @@ impl IndexNode for LockedExt4Inode {
             // Buffered reads/writes can update cached times without io_lock.
             // Preserve and leave dirty any value that changed while setattr
             // was in flight; writeback will then persist the newer value.
-            if let Some(atime) = atime {
+            if let (Some(atime), Some(next_atime_version)) = (atime, next_atime_version) {
                 if guard.cached_atime_version == before_atime_version {
                     guard.cached_times.atime = atime;
-                    guard.cached_atime_version = guard.cached_atime_version.wrapping_add(1);
+                    guard.cached_atime_version = next_atime_version;
+                    guard.durable_atime_version = guard.cached_atime_version;
                     guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
                 }
             }
-            if let Some(mtime) = mtime {
+            if let (Some(mtime), Some(next_mtime_version)) = (mtime, next_mtime_version) {
                 if guard.cached_mtime_version == before_mtime_version {
                     guard.cached_times.mtime = mtime;
-                    guard.cached_mtime_version = guard.cached_mtime_version.wrapping_add(1);
+                    guard.cached_mtime_version = next_mtime_version;
+                    guard.durable_mtime_version = guard.cached_mtime_version;
                     guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
                 }
             }
-            if let Some(ctime) = ctime {
-                guard.cached_times.ctime = ctime;
+            if let (Some(ctime), Some(next_ctime_version)) = (ctime, next_ctime_version) {
+                if guard.cached_ctime_version == before_ctime_version {
+                    guard.cached_times.ctime = ctime;
+                    guard.cached_ctime_version = next_ctime_version;
+                    guard.durable_ctime_version = guard.cached_ctime_version;
+                    guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
+                }
             }
         }
         self.release_clean_metadata_queue_owner(&fs);
@@ -979,6 +1958,8 @@ impl IndexNode for LockedExt4Inode {
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
         let (fs, inode_num, page_cache) = {
             let guard = self.inner.lock();
             (
@@ -1586,6 +2567,638 @@ impl IndexNode for LockedExt4Inode {
 }
 
 impl LockedExt4Inode {
+    pub(super) fn close_production_delalloc_admission(
+        &self,
+    ) -> Result<ProductionDelallocAdmissionGuard<'_>, SystemError> {
+        let _io = self.io_lock.lock();
+        let mut guard = self.inner.lock();
+        guard.delalloc.production.admission_closed = guard
+            .delalloc
+            .production
+            .admission_closed
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(ProductionDelallocAdmissionGuard { inode: self })
+    }
+
+    fn try_merge_delalloc_tail_segment(
+        &self,
+        page_cache: &Arc<PageCache>,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<Option<usize>, SystemError> {
+        if buf.is_empty()
+            || (offset & (MMArch::PAGE_SIZE - 1))
+                .checked_add(buf.len())
+                .is_none_or(|end| end > MMArch::PAGE_SIZE)
+        {
+            return Ok(None);
+        }
+        let page_start = offset & !(MMArch::PAGE_SIZE - 1);
+        let new_eof = offset.checked_add(buf.len()).ok_or(SystemError::EFBIG)? as u64;
+        let write_time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or(0);
+        let _invalidate = page_cache.invalidate_write();
+        let _size = self.size_lock.read();
+        let _io = self.io_lock.lock();
+        let (fs, sequence, certificate) = {
+            let guard = self.inner.lock();
+            if guard.delalloc.production.admission_closed != 0
+                || guard.cached_file_size != Some(offset as u64)
+            {
+                return Ok(None);
+            }
+            let Some((&tail_offset, tail)) = guard.delalloc.production.entries.last_key_value()
+            else {
+                return Ok(None);
+            };
+            if tail_offset != page_start {
+                return Ok(None);
+            }
+            let ProductionDelallocEntryState::Ready(pending) = &tail.state else {
+                return Ok(None);
+            };
+            let Some(certificate) = pending.certificate else {
+                return Err(SystemError::EIO);
+            };
+            // Refuse exhaustion before PageCache publishes the merged bytes.
+            guard
+                .cached_mtime_version
+                .checked_add(1)
+                .ok_or(SystemError::EOVERFLOW)?;
+            guard
+                .cached_ctime_version
+                .checked_add(1)
+                .ok_or(SystemError::EOVERFLOW)?;
+            (guard.concret_fs(), tail.sequence, certificate)
+        };
+        drop(_io);
+        drop(_size);
+
+        let mut merged = false;
+        let publication = page_cache.write_single_page_segment_with_transition(
+            offset,
+            buf,
+            PageCacheExpectedDirtyTransition::Merge(certificate),
+            |transition| {
+                merged = transition.kind()
+                    == crate::filesystem::page_cache::PageCacheDirtyTransitionKind::MergedIntoDirty
+                    && transition.dirty_incarnation() == certificate.dirty_incarnation()
+            },
+        );
+        let _size = self.size_lock.read();
+        let _io = self.io_lock.lock();
+        match publication {
+            Ok(written) if merged => {
+                let mut guard = self.inner.lock();
+                // Another metadata publisher may have advanced the version
+                // while PageCache held the page lock.  Recompute before
+                // moving the linear reservation out of the queue.  At this
+                // point merged bytes are already dirty, so an unexpected
+                // exhaustion is terminal rather than a recoverable partial
+                // queue mutation.
+                let Some(mtime_version) = guard.cached_mtime_version.checked_add(1) else {
+                    drop(guard);
+                    fs.fail_stop_lifecycle();
+                    self.delalloc_progress
+                        .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
+                    return Err(SystemError::EIO);
+                };
+                let Some(ctime_version) = guard.cached_ctime_version.checked_add(1) else {
+                    drop(guard);
+                    fs.fail_stop_lifecycle();
+                    self.delalloc_progress
+                        .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
+                    return Err(SystemError::EIO);
+                };
+                let entry = guard
+                    .delalloc
+                    .production
+                    .entries
+                    .remove(&page_start)
+                    .ok_or(SystemError::EIO)?;
+                let mut pending = match entry {
+                    ProductionDelallocEntry {
+                        sequence: current,
+                        state: ProductionDelallocEntryState::Ready(pending),
+                    } if current == sequence && pending.certificate == Some(certificate) => pending,
+                    entry => {
+                        guard.delalloc.production.entries.insert(page_start, entry);
+                        drop(guard);
+                        fs.fail_stop_lifecycle();
+                        self.delalloc_progress
+                            .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
+                        return Err(SystemError::EIO);
+                    }
+                };
+                pending.durable_eof = new_eof;
+                pending.mtime = write_time;
+                pending.ctime = write_time;
+                guard.cached_file_size = Some(new_eof);
+                guard.cached_times.mtime = write_time;
+                guard.cached_times.ctime = write_time;
+                guard.cached_mtime_version = mtime_version;
+                guard.cached_ctime_version = ctime_version;
+                pending.mtime_version = guard.cached_mtime_version;
+                pending.ctime_version = guard.cached_ctime_version;
+                guard.delalloc.production.entries.insert(
+                    page_start,
+                    ProductionDelallocEntry {
+                        sequence,
+                        state: ProductionDelallocEntryState::Ready(pending),
+                    },
+                );
+                Ok(Some(written))
+            }
+            Ok(_) => {
+                fs.fail_stop_lifecycle();
+                self.delalloc_progress
+                    .publish(PageCacheWritebackProgressOutcome::Failed(SystemError::EIO));
+                Err(SystemError::EIO)
+            }
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_write_delalloc_new_page_segment(
+        &self,
+        page_cache: &Arc<PageCache>,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<Option<usize>, SystemError> {
+        let page_offset = offset & (MMArch::PAGE_SIZE - 1);
+        if buf.is_empty()
+            || page_offset
+                .checked_add(buf.len())
+                .is_none_or(|end| end > MMArch::PAGE_SIZE)
+            || MMArch::PAGE_SIZE != another_ext4::BLOCK_SIZE
+        {
+            return Ok(None);
+        }
+
+        let mut operation = Some(self.begin_operation()?);
+        let page_start = offset & !(MMArch::PAGE_SIZE - 1);
+        let new_eof = offset.checked_add(buf.len()).ok_or(SystemError::EFBIG)? as u64;
+        let write_time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or(0);
+        let mut contention_attempt = 0usize;
+
+        'admission: loop {
+            let _invalidate = page_cache.invalidate_write();
+            let _size = self.size_lock.read();
+            let _io = self.io_lock.lock();
+            let (
+                fs,
+                inode_num,
+                self_arc,
+                old_size,
+                old_mtime,
+                old_ctime,
+                mtime_version,
+                ctime_version,
+                expected_durable_eof_before,
+                was_empty,
+                sequence,
+            ) = {
+                let guard = self.inner.lock();
+                if guard.delalloc.production.admission_closed != 0
+                    || guard.dirty_state.intersects(
+                        InodeDirtyState::SIZE_DIRTY
+                            | InodeDirtyState::MTIME_DIRTY
+                            | InodeDirtyState::CTIME_DIRTY,
+                    )
+                {
+                    return Ok(None);
+                }
+                let fs = guard.concret_fs();
+                if !fs.delalloc_admission_open() {
+                    return Ok(None);
+                }
+                let old_size = guard.cached_file_size.ok_or(SystemError::EIO)?;
+                if old_size as usize > offset {
+                    return Ok(None);
+                }
+                if guard.delalloc.production.entries.values().any(|entry| {
+                    matches!(entry.state, ProductionDelallocEntryState::Claimed { .. })
+                }) {
+                    let progress = self.delalloc_progress.ticket(guard.self_ref.clone());
+                    drop(guard);
+                    drop(_io);
+                    drop(_size);
+                    drop(_invalidate);
+                    progress.arm();
+                    match progress.wait_for_progress() {
+                        PageCacheWritebackProgressOutcome::Failed(error) => return Err(error),
+                        PageCacheWritebackProgressOutcome::Progress
+                        | PageCacheWritebackProgressOutcome::Cancelled => continue 'admission,
+                    }
+                }
+                let expected_durable_eof_before = guard
+                    .delalloc
+                    .production
+                    .entries
+                    .last_key_value()
+                    .map(|(_, entry)| match &entry.state {
+                        ProductionDelallocEntryState::Prepared(pending)
+                        | ProductionDelallocEntryState::Ready(pending) => pending.durable_eof,
+                        ProductionDelallocEntryState::Claimed { durable_eof, .. } => *durable_eof,
+                    })
+                    .unwrap_or(old_size);
+                let sequence = guard.delalloc.production.next_sequence;
+                sequence.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
+                let mtime_version = guard
+                    .cached_mtime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let ctime_version = guard
+                    .cached_ctime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                (
+                    fs,
+                    guard.inner_inode_num,
+                    guard.self_ref.upgrade().ok_or(SystemError::ESTALE)?,
+                    old_size,
+                    guard.cached_times.mtime,
+                    guard.cached_times.ctime,
+                    mtime_version,
+                    ctime_version,
+                    expected_durable_eof_before,
+                    guard.delalloc.production.entries.is_empty(),
+                    sequence,
+                )
+            };
+            let authority = fs
+                .delalloc_mapper_authority
+                .as_ref()
+                .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+            if was_empty && self.delalloc_pool.lock().is_none() {
+                // Pool creation snapshots the inode's current right spine
+                // under another_ext4's non-blocking direct-metadata gate.
+                // A concurrent journal owner (for example syncfs draining the
+                // previous head) makes that snapshot temporarily unavailable;
+                // this is internal metadata contention, not userspace
+                // nonblocking I/O, so keep the write admission pending until
+                // the owner releases the gate.
+                let pool = Self::retry_metadata_contention(|| {
+                    fs.fs
+                        .create_delalloc_extent_node_pool_authorized(authority, inode_num)
+                })?;
+                let mut slot = self.delalloc_pool.lock();
+                if slot.is_none() {
+                    *slot = Some(pool);
+                }
+            }
+            let reservation_result = {
+                let mut slot = self.delalloc_pool.lock();
+                let pool = slot.as_mut().ok_or(SystemError::EIO)?;
+                fs.fs.reserve_delalloc_append_block_projected_authorized(
+                    authority,
+                    inode_num,
+                    page_start,
+                    expected_durable_eof_before,
+                    pool,
+                )
+            };
+            let reservation = match reservation_result {
+                Ok(reservation) => reservation,
+                Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
+                    drop(_io);
+                    drop(_size);
+                    drop(_invalidate);
+                    contention_attempt = contention_attempt.saturating_add(1);
+                    Self::metadata_contention_backoff(contention_attempt);
+                    continue 'admission;
+                }
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        another_ext4::ErrCode::EINVAL | another_ext4::ErrCode::ENOTSUP
+                    ) =>
+                {
+                    if was_empty {
+                        self.release_empty_delalloc_pool(&fs, authority)?;
+                    }
+                    return Ok(None);
+                }
+                Err(error) => {
+                    if was_empty {
+                        self.release_empty_delalloc_pool(&fs, authority)?;
+                    }
+                    return Err(error.into());
+                }
+            };
+            let sequence = {
+                let mut guard = self.inner.lock();
+                let tail_eof = guard
+                    .delalloc
+                    .production
+                    .entries
+                    .last_key_value()
+                    .map(|(_, entry)| match &entry.state {
+                        ProductionDelallocEntryState::Prepared(pending)
+                        | ProductionDelallocEntryState::Ready(pending) => pending.durable_eof,
+                        ProductionDelallocEntryState::Claimed { durable_eof, .. } => *durable_eof,
+                    })
+                    .unwrap_or(old_size);
+                if guard.delalloc.production.admission_closed != 0
+                    || guard.cached_file_size != Some(old_size)
+                    || guard.cached_times.mtime != old_mtime
+                    || guard.cached_times.ctime != old_ctime
+                    || tail_eof != expected_durable_eof_before
+                    || guard.delalloc.production.entries.contains_key(&page_start)
+                    || guard.delalloc.production.entries.is_empty() != was_empty
+                {
+                    drop(guard);
+                    let mut reservation = reservation;
+                    self.cancel_projected_delalloc_reservation(&fs, authority, &mut reservation)?;
+                    return Ok(None);
+                }
+                if guard.delalloc.production.next_sequence != sequence {
+                    drop(guard);
+                    let mut reservation = reservation;
+                    self.cancel_projected_delalloc_reservation(&fs, authority, &mut reservation)?;
+                    return Ok(None);
+                }
+                guard.delalloc.production.next_sequence = sequence + 1;
+                if was_empty {
+                    let Some(queue_operation) = operation.take() else {
+                        drop(guard);
+                        let mut reservation = reservation;
+                        self.cancel_projected_delalloc_reservation(
+                            &fs,
+                            authority,
+                            &mut reservation,
+                        )?;
+                        return Err(SystemError::EIO);
+                    };
+                    guard.delalloc.production.queue_operation = Some(queue_operation);
+                }
+                guard.delalloc.production.entries.insert(
+                    page_start,
+                    ProductionDelallocEntry {
+                        sequence,
+                        state: ProductionDelallocEntryState::Prepared(ProductionDelallocPending {
+                            reservation,
+                            certificate: None,
+                            offset: page_start,
+                            durable_eof: new_eof,
+                            mtime: write_time,
+                            ctime: write_time,
+                            mtime_version,
+                            ctime_version,
+                        }),
+                    },
+                );
+                sequence
+            };
+            if was_empty {
+                if let Err(error) = fs.register_delalloc_inode(inode_num, self_arc) {
+                    let (mut pending, owner) = {
+                        let mut guard = self.inner.lock();
+                        let entry = guard
+                            .delalloc
+                            .production
+                            .entries
+                            .remove(&page_start)
+                            .ok_or(SystemError::EIO)?;
+                        let owner = guard.delalloc.production.queue_operation.take();
+                        let pending = match entry {
+                            ProductionDelallocEntry {
+                                sequence: current,
+                                state: ProductionDelallocEntryState::Prepared(pending),
+                            } if current == sequence => pending,
+                            _ => return Err(SystemError::EIO),
+                        };
+                        (pending, owner)
+                    };
+                    drop(_io);
+                    drop(_size);
+                    self.cancel_projected_delalloc_reservation(
+                        &fs,
+                        authority,
+                        &mut pending.reservation,
+                    )?;
+                    self.release_empty_delalloc_pool(&fs, authority)?;
+                    drop(pending);
+                    drop(owner);
+                    return Err(error);
+                }
+            }
+
+            drop(_io);
+            drop(_size);
+            let mut published = None;
+            let publication = page_cache.write_single_page_segment_with_transition(
+                offset,
+                buf,
+                PageCacheExpectedDirtyTransition::Start,
+                |transition| published = transition.certificate(),
+            );
+            let _size = self.size_lock.read();
+            let _io = self.io_lock.lock();
+            return match publication {
+                Ok(written) => {
+                    let Some(certificate) = published else {
+                        fs.fail_stop_lifecycle();
+                        return Err(SystemError::EIO);
+                    };
+                    let mut guard = self.inner.lock();
+                    let entry = guard
+                        .delalloc
+                        .production
+                        .entries
+                        .remove(&page_start)
+                        .ok_or(SystemError::EIO)?;
+                    let mut pending = match entry {
+                        ProductionDelallocEntry {
+                            sequence: current,
+                            state: ProductionDelallocEntryState::Prepared(pending),
+                        } if current == sequence => pending,
+                        _ => {
+                            fs.fail_stop_lifecycle();
+                            return Err(SystemError::EIO);
+                        }
+                    };
+                    pending.certificate = Some(certificate);
+                    guard.cached_file_size = Some(new_eof);
+                    guard.cached_times.mtime = write_time;
+                    guard.cached_times.ctime = write_time;
+                    guard.cached_mtime_version = pending.mtime_version;
+                    guard.cached_ctime_version = pending.ctime_version;
+                    guard.delalloc.production.entries.insert(
+                        page_start,
+                        ProductionDelallocEntry {
+                            sequence,
+                            state: ProductionDelallocEntryState::Ready(pending),
+                        },
+                    );
+                    Ok(Some(written))
+                }
+                Err(error) => {
+                    let (mut pending, became_empty, owner) = {
+                        let mut guard = self.inner.lock();
+                        let entry = guard
+                            .delalloc
+                            .production
+                            .entries
+                            .remove(&page_start)
+                            .ok_or(SystemError::EIO)?;
+                        let pending = match entry {
+                            ProductionDelallocEntry {
+                                sequence: current,
+                                state: ProductionDelallocEntryState::Prepared(pending),
+                            } if current == sequence => pending,
+                            _ => {
+                                fs.fail_stop_lifecycle();
+                                return Err(SystemError::EIO);
+                            }
+                        };
+                        let became_empty = guard.delalloc.production.entries.is_empty();
+                        let owner = became_empty
+                            .then(|| guard.delalloc.production.queue_operation.take())
+                            .flatten();
+                        (pending, became_empty, owner)
+                    };
+                    drop(_io);
+                    drop(_size);
+                    self.cancel_projected_delalloc_reservation(
+                        &fs,
+                        authority,
+                        &mut pending.reservation,
+                    )?;
+                    if became_empty {
+                        self.release_empty_delalloc_pool(&fs, authority)?;
+                        fs.unregister_delalloc_inode(inode_num);
+                    }
+                    drop(pending);
+                    drop(owner);
+                    if error == SystemError::EAGAIN_OR_EWOULDBLOCK {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    }
+                }
+            };
+        }
+    }
+
+    fn cancel_projected_delalloc_reservation(
+        &self,
+        fs: &Arc<Ext4FileSystem>,
+        authority: &another_ext4::DelallocAppendMapperAuthority,
+        reservation: &mut another_ext4::DelallocAppendBlockReservation,
+    ) -> Result<(), SystemError> {
+        {
+            let mut slot = self.delalloc_pool.lock();
+            let pool = slot.as_mut().ok_or(SystemError::EIO)?;
+            if fs
+                .fs
+                .cancel_projected_delalloc_append_block_authorized(authority, reservation, pool)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        fs.fail_stop_lifecycle();
+        fs.fs
+            .terminalize_delalloc_append_block_authorized_after_fail_stop(authority, reservation)
+            .map_err(SystemError::from)
+    }
+
+    fn release_empty_delalloc_pool(
+        &self,
+        fs: &Arc<Ext4FileSystem>,
+        authority: &another_ext4::DelallocAppendMapperAuthority,
+    ) -> Result<(), SystemError> {
+        let Some(mut pool) = self.delalloc_pool.lock().take() else {
+            return Ok(());
+        };
+        if fs
+            .fs
+            .release_delalloc_extent_node_pool_authorized(authority, &mut pool)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        fs.fail_stop_lifecycle();
+        fs.fs
+            .terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(authority, &mut pool)
+            .map_err(SystemError::from)
+    }
+
+    pub(super) fn drain_delalloc_before_eager(&self) -> Result<(), SystemError> {
+        loop {
+            let (page_cache, page_index) = {
+                let guard = self.inner.lock();
+                let Some((_, head)) = guard.delalloc.production.head() else {
+                    return Ok(());
+                };
+                let offset = match &head.state {
+                    ProductionDelallocEntryState::Prepared(pending)
+                    | ProductionDelallocEntryState::Ready(pending) => pending.offset,
+                    ProductionDelallocEntryState::Claimed { certificate, .. } => {
+                        certificate.page_index() * MMArch::PAGE_SIZE
+                    }
+                };
+                (
+                    guard.page_cache.clone().ok_or(SystemError::EIO)?,
+                    offset / MMArch::PAGE_SIZE,
+                )
+            };
+            page_cache
+                .manager()
+                .writeback_range(page_index, page_index)?;
+        }
+    }
+
+    /// Detach an idle delayed head after the lower mount has fail-stopped.
+    /// Claimed heads remain owned by their live submission (which strongly
+    /// holds the filesystem); Prepared/Ready heads have no other terminal
+    /// owner and must be consumed here before filesystem teardown.
+    pub(super) fn terminalize_idle_delalloc_after_fail_stop(&self, fs: &Ext4FileSystem) -> bool {
+        let (inode_num, pending, owner) =
+            {
+                let _io = self.io_lock.lock();
+                let mut guard = self.inner.lock();
+                let inode_num = guard.inner_inode_num;
+                if guard.delalloc.production.entries.values().any(|entry| {
+                    matches!(entry.state, ProductionDelallocEntryState::Claimed { .. })
+                }) {
+                    return false;
+                }
+                let mut pending = Vec::new();
+                for (_, entry) in core::mem::take(&mut guard.delalloc.production.entries) {
+                    match entry.state {
+                        ProductionDelallocEntryState::Prepared(entry)
+                        | ProductionDelallocEntryState::Ready(entry) => pending.push(entry),
+                        ProductionDelallocEntryState::Claimed { .. } => unreachable!(),
+                    }
+                }
+                let owner = guard.delalloc.production.queue_operation.take();
+                (inode_num, pending, owner)
+            };
+        if let Some(authority) = fs.delalloc_mapper_authority.as_ref() {
+            for mut pending in pending {
+                let _terminalized = fs
+                    .fs
+                    .terminalize_delalloc_append_block_authorized_after_fail_stop(
+                        authority,
+                        &mut pending.reservation,
+                    );
+            }
+            if let Some(mut pool) = self.delalloc_pool.lock().take() {
+                let _terminalized = fs
+                    .fs
+                    .terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(
+                        authority, &mut pool,
+                    );
+            }
+        }
+        fs.unregister_delalloc_inode(inode_num);
+        drop(owner);
+        true
+    }
+
     fn quarantine_unexpected_rename_reclaim(
         fs: &Arc<Ext4FileSystem>,
         handle: another_ext4::InodeReclaimHandle,
@@ -1831,6 +3444,7 @@ impl LockedExt4Inode {
         attr: &another_ext4::FileAttr,
     ) -> Result<Arc<Self>, SystemError> {
         debug_assert_eq!(inode_num, attr.ino);
+        let fs = fs_ptr.upgrade().ok_or(SystemError::EIO)?;
         let lifecycle = Ext4InodeLifecycle::new();
         let inode = Arc::new_cyclic(|self_ref| LockedExt4Inode {
             inner: Mutex::new(Ext4Inode::new(
@@ -1841,6 +3455,7 @@ impl LockedExt4Inode {
                 Ext4InodeTimes::from(attr),
             )),
             io_lock: Mutex::new(()),
+            metadata_commit_lock: Mutex::new(()),
             size_lock: RwSem::new(()),
             namespace_lock: Mutex::new(()),
             lifecycle,
@@ -1849,15 +3464,32 @@ impl LockedExt4Inode {
             eviction_scheduled: SpinLock::new(false),
             retention_callback_self: self_ref.clone(),
             eviction_filesystem: SpinLock::new(fs_ptr.clone()),
+            delalloc_progress: Ext4DelallocProgress::new(),
+            delalloc_pool: Mutex::new(None),
         });
         let mut guard = inode.inner.lock();
 
         // 设置self_ref
         guard.self_ref = Arc::downgrade(&inode);
+        guard.cached_file_size = Some(attr.size);
 
-        let backend = Arc::new(AsyncPageCacheBackend::new(
-            Arc::downgrade(&inode) as Weak<dyn IndexNode>
-        ));
+        // Preserve the established eager backend until the delayed-allocation
+        // protocol can split ext4's `io_lock`-protected claim/bind phase from
+        // PageCache snapshotting. `snapshot_writeback_batch()` calls
+        // `mkclean_page()`, which takes an AddressSpace read lock; a shared
+        // mmap fault already holds AddressSpace write while it enters
+        // `prepare_mmap_write()` and takes `io_lock`. Holding `io_lock` across
+        // the current generic admission callback would therefore form an
+        // ABBA. Do not add an ext4 admission wrapper here until that split,
+        // token lifecycle, and defer/progress protocol are complete.
+        let backend: Arc<dyn PageCacheBackend> =
+            if attr.ftype == FileType::RegularFile && fs.delalloc_mapper_authority.is_some() {
+                Arc::new(Ext4PageCacheBackend::new(Arc::downgrade(&inode)))
+            } else {
+                Arc::new(AsyncPageCacheBackend::new(
+                    Arc::downgrade(&inode) as Weak<dyn IndexNode>
+                ))
+            };
         let page_cache = PageCache::new(
             Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>),
             Some(backend),
@@ -1920,8 +3552,33 @@ impl Ext4Inode {
             cached_times: times,
             cached_atime_version: 0,
             cached_mtime_version: 0,
+            cached_ctime_version: 0,
+            durable_atime_version: 0,
+            durable_mtime_version: 0,
+            durable_ctime_version: 0,
+            delalloc: DelallocInodeState::default(),
             dirty_state: InodeDirtyState::empty(),
         }
+    }
+
+    /// Construct the bootstrap root inode used while its filesystem object is
+    /// still being formed by `Arc::new_cyclic`.
+    ///
+    /// Keeping this special construction here prevents sibling modules from
+    /// depending on private inode-internal state such as the delayed
+    /// allocation planner.  The root has no filesystem back-pointer until
+    /// publication, and is its own namespace parent, matching the previous
+    /// explicit construction.
+    pub(super) fn new_mount_root(self_ref: Weak<LockedExt4Inode>, times: Ext4InodeTimes) -> Self {
+        let mut inode = Self::new(
+            another_ext4::EXT4_ROOT_INO,
+            Weak::new(),
+            DName::from("/"),
+            Some(self_ref.clone()),
+            times,
+        );
+        inode.self_ref = self_ref;
+        inode
     }
 }
 
@@ -2001,6 +3658,11 @@ impl LockedExt4Inode {
     }
 
     pub(super) fn run_deferred_eviction(self: &Arc<Self>) -> Result<(), SystemError> {
+        // Final reclaim is also a size/extent publisher.  Close the narrow
+        // delayed-append front and materialise its exact head before taking
+        // the lifecycle to Freeing or discarding PageCache state.
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
         let fs = self.inner.lock().concret_fs();
         let tombstone = match fs.begin_freeing(self) {
             Ok(tombstone) => tombstone,
@@ -2046,9 +3708,107 @@ impl LockedExt4Inode {
         }
     }
 
+    fn freeze_metadata(&self, datasync: bool) -> Result<Ext4FrozenMetadata, SystemError> {
+        let _size = self.size_lock.read();
+        let _io = self.io_lock.lock();
+        let guard = self.inner.lock();
+        let mut dirty = guard
+            .dirty_state
+            .intersection(InodeDirtyState::PERSISTENT_DIRTY);
+        if datasync {
+            dirty.remove(
+                InodeDirtyState::ATIME_DIRTY
+                    | InodeDirtyState::MTIME_DIRTY
+                    | InodeDirtyState::CTIME_DIRTY,
+            );
+        }
+        Ok(Ext4FrozenMetadata {
+            fs: guard.concret_fs(),
+            inode_num: guard.inner_inode_num,
+            dirty,
+            cached_size: guard.cached_file_size,
+            cached_times: guard.cached_times,
+            atime_version: guard.cached_atime_version,
+            mtime_version: guard.cached_mtime_version,
+            ctime_version: guard.cached_ctime_version,
+        })
+    }
+
+    fn flush_frozen_metadata(&self, snapshot: Ext4FrozenMetadata) -> Result<(), SystemError> {
+        let _io = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
+        let (current_size, durable_atime_version, durable_mtime_version, durable_ctime_version) = {
+            let guard = self.inner.lock();
+            (
+                guard.cached_file_size,
+                guard.durable_atime_version,
+                guard.durable_mtime_version,
+                guard.durable_ctime_version,
+            )
+        };
+
+        // Cached SIZE_DIRTY is growth-only. A concurrent truncate commits
+        // synchronously and leaves a smaller cached size; never resurrect the
+        // frozen pre-truncate EOF. Conversely, a later growth may coexist with
+        // this fsync, so the lower layer applies this size as a lower bound.
+        let size = snapshot
+            .dirty
+            .contains(InodeDirtyState::SIZE_DIRTY)
+            .then_some(snapshot.cached_size)
+            .flatten()
+            .filter(|frozen| current_size.is_some_and(|current| current >= *frozen));
+        let atime = (snapshot.dirty.contains(InodeDirtyState::ATIME_DIRTY)
+            && durable_atime_version < snapshot.atime_version)
+            .then_some(snapshot.cached_times.atime);
+        let mtime = (snapshot.dirty.contains(InodeDirtyState::MTIME_DIRTY)
+            && durable_mtime_version < snapshot.mtime_version)
+            .then_some(snapshot.cached_times.mtime);
+        let ctime = (snapshot.dirty.contains(InodeDirtyState::CTIME_DIRTY)
+            && durable_ctime_version < snapshot.ctime_version)
+            .then_some(snapshot.cached_times.ctime);
+
+        if size.is_some() || atime.is_some() || mtime.is_some() || ctime.is_some() {
+            Self::retry_metadata_contention(|| {
+                snapshot
+                    .fs
+                    .fs
+                    .commit_inode_metadata(snapshot.inode_num, size, atime, mtime, ctime)
+            })?;
+        }
+
+        let mut guard = self.inner.lock();
+        if atime.is_some() {
+            guard.durable_atime_version = guard.durable_atime_version.max(snapshot.atime_version);
+        }
+        if mtime.is_some() {
+            guard.durable_mtime_version = guard.durable_mtime_version.max(snapshot.mtime_version);
+        }
+        if ctime.is_some() {
+            guard.durable_ctime_version = guard.durable_ctime_version.max(snapshot.ctime_version);
+        }
+        if size.is_some() && guard.cached_file_size == snapshot.cached_size {
+            guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+        }
+        if atime.is_some() && guard.cached_atime_version == snapshot.atime_version {
+            guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
+        }
+        if mtime.is_some() && guard.cached_mtime_version == snapshot.mtime_version {
+            guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+        }
+        if ctime.is_some() && guard.cached_ctime_version == snapshot.ctime_version {
+            guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
+        }
+        drop(guard);
+        self.release_clean_metadata_queue_owner(&snapshot.fs);
+        Ok(())
+    }
+
     pub(super) fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
         let _io_guard = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
         let (
             fs,
             inode_num,
@@ -2057,6 +3817,7 @@ impl LockedExt4Inode {
             cached_times,
             cached_atime_version,
             cached_mtime_version,
+            cached_ctime_version,
         ) = {
             let guard = self.inner.lock();
             (
@@ -2067,14 +3828,16 @@ impl LockedExt4Inode {
                 guard.cached_times,
                 guard.cached_atime_version,
                 guard.cached_mtime_version,
+                guard.cached_ctime_version,
             )
         };
 
         let size_dirty = dirty.contains(InodeDirtyState::SIZE_DIRTY);
         let atime_dirty = dirty.contains(InodeDirtyState::ATIME_DIRTY);
         let mtime_dirty = dirty.contains(InodeDirtyState::MTIME_DIRTY);
+        let ctime_dirty = dirty.contains(InodeDirtyState::CTIME_DIRTY);
 
-        if !size_dirty && (datasync || (!atime_dirty && !mtime_dirty)) {
+        if !size_dirty && (datasync || (!atime_dirty && !mtime_dirty && !ctime_dirty)) {
             self.release_clean_metadata_queue_owner(&fs);
             return Ok(());
         }
@@ -2097,11 +3860,26 @@ impl LockedExt4Inode {
         } else {
             None
         };
+        let ctime = if !datasync && ctime_dirty {
+            Some(cached_times.ctime)
+        } else {
+            None
+        };
         Self::retry_metadata_contention(|| {
-            fs.fs.commit_inode_metadata(inode_num, size, atime, mtime)
+            fs.fs
+                .commit_inode_metadata(inode_num, size, atime, mtime, ctime)
         })?;
 
         let mut guard = self.inner.lock();
+        if !datasync && atime_dirty {
+            guard.durable_atime_version = guard.durable_atime_version.max(cached_atime_version);
+        }
+        if !datasync && mtime_dirty {
+            guard.durable_mtime_version = guard.durable_mtime_version.max(cached_mtime_version);
+        }
+        if !datasync && ctime_dirty {
+            guard.durable_ctime_version = guard.durable_ctime_version.max(cached_ctime_version);
+        }
         if size_dirty && guard.cached_file_size == cached_size {
             guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
         }
@@ -2110,6 +3888,9 @@ impl LockedExt4Inode {
         }
         if !datasync && mtime_dirty && guard.cached_mtime_version == cached_mtime_version {
             guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+        }
+        if !datasync && ctime_dirty && guard.cached_ctime_version == cached_ctime_version {
+            guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
         }
         drop(guard);
         self.release_clean_metadata_queue_owner(&fs);
@@ -2126,8 +3907,11 @@ impl LockedExt4Inode {
         page_index: usize,
     ) -> Result<Ext4MmapWriteGuard<'_>, SystemError> {
         let operation = self.begin_operation()?;
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
         let size_guard = self.size_lock.read();
         let io_guard = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
         let (fs, inode_num, file_size) = {
             let mut guard = self.inner.lock();
             let fs = guard.concret_fs();
@@ -2148,6 +3932,19 @@ impl LockedExt4Inode {
             return Err(SystemError::EFBIG);
         }
         let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or(0);
+        let (mtime_version, ctime_version) = {
+            let guard = self.inner.lock();
+            (
+                guard
+                    .cached_mtime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?,
+                guard
+                    .cached_ctime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?,
+            )
+        };
         Self::retry_metadata_contention(|| {
             fs.fs.prepare_buffered_write(
                 inode_num,
@@ -2161,15 +3958,19 @@ impl LockedExt4Inode {
         // handoff, so truncate cannot remove the prepared extent.  Release the
         // inode I/O lock first: filemap_page_mkwrite may wait for an existing
         // writeback, whose write_sync path needs this same lock.
-        drop(io_guard);
-
         let self_arc = {
             let mut guard = self.inner.lock();
             guard.cached_times.mtime = time;
-            guard.cached_mtime_version = guard.cached_mtime_version.wrapping_add(1);
+            guard.cached_times.ctime = time;
+            guard.cached_mtime_version = mtime_version;
+            guard.cached_ctime_version = ctime_version;
             guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
         };
-        Ext4FileSystem::mark_inode_dirty(&self_arc, InodeDirtyState::MTIME_DIRTY)?;
+        drop(io_guard);
+        Ext4FileSystem::mark_inode_dirty(
+            &self_arc,
+            InodeDirtyState::MTIME_DIRTY | InodeDirtyState::CTIME_DIRTY,
+        )?;
         Ok(Ext4MmapWriteGuard {
             _operation: operation,
             _size_guard: size_guard,

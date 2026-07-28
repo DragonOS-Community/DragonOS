@@ -92,6 +92,11 @@ pub fn xattr_block_checksum(
     ))
 }
 
+#[inline]
+fn xattr_value_storage_size(size: usize) -> Option<usize> {
+    size.checked_add(3).map(|size| size & !3)
+}
+
 /// Validate the fixed header and entry table needed before releasing a block.
 /// Returns whether any value is stored in an EA inode, which this crate cannot
 /// reclaim yet.
@@ -422,7 +427,9 @@ impl XattrBlock {
         let mut ins_entry_pos = p_entry;
         let mut ins_value_pos = p_value;
         let ins_entry_size = XattrEntry::required_size(name);
-        let ins_value_size = value.len();
+        let Some(ins_value_size) = xattr_value_storage_size(value.len()) else {
+            return false;
+        };
 
         // Iterate over entry table, find the position to insert entry
         // and the end of entry table
@@ -455,7 +462,16 @@ impl XattrBlock {
         // `[p_entry, p_value)` is the blank area.
 
         // Check space, '+1' is reserved for blank area
-        if p_value - p_entry < ins_entry_size + ins_value_size + 1 {
+        let Some(required) = ins_entry_size
+            .checked_add(ins_value_size)
+            .and_then(|size| size.checked_add(size_of::<u32>()))
+        else {
+            return false;
+        };
+        if p_value
+            .checked_sub(p_entry)
+            .is_none_or(|free| free < required)
+        {
             // Not enough space
             return false;
         }
@@ -518,7 +534,10 @@ impl XattrBlock {
                 rem_entry_pos = p_entry;
                 rem_value_pos = p_value;
                 rem_entry_size = entry.used_size();
-                rem_value_size = entry.value_size as usize;
+                let Some(storage_size) = xattr_value_storage_size(entry.value_size as usize) else {
+                    return false;
+                };
+                rem_value_size = storage_size;
                 is_rem_pos_found = true;
             }
             p_entry += entry.used_size();
@@ -642,14 +661,37 @@ mod release_tests {
         let mut block = XattrBlock::new(Block::new(block_id, Box::new([0; BLOCK_SIZE])));
         block.init();
         assert!(block.insert("user.test", b"value"));
+        assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
         assert!(block.update_checksum(seed, block_id));
         assert!(block.verify_checksum(seed, block_id));
 
         assert!(block.remove("user.test"));
+        assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
         assert!(!block.verify_checksum(seed, block_id));
         assert!(block.update_checksum(seed, block_id));
         assert!(block.verify_checksum(seed, block_id));
         assert!(!block.verify_checksum(seed, block_id + 1));
+    }
+
+    #[test]
+    fn unaligned_values_keep_linux_padded_layout_across_insert_and_remove() {
+        let mut block = XattrBlock::new(Block::new(17, Box::new([0; BLOCK_SIZE])));
+        block.init();
+
+        assert!(block.insert("user.first", b"1234567"));
+        assert!(block.insert("user.second", b"abc"));
+        assert!(block.insert("user.third", b"12345"));
+        assert_eq!(block.get("user.first"), Some(&b"1234567"[..]));
+        assert_eq!(block.get("user.second"), Some(&b"abc"[..]));
+        assert_eq!(block.get("user.third"), Some(&b"12345"[..]));
+        assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
+
+        assert!(block.remove("user.first"));
+        assert!(block.remove("user.third"));
+        assert_eq!(block.get("user.first"), None);
+        assert_eq!(block.get("user.second"), Some(&b"abc"[..]));
+        assert_eq!(block.get("user.third"), None);
+        assert!(validate_xattr_block_for_release(&block.0.data[..]).is_some());
     }
 
     #[test]

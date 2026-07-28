@@ -112,13 +112,45 @@ fn sync_file_range(
         manager.wait_writeback_range(start_index, end_index)?;
         file.check_and_advance_wb_error(&page_cache)?;
     }
+    let mut writeback = None;
     if flags.contains(SyncFileRangeFlags::WRITE) {
-        let sync_all =
-            flags.contains(SyncFileRangeFlags::WAIT_BEFORE | SyncFileRangeFlags::WAIT_AFTER);
-        manager.start_writeback_range(start_index, end_index, sync_all)?;
+        // This freezes the dirty generation visible to this invocation and
+        // schedules its writeback.  It deliberately does not synchronously
+        // drain later redirties: Linux uses WB_SYNC_ALL only for the complete
+        // WRITE|WAIT_BEFORE|WAIT_AFTER combination, not every WRITE|WAIT_AFTER.
+        writeback = Some(manager.start_writeback_range(start_index, end_index)?);
+    }
+    if flags.contains(SyncFileRangeFlags::WAIT_BEFORE) {
+        if let Some(writeback) = writeback.as_ref() {
+            // Linux defines WAIT_BEFORE|WRITE as a start-write-for-data-
+            // integrity operation: every generation frozen by this call must
+            // have returned from its backend writeout-start path. This does
+            // not add a separate wait for already-published Writeback I/O,
+            // although a Legacy write_pages() may itself be synchronous. A
+            // delayed-allocation head may defer mapping, so do not confuse
+            // merely scheduling a worker with this boundary.
+            writeback.wait_for_submission()?;
+            // A deferred ticket can fail while this call waits for its frozen
+            // generation to reach writeout. Its callback records the same
+            // terminal errseq as normal writeback completion, so this
+            // start-write boundary must report it rather than returning a
+            // false successful WAIT_BEFORE|WRITE.
+            file.check_and_advance_wb_error(&page_cache)?;
+        }
     }
     if flags.contains(SyncFileRangeFlags::WAIT_AFTER) {
-        manager.wait_writeback_range(start_index, end_index)?;
+        if let Some(writeback) = writeback.as_ref() {
+            // A deferred token returns a claimed page to Dirty while its
+            // producer runs.  Wait for the frozen generation to be submitted
+            // (including its ticket-driven retries) before the ordinary
+            // writeback wait; otherwise a transiently empty Writeback set
+            // would let WAIT_AFTER return too early.
+            writeback.wait_for_completion()?;
+        } else {
+            manager.wait_writeback_range(start_index, end_index)?;
+        }
+    }
+    if flags.contains(SyncFileRangeFlags::WAIT_AFTER) {
         file.check_and_advance_wb_error(&page_cache)?;
     }
 

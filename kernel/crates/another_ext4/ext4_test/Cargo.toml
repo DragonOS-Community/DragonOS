@@ -6,6 +6,6 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-another_ext4 = { path = ".." }
+another_ext4 = { path = "..", features = ["test-api"] }
 simple_logger = "4.3"
 log = "0.4"

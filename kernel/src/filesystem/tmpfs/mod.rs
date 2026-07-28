@@ -1019,8 +1019,8 @@ impl IndexNode for LockedTmpfsInode {
                     .copy_from_slice(&buf[written..written + page_write_len]);
             }
             page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
-            drop(page_guard);
-            if let Err(err) = page_cache.manager().update_page(page_index) {
+            if let Err(err) = page_cache.mark_page_dirty_page_locked(page_index, &page_guard) {
+                page_guard.remove_flags(crate::mm::page::PageFlags::PG_DIRTY);
                 if written == 0 {
                     return Err(err);
                 }
@@ -1279,8 +1279,10 @@ impl IndexNode for LockedTmpfsInode {
                 page_guard.as_slice_mut()[..target.len()].copy_from_slice(target.as_bytes());
             }
             page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
-            drop(page_guard);
-            page_cache.manager().update_page(0)?;
+            if let Err(error) = page_cache.mark_page_dirty_page_locked(0, &page_guard) {
+                page_guard.remove_flags(crate::mm::page::PageFlags::PG_DIRTY);
+                return Err(error);
+            }
         }
 
         parent.children.insert(name, result.clone());

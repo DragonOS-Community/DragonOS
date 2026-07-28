@@ -47,7 +47,13 @@ TEST(PageCacheAccounting, MembershipLifecycleIsBalanced) {
     EXPECT_NE(std::string::npos, report.find("file_membership=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("shmem_membership=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("dirty_membership=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("dirty_incarnation=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("writeback_membership=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("writeback_admission_order=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("writeback_submission_token=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("writeback_defer_progress=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("writeback_budget_retry=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("fault_invalidate_retry_order=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("unevictable_membership=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("inflight_teardown=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("late_completion=ok\n")) << report;

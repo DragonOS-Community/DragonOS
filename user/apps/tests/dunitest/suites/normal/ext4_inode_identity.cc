@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,9 +14,12 @@
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <thread>
 
@@ -109,6 +113,9 @@ void CopySparseFile(const std::string& source, int destination) {
 class LoopExt4 {
   public:
     ~LoopExt4() {
+        if (second_mounted_) {
+            umount(second_mount_point_.c_str());
+        }
         if (mounted_) {
             umount(mount_point_.c_str());
         }
@@ -121,6 +128,9 @@ class LoopExt4 {
         }
         if (!mount_point_.empty()) {
             rmdir(mount_point_.c_str());
+        }
+        if (!second_mount_point_.empty()) {
+            rmdir(second_mount_point_.c_str());
         }
         if (!image_.empty()) {
             unlink(image_.c_str());
@@ -166,6 +176,25 @@ class LoopExt4 {
         mounted_ = false;
     }
 
+    void MountSecond() {
+        ASSERT_TRUE(mounted_);
+        ASSERT_FALSE(second_mounted_);
+        second_mount_point_ = "/tmp/ext4_inode_identity_" + std::to_string(getpid())
+            + "_second_mnt";
+        ASSERT_EQ(0, mkdir(second_mount_point_.c_str(), 0700)) << strerror(errno);
+        ASSERT_EQ(0, mount(loop_path_.c_str(), second_mount_point_.c_str(), "ext4", 0, nullptr))
+            << strerror(errno);
+        second_mounted_ = true;
+    }
+
+    void UnmountSecond() {
+        ASSERT_TRUE(second_mounted_);
+        ASSERT_EQ(0, umount(second_mount_point_.c_str())) << strerror(errno);
+        second_mounted_ = false;
+        ASSERT_EQ(0, rmdir(second_mount_point_.c_str())) << strerror(errno);
+        second_mount_point_.clear();
+    }
+
     void Detach() {
         ASSERT_TRUE(mounted_);
         ASSERT_EQ(0, umount2(mount_point_.c_str(), MNT_DETACH)) << strerror(errno);
@@ -204,13 +233,19 @@ class LoopExt4 {
         return mount_point_;
     }
 
+    const std::string& second_mount_point() const {
+        return second_mount_point_;
+    }
+
   private:
     std::string image_;
     std::string mount_point_;
+    std::string second_mount_point_;
     std::string loop_path_;
     int backing_fd_ = -1;
     int loop_fd_ = -1;
     bool mounted_ = false;
+    bool second_mounted_ = false;
     bool detached_ = false;
 };
 
@@ -221,6 +256,245 @@ void WriteAll(int fd, const char* data, size_t len) {
         ASSERT_GT(written, 0) << strerror(errno);
         done += static_cast<size_t>(written);
     }
+}
+
+// Run the concurrent part of the mmap/writeback pressure case. It deliberately
+// uses no gtest assertion because the parent executes it in a child process
+// with a deadline; return zero on success, otherwise an errno-style failure.
+int RunMmapBufferedWriteAndFsyncStress(char* mapping, size_t page_size, int buffered_fd,
+                                       int sync_fd) {
+    constexpr int kIterations = 32;
+    constexpr size_t kMappingHalf = 2048;
+    constexpr size_t kBufferedHalf = 2048;
+
+    std::atomic<unsigned int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<bool> buffered_dirty{false};
+    std::atomic<bool> syncer_entered{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> first_error{0};
+    auto record_error = [&](int error) {
+        int expected = 0;
+        first_error.compare_exchange_strong(expected, error == 0 ? EIO : error);
+        stop.store(true, std::memory_order_release);
+    };
+    auto wait_for_start = [&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {
+            if (stop.load(std::memory_order_acquire)) {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        return true;
+    };
+    auto wait_for = [&](const std::atomic<bool>& entered) {
+        while (!entered.load(std::memory_order_acquire)) {
+            if (stop.load(std::memory_order_acquire)) {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        return true;
+    };
+
+    std::thread mapping_writer([&] {
+        if (!wait_for_start() || !wait_for(syncer_entered)) {
+            return;
+        }
+        for (int iteration = 0; iteration < kIterations; ++iteration) {
+            if (madvise(mapping, page_size, MADV_DONTNEED) != 0) {
+                record_error(errno);
+                return;
+            }
+            // Mapping and buffered writes intentionally use disjoint halves
+            // of one page. This keeps the invalidate domain identical without
+            // introducing unrelated, non-atomic byte races.
+            mapping[(iteration * 37) % kMappingHalf] = static_cast<char>(iteration + 1);
+            std::this_thread::yield();
+        }
+    });
+    std::thread buffered_writer([&] {
+        if (!wait_for_start()) {
+            return;
+        }
+
+        // Make the first fsync observe a dirty PageCache page before it is
+        // allowed to start. Later writes are the buffered invalidate-write
+        // contenders while mmap stores repeatedly take fresh write faults.
+        constexpr char kBootstrapByte = 'B';
+        if (pwrite(buffered_fd, &kBootstrapByte, 1, kBufferedHalf) != 1) {
+            record_error(errno);
+            return;
+        }
+        buffered_dirty.store(true, std::memory_order_release);
+        if (!wait_for(syncer_entered)) {
+            return;
+        }
+        for (int iteration = 0; iteration < kIterations; ++iteration) {
+            const char byte = static_cast<char>('a' + (iteration % 26));
+            const off_t offset = static_cast<off_t>(
+                kBufferedHalf + ((iteration * 73 + 1) % kBufferedHalf));
+            if (pwrite(buffered_fd, &byte, 1, offset) != 1) {
+                record_error(errno);
+                return;
+            }
+            std::this_thread::yield();
+        }
+    });
+    std::thread syncer([&] {
+        if (!wait_for_start() || !wait_for(buffered_dirty)) {
+            return;
+        }
+        syncer_entered.store(true, std::memory_order_release);
+        for (int iteration = 0; iteration < kIterations; ++iteration) {
+            if (fsync(sync_fd) != 0) {
+                record_error(errno);
+                return;
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    while (ready.load(std::memory_order_acquire) != 3) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    mapping_writer.join();
+    buffered_writer.join();
+    syncer.join();
+
+    return first_error.load(std::memory_order_acquire);
+}
+
+// Exercise the mmap/writeback conflict shape without a kernel-only test hook.
+// The mapper repeatedly discards its PTE so the next store takes a file-backed
+// write-fault path; buffered pwrite is the invalidate-write contender; fsync
+// drives PageCache snapshot/writeback. MAP_SHARED covers page_mkwrite, while
+// MAP_PRIVATE covers COW. The exact A/B/C lock order is proved by PageCache's
+// deterministic debug selftest; this is a bounded integration stress test of
+// the real ext4 paths.
+void RunMmapBufferedWriteAndFsyncProgress(int mapping_mode) {
+    constexpr size_t kPageSize = 4096;
+    constexpr char kInitialByte = 'I';
+    constexpr char kPrivateByte = 'P';
+    const bool private_mapping = mapping_mode == MAP_PRIVATE;
+
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point()
+        + (private_mapping ? "/private_mmap_cow_fsync_race" : "/shared_mmap_fsync_race");
+    int writer_fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(writer_fd, 0) << strerror(errno);
+    int sync_fd = dup(writer_fd);
+    ASSERT_GE(sync_fd, 0) << strerror(errno);
+    int buffered_fd = dup(writer_fd);
+    ASSERT_GE(buffered_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(writer_fd, static_cast<off_t>(kPageSize))) << strerror(errno);
+    ASSERT_EQ(1, pwrite(writer_fd, &kInitialByte, 1, 0)) << strerror(errno);
+    ASSERT_EQ(0, fsync(writer_fd)) << strerror(errno);
+
+    char* mapping = static_cast<char*>(
+        mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE, mapping_mode, writer_fd, 0));
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+
+    // Establish that this mapping genuinely takes COW semantics before the
+    // pressure loop. The subsequent MADV_DONTNEED makes the loop's first
+    // private store fault again instead of reusing this private page.
+    if (private_mapping) {
+        mapping[0] = kPrivateByte;
+        char on_disk = 0;
+        ASSERT_EQ(1, pread(writer_fd, &on_disk, 1, 0)) << strerror(errno);
+        ASSERT_EQ(kInitialByte, on_disk);
+        ASSERT_EQ(0, madvise(mapping, kPageSize, MADV_DONTNEED)) << strerror(errno);
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        const int saved_errno = errno;
+        FAIL() << "fork mmap/writeback stress child: " << strerror(saved_errno);
+    }
+    if (child == 0) {
+        _exit(RunMmapBufferedWriteAndFsyncStress(mapping, kPageSize, buffered_fd, sync_fd) == 0
+                  ? 0
+                  : 1);
+    }
+
+    // The child is forked before the stress threads exist. The parent retains
+    // the LoopExt4 fixture and its descriptors, so after a timeout it can kill
+    // only the stalled workload and still perform normal unmap/unmount/loop
+    // cleanup. Never use a completion notification as proof that the child
+    // reached _exit(): only a successful nonblocking reap may end this loop.
+    constexpr int kStressTimeoutMs = 10 * 1000;
+    int child_status = 0;
+    pid_t waited = 0;
+    int wait_error = 0;
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(kStressTimeoutMs);
+    for (;;) {
+        waited = waitpid(child, &child_status, WNOHANG);
+        if (waited == child) {
+            break;
+        }
+        if (waited < 0) {
+            if (errno == EINTR) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    waited = 0;
+                    break;
+                }
+                continue;
+            }
+            wait_error = errno;
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        usleep(1000);
+    }
+
+    if (waited == 0) {
+        if (kill(child, SIGKILL) != 0 && errno != ESRCH) {
+            ADD_FAILURE() << "kill stalled mmap/writeback stress child: " << strerror(errno);
+        }
+        do {
+            waited = waitpid(child, &child_status, 0);
+        } while (waited < 0 && errno == EINTR);
+        const int reap_error = waited < 0 ? errno : 0;
+        EXPECT_EQ(child, waited) << "reap stalled mmap/writeback stress child: "
+                                 << strerror(reap_error);
+        ADD_FAILURE() << "mmap/writeback stress exceeded " << kStressTimeoutMs << " ms";
+    } else if (waited < 0) {
+        ADD_FAILURE() << "waitpid mmap/writeback stress child: " << strerror(wait_error);
+    } else {
+        EXPECT_TRUE(WIFEXITED(child_status));
+        if (WIFEXITED(child_status)) {
+            EXPECT_EQ(0, WEXITSTATUS(child_status));
+        }
+    }
+
+    if (!private_mapping) {
+        EXPECT_EQ(0, msync(mapping, kPageSize, MS_SYNC)) << strerror(errno);
+    }
+
+    // Concurrent writers have no defined last-byte ordering. Re-establish a
+    // deterministic buffered-write/fsync/read boundary after the stress phase
+    // so this is also a data-integrity regression test.
+    constexpr char kExpected = '!';
+    EXPECT_EQ(1, pwrite(writer_fd, &kExpected, 1, kPageSize - 1)) << strerror(errno);
+    EXPECT_EQ(0, fsync(writer_fd)) << strerror(errno);
+    char observed = 0;
+    EXPECT_EQ(1, pread(writer_fd, &observed, 1, kPageSize - 1)) << strerror(errno);
+    EXPECT_EQ(kExpected, observed);
+
+    EXPECT_EQ(0, munmap(mapping, kPageSize)) << strerror(errno);
+    EXPECT_EQ(0, close(buffered_fd)) << strerror(errno);
+    EXPECT_EQ(0, close(sync_fd)) << strerror(errno);
+    EXPECT_EQ(0, close(writer_fd)) << strerror(errno);
+    EXPECT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
 TEST(Ext4InodeIdentity, StatfsReportsLinuxAbi) {
@@ -271,6 +545,10 @@ std::string ReadFile(const char* path) {
 }
 
 TEST(Ext4InodeIdentity, KernelLifecycleSelftestPasses) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
     int fd = open("/sys/kernel/debug/ext4/lifecycle_selftest", O_RDONLY);
     ASSERT_GE(fd, 0) << strerror(errno);
     char report[4096] = {};
@@ -281,6 +559,316 @@ TEST(Ext4InodeIdentity, KernelLifecycleSelftestPasses) {
     std::string text(report, static_cast<size_t>(size));
     EXPECT_NE(std::string::npos, text.find("status=ok\n")) << text;
     EXPECT_EQ(std::string::npos, text.find("=fail\n")) << text;
+}
+
+TEST(Ext4InodeIdentity, DelallocQueuePublishesAndRecoversInOrder) {
+    constexpr size_t kPageSize = 4096;
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/delalloc_queue";
+    const std::string first(kPageSize, 'A');
+    const std::string second(kPageSize, 'B');
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+
+    // Bytes and visible EOF are published together before writeback.
+    ASSERT_EQ(static_cast<ssize_t>(first.size()),
+              pwrite(fd, first.data(), first.size(), 0))
+        << strerror(errno);
+    struct stat visible = {};
+    ASSERT_EQ(0, fstat(fd, &visible)) << strerror(errno);
+    EXPECT_EQ(static_cast<off_t>(kPageSize), visible.st_size);
+    std::string observed(kPageSize, '\0');
+    ASSERT_EQ(static_cast<ssize_t>(observed.size()),
+              pread(fd, observed.data(), observed.size(), 0))
+        << strerror(errno);
+    EXPECT_EQ(first, observed);
+
+    // Followers and a partial tail remain ordered by the per-inode FIFO.
+    ASSERT_EQ(static_cast<ssize_t>(second.size()),
+              pwrite(fd, second.data(), second.size(), kPageSize))
+        << strerror(errno);
+    constexpr char kTail = 'C';
+    ASSERT_EQ(1, pwrite(fd, &kTail, 1, 2 * kPageSize)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    fd = open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    struct stat recovered = {};
+    ASSERT_EQ(0, fstat(fd, &recovered)) << strerror(errno);
+    EXPECT_EQ(static_cast<off_t>(2 * kPageSize + 1), recovered.st_size);
+    std::string recovered_data(2 * kPageSize + 1, '\0');
+    ASSERT_EQ(static_cast<ssize_t>(recovered_data.size()),
+              pread(fd, recovered_data.data(), recovered_data.size(), 0))
+        << strerror(errno);
+    EXPECT_EQ(0, memcmp(recovered_data.data(), first.data(), kPageSize));
+    EXPECT_EQ(0, memcmp(recovered_data.data() + kPageSize, second.data(), kPageSize));
+    EXPECT_EQ(kTail, recovered_data.back());
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, DelallocNonalignedThreePageAndSparseForwardAreZeroSafe) {
+    constexpr size_t kPageSize = 4096;
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string cross_path = fs.mount_point() + "/delalloc_cross_partial";
+    const size_t cross_offset = 17;
+    const std::string payload(2 * kPageSize + 31, 'P');
+    int fd = open(cross_path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+              pwrite(fd, payload.data(), payload.size(), cross_offset))
+        << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    const std::string sparse_path = fs.mount_point() + "/delalloc_sparse";
+    fd = open(sparse_path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    const std::string prefix(17, 'A');
+    ASSERT_EQ(static_cast<ssize_t>(prefix.size()),
+              pwrite(fd, prefix.data(), prefix.size(), 0))
+        << strerror(errno);
+    // Keep the short head undrained while admitting the sparse successor.
+    // The first PageCache snapshot is page-sized, but the head's own durable
+    // EOF is only 17 bytes; one fsync must clip that submission rather than
+    // fail-stopping the mount.
+    const size_t sparse_offset = 3 * kPageSize + 7;
+    const std::string sparse_tail(29, 'S');
+    ASSERT_EQ(static_cast<ssize_t>(sparse_tail.size()),
+              pwrite(fd, sparse_tail.data(), sparse_tail.size(), sparse_offset))
+        << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    fd = open(cross_path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    std::string cross(cross_offset + payload.size(), '\xff');
+    ASSERT_EQ(static_cast<ssize_t>(cross.size()),
+              pread(fd, cross.data(), cross.size(), 0))
+        << strerror(errno);
+    EXPECT_TRUE(std::all_of(cross.begin(), cross.begin() + cross_offset,
+                            [](char byte) { return byte == 0; }));
+    EXPECT_EQ(0, memcmp(cross.data() + cross_offset, payload.data(), payload.size()));
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    fd = open(sparse_path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    std::string sparse(sparse_offset + sparse_tail.size(), '\xff');
+    ASSERT_EQ(static_cast<ssize_t>(sparse.size()),
+              pread(fd, sparse.data(), sparse.size(), 0))
+        << strerror(errno);
+    EXPECT_EQ(0, memcmp(sparse.data(), prefix.data(), prefix.size()));
+    EXPECT_TRUE(std::all_of(sparse.begin() + prefix.size(),
+                            sparse.begin() + sparse_offset,
+                            [](char byte) { return byte == 0; }));
+    EXPECT_EQ(0, memcmp(sparse.data() + sparse_offset, sparse_tail.data(),
+                        sparse_tail.size()));
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, FsyncFrozenFrontierDoesNotFollowLaterAppendWriteback) {
+    constexpr size_t kPageSize = 4096;
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/fsync_frozen_frontier";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_APPEND, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    const std::string page(kPageSize, 'F');
+    for (int index = 0; index < 8; ++index) {
+        ASSERT_EQ(static_cast<ssize_t>(page.size()), write(fd, page.data(), page.size()))
+            << strerror(errno);
+    }
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> appends{0};
+    std::atomic<int> writer_error{0};
+    std::thread writer([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            off_t before = lseek(fd, 0, SEEK_END);
+            if (before < 0
+                || write(fd, page.data(), page.size())
+                    != static_cast<ssize_t>(page.size())
+                || sync_file_range(fd, before, page.size(), SYNC_FILE_RANGE_WRITE) != 0) {
+                writer_error.store(errno == 0 ? EIO : errno, std::memory_order_release);
+                return;
+            }
+            appends.fetch_add(1, std::memory_order_release);
+            std::this_thread::yield();
+        }
+    });
+    while (appends.load(std::memory_order_acquire) < 8
+           && writer_error.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+    if (writer_error.load(std::memory_order_acquire) != 0) {
+        stop.store(true, std::memory_order_release);
+        writer.join();
+        FAIL() << strerror(writer_error.load(std::memory_order_acquire));
+    }
+    const int before_fsync = appends.load(std::memory_order_acquire);
+
+    // The writer keeps creating and actively starting higher-index
+    // writeback. fsync must wait only for its frozen dirty/in-flight
+    // incarnations and return without requiring the producer to stop.
+    const int fsync_result = fsync(fd);
+    const int fsync_error = errno;
+    const int after_fsync = appends.load(std::memory_order_acquire);
+    stop.store(true, std::memory_order_release);
+    writer.join();
+
+    ASSERT_EQ(0, fsync_result) << strerror(fsync_error);
+    ASSERT_EQ(0, writer_error.load(std::memory_order_acquire));
+    EXPECT_GE(after_fsync, before_fsync);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, DelayedAndEagerWritesPersistCtimeAcrossRemount) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/write_ctime";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    struct stat initial = {};
+    ASSERT_EQ(0, fstat(fd, &initial)) << strerror(errno);
+
+    sleep(1);
+    ASSERT_EQ(1, pwrite(fd, "A", 1, 0)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    struct stat delayed = {};
+    ASSERT_EQ(0, fstat(fd, &delayed)) << strerror(errno);
+    EXPECT_GT(delayed.st_ctime, initial.st_ctime);
+
+    // This is an overwrite of an already mapped block, so it exercises the
+    // eager buffered fallback rather than the append-only delayed mapper.
+    // Keep a second mount alive as an independent on-disk observer: checking
+    // it immediately after fsync proves that fsync itself committed the
+    // timestamp, without relying on the first mount's later clean unmount.
+    ASSERT_NO_FATAL_FAILURE(fs.MountSecond());
+    sleep(1);
+    ASSERT_EQ(1, pwrite(fd, "B", 1, 0)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    struct stat eager = {};
+    ASSERT_EQ(0, fstat(fd, &eager)) << strerror(errno);
+    EXPECT_GT(eager.st_ctime, delayed.st_ctime);
+    struct stat independently_observed = {};
+    const std::string second_path = fs.second_mount_point() + "/write_ctime";
+    ASSERT_EQ(0, stat(second_path.c_str(), &independently_observed)) << strerror(errno);
+    EXPECT_EQ(eager.st_ctime, independently_observed.st_ctime);
+    ASSERT_NO_FATAL_FAILURE(fs.UnmountSecond());
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    ASSERT_EQ(0, stat(path.c_str(), &eager)) << strerror(errno);
+    EXPECT_GT(eager.st_ctime, delayed.st_ctime);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, ConcurrentAppendRecordsRemainAtomicAndDurable) {
+    constexpr int kWriters = 4;
+    constexpr int kRecordsPerWriter = 32;
+    constexpr size_t kRecordSize = 64;
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/concurrent_append";
+    int creator = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(creator, 0) << strerror(errno);
+    std::atomic<bool> start{false};
+    std::atomic<int> first_error{0};
+    std::thread writers[kWriters];
+    for (int writer = 0; writer < kWriters; ++writer) {
+        writers[writer] = std::thread([&, writer] {
+            int fd = open(path.c_str(), O_WRONLY | O_APPEND);
+            if (fd < 0) {
+                int expected = 0;
+                first_error.compare_exchange_strong(expected, errno);
+                return;
+            }
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            char record[kRecordSize];
+            memset(record, 'A' + writer, sizeof(record));
+            for (int index = 0; index < kRecordsPerWriter; ++index) {
+                if (write(fd, record, sizeof(record))
+                    != static_cast<ssize_t>(sizeof(record))) {
+                    int error = errno == 0 ? EIO : errno;
+                    int expected = 0;
+                    first_error.compare_exchange_strong(expected, error);
+                    break;
+                }
+            }
+            close(fd);
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    ASSERT_EQ(0, first_error.load()) << strerror(first_error.load());
+    ASSERT_EQ(0, fsync(creator)) << strerror(errno);
+    ASSERT_EQ(0, close(creator)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    int fd = open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    const size_t expected_size =
+        kWriters * kRecordsPerWriter * kRecordSize;
+    std::string contents(expected_size, '\0');
+    ASSERT_EQ(static_cast<ssize_t>(contents.size()),
+              pread(fd, contents.data(), contents.size(), 0))
+        << strerror(errno);
+    int counts[kWriters] = {};
+    for (size_t offset = 0; offset < contents.size(); offset += kRecordSize) {
+        const char marker = contents[offset];
+        ASSERT_GE(marker, 'A');
+        ASSERT_LT(marker, 'A' + kWriters);
+        EXPECT_TRUE(std::all_of(contents.begin() + offset,
+                                contents.begin() + offset + kRecordSize,
+                                [marker](char byte) { return byte == marker; }));
+        ++counts[marker - 'A'];
+    }
+    for (int writer = 0; writer < kWriters; ++writer) {
+        EXPECT_EQ(kRecordsPerWriter, counts[writer]);
+    }
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, SameBlockDeviceCanBeMountedTwice) {
+    // Linux reuses a block device's superblock for a compatible second mount.
+    // DragonOS does not have that shared-superblock layer yet, but a dormant
+    // delayed-allocation experiment must not turn the established mount(2)
+    // behavior into unconditional EBUSY. This test intentionally asserts
+    // only mount namespace admission; page-cache sharing is a separate VFS
+    // design task and must not be emulated by this ext4 regression test.
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    ASSERT_NO_FATAL_FAILURE(fs.MountSecond());
+    ASSERT_NO_FATAL_FAILURE(fs.UnmountSecond());
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
 TEST(Ext4InodeIdentity, OpenFileSurvivesFinalUnlink) {
@@ -496,6 +1084,90 @@ TEST(Ext4InodeIdentity, SharedMmapWriteSerializesWithTruncate) {
     ASSERT_EQ(0, fsync(fd)) << strerror(errno);
     ASSERT_EQ(0, munmap(mapping, 8192)) << strerror(errno);
     ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, SharedMmapBufferedWriteAndFsyncMakeProgress) {
+    ASSERT_NO_FATAL_FAILURE(RunMmapBufferedWriteAndFsyncProgress(MAP_SHARED));
+}
+
+TEST(Ext4InodeIdentity, PrivateMmapCowBufferedWriteAndFsyncMakeProgress) {
+    ASSERT_NO_FATAL_FAILURE(RunMmapBufferedWriteAndFsyncProgress(MAP_PRIVATE));
+}
+
+TEST(Ext4InodeIdentity, BufferedPartialTailWritebackSerializesWithTruncate) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/buffered_tail_truncate_race";
+    int writer_fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(writer_fd, 0) << strerror(errno);
+    int sync_fd = dup(writer_fd);
+    ASSERT_GE(sync_fd, 0) << strerror(errno);
+
+    constexpr off_t kPageSize = 4096;
+    constexpr off_t kTailSize = kPageSize + 37;
+    constexpr off_t kTailByte = kTailSize - 1;
+    ASSERT_EQ(0, ftruncate(writer_fd, kPageSize)) << strerror(errno);
+
+    std::atomic<bool> start{false};
+    std::atomic<int> first_error{0};
+    auto record_error = [&](int error) {
+        int expected = 0;
+        first_error.compare_exchange_strong(expected, error);
+    };
+    std::thread writer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (int iteration = 0; iteration < 32; ++iteration) {
+            if (ftruncate(writer_fd, kPageSize) != 0) {
+                record_error(errno);
+                return;
+            }
+            const char byte = static_cast<char>('a' + (iteration % 26));
+            if (pwrite(writer_fd, &byte, 1, kTailByte) != 1) {
+                record_error(errno);
+                return;
+            }
+        }
+    });
+    std::thread syncer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (int iteration = 0; iteration < 32; ++iteration) {
+            if (fsync(sync_fd) != 0) {
+                record_error(errno);
+                return;
+            }
+        }
+    });
+    start.store(true, std::memory_order_release);
+    writer.join();
+    syncer.join();
+
+    EXPECT_EQ(0, first_error.load());
+    ASSERT_EQ(0, ftruncate(writer_fd, kTailSize)) << strerror(errno);
+    constexpr char kExpected = '!';
+    ASSERT_EQ(1, pwrite(writer_fd, &kExpected, 1, kTailByte)) << strerror(errno);
+    ASSERT_EQ(0, fsync(writer_fd)) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(writer_fd, &st)) << strerror(errno);
+    EXPECT_EQ(kTailSize, st.st_size);
+    constexpr size_t kExtendedBytes = static_cast<size_t>(kTailSize - kPageSize);
+    char observed[kExtendedBytes] = {};
+    ASSERT_EQ(static_cast<ssize_t>(kExtendedBytes),
+              pread(writer_fd, observed, kExtendedBytes, kPageSize))
+        << strerror(errno);
+    for (size_t offset = 0; offset + 1 < kExtendedBytes; ++offset) {
+        EXPECT_EQ('\0', observed[offset]) << "unexpected data at tail offset " << offset;
+    }
+    EXPECT_EQ(kExpected, observed[kExtendedBytes - 1]);
+
+    ASSERT_EQ(0, close(sync_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(writer_fd)) << strerror(errno);
     ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }

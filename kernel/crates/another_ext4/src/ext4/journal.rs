@@ -110,6 +110,15 @@ impl Ext4 {
             }
             mapping.push(physical);
         }
+        // The journal inode's external extent-tree nodes are journal-owned
+        // metadata too.  Protect them from the allocator and from replay home
+        // targets; otherwise a corrupted free bitmap could let a delayed data
+        // allocation overwrite the tree which defines the journal mapping.
+        for physical in self.extent_all_tree_blocks(inode)? {
+            if physical == 0 || physical >= filesystem_blocks || !blocks.insert(physical) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+        }
         Ok((mapping, blocks))
     }
 
@@ -201,6 +210,14 @@ impl Ext4 {
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Journal(core) => core.start(credits),
             MetadataMutationMode::Direct(core) => core.start(credits),
+        }
+    }
+
+    pub(super) fn transaction_credits_fit(&self, credits: usize) -> Result<bool> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Journal(core) => core.credits_fit(credits),
+            MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Direct(_) => Ok(true),
         }
     }
 

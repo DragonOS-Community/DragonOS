@@ -10,7 +10,7 @@ use crate::{
             fcntl::AtFlags,
             mount::MountFlags,
             utils::{user_path_at, DName},
-            vcore::{generate_inode_id, try_find_gendisk},
+            vcore::try_find_gendisk,
             EvictionEpoch, FileSystem, FileSystemMakerData, FsReconfigureRequest, IndexNode,
             InodeRetentionKind, Magic, MountableFileSystem, FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
@@ -34,7 +34,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::fmt::Write;
+use core::{
+    fmt::Write,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use kdepends::another_ext4;
 use lazy_static::lazy_static;
 use linkme::distributed_slice;
@@ -59,6 +62,12 @@ struct Ext4EvictionQueueState {
 lazy_static! {
     static ref EXT4_EVICTION_WQ: Arc<WorkQueue> = WorkQueue::new("ext4_evict");
     static ref EXT4_STATS_REGISTRY: SpinLock<Vec<Weak<Ext4FileSystem>>> = SpinLock::new(Vec::new());
+    /// Serialises ext4 instance publication for one device.  Multiple mounts
+    /// remain allowed; until VFS shares one canonical superblock, introducing
+    /// a second writable instance permanently disables delayed admission on
+    /// both sides after draining the first.
+    static ref EXT4_DELALLOC_MOUNT_REGISTRY:
+        Mutex<BTreeMap<usize, Vec<Weak<Ext4FileSystem>>>> = Mutex::new(BTreeMap::new());
 }
 
 pub(crate) fn prepare_stats_report() -> String {
@@ -115,6 +124,14 @@ pub struct Ext4FileSystem {
 
     /// Per-superblock canonical VFS inode identity, keyed by the on-disk inode number.
     inode_table: Mutex<BTreeMap<u32, CanonicalInodeEntry>>,
+
+    /// Unique lower authority and strong owners for the Stage-3b single-head
+    /// delayed mapper.  An inode is present exactly while it owns a live
+    /// capability or mapper token.
+    pub(super) delalloc_mapper_authority: Option<another_ext4::DelallocAppendMapperAuthority>,
+    delalloc_inodes: Mutex<BTreeMap<u32, Arc<LockedExt4Inode>>>,
+    delalloc_wait: WaitQueue,
+    delalloc_admission_open: AtomicBool,
 
     /// Allocations hold a read guard through canonical publication. Physical reclaim
     /// holds a write guard through tombstone completion so an inode number cannot be
@@ -321,6 +338,25 @@ impl FileSystem for Ext4FileSystem {
         if self._mount_options.read_only {
             return;
         }
+        self.close_delalloc_admission();
+        if let Err(error) = self.drain_registered_delalloc() {
+            log::error!(
+                "ext4: failed to drain delayed mappings on unmount: {:?}",
+                error
+            );
+            self.fail_stop_lifecycle();
+            self.terminalize_idle_delalloc_after_fail_stop();
+            return;
+        }
+        if let Err(error) = self.flush_dirty_inodes() {
+            log::error!(
+                "ext4: failed final metadata sync after delayed-map drain: {:?}",
+                error
+            );
+            self.fail_stop_lifecycle();
+            self.terminalize_idle_delalloc_after_fail_stop();
+            return;
+        }
         if let Err(error) = self.fs.shutdown_writable() {
             log::error!("ext4: failed to mark journal clean on unmount: {:?}", error);
         }
@@ -343,6 +379,69 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
+    pub(super) fn delalloc_admission_open(&self) -> bool {
+        self.delalloc_mapper_authority.is_some()
+            && self.delalloc_admission_open.load(Ordering::Acquire)
+            && self.lifecycle_error.lock().is_none()
+    }
+
+    pub(super) fn register_delalloc_inode(
+        &self,
+        inode_num: u32,
+        inode: Arc<LockedExt4Inode>,
+    ) -> Result<(), SystemError> {
+        let mut owners = self.delalloc_inodes.lock();
+        if !self.delalloc_admission_open() {
+            return Err(SystemError::EROFS);
+        }
+        if owners.contains_key(&inode_num) {
+            return Err(SystemError::EIO);
+        }
+        owners.insert(inode_num, inode);
+        Ok(())
+    }
+
+    pub(super) fn unregister_delalloc_inode(&self, inode_num: u32) {
+        self.delalloc_inodes.lock().remove(&inode_num);
+        self.delalloc_wait.wake_all();
+    }
+
+    fn close_delalloc_admission(&self) {
+        // Serialize the open->registry publication with close.  Storing the
+        // fence while holding the registry lock guarantees that a producer is
+        // either fully visible to the subsequent drain or observes closed
+        // admission; it cannot publish into an already-emptied registry.
+        let _owners = self.delalloc_inodes.lock();
+        self.delalloc_admission_open.store(false, Ordering::Release);
+    }
+
+    fn drain_registered_delalloc(&self) -> Result<(), SystemError> {
+        loop {
+            let owners: Vec<_> = self.delalloc_inodes.lock().values().cloned().collect();
+            if owners.is_empty() {
+                return Ok(());
+            }
+            for inode in owners {
+                inode.drain_delalloc_before_eager()?;
+            }
+            self.delalloc_wait
+                .wait_until(|| self.delalloc_inodes.lock().is_empty().then_some(()));
+        }
+    }
+
+    fn terminalize_idle_delalloc_after_fail_stop(&self) {
+        loop {
+            let owners: Vec<_> = self.delalloc_inodes.lock().values().cloned().collect();
+            let mut progressed = false;
+            for inode in owners {
+                progressed |= inode.terminalize_idle_delalloc_after_fail_stop(self);
+            }
+            if !progressed {
+                return;
+            }
+        }
+    }
+
     /// Complete an explicit fsync/fdatasync/O_SYNC durability boundary.
     ///
     /// Linux ext4 performs the nojournal barrier after data and metadata
@@ -399,8 +498,9 @@ impl Ext4FileSystem {
     }
 
     pub(super) fn fail_stop_lifecycle(&self) {
-        *self.lifecycle_error.lock() = Some(SystemError::EIO);
         self.fs.fail_stop_mutations();
+        *self.lifecycle_error.lock() = Some(SystemError::EIO);
+        self.close_delalloc_admission();
     }
 
     pub(super) fn get_or_create_inode(
@@ -580,7 +680,11 @@ impl Ext4FileSystem {
         _error: SystemError,
     ) -> Result<(), SystemError> {
         let poison = SystemError::EIO;
-        *self.lifecycle_error.lock() = Some(poison.clone());
+        // An unresolved canonical inode tombstone makes the filesystem-wide
+        // lifecycle unsafe, not merely this one inode. Use the same ordered
+        // lower-poison/proof/cleanup publication as delayed mapper failures
+        // so queued leases cannot continue retrying on a nominally failed FS.
+        self.fail_stop_lifecycle();
         self.finish_tombstone(
             &mut tombstone,
             Ext4InodeLifecycleState::Poisoned(poison),
@@ -615,8 +719,13 @@ impl Ext4FileSystem {
                 )
             },
             |guard| {
+                let atime_version = guard
+                    .cached_atime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)?;
                 guard.cached_times.atime = atime;
-                guard.cached_atime_version = guard.cached_atime_version.wrapping_add(1);
+                guard.cached_atime_version = atime_version;
+                Ok(())
             },
         )
     }
@@ -629,7 +738,15 @@ impl Ext4FileSystem {
     where
         F: FnOnce(&mut super::inode::Ext4Inode),
     {
-        Self::mark_inode_dirty_if(inode, dirty, |_| true, update_cached_metadata)
+        Self::mark_inode_dirty_if(
+            inode,
+            dirty,
+            |_| true,
+            |guard| {
+                update_cached_metadata(guard);
+                Ok(())
+            },
+        )
     }
 
     fn mark_inode_dirty_if<P, F>(
@@ -640,7 +757,7 @@ impl Ext4FileSystem {
     ) -> Result<(), SystemError>
     where
         P: FnOnce(&super::inode::Ext4Inode) -> bool,
-        F: FnOnce(&mut super::inode::Ext4Inode),
+        F: FnOnce(&mut super::inode::Ext4Inode) -> Result<(), SystemError>,
     {
         let _operation = inode.lifecycle().begin_operation()?;
         // Acquire a prospective queue ownership before publishing dirty state.
@@ -667,7 +784,11 @@ impl Ext4FileSystem {
             } else {
                 None
             };
-            update_cached_metadata(&mut guard);
+            if let Err(error) = update_cached_metadata(&mut guard) {
+                drop(guard);
+                inode.release(InodeRetentionKind::AsyncWork);
+                return Err(error);
+            }
             guard.dirty_state.insert(dirty);
             if should_queue {
                 guard.dirty_state.insert(InodeDirtyState::QUEUED);
@@ -802,9 +923,27 @@ impl Ext4FileSystem {
                 }
             };
 
+            // The metadata worker must obey the same ordered publication gate
+            // as fsync/truncate: no cached size/time snapshot may overtake the
+            // single delayed append which owns the next durable EOF.
+            let _delalloc_admission = match inode.close_production_delalloc_admission() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    requeue.push(inode.clone());
+                    last_err = Err(error);
+                    continue;
+                }
+            };
+            if let Err(error) = inode.drain_delalloc_before_eager() {
+                requeue.push(inode.clone());
+                last_err = Err(error);
+                continue;
+            }
+
             let result = {
                 let _operation = operation;
                 let _io_guard = inode.io_lock.lock();
+                let _metadata_commit = inode.metadata_commit_lock.lock();
                 let (
                     fs,
                     inode_num,
@@ -813,6 +952,7 @@ impl Ext4FileSystem {
                     cached_times,
                     cached_atime_version,
                     cached_mtime_version,
+                    cached_ctime_version,
                 ) = {
                     let mut guard = inode.inner.lock();
                     guard.dirty_state.remove(InodeDirtyState::QUEUED);
@@ -834,6 +974,7 @@ impl Ext4FileSystem {
                         guard.cached_times,
                         guard.cached_atime_version,
                         guard.cached_mtime_version,
+                        guard.cached_ctime_version,
                     )
                 };
 
@@ -864,8 +1005,14 @@ impl Ext4FileSystem {
                             } else {
                                 None
                             };
+                            let ctime = if snapshot_dirty.contains(InodeDirtyState::CTIME_DIRTY) {
+                                Some(cached_times.ctime)
+                            } else {
+                                None
+                            };
                             LockedExt4Inode::retry_metadata_contention(|| {
-                                fs.fs.commit_inode_metadata(inode_num, size, atime, mtime)
+                                fs.fs
+                                    .commit_inode_metadata(inode_num, size, atime, mtime, ctime)
                             })
                         })
                     } else {
@@ -874,6 +1021,18 @@ impl Ext4FileSystem {
 
                     let mut guard = inode.inner.lock();
                     if result.is_ok() {
+                        if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY) {
+                            guard.durable_mtime_version =
+                                guard.durable_mtime_version.max(cached_mtime_version);
+                        }
+                        if snapshot_dirty.contains(InodeDirtyState::ATIME_DIRTY) {
+                            guard.durable_atime_version =
+                                guard.durable_atime_version.max(cached_atime_version);
+                        }
+                        if snapshot_dirty.contains(InodeDirtyState::CTIME_DIRTY) {
+                            guard.durable_ctime_version =
+                                guard.durable_ctime_version.max(cached_ctime_version);
+                        }
                         if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY)
                             && guard.cached_file_size == cached_size
                         {
@@ -888,6 +1047,11 @@ impl Ext4FileSystem {
                             && guard.cached_atime_version == cached_atime_version
                         {
                             guard.dirty_state.remove(InodeDirtyState::ATIME_DIRTY);
+                        }
+                        if snapshot_dirty.contains(InodeDirtyState::CTIME_DIRTY)
+                            && guard.cached_ctime_version == cached_ctime_version
+                        {
+                            guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
                         }
                     }
                     guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
@@ -910,7 +1074,7 @@ impl Ext4FileSystem {
                 last_err = Err(e);
             }
             if should_requeue {
-                requeue.push(inode);
+                requeue.push(inode.clone());
             } else if release_async_owner {
                 inode.release(InodeRetentionKind::AsyncWork);
             }
@@ -957,6 +1121,23 @@ impl Ext4FileSystem {
         // publication while inode/eviction locks are held.
         lazy_static::initialize(&EXT4_EVICTION_WQ);
         let raw_dev = mount_data.device_num();
+        let mut mount_registry = EXT4_DELALLOC_MOUNT_REGISTRY.lock();
+        let existing_writable: Vec<_> = {
+            let instances = mount_registry.entry(raw_dev.data() as usize).or_default();
+            instances.retain(|entry| entry.strong_count() != 0);
+            instances
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|fs| !fs._mount_options.read_only)
+                .collect()
+        };
+        if !mount_options.read_only {
+            for existing in &existing_writable {
+                existing.close_delalloc_admission();
+                existing.drain_registered_delalloc()?;
+            }
+        }
+        let delalloc_unique_writable = !mount_options.read_only && existing_writable.is_empty();
         // Writable mounts recover the journal and the validated legacy orphan
         // chain before this filesystem is published to the VFS.
         let fs = if mount_options.read_only {
@@ -968,25 +1149,19 @@ impl Ext4FileSystem {
             )?
         };
         let root_attr = fs.getattr(another_ext4::EXT4_ROOT_INO)?;
+        let delalloc_mapper_authority = if !delalloc_unique_writable {
+            None
+        } else {
+            fs.delalloc_append_mapper_authority().ok()
+        };
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| LockedExt4Inode {
-                inner: Mutex::new(Ext4Inode {
-                    inner_inode_num: another_ext4::EXT4_ROOT_INO,
-                    fs_ptr: Weak::default(),
-                    page_cache: None,
-                    children: BTreeMap::new(),
-                    dname: DName::from("/"),
-                    vfs_inode_id: generate_inode_id(),
-                    parent: self_ref.clone(),
-                    self_ref: self_ref.clone(),
-                    special_node: None,
-                    cached_file_size: None,
-                    cached_times: Ext4InodeTimes::from(&root_attr),
-                    cached_atime_version: 0,
-                    cached_mtime_version: 0,
-                    dirty_state: super::inode::InodeDirtyState::empty(),
-                }),
+                inner: Mutex::new(Ext4Inode::new_mount_root(
+                    self_ref.clone(),
+                    Ext4InodeTimes::from(&root_attr),
+                )),
                 io_lock: Mutex::new(()),
+                metadata_commit_lock: Mutex::new(()),
                 size_lock: RwSem::new(()),
                 namespace_lock: Mutex::new(()),
                 lifecycle: Ext4InodeLifecycle::new(),
@@ -995,6 +1170,8 @@ impl Ext4FileSystem {
                 eviction_scheduled: SpinLock::new(false),
                 retention_callback_self: self_ref.clone(),
                 eviction_filesystem: SpinLock::new(Weak::new()),
+                delalloc_progress: super::inode::Ext4DelallocProgress::new(),
+                delalloc_pool: Mutex::new(None),
             });
 
         let fs = Arc::new(Ext4FileSystem {
@@ -1003,6 +1180,10 @@ impl Ext4FileSystem {
             root_inode,
             dirty_inodes: Mutex::new(Vec::new()),
             inode_table: Mutex::new(BTreeMap::new()),
+            delalloc_mapper_authority,
+            delalloc_inodes: Mutex::new(BTreeMap::new()),
+            delalloc_wait: WaitQueue::default(),
+            delalloc_admission_open: AtomicBool::new(true),
             inode_reuse_barrier: RwSem::new(()),
             lifecycle_error: Mutex::new(None),
             quarantined_reclaims: SpinLock::new(Vec::new()),
@@ -1010,6 +1191,11 @@ impl Ext4FileSystem {
             eviction_wait: WaitQueue::default(),
             _mount_options: mount_options,
         });
+        mount_registry
+            .entry(raw_dev.data() as usize)
+            .or_default()
+            .push(Arc::downgrade(&fs));
+        drop(mount_registry);
         let mut stats_registry = EXT4_STATS_REGISTRY.lock();
         stats_registry.retain(|entry| entry.strong_count() != 0);
         stats_registry.push(Arc::downgrade(&fs));
@@ -1017,6 +1203,7 @@ impl Ext4FileSystem {
 
         let mut guard = fs.root_inode.inner.lock();
         guard.fs_ptr = Arc::downgrade(&fs);
+        guard.cached_file_size = Some(root_attr.size);
         drop(guard);
         *fs.root_inode.eviction_filesystem.lock() = Arc::downgrade(&fs);
         fs.inode_table.lock().insert(
@@ -1038,7 +1225,7 @@ impl Drop for Ext4InodeTombstone {
         }
         if let Some(fs) = self.fs.upgrade() {
             let error = SystemError::EIO;
-            *fs.lifecycle_error.lock() = Some(error.clone());
+            fs.fail_stop_lifecycle();
             if fs
                 .finish_tombstone(
                     self,
@@ -1060,6 +1247,25 @@ impl Drop for Ext4InodeTombstone {
             self.lifecycle
                 .set_state(Ext4InodeLifecycleState::Poisoned(SystemError::EIO));
         }
+    }
+}
+
+impl Drop for Ext4FileSystem {
+    fn drop(&mut self) {
+        if self.delalloc_inodes.lock().is_empty() {
+            return;
+        }
+        // The final Arc owner proves that no claimed submission remains:
+        // every submission holds its own strong filesystem reference.  Idle
+        // Prepared/Ready owners must nevertheless be detached explicitly
+        // before their linear reservation fields are destroyed.
+        self.fs.fail_stop_mutations();
+        self.delalloc_admission_open.store(false, Ordering::Release);
+        self.terminalize_idle_delalloc_after_fail_stop();
+        debug_assert!(
+            self.delalloc_inodes.lock().is_empty(),
+            "last ext4 owner cannot retain a claimed delayed submission"
+        );
     }
 }
 

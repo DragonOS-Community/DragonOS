@@ -337,6 +337,11 @@ TEST(MlockAll, FutureAppliesToNewMappings) {
     void* fresh = mmap(nullptr, ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     ASSERT_NE(MAP_FAILED, fresh);
 
+    unsigned char vec[1] = {0};
+    ASSERT_EQ(0, mincore(fresh, ps, vec));
+    EXPECT_TRUE(IsResident(vec[0]))
+        << "MCL_FUTURE must populate a new mapping before its first user access";
+
     errno = 0;
     EXPECT_EQ(-1, msync(fresh, ps, MS_INVALIDATE));
     EXPECT_EQ(EBUSY, errno);
@@ -420,6 +425,11 @@ TEST(MlockAll, FutureAppliesToBrkGrowth) {
             _exit(1);
         }
 
+        unsigned char vec[1] = {0};
+        if (mincore(grown, ps, vec) != 0 || !IsResident(vec[0])) {
+            _exit(9);
+        }
+
         auto* p = static_cast<volatile char*>(grown);
         *p = 0x12;
 
@@ -446,7 +456,8 @@ TEST(MlockAll, FutureAppliesToBrkGrowth) {
     }
     EXPECT_EQ(0, WEXITSTATUS(status))
         << "child exit code=" << WEXITSTATUS(status)
-        << " (1 means MCL_FUTURE brk growth failed after a successful baseline growth)";
+        << " (1 means MCL_FUTURE brk growth failed after a successful baseline growth; "
+           "9 means the newly grown heap was not prefaulted)";
 }
 
 TEST(Mlock, MapLockedBehavesAsLockedMapping) {

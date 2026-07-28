@@ -1,0 +1,11 @@
+# LMbench runner 全局配置(KEY=VALUE,被 run_tests.sh 解析;勿加空格/引号)
+# 单个测例可用其 .meta 里的 SAMPLES= 覆盖 SAMPLES。
+
+# 每个测例重复采样次数(用于算 mean/median/stddev/min/max)
+SAMPLES=3
+
+# 单个测例单次运行的墙钟超时(秒);超时记为 failed,不阻断整轮
+TIMEOUT_SEC=120
+
+# 采样前丢弃的预热轮数(0 表示不额外预热;lmbench 自身也有 warmup)
+WARMUP=0

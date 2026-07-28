@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Test: mem_read_bw
 # Binary: bw_mem
 # Description: Memory read bandwidth test
@@ -6,9 +6,9 @@
 set -e
 
 # 加载环境变量
-SCTIPDIR=$(cd $(dirname ${BASH_SOURCE[0]}) > /dev/null && pwd)
-ENV_PATH="${SCTIPDIR}/../env.sh"
-source ${ENV_PATH}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ENV_PATH="$SCRIPT_DIR/../env.sh"
+. "$ENV_PATH"
 
 echo "=== Running mem_read_bw test ==="
 ${LMBENCH_BIN_DIR}/bw_mem -P 1 -N 50 512m frd

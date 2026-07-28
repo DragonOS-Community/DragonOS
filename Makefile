@@ -307,6 +307,27 @@ test-syscall: prepare_rootfs_manifest
 		exit $$status; \
 	}
 
+test-benchmark: prepare_rootfs_manifest
+	@set -e; \
+	cleanup() { bash user/apps/tests/benchmark/lmbench/toggle_compile_lmbench.sh disable; }; \
+	trap cleanup EXIT; \
+	echo "构建运行并执行lmbench性能基准测试"; \
+	bash user/apps/tests/benchmark/lmbench/toggle_compile_lmbench.sh enable; \
+	$(MAKE) all -j $(NPROCS); \
+	if [ "$(DISK_SAVE_MODE)" = "1" ]; then \
+		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
+		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
+	fi; \
+	SKIP_GRUB=1 $(MAKE) write_diskimage; \
+	$(MAKE) qemu-nographic AUTO_TEST=benchmark BENCHMARK_TEST_DIR=/opt/tests/benchmark/lmbench & \
+	sleep 5; \
+	status=0; \
+	bash user/apps/tests/benchmark/lmbench/monitor_test_results.sh || status=$$?; \
+	if [ $$status -eq 0 ]; then \
+		python3 user/apps/tests/benchmark/lmbench/collect_results.py || status=$$?; \
+	fi; \
+	exit $$status
+
 test-dunit: prepare_rootfs_manifest
 	@echo "构建运行并执行dunitest测试"
 	$(MAKE) all -j $(NPROCS)

@@ -71,6 +71,22 @@
 
 .. toctree::
    :maxdepth: 1
+   :caption: Harness / Agent 文档
+
+   product-specs/index
+   design-docs/index
+   references/index
+
+.. toctree::
+   :hidden:
+
+   constraints/COMMIT
+   exec-plans/product-debt-tracker
+   exec-plans/tech-debt-tracker
+   agents/release_agent_capability
+
+.. toctree::
+   :maxdepth: 1
    :caption: Q&A
 
    questions/index

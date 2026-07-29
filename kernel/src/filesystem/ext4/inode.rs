@@ -1452,7 +1452,7 @@ impl IndexNode for LockedExt4Inode {
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         let _delalloc_admission = self.close_production_delalloc_admission()?;
-        self.drain_delalloc_before_eager()?;
+        self.drain_delalloc_range_before_eager(offset, len)?;
         self.read_sync(offset, &mut buf[0..len])
     }
 
@@ -3360,6 +3360,81 @@ impl LockedExt4Inode {
                 .manager()
                 .writeback_range(first_page, last_page)?;
         }
+    }
+
+    /// Persist only the delayed-allocation prefix required to make one direct
+    /// read range coherent with buffered writes.
+    ///
+    /// The lower mapper is FIFO, so reaching an overlapping entry may require
+    /// submitting earlier entries, but entries after the final overlap are
+    /// unrelated to this read and remain delayed.
+    fn drain_delalloc_range_before_eager(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), SystemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let last_byte = offset.checked_add(len - 1).ok_or(SystemError::EOVERFLOW)?;
+        let first_offset = offset & !(MMArch::PAGE_SIZE - 1);
+        let last_offset = last_byte & !(MMArch::PAGE_SIZE - 1);
+        let page_cache = self
+            .inner
+            .lock()
+            .page_cache
+            .clone()
+            .ok_or(SystemError::EIO)?;
+
+        loop {
+            let batch = {
+                let guard = self.inner.lock();
+                let Some((&target_offset, _)) = guard
+                    .delalloc
+                    .production
+                    .entries
+                    .range(first_offset..=last_offset)
+                    .next_back()
+                else {
+                    break;
+                };
+                let Some((&head_offset, head)) = guard.delalloc.production.head() else {
+                    return Err(SystemError::EIO);
+                };
+                let submit_last = match &head.state {
+                    ProductionDelallocEntryState::Prepared(_) => head_offset,
+                    ProductionDelallocEntryState::Ready(_) => {
+                        let max_entries = target_offset
+                            .checked_sub(head_offset)
+                            .and_then(|distance| distance.checked_div(MMArch::PAGE_SIZE))
+                            .and_then(|pages| pages.checked_add(1))
+                            .ok_or(SystemError::EIO)?;
+                        guard
+                            .delalloc
+                            .production
+                            .ready_prefix_end(head_offset, max_entries)
+                            .unwrap_or(head_offset)
+                    }
+                    ProductionDelallocEntryState::Claimed { certificate, .. } => certificate
+                        .page_index()
+                        .checked_mul(MMArch::PAGE_SIZE)
+                        .ok_or(SystemError::EOVERFLOW)?,
+                };
+                (
+                    head_offset / MMArch::PAGE_SIZE,
+                    submit_last / MMArch::PAGE_SIZE,
+                )
+            };
+            page_cache.manager().writeback_range(batch.0, batch.1)?;
+        }
+
+        // The requested range may also contain eager dirty pages, including
+        // on nojournal and secondary writable mounts which never own delayed
+        // mapper authority.
+        page_cache.manager().writeback_range(
+            first_offset / MMArch::PAGE_SIZE,
+            last_offset / MMArch::PAGE_SIZE,
+        )
     }
 
     /// Detach an idle delayed head after the lower mount has fail-stopped.

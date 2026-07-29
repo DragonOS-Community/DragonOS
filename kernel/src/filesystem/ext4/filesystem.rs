@@ -62,12 +62,65 @@ struct Ext4EvictionQueueState {
 lazy_static! {
     static ref EXT4_EVICTION_WQ: Arc<WorkQueue> = WorkQueue::new("ext4_evict");
     static ref EXT4_STATS_REGISTRY: SpinLock<Vec<Weak<Ext4FileSystem>>> = SpinLock::new(Vec::new());
-    /// Serialises ext4 instance publication for one device.  Multiple mounts
-    /// remain allowed; until VFS shares one canonical superblock, introducing
-    /// a second writable instance permanently disables delayed admission on
-    /// both sides after draining the first.
+    /// Locates the mount-serialization domain for each block device.  The
+    /// global lock covers only this in-memory lookup; recovery and writeback
+    /// are serialized by the selected device domain.
     static ref EXT4_DELALLOC_MOUNT_REGISTRY:
-        Mutex<BTreeMap<usize, Vec<Weak<Ext4FileSystem>>>> = Mutex::new(BTreeMap::new());
+        Mutex<BTreeMap<usize, Weak<Ext4MountDomain>>> = Mutex::new(BTreeMap::new());
+}
+
+#[derive(Debug)]
+struct Ext4MountDomain {
+    /// Multiple mounts remain allowed; until VFS shares one canonical
+    /// superblock, publishing a second writable instance permanently disables
+    /// delayed admission on both sides after draining the first.
+    instances: Mutex<Vec<Weak<Ext4FileSystem>>>,
+}
+
+impl Default for Ext4MountDomain {
+    fn default() -> Self {
+        Self {
+            instances: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+fn ext4_mount_domain(device: usize) -> Arc<Ext4MountDomain> {
+    let mut registry = EXT4_DELALLOC_MOUNT_REGISTRY.lock();
+    registry.retain(|_, domain| domain.strong_count() != 0);
+    if let Some(domain) = registry.get(&device).and_then(Weak::upgrade) {
+        return domain;
+    }
+    let domain = Arc::new(Ext4MountDomain::default());
+    registry.insert(device, Arc::downgrade(&domain));
+    domain
+}
+
+#[derive(Default)]
+struct DelallocAdmissionRollback {
+    reopen: Vec<Arc<Ext4FileSystem>>,
+    committed: bool,
+}
+
+impl DelallocAdmissionRollback {
+    fn record(&mut self, fs: Arc<Ext4FileSystem>) {
+        self.reopen.push(fs);
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DelallocAdmissionRollback {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for fs in &self.reopen {
+            fs.reopen_delalloc_admission_after_failed_mount();
+        }
+    }
 }
 
 pub(crate) fn prepare_stats_report() -> String {
@@ -124,6 +177,10 @@ pub struct Ext4FileSystem {
 
     /// Per-superblock canonical VFS inode identity, keyed by the on-disk inode number.
     inode_table: Mutex<BTreeMap<u32, CanonicalInodeEntry>>,
+
+    /// Keeps this device's mount-serialization domain alive for the complete
+    /// filesystem lifetime.
+    _mount_domain: Arc<Ext4MountDomain>,
 
     /// Unique lower authority and strong owners for the Stage-3b single-head
     /// delayed mapper.  An inode is present exactly while it owns a live
@@ -415,17 +472,14 @@ impl Ext4FileSystem {
         self.delalloc_admission_open.store(false, Ordering::Release);
     }
 
-    /// Restore admission only for a healthy, mapper-owning filesystem which
-    /// was completely drained for a prospective sibling writable mount.
+    /// Restore admission on a healthy mapper-owning filesystem after a
+    /// prospective sibling writable mount failed.
     ///
-    /// The caller holds the per-device mount registry lock, so a successful
+    /// The caller holds the per-device mount-domain lock, so a successful
     /// reopen cannot race publication of another writable instance.
     fn reopen_delalloc_admission_after_failed_mount(&self) {
-        let owners = self.delalloc_inodes.lock();
-        if self.delalloc_mapper_authority.is_some()
-            && owners.is_empty()
-            && self.lifecycle_error.lock().is_none()
-        {
+        let lifecycle_error = self.lifecycle_error.lock();
+        if self.delalloc_mapper_authority.is_some() && lifecycle_error.is_none() {
             self.delalloc_admission_open.store(true, Ordering::Release);
         }
     }
@@ -1136,25 +1190,27 @@ impl Ext4FileSystem {
         // publication while inode/eviction locks are held.
         lazy_static::initialize(&EXT4_EVICTION_WQ);
         let raw_dev = mount_data.device_num();
-        let mut mount_registry = EXT4_DELALLOC_MOUNT_REGISTRY.lock();
+        let mount_domain = ext4_mount_domain(raw_dev.data() as usize);
+        let mut mounted_instances = mount_domain.instances.lock();
         let existing_writable: Vec<_> = {
-            let instances = mount_registry.entry(raw_dev.data() as usize).or_default();
-            instances.retain(|entry| entry.strong_count() != 0);
-            instances
+            mounted_instances.retain(|entry| entry.strong_count() != 0);
+            mounted_instances
                 .iter()
                 .filter_map(Weak::upgrade)
                 .filter(|fs| !fs._mount_options.read_only)
                 .collect()
         };
-        let mut reopen_on_mount_failure = Vec::new();
+        let mut admission_rollback = DelallocAdmissionRollback::default();
         if !mount_options.read_only {
             for existing in &existing_writable {
                 let was_open = existing.delalloc_admission_open();
+                if was_open {
+                    // Record before close/drain so every failure exit restores
+                    // this instance, including an error from the drain itself.
+                    admission_rollback.record(existing.clone());
+                }
                 existing.close_delalloc_admission();
                 existing.drain_registered_delalloc()?;
-                if was_open {
-                    reopen_on_mount_failure.push(existing.clone());
-                }
             }
         }
         let delalloc_unique_writable = !mount_options.read_only && existing_writable.is_empty();
@@ -1172,15 +1228,7 @@ impl Ext4FileSystem {
             let root_attr = fs.getattr(another_ext4::EXT4_ROOT_INO)?;
             Ok::<_, SystemError>((fs, root_attr))
         })();
-        let (fs, root_attr) = match prospective {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                for existing in reopen_on_mount_failure {
-                    existing.reopen_delalloc_admission_after_failed_mount();
-                }
-                return Err(error);
-            }
-        };
+        let (fs, root_attr) = prospective?;
         let delalloc_mapper_authority = if !delalloc_unique_writable {
             None
         } else {
@@ -1212,6 +1260,7 @@ impl Ext4FileSystem {
             root_inode,
             dirty_inodes: Mutex::new(Vec::new()),
             inode_table: Mutex::new(BTreeMap::new()),
+            _mount_domain: mount_domain.clone(),
             delalloc_mapper_authority,
             delalloc_inodes: Mutex::new(BTreeMap::new()),
             delalloc_wait: WaitQueue::default(),
@@ -1223,11 +1272,9 @@ impl Ext4FileSystem {
             eviction_wait: WaitQueue::default(),
             _mount_options: mount_options,
         });
-        mount_registry
-            .entry(raw_dev.data() as usize)
-            .or_default()
-            .push(Arc::downgrade(&fs));
-        drop(mount_registry);
+        mounted_instances.push(Arc::downgrade(&fs));
+        admission_rollback.commit();
+        drop(mounted_instances);
         let mut stats_registry = EXT4_STATS_REGISTRY.lock();
         stats_registry.retain(|entry| entry.strong_count() != 0);
         stats_registry.push(Arc::downgrade(&fs));

@@ -8,8 +8,10 @@ else
 INSTALL_DIR = ./install
 endif
 
-# Files needed inside the guest at runtime.
-GUEST_SCRIPTS = run_tests.sh init.sh env.sh clean_up.sh run_test_case.sh
+# Files needed inside the guest at runtime. Sources live under runner/;
+# `install` flattens them into INSTALL_DIR (guest runtime layout is flat).
+RUNNER_DIR    = runner
+GUEST_SCRIPTS = $(RUNNER_DIR)/run.sh $(RUNNER_DIR)/init.sh $(RUNNER_DIR)/env.sh $(RUNNER_DIR)/clean_up.sh
 GUEST_DATA    = whitelist.txt config
 
 .PHONY: all build install clean help
@@ -25,7 +27,7 @@ install:
 	@mkdir -p $(INSTALL_DIR)
 	@install -m755 $(GUEST_SCRIPTS) $(INSTALL_DIR)/
 	@install -m644 $(GUEST_DATA) $(INSTALL_DIR)/
-	@cp -r test_cases $(INSTALL_DIR)/
+	@cp -r $(RUNNER_DIR)/test_cases $(INSTALL_DIR)/
 	@chmod +x $(INSTALL_DIR)/test_cases/*.sh 2>/dev/null || true
 	@echo "[lmbench] install done"
 

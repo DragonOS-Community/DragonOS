@@ -38,7 +38,7 @@
 
       apps.${system}.default = {
         type = "app";
-        program = "${lmbench}/${defaultInstallDir}/run_tests.sh";
+        program = "${lmbench}/${defaultInstallDir}/run.sh";
       };
     };
 }

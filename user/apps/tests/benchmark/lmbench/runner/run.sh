@@ -31,7 +31,45 @@ TIMEOUT_SEC=120
 WARMUP=0
 SUITE_VERSION="3.0-a9"
 
+# CLI intent variables (set by parse_args, applied after load_config).
+CLI_SAMPLES=""; CLI_TIMEOUT=""; CLI_WARMUP=""
+CLI_WHITELIST=""; CLI_CONFIG=""; ONLY_NAME=""; LIST_ONLY=""
+
 log() { echo "[lmbench-runner] $*"; }
+
+usage() {
+    cat >&2 <<'EOF'
+usage: run.sh [--samples N] [--timeout S] [--warmup N]
+              [--whitelist FILE] [--config FILE] [--only NAME] [--list]
+EOF
+}
+
+# Parse CLI args into CLI_* intent variables (applied after load_config).
+# Returns 2 on unknown arg (caller exits); does not exit the shell itself
+# so it can be unit-tested via `LMBENCH_RUNNER_NO_MAIN=1 . run.sh`.
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --samples)    CLI_SAMPLES=$2;    shift 2 ;;
+            --timeout)    CLI_TIMEOUT=$2;    shift 2 ;;
+            --warmup)     CLI_WARMUP=$2;     shift 2 ;;
+            --whitelist)  CLI_WHITELIST=$2;  shift 2 ;;
+            --config)     CLI_CONFIG=$2;     shift 2 ;;
+            --only)       ONLY_NAME=$2;      shift 2 ;;
+            --list)       LIST_ONLY=1;       shift ;;
+            -h|--help)    usage; return 0 ;;
+            *)            usage; return 2 ;;
+        esac
+    done
+}
+
+# Apply CLI overrides on top of config-file values.
+apply_cli_overrides() {
+    [ -n "$CLI_SAMPLES" ]   && SAMPLES=$CLI_SAMPLES
+    [ -n "$CLI_TIMEOUT" ]   && TIMEOUT_SEC=$CLI_TIMEOUT
+    [ -n "$CLI_WARMUP" ]    && WARMUP=$CLI_WARMUP
+    [ -n "$CLI_WHITELIST" ] && WHITELIST_FILE=$CLI_WHITELIST
+}
 
 # Read KEY=VALUE from a file without sourcing it (avoids clobbering runner state).
 # Use shell builtins only: DragonOS can stall when repeatedly constructing short
@@ -223,8 +261,26 @@ run_one_case() {
 
 # ============================== main ==============================
 run_main() {
-load_config
-mkdir -p "$WORK_TMP"
+    parse_args "$@" || exit $?
+
+    # --config may redirect the config file before load_config reads it.
+    [ -n "$CLI_CONFIG" ] && CONFIG_FILE=$CLI_CONFIG
+    load_config
+    apply_cli_overrides
+    mkdir -p "$WORK_TMP"
+
+    if [ "$LIST_ONLY" = "1" ]; then
+        ls "$CASES_DIR"/*.sh 2>/dev/null | sed 's|.*/||; s|\.sh$||'
+        return 0
+    fi
+
+    # --only: replace whitelist with a single-line file, reusing run_one_case
+    # unchanged (no second dispatch branch).
+    if [ -n "$ONLY_NAME" ]; then
+        wl_tmp="$WORK_TMP/only_whitelist"
+        printf '%s\n' "$ONLY_NAME" > "$wl_tmp"
+        WHITELIST_FILE="$wl_tmp"
+    fi
 
 log "LMbench benchmark run starting"
 echo "===LMBENCH_RUN_BEGIN==="
@@ -276,4 +332,4 @@ echo "benchmark测试完成"
 }
 
 # Allow sourcing for host-side unit tests without executing the run.
-[ "${LMBENCH_RUNNER_NO_MAIN:-0}" = "1" ] || run_main
+[ "${LMBENCH_RUNNER_NO_MAIN:-0}" = "1" ] || run_main "$@"

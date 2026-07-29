@@ -24,6 +24,8 @@ make test-benchmark
 
 结果位于 `results/<arch>/<timestamp>-<commit>.json`。
 
+当前 MVP 白名单包含 8 个代表性测例。已在 DragonOS x86_64/QEMU 上完成端到端验证：8 个指标均成功采集，结果通过 JSON Schema 校验。GNU `timeout` 调用 `timer_create(CLOCK_REALTIME)` 的内核兼容性问题由 [#2159](https://github.com/DragonOS-Community/DragonOS/issues/2159) 独立跟踪；它不属于 LMbench 结果解析修复。
+
 ## 架构
 
 ```

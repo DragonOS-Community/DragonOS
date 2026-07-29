@@ -4,7 +4,7 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-RUNNER="$SCRIPT_DIR/../run_tests.sh"
+RUNNER="$SCRIPT_DIR/../run.sh"
 META="$SCRIPT_DIR/tcp_loopback_lat.meta"
 TMPDIR=${TMPDIR:-/tmp}
 OUTPUT_FILE=$(mktemp "$TMPDIR/lmbench-tcp-parser.XXXXXX")

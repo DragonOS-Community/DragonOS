@@ -4,3 +4,4 @@
 /result
 ext4.img
 *.out
+__pycache__/

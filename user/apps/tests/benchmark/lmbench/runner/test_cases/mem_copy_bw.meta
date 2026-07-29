@@ -1,4 +1,4 @@
-# Extraction/metadata for mem_copy_bw (KEY=VALUE; parsed by run_tests.sh)
+# Extraction/metadata for mem_copy_bw (KEY=VALUE; parsed by run.sh)
 CATEGORY=memory
 BINARY=bw_mem
 METRIC_TYPE=bandwidth

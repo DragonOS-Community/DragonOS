@@ -3643,10 +3643,11 @@ impl PageCacheManager {
     }
 
     /// Freeze filesystem metadata and the matching page-cache dirty
-    /// generation under one invalidate-write exclusion boundary.
+    /// generation at one invalidate-write snapshot boundary.
     ///
     /// The callback must follow the filesystem's normal lock order below the
-    /// PageCache invalidate lock. Dispatch begins only after that exclusion is
+    /// PageCache invalidate lock. Tag publication then proceeds in bounded
+    /// invalidate-write chunks. Dispatch begins only after the final chunk is
     /// released, because backend admission itself takes invalidate-read.
     pub(crate) fn start_writeback_range_with_freeze<T, F>(
         &self,
@@ -3658,7 +3659,12 @@ impl PageCacheManager {
         F: FnOnce() -> Result<T, SystemError>,
     {
         let cache = self.upgrade()?;
-        let invalidate = cache.invalidate_write();
+        // Keep one freeze scanner's epoch from being split by a later
+        // scanner while `invalidate_write` is released between chunks.
+        // Truncate and fault paths do not take this lock, so they can make
+        // progress at every chunk boundary.
+        let _tag_scan = cache.writeback_tag_scan_lock.lock();
+        let mut invalidate = cache.invalidate_write();
         let frozen_filesystem_state = freeze()?;
         if start_index > end_index {
             return Ok((
@@ -3678,7 +3684,7 @@ impl PageCacheManager {
         // unbounded Vec. A monotonic index walk bounds transient memory and
         // prevents a low-index redirtier from starving later pages.
         const WRITEBACK_TAG_CHUNK: usize = 256;
-        let (preexisting_writeback_end, writeback_frontier) = {
+        let (preexisting_writeback_end, dirty_end) = {
             let inner = cache.inner.lock();
             (
                 inner
@@ -3686,10 +3692,14 @@ impl PageCacheManager {
                     .range(start_index..=end_index)
                     .next_back()
                     .copied(),
-                inner.next_writeback_incarnation.saturating_sub(1),
+                inner
+                    .dirty_pages
+                    .range(start_index..=end_index)
+                    .next_back()
+                    .copied(),
             )
         };
-        let (epoch, frozen_end, tagged_new) = {
+        let epoch = {
             let _tagged_writeback = cache.tagged_writeback_lock.lock();
             // The numeric epoch is also the request-generation order used by
             // WAIT_AFTER.  It must therefore be assigned under the same lock
@@ -3700,31 +3710,26 @@ impl PageCacheManager {
             if epoch == 0 {
                 epoch = PAGE_CACHE_WRITEBACK_TAG_EPOCH.fetch_add(1, Ordering::AcqRel);
             }
-            let dirty_end = {
-                let inner = cache.inner.lock();
-                inner
-                    .dirty_pages
-                    .range(start_index..=end_index)
-                    .next_back()
-                    .copied()
-            };
-            let Some(frozen_end) = dirty_end.into_iter().chain(preexisting_writeback_end).max()
-            else {
-                return Ok((
-                    frozen_filesystem_state,
-                    PageCacheWritebackRange {
-                        cache: Arc::downgrade(&cache),
-                        start_index,
-                        frozen_end: None,
-                        writeback_frontier,
-                        epoch,
-                    },
-                ));
-            };
-            let mut tagged_new = false;
-            let mut tag_cursor = start_index;
-            loop {
-                let last_tagged = {
+            epoch
+        };
+        let Some(frozen_end) = dirty_end.into_iter().chain(preexisting_writeback_end).max() else {
+            return Ok((
+                frozen_filesystem_state,
+                PageCacheWritebackRange {
+                    cache: Arc::downgrade(&cache),
+                    start_index,
+                    frozen_end: None,
+                    writeback_frontier: 0,
+                    epoch,
+                },
+            ));
+        };
+        let mut tagged_new = false;
+        let mut tag_cursor = start_index;
+        let writeback_frontier = loop {
+            let last_scanned = {
+                let _tagged_writeback = cache.tagged_writeback_lock.lock();
+                {
                     let inner = cache.inner.lock();
                     let mut last = None;
                     for index in inner
@@ -3746,20 +3751,29 @@ impl PageCacheManager {
                         }
                     }
                     last
-                };
-                let Some(last_tagged) = last_tagged else {
-                    break;
-                };
-                if last_tagged >= frozen_end || last_tagged == usize::MAX {
-                    break;
                 }
-                tag_cursor = last_tagged + 1;
-                // Mirror Linux tag_pages_for_writeback(): do not monopolize
-                // the page-cache index lock or CPU while tagging a very large
-                // range.
-                crate::sched::sched_yield();
+            };
+            let scan_complete = last_scanned.is_none_or(|last| last >= frozen_end);
+            if scan_complete {
+                // An ordinary writeback claimant may have moved an initially
+                // dirty page to Writeback while invalidate-write was released
+                // between chunks. Sample the final incarnation frontier while
+                // the last writer exclusion is still held, so every such I/O
+                // is either complete already or bounded by this operation.
+                let inner = cache.inner.lock();
+                break inner.next_writeback_incarnation.saturating_sub(1);
             }
-            (epoch, frozen_end, tagged_new)
+
+            tag_cursor = last_scanned
+                .expect("an incomplete tag scan must have examined an index")
+                .checked_add(1)
+                .expect("an incomplete tag scan cannot end at usize::MAX");
+            drop(invalidate);
+            // Match Linux tag_pages_for_writeback(): release the mapping
+            // exclusion as well as the page-cache index lock between bounded
+            // chunks, then allow queued faults and invalidators to run.
+            crate::sched::sched_yield();
+            invalidate = cache.invalidate_write();
         };
         let operation = PageCacheWritebackRange {
             cache: Arc::downgrade(&cache),

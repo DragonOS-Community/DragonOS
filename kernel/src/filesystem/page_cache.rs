@@ -392,6 +392,12 @@ pub struct PageCache {
     unevictable: AtomicBool,
     kind: PageCacheKind,
     reclassify_lock: Mutex<()>,
+    /// Serialize range-freeze tag scans while allowing each bounded chunk to
+    /// release `invalidate_write`. Without this separate scanner lock, two
+    /// epochs could interleave between chunks and a later epoch could take
+    /// ownership of pages which were already dirty at the earlier caller's
+    /// snapshot boundary.
+    writeback_tag_scan_lock: Mutex<()>,
     tagged_writeback_lock: Mutex<()>,
     /// Sequence/event pair for an in-progress tagged writeback operation.
     /// A deferred token returns its pages to Dirty, so `WAIT_AFTER` cannot use
@@ -1651,6 +1657,7 @@ impl PageCache {
             unevictable: AtomicBool::new(false),
             kind,
             reclassify_lock: Mutex::new(()),
+            writeback_tag_scan_lock: Mutex::new(()),
             tagged_writeback_lock: Mutex::new(()),
             tagged_writeback_progress: AtomicU64::new(0),
             tagged_writeback_wait: WaitQueue::default(),

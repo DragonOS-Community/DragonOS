@@ -104,6 +104,28 @@ impl PageCacheInvalidateRetrySelftestState {
     }
 }
 
+struct PageCacheTagScanChunkSelftestState {
+    start_reader: AtomicBool,
+    reader_attempting: AtomicBool,
+    reader_acquired: AtomicBool,
+    reader_saw_unscanned_tail: AtomicBool,
+    stop: AtomicBool,
+    wait: WaitQueue,
+}
+
+impl Default for PageCacheTagScanChunkSelftestState {
+    fn default() -> Self {
+        Self {
+            start_reader: AtomicBool::new(false),
+            reader_attempting: AtomicBool::new(false),
+            reader_acquired: AtomicBool::new(false),
+            reader_saw_unscanned_tail: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            wait: WaitQueue::default(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct PageCacheQuotaSelftestBackend {
     reserved: AtomicUsize,
@@ -937,6 +959,106 @@ fn run_invalidate_retry_lock_order_selftest() -> Result<bool, SystemError> {
         && state.fault_waiter_finished.load(Ordering::Acquire))
 }
 
+/// Verify that a large TOWRITE-style tag pass releases mapping exclusion
+/// between bounded chunks. The freeze callback starts a reader while it still
+/// owns the initial writer guard; that reader can therefore acquire only at a
+/// subsequent chunk boundary, where it records whether the final page is
+/// still untagged.
+fn run_tag_scan_chunk_release_selftest() -> Result<bool, SystemError> {
+    const SELFTEST_PAGES: usize = 513;
+    const SELFTEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let cache = PageCache::new(None, None);
+    let mut pages = Vec::with_capacity(SELFTEST_PAGES);
+    for index in 0..SELFTEST_PAGES {
+        let page = cache.get_or_create_page_zero(index)?;
+        page.write().add_flags(PageFlags::PG_DIRTY);
+        let mut inner = cache.inner.lock();
+        let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
+        entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+        entry.set_state(PageState::Dirty);
+        inner.dirty_pages.insert(index);
+        drop(inner);
+        pages.push(page);
+    }
+
+    let state = Arc::new(PageCacheTagScanChunkSelftestState::default());
+    let worker_cache = cache.clone();
+    let worker_state = state.clone();
+    PAGECACHE_IO_WQS[0].enqueue(Work::new(move || {
+        let started = worker_state.wait.wait_until_timeout(
+            || {
+                (worker_state.start_reader.load(Ordering::Acquire)
+                    || worker_state.stop.load(Ordering::Acquire))
+                .then_some(())
+            },
+            SELFTEST_TIMEOUT,
+        );
+        if started.is_ok() && !worker_state.stop.load(Ordering::Acquire) {
+            worker_state
+                .reader_attempting
+                .store(true, Ordering::Release);
+            worker_state.wait.wake_all();
+            let _invalidate = worker_cache.invalidate_read();
+            let tail_unscanned = {
+                let inner = worker_cache.inner.lock();
+                inner
+                    .pages
+                    .get(&(SELFTEST_PAGES - 1))
+                    .is_some_and(|entry| entry.writeback_tag() == 0)
+            };
+            worker_state
+                .reader_saw_unscanned_tail
+                .store(tail_unscanned, Ordering::Release);
+            worker_state.reader_acquired.store(true, Ordering::Release);
+        }
+        worker_state.wait.wake_all();
+    }));
+
+    // A synthetic cache has no inode, so dispatch returns EIO after the tag
+    // scan and retires the generation. The test concerns only the preceding
+    // mapping-exclusion window.
+    let _ = cache
+        .manager
+        .start_writeback_range_with_freeze(0, SELFTEST_PAGES - 1, || {
+            state.start_reader.store(true, Ordering::Release);
+            state.wait.wake_all();
+            state.wait.wait_until_timeout(
+                || {
+                    state
+                        .reader_attempting
+                        .load(Ordering::Acquire)
+                        .then_some(())
+                },
+                SELFTEST_TIMEOUT,
+            )?;
+            // Let the worker enter the production RwSem read path while this
+            // callback's caller still owns the initial write guard.
+            crate::sched::sched_yield();
+            Ok(())
+        });
+    let observed = state.wait.wait_until_timeout(
+        || {
+            state
+                .reader_acquired
+                .load(Ordering::Acquire)
+                .then_some(state.reader_saw_unscanned_tail.load(Ordering::Acquire))
+        },
+        SELFTEST_TIMEOUT,
+    );
+    state.stop.store(true, Ordering::Release);
+    state.wait.wake_all();
+
+    for (index, page) in pages.into_iter().enumerate() {
+        let _ = cache.manager.remove_page(index)?;
+        let paddr = page.phys_address();
+        page_manager_lock().remove_page(&paddr);
+        let _ = page_reclaimer_lock().remove_page(&paddr);
+    }
+
+    observed
+}
+
 /// Exercise page-cache membership accounting with local identity assertions and
 /// a high-signal aggregate check of the production vmstat wiring.
 fn run_dirty_incarnation_selftest() -> Result<bool, SystemError> {
@@ -1469,6 +1591,11 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let fault_invalidate_retry_order = run_invalidate_retry_lock_order_selftest().unwrap_or(false);
     if !fault_invalidate_retry_order {
         return Ok("status=fail stage=fault_invalidate_retry_order\n".into());
+    }
+
+    let tag_scan_chunk_release = run_tag_scan_chunk_release_selftest().unwrap_or(false);
+    if !tag_scan_chunk_release {
+        return Ok("status=fail stage=tag_scan_chunk_release\n".into());
     }
 
     let dirty_incarnation = match run_dirty_incarnation_selftest() {
@@ -3295,6 +3422,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

@@ -25,6 +25,7 @@ build:
 install:
 	@echo "[lmbench] installing to $(INSTALL_DIR)"
 	@mkdir -p $(INSTALL_DIR)
+	@rm -f $(INSTALL_DIR)/run_tests.sh $(INSTALL_DIR)/run_test_case.sh
 	@install -m755 $(GUEST_SCRIPTS) $(INSTALL_DIR)/
 	@install -m644 $(GUEST_DATA) $(INSTALL_DIR)/
 	@cp -r $(RUNNER_DIR)/test_cases $(INSTALL_DIR)/

@@ -1,4 +1,4 @@
-# LMbench runner 全局配置(KEY=VALUE,被 run_tests.sh 解析;勿加空格/引号)
+# LMbench runner 全局配置(KEY=VALUE,被 run.sh 解析;勿加空格/引号)
 # 单个测例可用其 .meta 里的 SAMPLES= 覆盖 SAMPLES。
 
 # 每个测例重复采样次数(用于算 mean/median/stddev/min/max)

@@ -49,5 +49,5 @@ if [ "$AUTO_TEST" = "syscall" ]; then
 elif [ "$AUTO_TEST" = "dunit" ]; then
     /bin/busybox sh $DUNITEST_DIR/run_tests.sh
 elif [ "$AUTO_TEST" = "benchmark" ]; then
-    /bin/busybox sh $BENCHMARK_TEST_DIR/run_tests.sh
+    /bin/busybox sh $BENCHMARK_TEST_DIR/run.sh
 fi

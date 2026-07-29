@@ -322,9 +322,9 @@ test-benchmark: prepare_rootfs_manifest
 	$(MAKE) qemu-nographic AUTO_TEST=benchmark BENCHMARK_TEST_DIR=/opt/tests/benchmark/lmbench & \
 	sleep 5; \
 	status=0; \
-	bash user/apps/tests/benchmark/lmbench/monitor_test_results.sh || status=$$?; \
+	bash user/apps/tests/benchmark/lmbench/orchestrator/monitor_test_results.sh || status=$$?; \
 	if [ $$status -eq 0 ]; then \
-		python3 user/apps/tests/benchmark/lmbench/collect_results.py || status=$$?; \
+		python3 user/apps/tests/benchmark/lmbench/orchestrator/collect_results.py || status=$$?; \
 	fi; \
 	exit $$status
 

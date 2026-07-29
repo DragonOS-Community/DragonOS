@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Collect an LMbench benchmark run from the guest serial log into persisted JSON.
 
-The guest runner (run_tests.sh) prints one ``LMBENCH_JSON`` line per metric plus
+The guest runner (run.sh) prints one ``LMBENCH_JSON`` line per metric plus
 ``LMBENCH_META`` / ``LMBENCH_SUMMARY`` framing. This tool parses the LAST run in the
 serial log, enriches it with host/git/QEMU context, validates it against
 schema/lmbench-run.schema.json, and writes:
@@ -266,7 +266,7 @@ def main():
     ap.add_argument("--serial", default=os.environ.get("SERIAL_FILE", "serial_opt.txt"),
                     help="guest serial log to parse")
     ap.add_argument("--schema", default=os.path.join(HERE, "schema", "lmbench-run.schema.json"))
-    ap.add_argument("--outdir", default=os.path.join(HERE, "results"))
+    ap.add_argument("--outdir", default=os.path.join(HERE, "..", "results"))
     ap.add_argument("--arch", default=os.environ.get("ARCH", "x86_64"))
     ap.add_argument("--root", default=os.environ.get("ROOT_PATH", os.getcwd()),
                     help="repo root for git metadata")

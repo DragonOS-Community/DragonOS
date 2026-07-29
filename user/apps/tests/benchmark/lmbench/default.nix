@@ -15,15 +15,20 @@ let
     version = "3.0-a9";
 
     src = lib.sourceByRegex ./. [
-      "^test_cases"
-      "^.*\.sh$"
+      "^runner"
+      "^runner/.*\.sh$"
+      "^runner/test_cases"
+      "^runner/test_cases/.*"
+      "^config$"
+      "^whitelist\.txt$"
     ];
 
     installPhase = ''
       mkdir -p $out/${installDir}
 
-      install -m755 *.sh $out/${installDir}/
-      cp -r test_cases $out/${installDir}/
+      install -m755 runner/*.sh $out/${installDir}/
+      install -m644 config whitelist.txt $out/${installDir}/
+      cp -r runner/test_cases $out/${installDir}/
       chmod +x $out/${installDir}/test_cases/*.sh
     '';
   };

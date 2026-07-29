@@ -155,6 +155,27 @@ impl Ext4 {
         inode: &InodeRef,
         start_lblock: LBlockId,
     ) -> Result<RightSpineAppendPlan> {
+        self.right_spine_append_plan_from_view(inode, start_lblock, None)
+    }
+
+    /// Plan against the transaction-private final image so consecutive
+    /// appends in one delayed-allocation batch observe earlier staged extent
+    /// mutations instead of rereading stale home blocks.
+    pub(super) fn transaction_right_spine_append_plan(
+        &self,
+        transaction: &super::journal_transaction::Transaction<'_>,
+        inode: &InodeRef,
+        start_lblock: LBlockId,
+    ) -> Result<RightSpineAppendPlan> {
+        self.right_spine_append_plan_from_view(inode, start_lblock, Some(transaction))
+    }
+
+    fn right_spine_append_plan_from_view(
+        &self,
+        inode: &InodeRef,
+        start_lblock: LBlockId,
+        transaction: Option<&super::journal_transaction::Transaction<'_>>,
+    ) -> Result<RightSpineAppendPlan> {
         let root = inode.inode.extent_root();
         self.validate_extent_node(inode.id, &root)?;
         if root.header().entries_count() == 0 {
@@ -178,8 +199,18 @@ impl Ext4 {
             let mut home = root.extent_index_at(node_entries - 1).leaf();
             loop {
                 path.push(home);
-                let block = self.read_extent_block(inode, home)?;
-                let node = ExtentNode::from_bytes(&block.data[..]);
+                let block = if let Some(transaction) = transaction {
+                    self.ensure_valid_pblock(inode.id, home, "extent tree node")?;
+                    self.validate_data_blocks(home, 1)?;
+                    let block = transaction.read(self.block_device.as_ref(), home)?;
+                    self.verify_transaction_extent_block(inode, &*block)?;
+                    block
+                } else {
+                    super::journal_transaction::BlockView::Device(
+                        self.read_extent_block(inode, home)?,
+                    )
+                };
+                let node = ExtentNode::from_bytes(&*block);
                 self.validate_extent_node(inode.id, &node)?;
                 if node.header().depth() + 1 != expected_depth || node.header().entries_count() == 0
                 {
@@ -196,7 +227,7 @@ impl Ext4 {
         }
         let leaf = leaf_block
             .as_ref()
-            .map(|block| ExtentNode::from_bytes(&block.data[..]));
+            .map(|block| ExtentNode::from_bytes(&**block));
         let node = leaf.as_ref().unwrap_or(&root);
         let last = node.extent_at(node_entries - 1);
         let mapped_frontier = last
@@ -211,7 +242,7 @@ impl Ext4 {
             .checked_add(last.block_count() as PBlockId)
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
 
-        let mut projection = self.extent_right_spine_projection(inode)?;
+        let mut projection = self.extent_right_spine_projection_from_view(inode, transaction)?;
         if projection.next_lblock != mapped_frontier {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         }
@@ -398,6 +429,14 @@ impl Ext4 {
         &self,
         inode: &InodeRef,
     ) -> Result<ExtentRightSpineProjection> {
+        self.extent_right_spine_projection_from_view(inode, None)
+    }
+
+    fn extent_right_spine_projection_from_view(
+        &self,
+        inode: &InodeRef,
+        transaction: Option<&super::journal_transaction::Transaction<'_>>,
+    ) -> Result<ExtentRightSpineProjection> {
         if !inode.inode.uses_extents() {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         }
@@ -438,8 +477,16 @@ impl Ext4 {
             .leaf();
         let mut external_capacity = None;
         let next_lblock = loop {
-            let block = self.read_extent_block(inode, home)?;
-            let node = ExtentNode::from_bytes(&block.data[..]);
+            let block = if let Some(transaction) = transaction {
+                self.ensure_valid_pblock(inode.id, home, "extent tree node")?;
+                self.validate_data_blocks(home, 1)?;
+                let block = transaction.read(self.block_device.as_ref(), home)?;
+                self.verify_transaction_extent_block(inode, &*block)?;
+                block
+            } else {
+                super::journal_transaction::BlockView::Device(self.read_extent_block(inode, home)?)
+            };
+            let node = ExtentNode::from_bytes(&*block);
             self.validate_extent_node(inode.id, &node)?;
             if node.header().depth() + 1 != expected_depth || node.header().entries_count() == 0 {
                 return Err(Ext4Error::new(ErrCode::EIO));

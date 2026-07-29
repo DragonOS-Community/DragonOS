@@ -171,24 +171,33 @@ fn run_production_projected_steps(
         );
     }
     before_submit();
-    for (reservation, step) in reservations.iter_mut().zip(steps) {
-        let payload = [step.fill; DELALLOC_BLOCK_LEN];
-        assert_eq!(
-            ext4.submit_delalloc_append_block_authorized_with_pool(
-                &authority,
-                reservation,
-                another_ext4::DelallocAppendBlockPublication {
-                    payload: &payload,
-                    durable_eof: step.durable_eof_after,
-                    mtime: Some(96),
-                    ctime: Some(96),
-                },
-                Some(&mut pool),
-            ),
-            another_ext4::DelallocAppendBlockSubmitOutcome::Completed,
-            "projected production append did not complete"
-        );
-    }
+    let payloads: Vec<[u8; DELALLOC_BLOCK_LEN]> = steps
+        .iter()
+        .map(|step| [step.fill; DELALLOC_BLOCK_LEN])
+        .collect();
+    let publications: Vec<_> = steps
+        .iter()
+        .zip(payloads.iter())
+        .map(
+            |(step, payload)| another_ext4::DelallocAppendBlockPublication {
+                payload,
+                durable_eof: step.durable_eof_after,
+                mtime: Some(96),
+                ctime: Some(96),
+            },
+        )
+        .collect();
+    let mut reservation_refs: Vec<_> = reservations.iter_mut().collect();
+    assert_eq!(
+        ext4.submit_delalloc_append_batch_authorized_with_pool(
+            &authority,
+            &mut reservation_refs,
+            &publications,
+            &mut pool,
+        ),
+        another_ext4::DelallocAppendBlockSubmitOutcome::Completed,
+        "projected production append batch did not complete"
+    );
     ext4.release_delalloc_extent_node_pool_authorized(&authority, &mut pool)
         .expect("projected production pool release failed");
 }
@@ -769,6 +778,84 @@ fn create_external_leaf_seed(path: &str) -> u32 {
     ext4.shutdown_writable()
         .expect("external-leaf seed clean shutdown failed");
     target
+}
+
+/// Cover the interaction between stale truncate-tail clearing and an extent
+/// root promotion in the same delayed-allocation transaction.  The mapper
+/// must query the old durable tree before the transaction-private root points
+/// at newly staged (not yet readable from the device) extent nodes.
+fn run_production_partial_eof_sparse_root_grow_test(persistence: PersistenceModel) {
+    const IMAGE: &str = "ext4-production-partial-eof-sparse-root-grow.img";
+    let inode = create_external_leaf_seed(IMAGE);
+    let device = Arc::new(CrashBlockFile::new(IMAGE));
+    persistence.configure(&device);
+    let ext4 =
+        Ext4::load_writable(device.clone()).expect("partial-EOF sparse root-grow mount failed");
+    let partial_eof = INLINE_EXTENT_CAPACITY * WRITE_LEN - DELALLOC_BLOCK_LEN + 17;
+    ext4.setattr(
+        inode,
+        another_ext4::SetAttr {
+            size: Some(partial_eof as u64),
+            ..Default::default()
+        },
+    )
+    .expect("partial-EOF sparse root-grow truncate failed");
+    let blocks_before = ext4
+        .getattr(inode)
+        .expect("partial-EOF sparse root-grow getattr failed")
+        .blocks;
+    let append_offset = INLINE_EXTENT_CAPACITY * WRITE_LEN + DELALLOC_BLOCK_LEN;
+    let durable_eof = append_offset + DELALLOC_BLOCK_LEN;
+    let steps = [ProductionProjectedStep {
+        offset: append_offset,
+        expected_durable_eof_before: partial_eof as u64,
+        durable_eof_after: durable_eof as u64,
+        fill: 0x6e,
+    }];
+    run_production_projected_steps(&ext4, inode, &steps, || {});
+
+    let attr = ext4
+        .getattr(inode)
+        .expect("partial-EOF sparse root-grow final getattr failed");
+    assert_eq!(attr.size, durable_eof as u64);
+    assert!(
+        attr.blocks > blocks_before + (DELALLOC_BLOCK_LEN / 512) as u64,
+        "partial-EOF sparse append did not promote the extent root"
+    );
+    let mut data = vec![0u8; durable_eof];
+    assert_eq!(
+        ext4.read(inode, 0, &mut data)
+            .expect("partial-EOF sparse root-grow read failed"),
+        data.len()
+    );
+    for segment in 0..INLINE_EXTENT_CAPACITY {
+        let start = segment * WRITE_LEN;
+        let end = ((segment + 1) * WRITE_LEN).min(partial_eof);
+        if start == end {
+            break;
+        }
+        assert_eq!(
+            &data[start..end],
+            &segment_payload(segment)[..end - start],
+            "partial-EOF sparse root-grow changed prefix segment {segment}"
+        );
+    }
+    assert!(
+        data[partial_eof..append_offset]
+            .iter()
+            .all(|byte| *byte == 0),
+        "partial-EOF sparse root-grow exposed stale tail or logical-gap data"
+    );
+    assert_eq!(
+        &data[append_offset..durable_eof],
+        &[0x6e; DELALLOC_BLOCK_LEN]
+    );
+    ext4.shutdown_writable()
+        .expect("partial-EOF sparse root-grow shutdown failed");
+    drop(ext4);
+    drop(device);
+    assert_clean_e2fsck(IMAGE, "partial-EOF sparse root-grow");
+    remove_if_exists(IMAGE);
 }
 
 fn count_external_leaf_append_operations(
@@ -2596,10 +2683,8 @@ fn recover_production_projected_scenario(
         .expect("projected target disappeared after recovery")
         .size;
     let initial_eof = steps[0].expected_durable_eof_before;
-    let valid_prefix = size == initial_eof
-        || steps
-            .iter()
-            .any(|step| size == step.durable_eof_after);
+    let valid_prefix =
+        size == initial_eof || steps.iter().any(|step| size == step.durable_eof_after);
     assert!(
         valid_prefix,
         "projected crash point {crash_point} published non-prefix EOF {size}"
@@ -2638,15 +2723,10 @@ fn recover_production_projected_scenario(
                 data.len()
             );
             assert!(
-                data[..3 * DELALLOC_BLOCK_LEN]
-                    .iter()
-                    .all(|byte| *byte == 0),
+                data[..3 * DELALLOC_BLOCK_LEN].iter().all(|byte| *byte == 0),
                 "projected sparse recovery allocated or exposed the logical gap"
             );
-            assert_eq!(
-                &data[3 * DELALLOC_BLOCK_LEN..],
-                &[0x6d; DELALLOC_BLOCK_LEN]
-            );
+            assert_eq!(&data[3 * DELALLOC_BLOCK_LEN..], &[0x6d; DELALLOC_BLOCK_LEN]);
         }
         DelallocCrashCase::ProductionProjectedSingle => {
             let mut tail = [0u8; DELALLOC_BLOCK_LEN];
@@ -2919,13 +2999,7 @@ fn run_production_delalloc_contract_failure_test(persistence: PersistenceModel) 
         .create_delalloc_extent_node_pool_authorized(&authority, inode)
         .expect("contract-failure pool creation failed");
     let mut reservation = ext4
-        .reserve_delalloc_append_block_projected_authorized(
-            &authority,
-            inode,
-            0,
-            0,
-            &mut pool,
-        )
+        .reserve_delalloc_append_block_projected_authorized(&authority, inode, 0, 0, &mut pool)
         .expect("contract-failure reservation failed");
 
     ext4.setattr(
@@ -2951,8 +3025,7 @@ fn run_production_delalloc_contract_failure_test(persistence: PersistenceModel) 
         another_ext4::DelallocAppendBlockSubmitOutcome::Terminal(another_ext4::ErrCode::EIO),
         "a stale production certificate must fail-stop once, not become EAGAIN"
     );
-    ext4
-        .terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(&authority, &mut pool)
+    ext4.terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(&authority, &mut pool)
         .expect("contract-failure pool terminalisation failed");
     drop(ext4);
     drop(device);
@@ -2987,6 +3060,7 @@ fn main() {
         run_production_delalloc_append_block_test(persistence);
         run_production_delalloc_extent_split_test(persistence);
         run_production_delalloc_partial_eof_test(persistence);
+        run_production_partial_eof_sparse_root_grow_test(persistence);
         run_production_delalloc_before_commit_fail_stop_test(persistence);
         run_production_delalloc_preexisting_fail_stop_test(persistence);
         run_production_delalloc_contract_failure_test(persistence);

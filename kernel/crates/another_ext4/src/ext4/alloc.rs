@@ -43,7 +43,7 @@ pub(super) struct DelallocConsumption {
 }
 
 impl DelallocConsumption {
-    fn resolve(&mut self) {
+    pub(super) fn resolve(&mut self) {
         self.unresolved = false;
     }
 }

@@ -327,13 +327,30 @@ impl ProductionDelallocState {
         self.entries.first_key_value()
     }
 
-    fn take_head(&mut self) -> Option<(usize, ProductionDelallocEntry)> {
-        let offset = *self.entries.first_key_value()?.0;
-        self.entries.remove_entry(&offset)
-    }
-
-    fn restore_head(&mut self, offset: usize, entry: ProductionDelallocEntry) {
-        assert!(self.entries.insert(offset, entry).is_none());
+    fn ready_prefix_end(&self, first_offset: usize, max_entries: usize) -> Option<usize> {
+        if max_entries == 0
+            || self
+                .head()
+                .is_none_or(|(&head_offset, _)| head_offset != first_offset)
+        {
+            return None;
+        }
+        let mut expected = first_offset;
+        let mut last = None;
+        let mut count = 0usize;
+        for (&offset, entry) in self.entries.range(first_offset..) {
+            if offset != expected || !matches!(entry.state, ProductionDelallocEntryState::Ready(_))
+            {
+                break;
+            }
+            last = Some(offset);
+            count += 1;
+            if count == max_entries {
+                break;
+            }
+            expected = expected.checked_add(MMArch::PAGE_SIZE)?;
+        }
+        last
     }
 }
 
@@ -366,10 +383,7 @@ impl Ext4DelallocProgress {
         })
     }
 
-    fn ticket(
-        self: &Arc<Self>,
-        inode: Weak<LockedExt4Inode>,
-    ) -> Arc<dyn PageCacheWritebackProgress> {
+    fn ticket(self: &Arc<Self>, inode: Weak<LockedExt4Inode>) -> Arc<Ext4DelallocProgressTicket> {
         Arc::new(Ext4DelallocProgressTicket {
             progress: self.clone(),
             inode,
@@ -408,52 +422,78 @@ impl Ext4DelallocProgress {
             let outcome =
                 inode
                     .upgrade()
-                    .map_or(Ok(PageCacheWritebackDispatchOutcome::Idle), |inode| {
+                    .map_or(Ext4DelallocProducerRunOutcome::Cancelled, |inode| {
                         let head = {
                             let guard = inode.inner.lock();
-                            guard
-                                .delalloc
-                                .production
-                                .head()
-                                .map(|(_, head)| match &head.state {
-                                    ProductionDelallocEntryState::Prepared(pending)
-                                    | ProductionDelallocEntryState::Ready(pending) => (
-                                        guard.page_cache.clone(),
-                                        pending.offset / MMArch::PAGE_SIZE,
-                                    ),
-                                    ProductionDelallocEntryState::Claimed {
-                                        certificate, ..
-                                    } => (guard.page_cache.clone(), certificate.page_index()),
-                                })
+                            guard.delalloc.production.head().map(|(_, head)| {
+                                let page_cache = guard.page_cache.clone();
+                                match &head.state {
+                                    ProductionDelallocEntryState::Ready(pending) => {
+                                        let first_page = pending.offset / MMArch::PAGE_SIZE;
+                                        let last_page = guard
+                                            .delalloc
+                                            .production
+                                            .ready_prefix_end(pending.offset, usize::MAX)
+                                            .unwrap_or(pending.offset)
+                                            / MMArch::PAGE_SIZE;
+                                        Ext4DelallocProducerAction::Dispatch(
+                                            page_cache, first_page, last_page,
+                                        )
+                                    }
+                                    ProductionDelallocEntryState::Prepared(_)
+                                    | ProductionDelallocEntryState::Claimed { .. } => {
+                                        Ext4DelallocProducerAction::Passive
+                                    }
+                                }
+                            })
                         };
-                        let Some((Some(page_cache), page_index)) = head else {
-                            return Ok(PageCacheWritebackDispatchOutcome::Idle);
-                        };
-                        page_cache
-                            .manager()
-                            .dispatch_writeback_once(page_index, page_index)
+                        match head {
+                            Some(Ext4DelallocProducerAction::Dispatch(
+                                Some(page_cache),
+                                first_page,
+                                last_page,
+                            )) => Ext4DelallocProducerRunOutcome::Dispatch(
+                                page_cache
+                                    .manager()
+                                    .dispatch_writeback_once(first_page, last_page),
+                            ),
+                            Some(Ext4DelallocProducerAction::Dispatch(None, _, _)) | None => {
+                                Ext4DelallocProducerRunOutcome::Cancelled
+                            }
+                            Some(Ext4DelallocProducerAction::Passive) => {
+                                Ext4DelallocProducerRunOutcome::Passive
+                            }
+                        }
                     });
 
             match outcome {
-                Ok(PageCacheWritebackDispatchOutcome::Progress) => {
+                Ext4DelallocProducerRunOutcome::Dispatch(Ok(
+                    PageCacheWritebackDispatchOutcome::Progress,
+                )) => {
                     // The successful delayed submission publishes the exact
                     // queue transition itself.
                 }
-                Ok(PageCacheWritebackDispatchOutcome::Deferred) => {
+                Ext4DelallocProducerRunOutcome::Dispatch(Ok(
+                    PageCacheWritebackDispatchOutcome::Deferred,
+                )) => {
                     // EAGAIN left the same head Ready. This producer must make
                     // another non-blocking attempt; it must never wait on the
                     // ticket whose progress it owns.
                     progress.demand.store(true, Ordering::Release);
                 }
-                Ok(PageCacheWritebackDispatchOutcome::Idle) => {
+                Ext4DelallocProducerRunOutcome::Dispatch(Ok(
+                    PageCacheWritebackDispatchOutcome::Idle,
+                ))
+                | Ext4DelallocProducerRunOutcome::Cancelled => {
                     // Truncate/unlink or a racing consumer removed the head.
                     // This is cancellation/revalidation, not a sticky I/O
                     // failure.
                     progress.publish(PageCacheWritebackProgressOutcome::Cancelled);
                 }
-                Err(error) => {
+                Ext4DelallocProducerRunOutcome::Dispatch(Err(error)) => {
                     progress.publish(PageCacheWritebackProgressOutcome::Failed(error));
                 }
+                Ext4DelallocProducerRunOutcome::Passive => {}
             }
 
             progress.work_scheduled.store(false, Ordering::Release);
@@ -462,6 +502,17 @@ impl Ext4DelallocProgress {
             Self::schedule_if_demanded(&progress, &inode);
         }));
     }
+}
+
+enum Ext4DelallocProducerAction {
+    Dispatch(Option<Arc<PageCache>>, usize, usize),
+    Passive,
+}
+
+enum Ext4DelallocProducerRunOutcome {
+    Dispatch(Result<PageCacheWritebackDispatchOutcome, SystemError>),
+    Passive,
+    Cancelled,
 }
 
 struct Ext4DelallocProgressTicket {
@@ -483,6 +534,18 @@ impl Ext4DelallocProgressTicket {
         }
         (self.progress.sequence.load(Ordering::Acquire) != self.observed)
             .then_some(PageCacheWritebackProgressOutcome::Progress)
+    }
+
+    fn wait_for_progress_interruptible(
+        &self,
+    ) -> Result<PageCacheWritebackProgressOutcome, SystemError> {
+        let current = ProcessManager::current_pcb();
+        if current.has_pending_signal_fast() && current.has_pending_not_masked_signal() {
+            return Err(SystemError::ERESTARTSYS);
+        }
+        self.progress
+            .wait_queue
+            .wait_until_interruptible(|| self.outcome_if_changed())
     }
 }
 
@@ -598,103 +661,114 @@ struct Ext4EagerSubmission {
 struct Ext4DelayedSubmission {
     inode: Arc<LockedExt4Inode>,
     fs: Arc<Ext4FileSystem>,
-    pending: Option<ProductionDelallocPending>,
-    sequence: u64,
+    entries: Vec<ClaimedDelallocEntry>,
     claim_incarnation: u64,
     progress: Arc<Ext4DelallocProgress>,
 }
 
+struct ClaimedDelallocEntry {
+    pending: ProductionDelallocPending,
+    sequence: u64,
+}
+
 impl Ext4DelayedSubmission {
+    fn claimed_entries_match(
+        state: &ProductionDelallocState,
+        entries: &[ClaimedDelallocEntry],
+        claim_incarnation: u64,
+    ) -> bool {
+        entries.iter().all(|claimed| {
+            state
+                .entries
+                .get(&claimed.pending.offset)
+                .is_some_and(|entry| {
+                    entry.sequence == claimed.sequence
+                        && matches!(
+                            entry.state,
+                            ProductionDelallocEntryState::Claimed {
+                                claim_incarnation: current,
+                                certificate,
+                                ..
+                            } if current == claim_incarnation
+                                && Some(certificate) == claimed.pending.certificate
+                        )
+                })
+        })
+    }
+
     fn restore_pending(
         inode: &LockedExt4Inode,
-        pending: ProductionDelallocPending,
-        expected_sequence: u64,
+        entries: Vec<ClaimedDelallocEntry>,
         claim_incarnation: u64,
-    ) -> core::ops::ControlFlow<ProductionDelallocPending> {
+    ) -> core::ops::ControlFlow<Vec<ClaimedDelallocEntry>> {
         let mut guard = inode.inner.lock();
-        let offset = pending.offset;
-        match guard.delalloc.production.take_head() {
-            Some((
-                entry_offset,
-                ProductionDelallocEntry {
-                    sequence,
-                    state:
-                        ProductionDelallocEntryState::Claimed {
-                            claim_incarnation: current_incarnation,
-                            certificate,
-                            ..
-                        },
-                },
-            )) if entry_offset == offset
-                && sequence == expected_sequence
-                && current_incarnation == claim_incarnation
-                && Some(certificate) == pending.certificate =>
-            {
-                guard.delalloc.production.restore_head(
+        if !Self::claimed_entries_match(&guard.delalloc.production, &entries, claim_incarnation) {
+            return core::ops::ControlFlow::Break(entries);
+        }
+        for claimed in entries {
+            let offset = claimed.pending.offset;
+            let removed = guard.delalloc.production.entries.remove(&offset);
+            debug_assert!(removed.is_some());
+            assert!(guard
+                .delalloc
+                .production
+                .entries
+                .insert(
                     offset,
                     ProductionDelallocEntry {
-                        sequence,
-                        state: ProductionDelallocEntryState::Ready(pending),
+                        sequence: claimed.sequence,
+                        state: ProductionDelallocEntryState::Ready(claimed.pending),
                     },
-                );
-                core::ops::ControlFlow::Continue(())
-            }
-            Some((offset, entry)) => {
-                guard.delalloc.production.restore_head(offset, entry);
-                core::ops::ControlFlow::Break(pending)
-            }
-            None => core::ops::ControlFlow::Break(pending),
+                )
+                .is_none());
         }
+        core::ops::ControlFlow::Continue(())
     }
 
     fn restore_ready(&mut self, admission_held: bool) -> Result<(), SystemError> {
-        let pending = self.pending.take().ok_or(SystemError::EIO)?;
+        if self.entries.is_empty() {
+            return Err(SystemError::EIO);
+        }
+        let entries = core::mem::take(&mut self.entries);
         let result = if admission_held {
-            Self::restore_pending(&self.inode, pending, self.sequence, self.claim_incarnation)
+            Self::restore_pending(&self.inode, entries, self.claim_incarnation)
         } else {
             let _io = self.inode.io_lock.lock();
-            Self::restore_pending(&self.inode, pending, self.sequence, self.claim_incarnation)
+            Self::restore_pending(&self.inode, entries, self.claim_incarnation)
         };
-        if let core::ops::ControlFlow::Break(pending) = result {
+        if let core::ops::ControlFlow::Break(entries) = result {
             // Keep exact capability ownership in this submission so the
             // terminal path can consume it after fail-stop.
-            self.pending = Some(pending);
+            self.entries = entries;
             return Err(SystemError::EIO);
         }
         Ok(())
     }
 
     fn finish_completed(&mut self) -> Result<(), SystemError> {
-        let pending = self.pending.take().ok_or(SystemError::EIO)?;
+        if self.entries.is_empty() {
+            return Err(SystemError::EIO);
+        }
+        let entries = core::mem::take(&mut self.entries);
         let empty_cleanup = {
             let _io = self.inode.io_lock.lock();
             let mut guard = self.inode.inner.lock();
-            match guard.delalloc.production.take_head() {
-                Some((
-                    _,
-                    ProductionDelallocEntry {
-                        sequence,
-                        state:
-                            ProductionDelallocEntryState::Claimed {
-                                claim_incarnation,
-                                certificate,
-                                ..
-                            },
-                    },
-                )) if sequence == self.sequence
-                    && claim_incarnation == self.claim_incarnation
-                    && Some(certificate) == pending.certificate => {}
-                head => {
-                    // The lower transaction has already published and
-                    // consumed the reservation.  Restoring any head here
-                    // would create a claim with no remaining owner.
-                    if let Some((offset, entry)) = head {
-                        guard.delalloc.production.restore_head(offset, entry);
-                    }
-                    drop(guard);
-                    self.fs.fail_stop_lifecycle();
-                    return Err(SystemError::EIO);
-                }
+            if !Self::claimed_entries_match(
+                &guard.delalloc.production,
+                &entries,
+                self.claim_incarnation,
+            ) {
+                drop(guard);
+                self.fs.fail_stop_lifecycle();
+                return Err(SystemError::EIO);
+            }
+            for claimed in entries.iter() {
+                let removed = guard
+                    .delalloc
+                    .production
+                    .entries
+                    .remove(&claimed.pending.offset);
+                debug_assert!(removed.is_some());
             }
             if guard.delalloc.production.entries.is_empty() {
                 let owner = guard
@@ -719,12 +793,12 @@ impl Ext4DelayedSubmission {
             self.fs.unregister_delalloc_inode(inode_num);
             drop(owner);
         }
-        drop(pending);
+        drop(entries);
         Ok(())
     }
 
     fn finish_terminal(&mut self) {
-        let mut pending = self.pending.take();
+        let mut claimed = core::mem::take(&mut self.entries);
         let mut idle = Vec::new();
         let (inode_num, owner) = {
             let _io = self.inode.io_lock.lock();
@@ -742,18 +816,16 @@ impl Ext4DelayedSubmission {
             )
         };
         self.fs.fail_stop_lifecycle();
-        if let (Some(authority), Some(pending)) =
-            (self.fs.delalloc_mapper_authority.as_ref(), pending.as_mut())
-        {
-            let _terminalized = self
-                .fs
-                .fs
-                .terminalize_delalloc_append_block_authorized_after_fail_stop(
-                    authority,
-                    &mut pending.reservation,
-                );
-        }
         if let Some(authority) = self.fs.delalloc_mapper_authority.as_ref() {
+            for entry in claimed.iter_mut() {
+                let _ = self
+                    .fs
+                    .fs
+                    .terminalize_delalloc_append_block_authorized_after_fail_stop(
+                        authority,
+                        &mut entry.pending.reservation,
+                    );
+            }
             for mut pending in idle {
                 let _ = self
                     .fs
@@ -774,7 +846,7 @@ impl Ext4DelayedSubmission {
         }
         self.fs.unregister_delalloc_inode(inode_num);
         drop(owner);
-        drop(pending);
+        drop(claimed);
     }
 }
 
@@ -804,58 +876,109 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
         descriptor: &PageCacheWritebackDescriptor,
         data: &[u8],
     ) -> Result<PageCacheWritebackSubmitResult, SystemError> {
-        let pending = self.pending.as_mut().ok_or(SystemError::EIO)?;
-        let entry_visible = pending
-            .durable_eof
-            .checked_sub(pending.offset as u64)
-            .and_then(|visible| usize::try_from(visible).ok())
-            .filter(|visible| *visible != 0 && *visible <= MMArch::PAGE_SIZE);
-        if descriptor.first_index() != pending.offset / MMArch::PAGE_SIZE
-            || descriptor.last_index() != descriptor.first_index()
+        let certificates = descriptor.dirty_certificates();
+        let descriptor_pages = descriptor
+            .last_index()
+            .checked_sub(descriptor.first_index())
+            .and_then(|distance| distance.checked_add(1));
+        if self.entries.is_empty()
+            || descriptor_pages != Some(self.entries.len())
+            || certificates.len() != self.entries.len()
             || descriptor.valid_bytes() != data.len()
-            || entry_visible.is_none()
-            || data.len() < entry_visible.unwrap_or(usize::MAX)
-            || data.len() > MMArch::PAGE_SIZE
-            || descriptor.dirty_certificate() != pending.certificate
         {
             self.finish_terminal();
             return Err(SystemError::EIO);
         }
-        let entry_visible = entry_visible.unwrap();
-        let authority = self
-            .fs
-            .delalloc_mapper_authority
-            .as_ref()
-            .ok_or(SystemError::EROFS)?;
-        let outcome = {
-            let _metadata_commit = self.inode.metadata_commit_lock.lock();
-            let mut pool_slot = self.inode.delalloc_pool.lock();
-            let pool = pool_slot.as_mut().ok_or(SystemError::EIO)?;
-            let outcome = self
-                .fs
-                .fs
-                .submit_delalloc_append_block_authorized_with_pool(
-                    authority,
-                    &mut pending.reservation,
-                    another_ext4::DelallocAppendBlockPublication {
-                        payload: &data[..entry_visible],
-                        durable_eof: pending.durable_eof,
-                        mtime: Some(pending.mtime),
-                        ctime: Some(pending.ctime),
-                    },
-                    Some(pool),
-                );
-            if matches!(
-                outcome,
-                another_ext4::DelallocAppendBlockSubmitOutcome::Completed
-            ) {
-                let mut guard = self.inode.inner.lock();
-                guard.durable_mtime_version =
-                    guard.durable_mtime_version.max(pending.mtime_version);
-                guard.durable_ctime_version =
-                    guard.durable_ctime_version.max(pending.ctime_version);
+        let Some(authority) = self.fs.delalloc_mapper_authority.as_ref() else {
+            self.finish_terminal();
+            self.progress
+                .publish(PageCacheWritebackProgressOutcome::Failed(
+                    SystemError::EROFS,
+                ));
+            return Err(SystemError::EROFS);
+        };
+        let outcome =
+            (|| -> Result<another_ext4::DelallocAppendBlockSubmitOutcome, SystemError> {
+                let _metadata_commit = self.inode.metadata_commit_lock.lock();
+                let mut pool_slot = self.inode.delalloc_pool.lock();
+                let pool = pool_slot.as_mut().ok_or(SystemError::EIO)?;
+                let mut publications = Vec::new();
+                let mut reservations = Vec::new();
+                publications
+                    .try_reserve_exact(self.entries.len())
+                    .map_err(|_| SystemError::ENOMEM)?;
+                reservations
+                    .try_reserve_exact(self.entries.len())
+                    .map_err(|_| SystemError::ENOMEM)?;
+                for (index, entry) in self.entries.iter_mut().enumerate() {
+                    let expected_page = descriptor
+                        .first_index()
+                        .checked_add(index)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    let visible = entry
+                        .pending
+                        .durable_eof
+                        .checked_sub(entry.pending.offset as u64)
+                        .and_then(|visible| usize::try_from(visible).ok())
+                        .filter(|visible| *visible != 0 && *visible <= MMArch::PAGE_SIZE)
+                        .ok_or(SystemError::EIO)?;
+                    let data_start = index
+                        .checked_mul(MMArch::PAGE_SIZE)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    let data_end = data_start
+                        .checked_add(visible)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    if entry.pending.offset / MMArch::PAGE_SIZE != expected_page
+                        || entry.pending.certificate != Some(certificates[index])
+                        || data_end > data.len()
+                    {
+                        return Err(SystemError::EIO);
+                    }
+                    publications.push(another_ext4::DelallocAppendBlockPublication {
+                        payload: &data[data_start..data_end],
+                        durable_eof: entry.pending.durable_eof,
+                        mtime: Some(entry.pending.mtime),
+                        ctime: Some(entry.pending.ctime),
+                    });
+                    reservations.push(&mut entry.pending.reservation);
+                }
+                let outcome = self
+                    .fs
+                    .fs
+                    .submit_delalloc_append_batch_authorized_with_pool(
+                        authority,
+                        &mut reservations,
+                        &publications,
+                        pool,
+                    );
+                if matches!(
+                    outcome,
+                    another_ext4::DelallocAppendBlockSubmitOutcome::Completed
+                ) {
+                    let mut guard = self.inode.inner.lock();
+                    for entry in self.entries.iter() {
+                        guard.durable_mtime_version =
+                            guard.durable_mtime_version.max(entry.pending.mtime_version);
+                        guard.durable_ctime_version =
+                            guard.durable_ctime_version.max(entry.pending.ctime_version);
+                    }
+                }
+                Ok(outcome)
+            })();
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(SystemError::ENOMEM) => {
+                self.restore_ready(false)?;
+                self.progress
+                    .publish(PageCacheWritebackProgressOutcome::Progress);
+                return Err(SystemError::ENOMEM);
             }
-            outcome
+            Err(error) => {
+                self.finish_terminal();
+                self.progress
+                    .publish(PageCacheWritebackProgressOutcome::Failed(error.clone()));
+                return Err(error);
+            }
         };
         match outcome {
             another_ext4::DelallocAppendBlockSubmitOutcome::Completed => {
@@ -874,6 +997,8 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
             }
             another_ext4::DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error) => {
                 self.restore_ready(false)?;
+                self.progress
+                    .publish(PageCacheWritebackProgressOutcome::Progress);
                 Err(another_ext4::Ext4Error::new(error).into())
             }
             another_ext4::DelallocAppendBlockSubmitOutcome::Terminal(_) => {
@@ -925,7 +1050,38 @@ impl PageCacheBackend for Ext4PageCacheBackend {
     }
 
     fn write_batch_pages(&self) -> Result<usize, SystemError> {
-        Ok(1)
+        let inode = self.inode()?;
+        let fs = inode.inner.lock().concret_fs();
+        let authority = fs
+            .delalloc_mapper_authority
+            .as_ref()
+            .ok_or(SystemError::EROFS)?;
+        fs.fs
+            .max_delalloc_append_batch_blocks_authorized(authority)
+            .map_err(SystemError::from)
+    }
+
+    fn write_batch_pages_from(&self, first_index: usize) -> Result<usize, SystemError> {
+        let max = self.write_batch_pages()?.min(64);
+        let inode = self.inode()?;
+        let first_offset = first_index
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let guard = inode.inner.lock();
+        let Some((&head_offset, _)) = guard.delalloc.production.head() else {
+            return Ok(1);
+        };
+        if head_offset != first_offset {
+            return Ok(1);
+        }
+        let Some(last_offset) = guard
+            .delalloc
+            .production
+            .ready_prefix_end(first_offset, max)
+        else {
+            return Ok(1);
+        };
+        Ok((last_offset - first_offset) / MMArch::PAGE_SIZE + 1)
     }
 
     fn writeback_admission_order(&self) -> PageCacheWritebackAdmissionOrder {
@@ -992,105 +1148,138 @@ impl PageCacheBackend for Ext4PageCacheBackend {
         descriptor: &PageCacheWritebackDescriptor,
     ) -> Result<PageCacheWritebackBindResult, SystemError> {
         let inode = self.inode()?;
-        let certificate = descriptor.dirty_certificate().ok_or(SystemError::EIO)?;
+        let certificates = descriptor.dirty_certificates();
+        if certificates.is_empty() {
+            return Err(SystemError::EIO);
+        }
         let descriptor_offset = descriptor
             .first_index()
             .checked_mul(MMArch::PAGE_SIZE)
             .ok_or(SystemError::EOVERFLOW)?;
+        let descriptor_pages = descriptor
+            .last_index()
+            .checked_sub(descriptor.first_index())
+            .and_then(|distance| distance.checked_add(1))
+            .ok_or(SystemError::EOVERFLOW)?;
+        if descriptor_pages != certificates.len() {
+            return Err(SystemError::EIO);
+        }
+        let mut claimed = Vec::new();
+        claimed
+            .try_reserve_exact(descriptor_pages)
+            .map_err(|_| SystemError::ENOMEM)?;
         let mut guard = inode.inner.lock();
-        match guard.delalloc.production.take_head() {
-            Some((
-                offset,
-                ProductionDelallocEntry {
-                    sequence,
-                    state: ProductionDelallocEntryState::Ready(pending),
-                },
-            )) if pending.certificate == Some(certificate)
-                && offset == descriptor_offset
-                && descriptor.first_index() == pending.offset / MMArch::PAGE_SIZE
-                && descriptor.last_index() == descriptor.first_index() =>
-            {
-                let Some(incarnation) = guard
+        let head_matches = guard
+            .delalloc
+            .production
+            .head()
+            .is_some_and(|(&offset, _)| offset == descriptor_offset);
+        let batch_matches = head_matches
+            && certificates.iter().enumerate().all(|(index, certificate)| {
+                let Some(relative_offset) = index.checked_mul(MMArch::PAGE_SIZE) else {
+                    return false;
+                };
+                descriptor_offset
+                    .checked_add(relative_offset)
+                    .and_then(|offset| guard.delalloc.production.entries.get(&offset))
+                    .is_some_and(|entry| {
+                        matches!(
+                            &entry.state,
+                            ProductionDelallocEntryState::Ready(pending)
+                                if descriptor.first_index().checked_add(index)
+                                    == Some(pending.offset / MMArch::PAGE_SIZE)
+                                    && pending.certificate == Some(*certificate)
+                        )
+                    })
+            });
+        if batch_matches {
+            let incarnation = guard
+                .delalloc
+                .production
+                .next_claim_incarnation
+                .checked_add(1)
+                .ok_or(SystemError::EOVERFLOW)?;
+            guard.delalloc.production.next_claim_incarnation = incarnation;
+            for (index, certificate) in certificates.iter().copied().enumerate() {
+                let relative_offset = index
+                    .checked_mul(MMArch::PAGE_SIZE)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let offset = descriptor_offset
+                    .checked_add(relative_offset)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let entry = guard
                     .delalloc
                     .production
-                    .next_claim_incarnation
-                    .checked_add(1)
-                else {
-                    guard.delalloc.production.restore_head(
+                    .entries
+                    .remove(&offset)
+                    .ok_or(SystemError::EIO)?;
+                let ProductionDelallocEntryState::Ready(pending) = entry.state else {
+                    unreachable!("validated delayed writeback entry changed under inode lock")
+                };
+                let durable_eof = pending.durable_eof;
+                claimed.push(ClaimedDelallocEntry {
+                    pending,
+                    sequence: entry.sequence,
+                });
+                assert!(guard
+                    .delalloc
+                    .production
+                    .entries
+                    .insert(
                         offset,
                         ProductionDelallocEntry {
-                            sequence,
-                            state: ProductionDelallocEntryState::Ready(pending),
+                            sequence: entry.sequence,
+                            state: ProductionDelallocEntryState::Claimed {
+                                claim_incarnation: incarnation,
+                                certificate,
+                                durable_eof,
+                            },
                         },
-                    );
-                    return Err(SystemError::EOVERFLOW);
-                };
-                guard.delalloc.production.next_claim_incarnation = incarnation;
-                guard.delalloc.production.restore_head(
-                    offset,
-                    ProductionDelallocEntry {
-                        sequence,
-                        state: ProductionDelallocEntryState::Claimed {
-                            claim_incarnation: incarnation,
-                            certificate,
-                            durable_eof: pending.durable_eof,
-                        },
-                    },
-                );
-                let fs = guard.concret_fs();
-                drop(guard);
-                let progress = inode.delalloc_progress.clone();
-                Ok(PageCacheWritebackBindResult::Submission(Box::new(
-                    Ext4DelayedSubmission {
-                        inode,
-                        fs,
-                        pending: Some(pending),
-                        sequence,
-                        claim_incarnation: incarnation,
-                        progress,
-                    },
-                )))
+                    )
+                    .is_none());
             }
-            Some((head_offset, head)) => {
-                guard.delalloc.production.restore_head(head_offset, head);
-                if let Some(entry) = guard.delalloc.production.entries.get(&descriptor_offset) {
-                    let matches_certificate = match &entry.state {
-                        ProductionDelallocEntryState::Ready(pending)
-                        | ProductionDelallocEntryState::Prepared(pending) => {
-                            pending.certificate == Some(certificate)
-                        }
-                        ProductionDelallocEntryState::Claimed {
-                            certificate: claimed,
-                            ..
-                        } => *claimed == certificate,
-                    };
-                    if !matches_certificate {
-                        return Err(SystemError::EIO);
-                    }
-                    drop(guard);
-                    return Ok(PageCacheWritebackBindResult::Deferred(
-                        inode.delalloc_progress.ticket(Arc::downgrade(&inode)),
-                    ));
+            let fs = guard.concret_fs();
+            drop(guard);
+            let progress = inode.delalloc_progress.clone();
+            return Ok(PageCacheWritebackBindResult::Submission(Box::new(
+                Ext4DelayedSubmission {
+                    inode,
+                    fs,
+                    entries: claimed,
+                    claim_incarnation: incarnation,
+                    progress,
+                },
+            )));
+        }
+
+        if let Some(entry) = guard.delalloc.production.entries.get(&descriptor_offset) {
+            let matches_certificate = match &entry.state {
+                ProductionDelallocEntryState::Ready(pending)
+                | ProductionDelallocEntryState::Prepared(pending) => {
+                    pending.certificate == Some(certificates[0])
                 }
-                drop(guard);
-                let operation = inode.begin_operation()?;
-                Ok(PageCacheWritebackBindResult::Submission(Box::new(
-                    Ext4EagerSubmission {
-                        inode,
-                        _operation: operation,
-                    },
-                )))
+                ProductionDelallocEntryState::Claimed {
+                    certificate: claimed,
+                    ..
+                } => *claimed == certificates[0],
+            };
+            if !matches_certificate {
+                return Err(SystemError::EIO);
             }
-            None => {
-                drop(guard);
-                let operation = inode.begin_operation()?;
-                Ok(PageCacheWritebackBindResult::Submission(Box::new(
-                    Ext4EagerSubmission {
-                        inode,
-                        _operation: operation,
-                    },
-                )))
-            }
+            drop(guard);
+            return Ok(PageCacheWritebackBindResult::Deferred(
+                inode.delalloc_progress.ticket(Arc::downgrade(&inode)),
+            ));
+        }
+        {
+            drop(guard);
+            let operation = inode.begin_operation()?;
+            Ok(PageCacheWritebackBindResult::Submission(Box::new(
+                Ext4EagerSubmission {
+                    inode,
+                    _operation: operation,
+                },
+            )))
         }
     }
 }
@@ -2785,11 +2974,18 @@ impl LockedExt4Inode {
                     drop(_io);
                     drop(_size);
                     drop(_invalidate);
-                    progress.arm();
-                    match progress.wait_for_progress() {
+                    match progress.wait_for_progress_interruptible()? {
                         PageCacheWritebackProgressOutcome::Failed(error) => return Err(error),
                         PageCacheWritebackProgressOutcome::Progress
-                        | PageCacheWritebackProgressOutcome::Cancelled => continue 'admission,
+                        | PageCacheWritebackProgressOutcome::Cancelled => {
+                            let current = ProcessManager::current_pcb();
+                            if current.has_pending_signal_fast()
+                                && current.has_pending_not_masked_signal()
+                            {
+                                return Err(SystemError::ERESTARTSYS);
+                            }
+                            continue 'admission;
+                        }
                     }
                 }
                 let expected_durable_eof_before = guard
@@ -3128,26 +3324,37 @@ impl LockedExt4Inode {
 
     pub(super) fn drain_delalloc_before_eager(&self) -> Result<(), SystemError> {
         loop {
-            let (page_cache, page_index) = {
+            let (page_cache, first_page, last_page) = {
                 let guard = self.inner.lock();
                 let Some((_, head)) = guard.delalloc.production.head() else {
                     return Ok(());
                 };
-                let offset = match &head.state {
-                    ProductionDelallocEntryState::Prepared(pending)
-                    | ProductionDelallocEntryState::Ready(pending) => pending.offset,
+                let (first_offset, last_offset) = match &head.state {
+                    ProductionDelallocEntryState::Prepared(pending) => {
+                        (pending.offset, pending.offset)
+                    }
+                    ProductionDelallocEntryState::Ready(pending) => {
+                        let last = guard
+                            .delalloc
+                            .production
+                            .ready_prefix_end(pending.offset, usize::MAX)
+                            .unwrap_or(pending.offset);
+                        (pending.offset, last)
+                    }
                     ProductionDelallocEntryState::Claimed { certificate, .. } => {
-                        certificate.page_index() * MMArch::PAGE_SIZE
+                        let offset = certificate.page_index() * MMArch::PAGE_SIZE;
+                        (offset, offset)
                     }
                 };
                 (
                     guard.page_cache.clone().ok_or(SystemError::EIO)?,
-                    offset / MMArch::PAGE_SIZE,
+                    first_offset / MMArch::PAGE_SIZE,
+                    last_offset / MMArch::PAGE_SIZE,
                 )
             };
             page_cache
                 .manager()
-                .writeback_range(page_index, page_index)?;
+                .writeback_range(first_page, last_page)?;
         }
     }
 

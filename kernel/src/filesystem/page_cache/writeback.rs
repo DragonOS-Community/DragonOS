@@ -378,17 +378,16 @@ impl Drop for ReclaimerRunnerGuard {
 /// The identity does not by itself describe per-page redirty state; a
 /// filesystem which owns a persistent delayed-allocation ticket still has to
 /// bind that ticket to this generation (or a stricter certificate).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct PageCacheWritebackDescriptor {
     first_index: usize,
     last_index: usize,
     file_size: usize,
     valid_bytes: usize,
     writeback_generation: u64,
-    /// Present only for the single-page Token prototype. It identifies the
-    /// exact front Dirty incarnation which this descriptor is freezing, not
-    /// merely the page index or later writeback generation.
-    dirty_certificate: Option<PageCacheDirtyCertificate>,
+    /// One exact Dirty-incarnation certificate per page in a non-empty Token
+    /// batch. Legacy and zero-payload descriptors keep this vector empty.
+    dirty_certificates: Vec<PageCacheDirtyCertificate>,
 }
 
 impl PageCacheWritebackDescriptor {
@@ -414,8 +413,15 @@ impl PageCacheWritebackDescriptor {
         self.writeback_generation
     }
 
-    pub(crate) const fn dirty_certificate(&self) -> Option<PageCacheDirtyCertificate> {
-        self.dirty_certificate
+    pub(crate) fn dirty_certificates(&self) -> &[PageCacheDirtyCertificate] {
+        &self.dirty_certificates
+    }
+
+    pub(crate) fn dirty_certificate(&self) -> Option<PageCacheDirtyCertificate> {
+        let [certificate] = self.dirty_certificates.as_slice() else {
+            return None;
+        };
+        Some(*certificate)
     }
 }
 
@@ -579,6 +585,14 @@ pub trait PageCacheBackend: Send + Sync + core::fmt::Debug {
     /// write request.  Backends are single-page by default.
     fn write_batch_pages(&self) -> Result<usize, SystemError> {
         Ok(1)
+    }
+
+    /// Maximum useful batch beginning at the already identified first Dirty
+    /// page. PageCache invokes this without its inner lock and revalidates the
+    /// first page afterwards, so an ordered backend may inspect private queue
+    /// state without introducing a PageCache -> filesystem lock inversion.
+    fn write_batch_pages_from(&self, _first_index: usize) -> Result<usize, SystemError> {
+        self.write_batch_pages()
     }
 
     /// Write a stable, i_size-clipped snapshot beginning at `start_index`.
@@ -1132,8 +1146,48 @@ impl PageCacheManager {
             // that side path, even before its first normal bind.
             return Err(SystemError::EIO);
         }
+        // Locate only the prospective first page while holding PageCache
+        // inner, then release it before asking an ordered backend for a
+        // queue-aware bound. The full selector below revalidates this exact
+        // identity, state and tag before publishing any Writeback state.
+        let first_candidate = {
+            let inner = cache.inner.lock();
+            if let Some((required_index, required_entry, epoch)) = required_first {
+                let Some(current) = inner.pages.get(&required_index) else {
+                    return Ok(WritebackClaimOutcome::NoBatch);
+                };
+                if required_index < start_index
+                    || required_index > end_index
+                    || !Arc::ptr_eq(current, required_entry)
+                    || !inner.dirty_pages.contains(&required_index)
+                    || current.writeback_tag() != epoch
+                    || !matches!(
+                        current.state(),
+                        PageState::UpToDate | PageState::Dirty | PageState::Error
+                    )
+                {
+                    return Ok(WritebackClaimOutcome::NoBatch);
+                }
+                Some((required_index, current.clone()))
+            } else {
+                inner
+                    .dirty_pages
+                    .range(start_index..=end_index)
+                    .find_map(|index| {
+                        let entry = inner.pages.get(index)?;
+                        matches!(
+                            entry.state(),
+                            PageState::UpToDate | PageState::Dirty | PageState::Error
+                        )
+                        .then(|| (*index, entry.clone()))
+                    })
+            }
+        };
+        let Some((prospective_first_index, prospective_first_entry)) = first_candidate else {
+            return Ok(WritebackClaimOutcome::NoBatch);
+        };
         let reported_pages = match backend.as_ref() {
-            Some(backend) => backend.write_batch_pages()?,
+            Some(backend) => backend.write_batch_pages_from(prospective_first_index)?,
             None => 1,
         };
         if reported_pages == 0 {
@@ -1143,6 +1197,10 @@ impl PageCacheManager {
         let max_data_len = batch_pages
             .checked_mul(MMArch::PAGE_SIZE)
             .ok_or(SystemError::EOVERFLOW)?;
+        let token_protocol = bind_submission
+            && backend.as_ref().is_some_and(|backend| {
+                backend.writeback_submission_protocol() == PageCacheWritebackProtocol::Token
+            });
 
         let mut candidates = Vec::new();
         candidates
@@ -1151,6 +1209,7 @@ impl PageCacheManager {
         let mut prepared = Vec::new();
         let mut guards = Vec::new();
         let mut data = Vec::new();
+        let mut dirty_certificates = Vec::new();
         prepared
             .try_reserve_exact(batch_pages)
             .map_err(|_| SystemError::ENOMEM)?;
@@ -1159,6 +1218,11 @@ impl PageCacheManager {
             .map_err(|_| SystemError::ENOMEM)?;
         data.try_reserve_exact(max_data_len)
             .map_err(|_| SystemError::ENOMEM)?;
+        if token_protocol {
+            dirty_certificates
+                .try_reserve_exact(batch_pages)
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
 
         let (first_index, descriptor, submission) = {
             let mut inner = cache.inner.lock();
@@ -1215,6 +1279,11 @@ impl PageCacheManager {
                 return Ok(WritebackClaimOutcome::NoBatch);
             };
             let first_index = *first_index;
+            if first_index != prospective_first_index
+                || !Arc::ptr_eq(&candidates[0].1, &prospective_first_entry)
+            {
+                return Ok(WritebackClaimOutcome::NoBatch);
+            }
 
             // Validate every fallible condition before publishing any member
             // as Writeback.  The state/identity recheck and dirty-set removal
@@ -1268,27 +1337,19 @@ impl PageCacheManager {
             } else {
                 0
             };
-            // The generic Token selftest still exercises multi-page
-            // submission. A real delayed-allocation backend must force a
-            // one-page batch and reject a missing certificate; only that
-            // shape has one exact front dirty incarnation to bind today.
-            let dirty_certificate = if token_protocol == Some(PageCacheWritebackProtocol::Token)
-                && candidates.len() == 1
-            {
-                let (page_index, entry) = candidates
-                    .first()
-                    .expect("non-empty token writeback candidate disappeared");
-                Some(entry.current_dirty_certificate(cache.instance_id, *page_index)?)
-            } else {
-                None
-            };
+            if token_protocol == Some(PageCacheWritebackProtocol::Token) {
+                for (page_index, entry) in candidates.iter() {
+                    dirty_certificates
+                        .push(entry.current_dirty_certificate(cache.instance_id, *page_index)?);
+                }
+            }
             let claim_descriptor = PageCacheWritebackDescriptor {
                 first_index,
                 last_index,
                 file_size,
                 valid_bytes,
                 writeback_generation,
-                dirty_certificate,
+                dirty_certificates,
             };
 
             // The backend's binding hook runs only after every PageCache

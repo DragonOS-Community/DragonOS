@@ -601,31 +601,37 @@ impl PageCacheBackend for PageCacheSubmissionSelftestBackend {
                 .generation_regressions
                 .fetch_add(1, Ordering::Relaxed);
         }
-        match (
-            descriptor.first_index() == descriptor.last_index(),
-            descriptor.dirty_certificate(),
-        ) {
-            (true, Some(certificate))
-                if certificate.page_index() == descriptor.first_index()
-                    && certificate.cache_instance_id() != 0
-                    && certificate.entry_instance_id() != 0
-                    && certificate.dirty_incarnation() != 0
-                    && matches!(
-                        certificate.kind(),
-                        PageCacheDirtyTransitionKind::NewlyDirty
-                            | PageCacheDirtyTransitionKind::RedirtiedDuringWriteback
-                    ) =>
-            {
-                self.state
-                    .single_page_certificates
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            (false, None) => {}
-            _ => {
-                self.state
-                    .certificate_errors
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+        let certificates = descriptor.dirty_certificates();
+        let expected_count = descriptor
+            .last_index()
+            .checked_sub(descriptor.first_index())
+            .and_then(|distance| distance.checked_add(1));
+        let certificates_valid = expected_count == Some(certificates.len())
+            && certificates
+                .iter()
+                .enumerate()
+                .all(|(offset, certificate)| {
+                    descriptor
+                        .first_index()
+                        .checked_add(offset)
+                        .is_some_and(|index| certificate.page_index() == index)
+                        && certificate.cache_instance_id() != 0
+                        && certificate.entry_instance_id() != 0
+                        && certificate.dirty_incarnation() != 0
+                        && matches!(
+                            certificate.kind(),
+                            PageCacheDirtyTransitionKind::NewlyDirty
+                                | PageCacheDirtyTransitionKind::RedirtiedDuringWriteback
+                        )
+                });
+        if !certificates_valid {
+            self.state
+                .certificate_errors
+                .fetch_add(1, Ordering::Relaxed);
+        } else if certificates.len() == 1 {
+            self.state
+                .single_page_certificates
+                .fetch_add(1, Ordering::Relaxed);
         }
         if self.state.defer_next_bind.swap(false, Ordering::AcqRel) {
             self.state

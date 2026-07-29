@@ -3007,12 +3007,59 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         .get_entry(0)
         .ok_or(SystemError::EIO)?;
     let writeback_paddr = writeback_page.phys_address();
+    writeback_page.write().add_flags(PageFlags::PG_DIRTY);
+    {
+        let mut inner = writeback_cache.inner.lock();
+        writeback_entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+        writeback_entry.set_state(PageState::Dirty);
+        inner.dirty_pages.insert(0);
+    }
+    let invalidate_ordinary_claim_rejected = {
+        let _invalidate = writeback_cache.invalidate_write();
+        !writeback_cache.try_mark_page_writeback(0, writeback_paddr)
+    } && writeback_entry.state() == PageState::Dirty
+        && writeback_entry.writeback_tag() == 0
+        && writeback_entry
+            .writeback_incarnation
+            .load(Ordering::Acquire)
+            == 0
+        && {
+            let inner = writeback_cache.inner.lock();
+            inner.dirty_pages.contains(&0) && !inner.writeback_pages.contains(&0)
+        };
+    if !invalidate_ordinary_claim_rejected {
+        return Ok("status=fail stage=writeback_invalidate_ordinary_claim\n".into());
+    }
+    writeback_entry.set_writeback_tag(0x6a01);
+    let tagged_ordinary_claim_rejected = !writeback_cache
+        .try_mark_page_writeback(0, writeback_paddr)
+        && writeback_entry.state() == PageState::Dirty
+        && writeback_entry.writeback_tag() == 0x6a01
+        && writeback_entry
+            .writeback_incarnation
+            .load(Ordering::Acquire)
+            == 0
+        && {
+            let inner = writeback_cache.inner.lock();
+            inner.dirty_pages.contains(&0) && !inner.writeback_pages.contains(&0)
+        };
+    if !tagged_ordinary_claim_rejected {
+        return Ok("status=fail stage=writeback_tagged_ordinary_claim\n".into());
+    }
+    writeback_entry.set_writeback_tag(0);
     if !writeback_cache.try_mark_page_writeback(0, writeback_paddr) {
         return Ok("status=fail stage=writeback_claim_success\n".into());
     }
+    writeback_page.write().remove_flags(PageFlags::PG_DIRTY);
+    let first_writeback_incarnation = writeback_entry
+        .writeback_incarnation
+        .load(Ordering::Acquire);
     {
         let inner = writeback_cache.inner.lock();
-        if !inner.writeback_pages.contains(&0) || inner.dirty_pages.contains(&0) {
+        if first_writeback_incarnation == 0
+            || !inner.writeback_pages.contains(&0)
+            || inner.dirty_pages.contains(&0)
+        {
             return Ok("status=fail stage=writeback_set_success\n".into());
         }
     }
@@ -3035,6 +3082,20 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
     if !writeback_cache.try_mark_page_writeback(0, writeback_paddr) {
         return Ok("status=fail stage=writeback_claim_error\n".into());
+    }
+    let second_writeback_incarnation = writeback_entry
+        .writeback_incarnation
+        .load(Ordering::Acquire);
+    if second_writeback_incarnation <= first_writeback_incarnation
+        || !matches!(
+            PageCacheManager::writeback_incarnation_result(
+                &writeback_entry,
+                first_writeback_incarnation
+            ),
+            Some(Ok(()))
+        )
+    {
+        return Ok("status=fail stage=writeback_incarnation_aba\n".into());
     }
     if PageCacheManager::finish_writeback_entry_state(
         writeback_cache.clone(),
@@ -3064,6 +3125,31 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let _ = page_reclaimer_lock().remove_page(&writeback_paddr);
     if !writeback_ok {
         return Ok("status=fail stage=writeback_teardown\n".into());
+    }
+
+    // Exhaustion must fail before publishing any Legacy state transition.
+    // Wrapping to zero would make a later frozen waiter indistinguishable
+    // from an old incarnation.
+    let overflow_cache = PageCache::new(None, None);
+    let overflow_page = overflow_cache.get_or_create_page_zero(0)?;
+    let overflow_entry = overflow_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    overflow_cache.inner.lock().next_writeback_incarnation = u64::MAX;
+    if overflow_cache.try_mark_page_writeback(0, overflow_page.phys_address())
+        || overflow_entry.state() != PageState::UpToDate
+        || overflow_entry.writeback_incarnation.load(Ordering::Acquire) != 0
+    {
+        return Ok("status=fail stage=writeback_incarnation_overflow\n".into());
+    }
+    let overflow_removed = overflow_cache.manager.remove_page(0)?.is_some();
+    let overflow_paddr = overflow_page.phys_address();
+    page_manager_lock().remove_page(&overflow_paddr);
+    let _ = page_reclaimer_lock().remove_page(&overflow_paddr);
+    if !overflow_removed {
+        return Ok("status=fail stage=writeback_incarnation_overflow_cleanup\n".into());
     }
 
     // Generic asynchronous reads may leave a Loading entry at final drop. A

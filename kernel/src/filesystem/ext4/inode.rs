@@ -327,6 +327,12 @@ impl ProductionDelallocState {
         self.entries.first_key_value()
     }
 
+    fn head_is_claimed(&self) -> bool {
+        self.head().is_some_and(|(_, entry)| {
+            matches!(entry.state, ProductionDelallocEntryState::Claimed { .. })
+        })
+    }
+
     fn ready_prefix_end(&self, first_offset: usize, max_entries: usize) -> Option<usize> {
         if max_entries == 0
             || self
@@ -2966,9 +2972,7 @@ impl LockedExt4Inode {
                 if old_size as usize > offset {
                     return Ok(None);
                 }
-                if guard.delalloc.production.entries.values().any(|entry| {
-                    matches!(entry.state, ProductionDelallocEntryState::Claimed { .. })
-                }) {
+                if guard.delalloc.production.head_is_claimed() {
                     let progress = self.delalloc_progress.ticket(guard.self_ref.clone());
                     drop(guard);
                     drop(_io);

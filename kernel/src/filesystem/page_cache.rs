@@ -58,8 +58,8 @@ pub(crate) use writeback::{
 };
 use writeback::{
     run_async_writeback_budget_retry_selftest, ClaimedWritebackBatch, TaggedWritebackBudgetRetry,
-    TaggedWritebackSubmission, WritebackClaimOutcome, WritebackSubmitOutcome,
-    PAGECACHE_WRITEBACK_WQS,
+    TaggedWritebackIncarnationRetry, TaggedWritebackSubmission, WritebackClaimOutcome,
+    WritebackSubmitOutcome, PAGECACHE_WRITEBACK_WQS,
 };
 pub use writeback::{
     AsyncPageCacheBackend, PageCacheBackend, PageCacheWritebackAdmissionOrder,
@@ -404,6 +404,10 @@ pub struct PageCache {
     /// distinguish an already published Writeback page from a batch still
     /// executing on a worker or waiting to publish its completion.
     tagged_writeback_submissions: Mutex<Vec<TaggedWritebackSubmission>>,
+    /// Exact continuations for frozen pages redirtied behind an older
+    /// Writeback incarnation. Completion removes and dispatches these without
+    /// parking a shared worker.
+    writeback_incarnation_retries: Mutex<Vec<TaggedWritebackIncarnationRetry>>,
     /// At most one global-budget retry per frozen generation.  Keeping the
     /// ticket in the cache makes deferred retry memory proportional to live
     /// tagged generations rather than to repeated WRITE syscalls; Drop also
@@ -1651,6 +1655,7 @@ impl PageCache {
             tagged_writeback_progress: AtomicU64::new(0),
             tagged_writeback_wait: WaitQueue::default(),
             tagged_writeback_submissions: Mutex::new(Vec::new()),
+            writeback_incarnation_retries: Mutex::new(Vec::new()),
             tagged_writeback_budget_retries: Mutex::new(HashMap::new()),
             writeback_protocol: AtomicU8::new(PageCacheWritebackProtocolState::Unset as u8),
             reclaimer_writeback_active: AtomicBool::new(false),
@@ -2807,9 +2812,18 @@ impl PageCache {
             // claim path instead.
             return false;
         }
+        // Reclaim enters with the page write-locked, so it cannot sleep
+        // behind an invalidation writer which may need that same page. This
+        // read guard also closes frozen writeback's frontier-snapshot -> tag-
+        // publication window: reclaim either publishes before the frontier
+        // is sampled or leaves the page Dirty for the range owner.
+        let Some(_invalidate) = self.try_invalidate_read() else {
+            return false;
+        };
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
             if entry.page.phys_address() != expected_paddr
+                || entry.writeback_tag() != 0
                 || matches!(
                     entry.state(),
                     PageState::Loading | PageState::Writeback | PageState::Error
@@ -2817,8 +2831,17 @@ impl PageCache {
             {
                 return false;
             }
+            let Ok(writeback_incarnation) = guard.allocate_writeback_incarnation() else {
+                // Zero is reserved and identities must never wrap: leave the
+                // page untouched so a bounded caller can report/retry the
+                // exhausted mapping instead of publishing an ABA identity.
+                return false;
+            };
             let old_state = entry.state();
             entry.account_state_transition(old_state, PageState::Writeback);
+            entry
+                .writeback_incarnation
+                .store(writeback_incarnation, Ordering::Release);
             entry.set_state(PageState::Writeback);
             guard.dirty_pages.remove(&page_index);
             guard.writeback_pages.insert(page_index);

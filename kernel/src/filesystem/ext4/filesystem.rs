@@ -415,6 +415,21 @@ impl Ext4FileSystem {
         self.delalloc_admission_open.store(false, Ordering::Release);
     }
 
+    /// Restore admission only for a healthy, mapper-owning filesystem which
+    /// was completely drained for a prospective sibling writable mount.
+    ///
+    /// The caller holds the per-device mount registry lock, so a successful
+    /// reopen cannot race publication of another writable instance.
+    fn reopen_delalloc_admission_after_failed_mount(&self) {
+        let owners = self.delalloc_inodes.lock();
+        if self.delalloc_mapper_authority.is_some()
+            && owners.is_empty()
+            && self.lifecycle_error.lock().is_none()
+        {
+            self.delalloc_admission_open.store(true, Ordering::Release);
+        }
+    }
+
     fn drain_registered_delalloc(&self) -> Result<(), SystemError> {
         loop {
             let owners: Vec<_> = self.delalloc_inodes.lock().values().cloned().collect();
@@ -1131,24 +1146,41 @@ impl Ext4FileSystem {
                 .filter(|fs| !fs._mount_options.read_only)
                 .collect()
         };
+        let mut reopen_on_mount_failure = Vec::new();
         if !mount_options.read_only {
             for existing in &existing_writable {
+                let was_open = existing.delalloc_admission_open();
                 existing.close_delalloc_admission();
                 existing.drain_registered_delalloc()?;
+                if was_open {
+                    reopen_on_mount_failure.push(existing.clone());
+                }
             }
         }
         let delalloc_unique_writable = !mount_options.read_only && existing_writable.is_empty();
         // Writable mounts recover the journal and the validated legacy orphan
         // chain before this filesystem is published to the VFS.
-        let fs = if mount_options.read_only {
-            another_ext4::Ext4::load_read_only_checked(mount_data.clone())?
-        } else {
-            another_ext4::Ext4::load_writable_with_options(
-                mount_data.clone(),
-                mount_options.write_barrier,
-            )?
+        let prospective = (|| {
+            let fs = if mount_options.read_only {
+                another_ext4::Ext4::load_read_only_checked(mount_data.clone())?
+            } else {
+                another_ext4::Ext4::load_writable_with_options(
+                    mount_data.clone(),
+                    mount_options.write_barrier,
+                )?
+            };
+            let root_attr = fs.getattr(another_ext4::EXT4_ROOT_INO)?;
+            Ok::<_, SystemError>((fs, root_attr))
+        })();
+        let (fs, root_attr) = match prospective {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                for existing in reopen_on_mount_failure {
+                    existing.reopen_delalloc_admission_after_failed_mount();
+                }
+                return Err(error);
+            }
         };
-        let root_attr = fs.getattr(another_ext4::EXT4_ROOT_INO)?;
         let delalloc_mapper_authority = if !delalloc_unique_writable {
             None
         } else {

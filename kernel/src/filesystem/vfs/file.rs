@@ -844,10 +844,10 @@ impl File {
         if need_data_sync || inode_sync {
             if need_metadata_sync || inode_sync {
                 // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.inode.sync_file(false, self.private_data.lock())?;
+                self.sync_range_and_check_wb_error(0, usize::MAX, false)?;
             } else {
                 // O_DSYNC: 仅数据同步
-                self.inode.sync_file(true, self.private_data.lock())?;
+                self.sync_range_and_check_wb_error(0, usize::MAX, true)?;
             }
         }
         Ok(())

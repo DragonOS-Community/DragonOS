@@ -873,6 +873,14 @@ struct TaggedWritebackCursor {
 }
 
 #[derive(Debug)]
+pub(super) struct TaggedWritebackIncarnationRetry {
+    entry: Arc<PageEntry>,
+    observed_incarnation: u64,
+    inode: Weak<dyn IndexNode>,
+    continuation: TaggedWritebackCursor,
+}
+
+#[derive(Debug)]
 struct AsyncWritebackRetryTicket {
     cache: Weak<PageCache>,
     epoch: u64,
@@ -996,6 +1004,7 @@ pub(super) struct ClaimedWritebackBatch {
     pub(super) descriptor: PageCacheWritebackDescriptor,
     submission: Option<Box<dyn PageCacheWritebackSubmission>>,
     retry_writeback_tag: Option<u64>,
+    writeback_incarnation: u64,
     entries: Vec<(usize, Arc<PageEntry>, Arc<Page>)>,
     guards: Vec<WritebackGuard>,
     data: Vec<u8>,
@@ -1175,10 +1184,11 @@ impl PageCacheManager {
                     .range(start_index..=end_index)
                     .find_map(|index| {
                         let entry = inner.pages.get(index)?;
-                        matches!(
-                            entry.state(),
-                            PageState::UpToDate | PageState::Dirty | PageState::Error
-                        )
+                        (entry.writeback_tag() == 0
+                            && matches!(
+                                entry.state(),
+                                PageState::UpToDate | PageState::Dirty | PageState::Error
+                            ))
                         .then(|| (*index, entry.clone()))
                     })
             }
@@ -1224,7 +1234,7 @@ impl PageCacheManager {
                 .map_err(|_| SystemError::ENOMEM)?;
         }
 
-        let (first_index, descriptor, submission) = {
+        let (first_index, descriptor, submission, writeback_incarnation) = {
             let mut inner = cache.inner.lock();
             if let Some((required_index, required_entry, epoch)) = required_first {
                 let Some(current) = inner.pages.get(&required_index) else {
@@ -1260,7 +1270,7 @@ impl PageCacheManager {
                 );
                 let tagged = required_first
                     .map(|(_, _, epoch)| entry.writeback_tag() == epoch)
-                    .unwrap_or(true);
+                    .unwrap_or_else(|| entry.writeback_tag() == 0);
                 if !eligible || !tagged {
                     if candidates.is_empty() {
                         continue;
@@ -1437,7 +1447,12 @@ impl PageCacheManager {
                 ));
                 prepared.push((page_index, entry, page));
             }
-            (first_index, claim_descriptor, claim_submission)
+            (
+                first_index,
+                claim_descriptor,
+                claim_submission,
+                writeback_incarnation,
+            )
         };
 
         let retry_writeback_tag = required_first.map(|(_, _, epoch)| epoch);
@@ -1461,6 +1476,7 @@ impl PageCacheManager {
             descriptor,
             submission,
             retry_writeback_tag,
+            writeback_incarnation,
             entries: prepared,
             guards,
             data,
@@ -1508,6 +1524,11 @@ impl PageCacheManager {
     /// ordinary completion; the transition is merely batched between those
     /// two phases.
     fn defer_writeback_batch(mut batch: ClaimedWritebackBatch) {
+        // Capture the batch identity being retired before publishing Dirty. A
+        // successor claim may allocate a new incarnation immediately after
+        // the inner lock is released, and retries for the old owner must not
+        // be mistaken for that successor.
+        let completed_incarnation = batch.writeback_incarnation;
         for (guard, (_page_index, _entry, page)) in
             batch.guards.iter_mut().zip(batch.entries.iter())
         {
@@ -1539,6 +1560,11 @@ impl PageCacheManager {
 
         for (_page_index, entry, _page) in batch.entries.drain(..) {
             entry.wait_queue.wake_all();
+            Self::dispatch_writeback_incarnation_retries(
+                &batch.cache,
+                &entry,
+                completed_incarnation,
+            );
         }
     }
 
@@ -2976,6 +3002,75 @@ impl PageCacheManager {
         );
     }
 
+    /// Register an exact completion continuation for a tagged page redirtied
+    /// behind an older Writeback incarnation.
+    ///
+    /// Registration precedes the completion recheck. The completion path and
+    /// this recheck both remove under the same retry lock, so a racing old I/O
+    /// either observes the continuation or has already made it dispatchable;
+    /// neither side can lose or dispatch it twice.
+    fn register_tagged_writeback_incarnation_retry(
+        cache: &Arc<PageCache>,
+        inode: Weak<dyn IndexNode>,
+        entry: Arc<PageEntry>,
+        observed_incarnation: u64,
+        continuation: TaggedWritebackCursor,
+    ) -> Result<(), SystemError> {
+        {
+            let mut pending = cache.writeback_incarnation_retries.lock();
+            pending.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            pending.push(TaggedWritebackIncarnationRetry {
+                entry: entry.clone(),
+                observed_incarnation,
+                inode,
+                continuation,
+            });
+        }
+        Self::dispatch_writeback_incarnation_retries(cache, &entry, observed_incarnation);
+        Ok(())
+    }
+
+    fn dispatch_writeback_incarnation_retries(
+        cache: &Arc<PageCache>,
+        completed_entry: &Arc<PageEntry>,
+        completed_incarnation: u64,
+    ) {
+        loop {
+            let retry = {
+                let mut pending = cache.writeback_incarnation_retries.lock();
+                pending
+                    .iter()
+                    .position(|retry| {
+                        Arc::ptr_eq(&retry.entry, completed_entry)
+                            && retry.observed_incarnation == completed_incarnation
+                            && Self::writeback_incarnation_result(
+                                &retry.entry,
+                                retry.observed_incarnation,
+                            )
+                            .is_some()
+                    })
+                    .map(|index| pending.swap_remove(index))
+            };
+            let Some(retry) = retry else {
+                break;
+            };
+            let TaggedWritebackCursor {
+                start_index,
+                frozen_end,
+                epoch,
+                cursor,
+            } = retry.continuation;
+            Self::schedule_tagged_writeback_drain(
+                Arc::downgrade(cache),
+                retry.inode,
+                start_index,
+                frozen_end,
+                epoch,
+                cursor,
+            );
+        }
+    }
+
     fn schedule_tagged_writeback_drain_with_permit(
         cache: Weak<PageCache>,
         inode: Weak<dyn IndexNode>,
@@ -3422,19 +3517,37 @@ impl PageCacheManager {
                 }
                 WritebackClaimOutcome::NoBatch => {
                     drop(permit);
-                    let still_owns_tag = {
+                    let retry_incarnation = {
                         let inner = cache.inner.lock();
-                        inner.pages.get(&target_index).is_some_and(|current| {
-                            Arc::ptr_eq(current, &target_entry)
+                        inner.pages.get(&target_index).and_then(|current| {
+                            (Arc::ptr_eq(current, &target_entry)
                                 && inner.dirty_pages.contains(&target_index)
-                                && current.writeback_tag() == epoch
+                                && current.writeback_tag() == epoch)
+                                .then(|| current.writeback_incarnation.load(Ordering::Acquire))
                         })
                     };
-                    if still_owns_tag {
-                        // A state/identity race can only make the same entry
-                        // retryable again; preserve the head-first order.
-                        crate::sched::sched_yield();
-                        continue;
+                    if let Some(observed_incarnation) = retry_incarnation {
+                        if let Err(error) = Self::register_tagged_writeback_incarnation_retry(
+                            cache,
+                            Arc::downgrade(inode),
+                            target_entry,
+                            observed_incarnation,
+                            TaggedWritebackCursor {
+                                start_index,
+                                frozen_end,
+                                epoch,
+                                cursor: target_index,
+                            },
+                        ) {
+                            Self::abandon_tagged_writeback_generation(
+                                cache,
+                                start_index,
+                                frozen_end,
+                                epoch,
+                                error,
+                            );
+                        }
+                        return;
                     }
                     if target_index == usize::MAX {
                         Self::notify_tagged_writeback_progress(cache);
@@ -3770,17 +3883,38 @@ impl PageCacheManager {
                 }
                 WritebackClaimOutcome::NoBatch => {
                     drop(permit);
-                    let still_owns_tag = {
+                    let retry_incarnation = {
                         let inner = cache.inner.lock();
-                        inner.pages.get(&target_index).is_some_and(|current| {
-                            Arc::ptr_eq(current, &target_entry)
+                        inner.pages.get(&target_index).and_then(|current| {
+                            (Arc::ptr_eq(current, &target_entry)
                                 && inner.dirty_pages.contains(&target_index)
-                                && current.writeback_tag() == epoch
+                                && current.writeback_tag() == epoch)
+                                .then(|| current.writeback_incarnation.load(Ordering::Acquire))
                         })
                     };
-                    if still_owns_tag {
-                        crate::sched::sched_yield();
-                        continue;
+                    if let Some(observed_incarnation) = retry_incarnation {
+                        if let Err(error) = Self::register_tagged_writeback_incarnation_retry(
+                            &cache,
+                            Arc::downgrade(&inode),
+                            target_entry,
+                            observed_incarnation,
+                            TaggedWritebackCursor {
+                                start_index,
+                                frozen_end,
+                                epoch,
+                                cursor: target_index,
+                            },
+                        ) {
+                            Self::abandon_tagged_writeback_generation(
+                                &cache,
+                                start_index,
+                                frozen_end,
+                                epoch,
+                                error.clone(),
+                            );
+                            return Err(error);
+                        }
+                        break;
                     }
                     if target_index == usize::MAX {
                         Self::notify_tagged_writeback_progress(&cache);
@@ -3977,6 +4111,7 @@ impl PageCacheManager {
         result: Result<(), SystemError>,
         record_error: bool,
     ) -> Result<(), SystemError> {
+        let completed_incarnation = entry.writeback_incarnation.load(Ordering::Acquire);
         if let Err(e) = result {
             if record_error {
                 cache.record_writeback_error_with_superblock(e.clone());
@@ -3999,6 +4134,7 @@ impl PageCacheManager {
                 entry.set_state(PageState::Dirty);
             }
             entry.wait_queue.wake_all();
+            Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
             return Err(e);
         }
 
@@ -4022,6 +4158,7 @@ impl PageCacheManager {
                 });
                 drop(inner);
                 entry.wait_queue.wake_all();
+                Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
                 drop(cache.detach_dirty_retention_if_idle());
                 return Ok(());
             }
@@ -4046,6 +4183,7 @@ impl PageCacheManager {
             }
         }
         entry.wait_queue.wake_all();
+        Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
         drop(cache.detach_dirty_retention_if_idle());
         Ok(())
     }

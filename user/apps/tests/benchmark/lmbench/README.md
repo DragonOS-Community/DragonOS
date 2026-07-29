@@ -34,7 +34,7 @@ make test-benchmark (host)
       │  monitor_test_results.sh  (轮询 serial_opt.txt,超时/完成判定)
       │  collect_results.py       (解析 → 校验 schema → 持久化)
       ▼
-guest: /etc/init.d/rcS  →  $BENCHMARK_TEST_DIR/run_tests.sh
+guest: /etc/init.d/rcS  →  $BENCHMARK_TEST_DIR/run.sh
       · init.sh 建 ext4 loop fs + 测试文件(一次)
       · 读 whitelist.txt + config,逐测例跑 N 次
       · 按 test_cases/<name>.meta 的规则从输出抽取数值
@@ -46,23 +46,42 @@ guest: /etc/init.d/rcS  →  $BENCHMARK_TEST_DIR/run_tests.sh
 ## 目录结构
 
 ```
-run_tests.sh              guest 端 runner(AUTO_TEST=benchmark 入口)
-monitor_test_results.sh   host 端串口监控 + 超时/完成判定
-collect_results.py        host 端解析串口 → 校验 → 持久化
-init.sh / env.sh / clean_up.sh   测试环境准备/变量/清理
-run_test_case.sh          手动单测例运行(init→run→cleanup)
-whitelist.txt             要运行的测例清单(每行一个)
-config                    全局配置(SAMPLES / TIMEOUT_SEC / WARMUP)
-schema/lmbench-run.schema.json   结果 JSON Schema(draft-07)
-test_cases/<name>.sh      测例包装脚本(调用 lmbench 二进制)
-test_cases/<name>.meta    该测例的抽取规则 + 单位 + 方向元数据
-toggle_compile_lmbench.sh 切换是否把本套件编进 rootfs
-Makefile                  DADK build-from-source 的安装脚本
-results/                  运行产物(gitignore;作为 CI 制品归档)
+runner/                        guest 端 runner(AUTO_TEST=benchmark 入口)
+  run.sh                       参数化入口(原 run_tests.sh)
+  init.sh / env.sh / clean_up.sh   测试环境准备/变量/清理
+  test_cases/<name>.sh        测例包装脚本(调用 lmbench 二进制)
+  test_cases/<name>.meta      该测例的抽取规则 + 单位 + 方向元数据
+  test_cases/test_*_parser.sh host 侧回归测试(busybox sh,source run.sh)
+orchestrator/                  host 端编排
+  monitor_test_results.sh      串口监控 + 超时/完成判定
+  collect_results.py           解析串口 → 校验 → 持久化
+  schema/lmbench-run.schema.json   结果 JSON Schema(draft-07)
+config                         全局配置(SAMPLES / TIMEOUT_SEC / WARMUP)
+whitelist.txt                  要运行的测例清单(每行一个)
+toggle_compile_lmbench.sh      切换是否把本套件编进 rootfs
+Makefile                       DADK build-from-source 的安装脚本
+default.nix / flake.nix        Nix 打包(可选)
+results/                       运行产物(gitignore;作为 CI 制品归档)
   <arch>/<ts>-<commit>.json    每次运行的完整快照(canonical)
   history.jsonl                每条指标一行(时序友好)
   github-benchmark/data.json   github-action-benchmark 兼容格式(为可视化预留)
 ```
+
+## runner 入口参数
+
+`runner/run.sh` 支持以下参数（无参数 = 读 `config` + `whitelist.txt` 全跑，与 rcS 调用一致）：
+
+```
+run.sh [--samples N] [--timeout S] [--warmup N]
+       [--whitelist FILE] [--config FILE] [--only NAME] [--list]
+```
+
+- `--samples N` / `--timeout S` / `--warmup N`：覆盖 `config` 的对应项。
+- `--whitelist FILE` / `--config FILE`：覆盖默认路径（`$SCRIPT_DIR/whitelist.txt` / `$SCRIPT_DIR/config`）。
+- `--only NAME`：只跑单个测例（用于手动调试），等价于临时 whitelist 只含 NAME。
+- `--list`：列出 `test_cases/*.sh` 可用测例名，不跑。
+
+优先级：命令行参数 > `--config` 指定文件 > 内置默认。
 
 ## 添加/启用一个测例
 

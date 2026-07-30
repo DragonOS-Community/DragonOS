@@ -29,3 +29,6 @@ config/rootfs.generated.toml
 *.cpio.xz
 *.cpio*
 .direnv/
+
+# Claude Code agent worktrees (local isolation dirs, never for VCS)
+.claude/worktrees/

@@ -140,25 +140,28 @@ int OpenSecondDescription(const TempFile& file) {
     return fd;
 }
 
-void ExpectSynchronousWriteReportsMappingError(const TempFile& file, int flags,
-                                               int expected_errno) {
+void ExpectTmpfsSynchronousWriteDefersMappingError(const TempFile& file, int flags,
+                                                   int expected_errno) {
     int fd = open(file.path(), O_RDWR | flags);
     ASSERT_GE(fd, 0) << "open synchronous fd failed: errno=" << errno << " ("
                      << strerror(errno) << ")";
 
     InjectError("mapping", fd, expected_errno == EIO ? "EIO" : "ENOSPC");
 
-    const char first = 's';
+    // Linux shmem_file_write_iter() does not call generic_write_sync(), and
+    // tmpfs uses noop_fsync. O_SYNC/O_DSYNC therefore do not consume the
+    // mapping errseq event. Use sync_file_range(WAIT_AFTER) as the explicit
+    // mapping-error observation point.
+    const char value = 's';
     errno = 0;
-    ExpectFailsWithErrno(write(fd, &first, sizeof(first)), expected_errno);
-
-    // The mapping error is consumed per open file description. A subsequent
-    // synchronous write must report its own byte count rather than replaying
-    // the old errseq event.
-    const char second = 't';
-    errno = 0;
-    EXPECT_EQ(static_cast<ssize_t>(sizeof(second)), write(fd, &second, sizeof(second)))
+    EXPECT_EQ(static_cast<ssize_t>(sizeof(value)), write(fd, &value, sizeof(value)))
         << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    errno = 0;
+    ExpectFailsWithErrno(
+        RawSyncFileRange(fd, 0, 0, SYNC_FILE_RANGE_WAIT_AFTER), expected_errno);
+    errno = 0;
+    ExpectSucceeds(RawSyncFileRange(fd, 0, 0, SYNC_FILE_RANGE_WAIT_AFTER));
     EXPECT_EQ(0, close(fd));
 }
 
@@ -207,16 +210,16 @@ TEST(ErrSeqWritebackReporting, FdatasyncReportsMappingErrorOnce) {
     ExpectFailsWithErrno(RawSyncfs(file.fd()), ENOSPC);
 }
 
-TEST(ErrSeqWritebackReporting, SyncWriteReportsMappingErrorOnce) {
+TEST(ErrSeqWritebackReporting, TmpfsSyncWriteDoesNotConsumeMappingError) {
     TempFile file;
     ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
-    ExpectSynchronousWriteReportsMappingError(file, O_SYNC, EIO);
+    ExpectTmpfsSynchronousWriteDefersMappingError(file, O_SYNC, EIO);
 }
 
-TEST(ErrSeqWritebackReporting, DataSyncWriteReportsMappingErrorOnce) {
+TEST(ErrSeqWritebackReporting, TmpfsDataSyncWriteDoesNotConsumeMappingError) {
     TempFile file;
     ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
-    ExpectSynchronousWriteReportsMappingError(file, O_DSYNC, ENOSPC);
+    ExpectTmpfsSynchronousWriteDefersMappingError(file, O_DSYNC, ENOSPC);
 }
 
 TEST(ErrSeqWritebackReporting, CloseDoesNotConsumeMappingError) {

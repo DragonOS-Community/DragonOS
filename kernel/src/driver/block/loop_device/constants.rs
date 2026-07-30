@@ -60,6 +60,8 @@ bitflags! {
     pub struct LoopFlags: u32 {
         /// 只读模式
         const READ_ONLY = 1 << 0;
+        /// Clear the backing file after the last opener and mount holder leave.
+        const AUTOCLEAR = 1 << 2;
     }
 }
 

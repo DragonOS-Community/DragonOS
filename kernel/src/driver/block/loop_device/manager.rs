@@ -111,6 +111,18 @@ impl LoopManager {
         }
     }
 
+    /// Allocate and register a new loop device with the first unused minor.
+    pub fn loop_add_new(&self) -> Result<Arc<LoopDevice>, SystemError> {
+        let _control = self.control_mutex.lock();
+        let mut inner = self.inner();
+        let id = Self::alloc_id_locked(&mut inner).ok_or(SystemError::ENOSPC)?;
+        let result = self.create_and_register_device_locked(&mut inner, id);
+        if result.is_err() {
+            Self::free_id_locked(&mut inner, id);
+        }
+        result
+    }
+
     /// # 功能
     ///
     /// 在锁作用域内分配指定次设备号的 loop 设备。
@@ -132,14 +144,10 @@ impl LoopManager {
             return Err(SystemError::EINVAL);
         }
 
-        if let Some(device) = Self::find_device_by_minor_locked(inner, minor) {
-            if device.is_bound() {
-                return Err(SystemError::EEXIST);
-            }
-            if Self::device_reusable(&device) {
-                return Ok(device);
-            }
-            return Err(SystemError::EBUSY);
+        if Self::find_device_by_minor_locked(inner, minor).is_some() {
+            // LOOP_CTL_ADD reserves a new minor. A registered device already
+            // owns this number even while Unbound; only GET_FREE may reuse it.
+            return Err(SystemError::EEXIST);
         }
 
         let id =
@@ -270,18 +278,13 @@ impl LoopManager {
         Ok(())
     }
 
-    pub fn find_free_minor(&self) -> Option<u32> {
+    /// Return a registered unbound loop device, creating one atomically when
+    /// no reusable device exists. This matches Linux LOOP_CTL_GET_FREE.
+    pub fn find_or_add_free_minor(&self) -> Result<u32, SystemError> {
         let _control = self.control_mutex.lock();
-        let inner = self.inner();
-        for minor in 0..Self::MAX_DEVICES as u32 {
-            match &inner.devices[minor as usize] {
-                // 只有 Unbound 才能视为可复用；删除流程中的设备不应返回给 loop_add
-                Some(dev) if Self::device_reusable(dev) => return Some(minor),
-                Some(_) => continue,
-                None => return Some(minor),
-            }
-        }
-        None
+        let mut inner = self.inner();
+        let device = self.loop_add_first_available_locked(&mut inner)?;
+        Ok(device.minor())
     }
 
     pub fn loop_init(&self, _driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {

@@ -322,10 +322,6 @@ impl LoopDevice {
         Self::calc_effective_size(total_size, offset, size_limit)
     }
 
-    pub fn is_bound(&self) -> bool {
-        matches!(self.inner().state(), LoopState::Bound)
-    }
-
     /// Validate a candidate while the global backing-topology lock is held.
     fn validate_backing_chain(&self, candidate: &Arc<File>) -> Result<(), SystemError> {
         let mut current = candidate.clone();
@@ -445,7 +441,7 @@ impl LoopDevice {
             let _config = self.config_mutex.lock();
             let mut inner = self.inner();
             match inner.state() {
-                LoopState::Unbound => return Ok(()),
+                LoopState::Unbound => return Err(SystemError::ENXIO),
                 LoopState::Bound => {
                     // The ioctl file itself owns one open description. Any
                     // additional open description includes nested-loop backing
@@ -453,7 +449,15 @@ impl LoopDevice {
                     if self.open_count.load(Ordering::Acquire) > 1
                         || self.mount_holder_count.load(Ordering::Acquire) != 0
                     {
-                        return Err(SystemError::EBUSY);
+                        // Linux LOOP_CLR_FD succeeds for a busy loop device and
+                        // defers the actual detach until the final user leaves.
+                        if !inner.flags.contains(LoopFlags::AUTOCLEAR) {
+                            inner.flags.insert(LoopFlags::AUTOCLEAR);
+                            // Invalidate reconfiguration snapshots that would
+                            // otherwise republish the old flag value.
+                            inner.generation = inner.generation.wrapping_add(1);
+                        }
+                        return Ok(());
                     }
                     inner.set_state(LoopState::Draining)?;
                     Self::install_quiesce_owner(&mut inner, LoopQuiesceOwner::Clear)
@@ -464,6 +468,10 @@ impl LoopDevice {
             }
         };
 
+        self.finish_clear(epoch, generation)
+    }
+
+    fn finish_clear(&self, epoch: u64, generation: u64) -> Result<(), SystemError> {
         if let Err(error) = self.wait_for_active_io() {
             self.rollback_bound_quiesce(epoch, generation, LoopQuiesceOwner::Clear);
             return Err(error);
@@ -491,6 +499,37 @@ impl LoopDevice {
         drop(topology);
         drop(old_file);
         Ok(())
+    }
+
+    fn maybe_autoclear(&self) {
+        // file_open() and mount_holder_acquire() take config_mutex before
+        // incrementing their counters. Recheck both counters and publish
+        // Draining under that same mutex so a new user cannot race the final
+        // close and get detached after a successful open.
+        let owner = {
+            let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+            let _config = self.config_mutex.lock();
+            let mut inner = self.inner();
+            if !matches!(inner.state(), LoopState::Bound)
+                || !inner.flags.contains(LoopFlags::AUTOCLEAR)
+                || self.open_count.load(Ordering::Acquire) != 0
+                || self.mount_holder_count.load(Ordering::Acquire) != 0
+            {
+                return;
+            }
+            if let Err(error) = inner.set_state(LoopState::Draining) {
+                warn!(
+                    "loop{}: cannot begin deferred autoclear: {:?}",
+                    self.minor, error
+                );
+                return;
+            }
+            Self::install_quiesce_owner(&mut inner, LoopQuiesceOwner::Clear)
+        };
+
+        if let Err(error) = self.finish_clear(owner.0, owner.1) {
+            warn!("loop{}: deferred autoclear failed: {:?}", self.minor, error);
+        }
     }
 
     fn validate_loop_status64_params(info: &LoopStatus64) -> Result<(), SystemError> {
@@ -543,11 +582,12 @@ impl LoopDevice {
         &self,
         requested_offset: Option<usize>,
         requested_limit: Option<usize>,
+        requested_autoclear: Option<bool>,
     ) -> Result<(), SystemError> {
         const MAX_RETRY: usize = 16;
 
         for _ in 0..MAX_RETRY {
-            let (backing_file, old_offset, old_limit, old_size, generation) = {
+            let (backing_file, old_offset, old_limit, old_size, old_autoclear, generation) = {
                 let inner = self.inner();
                 if !matches!(inner.state(), LoopState::Bound) {
                     return Err(SystemError::ENXIO);
@@ -557,11 +597,38 @@ impl LoopDevice {
                     inner.offset,
                     inner.size_limit,
                     inner.file_size,
+                    inner.flags.contains(LoopFlags::AUTOCLEAR),
                     inner.generation,
                 )
             };
             let new_offset = requested_offset.unwrap_or(old_offset);
             let new_limit = requested_limit.unwrap_or(old_limit);
+            let new_autoclear = requested_autoclear.unwrap_or(old_autoclear);
+
+            // LOOP_SET_STATUS must not refresh capacity merely because the
+            // backing file changed size. Linux only does so when offset or
+            // sizelimit changes; LOOP_SET_CAPACITY is the explicit refresh.
+            let refresh_capacity = requested_offset.is_none() && requested_limit.is_none();
+            if !refresh_capacity && new_offset == old_offset && new_limit == old_limit {
+                let _topology = LOOP_BACKING_TOPOLOGY_LOCK.lock();
+                let _config = self.config_mutex.lock();
+                let mut inner = self.inner();
+                let unchanged_snapshot = inner
+                    .backing_file
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &backing_file))
+                    && inner.generation == generation
+                    && matches!(inner.state(), LoopState::Bound);
+                if !unchanged_snapshot {
+                    continue;
+                }
+                if inner.flags.contains(LoopFlags::AUTOCLEAR) != new_autoclear {
+                    inner.flags.set(LoopFlags::AUTOCLEAR, new_autoclear);
+                    inner.generation = inner.generation.wrapping_add(1);
+                }
+                return Ok(());
+            }
+
             let effective = Self::compute_effective_size(&backing_file, new_offset, new_limit)?;
 
             let owner = {
@@ -581,6 +648,10 @@ impl LoopDevice {
                     && inner.size_limit == new_limit
                     && inner.file_size == effective
                 {
+                    if inner.flags.contains(LoopFlags::AUTOCLEAR) != new_autoclear {
+                        inner.flags.set(LoopFlags::AUTOCLEAR, new_autoclear);
+                        inner.generation = inner.generation.wrapping_add(1);
+                    }
                     return Ok(());
                 }
                 if self.mount_holder_count.load(Ordering::Acquire) != 0 {
@@ -607,9 +678,9 @@ impl LoopDevice {
             inner.offset = new_offset;
             inner.size_limit = new_limit;
             inner.file_size = effective;
-            // READ_ONLY is fixed at bind time. DragonOS currently implements
-            // no runtime-settable loop flags.
-            inner.flags &= LoopFlags::READ_ONLY;
+            // READ_ONLY is fixed at bind time; LOOP_SET_STATUS may update
+            // AUTOCLEAR together with the mapping.
+            inner.flags.set(LoopFlags::AUTOCLEAR, new_autoclear);
             inner.generation = inner.generation.wrapping_add(1);
             inner.quiesce_owner = None;
             inner.set_state(LoopState::Bound)?;
@@ -649,7 +720,11 @@ impl LoopDevice {
             info.lo_sizelimit as usize
         };
 
-        self.reconfigure_mapping(Some(new_offset), Some(new_limit))
+        self.reconfigure_mapping(
+            Some(new_offset),
+            Some(new_limit),
+            Some(info.lo_flags & LoopFlags::AUTOCLEAR.bits() != 0),
+        )
     }
 
     /// # 功能
@@ -708,7 +783,11 @@ impl LoopDevice {
 
         let new_offset = info.lo_offset as usize;
         // legacy loop_info does not carry sizelimit.
-        self.reconfigure_mapping(Some(new_offset), None)
+        self.reconfigure_mapping(
+            Some(new_offset),
+            None,
+            Some(info.lo_flags as u32 & LoopFlags::AUTOCLEAR.bits() != 0),
+        )
     }
 
     fn get_status(&self, user_ptr: usize) -> Result<(), SystemError> {
@@ -828,7 +907,7 @@ impl LoopDevice {
     }
 
     fn set_capacity(&self, _arg: usize) -> Result<(), SystemError> {
-        self.reconfigure_mapping(None, None)
+        self.reconfigure_mapping(None, None, None)
     }
 
     /// # 功能
@@ -1367,12 +1446,18 @@ impl BlockDevice for LoopDevice {
     }
 
     fn file_close(&self, mut data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        let mut became_last_opener = false;
         if let FilePrivateData::Loop(loop_data) = &mut *data {
             if loop_data.open_counted {
                 loop_data.open_counted = false;
                 let previous = self.open_count.fetch_sub(1, Ordering::AcqRel);
                 debug_assert!(previous > 0, "loop open count underflow");
+                became_last_opener = previous == 1;
             }
+        }
+        drop(data);
+        if became_last_opener {
+            self.maybe_autoclear();
         }
         Ok(())
     }
@@ -1389,6 +1474,9 @@ impl BlockDevice for LoopDevice {
     fn mount_holder_release(&self) {
         let previous = self.mount_holder_count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "loop mount holder count underflow");
+        if previous == 1 {
+            self.maybe_autoclear();
+        }
     }
 
     fn dev_name(&self) -> &DevName {

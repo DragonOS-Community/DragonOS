@@ -7798,7 +7798,6 @@ static int ext_test_loop_fuse_backing_sync_semantics() {
     const char *mp = "/tmp/test_fuse_loop_sync";
     const unsigned long loop_ctl_add = 0x4C80;
     const unsigned long loop_ctl_remove = 0x4C81;
-    const unsigned long loop_ctl_get_free = 0x4C82;
     const unsigned long loop_set_fd = 0x4C00;
     const unsigned long loop_clr_fd = 0x4C01;
     const uint64_t expected_fh = 950;
@@ -7900,8 +7899,8 @@ static int ext_test_loop_fuse_backing_sync_semantics() {
         printf("[FAIL] loop+fuse open loop-control: %s (errno=%d)\n", strerror(errno), errno);
         goto fail;
     }
-    minor = ioctl(control_fd, loop_ctl_get_free, 0);
-    if (minor < 0 || ioctl(control_fd, loop_ctl_add, minor) < 0) {
+    minor = ioctl(control_fd, loop_ctl_add, UINT32_MAX);
+    if (minor < 0) {
         printf("[FAIL] loop+fuse add loop device: %s (errno=%d)\n", strerror(errno), errno);
         goto fail;
     }

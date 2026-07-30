@@ -176,6 +176,23 @@ class LoopExt4 {
         mounted_ = false;
     }
 
+    void RequestAutoclearAndCloseLoop() {
+        ASSERT_GE(loop_fd_, 0);
+        ASSERT_EQ(0, ioctl(loop_fd_, kLoopClrFd, 0)) << strerror(errno);
+        ASSERT_EQ(0, close(loop_fd_)) << strerror(errno);
+        loop_fd_ = -1;
+    }
+
+    void ExpectLoopUnbound() const {
+        int probe = open(loop_path_.c_str(), O_RDWR);
+        ASSERT_GE(probe, 0) << strerror(errno);
+        unsigned char block[512] = {};
+        errno = 0;
+        EXPECT_EQ(-1, pread(probe, block, sizeof(block), 0));
+        EXPECT_EQ(ENODEV, errno);
+        EXPECT_EQ(0, close(probe));
+    }
+
     void MountSecond() {
         ASSERT_TRUE(mounted_);
         ASSERT_FALSE(second_mounted_);
@@ -525,6 +542,20 @@ TEST(Ext4InodeIdentity, StatfsReportsLinuxAbi) {
     EXPECT_LE(by_fd.f_bavail, by_fd.f_bfree);
 
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, AutoclearWaitsForFinalMountHolder) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    ASSERT_NO_FATAL_FAILURE(fs.RequestAutoclearAndCloseLoop());
+
+    struct statfs mounted = {};
+    ASSERT_EQ(0, statfs(fs.mount_point().c_str(), &mounted)) << strerror(errno);
+    EXPECT_EQ(0xEF53, mounted.f_type);
+
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.ExpectLoopUnbound());
 }
 
 std::string ReadFile(const char* path) {

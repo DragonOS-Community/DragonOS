@@ -16,9 +16,10 @@ use log::error;
 use lru::LruCache;
 use system_error::SystemError;
 
-use crate::driver::base::block::gendisk::GenDisk;
+use crate::driver::base::block::gendisk::{GenDisk, GenDiskMountGuard};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::page_cache::{AsyncPageCacheBackend, PageCache};
+use crate::filesystem::vfs::mount::filesystem_is_synchronous;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
@@ -94,6 +95,8 @@ impl Eq for Cluster {}
 pub struct FATFileSystem {
     /// 当前文件系统所在的分区
     pub gendisk: Arc<GenDisk>,
+    /// Prevents loop clear/remove for the complete filesystem lifetime.
+    _device_mount_holder: GenDiskMountGuard,
     /// 当前文件系统的BOPB
     pub bpb: BiosParameterBlock,
     /// 当前文件系统的第一个数据扇区（相对分区开始位置）
@@ -697,6 +700,7 @@ impl FATFileSystem {
     }
 
     pub fn new(gendisk: Arc<GenDisk>) -> Result<Arc<FATFileSystem>, SystemError> {
+        let device_mount_holder = gendisk.acquire_mount_holder()?;
         let bpb = BiosParameterBlock::new(&gendisk)?;
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
         let fs_info: FATFsInfo = match bpb.fat_type {
@@ -772,6 +776,7 @@ impl FATFileSystem {
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
             gendisk,
+            _device_mount_holder: device_mount_holder,
             bpb,
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
@@ -1883,18 +1888,9 @@ impl IndexNode for LockedFATInode {
     fn sync_file(
         &self,
         datasync: bool,
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        match self.metadata()?.file_type {
-            FileType::File | FileType::Dir => {
-                if datasync {
-                    self.datasync()
-                } else {
-                    self.sync()
-                }
-            }
-            _ => Err(SystemError::EINVAL),
-        }
+        self.sync_file_range(0, usize::MAX, datasync, data)
     }
 
     fn sync_file_range(
@@ -1904,19 +1900,38 @@ impl IndexNode for LockedFATInode {
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        match self.metadata()?.file_type {
-            FileType::File | FileType::Dir => {
-                if let Some(page_cache) = self.page_cache() {
-                    let start_index = start >> MMArch::PAGE_SHIFT;
-                    let end_index = end >> MMArch::PAGE_SHIFT;
-                    page_cache
-                        .manager()
-                        .writeback_range(start_index, end_index)?;
-                }
-                Ok(())
-            }
-            _ => Err(SystemError::EINVAL),
+        let (file_type, page_cache, fs) = {
+            let inode = self.0.lock();
+            (
+                inode.metadata.file_type,
+                inode.page_cache.clone(),
+                inode.fs.upgrade().ok_or(SystemError::EIO)?,
+            )
+        };
+
+        if !matches!(file_type, FileType::File | FileType::Dir) {
+            return Err(SystemError::EINVAL);
         }
+
+        if let Some(page_cache) = page_cache {
+            let start_index = start >> MMArch::PAGE_SHIFT;
+            let end_index = end >> MMArch::PAGE_SHIFT;
+            // writeback_range() is synchronous: it submits and waits for the
+            // selected dirty pages, propagating submission/writeback errors.
+            // FATFile::write()/ensure_len() also submits the FAT chain and
+            // short direntry updates needed to make an extended file
+            // reachable before this call returns.
+            page_cache
+                .manager()
+                .writeback_range(start_index, end_index)?;
+        }
+
+        // FAT cannot safely omit size/cluster metadata for fdatasync, so both
+        // fsync and fdatasync share this final power-loss durability boundary.
+        // Do not move this barrier into page writeback: a single file-level
+        // sync must cover the related data, FAT chain, and directory entry,
+        // and the device flush error must be visible to the caller.
+        fs.gendisk.sync()
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -2151,6 +2166,19 @@ impl IndexNode for LockedFATInode {
                             remain_size -= write_size;
                             offset += write_size;
                         }
+                        // Unlike ordinary/O_SYNC writes, resize and mode-0
+                        // fallocate do not pass through File post-write sync.
+                        // Match Linux fat_cont_expand() only for IS_SYNC.
+                        guard.synchronize_metadata();
+                        guard.metadata.size = len as i64;
+                        let inode_sync = guard.metadata.flags.contains(InodeFlags::S_SYNC);
+                        let fs = fs.clone();
+                        drop(guard);
+                        let mounted_fs: Arc<dyn FileSystem> = fs.clone();
+                        if inode_sync || filesystem_is_synchronous(&mounted_fs) {
+                            fs.gendisk.sync()?;
+                        }
+                        return Ok(());
                     }
                     Ordering::Less => {
                         guard.metadata.size = len as i64;
@@ -2175,10 +2203,6 @@ impl IndexNode for LockedFATInode {
                         }
                     }
                 }
-                // 同步元数据：从文件对象获取最新大小，并确保一致
-                guard.synchronize_metadata();
-                guard.metadata.size = len as i64;
-                return Ok(());
             }
             FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
             FATDirEntry::UnInit => {

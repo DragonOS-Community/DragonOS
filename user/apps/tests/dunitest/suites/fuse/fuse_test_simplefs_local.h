@@ -796,6 +796,7 @@ struct fuse_daemon_args {
     volatile unsigned char *write_watch_bytes;
     volatile unsigned char *write_covers_watch;
     volatile unsigned char *backend_watch_byte;
+    volatile unsigned char *backend_watch_byte2;
     unsigned char *large_write_backing;
     size_t large_write_backing_capacity;
     volatile uint64_t *large_write_nodeid;
@@ -808,6 +809,7 @@ struct fuse_daemon_args {
     volatile int *write_entered;
     volatile int *release_write;
     volatile uint64_t *last_fsync_fh;
+    volatile uint32_t *last_fsync_flags;
     volatile uint32_t *write_count_at_fsync;
     volatile uint32_t *last_write_flags_at_fsync;
     volatile uint64_t *last_release_fh;
@@ -831,6 +833,7 @@ struct fuse_daemon_args {
     uint32_t init_out_flags_override;
     uint32_t init_out_max_write_override;
     uint64_t write_watch_offset;
+    uint64_t write_watch_offset2;
     uint64_t hello_open_fh_override;
     uint64_t next_open_fh;
     uint64_t create_reuse_nodeid;
@@ -850,6 +853,7 @@ struct fuse_daemon_args {
     int force_opendir_enosys;
     int force_flush_errno;
     int force_fsync_errno;
+    volatile int *forced_fsync_errno;
     int force_fsyncdir_errno;
     int force_xattr_enosys;
     int force_getxattr_erange_at_max;
@@ -1521,14 +1525,19 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->last_fsync_fh) {
             *a->last_fsync_fh = in->fh;
         }
+        if (a->last_fsync_flags) {
+            *a->last_fsync_flags = in->fsync_flags;
+        }
         if (a->write_count_at_fsync && a->write_count) {
             *a->write_count_at_fsync = *a->write_count;
         }
         if (a->last_write_flags_at_fsync && a->last_write_flags) {
             *a->last_write_flags_at_fsync = *a->last_write_flags;
         }
-        if (a->force_fsync_errno > 0) {
-            return fuse_write_reply(a->fd, h->unique, -a->force_fsync_errno, NULL, 0);
+        int fsync_errno =
+            a->forced_fsync_errno ? *a->forced_fsync_errno : a->force_fsync_errno;
+        if (fsync_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -fsync_errno, NULL, 0);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     }
@@ -1692,8 +1701,15 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 *a->backend_watch_byte = write_backing[watch];
             }
         }
+        if (a->backend_watch_byte2) {
+            uint64_t watch = a->write_watch_offset2;
+            if (watch < node->size && watch < write_capacity) {
+                *a->backend_watch_byte2 = write_backing[watch];
+            }
+        }
         if (a->write_count) {
-            if (a->write_trace_capacity > 0 || a->backend_watch_byte) {
+            if (a->write_trace_capacity > 0 || a->backend_watch_byte ||
+                a->backend_watch_byte2) {
                 __sync_synchronize();
             }
             (*a->write_count)++;

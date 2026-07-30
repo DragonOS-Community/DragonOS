@@ -7593,6 +7593,11 @@ static int ext_test_shared_writable_mmap_osync_writeback() {
     volatile char c = 0;
     pid_t daemon = -1;
     const uint32_t expected_writeback_flags = FUSE_WRITE_CACHE;
+    // This mount does not negotiate FUSE_WRITEBACK_CACHE.  The pwrite request
+    // is therefore an ordinary cached write; only later page writeback carries
+    // FUSE_WRITE_CACHE.
+    const uint32_t expected_cached_write_flags = 0;
+    const uint32_t expected_cached_write_open_flags = O_RDWR | O_SYNC;
     const size_t page_size = 4096;
     const size_t map_len = page_size * 2;
     const char marker = 'Z';
@@ -7611,6 +7616,8 @@ static int ext_test_shared_writable_mmap_osync_writeback() {
         volatile uint64_t last_fsync_fh;
         volatile uint32_t write_count_at_fsync;
         volatile uint32_t last_write_flags_at_fsync;
+        volatile unsigned char mmap_dirty_byte;
+        volatile unsigned char pwrite_marker_byte;
     };
     struct mmap_shared_state *shared =
         (struct mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
@@ -7663,6 +7670,10 @@ static int ext_test_shared_writable_mmap_osync_writeback() {
         child_args.last_fsync_fh = &shared->last_fsync_fh;
         child_args.write_count_at_fsync = &shared->write_count_at_fsync;
         child_args.last_write_flags_at_fsync = &shared->last_write_flags_at_fsync;
+        child_args.backend_watch_byte = &shared->mmap_dirty_byte;
+        child_args.backend_watch_byte2 = &shared->pwrite_marker_byte;
+        child_args.write_watch_offset = 2;
+        child_args.write_watch_offset2 = page_size;
         child_args.next_open_fh = 930;
         child_args.hello_data_size_override = map_len;
         fuse_daemon_thread(&child_args);
@@ -7711,19 +7722,44 @@ static int ext_test_shared_writable_mmap_osync_writeback() {
         goto fail;
     }
 
-    if (shared->open_count != 1 || shared->read_count != 1 || shared->write_count != 2 ||
+    // O_SYNC must synchronize only the range written by pwrite().  The dirty
+    // mmap page at offset zero is deliberately outside that range and must
+    // remain dirty until the explicit msync() below.
+    if (shared->open_count != 1 || shared->read_count != 1 || shared->write_count != 1 ||
         shared->fsync_count != 1 || shared->last_write_fh != 930 || shared->last_fsync_fh != 930 ||
-        shared->last_write_offset != 0 || shared->last_write_size != page_size ||
-        shared->last_write_flags != expected_writeback_flags || shared->last_write_open_flags != 0 ||
-        shared->write_count_at_fsync != 2 ||
-        shared->last_write_flags_at_fsync != expected_writeback_flags) {
-        printf("[FAIL] shared mmap osync counters open=%u read=%u write=%u fsync=%u wfh=%llu fsh=%llu off=%llu size=%u wflags=%u oflags=%u fsync_writes=%u fsync_wflags=%u\n",
+        shared->last_write_offset != page_size || shared->last_write_size != 1 ||
+        shared->last_write_flags != expected_cached_write_flags ||
+        shared->last_write_open_flags != expected_cached_write_open_flags ||
+        shared->write_count_at_fsync != 1 ||
+        shared->last_write_flags_at_fsync != expected_cached_write_flags) {
+        printf("[FAIL] shared mmap osync range counters open=%u read=%u write=%u fsync=%u wfh=%llu fsh=%llu off=%llu size=%u wflags=%u oflags=%u fsync_writes=%u fsync_wflags=%u\n",
                shared->open_count, shared->read_count, shared->write_count, shared->fsync_count,
                (unsigned long long)shared->last_write_fh,
                (unsigned long long)shared->last_fsync_fh,
                (unsigned long long)shared->last_write_offset, shared->last_write_size,
                shared->last_write_flags, shared->last_write_open_flags,
                shared->write_count_at_fsync, shared->last_write_flags_at_fsync);
+        goto fail;
+    }
+
+    if (msync(addr, page_size, MS_SYNC) != 0) {
+        printf("[FAIL] msync(dirty page outside O_SYNC range): %s (errno=%d)\n",
+               strerror(errno), errno);
+        goto fail;
+    }
+    if (shared->write_count != 2 || shared->fsync_count != 2 ||
+        shared->last_write_offset != 0 || shared->last_write_size != page_size ||
+        shared->last_write_flags != expected_writeback_flags ||
+        shared->last_write_open_flags != 0 || shared->last_fsync_fh != 930 ||
+        shared->write_count_at_fsync != 2 ||
+        shared->last_write_flags_at_fsync != expected_writeback_flags ||
+        shared->mmap_dirty_byte != 'F' ||
+        shared->pwrite_marker_byte != (unsigned char)marker) {
+        printf("[FAIL] shared mmap deferred writeback counters write=%u fsync=%u off=%llu size=%u wflags=%u oflags=%u mmap_byte=%u marker_byte=%u\n",
+               shared->write_count, shared->fsync_count,
+               (unsigned long long)shared->last_write_offset, shared->last_write_size,
+               shared->last_write_flags, shared->last_write_open_flags,
+               shared->mmap_dirty_byte, shared->pwrite_marker_byte);
         goto fail;
     }
 
@@ -7754,6 +7790,299 @@ fail:
         waitpid(daemon, NULL, 0);
     }
     munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_loop_fuse_backing_sync_semantics() {
+    const char *mp = "/tmp/test_fuse_loop_sync";
+    const unsigned long loop_ctl_add = 0x4C80;
+    const unsigned long loop_ctl_remove = 0x4C81;
+    const unsigned long loop_set_fd = 0x4C00;
+    const unsigned long loop_clr_fd = 0x4C01;
+    const uint64_t expected_fh = 950;
+    char backing_path[256];
+    char loop_path[64];
+    int fuse_fd = -1;
+    int backing_fd = -1;
+    int control_fd = -1;
+    int loop_sync_fd = -1;
+    int loop_dsync_fd = -1;
+    int minor = -1;
+    int mounted = 0;
+    int loop_added = 0;
+    int loop_bound = 0;
+    pid_t daemon = -1;
+    unsigned char block[512];
+    struct loop_fuse_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile int forced_fsync_errno;
+        volatile uint32_t open_count;
+        volatile uint32_t write_count;
+        volatile uint32_t fsync_count;
+        volatile uint64_t last_write_fh;
+        volatile uint64_t last_fsync_fh;
+        volatile uint32_t last_fsync_flags;
+        volatile uint32_t write_count_at_fsync;
+    };
+    struct loop_fuse_shared_state *shared =
+        (struct loop_fuse_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] loop+fuse mmap(shared): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset((void *)shared, 0, sizeof(*shared));
+    memset(block, 0x5a, sizeof(block));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] loop+fuse ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    fuse_fd = open("/dev/fuse", O_RDWR);
+    if (fuse_fd < 0) {
+        printf("[FAIL] loop+fuse open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    daemon = fork();
+    if (daemon < 0) {
+        printf("[FAIL] loop+fuse fork daemon: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (daemon == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fuse_fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.enable_write_ops = 1;
+        child_args.stop_on_destroy = 1;
+        child_args.open_count = &shared->open_count;
+        child_args.write_count = &shared->write_count;
+        child_args.fsync_count = &shared->fsync_count;
+        child_args.last_write_fh = &shared->last_write_fh;
+        child_args.last_fsync_fh = &shared->last_fsync_fh;
+        child_args.last_fsync_flags = &shared->last_fsync_flags;
+        child_args.write_count_at_fsync = &shared->write_count_at_fsync;
+        child_args.forced_fsync_errno = &shared->forced_fsync_errno;
+        child_args.next_open_fh = expected_fh;
+        child_args.hello_data_size_override = 8192;
+        child_args.init_out_flags_override =
+            FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_WRITEBACK_CACHE;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fuse_fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] loop+fuse mount: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 1;
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] loop+fuse init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(backing_path, sizeof(backing_path), "%s/hello.txt", mp);
+    backing_fd = open(backing_path, O_RDWR);
+    if (backing_fd < 0) {
+        printf("[FAIL] loop+fuse open backing: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    control_fd = open("/dev/loop-control", O_RDWR);
+    if (control_fd < 0) {
+        printf("[FAIL] loop+fuse open loop-control: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    minor = ioctl(control_fd, loop_ctl_add, UINT32_MAX);
+    if (minor < 0) {
+        printf("[FAIL] loop+fuse add loop device: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    loop_added = 1;
+    snprintf(loop_path, sizeof(loop_path), "/dev/loop%d", minor);
+    loop_sync_fd = open(loop_path, O_RDWR | O_SYNC);
+    if (loop_sync_fd < 0 || ioctl(loop_sync_fd, loop_set_fd, backing_fd) != 0) {
+        printf("[FAIL] loop+fuse bind backing: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    loop_bound = 1;
+
+    // The loop device must retain this exact FUSE open file description and fh.
+    if (close(backing_fd) != 0) {
+        printf("[FAIL] loop+fuse close setup backing fd: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    backing_fd = -1;
+    loop_dsync_fd = open(loop_path, O_RDWR | O_DSYNC);
+    if (loop_dsync_fd < 0) {
+        printf("[FAIL] loop+fuse open O_DSYNC loop fd: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    // Stage 1: O_SYNC must complete backing WRITE then full FSYNC before return.
+    if (pwrite(loop_sync_fd, block, sizeof(block), 0) != (ssize_t)sizeof(block) ||
+        shared->write_count != 1 || shared->fsync_count != 1 ||
+        shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
+        shared->last_fsync_flags != 0 || shared->write_count_at_fsync != 1) {
+        printf("[FAIL] loop+fuse O_SYNC write=%u fsync=%u wfh=%llu ffh=%llu flags=%u writes_at_fsync=%u errno=%d\n",
+               shared->write_count, shared->fsync_count,
+               (unsigned long long)shared->last_write_fh,
+               (unsigned long long)shared->last_fsync_fh, shared->last_fsync_flags,
+               shared->write_count_at_fsync, errno);
+        goto fail;
+    }
+
+    // Stage 2: O_DSYNC has an independent write+fsync boundary and sets FDATASYNC.
+    memset(block, 0xa5, sizeof(block));
+    if (pwrite(loop_dsync_fd, block, sizeof(block), 512) != (ssize_t)sizeof(block) ||
+        shared->write_count != 2 || shared->fsync_count != 2 ||
+        shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
+        shared->last_fsync_flags != FUSE_FSYNC_FDATASYNC ||
+        shared->write_count_at_fsync != 2) {
+        printf("[FAIL] loop+fuse O_DSYNC write=%u fsync=%u wfh=%llu ffh=%llu flags=%u writes_at_fsync=%u errno=%d\n",
+               shared->write_count, shared->fsync_count,
+               (unsigned long long)shared->last_write_fh,
+               (unsigned long long)shared->last_fsync_fh, shared->last_fsync_flags,
+               shared->write_count_at_fsync, errno);
+        goto fail;
+    }
+
+    // Stage 3: explicit fsync/fdatasync must reach the same retained fh.
+    if (fsync(loop_sync_fd) != 0 || shared->fsync_count != 3 ||
+        shared->last_fsync_fh != expected_fh || shared->last_fsync_flags != 0 ||
+        shared->write_count_at_fsync != 2) {
+        printf("[FAIL] loop+fuse explicit fsync count=%u fh=%llu flags=%u writes=%u errno=%d\n",
+               shared->fsync_count, (unsigned long long)shared->last_fsync_fh,
+               shared->last_fsync_flags, shared->write_count_at_fsync, errno);
+        goto fail;
+    }
+    // Block-device fsync/fdatasync both use the device flush operation; unlike
+    // delegated O_DSYNC above, the explicit block-device operation is a full flush.
+    if (fdatasync(loop_dsync_fd) != 0 || shared->fsync_count != 4 ||
+        shared->last_fsync_fh != expected_fh || shared->last_fsync_flags != 0 ||
+        shared->write_count_at_fsync != 2) {
+        printf("[FAIL] loop+fuse explicit fdatasync count=%u fh=%llu flags=%u writes=%u errno=%d\n",
+               shared->fsync_count, (unsigned long long)shared->last_fsync_fh,
+               shared->last_fsync_flags, shared->write_count_at_fsync, errno);
+        goto fail;
+    }
+
+    // Stage 4: a backing FUSE_FSYNC EIO must be returned by the loop O_SYNC write.
+    shared->forced_fsync_errno = EIO;
+    errno = 0;
+    if (pwrite(loop_sync_fd, block, sizeof(block), 1024) >= 0 || errno != EIO ||
+        shared->write_count != 3 || shared->fsync_count != 5 ||
+        shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
+        shared->last_fsync_flags != 0 || shared->write_count_at_fsync != 3) {
+        printf("[FAIL] loop+fuse injected EIO ret_errno=%d write=%u fsync=%u wfh=%llu ffh=%llu flags=%u writes_at_fsync=%u\n",
+               errno, shared->write_count, shared->fsync_count,
+               (unsigned long long)shared->last_write_fh,
+               (unsigned long long)shared->last_fsync_fh, shared->last_fsync_flags,
+               shared->write_count_at_fsync);
+        goto fail;
+    }
+    shared->forced_fsync_errno = 0;
+
+    // Stage 5: Linux loop ignores EINVAL from a backing flush.
+    shared->forced_fsync_errno = EINVAL;
+    errno = 0;
+    if (pwrite(loop_sync_fd, block, sizeof(block), 1536) != (ssize_t)sizeof(block) ||
+        shared->write_count != 4 || shared->fsync_count != 6 ||
+        shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
+        shared->last_fsync_flags != 0 || shared->write_count_at_fsync != 4) {
+        printf("[FAIL] loop+fuse injected EINVAL ret_errno=%d write=%u fsync=%u wfh=%llu ffh=%llu flags=%u writes_at_fsync=%u\n",
+               errno, shared->write_count, shared->fsync_count,
+               (unsigned long long)shared->last_write_fh,
+               (unsigned long long)shared->last_fsync_fh, shared->last_fsync_flags,
+               shared->write_count_at_fsync);
+        goto fail;
+    }
+
+    // Stage 6: every other backing flush error is normalized to EIO.
+    shared->forced_fsync_errno = ENOSPC;
+    errno = 0;
+    if (pwrite(loop_sync_fd, block, sizeof(block), 2048) >= 0 || errno != EIO ||
+        shared->write_count != 5 || shared->fsync_count != 7 ||
+        shared->last_write_fh != expected_fh || shared->last_fsync_fh != expected_fh ||
+        shared->last_fsync_flags != 0 || shared->write_count_at_fsync != 5) {
+        printf("[FAIL] loop+fuse injected ENOSPC ret_errno=%d write=%u fsync=%u wfh=%llu ffh=%llu flags=%u writes_at_fsync=%u\n",
+               errno, shared->write_count, shared->fsync_count,
+               (unsigned long long)shared->last_write_fh,
+               (unsigned long long)shared->last_fsync_fh, shared->last_fsync_flags,
+               shared->write_count_at_fsync);
+        goto fail;
+    }
+    shared->forced_fsync_errno = 0;
+
+    close(loop_dsync_fd);
+    loop_dsync_fd = -1;
+    if (ioctl(loop_sync_fd, loop_clr_fd, 0) != 0) {
+        printf("[FAIL] loop+fuse LOOP_CLR_FD: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    loop_bound = 0;
+    close(loop_sync_fd);
+    loop_sync_fd = -1;
+    if (ioctl(control_fd, loop_ctl_remove, minor) != 0) {
+        printf("[FAIL] loop+fuse LOOP_CTL_REMOVE: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    loop_added = 0;
+    close(control_fd);
+    control_fd = -1;
+    if (umount(mp) != 0) {
+        printf("[FAIL] loop+fuse umount: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    mounted = 0;
+    shared->stop = 1;
+    close(fuse_fd);
+    fuse_fd = -1;
+    waitpid(daemon, NULL, 0);
+    daemon = -1;
+    munmap((void *)shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    shared->forced_fsync_errno = 0;
+    if (loop_dsync_fd >= 0) {
+        close(loop_dsync_fd);
+    }
+    if (loop_sync_fd >= 0) {
+        if (loop_bound) {
+            ioctl(loop_sync_fd, loop_clr_fd, 0);
+            loop_bound = 0;
+        }
+        close(loop_sync_fd);
+    }
+    if (backing_fd >= 0) {
+        close(backing_fd);
+    }
+    if (control_fd >= 0) {
+        if (loop_added) {
+            ioctl(control_fd, loop_ctl_remove, minor);
+        }
+        close(control_fd);
+    }
+    if (mounted) {
+        umount2(mp, MNT_DETACH);
+    }
+    shared->stop = 1;
+    if (fuse_fd >= 0) {
+        close(fuse_fd);
+    }
+    if (daemon > 0) {
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+    }
+    munmap((void *)shared, sizeof(*shared));
     rmdir(mp);
     return -1;
 }
@@ -10771,6 +11100,10 @@ TEST(FuseExtended, SharedMmapDirtyThenPwriteKeepsLatestData) {
 
 TEST(FuseExtended, SharedWritableMmapOSyncWriteback) {
     ASSERT_EQ(0, ext_test_shared_writable_mmap_osync_writeback());
+}
+
+TEST(FuseExtended, LoopFuseBackingSyncSemantics) {
+    ASSERT_EQ(0, ext_test_loop_fuse_backing_sync_semantics());
 }
 
 TEST(FuseExtended, SharedMmapMprotectWriteback) {

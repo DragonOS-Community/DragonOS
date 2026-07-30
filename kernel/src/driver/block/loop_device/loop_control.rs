@@ -176,7 +176,7 @@ impl IndexNode for LoopControlDevice {
                 log::info!("Starting LOOP_CTL_ADD ioctl");
                 let requested_index = data as u32;
                 let loop_dev = if requested_index == u32::MAX {
-                    self.loop_mgr.loop_add(None)?
+                    self.loop_mgr.loop_add_new()?
                 } else {
                     self.loop_mgr.loop_add(Some(requested_index))?
                 };
@@ -196,10 +196,7 @@ impl IndexNode for LoopControlDevice {
                 self.loop_mgr.loop_remove(minor_to_remove)?;
                 Ok(0)
             }
-            Some(LoopControlIoctl::GetFree) => match self.loop_mgr.find_free_minor() {
-                Some(minor) => Ok(minor as usize),
-                None => Err(SystemError::ENOSPC),
-            },
+            Some(LoopControlIoctl::GetFree) => Ok(self.loop_mgr.find_or_add_free_minor()? as usize),
             _ => Err(SystemError::ENOSYS),
         }
     }

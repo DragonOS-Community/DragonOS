@@ -1,8 +1,9 @@
 use super::{
-    file::{File, FileFlags, FileMode, PreopenedFile},
+    file::{File, FileFlags, PreopenedFile},
     utils::DName,
-    DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode,
-    InodeRetentionKind, PollableInode, SetMetadataMask, SuperBlock, XattrFlags,
+    DelegatedWriteResult, DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode,
+    InodeId, InodeMode, InodeRetentionKind, PollableInode, SetMetadataMask, SuperBlock,
+    WriteSyncIntent, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -667,6 +668,7 @@ pub struct SuperBlockState {
     /// Bind mounts and mount-namespace copies retain the same owner.
     owner_user_ns: Arc<UserNamespace>,
     flags: RwSem<MountFlags>,
+    synchronous: AtomicBool,
     write_count: AtomicUsize,
     wb_error: ErrSeq,
     umount_lock: RwSem<()>,
@@ -841,9 +843,11 @@ struct MountStateInit {
 
 impl SuperBlockState {
     pub fn new(flags: MountFlags) -> Self {
+        let flags = flags & MountFlags::SB_SETTABLE_MASK;
         Self {
             owner_user_ns: ProcessManager::current_user_ns(),
-            flags: RwSem::new(flags & MountFlags::SB_SETTABLE_MASK),
+            flags: RwSem::new(flags),
+            synchronous: AtomicBool::new(flags.contains(MountFlags::SYNCHRONOUS)),
             write_count: AtomicUsize::new(0),
             wb_error: ErrSeq::new(),
             umount_lock: RwSem::new(()),
@@ -1103,7 +1107,15 @@ impl SuperBlockState {
     }
 
     pub fn set_flags(&self, flags: MountFlags) {
-        *self.flags.write() = flags & MountFlags::SB_SETTABLE_MASK;
+        let flags = flags & MountFlags::SB_SETTABLE_MASK;
+        let mut current = self.flags.write();
+        *current = flags;
+        self.synchronous
+            .store(flags.contains(MountFlags::SYNCHRONOUS), Ordering::Release);
+    }
+
+    pub fn is_synchronous(&self) -> bool {
+        self.synchronous.load(Ordering::Acquire)
     }
 
     pub fn inc_write_count(&self) {
@@ -2914,9 +2926,21 @@ pub fn record_writeback_error_for_fs(inner_fs: &Arc<dyn FileSystem>, error: Syst
     }
 }
 
+/// Query the canonical SB_SYNCHRONOUS state for a filesystem operation which
+/// runs on an unwrapped backing inode and therefore has no MountExternalGuard.
+pub fn filesystem_is_synchronous(inner_fs: &Arc<dyn FileSystem>) -> bool {
+    list_unique_mounted_superblocks().iter().any(|mount| {
+        Arc::ptr_eq(&mount.inner_filesystem(), inner_fs) && mount.super_block_state.is_synchronous()
+    })
+}
+
 impl MountExternalGuard {
     pub fn mount(&self) -> Arc<MountFS> {
         self.mount.clone()
+    }
+
+    pub fn is_synchronous(&self) -> bool {
+        self.mount.super_block_state.is_synchronous()
     }
 
     /// Derive another owner from an already valid path. This remains legal
@@ -3607,8 +3631,8 @@ impl IndexNode for MountFSInode {
         return self.dentry.inode.open(data, flags);
     }
 
-    fn adjust_file_mode_after_open(&self, data: &FilePrivateData, mode: &mut FileMode) {
-        self.dentry.inode.adjust_file_mode_after_open(data, mode)
+    fn configure_open_file(&self, data: &FilePrivateData, behavior: &mut super::OpenFileBehavior) {
+        self.dentry.inode.configure_open_file(data, behavior)
     }
 
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
@@ -3756,6 +3780,20 @@ impl IndexNode for MountFSInode {
     ) -> Result<usize, SystemError> {
         self.ensure_mount_writable()?;
         return self.dentry.inode.write_at(offset, len, buf, data);
+    }
+
+    fn write_at_with_sync(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync_intent: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        self.ensure_mount_writable()?;
+        self.dentry
+            .inode
+            .write_at_with_sync(offset, len, buf, sync_intent, data)
     }
 
     fn read_direct(

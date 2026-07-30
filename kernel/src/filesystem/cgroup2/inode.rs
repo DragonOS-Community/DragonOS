@@ -17,7 +17,8 @@ use crate::{
         file::{FileFlags, FilePrivateData},
         permission::PermissionMask,
         vcore::generate_inode_id,
-        FileSystem, FileType, IndexNode, InodeFlags, InodeMode, Metadata,
+        FileSystem, FileType, IndexNode, InodeFlags, InodeMode, Metadata, OpenFileBehavior,
+        PostWriteSyncPolicy,
     },
     libs::{mutex::MutexGuard, rwsem::RwSem, spinlock::SpinLock},
     process::ProcessManager,
@@ -556,6 +557,10 @@ impl Cgroup2Inode {
 }
 
 impl IndexNode for Cgroup2Inode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+    }
+
     fn open(
         &self,
         _data: MutexGuard<FilePrivateData>,

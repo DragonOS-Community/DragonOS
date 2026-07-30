@@ -3,7 +3,10 @@ use crate::{
         block::{block_device::BlockDevice, manager::block_dev_manager},
         device::DevName,
     },
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{
+        mutex::Mutex,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
 };
 use alloc::{format, sync::Arc};
 use ida::IdAllocator;
@@ -19,6 +22,8 @@ use super::{
 /// Loop 设备管理器
 pub struct LoopManager {
     inner: SpinLock<LoopManagerInner>,
+    /// Linux loop_ctl_mutex equivalent for device visibility and allocation.
+    control_mutex: Mutex<()>,
 }
 
 pub struct LoopManagerInner {
@@ -39,6 +44,7 @@ impl LoopManager {
                 id_alloc: IdAllocator::new(0, Self::MAX_DEVICES)
                     .expect("create IdAllocator failed"),
             }),
+            control_mutex: Mutex::new(()),
         }
     }
 
@@ -97,11 +103,24 @@ impl LoopManager {
     /// - `Ok(Arc<LoopDevice>)`: 成功获得的设备。
     /// - `Err(SystemError)`: 无可用设备或参数错误。
     pub fn loop_add(&self, requested_minor: Option<u32>) -> Result<Arc<LoopDevice>, SystemError> {
+        let _control = self.control_mutex.lock();
         let mut inner = self.inner();
         match requested_minor {
             Some(req_minor) => self.loop_add_specific_locked(&mut inner, req_minor),
             None => self.loop_add_first_available_locked(&mut inner),
         }
+    }
+
+    /// Allocate and register a new loop device with the first unused minor.
+    pub fn loop_add_new(&self) -> Result<Arc<LoopDevice>, SystemError> {
+        let _control = self.control_mutex.lock();
+        let mut inner = self.inner();
+        let id = Self::alloc_id_locked(&mut inner).ok_or(SystemError::ENOSPC)?;
+        let result = self.create_and_register_device_locked(&mut inner, id);
+        if result.is_err() {
+            Self::free_id_locked(&mut inner, id);
+        }
+        result
     }
 
     /// # 功能
@@ -125,14 +144,10 @@ impl LoopManager {
             return Err(SystemError::EINVAL);
         }
 
-        if let Some(device) = Self::find_device_by_minor_locked(inner, minor) {
-            if device.is_bound() {
-                return Err(SystemError::EEXIST);
-            }
-            if Self::device_reusable(&device) {
-                return Ok(device);
-            }
-            return Err(SystemError::EBUSY);
+        if Self::find_device_by_minor_locked(inner, minor).is_some() {
+            // LOOP_CTL_ADD reserves a new minor. A registered device already
+            // owns this number even while Unbound; only GET_FREE may reuse it.
+            return Err(SystemError::EEXIST);
         }
 
         let id =
@@ -218,6 +233,7 @@ impl LoopManager {
     /// - `Ok(())`: 成功删除设备
     /// - `Err(SystemError)`: 删除失败
     pub fn loop_remove(&self, minor: u32) -> Result<(), SystemError> {
+        let _control = self.control_mutex.lock();
         if minor >= Self::MAX_DEVICES as u32 {
             return Err(SystemError::EINVAL);
         }
@@ -228,17 +244,7 @@ impl LoopManager {
         .ok_or(SystemError::ENODEV)?;
         let id = device.id();
         info!("Starting removal of loop device loop{} (id {})", minor, id);
-        device.enter_rundown_state()?;
-        let needs_drain = {
-            let inner = device.inner();
-            !matches!(inner.state(), LoopState::Deleting)
-        };
-
-        if needs_drain {
-            device.drain_active_io()?;
-        }
-
-        device.clear_file()?;
+        device.prepare_delete()?;
 
         let block_dev: Arc<dyn BlockDevice> = device.clone();
         // 先尝试从 BlockDevManager 注销（会卸载 devfs gendisk 节点）。
@@ -252,17 +258,8 @@ impl LoopManager {
                 device.inner().state()
             );
 
-            // 回滚状态到 Rundown，允许后续重试删除操作。
-            // 这避免了设备卡在 Deleting 状态成为"僵尸"的问题。
-            let mut inner = device.inner();
-            if matches!(inner.state(), LoopState::Deleting) {
-                // Deleting -> Rundown 回滚
-                let _ = inner.set_state(LoopState::Rundown);
-                log::warn!(
-                    "Rolled back loop{} state from Deleting to Rundown for retry",
-                    minor
-                );
-            }
+            // Keep Deleting: new I/O/configuration must remain rejected. A
+            // later LOOP_CTL_REMOVE retry can safely retry unregister.
             return Err(e);
         }
 
@@ -281,17 +278,13 @@ impl LoopManager {
         Ok(())
     }
 
-    pub fn find_free_minor(&self) -> Option<u32> {
-        let inner = self.inner();
-        for minor in 0..Self::MAX_DEVICES as u32 {
-            match &inner.devices[minor as usize] {
-                // 只有 Unbound 才能视为可复用；删除流程中的设备不应返回给 loop_add
-                Some(dev) if Self::device_reusable(dev) => return Some(minor),
-                Some(_) => continue,
-                None => return Some(minor),
-            }
-        }
-        None
+    /// Return a registered unbound loop device, creating one atomically when
+    /// no reusable device exists. This matches Linux LOOP_CTL_GET_FREE.
+    pub fn find_or_add_free_minor(&self) -> Result<u32, SystemError> {
+        let _control = self.control_mutex.lock();
+        let mut inner = self.inner();
+        let device = self.loop_add_first_available_locked(&mut inner)?;
+        Ok(device.minor())
     }
 
     pub fn loop_init(&self, _driver: Arc<LoopDeviceDriver>) -> Result<(), SystemError> {

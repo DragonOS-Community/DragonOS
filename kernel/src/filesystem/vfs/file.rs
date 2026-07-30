@@ -10,7 +10,7 @@ use system_error::SystemError;
 use super::{
     append_lock::{with_inode_append_lock, AppendLockKey},
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
-    mount::{MountExternalGuard, MountFSInode},
+    mount::{MountExternalGuard, MountFSInode, MountFlags},
     utils::should_remove_sgid,
     DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask,
     SpecialNodeData,
@@ -205,10 +205,68 @@ struct WriteConfig {
     update_offset: bool,
     /// 偏移量更新方式
     offset_update: OffsetUpdate,
-    /// 文件标志
-    flags: FileFlags,
-    /// inode 标志
-    inode_flags: InodeFlags,
+    /// Only consumed by a delegated write operation.
+    sync_intent: WriteSyncIntent,
+}
+
+/// Determines which write operation owns Linux post-write synchronous-I/O
+/// semantics for one open file description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostWriteSyncPolicy {
+    /// The VFS calls the file-level range fsync operation after a positive write.
+    Generic,
+    /// The selected write operation consumes [`WriteSyncIntent`] itself.
+    Delegated,
+    /// The selected Linux write operation does not use `generic_write_sync()`.
+    NotApplicable,
+}
+
+/// Per-open behavior selected after the inode has initialized private data.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenFileBehavior {
+    pub mode: FileMode,
+    pub post_write_sync: PostWriteSyncPolicy,
+}
+
+impl OpenFileBehavior {
+    fn new(mode: FileMode, file_type: FileType) -> Self {
+        let post_write_sync = match file_type {
+            FileType::File | FileType::BlockDevice => PostWriteSyncPolicy::Generic,
+            _ => PostWriteSyncPolicy::NotApplicable,
+        };
+        Self {
+            mode,
+            post_write_sync,
+        }
+    }
+}
+
+/// Synchronization requested as part of a delegated write operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteSyncIntent {
+    None,
+    Data,
+    Full,
+}
+
+impl WriteSyncIntent {
+    pub fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::Data, _) | (_, Self::Data) => Self::Data,
+            _ => Self::None,
+        }
+    }
+}
+
+/// A delegated write reports data progress separately from its sync result.
+///
+/// This preserves Linux's ordering: offset and write side effects are finalized
+/// after a positive write even when the following synchronous flush fails.
+#[derive(Debug)]
+pub struct DelegatedWriteResult {
+    pub written_len: usize,
+    pub sync_result: Result<(), SystemError>,
 }
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
 #[derive(Clone)]
@@ -590,6 +648,8 @@ pub struct File {
     mode: RwSem<FileMode>,
     /// 文件类型
     file_type: FileType,
+    /// Immutable write-operation policy selected for this open file description.
+    post_write_sync: PostWriteSyncPolicy,
     /// Per-open immutable directory snapshot and its next record index.
     readdir_state: Mutex<ReaddirState>,
     pub private_data: Mutex<FilePrivateData>,
@@ -697,6 +757,30 @@ mod readdir_tests {
 }
 
 impl File {
+    fn configure_base_open_mode(inode: &Arc<dyn IndexNode>, mode: &mut FileMode) {
+        mode.remove(
+            FileMode::FMODE_STREAM
+                | FileMode::FMODE_LSEEK
+                | FileMode::FMODE_PREAD
+                | FileMode::FMODE_PWRITE
+                | FileMode::FMODE_ATOMIC_POS
+                | FileMode::FMODE_CAN_READ
+                | FileMode::FMODE_CAN_WRITE,
+        );
+        if inode.is_stream() {
+            mode.insert(FileMode::FMODE_STREAM);
+        }
+        if inode.supports_seek() {
+            mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
+        }
+        if inode.supports_pread() {
+            mode.insert(FileMode::FMODE_PREAD);
+        }
+        if inode.supports_pwrite() {
+            mode.insert(FileMode::FMODE_PWRITE);
+        }
+    }
+
     pub fn resolved_path(&self) -> Result<super::utils::ResolvedPath, SystemError> {
         let mount_guard = self
             ._mount_guard
@@ -828,44 +912,81 @@ impl File {
         Ok(len.min(limit.saturating_sub(offset)))
     }
 
-    fn maybe_sync_after_write(
+    fn mount_is_synchronous(&self) -> bool {
+        self._mount_guard.as_ref().map_or_else(
+            || self.inode.mount_flags().contains(MountFlags::SYNCHRONOUS),
+            MountExternalGuard::is_synchronous,
+        )
+    }
+
+    fn generic_sync_after_write(
         &self,
-        flags: FileFlags,
-        inode_flags: InodeFlags,
+        start: usize,
+        written_len: usize,
+        sync_intent: WriteSyncIntent,
     ) -> Result<(), SystemError> {
-        // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
-        let need_data_sync = flags.contains(FileFlags::O_DSYNC);
-        // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
-        let need_metadata_sync = flags.contains(FileFlags::__O_SYNC);
-
-        // inode 级别的 S_SYNC 标志
-        let inode_sync = inode_flags.contains(InodeFlags::S_SYNC);
-
-        if need_data_sync || inode_sync {
-            if need_metadata_sync || inode_sync {
-                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.sync_range_and_check_wb_error(0, usize::MAX, false)?;
-            } else {
-                // O_DSYNC: 仅数据同步
-                self.sync_range_and_check_wb_error(0, usize::MAX, true)?;
-            }
+        if written_len == 0
+            || sync_intent == WriteSyncIntent::None
+            || self.post_write_sync != PostWriteSyncPolicy::Generic
+        {
+            return Ok(());
         }
-        Ok(())
+
+        let end = start
+            .checked_add(written_len - 1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        // Linux generic_write_sync() 只有 IOCB_SYNC 才请求完整 metadata sync；
+        // O_DSYNC、S_SYNC 与 SB_SYNCHRONOUS 都按 datasync 处理。
+        self.sync_range_and_check_wb_error(start, end, sync_intent != WriteSyncIntent::Full)
+    }
+
+    fn post_write_sync_intent(&self, flags: FileFlags, inode_flags: InodeFlags) -> WriteSyncIntent {
+        if self.post_write_sync == PostWriteSyncPolicy::NotApplicable {
+            return WriteSyncIntent::None;
+        }
+        if flags.contains(FileFlags::__O_SYNC) {
+            return WriteSyncIntent::Full;
+        }
+        if flags.contains(FileFlags::O_DSYNC)
+            || inode_flags.contains(InodeFlags::S_SYNC)
+            || self.mount_is_synchronous()
+        {
+            return WriteSyncIntent::Data;
+        }
+        WriteSyncIntent::None
     }
 
     #[inline(never)]
-    fn write_at_and_finalize(
+    fn write_at_and_finalize_split(
         &self,
         actual_offset: usize,
         actual_len: usize,
         buf: &[u8],
         config: WriteConfig,
-    ) -> Result<usize, SystemError> {
-        let written_len =
-            self.inode
-                .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        let (written_len, sync_result) = match self.post_write_sync {
+            PostWriteSyncPolicy::Delegated => {
+                let result = self.inode.write_at_with_sync(
+                    actual_offset,
+                    actual_len,
+                    buf,
+                    config.sync_intent,
+                    self.private_data.lock(),
+                )?;
+                (result.written_len, Some(result.sync_result))
+            }
+            PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::NotApplicable => (
+                self.inode
+                    .write_at(actual_offset, actual_len, buf, self.private_data.lock())?,
+                None,
+            ),
+        };
 
-        self.finalize_write(actual_offset, written_len, config)
+        let written_len = self.finalize_write(actual_offset, written_len, config)?;
+        Ok(DelegatedWriteResult {
+            written_len,
+            sync_result: sync_result.unwrap_or(Ok(())),
+        })
     }
 
     fn write_user_at_and_finalize(
@@ -875,25 +996,50 @@ impl File {
         reader: &UserBufferReader<'_>,
         config: WriteConfig,
     ) -> Result<usize, SystemError> {
-        let written_len = match self.inode.write_user_at(
-            actual_offset,
-            actual_len,
-            reader,
-            self.private_data.lock(),
-        )? {
-            Some(written_len) => written_len,
-            None => {
-                let mut buf = Vec::new();
-                buf.try_reserve(actual_len)
-                    .map_err(|_| SystemError::ENOMEM)?;
-                buf.resize(actual_len, 0);
-                reader.copy_from_user(&mut buf, 0)?;
-                self.inode
-                    .write_at(actual_offset, actual_len, &buf, self.private_data.lock())?
-            }
+        let (written_len, sync_result) = if self.post_write_sync == PostWriteSyncPolicy::Delegated {
+            let mut buf = Vec::new();
+            buf.try_reserve(actual_len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            buf.resize(actual_len, 0);
+            reader.copy_from_user(&mut buf, 0)?;
+            let result = self.inode.write_at_with_sync(
+                actual_offset,
+                actual_len,
+                &buf,
+                config.sync_intent,
+                self.private_data.lock(),
+            )?;
+            (result.written_len, Some(result.sync_result))
+        } else {
+            let written_len = match self.inode.write_user_at(
+                actual_offset,
+                actual_len,
+                reader,
+                self.private_data.lock(),
+            )? {
+                Some(written_len) => written_len,
+                None => {
+                    let mut buf = Vec::new();
+                    buf.try_reserve(actual_len)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    buf.resize(actual_len, 0);
+                    reader.copy_from_user(&mut buf, 0)?;
+                    self.inode.write_at(
+                        actual_offset,
+                        actual_len,
+                        &buf,
+                        self.private_data.lock(),
+                    )?
+                }
+            };
+            (written_len, None)
         };
 
-        self.finalize_write(actual_offset, written_len, config)
+        let written_len = self.finalize_write(actual_offset, written_len, config)?;
+        if let Some(sync_result) = sync_result {
+            sync_result?;
+        }
+        Ok(written_len)
     }
 
     fn finalize_write(
@@ -921,7 +1067,6 @@ impl File {
             }
         }
 
-        self.maybe_sync_after_write(config.flags, config.inode_flags)?;
         Ok(written_len)
     }
     /// @brief 创建一个新的文件对象
@@ -1049,6 +1194,7 @@ impl File {
         flags.remove(FileFlags::O_CLOEXEC);
 
         let mut mode = FileMode::open_fmode(flags);
+        let mut post_write_sync = PostWriteSyncPolicy::NotApplicable;
         // Pin the final operation inode before invoking filesystem open. If
         // open fails, the local guard releases exactly once on this error path.
         let inode_retention =
@@ -1069,21 +1215,12 @@ impl File {
                 inode.open(private_data.lock(), &flags)?;
             }
 
-            // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
-            if inode.is_stream() {
-                mode.insert(FileMode::FMODE_STREAM);
-            }
-            if inode.supports_seek() {
-                mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
-            }
-            if inode.supports_pread() {
-                mode.insert(FileMode::FMODE_PREAD);
-            }
-            if inode.supports_pwrite() {
-                mode.insert(FileMode::FMODE_PWRITE);
-            }
-
-            inode.adjust_file_mode_after_open(&private_data.lock(), &mut mode);
+            // Select capabilities and behavior from this open's private data.
+            Self::configure_base_open_mode(&inode, &mut mode);
+            let mut behavior = OpenFileBehavior::new(mode, file_type);
+            inode.configure_open_file(&private_data.lock(), &mut behavior);
+            mode = behavior.mode;
+            post_write_sync = behavior.post_write_sync;
 
             // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
             // 这需要在IndexNode trait中添加相应的检查方法
@@ -1128,6 +1265,7 @@ impl File {
             fasync_lock: Mutex::new(()),
             mode: RwSem::new(mode),
             file_type,
+            post_write_sync,
             readdir_state: Mutex::new(ReaddirState::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
@@ -1256,6 +1394,23 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功写入的字节数
     pub fn pwrite(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let result = self.pwrite_with_sync_intent(offset, len, buf, WriteSyncIntent::None)?;
+        result.sync_result?;
+        Ok(result.written_len)
+    }
+
+    /// Perform a positional write while merging an operation-level sync
+    /// request with this file's own O_SYNC/S_SYNC/SB_SYNCHRONOUS semantics.
+    ///
+    /// Data progress is returned separately from the synchronization result so
+    /// stacking filesystems can preserve write side effects when fsync fails.
+    pub fn pwrite_with_sync_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        requested_sync: WriteSyncIntent,
+    ) -> Result<DelegatedWriteResult, SystemError> {
         // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
         let mode = *self.mode.read();
         if mode.contains(FileMode::FMODE_PATH) {
@@ -1277,7 +1432,7 @@ impl File {
             return Err(SystemError::EBADF);
         }
 
-        self.do_write(offset, len, buf, false, false)
+        self.do_write_split(offset, len, buf, false, false, requested_sync)
     }
 
     /// 强制追加写（Linux `RWF_APPEND`/`IOCB_APPEND` 语义）：
@@ -1449,6 +1604,27 @@ impl File {
         update_offset: bool,
         force_append: bool,
     ) -> Result<usize, SystemError> {
+        let result = self.do_write_split(
+            offset,
+            len,
+            buf,
+            update_offset,
+            force_append,
+            WriteSyncIntent::None,
+        )?;
+        result.sync_result?;
+        Ok(result.written_len)
+    }
+
+    fn do_write_split(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        update_offset: bool,
+        force_append: bool,
+        requested_sync: WriteSyncIntent,
+    ) -> Result<DelegatedWriteResult, SystemError> {
         self.writeable()?;
 
         let inode_flags = self.get_inode_flags()?;
@@ -1467,6 +1643,12 @@ impl File {
         }
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
+        let sync_intent = match self.post_write_sync {
+            PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::Delegated => self
+                .post_write_sync_intent(flags, inode_flags)
+                .combine(requested_sync),
+            PostWriteSyncPolicy::NotApplicable => WriteSyncIntent::None,
+        };
 
         let is_append = matches!(file_type, FileType::File)
             && (flags.contains(FileFlags::O_APPEND) || force_append);
@@ -1480,38 +1662,62 @@ impl File {
                 let actual_offset = md.size.max(0) as usize;
                 let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-                self.write_at_and_finalize(
+                self.write_at_and_finalize_split(
                     actual_offset,
                     actual_len,
                     buf,
                     WriteConfig {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
-                        flags,
-                        inode_flags,
+                        sync_intent,
                     },
                 )
+                .map(|result| (actual_offset, result))
             };
-            return match self.append_lock_domain.as_ref() {
+            let (actual_offset, mut result) = match self.append_lock_domain.as_ref() {
                 Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
                 None => append_write(),
-            };
+            }?;
+            if result.sync_result.is_ok() {
+                // generic_write_sync() observes IS_SYNC after the write.
+                // Re-sample the cheap mount atomic here while reusing the
+                // inode flags already fetched before I/O.
+                let current_sync_intent = self
+                    .post_write_sync_intent(flags, inode_flags)
+                    .combine(requested_sync);
+                result.sync_result = self.generic_sync_after_write(
+                    actual_offset,
+                    result.written_len,
+                    current_sync_intent,
+                );
+            }
+            return Ok(result);
         }
 
         let actual_offset = offset;
         let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-        self.write_at_and_finalize(
+        let mut result = self.write_at_and_finalize_split(
             actual_offset,
             actual_len,
             buf,
             WriteConfig {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
-                flags,
-                inode_flags,
+                sync_intent,
             },
-        )
+        )?;
+        if result.sync_result.is_ok() {
+            let current_sync_intent = self
+                .post_write_sync_intent(flags, inode_flags)
+                .combine(requested_sync);
+            result.sync_result = self.generic_sync_after_write(
+                actual_offset,
+                result.written_len,
+                current_sync_intent,
+            );
+        }
+        Ok(result)
     }
 
     pub fn do_write_user(
@@ -1537,6 +1743,7 @@ impl File {
 
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
+        let sync_intent = self.post_write_sync_intent(flags, inode_flags);
 
         let is_append = matches!(file_type, FileType::File)
             && (flags.contains(FileFlags::O_APPEND) || force_append);
@@ -1556,31 +1763,36 @@ impl File {
                     WriteConfig {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
-                        flags,
-                        inode_flags,
+                        sync_intent,
                     },
                 )
+                .map(|written_len| (actual_offset, written_len))
             };
-            return match self.append_lock_domain.as_ref() {
+            let (actual_offset, written_len) = match self.append_lock_domain.as_ref() {
                 Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
                 None => append_write(),
-            };
+            }?;
+            let current_sync_intent = self.post_write_sync_intent(flags, inode_flags);
+            self.generic_sync_after_write(actual_offset, written_len, current_sync_intent)?;
+            return Ok(written_len);
         }
 
         let actual_offset = offset;
         let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-        self.write_user_at_and_finalize(
+        let written_len = self.write_user_at_and_finalize(
             actual_offset,
             actual_len,
             reader,
             WriteConfig {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
-                flags,
-                inode_flags,
+                sync_intent,
             },
-        )
+        )?;
+        let current_sync_intent = self.post_write_sync_intent(flags, inode_flags);
+        self.generic_sync_after_write(actual_offset, written_len, current_sync_intent)?;
+        Ok(written_len)
     }
 
     /// Write to the file from a userspace buffer.
@@ -1870,7 +2082,7 @@ impl File {
             InodeRetentionGuard::new(self.inode.clone(), InodeRetentionKind::OpenFileDescription)
                 .ok()?;
         let flags = self.flags();
-        let mode = self.mode();
+        let mut mode = self.mode();
         let private_data = Mutex::new(self.private_data.lock().clone());
         let mount_guard = self
             ._mount_guard
@@ -1884,6 +2096,23 @@ impl File {
         {
             return None;
         }
+
+        let post_write_sync = if mode.contains(FileMode::FMODE_PATH) {
+            PostWriteSyncPolicy::NotApplicable
+        } else {
+            Self::configure_base_open_mode(&self.inode, &mut mode);
+            let mut behavior = OpenFileBehavior::new(mode, self.file_type);
+            self.inode
+                .configure_open_file(&private_data.lock(), &mut behavior);
+            mode = behavior.mode;
+            if mode.contains(FileMode::FMODE_READ) {
+                mode.insert(FileMode::FMODE_CAN_READ);
+            }
+            if mode.contains(FileMode::FMODE_WRITE) {
+                mode.insert(FileMode::FMODE_CAN_WRITE);
+            }
+            behavior.post_write_sync
+        };
 
         if mode.contains(FileMode::FMODE_WRITER) {
             if let Some(mnt_inode) = self.inode.clone().downcast_arc::<MountFSInode>() {
@@ -1900,6 +2129,7 @@ impl File {
             fasync_lock: Mutex::new(()),
             mode: RwSem::new(mode),
             file_type: self.file_type,
+            post_write_sync,
             readdir_state: Mutex::new(self.readdir_state.lock().clone()),
             private_data,
             cred: self.cred.clone(),

@@ -47,9 +47,15 @@ use crate::{
 };
 
 pub use self::inode_lifecycle::{EvictionEpoch, InodeRetentionKind, InodeRetentionState};
-pub use self::{file::FilePrivateData, mount::MountFS};
+pub use self::{
+    file::{
+        DelegatedWriteResult, FilePrivateData, OpenFileBehavior, PostWriteSyncPolicy,
+        WriteSyncIntent,
+    },
+    mount::MountFS,
+};
 use self::{
-    file::{FileFlags, FileMode, PreopenedFile},
+    file::{FileFlags, PreopenedFile},
     utils::DName,
     vcore::generate_inode_id,
 };
@@ -589,12 +595,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(())
     }
 
-    /// Adjust per-open file mode bits after `open()` initialized private data.
-    ///
-    /// This models Linux helpers such as `nonseekable_open()` and
-    /// `stream_open()` without making VFS syscalls know filesystem-specific
-    /// protocol flags.
-    fn adjust_file_mode_after_open(&self, _data: &FilePrivateData, _mode: &mut FileMode) {}
+    /// Select per-open mode and write-operation behavior after `open()` has
+    /// initialized private data.
+    fn configure_open_file(&self, _data: &FilePrivateData, _behavior: &mut OpenFileBehavior) {}
 
     /// @brief 关闭文件
     ///
@@ -705,6 +708,20 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Execute a write whose selected operation owns any required post-write
+    /// synchronization. Only inodes selecting `PostWriteSyncPolicy::Delegated`
+    /// may use this entry point.
+    fn write_at_with_sync(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _sync_intent: WriteSyncIntent,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache

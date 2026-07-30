@@ -90,9 +90,22 @@ pub(super) fn write_at(
     buf: &[u8],
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
 ) -> Result<usize, SystemError> {
+    let result = write_at_with_sync(inode, offset, len, buf, vfs::WriteSyncIntent::None, data)?;
+    result.sync_result?;
+    Ok(result.written_len)
+}
+
+pub(super) fn write_at_with_sync(
+    inode: &OvlInode,
+    offset: usize,
+    len: usize,
+    buf: &[u8],
+    sync_intent: vfs::WriteSyncIntent,
+    data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+) -> Result<vfs::DelegatedWriteResult, SystemError> {
     if len == 0 {
         let (backing_file, _) = backing_file_for_io(inode, data)?;
-        return backing_file.pwrite(offset, len, buf);
+        return backing_file.pwrite_with_sync_intent(offset, len, buf, sync_intent);
     }
 
     let _privilege_guard = inode.content_privilege_lock.lock();
@@ -101,7 +114,7 @@ pub(super) fn write_at(
     let _content_guard = fs.content_lock(&backing_file.inode())?.lock();
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     super::metadata::remove_security_capability(&backing_file.inode())?;
-    backing_file.pwrite(offset, len, buf)
+    backing_file.pwrite_with_sync_intent(offset, len, buf, sync_intent)
 }
 
 pub(super) fn sync_file(
@@ -220,7 +233,14 @@ fn open_flags_need_copy_up(file_type: FileType, flags: &FileFlags) -> bool {
 }
 
 fn backing_open_flags(mut flags: FileFlags) -> FileFlags {
-    flags.remove(FileFlags::O_CREAT | FileFlags::O_EXCL | FileFlags::O_NOCTTY | FileFlags::O_TRUNC);
+    flags.remove(
+        FileFlags::O_CREAT
+            | FileFlags::O_EXCL
+            | FileFlags::O_NOCTTY
+            | FileFlags::O_TRUNC
+            | FileFlags::O_SYNC
+            | FileFlags::O_DSYNC,
+    );
     flags
 }
 

@@ -5,7 +5,7 @@ use crate::{
         procfs::{template::Common, ProcfsFilePrivateData},
         vfs::{
             file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            IndexNode, InodeFlags, InodeMode, Metadata,
+            IndexNode, InodeFlags, InodeMode, Metadata, OpenFileBehavior, PostWriteSyncPolicy,
         },
     },
     time::PosixTimeSpec,
@@ -125,6 +125,10 @@ pub trait FileOps: Sync + Send + Sized + Debug {
 /// 使用 inherit_methods 宏从 common 继承通用方法
 #[inherit_methods(from = "self.common")]
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+    }
+
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn as_any_ref(&self) -> &dyn core::any::Any;
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;

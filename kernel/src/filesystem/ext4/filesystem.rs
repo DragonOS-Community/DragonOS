@@ -1,5 +1,8 @@
 use crate::{
-    driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
+    driver::base::{
+        block::gendisk::{GenDisk, GenDiskMountGuard},
+        device::device_number::DeviceNumber,
+    },
     exception::workqueue::{Work, WorkQueue},
     filesystem::{
         ext4::inode::{
@@ -168,6 +171,8 @@ pub struct Ext4FileSystem {
     pub(super) fs: another_ext4::Ext4,
     /// 当前文件系统对应的设备号
     pub(super) raw_dev: DeviceNumber,
+    /// Prevents loop clear/remove for the complete filesystem lifetime.
+    _device_mount_holder: GenDiskMountGuard,
 
     /// 根 inode
     root_inode: Arc<LockedExt4Inode>,
@@ -1185,6 +1190,7 @@ impl Ext4FileSystem {
         mount_options: Ext4MountOptions,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
         mount_options.validate_error_behavior()?;
+        let device_mount_holder = mount_data.acquire_mount_holder()?;
 
         // Worker creation may sleep and must never happen from final-release
         // publication while inode/eviction locks are held.
@@ -1257,6 +1263,7 @@ impl Ext4FileSystem {
         let fs = Arc::new(Ext4FileSystem {
             fs,
             raw_dev,
+            _device_mount_holder: device_mount_holder,
             root_inode,
             dirty_inodes: Mutex::new(Vec::new()),
             inode_table: Mutex::new(BTreeMap::new()),

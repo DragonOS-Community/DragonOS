@@ -9,7 +9,8 @@ use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{
     self, inode_lifecycle::InodeRetentionGuard, DirectoryEntry, FileSystem, FileType, IndexNode,
-    InodeId, InodeRetentionKind, Metadata, SetMetadataMask, XattrFlags,
+    InodeId, InodeRetentionKind, Metadata, OpenFileBehavior, PostWriteSyncPolicy, SetMetadataMask,
+    XattrFlags,
 };
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::Mutex;
@@ -306,6 +307,12 @@ impl OvlInode {
 }
 
 impl IndexNode for OvlInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        if self.file_type == FileType::File {
+            behavior.post_write_sync = PostWriteSyncPolicy::Delegated;
+        }
+    }
+
     fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
         Some(self.fs())
     }
@@ -340,6 +347,17 @@ impl IndexNode for OvlInode {
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         file::write_at(self, offset, len, buf, data)
+    }
+
+    fn write_at_with_sync(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync_intent: vfs::WriteSyncIntent,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<vfs::DelegatedWriteResult, SystemError> {
+        file::write_at_with_sync(self, offset, len, buf, sync_intent, data)
     }
 
     fn sync_file(

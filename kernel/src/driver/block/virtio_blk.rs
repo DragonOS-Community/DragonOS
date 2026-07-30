@@ -58,7 +58,7 @@ use crate::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         mbr::MbrDiskPartionTable,
-        vfs::{utils::DName, FilePrivateData, FileType, IndexNode, InodeMode, Metadata},
+        vfs::{utils::DName, FilePrivateData, IndexNode, InodeMode, Metadata},
     },
     init::initcall::INITCALL_POSTCORE,
     libs::{
@@ -848,10 +848,6 @@ impl IndexNode for VirtIOBlkDevice {
     }
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
-    }
-
-    fn supports_post_write_sync(&self, file_type: FileType) -> bool {
-        file_type == FileType::BlockDevice
     }
 
     fn sync_file(

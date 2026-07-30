@@ -22,7 +22,8 @@ use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
     file::FileFlags, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-    FsInfo, IndexNode, InodeFlags, InodeId, InodeMode, Magic, Metadata, SuperBlock,
+    FsInfo, IndexNode, InodeFlags, InodeId, InodeMode, Magic, Metadata, OpenFileBehavior,
+    PostWriteSyncPolicy, SuperBlock,
 };
 
 pub mod callback;
@@ -163,6 +164,10 @@ pub struct InnerKernFSInode {
 }
 
 impl IndexNode for KernFSInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }

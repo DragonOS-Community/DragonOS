@@ -35,7 +35,8 @@ use system_error::SystemError;
 
 use super::vfs::{
     file::FilePrivateData, mount::MountFlags, utils::DName, FileSystem, FsInfo,
-    FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode, Metadata, SpecialNodeData,
+    FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode, Metadata, OpenFileBehavior,
+    PostWriteSyncPolicy, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -786,6 +787,10 @@ impl MountableFileSystem for Tmpfs {
 register_mountable_fs!(Tmpfs, TMPFSMAKER, "tmpfs");
 
 impl IndexNode for LockedTmpfsInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+    }
+
     fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
         Some(self.fs())
     }

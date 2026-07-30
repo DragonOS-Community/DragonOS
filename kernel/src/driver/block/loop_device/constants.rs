@@ -14,10 +14,6 @@ pub const LOOP_IO_DRAIN_TIMEOUT_MS: u32 = 30_000;
 /// I/O 排空检查间隔 (微秒)
 pub const LOOP_IO_DRAIN_CHECK_INTERVAL_US: u32 = 10_000;
 
-/// drain_active_io 最大重试次数
-/// 超过此次数后将强制进入 Deleting 状态，避免无限重试
-pub const LOOP_IO_DRAIN_MAX_RETRIES: u32 = 3;
-
 /// Loop 设备 ioctl 命令
 #[repr(u32)]
 #[derive(Debug, FromPrimitive)]

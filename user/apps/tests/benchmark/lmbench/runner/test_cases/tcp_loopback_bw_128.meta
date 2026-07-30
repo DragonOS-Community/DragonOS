@@ -1,0 +1,11 @@
+# Extraction/metadata for tcp_loopback_bw_128 (KEY=VALUE; parsed by run.sh)
+CATEGORY=network
+BINARY=bw_tcp
+METRIC_TYPE=bandwidth
+UNIT=MB/s
+BIGGER_IS_BETTER=1
+# bw_tcp prints "socket connection: <N> MB/sec" (prefix via strings; host hung).
+SEARCH_PATTERN=socket connection
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=TCP loopback bandwidth via bw_tcp (128B)

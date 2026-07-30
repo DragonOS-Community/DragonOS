@@ -1,0 +1,11 @@
+# Extraction/metadata for tcp_virtio_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=network
+BINARY=lat_tcp
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_tcp prints "TCP latency using <host>: <N> microseconds"; virtio uses 10.0.2.15.
+SEARCH_PATTERN=^TCP latency using
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=TCP virtio latency via lat_tcp (10.0.2.15)

@@ -124,3 +124,13 @@
 - 补 `init.sh` 环境（ramfs 挂载、test_file 创建、hello 二进制）。
 - 修 `tcp_loopback_http_bw.sh` 的 file_list。
 - 内核限制修复。
+
+## 容器复核补充（docker 24.04 代理配好后补测）
+
+`.meta` 提取完成后，docker 代理可用，用 ubuntu:24.04 容器（原生 glibc 2.39，非 archive LD hack）补测 host 跑不通的工具：
+
+- **容器跑通，格式确认**：
+  - `lat_syscall null`（process_getppid_lat）：输出 `Simple syscall: <N> microseconds`——**不是** `Simple null`。已修正 `process_getppid_lat.meta` 的 SEARCH_PATTERN 为 `Simple syscall`。
+  - `lat_connect`（tcp_loopback/virtio_connect_lat）：输出 `TCP/IP connection cost to <host>: <N> microseconds`，与 strings 推断一致，`.meta` 不变。
+- **容器仍卡死（无输出，timeout rc=124）**：`lat_fifo`/`bw_unix`/`lat_sem`/`bw_tcp`/`lat_select tcp`/`lat_udp`/`lat_unix_connect`——这些用 lmbench `benchmp` 框架（fork + SIGCHLD + waitpid + 共享内存同步），容器与 host 共享同一内核，`benchmp` 的信号竞争死锁在容器里同样发生。`.meta` 保留 strings 推断的 SEARCH_PATTERN（锚定二进制真实输出 prefix），待 guest 校准。
+- **网络工具依赖 libtirpc**：容器原生跑需 `apt install libtirpc3t64`（archive sysroot 自带，host LD 方式不缺；guest DADK 打包会带上依赖）。

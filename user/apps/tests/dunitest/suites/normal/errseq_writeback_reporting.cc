@@ -88,6 +88,12 @@ class TempFile {
         return fd_;
     }
 
+    int release() {
+        int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+
     const char* path() const {
         return path_.c_str();
     }
@@ -134,6 +140,28 @@ int OpenSecondDescription(const TempFile& file) {
     return fd;
 }
 
+void ExpectSynchronousWriteReportsMappingError(const TempFile& file, int flags,
+                                               int expected_errno) {
+    int fd = open(file.path(), O_RDWR | flags);
+    ASSERT_GE(fd, 0) << "open synchronous fd failed: errno=" << errno << " ("
+                     << strerror(errno) << ")";
+
+    InjectError("mapping", fd, expected_errno == EIO ? "EIO" : "ENOSPC");
+
+    const char first = 's';
+    errno = 0;
+    ExpectFailsWithErrno(write(fd, &first, sizeof(first)), expected_errno);
+
+    // The mapping error is consumed per open file description. A subsequent
+    // synchronous write must report its own byte count rather than replaying
+    // the old errseq event.
+    const char second = 't';
+    errno = 0;
+    EXPECT_EQ(static_cast<ssize_t>(sizeof(second)), write(fd, &second, sizeof(second)))
+        << "errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(0, close(fd));
+}
+
 }  // namespace
 
 TEST(ErrSeqWritebackReporting, FsyncReportsMappingErrorPerOpenDescription) {
@@ -177,6 +205,43 @@ TEST(ErrSeqWritebackReporting, FdatasyncReportsMappingErrorOnce) {
 
     errno = 0;
     ExpectFailsWithErrno(RawSyncfs(file.fd()), ENOSPC);
+}
+
+TEST(ErrSeqWritebackReporting, SyncWriteReportsMappingErrorOnce) {
+    TempFile file;
+    ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
+    ExpectSynchronousWriteReportsMappingError(file, O_SYNC, EIO);
+}
+
+TEST(ErrSeqWritebackReporting, DataSyncWriteReportsMappingErrorOnce) {
+    TempFile file;
+    ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
+    ExpectSynchronousWriteReportsMappingError(file, O_DSYNC, ENOSPC);
+}
+
+TEST(ErrSeqWritebackReporting, CloseDoesNotConsumeMappingError) {
+    TempFile file;
+    ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
+    int second = OpenSecondDescription(file);
+    ASSERT_GE(second, 0);
+
+    const int closing_fd = file.release();
+    ASSERT_GE(closing_fd, 0);
+    InjectError("mapping", closing_fd, "EIO");
+
+    // Linux ext4 has no file_operations::flush hook. close(2) may report a
+    // filesystem-specific flush error, but it is not the errseq observation
+    // point for ordinary ext4 buffered writeback. The second open file
+    // description must still observe the injected mapping error through
+    // fsync(2).
+    errno = 0;
+    ExpectSucceeds(close(closing_fd));
+
+    errno = 0;
+    ExpectFailsWithErrno(fsync(second), EIO);
+    errno = 0;
+    ExpectSucceeds(fsync(second));
+    close(second);
 }
 
 TEST(ErrSeqWritebackReporting, SyncFileRangeWaitConsumesMappingError) {

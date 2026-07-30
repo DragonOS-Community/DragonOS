@@ -250,7 +250,9 @@ impl InnerAddressSpace {
     pub fn can_extend_stack(&self, bytes: usize) -> bool {
         let bytes = page_align_up(bytes);
         let stack = self.user_stack.as_ref().unwrap();
-        let new_size = stack.mapped_size + bytes;
+        let Some(new_size) = stack.mapped_size.checked_add(bytes) else {
+            return false;
+        };
         if new_size > stack.max_limit {
             // Don't exceed the maximum stack size
             return false;
@@ -262,7 +264,10 @@ impl InnerAddressSpace {
     /// ## Parameters
     ///
     /// - `bytes`: extension size
-    pub fn extend_stack(&mut self, mut bytes: usize) -> Result<(), SystemError> {
+    pub(crate) fn extend_stack(
+        &mut self,
+        mut bytes: usize,
+    ) -> Result<Option<LockedPopulationRequest>, SystemError> {
         // log::debug!("extend user stack");
 
         // Layout
@@ -276,12 +281,19 @@ impl InnerAddressSpace {
 
         let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
         let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_GROWSDOWN;
-        let stack = self.user_stack.as_mut().unwrap();
-
         bytes = page_align_up(bytes);
-        stack.mapped_size += bytes;
-        // map new stack pages
-        let extend_stack_start = stack.stack_bottom - stack.mapped_size;
+        // Do not publish the larger stack size until the VMA insertion has
+        // committed. In particular, MCL_FUTURE may make map_anonymous fail its
+        // memlock accounting; advancing this metadata first would make a later
+        // stack fault believe an unmapped range existed.
+        let (extend_stack_start, new_mapped_size) = {
+            let stack = self.user_stack.as_ref().unwrap();
+            let new_mapped_size = stack
+                .mapped_size
+                .checked_add(bytes)
+                .ok_or(SystemError::ENOMEM)?;
+            (stack.stack_bottom - new_mapped_size, new_mapped_size)
+        };
 
         self.map_anonymous(
             extend_stack_start,
@@ -291,7 +303,17 @@ impl InnerAddressSpace {
             false,
             false,
         )?;
-        return Ok(());
+        self.user_stack.as_mut().unwrap().mapped_size = new_mapped_size;
+        let post_commit_population = self.mappings.contains(extend_stack_start).and_then(|vma| {
+            vma.lock()
+                .vm_flags()
+                .contains(VmFlags::VM_LOCKED)
+                .then(|| LockedPopulationRequest {
+                    region: VirtRegion::new(extend_stack_start, bytes),
+                    expected_vma: Arc::downgrade(&vma),
+                })
+        });
+        return Ok(post_commit_population);
     }
 
     /// Check whether this address space is the current process's address space
@@ -395,10 +417,14 @@ impl InnerAddressSpace {
             })
     }
 
-    fn mlock_fault_flags(vm_flags: VmFlags) -> Option<FaultFlags> {
-        if vm_flags.contains(VmFlags::VM_WRITE) {
+    pub(super) fn mlock_fault_flags(vm_flags: VmFlags) -> Option<FaultFlags> {
+        // Linux populate_vma_page_range() write-faults only a private writable
+        // mapping. A writable shared mapping is populated with a read fault:
+        // forcing FAULT_FLAG_WRITE would call page_mkwrite(), dirty a clean
+        // file page, and can introduce an otherwise spurious writeback.
+        if vm_flags.contains(VmFlags::VM_WRITE) && !vm_flags.contains(VmFlags::VM_SHARED) {
             Some(FaultFlags::FAULT_FLAG_WRITE)
-        } else if vm_flags.contains(VmFlags::VM_READ) {
+        } else if vm_flags.intersects(VmFlags::VM_READ | VmFlags::VM_WRITE) {
             Some(FaultFlags::empty())
         } else if vm_flags.contains(VmFlags::VM_EXEC) {
             Some(FaultFlags::FAULT_FLAG_INSTRUCTION)
@@ -407,7 +433,7 @@ impl InnerAddressSpace {
         }
     }
 
-    fn add_present_page_mlock_ref(&mut self, addr: VirtAddr, vma: &Arc<LockedVMA>) {
+    pub(super) fn add_present_page_mlock_ref(&mut self, addr: VirtAddr, vma: &Arc<LockedVMA>) {
         if let Some((paddr, _)) = self.user_mapper.utable.translate(addr) {
             let vm_flags = *vma.lock().vm_flags();
             let mut page_manager_guard = page_manager_lock();
@@ -465,167 +491,6 @@ impl InnerAddressSpace {
 
         for page in pages_to_reclassify {
             Self::remove_page_unevictable_if_unneeded(&page);
-        }
-    }
-
-    fn populate_vma_page(
-        &mut self,
-        vma: Arc<LockedVMA>,
-        addr: VirtAddr,
-        fault_flags: FaultFlags,
-    ) -> Result<(), SystemError> {
-        let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
-        let fault = unsafe {
-            let message =
-                PageFaultMessage::new(vma, addr, fault_flags, &mut self.user_mapper.utable, mm);
-            PageFaultHandler::handle_mm_fault(message)
-        };
-
-        if fault.reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
-            Ok(())
-        } else if fault.reason.contains(VmFaultReason::VM_FAULT_OOM) {
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-        } else {
-            Err(SystemError::ENOMEM)
-        }
-    }
-
-    fn populate_vma_intersection(
-        &mut self,
-        vma: Arc<LockedVMA>,
-        intersection: VirtRegion,
-        vm_flags: VmFlags,
-        fault_in_missing: bool,
-    ) -> Result<(), SystemError> {
-        if vm_flags.is_mlock_population_unsupported() {
-            return Ok(());
-        }
-
-        let fault_flags = if fault_in_missing {
-            Some(Self::mlock_fault_flags(vm_flags).ok_or(SystemError::ENOMEM)?)
-        } else {
-            None
-        };
-        let mut addr = intersection.start();
-        while addr < intersection.end() {
-            if self.user_mapper.utable.translate(addr).is_some() {
-                if vm_flags.contains(VmFlags::VM_LOCKED) {
-                    self.add_present_page_mlock_ref(addr, &vma);
-                }
-            } else if fault_in_missing {
-                self.populate_vma_page(vma.clone(), addr, fault_flags.unwrap())?;
-            }
-            addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
-        }
-        Ok(())
-    }
-
-    pub(super) fn populate_vma_range(
-        &mut self,
-        start: VirtAddr,
-        len: usize,
-        fault_in_missing: bool,
-    ) -> Result<(), SystemError> {
-        let target = Self::checked_user_region(start, len)?;
-        let mut vmas = self.mappings.conflicts(target);
-        vmas.sort_by_key(|vma| vma.lock().region().start().data());
-
-        let mut cursor = target.start();
-        for vma in vmas {
-            let (region, vm_flags) = {
-                let guard = vma.lock();
-                (*guard.region(), *guard.vm_flags())
-            };
-            let Some(intersection) = region.intersect(&target) else {
-                continue;
-            };
-            if intersection.start() > cursor {
-                return Err(SystemError::ENOMEM);
-            }
-            if intersection.end() <= cursor {
-                continue;
-            }
-
-            self.populate_vma_intersection(vma, intersection, vm_flags, fault_in_missing)?;
-
-            cursor = intersection.end();
-            if cursor >= target.end() {
-                break;
-            }
-        }
-
-        if cursor != target.end() {
-            return Err(SystemError::ENOMEM);
-        }
-
-        Ok(())
-    }
-
-    /// Populate the current VMAs intersecting an already validated mlock
-    /// range.  Unlike the commit-time coverage check, holes created after the
-    /// mlock flags were committed are skipped, matching Linux __mm_populate().
-    pub(super) fn populate_mlock_range_post_commit(
-        &mut self,
-        start: VirtAddr,
-        len: usize,
-    ) -> Result<(), SystemError> {
-        let target = Self::checked_user_region(start, len)?;
-        let mut vmas = self.mappings.conflicts(target);
-        vmas.sort_by_key(|vma| vma.lock().region().start().data());
-
-        for vma in vmas {
-            let (region, vm_flags) = {
-                let guard = vma.lock();
-                (*guard.region(), *guard.vm_flags())
-            };
-            let Some(intersection) = region.intersect(&target) else {
-                continue;
-            };
-            let fault_in_missing = !vm_flags.contains(VmFlags::VM_LOCKONFAULT);
-            self.populate_vma_intersection(vma, intersection, vm_flags, fault_in_missing)?;
-        }
-        Ok(())
-    }
-
-    /// Best-effort population used after mlockall(MCL_CURRENT).  Address-space
-    /// holes and per-VMA failures do not prevent later VMAs from being visited.
-    pub(super) fn populate_mlockall_post_commit(&mut self) {
-        let vmas = self.mappings.iter_vmas().cloned().collect::<Vec<_>>();
-        for vma in vmas {
-            let (region, vm_flags) = {
-                let guard = vma.lock();
-                (*guard.region(), *guard.vm_flags())
-            };
-            let fault_in_missing = !vm_flags.contains(VmFlags::VM_LOCKONFAULT);
-            let _ = self.populate_vma_intersection(vma, region, vm_flags, fault_in_missing);
-        }
-    }
-
-    pub(super) fn best_effort_locked_population(
-        &mut self,
-        start: VirtAddr,
-        len: usize,
-        vm_flags: VmFlags,
-    ) {
-        if len == 0 || !vm_flags.contains(VmFlags::VM_LOCKED) {
-            return;
-        }
-
-        let fault_in_missing = !vm_flags.contains(VmFlags::VM_LOCKONFAULT);
-        let _ = self.populate_vma_range(start, len, fault_in_missing);
-    }
-
-    pub(super) fn post_map_population(&mut self, start: VirtAddr, len: usize, map_flags: MapFlags) {
-        let Some(vma) = self.mappings.contains(start) else {
-            return;
-        };
-
-        let vm_flags = *vma.lock().vm_flags();
-        let fault_in_missing = map_flags.contains(MapFlags::MAP_POPULATE)
-            || (vm_flags.contains(VmFlags::VM_LOCKED)
-                && !vm_flags.contains(VmFlags::VM_LOCKONFAULT));
-        if fault_in_missing || vm_flags.contains(VmFlags::VM_LOCKED) {
-            let _ = self.populate_vma_range(start, len, fault_in_missing);
         }
     }
 }

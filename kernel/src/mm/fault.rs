@@ -10,7 +10,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{mm::PageMapper, MMArch},
-    filesystem::page_cache::PageCachePagePin,
+    filesystem::page_cache::{PageCacheFaultInvalidateRead, PageCachePagePin},
     libs::align::align_down,
     mm::{
         page::{page_manager_lock, EntryFlags},
@@ -633,9 +633,22 @@ impl PageFaultHandler {
     #[inline(never)]
     pub unsafe fn do_cow_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let page_cache = Self::file_page_cache(pfm);
-        let _invalidate = page_cache
-            .as_ref()
-            .map(|page_cache| page_cache.invalidate_read());
+        let _invalidate = match page_cache.as_ref() {
+            Some(page_cache) => match page_cache.file_fault_invalidate_read() {
+                PageCacheFaultInvalidateRead::Acquired(guard) => Some(guard),
+                PageCacheFaultInvalidateRead::Retry(wait) => {
+                    // The architecture fault loop still owns
+                    // AddressSpace::write(). Do not block behind a queued
+                    // invalidate writer while holding it: writeback may hold
+                    // invalidate_read and be waiting to mkclean this MM.
+                    // Return the PageCache-owned retry predicate so the
+                    // outer loop drops the MM guard before it waits.
+                    pfm.set_retry_wait(wait);
+                    return VmFaultReason::VM_FAULT_RETRY;
+                }
+            },
+            None => None,
+        };
         let file = pfm.vm_file().unwrap().clone();
         let mut ret = file.with_io_fs(|fs| fs.fault(pfm));
 
@@ -736,9 +749,19 @@ impl PageFaultHandler {
     #[inline(never)]
     pub unsafe fn do_shared_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let page_cache = Self::file_page_cache(pfm);
-        let _invalidate = page_cache
-            .as_ref()
-            .map(|page_cache| page_cache.invalidate_read());
+        let _invalidate = match page_cache.as_ref() {
+            Some(page_cache) => match page_cache.file_fault_invalidate_read() {
+                PageCacheFaultInvalidateRead::Acquired(guard) => Some(guard),
+                PageCacheFaultInvalidateRead::Retry(wait) => {
+                    // See do_cow_fault(): the retry is deliberately armed
+                    // before entering filesystem page_mkwrite so the outer
+                    // fault loop releases AddressSpace::write() first.
+                    pfm.set_retry_wait(wait);
+                    return VmFaultReason::VM_FAULT_RETRY;
+                }
+            },
+            None => None,
+        };
         let file = pfm.vm_file().unwrap().clone();
         let mut ret = file.with_io_fs(|fs| fs.fault(pfm));
 
@@ -764,12 +787,21 @@ impl PageFaultHandler {
                     Ok(reservation) => reservation,
                     Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
                 };
-                cache_page.write().add_flags(PageFlags::PG_DIRTY);
+                // Keep the page lock through the PageCache dirty publication:
+                // writeback completion samples PG_DIRTY under the same lock,
+                // so a new shared-fault write cannot be merged into an older
+                // writeback incarnation in the flag-to-cache gap.
+                let mut page_locked = cache_page.write();
+                page_locked.add_flags(PageFlags::PG_DIRTY);
                 if page_cache
-                    .mark_page_dirty_prepared(info.index, &mut dirty_reservation)
+                    .mark_page_dirty_prepared_page_locked(
+                        info.index,
+                        &mut dirty_reservation,
+                        &page_locked,
+                    )
                     .is_err()
                 {
-                    cache_page.write().remove_flags(PageFlags::PG_DIRTY);
+                    page_locked.remove_flags(PageFlags::PG_DIRTY);
                     return VmFaultReason::VM_FAULT_SIGBUS;
                 }
             }
@@ -902,12 +934,17 @@ impl PageFaultHandler {
                         Ok(reservation) => reservation,
                         Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
                     };
-                    old_page.write().add_flags(PageFlags::PG_DIRTY);
+                    let mut page_locked = old_page.write();
+                    page_locked.add_flags(PageFlags::PG_DIRTY);
                     if page_cache
-                        .mark_page_dirty_prepared(info.index, &mut dirty_reservation)
+                        .mark_page_dirty_prepared_page_locked(
+                            info.index,
+                            &mut dirty_reservation,
+                            &page_locked,
+                        )
                         .is_err()
                     {
-                        old_page.write().remove_flags(PageFlags::PG_DIRTY);
+                        page_locked.remove_flags(PageFlags::PG_DIRTY);
                         return VmFaultReason::VM_FAULT_SIGBUS;
                     }
                 }

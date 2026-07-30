@@ -436,15 +436,41 @@ impl X86_64MMArch {
                             send_segv_maperr();
                             return;
                         }
-                        space_guard
-                            .extend_stack(extension_size)
-                            .unwrap_or_else(|_| {
-                                panic!(
-                                    "user stack extend failed, error_code: {:?}, address: {:#x}",
+                        let post_commit_population = match space_guard.extend_stack(extension_size)
+                        {
+                            Ok(request) => request,
+                            Err(err) => {
+                                log::warn!(
+                                    "pid {} user stack extend failed: {:?}, error_code: {:?}, address: {:#x}",
+                                    ProcessManager::current_pid().data(),
+                                    err,
                                     error_code,
                                     address.data(),
-                                )
-                            });
+                                );
+                                if handle_kernel_access_failed(regs) {
+                                    return;
+                                }
+                                send_segv_maperr();
+                                return;
+                            }
+                        };
+                        if let Some(request) = post_commit_population {
+                            // MCL_FUTURE can make this new anonymous stack
+                            // VMA locked.  Population owns a retry boundary,
+                            // so it must happen only after the MM write guard
+                            // is released; then restart the original fault
+                            // against the revalidated VMA set.
+                            drop(space_guard);
+                            let _ = current_address_space.populate_locked_vma_post_commit(request);
+                            continue 'fault_retry;
+                        }
+                        // extend_stack() inserts a distinct VMA. The nearest
+                        // VMA sampled above does not contain `address`, so
+                        // never feed it to the fault handler after a successful
+                        // extension. Re-enter through the normal lookup path
+                        // after releasing the write guard.
+                        drop(space_guard);
+                        continue 'fault_retry;
                     } else {
                         log::error!(
                         "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",

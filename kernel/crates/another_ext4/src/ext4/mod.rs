@@ -1,8 +1,12 @@
 use crate::constants::*;
 use crate::ext4_defs::*;
+use crate::format_error;
 use crate::prelude::*;
 use crate::return_error;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    marker::PhantomData,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 
 mod alloc;
 mod dir;
@@ -17,6 +21,12 @@ mod orphan;
 mod rw;
 mod xattr_reclaim;
 
+#[cfg(any(test, feature = "test-api"))]
+pub use low_level::DelallocAppendBlockWriteback;
+pub use low_level::{
+    DelallocAppendBlockPublication, DelallocAppendBlockReservation,
+    DelallocAppendBlockSubmitOutcome, DelallocAppendMapperAuthority, DelallocExtentNodePool,
+};
 pub use low_level::{InodeOwner, SetAttr};
 
 /// Simple fixed-size inode cache.
@@ -58,6 +68,268 @@ impl InodeCache {
     }
 }
 
+/// Opaque identity for one delayed-allocation space claim.
+///
+/// Identities contain a mount generation and an allocation sequence.  Neither
+/// component is recycled: a stale writeback token must never be able to
+/// consume a later claim, including a claim on another mounted filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DelallocReservationId {
+    mount_generation: u64,
+    serial: u64,
+}
+
+/// Opaque lease for space reserved by a delayed-allocation write before it has
+/// a physical extent.
+///
+/// The VFS may retain and move this lease with a pending-map entry, but cannot
+/// inspect its identity, budget, or allocation class.  It must be explicitly
+/// consumed by an `Ext4` lifecycle operation: dropping a live lease is a
+/// protocol violation because it would permanently hide capacity from both
+/// eager and delayed allocation.
+#[must_use = "a delayed-allocation lease must be explicitly released or finalised"]
+#[derive(PartialEq, Eq)]
+pub struct DelallocLease {
+    id: DelallocReservationId,
+    data_blocks: u64,
+    metadata_blocks: u64,
+    active: bool,
+    /// A generic ledger lease is sufficient for accounting tests, but it
+    /// must never be accepted by the bounded append mapper. The mapper
+    /// instead requires this immutable append certificate
+    /// to couple a front-end reservation to one inode generation and one
+    /// logical block.  Keeping it inside the opaque lease avoids exporting a
+    /// forgeable allocation class to VFS callers.
+    append_block_certificate: Option<DelallocAppendBlockCertificate>,
+}
+
+/// Provenance captured while admitting one production delayed-allocation
+/// block.  It is intentionally private to the ext4 crate: the VFS may own the
+/// lease but cannot alter the inode/range identity which the mapper verifies
+/// before touching allocation metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DelallocAppendBlockCertificate {
+    inode_id: InodeId,
+    inode_generation: u32,
+    offset: usize,
+    /// The ext4 inode EOF observed while the reservation was admitted. This
+    /// is the local on-disk EOF used to reject stale append geometry; it is
+    /// deliberately not the VFS/PageCache visible EOF. A truncate/resize must
+    /// invalidate the certificate rather than allowing a stale delayed
+    /// writeback to recreate the old tail.
+    expected_durable_eof_before: u64,
+}
+
+impl core::fmt::Debug for DelallocLease {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Identity and budget are deliberately not observable outside this
+        // crate: callers may hold the capability but must not manufacture an
+        // allocation class or sort leases by an exposed serial.
+        f.write_str("DelallocLease(..)")
+    }
+}
+
+impl DelallocLease {
+    fn deactivate(&mut self) {
+        self.active = false;
+    }
+
+    /// Validate the opaque capability against its issuing filesystem before a
+    /// fail-stop path can terminalise it.  This remains crate-private: VFS
+    /// must not inspect or sort reservation identities.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    pub(super) fn belongs_to_mount(&self, mount_generation: u64) -> bool {
+        self.id.mount_generation == mount_generation
+    }
+
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    fn bind_append_block_certificate(
+        &mut self,
+        inode_id: InodeId,
+        inode_generation: u32,
+        offset: usize,
+        expected_durable_eof_before: u64,
+    ) -> Result<()> {
+        if !self.active || self.append_block_certificate.is_some() {
+            return_error!(
+                ErrCode::EINVAL,
+                "Delayed-allocation lease cannot be rebound"
+            );
+        }
+        self.append_block_certificate = Some(DelallocAppendBlockCertificate {
+            inode_id,
+            inode_generation,
+            offset,
+            expected_durable_eof_before,
+        });
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    fn append_block_certificate(&self) -> Option<DelallocAppendBlockCertificate> {
+        self.append_block_certificate
+    }
+}
+
+impl Drop for DelallocLease {
+    fn drop(&mut self) {
+        assert!(
+            !self.active,
+            "Delayed-allocation lease was dropped without release or finalisation"
+        );
+    }
+}
+
+/// Durable state returned after a delayed-allocation reservation has been
+/// materialised into an extent, but before its data and extending EOF are
+/// committed.
+///
+/// This is deliberately an opaque, linear receipt.  The successful mapping
+/// transaction has already consumed the lease and left a linked orphan on
+/// disk, so dropping it would lose the only owner that can either submit the
+/// exact full-block payload and remove that orphan or fail the mount.  A
+/// future PageCache token stores this receipt while a mapped page is retried;
+/// it must not turn a mapped-but-unsubmitted range back into a fresh
+/// reservation.
+#[must_use = "a mapped delayed-allocation receipt must be completed or fail-stopped"]
+#[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+pub struct DelallocMappedWriteback {
+    mount_generation: u64,
+    inode_id: InodeId,
+    inode_generation: u32,
+    offset: usize,
+    end: u64,
+    active: bool,
+    /// A raw host-test receipt must not be smuggled into a writeback worker.
+    /// The production replacement is a distinct `Send` VFS token which also
+    /// owns the inode lifecycle lease and drain registration.
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl core::fmt::Debug for DelallocMappedWriteback {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DelallocMappedWriteback(..)")
+    }
+}
+
+impl DelallocMappedWriteback {
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    fn deactivate(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for DelallocMappedWriteback {
+    fn drop(&mut self) {
+        assert!(
+            !self.active,
+            "Mapped delayed-allocation writeback receipt was dropped without completion"
+        );
+    }
+}
+
+// Internal ledger helpers retain the term reservation, while the public API
+// makes the capability boundary explicit.
+pub(crate) type DelallocReservation = DelallocLease;
+
+/// Selects whether an allocation spends ordinary free space or a particular
+/// delayed-allocation claim.  This stays crate-private until phase 3b binds it
+/// to a complete PageCache/ext4 writeback token.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocationClass {
+    Unreserved,
+    Delalloc(DelallocReservationId),
+}
+
+/// Claim category to debit when materialising a delayed mapping.  Data and
+/// extent-tree metadata may not borrow from each other.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DelallocReservationUse {
+    Data,
+    Metadata,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl DelallocReservation {
+    pub(crate) const fn data_blocks(&self) -> u64 {
+        self.data_blocks
+    }
+
+    pub(crate) const fn metadata_blocks(&self) -> u64 {
+        self.metadata_blocks
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DelallocClaim {
+    data_blocks: u64,
+    metadata_blocks: u64,
+    // Number of one-shot debit records which have changed this claim but have
+    // not yet reached their commit-or-rollback decision.  Keeping this next
+    // to the claim makes whole-reservation release and finalisation O(1) per
+    // lease while holding the global allocation lock.
+    inflight_consumptions: u64,
+}
+
+/// The ledger-side record backing an outstanding one-shot consumption token.
+/// It remains in `AllocationState` until the mapper explicitly commits or
+/// rolls back the token, making a forgotten error-path rollback observable at
+/// reservation finalisation instead of silently releasing the wrong budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DelallocConsumptionRecord {
+    reservation: DelallocReservationId,
+    use_kind: DelallocReservationUse,
+    blocks: u64,
+}
+
+/// All counters that decide whether a physical-block allocation may proceed.
+///
+/// `alloc_lock` protects this state together with ext4 block/inode bitmaps and
+/// free-block counters.  Keeping the ledger in that same critical section is
+/// essential: a separate reservation mutex would leave a window in which a
+/// direct allocator could spend space already promised to delayed writeback.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct AllocationState {
+    mount_generation: u64,
+    next_delalloc_reservation_serial: u64,
+    next_delalloc_consumption_serial: u64,
+    reserved_data_blocks: u64,
+    reserved_metadata_blocks: u64,
+    delalloc_claims: BTreeMap<DelallocReservationId, DelallocClaim>,
+    delalloc_consumptions: BTreeMap<u64, DelallocConsumptionRecord>,
+}
+
+static NEXT_DELALLOC_MOUNT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl AllocationState {
+    pub(super) fn new() -> Result<Self> {
+        let mount_generation = NEXT_DELALLOC_MOUNT_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                format_error!(
+                    ErrCode::ERANGE,
+                    "Delayed-allocation mount generations are exhausted"
+                )
+            })?;
+        Ok(Self {
+            // Zero is never issued, so arithmetic overflow cannot silently
+            // wrap a stale handle into a valid new claim.
+            mount_generation,
+            next_delalloc_reservation_serial: 1,
+            next_delalloc_consumption_serial: 1,
+            reserved_data_blocks: 0,
+            reserved_metadata_blocks: 0,
+            delalloc_claims: BTreeMap::new(),
+            delalloc_consumptions: BTreeMap::new(),
+        })
+    }
+}
+
 /// The Ext4 filesystem implementation.
 pub struct Ext4 {
     block_device: Arc<dyn BlockDevice>,
@@ -72,10 +344,13 @@ pub struct Ext4 {
     system_metadata_ranges: Vec<(PBlockId, PBlockId)>,
     /// LRU-ish inode cache. Avoids repeated disk reads for frequently accessed inodes.
     inode_cache: spin::Mutex<InodeCache>,
-    /// Global allocation lock. Protects block/inode bitmap operations from
-    /// concurrent modification, which would cause two inodes to receive the
-    /// same physical block (corrupting extent trees and data).
-    alloc_lock: spin::Mutex<()>,
+    /// Global allocation lock and delayed-allocation budget. Protects
+    /// block/inode bitmap operations, free-block counters, and outstanding
+    /// delayed-allocation claims from concurrent modification.
+    ///
+    /// Keeping the claim ledger here prevents a direct allocation from
+    /// overselling blocks already promised to a successful buffered write.
+    alloc_lock: spin::Mutex<AllocationState>,
     /// Serializes directory-entry/link-count transactions.  Inode data and
     /// writeback remain sharded; namespace operations are comparatively cold
     /// and need a single ordering domain until journal transactions exist.
@@ -90,6 +365,9 @@ pub struct Ext4 {
     metadata_mutation_barrier: MetadataMutationGate,
     /// First unrecoverable metadata error.  Once set, mutation must fail-stop.
     poisoned: spin::Mutex<Option<ErrCode>>,
+    /// The normal bounded append mapper has one non-replayable authority per
+    /// writable mount generation.
+    delalloc_mapper_authority_issued: AtomicBool,
     /// Explicit metadata mutation lifecycle. Read-only probing cannot acquire
     /// either transaction backend and therefore cannot mutate or recover media.
     metadata_mode: MetadataMutationMode,
@@ -610,10 +888,11 @@ impl Ext4 {
             cached_block_groups,
             system_metadata_ranges,
             inode_cache: spin::Mutex::new(InodeCache::new(INODE_CACHE_SIZE)),
-            alloc_lock: spin::Mutex::new(()),
+            alloc_lock: spin::Mutex::new(AllocationState::new()?),
             namespace_lock: spin::Mutex::new(()),
             metadata_mutation_barrier: MetadataMutationGate::new(),
             poisoned: spin::Mutex::new(None),
+            delalloc_mapper_authority_issued: AtomicBool::new(false),
             metadata_mode: MetadataMutationMode::ReadOnly,
             write_barrier: true,
             direct_restore_clean: false,
@@ -698,6 +977,17 @@ impl Ext4 {
     /// lifecycle invariant becomes indeterminate.
     pub fn fail_stop_mutations(&self) {
         self.poison(ErrCode::EIO);
+    }
+
+    /// Host-only synchronization point immediately before fail-stop tries to
+    /// acquire the poison mutex. It is intentionally absent from normal and
+    /// `test-api` builds; the low-level race test uses it only to establish a
+    /// deterministic ordering against a clean ledger mutation already holding
+    /// that mutex.
+    #[cfg(test)]
+    pub(super) fn test_fail_stop_mutations_before_poison_lock(&self, before_lock: impl FnOnce()) {
+        before_lock();
+        self.fail_stop_mutations();
     }
 
     fn ranges_overlap(

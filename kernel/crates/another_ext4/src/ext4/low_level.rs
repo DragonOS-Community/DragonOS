@@ -3,6 +3,12 @@
 //! These interfaces are designed and arranged coresponding to FUSE low-level ops.
 //! Ref: https://libfuse.github.io/doxygen/structfuse__lowlevel__ops.html
 
+#[cfg(any(test, feature = "test-api"))]
+use super::orphan::LegacyOrphanMembership;
+use super::orphan::{final_unlink_orphan_action, FinalUnlinkOrphanAction};
+use super::DelallocLease;
+#[cfg(any(test, feature = "test-api"))]
+use super::DelallocMappedWriteback;
 use super::Ext4;
 use crate::constants::*;
 use crate::ext4_defs::*;
@@ -20,12 +26,215 @@ enum TransactionalRangePrepare {
     Unsupported,
 }
 
+/// Outcome of the test-only mapped-tail data phase.
+///
+/// A block-device write can be retried with the same receipt: the extent and
+/// linked orphan remain the authority for that receipt. Validation failures
+/// instead prove that the raw primitive has lost its unique owner.
+#[cfg(any(test, feature = "test-api"))]
+enum DelallocMappedDataFailure {
+    Retryable(Ext4Error),
+    Fatal(Ext4Error),
+}
+
 struct TransactionalRangePlan {
     start_lblock: LBlockId,
     count: u32,
     preferred_first: Option<PBlockId>,
     requires_merge: bool,
+    requires_root_split: bool,
+    requires_leaf_split: bool,
     leaf_home: Option<PBlockId>,
+}
+
+/// One complete delayed-allocation writeback operation on a single ext4
+/// block. Unlike the host-only mapped-tail receipt, this request has no
+/// externally visible intermediate state: the mapper writes
+/// initialized data before committing the allocation, extent and durable EOF
+/// in one journal transaction.
+///
+/// `payload` is exactly one filesystem block beginning at `offset`.
+/// `durable_eof` may stop inside that block when PageCache's stable snapshot
+/// is partial, but it may never pass the mapped block.  The VFS computes it
+/// from its committable-EOF ledger rather than from visible `i_size` alone.
+#[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+pub struct DelallocAppendBlockWriteback<'a> {
+    pub offset: usize,
+    pub payload: &'a [u8],
+    pub durable_eof: u64,
+    pub mtime: Option<u32>,
+    pub ctime: Option<u32>,
+}
+
+/// Data and inode metadata which a production append capability publishes.
+///
+/// The inode and logical offset deliberately remain absent: they are fixed by
+/// the opaque reservation's admission certificate and cannot be rebound by a
+/// caller at submission time.
+pub struct DelallocAppendBlockPublication<'a> {
+    pub payload: &'a [u8],
+    pub durable_eof: u64,
+    pub mtime: Option<u32>,
+    pub ctime: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct DelallocAppendSubmitPolicy {
+    strict_aligned: bool,
+    journal_credits_bound: Option<usize>,
+    terminal_on_contract_error: bool,
+}
+
+/// Opaque, single-use capability for the first production delayed-allocation
+/// mapper shape.
+///
+/// This is deliberately not a generic [`DelallocLease`]: its private inner
+/// lease was admitted under the target inode's direct-metadata exclusion and
+/// is bound to one inode generation, one logical block and the on-disk EOF
+/// observed at admission.  Host recovery callers can neither construct it
+/// from an arbitrary lease nor choose a different inode/offset at submit
+/// time.
+///
+/// The VFS still has to couple this capability to its lifecycle lease,
+/// queue-head claim, PageCache dirty-generation ticket and truncate drain
+/// before it makes a page dirty.  This type closes the lower-layer raw
+/// `inode + request + lease` escape hatch; it does not pretend that the VFS
+/// proof already exists.
+#[must_use = "an append delayed-allocation reservation must be released or finalised"]
+pub struct DelallocAppendBlockReservation {
+    lease: DelallocLease,
+    pool_checkpoint: Option<DelallocPoolCheckpoint>,
+    journal_credits_bound: usize,
+}
+
+struct DelallocPoolCheckpoint {
+    before: super::extent::ExtentRightSpineProjection,
+    after: super::extent::ExtentRightSpineProjection,
+    added_metadata_leases: usize,
+}
+
+impl core::fmt::Debug for DelallocAppendBlockReservation {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("DelallocAppendBlockReservation(..)")
+    }
+}
+
+#[must_use = "an extent-node pool must be released or terminalised"]
+pub struct DelallocExtentNodePool {
+    inode_id: InodeId,
+    inode_generation: u32,
+    projection: super::extent::ExtentRightSpineProjection,
+    leases: Vec<DelallocLease>,
+}
+
+impl core::fmt::Debug for DelallocExtentNodePool {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("DelallocExtentNodePool(..)")
+    }
+}
+
+impl DelallocAppendBlockReservation {
+    fn new(lease: DelallocLease) -> Self {
+        Self {
+            lease,
+            pool_checkpoint: None,
+            journal_credits_bound: DELALLOC_APPEND_MAX_JOURNAL_CREDITS,
+        }
+    }
+
+    /// This stays private to the ext4 crate.  The host recovery API below is
+    /// the only compatibility caller that may unwrap the old raw test
+    /// carrier.  The future VFS token will adopt this shape only together
+    /// with its lifecycle, queue, EOF and drain proof.
+    #[cfg(any(test, feature = "test-api"))]
+    fn into_host_test_lease(self) -> DelallocLease {
+        self.lease
+    }
+}
+
+// Extent validation accepts depths 0..=5. Appending through a completely full
+// right spine can allocate one node at every existing level plus a promoted
+// root, hence at most six new extent-tree blocks in one submission.
+const DELALLOC_APPEND_MAX_NEW_EXTENT_NODES: usize = 6;
+// Home-image bound for one append:
+//   10 = inode/path plus the data allocation bitmap/GDT/superblock envelope;
+//   4 per new node = node image plus its allocation bitmap/GDT/superblock.
+// Allocation groups are chosen only after the transaction starts, so admission
+// cannot know an exact home set. This checked single-submit upper bound is the
+// proof carried by the private reservation.
+const DELALLOC_APPEND_MAX_JOURNAL_CREDITS: usize = 10 + 4 * DELALLOC_APPEND_MAX_NEW_EXTENT_NODES;
+
+fn delalloc_append_journal_credits(metadata_blocks: usize) -> Result<usize> {
+    10usize
+        .checked_add(
+            metadata_blocks
+                .checked_mul(4)
+                .ok_or_else(|| Ext4Error::new(ErrCode::E2BIG))?,
+        )
+        .ok_or_else(|| Ext4Error::new(ErrCode::E2BIG))
+}
+
+fn delalloc_append_batch_journal_credits(blocks: usize) -> Result<usize> {
+    DELALLOC_APPEND_MAX_JOURNAL_CREDITS
+        .checked_mul(blocks)
+        .ok_or_else(|| Ext4Error::new(ErrCode::E2BIG))
+}
+
+fn validate_delalloc_journal_credit_bound(actual: usize, bound: Option<usize>) -> Result<usize> {
+    match bound {
+        Some(bound) if actual <= bound => Ok(bound),
+        // A private production certificate is admitted only after proving
+        // this bound.  Exceeding it is a deterministic capability-contract
+        // violation, not an I/O EIO that may be retried.
+        Some(_) => Err(Ext4Error::new(ErrCode::E2BIG)),
+        None => Ok(actual),
+    }
+}
+
+fn is_delalloc_contract_error(code: ErrCode) -> bool {
+    matches!(
+        code,
+        ErrCode::EINVAL
+            | ErrCode::ENOTSUP
+            | ErrCode::EFBIG
+            | ErrCode::ERANGE
+            | ErrCode::E2BIG
+            | ErrCode::ENOSPC
+            | ErrCode::EROFS
+    )
+}
+
+/// Mount-scoped authority for the bounded production append mapper.
+///
+/// Callers cannot construct, clone, or inspect this value.  Every production
+/// reserve/submit/release terminal validates it against the issuing `Ext4`
+/// instance, so a typed reservation cannot be rebound through a foreign
+/// superblock.  The DragonOS VFS keeps one authority in the canonical
+/// filesystem object and combines it with its inode/PageCache lifecycle proof.
+#[must_use = "the mapper authority must remain owned by its filesystem"]
+pub struct DelallocAppendMapperAuthority {
+    mount_generation: u64,
+}
+
+impl core::fmt::Debug for DelallocAppendMapperAuthority {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("DelallocAppendMapperAuthority(..)")
+    }
+}
+
+/// Publication-aware result of the bounded append mapper.
+///
+/// `RetryableNotPublished` is deliberately not a user-visible retry hint: it
+/// proves that the exact lease remains active and the caller must restore its
+/// queue claim before PageCache redirties the batch. `Terminal` means the
+/// mapper either crossed a commit attempt or observed an already fail-stopped
+/// mount and terminalised the lease. Recovery, rather than the caller, owns
+/// any tail in both cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelallocAppendBlockSubmitOutcome {
+    Completed,
+    RetryableNotPublished(ErrCode),
+    Terminal(ErrCode),
 }
 
 /// Attributes that can be set on an inode via `setattr`.
@@ -63,6 +272,2066 @@ impl SetAttr {
 }
 
 impl Ext4 {
+    /// Build the bounded one-block append plan. This deliberately keeps
+    /// the first mapper small enough that a successful reservation cannot
+    /// turn into a writeback-time metadata `ENOSPC`:
+    /// root/leaf growth receives one explicit metadata credit, while shapes
+    /// that require a physically adjacent run are deferred to the later range
+    /// mapper instead of being guessed from aggregate free space.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    fn delalloc_append_block_plan(
+        &self,
+        inode: &InodeRef,
+        offset: usize,
+    ) -> Result<(TransactionalRangePlan, u64)> {
+        if !offset.is_multiple_of(BLOCK_SIZE) {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        // This bounded primitive can bridge exactly the one partial block at
+        // the current EOF.  Supporting a larger preallocated/sparse gap would
+        // require one durable zero proof per intervening block, which belongs
+        // to the later range token rather than an aggregate single-block
+        // reservation.
+        let next_lblock = inode
+            .inode
+            .size()
+            .checked_add(BLOCK_SIZE as u64 - 1)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?
+            / BLOCK_SIZE as u64;
+        let append_offset = next_lblock
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if u64::try_from(offset).map_err(|_| Ext4Error::new(ErrCode::EFBIG))? != append_offset {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let start_lblock =
+            u32::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let shape = self
+            .direct_append_shape(inode, start_lblock, 1)?
+            .ok_or_else(|| Ext4Error::new(ErrCode::ENOTSUP))?;
+        if shape.requires_merge {
+            // A full unsupported leaf can only accept an append when the
+            // physical block directly follows its tail. A logical reservation
+            // does not pin that run, so accepting it would manufacture a late
+            // writeback ENOSPC after userspace observed a successful write.
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let metadata_blocks = u64::from(shape.requires_root_split)
+            .checked_add(u64::from(shape.requires_leaf_split))
+            .ok_or_else(|| Ext4Error::new(ErrCode::ERANGE))?;
+        Ok((
+            TransactionalRangePlan {
+                start_lblock,
+                count: 1,
+                preferred_first: shape.preferred_first,
+                requires_merge: false,
+                requires_root_split: shape.requires_root_split,
+                requires_leaf_split: shape.requires_leaf_split,
+                leaf_home: shape.leaf_home,
+            },
+            metadata_blocks,
+        ))
+    }
+
+    /// Admission projection for a follower whose predecessors are still only
+    /// represented by the inode queue. Stage 3c-1 admits followers only while
+    /// every projected non-merging extent fits in the current right-most
+    /// leaf; right-spine growth is added by the next implementation phase.
+    fn delalloc_projected_append_block_plan(
+        &self,
+        inode: &InodeRef,
+        offset: usize,
+        expected_durable_eof_before: u64,
+    ) -> Result<(TransactionalRangePlan, u64)> {
+        if expected_durable_eof_before == inode.inode.size() {
+            return self.delalloc_append_block_plan(inode, offset);
+        }
+        let append_offset = expected_durable_eof_before
+            .checked_add(BLOCK_SIZE as u64 - 1)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?
+            / BLOCK_SIZE as u64
+            * BLOCK_SIZE as u64;
+        if expected_durable_eof_before < inode.inode.size()
+            || u64::try_from(offset).map_err(|_| Ext4Error::new(ErrCode::EFBIG))? != append_offset
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let start_lblock =
+            u32::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let (on_disk_next_lblock, free_entries) = self.extent_rightmost_append_capacity(inode)?;
+        let projected_predecessors = start_lblock
+            .checked_sub(on_disk_next_lblock)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?
+            as usize;
+        if projected_predecessors >= free_entries {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        Ok((
+            TransactionalRangePlan {
+                start_lblock,
+                count: 1,
+                preferred_first: None,
+                requires_merge: false,
+                requires_root_split: false,
+                requires_leaf_split: false,
+                leaf_home: None,
+            },
+            0,
+        ))
+    }
+
+    /// Make the old partial EOF block safe to expose before an append grows
+    /// the file into the next filesystem block.  A truncate may leave the
+    /// physical block allocated with bytes beyond `i_size`; Linux similarly
+    /// zeroes that partial block before extending the file.  The bounded
+    /// A sparse write may either allocate the currently-unmapped block which
+    /// contains EOF or a later right-edge block.  If the EOF block is already
+    /// mapped, only a later block is eligible and its old tail must be zeroed.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    fn zero_delalloc_append_eof_tail(
+        &self,
+        inode: &InodeRef,
+        old_eof: u64,
+        offset: usize,
+    ) -> Result<()> {
+        if self.write_delalloc_append_eof_tail(inode, old_eof, offset)? {
+            self.block_device.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Write the old partial-EOF tail without creating its own durability
+    /// boundary. Batched delayed writeback includes this data write in the
+    /// single flush which precedes mapping publication.
+    fn write_delalloc_append_eof_tail(
+        &self,
+        inode: &InodeRef,
+        old_eof: u64,
+        offset: usize,
+    ) -> Result<bool> {
+        let tail_offset = usize::try_from(old_eof % BLOCK_SIZE as u64)
+            .map_err(|_| Ext4Error::new(ErrCode::ERANGE))?;
+        if old_eof == 0 || tail_offset == 0 {
+            return Ok(false);
+        }
+        let target_lblock =
+            u32::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let eof_lblock = u32::try_from(old_eof / BLOCK_SIZE as u64)
+            .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        if target_lblock < eof_lblock {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let pblock = match self.extent_query(inode, eof_lblock) {
+            Ok(pblock) => pblock,
+            Err(error) if error.code() == ErrCode::ENOENT => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if target_lblock == eof_lblock {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let mut block = self.read_block(pblock)?;
+        block.data[tail_offset..].fill(0);
+        self.write_block(&block)?;
+        Ok(true)
+    }
+
+    /// Reserve the first production mapper shape as an opaque capability.
+    ///
+    /// The returned capability captures the canonical inode/range provenance
+    /// while the direct-metadata domain and this inode's mutation shard are
+    /// both held.  Its private lease cannot subsequently be rebound to a
+    /// different append request.  A future VFS token must still add its
+    /// lifecycle, queue-head, EOF-ticket and truncate-drain proof before it
+    /// makes a dirty page visible.
+    fn reserve_delalloc_append_block_capability_inner(
+        &self,
+        id: InodeId,
+        offset: usize,
+        expected_durable_eof_before: Option<u64>,
+    ) -> Result<DelallocAppendBlockReservation> {
+        self.ensure_mutable()?;
+        if !self.uses_journal() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+        let inode = self.read_inode(id)?;
+        if !inode.inode.is_file() || !inode.inode.uses_extents() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let expected_durable_eof_before =
+            expected_durable_eof_before.unwrap_or_else(|| inode.inode.size());
+        let (_plan, metadata_blocks) =
+            self.delalloc_projected_append_block_plan(&inode, offset, expected_durable_eof_before)?;
+        let mut lease =
+            self.reserve_delalloc_lease_in_direct_mutation_domain(1, metadata_blocks)?;
+        lease
+            .bind_append_block_certificate(
+                id,
+                inode.inode.generation(),
+                offset,
+                expected_durable_eof_before,
+            )
+            .expect("fresh delayed-allocation append lease must accept one certificate");
+        Ok(DelallocAppendBlockReservation::new(lease))
+    }
+
+    /// Issue the normal-build mount authority for the bounded append mapper.
+    pub fn delalloc_append_mapper_authority(&self) -> Result<DelallocAppendMapperAuthority> {
+        self.ensure_mutable()?;
+        if !self.uses_journal() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        self.delalloc_mapper_authority_issued
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| Ext4Error::new(ErrCode::EEXIST))?;
+        Ok(DelallocAppendMapperAuthority {
+            mount_generation: self.delalloc_mount_generation(),
+        })
+    }
+
+    fn validate_delalloc_append_mapper_authority(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+    ) -> Result<()> {
+        self.ensure_mutable()?;
+        if !self.uses_journal() || authority.mount_generation != self.delalloc_mount_generation() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        Ok(())
+    }
+
+    pub fn create_delalloc_extent_node_pool_authorized(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        id: InodeId,
+    ) -> Result<DelallocExtentNodePool> {
+        self.validate_delalloc_append_mapper_authority(authority)?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+        let inode = self.read_inode(id)?;
+        if !inode.inode.is_file() || !inode.inode.uses_extents() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        Ok(DelallocExtentNodePool {
+            inode_id: id,
+            inode_generation: inode.inode.generation(),
+            projection: self.extent_right_spine_projection(&inode)?,
+            leases: Vec::new(),
+        })
+    }
+
+    pub fn release_delalloc_extent_node_pool_authorized(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        pool: &mut DelallocExtentNodePool,
+    ) -> Result<()> {
+        self.validate_delalloc_append_mapper_authority(authority)?;
+        let mut leases: Vec<&mut DelallocLease> = pool.leases.iter_mut().collect();
+        self.release_delalloc_lease_batch(&mut leases)?;
+        pool.leases.clear();
+        Ok(())
+    }
+
+    pub fn terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        pool: &mut DelallocExtentNodePool,
+    ) -> Result<()> {
+        if authority.mount_generation != self.delalloc_mount_generation()
+            || pool
+                .leases
+                .iter()
+                .any(|lease| !lease.belongs_to_mount(self.delalloc_mount_generation()))
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        self.poison(ErrCode::EIO);
+        for lease in &mut pool.leases {
+            if lease.active {
+                lease.deactivate();
+            }
+        }
+        pool.leases.clear();
+        Ok(())
+    }
+
+    /// Reserve one aligned append block for the production VFS bridge.
+    pub fn reserve_delalloc_append_block_authorized(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        id: InodeId,
+        offset: usize,
+    ) -> Result<DelallocAppendBlockReservation> {
+        self.validate_delalloc_append_mapper_authority(authority)?;
+        self.reserve_delalloc_append_block_capability_inner(id, offset, None)
+    }
+
+    /// Reserve a follower against the inode queue's exact durable-EOF
+    /// predecessor. The certificate remains opaque and submit validates the
+    /// actual on-disk EOF after all older entries complete.
+    pub fn reserve_delalloc_append_block_projected_authorized(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        id: InodeId,
+        offset: usize,
+        expected_durable_eof_before: u64,
+        pool: &mut DelallocExtentNodePool,
+    ) -> Result<DelallocAppendBlockReservation> {
+        self.validate_delalloc_append_mapper_authority(authority)?;
+        if pool.inode_id != id {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        if !self.transaction_credits_fit(DELALLOC_APPEND_MAX_JOURNAL_CREDITS)? {
+            // This journal geometry cannot ever materialize the admitted
+            // right-spine shape. Reject before reserving blocks or publishing
+            // a Dirty page; writeback must never discover deterministic
+            // E2BIG and spin it as EAGAIN.
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+
+        let (inode_generation, expected_lblock, mut projection) = {
+            let _metadata_guard = self.lock_direct_metadata_mutation()?;
+            let _mutation_guard =
+                self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+            let inode = self.read_inode(id)?;
+            if inode.inode.generation() != pool.inode_generation {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            let expected_lblock =
+                u32::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+            let minimum_lblock = u32::try_from(expected_durable_eof_before / BLOCK_SIZE as u64)
+                .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+            if !offset.is_multiple_of(BLOCK_SIZE)
+                || expected_lblock < minimum_lblock
+                || pool.projection.next_lblock > expected_lblock
+            {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            (
+                inode.inode.generation(),
+                expected_lblock,
+                pool.projection.clone(),
+            )
+        };
+        let new_nodes = projection.append_nonmerge_at(expected_lblock, 1)?;
+
+        let mut data_lease = self.reserve_delalloc_lease(1, 0)?;
+        if let Err(error) = data_lease.bind_append_block_certificate(
+            id,
+            inode_generation,
+            offset,
+            expected_durable_eof_before,
+        ) {
+            let _ = self.release_delalloc_lease_batch(&mut [&mut data_lease]);
+            return Err(error);
+        }
+        let mut new_metadata = Vec::new();
+        for _ in 0..new_nodes {
+            match self.reserve_delalloc_lease(0, 1) {
+                Ok(lease) => new_metadata.push(lease),
+                Err(error) => {
+                    let mut leases: Vec<&mut DelallocLease> = new_metadata.iter_mut().collect();
+                    leases.push(&mut data_lease);
+                    if self.release_delalloc_lease_batch(&mut leases).is_err() {
+                        self.poison(ErrCode::EIO);
+                        for lease in &mut new_metadata {
+                            lease.deactivate();
+                        }
+                        data_lease.deactivate();
+                        return Err(Ext4Error::new(ErrCode::EIO));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let checkpoint = DelallocPoolCheckpoint {
+            before: core::mem::replace(&mut pool.projection, projection.clone()),
+            after: projection,
+            added_metadata_leases: new_metadata.len(),
+        };
+        pool.leases.extend(new_metadata);
+        Ok(DelallocAppendBlockReservation {
+            lease: data_lease,
+            pool_checkpoint: Some(checkpoint),
+            journal_credits_bound: DELALLOC_APPEND_MAX_JOURNAL_CREDITS,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn reserve_delalloc_append_block_capability(
+        &self,
+        id: InodeId,
+        offset: usize,
+    ) -> Result<DelallocAppendBlockReservation> {
+        self.reserve_delalloc_append_block_capability_inner(id, offset, None)
+    }
+
+    /// Host-recovery compatibility wrapper for the pre-capability reserve
+    /// API.  It intentionally remains unavailable to normal DragonOS builds:
+    /// the raw lease does not carry the VFS proof required for production
+    /// PageCache writeback.
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn reserve_delalloc_append_block(
+        &self,
+        id: InodeId,
+        offset: usize,
+    ) -> Result<DelallocLease> {
+        self.reserve_delalloc_append_block_capability_inner(id, offset, None)
+            .map(DelallocAppendBlockReservation::into_host_test_lease)
+    }
+
+    fn abort_delalloc_append_block_transaction_many(
+        &self,
+        transaction: super::journal_transaction::Transaction<'_>,
+        data: super::alloc::DelallocConsumption,
+        metadata: Vec<super::alloc::DelallocConsumption>,
+    ) -> Result<()> {
+        transaction.abort();
+        let mut failure = None;
+        for consumption in metadata.into_iter().rev() {
+            if let Err(error) = self.rollback_delalloc_allocation(consumption) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.rollback_delalloc_allocation(data) {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn finish_unpublished_delalloc_error(
+        &self,
+        cleanup: Result<()>,
+        lease: &mut DelallocLease,
+        original: Ext4Error,
+    ) -> Result<()> {
+        if cleanup.is_ok() {
+            return Err(original);
+        }
+        self.poison(ErrCode::EIO);
+        lease.deactivate();
+        Err(Ext4Error::new(ErrCode::EIO))
+    }
+
+    fn rollback_delalloc_consumptions_many(
+        &self,
+        data: super::alloc::DelallocConsumption,
+        metadata: Vec<super::alloc::DelallocConsumption>,
+    ) -> Result<()> {
+        let mut failure = None;
+        for consumption in metadata.into_iter().rev() {
+            if let Err(error) = self.rollback_delalloc_allocation(consumption) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.rollback_delalloc_allocation(data) {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn rollback_delalloc_consumption_vectors(
+        &self,
+        data: Vec<super::alloc::DelallocConsumption>,
+        metadata: Vec<super::alloc::DelallocConsumption>,
+    ) -> Result<()> {
+        let mut failure = None;
+        for consumption in metadata.into_iter().rev().chain(data.into_iter().rev()) {
+            if let Err(error) = self.rollback_delalloc_allocation(consumption) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn finalize_delalloc_append_consumptions(
+        &self,
+        lease: &mut DelallocLease,
+        data: &mut super::alloc::DelallocConsumption,
+        metadata: &mut Vec<super::alloc::DelallocConsumption>,
+        pool: Option<&mut DelallocExtentNodePool>,
+        pool_indices: Vec<usize>,
+    ) -> Result<()> {
+        let Some(pool) = pool else {
+            if metadata.len() > 1 || !pool_indices.is_empty() {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            return self.finalize_delalloc_append_block(lease, data, metadata.first_mut());
+        };
+
+        if pool_indices.len() != metadata.len() {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        self.finalize_delalloc_append_block_with_pool(lease, data, None)?;
+        for (index, consumption) in pool_indices.iter().copied().zip(metadata.drain(..)) {
+            self.commit_delalloc_allocation(consumption, &mut pool.leases[index])?;
+        }
+        for index in pool_indices.into_iter().rev() {
+            drop(pool.leases.swap_remove(index));
+        }
+        Ok(())
+    }
+
+    /// Materialise, initialize and submit one previously reserved append
+    /// block, then publish the extent and the caller-proven durable EOF in one
+    /// journal transaction.
+    ///
+    /// Data I/O is flushed before the journal commit.  Therefore a crash
+    /// before a commit record leaves an unreachable (and reusable) block,
+    /// while a replayed commit can only reveal initialized payload.  A commit
+    /// outcome after the publication point fail-stops the mount and finalises
+    /// the lease; an ordinary data I/O failure aborts the transaction and
+    /// leaves the lease live so PageCache may re-dirty and retry it.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    fn submit_delalloc_append_block_inner(
+        &self,
+        id: InodeId,
+        request: DelallocAppendBlockWriteback<'_>,
+        lease: &mut DelallocLease,
+        pool: Option<&mut DelallocExtentNodePool>,
+        strict_aligned: bool,
+        journal_credits_bound: Option<usize>,
+    ) -> Result<()> {
+        let mut pool = pool;
+        self.ensure_mutable()?;
+        if !self.uses_journal()
+            || !request.offset.is_multiple_of(BLOCK_SIZE)
+            || request.payload.is_empty()
+            || request.payload.len() > BLOCK_SIZE
+            || !lease.active
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let block_end = request
+            .offset
+            .checked_add(BLOCK_SIZE)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        let block_end_u64 = u64::try_from(block_end).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        if request.durable_eof <= request.offset as u64
+            || request.durable_eof > block_end_u64
+            || (strict_aligned && request.durable_eof != block_end_u64)
+        {
+            return Err(Ext4Error::new(if strict_aligned {
+                ErrCode::EINVAL
+            } else {
+                ErrCode::EAGAIN
+            }));
+        }
+        let visible_len = usize::try_from(request.durable_eof - request.offset as u64)
+            .map_err(|_| Ext4Error::new(ErrCode::ERANGE))?;
+        if request.payload.len() != visible_len {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+
+        let certificate = lease
+            .append_block_certificate()
+            .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
+        if certificate.inode_id != id
+            || certificate.offset != request.offset
+            || lease.data_blocks != 1
+        {
+            return Err(Ext4Error::new(if strict_aligned {
+                ErrCode::EINVAL
+            } else {
+                ErrCode::EAGAIN
+            }));
+        }
+
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+        let mut inode = self.read_inode(id)?;
+        let on_disk_eof = inode.inode.size();
+        if !inode.inode.is_file()
+            || !inode.inode.uses_extents()
+            || inode.inode.generation() != certificate.inode_generation
+            || on_disk_eof != certificate.expected_durable_eof_before
+            || (strict_aligned
+                && (on_disk_eof != request.offset as u64 || on_disk_eof % BLOCK_SIZE as u64 != 0))
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let start_lblock = u32::try_from(request.offset / BLOCK_SIZE)
+            .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let extent_plan = self.right_spine_append_plan(&inode, start_lblock)?;
+        let projected_metadata_blocks = extent_plan.new_nodes();
+        if pool.as_ref().is_some_and(|pool| {
+            pool.inode_id != id || pool.inode_generation != inode.inode.generation()
+        }) || (projected_metadata_blocks != 0
+            && match pool.as_ref() {
+                Some(pool) => {
+                    pool.leases.iter().filter(|lease| lease.active).count()
+                        < projected_metadata_blocks
+                }
+                None => lease.metadata_blocks < projected_metadata_blocks as u64,
+            })
+        {
+            // The VFS must drain conflicting eager/mapped work before it
+            // reuses a certificate.  Do not reinterpret a reservation with a
+            // larger metadata need as a retryable ENOSPC.
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+
+        let actual_credits = delalloc_append_journal_credits(projected_metadata_blocks)?;
+        let credits =
+            validate_delalloc_journal_credit_bound(actual_credits, journal_credits_bound)?;
+        let mut transaction = self.transaction_start(credits)?;
+        let (allocation, data_consumption) = match self.transaction_alloc_delalloc_range(
+            &mut transaction,
+            id,
+            extent_plan.preferred_first,
+            false,
+            1,
+            lease,
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                transaction.abort();
+                return Err(error);
+            }
+        };
+        // Admission reserves the non-merge right-spine upper bound. The data
+        // allocator can now prove whether the actual physical block extends
+        // the current tail; a merge consumes no metadata-node lease even when
+        // the leaf is full, leaving that conservative pool capacity for a
+        // later non-contiguous follower.
+        let metadata_blocks = if extent_plan.can_merge(allocation.first, 1) {
+            0
+        } else {
+            projected_metadata_blocks
+        };
+        let mut metadata_consumptions = Vec::new();
+        let mut metadata_pool_indices = Vec::new();
+        let mut metadata_homes = Vec::new();
+        if metadata_blocks != 0 {
+            let selected: Vec<Option<usize>> = if let Some(pool) = pool.as_deref() {
+                pool.leases
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, lease)| lease.active.then_some(Some(index)))
+                    .take(metadata_blocks)
+                    .collect()
+            } else {
+                if metadata_blocks != 1 || lease.metadata_blocks < 1 {
+                    return Err(Ext4Error::new(ErrCode::EINVAL));
+                }
+                vec![None]
+            };
+            for pool_index in selected {
+                let metadata_lease = match pool_index {
+                    Some(index) => {
+                        &mut pool
+                            .as_deref_mut()
+                            .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?
+                            .leases[index]
+                    }
+                    None => &mut *lease,
+                };
+                let (metadata_allocation, consumption) = match self
+                    .transaction_alloc_delalloc_metadata_block(
+                        &mut transaction,
+                        id,
+                        Some(allocation.first),
+                        metadata_lease,
+                    ) {
+                    Ok(allocation) => allocation,
+                    Err(error) => {
+                        let cleanup = self.abort_delalloc_append_block_transaction_many(
+                            transaction,
+                            data_consumption,
+                            metadata_consumptions,
+                        );
+                        return self.finish_unpublished_delalloc_error(cleanup, lease, error);
+                    }
+                };
+                if let Some(index) = pool_index {
+                    metadata_pool_indices.push(index);
+                }
+                metadata_homes.push(metadata_allocation.first);
+                metadata_consumptions.push(consumption);
+            }
+            if metadata_homes.len() != metadata_blocks {
+                let cleanup = self.abort_delalloc_append_block_transaction_many(
+                    transaction,
+                    data_consumption,
+                    metadata_consumptions,
+                );
+                return self.finish_unpublished_delalloc_error(
+                    cleanup,
+                    lease,
+                    Ext4Error::new(ErrCode::EIO),
+                );
+            }
+        }
+
+        let mut initialized = [0u8; BLOCK_SIZE];
+        initialized[..visible_len].copy_from_slice(request.payload);
+        if !strict_aligned {
+            if let Err(error) =
+                self.zero_delalloc_append_eof_tail(&inode, on_disk_eof, request.offset)
+            {
+                let cleanup = self.abort_delalloc_append_block_transaction_many(
+                    transaction,
+                    data_consumption,
+                    metadata_consumptions,
+                );
+                return self.finish_unpublished_delalloc_error(cleanup, lease, error);
+            }
+        }
+        // `initialized` is already a complete zero-padded block. Persist it
+        // exactly once; a separate pre-zero write doubles I/O without adding
+        // a recovery guarantee because the extent is still unpublished.
+        if let Err(error) = self
+            .block_device
+            .write_blocks(allocation.first, &initialized)
+        {
+            let cleanup = self.abort_delalloc_append_block_transaction_many(
+                transaction,
+                data_consumption,
+                metadata_consumptions,
+            );
+            return self.finish_unpublished_delalloc_error(cleanup, lease, error);
+        }
+        if let Err(error) = self.block_device.flush() {
+            let cleanup = self.abort_delalloc_append_block_transaction_many(
+                transaction,
+                data_consumption,
+                metadata_consumptions,
+            );
+            return self.finish_unpublished_delalloc_error(cleanup, lease, error);
+        }
+
+        if let Err(error) = self.stage_journaled_right_spine_append(
+            &mut transaction,
+            &mut inode,
+            &extent_plan,
+            &metadata_homes,
+            allocation.first,
+            1,
+        ) {
+            let cleanup = self.abort_delalloc_append_block_transaction_many(
+                transaction,
+                data_consumption,
+                metadata_consumptions,
+            );
+            return self.finish_unpublished_delalloc_error(cleanup, lease, error);
+        }
+        inode.inode.set_size(request.durable_eof);
+        if let Some(mtime) = request.mtime {
+            inode.inode.set_mtime(mtime);
+        }
+        if let Some(ctime) = request.ctime {
+            inode.inode.set_ctime(ctime);
+        }
+        if let Err(error) = self.transaction_stage_inode_with_csum(&mut transaction, &mut inode) {
+            let cleanup = self.abort_delalloc_append_block_transaction_many(
+                transaction,
+                data_consumption,
+                metadata_consumptions,
+            );
+            return self.finish_unpublished_delalloc_error(cleanup, lease, error);
+        }
+
+        match transaction.commit(self.block_device.as_ref(), self) {
+            Ok(()) => {
+                let mut data_consumption = data_consumption;
+                if self
+                    .finalize_delalloc_append_consumptions(
+                        lease,
+                        &mut data_consumption,
+                        &mut metadata_consumptions,
+                        pool.as_deref_mut(),
+                        metadata_pool_indices,
+                    )
+                    .is_err()
+                {
+                    self.poison(ErrCode::EIO);
+                    return Err(Ext4Error::new(ErrCode::EIO));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if error.failure == super::journal_transaction::CommitFailure::BeforeCommit {
+                    if self
+                        .rollback_delalloc_consumptions_many(
+                            data_consumption,
+                            metadata_consumptions,
+                        )
+                        .is_err()
+                    {
+                        self.poison(ErrCode::EIO);
+                        lease.deactivate();
+                        return Err(Ext4Error::new(ErrCode::EIO));
+                    }
+                    if error.poisoned {
+                        // No commit record exists, but journal I/O has made
+                        // the core unusable. The consumption is back in this
+                        // exact lease; terminalise it without restoring
+                        // capacity to a mount which can no longer allocate.
+                        self.poison(ErrCode::EIO);
+                        lease.deactivate();
+                        return Err(Ext4Error::new(ErrCode::EIO));
+                    }
+                    // Pre-commit validation/capacity failure left the journal
+                    // core usable. Preserve the same active lease serial so
+                    // PageCache can redirty and retry this exact queue entry.
+                    return Err(error.error);
+                } else {
+                    let mut data_consumption = data_consumption;
+                    if self
+                        .finalize_delalloc_append_consumptions(
+                            lease,
+                            &mut data_consumption,
+                            &mut metadata_consumptions,
+                            pool,
+                            metadata_pool_indices,
+                        )
+                        .is_err()
+                    {
+                        self.poison(ErrCode::EIO);
+                        return Err(Ext4Error::new(ErrCode::EIO));
+                    }
+                }
+                self.poison(ErrCode::EIO);
+                Err(error.error)
+            }
+        }
+    }
+
+    /// Submit an opaque append capability and report whether its ownership
+    /// remains retryable or has crossed the terminal journal boundary.
+    ///
+    /// Neither the caller nor this API can substitute a different inode or
+    /// logical offset: both are read from the private admission certificate.
+    /// `durable_eof` remains a VFS-proven input, because only the VFS owns the
+    /// committable-EOF ledger.  Callers must advance that ledger only for
+    /// [`DelallocAppendBlockSubmitOutcome::Completed`].
+    fn submit_delalloc_append_block_capability_inner(
+        &self,
+        reservation: &mut DelallocAppendBlockReservation,
+        publication: DelallocAppendBlockPublication<'_>,
+        pool: Option<&mut DelallocExtentNodePool>,
+        strict_aligned: bool,
+        terminal_on_contract_error: bool,
+    ) -> DelallocAppendBlockSubmitOutcome {
+        let Some(certificate) = reservation.lease.append_block_certificate() else {
+            // A typed reservation without its immutable certificate proves
+            // internal capability corruption.  Do not panic in writeback: if
+            // this mount owns the token, fail-stop it and consume the only
+            // remaining owner.  A foreign token must remain untouched.
+            if terminal_on_contract_error
+                && reservation
+                    .lease
+                    .belongs_to_mount(self.delalloc_mount_generation())
+            {
+                self.poison(ErrCode::EIO);
+                if reservation.lease.active {
+                    reservation.lease.deactivate();
+                }
+                return DelallocAppendBlockSubmitOutcome::Terminal(ErrCode::EIO);
+            }
+            return DelallocAppendBlockSubmitOutcome::RetryableNotPublished(ErrCode::EINVAL);
+        };
+        let request = DelallocAppendBlockWriteback {
+            offset: certificate.offset,
+            payload: publication.payload,
+            durable_eof: publication.durable_eof,
+            mtime: publication.mtime,
+            ctime: publication.ctime,
+        };
+        let journal_credits_bound = reservation.journal_credits_bound;
+        let outcome = self.submit_delalloc_append_block_with_lease(
+            certificate.inode_id,
+            request,
+            &mut reservation.lease,
+            pool,
+            DelallocAppendSubmitPolicy {
+                strict_aligned,
+                journal_credits_bound: Some(journal_credits_bound),
+                terminal_on_contract_error,
+            },
+        );
+        if !matches!(
+            outcome,
+            DelallocAppendBlockSubmitOutcome::RetryableNotPublished(_)
+        ) {
+            reservation.pool_checkpoint = None;
+        }
+        outcome
+    }
+
+    /// Return the largest batch whose worst-case fragmented metadata footprint
+    /// fits the mounted journal. The bound is established before PageCache
+    /// freezes a descriptor; lower submission never shortens a claimed batch.
+    pub fn max_delalloc_append_batch_blocks_authorized(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+    ) -> Result<usize> {
+        self.validate_delalloc_append_mapper_authority(authority)?;
+        for blocks in (1..=64).rev() {
+            let credits = delalloc_append_batch_journal_credits(blocks)?;
+            if self.transaction_credits_fit(credits)? {
+                return Ok(blocks);
+            }
+        }
+        Err(Ext4Error::new(ErrCode::E2BIG))
+    }
+
+    /// Materialise a FIFO append batch from independent per-block
+    /// capabilities. Physical continuity is only an optimisation: every
+    /// block is allocated from its own admitted lease and consecutive
+    /// allocations are appended through the transaction-private extent view.
+    fn submit_delalloc_append_batch_inner(
+        &self,
+        reservations: &mut [&mut DelallocAppendBlockReservation],
+        publications: &[DelallocAppendBlockPublication<'_>],
+        pool: &mut DelallocExtentNodePool,
+    ) -> Result<()> {
+        self.ensure_mutable()?;
+        if !self.uses_journal()
+            || reservations.is_empty()
+            || reservations.len() != publications.len()
+            || reservations.len() > 64
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+
+        let mut certificates = Vec::new();
+        let mut initialized_blocks = Vec::new();
+        certificates
+            .try_reserve_exact(reservations.len())
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        initialized_blocks
+            .try_reserve_exact(reservations.len())
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        for (index, (reservation, publication)) in
+            reservations.iter().zip(publications.iter()).enumerate()
+        {
+            let certificate = reservation
+                .lease
+                .append_block_certificate()
+                .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
+            if !reservation.lease.active
+                || reservation.lease.data_blocks != 1
+                || publication.payload.is_empty()
+                || publication.payload.len() > BLOCK_SIZE
+                || publication.durable_eof <= certificate.offset as u64
+                || publication.durable_eof
+                    > certificate
+                        .offset
+                        .checked_add(BLOCK_SIZE)
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))? as u64
+                || publication.payload.len() as u64
+                    != publication.durable_eof - certificate.offset as u64
+            {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            if let Some(previous) = certificates.last() {
+                let previous: &super::DelallocAppendBlockCertificate = previous;
+                if certificate.inode_id != previous.inode_id
+                    || certificate.inode_generation != previous.inode_generation
+                    || certificate.offset
+                        != previous
+                            .offset
+                            .checked_add(BLOCK_SIZE)
+                            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?
+                    || certificate.expected_durable_eof_before
+                        != publications[index - 1].durable_eof
+                {
+                    return Err(Ext4Error::new(ErrCode::EINVAL));
+                }
+            }
+            let mut initialized = [0u8; BLOCK_SIZE];
+            initialized[..publication.payload.len()].copy_from_slice(publication.payload);
+            initialized_blocks.push(initialized);
+            certificates.push(certificate);
+        }
+        let first_certificate = certificates[0];
+        if pool.inode_id != first_certificate.inode_id
+            || pool.inode_generation != first_certificate.inode_generation
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+
+        let credits = delalloc_append_batch_journal_credits(reservations.len())?;
+        if !self.transaction_credits_fit(credits)? {
+            return Err(Ext4Error::new(ErrCode::E2BIG));
+        }
+
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let _mutation_guard = self.inode_mutation_locks
+            [self.inode_mutation_lock_index(first_certificate.inode_id)]
+        .lock();
+        let mut inode = self.read_inode(first_certificate.inode_id)?;
+        if !inode.inode.is_file()
+            || !inode.inode.uses_extents()
+            || inode.inode.generation() != first_certificate.inode_generation
+            || inode.inode.size() != first_certificate.expected_durable_eof_before
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let on_disk_eof = inode.inode.size();
+        let mut transaction = self.transaction_start(credits)?;
+        let mut data_consumptions = Vec::new();
+        let mut metadata_consumptions = Vec::new();
+        let mut metadata_pool_indices = Vec::new();
+        let mut data_allocations = Vec::new();
+        data_consumptions
+            .try_reserve_exact(reservations.len())
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        metadata_consumptions
+            .try_reserve_exact(pool.leases.len())
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        metadata_pool_indices
+            .try_reserve_exact(pool.leases.len())
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        data_allocations
+            .try_reserve_exact(reservations.len())
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+
+        let staged = (|| -> Result<()> {
+            // Query the durable tree before staging an append that may replace the
+            // inline root with transaction-private external nodes.  The tail write
+            // is beyond durable EOF, so it is safe if the transaction later aborts;
+            // on success it is covered by the batch's single data flush below.
+            self.write_delalloc_append_eof_tail(&inode, on_disk_eof, first_certificate.offset)?;
+
+            for (certificate, reservation) in certificates.iter().zip(reservations.iter_mut()) {
+                let start_lblock = u32::try_from(certificate.offset / BLOCK_SIZE)
+                    .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+                let extent_plan =
+                    self.transaction_right_spine_append_plan(&transaction, &inode, start_lblock)?;
+                let (allocation, data_consumption) = self.transaction_alloc_delalloc_range(
+                    &mut transaction,
+                    certificate.inode_id,
+                    extent_plan.preferred_first,
+                    false,
+                    1,
+                    &reservation.lease,
+                )?;
+                data_consumptions.push(data_consumption);
+                let metadata_blocks = if extent_plan.can_merge(allocation.first, 1) {
+                    0
+                } else {
+                    extent_plan.new_nodes()
+                };
+                let mut metadata_homes = Vec::new();
+                metadata_homes
+                    .try_reserve_exact(metadata_blocks)
+                    .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+                for _ in 0..metadata_blocks {
+                    let pool_index = pool
+                        .leases
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, lease)| {
+                            (lease.active
+                                && lease.metadata_blocks != 0
+                                && !metadata_pool_indices.contains(&index))
+                            .then_some(index)
+                        })
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
+                    let (metadata_allocation, consumption) = self
+                        .transaction_alloc_delalloc_metadata_block(
+                            &mut transaction,
+                            certificate.inode_id,
+                            Some(allocation.first),
+                            &pool.leases[pool_index],
+                        )?;
+                    metadata_pool_indices.push(pool_index);
+                    metadata_homes.push(metadata_allocation.first);
+                    metadata_consumptions.push(consumption);
+                }
+                self.stage_journaled_right_spine_append(
+                    &mut transaction,
+                    &mut inode,
+                    &extent_plan,
+                    &metadata_homes,
+                    allocation.first,
+                    1,
+                )?;
+                data_allocations.push(allocation);
+            }
+
+            let mut run_start = 0usize;
+            while run_start < data_allocations.len() {
+                let mut run_end = run_start + 1;
+                while run_end < data_allocations.len()
+                    && data_allocations[run_end].first
+                        == data_allocations[run_end - 1]
+                            .first
+                            .checked_add(1)
+                            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?
+                {
+                    run_end += 1;
+                }
+                self.block_device.write_blocks(
+                    data_allocations[run_start].first,
+                    initialized_blocks[run_start..run_end].as_flattened(),
+                )?;
+                run_start = run_end;
+            }
+            self.block_device.flush()?;
+
+            let last_publication = publications
+                .last()
+                .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
+            inode.inode.set_size(last_publication.durable_eof);
+            if let Some(mtime) = last_publication.mtime {
+                inode.inode.set_mtime(mtime);
+            }
+            if let Some(ctime) = last_publication.ctime {
+                inode.inode.set_ctime(ctime);
+            }
+            self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)
+        })();
+
+        if let Err(error) = staged {
+            transaction.abort();
+            let cleanup = self
+                .rollback_delalloc_consumption_vectors(data_consumptions, metadata_consumptions);
+            if cleanup.is_err() {
+                self.poison(ErrCode::EIO);
+                for reservation in reservations.iter_mut() {
+                    reservation.lease.deactivate();
+                }
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            return Err(error);
+        }
+
+        match transaction.commit(self.block_device.as_ref(), self) {
+            Ok(()) => {
+                let mut failure = None;
+                for (reservation, consumption) in
+                    reservations.iter_mut().zip(data_consumptions.iter_mut())
+                {
+                    if let Err(error) = self.finalize_delalloc_append_block_with_pool(
+                        &mut reservation.lease,
+                        consumption,
+                        None,
+                    ) {
+                        failure.get_or_insert(error);
+                    }
+                }
+                for (pool_index, consumption) in metadata_pool_indices
+                    .iter()
+                    .copied()
+                    .zip(metadata_consumptions.drain(..))
+                {
+                    if let Err(error) =
+                        self.commit_delalloc_allocation(consumption, &mut pool.leases[pool_index])
+                    {
+                        failure.get_or_insert(error);
+                    }
+                }
+                for index in metadata_pool_indices.into_iter().rev() {
+                    if index < pool.leases.len() && !pool.leases[index].active {
+                        drop(pool.leases.swap_remove(index));
+                    }
+                }
+                if let Some(error) = failure {
+                    self.poison(ErrCode::EIO);
+                    return Err(error);
+                }
+                Ok(())
+            }
+            Err(error)
+                if !error.poisoned
+                    && error.failure == super::journal_transaction::CommitFailure::BeforeCommit =>
+            {
+                let cleanup = self.rollback_delalloc_consumption_vectors(
+                    data_consumptions,
+                    metadata_consumptions,
+                );
+                if cleanup.is_err() {
+                    self.poison(ErrCode::EIO);
+                    for reservation in reservations.iter_mut() {
+                        reservation.lease.deactivate();
+                    }
+                    return Err(Ext4Error::new(ErrCode::EIO));
+                }
+                Err(error.error)
+            }
+            Err(error) => {
+                self.poison(ErrCode::EIO);
+                for reservation in reservations.iter_mut() {
+                    reservation.lease.deactivate();
+                }
+                for consumption in data_consumptions.iter_mut() {
+                    consumption.resolve();
+                }
+                for consumption in metadata_consumptions.iter_mut() {
+                    consumption.resolve();
+                }
+                Err(error.error)
+            }
+        }
+    }
+
+    pub fn submit_delalloc_append_batch_authorized_with_pool(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        reservations: &mut [&mut DelallocAppendBlockReservation],
+        publications: &[DelallocAppendBlockPublication<'_>],
+        pool: &mut DelallocExtentNodePool,
+    ) -> DelallocAppendBlockSubmitOutcome {
+        if let Err(error) = self.validate_delalloc_append_mapper_authority(authority) {
+            let mount_generation = self.delalloc_mount_generation();
+            if authority.mount_generation == mount_generation
+                && reservations
+                    .iter()
+                    .all(|reservation| reservation.lease.belongs_to_mount(mount_generation))
+            {
+                self.poison(ErrCode::EIO);
+                for reservation in reservations.iter_mut() {
+                    reservation.lease.deactivate();
+                }
+                return DelallocAppendBlockSubmitOutcome::Terminal(error.code());
+            }
+            return DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error.code());
+        }
+        let mount_generation = self.delalloc_mount_generation();
+        if reservations
+            .iter()
+            .any(|reservation| !reservation.lease.belongs_to_mount(mount_generation))
+        {
+            return DelallocAppendBlockSubmitOutcome::RetryableNotPublished(ErrCode::EINVAL);
+        }
+        let outcome = self.submit_delalloc_append_batch_inner(reservations, publications, pool);
+        let result = match outcome {
+            Ok(()) => DelallocAppendBlockSubmitOutcome::Completed,
+            Err(error)
+                if reservations
+                    .iter()
+                    .any(|reservation| !reservation.lease.active)
+                    || self.poisoned.lock().is_some() =>
+            {
+                for reservation in reservations.iter_mut() {
+                    if reservation.lease.active {
+                        reservation.lease.deactivate();
+                    }
+                }
+                DelallocAppendBlockSubmitOutcome::Terminal(error.code())
+            }
+            Err(error) if is_delalloc_contract_error(error.code()) => {
+                self.poison(ErrCode::EIO);
+                for reservation in reservations.iter_mut() {
+                    reservation.lease.deactivate();
+                }
+                DelallocAppendBlockSubmitOutcome::Terminal(ErrCode::EIO)
+            }
+            Err(error) => DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error.code()),
+        };
+        if !matches!(
+            result,
+            DelallocAppendBlockSubmitOutcome::RetryableNotPublished(_)
+        ) {
+            for reservation in reservations.iter_mut() {
+                reservation.pool_checkpoint = None;
+            }
+        }
+        result
+    }
+
+    /// Submit a production reservation through its issuing mount authority.
+    pub fn submit_delalloc_append_block_authorized(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        reservation: &mut DelallocAppendBlockReservation,
+        payload: &[u8],
+        durable_eof: u64,
+        mtime: Option<u32>,
+    ) -> DelallocAppendBlockSubmitOutcome {
+        self.submit_delalloc_append_block_authorized_with_times(
+            authority,
+            reservation,
+            payload,
+            durable_eof,
+            mtime,
+            None,
+        )
+    }
+
+    /// Production variant which atomically publishes both Linux write
+    /// timestamps with the durable EOF.
+    pub fn submit_delalloc_append_block_authorized_with_times(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        reservation: &mut DelallocAppendBlockReservation,
+        payload: &[u8],
+        durable_eof: u64,
+        mtime: Option<u32>,
+        ctime: Option<u32>,
+    ) -> DelallocAppendBlockSubmitOutcome {
+        self.submit_delalloc_append_block_authorized_with_pool(
+            authority,
+            reservation,
+            DelallocAppendBlockPublication {
+                payload,
+                durable_eof,
+                mtime,
+                ctime,
+            },
+            None,
+        )
+    }
+
+    pub fn submit_delalloc_append_block_authorized_with_pool(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        reservation: &mut DelallocAppendBlockReservation,
+        publication: DelallocAppendBlockPublication<'_>,
+        pool: Option<&mut DelallocExtentNodePool>,
+    ) -> DelallocAppendBlockSubmitOutcome {
+        if let Err(error) = self.validate_delalloc_append_mapper_authority(authority) {
+            // A capability issued by this exact mount must not remain live
+            // when validation fails only because another writer has already
+            // fail-stopped the mount.  The VFS token may now be destroyed, so
+            // consume its ownership without restoring poisoned ledger
+            // capacity.  A foreign authority is intentionally left alone.
+            if authority.mount_generation == self.delalloc_mount_generation()
+                && reservation
+                    .lease
+                    .belongs_to_mount(self.delalloc_mount_generation())
+                && reservation.lease.active
+            {
+                self.poison(ErrCode::EIO);
+                if self
+                    .terminalize_delalloc_append_block_authorized_after_fail_stop(
+                        authority,
+                        reservation,
+                    )
+                    .is_ok()
+                {
+                    return DelallocAppendBlockSubmitOutcome::Terminal(error.code());
+                }
+            }
+            return DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error.code());
+        }
+        self.submit_delalloc_append_block_capability_inner(
+            reservation,
+            publication,
+            pool,
+            false,
+            true,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn submit_delalloc_append_block_capability(
+        &self,
+        reservation: &mut DelallocAppendBlockReservation,
+        payload: &[u8],
+        durable_eof: u64,
+        mtime: Option<u32>,
+    ) -> DelallocAppendBlockSubmitOutcome {
+        let payload = reservation
+            .lease
+            .append_block_certificate()
+            .and_then(|certificate| {
+                durable_eof
+                    .checked_sub(certificate.offset as u64)
+                    .and_then(|len| usize::try_from(len).ok())
+            })
+            .filter(|visible| *visible <= payload.len() && payload.len() == BLOCK_SIZE)
+            .map_or(payload, |visible| &payload[..visible]);
+        self.submit_delalloc_append_block_capability_inner(
+            reservation,
+            DelallocAppendBlockPublication {
+                payload,
+                durable_eof,
+                mtime,
+                ctime: None,
+            },
+            None,
+            false,
+            false,
+        )
+    }
+
+    /// Release one unmaterialised append capability.  A successful release
+    /// consumes exactly the opaque lease it contains; callers cannot release
+    /// a different generic reservation by mistake.  Once the mapper has
+    /// entered a journal publication attempt this operation is intentionally
+    /// rejected by the underlying ledger/lease state.
+    fn release_delalloc_append_block_capability_inner(
+        &self,
+        reservation: &mut DelallocAppendBlockReservation,
+    ) -> Result<()> {
+        if reservation.pool_checkpoint.is_some() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        self.release_delalloc_lease_batch(&mut [&mut reservation.lease])
+    }
+
+    /// Cancel the newest projected admission before its PageCache dirty
+    /// transition is published.  The data lease, pool capacity delta and
+    /// right-spine frontier are one atomic lower-layer state transition; the
+    /// VFS neither inspects nor reconstructs extent-tree accounting.
+    pub fn cancel_projected_delalloc_append_block_authorized(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        reservation: &mut DelallocAppendBlockReservation,
+        pool: &mut DelallocExtentNodePool,
+    ) -> Result<()> {
+        self.validate_delalloc_append_mapper_authority(authority)?;
+        let checkpoint = reservation
+            .pool_checkpoint
+            .as_ref()
+            .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?;
+        if pool.inode_id
+            != reservation
+                .lease
+                .append_block_certificate()
+                .ok_or_else(|| Ext4Error::new(ErrCode::EINVAL))?
+                .inode_id
+            || pool.projection != checkpoint.after
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+
+        let mut selected: Vec<usize> = pool
+            .leases
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, lease)| lease.active.then_some(index))
+            .take(checkpoint.added_metadata_leases)
+            .collect();
+        if selected.len() != checkpoint.added_metadata_leases {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        selected.sort_unstable();
+        let mut leases: Vec<&mut DelallocLease> = Vec::with_capacity(selected.len() + 1);
+        leases.push(&mut reservation.lease);
+        let mut remaining = pool.leases.as_mut_slice();
+        let mut base = 0usize;
+        for index in selected.iter().copied() {
+            let relative = index
+                .checked_sub(base)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            let (_, tail) = remaining.split_at_mut(relative);
+            let (lease, rest) = tail
+                .split_first_mut()
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            leases.push(lease);
+            remaining = rest;
+            base = index
+                .checked_add(1)
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        }
+        self.release_delalloc_lease_batch(&mut leases)?;
+        drop(leases);
+
+        for index in selected.into_iter().rev() {
+            drop(pool.leases.swap_remove(index));
+        }
+        let checkpoint = reservation
+            .pool_checkpoint
+            .take()
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        pool.projection = checkpoint.before;
+        Ok(())
+    }
+
+    pub fn release_delalloc_append_block_authorized(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        reservation: &mut DelallocAppendBlockReservation,
+    ) -> Result<()> {
+        self.validate_delalloc_append_mapper_authority(authority)?;
+        self.release_delalloc_append_block_capability_inner(reservation)
+    }
+
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn release_delalloc_append_block_capability(
+        &self,
+        reservation: &mut DelallocAppendBlockReservation,
+    ) -> Result<()> {
+        self.release_delalloc_append_block_capability_inner(reservation)
+    }
+
+    /// Terminalise an append capability only after this mount has fail-stopped.
+    /// This mirrors the generic lease operation while preserving the typed
+    /// ownership boundary for the VFS token finaliser.
+    fn abandon_delalloc_append_block_capability_after_fail_stop_inner(
+        &self,
+        reservation: &mut DelallocAppendBlockReservation,
+    ) -> Result<()> {
+        self.abandon_delalloc_lease_after_fail_stop(&mut reservation.lease)
+    }
+
+    pub fn abandon_delalloc_append_block_authorized_after_fail_stop(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        reservation: &mut DelallocAppendBlockReservation,
+    ) -> Result<()> {
+        if authority.mount_generation != self.delalloc_mount_generation()
+            || !reservation
+                .lease
+                .belongs_to_mount(self.delalloc_mount_generation())
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        self.abandon_delalloc_append_block_capability_after_fail_stop_inner(reservation)
+    }
+
+    /// Destroy a capability proven to belong to this mount after fail-stop.
+    /// A foreign reservation is rejected without mutation, so `Terminal`
+    /// never lies about ownership.
+    pub fn terminalize_delalloc_append_block_authorized_after_fail_stop(
+        &self,
+        authority: &DelallocAppendMapperAuthority,
+        reservation: &mut DelallocAppendBlockReservation,
+    ) -> Result<()> {
+        if authority.mount_generation != self.delalloc_mount_generation()
+            || !reservation
+                .lease
+                .belongs_to_mount(self.delalloc_mount_generation())
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        self.poison(ErrCode::EIO);
+        if reservation.lease.active {
+            reservation.lease.deactivate();
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn abandon_delalloc_append_block_capability_after_fail_stop(
+        &self,
+        reservation: &mut DelallocAppendBlockReservation,
+    ) -> Result<()> {
+        self.abandon_delalloc_append_block_capability_after_fail_stop_inner(reservation)
+    }
+
+    /// Shared outcome classifier for the typed capability and the host-only
+    /// raw compatibility facade.  Keeping the classifier in one place avoids
+    /// a divergent retry/terminal decision at the production boundary.
+    fn submit_delalloc_append_block_with_lease(
+        &self,
+        id: InodeId,
+        request: DelallocAppendBlockWriteback<'_>,
+        lease: &mut DelallocLease,
+        pool: Option<&mut DelallocExtentNodePool>,
+        policy: DelallocAppendSubmitPolicy,
+    ) -> DelallocAppendBlockSubmitOutcome {
+        let DelallocAppendSubmitPolicy {
+            strict_aligned,
+            journal_credits_bound,
+            terminal_on_contract_error,
+        } = policy;
+        // Preserve the linear outcome contract before inspecting provenance:
+        // a terminal lease can never be reported as retryable, even when a
+        // caller incorrectly presents it to a foreign mount.
+        if !lease.active {
+            return DelallocAppendBlockSubmitOutcome::Terminal(ErrCode::EINVAL);
+        }
+        // Validate provenance before `ensure_mutable()`: a poisoned foreign
+        // filesystem must never terminalise a live capability owned by the
+        // lease's source mount. The source owner can still explicitly release
+        // or abandon it according to its own lifecycle.
+        if !lease.belongs_to_mount(self.delalloc_mount_generation()) {
+            return DelallocAppendBlockSubmitOutcome::RetryableNotPublished(ErrCode::EINVAL);
+        }
+        match self.submit_delalloc_append_block_inner(
+            id,
+            request,
+            lease,
+            pool,
+            strict_aligned,
+            journal_credits_bound,
+        ) {
+            Ok(()) => DelallocAppendBlockSubmitOutcome::Completed,
+            // The mapper can terminalise a lease itself after a commit
+            // failure. Re-check after the call as well as before it so that
+            // path never falls through to the pre-existing-fail-stop
+            // abandonment branch.
+            Err(error) if !lease.active => DelallocAppendBlockSubmitOutcome::Terminal(error.code()),
+            // `ensure_mutable()` can reject this request because a different
+            // writer already fail-stopped the mount. Returning that active
+            // lease as retryable would make a future queue/token own a
+            // capability which can no longer be released through the normal
+            // mutable path. Terminalise it without restoring ledger capacity:
+            // this mount must never allocate again, and recovery owns any
+            // reserved state after remount.
+            Err(error) if self.poisoned.lock().is_some() => {
+                lease.deactivate();
+                DelallocAppendBlockSubmitOutcome::Terminal(error.code())
+            }
+            // Production admission proves that its private journal-credit
+            // bound fits before Dirty publication. Reaching E2BIG here is an
+            // internal contract violation, never transient contention.
+            Err(error)
+                if terminal_on_contract_error && is_delalloc_contract_error(error.code()) =>
+            {
+                self.poison(ErrCode::EIO);
+                lease.deactivate();
+                DelallocAppendBlockSubmitOutcome::Terminal(ErrCode::EIO)
+            }
+            Err(error) if strict_aligned && is_delalloc_contract_error(error.code()) => {
+                self.poison(ErrCode::EIO);
+                lease.deactivate();
+                DelallocAppendBlockSubmitOutcome::Terminal(ErrCode::EIO)
+            }
+            Err(error) if !strict_aligned && is_delalloc_contract_error(error.code()) => {
+                // Host/test compatibility callers retain the old explicit
+                // release contract. Production callers take the terminal
+                // branch above for deterministic contract failures.
+                DelallocAppendBlockSubmitOutcome::RetryableNotPublished(ErrCode::EAGAIN)
+            }
+            Err(error) => DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error.code()),
+        }
+    }
+
+    /// Host-recovery compatibility facade.  The typed test facade above
+    /// fixes the inode and offset at reservation time; neither entry is a
+    /// normal DragonOS VFS writeback API before the future token bridge exists.
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn submit_delalloc_append_block(
+        &self,
+        id: InodeId,
+        request: DelallocAppendBlockWriteback<'_>,
+        lease: &mut DelallocLease,
+    ) -> DelallocAppendBlockSubmitOutcome {
+        let visible = request
+            .durable_eof
+            .checked_sub(request.offset as u64)
+            .and_then(|len| usize::try_from(len).ok());
+        let payload = visible
+            .filter(|visible| {
+                *visible <= request.payload.len() && request.payload.len() == BLOCK_SIZE
+            })
+            .map_or(request.payload, |visible| &request.payload[..visible]);
+        let request = DelallocAppendBlockWriteback { payload, ..request };
+        self.submit_delalloc_append_block_with_lease(
+            id,
+            request,
+            lease,
+            None,
+            DelallocAppendSubmitPolicy {
+                strict_aligned: false,
+                journal_credits_bound: None,
+                terminal_on_contract_error: false,
+            },
+        )
+    }
+
+    /// Host-recovery compatibility wrapper for the pre-contract probe API.
+    /// Test callers which need publication-aware classification use the typed
+    /// capability facade; this wrapper preserves the historical `Result` API.
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn writeback_delalloc_append_block(
+        &self,
+        id: InodeId,
+        request: DelallocAppendBlockWriteback<'_>,
+        lease: &mut DelallocLease,
+    ) -> Result<()> {
+        match self.submit_delalloc_append_block(id, request, lease) {
+            DelallocAppendBlockSubmitOutcome::Completed => Ok(()),
+            DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error)
+            | DelallocAppendBlockSubmitOutcome::Terminal(error) => Err(Ext4Error::new(error)),
+        }
+    }
+
+    /// Build the deliberately narrow first delayed-allocation map shape.
+    ///
+    /// Aggregate reservation alone cannot promise an arbitrary contiguous
+    /// range on a fragmented filesystem.  The first production mapper
+    /// primitive therefore accepts exactly one filesystem block and refuses
+    /// every tree split: after a successful reservation, searching all block
+    /// groups is sufficient to find one data block, while no additional
+    /// metadata allocation can fail after the foreground write succeeded.
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    fn delalloc_single_block_append_plan(
+        &self,
+        inode: &InodeRef,
+        offset: usize,
+    ) -> Result<TransactionalRangePlan> {
+        if !offset.is_multiple_of(BLOCK_SIZE) || inode.inode.size() != offset as u64 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let start_lblock =
+            u32::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let shape = self
+            .direct_append_shape(inode, start_lblock, 1)?
+            .ok_or_else(|| Ext4Error::new(ErrCode::ENOTSUP))?;
+        // The test primitive has no metadata reservation or VFS certificate
+        // for an extent-tree split. A full leaf that can accept the append
+        // only by physically merging also needs an exact adjacent block,
+        // which an aggregate data reservation cannot promise. Reject all of
+        // those shapes before consuming the lease.
+        if shape.requires_merge || shape.requires_root_split || shape.requires_leaf_split {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        Ok(TransactionalRangePlan {
+            start_lblock,
+            count: 1,
+            preferred_first: shape.preferred_first,
+            // A non-adjacent physical block may form a new in-inode/leaf
+            // extent without allocating metadata. Requiring adjacency here
+            // would turn a valid aggregate reservation into late ENOSPC.
+            requires_merge: false,
+            requires_root_split: false,
+            requires_leaf_split: false,
+            leaf_home: shape.leaf_home,
+        })
+    }
+
+    #[cfg_attr(not(feature = "test-api"), allow(dead_code))]
+    fn abort_delalloc_mapping_transaction(
+        &self,
+        transaction: super::journal_transaction::Transaction<'_>,
+        consumption: super::alloc::DelallocConsumption,
+    ) -> Result<()> {
+        transaction.abort();
+        self.rollback_delalloc_allocation(consumption)
+    }
+
+    /// The host-only raw mapper leaves a linked tail between map and payload
+    /// completion.  Its generic publishers must not publish an unrelated
+    /// size or overwrite that payload.  This scan is deliberately absent
+    /// from normal builds: production has no raw receipt and must eventually
+    /// use the VFS queue/lifecycle/drain protocol, not add an orphan-chain
+    /// walk to every ordinary write while a zero-link orphan is pending.
+    #[cfg(any(test, feature = "test-api"))]
+    fn reject_external_linked_tail_mutation(&self, inode: &InodeRef) -> Result<()> {
+        if self.legacy_orphan_membership(inode)? == LegacyOrphanMembership::LinkedTail {
+            return Err(Ext4Error::new(ErrCode::EAGAIN));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "test-api")))]
+    #[inline]
+    fn reject_external_linked_tail_mutation(&self, _inode: &InodeRef) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-api"))]
+    fn fail_mapped_delalloc_writeback<T>(
+        &self,
+        receipt: &mut DelallocMappedWriteback,
+        error: Ext4Error,
+    ) -> Result<T> {
+        // A transaction-owner collision is the only retryable outcome after
+        // the data block exists. The future PageCache token converts it to a
+        // progress ticket while retaining this exact receipt. Any other
+        // failure is either corruption or an unpublishable metadata state;
+        // leaving a live receipt for a generic error path would make Drop
+        // fail-stop without a recovery owner, so poison the mount and hand
+        // the tail to orphan recovery instead.
+        if error.code() == ErrCode::EAGAIN {
+            return Err(error);
+        }
+        receipt.deactivate();
+        self.poison(ErrCode::EIO);
+        Err(error)
+    }
+
+    /// Materialise one previously reserved, full-block append for the host
+    /// recovery harness.
+    ///
+    /// This deliberately is not a production mapper API. It proves the
+    /// ledger -> bitmap -> zero -> linked-orphan -> extent publication
+    /// boundary while the VFS token, queue claim, lifecycle lease and
+    /// truncate drain are still being implemented. The normal write path
+    /// cannot name either this method or its receipt.
+    ///
+    /// On success the returned receipt owns the mapped-but-not-yet-visible
+    /// tail. Call [`Self::test_writeback_delalloc_mapped_block`] with the
+    /// exact block payload to submit data, persist EOF and remove the linked
+    /// orphan.
+    /// If mapping publication is uncertain the filesystem is poisoned and the
+    /// lease is finalised rather than being returned to free space.
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn test_map_delalloc_reserved_block_append(
+        &self,
+        id: InodeId,
+        offset: usize,
+        lease: &mut DelallocLease,
+    ) -> Result<DelallocMappedWriteback> {
+        self.ensure_mutable()?;
+        if !self.uses_journal() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        if !lease.active || lease.data_blocks != 1 || lease.metadata_blocks != 0 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let end = offset
+            .checked_add(BLOCK_SIZE)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        let end = u64::try_from(end).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+        let mut inode = self.read_inode(id)?;
+        if !inode.inode.is_file() || !inode.inode.uses_extents() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        // A linked tail is an already published mapper receipt, not an
+        // unsupported extent shape.  Report the queue-head dependency before
+        // inspecting append geometry so a future PageCache backend can defer
+        // without allocating or misclassifying the follower as a permanent
+        // compatibility fallback.
+        match self.legacy_orphan_membership(&inode)? {
+            LegacyOrphanMembership::Absent => {}
+            LegacyOrphanMembership::LinkedTail => return Err(Ext4Error::new(ErrCode::EAGAIN)),
+            LegacyOrphanMembership::ZeroLink => return Err(Ext4Error::new(ErrCode::EIO)),
+        }
+        // Before the production orphan-role index exists, the recovery
+        // primitive permits exactly one active orphan entry per mount. This
+        // keeps its linear membership walk out of a fake multi-token hot
+        // path and makes the missing production index explicit.
+        if self.read_super_block_cached().last_orphan() != 0 {
+            return Err(Ext4Error::new(ErrCode::EAGAIN));
+        }
+        let plan = self.delalloc_single_block_append_plan(&inode, offset)?;
+        // All allocation which can fail independently of the transaction is
+        // complete before a lease debit exists. In particular, ENOMEM here
+        // must not leave a staged bitmap image or unresolved consumption.
+        let mut zeros = Vec::new();
+        zeros
+            .try_reserve_exact(BLOCK_SIZE)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        zeros.resize(BLOCK_SIZE, 0);
+        let credits = if plan.leaf_home.is_some() { 5 } else { 4 };
+        let mut transaction = self.transaction_start(credits)?;
+        let (allocation, consumption) = match self.transaction_alloc_delalloc_range(
+            &mut transaction,
+            id,
+            plan.preferred_first,
+            plan.requires_merge,
+            plan.count,
+            lease,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                transaction.abort();
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self.initialize_allocated_range(allocation.first, 1, &zeros) {
+            self.abort_delalloc_mapping_transaction(transaction, consumption)
+                .expect("delalloc allocation rollback after zero failure");
+            return Err(error);
+        }
+
+        let mut sb = match self.transaction_read_super_block(&transaction) {
+            Ok(sb) => sb,
+            Err(error) => {
+                self.abort_delalloc_mapping_transaction(transaction, consumption)
+                    .expect("delalloc allocation rollback after superblock read failure");
+                return Err(error);
+            }
+        };
+        let enrolled =
+            match self.transaction_ensure_linked_tail_orphan(&mut transaction, &mut inode, &mut sb)
+            {
+                Ok(enrolled) => enrolled,
+                Err(error) => {
+                    self.abort_delalloc_mapping_transaction(transaction, consumption)
+                        .expect("delalloc allocation rollback after orphan enrollment failure");
+                    return Err(error);
+                }
+            };
+        // A live linked tail belongs to an earlier mapped receipt. Allowing a
+        // second raw mapper call would make one orphan removal incorrectly
+        // cover multiple uncommitted tails. The future queue may defer on its
+        // head, but this primitive must not silently merge those lifetimes.
+        if !enrolled {
+            self.abort_delalloc_mapping_transaction(transaction, consumption)
+                .expect("delalloc allocation rollback after duplicate tail enrollment");
+            return Err(Ext4Error::new(ErrCode::EAGAIN));
+        }
+        if let Err(error) = self.stage_journaled_append_extent(
+            &mut transaction,
+            &mut inode,
+            super::extent::JournaledAppendExtent {
+                leaf_home: plan.leaf_home,
+                root_split_leaf_home: None,
+                leaf_split_new_home: None,
+                start_lblock: plan.start_lblock,
+                start_pblock: allocation.first,
+                count: 1,
+            },
+        ) {
+            self.abort_delalloc_mapping_transaction(transaction, consumption)
+                .expect("delalloc allocation rollback after extent staging failure");
+            return Err(error);
+        }
+        if let Err(error) = self.transaction_stage_inode_with_csum(&mut transaction, &mut inode) {
+            self.abort_delalloc_mapping_transaction(transaction, consumption)
+                .expect("delalloc allocation rollback after inode staging failure");
+            return Err(error);
+        }
+
+        match transaction.commit(self.block_device.as_ref(), self) {
+            Ok(()) => {
+                self.commit_delalloc_allocation(consumption, lease)
+                    .expect("published delayed mapping must finalise its exact lease");
+                Ok(DelallocMappedWriteback {
+                    mount_generation: self.delalloc_mount_generation(),
+                    inode_id: id,
+                    inode_generation: inode.inode.generation(),
+                    offset,
+                    end,
+                    active: true,
+                    _not_send: core::marker::PhantomData,
+                })
+            }
+            Err(error) => {
+                if error.failure == super::journal_transaction::CommitFailure::BeforeCommit {
+                    // No commit record exists. Restore the debit and drop the
+                    // whole claim while still in the transactional exclusion
+                    // domain. If another fail-stop wins the ledger race, do
+                    // not restore capacity: terminalise the active lease.
+                    self.rollback_delalloc_allocation(consumption)
+                        .expect("unpublished delayed mapping must roll back its debit");
+                    if self
+                        .release_delalloc_lease_after_transaction_abort(lease)
+                        .is_err()
+                    {
+                        self.poison(ErrCode::EIO);
+                        self.abandon_delalloc_lease_after_fail_stop(lease)
+                            .expect("poisoned unpublished delayed mapping must abandon its lease");
+                    }
+                } else {
+                    // The log may be replayed. Preserve the debit/bitmap
+                    // ownership and let linked-orphan recovery clean the tail
+                    // after remount; reuse on this poisoned mount is unsafe.
+                    self.commit_delalloc_allocation(consumption, lease)
+                        .expect("uncertain delayed mapping must finalise its exact lease");
+                }
+                self.poison(ErrCode::EIO);
+                Err(error.error)
+            }
+        }
+    }
+
+    /// Submit the exact payload for a mapped delayed block, then make its EOF
+    /// durable and remove the linked truncate orphan in one journal
+    /// transaction.  A payload I/O failure leaves the receipt active for a
+    /// future retry; a metadata publication failure poisons the mount and
+    /// deactivates the receipt because recovery owns the remaining tail.
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn test_writeback_delalloc_mapped_block(
+        &self,
+        receipt: &mut DelallocMappedWriteback,
+        data: &[u8],
+        mtime: Option<u32>,
+    ) -> Result<()> {
+        if !receipt.active || data.len() != BLOCK_SIZE {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        if self.delalloc_mount_generation() != receipt.mount_generation {
+            // Do not poison an unrelated mount or consume a receipt which
+            // still belongs to its source filesystem.
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        if let Err(error) = self.ensure_mutable() {
+            // A matching mount is already fail-stopped.  The reservation is
+            // intentionally not released, but this in-memory capability must
+            // become terminal so teardown cannot turn a prior I/O error into
+            // a Drop assertion.
+            receipt.deactivate();
+            return Err(error);
+        }
+        match self.write_delalloc_mapped_data(receipt, data) {
+            Ok(()) => {}
+            Err(DelallocMappedDataFailure::Retryable(error)) => return Err(error),
+            Err(DelallocMappedDataFailure::Fatal(error)) => {
+                return self.fail_mapped_delalloc_writeback(receipt, error)
+            }
+        }
+
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(receipt.inode_id)].lock();
+        let mut inode = match self.read_inode(receipt.inode_id) {
+            Ok(inode) => inode,
+            Err(error) => return self.fail_mapped_delalloc_writeback(receipt, error),
+        };
+        let membership = match self.legacy_orphan_membership(&inode) {
+            Ok(membership) => membership,
+            Err(error) => return self.fail_mapped_delalloc_writeback(receipt, error),
+        };
+        if !inode.inode.is_file()
+            || inode.inode.generation() != receipt.inode_generation
+            || inode.inode.size() != receipt.offset as u64
+            || membership != LegacyOrphanMembership::LinkedTail
+        {
+            return self.fail_mapped_delalloc_writeback(receipt, Ext4Error::new(ErrCode::EIO));
+        }
+        inode.inode.set_size(receipt.end);
+        if let Some(mtime) = mtime {
+            inode.inode.set_mtime(mtime);
+        }
+        // A non-head member may require a predecessor inode-table image;
+        // head and inode images are deduplicated by Transaction, so three
+        // credits bound both forms without relying on test ordering.
+        let mut transaction = match self.transaction_start(3) {
+            Ok(transaction) => transaction,
+            Err(error) => return self.fail_mapped_delalloc_writeback(receipt, error),
+        };
+        let mut sb = match self.transaction_read_super_block(&transaction) {
+            Ok(sb) => sb,
+            Err(error) => {
+                transaction.abort();
+                return self.fail_mapped_delalloc_writeback(receipt, error);
+            }
+        };
+        if let Err(error) = self.transaction_orphan_del(&mut transaction, &inode, &mut sb) {
+            transaction.abort();
+            return self.fail_mapped_delalloc_writeback(receipt, error);
+        }
+        if let Err(error) = self.transaction_stage_inode_with_csum(&mut transaction, &mut inode) {
+            transaction.abort();
+            return self.fail_mapped_delalloc_writeback(receipt, error);
+        }
+        match transaction.commit(self.block_device.as_ref(), self) {
+            Ok(()) => {
+                receipt.deactivate();
+                Ok(())
+            }
+            Err(error) => {
+                // Size/orphan publication is now uncertain or the journal
+                // core rejected a commit.  In either case this mount cannot
+                // safely reuse the receipt; recovery will decide from the
+                // durable log and orphan list on the next mount.
+                receipt.deactivate();
+                self.poison(ErrCode::EIO);
+                Err(error.error)
+            }
+        }
+    }
+
+    /// Terminalise a test receipt only after its owning mount has already
+    /// fail-stopped.  This does not remove the on-disk linked tail or make the
+    /// filesystem writable again; recovery remains the owner of that state.
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn test_abandon_mapped_delalloc_after_fail_stop(
+        &self,
+        receipt: &mut DelallocMappedWriteback,
+    ) -> Result<()> {
+        if !receipt.active
+            || self.delalloc_mount_generation() != receipt.mount_generation
+            || self.poisoned.lock().is_none()
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        receipt.deactivate();
+        Ok(())
+    }
+
     fn initialize_allocated_range(
         &self,
         first: PBlockId,
@@ -146,6 +2415,8 @@ impl Ext4 {
             count,
             preferred_first: shape.preferred_first,
             requires_merge: shape.requires_merge,
+            requires_root_split: shape.requires_root_split,
+            requires_leaf_split: shape.requires_leaf_split,
             leaf_home: shape.leaf_home,
         }))
     }
@@ -171,7 +2442,20 @@ impl Ext4 {
         zeros.resize(zero_bytes, 0);
 
         let journaled = self.uses_journal();
-        let credits = if journaled && plan.leaf_home.is_some() {
+        let credits = if journaled && plan.requires_leaf_split {
+            // Two allocation groups can contribute two bitmap/descriptor
+            // pairs plus one superblock; the new leaf and inode root add two
+            // more metadata images.  Keep one spare credit so this path never
+            // silently falls back to the legacy direct leaf split.
+            9
+        } else if journaled && plan.requires_root_split {
+            // Data and the new extent leaf can land in different groups:
+            // bitmap + descriptor for each group, one shared superblock, the
+            // leaf image and the inode home require at most seven images.
+            // Reserve one extra slot so a conservative transaction never
+            // falls back to the non-journaled extent split path.
+            8
+        } else if journaled && plan.leaf_home.is_some() {
             5
         } else {
             4
@@ -196,6 +2480,43 @@ impl Ext4 {
             Err(error) => return Err(error),
         };
 
+        let root_split_leaf_home = if plan.requires_root_split {
+            match self.transaction_alloc_range(
+                &mut transaction,
+                inode.id,
+                Some(allocation.first),
+                false,
+                1,
+            ) {
+                Ok(allocation) => Some(allocation.first),
+                Err(error) if error.code() == ErrCode::ENOSPC => {
+                    transaction.abort();
+                    return Ok(TransactionalRangePrepare::Unsupported);
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let leaf_split_new_home = if plan.requires_leaf_split {
+            match self.transaction_alloc_range(
+                &mut transaction,
+                inode.id,
+                Some(allocation.first),
+                false,
+                1,
+            ) {
+                Ok(allocation) => Some(allocation.first),
+                Err(error) if error.code() == ErrCode::ENOSPC => {
+                    transaction.abort();
+                    return Ok(TransactionalRangePrepare::Unsupported);
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+
         self.prepare_stats.record_call();
         self.prepare_stats.record_requested(plan.count as usize);
         self.prepare_stats
@@ -218,10 +2539,14 @@ impl Ext4 {
             self.stage_journaled_append_extent(
                 &mut transaction,
                 inode,
-                plan.leaf_home,
-                plan.start_lblock,
-                allocation.first,
-                plan.count,
+                super::extent::JournaledAppendExtent {
+                    leaf_home: plan.leaf_home,
+                    root_split_leaf_home,
+                    leaf_split_new_home,
+                    start_lblock: plan.start_lblock,
+                    start_pblock: allocation.first,
+                    count: plan.count,
+                },
             )
         } else {
             self.stage_direct_append_extent(inode, plan.start_lblock, allocation.first, plan.count)
@@ -381,6 +2706,9 @@ impl Ext4 {
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
+        if attr.size.is_some() {
+            self.reject_external_linked_tail_mutation(&inode)?;
+        }
         if let Some(mode) = attr.mode {
             inode.inode.set_mode(mode);
         }
@@ -493,6 +2821,7 @@ impl Ext4 {
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
+        self.reject_external_linked_tail_mutation(&inode)?;
         self.ensure_blocks_for_write_range_locked(&mut inode, offset, len)
     }
 
@@ -523,6 +2852,7 @@ impl Ext4 {
                 if inode.inode.mode().bits() == 0 {
                     return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
                 }
+                self.reject_external_linked_tail_mutation(&inode)?;
                 if self
                     .transactional_range_plan(&inode, offset, len)?
                     .is_none()
@@ -538,6 +2868,7 @@ impl Ext4 {
                 if inode.inode.mode().bits() == 0 {
                     return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
                 }
+                self.reject_external_linked_tail_mutation(&inode)?;
                 self.try_prepare_transactional_range(&mut inode, offset, len)?
             };
             if matches!(outcome, TransactionalRangePrepare::Handled) {
@@ -550,16 +2881,23 @@ impl Ext4 {
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
+        self.reject_external_linked_tail_mutation(&inode)?;
         self.ensure_blocks_for_write_range_locked(&mut inode, offset, len)
     }
 
-    /// Commit cached inode metadata to disk without allocating data blocks.
+    /// Commit cached writeback metadata without allocating data blocks.
+    ///
+    /// The cached-size path is growth-only: truncate uses `setattr()` under
+    /// the VFS truncate exclusion. Treating this value as a lower bound keeps
+    /// an older frozen fsync from shrinking an EOF already advanced by a
+    /// concurrent delayed mapper.
     pub fn commit_inode_metadata(
         &self,
         id: InodeId,
         size: Option<u64>,
         atime: Option<u32>,
         mtime: Option<u32>,
+        ctime: Option<u32>,
     ) -> Result<()> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
@@ -568,14 +2906,22 @@ impl Ext4 {
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
+        if size.is_some() {
+            self.reject_external_linked_tail_mutation(&inode)?;
+        }
         if let Some(size) = size {
-            inode.inode.set_size(size);
+            if size > inode.inode.size() {
+                inode.inode.set_size(size);
+            }
         }
         if let Some(atime) = atime {
             inode.inode.set_atime(atime);
         }
         if let Some(mtime) = mtime {
             inode.inode.set_mtime(mtime);
+        }
+        if let Some(ctime) = ctime {
+            inode.inode.set_ctime(ctime);
         }
         self.write_inode_with_csum(&mut inode)?;
         Ok(())
@@ -586,7 +2932,7 @@ impl Ext4 {
     ///
     /// Call this after successful page-cache write to finalise the new file size.
     pub fn commit_inode_size(&self, id: InodeId, size: u64, mtime: Option<u32>) -> Result<()> {
-        self.commit_inode_metadata(id, Some(size), None, mtime)
+        self.commit_inode_metadata(id, Some(size), None, mtime, None)
     }
 
     /// Link a newly created inode into `parent`.
@@ -910,6 +3256,7 @@ impl Ext4 {
         if !file.inode.is_file() {
             return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
         }
+        self.reject_external_linked_tail_mutation(&file)?;
 
         self.ensure_blocks_for_write_range_locked(&mut file, offset, write_size)?;
 
@@ -955,7 +3302,7 @@ impl Ext4 {
     /// This eliminates the race between foreground `setattr` block-allocation
     /// and background writeback, which can corrupt the extent tree when both
     /// operate on cloned `InodeRef` snapshots from the inode cache.
-    pub fn write_data_only(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
+    fn write_data_only_checked(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let write_size = data.len();
@@ -966,6 +3313,7 @@ impl Ext4 {
         if !file.inode.is_file() {
             return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
         }
+        self.reject_external_linked_tail_mutation(&file)?;
 
         let mut cursor = 0;
         let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
@@ -1004,6 +3352,59 @@ impl Ext4 {
         }
 
         Ok(write_size)
+    }
+
+    /// Write data to pre-allocated blocks without modifying inode metadata.
+    pub fn write_data_only(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
+        self.write_data_only_checked(file, offset, data)
+    }
+
+    /// Verify the mapped receipt while the direct metadata gate and inode
+    /// shard exclude unlink/reclaim, then write its exact block payload. This
+    /// prevents a stale receipt from reaching an inode number that was reused
+    /// by a later allocation before the EOF/orphan transaction can reject it.
+    #[cfg(any(test, feature = "test-api"))]
+    fn write_delalloc_mapped_data(
+        &self,
+        receipt: &DelallocMappedWriteback,
+        data: &[u8],
+    ) -> core::result::Result<(), DelallocMappedDataFailure> {
+        let _metadata_guard = match self.lock_direct_metadata_mutation() {
+            Ok(guard) => guard,
+            Err(error) if error.code() == ErrCode::EAGAIN => {
+                return Err(DelallocMappedDataFailure::Retryable(error));
+            }
+            Err(error) => return Err(DelallocMappedDataFailure::Fatal(error)),
+        };
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(receipt.inode_id)].lock();
+        let inode = self
+            .read_inode(receipt.inode_id)
+            .map_err(DelallocMappedDataFailure::Fatal)?;
+        if !inode.inode.is_file()
+            || inode.inode.generation() != receipt.inode_generation
+            || inode.inode.size() != receipt.offset as u64
+        {
+            return Err(DelallocMappedDataFailure::Fatal(Ext4Error::new(
+                ErrCode::EIO,
+            )));
+        }
+        match self.legacy_orphan_membership(&inode) {
+            Ok(LegacyOrphanMembership::LinkedTail) => {}
+            Ok(_) => {
+                return Err(DelallocMappedDataFailure::Fatal(Ext4Error::new(
+                    ErrCode::EIO,
+                )));
+            }
+            Err(error) => return Err(DelallocMappedDataFailure::Fatal(error)),
+        }
+        let lblock = (receipt.offset / BLOCK_SIZE) as LBlockId;
+        let pblock = self
+            .extent_query(&inode, lblock)
+            .map_err(DelallocMappedDataFailure::Fatal)?;
+        self.block_device
+            .write_blocks(pblock, data)
+            .map_err(DelallocMappedDataFailure::Retryable)
     }
 
     /// Create a hard link. This function will not check name conflict,
@@ -1247,6 +3648,13 @@ impl Ext4 {
                 // still have independent hard links.
                 let final_target =
                     super::link::namespace_removal_is_final(existing_is_dir, existing_link_cnt);
+                let orphan_action = if final_target && self.uses_journal() {
+                    Some(final_unlink_orphan_action(
+                        self.legacy_orphan_membership(&existing_inode)?,
+                    )?)
+                } else {
+                    None
+                };
 
                 // Upper bound of distinct home blocks in the replace set:
                 // destination dirent + source dirent + optional child "..";
@@ -1318,11 +3726,23 @@ impl Ext4 {
                     existing_inode.inode.set_link_count(0);
                     if self.uses_journal() {
                         let mut sb = self.read_super_block_cached();
-                        self.transaction_orphan_add(
-                            &mut transaction,
-                            &mut existing_inode,
-                            &mut sb,
-                        )?;
+                        let orphan_action =
+                            orphan_action.ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                        match orphan_action {
+                            FinalUnlinkOrphanAction::AddZeroLink => {
+                                self.transaction_orphan_add_zero_link(
+                                    &mut transaction,
+                                    &mut existing_inode,
+                                    &mut sb,
+                                )?;
+                            }
+                            FinalUnlinkOrphanAction::PreserveLinkedTail => {
+                                self.transaction_stage_inode_with_csum(
+                                    &mut transaction,
+                                    &mut existing_inode,
+                                )?;
+                            }
+                        }
                     } else {
                         existing_inode.inode.set_next_orphan(0);
                         self.transaction_stage_inode_with_csum(
@@ -1872,6 +4292,26 @@ mod tests {
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
+    fn production_credit_bound_violation_is_a_terminal_contract_error() {
+        assert_eq!(
+            validate_delalloc_journal_credit_bound(11, Some(10))
+                .unwrap_err()
+                .code(),
+            ErrCode::E2BIG
+        );
+        assert!(is_delalloc_contract_error(ErrCode::E2BIG));
+        assert!(!is_delalloc_contract_error(ErrCode::EIO));
+        assert_eq!(
+            validate_delalloc_journal_credit_bound(10, Some(10)).unwrap(),
+            10
+        );
+        assert_eq!(
+            validate_delalloc_journal_credit_bound(11, None).unwrap(),
+            11
+        );
+    }
+
+    #[test]
     fn file_attr_is_derived_from_the_authoritative_in_memory_inode() {
         let mut inode = Box::new(Inode::default());
         inode.set_mode(InodeMode::CHARDEV | InodeMode::from_bits_retain(0o640));
@@ -1954,10 +4394,11 @@ mod tests {
             cached_block_groups: Vec::new(),
             system_metadata_ranges: Vec::new(),
             inode_cache: spin::Mutex::new(crate::ext4::InodeCache::new(16)),
-            alloc_lock: spin::Mutex::new(()),
+            alloc_lock: spin::Mutex::new(crate::ext4::AllocationState::new().unwrap()),
             namespace_lock: spin::Mutex::new(()),
             metadata_mutation_barrier: crate::ext4::MetadataMutationGate::new(),
             poisoned: spin::Mutex::new(None),
+            delalloc_mapper_authority_issued: core::sync::atomic::AtomicBool::new(false),
             metadata_mode: crate::ext4::MetadataMutationMode::Direct(
                 crate::ext4::journal_transaction::DirectTransactionCore::new(block_count as u64)
                     .unwrap(),
@@ -2205,6 +4646,244 @@ mod tests {
             release.wait();
         });
         drop(fs.lock_transactional_metadata_mutation().unwrap());
+    }
+
+    #[test]
+    fn clean_delalloc_ledger_mutation_completes_before_concurrent_fail_stop() {
+        let fs = Arc::new(make_test_fs(16));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+
+        let mut lease = std::thread::scope(|scope| {
+            let writer_fs = fs.clone();
+            let writer = scope.spawn(move || {
+                writer_fs.test_reserve_clean_delalloc_lease_with_hook(|| {
+                    // The helper has both `alloc_lock` and `poisoned` here.
+                    // Hold that exact linearization point until fail-stop has
+                    // been started on another thread.
+                    entered_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                })
+            });
+
+            entered_rx.recv().unwrap();
+            let poison_fs = fs.clone();
+            let poisoner = scope.spawn(move || poison_fs.fail_stop_mutations());
+            continue_tx.send(()).unwrap();
+
+            let lease = writer
+                .join()
+                .expect("ledger writer must not panic")
+                .expect("pre-admitted ledger update must win the race");
+            poisoner
+                .join()
+                .expect("fail-stop must not wait on alloc_lock");
+            lease
+        });
+
+        // The winning reservation is ordered before poison, but abandonment
+        // after poison must leave its capacity unavailable for this mount.
+        fs.abandon_delalloc_lease_after_fail_stop(&mut lease)
+            .expect("post-poison owner must abandon the pre-admitted lease");
+        let allocation = fs.alloc_lock.lock();
+        assert_eq!(allocation.reserved_data_blocks, 1);
+        assert_eq!(allocation.delalloc_claims.len(), 1);
+    }
+
+    #[test]
+    fn clean_delalloc_ledger_mutation_rejects_after_fail_stop_without_releasing_capacity() {
+        let fs = make_test_fs(16);
+        let mut lease = fs
+            .test_reserve_clean_delalloc_lease_with_hook(|| {})
+            .expect("test fixture must create one in-memory lease");
+
+        fs.fail_stop_mutations();
+        assert_eq!(
+            fs.test_release_clean_delalloc_lease(&mut lease, || {})
+                .expect_err("poison must win before a later ledger release")
+                .code(),
+            ErrCode::EIO
+        );
+        assert!(lease.active);
+        fs.abandon_delalloc_lease_after_fail_stop(&mut lease)
+            .expect("failed post-poison release must terminalise by abandonment");
+
+        let allocation = fs.alloc_lock.lock();
+        assert_eq!(allocation.reserved_data_blocks, 1);
+        assert_eq!(allocation.delalloc_claims.len(), 1);
+    }
+
+    #[test]
+    fn foreign_mapper_authority_never_terminalises_another_mount_reservation() {
+        let fs_a = make_test_fs(16);
+        let fs_b = make_test_fs(16);
+        let authority_a = DelallocAppendMapperAuthority {
+            mount_generation: fs_a.delalloc_mount_generation(),
+        };
+        let lease_b = fs_b
+            .test_reserve_clean_delalloc_lease_with_hook(|| {})
+            .expect("fixture B must reserve one exact lease");
+        let mut reservation_b = DelallocAppendBlockReservation::new(lease_b);
+
+        let outcome = fs_a.submit_delalloc_append_block_authorized(
+            &authority_a,
+            &mut reservation_b,
+            &[0u8; BLOCK_SIZE],
+            BLOCK_SIZE as u64,
+            None,
+        );
+        assert_eq!(
+            outcome,
+            DelallocAppendBlockSubmitOutcome::RetryableNotPublished(ErrCode::EINVAL)
+        );
+        assert!(reservation_b.lease.active);
+
+        fs_a.fail_stop_mutations();
+        assert_eq!(
+            fs_a.terminalize_delalloc_append_block_authorized_after_fail_stop(
+                &authority_a,
+                &mut reservation_b,
+            )
+            .unwrap_err()
+            .code(),
+            ErrCode::EINVAL
+        );
+        assert!(reservation_b.lease.active);
+        fs_b.test_release_clean_delalloc_lease(&mut reservation_b.lease, || {})
+            .expect("source mount must retain normal release authority");
+    }
+
+    #[test]
+    fn fail_stop_while_holding_direct_gate_and_allocator_does_not_deadlock_lease_release() {
+        let fs = Arc::new(make_test_fs(16));
+        let mut lease = fs
+            .test_reserve_clean_delalloc_lease_with_hook(|| {})
+            .expect("test fixture must create one in-memory lease");
+        let (holder_ready_tx, holder_ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (poison_now_tx, poison_now_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_started_tx, release_started_rx) = std::sync::mpsc::sync_channel(0);
+
+        let release_result = {
+            let lease_ref = &mut lease;
+            std::thread::scope(|scope| {
+                let holder_fs = fs.clone();
+                let holder = scope.spawn(move || {
+                    let _direct = holder_fs
+                        .lock_direct_metadata_mutation()
+                        .expect("direct fixture gate must admit its first holder");
+                    let _allocation = holder_fs.alloc_lock.lock();
+                    holder_ready_tx.send(()).unwrap();
+                    poison_now_rx.recv().unwrap();
+                    // This is the historical ABBA trigger: fail-stop is invoked
+                    // while the direct gate and allocator are both owned.
+                    holder_fs.fail_stop_mutations();
+                });
+
+                holder_ready_rx.recv().unwrap();
+                let release_fs = fs.clone();
+                let releaser = scope.spawn(move || {
+                    let _direct = release_fs
+                        .lock_direct_metadata_mutation()
+                        .expect("direct writers must remain mutually compatible");
+                    release_started_tx.send(()).unwrap();
+                    release_fs.test_release_clean_delalloc_lease(lease_ref, || {})
+                });
+
+                release_started_rx.recv().unwrap();
+                poison_now_tx.send(()).unwrap();
+                holder.join().expect("fail-stop must not self-deadlock");
+                releaser
+                    .join()
+                    .expect("post-poison lease release must return")
+            })
+        };
+
+        assert_eq!(
+            release_result
+                .expect_err("release after fail-stop must not restore capacity")
+                .code(),
+            ErrCode::EIO
+        );
+        assert!(lease.active);
+        fs.abandon_delalloc_lease_after_fail_stop(&mut lease)
+            .expect("post-poison release owner must abandon its live lease");
+    }
+
+    #[test]
+    fn clean_delalloc_release_linearizes_before_a_waiting_fail_stop() {
+        let fs = Arc::new(make_test_fs(16));
+        let mut lease = fs
+            .test_reserve_clean_delalloc_lease_with_hook(|| {})
+            .expect("test fixture must create one in-memory lease");
+        let (release_entered_tx, release_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_continue_tx, release_continue_rx) = std::sync::mpsc::sync_channel(0);
+        let (poison_requested_tx, poison_requested_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let release_fs = fs.clone();
+            let lease_ref = &mut lease;
+            let releaser = scope.spawn(move || {
+                release_fs.test_release_clean_delalloc_lease(lease_ref, || {
+                    release_entered_tx.send(()).unwrap();
+                    release_continue_rx.recv().unwrap();
+                })
+            });
+
+            release_entered_rx.recv().unwrap();
+            let poison_fs = fs.clone();
+            let poisoner = scope.spawn(move || {
+                poison_fs.test_fail_stop_mutations_before_poison_lock(|| {
+                    poison_requested_tx.send(()).unwrap();
+                });
+            });
+
+            // The release hook still holds both `alloc_lock` and `poisoned`.
+            // Therefore this signal proves the fail-stop thread is about to
+            // contend on the latter lock, but cannot have won it yet.
+            poison_requested_rx.recv().unwrap();
+            release_continue_tx.send(()).unwrap();
+            releaser
+                .join()
+                .expect("release thread must not panic")
+                .expect("release must linearize before the waiting fail-stop");
+            poisoner
+                .join()
+                .expect("fail-stop must complete after release");
+        });
+
+        assert!(!lease.active);
+        let allocation = fs.alloc_lock.lock();
+        assert_eq!(allocation.reserved_data_blocks, 0);
+        assert!(allocation.delalloc_claims.is_empty());
+    }
+
+    #[test]
+    fn fail_stop_inside_transactional_gate_does_not_self_deadlock_or_reopen_release() {
+        let fs = make_test_fs(16);
+        let mut lease = fs
+            .test_reserve_clean_delalloc_lease_with_hook(|| {})
+            .expect("test fixture must create one in-memory lease");
+
+        let transaction = fs
+            .lock_transactional_metadata_mutation()
+            .expect("test fixture must admit its transaction owner");
+        fs.fail_stop_mutations();
+        assert_eq!(
+            fs.lock_direct_metadata_mutation()
+                .expect_err("transaction gate must still reject a direct release owner")
+                .code(),
+            ErrCode::EAGAIN
+        );
+        drop(transaction);
+
+        assert_eq!(
+            fs.test_release_clean_delalloc_lease(&mut lease, || {})
+                .expect_err("release after the transaction-gate fail-stop must be rejected")
+                .code(),
+            ErrCode::EIO
+        );
+        fs.abandon_delalloc_lease_after_fail_stop(&mut lease)
+            .expect("post-transaction fail-stop owner must abandon its lease");
     }
 
     #[test]
@@ -2526,6 +5205,31 @@ mod tests {
 
         assert_eq!(err.code(), ErrCode::EIO);
         assert_allocation_state(&fs, &block_device, false, TEST_INITIAL_FREE_BLOCKS);
+    }
+
+    #[test]
+    fn nojournal_mount_rejects_delayed_reservation_without_restricting_eager_allocation() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<DelallocAppendBlockReservation>();
+        let (block_device, fs) = load_failing_test_fs();
+        let mut inode = fs.read_inode(2).unwrap();
+
+        assert_eq!(
+            fs.reserve_delalloc_lease(1, 0).unwrap_err().code(),
+            ErrCode::ENOTSUP
+        );
+        // This call exercises the normal-build append capability boundary,
+        // rather than the host-only raw lease facade.  A no-journal mount
+        // must reject both before it can hand a live capability to VFS.
+        assert_eq!(
+            fs.reserve_delalloc_append_block_capability(2, 0)
+                .unwrap_err()
+                .code(),
+            ErrCode::ENOTSUP
+        );
+        assert_eq!(fs.alloc_block(&mut inode).unwrap(), TEST_XATTR_BLOCK);
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
     }
 
     #[test]

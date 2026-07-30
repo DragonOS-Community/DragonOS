@@ -41,7 +41,7 @@ impl JournalContext {
         if sb.block_size as usize != BLOCK_SIZE
             || (sb.features.checksum == ChecksumMode::V3 && sb.checksum_type != CRC32C_CHKSUM)
             || self.logical_blocks.len() != sb.max_len as usize
-            || self.journal_blocks.len() != self.logical_blocks.len()
+            || self.journal_blocks.len() < self.logical_blocks.len()
             || self.head < sb.first
             || self.head >= sb.max_len
             || self.target_blocks == 0
@@ -106,6 +106,11 @@ pub enum CommitFailure {
 pub struct CommitError {
     pub error: Ext4Error,
     pub failure: CommitFailure,
+    /// Whether this failure poisoned the transaction core. `BeforeCommit`
+    /// alone is insufficient to decide retryability: format/capacity
+    /// validation leaves the core usable, while an I/O failure after the
+    /// active journal tail reached disk does not.
+    pub poisoned: bool,
 }
 
 /// Owns the single-writer token and poison state.  The token is held only as
@@ -213,6 +218,19 @@ impl JournalTransactionCore {
                 .range(start..end)
                 .next()
                 .is_some()
+    }
+
+    pub fn credits_fit(&self, credits: usize) -> Result<bool> {
+        if credits == 0 || self.is_poisoned() {
+            return Err(Ext4Error::new(if credits == 0 {
+                ErrCode::EINVAL
+            } else {
+                ErrCode::EROFS
+            }));
+        }
+        let context = self.context.lock();
+        required_log_blocks(credits, context.superblock.features)
+            .and_then(|needed| ring_len(&context.superblock).map(|available| needed <= available))
     }
 
     pub fn start(&self, credits: usize) -> Result<Transaction<'_>> {
@@ -538,11 +556,13 @@ impl Transaction<'_> {
             required_log_blocks(self.staged.len(), sb.features).map_err(|error| CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
+                poisoned: false,
             })?;
         if needed
             > ring_len(&sb).map_err(|error| CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
+                poisoned: false,
             })?
         {
             return self.fail(
@@ -556,6 +576,7 @@ impl Transaction<'_> {
         let positions = ring_positions(&sb, head, needed).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
+            poisoned: false,
         })?;
         if self
             .staged
@@ -574,16 +595,19 @@ impl Transaction<'_> {
         let encoded = encode_log(&sb, sequence, &self.staged).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
+            poisoned: false,
         })?;
         let commit = encode_commit(&sb, sequence).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
+            poisoned: false,
         })?;
         let mut active_sb_image = sb_image.clone();
         update_superblock(&mut active_sb_image, sequence, head, &sb).map_err(|error| {
             CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
+                poisoned: false,
             }
         })?;
         let next_sequence = sequence.wrapping_add(1);
@@ -592,6 +616,7 @@ impl Transaction<'_> {
             CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
+                poisoned: false,
             }
         })?;
 
@@ -660,7 +685,11 @@ impl Transaction<'_> {
             }
         }
         self.release_writer();
-        Err(CommitError { error, failure })
+        Err(CommitError {
+            error,
+            failure,
+            poisoned: poison,
+        })
     }
 
     fn release_writer(&mut self) {

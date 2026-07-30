@@ -1,3 +1,4 @@
+use super::orphan::{final_unlink_orphan_action, FinalUnlinkOrphanAction};
 use super::Ext4;
 use crate::ext4_defs::*;
 use crate::prelude::*;
@@ -22,7 +23,9 @@ impl Ext4 {
         let child_link_count = child.inode.link_count();
         let parent_link_count = parent.inode.link_count();
         if child_link_count == 0 && allow_orphan_relink {
-            if !self.legacy_orphan_contains(child.id)? {
+            if self.legacy_orphan_membership(child)?
+                != super::orphan::LegacyOrphanMembership::ZeroLink
+            {
                 return Err(Ext4Error::new(ErrCode::EINVAL));
             }
             if child.inode.is_dir() {
@@ -94,6 +97,11 @@ impl Ext4 {
             // the same crash invariant here: after recovery the inode is
             // either still named, or unreachable and discoverable from the
             // on-disk orphan head.
+            let orphan_action = if self.uses_journal() {
+                final_unlink_orphan_action(self.legacy_orphan_membership(child)?)?
+            } else {
+                FinalUnlinkOrphanAction::AddZeroLink
+            };
             let mut transaction =
                 self.transaction_start(if child.inode.is_dir() { 4 } else { 3 })?;
             self.transaction_dir_remove_entry(&mut transaction, parent, name)?;
@@ -105,7 +113,17 @@ impl Ext4 {
             child.inode.set_link_count(0);
             if self.uses_journal() {
                 let mut sb = self.read_super_block_cached();
-                self.transaction_orphan_add(&mut transaction, child, &mut sb)?;
+                match orphan_action {
+                    FinalUnlinkOrphanAction::AddZeroLink => {
+                        self.transaction_orphan_add_zero_link(&mut transaction, child, &mut sb)?;
+                    }
+                    FinalUnlinkOrphanAction::PreserveLinkedTail => {
+                        // The existing chain position and `next_orphan` are
+                        // still the only durable route to this now-zero-link
+                        // inode.  Re-adding it could self-loop at the head.
+                        self.transaction_stage_inode_with_csum(&mut transaction, child)?;
+                    }
+                }
             } else {
                 // Linux nojournal mode does not enroll newly unlinked inodes in
                 // the persistent orphan chain. Lifetime reclaim starts only

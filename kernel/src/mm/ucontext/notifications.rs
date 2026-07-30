@@ -26,6 +26,33 @@ impl VmaCloseNotifications {
 pub(super) struct MremapOutcome {
     pub(super) addr: VirtAddr,
     pub(super) notifications: VmaCloseNotifications,
+    /// Locked pages in this committed range must be populated only after the
+    /// caller has released `AddressSpace::write()`.  A file fault can return
+    /// `VM_FAULT_RETRY` and wait on PageCache invalidation.
+    pub(super) post_commit_population: Option<(VirtRegion, Weak<LockedVMA>)>,
+}
+
+/// Result of a committed program-break operation.
+///
+/// `set_brk()` runs under `AddressSpace::write()` to change the VMA set, but
+/// a new heap VMA can inherit `MCL_FUTURE`.  Its population must therefore be
+/// deferred to the outer `AddressSpace` owner: a file-backed fault reached by
+/// the generic population machinery may return `VM_FAULT_RETRY` and must not
+/// wait while that write guard is held.
+pub(super) struct BrkOutcome {
+    pub(super) old_brk: VirtAddr,
+    pub(super) post_commit_population: Option<(VirtRegion, Weak<LockedVMA>)>,
+}
+
+/// A committed locked VMA that must be populated after its owner drops
+/// `AddressSpace::write()`.
+///
+/// This is intentionally an owned request rather than an `InnerAddressSpace`
+/// callback: retrying a file-backed fault can block on PageCache invalidation,
+/// while the VMA identity must still be revalidated after that wait.
+pub(crate) struct LockedPopulationRequest {
+    pub(super) region: VirtRegion,
+    pub(super) expected_vma: Weak<LockedVMA>,
 }
 
 pub(super) struct MremapFailure {

@@ -32,6 +32,8 @@ export LD=ld
 export AS=as
 export NM=nm
 export OBJCOPY=objcopy
+# GCC 15 默认 C23，C23 将 bool/true/false 作为关键字，GRUB 2.06 不兼容，强制用 gnu11
+export CFLAGS="-std=gnu11"
 
 
 #检测grub是否已经安装
@@ -55,7 +57,7 @@ install_options=("install -y" \
                      "-S --needed --noconfirm" \
 		     "install -y" \
 		     "install -y" \
-		     ""
+		     "-v"
 		)
 found_pm=0
 pm_index=0

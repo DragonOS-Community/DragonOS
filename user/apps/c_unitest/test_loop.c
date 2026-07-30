@@ -149,31 +149,18 @@ static int create_test_file(const char *filename, int size) {
   return 0;
 }
 
-// 使用重试机制创建 loop 设备
+// Allocate a new registered loop device atomically. LOOP_CTL_GET_FREE returns
+// an already registered reusable device and must not be followed by ADD of
+// the same minor.
 static int create_loop_device(int control_fd, int *out_minor) {
-  for (int retry = 0; retry < 10; retry++) {
-    // LOOP_CTL_GET_FREE 通过返回值返回 free 的 minor 号
-    int free_minor = ioctl(control_fd, LOOP_CTL_GET_FREE, 0);
-    if (free_minor < 0) {
-      LOG_ERROR("Failed to get free loop device: %s", strerror(errno));
-      return -1;
-    }
-
-    int ret = ioctl(control_fd, LOOP_CTL_ADD, free_minor);
-    if (ret >= 0) {
-      *out_minor = ret;
-      return 0;
-    }
-
-    if (errno != EEXIST) {
-      LOG_ERROR("Failed to add loop device: %s", strerror(errno));
-      return -1;
-    }
-    // 设备已存在，重试
+  int minor = ioctl(control_fd, LOOP_CTL_ADD, UINT32_MAX);
+  if (minor < 0) {
+    LOG_ERROR("Failed to add loop device: %s", strerror(errno));
+    return -1;
   }
 
-  LOG_ERROR("Failed to create loop device after 10 retries");
-  return -1;
+  *out_minor = minor;
+  return 0;
 }
 
 // ===================================================================
@@ -916,6 +903,7 @@ static int test_device_inaccessible_after_deletion(void) {
   // 执行一次成功的 I/O
   char buf[512] = "Test data";
   if (write(fd, buf, sizeof(buf)) != sizeof(buf)) {
+    ioctl(fd, LOOP_CLR_FD, 0);
     close(fd);
     ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
     TEST_END_FAIL(test_name, "initial write failed");
@@ -923,6 +911,14 @@ static int test_device_inaccessible_after_deletion(void) {
   }
   LOG_STEP("Initial I/O successful");
 
+  // Linux rejects LOOP_CTL_REMOVE while the device is still bound. Detach the
+  // backing file first, then close the final opener before removing the node.
+  if (ioctl(fd, LOOP_CLR_FD, 0) < 0) {
+    close(fd);
+    ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+    TEST_END_FAIL(test_name, "failed to clear loop backing");
+    return TEST_FAIL;
+  }
   close(fd);
 
   // 删除设备

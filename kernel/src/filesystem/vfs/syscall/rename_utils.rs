@@ -1,3 +1,4 @@
+use crate::filesystem::fsnotify::{self, FsEvent};
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::is_ancestor;
@@ -93,10 +94,15 @@ pub fn do_renameat2(
         }
     }
 
-    if flags.contains(RenameFlags::EXCHANGE) {
-        let new_inode = new_parent_inode.lookup(new_filename)?;
+    // RENAME_EXCHANGE 目标必须存在；预先 lookup 供事件投递复用（move_to 后原位置查不到）。
+    let exchange_new_inode = if flags.contains(RenameFlags::EXCHANGE) {
+        Some(new_parent_inode.lookup(new_filename)?)
+    } else {
+        None
+    };
+    if let Some(new_inode) = &exchange_new_inode {
         if new_inode.metadata()?.file_type == crate::filesystem::vfs::FileType::Dir
-            && is_ancestor(&new_inode, &old_parent_inode)
+            && is_ancestor(new_inode, &old_parent_inode)
         {
             return Err(SystemError::EINVAL);
         }
@@ -121,6 +127,80 @@ pub fn do_renameat2(
         PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
     )?;
 
+    // 非 EXCHANGE：预先取出可能被覆盖的目标 inode（move_to 会静默销毁它），
+    // 否则其上的 watch 会沦为持续产生事件的「幽灵 watch」。
+    let displaced = if !flags.contains(RenameFlags::EXCHANGE) {
+        new_parent_inode.find(new_filename).ok()
+    } else {
+        None
+    };
+
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
+
+    if flags.contains(RenameFlags::EXCHANGE) {
+        // EXCHANGE：两个 inode 互换位置 → 两组配对事件、两个 cookie、双方各 IN_MOVE_SELF。
+        // - old_inode: old_dir/old_name → new_dir/new_name（cookie1）
+        // - new_inode: new_dir/new_name → old_dir/old_name（cookie2）
+        let new_inode = exchange_new_inode
+            .as_ref()
+            .expect("RENAME_EXCHANGE requires target to exist (checked above)");
+        let cookie1 = fsnotify::next_cookie();
+        fsnotify::fsnotify(
+            FsEvent::MOVED_FROM | FsEvent::MOVE_SELF,
+            Some((&old_parent_inode, old_filename)),
+            Some(&old_inode),
+            cookie1,
+        );
+        fsnotify::fsnotify(
+            FsEvent::MOVED_TO,
+            Some((&new_parent_inode, new_filename)),
+            Some(&old_inode),
+            cookie1,
+        );
+        let cookie2 = fsnotify::next_cookie();
+        fsnotify::fsnotify(
+            FsEvent::MOVED_FROM | FsEvent::MOVE_SELF,
+            Some((&new_parent_inode, new_filename)),
+            Some(new_inode),
+            cookie2,
+        );
+        fsnotify::fsnotify(
+            FsEvent::MOVED_TO,
+            Some((&old_parent_inode, old_filename)),
+            Some(new_inode),
+            cookie2,
+        );
+    } else {
+        // 普通 rename（可能覆盖目标）：单 cookie 配对 MOVED_FROM/MOVED_TO + MOVE_SELF。
+        let cookie = fsnotify::next_cookie();
+        fsnotify::fsnotify(
+            FsEvent::MOVED_FROM | FsEvent::MOVE_SELF,
+            Some((&old_parent_inode, old_filename)),
+            Some(&old_inode),
+            cookie,
+        );
+        fsnotify::fsnotify(
+            FsEvent::MOVED_TO,
+            Some((&new_parent_inode, new_filename)),
+            Some(&old_inode),
+            cookie,
+        );
+        // 覆盖了已存在目标：补投 IN_DELETE（目标父目录）；仅当被覆盖的是不同 inode 时才发
+        // IN_DELETE_SELF（随之撤销 mark 并投递 IN_IGNORED）。若 old_inode 与 displaced 是同一
+        // inode 的硬链接（rename 覆盖自身别名），inode 仅重命名而未销毁，不应误撤销其 watch。
+        if let Some(displaced) = &displaced {
+            let same_inode = displaced.metadata()?.inode_id == old_inode.metadata()?.inode_id;
+            let mut mask = FsEvent::DELETE;
+            if !same_inode {
+                mask |= FsEvent::DELETE_SELF;
+            }
+            fsnotify::fsnotify(
+                mask,
+                Some((&new_parent_inode, new_filename)),
+                Some(displaced),
+                0,
+            );
+        }
+    }
     return Ok(0);
 }

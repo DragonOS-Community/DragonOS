@@ -7,12 +7,15 @@ use crate::{
     filesystem::{
         procfs::{
             pid::ProcPidTarget,
-            template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
+            template::{
+                Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder, ProcSymBuilder,
+                SymOps,
+            },
             thread_self::NsFileType,
         },
         vfs::{
             file::{FilePrivateData, NamespaceFilePrivateData},
-            IndexNode, InodeId, InodeMode,
+            FileSystem, IndexNode, InodeId, InodeMode, SpecialNodeData,
         },
     },
     process::namespace::{nsproxy::NamespaceId, NamespaceOps},
@@ -25,42 +28,27 @@ use alloc::{
 use core::convert::TryFrom;
 use system_error::SystemError;
 
-/// 获取指定进程的命名空间 ID
-fn get_ns_ino(target: &ProcPidTarget, ns_type: NsFileType) -> Result<usize, SystemError> {
-    let pcb = target.task().ok_or(SystemError::ESRCH)?;
-    let nsproxy = pcb.nsproxy();
-
-    let ino: NamespaceId = match ns_type {
-        NsFileType::Ipc => nsproxy.ipc_ns.ns_common().nsid,
-        NsFileType::Uts => nsproxy.uts_ns.ns_common().nsid,
-        NsFileType::Mnt => nsproxy.mnt_ns.ns_common().nsid,
-        NsFileType::Net => nsproxy.net_ns.ns_common().nsid,
-        NsFileType::Pid => pcb.active_pid_ns().ns_common().nsid,
-        NsFileType::PidForChildren => nsproxy.pid_ns_for_children.ns_common().nsid,
-        NsFileType::Time | NsFileType::TimeForChildren => {
-            // Time namespace 尚未实现
-            NamespaceId::new(0)
-        }
-        NsFileType::User => pcb.cred().user_ns.ns_common().nsid,
-        NsFileType::Cgroup => nsproxy.cgroup_ns.ns_common().nsid,
-    };
-
-    Ok(ino.data())
+#[derive(Debug)]
+struct NamespaceSnapshot {
+    data: NamespaceFilePrivateData,
+    nsid: NamespaceId,
 }
 
-fn namespace_private_data(
+fn namespace_snapshot(
     target: &ProcPidTarget,
     ns_type: NsFileType,
-) -> Result<NamespaceFilePrivateData, SystemError> {
+) -> Result<NamespaceSnapshot, SystemError> {
     let pcb = target.task().ok_or(SystemError::ESRCH)?;
     let nsproxy = pcb.nsproxy();
 
-    let ns_data = match ns_type {
+    let data = match ns_type {
         NsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),
         NsFileType::Uts => NamespaceFilePrivateData::Uts(nsproxy.uts_ns.clone()),
         NsFileType::Mnt => NamespaceFilePrivateData::Mnt(nsproxy.mnt_ns.clone()),
         NsFileType::Net => NamespaceFilePrivateData::Net(nsproxy.net_ns.clone()),
-        NsFileType::Pid => NamespaceFilePrivateData::Pid(pcb.active_pid_ns()),
+        NsFileType::Pid => {
+            NamespaceFilePrivateData::Pid(pcb.try_active_pid_ns().ok_or(SystemError::ESRCH)?)
+        }
         NsFileType::PidForChildren => {
             NamespaceFilePrivateData::PidForChildren(nsproxy.pid_ns_for_children.clone())
         }
@@ -71,7 +59,19 @@ fn namespace_private_data(
         NsFileType::Cgroup => NamespaceFilePrivateData::Cgroup(nsproxy.cgroup_ns.clone()),
     };
 
-    Ok(ns_data)
+    let nsid = match &data {
+        NamespaceFilePrivateData::Ipc(ns) => ns.ns_common().nsid,
+        NamespaceFilePrivateData::Uts(ns) => ns.ns_common().nsid,
+        NamespaceFilePrivateData::Mnt(ns) => ns.ns_common().nsid,
+        NamespaceFilePrivateData::Net(ns) => ns.ns_common().nsid,
+        NamespaceFilePrivateData::Pid(ns) | NamespaceFilePrivateData::PidForChildren(ns) => {
+            ns.ns_common().nsid
+        }
+        NamespaceFilePrivateData::User(ns) => ns.ns_common().nsid,
+        NamespaceFilePrivateData::Cgroup(ns) => ns.ns_common().nsid,
+    };
+
+    Ok(NamespaceSnapshot { data, nsid })
 }
 
 /// /proc/[pid]/ns 目录的 DirOps 实现
@@ -110,7 +110,12 @@ impl DirOps for NsDirOps {
         }
 
         // 创建命名空间符号链接
-        let inode = NsSymOps::new_inode(self.target.clone(), ns_type, dir.self_ref_weak().clone());
+        let inode = NsSymOps::new_inode(
+            self.target.clone(),
+            ns_type,
+            Arc::downgrade(&dir.fs()),
+            dir.self_ref_weak().clone(),
+        );
         cached_children.insert(name.to_string(), inode.clone());
         Ok(inode)
     }
@@ -125,7 +130,12 @@ impl DirOps for NsDirOps {
         for name in NsFileType::ALL_NAMES {
             if let Ok(ns_type) = NsFileType::try_from(name) {
                 cached_children.entry(name.to_string()).or_insert_with(|| {
-                    NsSymOps::new_inode(self.target.clone(), ns_type, dir.self_ref_weak().clone())
+                    NsSymOps::new_inode(
+                        self.target.clone(),
+                        ns_type,
+                        Arc::downgrade(&dir.fs()),
+                        dir.self_ref_weak().clone(),
+                    )
                 });
             }
         }
@@ -137,43 +147,82 @@ impl DirOps for NsDirOps {
 pub struct NsSymOps {
     target: ProcPidTarget,
     ns_type: NsFileType,
+    fs: Weak<dyn FileSystem>,
 }
 
 impl NsSymOps {
     pub fn new_inode(
         target: ProcPidTarget,
         ns_type: NsFileType,
+        fs: Weak<dyn FileSystem>,
         parent: Weak<dyn IndexNode>,
     ) -> Arc<dyn IndexNode> {
-        ProcSymBuilder::new(Self { target, ns_type }, InodeMode::S_IRWXUGO)
-            .parent(parent)
-            .build()
-            .unwrap()
+        ProcSymBuilder::new(
+            Self {
+                target,
+                ns_type,
+                fs,
+            },
+            InodeMode::S_IRWXUGO,
+        )
+        .parent(parent)
+        .build()
+        .unwrap()
+    }
+}
+
+#[derive(Debug)]
+struct NamespaceFileOps {
+    snapshot: NamespaceSnapshot,
+}
+
+impl FileOps for NamespaceFileOps {
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        **data = FilePrivateData::Namespace(self.snapshot.data.clone());
+        Ok(())
+    }
+
+    fn dynamic_inode_id(&self) -> Option<InodeId> {
+        Some(InodeId::new(self.snapshot.nsid.data()))
     }
 }
 
 impl SymOps for NsSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let ino = get_ns_ino(&self.target, self.ns_type)?;
+        let ino = namespace_snapshot(&self.target, self.ns_type)?.nsid.data();
         let target = format!("{}:[{}]", self.ns_type.name(), ino);
         let len = target.len().min(buf.len());
         buf[..len].copy_from_slice(&target.as_bytes()[..len]);
         Ok(len)
     }
 
-    fn is_self_reference(&self) -> bool {
-        // 命名空间符号链接是自引用的魔法链接
-        true
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        let snapshot = namespace_snapshot(&self.target, self.ns_type).ok()?;
+        let inode = ProcFileBuilder::new(NamespaceFileOps { snapshot }, InodeMode::S_IRUGO)
+            .fs(self.fs.clone())
+            .build()
+            .ok()?;
+        Some(SpecialNodeData::MountProjectedReference(inode))
     }
 
     fn dynamic_inode_id(&self) -> Option<InodeId> {
-        get_ns_ino(&self.target, self.ns_type)
+        namespace_snapshot(&self.target, self.ns_type)
             .ok()
-            .map(InodeId::new)
+            .map(|snapshot| InodeId::new(snapshot.nsid.data()))
     }
 
     fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        **data = FilePrivateData::Namespace(namespace_private_data(&self.target, self.ns_type)?);
+        **data = FilePrivateData::Namespace(namespace_snapshot(&self.target, self.ns_type)?.data);
         Ok(())
     }
 }

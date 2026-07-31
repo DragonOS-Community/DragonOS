@@ -14,6 +14,7 @@ normal/syncfs_semantics
 normal/fcntl_lock
 normal/fcntl_signal
 normal/epoll_timeout_budget
+normal/epoll_ctl_wait_concurrency
 normal/devpts_dir_read
 normal/debugfs_mount
 normal/fuse_stats_debugfs

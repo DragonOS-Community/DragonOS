@@ -10,18 +10,25 @@ pub const DISABLE: u32 = 1 << 2;
 pub enum CompleteState {
     Completed,
     Missed,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduleState {
+    Acquired,
+    Missed,
+    Disabled,
 }
 
 /// Try to acquire the single NAPI poll owner.
 ///
-/// A caller which gets `true` owns the transition from idle to scheduled and
-/// must publish the NAPI instance exactly once. A caller which observes an
-/// existing owner only records `MISSED`.
-pub fn schedule_prep(state: &AtomicU32) -> bool {
+/// A caller which acquires ownership must publish the NAPI instance exactly
+/// once. A caller which observes an existing owner only records `MISSED`.
+pub fn schedule_prep(state: &AtomicU32) -> ScheduleState {
     let mut current = state.load(Ordering::Acquire);
     loop {
         if current & DISABLE != 0 {
-            return false;
+            return ScheduleState::Disabled;
         }
 
         let mut next = current | SCHED;
@@ -30,7 +37,8 @@ pub fn schedule_prep(state: &AtomicU32) -> bool {
         }
 
         match state.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return current & SCHED == 0,
+            Ok(_) if current & SCHED == 0 => return ScheduleState::Acquired,
+            Ok(_) => return ScheduleState::Missed,
             Err(observed) => current = observed,
         }
     }
@@ -44,6 +52,9 @@ pub fn schedule_prep(state: &AtomicU32) -> bool {
 pub fn complete(state: &AtomicU32) -> CompleteState {
     let mut current = state.load(Ordering::Acquire);
     loop {
+        if current & DISABLE != 0 {
+            return CompleteState::Disabled;
+        }
         debug_assert_ne!(current & SCHED, 0, "completing an unscheduled NAPI");
 
         let mut next = current & !(SCHED | MISSED);
@@ -81,21 +92,21 @@ mod tests {
     #[test]
     fn first_schedule_acquires_owner() {
         let state = AtomicU32::new(0);
-        assert!(schedule_prep(&state));
+        assert_eq!(schedule_prep(&state), ScheduleState::Acquired);
         assert_eq!(state.load(Ordering::Relaxed), SCHED);
     }
 
     #[test]
     fn repeated_schedule_only_records_missed() {
         let state = AtomicU32::new(SCHED);
-        assert!(!schedule_prep(&state));
+        assert_eq!(schedule_prep(&state), ScheduleState::Missed);
         assert_eq!(state.load(Ordering::Relaxed), SCHED | MISSED);
     }
 
     #[test]
     fn disable_rejects_schedule() {
         let state = AtomicU32::new(DISABLE);
-        assert!(!schedule_prep(&state));
+        assert_eq!(schedule_prep(&state), ScheduleState::Disabled);
         assert_eq!(state.load(Ordering::Relaxed), DISABLE);
     }
 
@@ -122,7 +133,7 @@ mod tests {
 
         let scheduler = thread::spawn(move || {
             worker_barrier.wait();
-            assert!(!schedule_prep(&worker_state));
+            assert_eq!(schedule_prep(&worker_state), ScheduleState::Missed);
         });
 
         barrier.wait();
@@ -136,6 +147,26 @@ mod tests {
         let state = AtomicU32::new(SCHED | MISSED);
         disable(&state);
         assert_eq!(state.load(Ordering::Acquire), DISABLE);
-        assert!(!schedule_prep(&state));
+        assert_eq!(schedule_prep(&state), ScheduleState::Disabled);
+        assert_eq!(complete(&state), CompleteState::Disabled);
+        assert_eq!(state.load(Ordering::Acquire), DISABLE);
+    }
+
+    #[test]
+    fn concurrent_disable_cannot_be_cleared_by_complete() {
+        let state = Arc::new(AtomicU32::new(SCHED));
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_state = state.clone();
+        let worker_barrier = barrier.clone();
+
+        let disabler = thread::spawn(move || {
+            worker_barrier.wait();
+            disable(&worker_state);
+        });
+
+        barrier.wait();
+        disabler.join().unwrap();
+        assert_eq!(complete(&state), CompleteState::Disabled);
+        assert_eq!(state.load(Ordering::Acquire), DISABLE);
     }
 }

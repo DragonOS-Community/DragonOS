@@ -35,7 +35,7 @@ use crate::{
         net::{
             napi::{
                 __napi_schedule, napi_complete_state, napi_disable, napi_schedule,
-                napi_schedule_prep, NapiStruct,
+                napi_schedule_prep, NapiStruct, ScheduleState,
             },
             register_netdevice,
             types::InterfaceFlags,
@@ -1234,6 +1234,7 @@ impl Iface for VirtioInterface {
         };
 
         match napi_complete_state(&napi) {
+            CompleteState::Disabled => {}
             CompleteState::Missed => {
                 self.device_inner
                     .inner
@@ -1259,7 +1260,7 @@ impl Iface for VirtioInterface {
                     let has_work = driver.inner.interrupt_pending(interrupt_state)
                         || tx_completed != 0
                         || has_rx;
-                    if has_work && napi_schedule_prep(&napi) {
+                    if has_work && napi_schedule_prep(&napi) == ScheduleState::Acquired {
                         driver.inner.disable_interrupts();
                         acquired = true;
                     }

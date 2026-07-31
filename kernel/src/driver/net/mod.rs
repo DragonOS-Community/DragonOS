@@ -3,6 +3,7 @@ use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use net_poll_state::{DueResult, PollDeadline, PublishResult};
 use sysfs::netdev_register_kobject;
 
 use crate::driver::net::napi::NapiStruct;
@@ -283,8 +284,9 @@ pub struct IfaceCommon {
     bounds: RwLock<Arc<Vec<Arc<dyn InetSocket>>>>,
     /// 端口管理器
     port_manager: PortManager,
-    /// 下次需要推进协议栈的时间点（单位：微秒时间戳，0 表示无定时事件）
-    poll_at_us: core::sync::atomic::AtomicU64,
+    /// Scheduler-owned future protocol deadline. Immediate work stays with
+    /// the current poll owner and is never armed here.
+    poll_deadline: PollDeadline,
     /// 网络命名空间
     net_namespace: RwLock<Weak<NetNamespace>>,
     /// 路由相关数据
@@ -306,7 +308,7 @@ impl fmt::Debug for IfaceCommon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IfaceCommon")
             .field("iface_id", &self.iface_id)
-            .field("poll_at_us", &self.poll_at_us)
+            .field("poll_deadline", &self.poll_deadline)
             .finish()
     }
 }
@@ -332,7 +334,7 @@ impl IfaceCommon {
             sockets: Mutex::new(smoltcp::iface::SocketSet::new(Vec::new())),
             bounds: RwLock::new(Arc::new(Vec::new())),
             port_manager: PortManager::default(),
-            poll_at_us: core::sync::atomic::AtomicU64::new(0),
+            poll_deadline: PollDeadline::new(),
             net_namespace: RwLock::new(Weak::new()),
             router_common_data,
             flags: AtomicU32::new(flags.bits()),
@@ -420,7 +422,7 @@ impl IfaceCommon {
         self.tcp_listener_backlog
             .refresh_listen_socket_present(&sockets);
 
-        let (has_events, poll_at) = {
+        let (has_events, poll_again, deadline_rearm) = {
             let poll_result = interface.poll(timestamp, device, &mut sockets);
 
             // Reclaim/advance orphaned TCP sockets after smoltcp has processed ingress.
@@ -428,46 +430,20 @@ impl IfaceCommon {
             // scheduled immediately instead of waiting for an unrelated future poll.
             self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
 
+            let poll_at = interface.poll_at(timestamp, &sockets);
+            let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
             (
                 matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged),
-                {
-                    // `poll_at()` may legally return an instant that is <= `timestamp`
-                    // (e.g. "poll immediately"). The previous implementation retried
-                    // in a tight loop without updating `timestamp`, which can spin
-                    // forever and look like a deadlock.
-                    //
-                    // Clamp to `timestamp` to indicate "poll ASAP" without spinning.
-                    match interface.poll_at(timestamp, &sockets) {
-                        Some(instant) if instant <= timestamp => Some(timestamp),
-                        other => other,
-                    }
-                },
+                poll_again,
+                deadline_rearm,
             )
         };
 
-        // drop sockets here to avoid deadlock
+        // Publish the deadline while the smoltcp serialization locks are held,
+        // but notify the namespace only after dropping them.
         drop(interface);
         drop(sockets);
-        // log::info!(
-        //     "polling iface {}, has_events: {}, poll_at: {:?}",
-        //     self.iface_id,
-        //     has_events,
-        //     poll_at
-        // );
-
-        use core::sync::atomic::Ordering;
-        if let Some(instant) = poll_at {
-            let _old_instant = self.poll_at_us.load(Ordering::Relaxed);
-            let new_instant = instant.total_micros() as u64;
-            self.poll_at_us.store(new_instant, Ordering::Relaxed);
-
-            // TODO: poll at
-            // if old_instant == 0 || new_instant < old_instant {
-            //     self.polling_wait_queue.wake_all();
-            // }
-        } else {
-            self.poll_at_us.store(0, Ordering::Relaxed);
-        }
+        self.notify_deadline_rearm(deadline_rearm);
 
         // 注意：不要在持有 bounds 读锁(且 irqsave)期间调用 socket.notify()。
         // 否则会形成典型锁顺序反转死锁：
@@ -495,22 +471,21 @@ impl IfaceCommon {
         // （例如 loopback 二次往返、ACK/window update、仅 egress 前进等）。
         // 如果这里只返回 `has_events`，快路径会过早停止，剩余工作只能等下一次外部事件，
         // 在 blocking TCP 大包场景就会表现为 send/recv 偶发永久卡住。
-        has_events || matches!(poll_at, Some(instant) if instant <= timestamp)
+        has_events || poll_again
     }
 
-    /// 返回 smoltcp 计算的“下次需要 poll 的时间点”（微秒时间戳）。
-    ///
-    /// - `None` 表示当前没有定时事件需要驱动。
-    /// - `Some(us)` 表示应当在 `us` 到达时再次 poll，以推进 TCP 定时器等。
+    /// Atomically classify and, when due, claim this interface's future
+    /// protocol deadline.
     #[inline]
-    pub fn poll_at_us(&self) -> Option<u64> {
-        use core::sync::atomic::Ordering;
-        let v = self.poll_at_us.load(Ordering::Relaxed);
-        if v == 0 {
-            None
-        } else {
-            Some(v)
-        }
+    pub fn classify_poll_deadline(&self, now_us: u64) -> DueResult {
+        self.poll_deadline.classify_and_claim(now_us)
+    }
+
+    /// Restore a claimed deadline after a failed scheduler handoff, without
+    /// overwriting a concurrent publisher.
+    #[inline]
+    pub fn restore_poll_deadline(&self, claimed_us: u64) -> bool {
+        self.poll_deadline.restore_claimed_if_empty(claimed_us)
     }
 
     /// NAPI 使用的 bounded poll：最多处理 `budget` 个 ingress 包，然后推进一次 egress。
@@ -548,22 +523,13 @@ impl IfaceCommon {
         // 推进发送路径（smoltcp 保证 bounded work）。
         let _ = interface.poll_egress(timestamp, device, &mut sockets);
 
-        // 更新 poll_at（用于定时驱动 TCP）。
-        use core::sync::atomic::Ordering;
-        let poll_at = match interface.poll_at(timestamp, &sockets) {
-            Some(instant) if instant <= timestamp => Some(timestamp),
-            other => other,
-        };
-        if let Some(instant) = poll_at {
-            self.poll_at_us
-                .store(instant.total_micros() as u64, Ordering::Relaxed);
-        } else {
-            self.poll_at_us.store(0, Ordering::Relaxed);
-        }
+        let poll_at = interface.poll_at(timestamp, &sockets);
+        let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
 
         // 解锁后唤醒/通知 socket（沿用原 poll() 的 Linux-like 语义）。
         drop(interface);
         drop(sockets);
+        self.notify_deadline_rearm(deadline_rearm);
         self.notify_all_bound_sockets();
 
         // NAPI 语义：只要“还有立即可推进的工作”，就应继续留在 poll_list。
@@ -575,11 +541,44 @@ impl IfaceCommon {
         // - 但仍有 ACK / window update / 后续 egress 需要立即发送；
         // - NAPI 线程却错误睡眠，直到下一次外部事件才继续推进，
         //   导致 send done 后 recv 端偶发卡住。
-        napi::NapiPollResult::new(
-            processed,
-            (had_packet && processed == budget)
-                || matches!(poll_at, Some(instant) if instant <= timestamp),
-        )
+        napi::NapiPollResult::new(processed, (had_packet && processed == budget) || poll_again)
+    }
+
+    /// Publish smoltcp's next scheduling decision while both smoltcp
+    /// serialization locks are held.
+    ///
+    /// The returned boolean pair is `(poll_again, deadline_rearm)`.
+    fn publish_poll_deadline(
+        &self,
+        now: smoltcp::time::Instant,
+        poll_at: Option<smoltcp::time::Instant>,
+    ) -> (bool, bool) {
+        match poll_at {
+            Some(instant) if instant <= now => {
+                self.poll_deadline.disarm();
+                (true, false)
+            }
+            Some(instant) => {
+                let now_us = now.total_micros() as u64;
+                let deadline_us = instant.total_micros() as u64;
+                let rearm = self.poll_deadline.publish_future(now_us, deadline_us)
+                    == PublishResult::RearmRequired;
+                (false, rearm)
+            }
+            None => {
+                self.poll_deadline.disarm();
+                (false, false)
+            }
+        }
+    }
+
+    fn notify_deadline_rearm(&self, rearm: bool) {
+        if !rearm {
+            return;
+        }
+        if let Some(netns) = self.net_namespace() {
+            netns.notify_deadline_changed();
+        }
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
@@ -674,8 +673,9 @@ impl IfaceCommon {
         &self,
         requested: InterfaceFlags,
         change_mask: InterfaceFlags,
-    ) -> Result<InterfaceFlags, SystemError> {
+    ) -> Result<(InterfaceFlags, InterfaceFlags), SystemError> {
         let mut state = self.receive_mode.lock();
+        let old = InterfaceFlags::from_bits_truncate(state.configured_flags);
         let configured = (state.configured_flags & !change_mask.bits())
             | (requested.bits() & change_mask.bits());
 
@@ -690,7 +690,7 @@ impl IfaceCommon {
 
         state.configured_flags = configured;
         self.publish_effective_flags(&state);
-        Ok(InterfaceFlags::from_bits_truncate(configured))
+        Ok((old, InterfaceFlags::from_bits_truncate(configured)))
     }
 
     pub fn link_flags_snapshot(&self) -> Result<LinkFlagsSnapshot, SystemError> {

@@ -298,6 +298,27 @@ printf 'LMBENCH_META {"suite":"lmbench","suite_version":"%s","samples":%s,"timeo
         fi
     fi
 
+    # Pre-compute ENOUGH once. lmbench's BENCH_INNER macro (bench.h) loops
+    # `while(__result < 0.95 * get_enough(0))`; under virtualized timing
+    # compute_enough() can return SHORT=1000000, making __iterations explode
+    # (<<=3 past the 1<<27 break that resets __result=0) into an infinite
+    # while — the observed benchmp hangs on WSL2. Keep enough <= 100000 so
+    # the inner calibration converges. lmbench's scripts/config-run
+    # precomputes ENOUGH via the `enough` binary; we do the same, then clamp
+    # to <=100000, with a 50000 (REAL_SHORT) fallback on hang/failure.
+    if [ -z "${ENOUGH:-}" ]; then
+        . "$SCRIPT_DIR/env.sh" 2>/dev/null || true
+        if [ -x "${LMBENCH_BIN_DIR:-}/enough" ]; then
+            ENOUGH=$(/usr/local/bin/timeout -k 2s 10s "${LMBENCH_BIN_DIR}/enough" 2>/dev/null) || ENOUGH=50000
+            case "$ENOUGH" in *[!0-9]*|'') ENOUGH=50000 ;; esac
+            [ "$ENOUGH" -gt 100000 ] 2>/dev/null && ENOUGH=50000
+        else
+            ENOUGH=50000
+        fi
+        export ENOUGH
+        log "ENOUGH=$ENOUGH (precomputed via enough tool, clamped <=100000, fallback 50000)"
+    fi
+
 if [ ! -f "$WHITELIST_FILE" ]; then
     log "ERROR: whitelist not found: $WHITELIST_FILE"
     echo "===LMBENCH_RUN_END==="

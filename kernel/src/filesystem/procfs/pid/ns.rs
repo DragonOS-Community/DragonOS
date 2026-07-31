@@ -15,6 +15,7 @@ use crate::{
         },
         vfs::{
             file::{FilePrivateData, NamespaceFilePrivateData},
+            utils::DName,
             FileSystem, IndexNode, InodeId, InodeMode, SpecialNodeData,
         },
     },
@@ -208,11 +209,19 @@ impl SymOps for NsSymOps {
 
     fn special_node(&self) -> Option<SpecialNodeData> {
         let snapshot = namespace_snapshot(&self.target, self.ns_type).ok()?;
+        let dname = DName::from(format!(
+            "{}:[{}]",
+            self.ns_type.name(),
+            snapshot.nsid.data()
+        ));
         let inode = ProcFileBuilder::new(NamespaceFileOps { snapshot }, InodeMode::S_IRUGO)
             .fs(self.fs.clone())
             .build()
             .ok()?;
-        Some(SpecialNodeData::MountProjectedReference(inode))
+        Some(SpecialNodeData::MountProjectedReference {
+            target: inode,
+            dname,
+        })
     }
 
     fn dynamic_inode_id(&self) -> Option<InodeId> {

@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -135,6 +136,35 @@ static bool mount_has_option(const char *mountpoint, const char *option) {
         break;
     }
 
+    free(line);
+    fclose(fp);
+    return found;
+}
+
+static bool mountinfo_root_for(const std::string &mountpoint, std::string *root) {
+    FILE *fp = fopen("/proc/self/mountinfo", "r");
+    if (fp == nullptr) return false;
+
+    char *line = nullptr;
+    size_t cap = 0;
+    bool found = false;
+    while (getline(&line, &cap, fp) > 0) {
+        char *saveptr = nullptr;
+        char *field = strtok_r(line, " ", &saveptr);  // mount ID
+        if (field == nullptr) continue;
+        field = strtok_r(nullptr, " ", &saveptr);  // parent ID
+        if (field == nullptr) continue;
+        field = strtok_r(nullptr, " ", &saveptr);  // major:minor
+        if (field == nullptr) continue;
+        char *mount_root = strtok_r(nullptr, " ", &saveptr);
+        char *current_mountpoint = strtok_r(nullptr, " ", &saveptr);
+        if (mount_root != nullptr && current_mountpoint != nullptr &&
+            mountpoint == current_mountpoint) {
+            *root = mount_root;
+            found = true;
+            break;
+        }
+    }
     free(line);
     fclose(fp);
     return found;
@@ -1464,6 +1494,15 @@ TEST(MountReconfigure, BoundNamespaceSurvivesSourceTaskExit) {
     struct stat original_stat {};
     ASSERT_EQ(0, fstat(cleanup.original_fd, &original_stat)) << strerror(errno);
 
+    char proc_fd[64];
+    ASSERT_GT(snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", cleanup.original_fd), 0);
+    char namespace_identity[128] = {};
+    const ssize_t identity_len =
+        readlink(proc_fd, namespace_identity, sizeof(namespace_identity) - 1);
+    ASSERT_GT(identity_len, 0) << strerror(errno);
+    namespace_identity[identity_len] = '\0';
+    EXPECT_EQ("uts:[" + std::to_string(original_stat.st_ino) + "]", namespace_identity);
+
     int result_pipe[2];
     ASSERT_EQ(0, pipe2(result_pipe, O_CLOEXEC)) << strerror(errno);
     pid_t child = fork();
@@ -1512,9 +1551,18 @@ TEST(MountReconfigure, BoundNamespaceSurvivesSourceTaskExit) {
     ASSERT_EQ(0, stat(cleanup.target.c_str(), &persistent_stat)) << strerror(errno);
     EXPECT_EQ(source_ino, persistent_stat.st_ino);
     EXPECT_NE(original_stat.st_ino, persistent_stat.st_ino);
+    std::string mountinfo_root;
+    ASSERT_TRUE(mountinfo_root_for(cleanup.target, &mountinfo_root));
+    EXPECT_EQ("uts:[" + std::to_string(source_ino) + "]", mountinfo_root);
 
     cleanup.target_fd = open(cleanup.target.c_str(), O_RDONLY | O_CLOEXEC);
     ASSERT_GE(cleanup.target_fd, 0) << strerror(errno);
+    ASSERT_GT(snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", cleanup.target_fd), 0);
+    char bound_path[PATH_MAX] = {};
+    const ssize_t bound_path_len = readlink(proc_fd, bound_path, sizeof(bound_path) - 1);
+    ASSERT_GT(bound_path_len, 0) << strerror(errno);
+    bound_path[bound_path_len] = '\0';
+    EXPECT_EQ(cleanup.target, bound_path);
     ASSERT_EQ(0, setns(cleanup.target_fd, CLONE_NEWUTS)) << strerror(errno);
     cleanup.switched = true;
 

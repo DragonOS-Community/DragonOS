@@ -323,7 +323,12 @@ pub enum SpecialNodeData {
     ///
     /// `MountFSInode` consumes this variant and wraps the raw target in an
     /// anonymous dentry. Raw filesystem walks follow it like `Reference`.
-    MountProjectedReference(Arc<dyn IndexNode>),
+    MountProjectedReference {
+        target: Arc<dyn IndexNode>,
+        /// Stable identity rendered by `/proc/<pid>/fd/<fd>` for the
+        /// anonymous target (for example, `uts:[4026531838]`).
+        dname: utils::DName,
+    },
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -1775,9 +1780,10 @@ impl dyn IndexNode {
                 // 但它们有一个 special_node 指向真实的 inode
                 let magic_target = match inode.special_node() {
                     Some(SpecialNodeData::Reference(target_inode))
-                    | Some(SpecialNodeData::MountProjectedReference(target_inode)) => {
-                        Some(target_inode)
-                    }
+                    | Some(SpecialNodeData::MountProjectedReference {
+                        target: target_inode,
+                        ..
+                    }) => Some(target_inode),
                     _ => None,
                 };
                 if let Some(target_inode) = magic_target {

@@ -10,6 +10,7 @@ use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicU32;
 use napi_state::CompleteState;
+pub(crate) use napi_state::ScheduleState;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -155,6 +156,10 @@ fn net_rx_action() {
             let budget = core::cmp::min(napi.weight, packets_left);
             polls_left -= 1;
 
+            if napi_is_disabled(&napi) {
+                continue;
+            }
+
             let Some((iface, result)) = napi.poll(budget) else {
                 // A registered NAPI must not outlive its interface. Clear the state to avoid
                 // retaining an owner forever; device teardown is responsible for stopping DMA.
@@ -214,11 +219,14 @@ pub(crate) fn napi_disable(napi: &NapiStruct) {
     napi_state::disable(&napi.state);
 }
 
-pub(crate) fn napi_schedule_prep(napi: &NapiStruct) -> bool {
+pub(crate) fn napi_schedule_prep(napi: &NapiStruct) -> ScheduleState {
     napi_state::schedule_prep(&napi.state)
 }
 
 pub(crate) fn __napi_schedule(napi: Arc<NapiStruct>) {
+    if napi_is_disabled(&napi) {
+        return;
+    }
     debug_assert_ne!(
         napi.state.load(core::sync::atomic::Ordering::Relaxed) & napi_state::SCHED,
         0
@@ -231,10 +239,24 @@ pub(crate) fn __napi_schedule(napi: Arc<NapiStruct>) {
     GLOBAL_NAPI_MANAGER.wakeup();
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NapiScheduleResult {
+    Accepted,
+    Disabled,
+    Detached,
+}
+
+#[inline]
+pub fn napi_is_disabled(napi: &NapiStruct) -> bool {
+    napi.state.load(core::sync::atomic::Ordering::Acquire) & napi_state::DISABLE != 0
+}
+
 /// Acquire a NAPI owner, let the device mask callbacks, then publish it once.
-pub fn napi_schedule(napi: Arc<NapiStruct>) {
-    if !napi_schedule_prep(&napi) {
-        return;
+pub fn napi_schedule(napi: Arc<NapiStruct>) -> NapiScheduleResult {
+    match napi_schedule_prep(&napi) {
+        ScheduleState::Disabled => return NapiScheduleResult::Disabled,
+        ScheduleState::Missed => return NapiScheduleResult::Accepted,
+        ScheduleState::Acquired => {}
     }
 
     let Some(iface) = napi.net_device.upgrade() else {
@@ -243,10 +265,14 @@ pub fn napi_schedule(napi: Arc<NapiStruct>) {
             napi.napi_id
         );
         napi_disable(&napi);
-        return;
+        return NapiScheduleResult::Detached;
     };
     iface.napi_poll_begin();
+    if napi_is_disabled(&napi) {
+        return NapiScheduleResult::Disabled;
+    }
     __napi_schedule(napi);
+    NapiScheduleResult::Accepted
 }
 
 pub struct NapiManager {

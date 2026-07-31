@@ -1,8 +1,10 @@
 use crate::{
     driver::net::{
+        napi::napi_schedule,
         types::{InterfaceFlags, InterfaceType},
         Iface, Operstate,
     },
+    libs::mutex::Mutex,
     net::socket::{
         netlink::{
             message::segment::{
@@ -31,6 +33,16 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::num::NonZero;
 use system_error::SystemError;
+
+lazy_static! {
+    /// Serialize RTM_SETLINK transactions through flag publication, operstate,
+    /// timer rearm, rename/MTU updates, and notification.
+    ///
+    /// Linux provides this boundary with RTNL. DragonOS does not yet expose a
+    /// general RTNL lock, so link mutation owns the smallest equivalent
+    /// serialization point here.
+    static ref RTNL_LINK_LOCK: Mutex<()> = Mutex::new(());
+}
 
 pub(super) fn do_get_link(
     request_segment: &LinkSegment,
@@ -196,6 +208,7 @@ pub(super) fn do_set_link(
     request_segment: &LinkSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
+    let _rtnl_guard = RTNL_LINK_LOCK.lock();
     let iface = find_iface_for_setlink(request_segment, netns.clone())?;
     let updates = validate_setlink_request(request_segment, iface.as_ref())?;
 
@@ -211,17 +224,30 @@ pub(super) fn do_set_link(
 
     let change_mask = InterfaceFlags::from_bits_truncate(request_segment.body().change.bits());
     let requested_flags = InterfaceFlags::from_bits_truncate(request_segment.body().flags.bits());
-    let new_flags = iface
+    let (old_flags, new_flags) = iface
         .common()
         .update_configured_flags(requested_flags, change_mask)?;
 
     if change_mask.contains(InterfaceFlags::UP) {
-        let operstate = if new_flags.contains(InterfaceFlags::UP) {
+        let was_up = old_flags.contains(InterfaceFlags::UP);
+        let is_up = new_flags.contains(InterfaceFlags::UP);
+        let operstate = if is_up {
             Operstate::IF_OPER_UP
         } else {
             Operstate::IF_OPER_DOWN
         };
         iface.set_operstate(operstate);
+
+        if was_up != is_up {
+            if is_up {
+                if let Some(napi) = iface.napi_struct() {
+                    napi_schedule(napi);
+                } else {
+                    netns.wakeup_poll_thread();
+                }
+            }
+            netns.notify_deadline_changed();
+        }
     }
 
     if let Some(name) = updates.name {

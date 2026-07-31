@@ -546,8 +546,9 @@ pub(super) enum MetadataMutationMode {
 /// Non-blocking gate separating legacy direct writers from journal snapshots.
 ///
 /// The top bit denotes an exclusive transactional owner; the remaining bits
-/// count direct writers.  Acquisition never waits for an existing owner, which
-/// is essential because guards intentionally span block-device I/O.
+/// count direct writers. Acquisition is lock-free rather than per-caller
+/// wait-free: it never sleeps or waits for an incompatible owner, which is
+/// essential because guards intentionally span block-device I/O.
 pub trait MetadataMutationWaker: Send + Sync {
     /// Wake every upper-layer waiter which may have observed the previous
     /// metadata-mutation generation.
@@ -631,6 +632,12 @@ impl MetadataMutationGate {
                 // Retry only a compatible direct-count collision. Observing an
                 // exclusive owner is rejected at the top of the next iteration;
                 // no acquisition waits for an I/O-spanning owner to depart.
+                //
+                // Do not turn a retry limit into EAGAIN: generation advances
+                // only when the last direct owner exits, so compatible count
+                // churn has no matching progress event for an upper-layer
+                // waiter. Such a rejection could strand an otherwise
+                // compatible caller until the whole direct cohort drains.
                 Err(observed) => state = observed,
             }
         }

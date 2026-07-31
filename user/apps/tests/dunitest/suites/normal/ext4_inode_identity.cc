@@ -644,6 +644,93 @@ TEST(Ext4InodeIdentity, DelallocQueuePublishesAndRecoversInOrder) {
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
+TEST(Ext4InodeIdentity, ConcurrentDelallocInodesCompleteAndRecover) {
+    constexpr int kWriters = 4;
+    constexpr size_t kPageSize = 4096;
+    constexpr size_t kPagesPerWriter = 128;
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<int> first_error{0};
+    std::thread writers[kWriters];
+    for (int writer = 0; writer < kWriters; ++writer) {
+        writers[writer] = std::thread([&, writer] {
+            const std::string path =
+                fs.mount_point() + "/concurrent_delalloc_" + std::to_string(writer);
+            int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+            if (fd < 0) {
+                int expected = 0;
+                first_error.compare_exchange_strong(expected, errno);
+                return;
+            }
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            char page[kPageSize];
+            for (size_t index = 0; index < kPagesPerWriter; ++index) {
+                memset(page, 1 + (writer * 37 + index) % 251, sizeof(page));
+                size_t written = 0;
+                while (written != sizeof(page)) {
+                    ssize_t count = write(fd, page + written, sizeof(page) - written);
+                    if (count < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (count <= 0) {
+                        int expected = 0;
+                        first_error.compare_exchange_strong(
+                            expected, count < 0 ? errno : EIO);
+                        close(fd);
+                        return;
+                    }
+                    written += static_cast<size_t>(count);
+                }
+            }
+            if (fsync(fd) != 0) {
+                int expected = 0;
+                first_error.compare_exchange_strong(expected, errno);
+            }
+            close(fd);
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) != kWriters
+           && first_error.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    ASSERT_EQ(0, first_error.load()) << strerror(first_error.load());
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    std::string page(kPageSize, '\0');
+    for (int writer = 0; writer < kWriters; ++writer) {
+        const std::string path =
+            fs.mount_point() + "/concurrent_delalloc_" + std::to_string(writer);
+        int fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        for (size_t index = 0; index < kPagesPerWriter; ++index) {
+            ASSERT_EQ(static_cast<ssize_t>(page.size()),
+                      pread(fd, page.data(), page.size(), index * kPageSize))
+                << path << " page " << index << ": " << strerror(errno);
+            const char expected = 1 + (writer * 37 + index) % 251;
+            ASSERT_TRUE(std::all_of(page.begin(), page.end(),
+                                    [expected](char byte) {
+                                        return byte == expected;
+                                    }))
+                << path << " page " << index;
+        }
+        ASSERT_EQ(0, close(fd)) << strerror(errno);
+    }
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
 TEST(Ext4InodeIdentity, DelallocNonalignedThreePageAndSparseForwardAreZeroSafe) {
     constexpr size_t kPageSize = 4096;
     LoopExt4 fs;

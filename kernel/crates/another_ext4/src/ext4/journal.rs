@@ -206,11 +206,12 @@ impl Ext4 {
         &self,
         credits: usize,
     ) -> Result<journal_transaction::Transaction<'_>> {
-        match &self.metadata_mode {
+        let result = match &self.metadata_mode {
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Journal(core) => core.start(credits),
             MetadataMutationMode::Direct(core) => core.start(credits),
-        }
+        };
+        self.normalize_transaction_start(result)
     }
 
     pub(super) fn transaction_credits_fit(&self, credits: usize) -> Result<bool> {
@@ -225,10 +226,32 @@ impl Ext4 {
         &self,
         credits: usize,
     ) -> Result<journal_transaction::Transaction<'_>> {
-        match &self.metadata_mode {
+        let result = match &self.metadata_mode {
             MetadataMutationMode::Direct(core) => core.start_direct_range(credits),
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Journal(_) => Err(Ext4Error::new(ErrCode::ENOTSUP)),
+        };
+        self.normalize_transaction_start(result)
+    }
+
+    fn normalize_transaction_start<'a>(
+        &self,
+        result: Result<journal_transaction::Transaction<'a>>,
+    ) -> Result<journal_transaction::Transaction<'a>> {
+        match result {
+            // Every production transaction start is protected either by the
+            // exclusive metadata gate or by unpublished single-threaded mount
+            // recovery. A busy raw core therefore means the ownership
+            // invariant is already broken; retrying it through the upper
+            // generation bridge would create a self-waking hot loop.
+            Err(error) if error.code() == ErrCode::EAGAIN => {
+                log::error!(
+                    "ext4 transaction core is busy behind the metadata gate; fail-stopping"
+                );
+                self.poison(ErrCode::EIO);
+                Err(Ext4Error::new(ErrCode::EIO))
+            }
+            result => result,
         }
     }
 

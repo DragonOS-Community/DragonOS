@@ -166,6 +166,25 @@ pub(super) struct Ext4InodeTombstone {
     resolved: bool,
 }
 
+#[derive(Debug)]
+struct Ext4MetadataMutationWait {
+    wait_queue: WaitQueue,
+}
+
+impl Ext4MetadataMutationWait {
+    fn new() -> Self {
+        Self {
+            wait_queue: WaitQueue::default(),
+        }
+    }
+}
+
+impl another_ext4::MetadataMutationWaker for Ext4MetadataMutationWait {
+    fn wake_all(&self) {
+        self.wait_queue.wake_all();
+    }
+}
+
 pub struct Ext4FileSystem {
     /// 对应 another_ext4 中的实际文件系统
     pub(super) fs: another_ext4::Ext4,
@@ -194,6 +213,24 @@ pub struct Ext4FileSystem {
     delalloc_inodes: Mutex<BTreeMap<u32, Arc<LockedExt4Inode>>>,
     delalloc_wait: WaitQueue,
     delalloc_admission_open: AtomicBool,
+
+    /// Serializes only delayed-allocation transaction submission for this
+    /// mount. The lower transactional metadata gate has filesystem scope, so
+    /// per-inode producers must wait in the same ownership domain instead of
+    /// repeatedly restoring and reclaiming their PageCache batch on EAGAIN.
+    ///
+    /// Lock order:
+    /// delalloc_submit_lock -> inode.metadata_commit_lock
+    ///     -> inode.delalloc_pool -> lower transactional gate.
+    ///
+    /// PageCache, delalloc registry, and admission guards must never be held
+    /// while acquiring this sleeping lock.
+    pub(super) delalloc_submit_lock: Mutex<()>,
+
+    /// Scheduler-specific side of another_ext4's metadata-gate progress
+    /// bridge. It owns only a wait queue and deliberately has no filesystem
+    /// back-reference, so the lower install-once Arc cannot form a cycle.
+    metadata_mutation_wait: Arc<Ext4MetadataMutationWait>,
 
     /// Allocations hold a read guard through canonical publication. Physical reclaim
     /// holds a write guard through tombstone completion so an inode number cannot be
@@ -441,6 +478,41 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
+    pub(super) fn wait_metadata_mutation_progress(&self, observed: u64) -> Result<(), SystemError> {
+        if self.fs.metadata_mutations_terminal() || self.lifecycle_error.lock().is_some() {
+            return Err(SystemError::EIO);
+        }
+        if self.fs.metadata_mutation_generation() != observed {
+            return Ok(());
+        }
+
+        self.metadata_mutation_wait.wait_queue.wait_until_io(|| {
+            if self.fs.metadata_mutations_terminal() || self.lifecycle_error.lock().is_some() {
+                Some(Err(SystemError::EIO))
+            } else if self.fs.metadata_mutation_generation() != observed {
+                Some(Ok(()))
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(super) fn retry_metadata_contention<T>(
+        &self,
+        mut operation: impl FnMut() -> core::result::Result<T, another_ext4::Ext4Error>,
+    ) -> Result<T, SystemError> {
+        loop {
+            let observed = self.fs.metadata_mutation_generation();
+            match operation() {
+                Ok(value) => return Ok(value),
+                Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
+                    self.wait_metadata_mutation_progress(observed)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     pub(super) fn delalloc_admission_open(&self) -> bool {
         self.delalloc_mapper_authority.is_some()
             && self.delalloc_admission_open.load(Ordering::Acquire)
@@ -575,6 +647,10 @@ impl Ext4FileSystem {
         self.fs.fail_stop_mutations();
         *self.lifecycle_error.lock() = Some(SystemError::EIO);
         self.close_delalloc_admission();
+        // lower fail-stop already broadcasts its generation. This second
+        // broadcast closes the upper lifecycle transition as well and is
+        // harmless because every waiter rechecks the predicate.
+        self.metadata_mutation_wait.wait_queue.wake_all();
     }
 
     pub(super) fn get_or_create_inode(
@@ -1084,7 +1160,7 @@ impl Ext4FileSystem {
                             } else {
                                 None
                             };
-                            LockedExt4Inode::retry_metadata_contention(|| {
+                            fs.retry_metadata_contention(|| {
                                 fs.fs
                                     .commit_inode_metadata(inode_num, size, atime, mtime, ctime)
                             })
@@ -1235,6 +1311,8 @@ impl Ext4FileSystem {
             Ok::<_, SystemError>((fs, root_attr))
         })();
         let (fs, root_attr) = prospective?;
+        let metadata_mutation_wait = Arc::new(Ext4MetadataMutationWait::new());
+        fs.install_metadata_mutation_waker(metadata_mutation_wait.clone())?;
         let delalloc_mapper_authority = if !delalloc_unique_writable {
             None
         } else {
@@ -1272,6 +1350,8 @@ impl Ext4FileSystem {
             delalloc_inodes: Mutex::new(BTreeMap::new()),
             delalloc_wait: WaitQueue::default(),
             delalloc_admission_open: AtomicBool::new(true),
+            delalloc_submit_lock: Mutex::new(()),
+            metadata_mutation_wait,
             inode_reuse_barrier: RwSem::new(()),
             lifecycle_error: Mutex::new(None),
             quarantined_reclaims: SpinLock::new(Vec::new()),

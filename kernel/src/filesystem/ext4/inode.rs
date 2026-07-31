@@ -28,8 +28,6 @@ use crate::{
     },
     mm::MemoryManagementArch,
     process::{ProcessManager, RawPid},
-    sched::sched_yield,
-    time::sleep::nanosleep,
     time::{PosixTimeSpec, TimeArch},
 };
 use alloc::{
@@ -905,9 +903,6 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
         };
         let outcome =
             (|| -> Result<another_ext4::DelallocAppendBlockSubmitOutcome, SystemError> {
-                let _metadata_commit = self.inode.metadata_commit_lock.lock();
-                let mut pool_slot = self.inode.delalloc_pool.lock();
-                let pool = pool_slot.as_mut().ok_or(SystemError::EIO)?;
                 let mut publications = Vec::new();
                 let mut reservations = Vec::new();
                 publications
@@ -948,15 +943,41 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
                     });
                     reservations.push(&mut entry.pending.reservation);
                 }
-                let outcome = self
-                    .fs
-                    .fs
-                    .submit_delalloc_append_batch_authorized_with_pool(
-                        authority,
-                        &mut reservations,
-                        &publications,
-                        pool,
-                    );
+
+                // All fallible descriptor preparation is complete before this
+                // mount-scoped serialization point. The lower transaction
+                // gate has filesystem scope; waiting here aligns the upper
+                // ownership domain without exposing ext4 policy to PageCache.
+                let _delalloc_submit = self.fs.delalloc_submit_lock.lock();
+                let _metadata_commit = self.inode.metadata_commit_lock.lock();
+                let mut pool_slot = self.inode.delalloc_pool.lock();
+                let pool = pool_slot.as_mut().ok_or(SystemError::EIO)?;
+
+                let outcome = loop {
+                    let observed = self.fs.fs.metadata_mutation_generation();
+                    let outcome = self
+                        .fs
+                        .fs
+                        .submit_delalloc_append_batch_authorized_with_pool(
+                            authority,
+                            &mut reservations,
+                            &publications,
+                            pool,
+                        );
+                    if matches!(
+                        outcome,
+                        another_ext4::DelallocAppendBlockSubmitOutcome::RetryableNotPublished(
+                            another_ext4::ErrCode::EAGAIN
+                        )
+                    ) {
+                        // Preserve the exact claimed pages, reservations and
+                        // pool while sleeping on the filesystem-wide owner
+                        // which can actually make this transaction runnable.
+                        self.fs.wait_metadata_mutation_progress(observed)?;
+                        continue;
+                    }
+                    break outcome;
+                };
                 if matches!(
                     outcome,
                     another_ext4::DelallocAppendBlockSubmitOutcome::Completed
@@ -1341,7 +1362,7 @@ impl IndexNode for LockedExt4Inode {
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
 
         let attr = if file_type == vfs::FileType::Dir {
-            Self::retry_metadata_contention(|| {
+            fs.retry_metadata_contention(|| {
                 ext4.mkdir_with_owner_and_attr(
                     guard.inner_inode_num,
                     name,
@@ -1353,7 +1374,7 @@ impl IndexNode for LockedExt4Inode {
                 )
             })?
         } else {
-            Self::retry_metadata_contention(|| {
+            fs.retry_metadata_contention(|| {
                 ext4.create_with_owner_and_attr(
                     guard.inner_inode_num,
                     name,
@@ -1429,16 +1450,12 @@ impl IndexNode for LockedExt4Inode {
             let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
-        let file_type = Self::retry_metadata_contention(|| fs.fs.getattr(inode_num))?.ftype;
+        let file_type = fs.fs.getattr(inode_num)?.ftype;
         match file_type {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            FileType::RegularFile => {
-                Self::retry_metadata_contention(|| fs.fs.read(inode_num, offset, buf))
-            }
-            FileType::SymLink => {
-                Self::retry_metadata_contention(|| fs.fs.readlink(inode_num, offset, buf))
-            }
+            FileType::RegularFile => fs.fs.read(inode_num, offset, buf).map_err(Into::into),
+            FileType::SymLink => fs.fs.readlink(inode_num, offset, buf).map_err(Into::into),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -1540,8 +1557,7 @@ impl IndexNode for LockedExt4Inode {
                 match cached_size {
                     Some(size) => size,
                     None => {
-                        let size =
-                            Self::retry_metadata_contention(|| fs.fs.getattr(inode_num))?.size;
+                        let size = fs.fs.getattr(inode_num)?.size;
                         self.inner.lock().cached_file_size = Some(size);
                         size
                     }
@@ -1583,7 +1599,7 @@ impl IndexNode for LockedExt4Inode {
                 .fs
                 .prepare_stats_enabled()
                 .then(CurrentTimeArch::get_cycles);
-            let prepare_result = Self::retry_metadata_contention(|| {
+            let prepare_result = fs.retry_metadata_contention(|| {
                 fs.fs.prepare_buffered_write(
                     inode_num,
                     alloc_start,
@@ -1638,7 +1654,7 @@ impl IndexNode for LockedExt4Inode {
             let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
-        let file_type = Self::retry_metadata_contention(|| fs.fs.getattr(inode_num))?.ftype;
+        let file_type = fs.fs.getattr(inode_num)?.ftype;
         match file_type {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
@@ -1648,7 +1664,7 @@ impl IndexNode for LockedExt4Inode {
             // snapshot, causing setattr to re-allocate blocks endlessly until
             // the extent tree overflows (entries > max_entries → EIO).
             FileType::RegularFile => {
-                Self::retry_metadata_contention(|| fs.fs.write_data_only(inode_num, offset, buf))
+                fs.retry_metadata_contention(|| fs.fs.write_data_only(inode_num, offset, buf))
             }
             _ => Err(SystemError::EINVAL),
         }
@@ -1756,7 +1772,7 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EEXIST);
         }
 
-        Self::retry_metadata_contention(|| ext4.link(other_inode_num, inode_num, name))?;
+        fs.retry_metadata_contention(|| ext4.link(other_inode_num, inode_num, name))?;
         if other_attr.links == 0 {
             // The orphan-del transaction made this inode live again. Discard
             // the one-shot capability published by its previous final unlink
@@ -1799,7 +1815,7 @@ impl IndexNode for LockedExt4Inode {
             Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             Err(error) => return Err(error.into()),
         }
-        let reclaim = Self::retry_metadata_contention(|| ext4.unlink(inode_num, name))?;
+        let reclaim = fs.retry_metadata_contention(|| ext4.unlink(inode_num, name))?;
         target.handoff_namespace_reclaim(reclaim)?;
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
@@ -1973,7 +1989,7 @@ impl IndexNode for LockedExt4Inode {
             .checked_add(1)
             .ok_or(SystemError::EOVERFLOW)?;
         let ext4 = &fs.fs;
-        Self::retry_metadata_contention(|| {
+        fs.retry_metadata_contention(|| {
             ext4.setattr(
                 inode_num,
                 another_ext4::SetAttr {
@@ -2076,7 +2092,7 @@ impl IndexNode for LockedExt4Inode {
             })
             .transpose()?;
 
-        Self::retry_metadata_contention(|| {
+        fs.retry_metadata_contention(|| {
             fs.fs.setattr(
                 inode_num,
                 another_ext4::SetAttr {
@@ -2167,7 +2183,7 @@ impl IndexNode for LockedExt4Inode {
             let _io_guard = self.io_lock.lock();
             let ext4 = &fs.fs;
             // 仅调整文件大小，其他属性保持不变
-            Self::retry_metadata_contention(|| {
+            fs.retry_metadata_contention(|| {
                 ext4.setattr(
                     inode_num,
                     another_ext4::SetAttr {
@@ -2300,7 +2316,7 @@ impl IndexNode for LockedExt4Inode {
             Ok(_) => return Err(SystemError::ENOTEMPTY),
             Err(error) => return Err(error.into()),
         }
-        let reclaim = Self::retry_metadata_contention(|| concret_fs.rmdir(inode_num, name))?;
+        let reclaim = fs.retry_metadata_contention(|| concret_fs.rmdir(inode_num, name))?;
         target.handoff_namespace_reclaim(reclaim)?;
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
@@ -2315,7 +2331,8 @@ impl IndexNode for LockedExt4Inode {
     fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let guard = self.inner.lock();
-        let ext4 = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
         if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
@@ -2345,14 +2362,15 @@ impl IndexNode for LockedExt4Inode {
     fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let guard = self.inner.lock();
-        let ext4 = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
         if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
             return Err(SystemError::EPERM);
         }
 
-        Self::retry_metadata_contention(|| {
+        fs.retry_metadata_contention(|| {
             ext4.setxattr_with_flags(
                 inode_num,
                 name,
@@ -2400,14 +2418,15 @@ impl IndexNode for LockedExt4Inode {
     fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let guard = self.inner.lock();
-        let ext4 = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
         if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
             return Err(SystemError::EPERM);
         }
 
-        Self::retry_metadata_contention(|| ext4.removexattr(inode_num, name))?;
+        fs.retry_metadata_contention(|| ext4.removexattr(inode_num, name))?;
         Ok(0)
     }
 
@@ -2449,7 +2468,7 @@ impl IndexNode for LockedExt4Inode {
             vfs::FileType::CharDevice | vfs::FileType::BlockDevice
         ) {
             // Character/block device: use mknod to store device number in i_block
-            Self::retry_metadata_contention(|| {
+            fs.retry_metadata_contention(|| {
                 ext4.mknod_with_owner_and_attr(
                     inode_num,
                     filename,
@@ -2464,7 +2483,7 @@ impl IndexNode for LockedExt4Inode {
             })?
         } else {
             // FIFO, Socket, etc.: use regular create (no device number needed)
-            Self::retry_metadata_contention(|| {
+            fs.retry_metadata_contention(|| {
                 ext4.create_with_owner_and_attr(
                     inode_num,
                     filename,
@@ -2559,7 +2578,7 @@ impl IndexNode for LockedExt4Inode {
         // RENAME_EXCHANGE: 原子交换两个文件/目录
         if flags.contains(RenameFlags::EXCHANGE) {
             // VFS 层已验证目标存在，直接调用 exchange
-            Self::retry_metadata_contention(|| {
+            ext4_fs.retry_metadata_contention(|| {
                 ext4.rename_exchange(src_inode_num, old_name, target_inode_num, new_name)
             })?;
 
@@ -2633,7 +2652,7 @@ impl IndexNode for LockedExt4Inode {
                     continue;
                 }
                 let allocation = ext4_fs.begin_allocation()?;
-                let whiteout_attr = Self::retry_metadata_contention(|| {
+                let whiteout_attr = ext4_fs.retry_metadata_contention(|| {
                     ext4.mknod_with_owner_and_attr(
                         src_inode_num,
                         &candidate,
@@ -2657,16 +2676,15 @@ impl IndexNode for LockedExt4Inode {
                     Err(error) => {
                         drop(allocation);
                         let _reclaim = ext4_fs.begin_reclaim();
-                        let cleanup = Self::retry_metadata_contention(|| {
-                            ext4.unlink(src_inode_num, &candidate)
-                        })
-                        .and_then(|handle| match handle {
-                            Some(handle) => {
-                                Self::reclaim_with_metadata_contention_retry(ext4, handle)
-                                    .map_err(|failure| SystemError::from(failure.0))
-                            }
-                            None => Ok(()),
-                        });
+                        let cleanup = ext4_fs
+                            .retry_metadata_contention(|| ext4.unlink(src_inode_num, &candidate))
+                            .and_then(|handle| match handle {
+                                Some(handle) => {
+                                    Self::reclaim_with_metadata_contention_retry(&ext4_fs, handle)
+                                        .map_err(|failure| SystemError::from(failure.0))
+                                }
+                                None => Ok(()),
+                            });
                         if cleanup.is_err() {
                             ext4_fs.fail_stop_lifecycle();
                             return Err(SystemError::EIO);
@@ -2681,7 +2699,7 @@ impl IndexNode for LockedExt4Inode {
                 return Err(SystemError::EEXIST);
             }
 
-            if let Err(err) = Self::retry_metadata_contention(|| {
+            if let Err(err) = ext4_fs.retry_metadata_contention(|| {
                 ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name)
             }) {
                 Self::reclaim_temporary_inode(
@@ -2692,12 +2710,12 @@ impl IndexNode for LockedExt4Inode {
                 )?;
                 return Err(err);
             }
-            let rename_handle = match Self::retry_metadata_contention(|| {
+            let rename_handle = match ext4_fs.retry_metadata_contention(|| {
                 ext4.rename(src_inode_num, &temp_name, target_inode_num, new_name)
             }) {
                 Ok(handle) => handle,
                 Err(rename_error) => {
-                    let rollback = Self::retry_metadata_contention(|| {
+                    let rollback = ext4_fs.retry_metadata_contention(|| {
                         ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name)
                     });
                     if rollback.is_err() {
@@ -2730,13 +2748,13 @@ impl IndexNode for LockedExt4Inode {
             resulting_whiteout = whiteout_inode;
         } else {
             if let Some(dst_inode) = &dst_inode {
-                let reclaim = Self::retry_metadata_contention(|| {
+                let reclaim = ext4_fs.retry_metadata_contention(|| {
                     ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
                 })?;
                 dst_inode.handoff_namespace_reclaim(reclaim)?;
             } else {
                 // ext4 library now correctly handles atomic replace
-                let reclaim = Self::retry_metadata_contention(|| {
+                let reclaim = ext4_fs.retry_metadata_contention(|| {
                     ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
                 })?;
                 if let Some(handle) = reclaim {
@@ -2935,8 +2953,6 @@ impl LockedExt4Inode {
         let page_start = offset & !(MMArch::PAGE_SIZE - 1);
         let new_eof = offset.checked_add(buf.len()).ok_or(SystemError::EFBIG)? as u64;
         let write_time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or(0);
-        let mut contention_attempt = 0usize;
-
         'admission: loop {
             let _invalidate = page_cache.invalidate_write();
             let _size = self.size_lock.read();
@@ -2978,7 +2994,8 @@ impl LockedExt4Inode {
                     drop(_io);
                     drop(_size);
                     drop(_invalidate);
-                    match progress.wait_for_progress_interruptible()? {
+                    let wait_outcome = progress.wait_for_progress_interruptible();
+                    match wait_outcome? {
                         PageCacheWritebackProgressOutcome::Failed(error) => return Err(error),
                         PageCacheWritebackProgressOutcome::Progress
                         | PageCacheWritebackProgressOutcome::Cancelled => {
@@ -3039,7 +3056,7 @@ impl LockedExt4Inode {
                 // this is internal metadata contention, not userspace
                 // nonblocking I/O, so keep the write admission pending until
                 // the owner releases the gate.
-                let pool = Self::retry_metadata_contention(|| {
+                let pool = fs.retry_metadata_contention(|| {
                     fs.fs
                         .create_delalloc_extent_node_pool_authorized(authority, inode_num)
                 })?;
@@ -3048,6 +3065,7 @@ impl LockedExt4Inode {
                     *slot = Some(pool);
                 }
             }
+            let observed = fs.fs.metadata_mutation_generation();
             let reservation_result = {
                 let mut slot = self.delalloc_pool.lock();
                 let pool = slot.as_mut().ok_or(SystemError::EIO)?;
@@ -3065,8 +3083,7 @@ impl LockedExt4Inode {
                     drop(_io);
                     drop(_size);
                     drop(_invalidate);
-                    contention_attempt = contention_attempt.saturating_add(1);
-                    Self::metadata_contention_backoff(contention_attempt);
+                    fs.wait_metadata_mutation_progress(observed)?;
                     continue 'admission;
                 }
                 Err(error)
@@ -3503,40 +3520,13 @@ impl LockedExt4Inode {
         }
     }
 
-    fn metadata_contention_backoff(attempt: usize) {
-        const YIELDS_BEFORE_SLEEP: usize = 64;
-        if attempt.is_multiple_of(YIELDS_BEFORE_SLEEP) {
-            // Keep the current eviction epoch pending, but avoid a workqueue
-            // hot loop while an I/O-spanning metadata owner is asleep.
-            let _ = nanosleep(PosixTimeSpec::new(0, 1_000_000));
-        } else {
-            sched_yield();
-        }
-    }
-
-    pub(super) fn retry_metadata_contention<T>(
-        mut operation: impl FnMut() -> core::result::Result<T, another_ext4::Ext4Error>,
-    ) -> Result<T, SystemError> {
-        let mut attempt = 1usize;
-        loop {
-            match operation() {
-                Ok(value) => return Ok(value),
-                Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
-                    Self::metadata_contention_backoff(attempt);
-                    attempt = attempt.saturating_add(1);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-
     fn reclaim_with_metadata_contention_retry(
-        fs: &another_ext4::Ext4,
+        fs: &Arc<Ext4FileSystem>,
         mut handle: another_ext4::InodeReclaimHandle,
     ) -> Result<(), (another_ext4::Ext4Error, another_ext4::InodeReclaimHandle)> {
-        let mut attempt = 1usize;
         loop {
-            match fs.reclaim_inode(handle) {
+            let observed = fs.fs.metadata_mutation_generation();
+            match fs.fs.reclaim_inode(handle) {
                 Ok(()) => return Ok(()),
                 Err(failure) => {
                     let (error, returned_handle) = failure.into_parts();
@@ -3544,8 +3534,12 @@ impl LockedExt4Inode {
                         return Err((error, returned_handle));
                     }
                     handle = returned_handle;
-                    Self::metadata_contention_backoff(attempt);
-                    attempt = attempt.saturating_add(1);
+                    if fs.wait_metadata_mutation_progress(observed).is_err() {
+                        return Err((
+                            another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO),
+                            handle,
+                        ));
+                    }
                 }
             }
         }
@@ -3561,8 +3555,8 @@ impl LockedExt4Inode {
         let _link_mutation = lifecycle.lock_link_mutation();
         let tombstone = fs.begin_freeing(&inode)?;
         let _reuse = fs.begin_reclaim();
-        let mut attempt = 1usize;
         let handle = loop {
+            let observed = fs.fs.metadata_mutation_generation();
             match fs.fs.unlink(parent_inode_num, name) {
                 Ok(Some(handle)) => break handle,
                 Ok(None) => {
@@ -3571,8 +3565,10 @@ impl LockedExt4Inode {
                     return Err(error);
                 }
                 Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
-                    Self::metadata_contention_backoff(attempt);
-                    attempt = attempt.saturating_add(1);
+                    if let Err(error) = fs.wait_metadata_mutation_progress(observed) {
+                        let _ = fs.poison_freeing(tombstone, error.clone());
+                        return Err(error);
+                    }
                 }
                 Err(error) => {
                     let error = SystemError::from(error);
@@ -3581,7 +3577,7 @@ impl LockedExt4Inode {
                 }
             }
         };
-        if let Err((error, handle)) = Self::reclaim_with_metadata_contention_retry(&fs.fs, handle) {
+        if let Err((error, handle)) = Self::reclaim_with_metadata_contention_retry(fs, handle) {
             *inode.pending_reclaim.lock() = Some(handle);
             let error = SystemError::from(error);
             let _ = fs.poison_freeing(tombstone, error.clone());
@@ -3980,7 +3976,7 @@ impl LockedExt4Inode {
                 return Err(error);
             }
         }
-        match Self::reclaim_with_metadata_contention_retry(&fs.fs, handle) {
+        match Self::reclaim_with_metadata_contention_retry(&fs, handle) {
             Ok(()) => {
                 fs.complete_freeing(tombstone)?;
                 Ok(())
@@ -4054,7 +4050,7 @@ impl LockedExt4Inode {
             .then_some(snapshot.cached_times.ctime);
 
         if size.is_some() || atime.is_some() || mtime.is_some() || ctime.is_some() {
-            Self::retry_metadata_contention(|| {
+            snapshot.fs.retry_metadata_contention(|| {
                 snapshot
                     .fs
                     .fs
@@ -4151,7 +4147,7 @@ impl LockedExt4Inode {
         } else {
             None
         };
-        Self::retry_metadata_contention(|| {
+        fs.retry_metadata_contention(|| {
             fs.fs
                 .commit_inode_metadata(inode_num, size, atime, mtime, ctime)
         })?;
@@ -4231,7 +4227,7 @@ impl LockedExt4Inode {
                     .ok_or(SystemError::EOVERFLOW)?,
             )
         };
-        Self::retry_metadata_contention(|| {
+        fs.retry_metadata_contention(|| {
             fs.fs.prepare_buffered_write(
                 inode_num,
                 page_start,
@@ -4317,20 +4313,6 @@ pub(crate) fn run_lifecycle_selftests() -> String {
     append(
         "poison_is_observable",
         lifecycle.begin_operation().err() == Some(SystemError::EIO),
-    );
-
-    let mut attempts = 0usize;
-    let retry_result = LockedExt4Inode::retry_metadata_contention(|| {
-        attempts += 1;
-        if attempts < 3 {
-            Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EAGAIN))
-        } else {
-            Ok(())
-        }
-    });
-    append(
-        "metadata_contention_is_internal",
-        retry_result.is_ok() && attempts == 3,
     );
 
     if failures == 0 {

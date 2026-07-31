@@ -4288,8 +4288,19 @@ impl Ext4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ext4::{MetadataMutationMode, MetadataMutationWaker};
     use crate::FileType;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct CountingMetadataWaker {
+        wakes: AtomicUsize,
+    }
+
+    impl MetadataMutationWaker for CountingMetadataWaker {
+        fn wake_all(&self) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn production_credit_bound_violation_is_a_terminal_contract_error() {
@@ -4565,6 +4576,10 @@ mod tests {
     #[test]
     fn metadata_mutation_barrier_separates_direct_and_transactional_writers() {
         let fs = make_test_fs(16);
+        let waker = Arc::new(CountingMetadataWaker {
+            wakes: AtomicUsize::new(0),
+        });
+        fs.install_metadata_mutation_waker(waker.clone()).unwrap();
 
         let direct = fs.lock_direct_metadata_mutation().unwrap();
         let second_direct = fs.lock_direct_metadata_mutation().unwrap();
@@ -4575,7 +4590,11 @@ mod tests {
             ErrCode::EAGAIN
         );
         drop(second_direct);
+        assert_eq!(fs.metadata_mutation_generation(), 0);
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 0);
         drop(direct);
+        assert_eq!(fs.metadata_mutation_generation(), 1);
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 1);
 
         let transaction = fs.lock_transactional_metadata_mutation().unwrap();
         assert_eq!(
@@ -4591,8 +4610,12 @@ mod tests {
             ErrCode::EAGAIN
         );
         drop(transaction);
+        assert_eq!(fs.metadata_mutation_generation(), 2);
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 2);
         drop(fs.lock_transactional_metadata_mutation().unwrap());
         drop(fs.lock_direct_metadata_mutation().unwrap());
+        assert_eq!(fs.metadata_mutation_generation(), 4);
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -4606,11 +4629,93 @@ mod tests {
             fs.lock_direct_metadata_mutation()
                 .expect_err("direct count must not enter the exclusive bit")
                 .code(),
-            ErrCode::EAGAIN
+            ErrCode::EIO
         );
         fs.metadata_mutation_barrier
             .state
             .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn metadata_mutation_generation_wrap_and_fail_stop_are_observable() {
+        let fs = make_test_fs(16);
+        let waker = Arc::new(CountingMetadataWaker {
+            wakes: AtomicUsize::new(0),
+        });
+        fs.install_metadata_mutation_waker(waker.clone()).unwrap();
+        fs.metadata_mutation_barrier
+            .generation
+            .store(u64::MAX, Ordering::Relaxed);
+
+        drop(fs.lock_transactional_metadata_mutation().unwrap());
+        assert_eq!(fs.metadata_mutation_generation(), 0);
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 1);
+
+        fs.fail_stop_mutations();
+        assert!(fs.metadata_mutations_terminal());
+        assert_eq!(fs.metadata_mutation_generation(), 1);
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 2);
+        fs.fail_stop_mutations();
+        assert_eq!(fs.metadata_mutation_generation(), 1);
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn metadata_mutation_waker_is_install_once() {
+        let fs = make_test_fs(16);
+        let first = Arc::new(CountingMetadataWaker {
+            wakes: AtomicUsize::new(0),
+        });
+        fs.install_metadata_mutation_waker(first.clone()).unwrap();
+        assert_eq!(
+            fs.install_metadata_mutation_waker(Arc::new(CountingMetadataWaker {
+                wakes: AtomicUsize::new(0),
+            }))
+            .unwrap_err()
+            .code(),
+            ErrCode::EINVAL
+        );
+        // Re-installing even the same object is a caller lifecycle error.
+        assert_eq!(
+            fs.install_metadata_mutation_waker(first)
+                .unwrap_err()
+                .code(),
+            ErrCode::EINVAL
+        );
+    }
+
+    #[test]
+    fn transaction_wrapper_fail_stops_raw_core_writer_collision() {
+        let fs = make_test_fs(16);
+        let MetadataMutationMode::Direct(core) = &fs.metadata_mode else {
+            panic!("fixture must use the direct transaction core");
+        };
+        let owner = core.start(1).unwrap();
+
+        let error = match fs.transaction_start(1) {
+            Err(error) => error,
+            Ok(_) => panic!("core-writer collision must fail-stop"),
+        };
+        assert_eq!(error.code(), ErrCode::EIO);
+        assert!(fs.metadata_mutations_terminal());
+        owner.abort();
+    }
+
+    #[test]
+    fn direct_range_wrapper_fail_stops_raw_core_writer_collision() {
+        let fs = make_test_fs(16);
+        let MetadataMutationMode::Direct(core) = &fs.metadata_mode else {
+            panic!("fixture must use the direct transaction core");
+        };
+        let owner = core.start(1).unwrap();
+
+        let error = match fs.transaction_start_direct_range(1) {
+            Err(error) => error,
+            Ok(_) => panic!("direct-range core-writer collision must fail-stop"),
+        };
+        assert_eq!(error.code(), ErrCode::EIO);
+        assert!(fs.metadata_mutations_terminal());
+        owner.abort();
     }
 
     #[test]

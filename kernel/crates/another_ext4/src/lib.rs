@@ -17,7 +17,7 @@ pub use error::{ErrCode, Ext4Error};
 pub use ext4::{
     DelallocAppendBlockPublication, DelallocAppendBlockReservation,
     DelallocAppendBlockSubmitOutcome, DelallocAppendMapperAuthority, DelallocExtentNodePool,
-    DelallocLease, Ext4, InodeOwner, SetAttr,
+    DelallocLease, Ext4, InodeOwner, MetadataMutationWaker, SetAttr,
 };
 // The bounded append mapper implementation is compiled in normal builds, but
 // its raw facade remains test-only until the DragonOS VFS can supply the

@@ -193,6 +193,12 @@ bitflags! {
         /// Process is waiting for an I/O operation to complete (used for iowait
         /// accounting).
         const IN_IOWAIT = 1 << 13;
+        /// uprobe XOL 单步窗口判别位（计划步骤 8，评审 F4）。
+        ///
+        /// 由用户态 #BP handler 在重定向 rip 到 XOL slot 前置位；`do_debug` 检查并
+        /// 清之以区分「XOL 单步完成的 #DB」与 ptrace/硬件断点 #DB。**仅作 #DB
+        /// 分发判别**，不参与 [`ProcessFlags::exit_to_user_mode_work`]（非延迟工作）。
+        const NEED_UPROBE = 1 << 14;
         /// PID links and visible-thread accounting have already been released.
         const PID_UNHASHED = 1 << 15;
         /// Task is currently traced by another task.

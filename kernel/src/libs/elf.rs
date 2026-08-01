@@ -250,7 +250,15 @@ impl ElfLoader {
             prot
         };
         let start_page = user_vm_guard
-            .map_anonymous(addr_to_map, map_len, tmp_prot, map_flags, false, true)
+            .map_file_backed(
+                addr_to_map,
+                map_len,
+                tmp_prot,
+                map_flags,
+                false,
+                param.file(),
+                file_page_offset,
+            )
             .map_err(map_err_handler)?;
         let mapped = start_page.virt_address();
 

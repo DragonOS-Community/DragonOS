@@ -52,6 +52,21 @@ pub struct AddressSpace {
     inner: RwSem<InnerAddressSpace>,
     /// Wait for pending mmap reservations to be committed or cancelled.
     reservation_wait: WaitQueue,
+    // ── uprobe 子系统字段（计划步骤 3）──
+    //
+    // 这些字段位于 `inner` **之外**，由独立 irqsave `SpinLock` 保护（评审 F8）。
+    // 命中路径（#BP/#DB 关中断）仅 `lock_irqsave` + 查表，绝不取 `inner` 的 RwSem（会睡眠）。
+    //
+    /// Per-mm uprobe 表：`probe_vaddr → 已注册实例列表`。
+    /// 镜像 kprobe 的 `KPROBE_MANAGER: SpinLock<KprobeManager{break_list}>`。
+    #[cfg(target_arch = "x86_64")]
+    pub uprobe_list: SpinLock<BTreeMap<usize, Vec<Arc<RwLock<UprobeInstance>>>>>,
+    /// Per-mm XOL 区（懒初始化，首次注册 uprobe 时创建）。
+    #[cfg(target_arch = "x86_64")]
+    pub xol_area: SpinLock<Option<Box<XolArea>>>,
+    /// Per-page 断点状态（追踪 COW 副本 + refcount，供注销恢复原页）。
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) uprobe_page_state: SpinLock<BTreeMap<usize, UprobePageState>>,
 }
 
 impl AddressSpace {
@@ -243,6 +258,12 @@ impl AddressSpace {
             oom_reclaim_generation: AtomicU64::new(0),
             inner: RwSem::new(inner),
             reservation_wait: WaitQueue::default(),
+            #[cfg(target_arch = "x86_64")]
+            uprobe_list: SpinLock::new(BTreeMap::new()),
+            #[cfg(target_arch = "x86_64")]
+            xol_area: SpinLock::new(None),
+            #[cfg(target_arch = "x86_64")]
+            uprobe_page_state: SpinLock::new(BTreeMap::new()),
         });
         // Back-fill the Weak<AddressSpace> so that InnerAddressSpace methods can obtain
         // the outer Arc to construct MmuGather / initiate TLB shootdown.

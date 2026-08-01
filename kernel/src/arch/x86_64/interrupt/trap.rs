@@ -138,7 +138,13 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
         smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
-    DebugException::handle(regs).unwrap();
+    if regs.is_from_user() {
+        // 用户态 #DB：uprobe XOL 单步完成（NEED_UPROBE 判别）或 ptrace/硬件断点。
+        crate::exception::uprobe::uprobe_debug_handler(regs).unwrap();
+    } else {
+        // 内核态 #DB：kprobe 单步完成。
+        DebugException::handle(regs).unwrap();
+    }
 }
 
 /// 处理NMI中断 2 NMI
@@ -166,7 +172,13 @@ unsafe extern "C" fn do_int3(regs: &'static mut TrapFrame, error_code: u64) {
         smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
-    EBreak::handle(regs).unwrap();
+    if regs.is_from_user() {
+        // 用户态 #BP：uprobe 命中或未消费 #BP（→ SIGTRAP）。
+        crate::exception::uprobe::uprobe_breakpoint_handler(regs).unwrap();
+    } else {
+        // 内核态 #BP：kprobe 命中。
+        EBreak::handle(regs).unwrap();
+    }
 }
 
 /// 处理溢出异常 4 #OF

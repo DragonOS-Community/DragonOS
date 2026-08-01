@@ -2,6 +2,8 @@ mod bpf;
 mod kprobe;
 mod sys_perf_event_open;
 mod tracepoint;
+#[cfg(target_arch = "x86_64")]
+mod uprobe;
 mod util;
 
 use crate::arch::MMArch;
@@ -379,11 +381,26 @@ pub fn perf_event_open(
     let cloexec = file_mode.contains(FileFlags::O_CLOEXEC);
 
     let event: Box<dyn PerfEventOps> = match args.type_ {
-        // Kprobe
+        // Kprobe / uprobe（复用 PERF_TYPE_MAX，评审 F9）
         // See /sys/bus/event_source/devices/kprobe/type
         perf_type_id::PERF_TYPE_MAX => {
-            let kprobe_event = kprobe::perf_event_open_kprobe(args);
-            Box::new(kprobe_event)
+            if args.name.contains('/') {
+                // config1 含 '/'：用户态路径 → uprobe（config2 = 文件偏移）
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let uprobe_event = uprobe::perf_event_open_uprobe(args)?;
+                    Box::new(uprobe_event)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    // uprobe 仅支持 x86_64（需要 int3/XOL 机制）
+                    return Err(SystemError::ENOSYS);
+                }
+            } else {
+                // config1 为内核符号名 → kprobe（现有行为）
+                let kprobe_event = kprobe::perf_event_open_kprobe(args);
+                Box::new(kprobe_event)
+            }
         }
         perf_type_id::PERF_TYPE_SOFTWARE => {
             // For bpf prog output

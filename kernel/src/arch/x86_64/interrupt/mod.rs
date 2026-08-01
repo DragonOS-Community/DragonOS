@@ -242,6 +242,21 @@ impl ProbeArgs for TrapFrame {
     }
 }
 
+// uprobe 的 ProbeArgs 与 kprobe 同签名（独立 trait，低耦合）；TrapFrame 两套都实现，
+// 以便用户态 #BP/#DB 分发把同一个 trapframe 传给 uprobe 的 pre/post/event callback。
+impl uprobe::ProbeArgs for TrapFrame {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn break_address(&self) -> usize {
+        (self.rip - 1) as usize
+    }
+
+    fn debug_address(&self) -> usize {
+        self.rip as usize
+    }
+}
+
 impl crate::process::rseq::RseqTrapFrame for TrapFrame {
     #[inline]
     fn rseq_ip(&self) -> usize {

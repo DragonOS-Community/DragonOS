@@ -4,9 +4,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string>
 #include <string.h>
 #include <sys/mount.h>
@@ -15,6 +17,7 @@
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <time.h>
@@ -61,6 +64,33 @@ static bool path_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+static bool running_on_dragonos() {
+    struct utsname value {};
+    return uname(&value) == 0 &&
+           (strstr(value.release, "dragonos") != nullptr ||
+            strstr(value.nodename, "dragonos") != nullptr);
+}
+
+struct NamespaceBindCleanup {
+    std::string target;
+    std::string directory;
+    int original_fd = -1;
+    int target_fd = -1;
+    bool switched = false;
+    bool mounted = false;
+
+    ~NamespaceBindCleanup() {
+        if (switched && original_fd >= 0) {
+            setns(original_fd, CLONE_NEWUTS);
+        }
+        if (target_fd >= 0) close(target_fd);
+        if (original_fd >= 0) close(original_fd);
+        if (mounted) umount2(target.c_str(), MNT_DETACH);
+        if (!target.empty()) unlink(target.c_str());
+        if (!directory.empty()) rmdir(directory.c_str());
+    }
+};
+
 static bool mount_has_option(const char *mountpoint, const char *option) {
     FILE *fp;
     char *line = NULL;
@@ -106,6 +136,35 @@ static bool mount_has_option(const char *mountpoint, const char *option) {
         break;
     }
 
+    free(line);
+    fclose(fp);
+    return found;
+}
+
+static bool mountinfo_root_for(const std::string &mountpoint, std::string *root) {
+    FILE *fp = fopen("/proc/self/mountinfo", "r");
+    if (fp == nullptr) return false;
+
+    char *line = nullptr;
+    size_t cap = 0;
+    bool found = false;
+    while (getline(&line, &cap, fp) > 0) {
+        char *saveptr = nullptr;
+        char *field = strtok_r(line, " ", &saveptr);  // mount ID
+        if (field == nullptr) continue;
+        field = strtok_r(nullptr, " ", &saveptr);  // parent ID
+        if (field == nullptr) continue;
+        field = strtok_r(nullptr, " ", &saveptr);  // major:minor
+        if (field == nullptr) continue;
+        char *mount_root = strtok_r(nullptr, " ", &saveptr);
+        char *current_mountpoint = strtok_r(nullptr, " ", &saveptr);
+        if (mount_root != nullptr && current_mountpoint != nullptr &&
+            mountpoint == current_mountpoint) {
+            *root = mount_root;
+            found = true;
+            break;
+        }
+    }
     free(line);
     fclose(fp);
     return found;
@@ -1406,6 +1465,116 @@ TEST(MountReconfigure, BindNamespaceOverOpenFileKeepsOpenFileIoFs) {
     unlink(target);
     ASSERT_EQ(0, umount(base)) << strerror(errno);
     rmdir(base);
+}
+
+TEST(MountReconfigure, BoundNamespaceSurvivesSourceTaskExit) {
+    if (unshare(CLONE_NEWNS) != 0) {
+        if (errno == EPERM && !running_on_dragonos()) {
+            GTEST_SKIP() << "mount namespace unavailable: " << strerror(errno);
+        }
+        FAIL() << "unshare(CLONE_NEWNS): " << strerror(errno);
+    }
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+
+    char directory[] = "/tmp/dunitest-ns-pin-XXXXXX";
+    ASSERT_NE(nullptr, mkdtemp(directory)) << strerror(errno);
+
+    NamespaceBindCleanup cleanup;
+    cleanup.directory = directory;
+    cleanup.target = cleanup.directory + "/uts";
+    int placeholder = open(cleanup.target.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC, 0600);
+    ASSERT_GE(placeholder, 0) << strerror(errno);
+    close(placeholder);
+    // Cleanup may always attempt umount; this also covers a worker failure
+    // after mount succeeds but before it reports completion.
+    cleanup.mounted = true;
+
+    cleanup.original_fd = open("/proc/self/ns/uts", O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(cleanup.original_fd, 0) << strerror(errno);
+    struct stat original_stat {};
+    ASSERT_EQ(0, fstat(cleanup.original_fd, &original_stat)) << strerror(errno);
+
+    char proc_fd[64];
+    ASSERT_GT(snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", cleanup.original_fd), 0);
+    char namespace_identity[128] = {};
+    const ssize_t identity_len =
+        readlink(proc_fd, namespace_identity, sizeof(namespace_identity) - 1);
+    ASSERT_GT(identity_len, 0) << strerror(errno);
+    namespace_identity[identity_len] = '\0';
+    EXPECT_EQ("uts:[" + std::to_string(original_stat.st_ino) + "]", namespace_identity);
+
+    int result_pipe[2];
+    ASSERT_EQ(0, pipe2(result_pipe, O_CLOEXEC)) << strerror(errno);
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        close(result_pipe[0]);
+        if (unshare(CLONE_NEWUTS) != 0) _exit(errno == EPERM ? 77 : 79);
+
+        int source_fd = open("/proc/self/ns/uts", O_RDONLY | O_CLOEXEC);
+        if (source_fd < 0) _exit(80);
+        struct stat source_stat {};
+        if (fstat(source_fd, &source_stat) != 0) _exit(81);
+        close(source_fd);
+
+        if (mount("/proc/self/ns/uts", cleanup.target.c_str(), NULL, MS_BIND, NULL) != 0) {
+            _exit(errno == EPERM ? 78 : 82);
+        }
+        if (write(result_pipe[1], &source_stat.st_ino, sizeof(source_stat.st_ino)) !=
+            static_cast<ssize_t>(sizeof(source_stat.st_ino))) {
+            _exit(83);
+        }
+        close(result_pipe[1]);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    ino_t source_ino = 0;
+    ssize_t result_size = read(result_pipe[0], &source_ino, sizeof(source_ino));
+    close(result_pipe[0]);
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    const int exit_code = WEXITSTATUS(status);
+    if ((exit_code == 77 || exit_code == 78) && !running_on_dragonos()) {
+        GTEST_SKIP() << "namespace bind unavailable";
+    }
+    ASSERT_EQ(0, exit_code) << "namespace worker failed with code " << exit_code;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(source_ino)), result_size);
+
+    const std::string stale_source = "/proc/" + std::to_string(child) + "/ns/uts";
+    errno = 0;
+    EXPECT_EQ(-1, access(stale_source.c_str(), F_OK));
+    EXPECT_EQ(ENOENT, errno);
+
+    struct stat persistent_stat {};
+    ASSERT_EQ(0, stat(cleanup.target.c_str(), &persistent_stat)) << strerror(errno);
+    EXPECT_EQ(source_ino, persistent_stat.st_ino);
+    EXPECT_NE(original_stat.st_ino, persistent_stat.st_ino);
+    std::string mountinfo_root;
+    ASSERT_TRUE(mountinfo_root_for(cleanup.target, &mountinfo_root));
+    EXPECT_EQ("uts:[" + std::to_string(source_ino) + "]", mountinfo_root);
+
+    cleanup.target_fd = open(cleanup.target.c_str(), O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(cleanup.target_fd, 0) << strerror(errno);
+    ASSERT_GT(snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", cleanup.target_fd), 0);
+    char bound_path[PATH_MAX] = {};
+    const ssize_t bound_path_len = readlink(proc_fd, bound_path, sizeof(bound_path) - 1);
+    ASSERT_GT(bound_path_len, 0) << strerror(errno);
+    bound_path[bound_path_len] = '\0';
+    EXPECT_EQ(cleanup.target, bound_path);
+    ASSERT_EQ(0, setns(cleanup.target_fd, CLONE_NEWUTS)) << strerror(errno);
+    cleanup.switched = true;
+
+    struct stat selected_stat {};
+    ASSERT_EQ(0, stat("/proc/self/ns/uts", &selected_stat)) << strerror(errno);
+    EXPECT_EQ(source_ino, selected_stat.st_ino);
+
+    ASSERT_EQ(0, setns(cleanup.original_fd, CLONE_NEWUTS)) << strerror(errno);
+    cleanup.switched = false;
+    struct stat restored_stat {};
+    ASSERT_EQ(0, stat("/proc/self/ns/uts", &restored_stat)) << strerror(errno);
+    EXPECT_EQ(original_stat.st_ino, restored_stat.st_ino);
 }
 
 TEST(MountReconfigure, ProcFdMagicLinkKeepsReferencedMountProjection) {

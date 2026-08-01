@@ -15,10 +15,7 @@ use crate::{
         Duration, Instant, PosixTimeSpec,
     },
 };
-use core::{
-    fmt::Debug,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::fmt::Debug;
 
 use alloc::{
     collections::{BTreeSet, LinkedList},
@@ -77,8 +74,6 @@ pub struct EventPoll {
     ready_state: Arc<SpinLock<ReadyState>>,
     /// 监听本 epollfd 的 epitems（用于支持 epoll 嵌套：epollfd 被加入另一个 epoll）
     pub(super) poll_epitems: Arc<LockedEPItemLinkedList>,
-    /// 是否已经关闭
-    shutdown: AtomicBool,
     self_ref: Option<Weak<Mutex<EventPoll>>>,
 }
 
@@ -96,20 +91,12 @@ impl EventPoll {
                 epoll_wq: WaitQueue::default(),
             })),
             poll_epitems: Arc::new(LockedEPItemLinkedList::default()),
-            shutdown: AtomicBool::new(false),
             self_ref: None,
         }
     }
 
     /// 关闭epoll时，执行的逻辑
     pub(super) fn close(&mut self) -> Result<(), SystemError> {
-        // 唤醒epoll上面等待的所有进程
-        self.shutdown.store(true, Ordering::SeqCst);
-        {
-            let rs = self.ready_state.lock_irqsave();
-            rs.epoll_wq.wakeup_all(None);
-        }
-
         let fds: Vec<i32> = self.ep_items.keys().cloned().collect::<Vec<_>>();
         // 清理红黑树里面的epitems
         for fd in fds {
@@ -455,11 +442,6 @@ impl EventPoll {
                     continue;
                 }
 
-                if epoll.0.lock().shutdown.load(Ordering::SeqCst) {
-                    // 如果已经关闭
-                    return Err(SystemError::EBADF);
-                }
-
                 // 如果超时
                 if timeout {
                     return Ok(0);
@@ -524,9 +506,7 @@ impl EventPoll {
                 {
                     // 注册前再次检查，避免错过事件（仅需 SpinLock）
                     let rs = rs_arc.lock_irqsave();
-                    if Self::ready_state_has_events(&rs)
-                        || epoll.0.lock().shutdown.load(Ordering::SeqCst)
-                    {
+                    if Self::ready_state_has_events(&rs) {
                         available = true;
                         // 不注册，直接继续
                     } else {
@@ -555,10 +535,6 @@ impl EventPoll {
                     let rs = rs_arc.lock_irqsave();
                     rs.epoll_wq.remove_waker(&waker);
                     available = Self::ready_state_has_events(&rs);
-                    if epoll.0.lock().shutdown.load(Ordering::SeqCst) {
-                        // epoll 被关闭，直接退出
-                        return Err(SystemError::EINVAL);
-                    }
                 }
 
                 if let Some(timer) = timer {

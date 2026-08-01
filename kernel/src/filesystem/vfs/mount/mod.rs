@@ -734,6 +734,8 @@ pub struct VfsDentry {
     /// Global fast-path hint; namespace-local checks still inspect topology.
     mount_edges: AtomicUsize,
     automount_gate: Mutex<()>,
+    /// True for a magic-link target that has identity but no directory edge.
+    anonymous: bool,
     state: Mutex<VfsDentryState>,
 }
 
@@ -769,6 +771,32 @@ impl VfsDentry {
                     .self_mountpoint()
                     .is_some_and(|mountpoint| mountpoint.dentry.id == self.id)
         })
+    }
+
+    /// Create a connected dentry without a directory edge.
+    ///
+    /// Magic-link targets use this to retain a mount projection for open and
+    /// bind mount. Anonymous dentries deliberately never enter the ordinary
+    /// dentry registry and therefore cannot participate in lookup or rename.
+    fn new_anonymous(inode: Arc<dyn IndexNode>, dname: DName) -> Result<Arc<Self>, SystemError> {
+        let metadata = inode.metadata()?;
+        let generation = inode.inode_generation();
+        Ok(Arc::new(Self {
+            id: DentryId::alloc(),
+            inode,
+            registry_child: metadata.inode_id,
+            registry_generation: generation,
+            mount_gate: Mutex::new(()),
+            children_gate: Mutex::new(()),
+            mount_edges: AtomicUsize::new(0),
+            automount_gate: Mutex::new(()),
+            anonymous: true,
+            state: Mutex::new(VfsDentryState {
+                name: Some(dname),
+                parent: None,
+                disconnected: false,
+            }),
+        }))
     }
 }
 
@@ -964,6 +992,7 @@ impl SuperBlockState {
             children_gate: Mutex::new(()),
             mount_edges: AtomicUsize::new(0),
             automount_gate: Mutex::new(()),
+            anonymous: false,
             state: Mutex::new(VfsDentryState {
                 name,
                 parent: parent.cloned(),
@@ -2197,6 +2226,18 @@ impl MountFS {
     /// Snapshot-only variant of [`Self::root_path`].  The caller must hold
     /// `DENTRY_TOPOLOGY_LOCK` and the mount lifecycle snapshot.
     pub(crate) fn root_path_from_snapshot(&self) -> Result<String, SystemError> {
+        // Linux nsfs reports an anonymous namespace bind root as
+        // `type:[ino]`, without the slash used by ordinary filesystem paths.
+        if self.root_dentry.anonymous {
+            return self
+                .root_dentry
+                .state
+                .lock()
+                .name
+                .clone()
+                .map(|name| name.to_string())
+                .ok_or(SystemError::EINVAL);
+        }
         let mut current = self.root_dentry.clone();
         let mut parts: Vec<Arc<String>> = Vec::new();
         let mut deleted = false;
@@ -3061,6 +3102,22 @@ impl MountFSInode {
         Ok(Self::from_dentry(dentry, mount_fs))
     }
 
+    fn new_anonymous(
+        inner_inode: Arc<dyn IndexNode>,
+        dname: DName,
+        mount_fs: Arc<MountFS>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let dentry = VfsDentry::new_anonymous(inner_inode, dname)?;
+        // Anonymous magic-link targets have no directory edge and therefore
+        // cannot be rediscovered by dentry ID. Caching their wrappers would
+        // retain one stale Weak key for every namespace-link traversal.
+        Ok(Arc::new_cyclic(|self_ref| Self {
+            dentry,
+            mount_fs,
+            self_ref: self_ref.clone(),
+        }))
+    }
+
     fn update_move_dentries(
         source: &Arc<MountFSInode>,
         old_name: DName,
@@ -3489,6 +3546,19 @@ impl MountFSInode {
     }
 
     pub(crate) fn procfs_path(&self) -> Result<String, SystemError> {
+        // Anonymous magic-link targets have no namespace path. Render the
+        // stable identity captured when the target was resolved, mirroring
+        // Linux d_dname() handling for namespace file descriptors.
+        if self.dentry.anonymous && !self.is_mountpoint_root()? {
+            return self
+                .dentry
+                .state
+                .lock()
+                .name
+                .clone()
+                .map(|name| name.to_string())
+                .ok_or(SystemError::EINVAL);
+        }
         let mut path = self.do_absolute_path_impl(true)?;
         if self.dentry.is_disconnected() {
             path.push_str(" (deleted)");
@@ -4402,6 +4472,25 @@ impl IndexNode for MountFSInode {
             {
                 self.self_ref
                     .upgrade()
+                    .map(|inode| super::SpecialNodeData::Reference(inode as Arc<dyn IndexNode>))
+            }
+            Some(super::SpecialNodeData::MountProjectedReference { target, dname }) => {
+                if target.clone().downcast_arc::<MountFSInode>().is_some() {
+                    return Some(super::SpecialNodeData::Reference(target));
+                }
+
+                let target_fs = target.fs();
+                let inner_fs = self.mount_fs.inner_filesystem();
+                if !Arc::ptr_eq(&target_fs, &inner_fs) {
+                    debug_assert!(
+                        false,
+                        "mount-projected magic-link target changed filesystem"
+                    );
+                    return None;
+                }
+
+                Self::new_anonymous(target, dname, self.mount_fs.clone())
+                    .ok()
                     .map(|inode| super::SpecialNodeData::Reference(inode as Arc<dyn IndexNode>))
             }
             other => other,

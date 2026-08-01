@@ -119,6 +119,11 @@ pub trait FileOps: Sync + Send + Sized + Debug {
     fn owner(&self) -> Option<(usize, usize)> {
         None
     }
+
+    /// Override the generated inode ID for identity-bearing pseudo files.
+    fn dynamic_inode_id(&self) -> Option<crate::filesystem::vfs::InodeId> {
+        None
+    }
 }
 
 /// 为 ProcFile 实现 IndexNode trait
@@ -138,6 +143,9 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         if let Some((uid, gid)) = self.inner.owner() {
             metadata.uid = uid;
             metadata.gid = gid;
+        }
+        if let Some(inode_id) = self.inner.dynamic_inode_id() {
+            metadata.inode_id = inode_id;
         }
         Ok(metadata)
     }

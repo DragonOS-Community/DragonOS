@@ -54,6 +54,11 @@ impl<F: FileOps> ProcFileBuilder<F> {
         self.common.set_parent(parent);
         self
     }
+
+    pub fn fs(mut self, fs: Weak<dyn FileSystem>) -> Self {
+        self.common.set_fs(fs);
+        self
+    }
 }
 
 impl<F> Builder<F> for ProcFileBuilder<F>

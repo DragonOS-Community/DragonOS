@@ -318,6 +318,17 @@ pub enum SpecialNodeData {
     BlockDevice(Arc<dyn BlockDevice>),
     /// 指向其他 inode 的引用（用于 /proc/self/fd/N 这种魔法链接）
     Reference(Arc<dyn IndexNode>),
+    /// A magic-link target that belongs to the producer's inner filesystem
+    /// and must retain that filesystem's mount projection.
+    ///
+    /// `MountFSInode` consumes this variant and wraps the raw target in an
+    /// anonymous dentry. Raw filesystem walks follow it like `Reference`.
+    MountProjectedReference {
+        target: Arc<dyn IndexNode>,
+        /// Stable identity rendered by `/proc/<pid>/fd/<fd>` for the
+        /// anonymous target (for example, `uts:[4026531838]`).
+        dname: utils::DName,
+    },
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -1767,7 +1778,15 @@ impl dyn IndexNode {
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
-                if let Some(SpecialNodeData::Reference(target_inode)) = inode.special_node() {
+                let magic_target = match inode.special_node() {
+                    Some(SpecialNodeData::Reference(target_inode))
+                    | Some(SpecialNodeData::MountProjectedReference {
+                        target: target_inode,
+                        ..
+                    }) => Some(target_inode),
+                    _ => None,
+                };
+                if let Some(target_inode) = magic_target {
                     if ownership.is_some() {
                         ownership = Some(utils::ResolvedPath::new(target_inode.clone())?);
                     }

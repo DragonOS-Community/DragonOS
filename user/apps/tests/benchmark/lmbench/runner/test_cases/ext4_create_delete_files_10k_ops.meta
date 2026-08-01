@@ -1,0 +1,13 @@
+# Extraction/metadata for ext4_create_delete_files_10k_ops
+CATEGORY=filesystem
+BINARY=lat_fs
+METRIC_TYPE=ops
+UNIT=ops/sec
+BIGGER_IS_BETTER=1
+# CALIBRATE: lat_fs prints a per-size table; column layout must be confirmed against
+# real DragonOS output (runner captures raw_tail on no-match to make this trivial).
+# Best guess: the "10k" size row, creates/sec column.
+SEARCH_PATTERN=^10k
+RESULT_INDEX=3
+NTH_OCCURRENCE=1
+DESCRIPTION=ext4 create+delete throughput for 10k-byte files via lat_fs

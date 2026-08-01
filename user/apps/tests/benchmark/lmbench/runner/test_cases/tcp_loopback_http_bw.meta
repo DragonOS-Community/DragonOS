@@ -1,0 +1,11 @@
+# Extraction/metadata for tcp_loopback_http_bw (KEY=VALUE; parsed by run.sh)
+CATEGORY=network
+BINARY=lat_http
+METRIC_TYPE=bandwidth
+UNIT=KB/s
+BIGGER_IS_BETTER=1
+# lat_http prints "Avg xfer: <N>KB, <X> millisec, <Y> KB/sec"; value before KB/sec.
+SEARCH_PATTERN=Avg xfer
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=TCP loopback HTTP bandwidth via lat_http (lmhttp server)

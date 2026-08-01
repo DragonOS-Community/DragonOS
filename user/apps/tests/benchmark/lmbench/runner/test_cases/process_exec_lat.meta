@@ -1,0 +1,11 @@
+# Extraction/metadata for process_exec_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=process
+BINARY=lat_proc
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_proc exec prints "Process fork+execve: <N> microseconds"; anchor "Process fork".
+SEARCH_PATTERN=Process fork
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Process fork+execve latency via lat_proc exec

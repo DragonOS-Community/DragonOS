@@ -1,0 +1,10 @@
+# Extraction/metadata for tcp_loopback_bw_4k (KEY=VALUE; parsed by run.sh)
+CATEGORY=network
+BINARY=bw_tcp
+METRIC_TYPE=bandwidth
+UNIT=MB/s
+BIGGER_IS_BETTER=1
+SEARCH_PATTERN=socket connection
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=TCP loopback bandwidth via bw_tcp (4KB)

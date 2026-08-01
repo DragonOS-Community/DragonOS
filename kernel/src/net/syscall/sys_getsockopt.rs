@@ -289,24 +289,27 @@ pub(super) fn do_getsockopt(
 
     // 其它 level（如 SOL_IP/SOL_IPV6/SOL_RAW 等）交给具体 socket 实现。
     // gVisor raw_socket_test: getsockopt(SOL_IPV6, IPV6_CHECKSUM) 等
-    {
-        let kbuf_len = user_len.min(MAX_OPTVAL_LEN);
-        let mut kbuf = vec![0u8; kbuf_len];
-        let written = socket.option(level, optname, &mut kbuf)?;
-        let out_len = calc_out_len(optval, user_len, written);
-
-        if !optval.is_null() && out_len != 0 {
-            let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
-            optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
-        }
-
-        // Linux 语义：*optlen 回写实际输出长度；optval != NULL 时为 min(user_len, written)，
-        // optval == NULL 时为 written（用于探测选项大小）。
-        let mut optlen_writer =
-            UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
-        optlen_writer
-            .buffer_protected(0)?
-            .write_one::<u32>(0, &(written as u32))?;
-        Ok(0)
+    // Copy user-supplied optval into kbuf first, so that in/out options
+    // (e.g. PACKET_HDRLEN) can read the caller's input.
+    let kbuf_len = user_len.min(MAX_OPTVAL_LEN);
+    let mut kbuf = vec![0u8; kbuf_len];
+    if !optval.is_null() {
+        let optval_reader = UserBufferReader::new(optval, kbuf_len, from_user)?;
+        optval_reader.copy_from_user(&mut kbuf, 0)?;
     }
+    let written = socket.option(level, optname, &mut kbuf)?;
+    let out_len = calc_out_len(optval, user_len, written);
+
+    if !optval.is_null() && out_len != 0 {
+        let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
+        optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
+    }
+
+    // Linux 语义：*optlen 回写实际输出长度；optval != NULL 时为 min(user_len, written)，
+    // optval == NULL 时为 written（用于探测选项大小）。
+    let mut optlen_writer = UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
+    optlen_writer
+        .buffer_protected(0)?
+        .write_one::<u32>(0, &(written as u32))?;
+    Ok(0)
 }

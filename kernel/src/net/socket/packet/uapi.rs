@@ -98,6 +98,7 @@ pub const SOL_PACKET: i32 = 263;
 pub const TP_STATUS_USER: u32 = 1;
 pub const TP_STATUS_VLAN_VALID: u32 = 1 << 4;
 pub const TP_STATUS_VLAN_TPID_VALID: u32 = 1 << 6;
+pub const TP_STATUS_LOSING: u32 = 1 << 2;
 
 // ---------------------------------------------------------------------------
 // TPACKET ring buffer UAPI (PACKET_RX_RING / PACKET_TX_RING)

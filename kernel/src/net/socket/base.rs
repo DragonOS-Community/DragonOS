@@ -284,6 +284,19 @@ pub trait Socket: PollableInode + IndexNode {
     fn mmap_layout(&self) -> Option<SocketMmapLayout> {
         None
     }
+
+    /// Validate an mmap request before the VMA is installed.
+    ///
+    /// Default implementation checks the bounds against `mmap_layout().size`.
+    /// AF_PACKET overrides this to enforce Linux's `offset == 0 && len == ring_size`
+    /// contract and track the VMA for teardown EBUSY accounting.
+    fn mmap_validate(&self, len: usize, offset: usize) -> Result<(), SystemError> {
+        let layout = self.mmap_layout().ok_or(SystemError::EINVAL)?;
+        if offset.checked_add(len).is_none_or(|end| end > layout.size) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn read_to_user_buffer_via_kernel_buf<S: Socket + ?Sized>(

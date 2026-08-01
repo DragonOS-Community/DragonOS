@@ -10,6 +10,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::libs::mutex::Mutex;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -17,16 +18,18 @@ use system_error::SystemError;
 use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::MMArch;
 use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::{FileSystem, FsInfo, IndexNode, SuperBlock};
 use crate::mm::allocator::page_frame::PageFrameCount;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::page::{page_manager_lock, PageFlags, PageType};
 use crate::mm::MemoryManagementArch;
 use crate::mm::VmFaultReason;
+use crate::mm::{VirtRegion, VmFlags};
 
 use super::uapi::{
     tpacket_align, Tpacket2Hdr, TpacketHdr, TPACKET2_HDRLEN, TPACKET_HDRLEN, TP_STATUS_KERNEL,
-    TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID,
+    TP_STATUS_LOSING, TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID,
 };
 use super::{PacketMetadata, PacketSocketType};
 
@@ -74,6 +77,12 @@ impl FileSystem for PacketFakeFs {
     ) -> VmFaultReason {
         PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
+    fn vma_close(&self, file: &Arc<File>, _region: VirtRegion, _vm_flags: VmFlags) {
+        use super::PacketSocket;
+        if let Some(socket) = file.inode().as_any_ref().downcast_ref::<PacketSocket>() {
+            socket.ring_vma_closed();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +123,26 @@ pub enum RingWriteResult {
     Dropped,
 }
 
+#[derive(Debug)]
+pub struct RingState {
+    pub version: TpacketVersion,
+    pub reserve: u32,
+    pub ring: Option<Arc<Mutex<PacketRing>>>,
+    /// Number of active VMA mappings covering the ring. Teardown returns EBUSY
+    /// while this is non-zero, matching Linux `mapped` accounting.
+    pub mapped: u32,
+}
+
+impl RingState {
+    pub fn new() -> Self {
+        Self {
+            version: TpacketVersion::V1,
+            reserve: 0,
+            ring: None,
+            mapped: 0,
+        }
+    }
+}
 /// V1/V2 receive ring buffer.
 #[derive(Debug)]
 pub struct PacketRing {
@@ -161,7 +190,10 @@ impl PacketRing {
                 &mut LockedFrameAllocator,
                 PageFrameCount::new(pages_per_block),
             )?;
-            for j in 0..pages.len() {
+            // The allocator may round up to a power of two and return more
+            // pages than requested. Only insert `pages_per_block` pages into
+            // the page cache so block indices never overlap.
+            for j in 0..pages_per_block {
                 let page = pages.get(j).unwrap();
                 page.write().add_flags(PageFlags::PG_UPTODATE);
                 page_cache.insert_ready_page(block_idx * pages_per_block + j, page.clone())?;
@@ -213,15 +245,24 @@ impl PacketRing {
     }
 
     /// Write one packet into the ring. Caller must hold the ring lock.
-    pub fn write_frame(&mut self, frame: &[u8], meta: &PacketMetadata) -> RingWriteResult {
+    ///
+    /// `filter_snaplen` is the cBPF-limited visible length (already clamped to
+    /// `wire_len` by the caller).  `losing` requests TP_STATUS_LOSING on the
+    /// published frame (set while `stats_drops > 0`).
+    pub fn write_frame(
+        &mut self,
+        input: &super::rx::PacketFilterInput,
+        meta: &PacketMetadata,
+        filter_snaplen: usize,
+        losing: bool,
+    ) -> RingWriteResult {
         let hdrlen = self.version.hdrlen();
-        let is_vlan = meta.vlan_tpid != 0;
-        let mac_len = if is_vlan { 18 } else { 14 };
+        // Derive the visible MAC length from the normalized capture view's
+        // network offset — not from VLAN metadata presence.  Inbound
+        // normalized VLAN has a 14-byte visible MAC (tag stripped); outbound
+        // inline VLAN has an 18-byte visible MAC (tag retained).
+        let mac_len = meta.net_offset;
         // Linux formula: netoff = TPACKET_ALIGN(hdrlen + max(maclen, 16)) + reserve.
-        // This guarantees tp_net is 16-byte aligned. For SOCK_RAW the MAC
-        // header lives at tp_mac = netoff - mac_len, so the visible data
-        // (including the MAC) starts at tp_mac. For SOCK_DGRAM there is no
-        // MAC, so tp_mac == tp_net == netoff and data starts at netoff.
         let netoff = tpacket_align(hdrlen + core::cmp::max(mac_len, 16)) + self.reserve;
         let data_off = if self.raw { netoff - mac_len } else { netoff };
         let data_cap = self.config.frame_size.saturating_sub(data_off);
@@ -229,28 +270,32 @@ impl PacketRing {
             return RingWriteResult::Dropped;
         }
 
-        // Find the next KERNEL-owned frame, scanning from `head`.
-        let mut found = None;
-        for i in 0..self.config.frame_nr {
-            let idx = ((self.head as usize + i) % self.config.frame_nr) as u32;
-            let base = self.frame_base(idx as usize);
-            if self.read_tp_status(base) == TP_STATUS_KERNEL {
-                found = Some((idx, base));
-                break;
-            }
+        // O(1) single-head check: Linux never searches past a busy head slot.
+        // If the current head is USER-owned, the packet is dropped.
+        let base = self.frame_base(self.head as usize);
+        if self.read_tp_status(base) != TP_STATUS_KERNEL {
+            return RingWriteResult::Dropped;
         }
-        let (idx, base) = match found {
-            Some(x) => x,
-            None => return RingWriteResult::Dropped,
-        };
 
-        let status = self.fill_frame(base, frame, meta, netoff, data_off, data_cap);
+        let status = self.fill_frame(
+            base,
+            input,
+            meta,
+            netoff,
+            data_off,
+            data_cap,
+            filter_snaplen,
+        );
 
         // Publish: flip status KERNEL→USER *last*, with Release ordering so the
         // data writes above are visible before userspace observes USER.
-        self.publish(base, status);
+        let mut final_status = status;
+        if losing {
+            final_status |= TP_STATUS_LOSING;
+        }
+        self.publish(base, final_status);
 
-        self.head = ((idx as usize + 1) % self.config.frame_nr) as u32;
+        self.head = ((self.head as usize + 1) % self.config.frame_nr) as u32;
         RingWriteResult::Written
     }
 
@@ -295,41 +340,28 @@ impl PacketRing {
         }
     }
 
-    /// Fill the header and copy packet data into the frame at `base`.
-    /// VLAN tags are stripped from the data region (matching the queue path in
-    /// `rx.rs`) while VLAN metadata is recorded in the V2 header.
+    /// Fill the header and copy packet data into the frame at `base`, using the
+    /// normalized capture view so DGRAM/VLAN layout matches the queue path.
     fn fill_frame(
         &self,
         base: usize,
-        frame: &[u8],
+        input: &super::rx::PacketFilterInput,
         meta: &PacketMetadata,
         netoff: usize,
         data_off: usize,
         data_cap: usize,
+        filter_snaplen: usize,
     ) -> u32 {
         let is_vlan = meta.vlan_tpid != 0;
 
-        // tp_net = netoff (guaranteed 16-byte aligned by the formula in
-        // write_frame).  tp_mac = the byte offset where visible data starts.
-        //   RAW:  tp_mac = netoff - mac_len (MAC header at tp_mac).
-        //   DGRAM: tp_mac == tp_net == netoff (no MAC in the frame).
+        // tp_len = original socket-visible length (not truncated by filter).
+        // tp_snaplen = min(filter result, wire_len, frame capacity).
+        let wire_len = meta.wire_len;
+        let snaplen = filter_snaplen.min(wire_len).min(data_cap);
+
         let tp_mac = data_off as u16;
         let tp_net = netoff as u16;
 
-        // Visible (VLAN-stripped) length — this becomes tp_len (wire length).
-        let wire_len = if is_vlan {
-            frame.len().saturating_sub(4)
-        } else {
-            frame.len()
-        };
-        let snaplen = wire_len.min(data_cap);
-
-        // Timestamps are taken from per-version sources to match Linux
-        // semantics:
-        //   V1: microsecond resolution (struct timeval).
-        //   V2: nanosecond resolution (struct timespec), so we must read the
-        //       real nanoseconds from PosixTimeSpec rather than scaling a
-        //       microsecond value.
         let dst = base as *mut u8;
 
         unsafe {
@@ -381,34 +413,11 @@ impl PacketRing {
             *dst.add(sll_off + 11) = 6; // sll_halen
             core::ptr::copy_nonoverlapping(meta.src_mac.as_ptr(), dst.add(sll_off + 12), 6);
 
-            // Copy packet data into the data region (starting at data_off).
+            // Copy socket-visible data from the normalized capture view into
+            // the frame's data region. The view already handles DGRAM MAC
+            // stripping and VLAN normalization identically to the queue path.
             let data_dst = dst.add(data_off);
-            if self.raw {
-                if is_vlan {
-                    // Strip the 4-byte VLAN tag: [0..12] + [16..]
-                    let pre = 12usize;
-                    let copy_len = snaplen.min(pre);
-                    core::ptr::copy_nonoverlapping(frame.as_ptr(), data_dst, copy_len);
-                    let remain = snaplen.saturating_sub(pre);
-                    if remain > 0 {
-                        let src_off = 16usize;
-                        let n = remain.min(frame.len().saturating_sub(src_off));
-                        core::ptr::copy_nonoverlapping(
-                            frame.as_ptr().add(src_off),
-                            data_dst.add(pre),
-                            n,
-                        );
-                    }
-                } else {
-                    let n = snaplen.min(frame.len());
-                    core::ptr::copy_nonoverlapping(frame.as_ptr(), data_dst, n);
-                }
-            } else {
-                // DGRAM: skip MAC header
-                let start = if is_vlan { 18 } else { 14 };
-                let n = snaplen.min(frame.len().saturating_sub(start));
-                core::ptr::copy_nonoverlapping(frame.as_ptr().add(start), data_dst, n);
-            }
+            input.copy_visible_to_ptr(data_dst, snaplen);
         }
 
         // Compute final status: USER plus VLAN validity flags (V2 only).

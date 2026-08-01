@@ -54,7 +54,7 @@ struct ParsedFrame {
 /// into skb metadata, while outgoing taps retain an inline VLAN header. This
 /// view models both layouts with at most two borrowed segments and is shared
 /// by cBPF loads and the eventual queue copy.
-struct PacketFilterInput<'a> {
+pub(super) struct PacketFilterInput<'a> {
     first: &'a [u8],
     second: &'a [u8],
     data_offset: usize,
@@ -170,6 +170,37 @@ impl<'a> PacketFilterInput<'a> {
             let second_start = self.data_offset.saturating_sub(self.first.len());
             let second_end = end - self.first.len();
             output.extend_from_slice(&self.second[second_start..second_end]);
+        }
+    }
+
+    /// Copy up to `len` bytes of socket-visible data to `dst`.
+    /// For RAW sockets this includes the MAC header; for DGRAM it starts at
+    /// the network header. Handles two-segment VLAN-normalized views.
+    pub(super) fn copy_visible_to_ptr(&self, dst: *mut u8, len: usize) {
+        let end = self.data_offset + len;
+        let first_start = self.data_offset.min(self.first.len());
+        let first_end = end.min(self.first.len());
+        let mut written = 0;
+        if first_start < first_end {
+            let n = first_end - first_start;
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.first.as_ptr().add(first_start), dst, n);
+            }
+            written += n;
+        }
+        if end > self.first.len() {
+            let second_start = self.data_offset.saturating_sub(self.first.len());
+            let second_end = end - self.first.len();
+            if second_end > second_start {
+                let n = second_end - second_start;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        self.second.as_ptr().add(second_start),
+                        dst.add(written),
+                        n,
+                    );
+                }
+            }
         }
     }
 
@@ -788,7 +819,7 @@ impl PacketSocket {
         // When an RX ring is active, deliver directly into the ring instead of
         // the rx_buffer queue.  Clone the Arc and release the outer lock so
         // concurrent delivers from other NICs are not blocked by setup/teardown.
-        let ring_arc = self.rx_ring.lock().as_ref().cloned();
+        let ring_arc = self.ring_state.lock().ring.as_ref().cloned();
         if let Some(ring_arc) = ring_arc {
             let metadata = PacketMetadata {
                 src_mac: parsed.src,
@@ -803,8 +834,9 @@ impl PacketSocket {
                 vlan_tci: input.vlan.map_or(0, |v| v.0),
                 vlan_tpid: input.vlan.map_or(0, |v| v.1),
             };
+            let losing = self.stats_drops.load(Ordering::Relaxed) > 0;
             let mut ring = ring_arc.lock();
-            match ring.write_frame(frame, &metadata) {
+            match ring.write_frame(&input, &metadata, data_len, losing) {
                 RingWriteResult::Written => {
                     self.stats_packets.fetch_add(1, Ordering::Relaxed);
                     drop(ring);
@@ -889,7 +921,7 @@ impl PacketSocket {
     }
     pub(super) fn can_recv(&self) -> bool {
         // Ring mode: check for TP_STATUS_USER frames.
-        if let Some(r) = self.rx_ring.lock().as_ref() {
+        if let Some(r) = self.ring_state.lock().ring.as_ref() {
             return r.lock().has_user_frames();
         }
         // Queue mode (default).

@@ -61,9 +61,11 @@ impl PacketSocket {
                     if value.len() < 8 {
                         return Err(SystemError::EINVAL);
                     }
-                    let packets = self.stats_packets.swap(0, Ordering::Relaxed);
+                    // Linux clear-on-read semantics: tp_packets = accepted + drops.
                     let drops = self.stats_drops.swap(0, Ordering::Relaxed);
-                    value[..4].copy_from_slice(&packets.to_ne_bytes());
+                    let packets = self.stats_packets.swap(0, Ordering::Relaxed);
+                    let total = packets.wrapping_add(drops);
+                    value[..4].copy_from_slice(&total.to_ne_bytes());
                     value[4..8].copy_from_slice(&drops.to_ne_bytes());
                     Ok(8)
                 }
@@ -72,14 +74,26 @@ impl PacketSocket {
                     self.options.read().auxdata as i32,
                 )),
                 packet_option::PACKET_VERSION => {
-                    let v = match *self.tpacket_version.lock() {
-                        super::TpacketVersion::V1 => tpacket_version::TPACKET_V1,
-                        super::TpacketVersion::V2 => tpacket_version::TPACKET_V2,
+                    let v = match self.ring_state.lock().version {
+                        super::ring::TpacketVersion::V1 => tpacket_version::TPACKET_V1,
+                        super::ring::TpacketVersion::V2 => tpacket_version::TPACKET_V2,
                     };
                     Ok(write_i32_getsockopt(value, v))
                 }
                 packet_option::PACKET_HDRLEN => {
-                    let hdrlen = self.tpacket_version.lock().hdrlen() as i32;
+                    // Linux in/out semantics: the caller passes the TPACKET
+                    // version in optval[0..4]; we return sizeof(hdr) for that
+                    // version (V1=28, V2=32).
+                    let v = Self::parse_i32(value)?;
+                    let hdrlen = match v {
+                        tpacket_version::TPACKET_V1 => {
+                            core::mem::size_of::<super::uapi::TpacketHdr>() as i32
+                        }
+                        tpacket_version::TPACKET_V2 => {
+                            core::mem::size_of::<super::uapi::Tpacket2Hdr>() as i32
+                        }
+                        _ => return Err(SystemError::EINVAL),
+                    };
                     Ok(write_i32_getsockopt(value, hdrlen))
                 }
                 packet_option::PACKET_FANOUT => {
@@ -110,30 +124,29 @@ impl PacketSocket {
                 packet_option::PACKET_VERSION => {
                     let v = Self::parse_i32(value)?;
                     let new_version = match v {
-                        tpacket_version::TPACKET_V1 => super::TpacketVersion::V1,
-                        tpacket_version::TPACKET_V2 => super::TpacketVersion::V2,
+                        tpacket_version::TPACKET_V1 => super::ring::TpacketVersion::V1,
+                        tpacket_version::TPACKET_V2 => super::ring::TpacketVersion::V2,
                         _ => return Err(SystemError::EINVAL),
                     };
-                    if self.rx_ring.lock().is_some() {
+                    let mut state = self.ring_state.lock();
+                    if state.ring.is_some() {
                         return Err(SystemError::EBUSY);
                     }
-                    *self.tpacket_version.lock() = new_version;
+                    state.version = new_version;
                     Ok(())
                 }
                 packet_option::PACKET_RESERVE => {
                     let v = Self::parse_i32(value)? as u32;
-                    if self.rx_ring.lock().is_some() {
+                    let mut state = self.ring_state.lock();
+                    if state.ring.is_some() {
                         return Err(SystemError::EBUSY);
                     }
-                    self.tp_reserve.store(v, Ordering::Relaxed);
+                    state.reserve = v;
                     Ok(())
                 }
                 packet_option::PACKET_RX_RING => {
                     if value.len() < 16 {
                         return Err(SystemError::EINVAL);
-                    }
-                    if self.rx_ring.lock().is_some() {
-                        return Err(SystemError::EBUSY);
                     }
                     let req = super::uapi::TpacketReq {
                         tp_block_size: u32::from_ne_bytes(value[0..4].try_into().unwrap()),
@@ -141,17 +154,39 @@ impl PacketSocket {
                         tp_frame_size: u32::from_ne_bytes(value[8..12].try_into().unwrap()),
                         tp_frame_nr: u32::from_ne_bytes(value[12..16].try_into().unwrap()),
                     };
-                    let version = *self.tpacket_version.lock();
-                    let reserve = self.tp_reserve.load(Ordering::Relaxed) as usize;
+                    let mut state = self.ring_state.lock();
+                    // Linux teardown path: all-zero tpacket_req removes the
+                    // ring. Returns EBUSY if still mmaped or in use.
+                    let is_teardown = req.tp_block_nr == 0 && req.tp_frame_nr == 0;
+                    if is_teardown {
+                        if state.mapped > 0 {
+                            return Err(SystemError::EBUSY);
+                        }
+                        if state.ring.is_some() {
+                            // Remove ring from ingress visibility. The old
+                            // Arc is dropped here; any in-flight cloned writer
+                            // that already holds the inner lock will finish
+                            // safely.
+                            state.ring = None;
+                        }
+                        return Ok(());
+                    }
+                    if state.ring.is_some() {
+                        return Err(SystemError::EBUSY);
+                    }
+                    let version = state.version;
+                    let reserve = state.reserve as usize;
                     let config =
                         super::ring::validate_ring_config(&req, version.hdrlen(), reserve)?;
                     let (ring, _pc) = PacketRing::setup(config, version, self.sock_type, reserve)?;
-                    *self.rx_ring.lock() = Some(Arc::new(Mutex::new(ring)));
+                    state.ring = Some(Arc::new(Mutex::new(ring)));
                     Ok(())
                 }
                 packet_option::PACKET_COPY_THRESH => {
-                    let _ = Self::parse_i32(value)?;
-                    Ok(())
+                    // PACKET_COPY_THRESH is not implemented in Phase 1. Return
+                    // ENOPROTOOPT so userspace knows the option is unavailable
+                    // rather than being silently accepted without effect.
+                    Err(SystemError::ENOPROTOOPT)
                 }
                 packet_option::PACKET_FANOUT => {
                     let (raw, max_num_members) = Self::parse_fanout(value)?;

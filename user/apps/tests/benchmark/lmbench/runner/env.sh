@@ -7,3 +7,4 @@ export LMBENCH_TMP_DIR="/tmp"
 # 测试文件名
 export LMBENCH_TEST_FILE="test_file"
 export LMBENCH_ZERO_FILE="zero_file"
+export LMBENCH_CREATE_TEST_FILES=1

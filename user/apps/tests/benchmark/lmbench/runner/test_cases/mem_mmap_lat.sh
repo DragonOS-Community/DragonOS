@@ -11,7 +11,7 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 . "$ENV_PATH"
 
 echo "=== Running mem_mmap_lat test ==="
-sudo ${LMBENCH_BIN_DIR}/lat_mmap 4m ${LMBENCH_EXT4_DIR}/${LMBENCH_TEST_FILE}
+${LMBENCH_BIN_DIR}/lat_mmap 4m ${LMBENCH_EXT4_DIR}/${LMBENCH_TEST_FILE}
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

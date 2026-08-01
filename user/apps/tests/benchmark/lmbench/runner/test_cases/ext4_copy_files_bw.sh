@@ -13,7 +13,7 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 
 
 echo "=== Running ext4_copy_files_bw test ==="
-sudo ${LMBENCH_BIN_DIR}/lmdd if=${LMBENCH_EXT4_DIR}/${LMBENCH_ZERO_FILE} of=${LMBENCH_EXT4_DIR}/${LMBENCH_TEST_FILE}
+${LMBENCH_BIN_DIR}/lmdd if=${LMBENCH_EXT4_DIR}/${LMBENCH_ZERO_FILE} of=${LMBENCH_EXT4_DIR}/${LMBENCH_TEST_FILE}
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

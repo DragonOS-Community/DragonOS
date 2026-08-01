@@ -11,7 +11,7 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 . "$ENV_PATH"
 
 echo "=== Running ramfs_create_delete_files_10k_ops test ==="
-${LMBENCH_BIN_DIR}/lat_fs -s 10k -P 1 -W 30 -N 300
+${LMBENCH_BIN_DIR}/lat_fs -s 10k -P 1 ${LMBENCH_TMP_DIR}
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

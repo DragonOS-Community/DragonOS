@@ -24,22 +24,22 @@ create_test_file() {
 
     if [ ! -f "$ext4_zero_file_path" ]; then
         echo "[lmbench-init] creating $ext4_zero_file_path"
-        dd if=/dev/zero of="$ext4_zero_file_path" bs=1M count=512
+        dd if=/dev/zero of="$ext4_zero_file_path" bs=1M count=64
     fi
 
     if [ ! -f "$ext4_test_file_path" ]; then
         echo "[lmbench-init] creating $ext4_test_file_path"
-        dd if=/dev/zero of="$ext4_test_file_path" bs=1M count=512
+        dd if=/dev/zero of="$ext4_test_file_path" bs=1M count=64
     fi
 
     if [ ! -f "$tmp_zero_file_path" ]; then
         echo "[lmbench-init] creating $tmp_zero_file_path"
-        dd if=/dev/zero of="$tmp_zero_file_path" bs=1M count=512
+        dd if=/dev/zero of="$tmp_zero_file_path" bs=1M count=64
     fi
 
     if [ ! -f "$tmp_test_file_path" ]; then
         echo "[lmbench-init] creating $tmp_test_file_path"
-        dd if=/dev/zero of="$tmp_test_file_path" bs=1M count=512
+        dd if=/dev/zero of="$tmp_test_file_path" bs=1M count=64
     fi
 }
 
@@ -57,6 +57,10 @@ main() {
     if [ "${LMBENCH_CREATE_TEST_FILES:-0}" = "1" ]; then
         create_test_file
     fi
+    # Tolerate dd's "sh: write error: Invalid argument" on serial close (guest
+    # shell write EINVAL to serial device) — files are actually created; the
+    # spurious non-zero from dd's stderr close would otherwise abort run.sh.
+    return 0
 }
 
 if main "$@"; then

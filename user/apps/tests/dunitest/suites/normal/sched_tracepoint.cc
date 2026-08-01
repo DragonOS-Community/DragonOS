@@ -58,11 +58,47 @@ bool write_file(const char* path, const char* data) {
     return n == static_cast<ssize_t>(len);
 }
 
-// mount debugfs 到 root。
-void mount_debugfs(const char* root) {
-    ASSERT_EQ(0, mount("none", root, "debugfs", 0, nullptr))
-        << "mount debugfs failed: errno=" << errno << " (" << strerror(errno) << ")";
+// mount debugfs 到 root。返回 AssertionResult，供调用处 ASSERT_TRUE 在 mount
+// 失败时终止当前 TEST（Thread7：避免 void helper 里的 fatal assertion 只 return helper
+// 而让测试继续对着普通目录跑、产生连锁失败）。
+::testing::AssertionResult mount_debugfs(const char* root) {
+    if (mount("none", root, "debugfs", 0, nullptr) != 0) {
+        return ::testing::AssertionFailure()
+               << "mount debugfs failed: errno=" << errno << " (" << strerror(errno)
+               << ")";
+    }
+    return ::testing::AssertionSuccess();
 }
+
+// RAII guard：持有 debugfs mount 点，保证任意 ASSERT 提前 return 时都恢复测试前
+// 状态（Thread8：否则中途 ASSERT 失败会泄漏 enabled 的 static key + mount 点，污染
+// 共享 buffer 并给后续无关 exec 永久加开销）。
+//
+// 构造前提：mount_debugfs 已成功（mount 已生效）。此时析构必须 umount + rmdir。
+// arm_enable()：在事件成功 enable 后调用，记录 enable 文件路径；析构时写回 "0"。
+// 析构顺序：disable（仅当 arm 过）→ umount → rmdir。不可拷贝/移动（持有路径所有权）。
+class DebugfsMount {
+ public:
+    explicit DebugfsMount(const char* root) : root_(root) {}
+
+    ~DebugfsMount() {
+        if (!enable_path_.empty()) {
+            write_file(enable_path_.c_str(), "0");
+        }
+        umount(root_.c_str());
+        rmdir(root_.c_str());
+    }
+
+    DebugfsMount(const DebugfsMount&) = delete;
+    DebugfsMount& operator=(const DebugfsMount&) = delete;
+
+    // 在事件成功 enable 后调用：析构时把该文件写回 "0"。
+    void arm_enable(const char* enable_path) { enable_path_ = enable_path; }
+
+ private:
+    std::string root_;
+    std::string enable_path_;
+};
 
 // 子模式：被 execve 进来后立即退出 0。
 [[noreturn]] void helper_exec_exit0() {
@@ -100,7 +136,8 @@ TEST(SchedProcessExecTp, EventFilesExist) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_events_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
-    mount_debugfs(root);
+    ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
+    DebugfsMount guard(root);          // Thread8：RAII，任意提前 return 都 umount + rmdir。
 
     const char* base_rel = "/tracing/events/sched/sched_process_exec";
     char base[256] = {};
@@ -145,8 +182,7 @@ TEST(SchedProcessExecTp, EventFilesExist) {
     EXPECT_EQ(end != nullptr && *end == '\0', true) << "id has trailing garbage: " << id;
     EXPECT_GE(idval, 0) << "invalid id: " << id;
 
-    EXPECT_EQ(0, umount(root)) << strerror(errno);
-    EXPECT_EQ(0, rmdir(root)) << strerror(errno);
+    // 清理由 RAII guard 析构完成（umount + rmdir；本测例未 enable，无需 disable）。
 }
 
 // enable 后 execve 应触发事件，trace 文件留下记录。
@@ -155,7 +191,8 @@ TEST(SchedProcessExecTp, FiresOnExecve) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_fire_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
-    mount_debugfs(root);
+    ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
+    DebugfsMount guard(root);          // Thread8：RAII，析构 umount + rmdir。
 
     const char* base_rel = "/tracing/events/sched/sched_process_exec";
     char base[256] = {};
@@ -165,6 +202,7 @@ TEST(SchedProcessExecTp, FiresOnExecve) {
     char enable_path[320] = {};
     snprintf(enable_path, sizeof(enable_path), "%s/enable", base);
     ASSERT_TRUE(write_file(enable_path, "1")) << "enable write failed";
+    guard.arm_enable(enable_path);  // Thread8：任意提前 return 析构都会写回 "0"。
 
     // 清空 ring buffer：向 trace 写任意字节触发 clear。
     char trace_path[256] = {};
@@ -194,10 +232,7 @@ TEST(SchedProcessExecTp, FiresOnExecve) {
         << "trace missing comm= field:\n"
         << trace;
 
-    // 关闭事件并清理。
-    write_file(enable_path, "0");
-    EXPECT_EQ(0, umount(root)) << strerror(errno);
-    EXPECT_EQ(0, rmdir(root)) << strerror(errno);
+    // 清理由 RAII guard 析构完成（disable + umount + rmdir）。
 }
 
 // 默认 disabled 时 execve 不应在 trace 留下 sched_process_exec 记录。
@@ -207,7 +242,8 @@ TEST(SchedProcessExecTp, DefaultDisabledNoRecords) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_disabled_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
-    mount_debugfs(root);
+    ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
+    DebugfsMount guard(root);          // Thread8：RAII，析构 umount + rmdir（本测例不 enable）。
 
     char trace_path[256] = {};
     snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
@@ -233,8 +269,7 @@ TEST(SchedProcessExecTp, DefaultDisabledNoRecords) {
         << "tracepoint fired while disabled (static-key gate broken):\n"
         << trace;
 
-    EXPECT_EQ(0, umount(root)) << strerror(errno);
-    EXPECT_EQ(0, rmdir(root)) << strerror(errno);
+    // 清理由 RAII guard 析构完成（umount + rmdir；本测例未 enable，无需 disable）。
 }
 
 // enable 后能触发，disable 后不再触发。验证 enable/disable 状态机真正翻转 static-key。
@@ -243,7 +278,8 @@ TEST(SchedProcessExecTp, DisableStopsFiring) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_disable_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
-    mount_debugfs(root);
+    ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
+    DebugfsMount guard(root);          // Thread8：RAII，析构 umount + rmdir。
 
     const char* base_rel = "/tracing/events/sched/sched_process_exec";
     char base[256] = {};
@@ -256,6 +292,7 @@ TEST(SchedProcessExecTp, DisableStopsFiring) {
 
     // 基线：enable 后触发。
     ASSERT_TRUE(write_file(enable_path, "1")) << "enable write failed";
+    guard.arm_enable(enable_path);  // Thread8：任意提前 return 析构都会写回 "0"。
     ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
     {
         pid_t child = fork();
@@ -297,8 +334,7 @@ TEST(SchedProcessExecTp, DisableStopsFiring) {
             << trace;
     }
 
-    EXPECT_EQ(0, umount(root)) << strerror(errno);
-    EXPECT_EQ(0, rmdir(root)) << strerror(errno);
+    // 清理由 RAII guard 析构完成（disable + umount + rmdir；析构再次写 "0" 对已 disable 状态幂等）。
 }
 
 // non-leader 线程 execve：触发 de_thread 的 raw_pid 交换，old_pid ≠ pid。
@@ -308,7 +344,8 @@ TEST(SchedProcessExecTp, NonLeaderExecFiresWithDistinctOldPid) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_nonleader_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
-    mount_debugfs(root);
+    ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
+    DebugfsMount guard(root);          // Thread8：RAII，析构 umount + rmdir。
 
     const char* base_rel = "/tracing/events/sched/sched_process_exec";
     char base[256] = {};
@@ -320,6 +357,7 @@ TEST(SchedProcessExecTp, NonLeaderExecFiresWithDistinctOldPid) {
     snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
 
     ASSERT_TRUE(write_file(enable_path, "1")) << "enable write failed";
+    guard.arm_enable(enable_path);  // Thread8：任意提前 return 析构都会写回 "0"。
     ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
 
     // fork child：child 创建 sibling 线程（非 leader）执行 execve，leader 永久挂起。
@@ -363,9 +401,7 @@ TEST(SchedProcessExecTp, NonLeaderExecFiresWithDistinctOldPid) {
         << "non-leader exec should produce distinct old_pid vs pid:\n"
         << record;
 
-    write_file(enable_path, "0");
-    EXPECT_EQ(0, umount(root)) << strerror(errno);
-    EXPECT_EQ(0, rmdir(root)) << strerror(errno);
+    // 清理由 RAII guard 析构完成（disable + umount + rmdir）。
 }
 
 int main(int argc, char** argv) {

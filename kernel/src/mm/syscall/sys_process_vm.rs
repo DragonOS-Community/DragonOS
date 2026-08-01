@@ -149,7 +149,7 @@ fn find_target_process(pid: usize) -> Result<Arc<ProcessControlBlock>, SystemErr
 /// 3. Current process's uid/gid match target's euid/suid/uid and egid/sgid/gid
 ///
 /// See Linux kernel: kernel/ptrace.c __ptrace_may_access()
-fn check_process_vm_access(target_pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+pub fn check_process_vm_access(target_pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     let current_pcb = ProcessManager::current_pcb();
 
     // Self-access is always allowed

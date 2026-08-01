@@ -64,6 +64,20 @@ macro_rules! define_event_trace{
                     trace_point.callback_list(&mut f);
                 }
             }
+            /// 该 tracepoint 当前是否已启用（只读检查，无副作用）。
+            ///
+            /// 用于在构造 trace 参数之前进行廉价的禁用路径守卫：tracepoint 未启用时，
+            /// 调用方可据此跳过取锁 / 拷贝 / UTF-8 扫描等参数构造开销，避免 Rust 在进入
+            /// `trace_<name>()` 之前即求值参数所引入的禁用路径开销。
+            ///
+            /// 实现只读取 static-key 的运行时状态（atomic Relaxed 读），不操作代码段、
+            /// 不注册新的 jump entry，与 `trace_<name>()` 内部 `static_branch_unlikely!`
+            /// 的语义一致——二者都返回 true 当且仅当该 key 已被启用。
+            #[inline(always)]
+            #[allow(unused,non_snake_case)]
+            pub fn [<trace_ $name _enabled>]() -> bool {
+                [<__ $name _KEY>].is_enabled()
+            }
             #[allow(unused,non_snake_case)]
             pub fn [<register_trace_ $name>](func: fn(& (dyn core::any::Any+Send+Sync), $($arg_type),*), data: alloc::boxed::Box<dyn core::any::Any+Send+Sync>){
                 let func = unsafe{core::mem::transmute::<fn(& (dyn core::any::Any+Send+Sync), $($arg_type),*), fn()>(func)};

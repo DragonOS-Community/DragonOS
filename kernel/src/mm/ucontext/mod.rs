@@ -9,6 +9,7 @@ use core::{
 };
 
 use alloc::{
+    boxed::Box,
     collections::BTreeMap,
     sync::{Arc, Weak},
     vec::Vec,
@@ -35,6 +36,7 @@ use crate::{
         align::page_align_up,
         cpumask::CpuMask,
         mutex::{Mutex, MutexGuard},
+        rwlock::RwLock,
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
         wait_queue::WaitQueue,
@@ -107,15 +109,24 @@ mod mmap;
 mod mremap;
 mod notifications;
 mod stack;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod uprobe;
 mod vma;
 mod vma_ops;
-
+#[cfg(target_arch = "x86_64")]
+use self::{mappings::UserMappings, notifications::*, uprobe::UprobePageState, vma::VmaSplitSides};
+#[cfg(not(target_arch = "x86_64"))]
 use self::{mappings::UserMappings, notifications::*, vma::VmaSplitSides};
 
 pub use address_space::{AddressSpace, FileMappingWithFileArgs};
 pub use inner::InnerAddressSpace;
 pub use mapper::UserMapper;
 pub use stack::UserStack;
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_imports)]
+pub use uprobe::{
+    noop_handler, uprobe_register, uprobe_unregister, UprobeHandle, UprobeInstance, XolArea,
+};
 #[allow(unused_imports)]
 pub use vma::{
     AnonSharedMapping, LockedVMA, PhysmapParams, PresentPfn, Provider, VMASplitResult, VMA,

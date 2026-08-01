@@ -117,6 +117,14 @@ impl InnerAddressSpace {
 
         let mut parent_cow_remaps: Vec<(VirtAddr, EntryFlags<MMArch>)> = Vec::new();
         let mut child_present_pages = 0usize;
+        // Collect uprobe breakpoint page → original-paddr mappings.
+        // Child must NOT inherit COW copies (which contain 0xcc); map original pages instead.
+        #[cfg(target_arch = "x86_64")]
+        let uprobe_bp_originals: BTreeMap<usize, PhysAddr> = {
+            let pb = parent_mm.uprobe_page_state.lock_irqsave();
+            pb.iter().map(|(&k, v)| (k, v.original_paddr())).collect()
+        };
+
         let clone_result: Result<(), SystemError> = (|| {
             // Iterate over each VMA of the parent process and perform appropriate copying based on VMA attributes
             // Reference Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
@@ -178,6 +186,11 @@ impl InnerAddressSpace {
 
                     while current_page < end_page {
                         if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
+                            // uprobe: 若此页有断点（COW 副本含 0xcc），子进程映射原页而非副本
+                            #[cfg(target_arch = "x86_64")]
+                            let phys_addr = uprobe_bp_originals
+                                .get(&current_page.data())
+                                .map_or(phys_addr, |&orig| orig);
                             unsafe {
                                 if is_shared {
                                     let child_flags =

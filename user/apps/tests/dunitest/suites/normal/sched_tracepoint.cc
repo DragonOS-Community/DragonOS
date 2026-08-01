@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,6 +72,24 @@ void mount_debugfs(const char* root) {
     char* const envp[] = {nullptr};
     execve("/proc/self/exe", argv, envp);
     _exit(127);
+}
+
+// non-leader exec 辅助：sibling 线程（非 leader）执行 execve。
+void* sibling_exec_thread(void*) {
+    helper_exec_exit0();
+    return nullptr;
+}
+
+// 子模式：创建 sibling 线程（非 leader）执行 execve，主线程（leader）永久挂起。
+// 触发内核 de_thread 的 raw_pid 交换路径（old_pid ≠ pid）。
+[[noreturn]] void helper_sibling_exec_exit0() {
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, sibling_exec_thread, nullptr) != 0) {
+        _exit(1);
+    }
+    for (;;) {
+        pause();
+    }
 }
 
 }  // namespace
@@ -176,6 +195,174 @@ TEST(SchedProcessExecTp, FiresOnExecve) {
         << trace;
 
     // 关闭事件并清理。
+    write_file(enable_path, "0");
+    EXPECT_EQ(0, umount(root)) << strerror(errno);
+    EXPECT_EQ(0, rmdir(root)) << strerror(errno);
+}
+
+// 默认 disabled 时 execve 不应在 trace 留下 sched_process_exec 记录。
+// 验证 static-key 门控：未 enable 时 tracepoint 零记录（若门控坏了永远触发，此处可抓住）。
+TEST(SchedProcessExecTp, DefaultDisabledNoRecords) {
+    char root[128] = {};
+    snprintf(root, sizeof(root), "/tmp/sched_tp_disabled_%d", getpid());
+    ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
+
+    mount_debugfs(root);
+
+    char trace_path[256] = {};
+    snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
+
+    // 清空 ring buffer。
+    ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
+
+    // 不 enable（保持默认 disabled 状态），fork + execve 自身触发。
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: " << strerror(errno);
+    if (child == 0) {
+        helper_exec_exit0();
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << "waitpid failed: " << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally, status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status)) << "helper exit code != 0";
+
+    // 默认 disabled：trace 中不应出现 sched_process_exec 记录。
+    std::string trace = read_all(trace_path);
+    EXPECT_EQ(std::string::npos, trace.find("sched_process_exec("))
+        << "tracepoint fired while disabled (static-key gate broken):\n"
+        << trace;
+
+    EXPECT_EQ(0, umount(root)) << strerror(errno);
+    EXPECT_EQ(0, rmdir(root)) << strerror(errno);
+}
+
+// enable 后能触发，disable 后不再触发。验证 enable/disable 状态机真正翻转 static-key。
+TEST(SchedProcessExecTp, DisableStopsFiring) {
+    char root[128] = {};
+    snprintf(root, sizeof(root), "/tmp/sched_tp_disable_%d", getpid());
+    ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
+
+    mount_debugfs(root);
+
+    const char* base_rel = "/tracing/events/sched/sched_process_exec";
+    char base[256] = {};
+    snprintf(base, sizeof(base), "%s%s", root, base_rel);
+
+    char enable_path[320] = {};
+    snprintf(enable_path, sizeof(enable_path), "%s/enable", base);
+    char trace_path[256] = {};
+    snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
+
+    // 基线：enable 后触发。
+    ASSERT_TRUE(write_file(enable_path, "1")) << "enable write failed";
+    ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
+    {
+        pid_t child = fork();
+        ASSERT_GE(child, 0) << "fork failed: " << strerror(errno);
+        if (child == 0) {
+            helper_exec_exit0();
+        }
+        int status = 0;
+        ASSERT_EQ(child, waitpid(child, &status, 0)) << "waitpid failed: " << strerror(errno);
+        ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally, status=" << status;
+        ASSERT_EQ(0, WEXITSTATUS(status)) << "helper exit code != 0";
+    }
+    {
+        std::string trace = read_all(trace_path);
+        ASSERT_FALSE(trace.empty()) << "trace empty after enabled execve";
+        ASSERT_NE(std::string::npos, trace.find("sched_process_exec("))
+            << "enabled state did not fire (baseline):\n"
+            << trace;
+    }
+
+    // disable 后清 buffer 再触发：不应再记录。
+    ASSERT_TRUE(write_file(enable_path, "0")) << "disable write failed";
+    ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
+    {
+        pid_t child = fork();
+        ASSERT_GE(child, 0) << "fork failed: " << strerror(errno);
+        if (child == 0) {
+            helper_exec_exit0();
+        }
+        int status = 0;
+        ASSERT_EQ(child, waitpid(child, &status, 0)) << "waitpid failed: " << strerror(errno);
+        ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally, status=" << status;
+        ASSERT_EQ(0, WEXITSTATUS(status)) << "helper exit code != 0";
+    }
+    {
+        std::string trace = read_all(trace_path);
+        EXPECT_EQ(std::string::npos, trace.find("sched_process_exec("))
+            << "tracepoint still fired after disable:\n"
+            << trace;
+    }
+
+    EXPECT_EQ(0, umount(root)) << strerror(errno);
+    EXPECT_EQ(0, rmdir(root)) << strerror(errno);
+}
+
+// non-leader 线程 execve：触发 de_thread 的 raw_pid 交换，old_pid ≠ pid。
+// FiresOnExecve 走单线程 leader exec（old_pid == pid），此处覆盖非 leader 路径。
+TEST(SchedProcessExecTp, NonLeaderExecFiresWithDistinctOldPid) {
+    char root[128] = {};
+    snprintf(root, sizeof(root), "/tmp/sched_tp_nonleader_%d", getpid());
+    ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
+
+    mount_debugfs(root);
+
+    const char* base_rel = "/tracing/events/sched/sched_process_exec";
+    char base[256] = {};
+    snprintf(base, sizeof(base), "%s%s", root, base_rel);
+
+    char enable_path[320] = {};
+    snprintf(enable_path, sizeof(enable_path), "%s/enable", base);
+    char trace_path[256] = {};
+    snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
+
+    ASSERT_TRUE(write_file(enable_path, "1")) << "enable write failed";
+    ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
+
+    // fork child：child 创建 sibling 线程（非 leader）执行 execve，leader 永久挂起。
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: " << strerror(errno);
+    if (child == 0) {
+        helper_sibling_exec_exit0();
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << "waitpid failed: " << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally, status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status)) << "helper exit code != 0";
+
+    std::string trace = read_all(trace_path);
+    ASSERT_FALSE(trace.empty()) << "trace empty after non-leader execve";
+
+    // 找到包含 sched_process_exec 的记录行。
+    size_t rec = trace.find("sched_process_exec");
+    ASSERT_NE(std::string::npos, rec)
+        << "no sched_process_exec record after non-leader execve:\n"
+        << trace;
+    size_t line_end = trace.find('\n', rec);
+    if (line_end == std::string::npos) {
+        line_end = trace.size();
+    }
+    std::string record = trace.substr(rec, line_end - rec);
+
+    // 解析 old_pid=N。注意 "old_pid=" 含 "pid=" 子串，先取 old_pid。
+    size_t old_pos = record.find("old_pid=");
+    ASSERT_NE(std::string::npos, old_pos) << "record missing old_pid=:\n" << record;
+    long old_pid_val = strtol(record.c_str() + old_pos + strlen("old_pid="), nullptr, 10);
+
+    // 解析 pid=N：用 " pid="（带前导空格）避免命中 old_pid 内的 pid。
+    size_t pid_pos = record.find(" pid=");
+    ASSERT_NE(std::string::npos, pid_pos) << "record missing pid=:\n" << record;
+    long pid_val = strtol(record.c_str() + pid_pos + strlen(" pid="), nullptr, 10);
+
+    // non-leader exec 触发 de_thread 交换：old_pid（调用 execve 线程原 PID）≠ pid（交换后 leader PID）。
+    EXPECT_NE(old_pid_val, pid_val)
+        << "non-leader exec should produce distinct old_pid vs pid:\n"
+        << record;
+
     write_file(enable_path, "0");
     EXPECT_EQ(0, umount(root)) << strerror(errno);
     EXPECT_EQ(0, rmdir(root)) << strerror(errno);

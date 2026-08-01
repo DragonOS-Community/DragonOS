@@ -240,6 +240,9 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
             RawPid::from(args.pid as usize)
         };
         let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+        // 非特权调用者探测其他进程需通过 ptrace 访问检查
+        // （镜像 process_vm_readv/writev 的 check_process_vm_access，防越权改写目标代码页）
+        crate::mm::syscall::sys_process_vm::check_process_vm_access(&pcb)?;
         let mm = pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
         Some(mm)
     } else {

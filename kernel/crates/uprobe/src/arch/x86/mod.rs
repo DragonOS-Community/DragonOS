@@ -26,6 +26,9 @@ pub enum UprobeInsnError {
     TooLong,
     /// RIP-relative 重定位后的位移超出 i32 范围（disp32 装不下）。
     DisplacementOverflow,
+    /// 控制流指令（call/jmp/ret/jcc/loop/int 等）——XOL 执行会跳出 slot，
+    /// 后续 #DB 无法反推探针址，且可能损坏栈/控制流。注册时拒绝。
+    UnsupportedControlFlow,
 }
 
 /// RIP-relative 重定位信息（静态分析得出，运行时用真实 slot 地址套用）。
@@ -72,12 +75,44 @@ pub fn analyze_insn(bytes: &[u8]) -> Result<InsnAnalysis, UprobeInsnError> {
     if bytes.len() < insn_len {
         return Err(UprobeInsnError::Truncated);
     }
+    // 控制流指令从 XOL slot 执行会跳出 slot，后续 #DB 无法反推探针址，
+    // 且 call/ret 会损坏用户栈。注册时拒绝（与 Linux uprobe 一致：
+    // boost/add_on_return 机制不属于阶段一范围）。
+    if is_control_flow(&inst) {
+        return Err(UprobeInsnError::UnsupportedControlFlow);
+    }
 
     let rip_relative = find_rip_relative(&inst, insn_len)?;
     Ok(InsnAnalysis {
         insn_len,
         rip_relative,
     })
+}
+
+/// 判断指令是否为控制流指令（不可从 XOL slot 安全执行）。
+///
+/// 覆盖：直接跳转/调用/返回、条件跳转（Jcc）、循环（LOOP*）、
+/// 中断（INT/INT3/IRET*）、系统调用/返回（SYSCALL/SYSRET）。
+/// 这些指令改变 RIP 的方式使 XOL 单步后的 #DB 无法在 slot 内捕获，
+/// 或会向用户栈写入 XOL 地址损坏控制流。
+fn is_control_flow(inst: &Instruction) -> bool {
+    use yaxpeax_x86::amd64::Opcode;
+    matches!(
+        inst.opcode(),
+        Opcode::CALL
+            | Opcode::CALLF
+            | Opcode::JMP
+            | Opcode::JMPF
+            | Opcode::RETURN
+            | Opcode::RETF
+            | Opcode::LOOP
+            | Opcode::INT
+            | Opcode::IRET
+            | Opcode::IRETD
+            | Opcode::IRETQ
+            | Opcode::SYSCALL
+            | Opcode::SYSRET
+    ) || inst.opcode().is_jcc()
 }
 
 /// 在已解码指令中查找 RIP-relative 内存操作数，返回重定位信息。
@@ -182,6 +217,17 @@ pub fn build_xol_slot(
         let new_disp =
             i32::try_from(new_disp).map_err(|_| UprobeInsnError::DisplacementOverflow)?;
         slot[reloc.disp_offset..reloc.disp_offset + 4].copy_from_slice(&new_disp.to_le_bytes());
+    }
+
+    // 原指令之后的尾随字节填 int3(0xcc)。
+    //
+    // 正常路径：TF 在原指令执行后立即触发 #DB，不会执行到尾随字节。
+    // 竞态路径：若 #BP 后、#DB 前该 uprobe 被注销（slot 被释放），且 slot
+    // 被重分配给另一探针，#DB handler 无法反推 probe_vaddr。此时线程从 slot
+    // 继续执行会命中尾随 int3 → 再次触发 #BP → 正常 uprobe 分发或 SIGTRAP，
+    // 而非执行零填充（可能解码为 add [rax], al 等意外指令损坏内存）。
+    for b in &mut slot[len..] {
+        *b = 0xcc;
     }
     Ok(())
 }

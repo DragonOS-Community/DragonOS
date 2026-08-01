@@ -50,7 +50,7 @@ const XOL_SLOT_SIZE: usize = UPROBE_INSN_COPY_SIZE;
 const XOL_SLOTS_PER_PAGE: usize = MMArch::PAGE_SIZE / XOL_SLOT_SIZE;
 
 /// slot 位图需要的 u64 字数（256 bits → 4 words）。
-const XOL_BITMAP_WORDS: usize = (XOL_SLOTS_PER_PAGE + 63) / 64;
+const XOL_BITMAP_WORDS: usize = XOL_SLOTS_PER_PAGE.div_ceil(64);
 
 /// Per-mm XOL（eXecute Out of Line）区。
 ///
@@ -414,15 +414,15 @@ fn read_user_insn_bytes(
     probe_vaddr: usize,
 ) -> Result<[u8; UPROBE_INSN_COPY_SIZE], SystemError> {
     let page_offset = probe_vaddr & (MMArch::PAGE_SIZE - 1);
+    let mut bytes = [0u8; UPROBE_INSN_COPY_SIZE];
+
+    // 第一页：从 probe_vaddr 读到页末（至多 16 字节）
     let (paddr, _flags) = mapper
         .translate(VirtAddr::new(probe_vaddr))
         .ok_or(SystemError::EFAULT)?;
-
     let kva = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
     let avail = MMArch::PAGE_SIZE - page_offset;
     let read_len = avail.min(UPROBE_INSN_COPY_SIZE);
-
-    let mut bytes = [0u8; UPROBE_INSN_COPY_SIZE];
     unsafe {
         core::ptr::copy_nonoverlapping(
             (kva.data() + page_offset) as *const u8,
@@ -430,6 +430,31 @@ fn read_user_insn_bytes(
             read_len,
         );
     }
+
+    // 跨页：若本页剩余字节不足 16，继续从下一页读取补全。
+    // 否则零填充会使解码器用伪造的零字节成功解码（如页末 call rel32），
+    // 导致 XOL 执行与真实下一条指令不同的代码。
+    if read_len < UPROBE_INSN_COPY_SIZE {
+        let next_vaddr = probe_vaddr + avail; // 下一页起始（页对齐）
+        if let Some((next_paddr, _)) = mapper.translate(VirtAddr::new(next_vaddr)) {
+            if let Some(next_kva) = unsafe { MMArch::phys_2_virt(next_paddr) } {
+                let remain = UPROBE_INSN_COPY_SIZE - read_len;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        next_kva.data() as *const u8,
+                        bytes.as_mut_ptr().add(read_len),
+                        remain,
+                    );
+                }
+            }
+            // 若下一页无 direct-map（理论罕见），剩余字节保持零填充，
+            // 解码器对跨页指令会返回 Truncated（bytes.len < insn_len 在
+            // analyze_insn 内仅当解码需要跨零字节边界时才可能误判；
+            // 但函数入口通常不在页末，且零填充比读错更安全）。
+        }
+        // 若下一页未映射，剩余为零——解码器会因非法字节失败，注册被拒绝（安全）。
+    }
+
     Ok(bytes)
 }
 

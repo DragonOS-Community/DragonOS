@@ -1,12 +1,17 @@
-use alloc::vec::Vec;
+use alloc::{format, string::String, vec::Vec};
 use core::ptr::NonNull;
 use system_error::SystemError;
 
 use crate::arch::MMArch;
+use crate::libs::mutex::Mutex;
 use crate::libs::spinlock::SpinLock;
 use crate::mm::{
-    allocator::page_frame::{
-        allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
+    allocator::{
+        buddy::deterministic_buddy_selftest,
+        page_frame::{
+            allocate_page_frames, allocate_page_frames_below, deallocate_page_frames,
+            PageFrameCount, PhysPageFrame,
+        },
     },
     MemoryManagementArch, PhysAddr,
 };
@@ -219,18 +224,7 @@ impl DmaAllocator {
         // cache maintenance and cannot be emulated by rewriting PTE flags.
         validate_cache_policy(options.cache_policy)?;
         let pool_pages = self.pool_pages_for(page_count.data(), options.use_pool);
-        let raw = if let Some(pages) = pool_pages {
-            if let Some(raw) = self.take_from_pool(pages) {
-                if options.zeroed {
-                    self.zero_raw(&raw);
-                }
-                raw
-            } else {
-                self.try_alloc_raw(page_count, &options)?
-            }
-        } else {
-            self.try_alloc_raw(page_count, &options)?
-        };
+        let raw = self.try_alloc_from_pool_or_raw(page_count, pool_pages, &options)?;
         Ok(DmaBuffer {
             paddr: raw.paddr.data(),
             vaddr: raw.vaddr,
@@ -240,14 +234,48 @@ impl DmaAllocator {
         })
     }
 
+    fn try_alloc_from_pool_or_raw(
+        &self,
+        page_count: PageFrameCount,
+        pool_pages: Option<usize>,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, SystemError> {
+        if let Some(pages) = pool_pages {
+            if let Some(raw) = self.take_from_pool(pages) {
+                if allocation_fits_mask(&raw, options.dma_mask) {
+                    if options.zeroed {
+                        self.zero_raw(&raw);
+                    }
+                    Ok(raw)
+                } else {
+                    // This pool entry cannot satisfy the caller. Return it to
+                    // the global allocator before making a bounded request.
+                    unsafe {
+                        deallocate_page_frames(PhysPageFrame::new(raw.paddr), raw.page_count);
+                    }
+                    self.try_alloc_raw(page_count, options)
+                }
+            } else {
+                self.try_alloc_raw(page_count, options)
+            }
+        } else {
+            self.try_alloc_raw(page_count, options)
+        }
+    }
+
     fn try_alloc_raw(
         &self,
         page_count: PageFrameCount,
         options: &DmaAllocOptions,
     ) -> Result<DmaRawAllocation, SystemError> {
         validate_cache_policy(options.cache_policy)?;
-        let (paddr, count) =
-            unsafe { allocate_page_frames(page_count) }.ok_or(SystemError::ENOMEM)?;
+        let allocation = if let Some(mask) = options.dma_mask {
+            let max = usize::try_from(mask).unwrap_or(usize::MAX);
+            unsafe { allocate_page_frames_below(page_count, PhysAddr::new(max)) }
+        } else {
+            unsafe { allocate_page_frames(page_count) }
+        };
+        let (paddr, count) = allocation.ok_or(SystemError::ENOMEM)?;
         let virt = match unsafe { MMArch::phys_2_virt(paddr) } {
             Some(virt) => virt,
             None => {
@@ -312,6 +340,16 @@ impl DmaAllocator {
     }
 }
 
+fn allocation_fits_mask(allocation: &DmaRawAllocation, mask: Option<u64>) -> bool {
+    mask.is_none_or(|mask| {
+        allocation
+            .paddr
+            .data()
+            .checked_add(allocation.page_count.bytes().saturating_sub(1))
+            .is_some_and(|end| end as u64 <= mask)
+    })
+}
+
 pub fn dma_alloc_pages_raw(pages: usize, mut options: DmaAllocOptions) -> (usize, NonNull<u8>) {
     options.use_pool = false;
     let page_count = page_count_from_pages(pages).expect("invalid dma page count");
@@ -356,8 +394,122 @@ const DMA_POOL_CLASSES: &[usize] = &[1, 2, 4, 8, 16];
 
 lazy_static! {
     static ref DMA_ALLOCATOR: DmaAllocator = DmaAllocator::new();
+    static ref DMA_SELFTEST_LOCK: Mutex<()> = Mutex::new(());
 }
 
 fn dma_allocator() -> &'static DmaAllocator {
     &DMA_ALLOCATOR
+}
+
+fn release_raw(raw: DmaRawAllocation) {
+    unsafe {
+        deallocate_page_frames(PhysPageFrame::new(raw.paddr), raw.page_count);
+    }
+}
+
+fn raw_fits_mask(raw: &DmaRawAllocation, mask: u64) -> bool {
+    allocation_fits_mask(raw, Some(mask))
+}
+
+fn selftest_bounded_orders() -> bool {
+    let options = DmaAllocOptions {
+        zeroed: false,
+        dma_mask: Some(u32::MAX as u64),
+        use_pool: false,
+        ..Default::default()
+    };
+
+    for pages in [1, 2, 4, 8, 16] {
+        let Ok(raw) = dma_allocator().try_alloc_raw(PageFrameCount::new(pages), &options) else {
+            return false;
+        };
+        let ok = raw.page_count.data() == pages && raw_fits_mask(&raw, u32::MAX as u64);
+        release_raw(raw);
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn selftest_pool_mask_separation() -> bool {
+    let allocator = DmaAllocator::new();
+    let unbounded = DmaAllocOptions {
+        zeroed: false,
+        use_pool: false,
+        ..Default::default()
+    };
+    let Ok(first) = allocator.try_alloc_raw(PageFrameCount::ONE, &unbounded) else {
+        return false;
+    };
+    let Ok(second) = allocator.try_alloc_raw(PageFrameCount::ONE, &unbounded) else {
+        release_raw(first);
+        return false;
+    };
+    let (lower, higher) = if first.paddr < second.paddr {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let Some(mask) = lower
+        .paddr
+        .data()
+        .checked_add(lower.page_count.bytes().saturating_sub(1))
+        .map(|end| end as u64)
+    else {
+        release_raw(lower);
+        release_raw(higher);
+        return false;
+    };
+    let higher_copy = DmaRawAllocation {
+        paddr: higher.paddr,
+        vaddr: higher.vaddr,
+        page_count: higher.page_count,
+    };
+    if !allocator.return_to_pool(higher) {
+        release_raw(lower);
+        release_raw(higher_copy);
+        return false;
+    }
+    release_raw(lower);
+
+    let bounded = DmaAllocOptions {
+        dma_mask: Some(mask),
+        use_pool: true,
+        ..unbounded
+    };
+    match allocator.try_alloc_from_pool_or_raw(PageFrameCount::ONE, Some(1), &bounded) {
+        Ok(raw) => {
+            let ok = raw_fits_mask(&raw, mask);
+            release_raw(raw);
+            ok
+        }
+        Err(_) => false,
+    }
+}
+
+/// Run allocator checks against the live buddy allocator.  Every successful
+/// allocation is released before the function returns, so reading the report
+/// does not reserve memory or grow the normal DMA pools.
+pub(crate) fn dma_allocator_selftest_report() -> String {
+    let _guard = DMA_SELFTEST_LOCK.lock();
+    let (bounded_candidate_selection, split_free_merge, fragmented_arena) =
+        deterministic_buddy_selftest();
+    let cases = [
+        ("bounded_orders", selftest_bounded_orders()),
+        ("bounded_candidate_selection", bounded_candidate_selection),
+        ("split_free_merge", split_free_merge),
+        ("fragmented_arena", fragmented_arena),
+        ("pool_mask_separation", selftest_pool_mask_separation()),
+    ];
+    let failed = cases.iter().filter(|(_, passed)| !passed).count();
+    let mut report = format!("status={}\n", if failed == 0 { "ok" } else { "fail" });
+    for (name, passed) in cases {
+        report.push_str(&format!("{name}={}\n", if passed { "ok" } else { "fail" }));
+    }
+    report.push_str(&format!(
+        "summary_pass={}\nsummary_fail={failed}\n",
+        cases.len() - failed
+    ));
+    report
 }

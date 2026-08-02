@@ -55,7 +55,7 @@ impl TestDevice {
 
 impl PciDevice for TestDevice {
     fn dynid(&self) -> PciDeviceID {
-        PciDeviceID::dummpy()
+        PciDeviceID::any()
     }
 
     fn vendor(&self) -> u16 {

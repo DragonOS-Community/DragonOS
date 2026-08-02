@@ -100,14 +100,31 @@ impl BlockDevManager {
         &self,
         dev: &Arc<dyn BlockDevice>,
     ) -> Result<Vec<Arc<GenDisk>>, SystemError> {
-        if let Ok(gendisks) = self.prepare_gendisks_by_mbr(dev) {
-            if !gendisks.is_empty() {
-                return Ok(gendisks);
-            }
+        let disk_range = dev.disk_range();
+        // Linux publishes part0 (the whole-disk node) before scanning the
+        // partition table.  Keep that invariant here: a missing/malformed
+        // table or a media read error must not make the disk itself disappear.
+        let mut gendisks =
+            vec![self.create_gendisk_with_range(dev, disk_range, GenDisk::ENTIRE_DISK_IDX)];
+
+        // A zero-capacity device has no sector 0 to probe.  This is a normal
+        // state for an unbound loop device, so let the device reject I/O until
+        // media is attached.
+        if disk_range.len() == 0 {
+            return Ok(gendisks);
         }
 
-        let gendisks =
-            vec![self.create_gendisk_with_range(dev, dev.disk_range(), GenDisk::ENTIRE_DISK_IDX)];
+        match self.prepare_gendisks_by_mbr(dev) {
+            Ok(partitions) => gendisks.extend(partitions),
+            Err(SystemError::EINVAL | SystemError::EEXIST) => {}
+            Err(err) => {
+                log::warn!(
+                    "Failed to scan partitions on block device {}: {:?}",
+                    dev.dev_name().name(),
+                    err
+                );
+            }
+        }
         Ok(gendisks)
     }
 
@@ -118,8 +135,17 @@ impl BlockDevManager {
         let mbr = MbrDiskPartionTable::from_disk(dev.clone())?;
         let mut gendisks = Vec::new();
         for p in mbr.partitions_raw() {
-            let idx = dev.blkdev_meta().inner().gendisks.alloc_idx();
-            let range = p.try_into()?;
+            // MBR slots are numbered 1..=4.  Empty slots must not renumber
+            // later partitions (slot 2 is /dev/sda2, not /dev/sda1).
+            let idx = u32::from(p.partno) + 1;
+            let mut range: GeneralBlockRange = p.try_into()?;
+            let disk_range = dev.disk_range();
+            if range.lba_start >= disk_range.lba_end {
+                continue;
+            }
+            // Match Linux partition scanning: keep an in-range prefix rather
+            // than publishing I/O addresses beyond the end of the device.
+            range.lba_end = range.lba_end.min(disk_range.lba_end);
             if gendisks
                 .iter()
                 .any(|gendisk: &Arc<GenDisk>| gendisk.range().intersects_with(&range).is_some())
@@ -157,18 +183,24 @@ impl BlockDevManager {
         dev: &Arc<dyn BlockDevice>,
         gendisks: &[Arc<GenDisk>],
     ) -> Result<(), SystemError> {
-        let mut registered: Vec<Arc<GenDisk>> = Vec::new();
-        for gendisk in gendisks {
-            if let Err(e) = self.publish_gendisk(dev, gendisk.clone()) {
-                for rg in registered.into_iter() {
-                    if let Ok(name) = rg.dname() {
-                        let _ = devfs_unregister(name.as_ref(), rg.clone());
-                    }
-                    dev.blkdev_meta().inner().gendisks.remove(&rg.idx());
-                }
-                return Err(e);
+        let Some((whole_disk, partitions)) = gendisks.split_first() else {
+            return Err(SystemError::EINVAL);
+        };
+        debug_assert_eq!(whole_disk.idx(), GenDisk::ENTIRE_DISK_IDX);
+        self.publish_gendisk(dev, whole_disk.clone())?;
+
+        // Linux keeps part0 registered even if an individual partition cannot
+        // be added.  Partition nodes are therefore best-effort additions and
+        // must not roll back the usable whole-disk node.
+        for partition in partitions {
+            if let Err(err) = self.publish_gendisk(dev, partition.clone()) {
+                log::warn!(
+                    "Failed to publish partition {} on block device {}: {:?}",
+                    partition.idx(),
+                    dev.dev_name().name(),
+                    err
+                );
             }
-            registered.push(gendisk.clone());
         }
         Ok(())
     }
@@ -182,8 +214,10 @@ impl BlockDevManager {
         let idx = gendisk.idx();
         {
             let mut meta_inner = blk_meta.inner();
-            // 检查是否重复
-            if meta_inner.gendisks.intersects(&gendisk.range()) {
+            if meta_inner.gendisks.contains_key(&idx)
+                || (idx != GenDisk::ENTIRE_DISK_IDX
+                    && meta_inner.gendisks.intersects_partition(&gendisk.range()))
+            {
                 return Err(SystemError::EEXIST);
             }
 

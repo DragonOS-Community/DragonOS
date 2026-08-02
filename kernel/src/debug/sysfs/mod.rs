@@ -27,6 +27,7 @@ fn debugfs_init() -> Result<(), SystemError> {
     super::ext4::init_debugfs_ext4()?;
     super::fuse::init_debugfs_fuse()?;
     super::kthread::init_debugfs_kthread()?;
+    super::mm::init_debugfs_mm()?;
     super::page_cache::init_debugfs_page_cache()?;
     super::timekeeping::init_debugfs_timekeeping()?;
     return Ok(());

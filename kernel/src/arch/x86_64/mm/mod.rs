@@ -797,6 +797,19 @@ impl FrameAllocator for LockedFrameAllocator {
         retry_oom_victim_page_frame_alloc(|| unsafe { Self::allocate_inner(count) })
     }
 
+    unsafe fn allocate_below(
+        &mut self,
+        mut count: PageFrameCount,
+        max_phys_addr: PhysAddr,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        count = count.next_power_of_two();
+        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
+            allocator.buddy_alloc_below(count, max_phys_addr)
+        } else {
+            None
+        }
+    }
+
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {
         assert!(count.data().is_power_of_two());
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {

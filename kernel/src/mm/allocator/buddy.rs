@@ -7,7 +7,10 @@ use log::{debug, warn};
 /// @Description: 伙伴分配器
 use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
-use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
+use crate::mm::allocator::page_frame::{
+    allocate_page_frames, deallocate_page_frames, FrameAllocator, PageFrameCount, PageFrameUsage,
+    PhysPageFrame,
+};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr};
 
 use core::cmp::min;
@@ -356,6 +359,69 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             .map(|addr| (addr, PageFrameCount::new(1 << (order as usize - MIN_ORDER))));
     }
 
+    /// Allocate from a free block whose returned range fits below a physical
+    /// address limit. The selected larger buddy block may cross the limit;
+    /// only its low split is returned and the remaining halves go back to the
+    /// normal free lists.
+    pub fn buddy_alloc_below(
+        &mut self,
+        count: PageFrameCount,
+        max_phys_addr: PhysAddr,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        assert!(count.data().is_power_of_two());
+        let requested_bytes = count.data().checked_mul(A::PAGE_SIZE)?;
+        let requested_order = (log2(count.data()) + MIN_ORDER) as u8;
+        if requested_order as usize >= MAX_ORDER {
+            return None;
+        }
+
+        for current_order in requested_order as usize..MAX_ORDER {
+            let mut list_addr = self.free_area[Self::order2index(current_order as u8)];
+            loop {
+                let mut list: PageList<A> = Self::read_page(list_addr);
+                for index in 0..list.entry_num {
+                    let entry_addr = Self::entry_virt_addr(list_addr, index);
+                    let entry: PhysAddr = unsafe { A::read(entry_addr) };
+                    let fits = entry
+                        .data()
+                        .checked_add(requested_bytes - 1)
+                        .is_some_and(|end| end <= max_phys_addr.data());
+                    if !fits {
+                        continue;
+                    }
+
+                    let last_index = list.entry_num - 1;
+                    if index != last_index {
+                        let last: PhysAddr =
+                            unsafe { A::read(Self::entry_virt_addr(list_addr, last_index)) };
+                        unsafe { A::write(entry_addr, last) };
+                    }
+                    unsafe {
+                        A::write(
+                            Self::entry_virt_addr(list_addr, last_index),
+                            PhysAddr::new(0),
+                        )
+                    };
+                    list.entry_num -= 1;
+                    Self::write_page(list_addr, list);
+
+                    let base = entry;
+                    let mut split_order = current_order;
+                    while split_order > requested_order as usize {
+                        split_order -= 1;
+                        unsafe { self.buddy_free(base + (1 << split_order), split_order as u8) };
+                    }
+                    return Some((base, count));
+                }
+                if list.next_page.is_null() {
+                    break;
+                }
+                list_addr = list.next_page;
+            }
+        }
+        None
+    }
+
     /// 释放一个块
     ///
     /// ## 参数
@@ -568,6 +634,144 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         // 走到这一步，order应该为MAX_ORDER-1
         assert!(order == MAX_ORDER - 1);
     }
+}
+
+/// Exercise bounded allocation, splitting, and merging on a private arena.
+///
+/// The live allocator only supplies one aligned backing block.  All operations
+/// under test use a separate `BuddyAllocator`, so their exact addresses are
+/// deterministic and concurrent kernel allocations cannot affect the result.
+pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool) {
+    const BACKING_PAGES: usize = 64;
+    const ARENA_OFFSET_PAGES: usize = 32;
+    const ARENA_PAGES: usize = 16;
+
+    let Some((backing, backing_count)) =
+        (unsafe { allocate_page_frames(PageFrameCount::new(BACKING_PAGES)) })
+    else {
+        return (false, false, false);
+    };
+
+    unsafe fn empty_isolated_allocator(backing: PhysAddr) -> BuddyAllocator<MMArch> {
+        let mut free_area = [PhysAddr::new(0); MAX_ORDER - MIN_ORDER];
+        for (index, area) in free_area.iter_mut().enumerate() {
+            *area = backing + index * MMArch::PAGE_SIZE;
+            core::ptr::write_bytes(
+                MMArch::phys_2_virt(*area).unwrap().as_ptr::<u8>(),
+                0,
+                MMArch::PAGE_SIZE,
+            );
+            BuddyAllocator::<MMArch>::write_page(*area, PageList::new(0, PhysAddr::new(0)));
+        }
+        BuddyAllocator {
+            free_area,
+            total: PageFrameCount::new(ARENA_PAGES),
+            phantom: PhantomData,
+        }
+    }
+
+    unsafe fn isolated_allocator(backing: PhysAddr) -> BuddyAllocator<MMArch> {
+        let mut allocator = empty_isolated_allocator(backing);
+        allocator.buddy_free(
+            backing + ARENA_OFFSET_PAGES * MMArch::PAGE_SIZE,
+            (MIN_ORDER + ARENA_PAGES.trailing_zeros() as usize) as u8,
+        );
+        allocator
+    }
+
+    let arena = backing + ARENA_OFFSET_PAGES * MMArch::PAGE_SIZE;
+    let arena_max = arena + ARENA_PAGES * MMArch::PAGE_SIZE - 1;
+
+    let bounded_selection_ok = {
+        let mut allocator = unsafe { empty_isolated_allocator(backing) };
+        let low = arena;
+        let high = arena + ARENA_PAGES * MMArch::PAGE_SIZE;
+        // Insert the out-of-mask block first so the bounded search has to skip
+        // it rather than succeeding accidentally on the first entry.
+        unsafe {
+            allocator.free(high, PageFrameCount::new(8));
+            allocator.free(low, PageFrameCount::new(8));
+        }
+        let low_max = low + 8 * MMArch::PAGE_SIZE - 1;
+        let selected = allocator.buddy_alloc_below(PageFrameCount::new(8), low_max);
+        let remaining =
+            allocator.buddy_alloc_below(PageFrameCount::new(8), high + 8 * MMArch::PAGE_SIZE - 1);
+        selected.is_some_and(|(base, count)| base == low && count.data() == 8)
+            && remaining.is_some_and(|(base, count)| base == high && count.data() == 8)
+    };
+
+    let split_merge_ok = {
+        let mut allocator = unsafe { isolated_allocator(backing) };
+        let first = allocator.buddy_alloc_below(PageFrameCount::new(8), arena_max);
+        let second = allocator.buddy_alloc_below(PageFrameCount::new(8), arena_max);
+        match (first, second) {
+            (Some((first, first_count)), Some((second, second_count))) => {
+                let exact_split = first_count.data() == 8
+                    && second_count.data() == 8
+                    && min(first, second) == arena
+                    && core::cmp::max(first, second) == arena + 8 * MMArch::PAGE_SIZE;
+                unsafe {
+                    allocator.free(first, first_count);
+                    allocator.free(second, second_count);
+                }
+                let merged = allocator.buddy_alloc_below(PageFrameCount::new(16), arena_max);
+                exact_split
+                    && merged.is_some_and(|(base, count)| base == arena && count.data() == 16)
+            }
+            _ => false,
+        }
+    };
+
+    let fragmented_ok = {
+        let mut allocator = unsafe { isolated_allocator(backing) };
+        let mut pages = alloc::vec::Vec::with_capacity(ARENA_PAGES);
+        for _ in 0..ARENA_PAGES {
+            let Some((base, count)) = allocator.buddy_alloc_below(PageFrameCount::ONE, arena_max)
+            else {
+                break;
+            };
+            if count != PageFrameCount::ONE {
+                break;
+            }
+            pages.push(base);
+        }
+        pages.sort_unstable();
+        let exact_pages = pages.len() == ARENA_PAGES
+            && pages
+                .iter()
+                .enumerate()
+                .all(|(index, base)| *base == arena + index * MMArch::PAGE_SIZE);
+
+        if exact_pages {
+            for index in (0..ARENA_PAGES).step_by(2) {
+                unsafe { allocator.free(pages[index], PageFrameCount::ONE) };
+            }
+            let fragmented_rejects_pair = allocator
+                .buddy_alloc_below(PageFrameCount::new(2), arena_max)
+                .is_none();
+
+            unsafe { allocator.free(pages[1], PageFrameCount::ONE) };
+            let pair = allocator.buddy_alloc_below(PageFrameCount::new(2), arena_max);
+            let exact_pair = pair.is_some_and(|(base, count)| base == arena && count.data() == 2);
+            if let Some((base, count)) = pair {
+                unsafe { allocator.free(base, count) };
+            }
+            for index in (3..ARENA_PAGES).step_by(2) {
+                unsafe { allocator.free(pages[index], PageFrameCount::ONE) };
+            }
+            let merged = allocator.buddy_alloc_below(PageFrameCount::new(16), arena_max);
+            fragmented_rejects_pair
+                && exact_pair
+                && merged.is_some_and(|(base, count)| base == arena && count.data() == 16)
+        } else {
+            false
+        }
+    };
+
+    unsafe {
+        deallocate_page_frames(PhysPageFrame::new(backing), backing_count);
+    }
+    (bounded_selection_ok, split_merge_ok, fragmented_ok)
 }
 
 impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {

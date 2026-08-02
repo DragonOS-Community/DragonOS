@@ -9,4 +9,5 @@ pub mod pci_irq;
 pub mod raw_device;
 pub mod root;
 pub mod subsys;
+#[cfg(test)]
 pub mod test;

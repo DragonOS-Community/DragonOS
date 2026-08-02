@@ -153,6 +153,32 @@ TEST(LoopSemantics, GetFreeReturnsRegisteredDevice) {
     EXPECT_EQ(close(control_fd), 0) << strerror(errno);
 }
 
+TEST(LoopSemantics, ZeroCapacityDeviceRegistersBeforeBackingIsAttached) {
+    int control_fd = open("/dev/loop-control", O_RDWR);
+    ASSERT_GE(control_fd, 0) << strerror(errno);
+    const int minor = ioctl(control_fd, kLoopCtlAdd, UINT32_MAX);
+    ASSERT_GE(minor, 0) << strerror(errno);
+
+    char path[64];
+    snprintf(path, sizeof(path), "/dev/loop%d", minor);
+    int loop_fd = open(path, O_RDWR);
+    EXPECT_GE(loop_fd, 0) << "zero-capacity loop device was not published: " << strerror(errno);
+    if (loop_fd < 0) {
+        EXPECT_EQ(ioctl(control_fd, kLoopCtlRemove, minor), 0) << strerror(errno);
+        EXPECT_EQ(close(control_fd), 0) << strerror(errno);
+        return;
+    }
+
+    unsigned char sector[512] = {};
+    errno = 0;
+    EXPECT_EQ(pread(loop_fd, sector, sizeof(sector), 0), -1);
+    EXPECT_EQ(errno, ENODEV);
+
+    EXPECT_EQ(close(loop_fd), 0) << strerror(errno);
+    EXPECT_EQ(ioctl(control_fd, kLoopCtlRemove, minor), 0) << strerror(errno);
+    EXPECT_EQ(close(control_fd), 0) << strerror(errno);
+}
+
 TEST(LoopSemantics, SyncIoRetainsBackingOpenFileDescription) {
     LoopDevice device;
     ASSERT_NO_FATAL_FAILURE(device.SetUp(O_RDWR | O_SYNC));

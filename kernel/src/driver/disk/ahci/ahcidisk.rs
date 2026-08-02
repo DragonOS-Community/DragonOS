@@ -55,6 +55,7 @@ pub struct LockedAhciDisk {
     port_num: u8,
     capacity_lba: usize,
     flush_command: Option<u8>,
+    reliable_flush: bool,
     open_count: AtomicU32,
     mount_holder_count: AtomicU32,
 }
@@ -350,9 +351,12 @@ impl LockedAhciDisk {
     }
 
     fn sync_disk(&self) -> Result<(), SystemError> {
-        let command = self
-            .flush_command
-            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        // If IDENTIFY selected no flush command, completed DMA writes are still
+        // successful; only the power-loss durability guarantee is unavailable,
+        // which `supports_reliable_flush()` reports separately to filesystems.
+        let Some(command) = self.flush_command else {
+            return Ok(());
+        };
         self.controller
             .flush_port(self.port_num as usize, command, false)
     }
@@ -387,6 +391,7 @@ impl LockedAhciDisk {
             port_num,
             capacity_lba: identify.capacity_lba,
             flush_command: identify.flush_command,
+            reliable_flush: identify.reliable_flush,
             open_count: AtomicU32::new(0),
             mount_holder_count: AtomicU32::new(0),
         });
@@ -576,7 +581,7 @@ impl BlockDevice for LockedAhciDisk {
     }
 
     fn supports_reliable_flush(&self) -> bool {
-        self.flush_command.is_some()
+        self.reliable_flush
     }
 
     #[inline]

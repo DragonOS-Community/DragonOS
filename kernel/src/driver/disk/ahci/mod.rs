@@ -67,6 +67,7 @@ use self::{
 pub(crate) struct AhciIdentify {
     capacity_lba: usize,
     flush_command: Option<u8>,
+    reliable_flush: bool,
 }
 
 /* TFES - Task File Error Status */
@@ -536,9 +537,17 @@ impl AhciController {
             return Err(SystemError::EIO);
         }
         let capacity_lba = usize::try_from(capacity).map_err(|_| SystemError::EOVERFLOW)?;
-        let flush_command = if word83 & (1 << 13) != 0 {
+        let has_flush_ext = word83 & (1 << 13) != 0;
+        let has_flush = word83 & (1 << 12) != 0;
+        let word87 = word(87);
+        let write_cache_enabled = word87 & 0xc000 == 0x4000 && word(85) & (1 << 5) != 0;
+        // Linux also attempts the base FLUSH CACHE command when write cache is
+        // enabled but the capability bits are absent.  This makes a broken or
+        // incomplete IDENTIFY response fail visibly instead of silently
+        // treating volatile cached writes as synchronized.
+        let flush_command = if has_flush_ext {
             Some(ATA_CMD_FLUSH_CACHE_EXT)
-        } else if word83 & (1 << 12) != 0 {
+        } else if has_flush || write_cache_enabled {
             Some(ATA_CMD_FLUSH_CACHE)
         } else {
             None
@@ -546,6 +555,7 @@ impl AhciController {
         Ok(AhciIdentify {
             capacity_lba,
             flush_command,
+            reliable_flush: has_flush_ext || has_flush,
         })
     }
 

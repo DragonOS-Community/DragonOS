@@ -11,7 +11,12 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 . "$ENV_PATH"
 
 echo "=== Running mem_pagefault_lat test ==="
-${LMBENCH_BIN_DIR}/lat_pagefault -P 1 ${LMBENCH_EXT4_DIR}/${LMBENCH_TEST_FILE}
+# Pagefault the whole passed file; the 64MB fixture would touch every page of
+# the full ext4 image-backed file each sample and stall later fork tests.
+# Use a small dedicated file instead (lat_pagefault requires >= 1MB).
+PFAULT_FILE=${LMBENCH_TMP_DIR:-/tmp}/pagefault_file
+dd if=/dev/zero of="$PFAULT_FILE" bs=1M count=8 2>/dev/null
+${LMBENCH_BIN_DIR}/lat_pagefault -P 1 "$PFAULT_FILE"
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

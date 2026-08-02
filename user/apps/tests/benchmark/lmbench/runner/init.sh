@@ -16,31 +16,26 @@ create_ext4_fs() {
     fi
 }
 
+create_one_test_file() {
+    file_path="$1"
+    # Always recreate: a stale undersized file (e.g. left by an interrupted
+    # previous run) would survive a plain "[ -f ]" existence check and break
+    # size validation in bw_mmap_rd (size > file size), lat_mmap (< 4m) and
+    # lat_pagefault (< 1MB).
+    rm -f "$file_path"
+    dd if=/dev/zero of="$file_path" bs=1M count=64
+}
+
 create_test_file() {
-    ext4_zero_file_path="$LMBENCH_EXT4_DIR/zero_file"
-    ext4_test_file_path="$LMBENCH_EXT4_DIR/test_file"
-    tmp_zero_file_path=/tmp/zero_file
-    tmp_test_file_path=/tmp/test_file
-
-    if [ ! -f "$ext4_zero_file_path" ]; then
-        echo "[lmbench-init] creating $ext4_zero_file_path"
-        dd if=/dev/zero of="$ext4_zero_file_path" bs=1M count=64
-    fi
-
-    if [ ! -f "$ext4_test_file_path" ]; then
-        echo "[lmbench-init] creating $ext4_test_file_path"
-        dd if=/dev/zero of="$ext4_test_file_path" bs=1M count=64
-    fi
-
-    if [ ! -f "$tmp_zero_file_path" ]; then
-        echo "[lmbench-init] creating $tmp_zero_file_path"
-        dd if=/dev/zero of="$tmp_zero_file_path" bs=1M count=64
-    fi
-
-    if [ ! -f "$tmp_test_file_path" ]; then
-        echo "[lmbench-init] creating $tmp_test_file_path"
-        dd if=/dev/zero of="$tmp_test_file_path" bs=1M count=64
-    fi
+    for file_path in \
+        "$LMBENCH_EXT4_DIR/zero_file" \
+        "$LMBENCH_EXT4_DIR/test_file" \
+        /tmp/zero_file \
+        /tmp/test_file
+    do
+        echo "[lmbench-init] creating $file_path"
+        create_one_test_file "$file_path"
+    done
 }
 
 main() {

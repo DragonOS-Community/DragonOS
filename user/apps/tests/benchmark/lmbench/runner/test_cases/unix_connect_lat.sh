@@ -22,12 +22,14 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "=== Starting Unix socket server ==="
-${LMBENCH_BIN_DIR}/lat_unix_connect -s &
+# Guest kernel lacks unix-socket bind; server used to fail fast but can hang.
+# Bounded timeout keeps the whole run from stalling on this known limitation.
+/usr/local/bin/timeout 10s ${LMBENCH_BIN_DIR}/lat_unix_connect -s &
 SERVER_PID=$!
 sleep 2
 
 echo "=== Running Unix socket connection latency test ==="
-${LMBENCH_BIN_DIR}/lat_unix_connect -P 1
+/usr/local/bin/timeout 10s ${LMBENCH_BIN_DIR}/lat_unix_connect -P 1
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

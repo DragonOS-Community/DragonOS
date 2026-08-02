@@ -11,7 +11,9 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 . "$ENV_PATH"
 
 echo "=== Running VFS read page cache bandwidth test ==="
-${LMBENCH_BIN_DIR}/bw_file_rd -P 1 -W 30 -N 300 512m io_only ${LMBENCH_EXT4_DIR}/${LMBENCH_TEST_FILE}
+# size must be <= test file size (64MB fixture recreated by init.sh);
+# bw_file_rd validates against the file and fails with perror("x") otherwise.
+${LMBENCH_BIN_DIR}/bw_file_rd -P 1 -W 30 -N 300 64m io_only ${LMBENCH_EXT4_DIR}/${LMBENCH_TEST_FILE}
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

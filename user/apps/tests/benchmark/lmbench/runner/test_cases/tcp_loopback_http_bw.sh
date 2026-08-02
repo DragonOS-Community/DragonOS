@@ -11,6 +11,8 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 . "$ENV_PATH"
 
 SERVER_PID=""
+WEB_DIR="${LMBENCH_TMP_DIR:-/tmp}/lmbench_http"
+PORT=8080
 
 cleanup() {
     if [ ! -z "$SERVER_PID" ]; then
@@ -21,16 +23,25 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+# Rebuild a small web root. lmhttp serves files relative to its CWD (or
+# $DOCROOT); lat_http reads one relative file name per line from stdin.
+rm -rf "$WEB_DIR"
+mkdir -p "$WEB_DIR"
+dd if=/dev/zero of="$WEB_DIR/file1k"  bs=1024 count=1  2>/dev/null
+dd if=/dev/zero of="$WEB_DIR/file4k"  bs=1024 count=4  2>/dev/null
+dd if=/dev/zero of="$WEB_DIR/file16k" bs=1024 count=16 2>/dev/null
+printf 'file1k\nfile4k\nfile16k\n' > "$WEB_DIR/file_list"
+
 echo "=== Starting HTTP server ==="
-${LMBENCH_BIN_DIR}/lmhttp &
+DOCROOT="$WEB_DIR" ${LMBENCH_BIN_DIR}/lmhttp $PORT &
 SERVER_PID=$!
 sleep 2
 
 echo "=== Running HTTP bandwidth test ==="
-${LMBENCH_BIN_DIR}/lat_http 127.0.0.1 < file_list
+${LMBENCH_BIN_DIR}/lat_http 127.0.0.1 $PORT < "$WEB_DIR/file_list"
 
 echo "=== Shutting down server ==="
-${LMBENCH_BIN_DIR}/lat_http -S 127.0.0.1
+${LMBENCH_BIN_DIR}/lat_http -S 127.0.0.1 $PORT
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

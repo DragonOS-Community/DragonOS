@@ -4,7 +4,9 @@ BINARY=bw_tcp
 METRIC_TYPE=bandwidth
 UNIT=MB/s
 BIGGER_IS_BETTER=1
-SEARCH_PATTERN=socket connection
+# bw_tcp prints "<size MB> <MB/sec> MB/sec" e.g. "0.000128 0.09 MB/sec";
+# "socket connection" only appears in the perror on connect failure.
+SEARCH_PATTERN=^[0-9]
 RESULT_INDEX=NF-1
 NTH_OCCURRENCE=1
 DESCRIPTION=TCP virtio bandwidth via bw_tcp (128B, 10.0.2.15)

@@ -11,7 +11,9 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 . "$ENV_PATH"
 
 echo "=== Running semaphore_lat test ==="
-${LMBENCH_BIN_DIR}/lat_sem -P 1 -N 21
+# Guest kernel lacks sem_open (ENOSYS); it can also hang instead of failing
+# fast. Bounded timeout keeps the run from stalling on this limitation.
+/usr/local/bin/timeout 10s ${LMBENCH_BIN_DIR}/lat_sem -P 1 -N 21
 
 if [ $? -eq 0 ]; then
     echo "Test completed successfully"

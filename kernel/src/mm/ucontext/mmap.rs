@@ -118,6 +118,99 @@ impl InnerAddressSpace {
         return Ok((start_page, notifications));
     }
 
+    /// 创建**文件关联的立即映射**（file-backed eager mapping）。
+    ///
+    /// 与 [`Self::map_anonymous`] 的区别：创建的 VMA 绑定 `vm_file` +
+    /// `backing_pgoff`，使 `attach_vma` 将其注册到 inode 的 file-rmap
+    /// （`page_cache::register_file_vma`）。物理页仍由内核立即分配并零填充
+    /// （eager），调用方随后用字节拷贝（如 ELF loader 的 `do_load_file`）
+    /// 覆盖为真实文件内容。
+    ///
+    /// 这样设计的原因：ELF loader 在持有 `InnerAddressSpace` 写锁的进程上下文中
+    /// 加载段，不能触发缺页（缺页需取地址空间锁）。立即映射 + 拷贝既满足
+    /// 「页已驻留」（uprobe 注册等需要 translate 目标页）又满足「VMA 在 inode
+    /// rmap 中可被发现」（uprobe 经 `collect_file_vmas` 定位）。
+    ///
+    /// ## 参数
+    /// - `file`：关联的文件（VMA 的 `vm_file`）。
+    /// - `file_offset`：段在文件中的**页对齐**偏移（字节），用于计算
+    ///   `backing_pgoff = file_offset >> PAGE_SHIFT`。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_file_backed(
+        &mut self,
+        start_vaddr: VirtAddr,
+        len: usize,
+        prot_flags: ProtFlags,
+        map_flags: MapFlags,
+        round_to_min: bool,
+        file: Arc<File>,
+        file_offset: usize,
+    ) -> Result<VirtPageFrame, SystemError> {
+        let (page, notifications) = match self.map_file_backed_collect(
+            start_vaddr,
+            len,
+            prot_flags,
+            map_flags,
+            round_to_min,
+            file,
+            file_offset,
+        ) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                debug_assert!(
+                    failure.notifications.is_empty(),
+                    "locked map_file_backed caller must not replace existing VMAs"
+                );
+                return Err(failure.err);
+            }
+        };
+        debug_assert!(
+            notifications.is_empty(),
+            "locked map_file_backed caller must not replace existing VMAs"
+        );
+        Ok(page)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn map_file_backed_collect(
+        &mut self,
+        start_vaddr: VirtAddr,
+        len: usize,
+        prot_flags: ProtFlags,
+        map_flags: MapFlags,
+        round_to_min: bool,
+        file: Arc<File>,
+        file_offset: usize,
+    ) -> Result<(VirtPageFrame, VmaCloseNotifications), MmapFailure> {
+        let pgoff = file_offset >> MMArch::PAGE_SHIFT;
+        let fixed_hint = map_flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
+        let (start_page, notifications) = self.mmap_collect(
+            AddressSpace::round_mmap_hint(start_vaddr, round_to_min, fixed_hint),
+            PageFrameCount::from_bytes(page_align_up(len)).unwrap(),
+            prot_flags,
+            map_flags,
+            move |page, count, vm_flags, flags, mapper, flusher| {
+                let vma_file = Some(file.clone());
+                let vma_pgoff = Some(pgoff);
+                if !MMArch::PAGE_FAULT_ENABLED {
+                    // 无按需分页：立即映射物理页（零填充），内容由调用方覆盖。
+                    Ok(VMA::zeroed(
+                        page, count, vm_flags, flags, mapper, flusher, vma_file, vma_pgoff,
+                    )?)
+                } else {
+                    // 按需分页可用：创建 lazy 文件映射 VMA。
+                    // 注意：ELF loader 当前对只读段仍需 eager（uprobe 要求页驻留），
+                    // 走 eager 路径时 PAGE_FAULT_ENABLED 为真但调用方仍期望立即映射。
+                    // 这里与 map_anonymous 一致：无 allocate_at_once 参数时一律 eager。
+                    Ok(VMA::zeroed(
+                        page, count, vm_flags, flags, mapper, flusher, vma_file, vma_pgoff,
+                    )?)
+                }
+            },
+        )?;
+        Ok((start_page, notifications))
+    }
+
     /// Map pages into the process's address space
     ///
     /// # Parameters

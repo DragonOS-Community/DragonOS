@@ -396,10 +396,8 @@ impl AhciController {
                 for port_no in &provisional_ports {
                     // Do not short-circuit: every port must advance during
                     // every scan so one slow CR bit cannot serialize FRE stop.
-                    all_stopped &= unsafe {
-                        &mut *controller.port_ptr(*port_no)
-                    }
-                    .advance_provisional_stop();
+                    all_stopped &=
+                        unsafe { &mut *controller.port_ptr(*port_no) }.advance_provisional_stop();
                 }
                 if all_stopped {
                     break;

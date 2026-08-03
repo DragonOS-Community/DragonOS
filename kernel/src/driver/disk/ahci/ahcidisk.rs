@@ -31,7 +31,7 @@ use alloc::sync::Weak;
 use alloc::{sync::Arc, vec::Vec};
 
 use core::fmt::Debug;
-use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
+use core::sync::atomic::{compiler_fence, Ordering};
 use core::{mem::size_of, ptr::write_bytes};
 
 /// @brief: 只支持MBR分区格式的磁盘结构体
@@ -56,18 +56,11 @@ pub struct LockedAhciDisk {
     capacity_lba: usize,
     flush_command: Option<u8>,
     reliable_flush: bool,
-    open_count: AtomicU32,
-    mount_holder_count: AtomicU32,
 }
 
 impl LockedAhciDisk {
     pub fn inner(&self) -> MutexGuard<'_, AhciDisk> {
         self.inner.lock()
-    }
-
-    pub(crate) fn has_holders(&self) -> bool {
-        self.open_count.load(Ordering::Acquire) != 0
-            || self.mount_holder_count.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn needs_flush(&self) -> bool {
@@ -392,8 +385,6 @@ impl LockedAhciDisk {
             capacity_lba: identify.capacity_lba,
             flush_command: identify.flush_command,
             reliable_flush: identify.reliable_flush,
-            open_count: AtomicU32::new(0),
-            mount_holder_count: AtomicU32::new(0),
         });
         return Ok(result);
     }
@@ -535,22 +526,11 @@ impl BlockDevice for LockedAhciDisk {
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        self.controller.acquire_holder(&self.open_count)
-    }
-
-    fn file_close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        let previous = self.open_count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "AHCI open count underflow");
-        Ok(())
+        self.controller.acquire_holder()
     }
 
     fn mount_holder_acquire(&self) -> Result<(), SystemError> {
-        self.controller.acquire_holder(&self.mount_holder_count)
-    }
-
-    fn mount_holder_release(&self) {
-        let previous = self.mount_holder_count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "AHCI mount holder count underflow");
+        self.controller.acquire_holder()
     }
 
     fn dev_name(&self) -> &DevName {

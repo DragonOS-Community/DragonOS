@@ -163,11 +163,9 @@ impl HbaPort {
         }
     }
 
-    /// Re-establish a non-empty SATA link before trusting PxSIG.  A small
-    /// received-FIS area is active while COMRESET runs, then the port is
-    /// stopped again so the normal command-memory setup can take ownership.
-    pub fn reset_and_classify(&mut self, fb: u64) -> Result<HbaPortType, SystemError> {
-        self.stop()?;
+    /// Begin COMRESET after a controller-wide reset has stopped all engines.
+    /// Returns the virtual address of the received-FIS area used for polling.
+    pub fn begin_link_reset(&mut self, fb: u64) -> Result<usize, SystemError> {
         volatile_write!(self.fb, fb);
         let fb_vaddr = unsafe { MMArch::phys_2_virt(PhysAddr::new(fb as usize)) }
             .ok_or(SystemError::EFAULT)?;
@@ -180,46 +178,57 @@ impl HbaPort {
         let sctl = volatile_read!(self.sctl) & !0xf;
         volatile_write!(self.sctl, sctl | 1);
         if volatile_read!(self.sctl) & 0xf != 1 {
-            self.stop()?;
             return Err(SystemError::EIO);
         }
-        let assert_until = Instant::now() + Duration::from_millis(1);
-        while Instant::now() < assert_until {
-            core::hint::spin_loop();
-        }
+        Ok(fb_vaddr.data())
+    }
+
+    pub fn finish_link_reset_assertion(&mut self) {
+        let sctl = volatile_read!(self.sctl) & !0xf;
         volatile_write!(self.sctl, sctl);
         let _ = volatile_read!(self.sctl);
+    }
 
-        let link_deadline = Instant::now() + Duration::from_secs(2);
-        let mut stable_since = None;
-        loop {
-            if volatile_read!(self.ssts) & 0xf == HBA_SSTS_PRESENT {
-                let since = *stable_since.get_or_insert_with(Instant::now);
-                if Instant::now() >= since + Duration::from_millis(100) {
-                    break;
-                }
-            } else {
-                stable_since = None;
-            }
-            if Instant::now() >= link_deadline {
-                self.stop()?;
-                return Err(SystemError::ETIMEDOUT);
-            }
-            core::hint::spin_loop();
+    /// Start stopping the provisional receive-FIS engine without waiting.
+    /// Multiple ports can be stopped concurrently by advancing them together.
+    pub fn begin_provisional_stop(&mut self) {
+        let cmd = volatile_read!(self.cmd);
+        volatile_write!(self.cmd, cmd & !HBA_PORT_CMD_ST);
+    }
+
+    /// Advance the AHCI-mandated ST/CR then FRE/FR stop sequence.
+    /// Returns true once this port can no longer DMA into its FIS buffer.
+    pub fn advance_provisional_stop(&mut self) -> bool {
+        let cmd = volatile_read!(self.cmd);
+        if cmd & HBA_PORT_CMD_CR != 0 {
+            return false;
         }
-        // PxSIG is only trustworthy after this reset produced a fresh
-        // device-to-host register FIS in the newly zeroed receive area.
-        let d2h_fis_type = (fb_vaddr.data() + 0x40) as *const u8;
-        while unsafe { core::ptr::read_volatile(d2h_fis_type) } != FisType::RegD2H as u8 {
-            if Instant::now() >= link_deadline {
-                self.stop()?;
-                return Err(SystemError::ETIMEDOUT);
-            }
-            core::hint::spin_loop();
+        if cmd & HBA_PORT_CMD_FRE != 0 {
+            volatile_write!(self.cmd, cmd & !HBA_PORT_CMD_FRE);
         }
-        let port_type = self.check_type();
-        self.stop()?;
-        Ok(port_type)
+        volatile_read!(self.cmd) & HBA_PORT_CMD_FR == 0
+    }
+
+    /// Poll one link without blocking other ports that are training in the
+    /// same controller-wide window.
+    pub fn classify_reset_link(
+        &mut self,
+        received_fis_vaddr: usize,
+        stable_since: &mut Option<Instant>,
+    ) -> Option<HbaPortType> {
+        if volatile_read!(self.ssts) & 0xf != HBA_SSTS_PRESENT {
+            *stable_since = None;
+            return None;
+        }
+        let since = *stable_since.get_or_insert_with(Instant::now);
+        if Instant::now() < since + Duration::from_millis(100) {
+            return None;
+        }
+        let d2h_fis_type = (received_fis_vaddr + 0x40) as *const u8;
+        if unsafe { core::ptr::read_volatile(d2h_fis_type) } != FisType::RegD2H as u8 {
+            return None;
+        }
+        Some(self.check_type())
     }
 
     /// 启动该端口的命令引擎

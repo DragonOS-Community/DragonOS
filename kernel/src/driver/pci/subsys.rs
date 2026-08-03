@@ -123,7 +123,8 @@ impl Bus for PciBus {
             );
             SystemError::EINVAL
         })?;
-        pci_drv.remove(&pci_dev)
+        pci_drv.remove(&pci_dev);
+        Ok(())
     }
 
     fn sync_state(&self, _device: &Arc<dyn Device>) {

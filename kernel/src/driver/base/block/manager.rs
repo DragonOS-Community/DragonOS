@@ -311,6 +311,49 @@ impl BlockDevManager {
         Ok(())
     }
 
+    /// Unpublish a block device after its hardware has irreversibly gone.
+    ///
+    /// Unlike [`Self::unregister`], this operation cannot be rolled back. It
+    /// removes every devfs node on a best-effort basis, then always drops the
+    /// manager's strong reference and metadata so stale open nodes can only
+    /// observe a dead weak device rather than keeping a controller alive.
+    pub fn unregister_detached(&self, dev: &Arc<dyn BlockDevice>) {
+        let gendisks = dev
+            .blkdev_meta()
+            .inner()
+            .gendisks
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for gendisk in &gendisks {
+            match gendisk.dname() {
+                Ok(dname) => {
+                    if let Err(err) = devfs_unregister(dname.as_ref(), gendisk.clone()) {
+                        log::warn!(
+                            "Failed to remove detached block node {}: {:?}",
+                            dname.as_ref(),
+                            err
+                        );
+                    }
+                }
+                Err(err) => log::warn!(
+                    "Failed to resolve a detached block node for {}: {:?}",
+                    dev.dev_name().name(),
+                    err
+                ),
+            }
+        }
+
+        self.inner().disks.remove(dev.dev_name());
+        for gendisk in &gendisks {
+            if let Ok(dname) = gendisk.dname() {
+                self.emit_gendisk_uevent(dev, dname.as_ref(), "remove");
+            }
+        }
+        dev.blkdev_meta().inner().gendisks.clear();
+    }
+
     fn emit_gendisk_uevent(&self, dev: &Arc<dyn BlockDevice>, devname: &str, action: &str) {
         let kobj = dev.device() as Arc<dyn KObject>;
         let Ok(parent_devpath) = <dyn KObject>::devpath(&kobj) else {

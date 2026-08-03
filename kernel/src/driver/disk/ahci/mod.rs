@@ -87,14 +87,38 @@ const AHCI_PXCMD_ICC_MASK: u32 = 0xf << 28;
 const AHCI_PXCMD_ICC_ACTIVE: u32 = 1 << 28;
 const AHCI_PXCMD_POD: u32 = 1 << 2;
 const AHCI_PXCMD_SUD: u32 = 1 << 1;
+const AHCI_MAX_SECTORS: u64 = 1u64 << 48;
+const AHCI_POLL_YIELD_INTERVAL: usize = 1 << 10;
+const AHCI_LINK_TIMEOUT_MS: u64 = 2_000;
 // 32 command lists (32 KiB) + 32 received-FIS areas (8 KiB) +
 // 32 * 32 command tables (256 KiB), rounded to the allocator's power of two.
 const AHCI_COMMAND_ARENA_SIZE: usize = 1 << 19;
 
+const fn capacity_is_addressable(capacity: u64) -> bool {
+    capacity != 0 && capacity <= AHCI_MAX_SECTORS
+}
+
+const fn poll_should_yield(iteration: usize) -> bool {
+    iteration != 0 && iteration.is_multiple_of(AHCI_POLL_YIELD_INTERVAL)
+}
+
+// These protocol boundaries are checked by every kernel build, including
+// architectures that do not instantiate the x86-only AHCI driver.
+const _: () = {
+    assert!(!capacity_is_addressable(0));
+    assert!(capacity_is_addressable(AHCI_MAX_SECTORS));
+    assert!(!capacity_is_addressable(AHCI_MAX_SECTORS + 1));
+    assert!(!poll_should_yield(0));
+    assert!(!poll_should_yield(AHCI_POLL_YIELD_INTERVAL - 1));
+    assert!(poll_should_yield(AHCI_POLL_YIELD_INTERVAL));
+};
+
 lazy_static! {
-    /// Last-resort owner for DMA memory if a controller object is destroyed
-    /// without proof that all posted transactions have drained.
-    static ref AHCI_DMA_QUARANTINE: SpinLock<Vec<DmaBuffer>> = SpinLock::new(Vec::new());
+    /// DMA memory whose controller could not be stopped or reset. Entries are
+    /// keyed by PCI device name and reclaimed after that controller next
+    /// completes a successful HBA reset with Bus Master disabled.
+    static ref AHCI_DMA_QUARANTINE: Mutex<HashMap<String, Vec<DmaBuffer>>> =
+        Mutex::new(HashMap::new());
 }
 
 /// Resources owned by one bound PCI AHCI controller.
@@ -106,12 +130,13 @@ pub struct AhciController {
     original_command: Command,
     dma_mask: u64,
     command_slots: u8,
-    command_memory: Option<DmaBuffer>,
+    command_memory: Mutex<Option<DmaBuffer>>,
     disks: SpinLock<Vec<Weak<LockedAhciDisk>>>,
     accepting_io: AtomicBool,
     failed_ports: AtomicU32,
     quarantined_dma: SpinLock<Vec<DmaBuffer>>,
     hardware_stopped: AtomicBool,
+    detached: AtomicBool,
     port_locks: Vec<Mutex<()>>,
     lifecycle: Mutex<ControllerState>,
 }
@@ -132,7 +157,7 @@ impl core::fmt::Debug for AhciController {
             .field("abar", &self.abar)
             .field("port_count", &self.port_count)
             .field("command_slots", &self.command_slots)
-            .field("has_command_memory", &self.command_memory.is_some())
+            .field("has_command_memory", &self.command_memory.lock().is_some())
             .finish()
     }
 }
@@ -162,6 +187,7 @@ impl AhciController {
             drop(bars);
             let hba = abar as *mut HbaMem;
             Self::initialize_hba(hba, &pci)?;
+            Self::reclaim_quarantined_dma(&device.name());
 
             let cap = volatile_read!((*hba).cap);
             let pi = volatile_read!((*hba).pi);
@@ -231,10 +257,12 @@ impl AhciController {
                     _ => training_ports.push(port_no),
                 }
             }
-            // Ready links are handled before training/faulty links, and each
-            // port gets its own deadline so one bad port cannot starve a disk.
-            online_ports.extend(training_ports);
-            let candidate_ports = online_ports;
+            // Ready links are considered first, but all candidates train in
+            // one interleaved window below rather than serial per-port waits.
+            let candidate_ports = online_ports
+                .into_iter()
+                .chain(training_ports)
+                .collect::<Vec<_>>();
 
             // Empty controllers are normal and do not need command DMA memory.
             let dma_mask = if cap & (1 << 31) != 0 {
@@ -263,12 +291,13 @@ impl AhciController {
                 original_command,
                 dma_mask,
                 command_slots,
-                command_memory,
+                command_memory: Mutex::new(command_memory),
                 disks: SpinLock::new(Vec::new()),
                 accepting_io: AtomicBool::new(true),
                 failed_ports: AtomicU32::new(0),
                 quarantined_dma: SpinLock::new(Vec::new()),
                 hardware_stopped: AtomicBool::new(false),
+                detached: AtomicBool::new(false),
                 port_locks: (0..32).map(|_| Mutex::new(())).collect(),
                 lifecycle: Mutex::new(ControllerState::Running),
             });
@@ -277,19 +306,23 @@ impl AhciController {
                 let command = pci.status_command().1;
                 pci.set_command(command | Command::BUS_MASTER);
             }
+            let mut link_states = Vec::new();
+            let mut provisional_ports = Vec::new();
             for port_no in candidate_ports {
-                if !controller.accepting_io.load(Ordering::Acquire) {
-                    break;
-                }
-                let arena = controller
+                let base = controller
                     .command_memory
+                    .lock()
                     .as_ref()
-                    .ok_or(SystemError::ENOMEM)?;
-                let fb = arena.paddr() + (32 << 10) + (port_no << 8);
-                let port_type = match unsafe { &mut *controller.port_ptr(port_no) }
-                    .reset_and_classify(fb as u64)
-                {
-                    Ok(port_type) => port_type,
+                    .ok_or(SystemError::ENOMEM)?
+                    .paddr();
+                let fb = base + (32 << 10) + (port_no << 8);
+                // Keep every attempted port so even a partially failed setup
+                // has its provisional FIS receiver stopped below.
+                provisional_ports.push(port_no);
+                match unsafe { &mut *controller.port_ptr(port_no) }.begin_link_reset(fb as u64) {
+                    Ok(received_fis_vaddr) => {
+                        link_states.push((port_no, received_fis_vaddr, None, None));
+                    }
                     Err(err) => {
                         controller
                             .failed_ports
@@ -300,10 +333,105 @@ impl AhciController {
                             port_no,
                             err
                         );
+                    }
+                }
+            }
+
+            // AHCI requires COMRESET to remain asserted for at least 1 ms.
+            // Asserting every port first lets all links recover concurrently.
+            let assert_until = Instant::now() + Duration::from_millis(1);
+            while Instant::now() < assert_until {
+                core::hint::spin_loop();
+            }
+            for port_no in &provisional_ports {
+                unsafe { &mut *controller.port_ptr(*port_no) }.finish_link_reset_assertion();
+            }
+
+            let link_deadline = Instant::now() + Duration::from_millis(AHCI_LINK_TIMEOUT_MS);
+            let mut link_iteration = 0usize;
+            loop {
+                let mut pending = false;
+                for (port_no, received_fis_vaddr, stable_since, port_type) in &mut link_states {
+                    if port_type.is_some() {
                         continue;
                     }
-                };
-                if port_type != HbaPortType::Sata {
+                    *port_type = unsafe { &mut *controller.port_ptr(*port_no) }
+                        .classify_reset_link(*received_fis_vaddr, stable_since);
+                    pending |= port_type.is_none();
+                }
+                if !pending || Instant::now() >= link_deadline {
+                    break;
+                }
+                if poll_should_yield(link_iteration) {
+                    crate::sched::sched_yield();
+                } else {
+                    core::hint::spin_loop();
+                }
+                link_iteration = link_iteration.wrapping_add(1);
+            }
+
+            for (port_no, _, _, port_type) in &link_states {
+                if port_type.is_none() {
+                    controller
+                        .failed_ports
+                        .fetch_or(1 << *port_no, Ordering::AcqRel);
+                    log::warn!(
+                        "AHCI {} port {} link initialization timed out",
+                        controller.pci.common_header.bus_device_function,
+                        port_no
+                    );
+                }
+            }
+
+            // Stop all temporary FIS receivers concurrently.  A successful
+            // classification remains valid because the normal path does not
+            // reset the links again before IDENTIFY.
+            for port_no in &provisional_ports {
+                unsafe { &mut *controller.port_ptr(*port_no) }.begin_provisional_stop();
+            }
+            let stop_deadline = Instant::now() + Duration::from_millis(500);
+            let mut stop_iteration = 0usize;
+            loop {
+                let mut all_stopped = true;
+                for port_no in &provisional_ports {
+                    // Do not short-circuit: every port must advance during
+                    // every scan so one slow CR bit cannot serialize FRE stop.
+                    all_stopped &= unsafe {
+                        &mut *controller.port_ptr(*port_no)
+                    }
+                    .advance_provisional_stop();
+                }
+                if all_stopped {
+                    break;
+                }
+                if Instant::now() >= stop_deadline {
+                    // Do not publish using classifications obtained before a
+                    // recovery reset.  Reset only proves DMA is stopped; this
+                    // probe fails and a later probe must classify afresh.
+                    let command = pci.status_command().1;
+                    pci.set_command(command & !Command::BUS_MASTER);
+                    if Self::reset_hba(hba).is_ok() {
+                        controller.hardware_stopped.store(true, Ordering::Release);
+                    }
+                    return Err(SystemError::ETIMEDOUT);
+                }
+                if poll_should_yield(stop_iteration) {
+                    crate::sched::sched_yield();
+                } else {
+                    core::hint::spin_loop();
+                }
+                stop_iteration = stop_iteration.wrapping_add(1);
+            }
+
+            let has_sata = link_states
+                .iter()
+                .any(|(_, _, _, port_type)| *port_type == Some(HbaPortType::Sata));
+            if has_sata {
+                let command = pci.status_command().1;
+                pci.set_command(command | Command::BUS_MASTER);
+            }
+            for (port_no, _, _, port_type) in link_states {
+                if port_type != Some(HbaPortType::Sata) {
                     continue;
                 }
                 if let Err(err) = controller.publish_port(port_no) {
@@ -325,7 +453,7 @@ impl AhciController {
             Ok(controller)
         })();
         if result.is_err() {
-            pci.set_command(original_command);
+            pci.set_command(original_command & !Command::BUS_MASTER);
         }
         result
     }
@@ -351,7 +479,14 @@ impl AhciController {
         let command = pci.status_command().1;
         pci.set_command(command & !Command::BUS_MASTER);
 
+        Self::reset_hba(hba)
+    }
+
+    fn reset_hba(hba: *mut HbaMem) -> Result<(), SystemError> {
         let ghc = volatile_read!((*hba).ghc);
+        if ghc == u32::MAX {
+            return Err(SystemError::ENODEV);
+        }
         volatile_write!((*hba).ghc, ghc | AHCI_GHC_AE);
         if volatile_read!((*hba).ghc) & AHCI_GHC_AE == 0 {
             return Err(SystemError::EIO);
@@ -374,9 +509,19 @@ impl AhciController {
         Ok(())
     }
 
+    fn reclaim_quarantined_dma(device_name: &str) {
+        let retired = AHCI_DMA_QUARANTINE.lock().remove(device_name);
+        // Do not run the DMA allocator while holding the quarantine mutex.
+        drop(retired);
+    }
+
     fn publish_port(self: &Arc<Self>, port_no: usize) -> Result<(), SystemError> {
-        let arena = self.command_memory.as_ref().ok_or(SystemError::ENOMEM)?;
-        let base = arena.paddr();
+        let base = self
+            .command_memory
+            .lock()
+            .as_ref()
+            .ok_or(SystemError::ENOMEM)?
+            .paddr();
         let fb = base + (32 << 10) + (port_no << 8);
         let clb = base + (port_no << 10);
         let ctbas = (0..32)
@@ -425,18 +570,17 @@ impl AhciController {
         Ok(guard)
     }
 
-    pub(crate) fn acquire_holder(&self, counter: &AtomicU32) -> Result<(), SystemError> {
+    pub(crate) fn acquire_holder(&self) -> Result<(), SystemError> {
         let state = self.lifecycle.lock();
         if *state != ControllerState::Running || !self.accepting_io.load(Ordering::Acquire) {
             return Err(SystemError::ENODEV);
         }
-        counter.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
     /// Stop a failed port before releasing a buffer that may still be a DMA
-    /// target. If the engine cannot be stopped, disable PCI bus mastering for
-    /// the whole controller before the buffer is released.
+    /// target. If the engine cannot be stopped, retain the buffer until a
+    /// controller-wide reset proves that old DMA state is gone.
     pub(crate) fn abort_failed_dma(&self, port_no: usize, buffer: DmaBuffer) {
         self.failed_ports.fetch_or(1 << port_no, Ordering::AcqRel);
         if unsafe { &mut *self.port_ptr(port_no) }.stop().is_err() {
@@ -444,6 +588,8 @@ impl AhciController {
             let command = self.pci.status_command().1;
             self.pci.set_command(command & !Command::BUS_MASTER);
             self.quarantined_dma.lock().push(buffer);
+        } else {
+            drop(buffer);
         }
     }
 
@@ -533,8 +679,15 @@ impl AhciController {
             | u64::from(word(101)) << 16
             | u64::from(word(102)) << 32
             | u64::from(word(103)) << 48;
-        if capacity == 0 {
-            return Err(SystemError::EIO);
+        // READ/WRITE DMA EXT carries a 48-bit LBA, so at most 2^48 sectors
+        // (ending at LBA 2^48 - 1) are addressable. A larger IDENTIFY value
+        // would pass the range check but be truncated while building the FIS.
+        if !capacity_is_addressable(capacity) {
+            return Err(if capacity == 0 {
+                SystemError::EIO
+            } else {
+                SystemError::EOVERFLOW
+            });
         }
         let capacity_lba = usize::try_from(capacity).map_err(|_| SystemError::EOVERFLOW)?;
         let has_flush_ext = word83 & (1 << 13) != 0;
@@ -624,7 +777,7 @@ impl AhciController {
             if Instant::now() >= deadline {
                 return Err(SystemError::ETIMEDOUT);
             }
-            if iteration & 0x3ff == 0 {
+            if poll_should_yield(iteration) {
                 crate::sched::sched_yield();
             } else {
                 core::hint::spin_loop();
@@ -646,7 +799,7 @@ impl AhciController {
             if Instant::now() >= deadline {
                 return Err(SystemError::ETIMEDOUT);
             }
-            if iteration & 0x3ff == 0 {
+            if poll_should_yield(iteration) {
                 crate::sched::sched_yield();
             } else {
                 core::hint::spin_loop();
@@ -664,6 +817,14 @@ impl AhciController {
         }
     }
 
+    fn hba_accessible(&self) -> bool {
+        let hba = self.abar as *mut HbaMem;
+        // GHC contains reserved-zero bits, so an all-ones read is a reliable
+        // sign that the BAR no longer responds.  PI is a full 32-bit bitmap:
+        // all ones is valid for a controller implementing every port.
+        volatile_read!((*hba).ghc) != u32::MAX
+    }
+
     fn stop_quiesced(&self) -> Result<(), SystemError> {
         let pi = volatile_read!((*(self.abar as *mut HbaMem)).pi);
         let mut first_error = None;
@@ -678,12 +839,25 @@ impl AhciController {
         if let Some(err) = first_error {
             let command = self.pci.status_command().1;
             self.pci.set_command(command & !Command::BUS_MASTER);
-            Err(err)
+            if Self::reset_hba(self.abar as *mut HbaMem).is_err() {
+                Err(err)
+            } else {
+                self.hardware_stopped.store(true, Ordering::Release);
+                self.release_quarantined_dma();
+                Ok(())
+            }
         } else {
             self.hardware_stopped.store(true, Ordering::Release);
-            self.quarantined_dma.lock().clear();
+            self.release_quarantined_dma();
             Ok(())
         }
+    }
+
+    fn release_quarantined_dma(&self) {
+        let mut guard = self.quarantined_dma.lock();
+        let retired = core::mem::take(&mut *guard);
+        drop(guard);
+        drop(retired);
     }
 
     fn flush_disks(&self) -> Result<(), SystemError> {
@@ -712,15 +886,7 @@ impl AhciController {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn has_holders(&self) -> bool {
-        self.disks
-            .lock()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|disk| disk.has_holders())
-    }
-
-    fn unregister_disks(&self) -> Result<(), SystemError> {
+    fn unregister_disks(&self) {
         let disks = self
             .disks
             .lock()
@@ -728,35 +894,47 @@ impl AhciController {
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
         for disk in disks {
-            let result = block_dev_manager().unregister(
+            block_dev_manager().unregister_detached(
                 &(disk as Arc<dyn crate::driver::base::block::block_device::BlockDevice>),
             );
-            if let Err(err) = result {
-                if err != SystemError::ENOENT {
-                    return Err(err);
-                }
-            }
         }
-        Ok(())
+    }
+
+    fn retire_dma(&self, safe_to_release: bool) {
+        let mut local_guard = self.quarantined_dma.lock();
+        let mut retired = core::mem::take(&mut *local_guard);
+        drop(local_guard);
+        if let Some(memory) = self.command_memory.lock().take() {
+            retired.push(memory);
+        }
+        if safe_to_release || retired.is_empty() {
+            drop(retired);
+            return;
+        }
+        AHCI_DMA_QUARANTINE
+            .lock()
+            .entry(self.device.name())
+            .or_default()
+            .extend(retired);
     }
 }
 
 impl Drop for AhciController {
     fn drop(&mut self) {
+        if self.detached.load(Ordering::Acquire) {
+            return;
+        }
+        if self.hardware_stopped.load(Ordering::Acquire) {
+            self.pci
+                .set_command(self.original_command & !Command::BUS_MASTER);
+            return;
+        }
         self.quiesce();
         let _ = self.flush_disks();
         if self.stop_quiesced().is_err() {
-            // A failed engine stop must not turn into either DMA-after-free or
-            // a permanent allocation leak.  PCI Bus Master disable cuts off
-            // DMA before owned buffers are dropped.
             self.pci
                 .set_command(self.original_command & !Command::BUS_MASTER);
-            if let Some(memory) = self.command_memory.take() {
-                AHCI_DMA_QUARANTINE.lock().push(memory);
-            }
-            AHCI_DMA_QUARANTINE
-                .lock()
-                .extend(self.quarantined_dma.lock().drain(..));
+            self.retire_dma(false);
             return;
         }
         // A detached storage controller must not regain DMA permission merely
@@ -819,43 +997,61 @@ impl PciDriver for AhciPciDriver {
         }
     }
 
-    fn remove(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError> {
+    fn remove(&self, device: &Arc<dyn PciDevice>) {
         let name = device.name();
-        let controller = self
-            .controllers
-            .read()
-            .get(&name)
-            .and_then(Option::clone)
-            .ok_or(SystemError::ENODEV)?;
+        let Some(controller) = self.controllers.read().get(&name).and_then(Option::clone) else {
+            return;
+        };
         let mut state = controller.lifecycle.lock();
-        if !matches!(
-            *state,
-            ControllerState::Running | ControllerState::RemovalFailed
-        ) {
-            return Err(SystemError::EBUSY);
+        if controller.detached.load(Ordering::Acquire) {
+            self.controllers.write().remove(&name);
+            return;
         }
-        if controller.has_holders() {
-            return Err(SystemError::EBUSY);
+        let already_stopped = *state == ControllerState::Stopped;
+        if !already_stopped
+            && !matches!(
+                *state,
+                ControllerState::Running | ControllerState::RemovalFailed
+            )
+        {
+            log::warn!(
+                "AHCI {} detach observed unexpected state {:?}",
+                name,
+                *state
+            );
         }
-        *state = ControllerState::Detaching;
-        controller.quiesce();
-        let flush_result = controller.flush_disks();
-        let unregister_result = controller.unregister_disks();
-        let stop_result = controller.stop_quiesced();
-        if let Err(err) = stop_result {
-            *state = ControllerState::RemovalFailed;
-            return Err(err);
-        }
-        if let Err(err) = unregister_result {
-            *state = ControllerState::RemovalFailed;
-            return Err(err);
-        }
+
+        let mut flush_result = Ok(());
+        let stop_result = if already_stopped {
+            Ok(())
+        } else {
+            *state = ControllerState::Detaching;
+            controller.quiesce();
+            if controller.hba_accessible() {
+                flush_result = controller.flush_disks();
+                controller.stop_quiesced()
+            } else {
+                Err(SystemError::ENODEV)
+            }
+        };
+        controller.unregister_disks();
+
+        // This is the final PCI configuration access by this controller. The
+        // detached flag makes delayed Drop from an open mount hardware-silent.
+        let command = controller.pci.status_command().1;
+        controller.pci.set_command(command & !Command::BUS_MASTER);
+        controller.detached.store(true, Ordering::Release);
         *state = ControllerState::Stopped;
+        controller.retire_dma(stop_result.is_ok());
         self.controllers.write().remove(&name);
         if let Err(err) = flush_result {
             log::warn!("AHCI {} detach flush failed: {:?}", name, err);
         }
-        Ok(())
+        if let Err(err) = stop_result {
+            // The I/O gate is closed and all DMA allocations remain owned by
+            // this controller or its keyed quarantine until a reset succeeds.
+            log::warn!("AHCI {} command-engine stop failed: {:?}", name, err);
+        }
     }
 
     fn shutdown(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError> {
@@ -880,10 +1076,14 @@ impl PciDriver for AhciPciDriver {
             let flush_result = controller.flush_disks();
             match controller.stop_quiesced() {
                 Ok(()) => {
+                    let command = controller.pci.status_command().1;
+                    controller.pci.set_command(command & !Command::BUS_MASTER);
                     *state = ControllerState::Stopped;
                     flush_result?;
                 }
                 Err(err) => {
+                    let command = controller.pci.status_command().1;
+                    controller.pci.set_command(command & !Command::BUS_MASTER);
                     *state = ControllerState::RemovalFailed;
                     return Err(err);
                 }

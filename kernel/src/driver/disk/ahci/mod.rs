@@ -90,6 +90,7 @@ const AHCI_PXCMD_SUD: u32 = 1 << 1;
 const AHCI_MAX_SECTORS: u64 = 1u64 << 48;
 const AHCI_POLL_YIELD_INTERVAL: usize = 1 << 10;
 const AHCI_LINK_TIMEOUT_MS: u64 = 2_000;
+const AHCI_PORT_STOP_TIMEOUT_MS: u64 = 500;
 // 32 command lists (32 KiB) + 32 received-FIS areas (8 KiB) +
 // 32 * 32 command tables (256 KiB), rounded to the allocator's power of two.
 const AHCI_COMMAND_ARENA_SIZE: usize = 1 << 19;
@@ -386,39 +387,19 @@ impl AhciController {
             // Stop all temporary FIS receivers concurrently.  A successful
             // classification remains valid because the normal path does not
             // reset the links again before IDENTIFY.
-            for port_no in &provisional_ports {
-                unsafe { &mut *controller.port_ptr(*port_no) }.begin_provisional_stop();
-            }
-            let stop_deadline = Instant::now() + Duration::from_millis(500);
-            let mut stop_iteration = 0usize;
-            loop {
-                let mut all_stopped = true;
-                for port_no in &provisional_ports {
-                    // Do not short-circuit: every port must advance during
-                    // every scan so one slow CR bit cannot serialize FRE stop.
-                    all_stopped &=
-                        unsafe { &mut *controller.port_ptr(*port_no) }.advance_provisional_stop();
+            if controller
+                .stop_ports_concurrently(&provisional_ports)
+                .is_err()
+            {
+                // Do not publish using classifications obtained before a
+                // recovery reset.  Reset only proves DMA is stopped; this
+                // probe fails and a later probe must classify afresh.
+                let command = pci.status_command().1;
+                pci.set_command(command & !Command::BUS_MASTER);
+                if Self::reset_hba(hba).is_ok() {
+                    controller.hardware_stopped.store(true, Ordering::Release);
                 }
-                if all_stopped {
-                    break;
-                }
-                if Instant::now() >= stop_deadline {
-                    // Do not publish using classifications obtained before a
-                    // recovery reset.  Reset only proves DMA is stopped; this
-                    // probe fails and a later probe must classify afresh.
-                    let command = pci.status_command().1;
-                    pci.set_command(command & !Command::BUS_MASTER);
-                    if Self::reset_hba(hba).is_ok() {
-                        controller.hardware_stopped.store(true, Ordering::Release);
-                    }
-                    return Err(SystemError::ETIMEDOUT);
-                }
-                if poll_should_yield(stop_iteration) {
-                    crate::sched::sched_yield();
-                } else {
-                    core::hint::spin_loop();
-                }
-                stop_iteration = stop_iteration.wrapping_add(1);
+                return Err(SystemError::ETIMEDOUT);
             }
 
             let has_sata = link_states
@@ -440,7 +421,12 @@ impl AhciController {
                         err
                     );
                     if !controller.accepting_io.load(Ordering::Acquire) {
-                        break;
+                        // A failed port stop disables DMA for the whole HBA.
+                        // Complete a terminal detach before releasing the BDF
+                        // reservation, so stale mounts cannot later touch a
+                        // controller owned by a new probe generation.
+                        controller.rollback_failed_probe();
+                        return Err(err);
                     }
                 }
             }
@@ -823,18 +809,72 @@ impl AhciController {
         volatile_read!((*hba).ghc) != u32::MAX
     }
 
+    /// Stop every listed command/FIS engine within one controller-wide
+    /// deadline. Each scan advances all ports, so a stuck port cannot make
+    /// later ports wait for a separate timeout.
+    fn stop_ports_concurrently(&self, ports: &[usize]) -> Result<(), SystemError> {
+        for port_no in ports {
+            unsafe { &mut *self.port_ptr(*port_no) }.begin_provisional_stop();
+        }
+        let mut iteration = 0usize;
+        let mut deadline = Instant::now() + Duration::from_millis(AHCI_PORT_STOP_TIMEOUT_MS);
+        let mut stopping_fis_receive = false;
+        loop {
+            let mut all_stopped = true;
+            for port_no in ports {
+                // Intentionally non-short-circuiting: advance every port on
+                // every scan within each controller-wide phase.
+                let port = unsafe { &mut *self.port_ptr(*port_no) };
+                all_stopped &= if stopping_fis_receive {
+                    port.fis_receive_stopped()
+                } else {
+                    port.provisional_command_stopped()
+                };
+            }
+            if all_stopped {
+                if stopping_fis_receive {
+                    return Ok(());
+                }
+                for port_no in ports {
+                    unsafe { &mut *self.port_ptr(*port_no) }.begin_fis_receive_stop();
+                }
+                stopping_fis_receive = true;
+                deadline = Instant::now() + Duration::from_millis(AHCI_PORT_STOP_TIMEOUT_MS);
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return Err(SystemError::ETIMEDOUT);
+            }
+            if poll_should_yield(iteration) {
+                crate::sched::sched_yield();
+            } else {
+                core::hint::spin_loop();
+            }
+            iteration = iteration.wrapping_add(1);
+        }
+    }
+
+    /// Finish a failed initial probe before its BDF reservation is released.
+    /// Published nodes may already have mount holders, so this must make their
+    /// delayed controller Drop permanently hardware-silent.
+    fn rollback_failed_probe(&self) {
+        self.quiesce();
+        let stop_result = if self.hba_accessible() {
+            self.stop_quiesced()
+        } else {
+            Err(SystemError::ENODEV)
+        };
+        *self.lifecycle.lock() = ControllerState::Stopped;
+        self.finalize_detach(stop_result.is_ok());
+        self.unregister_disks();
+    }
+
     fn stop_quiesced(&self) -> Result<(), SystemError> {
         let pi = volatile_read!((*(self.abar as *mut HbaMem)).pi);
-        let mut first_error = None;
-        for port_no in 0..self.port_count {
-            if pi & (1 << port_no) != 0 {
-                let _guard = self.port_locks[port_no].lock();
-                if let Err(err) = unsafe { &mut *self.port_ptr(port_no) }.stop() {
-                    first_error.get_or_insert(err);
-                }
-            }
-        }
-        if let Some(err) = first_error {
+        let ports = (0..self.port_count)
+            .filter(|port_no| pi & (1 << port_no) != 0)
+            .collect::<Vec<_>>();
+        if let Err(err) = self.stop_ports_concurrently(&ports) {
             let command = self.pci.status_command().1;
             self.pci.set_command(command & !Command::BUS_MASTER);
             if Self::reset_hba(self.abar as *mut HbaMem).is_err() {
@@ -896,6 +936,15 @@ impl AhciController {
                 &(disk as Arc<dyn crate::driver::base::block::block_device::BlockDevice>),
             );
         }
+    }
+
+    /// Perform the final PCI access and transfer all DMA ownership before any
+    /// stale reference is allowed to outlive this controller generation.
+    fn finalize_detach(&self, safe_to_release_dma: bool) {
+        let command = self.pci.status_command().1;
+        self.pci.set_command(command & !Command::BUS_MASTER);
+        self.detached.store(true, Ordering::Release);
+        self.retire_dma(safe_to_release_dma);
     }
 
     fn retire_dma(&self, safe_to_release: bool) {
@@ -1036,11 +1085,8 @@ impl PciDriver for AhciPciDriver {
 
         // This is the final PCI configuration access by this controller. The
         // detached flag makes delayed Drop from an open mount hardware-silent.
-        let command = controller.pci.status_command().1;
-        controller.pci.set_command(command & !Command::BUS_MASTER);
-        controller.detached.store(true, Ordering::Release);
+        controller.finalize_detach(stop_result.is_ok());
         *state = ControllerState::Stopped;
-        controller.retire_dma(stop_result.is_ok());
         self.controllers.write().remove(&name);
         if let Err(err) = flush_result {
             log::warn!("AHCI {} detach flush failed: {:?}", name, err);

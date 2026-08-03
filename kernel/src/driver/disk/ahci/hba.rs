@@ -196,16 +196,18 @@ impl HbaPort {
         volatile_write!(self.cmd, cmd & !HBA_PORT_CMD_ST);
     }
 
-    /// Advance the AHCI-mandated ST/CR then FRE/FR stop sequence.
-    /// Returns true once this port can no longer DMA into its FIS buffer.
-    pub fn advance_provisional_stop(&mut self) -> bool {
+    pub fn provisional_command_stopped(&self) -> bool {
+        volatile_read!(self.cmd) & HBA_PORT_CMD_CR == 0
+    }
+
+    /// Disable receive-FIS only after CR has cleared on every participating
+    /// port; callers enforce that controller-wide phase boundary.
+    pub fn begin_fis_receive_stop(&mut self) {
         let cmd = volatile_read!(self.cmd);
-        if cmd & HBA_PORT_CMD_CR != 0 {
-            return false;
-        }
-        if cmd & HBA_PORT_CMD_FRE != 0 {
-            volatile_write!(self.cmd, cmd & !HBA_PORT_CMD_FRE);
-        }
+        volatile_write!(self.cmd, cmd & !HBA_PORT_CMD_FRE);
+    }
+
+    pub fn fis_receive_stopped(&self) -> bool {
         volatile_read!(self.cmd) & HBA_PORT_CMD_FR == 0
     }
 

@@ -1,11 +1,13 @@
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 use hashbrown::HashMap;
+use smoltcp::wire::IpAddress;
 use system_error::SystemError;
 
 use crate::{
     arch::rand::rand,
     libs::mutex::Mutex,
-    process::{ProcessManager, RawPid},
+    process::ProcessManager,
 };
 
 use super::Types::{self, *};
@@ -16,8 +18,8 @@ use super::Types::{self, *};
 /// because Linux device-bound sockets can legally share a port across ifaces.
 #[derive(Debug)]
 pub struct PortManager {
-    // TCP 端口记录表
-    tcp_port_table: Mutex<HashMap<u16, RawPid>>,
+    // TCP 端口记录表。一个端口可以有多条绑定记录（SO_REUSEPORT/SO_REUSEADDR 共享）。
+    tcp_port_table: Mutex<HashMap<u16, Vec<TcpPortBinding>>>,
 }
 
 impl Default for PortManager {
@@ -85,7 +87,14 @@ impl PortManager {
     }
 
     #[inline]
-    pub fn bind_ephemeral_port(&self, socket_type: Types) -> Result<u16, SystemError> {
+    pub fn bind_tcp_ephemeral_port(
+        &self,
+        addr: IpAddress,
+        reuseaddr: bool,
+        reuseport: bool,
+        iface_nic_id: usize,
+        handle: smoltcp::iface::SocketHandle,
+    ) -> Result<u16, SystemError> {
         let (min, max) = Self::local_port_range();
         let range = (max - min) as u32 + 1;
         if range == 0 {
@@ -93,8 +102,8 @@ impl PortManager {
         }
         let mut remaining = range;
         while remaining > 0 {
-            let port = self.get_ephemeral_port(socket_type)?;
-            match self.bind_port(socket_type, port) {
+            let port = self.get_ephemeral_port(Types::Tcp)?;
+            match self.bind_tcp_port(port, addr, reuseaddr, reuseport, iface_nic_id, handle) {
                 Ok(()) => return Ok(port),
                 Err(SystemError::EADDRINUSE) => {
                     // Race: another thread grabbed the port after we checked.
@@ -107,24 +116,73 @@ impl PortManager {
         Err(SystemError::EADDRINUSE)
     }
 
-    /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP 对应的表中记录
+    /// TCP: 绑定端口，支持 SO_REUSEADDR/SO_REUSEPORT。
     ///
-    pub fn bind_port(&self, socket_type: Types, port: u16) -> Result<(), SystemError> {
-        if port > 0 && socket_type == Tcp {
-            let mut guard = self.tcp_port_table.lock();
-            if guard.get(&port).is_some() {
+    /// 一条绑定记录以 `(iface_nic_id, handle)` 唯一标识（BoundInner 身份），
+    /// 因此多个进程/多个 socket 可以共享同一端口而不需要调用方保存额外 id。
+    pub fn bind_tcp_port(
+        &self,
+        port: u16,
+        addr: IpAddress,
+        reuseaddr: bool,
+        reuseport: bool,
+        iface_nic_id: usize,
+        handle: smoltcp::iface::SocketHandle,
+    ) -> Result<(), SystemError> {
+        if port == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let mut guard = self.tcp_port_table.lock();
+        let bindings = guard.entry(port).or_default();
+        for binding in bindings.iter() {
+            if !addrs_conflict(addr, binding.addr) {
+                continue;
+            }
+            let share_ok = (reuseport && binding.reuseport) || (reuseaddr && binding.reuseaddr);
+            if !share_ok {
                 return Err(SystemError::EADDRINUSE);
             }
-            guard.insert(port, ProcessManager::current_pid());
         }
-        return Ok(());
+        bindings.push(TcpPortBinding {
+            addr,
+            reuseaddr,
+            reuseport,
+            iface_nic_id,
+            handle,
+        });
+        Ok(())
     }
 
-    /// @brief 在对应的端口记录表中将端口和 socket 解绑
-    /// should call this function when socket is closed or aborted
-    pub fn unbind_port(&self, socket_type: Types, port: u16) {
-        if socket_type == Tcp {
-            self.tcp_port_table.lock().remove(&port);
-        };
+    /// TCP: 解绑端口（按 BoundInner 身份）
+    pub fn unbind_tcp_port(&self, port: u16, iface_nic_id: usize, handle: smoltcp::iface::SocketHandle) {
+        let mut guard = self.tcp_port_table.lock();
+        if let Some(list) = guard.get_mut(&port) {
+            list.retain(|b| b.iface_nic_id != iface_nic_id || b.handle != handle);
+            if list.is_empty() {
+                guard.remove(&port);
+            }
+        }
     }
+
+}
+
+/// TCP 端口绑定记录。`(iface_nic_id, handle)` 是绑定的 BoundInner 身份。
+#[derive(Debug, Clone)]
+struct TcpPortBinding {
+    addr: IpAddress,
+    reuseaddr: bool,
+    reuseport: bool,
+    iface_nic_id: usize,
+    handle: smoltcp::iface::SocketHandle,
+}
+
+#[inline]
+fn addrs_conflict(a: IpAddress, b: IpAddress) -> bool {
+    if a.version() != b.version() {
+        return false;
+    }
+    if a.is_unspecified() || b.is_unspecified() {
+        return true;
+    }
+    a == b
 }

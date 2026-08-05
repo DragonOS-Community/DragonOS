@@ -52,6 +52,8 @@ pub struct TcpSocketOptions {
     pub(crate) so_filter_attached: AtomicBool,
     /// SO_REUSEADDR
     pub(crate) so_reuseaddr: AtomicBool,
+    /// SO_REUSEPORT
+    pub(crate) so_reuseport: AtomicBool,
     /// SO_BROADCAST
     pub(crate) so_broadcast: AtomicBool,
     /// SO_PASSCRED
@@ -108,6 +110,7 @@ impl TcpSocketOptions {
             tcp_user_timeout: AtomicI32::new(0),
             so_filter_attached: AtomicBool::new(false),
             so_reuseaddr: AtomicBool::new(false),
+            so_reuseport: AtomicBool::new(false),
             so_broadcast: AtomicBool::new(false),
             so_passcred: AtomicBool::new(false),
             so_no_check: AtomicBool::new(false),
@@ -325,6 +328,11 @@ impl TcpSocket {
     #[inline]
     pub(crate) fn so_reuseaddr(&self) -> &AtomicBool {
         &self.options.so_reuseaddr
+    }
+
+    #[inline]
+    pub(crate) fn so_reuseport(&self) -> &AtomicBool {
+        &self.options.so_reuseport
     }
 
     #[inline]

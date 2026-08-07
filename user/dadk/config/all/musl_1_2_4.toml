@@ -21,9 +21,9 @@ type = "build-from-source"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "archive"
 # 路径或URL
-source-path = "https://github.com/ifduyue/musl/archive/refs/tags/v1.2.4.tar.gz"
+source-path = "https://github.com/ifduyue/musl/archive/f5f55d6589940fd2c2188d76686efe3a530e64e0.tar.gz"
 # 把压缩包中的哪个目录作为根目录（可选）,仅当 source = "archive" 时生效
-archive-rootdir = "musl-1.2.4"
+archive-rootdir = "musl-f5f55d6589940fd2c2188d76686efe3a530e64e0"
 
 # 构建相关信息
 [build]

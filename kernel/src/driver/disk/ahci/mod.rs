@@ -226,6 +226,7 @@ impl AhciController {
         // Preserve firmware's Bus Master state until BIOS/OS handoff finishes;
         // clearing it earlier can prevent firmware transactions from draining.
         pci.set_command(original_command | Command::MEMORY_SPACE);
+        let mut os_ownership_assumed = false;
         let result = (|| {
             if pci.bar_ioremap().ok_or(SystemError::EINVAL)?.is_err() {
                 return Err(SystemError::EIO);
@@ -241,7 +242,15 @@ impl AhciController {
                 .data();
             drop(bars);
             let hba = abar as *mut HbaMem;
-            Self::initialize_hba(hba, &pci)?;
+            Self::acquire_firmware_ownership(hba);
+            os_ownership_assumed = true;
+
+            // Firmware has either released ownership or exhausted its handoff
+            // grace period. Disable old DMA before reset invalidates firmware
+            // command-list addresses.
+            let command = pci.status_command().1;
+            pci.set_command(command & !Command::BUS_MASTER);
+            Self::reset_hba(hba)?;
             Self::reclaim_quarantined_dma(&device.name());
 
             let cap = volatile_read!((*hba).cap);
@@ -480,33 +489,50 @@ impl AhciController {
             Ok(controller)
         })();
         if result.is_err() {
-            pci.set_command(original_command & !Command::BUS_MASTER);
+            if os_ownership_assumed {
+                pci.set_command(original_command & !Command::BUS_MASTER);
+            } else {
+                // The controller still belongs to firmware. Restore the exact
+                // entry state instead of interrupting firmware DMA.
+                pci.set_command(original_command);
+            }
         }
         result
     }
 
-    fn initialize_hba(
-        hba: *mut HbaMem,
-        pci: &PciDeviceStructureGeneralDevice,
-    ) -> Result<(), SystemError> {
+    fn acquire_firmware_ownership(hba: *mut HbaMem) {
         if volatile_read!((*hba).cap2) & AHCI_CAP2_BOH != 0 {
             let bohc = volatile_read!((*hba).bohc);
             volatile_write!((*hba).bohc, bohc | AHCI_BOHC_OOS);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while volatile_read!((*hba).bohc) & (AHCI_BOHC_BOS | AHCI_BOHC_BB) != 0 {
-                if Instant::now() >= deadline {
-                    return Err(SystemError::ETIMEDOUT);
+
+            // AHCI 1.3.1 section 10.6 gives firmware 25 ms to declare
+            // cleanup busy. If it does, preserve its DMA permission for at
+            // least another two seconds before forcing the OS takeover.
+            let busy_deadline = Instant::now() + Duration::from_millis(25);
+            loop {
+                let bohc = volatile_read!((*hba).bohc);
+                if bohc & AHCI_BOHC_BOS == 0 {
+                    return;
+                }
+                if bohc & AHCI_BOHC_BB != 0 {
+                    break;
+                }
+                if Instant::now() >= busy_deadline {
+                    log::warn!("AHCI BIOS handoff did not enter busy state; forcing OS ownership");
+                    return;
+                }
+                core::hint::spin_loop();
+            }
+
+            let release_deadline = Instant::now() + Duration::from_secs(2);
+            while volatile_read!((*hba).bohc) & AHCI_BOHC_BOS != 0 {
+                if Instant::now() >= release_deadline {
+                    log::warn!("AHCI BIOS handoff timed out; forcing OS ownership");
+                    return;
                 }
                 core::hint::spin_loop();
             }
         }
-
-        // Firmware ownership is now released. Disable old DMA before reset
-        // invalidates firmware command-list addresses.
-        let command = pci.status_command().1;
-        pci.set_command(command & !Command::BUS_MASTER);
-
-        Self::reset_hba(hba)
     }
 
     fn reset_hba(hba: *mut HbaMem) -> Result<(), SystemError> {
@@ -1254,8 +1280,8 @@ impl AhciController {
     /// Perform the final PCI access and transfer all DMA ownership before any
     /// stale reference is allowed to outlive this controller generation.
     fn finalize_detach(&self, safe_to_release_dma: bool) {
-        let command = self.pci.status_command().1;
-        self.pci.set_command(command & !Command::BUS_MASTER);
+        self.pci
+            .set_command(self.original_command & !Command::BUS_MASTER);
         self.detached.store(true, Ordering::Release);
         self.retire_dma(safe_to_release_dma);
     }

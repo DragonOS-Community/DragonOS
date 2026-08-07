@@ -7,10 +7,11 @@ use log::{debug, warn};
 /// @Description: 伙伴分配器
 use crate::arch::MMArch;
 use crate::mm::allocator::bump::BumpAllocator;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 use crate::mm::allocator::page_frame::{
-    allocate_page_frames, deallocate_page_frames, FrameAllocator, PageFrameCount, PageFrameUsage,
-    PhysPageFrame,
+    allocate_page_frames, deallocate_page_frames, PhysPageFrame,
 };
+use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr};
 
 use core::cmp::min;
@@ -641,6 +642,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 /// The live allocator only supplies one aligned backing block.  All operations
 /// under test use a separate `BuddyAllocator`, so their exact addresses are
 /// deterministic and concurrent kernel allocations cannot affect the result.
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool) {
     const BACKING_PAGES: usize = 64;
     const ARENA_OFFSET_PAGES: usize = 32;

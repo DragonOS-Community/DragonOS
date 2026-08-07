@@ -35,7 +35,7 @@ use system_error::SystemError;
 
 use self::{
     bus::{bus_add_device, bus_probe_device, Bus, BusNotifyEvent},
-    dd::{DeviceAttrCoredump, DeviceAttrStateSynced},
+    dd::{block_device_bindings_and_wait, DeviceAttrCoredump, DeviceAttrStateSynced},
     device_number::{DeviceNumber, Major},
     driver::Driver,
 };
@@ -1357,6 +1357,11 @@ pub fn device_unregister<T: Device + 'static>(device: Arc<T>) {
 ///
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#4611
 pub fn device_shutdown() {
+    // Stabilize the reverse-registration order before removing the first
+    // device from the kset.  In particular, an admitted controller probe may
+    // still register child disks which must be shut down before their parent.
+    block_device_bindings_and_wait();
+
     let devices_kset = sys_devices_kset();
 
     loop {
@@ -1375,8 +1380,16 @@ pub fn device_shutdown() {
             }
         };
 
-        if let Some(dev_bus) = dev.bus().and_then(|bus| bus.upgrade()) {
-            dev_bus.shutdown(&dev);
+        let lifecycle = device_manager().lifecycle_lock(&dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        // The driver pointer is assigned before probe runs, while the reverse
+        // driver->device relation is published only after a successful commit.
+        // Never call shutdown on a preset or partially initialized driver.
+        if dev.is_registered() && device_manager().device_is_bound(&dev) {
+            if let Some(dev_bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+                dev_bus.shutdown(&dev);
+            }
         }
     }
 }

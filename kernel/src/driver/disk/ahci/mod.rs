@@ -115,6 +115,8 @@ const AHCI_POLL_YIELD_INTERVAL: usize = 1 << 10;
 const AHCI_LINK_TIMEOUT_MS: u64 = 2_000;
 const AHCI_PORT_STOP_TIMEOUT_MS: u64 = 500;
 const AHCI_COMMAND_TIMEOUT_MS: u64 = 30_000;
+// One in-flight payload per serialized port, plus the controller command arena.
+const AHCI_DMA_QUARANTINE_CAPACITY: usize = 32 + 1;
 // 32 command lists (32 KiB) + 32 received-FIS areas (8 KiB) +
 // 32 * 32 command tables (256 KiB), rounded to the allocator's power of two.
 const AHCI_COMMAND_ARENA_SIZE: usize = 1 << 19;
@@ -179,6 +181,7 @@ lazy_static! {
 /// Resources owned by one bound PCI AHCI controller.
 pub struct AhciController {
     device: Arc<dyn PciDevice>,
+    device_name: String,
     pci: Arc<PciDeviceStructureGeneralDevice>,
     abar: usize,
     port_count: usize,
@@ -251,7 +254,8 @@ impl AhciController {
             let command = pci.status_command().1;
             pci.set_command(command & !Command::BUS_MASTER);
             Self::reset_hba(hba)?;
-            Self::reclaim_quarantined_dma(&device.name());
+            let device_name = device.name();
+            Self::reclaim_quarantined_dma(&device_name);
 
             let cap = volatile_read!((*hba).cap);
             let pi = volatile_read!((*hba).pi);
@@ -347,8 +351,19 @@ impl AhciController {
                 Some(memory)
             };
 
+            let mut local_dma_quarantine = Vec::new();
+            local_dma_quarantine
+                .try_reserve_exact(AHCI_DMA_QUARANTINE_CAPACITY)
+                .map_err(|_| SystemError::ENOMEM)?;
+
+            // All allocations needed to retain DMA ownership happen while the
+            // controller is healthy. Teardown may run after an HBA fault when
+            // the allocator itself cannot make progress.
+            Self::prepare_dma_quarantine(&device_name)?;
+
             let controller = Arc::new(Self {
                 device,
+                device_name,
                 pci: pci.clone(),
                 abar,
                 port_count,
@@ -359,10 +374,9 @@ impl AhciController {
                 disks: SpinLock::new(Vec::new()),
                 accepting_io: AtomicBool::new(true),
                 failed_ports: AtomicU32::new(0),
-                // At most one command can be active on each serialized port.
-                // Reserve all possible entries before any fault path so DMA
-                // quarantine never allocates after a command-engine failure.
-                quarantined_dma: SpinLock::new(Vec::with_capacity(32)),
+                // At most one command can be active on each serialized port;
+                // teardown can additionally retain the command arena.
+                quarantined_dma: SpinLock::new(local_dma_quarantine),
                 hardware_stopped: AtomicBool::new(false),
                 detached: AtomicBool::new(false),
                 port_locks: (0..32).map(|_| Mutex::new(())).collect(),
@@ -566,6 +580,25 @@ impl AhciController {
         let retired = AHCI_DMA_QUARANTINE.lock().remove(device_name);
         // Do not run the DMA allocator while holding the quarantine mutex.
         drop(retired);
+    }
+
+    fn prepare_dma_quarantine(device_name: &str) -> Result<(), SystemError> {
+        let mut slot = Vec::new();
+        slot.try_reserve_exact(AHCI_DMA_QUARANTINE_CAPACITY)
+            .map_err(|_| SystemError::ENOMEM)?;
+
+        let mut key = String::new();
+        key.try_reserve_exact(device_name.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        key.push_str(device_name);
+
+        let mut quarantine = AHCI_DMA_QUARANTINE.lock();
+        if quarantine.contains_key(device_name) {
+            return Err(SystemError::EBUSY);
+        }
+        quarantine.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        quarantine.insert(key, slot);
+        Ok(())
     }
 
     fn initialize_port(&self, port_no: usize) -> Result<(), SystemError> {
@@ -1145,10 +1178,15 @@ impl AhciController {
     }
 
     fn release_quarantined_dma(&self) {
-        let mut guard = self.quarantined_dma.lock();
-        let retired = core::mem::take(&mut *guard);
-        drop(guard);
-        drop(retired);
+        loop {
+            let retired = self.quarantined_dma.lock().pop();
+            let Some(retired) = retired else {
+                return;
+            };
+            // Keep allocator lock ordering independent from the quarantine
+            // lock while preserving the queue's preallocated capacity.
+            drop(retired);
+        }
     }
 
     fn flush_disks(&self) -> Result<(), SystemError> {
@@ -1295,17 +1333,52 @@ impl AhciController {
         let mut retired = core::mem::take(&mut *local_guard);
         drop(local_guard);
         if let Some(memory) = self.command_memory.lock().take() {
-            retired.push(memory);
+            if retired.len() < retired.capacity() {
+                retired.push(memory);
+            } else {
+                if safe_to_release {
+                    drop(memory);
+                } else {
+                    log::error!(
+                        "AHCI {} local DMA quarantine capacity invariant failed; leaking command arena",
+                        self.device_name
+                    );
+                    core::mem::forget(memory);
+                }
+            }
         }
-        if safe_to_release || retired.is_empty() {
+        if safe_to_release {
             drop(retired);
+            Self::reclaim_quarantined_dma(&self.device_name);
             return;
         }
-        AHCI_DMA_QUARANTINE
-            .lock()
-            .entry(self.device.name())
-            .or_default()
-            .extend(retired);
+        if retired.is_empty() {
+            Self::reclaim_quarantined_dma(&self.device_name);
+            return;
+        }
+
+        let mut quarantine = AHCI_DMA_QUARANTINE.lock();
+        let Some(slot) = quarantine.get_mut(&self.device_name) else {
+            drop(quarantine);
+            log::error!(
+                "AHCI {} has no preallocated DMA quarantine; leaking DMA ownership",
+                self.device_name
+            );
+            core::mem::forget(retired);
+            return;
+        };
+        if slot.capacity().saturating_sub(slot.len()) < retired.len() {
+            drop(quarantine);
+            log::error!(
+                "AHCI {} DMA quarantine capacity invariant failed; leaking DMA ownership",
+                self.device_name
+            );
+            core::mem::forget(retired);
+            return;
+        }
+        slot.append(&mut retired);
+        drop(quarantine);
+        drop(retired);
     }
 }
 
@@ -1317,6 +1390,7 @@ impl Drop for AhciController {
         if self.hardware_stopped.load(Ordering::Acquire) {
             self.pci
                 .set_command(self.original_command & !Command::BUS_MASTER);
+            self.retire_dma(true);
             return;
         }
         self.quiesce();
@@ -1331,6 +1405,7 @@ impl Drop for AhciController {
         // because firmware happened to leave Bus Master set before binding.
         self.pci
             .set_command(self.original_command & !Command::BUS_MASTER);
+        self.retire_dma(true);
     }
 }
 

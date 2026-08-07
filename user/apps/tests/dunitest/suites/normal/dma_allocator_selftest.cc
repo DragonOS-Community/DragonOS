@@ -42,6 +42,8 @@ void ExpectSuccessfulReport(const std::string& report) {
     EXPECT_NE(report.find("bounded_candidate_selection=ok\n"), std::string::npos) << report;
     EXPECT_NE(report.find("split_free_merge=ok\n"), std::string::npos) << report;
     EXPECT_NE(report.find("fragmented_arena=ok\n"), std::string::npos) << report;
+    EXPECT_NE(report.find("dma32_zone=ok\n"), std::string::npos) << report;
+    EXPECT_NE(report.find("metadata_reuse=ok\n"), std::string::npos) << report;
     EXPECT_NE(report.find("pool_mask_separation=ok\n"), std::string::npos) << report;
     EXPECT_NE(report.find("summary_fail=0\n"), std::string::npos) << report;
 }

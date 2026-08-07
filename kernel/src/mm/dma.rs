@@ -518,13 +518,20 @@ fn selftest_pool_mask_separation() -> bool {
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 pub(crate) fn dma_allocator_selftest_report() -> String {
     let _guard = DMA_SELFTEST_LOCK.lock();
-    let (bounded_candidate_selection, split_free_merge, fragmented_arena) =
-        deterministic_buddy_selftest();
+    let (
+        bounded_candidate_selection,
+        split_free_merge,
+        fragmented_arena,
+        dma32_zone,
+        metadata_reuse,
+    ) = deterministic_buddy_selftest();
     let cases = [
         ("bounded_orders", selftest_bounded_orders()),
         ("bounded_candidate_selection", bounded_candidate_selection),
         ("split_free_merge", split_free_merge),
         ("fragmented_arena", fragmented_arena),
+        ("dma32_zone", dma32_zone),
+        ("metadata_reuse", metadata_reuse),
         ("pool_mask_separation", selftest_pool_mask_separation()),
     ];
     let failed = cases.iter().filter(|(_, passed)| !passed).count();

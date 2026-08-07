@@ -243,26 +243,24 @@ impl DmaAllocator {
         options: &DmaAllocOptions,
     ) -> Result<DmaRawAllocation, SystemError> {
         if let Some(pages) = pool_pages {
-            if let Some(raw) = self.take_from_pool(pages) {
+            while let Some(raw) = self.take_from_pool(pages) {
                 if allocation_fits_mask(&raw, options.dma_mask) {
                     if options.zeroed {
                         self.zero_raw(&raw);
                     }
-                    Ok(raw)
-                } else {
-                    // This pool entry cannot satisfy the caller. Return it to
-                    // the global allocator before making a bounded request.
-                    unsafe {
-                        deallocate_page_frames(PhysPageFrame::new(raw.paddr), raw.page_count);
-                    }
-                    self.try_alloc_raw(page_count, options)
+                    return Ok(raw);
                 }
-            } else {
-                self.try_alloc_raw(page_count, options)
+
+                // Keep scanning the bounded pool: a compatible low-address
+                // entry may sit below this one in the LIFO free list. Returning
+                // incompatible entries to the buddy allocator also prevents
+                // them from repeatedly blocking future bounded callers.
+                unsafe {
+                    deallocate_page_frames(PhysPageFrame::new(raw.paddr), raw.page_count);
+                }
             }
-        } else {
-            self.try_alloc_raw(page_count, options)
         }
+        self.try_alloc_raw(page_count, options)
     }
 
     fn try_alloc_raw(
@@ -471,17 +469,28 @@ fn selftest_pool_mask_separation() -> bool {
         release_raw(higher);
         return false;
     };
+    let lower_copy = DmaRawAllocation {
+        paddr: lower.paddr,
+        vaddr: lower.vaddr,
+        page_count: lower.page_count,
+    };
+    if !allocator.return_to_pool(lower) {
+        release_raw(lower_copy);
+        release_raw(higher);
+        return false;
+    }
     let higher_copy = DmaRawAllocation {
         paddr: higher.paddr,
         vaddr: higher.vaddr,
         page_count: higher.page_count,
     };
     if !allocator.return_to_pool(higher) {
-        release_raw(lower);
+        if let Some(pooled_lower) = allocator.take_from_pool(1) {
+            release_raw(pooled_lower);
+        }
         release_raw(higher_copy);
         return false;
     }
-    release_raw(lower);
 
     let bounded = DmaAllocOptions {
         dma_mask: Some(mask),
@@ -490,11 +499,16 @@ fn selftest_pool_mask_separation() -> bool {
     };
     match allocator.try_alloc_from_pool_or_raw(PageFrameCount::ONE, Some(1), &bounded) {
         Ok(raw) => {
-            let ok = raw_fits_mask(&raw, mask);
+            let ok = raw.paddr == lower_copy.paddr && raw_fits_mask(&raw, mask);
             release_raw(raw);
             ok
         }
-        Err(_) => false,
+        Err(_) => {
+            while let Some(raw) = allocator.take_from_pool(1) {
+                release_raw(raw);
+            }
+            false
+        }
     }
 }
 

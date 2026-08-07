@@ -665,6 +665,10 @@ impl AhciController {
             DmaAllocOptions {
                 direction,
                 dma_mask: Some(self.dma_mask),
+                // A host-to-device payload is fully initialized before the
+                // command is issued. Device-written and shared buffers still
+                // start zeroed so stale kernel data is never exposed.
+                zeroed: direction != DmaDirection::ToDevice,
                 ..Default::default()
             },
         )?;
@@ -1438,12 +1442,16 @@ impl PciDriver for AhciPciDriver {
     }
 
     fn shutdown(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError> {
-        if let Some(controller) = self
+        // Drop the controller-table read guard before taking the per-controller
+        // lifecycle lock. remove() takes those locks in the opposite phases
+        // (lifecycle first, table write last), so retaining both would deadlock
+        // concurrent shutdown and hot removal.
+        let controller = self
             .controllers
             .read()
             .get(&device.name())
-            .and_then(Option::clone)
-        {
+            .and_then(Option::clone);
+        if let Some(controller) = controller {
             let mut state = controller.lifecycle.lock();
             if *state == ControllerState::Stopped {
                 return Ok(());

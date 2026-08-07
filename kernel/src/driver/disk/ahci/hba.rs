@@ -26,8 +26,10 @@ pub const HBA_PORT_CMD_CR: u32 = 1 << 15;
 pub const HBA_PORT_CMD_FR: u32 = 1 << 14;
 pub const HBA_PORT_CMD_FRE: u32 = 1 << 4;
 pub const HBA_PORT_CMD_ST: u32 = 1;
-#[allow(dead_code)]
-pub const HBA_PORT_IS_ERR: u32 = 1 << 30 | 1 << 29 | 1 << 28 | 1 << 27;
+/// PxIS bits which Linux 6.6 treats as command errors (`PORT_IRQ_ERROR`).
+/// Non-fatal interface and overflow notifications are intentionally excluded.
+pub const HBA_PORT_IS_ERR: u32 =
+    1 << 30 | 1 << 29 | 1 << 28 | 1 << 27 | 1 << 23 | 1 << 22 | 1 << 6 | 1 << 4;
 pub const HBA_SSTS_PRESENT: u32 = 0x3;
 pub const HBA_SIG_ATA: u16 = 0x0000;
 pub const HBA_SIG_ATAPI: u16 = 0xEB14;

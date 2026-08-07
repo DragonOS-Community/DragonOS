@@ -61,6 +61,7 @@ use self::{
     hba::{
         FisRegH2D, FisType, HbaCmdHeader, HbaCmdTable, HbaMem, HbaPort, HbaPortType,
         ATA_CMD_FLUSH_CACHE, ATA_CMD_FLUSH_CACHE_EXT, ATA_CMD_IDENTIFY, ATA_DEV_BUSY, ATA_DEV_DRQ,
+        HBA_PORT_IS_ERR,
     },
 };
 
@@ -70,8 +71,30 @@ pub(crate) struct AhciIdentify {
     reliable_flush: bool,
 }
 
-/* TFES - Task File Error Status */
-pub const HBA_PXIS_TFES: u32 = 1 << 30;
+struct PendingAtaCommand {
+    port_no: usize,
+    slot: u32,
+    issued: bool,
+}
+
+struct PendingIdentify {
+    command: PendingAtaCommand,
+    buffer: Option<DmaBuffer>,
+    result: Option<Result<AhciIdentify, SystemError>>,
+}
+
+struct PendingFlush {
+    command: PendingAtaCommand,
+    result: Option<Result<(), SystemError>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AtaCommandStatus {
+    Pending,
+    Complete,
+    Error,
+}
+
 const AHCI_CLASS_CODE: u32 = 0x010601;
 const AHCI_CLASS_MASK: u32 = 0x00ff_ffff;
 const AHCI_GHC_AE: u32 = 1 << 31;
@@ -91,6 +114,7 @@ const AHCI_MAX_SECTORS: u64 = 1u64 << 48;
 const AHCI_POLL_YIELD_INTERVAL: usize = 1 << 10;
 const AHCI_LINK_TIMEOUT_MS: u64 = 2_000;
 const AHCI_PORT_STOP_TIMEOUT_MS: u64 = 500;
+const AHCI_COMMAND_TIMEOUT_MS: u64 = 30_000;
 // 32 command lists (32 KiB) + 32 received-FIS areas (8 KiB) +
 // 32 * 32 command tables (256 KiB), rounded to the allocator's power of two.
 const AHCI_COMMAND_ARENA_SIZE: usize = 1 << 19;
@@ -103,6 +127,24 @@ const fn poll_should_yield(iteration: usize) -> bool {
     iteration != 0 && iteration.is_multiple_of(AHCI_POLL_YIELD_INTERVAL)
 }
 
+const fn classify_command_status(port_is: u32, port_ci: u32, slot: u32) -> AtaCommandStatus {
+    if port_is & HBA_PORT_IS_ERR != 0 {
+        AtaCommandStatus::Error
+    } else if port_ci & (1 << slot) == 0 {
+        AtaCommandStatus::Complete
+    } else {
+        AtaCommandStatus::Pending
+    }
+}
+
+fn read_command_status(port: &HbaPort, slot: u32) -> AtaCommandStatus {
+    // Read CI first. If the device completes with an error between these two
+    // MMIO reads, the later, latched PxIS read still makes the result fail.
+    let port_ci = volatile_read!(port.ci);
+    let port_is = volatile_read!(port.is);
+    classify_command_status(port_is, port_ci, slot)
+}
+
 // These protocol boundaries are checked by every kernel build, including
 // architectures that do not instantiate the x86-only AHCI driver.
 const _: () = {
@@ -112,6 +154,18 @@ const _: () = {
     assert!(!poll_should_yield(0));
     assert!(!poll_should_yield(AHCI_POLL_YIELD_INTERVAL - 1));
     assert!(poll_should_yield(AHCI_POLL_YIELD_INTERVAL));
+    assert!(matches!(
+        classify_command_status(HBA_PORT_IS_ERR, 0, 0),
+        AtaCommandStatus::Error
+    ));
+    assert!(matches!(
+        classify_command_status(0, 0, 0),
+        AtaCommandStatus::Complete
+    ));
+    assert!(matches!(
+        classify_command_status(0, 1, 0),
+        AtaCommandStatus::Pending
+    ));
 };
 
 lazy_static! {
@@ -296,7 +350,10 @@ impl AhciController {
                 disks: SpinLock::new(Vec::new()),
                 accepting_io: AtomicBool::new(true),
                 failed_ports: AtomicU32::new(0),
-                quarantined_dma: SpinLock::new(Vec::new()),
+                // At most one command can be active on each serialized port.
+                // Reserve all possible entries before any fault path so DMA
+                // quarantine never allocates after a command-engine failure.
+                quarantined_dma: SpinLock::new(Vec::with_capacity(32)),
                 hardware_stopped: AtomicBool::new(false),
                 detached: AtomicBool::new(false),
                 port_locks: (0..32).map(|_| Mutex::new(())).collect(),
@@ -409,27 +466,13 @@ impl AhciController {
                 let command = pci.status_command().1;
                 pci.set_command(command | Command::BUS_MASTER);
             }
-            for (port_no, _, _, port_type) in link_states {
-                if port_type != Some(HbaPortType::Sata) {
-                    continue;
-                }
-                if let Err(err) = controller.publish_port(port_no) {
-                    log::error!(
-                        "AHCI {} port {} initialization failed: {:?}",
-                        controller.pci.common_header.bus_device_function,
-                        port_no,
-                        err
-                    );
-                    if !controller.accepting_io.load(Ordering::Acquire) {
-                        // A failed port stop disables DMA for the whole HBA.
-                        // Complete a terminal detach before releasing the BDF
-                        // reservation, so stale mounts cannot later touch a
-                        // controller owned by a new probe generation.
-                        controller.rollback_failed_probe();
-                        return Err(err);
-                    }
-                }
-            }
+            let sata_ports = link_states
+                .into_iter()
+                .filter_map(|(port_no, _, _, port_type)| {
+                    (port_type == Some(HbaPortType::Sata)).then_some(port_no)
+                })
+                .collect::<Vec<_>>();
+            controller.probe_sata_ports(&sata_ports);
             if controller.disks.lock().is_empty() {
                 let command = pci.status_command().1;
                 pci.set_command(command & !Command::BUS_MASTER);
@@ -499,7 +542,7 @@ impl AhciController {
         drop(retired);
     }
 
-    fn publish_port(self: &Arc<Self>, port_no: usize) -> Result<(), SystemError> {
+    fn initialize_port(&self, port_no: usize) -> Result<(), SystemError> {
         let base = self
             .command_memory
             .lock()
@@ -512,9 +555,15 @@ impl AhciController {
             .map(|slot| (base + (40 << 10) + (port_no << 13) + (slot << 8)) as u64)
             .collect::<Vec<_>>();
 
+        unsafe { &mut *self.port_ptr(port_no) }.init(clb as u64, fb as u64, &ctbas)
+    }
+
+    fn publish_identified(
+        self: &Arc<Self>,
+        port_no: usize,
+        identify: AhciIdentify,
+    ) -> Result<(), SystemError> {
         let result = (|| {
-            unsafe { &mut *self.port_ptr(port_no) }.init(clb as u64, fb as u64, &ctbas)?;
-            let identify = self.identify(port_no)?;
             let disk = LockedAhciDisk::new(self.clone(), port_no as u8, identify)?;
             block_dev_manager().register(disk.clone())?;
             self.disks.lock().push(Arc::downgrade(&disk));
@@ -551,6 +600,10 @@ impl AhciController {
             drop(guard);
             return Err(SystemError::ESHUTDOWN);
         }
+        if self.failed_ports.load(Ordering::Acquire) & (1 << port_no) != 0 {
+            drop(guard);
+            return Err(SystemError::EIO);
+        }
         Ok(guard)
     }
 
@@ -562,16 +615,15 @@ impl AhciController {
         Ok(())
     }
 
-    /// Stop a failed port before releasing a buffer that may still be a DMA
-    /// target. If the engine cannot be stopped, retain the buffer until a
-    /// controller-wide reset proves that old DMA state is gone.
-    pub(crate) fn abort_failed_dma(&self, port_no: usize, buffer: DmaBuffer) {
+    /// Freeze one failed port. A controller-wide Bus Master shutdown would
+    /// interrupt unrelated ports, so a buffer which may still be a DMA target
+    /// remains owned by this controller until teardown stops or resets the HBA.
+    pub(crate) fn abort_failed_command(&self, port_no: usize, buffer: Option<DmaBuffer>) {
         self.failed_ports.fetch_or(1 << port_no, Ordering::AcqRel);
         if unsafe { &mut *self.port_ptr(port_no) }.stop().is_err() {
-            self.accepting_io.store(false, Ordering::Release);
-            let command = self.pci.status_command().1;
-            self.pci.set_command(command & !Command::BUS_MASTER);
-            self.quarantined_dma.lock().push(buffer);
+            if let Some(buffer) = buffer {
+                self.quarantined_dma.lock().push(buffer);
+            }
         } else {
             drop(buffer);
         }
@@ -593,9 +645,9 @@ impl AhciController {
         Ok(buffer)
     }
 
-    fn identify(&self, port_no: usize) -> Result<AhciIdentify, SystemError> {
+    fn prepare_identify(&self, port_no: usize) -> Result<PendingIdentify, SystemError> {
         let port = unsafe { &mut *self.port_ptr(port_no) };
-        let mut identify = self.allocate_dma(512, DmaDirection::FromDevice)?;
+        let identify = self.allocate_dma(512, DmaDirection::FromDevice)?;
         let slot = port
             .find_cmdslot(self.command_slots)
             .ok_or(SystemError::EBUSY)?;
@@ -630,16 +682,18 @@ impl AhciController {
         volatile_write!(fis.pm, 1 << 7);
         volatile_write!(fis.command, ATA_CMD_IDENTIFY);
 
-        Self::wait_tfd_ready(port)?;
-        core::sync::atomic::compiler_fence(Ordering::Release);
-        let ci = volatile_read!(port.ci);
-        volatile_write!(port.ci, ci | (1 << slot));
-        if let Err(err) = Self::wait_slot(port, slot) {
-            self.abort_failed_dma(port_no, identify);
-            return Err(err);
-        }
-        core::sync::atomic::compiler_fence(Ordering::Acquire);
+        Ok(PendingIdentify {
+            command: PendingAtaCommand {
+                port_no,
+                slot,
+                issued: false,
+            },
+            buffer: Some(identify),
+            result: None,
+        })
+    }
 
+    fn parse_identify(mut identify: DmaBuffer) -> Result<AhciIdentify, SystemError> {
         let bytes = identify.as_mut_slice();
         let word = |index: usize| u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
         if word(49) & (1 << 8) == 0 {
@@ -696,17 +750,191 @@ impl AhciController {
         })
     }
 
-    pub(crate) fn flush_port(
+    /// Advance one already prepared command without waiting on another port.
+    /// This keeps controller-wide probe and teardown budgets fair when one
+    /// device remains BUSY forever.
+    fn advance_prepared_command(
+        &self,
+        command: &mut PendingAtaCommand,
+    ) -> Result<bool, SystemError> {
+        let port = unsafe { &mut *self.port_ptr(command.port_no) };
+        if read_command_status(port, command.slot) == AtaCommandStatus::Error {
+            return Err(SystemError::EIO);
+        }
+        if !command.issued {
+            if volatile_read!(port.tfd) as u8 & (ATA_DEV_BUSY | ATA_DEV_DRQ) != 0 {
+                return Ok(false);
+            }
+            core::sync::atomic::compiler_fence(Ordering::Release);
+            let ci = volatile_read!(port.ci);
+            volatile_write!(port.ci, ci | (1 << command.slot));
+            command.issued = true;
+        }
+        match read_command_status(port, command.slot) {
+            AtaCommandStatus::Error => return Err(SystemError::EIO),
+            AtaCommandStatus::Complete => {
+                core::sync::atomic::compiler_fence(Ordering::Acquire);
+                return Ok(true);
+            }
+            AtaCommandStatus::Pending => {}
+        }
+        Ok(false)
+    }
+
+    fn fail_pending_identify(pending: &mut PendingIdentify, err: SystemError) {
+        pending.result = Some(Err(err));
+    }
+
+    fn stop_failed_batch(&self, ports: &[usize]) -> bool {
+        let failed_mask = ports.iter().fold(0, |mask, port_no| mask | 1 << port_no);
+        self.failed_ports.fetch_or(failed_mask, Ordering::AcqRel);
+        self.stop_ports_concurrently(ports).is_ok()
+    }
+
+    /// Prepare every SATA port before polling any of them. All ports therefore
+    /// receive a chance to complete IDENTIFY within one controller budget.
+    fn probe_sata_ports(self: &Arc<Self>, ports: &[usize]) {
+        let mut pending = Vec::with_capacity(ports.len());
+        let mut setup_failed = Vec::new();
+        for &port_no in ports {
+            let prepared = self
+                .initialize_port(port_no)
+                .and_then(|()| self.prepare_identify(port_no));
+            match prepared {
+                Ok(command) => pending.push(command),
+                Err(err) => {
+                    setup_failed.push(port_no);
+                    log::error!(
+                        "AHCI {} port {} initialization failed: {:?}",
+                        self.pci.common_header.bus_device_function,
+                        port_no,
+                        err
+                    );
+                }
+            }
+        }
+        if !setup_failed.is_empty() {
+            self.stop_failed_batch(&setup_failed);
+        }
+
+        // Link reset and the concurrent provisional stop already established
+        // the setup bound. Start the IDENTIFY command budget only after every
+        // usable port is prepared, so setup failure on a low-numbered port
+        // cannot consume a healthy higher-numbered port's command window.
+        let deadline = Instant::now() + Duration::from_millis(AHCI_COMMAND_TIMEOUT_MS);
+        let mut remaining = pending.len();
+        let mut iteration = 0usize;
+        while remaining != 0 && Instant::now() < deadline {
+            for item in &mut pending {
+                if item.result.is_some() {
+                    continue;
+                }
+                match self.advance_prepared_command(&mut item.command) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let result = item
+                            .buffer
+                            .take()
+                            .ok_or(SystemError::EIO)
+                            .and_then(Self::parse_identify);
+                        if result.is_err() {
+                            self.failed_ports
+                                .fetch_or(1 << item.command.port_no, Ordering::AcqRel);
+                        }
+                        item.result = Some(result);
+                        remaining -= 1;
+                    }
+                    Err(err) => {
+                        Self::fail_pending_identify(item, err);
+                        remaining -= 1;
+                    }
+                }
+            }
+            if remaining != 0 {
+                if poll_should_yield(iteration) {
+                    crate::sched::sched_yield();
+                } else {
+                    core::hint::spin_loop();
+                }
+                iteration = iteration.wrapping_add(1);
+            }
+        }
+        // A scheduler yield may return after the deadline even though hardware
+        // completed before it. Observe already-issued commands once more, but
+        // never submit a previously BUSY command after its budget expired.
+        for item in &mut pending {
+            if item.result.is_some() || !item.command.issued {
+                continue;
+            }
+            let port = unsafe { &*self.port_ptr(item.command.port_no) };
+            match read_command_status(port, item.command.slot) {
+                AtaCommandStatus::Complete => {
+                    core::sync::atomic::compiler_fence(Ordering::Acquire);
+                    let result = item
+                        .buffer
+                        .take()
+                        .ok_or(SystemError::EIO)
+                        .and_then(Self::parse_identify);
+                    item.result = Some(result);
+                }
+                AtaCommandStatus::Error => item.result = Some(Err(SystemError::EIO)),
+                AtaCommandStatus::Pending => {}
+            }
+        }
+        for item in &mut pending {
+            if item.result.is_none() {
+                Self::fail_pending_identify(item, SystemError::ETIMEDOUT);
+            }
+        }
+
+        let failed = pending
+            .iter()
+            .filter_map(|item| {
+                item.result
+                    .as_ref()
+                    .is_some_and(Result::is_err)
+                    .then_some(item.command.port_no)
+            })
+            .collect::<Vec<_>>();
+        if !failed.is_empty() && !self.stop_failed_batch(&failed) {
+            let mut quarantine = self.quarantined_dma.lock();
+            for item in &mut pending {
+                if item.command.issued && item.result.as_ref().is_some_and(Result::is_err) {
+                    if let Some(buffer) = item.buffer.take() {
+                        quarantine.push(buffer);
+                    }
+                }
+            }
+        }
+
+        for item in pending {
+            let port_no = item.command.port_no;
+            match item.result.unwrap_or(Err(SystemError::EIO)) {
+                Ok(identify) => {
+                    if let Err(err) = self.publish_identified(port_no, identify) {
+                        log::error!(
+                            "AHCI {} port {} publication failed: {:?}",
+                            self.pci.common_header.bus_device_function,
+                            port_no,
+                            err
+                        );
+                    }
+                }
+                Err(err) => log::error!(
+                    "AHCI {} port {} IDENTIFY failed: {:?}",
+                    self.pci.common_header.bus_device_function,
+                    port_no,
+                    err
+                ),
+            }
+        }
+    }
+
+    fn prepare_flush_command(
         &self,
         port_no: usize,
         command: u8,
-        teardown: bool,
-    ) -> Result<(), SystemError> {
-        let _guard = if teardown {
-            self.port_locks[port_no].lock()
-        } else {
-            self.lock_port_for_io(port_no)?
-        };
+    ) -> Result<PendingAtaCommand, SystemError> {
         let port = unsafe { &mut *self.port_ptr(port_no) };
         volatile_write!(port.is, u32::MAX);
         let slot = port
@@ -738,13 +966,24 @@ impl AhciController {
         volatile_write!(fis.fis_type, FisType::RegH2D as u8);
         volatile_write!(fis.pm, 1 << 7);
         volatile_write!(fis.command, command);
+        Ok(PendingAtaCommand {
+            port_no,
+            slot,
+            issued: false,
+        })
+    }
+
+    pub(crate) fn flush_port(&self, port_no: usize, command: u8) -> Result<(), SystemError> {
+        let _guard = self.lock_port_for_io(port_no)?;
+        let mut pending = self.prepare_flush_command(port_no, command)?;
+        let port = unsafe { &mut *self.port_ptr(port_no) };
         Self::wait_tfd_ready(port)?;
         core::sync::atomic::compiler_fence(Ordering::Release);
         let ci = volatile_read!(port.ci);
-        volatile_write!(port.ci, ci | (1 << slot));
-        if let Err(err) = Self::wait_slot(port, slot) {
-            self.failed_ports.fetch_or(1 << port_no, Ordering::AcqRel);
-            let _ = port.stop();
+        volatile_write!(port.ci, ci | (1 << pending.slot));
+        pending.issued = true;
+        if let Err(err) = Self::wait_slot(port, pending.slot) {
+            self.abort_failed_command(port_no, None);
             return Err(err);
         }
         core::sync::atomic::compiler_fence(Ordering::Acquire);
@@ -771,14 +1010,13 @@ impl AhciController {
     }
 
     pub(crate) fn wait_slot(port: &HbaPort, slot: u32) -> Result<(), SystemError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_millis(AHCI_COMMAND_TIMEOUT_MS);
         let mut iteration = 0usize;
         loop {
-            if volatile_read!(port.is) & HBA_PXIS_TFES != 0 {
-                return Err(SystemError::EIO);
-            }
-            if volatile_read!(port.ci) & (1 << slot) == 0 {
-                return Ok(());
+            match read_command_status(port, slot) {
+                AtaCommandStatus::Error => return Err(SystemError::EIO),
+                AtaCommandStatus::Complete => return Ok(()),
+                AtaCommandStatus::Pending => {}
             }
             if Instant::now() >= deadline {
                 return Err(SystemError::ETIMEDOUT);
@@ -854,21 +1092,6 @@ impl AhciController {
         }
     }
 
-    /// Finish a failed initial probe before its BDF reservation is released.
-    /// Published nodes may already have mount holders, so this must make their
-    /// delayed controller Drop permanently hardware-silent.
-    fn rollback_failed_probe(&self) {
-        self.quiesce();
-        let stop_result = if self.hba_accessible() {
-            self.stop_quiesced()
-        } else {
-            Err(SystemError::ENODEV)
-        };
-        *self.lifecycle.lock() = ControllerState::Stopped;
-        self.finalize_detach(stop_result.is_ok());
-        self.unregister_disks();
-    }
-
     fn stop_quiesced(&self) -> Result<(), SystemError> {
         let pi = volatile_read!((*(self.abar as *mut HbaMem)).pi);
         let ports = (0..self.port_count)
@@ -916,10 +1139,100 @@ impl AhciController {
             };
         }
         let mut first_error = None;
+        let mut pending = Vec::with_capacity(disks.len());
+        let mut failed = Vec::new();
         for disk in disks {
-            if let Err(err) = disk.flush_for_teardown() {
-                first_error.get_or_insert(err);
+            let Some((port_no, command)) = disk.teardown_flush_command() else {
+                continue;
+            };
+            if self.failed_ports.load(Ordering::Acquire) & (1 << port_no) != 0 {
+                first_error.get_or_insert(SystemError::EIO);
+                failed.push(port_no);
+                log::warn!(
+                    "AHCI {} port {} teardown FLUSH skipped: port already failed",
+                    self.pci.common_header.bus_device_function,
+                    port_no
+                );
+                continue;
             }
+            match self.prepare_flush_command(port_no, command) {
+                Ok(command) => pending.push(PendingFlush {
+                    command,
+                    result: None,
+                }),
+                Err(err) => {
+                    failed.push(port_no);
+                    first_error.get_or_insert(err.clone());
+                    log::warn!(
+                        "AHCI {} port {} teardown FLUSH preparation failed: {:?}",
+                        self.pci.common_header.bus_device_function,
+                        port_no,
+                        err
+                    );
+                }
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(AHCI_COMMAND_TIMEOUT_MS);
+        let mut remaining = pending.len();
+        let mut iteration = 0usize;
+        while remaining != 0 && Instant::now() < deadline {
+            for item in &mut pending {
+                if item.result.is_some() {
+                    continue;
+                }
+                match self.advance_prepared_command(&mut item.command) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        item.result = Some(Ok(()));
+                        remaining -= 1;
+                    }
+                    Err(err) => {
+                        item.result = Some(Err(err));
+                        remaining -= 1;
+                    }
+                }
+            }
+            if remaining != 0 {
+                if poll_should_yield(iteration) {
+                    crate::sched::sched_yield();
+                } else {
+                    core::hint::spin_loop();
+                }
+                iteration = iteration.wrapping_add(1);
+            }
+        }
+        for item in &mut pending {
+            if item.result.is_some() || !item.command.issued {
+                continue;
+            }
+            let port = unsafe { &*self.port_ptr(item.command.port_no) };
+            item.result = match read_command_status(port, item.command.slot) {
+                AtaCommandStatus::Complete => {
+                    core::sync::atomic::compiler_fence(Ordering::Acquire);
+                    Some(Ok(()))
+                }
+                AtaCommandStatus::Error => Some(Err(SystemError::EIO)),
+                AtaCommandStatus::Pending => None,
+            };
+        }
+        for item in &mut pending {
+            if item.result.is_none() {
+                item.result = Some(Err(SystemError::ETIMEDOUT));
+            }
+            if let Some(Err(err)) = &item.result {
+                first_error.get_or_insert(err.clone());
+                failed.push(item.command.port_no);
+                log::warn!(
+                    "AHCI {} port {} teardown FLUSH failed: {:?}",
+                    self.pci.common_header.bus_device_function,
+                    item.command.port_no,
+                    err
+                );
+            }
+        }
+        if !failed.is_empty() {
+            self.stop_failed_batch(&failed);
         }
         first_error.map_or(Ok(()), Err)
     }

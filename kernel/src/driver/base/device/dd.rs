@@ -83,7 +83,6 @@ impl DeviceManager {
             if self.device_bind_driver(dev).is_ok() {
                 return Ok(true);
             } else {
-                dev.set_driver(None);
                 return Ok(false);
             }
         } else {
@@ -205,6 +204,34 @@ impl DeviceManager {
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#496
     pub fn device_bind_driver(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let expected_driver = dev.driver().ok_or(SystemError::ENODEV)?;
+        let lifecycle = self.lifecycle_lock(dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        let binding_is_current = dev
+            .driver()
+            .is_some_and(|driver| Arc::ptr_eq(&driver, &expected_driver));
+        if dev.is_dead()
+            || self.is_device_removing(dev)
+            || !dev.is_registered()
+            || !binding_is_current
+            || self.device_is_bound(dev)
+        {
+            return Err(SystemError::ENODEV);
+        }
+
+        let result = self.device_bind_driver_locked(dev);
+        if result.is_err()
+            && dev
+                .driver()
+                .is_some_and(|driver| Arc::ptr_eq(&driver, &expected_driver))
+        {
+            dev.set_driver(None);
+        }
+        result
+    }
+
+    fn device_bind_driver_locked(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let r = driver_manager().driver_sysfs_add(dev);
         if r.is_ok() {
             self.device_links_force_bind(dev);
@@ -349,7 +376,14 @@ impl DriverManager {
         driver: &Arc<dyn Driver>,
         device: &Arc<dyn Device>,
     ) -> Result<(), SystemError> {
-        let r = self.do_probe_device(driver, device);
+        let lifecycle = device_manager().lifecycle_lock(device);
+        let r = {
+            let _lifecycle_guard = lifecycle.lock();
+            // All eligibility checks in do_probe_device() deliberately happen after taking this
+            // lock.  A concurrent unbind or device removal therefore either runs wholly before
+            // probe starts or waits until really_probe() has committed/rolled back completely.
+            self.do_probe_device(driver, device)
+        };
         PROBE_WAIT_QUEUE.wakeup_all(None);
         return r;
     }
@@ -429,6 +463,35 @@ impl DriverManager {
             bind_failed();
             e
         })?;
+
+        // Driver callbacks may publish private resources.  Before publishing the core binding,
+        // verify the device/driver relationship once more at the commit point.  Concurrent core
+        // removal cannot change these fields while the lifecycle lock is held, but this check also
+        // turns an invalid callback-side mutation into a complete rollback instead of allowing a
+        // later driver_bound() unwrap or a ghost binding.
+        let binding_is_current = device
+            .driver()
+            .is_some_and(|bound| Arc::ptr_eq(&bound, driver));
+        if device.is_dead()
+            || device_manager().is_device_removing(device)
+            || !device.is_registered()
+            || !binding_is_current
+        {
+            warn!(
+                "really_probe: device '{}' changed state before binding commit",
+                device.name()
+            );
+
+            // Bus remove resolves the callback through device.driver().  Restore the driver which
+            // performed this probe before invoking rollback so the correct remove callback owns
+            // cleanup even if a broken probe callback altered the field.
+            device.set_driver(Some(Arc::downgrade(driver)));
+            remove_probed_driver();
+            remove_driver_sysfs();
+            sysfs_failed();
+            bind_failed();
+            return Err(SystemError::ENODEV);
+        }
 
         device_manager()
             .add_groups(device, driver.dev_groups())

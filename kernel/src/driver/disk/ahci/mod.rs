@@ -104,12 +104,13 @@ const AHCI_BOHC_BOS: u32 = 1;
 const AHCI_BOHC_OOS: u32 = 1 << 1;
 const AHCI_BOHC_BB: u32 = 1 << 4;
 const AHCI_CAP_SSS: u32 = 1 << 27;
-const AHCI_CAP_CPD: u32 = 1 << 20;
 const AHCI_PXCMD_CPD: u32 = 1 << 20;
+const AHCI_PXCMD_CPS: u32 = 1 << 16;
 const AHCI_PXCMD_ICC_MASK: u32 = 0xf << 28;
 const AHCI_PXCMD_ICC_ACTIVE: u32 = 1 << 28;
 const AHCI_PXCMD_POD: u32 = 1 << 2;
 const AHCI_PXCMD_SUD: u32 = 1 << 1;
+const AHCI_PXCMD_POWER_MASK: u32 = AHCI_PXCMD_POD | AHCI_PXCMD_SUD;
 const AHCI_MAX_SECTORS: u64 = 1u64 << 48;
 const AHCI_POLL_YIELD_INTERVAL: usize = 1 << 10;
 const AHCI_LINK_TIMEOUT_MS: u64 = 2_000;
@@ -127,6 +128,29 @@ const fn capacity_is_addressable(capacity: u64) -> bool {
 
 const fn poll_should_yield(iteration: usize) -> bool {
     iteration != 0 && iteration.is_multiple_of(AHCI_POLL_YIELD_INTERVAL)
+}
+
+#[inline]
+fn cooperative_poll_step(iteration: &mut usize) {
+    if poll_should_yield(*iteration) {
+        crate::sched::sched_yield();
+    } else {
+        core::hint::spin_loop();
+    }
+    *iteration = (*iteration).wrapping_add(1);
+}
+
+const fn prepare_port_power_command(cap: u32, cmd: u32) -> (u32, bool) {
+    let mut configured = cmd;
+    if cap & AHCI_CAP_SSS != 0 {
+        configured |= AHCI_PXCMD_SUD;
+    }
+    if cmd & (AHCI_PXCMD_CPD | AHCI_PXCMD_CPS) == (AHCI_PXCMD_CPD | AHCI_PXCMD_CPS) {
+        configured |= AHCI_PXCMD_POD;
+    }
+    configured = (configured & !AHCI_PXCMD_ICC_MASK) | AHCI_PXCMD_ICC_ACTIVE;
+    let power_transitioned = (configured ^ cmd) & AHCI_PXCMD_POWER_MASK != 0;
+    (configured, power_transitioned)
 }
 
 const fn classify_command_status(port_is: u32, port_ci: u32, slot: u32) -> AtaCommandStatus {
@@ -156,6 +180,23 @@ const _: () = {
     assert!(!poll_should_yield(0));
     assert!(!poll_should_yield(AHCI_POLL_YIELD_INTERVAL - 1));
     assert!(poll_should_yield(AHCI_POLL_YIELD_INTERVAL));
+    let (cmd, power_changed) = prepare_port_power_command(AHCI_CAP_SSS, 0);
+    assert!(cmd & AHCI_PXCMD_SUD != 0);
+    assert!(power_changed);
+    let (cmd, power_changed) = prepare_port_power_command(0, AHCI_PXCMD_CPD | AHCI_PXCMD_CPS);
+    assert!(cmd & AHCI_PXCMD_POD != 0);
+    assert!(power_changed);
+    let (cmd, power_changed) = prepare_port_power_command(0, AHCI_PXCMD_CPD);
+    assert!(cmd & AHCI_PXCMD_POD == 0);
+    assert!(!power_changed);
+    let (cmd, power_changed) = prepare_port_power_command(0, AHCI_PXCMD_CPS);
+    assert!(cmd & AHCI_PXCMD_POD == 0);
+    assert!(!power_changed);
+    let (_, power_changed) = prepare_port_power_command(AHCI_CAP_SSS, AHCI_PXCMD_SUD);
+    assert!(!power_changed);
+    let (_, power_changed) =
+        prepare_port_power_command(0, AHCI_PXCMD_CPD | AHCI_PXCMD_CPS | AHCI_PXCMD_POD);
+    assert!(!power_changed);
     assert!(matches!(
         classify_command_status(HBA_PORT_IS_ERR, 0, 0),
         AtaCommandStatus::Error
@@ -284,6 +325,7 @@ impl AhciController {
             }
             let mut online_ports = Vec::new();
             let mut training_ports = Vec::new();
+            let mut needs_power_settle = false;
             for port_no in 0..port_count {
                 if pi & (1 << port_no) == 0 {
                     continue;
@@ -293,21 +335,19 @@ impl AhciController {
                         .cast::<HbaPort>()
                         .add(port_no)
                 };
-                let mut cmd = volatile_read!((*port).cmd);
-                if cap & AHCI_CAP_SSS != 0 {
-                    cmd |= AHCI_PXCMD_SUD;
-                }
-                if cap & AHCI_CAP_CPD != 0 && cmd & AHCI_PXCMD_CPD != 0 {
-                    cmd |= AHCI_PXCMD_POD;
-                }
-                cmd = (cmd & !AHCI_PXCMD_ICC_MASK) | AHCI_PXCMD_ICC_ACTIVE;
+                let (cmd, power_transitioned) =
+                    prepare_port_power_command(cap, volatile_read!((*port).cmd));
+                needs_power_settle |= power_transitioned;
                 volatile_write!((*port).cmd, cmd);
                 let _ = volatile_read!((*port).cmd);
             }
-            if cap & (AHCI_CAP_SSS | AHCI_CAP_CPD) != 0 {
+            if needs_power_settle {
+                // Give a newly powered or spun-up device a brief stabilization
+                // window before sampling its link state.
                 let settle_until = Instant::now() + Duration::from_millis(100);
+                let mut iteration = 0usize;
                 while Instant::now() < settle_until {
-                    core::hint::spin_loop();
+                    cooperative_poll_step(&mut iteration);
                 }
             }
             for port_no in 0..port_count {
@@ -443,12 +483,7 @@ impl AhciController {
                 if !pending || Instant::now() >= link_deadline {
                     break;
                 }
-                if poll_should_yield(link_iteration) {
-                    crate::sched::sched_yield();
-                } else {
-                    core::hint::spin_loop();
-                }
-                link_iteration = link_iteration.wrapping_add(1);
+                cooperative_poll_step(&mut link_iteration);
             }
 
             for (port_no, _, _, port_type) in &link_states {
@@ -523,6 +558,7 @@ impl AhciController {
             // cleanup busy. If it does, preserve its DMA permission for at
             // least another two seconds before forcing the OS takeover.
             let busy_deadline = Instant::now() + Duration::from_millis(25);
+            let mut iteration = 0usize;
             loop {
                 let bohc = volatile_read!((*hba).bohc);
                 if bohc & AHCI_BOHC_BOS == 0 {
@@ -532,19 +568,20 @@ impl AhciController {
                     break;
                 }
                 if Instant::now() >= busy_deadline {
-                    log::warn!("AHCI BIOS handoff did not enter busy state; forcing OS ownership");
+                    log::debug!("AHCI BIOS handoff busy bit remained clear; assuming OS ownership");
                     return;
                 }
-                core::hint::spin_loop();
+                cooperative_poll_step(&mut iteration);
             }
 
             let release_deadline = Instant::now() + Duration::from_secs(2);
+            iteration = 0;
             while volatile_read!((*hba).bohc) & AHCI_BOHC_BOS != 0 {
                 if Instant::now() >= release_deadline {
                     log::warn!("AHCI BIOS handoff timed out; forcing OS ownership");
                     return;
                 }
-                core::hint::spin_loop();
+                cooperative_poll_step(&mut iteration);
             }
         }
     }
@@ -562,11 +599,12 @@ impl AhciController {
         volatile_write!((*hba).ghc, ghc | AHCI_GHC_HR);
         let _ = volatile_read!((*hba).ghc);
         let deadline = Instant::now() + Duration::from_secs(1);
+        let mut iteration = 0usize;
         while volatile_read!((*hba).ghc) & AHCI_GHC_HR != 0 {
             if Instant::now() >= deadline {
                 return Err(SystemError::ETIMEDOUT);
             }
-            core::hint::spin_loop();
+            cooperative_poll_step(&mut iteration);
         }
         let ghc = volatile_read!((*hba).ghc);
         volatile_write!((*hba).ghc, ghc | AHCI_GHC_AE);
@@ -914,12 +952,7 @@ impl AhciController {
                 }
             }
             if remaining != 0 {
-                if poll_should_yield(iteration) {
-                    crate::sched::sched_yield();
-                } else {
-                    core::hint::spin_loop();
-                }
-                iteration = iteration.wrapping_add(1);
+                cooperative_poll_step(&mut iteration);
             }
         }
         // A scheduler yield may return after the deadline even though hardware
@@ -1063,12 +1096,7 @@ impl AhciController {
             if Instant::now() >= deadline {
                 return Err(SystemError::ETIMEDOUT);
             }
-            if poll_should_yield(iteration) {
-                crate::sched::sched_yield();
-            } else {
-                core::hint::spin_loop();
-            }
-            iteration = iteration.wrapping_add(1);
+            cooperative_poll_step(&mut iteration);
         }
     }
 
@@ -1084,12 +1112,7 @@ impl AhciController {
             if Instant::now() >= deadline {
                 return Err(SystemError::ETIMEDOUT);
             }
-            if poll_should_yield(iteration) {
-                crate::sched::sched_yield();
-            } else {
-                core::hint::spin_loop();
-            }
-            iteration = iteration.wrapping_add(1);
+            cooperative_poll_step(&mut iteration);
         }
     }
 
@@ -1146,12 +1169,7 @@ impl AhciController {
             if Instant::now() >= deadline {
                 return Err(SystemError::ETIMEDOUT);
             }
-            if poll_should_yield(iteration) {
-                crate::sched::sched_yield();
-            } else {
-                core::hint::spin_loop();
-            }
-            iteration = iteration.wrapping_add(1);
+            cooperative_poll_step(&mut iteration);
         }
     }
 
@@ -1262,12 +1280,7 @@ impl AhciController {
                 }
             }
             if remaining != 0 {
-                if poll_should_yield(iteration) {
-                    crate::sched::sched_yield();
-                } else {
-                    core::hint::spin_loop();
-                }
-                iteration = iteration.wrapping_add(1);
+                cooperative_poll_step(&mut iteration);
             }
         }
         for item in &mut pending {

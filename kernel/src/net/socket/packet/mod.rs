@@ -2,6 +2,7 @@
 mod binding;
 mod fanout;
 mod mreq;
+mod ring;
 mod rx;
 mod sockopt;
 mod tx;
@@ -27,6 +28,7 @@ use crate::process::ProcessManager;
 use crate::rcu::RcuOptionArcSlot;
 
 pub(crate) use fanout::{membership_value, FanoutGroup, FanoutJoinParams};
+pub use ring::{RingWriteResult, TpacketVersion};
 #[allow(unused_imports)]
 pub use uapi::{
     eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,
@@ -128,6 +130,7 @@ pub struct PacketSocket {
     registry_active: AtomicBool,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
+    pub(super) ring_state: Mutex<ring::RingState>,
 }
 
 impl PacketSocket {
@@ -171,6 +174,7 @@ impl PacketSocket {
             filter: RcuOptionArcSlot::new_none(),
             filter_locked: Mutex::new(false),
             fasync_items: FAsyncItems::default(),
+            ring_state: Mutex::new(ring::RingState::new()),
         });
         socket
             .netns
@@ -202,6 +206,15 @@ impl PacketSocket {
     }
     pub fn self_ref(&self) -> Weak<Self> {
         self.self_ref.clone()
+    }
+
+    /// Called by `PacketFakeFs::vma_close` when a VMA covering the ring is
+    /// torn down. Decrements the mapped count so teardown can proceed.
+    pub fn ring_vma_closed(&self) {
+        let mut state = self.ring_state.lock();
+        if state.mapped > 0 {
+            state.mapped -= 1;
+        }
     }
 }
 
@@ -334,5 +347,30 @@ impl Socket for PacketSocket {
     }
     fn set_option(&self, l: PSOL, n: usize, v: &[u8]) -> Result<(), SystemError> {
         self.set_packet_option(l, n, v)
+    }
+    fn mmap_layout(&self) -> Option<crate::net::socket::base::SocketMmapLayout> {
+        let state = self.ring_state.lock();
+        state.ring.as_ref().map(|r| {
+            let inner = r.lock();
+            crate::net::socket::base::SocketMmapLayout {
+                page_cache: inner.page_cache().clone(),
+                fs: Arc::new(ring::PacketFakeFs),
+                size: inner.total_size(),
+            }
+        })
+    }
+    fn mmap_validate(&self, len: usize, offset: usize) -> Result<(), SystemError> {
+        let mut state = self.ring_state.lock();
+        let Some(ring_arc) = state.ring.as_ref() else {
+            return Err(SystemError::EINVAL);
+        };
+        // Linux packet_mmap(): offset must be 0 and length must equal the
+        // total ring size. Partial mappings or non-zero offsets are EINVAL.
+        let ring_size = ring_arc.lock().total_size();
+        if offset != 0 || len != ring_size {
+            return Err(SystemError::EINVAL);
+        }
+        state.mapped += 1;
+        Ok(())
     }
 }

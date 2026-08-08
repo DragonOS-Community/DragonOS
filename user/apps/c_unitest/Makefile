@@ -14,9 +14,13 @@ RETIRED_FALSE_POSITIVE_SRCS := test_mount_propagation.c test_pivot_root.c
 SRCS := $(filter-out $(RETIRED_FALSE_POSITIVE_SRCS),$(wildcard *.c))
 BINS := $(SRCS:.c=)
 
+# 含有自己 Makefile 的子目录
+SUBDIRS := $(patsubst %/Makefile,%,$(wildcard */Makefile))
+
 all: $(BINS)
 # 	@echo "src: $(SRCS)"
 	@echo "bins: $(BINS)"
+	@for dir in $(SUBDIRS); do $(MAKE) -C $$dir all ARCH=$(ARCH); done
 
 # 依赖同目录下所有 .h，任意头文件变更都会触发重编
 %: %.c $(wildcard *.h)
@@ -25,8 +29,13 @@ all: $(BINS)
 install: all
 	@echo "Installing binaries to $(DADK_CURRENT_BUILD_DIR)/"
 	mv $(BINS) $(DADK_CURRENT_BUILD_DIR)/
+	@for dir in $(SUBDIRS); do \
+		$(MAKE) -C $$dir install ARCH=$(ARCH) \
+			DADK_CURRENT_BUILD_DIR=$(DADK_CURRENT_BUILD_DIR); \
+	done
 
 clean:
 	rm -f $(BINS) $(RETIRED_FALSE_POSITIVE_SRCS:.c=)
+	@for dir in $(SUBDIRS); do $(MAKE) -C $$dir clean ARCH=$(ARCH); done
 
 .PHONY: all install clean

@@ -17,8 +17,11 @@ use crate::net::socket::PMSG;
 use super::uapi::{SOL_PACKET, TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID};
 use super::{
     eth_protocol, packet_option, PacketIngressMetadata, PacketMetadata, PacketSocket,
-    PacketSocketType, PacketType, ReceivedPacket, SockAddrLl, TpacketAuxdata,
+    PacketSocketType, PacketType, ReceivedPacket, RingWriteResult, SockAddrLl, TpacketAuxdata,
 };
+use crate::filesystem::epoll::event_poll::EventPoll;
+use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::fasync::FASYNC_POLL_IN;
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const MAX_FLOW_DISSECT_HDRS: u8 = 15;
@@ -41,8 +44,8 @@ struct BasicFlowKeys {
 }
 
 struct ParsedFrame {
-    dst: [u8; 6],
     src: [u8; 6],
+    dst: [u8; 6],
     protocol: u16,
     vlan: Option<(u16, u16)>,
 }
@@ -51,7 +54,7 @@ struct ParsedFrame {
 /// into skb metadata, while outgoing taps retain an inline VLAN header. This
 /// view models both layouts with at most two borrowed segments and is shared
 /// by cBPF loads and the eventual queue copy.
-struct PacketFilterInput<'a> {
+pub(super) struct PacketFilterInput<'a> {
     first: &'a [u8],
     second: &'a [u8],
     data_offset: usize,
@@ -167,6 +170,37 @@ impl<'a> PacketFilterInput<'a> {
             let second_start = self.data_offset.saturating_sub(self.first.len());
             let second_end = end - self.first.len();
             output.extend_from_slice(&self.second[second_start..second_end]);
+        }
+    }
+
+    /// Copy up to `len` bytes of socket-visible data to `dst`.
+    /// For RAW sockets this includes the MAC header; for DGRAM it starts at
+    /// the network header. Handles two-segment VLAN-normalized views.
+    pub(super) fn copy_visible_to_ptr(&self, dst: *mut u8, len: usize) {
+        let end = self.data_offset + len;
+        let first_start = self.data_offset.min(self.first.len());
+        let first_end = end.min(self.first.len());
+        let mut written = 0;
+        if first_start < first_end {
+            let n = first_end - first_start;
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.first.as_ptr().add(first_start), dst, n);
+            }
+            written += n;
+        }
+        if end > self.first.len() {
+            let second_start = self.data_offset.saturating_sub(self.first.len());
+            let second_end = end - self.first.len();
+            if second_end > second_start {
+                let n = second_end - second_start;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        self.second.as_ptr().add(second_start),
+                        dst.add(written),
+                        n,
+                    );
+                }
+            }
         }
     }
 
@@ -780,6 +814,45 @@ impl PacketSocket {
             Some(snaplen) => wire_len.min(snaplen as usize),
             None => wire_len,
         };
+
+        // --- TPACKET ring buffer path ---
+        // When an RX ring is active, deliver directly into the ring instead of
+        // the rx_buffer queue.  Clone the Arc and release the outer lock so
+        // concurrent delivers from other NICs are not blocked by setup/teardown.
+        let ring_arc = self.ring_state.lock().ring.as_ref().cloned();
+        if let Some(ring_arc) = ring_arc {
+            let metadata = PacketMetadata {
+                src_mac: parsed.src,
+                dst_mac: parsed.dst,
+                protocol: input.protocol,
+                ifindex: ingress.ifindex,
+                hatype: ingress.hatype,
+                pkt_type: ingress.pkt_type,
+                wire_len,
+                mac_offset: 0,
+                net_offset: input.network_offset,
+                vlan_tci: input.vlan.map_or(0, |v| v.0),
+                vlan_tpid: input.vlan.map_or(0, |v| v.1),
+            };
+            let losing = self.stats_drops.load(Ordering::Relaxed) > 0;
+            let mut ring = ring_arc.lock();
+            match ring.write_frame(&input, &metadata, data_len, losing) {
+                RingWriteResult::Written => {
+                    self.stats_packets.fetch_add(1, Ordering::Relaxed);
+                    drop(ring);
+                    self.wait_queue.wakeup(None);
+                    let _ = EventPoll::wakeup_epoll(
+                        self.epoll_items.as_ref(),
+                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+                    );
+                    self.fasync_items.send_sigio(FASYNC_POLL_IN);
+                }
+                RingWriteResult::Dropped => {
+                    self.stats_drops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
         // Linux runs the socket filter before checking sk_rmem_alloc: a packet
         // rejected by cBPF is not counted as a receive-buffer drop. Keep this
         // cheap precheck after the filter and the atomic reservation below as
@@ -847,6 +920,11 @@ impl PacketSocket {
         self.wait_queue.wakeup(None);
     }
     pub(super) fn can_recv(&self) -> bool {
+        // Ring mode: check for TP_STATUS_USER frames.
+        if let Some(r) = self.ring_state.lock().ring.as_ref() {
+            return r.lock().has_user_frames();
+        }
+        // Queue mode (default).
         !self.rx_buffer.lock().is_empty()
     }
     fn dequeue(&self, peek: bool) -> Result<ReceivedPacket, SystemError> {

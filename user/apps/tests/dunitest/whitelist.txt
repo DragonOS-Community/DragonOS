@@ -90,3 +90,4 @@ normal/af_packet_e2e
 normal/af_packet_mcast
 normal/rtnetlink_link_semantics
 normal/tty_termios
+normal/sched_tracepoint

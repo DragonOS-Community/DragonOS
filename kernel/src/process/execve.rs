@@ -1,3 +1,4 @@
+use super::trace::{trace_sched_process_exec, trace_sched_process_exec_enabled};
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
@@ -128,6 +129,11 @@ fn do_execve_internal(
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
+    // 捕获 sched_process_exec 的 old_pid：必须在 load_binary_file_with_context 之前，
+    // 因为该函数内的 begin_new_exec → de_thread 会在「非 leader 线程 execve」时
+    // 交换 current 与旧 thread-group leader 的 raw_pid（对齐 Linux fs/exec.c:1770）。
+    let old_pid = ProcessManager::current_pcb().raw_pid().data() as i32;
+
     // 尝试加载二进制文件
     let load_result = load_binary_file_with_context(&mut param, &ctx);
 
@@ -214,8 +220,41 @@ fn do_execve_internal(
             let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
             let exec_ret = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr);
             if exec_ret.is_ok() {
+                // Thread4：先 complete vfork parent，再触发 trace。
+                // 对齐 Linux：exec_mmap()/exec_mm_release() 内更早完成 vfork_done，
+                // 而 trace_sched_process_exec() 在 exec 成功提交尾部才执行。若先 trace
+                // 再 complete，父进程会被所有 tracepoint 回调阻塞，违反“child 完成 exec
+                // commit 即恢复父进程”的语义，给 exec 热路径引入不必要的 trace 回调延迟。
                 if let Some(completion) = vfork_done {
                     completion.complete_all();
+                }
+
+                // sched_process_exec：arch_do_execve 成功、用户态寄存器就绪后触发，
+                // 对齐 Linux fs/exec.c:1803（trace 在 start_thread 之后、所有失败点之后）。
+                //
+                // Thread5：disabled 路径零开销。Rust 在调用函数前即求值参数，因此即便
+                // trace_sched_process_exec() 内部有 static-key 检查，comm 的取锁 /
+                // UTF-8 扫描 / 拷贝在每个成功 exec 上仍会发生。这里用只读的 _enabled()
+                // 守卫：tracepoint 未启用时完全跳过字段构造与触发，不为禁用路径付出
+                // 取 irqsave basic 读锁、扫 UTF-8 边界、拷贝 name 的开销。
+                if trace_sched_process_exec_enabled() {
+                    let pid = pcb.raw_pid().data() as i32;
+                    // 先把 comm 复制到栈缓冲并释放 basic 读锁：trace 默认回调内部的
+                    // trace_cmdline_push 会再次获取 basic 读锁，持锁重入有 deadlock 风险。
+                    let mut comm_buf = [0u8; 16];
+                    let mut comm_len;
+                    {
+                        let basic_guard = pcb.basic();
+                        let name = basic_guard.name();
+                        comm_len = name.len().min(15);
+                        // 回退到 UTF-8 字符边界，避免在多字节字符中间截断导致 from_utf8 失败。
+                        while comm_len > 0 && !name.is_char_boundary(comm_len) {
+                            comm_len -= 1;
+                        }
+                        comm_buf[..comm_len].copy_from_slice(&name.as_bytes()[..comm_len]);
+                    }
+                    let comm = core::str::from_utf8(&comm_buf[..comm_len]).unwrap_or("");
+                    trace_sched_process_exec(comm, pid, old_pid);
                 }
             }
             exec_ret

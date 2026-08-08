@@ -8,6 +8,8 @@ use crate::mm::{MemoryManagementArch, PhysAddr};
 use crate::time::{Duration, Instant};
 use system_error::SystemError;
 
+use super::cooperative_poll_step;
+
 /// 根据 AHCI 写出 HBA 的 Command
 pub const ATA_CMD_READ_DMA_EXT: u8 = 0x25; // 读操作，并且退出
 pub const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35; // 写操作，并且退出
@@ -20,7 +22,12 @@ pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
 #[allow(dead_code)]
 pub const ATA_CMD_PACKET: u8 = 0xA0;
 pub const ATA_DEV_BUSY: u8 = 0x80;
+pub const ATA_DEV_READY: u8 = 0x40;
+pub const ATA_DEV_FAULT: u8 = 0x20;
 pub const ATA_DEV_DRQ: u8 = 0x08;
+pub const ATA_DEV_ERR: u8 = 0x01;
+pub const ATA_ERR_ICRC: u8 = 0x80;
+pub const ATA_ERR_UNC: u8 = 0x40;
 
 pub const HBA_PORT_CMD_CR: u32 = 1 << 15;
 pub const HBA_PORT_CMD_FR: u32 = 1 << 14;
@@ -30,6 +37,7 @@ pub const HBA_PORT_CMD_ST: u32 = 1;
 /// Non-fatal interface and overflow notifications are intentionally excluded.
 pub const HBA_PORT_IS_ERR: u32 =
     1 << 30 | 1 << 29 | 1 << 28 | 1 << 27 | 1 << 23 | 1 << 22 | 1 << 6 | 1 << 4;
+pub const HBA_PORT_IS_TFES: u32 = 1 << 30;
 pub const HBA_SSTS_PRESENT: u32 = 0x3;
 pub const HBA_SIG_ATA: u16 = 0x0000;
 pub const HBA_SIG_ATAPI: u16 = 0xEB14;
@@ -136,6 +144,7 @@ pub struct HbaCmdHeader {
 impl HbaPort {
     fn wait_cmd_clear(&self, mask: u32) -> Result<(), SystemError> {
         let deadline = Instant::now() + Duration::from_millis(500);
+        let mut iteration = 0usize;
         loop {
             if volatile_read!(self.cmd) & mask == 0 {
                 return Ok(());
@@ -143,7 +152,7 @@ impl HbaPort {
             if Instant::now() >= deadline {
                 return Err(SystemError::ETIMEDOUT);
             }
-            core::hint::spin_loop();
+            cooperative_poll_step(&mut iteration);
         }
     }
 
@@ -238,13 +247,27 @@ impl HbaPort {
     /// 启动该端口的命令引擎
     pub fn start(&mut self) -> Result<(), SystemError> {
         self.wait_cmd_clear(HBA_PORT_CMD_CR)?;
-        let val: u32 = volatile_read!(self.cmd) | HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST;
-        volatile_write!(self.cmd, val);
+        let cmd = volatile_read!(self.cmd) | HBA_PORT_CMD_FRE;
+        volatile_write!(self.cmd, cmd);
+        let _ = volatile_read!(self.cmd);
+        volatile_write!(self.cmd, cmd | HBA_PORT_CMD_ST);
+        let started = volatile_read!(self.cmd);
+        if started == u32::MAX
+            || started & (HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST)
+                != (HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST)
+        {
+            if started != u32::MAX {
+                let _ = self.stop();
+            }
+            return Err(SystemError::EIO);
+        }
         Ok(())
     }
 
-    /// 关闭该端口的命令引擎
-    pub fn stop(&mut self) -> Result<(), SystemError> {
+    /// Stop command-list processing. Once CR clears, command payloads are no
+    /// longer DMA targets; FIS receive may remain enabled for light-weight
+    /// command-error recovery.
+    pub fn stop_command_engine(&mut self) -> Result<(), SystemError> {
         #[allow(unused_unsafe)]
         {
             volatile_write!(
@@ -253,7 +276,12 @@ impl HbaPort {
             );
         }
 
-        self.wait_cmd_clear(HBA_PORT_CMD_CR)?;
+        self.wait_cmd_clear(HBA_PORT_CMD_CR)
+    }
+
+    /// 关闭该端口的命令引擎和 FIS 接收引擎
+    pub fn stop(&mut self) -> Result<(), SystemError> {
+        self.stop_command_engine()?;
 
         #[allow(unused_unsafe)]
         {

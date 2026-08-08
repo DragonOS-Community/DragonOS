@@ -195,7 +195,7 @@ impl LockedAhciDisk {
                                                      // 等待操作完成
         if let Err(err) = AhciController::wait_slot(port, slot) {
             self.controller
-                .abort_failed_command(self.port_num as usize, Some(dma));
+                .recover_or_fail_command(self.port_num as usize, Some(dma));
             return Err(err);
         }
         compiler_fence(Ordering::Acquire);
@@ -330,7 +330,7 @@ impl LockedAhciDisk {
         // 等待操作完成
         if let Err(err) = AhciController::wait_slot(port, slot) {
             self.controller
-                .abort_failed_command(self.port_num as usize, Some(dma));
+                .recover_or_fail_command(self.port_num as usize, Some(dma));
             return Err(err);
         }
         compiler_fence(Ordering::Acquire);

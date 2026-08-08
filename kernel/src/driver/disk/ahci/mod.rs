@@ -61,7 +61,8 @@ use self::{
     hba::{
         FisRegH2D, FisType, HbaCmdHeader, HbaCmdTable, HbaMem, HbaPort, HbaPortType,
         ATA_CMD_FLUSH_CACHE, ATA_CMD_FLUSH_CACHE_EXT, ATA_CMD_IDENTIFY, ATA_DEV_BUSY, ATA_DEV_DRQ,
-        HBA_PORT_IS_ERR,
+        ATA_DEV_ERR, ATA_DEV_FAULT, ATA_DEV_READY, ATA_ERR_ICRC, ATA_ERR_UNC, HBA_PORT_IS_ERR,
+        HBA_PORT_IS_TFES, HBA_SSTS_PRESENT,
     },
 };
 
@@ -116,6 +117,11 @@ const AHCI_POLL_YIELD_INTERVAL: usize = 1 << 10;
 const AHCI_LINK_TIMEOUT_MS: u64 = 2_000;
 const AHCI_PORT_STOP_TIMEOUT_MS: u64 = 500;
 const AHCI_COMMAND_TIMEOUT_MS: u64 = 30_000;
+// Normal command/FIS completion notifications which may be latched together
+// with TFES. Any other PxIS bit blocks light-weight error recovery.
+const AHCI_PORT_IS_BENIGN_COMMAND_EVENTS: u32 = 1 << 5 | 1 << 3 | 1 << 2 | 1 << 1 | 1 << 0;
+// Linux 6.6 ata_eh_analyze_serror() requests reset for these SError classes.
+const AHCI_SERR_REQUIRES_RESET: u32 = 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 16 | 1 << 26;
 // One in-flight payload per serialized port, plus the controller command arena.
 const AHCI_DMA_QUARANTINE_CAPACITY: usize = 32 + 1;
 // 32 command lists (32 KiB) + 32 received-FIS areas (8 KiB) +
@@ -171,6 +177,48 @@ fn read_command_status(port: &HbaPort, slot: u32) -> AtaCommandStatus {
     classify_command_status(port_is, port_ci, slot)
 }
 
+const fn command_error_is_recoverable(
+    port_is: u32,
+    port_serr: u32,
+    port_tfd: u32,
+    port_ci: u32,
+    port_sact: u32,
+) -> bool {
+    let status = port_tfd as u8;
+    let error = (port_tfd >> 8) as u8;
+    port_is & HBA_PORT_IS_TFES != 0
+        && port_is & !(HBA_PORT_IS_TFES | AHCI_PORT_IS_BENIGN_COMMAND_EVENTS) == 0
+        && port_serr & AHCI_SERR_REQUIRES_RESET == 0
+        && status & (ATA_DEV_BUSY | ATA_DEV_DRQ | ATA_DEV_READY) == ATA_DEV_READY
+        && status & (ATA_DEV_ERR | ATA_DEV_FAULT) == ATA_DEV_ERR
+        && error != 0
+        && error & ATA_ERR_ICRC == 0
+        && port_ci == 0
+        && port_sact == 0
+}
+
+const fn recovered_port_is_idle(
+    port_is: u32,
+    port_serr: u32,
+    port_tfd: u32,
+    port_ci: u32,
+    port_sact: u32,
+) -> bool {
+    let status = port_tfd as u8;
+    let error = (port_tfd >> 8) as u8;
+    port_is & !AHCI_PORT_IS_BENIGN_COMMAND_EVENTS == 0
+        && port_serr == 0
+        && status & (ATA_DEV_BUSY | ATA_DEV_DRQ | ATA_DEV_READY) == ATA_DEV_READY
+        && status & ATA_DEV_FAULT == 0
+        && error & ATA_ERR_ICRC == 0
+        && port_ci == 0
+        && port_sact == 0
+}
+
+const fn link_is_present(port_ssts: u32) -> bool {
+    port_ssts & 0xf == HBA_SSTS_PRESENT
+}
+
 // These protocol boundaries are checked by every kernel build, including
 // architectures that do not instantiate the x86-only AHCI driver.
 const _: () = {
@@ -209,6 +257,85 @@ const _: () = {
         classify_command_status(0, 1, 0),
         AtaCommandStatus::Pending
     ));
+    assert!(command_error_is_recoverable(
+        HBA_PORT_IS_TFES,
+        0,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(!command_error_is_recoverable(
+        HBA_PORT_IS_TFES | (1 << 29),
+        0,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(!command_error_is_recoverable(
+        HBA_PORT_IS_TFES,
+        1 << 8,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(command_error_is_recoverable(
+        HBA_PORT_IS_TFES,
+        1,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(!command_error_is_recoverable(
+        HBA_PORT_IS_TFES,
+        0,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_ICRC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(!command_error_is_recoverable(
+        HBA_PORT_IS_TFES,
+        0,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        1,
+        0
+    ));
+    assert!(!command_error_is_recoverable(
+        HBA_PORT_IS_TFES,
+        0,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        1
+    ));
+    assert!(!command_error_is_recoverable(
+        HBA_PORT_IS_TFES | (1 << 24),
+        0,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(!command_error_is_recoverable(
+        HBA_PORT_IS_TFES,
+        0,
+        ATA_DEV_ERR as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(recovered_port_is_idle(
+        0,
+        0,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(!recovered_port_is_idle(
+        HBA_PORT_IS_TFES,
+        0,
+        (ATA_DEV_READY | ATA_DEV_ERR) as u32 | ((ATA_ERR_UNC as u32) << 8),
+        0,
+        0
+    ));
+    assert!(link_is_present(HBA_SSTS_PRESENT));
+    assert!(!link_is_present(0));
 };
 
 lazy_static! {
@@ -712,18 +839,60 @@ impl AhciController {
         Ok(())
     }
 
-    /// Freeze one failed port. A controller-wide Bus Master shutdown would
-    /// interrupt unrelated ports, so a buffer which may still be a DMA target
-    /// remains owned by this controller until teardown stops or resets the HBA.
-    pub(crate) fn abort_failed_command(&self, port_no: usize, buffer: Option<DmaBuffer>) {
-        self.failed_ports.fetch_or(1 << port_no, Ordering::AcqRel);
-        if unsafe { &mut *self.port_ptr(port_no) }.stop().is_err() {
+    /// Stop a failed command and reopen the port only for an isolated ATA
+    /// device error. More serious errors keep the port stopped. If the command
+    /// engine cannot stop, the payload may still be a DMA target and remains
+    /// quarantined until controller teardown.
+    pub(crate) fn recover_or_fail_command(&self, port_no: usize, buffer: Option<DmaBuffer>) {
+        let port = unsafe { &mut *self.port_ptr(port_no) };
+        if port.stop_command_engine().is_err() {
+            self.failed_ports.fetch_or(1 << port_no, Ordering::AcqRel);
             if let Some(buffer) = buffer {
                 self.quarantined_dma.lock().push(buffer);
             }
-        } else {
-            drop(buffer);
+            return;
         }
+        let _payload_guard = buffer;
+
+        // Use one coherent stopped-state snapshot for both classification and
+        // W1C. CR is clear, so the payload can no longer be a DMA target.
+        let port_is = volatile_read!(port.is);
+        let port_serr = volatile_read!(port.serr);
+        let port_tfd = volatile_read!(port.tfd);
+        let port_ci = volatile_read!(port.ci);
+        let port_sact = volatile_read!(port.sact);
+        let port_ssts = volatile_read!(port.ssts);
+
+        if link_is_present(port_ssts)
+            && command_error_is_recoverable(port_is, port_serr, port_tfd, port_ci, port_sact)
+        {
+            // PxSERR and PxIS are write-one-to-clear. Clear only the state
+            // observed above, then make sure a new error did not arrive while
+            // recovery was in progress.
+            volatile_write!(port.serr, port_serr);
+            volatile_write!(port.is, port_is);
+            let remaining_serr = volatile_read!(port.serr);
+            let remaining_is = volatile_read!(port.is);
+            if remaining_serr == 0
+                && remaining_is & !AHCI_PORT_IS_BENIGN_COMMAND_EVENTS == 0
+                && port.start().is_ok()
+                && link_is_present(volatile_read!(port.ssts))
+                && recovered_port_is_idle(
+                    volatile_read!(port.is),
+                    volatile_read!(port.serr),
+                    volatile_read!(port.tfd),
+                    volatile_read!(port.ci),
+                    volatile_read!(port.sact),
+                )
+            {
+                return;
+            }
+        }
+
+        // A failed recovery must converge back to the stopped-port state.
+        // This is best effort if the controller has become inaccessible.
+        let _ = port.stop();
+        self.failed_ports.fetch_or(1 << port_no, Ordering::AcqRel);
     }
 
     pub(crate) fn allocate_dma(
@@ -1079,7 +1248,7 @@ impl AhciController {
         volatile_write!(port.ci, ci | (1 << pending.slot));
         pending.issued = true;
         if let Err(err) = Self::wait_slot(port, pending.slot) {
-            self.abort_failed_command(port_no, None);
+            self.recover_or_fail_command(port_no, None);
             return Err(err);
         }
         core::sync::atomic::compiler_fence(Ordering::Acquire);

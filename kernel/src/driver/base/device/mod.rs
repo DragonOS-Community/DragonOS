@@ -81,8 +81,42 @@ lazy_static! {
     /// driver core cannot borrow a sleeping lock from that data without changing every device
     /// type.  Keep the lock in the core, keyed by the allocation identity of the device instead.
     /// The weak reference prevents this table from extending a device's lifetime.
-    static ref DEVICE_LIFECYCLE_LOCKS: Mutex<BTreeMap<usize, DeviceLifecycleLock>> =
-        Mutex::new(BTreeMap::new());
+    static ref DEVICE_LIFECYCLE_LOCKS: Mutex<DeviceLifecycleLocks> =
+        Mutex::new(DeviceLifecycleLocks::new());
+}
+
+const LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS: usize = 64;
+
+#[derive(Debug)]
+struct DeviceLifecycleLocks {
+    entries: BTreeMap<usize, DeviceLifecycleLock>,
+    insertions_until_cleanup: usize,
+}
+
+impl DeviceLifecycleLocks {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            insertions_until_cleanup: LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS,
+        }
+    }
+
+    fn insert(&mut self, identity: usize, entry: DeviceLifecycleLock) {
+        self.entries.insert(identity, entry);
+        debug_assert!(self.insertions_until_cleanup > 0);
+        self.insertions_until_cleanup -= 1;
+
+        if self.insertions_until_cleanup == 0 {
+            self.entries
+                .retain(|_, entry| entry.device.strong_count() != 0);
+            // Scan at most once per current table size.  This keeps cleanup work amortized while
+            // still reclaiming dead identities in workloads which repeatedly create devices.
+            self.insertions_until_cleanup = self
+                .entries
+                .len()
+                .max(LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -582,7 +616,7 @@ impl DeviceManager {
         let identity = Arc::as_ptr(dev) as *const () as usize;
         let mut locks = DEVICE_LIFECYCLE_LOCKS.lock();
 
-        if let Some(entry) = locks.get(&identity) {
+        if let Some(entry) = locks.entries.get(&identity) {
             if entry
                 .device
                 .upgrade()
@@ -590,13 +624,6 @@ impl DeviceManager {
             {
                 return entry.lock.clone();
             }
-        }
-
-        // Keep dead device identities from accumulating forever without making every lookup
-        // linear in the number of devices.  Live entries must stay: callers which already cloned
-        // their lock must continue to rendezvous with later lifecycle operations.
-        if locks.len() >= 64 {
-            locks.retain(|_, entry| entry.device.strong_count() != 0);
         }
 
         let lock = Arc::new(Mutex::new(()));

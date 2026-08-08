@@ -1,10 +1,12 @@
+use crate::filesystem::fsnotify::{self, FsEvent};
+use crate::libs::casting::DowncastArc;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
     file::{File, FileFlags, PreopenedFile},
-    mount::MountFlags,
+    mount::{MountFSInode, MountFlags},
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{
@@ -133,6 +135,8 @@ pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, Sy
     metadata.mode = chmod_preserve_type(metadata.mode, mode);
     metadata.ctime = PosixTimeSpec::now();
     inode.set_metadata_masked(&metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME)?;
+    // fsnotify：属性变更 → IN_ATTRIB。
+    fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&inode), 0);
     Ok(0)
 }
 
@@ -242,6 +246,8 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         mask.insert(SetMetadataMask::CTIME);
     }
     inode.set_metadata_masked(&meta, mask)?;
+    // fsnotify：属主/属性变更 → IN_ATTRIB。
+    fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&inode), 0);
 
     return Ok(0);
 }
@@ -356,6 +362,13 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                         }
                         Err(err) => return Err(err),
                     };
+                // fsnotify：创建成功 → 父目录得 IN_CREATE（子项是普通文件，IN_ISDIR 不置位）。
+                fsnotify::fsnotify(
+                    FsEvent::CREATE,
+                    Some((&parent_inode, &filename)),
+                    Some(&inode),
+                    0,
+                );
                 created = true;
                 let created_path = ResolvedPath::new(inode)?;
                 drop(parent_resolved);
@@ -470,6 +483,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         None => File::new_with_mount_guard(inode, how.o_flags, mount_guard, operation_guard)?,
     };
     let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
+    let opened_inode = file.inode();
 
     // 把文件对象存入pcb
     let r = ProcessManager::current_pcb()
@@ -477,6 +491,27 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         .write()
         .alloc_fd(file, None, cloexec)
         .map(|fd| fd as usize);
+    // fsnotify：打开成功 → 被打开 inode 得 IN_OPEN。
+    if r.is_ok() {
+        // 同时通知父目录 watch（带子名，issue B）与被打开 inode 自身 watch。
+        if fsnotify::has_any_watch() {
+            let parent = opened_inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .and_then(|mnt| mnt.fsnotify_parent_and_name());
+            match parent {
+                Some((p, n)) => fsnotify::fsnotify(
+                    FsEvent::OPEN,
+                    Some((&p, n.as_str())),
+                    Some(&opened_inode),
+                    0,
+                ),
+                None => fsnotify::fsnotify(FsEvent::OPEN, None, Some(&opened_inode), 0),
+            }
+        } else {
+            fsnotify::fsnotify(FsEvent::OPEN, None, Some(&opened_inode), 0);
+        }
+    }
 
     return r;
 }
@@ -661,6 +696,8 @@ pub fn do_utimensat(
                 | SetMetadataMask::TIMES_BY_WRITE,
         )?;
     }
+    // fsnotify：时间戳变更 → IN_ATTRIB。
+    fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&inode), 0);
     return Ok(0);
 }
 

@@ -3541,6 +3541,25 @@ impl MountFSInode {
         }
     }
 
+    /// 供 fsnotify 内容事件 hook 解析「该 inode 的父目录 + 自身 dentry 名」。
+    ///
+    /// 在 File 构造期（open）调用一次，结果快照存入 File，供 do_write/do_read/Drop/
+    /// IN_OPEN 向父目录 watch 投递子项内容事件（IN_MODIFY/ACCESS/OPEN/CLOSE/ATTRIB）。
+    /// - 根或断连 dentry（`do_parent` 返回自身）→ None，避免把内容事件误投给自身 watch；
+    /// - 非 MountFSInode（设备/套接字等）由调用方 downcast 判定，本方法不涉及。
+    pub fn fsnotify_parent_and_name(&self) -> Option<(Arc<dyn IndexNode>, alloc::string::String)> {
+        let parent = self.do_parent().ok()?;
+        // do_parent 对根/无父 dentry 返回自身：必须排除，否则内容事件以 parent=自身 投递，
+        // fsnotify 用自身 inode_id 反查会把 MODIFY 当作「父目录的子项事件」误投给自身 watch。
+        if let Some(self_arc) = self.self_ref.upgrade() {
+            if Arc::ptr_eq(&parent, &self_arc) {
+                return None;
+            }
+        }
+        let name = self.dname().ok()?;
+        Some((parent as Arc<dyn IndexNode>, name.0.as_str().to_string()))
+    }
+
     fn do_absolute_path(&self) -> Result<String, SystemError> {
         self.do_absolute_path_impl(false)
     }

@@ -306,9 +306,30 @@ impl DmaAllocator {
                 return Ok(raw);
             }
         }
-        // Do not borrow from another DMA domain on a cache miss. The buddy
-        // allocator owns the low-memory fallback policy and its DMA32 reserve.
-        self.try_alloc_raw(page_count, options)
+        match self.try_alloc_raw(page_count, options) {
+            Ok(raw) => Ok(raw),
+            Err(SystemError::ENOMEM)
+                if pool_key.is_some_and(|key| key.domain == DmaPoolDomain::Dma32) =>
+            {
+                // Preserve the normal hot-path partition between wide and
+                // DMA32 users. Only after the constrained buddy allocation is
+                // exhausted may a DMA32 request reclaim a compatible low
+                // buffer cached by a wide request. The caller's Dma32 key then
+                // makes this a one-way migration on Drop.
+                let key = DmaPoolKey {
+                    pages: page_count.data(),
+                    domain: DmaPoolDomain::Unrestricted,
+                };
+                let raw = self
+                    .take_from_pool(key, options.dma_mask)
+                    .ok_or(SystemError::ENOMEM)?;
+                if options.zeroed {
+                    self.zero_raw(&raw);
+                }
+                Ok(raw)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn try_alloc_raw(
@@ -649,12 +670,34 @@ fn selftest_pool_domain_separation() -> bool {
             .put(DmaPoolDomain::Unrestricted, selftest_raw(0x6000, 1))
             .is_err();
 
+    // Under DMA32 pressure, a compatible low allocation may migrate out of
+    // the wide-request cache without discarding an incompatible high entry.
+    let mut migration_pool = DmaPool::new(1, DMA_POOL_MAX_PER_DOMAIN);
+    let migration_setup = migration_pool
+        .put(DmaPoolDomain::Unrestricted, selftest_raw(0x7000, 1))
+        .is_ok()
+        && migration_pool
+            .put(DmaPoolDomain::Unrestricted, selftest_raw(1usize << 32, 1))
+            .is_ok();
+    let migrated = migration_pool.take(DmaPoolDomain::Unrestricted, Some(u32::MAX as u64));
+    let incompatible_preserved = migration_pool.unrestricted_free_list.len() == 1;
+    let migration_returned = migrated
+        .map(|raw| migration_pool.put(DmaPoolDomain::Dma32, raw).is_ok())
+        .unwrap_or(false);
+    let migrated_reused = migration_pool
+        .take(DmaPoolDomain::Dma32, Some(u32::MAX as u64))
+        .is_some_and(|raw| raw.paddr.data() == 0x7000);
+
     low.is_some_and(|raw| raw.paddr.data() == 0x1000)
         && high_untouched
         && high.is_some_and(|raw| raw.paddr.data() == 1usize << 32)
         && dma32_did_not_cross
         && low_wide_reused.is_some_and(|raw| raw.paddr.data() == 0x2000)
         && per_domain_capacity
+        && migration_setup
+        && incompatible_preserved
+        && migration_returned
+        && migrated_reused
 }
 
 /// Run allocator checks against the live buddy allocator.  Every successful

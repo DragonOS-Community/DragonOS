@@ -66,10 +66,26 @@ use self::{
     },
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AhciIdentify {
+    serial: [u16; 10],
+    model: [u16; 20],
+    wwn: Option<[u16; 4]>,
     capacity_lba: usize,
     flush_command: Option<u8>,
     reliable_flush: bool,
+}
+
+impl AhciIdentify {
+    pub(crate) fn has_stable_identity(&self) -> bool {
+        self.wwn.is_some_and(|wwn| {
+            wwn.iter().any(|word| *word != 0) && wwn.iter().any(|word| *word != u16::MAX)
+        }) || self
+            .serial
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .any(|byte| byte != 0 && byte != b' ' && byte != u8::MAX)
+    }
 }
 
 struct PendingAtaCommand {
@@ -775,11 +791,63 @@ impl AhciController {
             .paddr();
         let fb = base + (32 << 10) + (port_no << 8);
         let clb = base + (port_no << 10);
-        let ctbas = (0..32)
-            .map(|slot| (base + (40 << 10) + (port_no << 13) + (slot << 8)) as u64)
-            .collect::<Vec<_>>();
+        let ctbas: [u64; 32] =
+            core::array::from_fn(|slot| (base + (40 << 10) + (port_no << 13) + (slot << 8)) as u64);
 
         unsafe { &mut *self.port_ptr(port_no) }.init(clb as u64, fb as u64, &ctbas)
+    }
+
+    /// Return CPU pointers only for command memory owned by this controller.
+    /// Device-returned CLB/CTBA values are consistency checks, never pointer
+    /// sources.
+    pub(crate) fn command_slot_ptrs(
+        &self,
+        port_no: usize,
+        slot: u32,
+        observed_clb: u64,
+    ) -> Result<(*mut HbaCmdHeader, *mut HbaCmdTable), SystemError> {
+        if port_no >= self.port_count || slot >= u32::from(self.command_slots.min(32)) {
+            return Err(SystemError::EINVAL);
+        }
+        let (base, len) = self
+            .command_memory
+            .lock()
+            .as_ref()
+            .map(|memory| (memory.paddr(), memory.len()))
+            .ok_or(SystemError::ENOMEM)?;
+        let arena_end = base.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        let clb = base
+            .checked_add(port_no << 10)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let header_paddr = clb
+            .checked_add(slot as usize * size_of::<HbaCmdHeader>())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let table_paddr = base
+            .checked_add(40 << 10)
+            .and_then(|address| address.checked_add(port_no << 13))
+            .and_then(|address| address.checked_add(slot as usize * 256))
+            .ok_or(SystemError::EOVERFLOW)?;
+        if observed_clb != clb as u64
+            || header_paddr
+                .checked_add(size_of::<HbaCmdHeader>())
+                .is_none_or(|end| end > arena_end)
+            || table_paddr
+                .checked_add(size_of::<HbaCmdTable>())
+                .is_none_or(|end| end > arena_end)
+        {
+            return Err(SystemError::EIO);
+        }
+
+        let header = unsafe { MMArch::phys_2_virt(PhysAddr::new(header_paddr)) }
+            .ok_or(SystemError::EFAULT)?
+            .data() as *mut HbaCmdHeader;
+        if volatile_read!((*header).ctba) != table_paddr as u64 {
+            return Err(SystemError::EIO);
+        }
+        let table = unsafe { MMArch::phys_2_virt(PhysAddr::new(table_paddr)) }
+            .ok_or(SystemError::EFAULT)?
+            .data() as *mut HbaCmdTable;
+        Ok((header, table))
     }
 
     fn publish_identified(
@@ -923,20 +991,9 @@ impl AhciController {
             .ok_or(SystemError::EBUSY)?;
         volatile_write!(port.is, u32::MAX);
 
-        let clb = volatile_read!(port.clb);
-        let header = unsafe {
-            &mut *(MMArch::phys_2_virt(PhysAddr::new(
-                clb as usize + slot as usize * size_of::<HbaCmdHeader>(),
-            ))
-            .ok_or(SystemError::EFAULT)?
-            .data() as *mut HbaCmdHeader)
-        };
-        let ctba = volatile_read!(header.ctba);
-        let table = unsafe {
-            &mut *(MMArch::phys_2_virt(PhysAddr::new(ctba as usize))
-                .ok_or(SystemError::EFAULT)?
-                .data() as *mut HbaCmdTable)
-        };
+        let (header, table) = self.command_slot_ptrs(port_no, slot, volatile_read!(port.clb))?;
+        let header = unsafe { &mut *header };
+        let table = unsafe { &mut *table };
         unsafe { write_bytes(table, 0, 1) };
         volatile_write!(
             header.cfl,
@@ -1014,6 +1071,10 @@ impl AhciController {
             None
         };
         Ok(AhciIdentify {
+            serial: core::array::from_fn(|index| word(10 + index)),
+            model: core::array::from_fn(|index| word(27 + index)),
+            wwn: ((word87 & 0xc100) == 0x4100)
+                .then(|| core::array::from_fn(|index| word(108 + index))),
             capacity_lba,
             flush_command,
             reliable_flush: has_flush_ext || has_flush,
@@ -1205,20 +1266,9 @@ impl AhciController {
         let slot = port
             .find_cmdslot(self.command_slots)
             .ok_or(SystemError::EBUSY)?;
-        let clb = volatile_read!(port.clb);
-        let header = unsafe {
-            &mut *(MMArch::phys_2_virt(PhysAddr::new(
-                clb as usize + slot as usize * size_of::<HbaCmdHeader>(),
-            ))
-            .ok_or(SystemError::EFAULT)?
-            .data() as *mut HbaCmdHeader)
-        };
-        let ctba = volatile_read!(header.ctba);
-        let table = unsafe {
-            &mut *(MMArch::phys_2_virt(PhysAddr::new(ctba as usize))
-                .ok_or(SystemError::EFAULT)?
-                .data() as *mut HbaCmdTable)
-        };
+        let (header, table) = self.command_slot_ptrs(port_no, slot, volatile_read!(port.clb))?;
+        let header = unsafe { &mut *header };
+        let table = unsafe { &mut *table };
         unsafe { write_bytes(table, 0, 1) };
         volatile_write!(
             header.cfl,
@@ -1241,8 +1291,8 @@ impl AhciController {
     pub(crate) fn flush_port(&self, port_no: usize, command: u8) -> Result<(), SystemError> {
         let _guard = self.lock_port_for_io(port_no)?;
         let mut pending = self.prepare_flush_command(port_no, command)?;
+        self.wait_tfd_ready_or_recover(port_no)?;
         let port = unsafe { &mut *self.port_ptr(port_no) };
-        Self::wait_tfd_ready(port)?;
         core::sync::atomic::compiler_fence(Ordering::Release);
         let ci = volatile_read!(port.ci);
         volatile_write!(port.ci, ci | (1 << pending.slot));
@@ -1267,6 +1317,144 @@ impl AhciController {
             }
             cooperative_poll_step(&mut iteration);
         }
+    }
+
+    pub(crate) fn wait_tfd_ready_or_recover(&self, port_no: usize) -> Result<(), SystemError> {
+        let port = unsafe { &*self.port_ptr(port_no) };
+        if let Err(err) = Self::wait_tfd_ready(port) {
+            if let Err(recovery_err) = self.recover_unready_port(port_no) {
+                log::warn!(
+                    "AHCI {} port {} recovery after ready timeout failed: {:?}",
+                    self.pci.common_header.bus_device_function,
+                    port_no,
+                    recovery_err
+                );
+            }
+            // Recovery only makes a later request safe. The prepared command
+            // table was reinitialized and this request must never be replayed.
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn identify_port_for_revalidation(&self, port_no: usize) -> Result<AhciIdentify, SystemError> {
+        let mut pending = self.prepare_identify(port_no)?;
+        let port = unsafe { &mut *self.port_ptr(port_no) };
+        Self::wait_tfd_ready(port)?;
+        core::sync::atomic::compiler_fence(Ordering::Release);
+        let ci = volatile_read!(port.ci);
+        volatile_write!(port.ci, ci | (1 << pending.command.slot));
+        pending.command.issued = true;
+        if let Err(err) = Self::wait_slot(port, pending.command.slot) {
+            if port.stop().is_err() {
+                if let Some(buffer) = pending.buffer.take() {
+                    self.quarantined_dma.lock().push(buffer);
+                }
+            }
+            return Err(err);
+        }
+        core::sync::atomic::compiler_fence(Ordering::Acquire);
+        Self::parse_identify(pending.buffer.take().ok_or(SystemError::EIO)?)
+    }
+
+    /// Recover a port whose device never became ready before command issue.
+    /// The caller holds the per-port I/O mutex and no payload has been issued.
+    fn recover_unready_port(&self, port_no: usize) -> Result<(), SystemError> {
+        let expected = self
+            .disks
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|disk| disk.port_num() == port_no)
+            .ok_or(SystemError::ENODEV)?;
+        let result = (|| {
+            let port = unsafe { &mut *self.port_ptr(port_no) };
+            port.stop()?;
+            if !self.accepting_io.load(Ordering::Acquire) {
+                return Err(SystemError::ESHUTDOWN);
+            }
+
+            // Never trust a device-returned PxFB as a CPU write target. The
+            // receive-FIS area is owned by our command arena at a fixed,
+            // checked offset; an unexpected register value fails recovery.
+            let (arena_base, arena_len) = self
+                .command_memory
+                .lock()
+                .as_ref()
+                .map(|memory| (memory.paddr(), memory.len()))
+                .ok_or(SystemError::ENOMEM)?;
+            let fb = arena_base
+                .checked_add(32 << 10)
+                .and_then(|base| base.checked_add(port_no << 8))
+                .ok_or(SystemError::EOVERFLOW)?;
+            let arena_end = arena_base
+                .checked_add(arena_len)
+                .ok_or(SystemError::EOVERFLOW)?;
+            if fb.checked_add(256).is_none_or(|end| end > arena_end)
+                || fb & 0xff != 0
+                || volatile_read!(port.fb) != fb as u64
+            {
+                return Err(SystemError::EIO);
+            }
+            let received_fis_vaddr = match port.begin_link_reset(fb as u64) {
+                Ok(address) => address,
+                Err(err) => {
+                    port.finish_link_reset_assertion();
+                    return Err(err);
+                }
+            };
+            let assert_until = Instant::now() + Duration::from_millis(1);
+            let mut iteration = 0usize;
+            while Instant::now() < assert_until {
+                cooperative_poll_step(&mut iteration);
+            }
+            port.finish_link_reset_assertion();
+
+            let deadline = Instant::now() + Duration::from_millis(AHCI_LINK_TIMEOUT_MS);
+            let mut stable_since = None;
+            let port_type = loop {
+                if !self.accepting_io.load(Ordering::Acquire) {
+                    return Err(SystemError::ESHUTDOWN);
+                }
+                if let Some(port_type) =
+                    port.classify_reset_link(received_fis_vaddr, &mut stable_since)
+                {
+                    break port_type;
+                }
+                if Instant::now() >= deadline {
+                    return Err(SystemError::ETIMEDOUT);
+                }
+                cooperative_poll_step(&mut iteration);
+            };
+            if port_type != HbaPortType::Sata {
+                return Err(SystemError::ENODEV);
+            }
+
+            // Stop FIS DMA before initialize_port clears the shared command
+            // arena, and reject any stale command ownership after COMRESET.
+            port.stop()?;
+            if volatile_read!(port.ci) != 0
+                || volatile_read!(port.sact) != 0
+                || !link_is_present(volatile_read!(port.ssts))
+            {
+                return Err(SystemError::EIO);
+            }
+            if !self.accepting_io.load(Ordering::Acquire) {
+                return Err(SystemError::ESHUTDOWN);
+            }
+            self.initialize_port(port_no)?;
+            let actual = self.identify_port_for_revalidation(port_no)?;
+            if !expected.matches_identify(actual) {
+                return Err(SystemError::ENODEV);
+            }
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = unsafe { &mut *self.port_ptr(port_no) }.stop();
+            self.failed_ports.fetch_or(1 << port_no, Ordering::AcqRel);
+        }
+        result
     }
 
     pub(crate) fn wait_slot(port: &HbaPort, slot: u32) -> Result<(), SystemError> {
@@ -1488,16 +1676,13 @@ impl AhciController {
     }
 
     fn unregister_disks(&self) {
-        let disks = self
-            .disks
-            .lock()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
+        let disks = core::mem::take(&mut *self.disks.lock());
         for disk in disks {
-            block_dev_manager().unregister_detached(
-                &(disk as Arc<dyn crate::driver::base::block::block_device::BlockDevice>),
-            );
+            if let Some(disk) = disk.upgrade() {
+                block_dev_manager().unregister_detached(
+                    &(disk as Arc<dyn crate::driver::base::block::block_device::BlockDevice>),
+                );
+            }
         }
     }
 

@@ -174,7 +174,7 @@ impl HbaPort {
         }
     }
 
-    /// Begin COMRESET after a controller-wide reset has stopped all engines.
+    /// Begin COMRESET after this port's command and FIS engines have stopped.
     /// Returns the virtual address of the received-FIS area used for polling.
     pub fn begin_link_reset(&mut self, fb: u64) -> Result<usize, SystemError> {
         volatile_write!(self.fb, fb);

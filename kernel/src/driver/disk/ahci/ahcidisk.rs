@@ -1,5 +1,4 @@
-use super::{hba::HbaCmdTable, AhciController, AhciIdentify};
-use crate::arch::MMArch;
+use super::{AhciController, AhciIdentify};
 use crate::driver::base::block::block_device::{BlockDevice, BlockId, GeneralBlockRange};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::manager::BlockDevMeta;
@@ -22,7 +21,7 @@ use crate::driver::disk::ahci::hba::{
 };
 use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
-use crate::mm::{dma::DmaDirection, MemoryManagementArch, PhysAddr};
+use crate::mm::dma::DmaDirection;
 use log::error;
 use system_error::SystemError;
 
@@ -56,6 +55,7 @@ pub struct LockedAhciDisk {
     capacity_lba: usize,
     flush_command: Option<u8>,
     reliable_flush: bool,
+    identify: AhciIdentify,
 }
 
 impl LockedAhciDisk {
@@ -70,6 +70,14 @@ impl LockedAhciDisk {
     pub(crate) fn teardown_flush_command(&self) -> Option<(usize, u8)> {
         self.flush_command
             .map(|command| (self.port_num as usize, command))
+    }
+
+    pub(crate) fn port_num(&self) -> usize {
+        self.port_num as usize
+    }
+
+    pub(crate) fn matches_identify(&self, identify: AhciIdentify) -> bool {
+        self.identify.has_stable_identity() && self.identify == identify
     }
 }
 
@@ -119,14 +127,12 @@ impl LockedAhciDisk {
             return Err(SystemError::EIO);
         }
 
-        let clb = volatile_read!(port.clb);
-        let cmdheader: &mut HbaCmdHeader = unsafe {
-            &mut *(MMArch::phys_2_virt(PhysAddr::new(
-                clb as usize + slot as usize * size_of::<HbaCmdHeader>(),
-            ))
-            .ok_or(SystemError::EFAULT)?
-            .data() as *mut HbaCmdHeader)
-        };
+        let (cmdheader, cmdtbl) = self.controller.command_slot_ptrs(
+            self.port_num as usize,
+            slot,
+            volatile_read!(port.clb),
+        )?;
+        let cmdheader: &mut HbaCmdHeader = unsafe { &mut *cmdheader };
 
         cmdheader.cfl = (size_of::<FisRegH2D>() / size_of::<u32>()) as u8;
         volatile_write!(cmdheader._pm, 0);
@@ -139,12 +145,7 @@ impl LockedAhciDisk {
             .allocate_dma(count * 512, DmaDirection::FromDevice)?;
         let mut buf_paddr = dma.paddr();
 
-        let ctba = volatile_read!(cmdheader.ctba);
-        let cmdtbl = unsafe {
-            &mut *(MMArch::phys_2_virt(PhysAddr::new(ctba as usize))
-                .ok_or(SystemError::EFAULT)?
-                .data() as *mut HbaCmdTable)
-        };
+        let cmdtbl = unsafe { &mut *cmdtbl };
         let mut tmp_count = count;
 
         unsafe {
@@ -187,8 +188,10 @@ impl LockedAhciDisk {
 
         volatile_write!(cmdfis.device, 1 << 6); // LBA Mode
 
-        AhciController::wait_tfd_ready(port)?;
+        self.controller
+            .wait_tfd_ready_or_recover(self.port_num as usize)?;
 
+        let port = unsafe { &mut *self.controller.port_ptr(self.port_num as usize) };
         compiler_fence(Ordering::Release);
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
                                                      // debug!("To wait ahci read complete.");
@@ -245,14 +248,12 @@ impl LockedAhciDisk {
         }
 
         compiler_fence(Ordering::SeqCst);
-        let clb = volatile_read!(port.clb);
-        let cmdheader: &mut HbaCmdHeader = unsafe {
-            &mut *(MMArch::phys_2_virt(PhysAddr::new(
-                clb as usize + slot as usize * size_of::<HbaCmdHeader>(),
-            ))
-            .ok_or(SystemError::EFAULT)?
-            .data() as *mut HbaCmdHeader)
-        };
+        let (cmdheader, cmdtbl) = self.controller.command_slot_ptrs(
+            self.port_num as usize,
+            slot,
+            volatile_read!(port.clb),
+        )?;
+        let cmdheader: &mut HbaCmdHeader = unsafe { &mut *cmdheader };
         compiler_fence(Ordering::SeqCst);
 
         // DW0: CFL in bits 0..4, W in bit 6. This is an ATA write, not ATAPI.
@@ -272,12 +273,7 @@ impl LockedAhciDisk {
         dma.as_mut_slice()[..count * 512].copy_from_slice(&buf[..count * 512]);
         let mut buf_paddr = dma.paddr();
 
-        let ctba = volatile_read!(cmdheader.ctba);
-        let cmdtbl = unsafe {
-            &mut *(MMArch::phys_2_virt(PhysAddr::new(ctba as usize))
-                .ok_or(SystemError::EFAULT)?
-                .data() as *mut HbaCmdTable)
-        };
+        let cmdtbl = unsafe { &mut *cmdtbl };
         let mut tmp_count = count;
         compiler_fence(Ordering::SeqCst);
 
@@ -323,7 +319,9 @@ impl LockedAhciDisk {
 
         volatile_write!(cmdfis.device, 1 << 6); // LBA Mode
 
-        AhciController::wait_tfd_ready(port)?;
+        self.controller
+            .wait_tfd_ready_or_recover(self.port_num as usize)?;
+        let port = unsafe { &mut *self.controller.port_ptr(self.port_num as usize) };
         compiler_fence(Ordering::Release);
         volatile_set_bit!(port.ci, 1 << slot, true); // Issue command
 
@@ -381,6 +379,7 @@ impl LockedAhciDisk {
             capacity_lba: identify.capacity_lba,
             flush_command: identify.flush_command,
             reliable_flush: identify.reliable_flush,
+            identify,
         });
         return Ok(result);
     }

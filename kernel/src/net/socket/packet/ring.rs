@@ -342,6 +342,7 @@ impl PacketRing {
 
     /// Fill the header and copy packet data into the frame at `base`, using the
     /// normalized capture view so DGRAM/VLAN layout matches the queue path.
+    #[allow(clippy::too_many_arguments)]
     fn fill_frame(
         &self,
         base: usize,

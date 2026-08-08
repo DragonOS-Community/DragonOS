@@ -305,8 +305,9 @@ TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
     // PACKET_VERSION is now a validated option (accepts V1/V2, rejects others).
+    // PACKET_COPY_THRESH now returns ENOPROTOOPT (Phase 1: not implemented).
     // PACKET_RESERVE is now stored (set succeeds, but no getter → ENOPROTOOPT on get).
-    const int options[] = {PACKET_COPY_THRESH, PACKET_ORIGDEV,
+    const int options[] = {PACKET_ORIGDEV,
                            PACKET_RESERVE, PACKET_VNET_HDR, PACKET_TX_TIMESTAMP,
                            PACKET_TIMESTAMP, PACKET_QDISC_BYPASS, 9999};
     for (int option : options) {

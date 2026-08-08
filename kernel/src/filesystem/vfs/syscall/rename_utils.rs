@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use crate::filesystem::fsnotify::{self, FsEvent};
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::RenameFlags;
@@ -135,6 +136,11 @@ pub fn do_renameat2(
         None
     };
 
+    // 缓存 displaced 的 nlinks（move_to 前，displaced 还活着）。
+    // move_to 会静默销毁 displaced 的目录项，之后的 metadata 可能失败或返回过时值。
+    // nlinks <= 1 表示这是最后一个链接，覆盖后 inode 被销毁。
+    let displaced_nlinks = displaced.as_ref().and_then(|d| d.metadata().ok()).map(|m| m.nlinks);
+
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
 
     if flags.contains(RenameFlags::EXCHANGE) {
@@ -170,8 +176,13 @@ pub fn do_renameat2(
             Some(new_inode),
             cookie2,
         );
-    } else {
         // 普通 rename（可能覆盖目标）：单 cookie 配对 MOVED_FROM/MOVED_TO + MOVE_SELF。
+        // No-op rename：同父目录 + 同文件名 → 无实际变更，跳过事件投递。
+        if Arc::ptr_eq(&old_parent_inode, &new_parent_inode)
+            && old_filename == new_filename
+        {
+            return Ok(0);
+        }
         let cookie = fsnotify::next_cookie();
         fsnotify::fsnotify(
             FsEvent::MOVED_FROM | FsEvent::MOVE_SELF,
@@ -185,12 +196,14 @@ pub fn do_renameat2(
             Some(&old_inode),
             cookie,
         );
-        // 覆盖了已存在目标：补投 IN_DELETE（目标父目录）；仅当被覆盖的是不同 inode 时才发
-        // IN_DELETE_SELF（随之撤销 mark 并投递 IN_IGNORED）。若 old_inode 与 displaced 是同一
-        // inode 的硬链接（rename 覆盖自身别名），inode 仅重命名而未销毁，不应误撤销其 watch。
+        // 覆盖了已存在目标：补投 IN_DELETE（目标父目录）。
+        // 仅当被覆盖的是不同 inode 且 nlinks 归零（最后一个硬链接）时才发
+        // IN_DELETE_SELF（随之撤销 mark 并投递 IN_IGNORED）。
+        // - 若 old_inode 与 displaced 是同一 inode（rename 覆盖自身别名），inode 未销毁；
+        // - 若 displaced 有多个硬链接（nlinks > 1），覆盖一个链接后 inode 仍存活。
         if let Some(displaced) = &displaced {
             // 容错：metadata 读失败（如 FUSE）不影响 rename 的成功返回值；
-            // 失败时按「不同 inode」处理（保守发 DELETE_SELF）。
+            // 失败时按「不同 inode + nlinks 未知」处理（保守发 DELETE_SELF）。
             let same_inode = displaced
                 .metadata()
                 .ok()
@@ -198,7 +211,7 @@ pub fn do_renameat2(
                 .map(|(d, o)| d.inode_id == o.inode_id)
                 .unwrap_or(false);
             let mut mask = FsEvent::DELETE;
-            if !same_inode {
+            if !same_inode && displaced_nlinks.map_or(true, |n| n <= 1) {
                 mask |= FsEvent::DELETE_SELF;
             }
             fsnotify::fsnotify(

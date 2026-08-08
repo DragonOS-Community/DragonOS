@@ -337,8 +337,9 @@ impl FileSystem for InotifyFs {
 pub struct InotifyInode {
     group: Arc<FsNotifyGroup>,
     state: Arc<InotifyState>,
-    /// `IN_NONBLOCK`：read 空队列时立即返回 EAGAIN。
-    nonblock: bool,
+    /// `O_NONBLOCK`：read 空队列时立即返回 EAGAIN。
+    /// 用 AtomicBool 以支持 fcntl(F_SETFL) 动态修改（由 File::set_flags 同步）。
+    nonblock: AtomicBool,
 }
 
 impl InotifyInode {
@@ -352,8 +353,13 @@ impl InotifyInode {
         Self {
             group,
             state,
-            nonblock,
+            nonblock: AtomicBool::new(nonblock),
         }
+    }
+
+    /// 同步 O_NONBLOCK 状态（由 File::set_flags 在 fcntl F_SETFL 时调用）。
+    pub fn set_nonblocking(&self, nb: bool) {
+        self.nonblock.store(nb, Ordering::Relaxed);
     }
 
     /// name 域长度（含末尾 NUL，向上对齐到 sizeof(inotify_event)=16 字节）。
@@ -408,8 +414,17 @@ impl InotifyInode {
             return Err(SystemError::EINVAL);
         }
 
+        // mask 必须含至少一个事件位（低 12 位 IN_ALL_EVENTS）。
+        if (mask & 0x0000_0fff) == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        // IN_MASK_ADD 与 IN_MASK_CREATE 互斥。
+        if (mask & user_mask::IN_MASK_ADD) != 0 && (mask & user_mask::IN_MASK_CREATE) != 0 {
+            return Err(SystemError::EINVAL);
+        }
+
         let md = inode.metadata()?;
-        let target_id = md.inode_id;
+        let target_identity = (md.inode_id, md.dev_id);
 
         // IN_ONLYDIR：目标必须是目录。
         if (mask & user_mask::IN_ONLYDIR) != 0 && md.file_type != FileType::Dir {
@@ -429,12 +444,16 @@ impl InotifyInode {
         // 锁序 marks → wd → FSNOTIFY 为此处引入的嵌套；全代码库无反向获取
         // （destroy_mark/dispatch 均先释放 marks 再取 wd/FSNOTIFY），故无死锁。
         let mut marks = self.group.marks.lock();
-        if let Some(existing) = marks.iter().find(|m| m.inode_id() == target_id) {
+        if let Some(existing) = marks.iter().find(|m| m.identity() == target_identity) {
             if (mask & user_mask::IN_MASK_CREATE) != 0 {
                 return Err(SystemError::EEXIST);
             }
             if (mask & user_mask::IN_MASK_ADD) != 0 {
                 existing.mask.fetch_or(event_mask, Ordering::Relaxed);
+                // OR 语义：任一来源设置 oneshot 即生效（新 mask 或已有状态）。
+                if (mask & user_mask::IN_ONESHOT) != 0 {
+                    existing.oneshot.store(true, Ordering::Relaxed);
+                }
             } else {
                 existing.mask.store(event_mask, Ordering::Relaxed);
                 existing
@@ -589,7 +608,7 @@ impl IndexNode for InotifyInode {
                 if q.list.is_empty() {
                     // 空队列
                     drop(q);
-                    if self.nonblock {
+                    if self.nonblock.load(Ordering::Relaxed) {
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
                     if ProcessManager::current_pcb().has_pending_signal_fast() {

@@ -1279,20 +1279,19 @@ impl File {
             .downcast_arc::<MountFSInode>()
             .map(|mnt_inode| mnt_inode.mount_fs() as Arc<dyn FileSystem>);
 
-        // fsnotify：仅当系统存在 watch 时，解析父目录+子项名快照存入 File，
-        // 供内容事件 hook 向父目录 watch 投递子项 IN_MODIFY/ACCESS/OPEN/CLOSE（issue B）。
-        // 无 watch 时跳过（零开销）。设备/套接字等非 MountFSInode 解析为 None。
-        let inotify_parent = if fsnotify::has_any_watch() {
-            // 注意：MountFSInode::as_any_ref() 返回内部 inode 的 Any，因此
-            // downcast_ref::<MountFSInode>() 永远失败。必须用 downcast_arc。
-            inode
-                .clone()
-                .downcast_arc::<MountFSInode>()
-                .and_then(|mnt| mnt.fsnotify_parent_and_name())
-                .map(|(parent, name)| (Arc::downgrade(&parent), name.into_boxed_str()))
-        } else {
-            None
-        };
+        // fsnotify：解析父目录+子项名快照存入 File，供内容事件 hook 向父目录 watch
+        // 投递子项 IN_MODIFY/ACCESS/OPEN/CLOSE（issue B）。
+        // 始终解析（不门控 has_any_watch）：若 open 时无 watch 则设为 None，之后加 watch
+        // 也不生效——watch 永远收不到已 open 文件的内容事件。解析本身轻量（一次 downcast
+        // + do_parent/dname），非 MountFSInode 直接 None。
+        // 设备/套接字等非 MountFSInode 解析为 None。
+        // 注意：MountFSInode::as_any_ref() 返回内部 inode 的 Any，因此
+        // downcast_ref::<MountFSInode>() 永远失败。必须用 downcast_arc。
+        let inotify_parent = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .and_then(|mnt| mnt.fsnotify_parent_and_name())
+            .map(|(parent, name)| (Arc::downgrade(&parent), name.into_boxed_str()));
         let f = File {
             open_file_id: alloc_open_file_id(),
             inode,
@@ -1323,7 +1322,7 @@ impl File {
 
     /// 解析 fsnotify 内容事件的 parent 参数：upgrade 构造期存储的 Weak 父目录。
     /// 返回 (owned Arc 父目录, 借用的子项名)；调用方须绑定返回值以延长大 Arc 生命周期。
-    /// 仅在构造期已填充（系统存在 watch）时返回 Some。
+    /// 仅对 MountFSInode 上的普通文件返回 Some。
     fn inotify_parent_for_fsnotify(&self) -> Option<(Arc<dyn IndexNode>, &str)> {
         let (parent, name) = self.inotify_parent.as_ref()?;
         Some((parent.upgrade()?, name.as_ref()))
@@ -1607,8 +1606,12 @@ impl File {
         if len > 0 || self.file_type == FileType::File {
             self.touch_atime_after_access();
         }
-        // fsnotify：读成功后投递 IN_ACCESS（FMODE_NONOTIFY 短路）。
-        if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) && fsnotify::has_any_watch() {
+        // fsnotify：仅在实际读到数据（len > 0）时投递 IN_ACCESS（FMODE_NONOTIFY 短路）。
+        // EOF 读（len==0）不投递——与 atime 语义独立。
+        if len > 0
+            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
+            && fsnotify::has_any_watch()
+        {
             // 同时通知父目录 watch（带子名，issue B）与子项自身 watch。
             match self.inotify_parent_for_fsnotify() {
                 Some((parent, name)) => {
@@ -2297,6 +2300,18 @@ impl File {
         self.private_data.lock().update_flags(new_flags)?;
         // 更新文件的打开模式
         *self.flags.write() = new_flags;
+
+        // 将 O_NONBLOCK 变更同步到 inotify fd（其 read_at 查内部 AtomicBool 而非 FileFlags，
+        // 与 socket 的 set_nonblocking 同理）。
+        if new_flags.contains(FileFlags::O_NONBLOCK) != old_flags.contains(FileFlags::O_NONBLOCK) {
+            if let Some(ino) = self
+                .inode
+                .as_any_ref()
+                .downcast_ref::<crate::filesystem::inotify::InotifyInode>()
+            {
+                ino.set_nonblocking(new_flags.contains(FileFlags::O_NONBLOCK));
+            }
+        }
         return Ok(());
     }
 

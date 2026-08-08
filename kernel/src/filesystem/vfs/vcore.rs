@@ -726,17 +726,17 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EISDIR);
     }
 
+    // 缓存 unlink 前的 nlinks——unlink 后 FUSE daemon 的 GETATTR 可能失败或返回过时值。
+    // 用 unlink 前的缓存值判断是否为最后一个链接：nlinks_before <= 1 则 inode 被销毁。
+    let nlinks_before = target_inode.metadata().map(|m| m.nlinks).unwrap_or(1);
+
     // 在父目录上执行 unlink 操作
     parent_inode.unlink(filename)?;
     // Linux 语义：unlink 只删除目录项本身；只有当该 inode 的硬链接数（nlinks）归零时
     // inode 才真正被销毁，此时才发 IN_DELETE_SELF（随后 mark 被撤销并投递 IN_IGNORED）。
     // 存在硬链接时 inode 仍然存活，不应误撤销其上的 watch。
-    // 注意：用 unwrap_or 容错——unlink 已成功，metadata 读失败（如 FUSE daemon 在 unlink
-    // 后对 GETATTR 返回 ENOENT）不得改变 unlink syscall 的成功返回值。metadata 失败时
-    // 按 nlinks==0 处理（保守：inode 可能已不可用，发 DELETE_SELF）。
-    let nlinks = target_inode.metadata().map(|m| m.nlinks).unwrap_or(0);
     let mut mask = FsEvent::DELETE;
-    if nlinks == 0 {
+    if nlinks_before <= 1 {
         mask |= FsEvent::DELETE_SELF;
     }
     fsnotify::fsnotify(

@@ -28,13 +28,18 @@ pub struct FsNotifyMark {
 }
 
 impl FsNotifyMark {
-    /// 取被监听 inode 的 `InodeId`（inode 被 pin，id 稳定）。
-    pub fn inode_id(&self) -> InodeId {
+    /// 取被监听 inode 的标识：(inode_id, dev_id) 复合键。
+    ///
+    /// FUSE 等多挂载场景可能复用相同 inode 号（如 FUSE_ROOT_ID=1），
+    /// 必须用 (inode_id, dev_id) 组合区分不同挂载上的 inode，否则会跨挂载
+    /// 误匹配 mark，导致事件泄露或误判已有 watch。
+    pub fn identity(&self) -> (InodeId, usize) {
         self.inode
             .metadata()
-            .map(|m| m.inode_id)
-            .unwrap_or(InodeId::new(0))
+            .map(|m| (m.inode_id, m.dev_id))
+            .unwrap_or((InodeId::new(0), 0))
     }
+
 }
 
 /// 撤销一个 mark：从 group.marks、全局索引移除，并维护全局计数。

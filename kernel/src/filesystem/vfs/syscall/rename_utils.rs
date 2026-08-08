@@ -189,7 +189,14 @@ pub fn do_renameat2(
         // IN_DELETE_SELF（随之撤销 mark 并投递 IN_IGNORED）。若 old_inode 与 displaced 是同一
         // inode 的硬链接（rename 覆盖自身别名），inode 仅重命名而未销毁，不应误撤销其 watch。
         if let Some(displaced) = &displaced {
-            let same_inode = displaced.metadata()?.inode_id == old_inode.metadata()?.inode_id;
+            // 容错：metadata 读失败（如 FUSE）不影响 rename 的成功返回值；
+            // 失败时按「不同 inode」处理（保守发 DELETE_SELF）。
+            let same_inode = displaced
+                .metadata()
+                .ok()
+                .zip(old_inode.metadata().ok())
+                .map(|(d, o)| d.inode_id == o.inode_id)
+                .unwrap_or(false);
             let mut mask = FsEvent::DELETE;
             if !same_inode {
                 mask |= FsEvent::DELETE_SELF;

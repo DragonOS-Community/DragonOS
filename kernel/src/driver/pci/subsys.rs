@@ -23,7 +23,6 @@ use crate::{
 use super::{
     device::{PciBusDevice, PciDevice},
     driver::PciDriver,
-    test::pt_init,
 };
 
 static mut PCI_BUS_DEVICE: Option<Arc<PciBusDevice>> = None;
@@ -124,7 +123,8 @@ impl Bus for PciBus {
             );
             SystemError::EINVAL
         })?;
-        pci_drv.remove(&pci_dev)
+        pci_drv.remove(&pci_dev);
+        Ok(())
     }
 
     fn sync_state(&self, _device: &Arc<dyn Device>) {
@@ -226,6 +226,5 @@ pub(super) fn pci_bus_subsys_init() -> Result<(), SystemError> {
 
     set_pci_bus(pci_bus.clone());
     let r = bus_register(pci_bus.clone() as Arc<dyn Bus>);
-    pt_init()?;
     return r;
 }

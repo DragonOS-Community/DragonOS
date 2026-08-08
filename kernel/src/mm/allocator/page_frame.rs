@@ -310,6 +310,17 @@ pub trait FrameAllocator {
     // @brief 分配count个页帧
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)>;
 
+    /// Allocate contiguous frames whose complete byte range is no higher than
+    /// `max_phys_addr`. Allocators without bounded-placement support fail
+    /// explicitly instead of returning an out-of-range block.
+    unsafe fn allocate_below(
+        &mut self,
+        _count: PageFrameCount,
+        _max_phys_addr: PhysAddr,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        None
+    }
+
     // @brief 通过地址释放count个页帧
     unsafe fn free(&mut self, address: PhysAddr, count: PageFrameCount);
     // @brief 分配一个页帧
@@ -328,6 +339,13 @@ pub trait FrameAllocator {
 impl<T: FrameAllocator> FrameAllocator for &mut T {
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         return T::allocate(self, count);
+    }
+    unsafe fn allocate_below(
+        &mut self,
+        count: PageFrameCount,
+        max_phys_addr: PhysAddr,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        return T::allocate_below(self, count, max_phys_addr);
     }
     unsafe fn free(&mut self, address: PhysAddr, count: PageFrameCount) {
         return T::free(self, address, count);
@@ -348,6 +366,13 @@ impl<T: FrameAllocator> FrameAllocator for &mut T {
 /// @param count 请求分配的页帧数量
 pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
     unsafe { LockedFrameAllocator.allocate(count) }
+}
+
+pub unsafe fn allocate_page_frames_below(
+    count: PageFrameCount,
+    max_phys_addr: PhysAddr,
+) -> Option<(PhysAddr, PageFrameCount)> {
+    unsafe { LockedFrameAllocator.allocate_below(count, max_phys_addr) }
 }
 
 pub fn retry_oom_victim_page_frame_alloc<F>(

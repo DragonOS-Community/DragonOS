@@ -5,10 +5,16 @@ use core::sync::atomic::compiler_fence;
 
 use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, PhysAddr};
+use crate::time::{Duration, Instant};
+use system_error::SystemError;
+
+use super::cooperative_poll_step;
 
 /// 根据 AHCI 写出 HBA 的 Command
 pub const ATA_CMD_READ_DMA_EXT: u8 = 0x25; // 读操作，并且退出
 pub const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35; // 写操作，并且退出
+pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+pub const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
 #[allow(dead_code)]
 pub const ATA_CMD_IDENTIFY: u8 = 0xEC;
 #[allow(dead_code)]
@@ -16,29 +22,37 @@ pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
 #[allow(dead_code)]
 pub const ATA_CMD_PACKET: u8 = 0xA0;
 pub const ATA_DEV_BUSY: u8 = 0x80;
+pub const ATA_DEV_READY: u8 = 0x40;
+pub const ATA_DEV_FAULT: u8 = 0x20;
 pub const ATA_DEV_DRQ: u8 = 0x08;
+pub const ATA_DEV_ERR: u8 = 0x01;
+pub const ATA_ERR_ICRC: u8 = 0x80;
+pub const ATA_ERR_UNC: u8 = 0x40;
 
 pub const HBA_PORT_CMD_CR: u32 = 1 << 15;
 pub const HBA_PORT_CMD_FR: u32 = 1 << 14;
 pub const HBA_PORT_CMD_FRE: u32 = 1 << 4;
 pub const HBA_PORT_CMD_ST: u32 = 1;
-#[allow(dead_code)]
-pub const HBA_PORT_IS_ERR: u32 = 1 << 30 | 1 << 29 | 1 << 28 | 1 << 27;
+/// PxIS bits which Linux 6.6 treats as command errors (`PORT_IRQ_ERROR`).
+/// Non-fatal interface and overflow notifications are intentionally excluded.
+pub const HBA_PORT_IS_ERR: u32 =
+    1 << 30 | 1 << 29 | 1 << 28 | 1 << 27 | 1 << 23 | 1 << 22 | 1 << 6 | 1 << 4;
+pub const HBA_PORT_IS_TFES: u32 = 1 << 30;
 pub const HBA_SSTS_PRESENT: u32 = 0x3;
-pub const HBA_SIG_ATA: u32 = 0x00000101;
-pub const HBA_SIG_ATAPI: u32 = 0xEB140101;
-pub const HBA_SIG_PM: u32 = 0x96690101;
-pub const HBA_SIG_SEMB: u32 = 0xC33C0101;
+pub const HBA_SIG_ATA: u16 = 0x0000;
+pub const HBA_SIG_ATAPI: u16 = 0xEB14;
+pub const HBA_SIG_PM: u16 = 0x9669;
+pub const HBA_SIG_SEMB: u16 = 0xC33C;
 
 /// 接入 Port 的 不同设备类型
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HbaPortType {
     None,
     Unknown(u32),
-    SATA,
-    SATAPI,
-    PM,
-    SEMB,
+    Sata,
+    Satapi,
+    PortMultiplier,
+    EnclosureManagement,
 }
 
 /// 声明了 HBA 的所有属性
@@ -128,33 +142,132 @@ pub struct HbaCmdHeader {
 
 /// Port 的函数实现
 impl HbaPort {
+    fn wait_cmd_clear(&self, mask: u32) -> Result<(), SystemError> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut iteration = 0usize;
+        loop {
+            if volatile_read!(self.cmd) & mask == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(SystemError::ETIMEDOUT);
+            }
+            cooperative_poll_step(&mut iteration);
+        }
+    }
+
     /// 获取设备类型
     pub fn check_type(&mut self) -> HbaPortType {
-        if volatile_read!(self.ssts) & HBA_SSTS_PRESENT > 0 {
-            let sig = volatile_read!(self.sig);
-            match sig {
-                HBA_SIG_ATA => HbaPortType::SATA,
-                HBA_SIG_ATAPI => HbaPortType::SATAPI,
-                HBA_SIG_PM => HbaPortType::PM,
-                HBA_SIG_SEMB => HbaPortType::SEMB,
-                _ => HbaPortType::Unknown(sig),
+        if volatile_read!(self.ssts) & 0xf == HBA_SSTS_PRESENT {
+            let raw_sig = volatile_read!(self.sig);
+            // ATA only requires the LBA mid/high signature bytes to classify
+            // a device.  The low 16 bits are not reliable on all hardware.
+            match (raw_sig >> 16) as u16 {
+                HBA_SIG_ATA => HbaPortType::Sata,
+                HBA_SIG_ATAPI => HbaPortType::Satapi,
+                HBA_SIG_PM => HbaPortType::PortMultiplier,
+                HBA_SIG_SEMB => HbaPortType::EnclosureManagement,
+                _ => HbaPortType::Unknown(raw_sig),
             }
         } else {
             HbaPortType::None
         }
     }
 
-    /// 启动该端口的命令引擎
-    pub fn start(&mut self) {
-        while volatile_read!(self.cmd) & HBA_PORT_CMD_CR > 0 {
-            core::hint::spin_loop();
+    /// Begin COMRESET after this port's command and FIS engines have stopped.
+    /// Returns the virtual address of the received-FIS area used for polling.
+    pub fn begin_link_reset(&mut self, fb: u64) -> Result<usize, SystemError> {
+        volatile_write!(self.fb, fb);
+        let fb_vaddr = unsafe { MMArch::phys_2_virt(PhysAddr::new(fb as usize)) }
+            .ok_or(SystemError::EFAULT)?;
+        unsafe { ptr::write_bytes(fb_vaddr.data() as *mut u8, 0, 256) };
+        volatile_write!(self.serr, u32::MAX);
+        volatile_write!(self.is, u32::MAX);
+        let cmd = volatile_read!(self.cmd);
+        volatile_write!(self.cmd, cmd | HBA_PORT_CMD_FRE);
+
+        let sctl = volatile_read!(self.sctl) & !0xf;
+        volatile_write!(self.sctl, sctl | 1);
+        if volatile_read!(self.sctl) & 0xf != 1 {
+            return Err(SystemError::EIO);
         }
-        let val: u32 = volatile_read!(self.cmd) | HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST;
-        volatile_write!(self.cmd, val);
+        Ok(fb_vaddr.data())
     }
 
-    /// 关闭该端口的命令引擎
-    pub fn stop(&mut self) {
+    pub fn finish_link_reset_assertion(&mut self) {
+        let sctl = volatile_read!(self.sctl) & !0xf;
+        volatile_write!(self.sctl, sctl);
+        let _ = volatile_read!(self.sctl);
+    }
+
+    /// Start stopping the provisional receive-FIS engine without waiting.
+    /// Multiple ports can be stopped concurrently by advancing them together.
+    pub fn begin_provisional_stop(&mut self) {
+        let cmd = volatile_read!(self.cmd);
+        volatile_write!(self.cmd, cmd & !HBA_PORT_CMD_ST);
+    }
+
+    pub fn provisional_command_stopped(&self) -> bool {
+        volatile_read!(self.cmd) & HBA_PORT_CMD_CR == 0
+    }
+
+    /// Disable receive-FIS only after CR has cleared on every participating
+    /// port; callers enforce that controller-wide phase boundary.
+    pub fn begin_fis_receive_stop(&mut self) {
+        let cmd = volatile_read!(self.cmd);
+        volatile_write!(self.cmd, cmd & !HBA_PORT_CMD_FRE);
+    }
+
+    pub fn fis_receive_stopped(&self) -> bool {
+        volatile_read!(self.cmd) & HBA_PORT_CMD_FR == 0
+    }
+
+    /// Poll one link without blocking other ports that are training in the
+    /// same controller-wide window.
+    pub fn classify_reset_link(
+        &mut self,
+        received_fis_vaddr: usize,
+        stable_since: &mut Option<Instant>,
+    ) -> Option<HbaPortType> {
+        if volatile_read!(self.ssts) & 0xf != HBA_SSTS_PRESENT {
+            *stable_since = None;
+            return None;
+        }
+        let since = *stable_since.get_or_insert_with(Instant::now);
+        if Instant::now() < since + Duration::from_millis(100) {
+            return None;
+        }
+        let d2h_fis_type = (received_fis_vaddr + 0x40) as *const u8;
+        if unsafe { core::ptr::read_volatile(d2h_fis_type) } != FisType::RegD2H as u8 {
+            return None;
+        }
+        Some(self.check_type())
+    }
+
+    /// 启动该端口的命令引擎
+    pub fn start(&mut self) -> Result<(), SystemError> {
+        self.wait_cmd_clear(HBA_PORT_CMD_CR)?;
+        let cmd = volatile_read!(self.cmd) | HBA_PORT_CMD_FRE;
+        volatile_write!(self.cmd, cmd);
+        let _ = volatile_read!(self.cmd);
+        volatile_write!(self.cmd, cmd | HBA_PORT_CMD_ST);
+        let started = volatile_read!(self.cmd);
+        if started == u32::MAX
+            || started & (HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST)
+                != (HBA_PORT_CMD_FRE | HBA_PORT_CMD_ST)
+        {
+            if started != u32::MAX {
+                let _ = self.stop();
+            }
+            return Err(SystemError::EIO);
+        }
+        Ok(())
+    }
+
+    /// Stop command-list processing. Once CR clears, command payloads are no
+    /// longer DMA targets; FIS receive may remain enabled for light-weight
+    /// command-error recovery.
+    pub fn stop_command_engine(&mut self) -> Result<(), SystemError> {
         #[allow(unused_unsafe)]
         {
             volatile_write!(
@@ -163,11 +276,12 @@ impl HbaPort {
             );
         }
 
-        while volatile_read!(self.cmd) & (HBA_PORT_CMD_FR | HBA_PORT_CMD_CR)
-            == (HBA_PORT_CMD_FR | HBA_PORT_CMD_CR)
-        {
-            core::hint::spin_loop();
-        }
+        self.wait_cmd_clear(HBA_PORT_CMD_CR)
+    }
+
+    /// 关闭该端口的命令引擎和 FIS 接收引擎
+    pub fn stop(&mut self) -> Result<(), SystemError> {
+        self.stop_command_engine()?;
 
         #[allow(unused_unsafe)]
         {
@@ -176,18 +290,19 @@ impl HbaPort {
                 (u32::MAX ^ HBA_PORT_CMD_FRE) & volatile_read!(self.cmd)
             );
         }
+        self.wait_cmd_clear(HBA_PORT_CMD_FR)
     }
 
     /// @return: 返回一个空闲 cmd table 的 id; 如果没有，则返回 Option::None
-    pub fn find_cmdslot(&self) -> Option<u32> {
+    pub fn find_cmdslot(&self, command_slots: u8) -> Option<u32> {
         let slots = volatile_read!(self.sact) | volatile_read!(self.ci);
-        (0..32).find(|&i| slots & 1 << i == 0)
+        (0..u32::from(command_slots.min(32))).find(|&i| slots & 1 << i == 0)
     }
 
     /// 初始化,  把 CmdList 等变量的地址赋值到 HbaPort 上 - 这些空间由操作系统分配且固定
     /// 等价于原C版本的 port_rebase 函数
-    pub fn init(&mut self, clb: u64, fb: u64, ctbas: &[u64]) {
-        self.stop(); // 先暂停端口
+    pub fn init(&mut self, clb: u64, fb: u64, ctbas: &[u64]) -> Result<(), SystemError> {
+        self.stop()?; // 先暂停端口
 
         // 赋值 command list base address
         // Command list offset: 1K*portno
@@ -196,54 +311,32 @@ impl HbaPort {
         // Command list maxim size = 32*32 = 1K per port
         volatile_write!(self.clb, clb);
 
-        unsafe {
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            ptr::write_bytes(
-                MMArch::phys_2_virt(PhysAddr::new(clb as usize))
-                    .unwrap()
-                    .data() as *mut u64,
-                0,
-                1024,
-            );
-        }
+        let clb_vaddr = unsafe { MMArch::phys_2_virt(PhysAddr::new(clb as usize)) }
+            .ok_or(SystemError::EFAULT)?;
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        unsafe { ptr::write_bytes(clb_vaddr.data() as *mut u8, 0, 1024) };
 
         // 赋值 fis base address
         // FIS offset: 32K+256*portno
         // FIS entry size = 256 bytes per port
         volatile_write!(self.fb, fb);
-        unsafe {
-            compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            ptr::write_bytes(
-                MMArch::phys_2_virt(PhysAddr::new(fb as usize))
-                    .unwrap()
-                    .data() as *mut u64,
-                0,
-                256,
-            );
-        }
+        let fb_vaddr = unsafe { MMArch::phys_2_virt(PhysAddr::new(fb as usize)) }
+            .ok_or(SystemError::EFAULT)?;
+        compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        unsafe { ptr::write_bytes(fb_vaddr.data() as *mut u8, 0, 256) };
 
         // 赋值 command table base address
         // Command table offset: 40K + 8K*portno
         // Command table size = 256*32 = 8K per port
-        let mut cmdheaders = unsafe {
-            MMArch::phys_2_virt(PhysAddr::new(clb as usize))
-                .unwrap()
-                .data()
-        } as *mut u64 as *mut HbaCmdHeader;
+        let mut cmdheaders = clb_vaddr.data() as *mut HbaCmdHeader;
         for ctbas_value in ctbas.iter().take(32) {
             volatile_write!((*cmdheaders).prdtl, 0); // 一开始没有询问，prdtl = 0（预留了8个PRDT项的空间）
             volatile_write!((*cmdheaders).ctba, *ctbas_value);
             // 这里限制了 prdtl <= 8, 所以一共用了256bytes，如果需要修改，可以修改这里
             compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            unsafe {
-                ptr::write_bytes(
-                    MMArch::phys_2_virt(PhysAddr::new(*ctbas_value as usize))
-                        .unwrap()
-                        .data() as *mut u64,
-                    0,
-                    256,
-                );
-            }
+            let table_vaddr = unsafe { MMArch::phys_2_virt(PhysAddr::new(*ctbas_value as usize)) }
+                .ok_or(SystemError::EFAULT)?;
+            unsafe { ptr::write_bytes(table_vaddr.data() as *mut u8, 0, size_of::<HbaCmdTable>()) };
             cmdheaders = (cmdheaders as usize + size_of::<HbaCmdHeader>()) as *mut HbaCmdHeader;
         }
 
@@ -261,7 +354,7 @@ impl HbaPort {
             // Power on and spin up device
             volatile_write!(self.cmd, volatile_read!(self.cmd) | 1 << 2 | 1 << 1);
         }
-        self.start(); // 重新开启端口
+        self.start() // 重新开启端口
     }
 }
 

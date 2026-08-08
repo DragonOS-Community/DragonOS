@@ -73,6 +73,7 @@ normal/wait_rusage
 normal/sysfs_cgroup2_mount
 normal/devfs_ptmx_unlink
 normal/devtmpfs_semantics
+normal/dma_allocator_selftest
 normal/mknod_socket
 normal/pmem_block
 normal/page_cache_accounting

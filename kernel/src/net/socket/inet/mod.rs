@@ -8,7 +8,7 @@ pub mod stream;
 pub mod syscall;
 
 pub use common::BoundInner;
-pub use common::Types;
+
 pub use datagram::UdpSocket;
 pub use raw::RawSocket;
 

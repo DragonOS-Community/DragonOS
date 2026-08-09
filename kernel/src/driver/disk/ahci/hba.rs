@@ -33,10 +33,14 @@ pub const HBA_PORT_CMD_CR: u32 = 1 << 15;
 pub const HBA_PORT_CMD_FR: u32 = 1 << 14;
 pub const HBA_PORT_CMD_FRE: u32 = 1 << 4;
 pub const HBA_PORT_CMD_ST: u32 = 1;
-/// PxIS bits which Linux 6.6 treats as command errors (`PORT_IRQ_ERROR`).
-/// Non-fatal interface and overflow notifications are intentionally excluded.
+/// PxIS bits which make an in-flight command unsafe to report as successful.
+///
+/// This includes Linux 6.6's `PORT_IRQ_ERROR` set plus OFS: AHCI 1.3.1
+/// requires software to use OFS to detect data received beyond the PRD table.
+/// INFS remains excluded because it reports an interface error from which the
+/// controller was able to continue.
 pub const HBA_PORT_IS_ERR: u32 =
-    1 << 30 | 1 << 29 | 1 << 28 | 1 << 27 | 1 << 23 | 1 << 22 | 1 << 6 | 1 << 4;
+    1 << 30 | 1 << 29 | 1 << 28 | 1 << 27 | 1 << 24 | 1 << 23 | 1 << 22 | 1 << 6 | 1 << 4;
 pub const HBA_PORT_IS_TFES: u32 = 1 << 30;
 pub const HBA_SSTS_PRESENT: u32 = 0x3;
 pub const HBA_SIG_ATA: u16 = 0x0000;

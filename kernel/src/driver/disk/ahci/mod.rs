@@ -266,6 +266,14 @@ const _: () = {
         AtaCommandStatus::Error
     ));
     assert!(matches!(
+        classify_command_status(1 << 24, 0, 0),
+        AtaCommandStatus::Error
+    ));
+    assert!(matches!(
+        classify_command_status(1 << 26, 0, 0),
+        AtaCommandStatus::Complete
+    ));
+    assert!(matches!(
         classify_command_status(0, 0, 0),
         AtaCommandStatus::Complete
     ));

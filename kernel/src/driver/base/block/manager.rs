@@ -314,19 +314,15 @@ impl BlockDevManager {
     /// Unpublish a block device after its hardware has irreversibly gone.
     ///
     /// Unlike [`Self::unregister`], this operation cannot be rolled back. It
-    /// removes every devfs node on a best-effort basis, then always drops the
-    /// manager's strong reference and metadata so stale open nodes can only
-    /// observe a dead weak device rather than keeping a controller alive.
+    /// first detaches all gendisk metadata, removes every devfs node on a
+    /// best-effort basis, and then drops the manager's strong reference so
+    /// stale open nodes can only observe a dead weak device rather than keeping
+    /// a controller alive. The caller serializes this operation against block
+    /// publication and recoverable unregistration for the same device.
     pub fn unregister_detached(&self, dev: &Arc<dyn BlockDevice>) {
-        let gendisks = dev
-            .blkdev_meta()
-            .inner()
-            .gendisks
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let gendisks = core::mem::take(&mut dev.blkdev_meta().inner().gendisks);
 
-        for gendisk in &gendisks {
+        for gendisk in gendisks.values() {
             match gendisk.dname() {
                 Ok(dname) => {
                     if let Err(err) = devfs_unregister(dname.as_ref(), gendisk.clone()) {
@@ -346,12 +342,11 @@ impl BlockDevManager {
         }
 
         self.inner().disks.remove(dev.dev_name());
-        for gendisk in &gendisks {
+        for gendisk in gendisks.values() {
             if let Ok(dname) = gendisk.dname() {
                 self.emit_gendisk_uevent(dev, dname.as_ref(), "remove");
             }
         }
-        dev.blkdev_meta().inner().gendisks.clear();
     }
 
     fn emit_gendisk_uevent(&self, dev: &Arc<dyn BlockDevice>, devname: &str, action: &str) {

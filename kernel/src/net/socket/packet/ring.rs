@@ -418,6 +418,5 @@ pub fn validate_ring_config(
     hdrlen: usize,
     reserve: usize,
 ) -> Result<RingConfig, SystemError> {
-    tpacket::validate_ring_config(req, hdrlen, reserve, PAGE_SIZE)
-        .map_err(|_| SystemError::EINVAL)
+    tpacket::validate_ring_config(req, hdrlen, reserve, PAGE_SIZE).map_err(|_| SystemError::EINVAL)
 }

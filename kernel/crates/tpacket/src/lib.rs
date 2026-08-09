@@ -165,7 +165,9 @@ impl fmt::Display for RingConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RingConfigError::InvalidBlockSize => write!(f, "block_size is 0 or not page-aligned"),
-            RingConfigError::InvalidTotalSize => write!(f, "block_nr * block_size overflows or is 0"),
+            RingConfigError::InvalidTotalSize => {
+                write!(f, "block_nr * block_size overflows or is 0")
+            }
             RingConfigError::InvalidFrameSize => {
                 write!(f, "frame_size < hdrlen + reserve or not 16-byte aligned")
             }

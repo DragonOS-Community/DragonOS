@@ -109,6 +109,6 @@ pub const TP_STATUS_LOSING: u32 = 1 << 2;
 
 pub use tpacket::tpacket_version;
 pub use tpacket::{
-    tpacket_align, TPACKET2_HDRLEN, TPACKET_ALIGNMENT, TPACKET_HDRLEN, TP_STATUS_KERNEL,
-    Tpacket2Hdr, TpacketHdr, TpacketReq, TpacketStats,
+    tpacket_align, Tpacket2Hdr, TpacketHdr, TpacketReq, TpacketStats, TPACKET2_HDRLEN,
+    TPACKET_ALIGNMENT, TPACKET_HDRLEN, TP_STATUS_KERNEL,
 };

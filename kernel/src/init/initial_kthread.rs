@@ -72,11 +72,6 @@ fn kernel_init() -> Result<(), SystemError> {
     rcu::start_worker();
     kenrel_init_freeable()?;
     set_system_state(SystemState::FreeingInitMem);
-    #[cfg(target_arch = "x86_64")]
-    crate::driver::disk::ahci::ahci_init()
-        .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
-        .ok();
-
     if super::initramfs_enabled() {
         // 使用 initramfs, 迁移文件系统
         #[cfg(feature = "initram")]

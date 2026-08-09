@@ -28,19 +28,54 @@ impl PciDeviceID {
         self.special_data = Some(data);
     }
 
-    pub fn dummpy() -> Self {
-        return Self {
+    /// Match any PCI device. This is intended for tests and deliberately
+    /// uses a zero class mask; a wildcard value with an all-ones mask would
+    /// only match a device whose class itself is all ones.
+    #[cfg(test)]
+    pub fn any() -> Self {
+        Self {
             vendor: PCI_ANY_ID,
             device_id: PCI_ANY_ID,
             subvendor: PCI_ANY_ID,
             subdevice: PCI_ANY_ID,
-            class: PCI_ANY_ID,
-            class_mask: PCI_ANY_ID,
+            class: 0,
+            class_mask: 0,
             _driver_data: 0,
             _override_only: PCI_ANY_ID,
             special_data: None,
-        };
+        }
     }
+
+    /// Construct the identity carried by an enumerated PCI function.
+    pub fn device(vendor: u16, device_id: u16, subvendor: u16, subdevice: u16, class: u32) -> Self {
+        Self {
+            vendor: vendor.into(),
+            device_id: device_id.into(),
+            subvendor: subvendor.into(),
+            subdevice: subdevice.into(),
+            class,
+            class_mask: u32::MAX,
+            _driver_data: 0,
+            _override_only: 0,
+            special_data: None,
+        }
+    }
+
+    /// Construct a driver match entry for a 24-bit PCI class code.
+    pub fn class_match(class: u32, class_mask: u32) -> Self {
+        Self {
+            vendor: PCI_ANY_ID,
+            device_id: PCI_ANY_ID,
+            subvendor: PCI_ANY_ID,
+            subdevice: PCI_ANY_ID,
+            class: class & 0x00ff_ffff,
+            class_mask: class_mask & 0x00ff_ffff,
+            _driver_data: 0,
+            _override_only: 0,
+            special_data: None,
+        }
+    }
+
     pub fn match_dev(&self, dev: &Arc<dyn PciDevice>) -> bool {
         if let Some(d_data) = &dev.dynid().special_data {
             return d_data.match_dev(self.special_data);

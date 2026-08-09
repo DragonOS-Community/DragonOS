@@ -2,7 +2,6 @@ use core::{
     convert::TryFrom,
     fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU32, Ordering},
 };
 
 use alloc::{
@@ -401,30 +400,23 @@ impl DeviceINode for GenDisk {
 #[derive(Default)]
 pub struct GenDiskMap {
     data: HashMap<u32, Arc<GenDisk>>,
-    max_idx: AtomicU32,
 }
 
 impl GenDiskMap {
     pub fn new() -> Self {
         GenDiskMap {
             data: HashMap::new(),
-            max_idx: AtomicU32::new(1),
         }
     }
 
-    #[inline]
-    #[allow(dead_code)]
-    pub fn max_idx(&self) -> u32 {
-        self.max_idx.load(Ordering::SeqCst)
-    }
-
-    #[inline]
-    pub fn alloc_idx(&self) -> u32 {
-        self.max_idx.fetch_add(1, Ordering::SeqCst)
-    }
-
-    pub fn intersects(&self, range: &GeneralBlockRange) -> bool {
-        for (_, v) in self.iter() {
+    /// Check overlap between partitions.  The whole-disk entry intentionally
+    /// covers every partition and therefore does not participate in this
+    /// validation.
+    pub fn intersects_partition(&self, range: &GeneralBlockRange) -> bool {
+        for (idx, v) in self.iter() {
+            if *idx == GenDisk::ENTIRE_DISK_IDX {
+                continue;
+            }
             if range.intersects_with(&v.range()).is_some() {
                 return true;
             }

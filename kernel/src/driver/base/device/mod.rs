@@ -23,6 +23,7 @@ use crate::{
         vfs::InodeMode,
     },
     libs::{
+        mutex::Mutex,
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -34,7 +35,7 @@ use system_error::SystemError;
 
 use self::{
     bus::{bus_add_device, bus_probe_device, Bus, BusNotifyEvent},
-    dd::{DeviceAttrCoredump, DeviceAttrStateSynced},
+    dd::{block_device_bindings_and_wait, DeviceAttrCoredump, DeviceAttrStateSynced},
     device_number::{DeviceNumber, Major},
     driver::Driver,
 };
@@ -73,6 +74,55 @@ lazy_static! {
     pub static ref DEVMAP: Arc<LockedKObjMap> = Arc::new(LockedKObjMap::default());
 
     static ref REMOVING_DEVICES: SpinLock<Vec<Weak<dyn Device>>> = SpinLock::new(Vec::new());
+
+    /// Serializes probe, unbind and removal for each device.
+    ///
+    /// Device implementations currently keep [`DeviceCommonData`] behind their own locks, so the
+    /// driver core cannot borrow a sleeping lock from that data without changing every device
+    /// type.  Keep the lock in the core, keyed by the allocation identity of the device instead.
+    /// The weak reference prevents this table from extending a device's lifetime.
+    static ref DEVICE_LIFECYCLE_LOCKS: Mutex<DeviceLifecycleLocks> =
+        Mutex::new(DeviceLifecycleLocks::new());
+}
+
+const LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS: usize = 64;
+
+#[derive(Debug)]
+struct DeviceLifecycleLocks {
+    entries: BTreeMap<usize, DeviceLifecycleLock>,
+    insertions_until_cleanup: usize,
+}
+
+impl DeviceLifecycleLocks {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            insertions_until_cleanup: LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS,
+        }
+    }
+
+    fn insert(&mut self, identity: usize, entry: DeviceLifecycleLock) {
+        self.entries.insert(identity, entry);
+        debug_assert!(self.insertions_until_cleanup > 0);
+        self.insertions_until_cleanup -= 1;
+
+        if self.insertions_until_cleanup == 0 {
+            self.entries
+                .retain(|_, entry| entry.device.strong_count() != 0);
+            // Scan at most once per current table size.  This keeps cleanup work amortized while
+            // still reclaiming dead identities in workloads which repeatedly create devices.
+            self.insertions_until_cleanup = self
+                .entries
+                .len()
+                .max(LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DeviceLifecycleLock {
+    device: Weak<dyn Device>,
+    lock: Arc<Mutex<()>>,
 }
 
 /// `/sys/devices` 的 kset 实例
@@ -557,6 +607,36 @@ impl DeviceManager {
         return Self;
     }
 
+    /// Return the sleeping lock which serializes binding lifecycle operations for `dev`.
+    ///
+    /// The erased data pointer is stable for the lifetime of an `Arc`.  We still validate the weak
+    /// reference with `Arc::ptr_eq` so a stale entry can never be reused after allocator address
+    /// reuse.
+    pub(super) fn lifecycle_lock(&self, dev: &Arc<dyn Device>) -> Arc<Mutex<()>> {
+        let identity = Arc::as_ptr(dev) as *const () as usize;
+        let mut locks = DEVICE_LIFECYCLE_LOCKS.lock();
+
+        if let Some(entry) = locks.entries.get(&identity) {
+            if entry
+                .device
+                .upgrade()
+                .is_some_and(|registered| Arc::ptr_eq(&registered, dev))
+            {
+                return entry.lock.clone();
+            }
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(
+            identity,
+            DeviceLifecycleLock {
+                device: Arc::downgrade(dev),
+                lock: lock.clone(),
+            },
+        );
+        lock
+    }
+
     pub fn register(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
         self.device_default_initialize(&device);
         return self.add_device(device);
@@ -782,6 +862,11 @@ impl DeviceManager {
     /// - drivers/base/bus.c:bus_remove_device()
     #[inline(never)]
     pub fn remove(&self, dev: &Arc<dyn Device>) {
+        let lifecycle = self.lifecycle_lock(dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        // Probe and remove use the same lifecycle lock.  All state must be checked after taking it
+        // because either operation may have completed while this caller was sleeping.
         if !dev.is_registered() {
             return;
         }
@@ -790,8 +875,11 @@ impl DeviceManager {
             return;
         }
 
-        if self.device_is_bound(dev) {
-            if let Err(err) = self.release_driver(dev) {
+        // `device_is_bound()` becomes true only after driver_bound().  Looking only at that list
+        // used to miss the interval where really_probe() had set dev.driver but had not published
+        // the reverse driver->device link yet.
+        if dev.driver().is_some() {
+            if let Err(err) = self.release_driver_locked(dev) {
                 warn!(
                     "skip removing bound device '{}': driver detach failed: {:?}",
                     dev.name(),
@@ -1104,7 +1192,11 @@ impl DeviceManager {
         sysfs_instance().remove_link(&driver_kobj, dev.name());
     }
 
-    fn release_driver(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+    /// Release a bound driver while the caller holds this device's lifecycle lock.
+    ///
+    /// Keep this separate from the public locking entry point: `remove()` already owns the lock
+    /// and recursively acquiring a sleeping mutex would deadlock.
+    fn release_driver_locked(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let driver = dev.driver().ok_or(SystemError::ENODEV)?;
         let bus = dev
             .bus()
@@ -1256,8 +1348,21 @@ impl DeviceManager {
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=35401&fi=1313#1313
-    pub fn device_driver_detach(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
-        self.release_driver(dev)
+    pub fn device_driver_detach(
+        &self,
+        dev: &Arc<dyn Device>,
+        expected_driver: &Arc<dyn Driver>,
+    ) -> Result<(), SystemError> {
+        let lifecycle = self.lifecycle_lock(dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        // The driver observed by the sysfs caller may have changed while it waited for an active
+        // probe.  Never let an unbind request for one driver detach a later binding to another.
+        let current_driver = dev.driver().ok_or(SystemError::ENODEV)?;
+        if !Arc::ptr_eq(&current_driver, expected_driver) {
+            return Err(SystemError::ENODEV);
+        }
+        self.release_driver_locked(dev)
     }
 }
 
@@ -1279,6 +1384,11 @@ pub fn device_unregister<T: Device + 'static>(device: Arc<T>) {
 ///
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#4611
 pub fn device_shutdown() {
+    // Stabilize the reverse-registration order before removing the first
+    // device from the kset.  In particular, an admitted controller probe may
+    // still register child disks which must be shut down before their parent.
+    block_device_bindings_and_wait();
+
     let devices_kset = sys_devices_kset();
 
     loop {
@@ -1297,8 +1407,16 @@ pub fn device_shutdown() {
             }
         };
 
-        if let Some(dev_bus) = dev.bus().and_then(|bus| bus.upgrade()) {
-            dev_bus.shutdown(&dev);
+        let lifecycle = device_manager().lifecycle_lock(&dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        // The driver pointer is assigned before probe runs, while the reverse
+        // driver->device relation is published only after a successful commit.
+        // Never call shutdown on a preset or partially initialized driver.
+        if dev.is_registered() && device_manager().device_is_bound(&dev) {
+            if let Some(dev_bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+                dev_bus.shutdown(&dev);
+            }
         }
     }
 }

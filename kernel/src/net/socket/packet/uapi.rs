@@ -101,79 +101,14 @@ pub const TP_STATUS_VLAN_TPID_VALID: u32 = 1 << 6;
 pub const TP_STATUS_LOSING: u32 = 1 << 2;
 
 // ---------------------------------------------------------------------------
-// TPACKET ring buffer UAPI (PACKET_RX_RING / PACKET_TX_RING)
+// TPACKET ring buffer UAPI — re-exported from the standalone `tpacket` crate.
+// The crate carries the `#[repr(C)]` structs, constants, and validation logic
+// so they can be unit-tested on the host without booting the kernel.
 // Layout matches Linux include/uapi/linux/if_packet.h (Linux 6.6 semantics).
 // ---------------------------------------------------------------------------
 
-/// TPACKET ring versions (enum tpacket_versions).
-#[allow(dead_code)]
-pub mod tpacket_version {
-    pub const TPACKET_V1: i32 = 0;
-    pub const TPACKET_V2: i32 = 1;
-    pub const TPACKET_V3: i32 = 2;
-}
-
-/// Frame alignment for all TPACKET versions.
-pub const TPACKET_ALIGNMENT: usize = 16;
-/// Align `x` up to [`TPACKET_ALIGNMENT`].
-pub const fn tpacket_align(x: usize) -> usize {
-    (x + TPACKET_ALIGNMENT - 1) & !(TPACKET_ALIGNMENT - 1)
-}
-
-// --- RX ring header status flags -------------------------------------------
-pub const TP_STATUS_KERNEL: u32 = 0;
-// TP_STATUS_USER (1) already defined above.
-
-/// V1 frame header (`struct tpacket_hdr`). 28 bytes on x86_64.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TpacketHdr {
-    pub tp_status: u64,
-    pub tp_len: u32,
-    pub tp_snaplen: u32,
-    pub tp_mac: u16,
-    pub tp_net: u16,
-    pub tp_sec: u32,
-    pub tp_usec: u32,
-}
-
-/// V2 frame header (`struct tpacket2_hdr`). 32 bytes.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Tpacket2Hdr {
-    pub tp_status: u32,
-    pub tp_len: u32,
-    pub tp_snaplen: u32,
-    pub tp_mac: u16,
-    pub tp_net: u16,
-    pub tp_sec: u32,
-    pub tp_nsec: u32,
-    pub tp_vlan_tci: u16,
-    pub tp_vlan_tpid: u16,
-    pub tp_padding: [u8; 4],
-}
-
-/// `struct tpacket_req` — ring configuration for V1/V2.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
-pub struct TpacketReq {
-    pub tp_block_size: u32,
-    pub tp_block_nr: u32,
-    pub tp_frame_size: u32,
-    pub tp_frame_nr: u32,
-}
-
-/// `struct tpacket_stats` — returned by PACKET_STATISTICS (V1/V2).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
-pub struct TpacketStats {
-    pub tp_packets: u32,
-    pub tp_drops: u32,
-}
-
-/// Header region size per version (= `TPACKET_ALIGN(sizeof(hdr)) + sizeof(sockaddr_ll)`).
-/// sockaddr_ll = 20 bytes. V1: align(28)+20 = 52. V2: align(32)+20 = 52.
-pub const TPACKET_HDRLEN: usize = tpacket_align(28) + 20;
-pub const TPACKET2_HDRLEN: usize = tpacket_align(32) + 20;
+pub use tpacket::tpacket_version;
+pub use tpacket::{
+    tpacket_align, TPACKET2_HDRLEN, TPACKET_ALIGNMENT, TPACKET_HDRLEN, TP_STATUS_KERNEL,
+    Tpacket2Hdr, TpacketHdr, TpacketReq, TpacketStats,
+};

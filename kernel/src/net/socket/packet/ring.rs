@@ -89,31 +89,9 @@ impl FileSystem for PacketFakeFs {
 // Types
 // ---------------------------------------------------------------------------
 
-/// TPACKET protocol version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TpacketVersion {
-    V1,
-    V2,
-}
-
-impl TpacketVersion {
-    /// Header-region size per frame (aligned header + `sockaddr_ll`).
-    pub fn hdrlen(&self) -> usize {
-        match self {
-            TpacketVersion::V1 => TPACKET_HDRLEN,
-            TpacketVersion::V2 => TPACKET2_HDRLEN,
-        }
-    }
-}
-
-/// Parsed ring configuration.
-#[derive(Debug, Clone, Copy)]
-pub struct RingConfig {
-    pub block_size: usize,
-    pub block_nr: usize,
-    pub frame_size: usize,
-    pub frame_nr: usize,
-}
+// TpacketVersion, RingConfig are re-exported from the standalone `tpacket`
+// crate for host-testable ABI and validation logic.
+pub use tpacket::{RingConfig, TpacketVersion};
 
 /// Result of attempting to write a packet into the ring.
 pub enum RingWriteResult {
@@ -431,7 +409,7 @@ impl PacketRing {
 }
 
 // ---------------------------------------------------------------------------
-// Configuration validation (§2.5 rules from Linux packet_setring)
+// Configuration validation — delegates to the standalone `tpacket` crate.
 // ---------------------------------------------------------------------------
 
 /// Validate a `tpacket_req` against the Linux rules and return the parsed config.
@@ -440,43 +418,6 @@ pub fn validate_ring_config(
     hdrlen: usize,
     reserve: usize,
 ) -> Result<RingConfig, SystemError> {
-    let block_size = req.tp_block_size as usize;
-    let block_nr = req.tp_block_nr as usize;
-    let frame_size = req.tp_frame_size as usize;
-    let frame_nr = req.tp_frame_nr as usize;
-
-    // block_size > 0, page-aligned.
-    if block_size == 0 || !block_size.is_multiple_of(PAGE_SIZE) {
-        return Err(SystemError::EINVAL);
-    }
-    // Overflow guard: ensure block_nr * block_size does not overflow and is
-    // non-zero. Done early (before frame_size checks) because subsequent
-    // validation and the eventual allocation depend on the total ring size.
-    let total = block_nr
-        .checked_mul(block_size)
-        .ok_or(SystemError::EINVAL)?;
-    if total == 0 {
-        return Err(SystemError::EINVAL);
-    }
-    // frame_size >= hdrlen + reserve, and 16-byte aligned.
-    let min_frame_size = hdrlen + reserve;
-    if frame_size < min_frame_size || !frame_size.is_multiple_of(tpacket_align(1)) {
-        return Err(SystemError::EINVAL);
-    }
-    // frames_per_block > 0.
-    if frame_size > block_size {
-        return Err(SystemError::EINVAL);
-    }
-    let frames_per_block = block_size / frame_size;
-    // frame_nr consistency: frames_per_block * block_nr == frame_nr.
-    if frames_per_block.checked_mul(block_nr) != Some(frame_nr) {
-        return Err(SystemError::EINVAL);
-    }
-
-    Ok(RingConfig {
-        block_size,
-        block_nr,
-        frame_size,
-        frame_nr,
-    })
+    tpacket::validate_ring_config(req, hdrlen, reserve, PAGE_SIZE)
+        .map_err(|_| SystemError::EINVAL)
 }

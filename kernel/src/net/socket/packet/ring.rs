@@ -19,7 +19,7 @@ use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::MMArch;
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::{FileSystem, FsInfo, IndexNode, SuperBlock};
+use crate::filesystem::vfs::{FileSystem, FsInfo, IndexNode, SuperBlock, VmaOpenRollback};
 use crate::mm::allocator::page_frame::PageFrameCount;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::page::{page_manager_lock, PageFlags, PageType};
@@ -28,8 +28,8 @@ use crate::mm::VmFaultReason;
 use crate::mm::{VirtRegion, VmFlags};
 
 use super::uapi::{
-    tpacket_align, Tpacket2Hdr, TpacketHdr, TPACKET2_HDRLEN, TPACKET_HDRLEN, TP_STATUS_KERNEL,
-    TP_STATUS_LOSING, TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID,
+    Tpacket2Hdr, TpacketHdr, TP_STATUS_KERNEL, TP_STATUS_LOSING, TP_STATUS_USER,
+    TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID,
 };
 use super::{PacketMetadata, PacketSocketType};
 
@@ -77,6 +77,20 @@ impl FileSystem for PacketFakeFs {
     ) -> VmFaultReason {
         PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
+    fn vma_open(
+        &self,
+        file: &Arc<File>,
+        _region: VirtRegion,
+        _vm_flags: VmFlags,
+    ) -> VmaOpenRollback {
+        use super::PacketSocket;
+        if let Some(socket) = file.inode().as_any_ref().downcast_ref::<PacketSocket>() {
+            socket.ring_vma_opened();
+            VmaOpenRollback::Close
+        } else {
+            VmaOpenRollback::NotRequired
+        }
+    }
     fn vma_close(&self, file: &Arc<File>, _region: VirtRegion, _vm_flags: VmFlags) {
         use super::PacketSocket;
         if let Some(socket) = file.inode().as_any_ref().downcast_ref::<PacketSocket>() {
@@ -93,6 +107,56 @@ impl FileSystem for PacketFakeFs {
 // crate for host-testable ABI and validation logic.
 pub use tpacket::{RingConfig, TpacketVersion};
 
+/// Bounded raw writer for a frame concurrently shared with userspace.
+///
+/// Deliberately does not create `&mut [u8]`: the kernel cannot prove exclusive
+/// access to an mmap'ed frame. Every operation checks its byte range before
+/// performing a raw write.
+struct FrameWriter {
+    base: *mut u8,
+    capacity: usize,
+}
+
+impl FrameWriter {
+    /// # Safety
+    ///
+    /// `base..base + capacity` must remain a live, writable, contiguous kernel
+    /// mapping for the lifetime of this writer. Concurrent userspace aliases
+    /// are allowed; callers must obey the TPACKET ownership protocol.
+    unsafe fn new(base: usize, capacity: usize) -> Self {
+        Self {
+            base: base as *mut u8,
+            capacity,
+        }
+    }
+
+    fn checked_ptr(&self, offset: usize, len: usize) -> Option<*mut u8> {
+        let end = offset.checked_add(len)?;
+        if end > self.capacity {
+            return None;
+        }
+        Some(unsafe { self.base.add(offset) })
+    }
+
+    fn write<T: Copy>(&self, offset: usize, value: T) -> Option<()> {
+        let dst = self.checked_ptr(offset, core::mem::size_of::<T>())?;
+        unsafe { core::ptr::write_unaligned(dst.cast::<T>(), value) };
+        Some(())
+    }
+
+    fn copy_slice(&self, offset: usize, source: &[u8]) -> Option<()> {
+        let dst = self.checked_ptr(offset, source.len())?;
+        unsafe { core::ptr::copy(source.as_ptr(), dst, source.len()) };
+        Some(())
+    }
+
+    fn zero(&self, offset: usize, len: usize) -> Option<()> {
+        let dst = self.checked_ptr(offset, len)?;
+        unsafe { core::ptr::write_bytes(dst, 0, len) };
+        Some(())
+    }
+}
+
 /// Result of attempting to write a packet into the ring.
 pub enum RingWriteResult {
     /// A frame was filled and published (status KERNEL→USER).
@@ -108,7 +172,7 @@ pub struct RingState {
     pub ring: Option<Arc<Mutex<PacketRing>>>,
     /// Number of active VMA mappings covering the ring. Teardown returns EBUSY
     /// while this is non-zero, matching Linux `mapped` accounting.
-    pub mapped: u32,
+    pub mapped: usize,
 }
 
 impl RingState {
@@ -154,34 +218,76 @@ impl PacketRing {
         let pages_per_block = config.block_size / PAGE_SIZE;
         // PageCache::new already returns Arc<PageCache>.
         let page_cache: Arc<PageCache> = PageCache::new(None, None);
-        let mut block_vaddrs = Vec::with_capacity(config.block_nr);
+        let mut block_vaddrs = Vec::new();
+        block_vaddrs
+            .try_reserve_exact(config.block_nr)
+            .map_err(|_| SystemError::ENOMEM)?;
 
         // Per-block allocation (matches Linux alloc_pg_vec): each block is an
         // independent `block_size` contiguous physical run. This avoids one
         // large `block_nr * block_size` allocation that fails under fragmented
         // memory.
-        let mut pm = page_manager_lock();
         for block_idx in 0..config.block_nr {
-            let (phy_addr, pages) = pm.create_pages(
-                PageType::Normal,
-                PageFlags::PG_UNEVICTABLE,
-                &mut LockedFrameAllocator,
-                PageFrameCount::new(pages_per_block),
-            )?;
-            // The allocator may round up to a power of two and return more
-            // pages than requested. Only insert `pages_per_block` pages into
-            // the page cache so block indices never overlap.
-            for j in 0..pages_per_block {
-                let page = pages.get(j).unwrap();
-                page.write().add_flags(PageFlags::PG_UPTODATE);
-                page_cache.insert_ready_page(block_idx * pages_per_block + j, page.clone())?;
+            let (phy_addr, mut pages) = {
+                let mut pm = page_manager_lock();
+                pm.create_pages(
+                    PageType::Normal,
+                    PageFlags::PG_UNEVICTABLE,
+                    &mut LockedFrameAllocator,
+                    PageFrameCount::new(pages_per_block),
+                )?
+            };
+            if pages.len() < pages_per_block {
+                let mut pm = page_manager_lock();
+                for page in &pages {
+                    pm.remove_page(&page.phys_address());
+                }
+                drop(pm);
+                return Err(SystemError::ENOMEM);
             }
-            let vaddr = unsafe { MMArch::phys_2_virt(phy_addr) }
-                .ok_or(SystemError::EFAULT)?
-                .data();
-            // Zero this block. TP_STATUS_KERNEL == 0, so every frame in it
-            // starts KERNEL-owned and is immediately writable.
-            unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, config.block_size) };
+
+            // Buddy may round the allocation up. Detach the unused tail from
+            // PageManager under its lock, then drop the final references only
+            // after releasing the lock.
+            if pages.len() > pages_per_block {
+                {
+                    let mut pm = page_manager_lock();
+                    for page in &pages[pages_per_block..] {
+                        pm.remove_page(&page.phys_address());
+                    }
+                }
+                pages.truncate(pages_per_block);
+            }
+
+            let vaddr = match unsafe { MMArch::phys_2_virt(phy_addr) } {
+                Some(vaddr) => vaddr.data(),
+                None => {
+                    let mut pm = page_manager_lock();
+                    for page in &pages {
+                        pm.remove_page(&page.phys_address());
+                    }
+                    drop(pm);
+                    return Err(SystemError::EFAULT);
+                }
+            };
+
+            for j in 0..pages_per_block {
+                let page = &pages[j];
+                page.write().add_flags(PageFlags::PG_UPTODATE);
+                if let Err(err) = page_cache.insert_preallocated_unevictable_page(
+                    block_idx * pages_per_block + j,
+                    page.clone(),
+                ) {
+                    let mut pm = page_manager_lock();
+                    for page in &pages {
+                        pm.remove_page(&page.phys_address());
+                    }
+                    drop(pm);
+                    return Err(err);
+                }
+            }
+            // create_pages() zeroed the whole actual extent before publishing
+            // any Page object, so every frame already starts KERNEL-owned.
             block_vaddrs.push(vaddr);
         }
 
@@ -207,19 +313,15 @@ impl PacketRing {
         &self.page_cache
     }
 
-    /// Returns `true` if at least one frame is in `TP_STATUS_USER` (readable by
-    /// userspace). Used by `can_recv()` / poll readiness.
-    ///
-    /// O(frame_nr) scan; only on the poll readiness path, never per-packet, so
-    /// the cost is acceptable for typical rings.
+    /// Match Linux packet_poll(): readiness is determined from the frame just
+    /// before the producer head, not by scanning the entire ring.
     pub fn has_user_frames(&self) -> bool {
-        for i in 0..self.config.frame_nr {
-            let base = self.frame_base(i);
-            if self.read_tp_status(base) == TP_STATUS_USER {
-                return true;
-            }
-        }
-        false
+        let previous = if self.head == 0 {
+            self.config.frame_nr - 1
+        } else {
+            self.head as usize - 1
+        };
+        self.read_tp_status(self.frame_base(previous)) != TP_STATUS_KERNEL
     }
 
     /// Write one packet into the ring. Caller must hold the ring lock.
@@ -227,7 +329,7 @@ impl PacketRing {
     /// `filter_snaplen` is the cBPF-limited visible length (already clamped to
     /// `wire_len` by the caller).  `losing` requests TP_STATUS_LOSING on the
     /// published frame (set while `stats_drops > 0`).
-    pub fn write_frame(
+    pub(super) fn write_frame(
         &mut self,
         input: &super::rx::PacketFilterInput,
         meta: &PacketMetadata,
@@ -240,10 +342,16 @@ impl PacketRing {
         // normalized VLAN has a 14-byte visible MAC (tag stripped); outbound
         // inline VLAN has an 18-byte visible MAC (tag retained).
         let mac_len = meta.net_offset;
-        // Linux formula: netoff = TPACKET_ALIGN(hdrlen + max(maclen, 16)) + reserve.
-        let netoff = tpacket_align(hdrlen + core::cmp::max(mac_len, 16)) + self.reserve;
-        let data_off = if self.raw { netoff - mac_len } else { netoff };
-        let data_cap = self.config.frame_size.saturating_sub(data_off);
+        let Some(offsets) =
+            tpacket::calculate_frame_offsets(hdrlen, mac_len, self.reserve, self.raw)
+        else {
+            return RingWriteResult::Dropped;
+        };
+        let netoff = offsets.netoff as usize;
+        let data_off = offsets.macoff as usize;
+        let Some(data_cap) = self.config.frame_size.checked_sub(data_off) else {
+            return RingWriteResult::Dropped;
+        };
         if data_cap == 0 {
             return RingWriteResult::Dropped;
         }
@@ -255,7 +363,7 @@ impl PacketRing {
             return RingWriteResult::Dropped;
         }
 
-        let status = self.fill_frame(
+        let Some(status) = self.fill_frame(
             base,
             input,
             meta,
@@ -263,7 +371,9 @@ impl PacketRing {
             data_off,
             data_cap,
             filter_snaplen,
-        );
+        ) else {
+            return RingWriteResult::Dropped;
+        };
 
         // Publish: flip status KERNEL→USER *last*, with Release ordering so the
         // data writes above are visible before userspace observes USER.
@@ -330,7 +440,7 @@ impl PacketRing {
         data_off: usize,
         data_cap: usize,
         filter_snaplen: usize,
-    ) -> u32 {
+    ) -> Option<u32> {
         let is_vlan = meta.vlan_tpid != 0;
 
         // tp_len = original socket-visible length (not truncated by filter).
@@ -338,73 +448,75 @@ impl PacketRing {
         let wire_len = meta.wire_len;
         let snaplen = filter_snaplen.min(wire_len).min(data_cap);
 
-        let tp_mac = data_off as u16;
-        let tp_net = netoff as u16;
+        let tp_mac = u16::try_from(data_off).ok()?;
+        let tp_net = u16::try_from(netoff).ok()?;
+        let tp_len = u32::try_from(wire_len).ok()?;
+        let tp_snaplen = u32::try_from(snaplen).ok()?;
+        // SAFETY: `base` names the selected frame inside this ring's live
+        // block allocation; validated ring geometry keeps the complete frame
+        // within that block. The ring Arc and lock keep the backing alive and
+        // serialize kernel writers while userspace follows status ownership.
+        let writer = unsafe { FrameWriter::new(base, self.config.frame_size) };
 
-        let dst = base as *mut u8;
-
-        unsafe {
-            match self.version {
-                TpacketVersion::V1 => {
-                    let now_micros = crate::time::Instant::now().total_micros();
-                    let tp_sec = (now_micros / 1_000_000) as u32;
-                    let tp_usec = (now_micros % 1_000_000) as u32;
-                    // tp_status is published atomically by the caller; zero here.
-                    let hdr = TpacketHdr {
-                        tp_status: 0,
-                        tp_len: wire_len as u32,
-                        tp_snaplen: snaplen as u32,
-                        tp_mac,
-                        tp_net,
-                        tp_sec,
-                        tp_usec,
-                    };
-                    core::ptr::write(dst as *mut TpacketHdr, hdr);
-                }
-                TpacketVersion::V2 => {
-                    let ts = crate::time::PosixTimeSpec::now();
-                    let tp_sec = ts.tv_sec as u32;
-                    let tp_nsec = ts.tv_nsec as u32;
-                    let hdr = Tpacket2Hdr {
-                        tp_status: 0,
-                        tp_len: wire_len as u32,
-                        tp_snaplen: snaplen as u32,
-                        tp_mac,
-                        tp_net,
-                        tp_sec,
-                        tp_nsec,
-                        tp_vlan_tci: meta.vlan_tci,
-                        tp_vlan_tpid: meta.vlan_tpid,
-                        tp_padding: [0; 4],
-                    };
-                    core::ptr::write(dst as *mut Tpacket2Hdr, hdr);
-                }
+        match self.version {
+            TpacketVersion::V1 => {
+                let now_micros = crate::time::Instant::now().total_micros();
+                let tp_sec = (now_micros / 1_000_000) as u32;
+                let tp_usec = (now_micros % 1_000_000) as u32;
+                // Clear the complete ABI object, including its four padding
+                // bytes, so a recycled frame cannot disclose stale data.
+                writer.zero(0, core::mem::size_of::<TpacketHdr>())?;
+                writer.write(core::mem::offset_of!(TpacketHdr, tp_len), tp_len)?;
+                writer.write(core::mem::offset_of!(TpacketHdr, tp_snaplen), tp_snaplen)?;
+                writer.write(core::mem::offset_of!(TpacketHdr, tp_mac), tp_mac)?;
+                writer.write(core::mem::offset_of!(TpacketHdr, tp_net), tp_net)?;
+                writer.write(core::mem::offset_of!(TpacketHdr, tp_sec), tp_sec)?;
+                writer.write(core::mem::offset_of!(TpacketHdr, tp_usec), tp_usec)?;
             }
-
-            // sockaddr_ll follows the aligned header. hdrlen() already includes
-            // the 20-byte sockaddr_ll, so the region starts at hdrlen - 20.
-            let sll_off = self.version.hdrlen() - 20;
-            *(dst.add(sll_off) as *mut u16) = 17u16; // sll_family = AF_PACKET
-            *(dst.add(sll_off + 2) as *mut u16) = meta.protocol.to_be(); // sll_protocol
-            *(dst.add(sll_off + 4) as *mut i32) = meta.ifindex as i32; // sll_ifindex
-            *(dst.add(sll_off + 8) as *mut u16) = 1u16.to_be(); // sll_hatype = ARPHRD_ETHER
-            *dst.add(sll_off + 10) = meta.pkt_type as u8; // sll_pkttype
-            *dst.add(sll_off + 11) = 6; // sll_halen
-            core::ptr::copy_nonoverlapping(meta.src_mac.as_ptr(), dst.add(sll_off + 12), 6);
-
-            // Copy socket-visible data from the normalized capture view into
-            // the frame's data region. The view already handles DGRAM MAC
-            // stripping and VLAN normalization identically to the queue path.
-            let data_dst = dst.add(data_off);
-            input.copy_visible_to_ptr(data_dst, snaplen);
+            TpacketVersion::V2 => {
+                let ts = crate::time::PosixTimeSpec::now();
+                let tp_sec = ts.tv_sec as u32;
+                let tp_nsec = ts.tv_nsec as u32;
+                writer.zero(0, core::mem::size_of::<Tpacket2Hdr>())?;
+                writer.write(core::mem::offset_of!(Tpacket2Hdr, tp_len), tp_len)?;
+                writer.write(core::mem::offset_of!(Tpacket2Hdr, tp_snaplen), tp_snaplen)?;
+                writer.write(core::mem::offset_of!(Tpacket2Hdr, tp_mac), tp_mac)?;
+                writer.write(core::mem::offset_of!(Tpacket2Hdr, tp_net), tp_net)?;
+                writer.write(core::mem::offset_of!(Tpacket2Hdr, tp_sec), tp_sec)?;
+                writer.write(core::mem::offset_of!(Tpacket2Hdr, tp_nsec), tp_nsec)?;
+                writer.write(
+                    core::mem::offset_of!(Tpacket2Hdr, tp_vlan_tci),
+                    meta.vlan_tci,
+                )?;
+                writer.write(
+                    core::mem::offset_of!(Tpacket2Hdr, tp_vlan_tpid),
+                    meta.vlan_tpid,
+                )?;
+            }
         }
+
+        // sockaddr_ll follows the aligned header. hdrlen() already includes
+        // the 20-byte sockaddr_ll, so the region starts at hdrlen - 20.
+        let sll_off = self.version.hdrlen().checked_sub(20)?;
+        writer.zero(sll_off, 20)?;
+        writer.write(sll_off, 17u16)?; // sll_family = AF_PACKET
+        writer.write(sll_off.checked_add(2)?, meta.protocol.to_be())?;
+        writer.write(sll_off.checked_add(4)?, meta.ifindex as i32)?;
+        writer.write(sll_off.checked_add(8)?, 1u16.to_be())?;
+        writer.write(sll_off.checked_add(10)?, meta.pkt_type as u8)?;
+        writer.write(sll_off.checked_add(11)?, 6u8)?;
+        writer.copy_slice(sll_off.checked_add(12)?, &meta.src_mac)?;
+
+        let (first, second) = input.visible_segments(snaplen)?;
+        writer.copy_slice(data_off, first)?;
+        writer.copy_slice(data_off.checked_add(first.len())?, second)?;
 
         // Compute final status: USER plus VLAN validity flags (V2 only).
         let mut status = TP_STATUS_USER;
         if is_vlan && self.version == TpacketVersion::V2 {
             status |= TP_STATUS_VLAN_VALID | TP_STATUS_VLAN_TPID_VALID;
         }
-        status
+        Some(status)
     }
 }
 

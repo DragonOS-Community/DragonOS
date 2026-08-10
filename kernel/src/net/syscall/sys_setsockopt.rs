@@ -3,6 +3,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETSOCKOPT;
 use crate::mm::VirtAddr;
+use crate::net::socket::packet::packet_option;
 use crate::net::socket::{PIPV6, PSO, PSOL};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -92,6 +93,21 @@ impl Syscall for SysSetsockoptHandle {
             }
         }
 
+        // Linux validates exact-width packet scalars before touching optval.
+        // Admit them here so malformed lengths cannot be turned into EFAULT
+        // by an invalid pointer before the option handler returns EINVAL.
+        let packet_exact_u32 = level == PSOL::PACKET as usize
+            && matches!(
+                optname,
+                packet_option::PACKET_VERSION | packet_option::PACKET_RESERVE
+            );
+        if packet_exact_u32 {
+            if optlen != core::mem::size_of::<u32>() {
+                return Err(SystemError::EINVAL);
+            }
+            optlen_to_read = core::mem::size_of::<u32>();
+        }
+
         // Verify optval address validity if from user space
         if frame.is_from_user() {
             let virt_optval = VirtAddr::new(optval as usize);
@@ -100,16 +116,22 @@ impl Syscall for SysSetsockoptHandle {
             }
         }
 
-        // Read optval from user space
+        // Copy optval through the exception-table protected path. access_ok()
+        // only validates the address range; it does not prove that every page
+        // is mapped, so directly borrowing userspace here can panic the kernel.
         let user_buffer_reader =
             UserBufferReader::new(optval, optlen_to_read, frame.is_from_user())?;
-        let data = user_buffer_reader.read_from_user(0)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(optlen_to_read)
+            .map_err(|_| SystemError::ENOMEM)?;
+        data.resize(optlen_to_read, 0);
+        user_buffer_reader.copy_from_user_protected(&mut data, 0)?;
 
         let sol = PSOL::try_from(level as u32)?;
         socket_inode
             .as_socket()
             .unwrap()
-            .set_option(sol, optname, data)
+            .set_option(sol, optname, &data)
             .map(|_| 0)
     }
 

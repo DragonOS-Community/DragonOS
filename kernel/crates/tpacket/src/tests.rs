@@ -52,6 +52,47 @@ fn tpacket_align_values() {
     assert_eq!(tpacket_align(52), 64);
 }
 
+#[test]
+fn raw_and_dgram_offsets_follow_linux_formulas() {
+    assert_eq!(
+        calculate_frame_offsets(TPACKET_HDRLEN, 14, 0, true),
+        Some(FrameOffsets {
+            macoff: 66,
+            netoff: 80,
+        })
+    );
+    assert_eq!(
+        calculate_frame_offsets(TPACKET_HDRLEN, 14, 0, false),
+        Some(FrameOffsets {
+            macoff: 80,
+            netoff: 80,
+        })
+    );
+}
+
+#[test]
+fn offsets_accept_u16_boundary_and_reject_truncation() {
+    let aligned_hdr = tpacket_align(TPACKET_HDRLEN);
+    let reserve_at_max = u16::MAX as usize - aligned_hdr - 16;
+    assert_eq!(
+        calculate_frame_offsets(TPACKET_HDRLEN, 14, reserve_at_max, false),
+        Some(FrameOffsets {
+            macoff: u16::MAX,
+            netoff: u16::MAX,
+        })
+    );
+    assert_eq!(
+        calculate_frame_offsets(TPACKET_HDRLEN, 14, reserve_at_max + 1, false),
+        None
+    );
+}
+
+#[test]
+fn offsets_reject_checked_arithmetic_overflow() {
+    assert_eq!(calculate_frame_offsets(usize::MAX, 14, 0, false), None);
+    assert_eq!(calculate_frame_offsets(64, usize::MAX, 0, true), None);
+}
+
 /// Minimum valid frame_size = tpacket_align(TPACKET_HDRLEN) = 64.
 /// frame_size must be >= hdrlen AND 16-byte aligned.
 const MIN_FRAME_SIZE: usize = 64;

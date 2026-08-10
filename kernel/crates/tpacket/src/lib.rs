@@ -65,6 +65,40 @@ pub const fn tpacket_align(x: usize) -> usize {
     (x + TPACKET_ALIGNMENT - 1) & !(TPACKET_ALIGNMENT - 1)
 }
 
+fn checked_tpacket_align(x: usize) -> Option<usize> {
+    Some(x.checked_add(TPACKET_ALIGNMENT - 1)? & !(TPACKET_ALIGNMENT - 1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameOffsets {
+    pub macoff: u16,
+    pub netoff: u16,
+}
+
+/// Calculate Linux V1/V2 receive offsets without permitting arithmetic or
+/// UAPI-width truncation.
+pub fn calculate_frame_offsets(
+    hdrlen: usize,
+    mac_len: usize,
+    reserve: usize,
+    raw: bool,
+) -> Option<FrameOffsets> {
+    let (macoff, netoff) = if raw {
+        let netoff =
+            checked_tpacket_align(hdrlen.checked_add(mac_len.max(16))?)?.checked_add(reserve)?;
+        (netoff.checked_sub(mac_len)?, netoff)
+    } else {
+        let netoff = checked_tpacket_align(hdrlen)?
+            .checked_add(16)?
+            .checked_add(reserve)?;
+        (netoff, netoff)
+    };
+    Some(FrameOffsets {
+        macoff: u16::try_from(macoff).ok()?,
+        netoff: u16::try_from(netoff).ok()?,
+    })
+}
+
 /// `struct sockaddr_ll` is 20 bytes on all supported architectures.
 const SOCKADDR_LL_SIZE: usize = 20;
 
@@ -213,7 +247,9 @@ pub fn validate_ring_config(
         return Err(RingConfigError::InvalidTotalSize);
     }
 
-    let min_frame_size = hdrlen + reserve;
+    let min_frame_size = hdrlen
+        .checked_add(reserve)
+        .ok_or(RingConfigError::InvalidFrameSize)?;
     if frame_size < min_frame_size || !frame_size.is_multiple_of(tpacket_align(1)) {
         return Err(RingConfigError::InvalidFrameSize);
     }

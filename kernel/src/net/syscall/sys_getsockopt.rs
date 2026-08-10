@@ -6,6 +6,7 @@ use crate::arch::MMArch;
 use crate::bpf::classic::{SockFilter, BPF_MAXINSNS};
 use crate::mm::MemoryManagementArch;
 use crate::net::socket::inet::stream::TcpOption;
+use crate::net::socket::packet::packet_option;
 use crate::net::socket::{PSO, PSOL};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -153,7 +154,8 @@ pub(super) fn do_getsockopt(
 
     let get_filter = level == PSOL::SOCKET as usize
         && matches!(PSO::try_from(optname as u32), Ok(PSO::ATTACH_FILTER));
-    if user_len > MAX_OPTVAL_LEN && !get_filter {
+    let packet_hdrlen = level == PSOL::PACKET as usize && optname == packet_option::PACKET_HDRLEN;
+    if user_len > MAX_OPTVAL_LEN && !get_filter && !packet_hdrlen {
         return Err(SystemError::EINVAL);
     }
 
@@ -289,27 +291,35 @@ pub(super) fn do_getsockopt(
 
     // 其它 level（如 SOL_IP/SOL_IPV6/SOL_RAW 等）交给具体 socket 实现。
     // gVisor raw_socket_test: getsockopt(SOL_IPV6, IPV6_CHECKSUM) 等
-    // Copy user-supplied optval into kbuf first, so that in/out options
-    // (e.g. PACKET_HDRLEN) can read the caller's input.
-    let kbuf_len = user_len.min(MAX_OPTVAL_LEN);
+    // PACKET_HDRLEN is the sole non-SOL_SOCKET in/out option: Linux reads
+    // exactly one int even when the advertised buffer is larger. Every other
+    // option is output-only and must not pre-read userspace.
+    if packet_hdrlen && user_len < core::mem::size_of::<i32>() {
+        return Err(SystemError::EINVAL);
+    }
+    let kbuf_len = if packet_hdrlen {
+        core::mem::size_of::<i32>()
+    } else {
+        user_len.min(MAX_OPTVAL_LEN)
+    };
     let mut kbuf = vec![0u8; kbuf_len];
-    if !optval.is_null() {
+    if packet_hdrlen {
         let optval_reader = UserBufferReader::new(optval, kbuf_len, from_user)?;
         optval_reader.copy_from_user(&mut kbuf, 0)?;
     }
     let written = socket.option(level, optname, &mut kbuf)?;
-    let out_len = calc_out_len(optval, user_len, written);
+    let out_len = user_len.min(written);
 
-    if !optval.is_null() && out_len != 0 {
+    if out_len != 0 {
         let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
         optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
     }
 
-    // Linux 语义：*optlen 回写实际输出长度；optval != NULL 时为 min(user_len, written)，
-    // optval == NULL 时为 written（用于探测选项大小）。
+    // Linux packet_getsockopt writes back the number of bytes selected for
+    // copy, including zero when the caller advertises a zero-length buffer.
     let mut optlen_writer = UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
     optlen_writer
         .buffer_protected(0)?
-        .write_one::<u32>(0, &(written as u32))?;
+        .write_one::<u32>(0, &(out_len as u32))?;
     Ok(0)
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::filesystem::vfs::VmaOpenRollback;
 
 /// Classification of a present user PTE in a VMA.
 ///
@@ -83,33 +84,57 @@ impl LockedVMA {
         &self,
         intersection: VirtRegion,
     ) -> Result<VmaSplitLifecycle, VmaSplitFailure> {
-        let (original_region, sysv_shm) = {
+        let (original_region, sysv_shm, file, vm_flags) = {
             let guard = self.lock();
             if intersection == *guard.region() {
                 return Ok(VmaSplitLifecycle::none());
             }
-            (*guard.region(), guard.sysv_shm())
-        };
-        let Some(sysv_shm) = sysv_shm else {
-            return Ok(VmaSplitLifecycle::none());
+            (
+                *guard.region(),
+                guard.sysv_shm(),
+                guard.vm_file(),
+                *guard.vm_flags(),
+            )
         };
 
+        let before = original_region.before(&intersection);
+        let after = original_region.after(&intersection);
+        let new_vma_count = usize::from(before.is_some()) + usize::from(after.is_some());
+
         let mut lifecycle = VmaSplitLifecycle {
-            sysv_shm: Some(sysv_shm.clone()),
+            sysv_shm: sysv_shm.clone(),
             open_count: 0,
+            file_opens: Vec::new(),
             committed: false,
         };
-        if original_region.before(&intersection).is_some() {
-            if let Err(err) = sysv_shm.open_vma() {
-                return Err(lifecycle.failure(err));
-            }
-            lifecycle.open_count += 1;
+
+        if file.is_some()
+            && lifecycle
+                .file_opens
+                .try_reserve_exact(new_vma_count)
+                .is_err()
+        {
+            return Err(lifecycle.failure(SystemError::ENOMEM));
         }
-        if original_region.after(&intersection).is_some() {
-            if let Err(err) = sysv_shm.open_vma() {
-                return Err(lifecycle.failure(err));
+
+        for region in [before, after].into_iter().flatten() {
+            if let Some(sysv_shm) = sysv_shm.as_ref() {
+                if let Err(err) = sysv_shm.open_vma() {
+                    return Err(lifecycle.failure(err));
+                }
+                lifecycle.open_count += 1;
             }
-            lifecycle.open_count += 1;
+
+            if let Some(file) = file.as_ref() {
+                let rollback = file.with_io_fs(|fs| fs.vma_open(file, region, vm_flags));
+                if rollback == VmaOpenRollback::Close {
+                    lifecycle.file_opens.push(VmaCloseNotification {
+                        file: file.clone(),
+                        region,
+                        vm_flags,
+                    });
+                }
+            }
         }
         Ok(lifecycle)
     }

@@ -369,9 +369,11 @@ impl InnerAddressSpace {
             vma
         };
 
-        // Linux mremap moves/duplicates an existing VMA; it does not call the
-        // filesystem mmap hook again. The file mapping was already accepted
-        // when the source VMA was created.
+        // Like Linux vm_ops->open, this is a lifetime notification for the new
+        // VMA, not another filesystem mmap admission check.
+        if let Some(file) = vm_file.as_ref() {
+            file.with_io_fs(|fs| fs.vma_open(file, new_region, vm_flags));
+        }
         self.mappings.insert_vma(new_vma.clone());
         let move_len = core::cmp::min(source_len, new_len);
 
@@ -438,6 +440,13 @@ impl InnerAddressSpace {
                 self.mappings.remove_vma(&new_region);
                 drop(page_manager_guard);
                 tlb.finish();
+                if let Some(file) = vm_file.as_ref() {
+                    notifications.vma.push(VmaCloseNotification {
+                        file: file.clone(),
+                        region: new_region,
+                        vm_flags,
+                    });
+                }
                 if let Some(sysv_shm) = sysv_shm.as_ref() {
                     notifications.sysv.push(sysv_shm.clone());
                 }

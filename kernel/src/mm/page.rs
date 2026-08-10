@@ -169,15 +169,49 @@ impl PageManager {
         let (start_paddr, count) = unsafe { allocator.allocate(count).ok_or(SystemError::ENOMEM)? };
         compiler_fence(Ordering::SeqCst);
 
+        let mut ret: Vec<Arc<Page>> = Vec::new();
+        if ret.try_reserve_exact(count.data()).is_err()
+            || self.phys2page.try_reserve(count.data()).is_err()
+        {
+            // No Page object exists yet, so the allocator still owns this
+            // extent as one unit. Reserve both metadata containers before
+            // publishing any Page, then return exactly what allocate() supplied
+            // if either reservation fails.
+            unsafe { allocator.free(start_paddr, count) };
+            return Err(SystemError::ENOMEM);
+        }
+
         unsafe {
             let vaddr = MMArch::phys_2_virt(start_paddr).unwrap();
             MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE * count.data());
         }
 
         let mut cur_phys = PhysPageFrame::new(start_paddr);
-        let mut ret: Vec<Arc<Page>> = Vec::new();
-        for _ in 0..count.data() {
-            let page = Page::new(cur_phys.phys_address(), page_type.clone(), flags);
+        for created in 0..count.data() {
+            let page = match Page::try_new(cur_phys.phys_address(), page_type.clone(), flags) {
+                Ok(page) => page,
+                Err(err) => {
+                    // Arc::try_new drops the just-constructed InnerPage on
+                    // failure, which releases the current frame. Published
+                    // prefix pages release individually after detaching from
+                    // PageManager; the untouched suffix still belongs to the
+                    // original extent and is returned as one range.
+                    for insert_page in ret {
+                        self.remove_page(&insert_page.read().phys_addr);
+                    }
+                    let remaining = count.data() - created - 1;
+                    let mut suffix = cur_phys.next();
+                    for _ in 0..remaining {
+                        // A failed Arc construction splits the original buddy
+                        // extent into individually owned/freed prefix pages.
+                        // Return the untouched suffix one page at a time so
+                        // arbitrary non-power-of-two tails coalesce safely.
+                        unsafe { allocator.free(suffix.phys_address(), PageFrameCount::ONE) };
+                        suffix = suffix.next();
+                    }
+                    return Err(err);
+                }
+            };
             if let Err(e) = self.insert(&page) {
                 for insert_page in ret {
                     self.remove_page(&insert_page.read().phys_addr);
@@ -720,16 +754,21 @@ impl Page {
     /// ## 返回值
     ///
     /// - `Arc<Page>`: 新页面
-    fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
+    fn try_new(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+    ) -> Result<Arc<Page>, SystemError> {
         let inner = InnerPage::new(phys_addr, page_type, flags);
-        let page = Arc::new(Self {
+        let page = Arc::try_new(Self {
             inner: RwSem::new(inner),
             phys_addr,
-        });
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
         if page.read().flags == PageFlags::PG_LRU {
             page_reclaimer_lock().insert_page(phys_addr, &page);
         };
-        page
+        Ok(page)
     }
 
     /// # 拷贝页面及内容

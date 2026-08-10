@@ -81,5 +81,6 @@ normal/eventfd_pending_signal
 normal/virtiofs_smoke
 normal/virtiofs_dax
 normal/af_packet_sockopt
+normal/af_packet_ring
 normal/af_packet_e2e
 normal/af_packet_mcast

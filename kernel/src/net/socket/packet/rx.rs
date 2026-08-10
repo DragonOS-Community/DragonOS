@@ -173,34 +173,24 @@ impl<'a> PacketFilterInput<'a> {
         }
     }
 
-    /// Copy up to `len` bytes of socket-visible data to `dst`.
-    /// For RAW sockets this includes the MAC header; for DGRAM it starts at
-    /// the network header. Handles two-segment VLAN-normalized views.
-    pub(super) fn copy_visible_to_ptr(&self, dst: *mut u8, len: usize) {
-        let end = self.data_offset + len;
+    /// Return the socket-visible prefix as at most two immutable segments.
+    /// The mmap writer retains sole responsibility for validating its raw
+    /// destination; this type never manufactures a mutable reference to the
+    /// userspace-shared ring.
+    pub(super) fn visible_segments(&self, len: usize) -> Option<(&[u8], &[u8])> {
+        if len > self.data_len() {
+            return None;
+        }
+        let end = self.data_offset.checked_add(len)?;
         let first_start = self.data_offset.min(self.first.len());
         let first_end = end.min(self.first.len());
-        let mut written = 0;
-        if first_start < first_end {
-            let n = first_end - first_start;
-            unsafe {
-                core::ptr::copy_nonoverlapping(self.first.as_ptr().add(first_start), dst, n);
-            }
-            written += n;
-        }
+        let first = &self.first[first_start..first_end];
         if end > self.first.len() {
             let second_start = self.data_offset.saturating_sub(self.first.len());
-            let second_end = end - self.first.len();
-            if second_end > second_start {
-                let n = second_end - second_start;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        self.second.as_ptr().add(second_start),
-                        dst.add(written),
-                        n,
-                    );
-                }
-            }
+            let second_end = end.checked_sub(self.first.len())?;
+            Some((first, self.second.get(second_start..second_end)?))
+        } else {
+            Some((first, &[]))
         }
     }
 

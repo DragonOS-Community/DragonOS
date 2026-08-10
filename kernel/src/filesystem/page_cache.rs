@@ -3504,6 +3504,28 @@ impl InnerPageCache {
         Ok(())
     }
 
+    /// Insert an intrinsically unevictable, preallocated page without adding
+    /// it to the ordered file-cache index. Ring backings are looked up by exact
+    /// page offset and are never candidates for range writeback/reclaim; not
+    /// creating a BTree node also keeps their user-sized metadata fallible.
+    fn insert_preallocated_entry(
+        &mut self,
+        offset: usize,
+        entry: Arc<PageEntry>,
+    ) -> Result<(), SystemError> {
+        match self.pages.entry(offset) {
+            Entry::Vacant(slot) => {
+                if let Some(backend) = self.accounting_backend.as_ref() {
+                    backend.reserve_page()?;
+                }
+                entry.account_insert(self.kind, true);
+                slot.insert(entry);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(SystemError::EEXIST),
+        }
+    }
+
     fn is_page_ready(&self, offset: usize) -> bool {
         self.pages
             .get(&offset)
@@ -3519,11 +3541,6 @@ impl InnerPageCache {
 impl Drop for InnerPageCache {
     fn drop(&mut self) {
         // log::debug!("page cache drop");
-        let page_addrs = self
-            .pages
-            .values()
-            .map(|entry| entry.page.phys_address())
-            .collect::<Vec<_>>();
         let mut page_manager = page_manager_lock();
         for entry in self.pages.values() {
             entry.account_remove();
@@ -3535,8 +3552,8 @@ impl Drop for InnerPageCache {
         drop(page_manager);
 
         let mut reclaimer = page_reclaimer_lock();
-        for paddr in page_addrs {
-            reclaimer.remove_page(&paddr);
+        for entry in self.pages.values() {
+            reclaimer.remove_page(&entry.page.phys_address());
         }
     }
 }
@@ -5092,8 +5109,20 @@ impl PageCache {
 
     /// Insert a pre-allocated page into page cache and mark it ready.
     /// This is for special in-kernel users (e.g. perf ring buffers).
-    pub fn insert_ready_page(&self, page_index: usize, page: Arc<Page>) -> Result<(), SystemError> {
-        let entry = Arc::new(PageEntry::new(page, PageState::UpToDate));
+    pub fn insert_preallocated_unevictable_page(
+        &self,
+        page_index: usize,
+        page: Arc<Page>,
+    ) -> Result<(), SystemError> {
+        let page_guard = page.read();
+        if !page_guard.flags().contains(PageFlags::PG_UNEVICTABLE)
+            || !matches!(page_guard.page_type(), PageType::Normal)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        drop(page_guard);
+        let entry = Arc::try_new(PageEntry::new(page, PageState::UpToDate))
+            .map_err(|_| SystemError::ENOMEM)?;
         let _reclassify_guard = self.reclassify_lock.lock();
         {
             let guard = self.inner.lock();
@@ -5108,7 +5137,11 @@ impl PageCache {
             self.discard_unlinked_page(&entry.page);
             return Err(SystemError::EEXIST);
         }
-        match guard.insert_entry(page_index, entry.clone()) {
+        guard
+            .pages
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        match guard.insert_preallocated_entry(page_index, entry.clone()) {
             Ok(()) => Ok(()),
             Err(error) => {
                 drop(guard);

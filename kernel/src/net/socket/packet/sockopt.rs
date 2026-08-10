@@ -32,6 +32,13 @@ impl PacketSocket {
         Ok(i32::from_ne_bytes(value[..4].try_into().unwrap()))
     }
 
+    fn parse_u32_exact(value: &[u8]) -> Result<u32, SystemError> {
+        if value.len() != core::mem::size_of::<u32>() {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(u32::from_ne_bytes(value.try_into().unwrap()))
+    }
+
     fn parse_fanout(value: &[u8]) -> Result<(u32, u32), SystemError> {
         if value.len() != core::mem::size_of::<u32>()
             && value.len() != 2 * core::mem::size_of::<u32>()
@@ -80,10 +87,13 @@ impl PacketSocket {
                     };
                     Ok(write_i32_getsockopt(value, v))
                 }
+                packet_option::PACKET_RESERVE => {
+                    Ok(write_u32_getsockopt(value, self.ring_state.lock().reserve))
+                }
                 packet_option::PACKET_HDRLEN => {
                     // Linux in/out semantics: the caller passes the TPACKET
                     // version in optval[0..4]; we return sizeof(hdr) for that
-                    // version (V1=28, V2=32).
+                    // version (V1=32 on the supported 64-bit ABI, V2=32).
                     let v = Self::parse_i32(value)?;
                     let hdrlen = match v {
                         tpacket_version::TPACKET_V1 => {
@@ -136,7 +146,10 @@ impl PacketSocket {
                     Ok(())
                 }
                 packet_option::PACKET_RESERVE => {
-                    let v = Self::parse_i32(value)? as u32;
+                    let v = Self::parse_u32_exact(value)?;
+                    if v > i32::MAX as u32 {
+                        return Err(SystemError::EINVAL);
+                    }
                     let mut state = self.ring_state.lock();
                     if state.ring.is_some() {
                         return Err(SystemError::EBUSY);

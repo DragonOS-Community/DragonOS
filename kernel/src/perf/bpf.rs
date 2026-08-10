@@ -9,9 +9,9 @@ use crate::include::bindings::linux_bpf::{
 use crate::libs::align::page_align_up;
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::SpinLock;
-use crate::mm::allocator::page_frame::{PageFrameCount, PhysPageFrame};
+use crate::mm::allocator::page_frame::PageFrameCount;
 use crate::mm::page::{page_manager_lock, PageFlags, PageType};
-use crate::mm::{MemoryManagementArch, PhysAddr};
+use crate::mm::MemoryManagementArch;
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -40,7 +40,6 @@ pub struct RingPage {
     ptr: usize,
     data_region_size: usize,
     lost: usize,
-    phys_addr: PhysAddr,
 }
 
 impl RingPage {
@@ -50,15 +49,14 @@ impl RingPage {
             size: 0,
             data_region_size: 0,
             lost: 0,
-            phys_addr: PhysAddr::new(0),
         }
     }
 
-    pub fn new_init(start: usize, len: usize, phys_addr: PhysAddr) -> Self {
-        Self::init(start as _, len, phys_addr)
+    pub fn new_init(start: usize, len: usize) -> Self {
+        Self::init(start as _, len)
     }
 
-    fn init(ptr: *mut u8, size: usize, phys_addr: PhysAddr) -> Self {
+    fn init(ptr: *mut u8, size: usize) -> Self {
         assert_eq!(size % PAGE_SIZE, 0);
         assert!(size / PAGE_SIZE >= 2);
         // The first page will be filled with perf_event_mmap_page
@@ -77,7 +75,6 @@ impl RingPage {
             size,
             data_region_size: size - PAGE_SIZE,
             lost: 0,
-            phys_addr,
         }
     }
 
@@ -242,21 +239,58 @@ impl BpfPerfEvent {
     }
     pub fn do_mmap(&self, _start: usize, len: usize, offset: usize) -> Result<()> {
         let mut data = self.data.lock();
-        let mut page_manager_guard = page_manager_lock();
-        let (phy_addr, pages) = page_manager_guard.create_pages(
-            PageType::Normal,
-            PageFlags::PG_UNEVICTABLE,
-            &mut LockedFrameAllocator,
-            PageFrameCount::new(page_align_up(len) / PAGE_SIZE),
-        )?;
+        if data.mmap_page.size != 0 {
+            return if data.mmap_page.size == len && data.offset == offset {
+                // Additional VMAs of the same perf event share the original
+                // backing; replacing it would invalidate live mappings.
+                Ok(())
+            } else {
+                Err(SystemError::EINVAL)
+            };
+        }
+        let page_cache = PageCache::new(None, None);
+        let requested_pages = page_align_up(len) / PAGE_SIZE;
+        let (phy_addr, mut pages) = {
+            let mut page_manager_guard = page_manager_lock();
+            page_manager_guard.create_pages(
+                PageType::Normal,
+                PageFlags::PG_UNEVICTABLE,
+                &mut LockedFrameAllocator,
+                PageFrameCount::new(requested_pages),
+            )?
+        };
+        if pages.len() > requested_pages {
+            {
+                let mut page_manager_guard = page_manager_lock();
+                for page in &pages[requested_pages..] {
+                    page_manager_guard.remove_page(&page.phys_address());
+                }
+            }
+            pages.truncate(requested_pages);
+        }
         for i in 0..pages.len() {
             let page = pages.get(i).unwrap();
             page.write().add_flags(PageFlags::PG_UPTODATE);
-            data.page_cache.insert_ready_page(i, page.clone())?;
+            if let Err(error) = page_cache.insert_preallocated_unevictable_page(i, page.clone()) {
+                let mut page_manager_guard = page_manager_lock();
+                for page in &pages {
+                    page_manager_guard.remove_page(&page.phys_address());
+                }
+                drop(page_manager_guard);
+                return Err(error);
+            }
         }
-        let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr) }.ok_or(SystemError::EFAULT)?;
+        let Some(virt_addr) = (unsafe { MMArch::phys_2_virt(phy_addr) }) else {
+            let mut page_manager_guard = page_manager_lock();
+            for page in &pages {
+                page_manager_guard.remove_page(&page.phys_address());
+            }
+            drop(page_manager_guard);
+            return Err(SystemError::EFAULT);
+        };
         // create mmap page
-        let mmap_page = RingPage::new_init(virt_addr.data(), len, phy_addr);
+        let mmap_page = RingPage::new_init(virt_addr.data(), len);
+        data.page_cache = page_cache;
         data.mmap_page = mmap_page;
         data.offset = offset;
         Ok(())
@@ -266,21 +300,6 @@ impl BpfPerfEvent {
         let mut inner_data = self.data.lock();
         inner_data.mmap_page.write_event(data)?;
         Ok(())
-    }
-}
-
-impl Drop for BpfPerfEvent {
-    fn drop(&mut self) {
-        let mut page_manager_guard = page_manager_lock();
-        let data = self.data.lock();
-        let phy_addr = data.mmap_page.phys_addr;
-        let len = data.mmap_page.size;
-        let page_count = PageFrameCount::new(len / PAGE_SIZE);
-        let mut cur_phys = PhysPageFrame::new(phy_addr);
-        for _ in 0..page_count.data() {
-            page_manager_guard.remove_page(&cur_phys.phys_address());
-            cur_phys = cur_phys.next();
-        }
     }
 }
 

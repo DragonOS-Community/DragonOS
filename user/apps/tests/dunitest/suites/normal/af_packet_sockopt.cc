@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -104,6 +105,9 @@ static_assert(sizeof(TestFanoutArgs) == 8);
 #endif
 #ifndef PACKET_VERSION
 #define PACKET_VERSION 10
+#endif
+#ifndef PACKET_HDRLEN
+#define PACKET_HDRLEN 11
 #endif
 #ifndef PACKET_RESERVE
 #define PACKET_RESERVE 12
@@ -306,9 +310,8 @@ TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
     ASSERT_GE(fd.Get(), 0);
     // PACKET_VERSION is now a validated option (accepts V1/V2, rejects others).
     // PACKET_COPY_THRESH now returns ENOPROTOOPT (Phase 1: not implemented).
-    // PACKET_RESERVE is now stored (set succeeds, but no getter → ENOPROTOOPT on get).
     const int options[] = {PACKET_ORIGDEV,
-                           PACKET_RESERVE, PACKET_VNET_HDR, PACKET_TX_TIMESTAMP,
+                           PACKET_VNET_HDR, PACKET_TX_TIMESTAMP,
                            PACKET_TIMESTAMP, PACKET_QDISC_BYPASS, 9999};
     for (int option : options) {
         ASSERT_EQ(SetIntOpt(fd.Get(), option, 999), 0)
@@ -318,6 +321,94 @@ TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
         EXPECT_EQ(GetIntOpt(fd.Get(), option, &got), -1) << "option=" << option;
         EXPECT_EQ(errno, ENOPROTOOPT) << "option=" << option << ": " << ErrnoString(errno);
     }
+}
+
+TEST(AfPacketSockopt, PacketReserveFollowsUnsignedIntAbi) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    for (uint32_t value : {0U, static_cast<uint32_t>(INT32_MAX)}) {
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, &value, sizeof(value)), 0)
+            << ErrnoString(errno);
+        uint32_t got = UINT32_MAX;
+        socklen_t len = sizeof(got);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, &got, &len), 0)
+            << ErrnoString(errno);
+        EXPECT_EQ(len, sizeof(got));
+        EXPECT_EQ(got, value);
+    }
+
+    for (uint32_t value : {static_cast<uint32_t>(INT32_MAX) + 1U, UINT32_MAX}) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, &value, sizeof(value)), -1);
+        EXPECT_EQ(errno, EINVAL) << value;
+    }
+
+    uint8_t value_bytes[5] = {1, 0, 0, 0, 0};
+    for (socklen_t len : {0U, 3U, 5U}) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, value_bytes, len), -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << len;
+
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE,
+                             reinterpret_cast<void*>(1), len), -1);
+        EXPECT_EQ(errno, EINVAL) << "bad pointer, len=" << len;
+    }
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE,
+                         reinterpret_cast<void*>(1), sizeof(uint32_t)), -1);
+    EXPECT_EQ(errno, EFAULT);
+
+    socklen_t len = sizeof(uint32_t);
+    errno = 0;
+    EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, nullptr, &len), -1);
+    EXPECT_EQ(errno, EFAULT);
+    len = 0;
+    EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, nullptr, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(len, 0U);
+}
+
+TEST(AfPacketSockopt, GetsockoptReadsOnlyPacketHdrlenInput) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    auto* pages = static_cast<uint8_t*>(mmap(nullptr, page_size * 2, PROT_READ | PROT_WRITE,
+                                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(pages, MAP_FAILED) << ErrnoString(errno);
+    ASSERT_EQ(mprotect(pages + page_size, page_size, PROT_NONE), 0);
+    auto* tail = reinterpret_cast<int*>(pages + page_size - sizeof(int));
+
+    *tail = -1;
+    socklen_t len = static_cast<socklen_t>(page_size);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_VERSION, tail, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(len, sizeof(int));
+    EXPECT_EQ(*tail, TPACKET_V1);
+
+    *tail = TPACKET_V2;
+    len = static_cast<socklen_t>(page_size * 4);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_HDRLEN, tail, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(len, sizeof(int));
+    EXPECT_EQ(*tail, static_cast<int>(sizeof(uint32_t) * 8));
+
+    int version = TPACKET_V1;
+    for (socklen_t short_len : {0U, 1U, 2U, 3U}) {
+        len = short_len;
+        errno = 0;
+        EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_HDRLEN, &version, &len), -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << short_len;
+    }
+    len = sizeof(int);
+    errno = 0;
+    EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_HDRLEN, nullptr, &len), -1);
+    EXPECT_EQ(errno, EFAULT);
+
+    ASSERT_EQ(munmap(pages, page_size * 2), 0);
 }
 
 // PACKET_VERSION is now a validated setsockopt: accepts TPACKET_V1/V2,

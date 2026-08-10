@@ -28,7 +28,7 @@ use crate::process::ProcessManager;
 use crate::rcu::RcuOptionArcSlot;
 
 pub(crate) use fanout::{membership_value, FanoutGroup, FanoutJoinParams};
-pub use ring::{RingWriteResult, TpacketVersion};
+pub use ring::RingWriteResult;
 #[allow(unused_imports)]
 pub use uapi::{
     eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,
@@ -210,11 +210,20 @@ impl PacketSocket {
 
     /// Called by `PacketFakeFs::vma_close` when a VMA covering the ring is
     /// torn down. Decrements the mapped count so teardown can proceed.
+    pub fn ring_vma_opened(&self) {
+        let mut state = self.ring_state.lock();
+        state.mapped = state
+            .mapped
+            .checked_add(1)
+            .expect("packet ring VMA count overflow");
+    }
+
     pub fn ring_vma_closed(&self) {
         let mut state = self.ring_state.lock();
-        if state.mapped > 0 {
-            state.mapped -= 1;
-        }
+        state.mapped = state
+            .mapped
+            .checked_sub(1)
+            .expect("packet ring VMA close without matching open");
     }
 }
 
@@ -370,7 +379,10 @@ impl Socket for PacketSocket {
         if offset != 0 || len != ring_size {
             return Err(SystemError::EINVAL);
         }
-        state.mapped += 1;
+        state.mapped = state
+            .mapped
+            .checked_add(1)
+            .expect("packet ring VMA count overflow");
         Ok(())
     }
 }

@@ -8,6 +8,11 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <netpacket/packet.h>
+#include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -36,10 +41,55 @@
 #ifndef TPACKET_V1
 #define TPACKET_V1 0
 #endif
+#ifndef TPACKET_V2
+#define TPACKET_V2 1
+#endif
+#ifndef TP_STATUS_KERNEL
+#define TP_STATUS_KERNEL 0
+#endif
+#ifndef TP_STATUS_USER
+#define TP_STATUS_USER 1
+#endif
+#ifndef PACKET_STATISTICS
+#define PACKET_STATISTICS 6
+#endif
 
 namespace {
 
 constexpr int kEthPAll = 0x0003;
+constexpr uint16_t kPrivateEtherType = 0x88b5;
+constexpr size_t kTestFrameSize = 96;
+
+struct TpacketHdrV1 {
+    uint64_t status;
+    uint32_t len;
+    uint32_t snaplen;
+    uint16_t mac;
+    uint16_t net;
+    uint32_t sec;
+    uint32_t usec;
+};
+
+struct TpacketHdrV2 {
+    uint32_t status;
+    uint32_t len;
+    uint32_t snaplen;
+    uint16_t mac;
+    uint16_t net;
+    uint32_t sec;
+    uint32_t nsec;
+    uint16_t vlan_tci;
+    uint16_t vlan_tpid;
+    uint8_t padding[4];
+};
+
+struct TpacketStats {
+    uint32_t packets;
+    uint32_t drops;
+};
+
+static_assert(sizeof(TpacketHdrV1) == 32);
+static_assert(sizeof(TpacketHdrV2) == 32);
 
 struct TpacketReq {
     uint32_t block_size;
@@ -60,6 +110,27 @@ class FdGuard {
 
   private:
     int fd_;
+};
+
+class MappingGuard {
+  public:
+    MappingGuard(void* address, size_t length) : address_(address), length_(length) {}
+    MappingGuard(const MappingGuard&) = delete;
+    MappingGuard& operator=(const MappingGuard&) = delete;
+    ~MappingGuard() {
+        if (address_ != MAP_FAILED) munmap(address_, length_);
+    }
+    void* Get() const { return address_; }
+    int Unmap() {
+        if (address_ == MAP_FAILED) return 0;
+        int result = munmap(address_, length_);
+        if (result == 0) address_ = MAP_FAILED;
+        return result;
+    }
+
+  private:
+    void* address_;
+    size_t length_;
 };
 
 std::string Error() {
@@ -89,7 +160,137 @@ void* MapRing(int fd, size_t length, int prot = PROT_READ | PROT_WRITE,
     return mmap(nullptr, length, prot, flags, fd, 0);
 }
 
+int InterfaceIndex(int fd, const char* name) {
+    struct ifreq request {};
+    std::strncpy(request.ifr_name, name, IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFINDEX, &request) < 0) return -1;
+    return request.ifr_ifindex;
+}
+
+void RunReceiveDataPath(int version) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    ASSERT_GE(page, 4096U);
+    const uint32_t frame_size = static_cast<uint32_t>(page / 2);
+    const TpacketReq request{static_cast<uint32_t>(page), 1, frame_size, 2};
+
+    FdGuard receiver(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(receiver.Get(), 0) << Error();
+    ASSERT_GE(sender.Get(), 0) << Error();
+
+    const int ifindex = InterfaceIndex(receiver.Get(), "veth1");
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic TPACKET RX testing";
+
+    struct sockaddr_ll bind_address {};
+    bind_address.sll_family = AF_PACKET;
+    bind_address.sll_protocol = htons(kPrivateEtherType);
+    bind_address.sll_ifindex = ifindex;
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&bind_address),
+                   sizeof(bind_address)),
+              0)
+        << Error();
+
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_PACKET, PACKET_VERSION, &version,
+                         sizeof(version)),
+              0)
+        << Error();
+    ASSERT_EQ(Configure(receiver.Get(), request), 0) << Error();
+    MappingGuard mapping(MapRing(receiver.Get(), page), page);
+    ASSERT_NE(mapping.Get(), MAP_FAILED) << Error();
+
+    uint8_t sent[kTestFrameSize]{};
+    std::memset(sent, 0xff, 6);
+    const uint8_t source[6] = {0x02, 0x00, 0x00, 0x20, 0x96, 0x01};
+    std::memcpy(sent + 6, source, sizeof(source));
+    sent[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    sent[13] = static_cast<uint8_t>(kPrivateEtherType);
+    std::memcpy(sent + 14, "DragonOS TPACKET dunitest", 25);
+
+    struct sockaddr_ll destination {};
+    destination.sll_family = AF_PACKET;
+    destination.sll_protocol = htons(kPrivateEtherType);
+    destination.sll_ifindex = ifindex;
+    destination.sll_hatype = ARPHRD_ETHER;
+    destination.sll_halen = 6;
+    std::memset(destination.sll_addr, 0xff, 6);
+    ASSERT_EQ(sendto(sender.Get(), sent, sizeof(sent), 0,
+                     reinterpret_cast<sockaddr*>(&destination), sizeof(destination)),
+              static_cast<ssize_t>(sizeof(sent)))
+        << Error();
+
+    struct pollfd poll_fd { receiver.Get(), POLLIN, 0 };
+    ASSERT_EQ(poll(&poll_fd, 1, 3000), 1) << Error();
+    ASSERT_NE(poll_fd.revents & POLLIN, 0);
+
+    bool matched = false;
+    auto* ring = static_cast<uint8_t*>(mapping.Get());
+    for (uint32_t frame_index = 0; frame_index < request.frame_nr; ++frame_index) {
+        uint8_t* frame = ring + frame_index * frame_size;
+        uint64_t status;
+        uint32_t packet_len;
+        uint32_t snaplen;
+        uint16_t mac;
+        uint16_t net;
+        if (version == TPACKET_V1) {
+            auto* header = reinterpret_cast<TpacketHdrV1*>(frame);
+            status = __atomic_load_n(&header->status, __ATOMIC_ACQUIRE);
+            packet_len = header->len;
+            snaplen = header->snaplen;
+            mac = header->mac;
+            net = header->net;
+        } else {
+            auto* header = reinterpret_cast<TpacketHdrV2*>(frame);
+            status = __atomic_load_n(&header->status, __ATOMIC_ACQUIRE);
+            packet_len = header->len;
+            snaplen = header->snaplen;
+            mac = header->mac;
+            net = header->net;
+        }
+        if ((status & TP_STATUS_USER) == 0) continue;
+
+        const bool bounds_valid = mac <= frame_size && snaplen <= frame_size - mac;
+        EXPECT_TRUE(bounds_valid) << "version=" << version << " mac=" << mac
+                                  << " snaplen=" << snaplen;
+        EXPECT_EQ(packet_len, sizeof(sent));
+        EXPECT_EQ(snaplen, sizeof(sent));
+        EXPECT_GE(net, static_cast<uint16_t>(mac + 14));
+        if (bounds_valid && snaplen >= sizeof(sent) &&
+            std::memcmp(frame + mac, sent, sizeof(sent)) == 0) {
+            matched = true;
+        }
+
+        if (version == TPACKET_V1) {
+            __atomic_store_n(&reinterpret_cast<TpacketHdrV1*>(frame)->status,
+                             static_cast<uint64_t>(TP_STATUS_KERNEL), __ATOMIC_RELEASE);
+        } else {
+            __atomic_store_n(&reinterpret_cast<TpacketHdrV2*>(frame)->status,
+                             static_cast<uint32_t>(TP_STATUS_KERNEL), __ATOMIC_RELEASE);
+        }
+    }
+    EXPECT_TRUE(matched) << "TPACKET version " << version << " did not contain the sent frame";
+
+    TpacketStats statistics{};
+    socklen_t statistics_len = sizeof(statistics);
+    ASSERT_EQ(getsockopt(receiver.Get(), SOL_PACKET, PACKET_STATISTICS, &statistics,
+                         &statistics_len),
+              0)
+        << Error();
+    EXPECT_EQ(statistics_len, sizeof(statistics));
+    EXPECT_GE(statistics.packets, 1U);
+
+    ASSERT_EQ(mapping.Unmap(), 0) << Error();
+    EXPECT_EQ(Teardown(receiver.Get()), 0) << Error();
+}
+
 }  // namespace
+
+TEST(AfPacketRing, V1ReceiveDataPath) {
+    RunReceiveDataPath(TPACKET_V1);
+}
+
+TEST(AfPacketRing, V2ReceiveDataPath) {
+    RunReceiveDataPath(TPACKET_V2);
+}
 
 TEST(AfPacketRing, PartialMiddleMunmapKeepsBackingBusy) {
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));

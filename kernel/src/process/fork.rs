@@ -826,8 +826,14 @@ impl ProcessManager {
         // log::debug!("fork: clone_flags: {:?}", clone_flags);
         // 设置线程组id、组长
         if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            pcb.thread.write_irqsave().group_leader =
-                current_pcb.thread.read_irqsave().group_leader.clone();
+            let current_thread = current_pcb.thread.read_irqsave();
+            let group_leader = current_thread.group_leader.clone();
+            let thread_group_live = current_thread.thread_group_live.clone();
+            drop(current_thread);
+            let mut child_thread = pcb.thread.write_irqsave();
+            child_thread.group_leader = group_leader;
+            child_thread.thread_group_live = thread_group_live;
+            drop(child_thread);
             unsafe {
                 let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
                 (*ptr).tgid = current_pcb.tgid;
@@ -902,6 +908,9 @@ impl ProcessManager {
         crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));
 
         let publish_result: Result<(), SystemError> = {
+            // Keep PGID/SID publication ordered before the relation lock, the
+            // same order used by de_thread's membership transaction.
+            let _membership_guard = crate::process::pid::pid_membership_lock();
             let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
             if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                 let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
@@ -913,7 +922,17 @@ impl ProcessManager {
                 pcb.exit_signal.store(-1, Ordering::SeqCst);
 
                 let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
+                // PCB construction happens before the membership transaction.
+                // Refresh the per-thread tty here so session_clear_tty() and
+                // thread publication have a single linearization order.
+                let inherited_tty = current_pcb.sig_info_irqsave().tty();
+                pcb.sig_info_mut().set_tty(inherited_tty);
                 current_pcb.sighand().with_group_exec_check(|| {
+                    let live = pcb
+                        .threads_read_irqsave()
+                        .thread_group_live
+                        .fetch_add(1, Ordering::Relaxed);
+                    assert_ne!(live, 0, "cannot publish a thread into a dead group");
                     pcb.attach_pid(PidType::PID);
                     pcb.task_join_group_stop();
                     group_leader
@@ -924,11 +943,7 @@ impl ProcessManager {
 
                 let leader_tgid_pid = group_leader.pid();
                 pcb.init_task_pid(PidType::TGID, leader_tgid_pid.clone());
-                pcb.init_task_pid(PidType::PGID, leader_tgid_pid.clone());
-                pcb.init_task_pid(PidType::SID, leader_tgid_pid.clone());
                 pcb.attach_pid(PidType::TGID);
-                pcb.attach_pid(PidType::PGID);
-                pcb.attach_pid(PidType::SID);
                 Ok(())
             } else {
                 if clone_flags.contains(CloneFlags::CLONE_PARENT) {

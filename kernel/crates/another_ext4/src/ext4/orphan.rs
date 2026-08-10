@@ -15,6 +15,27 @@ pub(super) struct LegacyOrphanChain {
     pub(super) inodes: Vec<InodeId>,
 }
 
+/// The durable role of an inode in the legacy orphan chain.
+///
+/// A linked tail is not interchangeable with a final-unlink orphan.  The
+/// former asks mount recovery to trim mappings beyond its durable EOF, while
+/// the latter asks it to reclaim the complete inode lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LegacyOrphanMembership {
+    Absent,
+    LinkedTail,
+    ZeroLink,
+}
+
+/// The only valid transition when a linked-tail inode loses its final name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FinalUnlinkOrphanAction {
+    /// The inode was not already recoverable, so insert a zero-link orphan.
+    AddZeroLink,
+    /// Preserve the existing chain node and change only `i_nlink` to zero.
+    PreserveLinkedTail,
+}
+
 trait LegacyOrphanReader {
     fn inode_count(&self) -> u32;
     fn first_inode(&self) -> u32;
@@ -93,6 +114,32 @@ fn validate_chain<R: LegacyOrphanReader>(reader: &R, head: InodeId) -> Result<Le
 }
 
 impl Ext4 {
+    /// Classify the inode's durable orphan role while the caller excludes all
+    /// namespace and transactional metadata writers which could alter the
+    /// chain.  `next_orphan == 0` cannot identify membership: both a list tail
+    /// and a non-member use that value.
+    pub(super) fn legacy_orphan_membership(
+        &self,
+        inode: &InodeRef,
+    ) -> Result<LegacyOrphanMembership> {
+        // The overwhelmingly common steady state after mount recovery has no
+        // legacy orphan members.  Avoid a complete chain validation on every
+        // ordinary final unlink when the durable head proves that directly.
+        if self.read_super_block_cached().last_orphan() == 0 {
+            return Ok(LegacyOrphanMembership::Absent);
+        }
+        if !self.legacy_orphan_contains(inode.id)? {
+            return Ok(LegacyOrphanMembership::Absent);
+        }
+        if inode.inode.link_count() == 0 {
+            return Ok(LegacyOrphanMembership::ZeroLink);
+        }
+        if inode.inode.is_file() && inode.inode.uses_extents() {
+            return Ok(LegacyOrphanMembership::LinkedTail);
+        }
+        Err(corruption())
+    }
+
     /// Verify that `inode_id` is a member of the complete, valid legacy list.
     ///
     /// Reclaim calls this while holding the target inode's mutation shard.  A
@@ -109,7 +156,7 @@ impl Ext4 {
     /// Insert a zero-link inode at the head of the legacy orphan list in the
     /// caller's transaction.  This helper only stages images; atomicity and
     /// commit error handling remain the namespace operation's responsibility.
-    pub(super) fn transaction_orphan_add(
+    pub(super) fn transaction_orphan_add_zero_link(
         &self,
         transaction: &mut super::journal_transaction::Transaction<'_>,
         inode: &mut InodeRef,
@@ -129,6 +176,105 @@ impl Ext4 {
         self.transaction_stage_inode_with_csum(transaction, inode)?;
         sb.set_last_orphan(inode.id);
         self.transaction_stage_super_block(transaction, sb)
+    }
+
+    /// Insert a still-linked regular extent inode at the orphan-list head so
+    /// mount recovery can discard a crash-interrupted mapped tail beyond its
+    /// durable EOF.  The caller must have classified the inode as `Absent`
+    /// under the same metadata exclusion domain before starting this
+    /// transaction; this helper deliberately does not perform a second walk
+    /// over a transaction-private chain image.
+    #[allow(dead_code)] // Consumed by the stage-3b mapper; host tests reach it through the gated constructor.
+    fn transaction_orphan_add_linked_tail(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: &mut InodeRef,
+        sb: &mut SuperBlock,
+    ) -> Result<()> {
+        if inode.inode.link_count() == 0
+            || !inode.inode.is_file()
+            || !inode.inode.uses_extents()
+            || !valid_orphan_number(self, inode.id)
+        {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let old_head = sb.last_orphan();
+        if old_head == inode.id || (old_head != 0 && !valid_orphan_number(self, old_head)) {
+            return Err(corruption());
+        }
+        inode.inode.set_next_orphan(old_head);
+        self.transaction_stage_inode_with_csum(transaction, inode)?;
+        sb.set_last_orphan(inode.id);
+        self.transaction_stage_super_block(transaction, sb)
+    }
+
+    /// Ensure that a linked regular extent inode is recoverable as a truncate
+    /// tail.  The mapper will use this in the same transaction as first tail
+    /// publication.  It owns the membership classification so a future caller
+    /// cannot forge an `already linked` result and silently skip recovery
+    /// enrolment for an absent inode.
+    #[allow(dead_code)] // The production mapper has not been connected yet.
+    pub(super) fn transaction_ensure_linked_tail_orphan(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: &mut InodeRef,
+        sb: &mut SuperBlock,
+    ) -> Result<bool> {
+        let membership = self.legacy_orphan_membership(inode)?;
+        match membership {
+            LegacyOrphanMembership::Absent => {
+                // A mapper can split one logical tail into several segments
+                // within one transaction.  The first call has already staged
+                // this inode as the transaction-private list head, while the
+                // mounted cache still correctly reports it absent until
+                // checkpoint publication.  Treat precisely that state as an
+                // idempotent ensure instead of trying to add a self-head.
+                if sb.last_orphan() == inode.id {
+                    return Ok(false);
+                }
+                self.transaction_orphan_add_linked_tail(transaction, inode, sb)?;
+                Ok(true)
+            }
+            LegacyOrphanMembership::LinkedTail => Ok(false),
+            // A live namespace entry with an already zero-link orphan is
+            // impossible.  Do not silently convert or detach it.
+            LegacyOrphanMembership::ZeroLink => Err(corruption()),
+        }
+    }
+
+    /// Test-only construction of the durable state which a future mapper will
+    /// create atomically together with its first tail mapping.  It is compiled
+    /// only for the host integration harness; no production write path calls
+    /// it or gains a new crash window from it.
+    #[cfg(any(test, feature = "test-api"))]
+    pub fn test_enroll_linked_tail_orphan(&self, inode_id: InodeId) -> Result<bool> {
+        self.ensure_mutable()?;
+        if !self.uses_journal() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(inode_id)].lock();
+        let mut inode = self.read_inode(inode_id)?;
+        let mut transaction = self.transaction_start(2)?;
+        let mut sb = self.transaction_read_super_block(&transaction)?;
+        let enrolled =
+            self.transaction_ensure_linked_tail_orphan(&mut transaction, &mut inode, &mut sb)?;
+        if self.transaction_ensure_linked_tail_orphan(&mut transaction, &mut inode, &mut sb)? {
+            // The same transaction must not turn its already staged head
+            // into a duplicate/self-referential chain node.
+            transaction.abort();
+            return Err(corruption());
+        }
+        if !enrolled {
+            transaction.abort();
+            return Ok(false);
+        }
+        if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
+            self.poison(ErrCode::EIO);
+            return Err(error.error);
+        }
+        Ok(true)
     }
 
     /// Remove an inode from the legacy orphan chain in the caller's final
@@ -246,6 +392,19 @@ impl Ext4 {
             }
         }
         Ok(())
+    }
+}
+
+/// Decide the final-unlink action from a membership snapshot taken while the
+/// caller owns namespace and inode-mutation exclusion.  A zero-link member
+/// cannot still be reachable through the directory entry being removed.
+pub(super) fn final_unlink_orphan_action(
+    membership: LegacyOrphanMembership,
+) -> Result<FinalUnlinkOrphanAction> {
+    match membership {
+        LegacyOrphanMembership::Absent => Ok(FinalUnlinkOrphanAction::AddZeroLink),
+        LegacyOrphanMembership::LinkedTail => Ok(FinalUnlinkOrphanAction::PreserveLinkedTail),
+        LegacyOrphanMembership::ZeroLink => Err(corruption()),
     }
 }
 
@@ -424,5 +583,18 @@ mod tests {
         inode.set_checksum(checked_sb.metadata_checksum_seed());
         inode.inode.set_generation(10);
         assert!(!inode_checksum_valid(&checked_sb, &inode));
+    }
+
+    #[test]
+    fn final_unlink_preserves_a_linked_tail_but_never_a_zero_link_member() {
+        assert_eq!(
+            final_unlink_orphan_action(LegacyOrphanMembership::Absent).unwrap(),
+            FinalUnlinkOrphanAction::AddZeroLink
+        );
+        assert_eq!(
+            final_unlink_orphan_action(LegacyOrphanMembership::LinkedTail).unwrap(),
+            FinalUnlinkOrphanAction::PreserveLinkedTail
+        );
+        assert!(final_unlink_orphan_action(LegacyOrphanMembership::ZeroLink).is_err());
     }
 }

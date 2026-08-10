@@ -1,0 +1,20 @@
+name = "timekeeping_calibration"
+version = "0.1.0"
+description = "Guest helper for bracketed DragonOS timekeeping calibration"
+build-once = false
+install-once = false
+target-arch = ["x86_64"]
+
+[task-source]
+type = "build-from-source"
+source = "local"
+source-path = "user/apps/timekeeping_calibration"
+
+[build]
+build-command = "make install"
+
+[install]
+in-dragonos-path = "/opt/tests/timekeeping-calibration"
+
+[clean]
+clean-command = "make clean"

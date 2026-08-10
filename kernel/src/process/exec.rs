@@ -7,6 +7,7 @@ use crate::{
     arch::ipc::signal::Signal,
     driver::base::block::SeekFrom,
     filesystem::vfs::{fcntl::AtFlags, file::File, open::do_open_execat},
+    ipc::sighand::GroupExecCancelResult,
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -330,216 +331,269 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     }
 
     let sighand = current.sighand();
-    // Mutually exclusive with group-exit / concurrent exec.
-    sighand.start_group_exec(&current)?;
+    let leader = {
+        let ti = current.threads_read_irqsave();
+        ti.group_leader().unwrap_or_else(|| current.clone())
+    };
+    let old_leader = (!Arc::ptr_eq(&leader, &current)).then_some(leader.clone());
 
-    let result = (|| {
-        // log::info!(
-        //     "de_thread: start pid={:?} tgid={:?}",
-        //     current.raw_pid(),
-        //     current.raw_tgid()
-        // );
+    // Collection and per-task token assignment share SigHand::inner with the
+    // unhash-tail completion path. An already exiting/ptraced zombie sibling
+    // remains pending until it has stopped touching identity-bearing lists.
+    let (kill_list, invalid_old_leader) =
+        sighand.start_group_exec_transaction(&current, old_leader.as_ref(), |generation| {
+            let invalid_old_leader = old_leader
+                .as_ref()
+                .map(|old| old.is_dead())
+                .unwrap_or(false);
+            let mut kill_list = Vec::new();
+            let mut pending = 0;
 
-        if current.threads_read_irqsave().thread_group_empty() {
-            // log::info!(
-            //     "de_thread: single-thread fast path pid={:?}",
-            //     current.raw_pid()
-            // );
-            current
-                .exit_signal
-                .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
-            return Ok(());
-        }
+            if let Some(old) = old_leader.as_ref() {
+                if !old.flags().contains(ProcessFlags::EXITING)
+                    && !old.is_exited()
+                    && !old.is_zombie()
+                    && !old.is_dead()
+                {
+                    kill_list.push(old.clone());
+                }
+            }
 
-        let leader = {
-            let ti = current.threads_read_irqsave();
-            ti.group_leader().unwrap_or_else(|| current.clone())
-        };
-
-        // log::info!(
-        //     "de_thread: leader pid={:?}, current_is_leader={}",
-        //     leader.raw_pid(),
-        //     Arc::ptr_eq(&leader, &current)
-        // );
-
-        let mut kill_list: Vec<Arc<ProcessControlBlock>> = Vec::new();
-        let mut leader_in_kill_list = false;
-        if !Arc::ptr_eq(&leader, &current)
-            && !leader.flags().contains(ProcessFlags::EXITING)
-            && !leader.is_exited()
-            && !leader.is_zombie()
-            && !leader.is_dead()
-        {
-            kill_list.push(leader.clone());
-            leader_in_kill_list = true;
-        }
-        {
             let ti = leader.threads_read_irqsave();
             for weak in &ti.group_tasks {
-                if let Some(task) = weak.upgrade() {
-                    if Arc::ptr_eq(&task, &current) {
-                        continue;
-                    }
-                    if task.flags().contains(ProcessFlags::EXITING)
-                        || task.is_exited()
-                        || task.is_zombie()
-                        || task.is_dead()
-                    {
-                        continue;
-                    }
+                let Some(task) = weak.upgrade() else {
+                    continue;
+                };
+                if Arc::ptr_eq(&task, &current)
+                    || old_leader
+                        .as_ref()
+                        .map(|old| Arc::ptr_eq(old, &task))
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                if !task.identity_unhash_complete() {
+                    task.assign_group_exec_generation(generation);
+                    pending += 1;
+                }
+                if !task.flags().contains(ProcessFlags::EXITING)
+                    && !task.is_exited()
+                    && !task.is_zombie()
+                    && !task.is_dead()
+                {
                     kill_list.push(task);
                 }
             }
-        }
+            ((kill_list, invalid_old_leader), pending)
+        })?;
 
-        let mut notify_count = kill_list.len() as isize;
-        // Non-leader exec: notify_count does not include the leader itself.
-        if !Arc::ptr_eq(&leader, &current) && leader_in_kill_list {
-            notify_count -= 1;
+    if invalid_old_leader {
+        match sighand.try_cancel_group_exec(&current) {
+            GroupExecCancelResult::Canceled => {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            GroupExecCancelResult::Committed => {
+                panic!("invalid old leader reached committed group-exec state");
+            }
+            GroupExecCancelResult::NotOwner => {
+                panic!("group-exec ownership disappeared during cleanup");
+            }
         }
-        sighand.set_group_exec_notify_count(notify_count);
+    }
 
-        for task in kill_list {
-            let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
+    for task in kill_list {
+        Signal::queue_private_sigkill_to_thread(&task);
+    }
+
+    let pending_wait = sighand.wait_group_exec_event_killable(
+        || Signal::fatal_signal_pending(&current) || sighand.group_exec_pending_complete(&current),
+        None::<fn()>,
+    );
+    if pending_wait.is_err() || Signal::fatal_signal_pending(&current) {
+        match sighand.try_cancel_group_exec(&current) {
+            GroupExecCancelResult::Canceled | GroupExecCancelResult::NotOwner => {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            GroupExecCancelResult::Committed => {
+                sighand
+                    .wait_group_exec_event_uninterruptible(
+                        || sighand.group_exec_handoff_ready(&current),
+                        None::<fn()>,
+                    )
+                    .expect("uninterruptible group-exec wait failed");
+            }
         }
+    }
 
-        // First wait for non-leader threads to exit (notify_count == 0).
-        let wait_res = sighand.wait_group_exec_event_killable(
-            || {
-                if Signal::fatal_signal_pending(&current) {
-                    return true;
-                }
-                sighand.group_exec_notify_count() == 0
-            },
-            None::<fn()>,
-        );
-        if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-
-        // Non-leader exec: wait for the leader to become zombie before swapping
-        // tid/raw_pid.
-        if !Arc::ptr_eq(&leader, &current) {
-            // Mark that we are waiting for the leader to exit (notify_count < 0),
-            // to be woken by exit_notify. The wait state must be published before
-            // checking the leader, otherwise the leader might exit between the
-            // check and the write, causing exit_notify to miss notify_count < 0
-            // and lose the wakeup.
-            sighand.set_group_exec_notify_count(-1);
-            let wait_res = sighand.wait_group_exec_event_killable(
+    if let Some(leader) = old_leader.as_ref() {
+        if !sighand.group_exec_handoff_ready(&current) {
+            let leader_wait = sighand.wait_group_exec_event_killable(
                 || {
-                    if Signal::fatal_signal_pending(&current) {
-                        return true;
-                    }
-                    leader.is_zombie() || leader.is_dead()
+                    Signal::fatal_signal_pending(&current)
+                        || sighand.group_exec_handoff_ready(&current)
                 },
                 None::<fn()>,
             );
-            if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-
-            ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
-
-            current
-                .exit_signal
-                .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
-            leader.exit_signal.store(-1, Ordering::SeqCst);
-
-            // Promote the current thread to thread-group leader and clear
-            // group_tasks (no other threads remain).
-            {
-                let mut cur_ti = current.threads_write_irqsave();
-                cur_ti.group_leader = Arc::downgrade(&current);
-                cur_ti.group_tasks.clear();
-            }
-            {
-                let mut leader_ti = leader.threads_write_irqsave();
-                leader_ti.group_leader = Arc::downgrade(&current);
-                leader_ti.group_tasks.clear();
-            }
-
-            // Transfer the old leader's children list to the new leader.
-            let moved_children = {
-                let leader_pid_ns = leader.active_pid_ns();
-                let (first, second) =
-                    if (Arc::as_ptr(&current) as usize) <= (Arc::as_ptr(&leader) as usize) {
-                        (current.clone(), leader.clone())
-                    } else {
-                        (leader.clone(), current.clone())
-                    };
-
-                let mut first_children = first.children.write_irqsave();
-                let mut second_children = second.children.write_irqsave();
-
-                if Arc::ptr_eq(&leader, &first) {
-                    let moved = core::mem::take(&mut *first_children);
-                    second_children.extend(moved.iter().copied());
-                    moved
-                } else {
-                    let moved = core::mem::take(&mut *second_children);
-                    first_children.extend(moved.iter().copied());
-                    moved
+            if leader_wait.is_err() || Signal::fatal_signal_pending(&current) {
+                match sighand.try_cancel_group_exec(&current) {
+                    GroupExecCancelResult::Canceled | GroupExecCancelResult::NotOwner => {
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                    GroupExecCancelResult::Committed => {
+                        sighand
+                            .wait_group_exec_event_uninterruptible(
+                                || sighand.group_exec_handoff_ready(&current),
+                                None::<fn()>,
+                            )
+                            .expect("uninterruptible group-exec wait failed");
+                    }
                 }
-                .into_iter()
-                .filter_map(|pid| ProcessManager::find_task_by_pid_ns(pid, &leader_pid_ns))
-                .collect::<Vec<_>>()
-            };
-            for child in moved_children {
-                ProcessControlBlock::reparent_child_links_from_thread_group(
-                    &child,
-                    current.tgid,
-                    &current,
-                );
             }
-
-            // Inherit parent process relationships from the old leader.
-            {
-                let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
-                let leader_parent = leader.real_parent_pcb.read_irqsave().clone();
-                *current.parent_pcb.write_irqsave() = leader_parent.clone();
-                *current.real_parent_pcb.write_irqsave() = leader_parent.clone();
-                *current.wait_parent_pcb.write_irqsave() = leader_parent.clone();
-                *current.fork_parent_pcb.write_irqsave() = leader_parent;
-            }
-
-            // log::info!("de_thread: reparented current to old leader's parent");
-
-            // The old leader should be reaped by the exec thread to prevent the
-            // parent from reaping it prematurely before/after the swap.
-            let mut release_leader = false;
-            if leader.is_zombie() {
-                if leader.try_mark_dead_from_zombie() {
-                    release_leader = true;
-                }
-            } else if leader.is_dead() {
-                release_leader = true;
-            }
-
-            if release_leader {
-                // Remove the old PCB from ALL_PROCESS before generic release can
-                // return its swapped-out TID to the PID allocator. Otherwise a
-                // concurrent fork can reuse that number and a late release would
-                // remove the newly published child under the same map key.
-                unsafe { ProcessManager::release(leader.raw_pid()) };
-
-                // Every DragonOS thread owns TGID/PGID/SID task links. The
-                // generic release path sees the migrated old leader as a
-                // non-leader and only detaches PID, so remove its remaining links
-                // explicitly. `leader` remains alive through this Arc.
-                leader.detach_exec_leader_non_pid_links();
-            }
-        } else {
-            current
-                .exit_signal
-                .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
         }
 
-        Ok(())
-    })();
+        assert!(
+            sighand.group_exec_handoff_ready(&current),
+            "committed group-exec handoff is not ready"
+        );
+        assert!(leader.is_zombie(), "old exec leader must be zombie");
 
-    sighand.finish_group_exec();
-    result
+        // Linux keeps these values in the shared signal_struct, so de_thread()
+        // naturally preserves them. DragonOS stores them on the leader PCB and
+        // must transfer the accumulated history before changing leader identity.
+        current.inherit_exited_thread_group_cputime_from(leader);
+        current.inherit_thread_group_rusage_from(leader);
+
+        let membership_guard = crate::process::pid::pid_membership_lock();
+        ProcessManager::exchange_tid_and_raw_pids(&current, leader);
+
+        current
+            .exit_signal
+            .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
+
+        // PGID/SID physical indices contain leaders only. Transfer both links
+        // after promoting the new leader and before demoting the old one, so a
+        // concurrent group lookup always has a valid representative.
+        leader.transfer_pid_link_to_locked(&current, PidType::PGID);
+        leader.transfer_pid_link_to_locked(&current, PidType::SID);
+        leader.exit_signal.store(-1, Ordering::SeqCst);
+
+        // Session-leader ownership is process-wide in Linux, but DragonOS
+        // currently stores the marker on the leader PCB. Move it together
+        // with the leader identity so job-control checks keep observing the
+        // same process after a non-leader exec.
+        let (leader_is_session_leader, leader_tty) = {
+            let mut leader_signal = leader.sig_info_mut();
+            let state = (leader_signal.is_session_leader, leader_signal.tty());
+            leader_signal.is_session_leader = false;
+            leader_signal.set_tty(None);
+            state
+        };
+        if leader_is_session_leader {
+            let mut current_signal = current.sig_info_mut();
+            current_signal.is_session_leader = true;
+            if current_signal.tty().is_none() {
+                current_signal.set_tty(leader_tty);
+            }
+        }
+
+        // Promote the current thread to thread-group leader and clear
+        // group_tasks (no other threads remain).
+        {
+            let mut cur_ti = current.threads_write_irqsave();
+            cur_ti.group_leader = Arc::downgrade(&current);
+            cur_ti.group_tasks.clear();
+        }
+        {
+            let mut leader_ti = leader.threads_write_irqsave();
+            leader_ti.group_leader = Arc::downgrade(&current);
+            leader_ti.group_tasks.clear();
+        }
+        drop(membership_guard);
+
+        // Transfer the old leader's children list and parent links as one
+        // tasklist-like transaction. A concurrent release must observe both
+        // the new owner and its index entry, or neither.
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        let leader_pid_ns = leader.active_pid_ns();
+        let moved_child_pids = {
+            let (first, second) =
+                if (Arc::as_ptr(&current) as usize) <= (Arc::as_ptr(leader) as usize) {
+                    (current.clone(), leader.clone())
+                } else {
+                    (leader.clone(), current.clone())
+                };
+
+            let mut first_children = first.children.write_irqsave();
+            let mut second_children = second.children.write_irqsave();
+
+            if Arc::ptr_eq(leader, &first) {
+                let moved = core::mem::take(&mut *first_children);
+                second_children.extend(moved.iter().copied());
+                moved
+            } else {
+                let moved = core::mem::take(&mut *second_children);
+                first_children.extend(moved.iter().copied());
+                moved
+            }
+        };
+        let moved_children = moved_child_pids
+            .into_iter()
+            .filter_map(|pid| ProcessManager::find_task_by_pid_ns(pid, &leader_pid_ns))
+            .collect::<Vec<_>>();
+        for child in moved_children {
+            ProcessControlBlock::reparent_child_links_from_thread_group_locked(
+                &child,
+                current.tgid,
+                &current,
+            );
+        }
+
+        // Inherit parent process relationships from the old leader.
+        {
+            let leader_parent = leader.real_parent_pcb.read_irqsave().clone();
+            *current.parent_pcb.write_irqsave() = leader_parent.clone();
+            *current.real_parent_pcb.write_irqsave() = leader_parent.clone();
+            *current.wait_parent_pcb.write_irqsave() = leader_parent.clone();
+            *current.fork_parent_pcb.write_irqsave() = leader_parent;
+        }
+        drop(_relation_guard);
+
+        // log::info!("de_thread: reparented current to old leader's parent");
+
+        // The old leader should be reaped by the exec thread to prevent the
+        // parent from reaping it prematurely before/after the swap.
+        let mut release_leader = false;
+        if leader.is_zombie() {
+            if leader.try_mark_dead_from_zombie() {
+                release_leader = true;
+            }
+        } else if leader.is_dead() {
+            release_leader = true;
+        }
+
+        if release_leader {
+            // Remove the old PCB from ALL_PROCESS before generic release can
+            // return its swapped-out TID to the PID allocator. Otherwise a
+            // concurrent fork can reuse that number and a late release would
+            // remove the newly published child under the same map key.
+            unsafe { ProcessManager::release(leader.raw_pid()) };
+
+            // DragonOS still indexes TGID by every thread. The generic release
+            // path sees the migrated old leader as a nonleader and only
+            // detaches PID, so remove its remaining TGID link explicitly.
+            leader.detach_pid(PidType::TGID);
+        }
+    } else {
+        current
+            .exit_signal
+            .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
+    }
+
+    assert!(
+        sighand.finish_group_exec_owned(&current),
+        "group-exec owner could not finish a completed transaction"
+    );
+    Ok(())
 }
 
 /// ## Load a binary file.

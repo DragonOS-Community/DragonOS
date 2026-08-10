@@ -24,6 +24,8 @@ ifeq ($(UNWIND_ENABLE), yes)
 	RUSTFLAGS +=  -Cforce-unwind-tables -Clink-arg=-Wl,eh_frame.ld -Cpanic=unwind
 endif
 
+LDFLAGS_X86_64 = -z noexecstack
+
 CFLAGS = $(GLOBAL_CFLAGS) -fno-pie $(CFLAGS_UNWIND) -I $(shell pwd) -I $(shell pwd)/include
 
 ifeq ($(ARCH), x86_64)
@@ -104,7 +106,7 @@ endif
 
 __link_x86_64_kernel:
 	@echo "Linking kernel..."
-	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T arch/x86_64/link.lds --no-relax
+	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_X86_64) $(LDFLAGS_UNWIND) -o kernel ../target/x86_64-unknown-none/release/libdragonos_kernel.a -T arch/x86_64/link.lds --no-relax
 # 生成kallsyms
 	current_dir=$(pwd)
 
@@ -117,7 +119,7 @@ __link_x86_64_kernel:
 # 重新链接
 	@echo "Re-Linking kernel..."
 	@echo $(shell find . -name "*.o")
-	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_UNWIND) -o kernel ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T arch/x86_64/link.lds --no-relax
+	$(LD) -b elf64-x86-64 -z muldefs $(LDFLAGS_X86_64) $(LDFLAGS_UNWIND) -o kernel ../target/x86_64-unknown-none/release/libdragonos_kernel.a ./debug/kallsyms.o  -T arch/x86_64/link.lds --no-relax
 	@echo "Generating kernel ELF file..."
 # 生成内核文件
 ifeq ($(UNWIND_ENABLE), yes)

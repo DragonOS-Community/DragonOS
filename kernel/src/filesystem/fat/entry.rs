@@ -306,8 +306,18 @@ impl FATFile {
         // 计算短目录项所在的位置，更新短目录项
         let short_entry_offset = fs.cluster_bytes_offset(self.loc.1 .0) + self.loc.1 .1;
         // todo: 更新时间信息
-        // 把短目录项写入磁盘
-        self.short_dir_entry.flush(fs, short_entry_offset)?;
+        //
+        // 这里只提交文件可达性所需的首簇和长度元数据，不提前发出设备
+        // barrier。调用者随后还要写入实际文件数据；若这里使用 flush()，
+        // O_SYNC 扩展写会在数据写入前后各做一次昂贵且顺序错误的 barrier。
+        //
+        // 当前 FAT 不延迟 FAT chain 或 short direntry 元数据：
+        // FATFile::write()/ensure_len() 返回前，这些写已经提交给底层设备。
+        // file-level fsync 会在数据页写回完成后执行最终 gendisk.sync()。
+        // 若未来引入延迟 metadata，必须同时扩展 FAT 的 sync_file_range()
+        // 以显式提交并等待这些 metadata。
+        self.short_dir_entry
+            .commit_without_barrier(fs, short_entry_offset)?;
         return Ok(());
     }
 
@@ -1149,16 +1159,13 @@ impl LongDirEntry {
         return Ok(());
     }
 
-    /// @brief 把当前长目录项写入磁盘
+    /// Submit the directory-sector RMW without issuing a device cache barrier.
     ///
-    /// @param fs 对应的文件系统
-    /// @param disk_bytes_offset 长目录项所在位置对应的在分区内的字节偏移量
-    ///
-    /// @return Ok(())
-    /// @return Err(SystemError) 错误码
-    pub fn flush(
+    /// The RMW remains serialized by `dirent_io_lock`; callers must establish
+    /// their own later durability boundary before promising persistence.
+    fn commit_without_barrier(
         &self,
-        fs: Arc<FATFileSystem>,
+        fs: &Arc<FATFileSystem>,
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
         // 目录项扇区 RMW 必须串行化，否则与并发的短/长目录项 flush 交错时，
@@ -1199,9 +1206,23 @@ impl LongDirEntry {
         // 把修改后的长目录项刷入磁盘
         fs.gendisk.write_at(cursor.as_slice(), lba)?;
 
-        fs.gendisk.sync()?;
+        Ok(())
+    }
 
-        return Ok(());
+    /// @brief 把当前长目录项写入磁盘，并建立设备持久化边界
+    ///
+    /// @param fs 对应的文件系统
+    /// @param disk_bytes_offset 长目录项所在位置对应的在分区内的字节偏移量
+    ///
+    /// @return Ok(())
+    /// @return Err(SystemError) 错误码
+    pub fn flush(
+        &self,
+        fs: Arc<FATFileSystem>,
+        gendisk_bytes_offset: u64,
+    ) -> Result<(), SystemError> {
+        self.commit_without_barrier(&fs, gendisk_bytes_offset)?;
+        fs.gendisk.sync()
     }
 }
 
@@ -1364,17 +1385,12 @@ impl ShortDirEntry {
         return result;
     }
 
-    /// # 把当前短目录项写入磁盘
+    /// Submit the directory-sector RMW without issuing a device cache barrier.
     ///
-    /// ## 参数
-    ///
-    /// - fs 对应的文件系统
-    /// - gendisk_bytes_offset 短目录项所在位置对应的在分区内的字节偏移量
-    ///
-    /// # 返回值
-    /// - Ok(())
-    /// - Err(SystemError) 错误码
-    pub fn flush(
+    /// This is intentionally private to the FAT implementation. The RMW is
+    /// complete when this function returns, but power-loss durability still
+    /// requires a later `gendisk.sync()`.
+    fn commit_without_barrier(
         &self,
         fs: &Arc<FATFileSystem>,
         gendisk_bytes_offset: u64,
@@ -1410,9 +1426,26 @@ impl ShortDirEntry {
         // 把修改后的长目录项刷入磁盘
         fs.gendisk.write_at(cursor.as_slice(), lba)?;
 
-        fs.gendisk.sync()?;
+        Ok(())
+    }
 
-        return Ok(());
+    /// # 把当前短目录项写入磁盘，并建立设备持久化边界
+    ///
+    /// ## 参数
+    ///
+    /// - fs 对应的文件系统
+    /// - gendisk_bytes_offset 短目录项所在位置对应的分区内字节偏移量
+    ///
+    /// # 返回值
+    /// - Ok(())
+    /// - Err(SystemError) 错误码
+    pub fn flush(
+        &self,
+        fs: &Arc<FATFileSystem>,
+        gendisk_bytes_offset: u64,
+    ) -> Result<(), SystemError> {
+        self.commit_without_barrier(fs, gendisk_bytes_offset)?;
+        fs.gendisk.sync()
     }
 
     /// @brief 设置短目录项的“第一个簇”字段的值

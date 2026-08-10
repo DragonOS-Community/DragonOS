@@ -2,7 +2,7 @@ use super::vfs::PollableInode;
 use crate::arch::MMArch;
 use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
 use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::InodeMode;
+use crate::filesystem::vfs::{InodeMode, OpenFileBehavior, PostWriteSyncPolicy};
 use crate::filesystem::{
     epoll::{event_poll::EventPoll, EPollEventType, EPollItem},
     vfs::{FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Magic, Metadata, SuperBlock},
@@ -167,6 +167,10 @@ impl PollableInode for EventFdInode {
 }
 
 impl IndexNode for EventFdInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+    }
+
     fn is_stream(&self) -> bool {
         // eventfd 属于典型的不可 seek 的伪文件描述符：
         // - lseek/pread/pwrite 应返回 ESPIPE（Linux 语义）

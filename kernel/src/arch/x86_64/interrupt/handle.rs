@@ -17,6 +17,7 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
         x86_64::registers::segmentation::GS::swap();
     }
 
+    let hardirq_guard = crate::exception::enter_hardirq();
     crate::rcu::irq_enter();
 
     // 由于x86上面，虚拟中断号与物理中断号是一一对应的，所以这里直接使用vector作为中断号来查询irqdesc
@@ -46,6 +47,7 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
     let resume_idle_eqs = !should_schedule
         && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
     let irq_exited_outermost = crate::rcu::irq_exit(resume_idle_eqs);
+    drop(hardirq_guard);
 
     if should_schedule && irq_exited_outermost {
         __schedule(SchedMode::SM_PREEMPT);

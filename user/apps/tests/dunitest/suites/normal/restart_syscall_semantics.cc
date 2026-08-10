@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -110,6 +111,65 @@ TEST(RestartSyscallSemantics, RestartBlockDeliveredHandlerReturnsEintrEvenWithSa
     EXPECT_EQ(-1, restart_ret);
     EXPECT_EQ(EINTR, restart_errno)
         << "stale restart block was consumed after signal handler returned";
+
+    EXPECT_EQ(0, sigaction(SIGUSR1, &old_action, nullptr));
+}
+
+TEST(RestartSyscallSemantics, NanosleepInterruptionReportsRemainingFromOriginalDeadline) {
+    struct sigaction action {};
+    struct sigaction old_action {};
+    action.sa_handler = SignalHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    ASSERT_EQ(0, sigaction(SIGUSR1, &action, &old_action))
+        << "sigaction failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    g_signal_count = 0;
+    SignalAfterArgs args {};
+    args.target = pthread_self();
+    args.signo = SIGUSR1;
+    args.send_result = -1;
+
+    pthread_t sender;
+    ASSERT_EQ(0, pthread_create(&sender, nullptr, SendSignalAfterDelay, &args));
+
+    timespec started {};
+    timespec finished {};
+    ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &started));
+
+    timespec request {};
+    request.tv_sec = 2;
+    timespec remain {};
+    remain.tv_sec = 123;
+    remain.tv_nsec = 456;
+    errno = 0;
+    int ret = nanosleep(&request, &remain);
+    int saved_errno = errno;
+
+    ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &finished));
+    ASSERT_EQ(0, pthread_join(sender, nullptr));
+
+    const int64_t elapsed_ns =
+        (finished.tv_sec - started.tv_sec) * 1000000000LL +
+        (finished.tv_nsec - started.tv_nsec);
+    const int64_t remain_ns =
+        remain.tv_sec * 1000000000LL + remain.tv_nsec;
+
+    EXPECT_EQ(0, args.send_result);
+    EXPECT_EQ(1, g_signal_count);
+    EXPECT_EQ(-1, ret);
+    EXPECT_EQ(EINTR, saved_errno)
+        << "nanosleep returned errno=" << saved_errno << " ("
+        << strerror(saved_errno) << "), remain={" << remain.tv_sec << ", "
+        << remain.tv_nsec << "}";
+    EXPECT_GE(remain.tv_sec, 0);
+    EXPECT_GE(remain.tv_nsec, 0);
+    EXPECT_LT(remain.tv_nsec, 1000000000L);
+    EXPECT_GT(remain_ns, 0);
+    EXPECT_LT(remain_ns, 2000000000LL);
+    EXPECT_GE(elapsed_ns, 0);
+    EXPECT_LT(elapsed_ns, 1500000000LL)
+        << "interrupted nanosleep appears to have restarted the full duration";
 
     EXPECT_EQ(0, sigaction(SIGUSR1, &old_action, nullptr));
 }

@@ -71,7 +71,7 @@ fn do_start_kernel() {
     // 初始化内核命令行参数
     kenrel_cmdline_param_manager().init();
 
-    boot_callback_except_early();
+    boot_callback_except_early().expect("failed to initialize boot parameters");
 
     init_intertrait();
 

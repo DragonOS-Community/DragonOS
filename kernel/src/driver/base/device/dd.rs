@@ -12,7 +12,7 @@ use crate::{
         },
         vfs::InodeMode,
     },
-    libs::wait_queue::WaitQueue,
+    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
 };
 use system_error::SystemError;
 
@@ -23,7 +23,65 @@ use super::{
     Device, DeviceManager,
 };
 
-static PROBE_WAIT_QUEUE: WaitQueue = WaitQueue::default();
+static BINDING_WAIT_QUEUE: WaitQueue = WaitQueue::default();
+static BINDING_GATE: SpinLock<BindingGateState> = SpinLock::new(BindingGateState {
+    blocked: false,
+    active: 0,
+});
+
+#[derive(Debug)]
+struct BindingGateState {
+    blocked: bool,
+    active: usize,
+}
+
+/// Admission ticket for operations which can publish a driver binding.
+///
+/// The gate is global because one probe can register child devices.  Shutdown
+/// must drain all admitted binding operations before it snapshots the reverse
+/// registration order from the devices kset.
+struct BindingTicket;
+
+impl BindingTicket {
+    fn acquire() -> Result<Self, SystemError> {
+        let mut gate = BINDING_GATE.lock();
+        if gate.blocked {
+            return Err(SystemError::ENODEV);
+        }
+        gate.active = gate
+            .active
+            .checked_add(1)
+            .expect("active driver binding count overflow");
+        Ok(Self)
+    }
+}
+
+impl Drop for BindingTicket {
+    fn drop(&mut self) {
+        let wake_waiters = {
+            let mut gate = BINDING_GATE.lock();
+            gate.active = gate
+                .active
+                .checked_sub(1)
+                .expect("active driver binding count underflow");
+            gate.active == 0
+        };
+        if wake_waiters {
+            BINDING_WAIT_QUEUE.wakeup_all(None);
+        }
+    }
+}
+
+/// Permanently reject new bindings and wait for every admitted operation to
+/// finish.  Shutdown is a terminal transition, so no unblock operation is
+/// exposed until DragonOS has suspend/resume probing semantics which need one.
+pub(super) fn block_device_bindings_and_wait() {
+    BINDING_GATE.lock().blocked = true;
+    BINDING_WAIT_QUEUE.wait_until(|| {
+        let gate = BINDING_GATE.lock();
+        (gate.active == 0).then_some(())
+    });
+}
 
 impl DeviceManager {
     /// 尝试把一个设备与一个驱动匹配
@@ -83,7 +141,6 @@ impl DeviceManager {
             if self.device_bind_driver(dev).is_ok() {
                 return Ok(true);
             } else {
-                dev.set_driver(None);
                 return Ok(false);
             }
         } else {
@@ -205,6 +262,37 @@ impl DeviceManager {
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c#496
     pub fn device_bind_driver(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let expected_driver = dev.driver().ok_or(SystemError::ENODEV)?;
+        let lifecycle = self.lifecycle_lock(dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        let result = BindingTicket::acquire().and_then(|_binding_ticket| {
+            let binding_is_current = dev
+                .driver()
+                .is_some_and(|driver| Arc::ptr_eq(&driver, &expected_driver));
+            if dev.is_dead()
+                || self.is_device_removing(dev)
+                || !dev.is_registered()
+                || !binding_is_current
+                || self.device_is_bound(dev)
+            {
+                return Err(SystemError::ENODEV);
+            }
+
+            self.device_bind_driver_locked(dev)
+        });
+        if result.is_err()
+            && !self.device_is_bound(dev)
+            && dev
+                .driver()
+                .is_some_and(|driver| Arc::ptr_eq(&driver, &expected_driver))
+        {
+            dev.set_driver(None);
+        }
+        result
+    }
+
+    fn device_bind_driver_locked(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let r = driver_manager().driver_sysfs_add(dev);
         if r.is_ok() {
             self.device_links_force_bind(dev);
@@ -349,8 +437,15 @@ impl DriverManager {
         driver: &Arc<dyn Driver>,
         device: &Arc<dyn Device>,
     ) -> Result<(), SystemError> {
-        let r = self.do_probe_device(driver, device);
-        PROBE_WAIT_QUEUE.wakeup_all(None);
+        let lifecycle = device_manager().lifecycle_lock(device);
+        let r = {
+            let _lifecycle_guard = lifecycle.lock();
+            let _binding_ticket = BindingTicket::acquire()?;
+            // All eligibility checks in do_probe_device() deliberately happen after taking this
+            // lock.  A concurrent unbind or device removal therefore either runs wholly before
+            // probe starts or waits until really_probe() has committed/rolled back completely.
+            self.do_probe_device(driver, device)
+        };
         return r;
     }
 
@@ -429,6 +524,35 @@ impl DriverManager {
             bind_failed();
             e
         })?;
+
+        // Driver callbacks may publish private resources.  Before publishing the core binding,
+        // verify the device/driver relationship once more at the commit point.  Concurrent core
+        // removal cannot change these fields while the lifecycle lock is held, but this check also
+        // turns an invalid callback-side mutation into a complete rollback instead of allowing a
+        // later driver_bound() unwrap or a ghost binding.
+        let binding_is_current = device
+            .driver()
+            .is_some_and(|bound| Arc::ptr_eq(&bound, driver));
+        if device.is_dead()
+            || device_manager().is_device_removing(device)
+            || !device.is_registered()
+            || !binding_is_current
+        {
+            warn!(
+                "really_probe: device '{}' changed state before binding commit",
+                device.name()
+            );
+
+            // Bus remove resolves the callback through device.driver().  Restore the driver which
+            // performed this probe before invoking rollback so the correct remove callback owns
+            // cleanup even if a broken probe callback altered the field.
+            device.set_driver(Some(Arc::downgrade(driver)));
+            remove_probed_driver();
+            remove_driver_sysfs();
+            sysfs_failed();
+            bind_failed();
+            return Err(SystemError::ENODEV);
+        }
 
         device_manager()
             .add_groups(device, driver.dev_groups())
@@ -606,12 +730,13 @@ impl DriverManager {
 
     fn driver_is_bound(&self, device: &Arc<dyn Device>) -> bool {
         if let Some(driver) = device.driver() {
-            if driver.find_device_by_name(&device.name()).is_some() {
-                return true;
-            }
+            return driver
+                .devices()
+                .iter()
+                .any(|bound| Arc::ptr_eq(bound, device));
         }
 
-        return false;
+        false
     }
 }
 

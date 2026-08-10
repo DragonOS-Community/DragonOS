@@ -160,7 +160,7 @@ pub struct HvmMemmapTableEntry {
 }
 
 /// The E820 types known to the kernel.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum E820Type {
     Ram = 1,

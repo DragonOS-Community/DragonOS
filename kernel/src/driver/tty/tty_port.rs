@@ -42,6 +42,7 @@ struct TtyInputQueue {
     len: usize,
     generation: usize,
     draining: bool,
+    flushing: bool,
 }
 
 impl TtyInputQueue {
@@ -52,6 +53,7 @@ impl TtyInputQueue {
             len: 0,
             generation: 0,
             draining: false,
+            flushing: false,
         }
     }
 
@@ -183,6 +185,20 @@ pub trait TtyPort: Sync + Send + Debug {
         ret
     }
 
+    fn receive_buf_termios_locked(
+        &self,
+        buf: &[u8],
+        _flags: &[u8],
+        count: usize,
+    ) -> Result<usize, SystemError> {
+        let tty = self.port_data().internal_tty().ok_or(SystemError::ENODEV)?;
+        let ld = tty.ldisc();
+        // N_TTY wakes read waiters and epoll when it commits input. Avoid a
+        // nested poll here: poll may try to drain PTY input and reacquire the
+        // termios semaphore already held by the caller.
+        ld.receive_buf2_termios_locked(tty, buf, None, count)
+    }
+
     fn internal_tty(&self) -> Option<Arc<TtyCore>> {
         self.port_data().internal_tty()
     }
@@ -202,6 +218,15 @@ pub trait TtyPort: Sync + Send + Debug {
     fn has_input(&self) -> bool;
 
     fn clear_input(&self) -> usize;
+
+    /// Stop new queue-to-ldisc drains and wait for an in-flight drain to
+    /// finish. The caller must pair this with `finish_input_flush`.
+    fn begin_input_flush(&self);
+
+    /// Clear the queue while an input flush gate is held.
+    fn clear_input_during_flush(&self) -> usize;
+
+    fn finish_input_flush(&self);
 
     fn clear_input_from_receive(&self) -> usize;
 
@@ -300,6 +325,35 @@ impl TtyPort for DefaultTtyPort {
         })
     }
 
+    fn begin_input_flush(&self) {
+        self.input_drain_wq.wait_until(|| {
+            let mut queue = self.input_queue.lock_irqsave();
+            let Some(queue) = queue.as_mut() else {
+                return Some(());
+            };
+            if queue.draining || queue.flushing {
+                return None;
+            }
+            queue.flushing = true;
+            Some(())
+        });
+    }
+
+    fn clear_input_during_flush(&self) -> usize {
+        self.input_queue
+            .lock_irqsave()
+            .as_mut()
+            .map(TtyInputQueue::clear_buffer)
+            .unwrap_or(0)
+    }
+
+    fn finish_input_flush(&self) {
+        if let Some(queue) = self.input_queue.lock_irqsave().as_mut() {
+            queue.flushing = false;
+        }
+        self.input_drain_wq.wakeup_all(None);
+    }
+
     fn clear_input_from_receive(&self) -> usize {
         self.input_queue
             .lock_irqsave()
@@ -316,6 +370,13 @@ impl TtyPort for DefaultTtyPort {
             let Some(queue) = queue.as_mut() else {
                 return Ok(TtyInputDrain::default());
             };
+            if queue.flushing {
+                return Ok(TtyInputDrain {
+                    still_pending: !queue.is_empty(),
+                    blocked: true,
+                    ..TtyInputDrain::default()
+                });
+            }
             let (copied, generation) = queue.copy_front(&mut chunk[..max_count]);
             if copied != 0 {
                 queue.draining = true;

@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -17,8 +17,18 @@ use crate::{
 
 #[derive(Debug)]
 pub struct ProcessSchedulerInfo {
-    /// The CPU the current process is on.
+    /// Runqueue CPU assigned to this task (`task_cpu` in Linux terminology).
+    ///
+    /// This is deliberately not the same thing as `running`: a sleeping task
+    /// keeps its last runqueue CPU, and a task being switched out remains
+    /// physically executing for a short interval after it has left the rq.
     on_cpu: AtomicProcessorId,
+    /// Whether this task is currently executing or is still in the
+    /// switch-out tail on some CPU (`p->on_cpu` in Linux terminology).
+    ///
+    /// A remote wakeup must not enqueue an off-rq task on another CPU until
+    /// this becomes false, otherwise both CPUs can use the same kernel stack.
+    running: AtomicBool,
     /// If the current process is waiting to be migrated to another CPU core
     /// (i.e. PF_NEED_MIGRATE is set in flags), this field stores the target
     /// processor core number.
@@ -105,6 +115,7 @@ impl ProcessSchedulerInfo {
         let cpus_allowed = Self::default_cpus_allowed();
         return Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
+            running: AtomicBool::new(false),
             migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
             state_atomic: AtomicU32::new(ProcessState::Blocked(false).to_u32()),
             pi_lock: SpinLock::new(PiProtected::new(cpus_allowed)),
@@ -140,6 +151,38 @@ impl ProcessSchedulerInfo {
             self.on_cpu.store(cpu_id, Ordering::SeqCst);
         } else {
             self.on_cpu.store(ProcessorId::INVALID, Ordering::SeqCst);
+        }
+    }
+
+    /// Publish that this task is about to become the current task.
+    ///
+    /// Returns false if another CPU still owns the task. Callers hold the
+    /// destination rq lock, so a false result is a scheduler invariant
+    /// violation rather than ordinary contention.
+    pub fn try_mark_running(&self) -> bool {
+        self.running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// Publish completion of the switch-out tail.
+    ///
+    /// Release pairs with `wait_until_not_running()` in the remote wakeup
+    /// path, after the old CPU has stopped using the task's kernel stack and
+    /// released its saved architecture context.
+    pub fn finish_running(&self) {
+        let was_running = self.running.swap(false, Ordering::Release);
+        debug_assert!(was_running, "finishing a task which was not running");
+    }
+
+    /// Wait until a task which has already left its rq has fully switched out.
+    pub fn wait_until_not_running(&self) {
+        while self.running.load(Ordering::Acquire) {
+            core::hint::spin_loop();
         }
     }
 

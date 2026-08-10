@@ -1,5 +1,6 @@
 use crate::driver::net::bridge::BridgeDriver;
 use crate::driver::net::loopback::LoopbackInterface;
+use crate::driver::net::types::InterfaceFlags;
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -21,7 +22,7 @@ use crate::process::ProcessManager;
 use crate::rcu::{RcuArcSlot, RcuOptionArcSlot};
 use crate::time::{Duration, Instant};
 use crate::{
-    driver::net::napi::napi_schedule,
+    driver::net::napi::{napi_is_disabled, napi_schedule, NapiScheduleResult},
     driver::net::Iface,
     process::namespace::{nsproxy::NsCommon, user_namespace::UserNamespace},
 };
@@ -31,9 +32,10 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use ida::IdAllocator;
+use net_poll_state::DueResult;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -181,6 +183,9 @@ struct NetnsPoller {
     poll_pending: AtomicBool,
     /// Topology cleanup wakes the poller without being treated as network I/O.
     cleanup_pending: AtomicBool,
+    /// Monotonic notification sequence for future protocol deadline changes.
+    /// Unlike `poll_pending`, this only requests a timeout rescan.
+    deadline_generation: AtomicU64,
     /// # 轮询线程的 PCB（用于 stop）
     thread: RwSem<Option<Arc<ProcessControlBlock>>>,
 }
@@ -192,6 +197,7 @@ impl NetnsPoller {
             wait_queue: WaitQueue::default(),
             poll_pending: AtomicBool::new(false),
             cleanup_pending: AtomicBool::new(false),
+            deadline_generation: AtomicU64::new(0),
             thread: RwSem::new(None),
         })
     }
@@ -239,6 +245,33 @@ impl NetnsPoller {
         self.wait_queue.wake_all();
     }
 
+    /// Notify the poller that its previously computed timeout may be stale.
+    ///
+    /// This path is NAPI-safe: it only touches atomics and the wait queue.
+    fn notify_deadline_changed(&self) {
+        self.deadline_generation.fetch_add(1, Ordering::AcqRel);
+        self.wait_queue.wake_all();
+    }
+
+    /// Run one bounded batch for an interface without NAPI.
+    ///
+    /// Returns `true` when the interface still reports immediate work. The
+    /// caller must publish another network wake instead of monopolizing this
+    /// netns worker until quiescence.
+    fn poll_direct_batch(iface: &Arc<dyn Iface>) -> bool {
+        const DIRECT_POLL_BATCH: usize = 64;
+
+        for _ in 0..DIRECT_POLL_BATCH {
+            if !iface.flags().contains(InterfaceFlags::UP) {
+                return false;
+            }
+            if !iface.poll() {
+                return false;
+            }
+        }
+        true
+    }
+
     fn polling(&self) {
         let mut cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
         let mut cleanup_retry_at = None;
@@ -256,8 +289,8 @@ impl NetnsPoller {
             };
 
             let nsid = netns.ns_common.nsid.data();
-            let now_us = Instant::now().total_micros() as u64;
-            if cleanup_retry_at.is_none_or(|deadline| now_us >= deadline) {
+            let cleanup_now_us = Instant::now().total_micros() as u64;
+            if cleanup_retry_at.is_none_or(|deadline| cleanup_now_us >= deadline) {
                 match netns.cleanup_packet_sockets() {
                     PacketSocketCleanupResult::Complete => {
                         cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
@@ -269,7 +302,7 @@ impl NetnsPoller {
                     }
                     PacketSocketCleanupResult::AllocationFailed => {
                         cleanup_retry_at =
-                            Some(now_us.saturating_add(cleanup_retry_delay.total_micros()));
+                            Some(cleanup_now_us.saturating_add(cleanup_retry_delay.total_micros()));
                         cleanup_retry_delay = Duration::from_micros(core::cmp::min(
                             cleanup_retry_delay.total_micros().saturating_mul(2),
                             PACKET_SOCKET_CLEANUP_RETRY_MAX.total_micros(),
@@ -278,42 +311,75 @@ impl NetnsPoller {
                 }
             }
 
-            // 处理“已到期的定时事件”：到期则 schedule NAPI 推进一次。
-            // 同时计算下一次最早到期时间点，用于设置 sleep 超时。
+            // Cleanup may wait on packet-socket ownership. Deadline
+            // classification and timeout calculation must use a fresh clock
+            // sample so time spent there cannot postpone an already-due TCP
+            // timer by one additional timeout interval.
+            let observed_generation = self.deadline_generation.load(Ordering::Acquire);
+            let deadline_now_us = Instant::now().total_micros() as u64;
+
+            // Classify and atomically claim due protocol deadlines. The
+            // device-list lock is only used for topology lookup; no direct
+            // protocol poll or yield is performed while it is held.
             let mut next_us = cleanup_retry_at;
-            let mut had_due = false;
-            for (_, iface) in netns.device_list.read().iter() {
-                if let Some(us) = iface.common().poll_at_us() {
-                    if us <= now_us {
-                        had_due = true;
-                        if let Some(napi) = iface.napi_struct() {
-                            napi_schedule(napi);
-                        } else {
-                            // 兜底：若未配置 NAPI，则仍调用一次 poll 推进（可能无界）。
-                            let _ = iface.poll();
-                        }
+            let mut direct_due = Vec::new();
+            {
+                let devices = netns.device_list.read();
+                for (_, iface) in devices.iter() {
+                    if !iface.flags().contains(InterfaceFlags::UP) {
                         continue;
                     }
 
-                    next_us = Some(match next_us {
-                        Some(cur) => core::cmp::min(cur, us),
-                        None => us,
-                    });
+                    let napi = iface.napi_struct();
+                    if napi.as_deref().is_some_and(napi_is_disabled) {
+                        continue;
+                    }
+
+                    match iface.common().classify_poll_deadline(deadline_now_us) {
+                        DueResult::Disarmed => {}
+                        DueResult::Future(us) => {
+                            next_us = Some(match next_us {
+                                Some(cur) => core::cmp::min(cur, us),
+                                None => us,
+                            });
+                        }
+                        DueResult::Claimed(claimed_us) => match napi {
+                            Some(napi) => match napi_schedule(napi) {
+                                NapiScheduleResult::Accepted => {}
+                                NapiScheduleResult::Disabled | NapiScheduleResult::Detached => {
+                                    iface.common().restore_poll_deadline(claimed_us);
+                                }
+                            },
+                            None => direct_due.push((iface.clone(), claimed_us)),
+                        },
+                    }
                 }
             }
 
-            // sleep 超时：
-            // - 若刚处理了 due timer：小睡一会儿，避免在 NAPI 尚未推进/更新时间戳前重复 schedule 形成忙等
-            // - 否则按最早 deadline 精确睡眠
-            let timeout = if had_due {
-                Some(Duration::from_micros(200))
-            } else {
-                next_us.map(|us| {
-                    let delta = us.saturating_sub(now_us);
-                    Duration::from_micros(core::cmp::max(1, delta))
-                })
-            };
+            if !direct_due.is_empty() {
+                drop(netns);
+                for (iface, claimed_us) in direct_due {
+                    if !iface.flags().contains(InterfaceFlags::UP) {
+                        iface.common().restore_poll_deadline(claimed_us);
+                        continue;
+                    }
+                    if Self::poll_direct_batch(&iface) {
+                        self.notify_network();
+                    }
+                }
+                // A direct poll may have published a new future deadline.
+                // Rescan from a fresh generation snapshot before sleeping.
+                continue;
+            }
 
+            // Scheduling due interfaces can contend on device-side locks and
+            // a namespace may contain many interfaces. Re-sample immediately
+            // before sleeping so scan time is not added to the next deadline.
+            let sleep_now_us = Instant::now().total_micros() as u64;
+            let timeout = next_us.map(|us| {
+                let delta = us.saturating_sub(sleep_now_us);
+                Duration::from_micros(core::cmp::max(1, delta))
+            });
             log::trace!(
                 "netns scheduler sleep: nsid={} timeout_us={:?}",
                 nsid,
@@ -326,44 +392,53 @@ impl NetnsPoller {
             // 等待事件唤醒（IRQ/lo Tx 等）或 timeout（smoltcp timer deadline）。
             // Keep cleanup and network wake reasons separate: only the latter
             // should schedule interface NAPI below.
-            let woke_by_event = match self.wait_queue.wait_event_uninterruptible_timeout(
+            match self.wait_queue.wait_event_uninterruptible_timeout(
                 || {
                     self.poll_pending.load(Ordering::Acquire)
                         || self.cleanup_pending.load(Ordering::Acquire)
+                        || self.deadline_generation.load(Ordering::Acquire) != observed_generation
                 },
                 timeout,
             ) {
-                Ok(()) => true,
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => false,
+                Ok(()) | Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {}
                 Err(e) => {
                     log::warn!("netns scheduler sleep error: {:?}", e);
-                    false
                 }
+            }
+
+            let network_pending = self.poll_pending.swap(false, Ordering::AcqRel);
+            self.cleanup_pending.swap(false, Ordering::AcqRel);
+            if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
+                break;
+            }
+            if !network_pending {
+                continue;
+            }
+
+            let netns = match self.netns.upgrade() {
+                Some(netns) => netns,
+                None => break,
             };
-
-            if woke_by_event {
-                let network_pending = self.poll_pending.swap(false, Ordering::AcqRel);
-                self.cleanup_pending.store(false, Ordering::Release);
-                if KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
-                    break;
-                }
-                if !network_pending {
-                    continue;
-                }
-                let netns = match self.netns.upgrade() {
-                    Some(netns) => netns,
-                    None => {
-                        break;
+            let mut direct_poll = Vec::new();
+            {
+                let devices = netns.device_list.read();
+                // Event-driven work is scheduled once; NAPI performs bounded
+                // polling and records concurrent requests through MISSED.
+                for (_, iface) in devices.iter() {
+                    if !iface.flags().contains(InterfaceFlags::UP) {
+                        continue;
                     }
-                };
-
-                // 事件驱动：尽量只 schedule 一次即可，由 NAPI 线程以 bounded poll 推进。
-                for (_, iface) in netns.device_list.read().iter() {
                     if let Some(napi) = iface.napi_struct() {
                         napi_schedule(napi);
                     } else {
-                        let _ = iface.poll();
+                        direct_poll.push(iface.clone());
                     }
+                }
+            }
+            drop(netns);
+            for iface in direct_poll {
+                if Self::poll_direct_batch(&iface) {
+                    self.notify_network();
                 }
             }
         }
@@ -928,6 +1003,7 @@ impl NetNamespace {
         device.set_net_namespace(self.self_ref.upgrade().unwrap());
 
         self.device_list_mut().insert(device.nic_id(), device);
+        self.notify_deadline_changed();
 
         // log::info!(
         //     "Network device added to namespace count: {:?}",
@@ -936,6 +1012,9 @@ impl NetNamespace {
     }
 
     pub fn remove_device(&self, nic_id: &usize) {
+        // Teardown helper only: the caller must quiesce IRQ, DMA, and NAPI
+        // before removing an active device. Runtime hot-remove is not provided
+        // by this API.
         let removed = self.device_list_mut().remove(nic_id);
         if removed.is_none() {
             return;
@@ -945,6 +1024,7 @@ impl NetNamespace {
             .clear_if_deferred(|current| current.iface.nic_id() == *nic_id);
         self.loopback_iface
             .clear_if_deferred(|current| current.nic_id() == *nic_id);
+        self.notify_deadline_changed();
     }
 
     pub fn insert_bridge(&self, bridge: Arc<BridgeDriver>) {
@@ -967,6 +1047,12 @@ impl NetNamespace {
             }
             log::trace!("netns: wakeup_poll_thread: woken={}", woken);
         }
+    }
+
+    /// Request a deadline-only timeout rescan without treating it as immediate
+    /// network I/O. Safe to call after dropping smoltcp and topology locks.
+    pub fn notify_deadline_changed(&self) {
+        self.poller.notify_deadline_changed();
     }
 
     fn create_polling_thread(netns: Arc<Self>, name: String) {

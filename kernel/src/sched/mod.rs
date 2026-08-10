@@ -1208,14 +1208,11 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
                 "current task migration target {:?} must be online",
                 dest_cpu
             );
-            debug_assert!(
-                prev.sched_info()
-                    .cpus_allowed()
-                    .get(dest_cpu)
-                    .unwrap_or(false),
-                "current task migration target {:?} must be allowed by affinity",
-                dest_cpu
-            );
+            // Do not read cpus_allowed under rq_lock: sched_setaffinity uses
+            // pi_lock -> rq_lock. The switch tail, after releasing this rq,
+            // revalidates the destination under pi_lock immediately before
+            // enqueue and therefore closes concurrent affinity changes
+            // without introducing rq_lock -> pi_lock inversion here.
 
             rq.deactivate_task(
                 prev.clone(),
@@ -1247,6 +1244,10 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     if likely(!Arc::ptr_eq(&prev, &next)) {
         crate::process::rseq::Rseq::on_preempt(&prev);
 
+        assert!(
+            next.sched_info().try_mark_running(),
+            "scheduler selected a task which is still running on another CPU"
+        );
         rq.set_current(Arc::downgrade(&next));
         compiler_fence(Ordering::SeqCst);
         account_context_switch();
@@ -1354,6 +1355,10 @@ pub fn enqueue_task_on_cpu(
     wake_flags: WakeupFlags,
     was_uninterruptible: bool,
 ) {
+    assert!(
+        !pcb.sched_info().is_running(),
+        "cannot enqueue a task before its previous switch-out completes"
+    );
     __set_task_cpu(pcb, target_cpu);
     pcb.sched_info().set_on_cpu(Some(target_cpu));
 
@@ -1425,6 +1430,7 @@ pub fn request_task_migration(
         pcb.sched_info().set_on_cpu(None);
         drop(_guard);
 
+        pcb.sched_info().wait_until_not_running();
         enqueue_task_on_cpu(pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
         return Ok(());
     }

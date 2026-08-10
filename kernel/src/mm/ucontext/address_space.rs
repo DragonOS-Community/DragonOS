@@ -55,16 +55,153 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    /// Populate pages after a VMA operation has committed.
+    ///
+    /// A file fault may return `VM_FAULT_RETRY` with a wait token.  The token
+    /// is specifically a request to drop `AddressSpace::write()` before
+    /// blocking, so this routine owns the guard and reacquires it after every
+    /// retry.  Do not move this loop back into `InnerAddressSpace`: doing so
+    /// would turn a normal PageCache invalidation conflict into a false
+    /// population failure or recreate the mmap/writeback lock cycle.
+    fn populate_range_post_commit(
+        self: &Arc<Self>,
+        start: VirtAddr,
+        len: usize,
+        force_fault_in_missing: bool,
+        locked_vmas_only: bool,
+        expected_vma: Option<Weak<LockedVMA>>,
+    ) -> Result<(), SystemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = start
+            .data()
+            .checked_add(len)
+            .filter(|end| *end <= MMArch::USER_END_VADDR.data())
+            .ok_or(SystemError::EINVAL)?;
+        if !start.check_aligned(MMArch::PAGE_SIZE) || !len.is_multiple_of(MMArch::PAGE_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut addr = start;
+        let mut retried = false;
+        while addr.data() < end {
+            let retry_wait = {
+                let mut guard = self.write();
+                let Some(vma) = guard.mappings.contains(addr) else {
+                    addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
+                    retried = false;
+                    continue;
+                };
+                if let Some(expected_vma) = expected_vma.as_ref() {
+                    let Some(expected_vma) = expected_vma.upgrade() else {
+                        return Ok(());
+                    };
+                    if !Arc::ptr_eq(&vma, &expected_vma) {
+                        return Ok(());
+                    }
+                }
+                let vm_flags = *vma.lock().vm_flags();
+                if vm_flags.is_mlock_population_unsupported()
+                    || (locked_vmas_only && !vm_flags.contains(VmFlags::VM_LOCKED))
+                {
+                    addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
+                    retried = false;
+                    continue;
+                }
+
+                if guard.user_mapper.utable.translate(addr).is_some() {
+                    if vm_flags.contains(VmFlags::VM_LOCKED) {
+                        guard.add_present_page_mlock_ref(addr, &vma);
+                    }
+                    addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
+                    retried = false;
+                    continue;
+                }
+
+                let fault_in_missing = force_fault_in_missing
+                    || (vm_flags.contains(VmFlags::VM_LOCKED)
+                        && !vm_flags.contains(VmFlags::VM_LOCKONFAULT));
+                if !fault_in_missing {
+                    addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
+                    retried = false;
+                    continue;
+                }
+
+                let mut fault_flags = InnerAddressSpace::mlock_fault_flags(vm_flags)
+                    .ok_or(SystemError::ENOMEM)?
+                    | FaultFlags::FAULT_FLAG_ALLOW_RETRY
+                    | FaultFlags::FAULT_FLAG_KILLABLE;
+                if retried {
+                    fault_flags |= FaultFlags::FAULT_FLAG_TRIED;
+                }
+                let outcome = unsafe {
+                    let message = PageFaultMessage::new(
+                        vma,
+                        addr,
+                        fault_flags,
+                        &mut guard.user_mapper.utable,
+                        self.clone(),
+                    );
+                    PageFaultHandler::handle_mm_fault(message)
+                };
+
+                if outcome.reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+                    addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
+                    retried = false;
+                    continue;
+                }
+                if outcome.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
+                    outcome.retry_wait
+                } else if outcome.reason.contains(VmFaultReason::VM_FAULT_OOM) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                } else {
+                    return Err(SystemError::ENOMEM);
+                }
+            };
+
+            // The write guard above is out of scope here.  This is the
+            // required fault-retry boundary: a writeback snapshot holding a
+            // PageCache invalidation read guard may now acquire the mm read
+            // side and complete before this population retry blocks.
+            if let Some(wait) = retry_wait {
+                wait.wait()?;
+            } else {
+                // A legacy retry (for example, a changed backing index) has
+                // no blocking predicate.  The guard is still released, and
+                // yielding prevents this post-commit best-effort path from
+                // monopolizing a CPU while it revalidates the VMA.
+                crate::sched::sched_yield();
+            }
+            retried = true;
+        }
+        Ok(())
+    }
+
     /// Populate a range after mlock flags have been committed and the commit
-    /// guard released.  Reservation waits happen without holding the mm guard.
+    /// guard released.  Holes created after the commit are skipped, matching
+    /// Linux's post-commit `__mm_populate()` behavior.
     pub fn populate_mlock_range_post_commit(
         self: &Arc<Self>,
         start: VirtAddr,
         len: usize,
     ) -> Result<(), SystemError> {
-        let region = VirtRegion::new(start, len);
-        let mut guard = self.write_guard_no_reservation_conflict(region);
-        guard.populate_mlock_range_post_commit(start, len)
+        self.populate_range_post_commit(start, len, false, true, None)
+    }
+
+    /// Execute a population request produced by a low-level anonymous mapping
+    /// operation after the caller has dropped `AddressSpace::write()`.
+    pub(crate) fn populate_locked_vma_post_commit(
+        self: &Arc<Self>,
+        request: LockedPopulationRequest,
+    ) -> Result<(), SystemError> {
+        self.populate_range_post_commit(
+            request.region.start(),
+            request.region.size(),
+            false,
+            true,
+            Some(request.expected_vma),
+        )
     }
 
     /// Best-effort post-commit population for mlockall(MCL_CURRENT).
@@ -72,8 +209,24 @@ impl AddressSpace {
         // Do not wait for reservations created after the mlockall commit.
         // They are not part of MCL_CURRENT's committed VMA set and a blocking
         // file mmap must not indefinitely delay this best-effort phase.
-        let mut guard = self.write();
-        guard.populate_mlockall_post_commit();
+        let ranges = {
+            let guard = self.read();
+            guard
+                .mappings
+                .iter_vmas()
+                .filter_map(|vma| {
+                    let vma_guard = vma.lock();
+                    vma_guard
+                        .vm_flags()
+                        .contains(VmFlags::VM_LOCKED)
+                        .then_some(*vma_guard.region())
+                })
+                .collect::<Vec<_>>()
+        };
+        for region in ranges {
+            let _ =
+                self.populate_range_post_commit(region.start(), region.size(), false, true, None);
+        }
     }
 
     pub fn new(create_stack: bool) -> Result<Arc<Self>, SystemError> {
@@ -424,8 +577,34 @@ impl AddressSpace {
                     return Err(failure.err);
                 }
             };
+            // A normal lazy anonymous mmap has no post-commit work. Do not
+            // feed it into the per-page population engine: doing so turns a
+            // large mapping into one AddressSpace::write() acquisition per
+            // page. Capture identity only for MAP_POPULATE or an inherited /
+            // explicit locked mapping, both of which genuinely need the
+            // post-commit pass.
+            let population_vma = guard
+                .mappings
+                .contains(page.virt_address())
+                .and_then(|vma| {
+                    let needs_population = map_flags.contains(MapFlags::MAP_POPULATE)
+                        || vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
+                    needs_population.then(|| Arc::downgrade(&vma))
+                });
             drop(guard);
             InnerAddressSpace::notify_close_notifications(notifications);
+            // Page faults may need to drop and reacquire the address-space
+            // write guard.  Keep post-map population at this outer boundary;
+            // `InnerAddressSpace` cannot honor VM_FAULT_RETRY safely.
+            if let Some(expected_vma) = population_vma {
+                let _ = self.populate_range_post_commit(
+                    page.virt_address(),
+                    len,
+                    map_flags.contains(MapFlags::MAP_POPULATE),
+                    false,
+                    Some(expected_vma),
+                );
+            }
             return Ok(page);
         }
     }
@@ -834,6 +1013,12 @@ impl AddressSpace {
             } else {
                 0
             };
+            // Preserve the identity of the VMA just committed.  MAP_POPULATE
+            // must not fault a later MAP_FIXED replacement after a retry
+            // releases the address-space write guard.
+            let post_commit_population = (map_flags.contains(MapFlags::MAP_POPULATE)
+                || vm_flags.contains(VmFlags::VM_LOCKED))
+            .then(|| Arc::downgrade(&new_vma));
 
             if let Err(err) = guard.mappings.commit_reserved_vma(reservation_id, new_vma) {
                 let sysv_to_close = if sysv_opened { sysv_shm.clone() } else { None };
@@ -850,6 +1035,15 @@ impl AddressSpace {
             reservation.disarm();
             drop(guard);
             self.wake_reservation_waiters();
+            if let Some(expected_vma) = post_commit_population {
+                let _ = self.populate_range_post_commit(
+                    region.start(),
+                    region.size(),
+                    map_flags.contains(MapFlags::MAP_POPULATE),
+                    false,
+                    Some(expected_vma),
+                );
+            }
             return Ok(page);
         }
     }
@@ -1037,8 +1231,18 @@ impl AddressSpace {
                 vm_flags,
             ) {
                 Ok(outcome) => {
+                    let post_commit_population = outcome.post_commit_population;
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(outcome.notifications);
+                    if let Some((region, expected_vma)) = post_commit_population {
+                        let _ = self.populate_range_post_commit(
+                            region.start(),
+                            region.size(),
+                            false,
+                            true,
+                            Some(expected_vma),
+                        );
+                    }
                     return Ok(outcome.addr);
                 }
                 Err(failure) if failure.err == SystemError::EAGAIN_OR_EWOULDBLOCK => {
@@ -1107,8 +1311,26 @@ impl AddressSpace {
             }
 
             unsafe {
-                guard.set_brk(new_brk).ok();
-                return Ok(guard.sbrk(0).unwrap().data());
+                match guard.set_brk(new_brk) {
+                    Ok(outcome) => {
+                        let current_brk = guard.brk.data();
+                        let post_commit_population = outcome.post_commit_population;
+                        drop(guard);
+                        if let Some((region, expected_vma)) = post_commit_population {
+                            let _ = self.populate_range_post_commit(
+                                region.start(),
+                                region.size(),
+                                false,
+                                true,
+                                Some(expected_vma),
+                            );
+                        }
+                        return Ok(current_brk);
+                    }
+                    // Linux brk(2) reports the current break, rather than an
+                    // errno, when its requested growth cannot be committed.
+                    Err(_) => return Ok(guard.brk.data()),
+                }
             }
         }
     }
@@ -1142,7 +1364,20 @@ impl AddressSpace {
                 }
             }
 
-            return unsafe { guard.sbrk(incr) };
+            let outcome = unsafe { guard.sbrk(incr) }?;
+            let post_commit_population = outcome.post_commit_population;
+            let old_brk = outcome.old_brk;
+            drop(guard);
+            if let Some((region, expected_vma)) = post_commit_population {
+                let _ = self.populate_range_post_commit(
+                    region.start(),
+                    region.size(),
+                    false,
+                    true,
+                    Some(expected_vma),
+                );
+            }
+            return Ok(old_brk);
         }
     }
 

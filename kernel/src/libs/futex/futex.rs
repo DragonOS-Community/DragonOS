@@ -366,9 +366,10 @@ impl Futex {
         // 创建超时计时器任务
         let mut timer = None;
         if let Some(time) = abs_time {
-            let sec = time.tv_sec;
-            let nsec = time.tv_nsec;
-            let total_us = (nsec / 1000 + sec * 1_000_000) as u64;
+            if !time.is_valid_timeout() {
+                return Err(SystemError::EINVAL);
+            }
+            let total_us = time.to_ktime_ns().div_ceil(1000);
 
             // 如果超时时间为0，直接返回ETIMEDOUT
             if total_us == 0 {

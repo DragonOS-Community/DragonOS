@@ -47,9 +47,15 @@ use crate::{
 };
 
 pub use self::inode_lifecycle::{EvictionEpoch, InodeRetentionKind, InodeRetentionState};
-pub use self::{file::FilePrivateData, mount::MountFS};
+pub use self::{
+    file::{
+        DelegatedWriteResult, FilePrivateData, OpenFileBehavior, PostWriteSyncPolicy,
+        WriteSyncIntent,
+    },
+    mount::MountFS,
+};
 use self::{
-    file::{FileFlags, FileMode, PreopenedFile},
+    file::{FileFlags, PreopenedFile},
     utils::DName,
     vcore::generate_inode_id,
 };
@@ -312,6 +318,17 @@ pub enum SpecialNodeData {
     BlockDevice(Arc<dyn BlockDevice>),
     /// 指向其他 inode 的引用（用于 /proc/self/fd/N 这种魔法链接）
     Reference(Arc<dyn IndexNode>),
+    /// A magic-link target that belongs to the producer's inner filesystem
+    /// and must retain that filesystem's mount projection.
+    ///
+    /// `MountFSInode` consumes this variant and wraps the raw target in an
+    /// anonymous dentry. Raw filesystem walks follow it like `Reference`.
+    MountProjectedReference {
+        target: Arc<dyn IndexNode>,
+        /// Stable identity rendered by `/proc/<pid>/fd/<fd>` for the
+        /// anonymous target (for example, `uts:[4026531838]`).
+        dname: utils::DName,
+    },
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -423,6 +440,15 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         // Default implementation: not supported
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Remove fasync state during final open-file-description release.
+    fn release_fasync(
+        &self,
+        _file: &file::File,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 }
@@ -580,12 +606,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(())
     }
 
-    /// Adjust per-open file mode bits after `open()` initialized private data.
-    ///
-    /// This models Linux helpers such as `nonseekable_open()` and
-    /// `stream_open()` without making VFS syscalls know filesystem-specific
-    /// protocol flags.
-    fn adjust_file_mode_after_open(&self, _data: &FilePrivateData, _mode: &mut FileMode) {}
+    /// Select per-open mode and write-operation behavior after `open()` has
+    /// initialized private data.
+    fn configure_open_file(&self, _data: &FilePrivateData, _behavior: &mut OpenFileBehavior) {}
 
     /// @brief 关闭文件
     ///
@@ -696,6 +719,20 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Execute a write whose selected operation owns any required post-write
+    /// synchronization. Only inodes selecting `PostWriteSyncPolicy::Delegated`
+    /// may use this entry point.
+    fn write_at_with_sync(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _sync_intent: WriteSyncIntent,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache
@@ -1042,8 +1079,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: usize,
         _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        // Match Linux vfs_ioctl(): a file without an ioctl handler does not
+        // support the command. sys_ioctl translates this internal error to
+        // the userspace-visible ENOTTY.
+        Err(SystemError::ENOIOCTLCMD)
     }
 
     /// @brief 获取inode所在的文件系统的指针
@@ -1739,7 +1778,15 @@ impl dyn IndexNode {
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
-                if let Some(SpecialNodeData::Reference(target_inode)) = inode.special_node() {
+                let magic_target = match inode.special_node() {
+                    Some(SpecialNodeData::Reference(target_inode))
+                    | Some(SpecialNodeData::MountProjectedReference {
+                        target: target_inode,
+                        ..
+                    }) => Some(target_inode),
+                    _ => None,
+                };
+                if let Some(target_inode) = magic_target {
                     if ownership.is_some() {
                         ownership = Some(utils::ResolvedPath::new(target_inode.clone())?);
                     }

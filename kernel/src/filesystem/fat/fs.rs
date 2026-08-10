@@ -16,9 +16,10 @@ use log::error;
 use lru::LruCache;
 use system_error::SystemError;
 
-use crate::driver::base::block::gendisk::GenDisk;
+use crate::driver::base::block::gendisk::{GenDisk, GenDiskMountGuard};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::page_cache::{AsyncPageCacheBackend, PageCache};
+use crate::filesystem::vfs::mount::filesystem_is_synchronous;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
@@ -94,6 +95,8 @@ impl Eq for Cluster {}
 pub struct FATFileSystem {
     /// 当前文件系统所在的分区
     pub gendisk: Arc<GenDisk>,
+    /// Prevents loop clear/remove for the complete filesystem lifetime.
+    _device_mount_holder: GenDiskMountGuard,
     /// 当前文件系统的BOPB
     pub bpb: BiosParameterBlock,
     /// 当前文件系统的第一个数据扇区（相对分区开始位置）
@@ -104,6 +107,13 @@ pub struct FATFileSystem {
     root_inode: Arc<LockedFATInode>,
     /// FAT表查询缓存（LRU）
     fat_cache: Mutex<LruCache<ClusterID, ClusterID>>,
+    /// Serialize FAT chain allocation and release.
+    ///
+    /// Selecting a free cluster and publishing it in the FAT must be one
+    /// filesystem-wide transaction.  Per-inode locking is insufficient
+    /// because writeback for different files can run concurrently and select
+    /// the same free entry.  This mirrors Linux's `msdos_sb_info::fat_lock`.
+    fat_lock: Mutex<()>,
     /// 目录项扇区读-改-写串行化锁。
     ///
     /// FAT 的 `ShortDirEntry`/`LongDirEntry` 只占 32 字节，而底层 gendisk 的写入粒度是
@@ -690,6 +700,7 @@ impl FATFileSystem {
     }
 
     pub fn new(gendisk: Arc<GenDisk>) -> Result<Arc<FATFileSystem>, SystemError> {
+        let device_mount_holder = gendisk.acquire_mount_holder()?;
         let bpb = BiosParameterBlock::new(&gendisk)?;
         // 从磁盘上读取FAT32文件系统的FsInfo结构体
         let fs_info: FATFsInfo = match bpb.fat_type {
@@ -765,6 +776,7 @@ impl FATFileSystem {
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
             gendisk,
+            _device_mount_holder: device_mount_holder,
             bpb,
             first_data_sector,
             fs_info: Arc::new(LockedFATFsInfo::new(fs_info)),
@@ -772,6 +784,7 @@ impl FATFileSystem {
             fat_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(FAT_LRU_CACHE_SIZE).unwrap(),
             )),
+            fat_lock: Mutex::new(()),
             dirent_io_lock: Mutex::new(()),
         });
 
@@ -1044,6 +1057,7 @@ impl FATFileSystem {
     /// @return Ok(Cluster) 新获取的空闲簇
     /// @return Err(SystemError) 错误码
     pub fn allocate_cluster(&self, prev_cluster: Option<Cluster>) -> Result<Cluster, SystemError> {
+        let _fat_guard = self.fat_lock.lock();
         let end_cluster: Cluster = self.max_cluster_number();
         let start_cluster: Cluster = match self.bpb.fat_type {
             FATType::FAT32(_) => {
@@ -1080,6 +1094,11 @@ impl FATFileSystem {
             // debug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
             self.set_entry(prev_cluster, FATEntry::Next(free_cluster))?;
         }
+        // The cluster is now reserved and linked, so another allocator cannot
+        // select it.  Do not serialize data-area zeroing behind the FAT
+        // metadata lock; callers already hold the owning inode lock until this
+        // initialization completes.
+        drop(_fat_guard);
         // 清空新获取的这个簇
         self.zero_cluster(free_cluster)?;
         return Ok(free_cluster);
@@ -1089,17 +1108,15 @@ impl FATFileSystem {
     ///
     /// @param start_cluster 簇链的第一个簇
     pub fn deallocate_cluster_chain(&self, start_cluster: Cluster) -> Result<(), SystemError> {
+        let _fat_guard = self.fat_lock.lock();
         let clusters: Vec<Cluster> = self.clusters(start_cluster);
         for c in clusters {
-            self.deallocate_cluster(c)?;
+            self.deallocate_cluster_locked(c)?;
         }
         return Ok(());
     }
 
-    /// @brief 释放簇
-    ///
-    /// @param 要释放的簇
-    pub fn deallocate_cluster(&self, cluster: Cluster) -> Result<(), SystemError> {
+    fn deallocate_cluster_locked(&self, cluster: Cluster) -> Result<(), SystemError> {
         let entry: FATEntry = self.get_fat_entry(cluster)?;
         // 如果不是坏簇
         if entry != FATEntry::Bad {
@@ -1871,18 +1888,9 @@ impl IndexNode for LockedFATInode {
     fn sync_file(
         &self,
         datasync: bool,
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        match self.metadata()?.file_type {
-            FileType::File | FileType::Dir => {
-                if datasync {
-                    self.datasync()
-                } else {
-                    self.sync()
-                }
-            }
-            _ => Err(SystemError::EINVAL),
-        }
+        self.sync_file_range(0, usize::MAX, datasync, data)
     }
 
     fn sync_file_range(
@@ -1892,19 +1900,38 @@ impl IndexNode for LockedFATInode {
         _datasync: bool,
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        match self.metadata()?.file_type {
-            FileType::File | FileType::Dir => {
-                if let Some(page_cache) = self.page_cache() {
-                    let start_index = start >> MMArch::PAGE_SHIFT;
-                    let end_index = end >> MMArch::PAGE_SHIFT;
-                    page_cache
-                        .manager()
-                        .writeback_range(start_index, end_index)?;
-                }
-                Ok(())
-            }
-            _ => Err(SystemError::EINVAL),
+        let (file_type, page_cache, fs) = {
+            let inode = self.0.lock();
+            (
+                inode.metadata.file_type,
+                inode.page_cache.clone(),
+                inode.fs.upgrade().ok_or(SystemError::EIO)?,
+            )
+        };
+
+        if !matches!(file_type, FileType::File | FileType::Dir) {
+            return Err(SystemError::EINVAL);
         }
+
+        if let Some(page_cache) = page_cache {
+            let start_index = start >> MMArch::PAGE_SHIFT;
+            let end_index = end >> MMArch::PAGE_SHIFT;
+            // writeback_range() is synchronous: it submits and waits for the
+            // selected dirty pages, propagating submission/writeback errors.
+            // FATFile::write()/ensure_len() also submits the FAT chain and
+            // short direntry updates needed to make an extended file
+            // reachable before this call returns.
+            page_cache
+                .manager()
+                .writeback_range(start_index, end_index)?;
+        }
+
+        // FAT cannot safely omit size/cluster metadata for fdatasync, so both
+        // fsync and fdatasync share this final power-loss durability boundary.
+        // Do not move this barrier into page writeback: a single file-level
+        // sync must cover the related data, FAT chain, and directory entry,
+        // and the device flush error must be visible to the caller.
+        fs.gendisk.sync()
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -2139,6 +2166,19 @@ impl IndexNode for LockedFATInode {
                             remain_size -= write_size;
                             offset += write_size;
                         }
+                        // Unlike ordinary/O_SYNC writes, resize and mode-0
+                        // fallocate do not pass through File post-write sync.
+                        // Match Linux fat_cont_expand() only for IS_SYNC.
+                        guard.synchronize_metadata();
+                        guard.metadata.size = len as i64;
+                        let inode_sync = guard.metadata.flags.contains(InodeFlags::S_SYNC);
+                        let fs = fs.clone();
+                        drop(guard);
+                        let mounted_fs: Arc<dyn FileSystem> = fs.clone();
+                        if inode_sync || filesystem_is_synchronous(&mounted_fs) {
+                            fs.gendisk.sync()?;
+                        }
+                        return Ok(());
                     }
                     Ordering::Less => {
                         guard.metadata.size = len as i64;
@@ -2163,10 +2203,6 @@ impl IndexNode for LockedFATInode {
                         }
                     }
                 }
-                // 同步元数据：从文件对象获取最新大小，并确保一致
-                guard.synchronize_metadata();
-                guard.metadata.size = len as i64;
-                return Ok(());
             }
             FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
             FATDirEntry::UnInit => {

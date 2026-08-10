@@ -3,15 +3,18 @@
 demo/gtest_demo
 normal/capability
 normal/fdatasync
+normal/loop_semantics
 normal/getrandom_bit_distribution
 normal/ext4_xattr
 normal/ext4_inode_identity
 normal/fat_statfs
+normal/fat_concurrent_allocation
 normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock
 normal/fcntl_signal
 normal/epoll_timeout_budget
+normal/epoll_ctl_wait_concurrency
 normal/devpts_dir_read
 normal/debugfs_mount
 normal/fuse_stats_debugfs
@@ -37,6 +40,8 @@ normal/rcu_selftest
 normal/kthread_selftest
 normal/restart_syscall_semantics
 normal/errseq_selftest
+normal/timekeeping_semantics
+normal/timekeeping_selftest
 normal/errseq_writeback_reporting
 normal/test_tlb_shootdown
 normal/pid_namespace_fork
@@ -68,6 +73,7 @@ normal/wait_rusage
 normal/sysfs_cgroup2_mount
 normal/devfs_ptmx_unlink
 normal/devtmpfs_semantics
+normal/dma_allocator_selftest
 normal/mknod_socket
 normal/pmem_block
 normal/page_cache_accounting
@@ -84,3 +90,5 @@ normal/af_packet_sockopt
 normal/af_packet_ring
 normal/af_packet_e2e
 normal/af_packet_mcast
+normal/rtnetlink_link_semantics
+normal/tty_termios

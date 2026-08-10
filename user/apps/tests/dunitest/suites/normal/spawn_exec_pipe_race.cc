@@ -4,14 +4,18 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -21,7 +25,21 @@ namespace {
 
 constexpr char kSiblingExecMode[] = "--spawn-exec-pipe-race-sibling-exec";
 constexpr char kExecExitMode[] = "--spawn-exec-pipe-race-exec-exit";
+constexpr char kExecBlockMode[] = "--spawn-exec-pipe-race-exec-block";
 constexpr int kIterations = 512;
+constexpr int kFatalIterations = 128;
+
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
+
+#ifndef SYS_pidfd_open
+#ifdef __NR_pidfd_open
+#define SYS_pidfd_open __NR_pidfd_open
+#else
+#define SYS_pidfd_open 434
+#endif
+#endif
 
 void SleepForMillis(long millis) {
   timespec ts {};
@@ -105,10 +123,76 @@ bool WaitForChildExit(pid_t child, int* status, int timeout_ms) {
   return false;
 }
 
+struct ChildCleanup {
+  pid_t child = -1;
+  int ready_read = -1;
+  int ready_write = -1;
+  int release_read = -1;
+  int release_write = -1;
+  int pidfd = -1;
+
+  ~ChildCleanup() {
+    CloseIfOpen(&ready_read);
+    CloseIfOpen(&ready_write);
+    CloseIfOpen(&release_read);
+    CloseIfOpen(&release_write);
+    CloseIfOpen(&pidfd);
+    if (child > 0) {
+      kill(child, SIGKILL);
+      while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+      }
+    }
+  }
+};
+
 void* SiblingExecThread(void*) {
   char arg0[] = "/proc/self/exe";
   char arg1[] = "--spawn-exec-pipe-race-exec-exit";
   char* const argv[] = {arg0, arg1, nullptr};
+  char* const envp[] = {nullptr};
+  execve("/proc/self/exe", argv, envp);
+  _exit(errno);
+}
+
+struct FatalExecArgs {
+  int tid_fd;
+  int release_fd;
+};
+
+void* FatalSiblingExecThread(void* opaque) {
+  auto* args = static_cast<FatalExecArgs*>(opaque);
+  pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  if (write(args->tid_fd, &tid, sizeof(tid)) != sizeof(tid)) {
+    _exit(5);
+  }
+
+  char ready_fd[16];
+  char release_fd[16];
+  snprintf(ready_fd, sizeof(ready_fd), "%d", args->tid_fd);
+  snprintf(release_fd, sizeof(release_fd), "%d", args->release_fd);
+  char arg0[] = "/proc/self/exe";
+  char* const argv[] = {arg0, const_cast<char*>(kExecBlockMode), ready_fd,
+                        release_fd, nullptr};
+  char* const envp[] = {nullptr};
+  execve("/proc/self/exe", argv, envp);
+  _exit(errno);
+}
+
+struct BlockingExecArgs {
+  int ready_fd;
+  int release_fd;
+};
+
+void* BlockingSiblingExecThread(void* opaque) {
+  auto* args = static_cast<BlockingExecArgs*>(opaque);
+  char ready_fd[16];
+  char release_fd[16];
+  snprintf(ready_fd, sizeof(ready_fd), "%d", args->ready_fd);
+  snprintf(release_fd, sizeof(release_fd), "%d", args->release_fd);
+
+  char arg0[] = "/proc/self/exe";
+  char* const argv[] = {arg0, const_cast<char*>(kExecBlockMode), ready_fd,
+                        release_fd, nullptr};
   char* const envp[] = {nullptr};
   execve("/proc/self/exe", argv, envp);
   _exit(errno);
@@ -123,6 +207,32 @@ void RunSiblingExecHelper() {
   for (;;) {
     pause();
   }
+}
+
+void RunBlockingSiblingExecHelper(int ready_fd, int release_fd) {
+  BlockingExecArgs args = {.ready_fd = ready_fd, .release_fd = release_fd};
+  pthread_t thread;
+  if (pthread_create(&thread, nullptr, BlockingSiblingExecThread, &args) != 0) {
+    _exit(1);
+  }
+
+  for (;;) {
+    pause();
+  }
+}
+
+void RunBlockedExecImage(int ready_fd, int release_fd) {
+  char ready = 'R';
+  if (write(ready_fd, &ready, sizeof(ready)) != sizeof(ready)) {
+    _exit(2);
+  }
+
+  char release = 0;
+  ssize_t n;
+  do {
+    n = read(release_fd, &release, sizeof(release));
+  } while (n < 0 && errno == EINTR);
+  _exit(n == sizeof(release) ? 0 : 3);
 }
 
 void TriggerSiblingExecOnce() {
@@ -266,12 +376,191 @@ TEST(SpawnExecPipeRace, GtestHelpSpawnAfterSiblingExecStress) {
   }
 }
 
+TEST(SpawnExecPipeRace, NonLeaderExecKeepsOriginalPidAndPidfdAlive) {
+  ChildCleanup cleanup;
+  int ready_pipe[2] = {-1, -1};
+  int release_pipe[2] = {-1, -1};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  cleanup.ready_read = ready_pipe[0];
+  cleanup.ready_write = ready_pipe[1];
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+  cleanup.release_read = release_pipe[0];
+  cleanup.release_write = release_pipe[1];
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(ready_pipe[0]);
+    close(release_pipe[1]);
+    RunBlockingSiblingExecHelper(ready_pipe[1], release_pipe[0]);
+    _exit(4);
+  }
+  cleanup.child = child;
+
+  close(ready_pipe[1]);
+  cleanup.ready_write = -1;
+  close(release_pipe[0]);
+  cleanup.release_read = -1;
+  int pidfd = static_cast<int>(syscall(SYS_pidfd_open, child, 0));
+  ASSERT_GE(pidfd, 0) << strerror(errno);
+  cleanup.pidfd = pidfd;
+
+  pollfd ready_poll = {.fd = ready_pipe[0], .events = POLLIN, .revents = 0};
+  ASSERT_EQ(1, poll(&ready_poll, 1, 5000)) << "exec image did not become ready";
+  char ready = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &ready, sizeof(ready)));
+  ASSERT_EQ('R', ready);
+
+  int status = 0;
+  EXPECT_EQ(0, waitpid(child, &status, WNOHANG));
+
+  pollfd pidfd_poll = {.fd = pidfd, .events = POLLIN, .revents = 0};
+  EXPECT_EQ(0, poll(&pidfd_poll, 1, 0));
+
+  siginfo_t info {};
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PIDFD, pidfd, &info,
+                       WEXITED | WNOHANG, nullptr))
+      << strerror(errno);
+  EXPECT_EQ(0, info.si_pid);
+
+  char release = 'X';
+  ASSERT_EQ(1, write(release_pipe[1], &release, sizeof(release)));
+  ASSERT_TRUE(WaitForChildExit(child, &status, 5000));
+  cleanup.child = -1;
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(0, WEXITSTATUS(status));
+
+  pidfd_poll.revents = 0;
+  EXPECT_EQ(1, poll(&pidfd_poll, 1, 1000));
+  EXPECT_NE(0, pidfd_poll.revents & POLLIN);
+
+  close(pidfd);
+  cleanup.pidfd = -1;
+  close(ready_pipe[0]);
+  cleanup.ready_read = -1;
+  close(release_pipe[1]);
+  cleanup.release_write = -1;
+}
+
+TEST(SpawnExecPipeRace, FatalSignalDuringSiblingExecKeepsWaitOwnership) {
+  for (int i = 0; i < kFatalIterations; ++i) {
+    ChildCleanup cleanup;
+    int tid_pipe[2] = {-1, -1};
+    int release_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(tid_pipe)) << "iter=" << i << ": " << strerror(errno);
+    cleanup.ready_read = tid_pipe[0];
+    cleanup.ready_write = tid_pipe[1];
+    ASSERT_EQ(0, pipe(release_pipe))
+        << "iter=" << i << ": " << strerror(errno);
+    cleanup.release_read = release_pipe[0];
+    cleanup.release_write = release_pipe[1];
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "iter=" << i << ": " << strerror(errno);
+    if (child == 0) {
+      close(tid_pipe[0]);
+      close(release_pipe[1]);
+      FatalExecArgs args = {
+          .tid_fd = tid_pipe[1],
+          .release_fd = release_pipe[0],
+      };
+      pthread_t thread;
+      if (pthread_create(&thread, nullptr, FatalSiblingExecThread, &args) != 0) {
+        _exit(6);
+      }
+      for (;;) {
+        pause();
+      }
+    }
+    cleanup.child = child;
+
+    close(tid_pipe[1]);
+    cleanup.ready_write = -1;
+    close(release_pipe[0]);
+    cleanup.release_read = -1;
+    pid_t exec_tid = -1;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(exec_tid)),
+              read(tid_pipe[0], &exec_tid, sizeof(exec_tid)))
+        << "iter=" << i << ": " << strerror(errno);
+    ASSERT_GT(exec_tid, 0) << "iter=" << i;
+
+    if ((i & 1) != 0) {
+      sched_yield();
+    }
+    if ((i & 3) == 3) {
+      SleepForMillis(1);
+    }
+
+    errno = 0;
+    int kill_result = static_cast<int>(
+        syscall(SYS_tgkill, child, exec_tid, SIGKILL));
+    const int kill_errno = errno;
+    ASSERT_TRUE(kill_result == 0 ||
+                (kill_result == -1 && kill_errno == ESRCH))
+        << "iter=" << i << ": " << strerror(kill_errno);
+
+    bool target_retired = kill_result == -1;
+    if (target_retired) {
+      close(release_pipe[1]);
+      cleanup.release_write = -1;
+    }
+
+    int status = 0;
+    bool child_exited = false;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(5000);
+    while (std::chrono::steady_clock::now() < deadline) {
+      pid_t waited = waitpid(child, &status, WNOHANG);
+      if (waited == -1 && errno == EINTR) {
+        continue;
+      }
+      ASSERT_TRUE(waited == 0 || waited == child)
+          << "iter=" << i << ": " << strerror(errno);
+      if (waited == child) {
+        child_exited = true;
+        break;
+      }
+
+      if (!target_retired) {
+        errno = 0;
+        int probe_result = static_cast<int>(
+            syscall(SYS_tgkill, child, exec_tid, 0));
+        const int probe_errno = errno;
+        ASSERT_TRUE(probe_result == 0 ||
+                    (probe_result == -1 && probe_errno == ESRCH))
+            << "iter=" << i << ": " << strerror(probe_errno);
+        if (probe_result == -1) {
+          target_retired = true;
+          close(release_pipe[1]);
+          cleanup.release_write = -1;
+        }
+      }
+      SleepForMillis(10);
+    }
+
+    ASSERT_TRUE(child_exited)
+        << "fatal sibling exec was not waitable at iter=" << i;
+    cleanup.child = -1;
+    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) {
+      continue;
+    }
+    ASSERT_TRUE(target_retired && WIFEXITED(status) &&
+                WEXITSTATUS(status) == 3)
+        << "thread-targeted SIGKILL was lost: child status=" << status
+        << " at iter=" << i;
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc >= 2 && strcmp(argv[1], kExecExitMode) == 0) {
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], kSiblingExecMode) == 0) {
     RunSiblingExecHelper();
+    return 1;
+  }
+  if (argc >= 4 && strcmp(argv[1], kExecBlockMode) == 0) {
+    RunBlockedExecImage(atoi(argv[2]), atoi(argv[3]));
     return 1;
   }
 

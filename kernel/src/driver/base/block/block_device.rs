@@ -16,6 +16,12 @@ use log::error;
 use system_error::SystemError;
 
 use super::{disk_info::Partition, gendisk::GenDisk, manager::BlockDevMeta};
+use crate::{
+    filesystem::vfs::{
+        file::FileFlags, DelegatedWriteResult, FilePrivateData, InodeMode, WriteSyncIntent,
+    },
+    libs::mutex::MutexGuard,
+};
 
 // 该文件定义了 Device 和 BlockDevice 的接口
 // Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -220,6 +226,32 @@ pub fn __lba_to_bytes(lba_id: usize, blk_size: usize) -> BlockId {
 
 /// @brief 块设备应该实现的操作
 pub trait BlockDevice: Device {
+    /// Permissions used for the published devfs block node.
+    fn devfs_mode(&self) -> InodeMode {
+        InodeMode::from_bits_truncate(0o755)
+    }
+
+    fn file_open(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Release per-open block-device state initialized by [`Self::file_open`].
+    fn file_close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Pin this block device for the lifetime of a mounted filesystem.
+    fn mount_holder_acquire(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Release a mount pin previously acquired by [`Self::mount_holder_acquire`].
+    fn mount_holder_release(&self) {}
+
     /// # dev_name
     /// 返回块设备的名字
     fn dev_name(&self) -> &DevName;
@@ -257,6 +289,25 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError>;
+
+    /// Whether this device implements an atomic write plus optional flush
+    /// operation for a delegated VFS synchronous write.
+    fn uses_delegated_write_sync(&self) -> bool {
+        false
+    }
+
+    /// Execute a byte write and consume the requested sync intent in the same
+    /// device operation. The default must not emulate this as write-then-sync:
+    /// devices without a stable configuration snapshot use generic VFS sync.
+    fn write_at_bytes_with_sync(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _sync_intent: WriteSyncIntent,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     /// @brief: 同步磁盘信息，把所有的dirty数据写回硬盘 - 待实现
     fn sync(&self) -> Result<(), SystemError>;

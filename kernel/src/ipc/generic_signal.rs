@@ -407,14 +407,14 @@ fn sig_terminate(sig: Signal) {
 
     if sig == Signal::SIGKILL {
         let current = ProcessManager::current_pcb();
-        if !current.is_thread_group_leader() {
-            // 线程级 SIGKILL：仅终止当前线程，避免误杀整个线程组
-            ProcessManager::exit(sig as usize);
-        }
         let sighand = current.sighand();
         if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
             if let Some(exec_task) = sighand.group_exec_task() {
                 if !Arc::ptr_eq(&exec_task, &current) {
+                    // de_thread() privately injects SIGKILL into the siblings
+                    // that the exec owner is replacing. Only those siblings
+                    // exit individually; an externally delivered SIGKILL
+                    // targeting the exec owner remains process-fatal.
                     ProcessManager::exit(sig as usize);
                 }
             }

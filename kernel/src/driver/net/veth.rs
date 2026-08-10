@@ -663,7 +663,7 @@ impl Iface for VethInterface {
         // self.clear_recv_buffer();
     }
 
-    fn poll_napi(&self, budget: usize) -> bool {
+    fn poll_napi(&self, budget: usize) -> super::napi::NapiPollResult {
         let mut driver = self.driver.clone();
         self.common.poll_napi(&mut driver, budget)
     }

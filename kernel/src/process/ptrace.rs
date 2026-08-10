@@ -67,25 +67,110 @@ pub fn traceme_current() -> Result<(), SystemError> {
 }
 
 pub fn unlink_tracee(tracee: &Arc<ProcessControlBlock>) {
-    let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
     let tracer = {
-        let mut ptracer = tracee.ptracer_pcb.write_irqsave();
-        let tracer = ptracer.upgrade();
-        *ptracer = Weak::new();
-        tracee.flags().remove(ProcessFlags::PTRACED);
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        let tracer = {
+            let mut ptracer = tracee.ptracer_pcb.write_irqsave();
+            let tracer = ptracer.upgrade();
+            *ptracer = Weak::new();
+            tracee.flags().remove(ProcessFlags::PTRACED);
+            tracer
+        };
+
+        if let Some(tracer) = tracer.as_ref() {
+            let raw_pid = tracee.raw_pid();
+            tracer.ptraced.write_irqsave().retain(|pid| *pid != raw_pid);
+        }
         tracer
     };
 
-    if let Some(tracer) = tracer {
-        let raw_pid = tracee.raw_pid();
-        tracer.ptraced.write_irqsave().retain(|pid| *pid != raw_pid);
+    // Linux wakes the ptrace parent before destroying the old leader in
+    // de_thread().  DragonOS keeps separate per-task wait queues, so both the
+    // tracer and natural parent must recheck their wait ownership after the
+    // relation and index update become visible.
+    if let Some(tracer) = tracer.as_ref() {
+        ProcessManager::wake_wait_parent(tracer);
     }
 
-    // Detaching can make a tracee observable by its natural parent again.
-    // Wake the DragonOS wait owner pair (parent task + group leader), matching
-    // Linux's shared signal->wait_chldexit visibility.
     if let Some(real_parent) = tracee.real_parent_pcb() {
-        ProcessManager::wake_wait_parent(&real_parent);
+        if !tracer
+            .as_ref()
+            .map(|tracer| Arc::ptr_eq(tracer, &real_parent))
+            .unwrap_or(false)
+        {
+            ProcessManager::wake_wait_parent(&real_parent);
+        }
+    }
+}
+
+pub(crate) struct TraceePidExchangePlan {
+    left: Option<TraceePidUpdate>,
+    right: Option<TraceePidUpdate>,
+}
+
+struct TraceePidUpdate {
+    tracer: Arc<ProcessControlBlock>,
+    index: usize,
+    old_pid: RawPid,
+    new_pid: RawPid,
+}
+
+/// Resolve tracer-side vector positions before entering the global process-map
+/// IRQ-off critical section. `PTRACE_RELATION_LOCK` keeps these indices stable
+/// until `commit_tracee_pid_exchange_locked()` applies the two O(1) writes.
+pub(crate) fn prepare_tracee_pid_exchange_locked(
+    left: &Arc<ProcessControlBlock>,
+    right: &Arc<ProcessControlBlock>,
+    left_old_pid: RawPid,
+    right_old_pid: RawPid,
+) -> TraceePidExchangePlan {
+    let left_tracer = left.ptracer_pcb.read_irqsave().upgrade();
+    let right_tracer = right.ptracer_pcb.read_irqsave().upgrade();
+    let left = left_tracer.as_ref().map(|tracer| {
+        let ptraced = tracer.ptraced.read_irqsave();
+        let index = ptraced
+            .iter()
+            .position(|pid| *pid == left_old_pid)
+            .expect("left tracee missing from tracer raw-PID index");
+        TraceePidUpdate {
+            tracer: tracer.clone(),
+            index,
+            old_pid: left_old_pid,
+            new_pid: right_old_pid,
+        }
+    });
+    let right = right_tracer.as_ref().map(|tracer| {
+        let ptraced = tracer.ptraced.read_irqsave();
+        let index = ptraced
+            .iter()
+            .position(|pid| *pid == right_old_pid)
+            .expect("right tracee missing from tracer raw-PID index");
+        TraceePidUpdate {
+            tracer: tracer.clone(),
+            index,
+            old_pid: right_old_pid,
+            new_pid: left_old_pid,
+        }
+    });
+
+    TraceePidExchangePlan { left, right }
+}
+
+/// Update tracer-side raw-PID indices after the corresponding task identities
+/// have been exchanged.  The caller must hold `PTRACE_RELATION_LOCK` and must
+/// call `prepare_tracee_pid_exchange_locked()` before beginning the identity
+/// transaction.
+pub(crate) fn commit_tracee_pid_exchange_locked(plan: TraceePidExchangePlan) {
+    for update in [plan.left, plan.right].into_iter().flatten() {
+        let mut ptraced = update.tracer.ptraced.write_irqsave();
+        let entry = ptraced
+            .get_mut(update.index)
+            .expect("tracee index changed during PID identity exchange");
+        assert_eq!(
+            *entry, update.old_pid,
+            "tracee PID changed during identity exchange"
+        );
+        *entry = update.new_pid;
     }
 }
 
@@ -135,7 +220,10 @@ pub fn ptracer_of(tracee: &Arc<ProcessControlBlock>) -> Option<Arc<ProcessContro
     ptracer_of_locked(tracee)
 }
 
-fn ptracer_of_locked(tracee: &Arc<ProcessControlBlock>) -> Option<Arc<ProcessControlBlock>> {
+/// Return the tracee's ptracer while the caller holds `PTRACE_RELATION_LOCK`.
+pub(crate) fn ptracer_of_locked(
+    tracee: &Arc<ProcessControlBlock>,
+) -> Option<Arc<ProcessControlBlock>> {
     tracee.ptracer_pcb.read_irqsave().upgrade()
 }
 

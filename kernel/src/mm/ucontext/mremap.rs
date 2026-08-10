@@ -217,6 +217,7 @@ impl InnerAddressSpace {
                 return Ok(MremapOutcome {
                     addr: old_vaddr,
                     notifications: VmaCloseNotifications::default(),
+                    post_commit_population: None,
                 });
             }
 
@@ -257,11 +258,17 @@ impl InnerAddressSpace {
             self.mappings.insert_vma(removed);
             if let Some(locked_vm_after_grow) = locked_vm_after_grow {
                 self.locked_vm = locked_vm_after_grow;
-                self.best_effort_locked_population(old_vaddr + old_len, grow, vm_flags);
             }
             return Ok(MremapOutcome {
                 addr: old_vaddr,
                 notifications: VmaCloseNotifications::default(),
+                post_commit_population: locked_source.then(|| {
+                    let vma = self
+                        .mappings
+                        .contains(old_vaddr)
+                        .expect("committed in-place mremap VMA disappeared");
+                    (grow_region, Arc::downgrade(&vma))
+                }),
             });
         }
 
@@ -569,17 +576,19 @@ impl InnerAddressSpace {
             }
             tlb.finish();
 
-            if locked_source && new_len > old_len {
-                self.best_effort_locked_population(
-                    new_region.start() + old_len,
-                    new_len - old_len,
-                    vm_flags,
-                );
-            }
-
             return Ok(MremapOutcome {
                 addr: new_region.start(),
                 notifications,
+                post_commit_population: (locked_source && new_len > old_len).then(|| {
+                    let vma = self
+                        .mappings
+                        .contains(new_region.start())
+                        .expect("committed moved mremap VMA disappeared");
+                    (
+                        VirtRegion::new(new_region.start() + old_len, new_len - old_len),
+                        Arc::downgrade(&vma),
+                    )
+                }),
             });
         }
 
@@ -588,17 +597,19 @@ impl InnerAddressSpace {
         }
         tlb.finish();
 
-        if locked_source && new_len > old_len {
-            self.best_effort_locked_population(
-                new_region.start() + old_len,
-                new_len - old_len,
-                vm_flags,
-            );
-        }
-
         Ok(MremapOutcome {
             addr: new_region.start(),
             notifications,
+            post_commit_population: (locked_source && new_len > old_len).then(|| {
+                let vma = self
+                    .mappings
+                    .contains(new_region.start())
+                    .expect("committed moved mremap VMA disappeared");
+                (
+                    VirtRegion::new(new_region.start() + old_len, new_len - old_len),
+                    Arc::downgrade(&vma),
+                )
+            }),
         })
     }
 }

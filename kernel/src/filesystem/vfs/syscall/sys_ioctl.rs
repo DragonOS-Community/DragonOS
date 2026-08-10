@@ -2,7 +2,7 @@
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_IOCTL;
-use crate::filesystem::vfs::fasync::set_file_fasync;
+use crate::filesystem::vfs::fasync::{set_file_fasync, FAsyncHandlerPolicy};
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::syscall::table::FormattedSyscallParam;
@@ -168,7 +168,7 @@ impl SysIoctlHandle {
             UserBufferReader::new(data as *const i32, core::mem::size_of::<i32>(), true)?;
         let value = user_reader.buffer_protected(0)?.read_one::<i32>(0)?;
 
-        set_file_fasync(file, fd, value != 0)?;
+        set_file_fasync(file, fd, value != 0, FAsyncHandlerPolicy::Required)?;
         Ok(0)
     }
 

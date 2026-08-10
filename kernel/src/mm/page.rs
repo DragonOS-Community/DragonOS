@@ -531,7 +531,7 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(guard: &mut InnerPage, unmap: bool) {
+    pub fn page_writeback(guard: &mut RwSemWriteGuard<'_, InnerPage>, unmap: bool) {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
@@ -609,7 +609,7 @@ impl PageReclaimer {
 
         guard.remove_flags(PageFlags::PG_ERROR);
         if guard.flags().contains(PageFlags::PG_DIRTY) {
-            let _ = page_cache.mark_page_dirty(page_index);
+            let _ = page_cache.mark_page_dirty_page_locked(page_index, guard);
         } else {
             page_cache.mark_page_uptodate(page_index);
         }
@@ -1022,7 +1022,7 @@ impl InnerPage {
     }
 
     #[inline(always)]
-    fn phys_address(&self) -> PhysAddr {
+    pub(crate) fn phys_address(&self) -> PhysAddr {
         self.phys_addr
     }
 

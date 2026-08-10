@@ -222,6 +222,14 @@ impl IndexNode for PmemBlockDevice {
         self
     }
 
+    fn sync_file(
+        &self,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        <Self as BlockDevice>::sync(self)
+    }
+
     fn read_at(
         &self,
         _offset: usize,

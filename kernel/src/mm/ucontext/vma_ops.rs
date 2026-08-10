@@ -1134,8 +1134,12 @@ impl InnerAddressSpace {
     ///
     /// ## Return Value
     ///
-    /// Returns the old heap end address
-    pub unsafe fn set_brk(&mut self, new_brk: VirtAddr) -> Result<VirtAddr, SystemError> {
+    /// Returns the old heap end address and, when the committed VMA inherited
+    /// `MCL_FUTURE`, an outer-layer population request.
+    ///
+    /// The caller must release `AddressSpace::write()` before consuming the
+    /// request.  See `AddressSpace::populate_range_post_commit`.
+    pub(super) unsafe fn set_brk(&mut self, new_brk: VirtAddr) -> Result<BrkOutcome, SystemError> {
         assert!(new_brk.check_aligned(MMArch::PAGE_SIZE));
 
         if !new_brk.check_user() || new_brk < self.brk_start {
@@ -1167,25 +1171,43 @@ impl InnerAddressSpace {
             self.map_anonymous(old_brk, len, prot_flags, map_flags, true, false)?;
 
             self.brk = new_brk;
-            return Ok(old_brk);
+            let post_commit_population = self.mappings.contains(old_brk).and_then(|vma| {
+                vma.lock()
+                    .vm_flags()
+                    .contains(VmFlags::VM_LOCKED)
+                    .then(|| (brk_region, Arc::downgrade(&vma)))
+            });
+            return Ok(BrkOutcome {
+                old_brk,
+                post_commit_population,
+            });
         } else {
             let unmap_len = self.brk - new_brk;
             let unmap_start = new_brk;
             if unmap_len == 0 {
-                return Ok(old_brk);
+                return Ok(BrkOutcome {
+                    old_brk,
+                    post_commit_population: None,
+                });
             }
             self.munmap(
                 VirtPageFrame::new(unmap_start),
                 PageFrameCount::from_bytes(unmap_len).unwrap(),
             )?;
             self.brk = new_brk;
-            return Ok(old_brk);
+            return Ok(BrkOutcome {
+                old_brk,
+                post_commit_population: None,
+            });
         }
     }
 
-    pub unsafe fn sbrk(&mut self, incr: isize) -> Result<VirtAddr, SystemError> {
+    pub(super) unsafe fn sbrk(&mut self, incr: isize) -> Result<BrkOutcome, SystemError> {
         if incr == 0 {
-            return Ok(self.brk);
+            return Ok(BrkOutcome {
+                old_brk: self.brk,
+                post_commit_population: None,
+            });
         }
 
         let new_brk = if incr > 0 {

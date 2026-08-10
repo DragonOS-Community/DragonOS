@@ -47,7 +47,7 @@ unsafe fn alloc_from_kernel_space() -> (VirtAddr, PhysAddr) {
     // | ..........  |
     // ---------------
 
-    let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
+    let _guard = KSTACK_LOCK.lock_irqsave();
     let need_size = KernelStack::SIZE * 2;
     let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());
 
@@ -95,7 +95,7 @@ unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr) {
     use crate::mm::kernel_mapper::KernelMapper;
     use crate::mm::MemoryManagementArch;
 
-    let _guard = KSTACK_LOCK.try_lock_irqsave().unwrap();
+    let _guard = KSTACK_LOCK.lock_irqsave();
 
     let need_size = KernelStack::SIZE * 2;
     let page_num = PageFrameCount::new(need_size.div_ceil(MMArch::PAGE_SIZE).next_power_of_two());

@@ -115,8 +115,6 @@ impl InnerAddressSpace {
             },
         )?;
 
-        self.post_map_population(start_page.virt_address(), len, map_flags);
-
         return Ok((start_page, notifications));
     }
 

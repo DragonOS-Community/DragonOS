@@ -9,7 +9,7 @@ use crate::filesystem::vfs::VmaOpenRollback;
 #[derive(Debug)]
 pub enum PresentPfn {
     Managed(Arc<Page>),
-    External(PhysAddr),
+    External,
 }
 
 /// A locked VMA (Virtual Memory Area)
@@ -51,7 +51,7 @@ impl LockedVMA {
             vm_flags.contains(VmFlags::VM_MIXEDMAP),
             "unmanaged PFN {paddr:?} installed in a non-mixed VMA"
         );
-        PresentPfn::External(paddr)
+        PresentPfn::External
     }
 
     pub fn new(vma: VMA) -> Arc<Self> {

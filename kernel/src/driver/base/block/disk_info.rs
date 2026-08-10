@@ -56,10 +56,13 @@ impl TryInto<GeneralBlockRange> for Partition {
     type Error = SystemError;
 
     fn try_into(self) -> Result<GeneralBlockRange, Self::Error> {
-        if let Some(range) = GeneralBlockRange::new(
-            self.lba_start as usize,
-            (self.lba_start + self.sectors_num) as usize,
-        ) {
+        let start = usize::try_from(self.lba_start).map_err(|_| SystemError::EINVAL)?;
+        let end = self
+            .lba_start
+            .checked_add(self.sectors_num)
+            .and_then(|end| usize::try_from(end).ok())
+            .ok_or(SystemError::EINVAL)?;
+        if let Some(range) = GeneralBlockRange::new(start, end) {
             return Ok(range);
         } else {
             return Err(SystemError::EINVAL);

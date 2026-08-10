@@ -12,6 +12,13 @@
 #
 # - AUTO_TEST: 自动测试选项
 # - SYSCALL_TEST_DIR: 系统调用测试目录
+# - DUNITEST_PATTERN: dunitest runner pattern filter
+# - DRAGONOS_QEMU_SMP: 覆盖 vCPU 拓扑，例如 1,cores=1,threads=1,sockets=1
+# - DRAGONOS_QEMU_SERIAL_SOCKET: nographic 模式下使用独立 Unix socket 承载 guest virtconsole
+# - DRAGONOS_QEMU_ARGV_FILE: 以 JSON 数组记录实际执行的 QEMU argv（目标必须不存在）
+# - DRAGONOS_QEMU_DISK_IMAGE: 覆盖主磁盘镜像路径
+# - DRAGONOS_QEMU_SNAPSHOT: 设为1时以 QEMU snapshot 模式运行，避免修改基线镜像
+# - DRAGONOS_QEMU_TRACE: 覆盖传给 QEMU -d 的日志项；性能测试应设为 none
 # - DRAGONOS_VIRTIOFS_ENABLE: 是否启用 virtiofs（1启用，默认0）
 # - DRAGONOS_VIRTIOFS_SOCKET: virtiofsd socket路径
 # - DRAGONOS_VIRTIOFS_TAG: virtiofs 挂载tag
@@ -116,7 +123,7 @@ EXT4_DISK_NAME="ext4.img"
 FAT_DISK_NAME="fat.img"
 
 QEMU=$(which qemu-system-${ARCH})
-QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
+QEMU_DISK_IMAGE="${DRAGONOS_QEMU_DISK_IMAGE:-../bin/${DISK_NAME}}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
 QEMU_MEMORY="2G"
@@ -379,14 +386,60 @@ GDB_PORT=$(find_free_port $((HOST_PORT + 1)))
 echo "${HOST_PORT}" > "${VMSTATE_DIR}/port"
 echo "${GDB_PORT}" > "${VMSTATE_DIR}/gdb"
 
-QEMU_SMP="2,cores=2,threads=1,sockets=1"
+QEMU_SMP="${DRAGONOS_QEMU_SMP:-2,cores=2,threads=1,sockets=1}"
+if ! [[ "${QEMU_SMP}" =~ ^[0-9]+(,(cores|threads|sockets|maxcpus)=[0-9]+)*$ ]]; then
+  echo "[错误] DRAGONOS_QEMU_SMP 格式无效: ${QEMU_SMP}"
+  exit 1
+fi
+IFS=',' read -r -a qemu_smp_fields <<< "${QEMU_SMP}"
+qemu_smp_cpus="${qemu_smp_fields[0]}"
+if [ "${qemu_smp_cpus}" -lt 1 ] || [ "${qemu_smp_cpus}" -gt 64 ]; then
+  echo "[错误] DRAGONOS_QEMU_SMP 的 vCPU 数必须位于 1..64: ${QEMU_SMP}"
+  exit 1
+fi
+declare -A qemu_smp_values=()
+for qemu_smp_field in "${qemu_smp_fields[@]:1}"; do
+  qemu_smp_key="${qemu_smp_field%%=*}"
+  qemu_smp_value="${qemu_smp_field#*=}"
+  if [ -n "${qemu_smp_values[${qemu_smp_key}]+set}" ] || \
+     [ "${qemu_smp_value}" -lt 1 ] || [ "${qemu_smp_value}" -gt 64 ]; then
+    echo "[错误] DRAGONOS_QEMU_SMP 含重复键或越界值: ${QEMU_SMP}"
+    exit 1
+  fi
+  qemu_smp_values["${qemu_smp_key}"]="${qemu_smp_value}"
+done
+if [ -n "${qemu_smp_values[maxcpus]+set}" ] && \
+   { [ "${qemu_smp_values[maxcpus]}" -lt "${qemu_smp_cpus}" ] || \
+     [ "${qemu_smp_values[maxcpus]}" -gt 64 ]; }; then
+  echo "[错误] DRAGONOS_QEMU_SMP 的 maxcpus 必须不小于当前 vCPU 数且不超过64: ${QEMU_SMP}"
+  exit 1
+fi
+if [ -n "${qemu_smp_values[cores]+set}" ] && \
+   [ -n "${qemu_smp_values[threads]+set}" ] && \
+   [ -n "${qemu_smp_values[sockets]+set}" ]; then
+  qemu_smp_product=$((qemu_smp_values[cores] * qemu_smp_values[threads] * qemu_smp_values[sockets]))
+  qemu_smp_expected_product="${qemu_smp_values[maxcpus]:-${qemu_smp_cpus}}"
+  if [ "${qemu_smp_product}" -ne "${qemu_smp_expected_product}" ]; then
+    echo "[错误] DRAGONOS_QEMU_SMP 的 cores*threads*sockets 必须等于 maxcpus（未指定时等于 vCPU 数）: ${QEMU_SMP}"
+    exit 1
+  fi
+fi
 QEMU_MONITOR_ARGS=(-monitor stdio)
-QEMU_TRACE="${qemu_trace_std}"
+QEMU_TRACE="${DRAGONOS_QEMU_TRACE:-${qemu_trace_std}}"
 QEMU_CPU_FEATURES=""
 QEMU_RTC_CLOCK=""
 QEMU_SERIAL_LOG_FILE="../serial_opt.txt"
 QEMU_SERIAL_ARGS=(-serial "file:${QEMU_SERIAL_LOG_FILE}")
-QEMU_DRIVE_ARGS=(-drive "id=disk,file=${QEMU_DISK_IMAGE},if=none,format=raw")
+QEMU_CONSOLE_CHARDEV_ID="mux"
+if [ "${DRAGONOS_QEMU_SNAPSHOT:-0}" != "0" ] && [ "${DRAGONOS_QEMU_SNAPSHOT:-0}" != "1" ]; then
+  echo "[错误] DRAGONOS_QEMU_SNAPSHOT 只能是0或1"
+  exit 1
+fi
+QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none,format=raw"
+if [ "${DRAGONOS_QEMU_SNAPSHOT:-0}" = "1" ]; then
+  QEMU_DRIVE+=",snapshot=on"
+fi
+QEMU_DRIVE_ARGS=(-drive "${QEMU_DRIVE}")
 QEMU_ACCEL_ARGS=()
 QEMU_DEVICE_ARGS=()
 QEMU_DISPLAY_ARGS=()
@@ -431,6 +484,8 @@ AUTO_TEST=${AUTO_TEST:=none}
 SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR:=/opt/tests/gvisor}
 # dunitest测试目录
 DUNITEST_DIR=${DUNITEST_DIR:=/opt/tests/dunitest}
+# dunitest pattern过滤条件
+DUNITEST_PATTERN=${DUNITEST_PATTERN:=}
 
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
@@ -545,7 +600,8 @@ while true;do
 
 setup_kernel_init_program() {
     if [ ${ARCH} == "x86_64" ]; then
-        KERNEL_CMDLINE+=" init=/bin/busybox init AUTO_TEST=${AUTO_TEST} SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR} DUNITEST_DIR=${DUNITEST_DIR} "
+        KERNEL_CMDLINE+=" init=/bin/busybox init AUTO_TEST=${AUTO_TEST} SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR} DUNITEST_DIR=${DUNITEST_DIR} DUNITEST_PATTERN=${DUNITEST_PATTERN} "
+        # KERNEL_CMDLINE+=" init=/bin/dragonreach "
     elif [ ${ARCH} == "riscv64" ]; then
         KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "
     fi
@@ -693,15 +749,36 @@ fi
 
 
 if [ ${QEMU_NOGRAPHIC} == true ]; then
-    QEMU_SERIAL_ARGS=(-serial chardev:mux -monitor chardev:mux -chardev "stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE}")
+    if [ -n "${DRAGONOS_QEMU_SERIAL_SOCKET:-}" ]; then
+      qemu_serial_socket_dir="$(dirname "${DRAGONOS_QEMU_SERIAL_SOCKET}")"
+      qemu_serial_socket_real_dir="$(realpath -e -- "${qemu_serial_socket_dir}" 2>/dev/null || true)"
+      if [[ "${DRAGONOS_QEMU_SERIAL_SOCKET}" != /* ]] || \
+         [ ${#DRAGONOS_QEMU_SERIAL_SOCKET} -gt 100 ] || \
+         [ ! -d "${qemu_serial_socket_dir}" ] || \
+         [ -L "${qemu_serial_socket_dir}" ] || \
+         [ "${qemu_serial_socket_real_dir}" != "${qemu_serial_socket_dir}" ] || \
+         [ -e "${DRAGONOS_QEMU_SERIAL_SOCKET}" ]; then
+        echo "[错误] DRAGONOS_QEMU_SERIAL_SOCKET 必须位于已存在的非符号链接目录，长度不超过100且目标不存在"
+        exit 1
+      fi
+      if [ "$(stat -c '%u' "${qemu_serial_socket_dir}")" -ne "$(id -u)" ] || \
+         [ "$(stat -c '%a' "${qemu_serial_socket_dir}")" != "700" ]; then
+        echo "[错误] DRAGONOS_QEMU_SERIAL_SOCKET 父目录必须由当前用户拥有且权限严格为0700"
+        exit 1
+      fi
+      QEMU_CONSOLE_CHARDEV_ID="calib_console"
+      QEMU_SERIAL_ARGS=(-serial none -monitor none -chardev "socket,id=${QEMU_CONSOLE_CHARDEV_ID},path=${DRAGONOS_QEMU_SERIAL_SOCKET},server=on,wait=off,logfile=${QEMU_SERIAL_LOG_FILE}")
+    else
+      QEMU_SERIAL_ARGS=(-serial chardev:mux -monitor chardev:mux -chardev "stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE}")
+    fi
 
     # 添加 virtio console 设备
     if [ ${ARCH} == "x86_64" ]; then
-      QEMU_DEVICE_ARGS+=(-device virtio-serial -device virtconsole,chardev=mux)
+      QEMU_DEVICE_ARGS+=(-device virtio-serial -device "virtconsole,chardev=${QEMU_CONSOLE_CHARDEV_ID}")
     elif [ ${ARCH} == "loongarch64" ]; then
-      QEMU_DEVICE_ARGS+=(-device virtio-serial -device virtconsole,chardev=mux)
+      QEMU_DEVICE_ARGS+=(-device virtio-serial -device "virtconsole,chardev=${QEMU_CONSOLE_CHARDEV_ID}")
     elif [ ${ARCH} == "riscv64" ]; then
-      QEMU_DEVICE_ARGS+=(-device virtio-serial-device -device virtconsole,chardev=mux)
+      QEMU_DEVICE_ARGS+=(-device virtio-serial-device -device "virtconsole,chardev=${QEMU_CONSOLE_CHARDEV_ID}")
     fi
 
     KERNEL_CMDLINE=" console=/dev/hvc0 ${KERNEL_CMDLINE}"
@@ -753,7 +830,9 @@ QEMU_ARGS+=(
 )
 QEMU_ARGS+=("${QEMU_MONITOR_ARGS[@]}")
 QEMU_ARGS+=("${QEMU_DISPLAY_ARGS[@]}")
-QEMU_ARGS+=(-d "${qemu_trace_std}")
+if [ "${QEMU_TRACE}" != "none" ]; then
+  QEMU_ARGS+=(-d "${QEMU_TRACE}")
+fi
 
 QEMU_ARGS+=(
   "${QEMU_MACHINE_ARGS[@]}"
@@ -822,6 +901,28 @@ if [ $flag_can_run -eq 1 ]; then
       echo "[QEMU] 等待GDB连接... (使用 'make gdb' 连接)"
     fi
     local -a cmd=("${QEMU}" "${bios_args[@]}" "${QEMU_ARGS[@]}")
+    if [ -n "${DRAGONOS_QEMU_ARGV_FILE:-}" ]; then
+      if [[ "${DRAGONOS_QEMU_ARGV_FILE}" != /* ]] || \
+         [ ! -d "$(dirname "${DRAGONOS_QEMU_ARGV_FILE}")" ] || \
+         [ -e "${DRAGONOS_QEMU_ARGV_FILE}" ]; then
+        echo "[错误] DRAGONOS_QEMU_ARGV_FILE 必须是父目录已存在且目标不存在的绝对路径"
+        return 1
+      fi
+      if ! python3 - "${DRAGONOS_QEMU_ARGV_FILE}" "${cmd[@]}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("x", encoding="utf-8") as output:
+    json.dump(sys.argv[2:], output, ensure_ascii=True, indent=2)
+    output.write("\n")
+PY
+      then
+        echo "[错误] 无法可靠记录 QEMU argv，终止启动"
+        return 1
+      fi
+    fi
     printf '[QEMU] 执行: sudo ' >&2
     printf '%q ' "${cmd[@]}" >&2
     printf '\n' >&2

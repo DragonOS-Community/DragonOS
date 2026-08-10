@@ -14,7 +14,7 @@ use crate::{
             syscall::RenameFlags,
             utils::DName,
             DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata,
-            SetMetadataMask, XattrFlags,
+            OpenFileBehavior, SetMetadataMask, XattrFlags,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -270,7 +270,8 @@ impl IndexNode for FuseNode {
         }
     }
 
-    fn adjust_file_mode_after_open(&self, data: &FilePrivateData, mode: &mut FileMode) {
+    fn configure_open_file(&self, data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        let mode = &mut behavior.mode;
         let fopen_flags = match data {
             FilePrivateData::Fuse(FuseFilePrivateData::File(p))
             | FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => p.fopen_flags,

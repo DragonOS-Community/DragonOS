@@ -57,6 +57,7 @@ fn try_fixup_kernel_user_access(trap_frame: &mut TrapFrame) -> bool {
 #[no_mangle]
 unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
     if trap_frame.cause.is_interrupt() {
+        let hardirq_guard = crate::exception::enter_hardirq();
         crate::rcu::irq_enter();
         riscv64_do_interrupt(trap_frame);
         let irq_outermost = crate::rcu::irq_is_outermost();
@@ -69,6 +70,7 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
         let resume_idle_eqs = !should_schedule
             && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
         let irq_exited_outermost = crate::rcu::irq_exit(resume_idle_eqs);
+        drop(hardirq_guard);
 
         if should_schedule && irq_exited_outermost {
             __schedule(SchedMode::SM_PREEMPT);

@@ -4,3 +4,4 @@ normal/mount_propagation
 normal/mount_object_topology
 normal/mount_limit
 normal/open_dangling_symlink
+normal/rtnetlink_link_semantics

@@ -1,10 +1,10 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CLOCK_NANOSLEEP;
 use crate::ipc::signal::{RestartBlock, RestartBlockData};
+use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
-use crate::time::timekeeping::getnstimeofday;
 use crate::time::{sleep::nanosleep, PosixTimeSpec};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -29,27 +29,12 @@ impl SysClockNanosleep {
 
     #[inline]
     fn ktime_now(clockid: PosixClockID) -> PosixTimeSpec {
-        // 暂时使用 realtime 近似；后续区分 monotonic/boottime
-        // - Realtime：使用 getnstimeofday()
-        // - Monotonic/Boottime：暂与 Realtime 等价（后续引入真正单调/启动时钟）
-        match clockid {
-            Realtime => getnstimeofday(),
-            Monotonic | Boottime => getnstimeofday(),
-            ProcessCPUTimeID => {
-                let pcb = ProcessManager::current_pcb();
-                PosixTimeSpec::from_ns(pcb.process_cputime_ns())
-            }
-            ThreadCPUTimeID => {
-                let pcb = ProcessManager::current_pcb();
-                PosixTimeSpec::from_ns(pcb.thread_cputime_ns())
-            }
-            _ => getnstimeofday(),
-        }
+        super::posix_clock::posix_clock_now(clockid)
     }
 
     #[inline]
     fn is_valid_timespec(ts: &PosixTimeSpec) -> bool {
-        ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000
+        ts.is_valid_timeout()
     }
 
     #[inline]
@@ -62,36 +47,12 @@ impl SysClockNanosleep {
 
     #[inline]
     fn calc_remaining(deadline: &PosixTimeSpec, now: &PosixTimeSpec) -> PosixTimeSpec {
-        let mut sec = deadline.tv_sec - now.tv_sec;
-        let mut nsec = deadline.tv_nsec - now.tv_nsec;
-        if nsec < 0 {
-            sec -= 1;
-            nsec += 1_000_000_000;
-        }
-        if sec < 0 {
-            return PosixTimeSpec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-        }
-        PosixTimeSpec {
-            tv_sec: sec,
-            tv_nsec: nsec,
-        }
+        deadline.saturating_sub_timespec(now)
     }
 
     #[inline]
     fn add_timespec(a: &PosixTimeSpec, b: &PosixTimeSpec) -> PosixTimeSpec {
-        let mut sec = a.tv_sec + b.tv_sec;
-        let mut nsec = a.tv_nsec + b.tv_nsec;
-        if nsec >= 1_000_000_000 {
-            sec += 1;
-            nsec -= 1_000_000_000;
-        }
-        PosixTimeSpec {
-            tv_sec: sec,
-            tv_nsec: nsec,
-        }
+        a.saturating_add_ktime(b)
     }
 
     fn do_wait_until(deadline: &PosixTimeSpec, clockid: PosixClockID) -> Result<(), SystemError> {
@@ -129,7 +90,18 @@ impl SysClockNanosleep {
                 if remain.tv_sec == 0 && remain.tv_nsec == 0 {
                     return Ok(());
                 }
-                nanosleep(remain).map(|_| ())
+                match nanosleep(remain) {
+                    Ok(()) => Ok(()),
+                    Err(SystemError::ERESTARTSYS) => {
+                        let remain = Self::calc_remaining(deadline, &Self::ktime_now(clockid));
+                        if remain.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(SystemError::ERESTARTSYS)
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
             }
         }
     }
@@ -144,10 +116,16 @@ impl Syscall for SysClockNanosleep {
         // 解析/校验参数
         let clockid = PosixClockID::try_from(Self::which_clock(args))?;
         match clockid {
-            Realtime | Monotonic | Boottime | ProcessCPUTimeID | ThreadCPUTimeID => {}
+            Realtime | Monotonic | Boottime | ProcessCPUTimeID => {}
+            // CLOCK_THREAD_CPUTIME_ID is a valid POSIX clock but Linux has no
+            // clock_nanosleep operation for it, so this is EOPNOTSUPP rather
+            // than EINVAL.
+            ThreadCPUTimeID => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
             _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
         }
         let flags = Self::flags(args);
+        // Linux 6.6 only interprets TIMER_ABSTIME here; unknown bits are
+        // ignored by the POSIX clock nanosleep implementations.
         let is_abstime = (flags & 0x01) != 0; // TIMER_ABSTIME = 1
 
         // 读取 rqtp
@@ -165,25 +143,25 @@ impl Syscall for SysClockNanosleep {
             tv_nsec: rq_user.tv_nsec,
         };
 
-        let rmtp_ptr = Self::rmtp(args);
-        let mut rmtp_writer = if !rmtp_ptr.is_null() && !is_abstime {
-            Some(UserBufferWriter::new(
-                rmtp_ptr,
-                core::mem::size_of::<PosixTimeSpec>(),
-                true,
-            )?)
+        let rmtp = if !Self::rmtp(args).is_null() && !is_abstime {
+            Some(VirtAddr::new(Self::rmtp(args) as usize))
         } else {
             None
         };
 
         // 计算 deadline
+        let deadline_clockid = if !is_abstime && matches!(clockid, Realtime) {
+            Monotonic
+        } else {
+            clockid
+        };
         let deadline: PosixTimeSpec = if is_abstime {
             PosixTimeSpec {
                 tv_sec: rq.tv_sec,
                 tv_nsec: rq.tv_nsec,
             }
         } else {
-            let now = Self::ktime_now(clockid);
+            let now = Self::ktime_now(deadline_clockid);
             Self::add_timespec(&now, &rq)
         };
 
@@ -197,7 +175,7 @@ impl Syscall for SysClockNanosleep {
         }
 
         // 等待
-        let wait_res = Self::do_wait_until(&deadline, clockid);
+        let wait_res = Self::do_wait_until(&deadline, deadline_clockid);
         match wait_res {
             Ok(()) => {
                 // log::debug!(
@@ -207,7 +185,7 @@ impl Syscall for SysClockNanosleep {
                 // );
                 return Ok(0);
             }
-            Err(_e) => {
+            Err(SystemError::ERESTARTSYS) => {
                 // 信号打断
                 if is_abstime {
                     // 绝对睡眠：返回 -ERESTARTNOHAND，不写 rmtp
@@ -215,18 +193,27 @@ impl Syscall for SysClockNanosleep {
                     return Err(SystemError::ERESTARTNOHAND);
                 } else {
                     // 相对睡眠：写回剩余时间，并设置restart block
-                    if let Some(ref mut w) = rmtp_writer {
-                        let now = Self::ktime_now(clockid);
+                    if let Some(rmtp) = rmtp {
+                        let now = Self::ktime_now(deadline_clockid);
                         let remain = Self::calc_remaining(&deadline, &now);
                         // log::debug!(
                         //     "clock_nanosleep: REL interrupted -> write rem {{sec={}, nsec={}}}",
                         //     remain.tv_sec,
                         //     remain.tv_nsec
                         // );
-                        w.copy_one_to_user(&remain, 0)?;
+                        let mut writer = UserBufferWriter::new(
+                            rmtp.as_ptr::<PosixTimeSpec>(),
+                            core::mem::size_of::<PosixTimeSpec>(),
+                            true,
+                        )?;
+                        writer.copy_one_to_user(&remain, 0)?;
                     }
                     // 设置重启函数
-                    let data = RestartBlockData::Nanosleep { deadline, clockid };
+                    let data = RestartBlockData::Nanosleep {
+                        deadline,
+                        clockid: deadline_clockid,
+                        rmtp,
+                    };
                     // log::debug!(
                     //     "clock_nanosleep: set restart block and return ERESTART_RESTARTBLOCK"
                     // );
@@ -234,6 +221,7 @@ impl Syscall for SysClockNanosleep {
                     return ProcessManager::current_pcb().set_restart_fn(Some(rb));
                 }
             }
+            Err(error) => return Err(error),
         }
     }
 

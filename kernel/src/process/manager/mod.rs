@@ -7,7 +7,6 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use log::{debug, error, info};
-use system_error::SystemError;
 
 use crate::{
     libs::{
@@ -21,7 +20,7 @@ use crate::{
         ucontext::AddressSpace,
     },
     process::{ProcessControlBlock, RawPid},
-    sched::{cpu_rq, enqueue_task_on_cpu, WakeupFlags},
+    sched::{cpu_rq, enqueue_task_on_cpu, select_task_rq, OnRq, WakeupFlags},
     smp::{core::smp_get_processor_id, cpu::ProcessorId, kick_cpu},
     syscall::user_access::write_one_to_user_protected,
 };
@@ -83,14 +82,15 @@ fn exchange_raw_pids_locked(
     map: &mut HashMap<RawPid, Arc<ProcessControlBlock>>,
     left: &Arc<ProcessControlBlock>,
     right: &Arc<ProcessControlBlock>,
-) -> Result<(), SystemError> {
+) {
     let left_pid = left.raw_pid();
     let right_pid = right.raw_pid();
-    if left_pid == right_pid {
-        return Err(SystemError::EINVAL);
-    }
-    let left_entry = map.remove(&left_pid).ok_or(SystemError::ESRCH)?;
-    let right_entry = map.remove(&right_pid).ok_or(SystemError::ESRCH)?;
+    let left_entry = map
+        .remove(&left_pid)
+        .expect("validated left PID disappeared during identity exchange");
+    let right_entry = map
+        .remove(&right_pid)
+        .expect("validated right PID disappeared during identity exchange");
 
     unsafe {
         left.force_set_raw_pid(right_pid);
@@ -99,7 +99,6 @@ fn exchange_raw_pids_locked(
 
     map.insert(right_pid, left_entry);
     map.insert(left_pid, right_entry);
-    Ok(())
 }
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
@@ -329,31 +328,55 @@ impl ProcessManager {
     pub(crate) fn exchange_tid_and_raw_pids(
         left: &Arc<ProcessControlBlock>,
         right: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
-        let mut all_proc = all_process().lock_irqsave();
-        let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
+    ) {
+        // Keep this order aligned with fork/release publication: ptrace
+        // relations, cgroup accounting, global raw-PID lookup, then the
+        // ordered per-task and struct-Pid locks acquired by exchange_tid_with.
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
         let left_old_pid = left.raw_pid();
         let right_old_pid = right.raw_pid();
-        if left_old_pid == right_old_pid {
-            return Err(SystemError::EINVAL);
-        }
-        if !map.contains_key(&left_old_pid) || !map.contains_key(&right_old_pid) {
-            return Err(SystemError::ESRCH);
-        }
+        let ptrace_plan = crate::process::ptrace::prepare_tracee_pid_exchange_locked(
+            left,
+            right,
+            left_old_pid,
+            right_old_pid,
+        );
+        let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+        let mut all_proc = all_process().lock_irqsave();
+        let map = all_proc
+            .as_mut()
+            .expect("PID identity exchange requires initialized process map");
+        assert_ne!(
+            left_old_pid, right_old_pid,
+            "PID identity exchange requires distinct raw PIDs"
+        );
+        assert!(
+            map.get(&left_old_pid)
+                .map(|entry| Arc::ptr_eq(entry, left))
+                .unwrap_or(false),
+            "left raw PID does not resolve to the expected task"
+        );
+        assert!(
+            map.get(&right_old_pid)
+                .map(|entry| Arc::ptr_eq(entry, right))
+                .unwrap_or(false),
+            "right raw PID does not resolve to the expected task"
+        );
 
         let left_cgroup = left.task_cgroup_node();
         let right_cgroup = right.task_cgroup_node();
         let left_alive = !left.is_exited();
         let right_alive = !right.is_exited();
 
-        left.exchange_tid_with(right)?;
-        exchange_raw_pids_locked(map, left, right)?;
+        left.exchange_tid_with(right, || {
+            exchange_raw_pids_locked(map, left, right);
+            crate::process::ptrace::commit_tracee_pid_exchange_locked(ptrace_plan);
+        });
 
         // cgroup.procs only shows tasks that are still alive; when exec
         // detaches threads and swaps pids, only rename the visible members.
         if Arc::ptr_eq(&left_cgroup, &right_cgroup) && left_alive && right_alive {
-            return Ok(());
+            return;
         }
         if left_alive {
             left_cgroup.rename_task(left_old_pid, left.raw_pid());
@@ -361,8 +384,6 @@ impl ProcessManager {
         if right_alive {
             right_cgroup.rename_task(right_old_pid, right.raw_pid());
         }
-
-        Ok(())
     }
 
     /// ### Returns the PIDs of all processes.
@@ -399,6 +420,12 @@ impl ProcessManager {
         prev_pcb.arch_info.force_unlock();
         fence(Ordering::SeqCst);
 
+        // The old CPU no longer uses prev_pcb's architecture context or
+        // kernel stack. Publish that fact only after releasing arch_info so a
+        // remote ttwu may safely enqueue and run the task on another CPU.
+        prev_pcb.sched_info().finish_running();
+        fence(Ordering::SeqCst);
+
         next_pcb.arch_info.force_unlock();
         fence(Ordering::SeqCst);
 
@@ -411,8 +438,27 @@ impl ProcessManager {
 
         if let Some(dest_cpu) = migrate_prev_to {
             debug_assert!(!Arc::ptr_eq(&prev_pcb, &next_pcb));
-            prev_pcb.sched_info().set_on_cpu(None);
-            enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
+            // The pending target may have been consumed by schedule just
+            // before a concurrent sched_setaffinity publishes a newer mask.
+            // Revalidate placement after switch-out, under pi_lock, and keep
+            // that lock through enqueue. A later affinity update will then
+            // either observe this legal placement or migrate it again.
+            let pi_guard = prev_pcb.sched_info().pi_lock_irqsave();
+            // stop_task() can win after schedule dequeues prev but before this
+            // tail obtains pi_lock. Likewise, wakeup_stop() can enqueue it
+            // after finish_running() and before this check. Only a still
+            // runnable, still off-rq task belongs to this migration owner;
+            // otherwise leave the stopped or already-enqueued state intact.
+            let still_owns_migration = prev_pcb.sched_info().state().is_runnable()
+                && *prev_pcb.sched_info().on_rq.lock_irqsave() == OnRq::None;
+            if still_owns_migration {
+                let allowed = pi_guard.cpus_allowed.clone();
+                let dest_cpu =
+                    select_task_rq(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, &allowed);
+                prev_pcb.sched_info().set_on_cpu(None);
+                enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
+            }
+            drop(pi_guard);
         }
 
         let set_child_tid = next_pcb.thread.write_irqsave().set_child_tid.take();

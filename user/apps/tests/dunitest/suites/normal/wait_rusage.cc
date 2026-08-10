@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <new>
+#include <memory>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -64,6 +65,24 @@ namespace {
 
 constexpr size_t kCloneStackSize = 1024 * 1024;
 constexpr uid_t kWaitidChildUid = 1234;
+
+volatile sig_atomic_t g_ptrace_clone_exit_signal = 0;
+
+void RecordPtraceCloneExitSignal(int) { ++g_ptrace_clone_exit_signal; }
+
+int PtraceCloneExit(void*) {
+  if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+    return 2;
+  }
+  return 0;
+}
+
+struct ScopedSignalAction {
+  int signal;
+  struct sigaction old_action;
+
+  ~ScopedSignalAction() { sigaction(signal, &old_action, nullptr); }
+};
 
 bool ReadExact(int fd, void* buf, size_t len) {
   char* cursor = static_cast<char*>(buf);
@@ -182,6 +201,7 @@ void* ForkChildFromThread(void* arg) {
 struct ThreadForkExitArgs {
   int ready_fd = -1;
   int release_fd = -1;
+  int release_write_fd = -1;
   pid_t child = -1;
   int fork_errno = 0;
 };
@@ -190,6 +210,8 @@ void* ForkChildAndExitThread(void* arg) {
   auto* args = reinterpret_cast<ThreadForkExitArgs*>(arg);
   pid_t child = fork();
   if (child == 0) {
+    close(args->ready_fd);
+    close(args->release_write_fd);
     char release = 0;
     if (read(args->release_fd, &release, 1) != 1) {
       _exit(22);
@@ -881,6 +903,31 @@ TEST(WaitRusage, PtraceTracemeChildIsWaitableWithWclone) {
   EXPECT_EQ(ECHILD, errno);
 }
 
+TEST(WaitRusage, PtraceTracemeClonePreservesExitSignal) {
+  struct sigaction action {};
+  action.sa_handler = RecordPtraceCloneExitSignal;
+  sigemptyset(&action.sa_mask);
+  struct sigaction old_action {};
+  ASSERT_EQ(0, sigaction(SIGUSR1, &action, &old_action)) << strerror(errno);
+  ScopedSignalAction restore = {.signal = SIGUSR1, .old_action = old_action};
+  g_ptrace_clone_exit_signal = 0;
+
+  auto stack = std::make_unique<char[]>(kCloneStackSize);
+  pid_t child = clone(PtraceCloneExit, stack.get() + kCloneStackSize, SIGUSR1,
+                      nullptr);
+  ASSERT_GT(child, 0) << strerror(errno);
+
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = wait4(child, &status, __WCLONE, nullptr);
+  } while (waited < 0 && errno == EINTR);
+  ASSERT_EQ(child, waited) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+  EXPECT_EQ(1, g_ptrace_clone_exit_signal);
+}
+
 TEST(WaitRusage, RepeatedPtraceTracemeFailsWithEperm) {
   pid_t child = fork();
   ASSERT_GE(child, 0) << strerror(errno);
@@ -1061,6 +1108,7 @@ TEST(WaitRusage, WnothreadChildReparentedWhenForkingThreadExits) {
   ThreadForkExitArgs args;
   args.ready_fd = ready_pipe[1];
   args.release_fd = release_pipe[0];
+  args.release_write_fd = release_pipe[1];
   pthread_t thread {};
   ASSERT_EQ(0, pthread_create(&thread, nullptr, ForkChildAndExitThread, &args))
       << strerror(errno);
@@ -1075,8 +1123,76 @@ TEST(WaitRusage, WnothreadChildReparentedWhenForkingThreadExits) {
   ASSERT_EQ(0, args.fork_errno) << strerror(args.fork_errno);
   ASSERT_GT(args.child, 0);
 
-  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
-  close(release_pipe[1]);
+  auto close_release_pipe = [&release_pipe] {
+    if (release_pipe[1] >= 0) {
+      close(release_pipe[1]);
+      release_pipe[1] = -1;
+    }
+  };
+  auto cleanup_child = [&args, &close_release_pipe] {
+    close_release_pipe();
+    int cleanup_status = 0;
+    while (wait4(args.child, &cleanup_status, 0, nullptr) == -1 &&
+           errno == EINTR) {
+    }
+  };
+
+  struct timespec reparent_deadline {};
+  if (clock_gettime(CLOCK_MONOTONIC, &reparent_deadline) != 0) {
+    const int clock_errno = errno;
+    cleanup_child();
+    FAIL() << strerror(clock_errno);
+  }
+  ++reparent_deadline.tv_sec;
+  bool reparented = false;
+  while (true) {
+    struct timespec now {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+      const int clock_errno = errno;
+      cleanup_child();
+      FAIL() << strerror(clock_errno);
+    }
+    if (now.tv_sec > reparent_deadline.tv_sec ||
+        (now.tv_sec == reparent_deadline.tv_sec &&
+         now.tv_nsec >= reparent_deadline.tv_nsec)) {
+      break;
+    }
+
+    siginfo_t si {};
+    errno = 0;
+    long ret = syscall(SYS_waitid, P_PID, args.child, &si,
+                       WEXITED | WNOHANG | WNOWAIT | __WNOTHREAD, nullptr);
+    if (ret == 0 && si.si_pid == 0) {
+      reparented = true;
+      break;
+    }
+    if (ret == -1 && (errno == ECHILD || errno == EINTR)) {
+      usleep(1000);
+      continue;
+    }
+
+    const int wait_errno = errno;
+    cleanup_child();
+    if (ret == 0) {
+      FAIL() << "waitid observed child " << si.si_pid
+             << " before it was released";
+    }
+    FAIL() << "waitid before releasing child returned " << ret << ": "
+           << strerror(wait_errno);
+  }
+
+  if (!reparented) {
+    cleanup_child();
+    FAIL() << "child was not reparented to the waiting thread before timeout";
+  }
+
+  errno = 0;
+  if (write(release_pipe[1], "x", 1) != 1) {
+    const int write_errno = errno;
+    cleanup_child();
+    FAIL() << strerror(write_errno);
+  }
+  close_release_pipe();
 
   int status = 0;
   ASSERT_EQ(args.child, wait4(args.child, &status, __WNOTHREAD, nullptr))

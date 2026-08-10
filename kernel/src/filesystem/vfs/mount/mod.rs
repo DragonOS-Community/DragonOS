@@ -1,8 +1,9 @@
 use super::{
-    file::{File, FileFlags, FileMode, PreopenedFile},
+    file::{File, FileFlags, PreopenedFile},
     utils::DName,
-    DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode,
-    InodeRetentionKind, PollableInode, SetMetadataMask, SuperBlock, VmaOpenRollback, XattrFlags,
+    DelegatedWriteResult, DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode,
+    InodeId, InodeMode, InodeRetentionKind, PollableInode, SetMetadataMask, SuperBlock,
+    VmaOpenRollback, WriteSyncIntent, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -667,6 +668,7 @@ pub struct SuperBlockState {
     /// Bind mounts and mount-namespace copies retain the same owner.
     owner_user_ns: Arc<UserNamespace>,
     flags: RwSem<MountFlags>,
+    synchronous: AtomicBool,
     write_count: AtomicUsize,
     wb_error: ErrSeq,
     umount_lock: RwSem<()>,
@@ -732,6 +734,8 @@ pub struct VfsDentry {
     /// Global fast-path hint; namespace-local checks still inspect topology.
     mount_edges: AtomicUsize,
     automount_gate: Mutex<()>,
+    /// True for a magic-link target that has identity but no directory edge.
+    anonymous: bool,
     state: Mutex<VfsDentryState>,
 }
 
@@ -767,6 +771,32 @@ impl VfsDentry {
                     .self_mountpoint()
                     .is_some_and(|mountpoint| mountpoint.dentry.id == self.id)
         })
+    }
+
+    /// Create a connected dentry without a directory edge.
+    ///
+    /// Magic-link targets use this to retain a mount projection for open and
+    /// bind mount. Anonymous dentries deliberately never enter the ordinary
+    /// dentry registry and therefore cannot participate in lookup or rename.
+    fn new_anonymous(inode: Arc<dyn IndexNode>, dname: DName) -> Result<Arc<Self>, SystemError> {
+        let metadata = inode.metadata()?;
+        let generation = inode.inode_generation();
+        Ok(Arc::new(Self {
+            id: DentryId::alloc(),
+            inode,
+            registry_child: metadata.inode_id,
+            registry_generation: generation,
+            mount_gate: Mutex::new(()),
+            children_gate: Mutex::new(()),
+            mount_edges: AtomicUsize::new(0),
+            automount_gate: Mutex::new(()),
+            anonymous: true,
+            state: Mutex::new(VfsDentryState {
+                name: Some(dname),
+                parent: None,
+                disconnected: false,
+            }),
+        }))
     }
 }
 
@@ -841,9 +871,11 @@ struct MountStateInit {
 
 impl SuperBlockState {
     pub fn new(flags: MountFlags) -> Self {
+        let flags = flags & MountFlags::SB_SETTABLE_MASK;
         Self {
             owner_user_ns: ProcessManager::current_user_ns(),
-            flags: RwSem::new(flags & MountFlags::SB_SETTABLE_MASK),
+            flags: RwSem::new(flags),
+            synchronous: AtomicBool::new(flags.contains(MountFlags::SYNCHRONOUS)),
             write_count: AtomicUsize::new(0),
             wb_error: ErrSeq::new(),
             umount_lock: RwSem::new(()),
@@ -960,6 +992,7 @@ impl SuperBlockState {
             children_gate: Mutex::new(()),
             mount_edges: AtomicUsize::new(0),
             automount_gate: Mutex::new(()),
+            anonymous: false,
             state: Mutex::new(VfsDentryState {
                 name,
                 parent: parent.cloned(),
@@ -1103,7 +1136,15 @@ impl SuperBlockState {
     }
 
     pub fn set_flags(&self, flags: MountFlags) {
-        *self.flags.write() = flags & MountFlags::SB_SETTABLE_MASK;
+        let flags = flags & MountFlags::SB_SETTABLE_MASK;
+        let mut current = self.flags.write();
+        *current = flags;
+        self.synchronous
+            .store(flags.contains(MountFlags::SYNCHRONOUS), Ordering::Release);
+    }
+
+    pub fn is_synchronous(&self) -> bool {
+        self.synchronous.load(Ordering::Acquire)
     }
 
     pub fn inc_write_count(&self) {
@@ -2185,6 +2226,18 @@ impl MountFS {
     /// Snapshot-only variant of [`Self::root_path`].  The caller must hold
     /// `DENTRY_TOPOLOGY_LOCK` and the mount lifecycle snapshot.
     pub(crate) fn root_path_from_snapshot(&self) -> Result<String, SystemError> {
+        // Linux nsfs reports an anonymous namespace bind root as
+        // `type:[ino]`, without the slash used by ordinary filesystem paths.
+        if self.root_dentry.anonymous {
+            return self
+                .root_dentry
+                .state
+                .lock()
+                .name
+                .clone()
+                .map(|name| name.to_string())
+                .ok_or(SystemError::EINVAL);
+        }
         let mut current = self.root_dentry.clone();
         let mut parts: Vec<Arc<String>> = Vec::new();
         let mut deleted = false;
@@ -2914,9 +2967,21 @@ pub fn record_writeback_error_for_fs(inner_fs: &Arc<dyn FileSystem>, error: Syst
     }
 }
 
+/// Query the canonical SB_SYNCHRONOUS state for a filesystem operation which
+/// runs on an unwrapped backing inode and therefore has no MountExternalGuard.
+pub fn filesystem_is_synchronous(inner_fs: &Arc<dyn FileSystem>) -> bool {
+    list_unique_mounted_superblocks().iter().any(|mount| {
+        Arc::ptr_eq(&mount.inner_filesystem(), inner_fs) && mount.super_block_state.is_synchronous()
+    })
+}
+
 impl MountExternalGuard {
     pub fn mount(&self) -> Arc<MountFS> {
         self.mount.clone()
+    }
+
+    pub fn is_synchronous(&self) -> bool {
+        self.mount.super_block_state.is_synchronous()
     }
 
     /// Derive another owner from an already valid path. This remains legal
@@ -3035,6 +3100,22 @@ impl MountFSInode {
             Some(name),
         )?;
         Ok(Self::from_dentry(dentry, mount_fs))
+    }
+
+    fn new_anonymous(
+        inner_inode: Arc<dyn IndexNode>,
+        dname: DName,
+        mount_fs: Arc<MountFS>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let dentry = VfsDentry::new_anonymous(inner_inode, dname)?;
+        // Anonymous magic-link targets have no directory edge and therefore
+        // cannot be rediscovered by dentry ID. Caching their wrappers would
+        // retain one stale Weak key for every namespace-link traversal.
+        Ok(Arc::new_cyclic(|self_ref| Self {
+            dentry,
+            mount_fs,
+            self_ref: self_ref.clone(),
+        }))
     }
 
     fn update_move_dentries(
@@ -3465,6 +3546,19 @@ impl MountFSInode {
     }
 
     pub(crate) fn procfs_path(&self) -> Result<String, SystemError> {
+        // Anonymous magic-link targets have no namespace path. Render the
+        // stable identity captured when the target was resolved, mirroring
+        // Linux d_dname() handling for namespace file descriptors.
+        if self.dentry.anonymous && !self.is_mountpoint_root()? {
+            return self
+                .dentry
+                .state
+                .lock()
+                .name
+                .clone()
+                .map(|name| name.to_string())
+                .ok_or(SystemError::EINVAL);
+        }
         let mut path = self.do_absolute_path_impl(true)?;
         if self.dentry.is_disconnected() {
             path.push_str(" (deleted)");
@@ -3607,8 +3701,8 @@ impl IndexNode for MountFSInode {
         return self.dentry.inode.open(data, flags);
     }
 
-    fn adjust_file_mode_after_open(&self, data: &FilePrivateData, mode: &mut FileMode) {
-        self.dentry.inode.adjust_file_mode_after_open(data, mode)
+    fn configure_open_file(&self, data: &FilePrivateData, behavior: &mut super::OpenFileBehavior) {
+        self.dentry.inode.configure_open_file(data, behavior)
     }
 
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
@@ -3756,6 +3850,20 @@ impl IndexNode for MountFSInode {
     ) -> Result<usize, SystemError> {
         self.ensure_mount_writable()?;
         return self.dentry.inode.write_at(offset, len, buf, data);
+    }
+
+    fn write_at_with_sync(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync_intent: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        self.ensure_mount_writable()?;
+        self.dentry
+            .inode
+            .write_at_with_sync(offset, len, buf, sync_intent, data)
     }
 
     fn read_direct(
@@ -4364,6 +4472,25 @@ impl IndexNode for MountFSInode {
             {
                 self.self_ref
                     .upgrade()
+                    .map(|inode| super::SpecialNodeData::Reference(inode as Arc<dyn IndexNode>))
+            }
+            Some(super::SpecialNodeData::MountProjectedReference { target, dname }) => {
+                if target.clone().downcast_arc::<MountFSInode>().is_some() {
+                    return Some(super::SpecialNodeData::Reference(target));
+                }
+
+                let target_fs = target.fs();
+                let inner_fs = self.mount_fs.inner_filesystem();
+                if !Arc::ptr_eq(&target_fs, &inner_fs) {
+                    debug_assert!(
+                        false,
+                        "mount-projected magic-link target changed filesystem"
+                    );
+                    return None;
+                }
+
+                Self::new_anonymous(target, dname, self.mount_fs.clone())
+                    .ok()
                     .map(|inode| super::SpecialNodeData::Reference(inode as Arc<dyn IndexNode>))
             }
             other => other,

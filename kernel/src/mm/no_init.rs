@@ -32,7 +32,7 @@ pub static EARLY_IOREMAP_PAGES: SpinLock<EarlyIoRemapPages> =
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 struct EarlyRemapPage {
-    data: [u64; MMArch::PAGE_SIZE],
+    data: [u64; MMArch::PAGE_SIZE / core::mem::size_of::<u64>()],
 }
 
 impl EarlyRemapPage {
@@ -60,7 +60,7 @@ impl EarlyIoRemapPages {
     const fn new() -> Self {
         Self {
             pages: [EarlyRemapPage {
-                data: [0; MMArch::PAGE_SIZE],
+                data: [0; MMArch::PAGE_SIZE / core::mem::size_of::<u64>()],
             }; Self::EARLY_REMAP_PAGES_NUM],
             bmp: StaticBitmap::new(),
         }
@@ -152,11 +152,10 @@ pub unsafe fn pseudo_map_phys(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrame
     pseudo_map_phys_with_flags(vaddr, paddr, count, flags);
 }
 
-/// Use pseudo mapper to map physical memory to virtual memory
-/// with READ_ONLY and EXECUTE flags.
+/// Use pseudo mapper to map read-only data with execute permission disabled.
 #[inline(never)]
 pub unsafe fn pseudo_map_phys_ro(vaddr: VirtAddr, paddr: PhysAddr, count: PageFrameCount) {
-    let flags: EntryFlags<MMArch> = EntryFlags::new().set_write(false).set_execute(true);
+    let flags: EntryFlags<MMArch> = EntryFlags::new().set_write(false).set_execute(false);
 
     pseudo_map_phys_with_flags(vaddr, paddr, count, flags);
 }

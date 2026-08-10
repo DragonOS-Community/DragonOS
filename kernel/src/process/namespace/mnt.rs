@@ -139,6 +139,7 @@ pub struct MntNamespace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootMountAttachment {
     /// Linux's initial rootfs has no parent and cannot be pivoted.
+    #[cfg(feature = "initram")]
     Unattached,
     /// The visible root is mounted on the hidden initial rootfs anchor.
     Attached,

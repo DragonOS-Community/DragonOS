@@ -19,16 +19,23 @@ pub struct TtyJobCtrlManager;
 impl TtyJobCtrlManager {
     /// ### 设置当前进程的tty
     pub fn proc_set_tty(tty: Arc<TtyCore>) {
-        let core = tty.core();
         let pcb = ProcessManager::current_pcb();
-
-        let mut ctrl = core.contorl_info_irqsave();
+        let _job_control_guard = tty.core().job_control_lock().lock();
+        let _membership_guard = crate::process::pid::pid_membership_lock();
+        if tty
+            .core()
+            .flags()
+            .intersects(super::tty_core::TtyFlag::HUPPING | super::tty_core::TtyFlag::HUPPED)
+        {
+            return;
+        }
+        let mut ctrl = tty.core().contorl_info_irqsave();
+        let mut signal = pcb.sig_info_mut();
+        if !signal.is_session_leader || signal.tty().is_some() || ctrl.session.is_some() {
+            return;
+        }
         ctrl.set_info_by_pcb(pcb.clone());
-
-        drop(ctrl);
-
-        let mut singal = pcb.sig_info_mut();
-        singal.set_tty(Some(tty.clone()));
+        signal.set_tty(Some(tty.clone()));
     }
 
     /// ### 清除进程的tty
@@ -44,10 +51,47 @@ impl TtyJobCtrlManager {
         wguard.set_tty(None);
     }
 
-    pub fn remove_session_tty(tty: &Arc<TtyCore>) {
+    pub fn remove_session_tty(tty: &Arc<TtyCore>) -> Option<Arc<Pid>> {
+        let _job_control_guard = tty.core().job_control_lock().lock();
+        Self::remove_session_tty_job_locked(tty, None)
+    }
+
+    pub(crate) fn remove_session_tty_job_locked(
+        tty: &Arc<TtyCore>,
+        expected_sid: Option<&Arc<Pid>>,
+    ) -> Option<Arc<Pid>> {
+        let _membership_guard = crate::process::pid::pid_membership_lock();
+        Self::remove_session_tty_locked(tty, expected_sid)
+    }
+
+    pub fn remove_session_tty_if_owner(
+        tty: &Arc<TtyCore>,
+        expected_sid: &Arc<Pid>,
+    ) -> Option<Arc<Pid>> {
+        let _job_control_guard = tty.core().job_control_lock().lock();
+        Self::remove_session_tty_job_locked(tty, Some(expected_sid))
+    }
+
+    /// The caller must hold PID_MEMBERSHIP_LOCK.
+    fn remove_session_tty_locked(
+        tty: &Arc<TtyCore>,
+        expected_sid: Option<&Arc<Pid>>,
+    ) -> Option<Arc<Pid>> {
         let mut ctrl = tty.core().contorl_info_irqsave();
-        ctrl.session = None;
-        ctrl.pgid = None;
+        if expected_sid.is_some_and(|expected| {
+            ctrl.session
+                .as_ref()
+                .is_none_or(|owner| !Arc::ptr_eq(owner, expected))
+        }) {
+            return None;
+        }
+        let sid = ctrl.session.take();
+        let pgid = ctrl.pgid.take();
+        drop(ctrl);
+        if let Some(sid) = sid {
+            Self::session_clear_tty_locked(sid);
+        }
+        pgid
     }
 
     /// ### 检查tty
@@ -125,18 +169,31 @@ impl TtyJobCtrlManager {
     // https://code.dragonos.org.cn/xref/linux-6.6.21/drivers/tty/tty_jobctrl.c#tiocsctty
     fn tiocsctty(real_tty: Arc<TtyCore>, arg: usize) -> Result<usize, SystemError> {
         let current = ProcessManager::current_pcb();
-        let siginfo_guard = current.sig_info_irqsave();
+        let _job_control_guard = real_tty.core().job_control_lock().lock();
+        let _membership_guard = crate::process::pid::pid_membership_lock();
+        if real_tty
+            .core()
+            .flags()
+            .intersects(super::tty_core::TtyFlag::HUPPING | super::tty_core::TtyFlag::HUPPED)
+        {
+            return Err(SystemError::EIO);
+        }
+        let (is_session_leader, current_tty) = {
+            let siginfo = current.sig_info_irqsave();
+            (siginfo.is_session_leader, siginfo.tty())
+        };
 
         // 只有会话首进程才能设置控制终端
-        if !siginfo_guard.is_session_leader {
+        if !is_session_leader {
             return Err(SystemError::EPERM);
         }
 
+        let current_session = current.task_session();
+
         // 如果当前进程已经有控制终端，则返回错误（除非是同一个tty且会话相同）
-        if let Some(current_tty) = siginfo_guard.tty() {
-            if Arc::ptr_eq(&current_tty, &real_tty)
-                && current.task_session() == real_tty.core().contorl_info_irqsave().session
-            {
+        if let Some(current_tty) = current_tty {
+            let tty_session = real_tty.core().contorl_info_irqsave().session.clone();
+            if Arc::ptr_eq(&current_tty, &real_tty) && current_session == tty_session {
                 // 如果已经是当前tty且会话相同，直接返回成功
                 return Ok(0);
             } else {
@@ -145,13 +202,11 @@ impl TtyJobCtrlManager {
             }
         }
 
-        drop(siginfo_guard);
-
-        let tty_ctrl_guard = real_tty.core().contorl_info_irqsave();
+        let mut tty_ctrl_guard = real_tty.core().contorl_info_irqsave();
 
         if let Some(ref sid) = tty_ctrl_guard.session {
             // 如果当前进程是会话首进程，且tty的会话是当前进程的会话，则允许设置
-            if current.task_session() == Some(sid.clone()) {
+            if current_session == Some(sid.clone()) {
                 // 这是正常情况：会话首进程要设置自己会话的tty为控制终端
             } else {
                 // tty被其他会话占用
@@ -161,16 +216,16 @@ impl TtyJobCtrlManager {
                     if !cred.has_capability(CAPFlags::CAP_SYS_ADMIN) {
                         return Err(SystemError::EPERM);
                     }
-                    Self::session_clear_tty(sid.clone());
+                    Self::session_clear_tty_locked(sid.clone());
                 } else {
                     return Err(SystemError::EPERM);
                 }
             }
         }
 
+        tty_ctrl_guard.set_info_by_pcb(current.clone());
+        current.sig_info_mut().set_tty(Some(real_tty.clone()));
         drop(tty_ctrl_guard);
-
-        Self::proc_set_tty(real_tty);
         Ok(0)
     }
 
@@ -249,57 +304,31 @@ impl TtyJobCtrlManager {
         }
 
         let current = ProcessManager::current_pcb();
-
+        let _job_control_guard = real_tty.core().job_control_lock().lock();
+        let _membership_guard = crate::process::pid::pid_membership_lock();
+        let current_session = current.task_session();
+        let current_tty = current.sig_info_irqsave().tty();
         let mut ctrl = real_tty.core().contorl_info_irqsave();
-
+        if current_tty
+            .as_ref()
+            .is_none_or(|tty| !Arc::ptr_eq(tty, &real_tty))
+            || ctrl.session != current_session
         {
-            // if current.sig_info_irqsave().tty().is_none()
-            //     || !Arc::ptr_eq(
-            //         &current.sig_info_irqsave().tty().clone().unwrap(),
-            //         &real_tty,
-            //     )
-            //     || ctrl.session != current.task_session()
-            // {
-            //     log::debug!("sss-2");
-            //     return Err(SystemError::ENOTTY);
-            // }
-
-            // 拆分判断条件以便调试
-            let current_tty = current.sig_info_irqsave().tty();
-            let condition1 = current_tty.is_none();
-
-            let condition2 = if let Some(ref tty) = current_tty {
-                !Arc::ptr_eq(tty, &real_tty)
-            } else {
-                false // 如果 tty 为 None，这个条件就不用检查了
-            };
-
-            let condition3 = ctrl.session != current.task_session();
-
-            if condition1 || condition2 || condition3 {
-                if condition1 {
-                    log::debug!("sss-2: 失败原因 - 当前进程没有关联的 tty");
-                } else if condition2 {
-                    log::debug!("sss-2: 失败原因 - 当前进程的 tty 与目标 tty 不匹配");
-                } else if condition3 {
-                    log::debug!("sss-2: 失败原因 - 会话不匹配");
-                }
-                return Err(SystemError::ENOTTY);
-            }
+            return Err(SystemError::ENOTTY);
         }
+
         let pgrp =
             ProcessManager::find_vpid(RawPid::new(pgrp_nr as usize)).ok_or(SystemError::ESRCH)?;
-
-        if Self::session_of_pgrp(&pgrp) != current.task_session() {
+        if Self::session_of_pgrp_locked(&pgrp) != current_session {
             return Err(SystemError::EPERM);
         }
-
         ctrl.pgid = Some(pgrp);
 
         return Ok(0);
     }
 
-    fn session_of_pgrp(pgrp: &Arc<Pid>) -> Option<Arc<Pid>> {
+    /// The caller must hold PID_MEMBERSHIP_LOCK.
+    fn session_of_pgrp_locked(pgrp: &Arc<Pid>) -> Option<Arc<Pid>> {
         let mut p = pgrp.pid_task(PidType::PGID);
         if p.is_none() {
             // this should not be None
@@ -329,33 +358,28 @@ impl TtyJobCtrlManager {
             return Ok(0);
         }
 
-        let sid = pcb.task_session();
-        let tty_pgrp = real_tty.core().contorl_info_irqsave().pgid.clone();
+        let tty_pgrp = if let Some(sid) = pcb.task_session() {
+            Self::remove_session_tty_if_owner(&real_tty, &sid)
+        } else {
+            Self::proc_clear_tty(&pcb);
+            None
+        };
 
         if let Some(pgrp) = tty_pgrp {
             let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
             let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGCONT);
         }
 
-        {
-            let mut ctrl = real_tty.core().contorl_info_irqsave();
-            ctrl.session = None;
-            ctrl.pgid = None;
-        }
-
-        if let Some(sid) = sid {
-            Self::session_clear_tty(sid);
-        } else {
-            Self::proc_clear_tty(&pcb);
-        }
-
         Ok(0)
     }
 
-    pub fn session_clear_tty(sid: Arc<Pid>) {
-        // 清除会话的tty
-        for task in sid.tasks_iter(PidType::SID) {
-            TtyJobCtrlManager::proc_clear_tty(&task);
+    /// The caller must hold PID_MEMBERSHIP_LOCK.
+    fn session_clear_tty_locked(sid: Arc<Pid>) {
+        let leaders: alloc::vec::Vec<_> = sid.tasks_iter(PidType::SID).collect();
+        for leader in leaders {
+            for task in ProcessManager::thread_group_tasks_snapshot(leader) {
+                TtyJobCtrlManager::proc_clear_tty(&task);
+            }
         }
     }
 

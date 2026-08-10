@@ -5,7 +5,7 @@ use crate::{
         procfs::{template::Common, ProcfsFilePrivateData},
         vfs::{
             file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            IndexNode, InodeFlags, InodeMode, Metadata,
+            IndexNode, InodeFlags, InodeMode, Metadata, OpenFileBehavior, PostWriteSyncPolicy,
         },
     },
     time::PosixTimeSpec,
@@ -62,6 +62,10 @@ impl<F: FileOps> ProcFile<F> {
             common,
         })
     }
+
+    pub(crate) fn ops(&self) -> &F {
+        &self.inner
+    }
 }
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作
@@ -115,12 +119,21 @@ pub trait FileOps: Sync + Send + Sized + Debug {
     fn owner(&self) -> Option<(usize, usize)> {
         None
     }
+
+    /// Override the generated inode ID for identity-bearing pseudo files.
+    fn dynamic_inode_id(&self) -> Option<crate::filesystem::vfs::InodeId> {
+        None
+    }
 }
 
 /// 为 ProcFile 实现 IndexNode trait
 /// 使用 inherit_methods 宏从 common 继承通用方法
 #[inherit_methods(from = "self.common")]
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+    }
+
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn as_any_ref(&self) -> &dyn core::any::Any;
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
@@ -130,6 +143,9 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         if let Some((uid, gid)) = self.inner.owner() {
             metadata.uid = uid;
             metadata.gid = gid;
+        }
+        if let Some(inode_id) = self.inner.dynamic_inode_id() {
+            metadata.inode_id = inode_id;
         }
         Ok(metadata)
     }

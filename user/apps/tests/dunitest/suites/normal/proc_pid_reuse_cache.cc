@@ -2,9 +2,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -29,6 +32,15 @@ bool read_text_file(const char* path, std::string* out) {
     close(fd);
     errno = saved_errno;
     return n >= 0;
+}
+
+bool wait_for_zombie(pid_t child) {
+    siginfo_t info = {};
+    int result = -1;
+    do {
+        result = waitid(P_PID, child, &info, WEXITED | WNOWAIT);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 && info.si_pid == child;
 }
 
 pid_t fork_waiting_child(int* release_fd) {
@@ -65,6 +77,51 @@ void release_child(pid_t child, int release_fd) {
     int status = 0;
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
     }
+}
+
+bool is_dragonos() {
+    utsname uts = {};
+    if (uname(&uts) != 0) {
+        return false;
+    }
+    return strstr(uts.release, "dragonos") != nullptr ||
+           strstr(uts.nodename, "dragonos") != nullptr;
+}
+
+struct NamespaceThreadResult {
+    const char* ns_name = nullptr;
+    pid_t tid = -1;
+    int open_errno = 0;
+    bool opened = false;
+    bool link_read = false;
+};
+
+void* open_thread_namespace(void* opaque) {
+    auto* result = static_cast<NamespaceThreadResult*>(opaque);
+    result->tid = static_cast<pid_t>(syscall(SYS_gettid));
+
+    char path[128] = {};
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/ns/%s", getpid(), result->tid,
+             result->ns_name);
+
+    const int fd = open(path, O_RDONLY);
+    result->open_errno = errno;
+    if (fd >= 0) {
+        result->opened = true;
+        close(fd);
+    }
+
+    char target[128] = {};
+    result->link_read = readlink(path, target, sizeof(target)) > 0;
+    return nullptr;
+}
+
+bool run_namespace_thread(NamespaceThreadResult* result) {
+    pthread_t thread = {};
+    if (pthread_create(&thread, nullptr, open_thread_namespace, result) != 0) {
+        return false;
+    }
+    return pthread_join(thread, nullptr) == 0;
 }
 
 }  // namespace
@@ -114,6 +171,104 @@ TEST(ProcPidReuseCache, NumericProcDirRefreshesAfterPidReuse) {
     EXPECT_NE(std::string::npos, status.find(pid_line)) << status_path << " content:\n" << status;
 
     release_child(reused, reused_release);
+}
+
+TEST(ProcPidReuseCache, ZombieFdEntriesDisappearWithEnoent) {
+    int release_fd = -1;
+    const pid_t child = fork_waiting_child(&release_fd);
+    ASSERT_GT(child, 0);
+
+    char fd_path[64] = {};
+    snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/0", child);
+    char link_target[64] = {};
+    EXPECT_GE(readlink(fd_path, link_target, sizeof(link_target)), 0);
+
+    char fdinfo_path[64] = {};
+    snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%d/fdinfo/0", child);
+    const int live_fdinfo = open(fdinfo_path, O_RDONLY);
+    EXPECT_GE(live_fdinfo, 0);
+
+    const char byte = 'x';
+    EXPECT_EQ(1, write(release_fd, &byte, 1));
+    close(release_fd);
+
+    const bool became_zombie = wait_for_zombie(child);
+    if (became_zombie) {
+        errno = 0;
+        EXPECT_EQ(-1, readlink(fd_path, link_target, sizeof(link_target)));
+        EXPECT_EQ(ENOENT, errno);
+
+        errno = 0;
+        const int fdinfo = open(fdinfo_path, O_RDONLY);
+        EXPECT_EQ(-1, fdinfo);
+        EXPECT_EQ(ENOENT, errno);
+        if (fdinfo >= 0) {
+            close(fdinfo);
+        }
+
+        if (live_fdinfo >= 0) {
+            char byte = {};
+            errno = 0;
+            EXPECT_EQ(-1, read(live_fdinfo, &byte, sizeof(byte)));
+            EXPECT_EQ(ENOENT, errno);
+        }
+    }
+    if (live_fdinfo >= 0) {
+        close(live_fdinfo);
+    }
+
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    EXPECT_EQ(child, waited);
+    ASSERT_TRUE(became_zombie) << "child did not become observable as a zombie";
+}
+
+TEST(ProcPidReuseCache, ReusedTidRefreshesTaskNamespaceDirectory) {
+    NamespaceThreadResult first;
+    first.ns_name = "ipc";
+    ASSERT_TRUE(run_namespace_thread(&first));
+    ASSERT_GT(first.tid, 0);
+    ASSERT_TRUE(first.opened)
+        << "initial namespace open failed: errno=" << first.open_errno << " ("
+        << strerror(first.open_errno) << ")";
+    ASSERT_TRUE(first.link_read);
+
+    char stale_path[96] = {};
+    snprintf(stale_path, sizeof(stale_path), "/proc/%d/task/%d", getpid(), first.tid);
+    errno = 0;
+    const int stale_fd = open(stale_path, O_RDONLY | O_DIRECTORY);
+    EXPECT_EQ(-1, stale_fd);
+    EXPECT_EQ(ENOENT, errno);
+    if (stale_fd >= 0) {
+        close(stale_fd);
+    }
+
+    constexpr int kMaxReuseAttempts = 128;
+    bool observed_reuse = false;
+    for (int attempt = 0; attempt < kMaxReuseAttempts; ++attempt) {
+        NamespaceThreadResult replacement;
+        replacement.ns_name = "uts";
+        ASSERT_TRUE(run_namespace_thread(&replacement));
+        ASSERT_TRUE(replacement.opened)
+            << "replacement namespace open failed: tid=" << replacement.tid
+            << " errno=" << replacement.open_errno << " (" << strerror(replacement.open_errno)
+            << ")";
+        ASSERT_TRUE(replacement.link_read);
+
+        if (replacement.tid == first.tid) {
+            observed_reuse = true;
+            break;
+        }
+    }
+
+    if (!observed_reuse && !is_dragonos()) {
+        GTEST_SKIP() << "Linux does not guarantee TID reuse within a small fixed attempt budget";
+    }
+    EXPECT_TRUE(observed_reuse) << "DragonOS did not reuse the released TID within "
+                                << kMaxReuseAttempts << " attempts";
 }
 
 int main(int argc, char** argv) {

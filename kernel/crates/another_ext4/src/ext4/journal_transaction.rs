@@ -18,6 +18,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 const CLEAN: u8 = 0;
 const POISONED: u8 = 1;
+const MAX_COALESCED_WRITE_BLOCKS: usize = 64;
 
 /// A fully validated journal mapping and its current allocation cursor.
 ///
@@ -41,18 +42,16 @@ impl JournalContext {
         if sb.block_size as usize != BLOCK_SIZE
             || (sb.features.checksum == ChecksumMode::V3 && sb.checksum_type != CRC32C_CHKSUM)
             || self.logical_blocks.len() != sb.max_len as usize
-            || self.journal_blocks.len() != self.logical_blocks.len()
+            || self.journal_blocks.len() < self.logical_blocks.len()
             || self.head < sb.first
             || self.head >= sb.max_len
             || self.target_blocks == 0
         {
             return Err(Ext4Error::new(ErrCode::ENOTSUP));
         }
-        if self
-            .logical_blocks
-            .iter()
-            .any(|block| *block == 0 || !self.journal_blocks.contains(block))
-        {
+        if self.logical_blocks.iter().any(|block| {
+            *block == 0 || *block >= self.target_blocks || !self.journal_blocks.contains(block)
+        }) {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
         Ok(())
@@ -106,6 +105,11 @@ pub enum CommitFailure {
 pub struct CommitError {
     pub error: Ext4Error,
     pub failure: CommitFailure,
+    /// Whether this failure poisoned the transaction core. `BeforeCommit`
+    /// alone is insufficient to decide retryability: format/capacity
+    /// validation leaves the core usable, while an I/O failure after the
+    /// active journal tail reached disk does not.
+    pub poisoned: bool,
 }
 
 /// Owns the single-writer token and poison state.  The token is held only as
@@ -215,6 +219,19 @@ impl JournalTransactionCore {
                 .is_some()
     }
 
+    pub fn credits_fit(&self, credits: usize) -> Result<bool> {
+        if credits == 0 || self.is_poisoned() {
+            return Err(Ext4Error::new(if credits == 0 {
+                ErrCode::EINVAL
+            } else {
+                ErrCode::EROFS
+            }));
+        }
+        let context = self.context.lock();
+        required_log_blocks(credits, context.superblock.features)
+            .and_then(|needed| ring_len(&context.superblock).map(|available| needed <= available))
+    }
+
     pub fn start(&self, credits: usize) -> Result<Transaction<'_>> {
         if credits == 0 || self.is_poisoned() {
             return Err(Ext4Error::new(if credits == 0 {
@@ -304,6 +321,15 @@ impl Transaction<'_> {
             },
         );
         Ok(())
+    }
+
+    /// Credits which are still available for previously untouched home blocks.
+    ///
+    /// Batched operations use this only to stop at a restartable boundary
+    /// before beginning their next logical mutation. Re-staging an existing
+    /// home remains free and the transaction is still the final authority.
+    pub(super) fn remaining_credits(&self) -> usize {
+        self.credits.saturating_sub(self.staged.len())
     }
 
     /// Return the transaction-private final image of `home` for mutation.
@@ -529,11 +555,13 @@ impl Transaction<'_> {
             required_log_blocks(self.staged.len(), sb.features).map_err(|error| CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
+                poisoned: false,
             })?;
         if needed
             > ring_len(&sb).map_err(|error| CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
+                poisoned: false,
             })?
         {
             return self.fail(
@@ -547,6 +575,7 @@ impl Transaction<'_> {
         let positions = ring_positions(&sb, head, needed).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
+            poisoned: false,
         })?;
         if self
             .staged
@@ -565,16 +594,19 @@ impl Transaction<'_> {
         let encoded = encode_log(&sb, sequence, &self.staged).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
+            poisoned: false,
         })?;
         let commit = encode_commit(&sb, sequence).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
+            poisoned: false,
         })?;
         let mut active_sb_image = sb_image.clone();
         update_superblock(&mut active_sb_image, sequence, head, &sb).map_err(|error| {
             CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
+                poisoned: false,
             }
         })?;
         let next_sequence = sequence.wrapping_add(1);
@@ -583,8 +615,29 @@ impl Transaction<'_> {
             CommitError {
                 error,
                 failure: CommitFailure::BeforeCommit,
+                poisoned: false,
             }
         })?;
+        let scratch_blocks = encoded
+            .len()
+            .max(self.staged.len())
+            .min(MAX_COALESCED_WRITE_BLOCKS);
+        let scratch_capacity =
+            scratch_blocks
+                .checked_mul(BLOCK_SIZE)
+                .ok_or_else(|| CommitError {
+                    error: Ext4Error::new(ErrCode::E2BIG),
+                    failure: CommitFailure::BeforeCommit,
+                    poisoned: false,
+                })?;
+        let mut write_scratch = Vec::new();
+        write_scratch
+            .try_reserve_exact(scratch_capacity)
+            .map_err(|_| CommitError {
+                error: Ext4Error::new(ErrCode::ENOMEM),
+                failure: CommitFailure::BeforeCommit,
+                poisoned: false,
+            })?;
 
         // Publish an active tail before log payload.  Recovery may safely scan
         // an empty/uncommitted transaction after a crash at this point.
@@ -595,10 +648,31 @@ impl Transaction<'_> {
         }
 
         debug_assert_eq!(encoded.len() + 1, positions.len());
-        for (logical, bytes) in positions[..encoded.len()].iter().zip(encoded.iter()) {
-            if let Err(error) = write_bytes(device, mapping[*logical as usize], bytes) {
+        // A logical ring wrap is a recovery boundary for run construction even
+        // when its physical mapping happens to be contiguous. Within each
+        // logical segment, coalesce only physically contiguous journal blocks.
+        let mut segment_start = 0;
+        for segment_end in 1..=encoded.len() {
+            let segment_complete = segment_end == encoded.len()
+                || positions[segment_end - 1].checked_add(1) != Some(positions[segment_end]);
+            if !segment_complete {
+                continue;
+            }
+            let blocks = positions[segment_start..segment_end]
+                .iter()
+                .zip(encoded[segment_start..segment_end].iter())
+                .map(|(logical, bytes)| {
+                    (
+                        mapping[*logical as usize],
+                        bytes.as_ref() as &[u8; BLOCK_SIZE],
+                    )
+                });
+            if let Err(error) =
+                write_contiguous_blocks(device, blocks, &mut write_scratch, scratch_blocks)
+            {
                 return self.fail(error, CommitFailure::BeforeCommit, true);
             }
+            segment_start = segment_end;
         }
         if let Err(error) = device.flush() {
             return self.fail(error, CommitFailure::BeforeCommit, true);
@@ -612,10 +686,14 @@ impl Transaction<'_> {
             return self.fail(error, CommitFailure::CommitUncertain, true);
         }
 
-        for staged in self.staged.values() {
-            if let Err(error) = write_bytes(device, staged.home, staged.bytes()) {
-                return self.fail(error, CommitFailure::CheckpointFailed, true);
-            }
+        let home_blocks = self
+            .staged
+            .values()
+            .map(|staged| (staged.home, staged.bytes()));
+        if let Err(error) =
+            write_contiguous_blocks(device, home_blocks, &mut write_scratch, scratch_blocks)
+        {
+            return self.fail(error, CommitFailure::CheckpointFailed, true);
         }
         if let Err(error) = device.flush() {
             return self.fail(error, CommitFailure::CheckpointFailed, true);
@@ -651,7 +729,11 @@ impl Transaction<'_> {
             }
         }
         self.release_writer();
-        Err(CommitError { error, failure })
+        Err(CommitError {
+            error,
+            failure,
+            poisoned: poison,
+        })
     }
 
     fn release_writer(&mut self) {
@@ -857,6 +939,43 @@ fn write_bytes(device: &dyn BlockDevice, id: PBlockId, bytes: &[u8; BLOCK_SIZE])
     device.write_block(&Block::new(id, Box::new(*bytes)))
 }
 
+fn write_contiguous_blocks<'a>(
+    device: &dyn BlockDevice,
+    blocks: impl IntoIterator<Item = (PBlockId, &'a [u8; BLOCK_SIZE])>,
+    scratch: &mut Vec<u8>,
+    max_blocks: usize,
+) -> Result<()> {
+    debug_assert!(
+        max_blocks <= MAX_COALESCED_WRITE_BLOCKS && scratch.capacity() >= max_blocks * BLOCK_SIZE,
+        "journal write scratch must be reserved before the active tail"
+    );
+    scratch.clear();
+    let mut first: Option<PBlockId> = None;
+    let mut previous: Option<PBlockId> = None;
+
+    for (physical, image) in blocks {
+        let at_capacity = scratch.len() == max_blocks * BLOCK_SIZE;
+        let contiguous = previous.and_then(|previous| previous.checked_add(1)) == Some(physical);
+        if !scratch.is_empty() && (at_capacity || !contiguous) {
+            device.write_blocks(first.expect("non-empty run has a first block"), scratch)?;
+            scratch.clear();
+            first = None;
+        }
+        if first.is_none() {
+            first = Some(physical);
+        }
+        debug_assert!(scratch.len() + BLOCK_SIZE <= scratch.capacity());
+        scratch.extend_from_slice(image);
+        previous = Some(physical);
+    }
+
+    if !scratch.is_empty() {
+        device.write_blocks(first.expect("non-empty run has a first block"), scratch)?;
+        scratch.clear();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +991,10 @@ mod tests {
         fail_at: AtomicUsize,
         fail_at_second: AtomicUsize,
         write_order: spin::Mutex<Vec<PBlockId>>,
+        bulk_writes: spin::Mutex<Vec<(PBlockId, usize)>>,
+        bulk_calls: AtomicUsize,
+        partial_bulk_call: AtomicUsize,
+        partial_bulk_prefix: AtomicUsize,
         reads: AtomicUsize,
         writes: AtomicUsize,
         flushes: AtomicUsize,
@@ -886,6 +1009,10 @@ mod tests {
                 fail_at: AtomicUsize::new(usize::MAX),
                 fail_at_second: AtomicUsize::new(usize::MAX),
                 write_order: spin::Mutex::new(Vec::new()),
+                bulk_writes: spin::Mutex::new(Vec::new()),
+                bulk_calls: AtomicUsize::new(0),
+                partial_bulk_call: AtomicUsize::new(usize::MAX),
+                partial_bulk_prefix: AtomicUsize::new(usize::MAX),
                 reads: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
                 flushes: AtomicUsize::new(0),
@@ -931,6 +1058,41 @@ mod tests {
             self.step()?;
             self.write_order.lock().push(block.id);
             self.volatile.lock().insert(block.id, block.data.clone());
+            Ok(())
+        }
+
+        fn write_blocks(&self, start: PBlockId, data: &[u8]) -> Result<()> {
+            if data.is_empty() || !data.len().is_multiple_of(BLOCK_SIZE) {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            let blocks = data.len() / BLOCK_SIZE;
+            let call = self.bulk_calls.fetch_add(1, Ordering::SeqCst);
+            self.bulk_writes.lock().push((start, blocks));
+            let partial = call == self.partial_bulk_call.load(Ordering::SeqCst);
+            let prefix = self.partial_bulk_prefix.load(Ordering::SeqCst);
+
+            for (index, bytes) in data.chunks_exact(BLOCK_SIZE).enumerate() {
+                if partial && index == prefix {
+                    return Err(Ext4Error::new(ErrCode::EIO));
+                }
+                let id = start
+                    .checked_add(index as PBlockId)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+                let mut image = Box::new([0; BLOCK_SIZE]);
+                image.copy_from_slice(bytes);
+                self.write_block(&Block::new(id, image))?;
+                if partial {
+                    // A failed multi-block request does not promise that its
+                    // completed prefix remained only in volatile cache.
+                    // Persist the prefix to model the conservative recovery
+                    // case required from a real block device after EIO.
+                    let stable_image = self.volatile.lock()[&id].clone();
+                    self.stable.lock().insert(id, stable_image);
+                }
+            }
+            if partial && prefix >= blocks {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
             Ok(())
         }
 
@@ -1302,7 +1464,23 @@ mod tests {
         }
     }
 
-    fn assert_counted_commit_shape(homes: usize, expected_reads: usize, expected_writes: usize) {
+    fn context_with_fragmented_log() -> JournalContext {
+        let mut context = context_with_ring(TEST_LARGE_JOURNAL_BLOCKS, 1);
+        let mut mapping = context.logical_blocks.to_vec();
+        for (logical, physical) in mapping.iter_mut().enumerate().skip(1) {
+            *physical = 200 + logical as PBlockId * 2;
+        }
+        context.journal_blocks = Arc::new(mapping.iter().copied().collect());
+        context.logical_blocks = mapping.into();
+        context
+    }
+
+    fn assert_counted_commit_shape(
+        homes: usize,
+        expected_reads: usize,
+        expected_writes: usize,
+        expected_bulk_writes: &[(PBlockId, usize)],
+    ) {
         let device = MemoryDevice::new();
         let publisher = Publisher(AtomicUsize::new(0));
         let core = JournalTransactionCore::new(context_with_ring(
@@ -1320,18 +1498,123 @@ mod tests {
         assert_eq!(device.reads.load(Ordering::SeqCst), expected_reads);
         assert_eq!(device.writes.load(Ordering::SeqCst), expected_writes);
         assert_eq!(device.flushes.load(Ordering::SeqCst), 5);
+        assert_eq!(&*device.bulk_writes.lock(), expected_bulk_writes);
         assert_eq!(publisher.0.load(Ordering::SeqCst), homes);
         assert!(!core.is_poisoned());
     }
 
     #[test]
     fn journal_commit_four_homes_has_expected_fixed_io_shape() {
-        assert_counted_commit_shape(4, 6, 12);
+        assert_counted_commit_shape(4, 6, 12, &[(163, 1), (101, 4), (42, 4)]);
     }
 
     #[test]
     fn journal_commit_max_fast_metadata_images_has_expected_fixed_io_shape() {
-        assert_counted_commit_shape(TEST_MAX_FAST_METADATA_IMAGES, 18, 36);
+        assert_counted_commit_shape(
+            TEST_MAX_FAST_METADATA_IMAGES,
+            18,
+            36,
+            &[(163, 1), (101, 16), (42, 16)],
+        );
+    }
+
+    #[test]
+    fn journal_commit_splits_physically_fragmented_log_runs() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context_with_fragmented_log()).unwrap();
+
+        staged_journal_transaction(&core, 4)
+            .commit(&device, &publisher)
+            .unwrap();
+
+        assert_eq!(
+            &*device.bulk_writes.lock(),
+            &[(202, 1), (204, 1), (206, 1), (208, 1), (210, 1), (42, 4)]
+        );
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 5);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn journal_core_rejects_out_of_range_mapping_at_construction() {
+        let mut context = context_with_ring(TEST_LARGE_JOURNAL_BLOCKS, 1);
+        let mut mapping = context.logical_blocks.to_vec();
+        mapping[2] = context.target_blocks;
+        context.journal_blocks = Arc::new(mapping.iter().copied().collect());
+        context.logical_blocks = mapping.into();
+
+        let error = JournalTransactionCore::new(context).err().unwrap();
+        assert_eq!(error.code(), ErrCode::EIO);
+    }
+
+    fn staged_journal_transaction<'a>(
+        core: &'a JournalTransactionCore,
+        homes: usize,
+    ) -> Transaction<'a> {
+        let mut transaction = core.start(homes).unwrap();
+        for home in 42..42 + homes as PBlockId {
+            transaction
+                .stage(home, Box::new([home as u8; BLOCK_SIZE]))
+                .unwrap();
+        }
+        transaction
+    }
+
+    #[test]
+    fn journal_bulk_log_partial_failure_never_publishes() {
+        for prefix in [0, 1, 2, 4] {
+            let device = MemoryDevice::new();
+            device.partial_bulk_call.store(0, Ordering::SeqCst);
+            device.partial_bulk_prefix.store(prefix, Ordering::SeqCst);
+            let core = JournalTransactionCore::new(context_with_ring(TEST_LARGE_JOURNAL_BLOCKS, 1))
+                .unwrap();
+            let publisher = Publisher(AtomicUsize::new(0));
+
+            let error = staged_journal_transaction(&core, 4)
+                .commit(&device, &publisher)
+                .unwrap_err();
+
+            assert_eq!(error.failure, CommitFailure::BeforeCommit);
+            assert!(core.is_poisoned());
+            assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+            assert_eq!(device.stable_block(101).is_some(), prefix != 0);
+            assert!(device.stable_block(42).is_none());
+            device.crash();
+            assert!(device.stable_block(42).is_none());
+        }
+    }
+
+    #[test]
+    fn journal_bulk_home_partial_failure_keeps_committed_log_for_recovery() {
+        for prefix in [0, 1, 2, 3, 4] {
+            let device = MemoryDevice::new();
+            device.partial_bulk_call.store(1, Ordering::SeqCst);
+            device.partial_bulk_prefix.store(prefix, Ordering::SeqCst);
+            let core = JournalTransactionCore::new(context_with_ring(TEST_LARGE_JOURNAL_BLOCKS, 1))
+                .unwrap();
+            let publisher = Publisher(AtomicUsize::new(0));
+
+            let error = staged_journal_transaction(&core, 4)
+                .commit(&device, &publisher)
+                .unwrap_err();
+
+            assert_eq!(error.failure, CommitFailure::CheckpointFailed);
+            assert!(core.is_poisoned());
+            assert_eq!(publisher.0.load(Ordering::SeqCst), 0);
+            for index in 0..4 {
+                assert_eq!(
+                    device.stable_block(42 + index as PBlockId).is_some(),
+                    index < prefix
+                );
+            }
+            // The commit block is stable before checkpoint starts, so mount
+            // recovery has the authoritative complete transaction even when
+            // an arbitrary home-block prefix reached stable media.
+            assert!(device.stable_block(106).is_some());
+            device.crash();
+            assert!(device.stable_block(106).is_some());
+        }
     }
 
     #[test]

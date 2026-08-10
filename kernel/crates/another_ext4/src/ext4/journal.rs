@@ -110,6 +110,15 @@ impl Ext4 {
             }
             mapping.push(physical);
         }
+        // The journal inode's external extent-tree nodes are journal-owned
+        // metadata too.  Protect them from the allocator and from replay home
+        // targets; otherwise a corrupted free bitmap could let a delayed data
+        // allocation overwrite the tree which defines the journal mapping.
+        for physical in self.extent_all_tree_blocks(inode)? {
+            if physical == 0 || physical >= filesystem_blocks || !blocks.insert(physical) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+        }
         Ok((mapping, blocks))
     }
 
@@ -197,10 +206,19 @@ impl Ext4 {
         &self,
         credits: usize,
     ) -> Result<journal_transaction::Transaction<'_>> {
-        match &self.metadata_mode {
+        let result = match &self.metadata_mode {
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Journal(core) => core.start(credits),
             MetadataMutationMode::Direct(core) => core.start(credits),
+        };
+        self.normalize_transaction_start(result)
+    }
+
+    pub(super) fn transaction_credits_fit(&self, credits: usize) -> Result<bool> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Journal(core) => core.credits_fit(credits),
+            MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Direct(_) => Ok(true),
         }
     }
 
@@ -208,10 +226,32 @@ impl Ext4 {
         &self,
         credits: usize,
     ) -> Result<journal_transaction::Transaction<'_>> {
-        match &self.metadata_mode {
+        let result = match &self.metadata_mode {
             MetadataMutationMode::Direct(core) => core.start_direct_range(credits),
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Journal(_) => Err(Ext4Error::new(ErrCode::ENOTSUP)),
+        };
+        self.normalize_transaction_start(result)
+    }
+
+    fn normalize_transaction_start<'a>(
+        &self,
+        result: Result<journal_transaction::Transaction<'a>>,
+    ) -> Result<journal_transaction::Transaction<'a>> {
+        match result {
+            // Every production transaction start is protected either by the
+            // exclusive metadata gate or by unpublished single-threaded mount
+            // recovery. A busy raw core therefore means the ownership
+            // invariant is already broken; retrying it through the upper
+            // generation bridge would create a self-waking hot loop.
+            Err(error) if error.code() == ErrCode::EAGAIN => {
+                log::error!(
+                    "ext4 transaction core is busy behind the metadata gate; fail-stopping"
+                );
+                self.poison(ErrCode::EIO);
+                Err(Ext4Error::new(ErrCode::EIO))
+            }
+            result => result,
         }
     }
 

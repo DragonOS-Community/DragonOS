@@ -12,6 +12,7 @@ use crate::{
     filesystem::{
         page_cache::{
             schedule_pagecache_io, PageCache, PageCacheBackend, PageCacheReadDmaReservation,
+            PageCacheWritebackAdmissionOrder,
         },
         vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
     },
@@ -247,6 +248,14 @@ impl PageCacheBackend for FusePageCacheBackend {
             Ok(_) => Err(SystemError::EIO),
             Err(error) => Err(error),
         }
+    }
+
+    /// FUSE host invalidation takes `writeback_barrier.write()` before it
+    /// launders and invalidates PageCache entries.  Pin the corresponding
+    /// writeback order instead of inheriting a future generic default: taking
+    /// PageCache invalidate-read first would form an ABBA with that worker.
+    fn writeback_admission_order(&self) -> PageCacheWritebackAdmissionOrder {
+        PageCacheWritebackAdmissionOrder::AdmissionBeforeInvalidate
     }
 
     fn with_write_admission(

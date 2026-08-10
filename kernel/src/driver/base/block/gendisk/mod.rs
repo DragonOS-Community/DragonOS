@@ -1,7 +1,7 @@
 use core::{
     convert::TryFrom,
+    fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU32, Ordering},
 };
 
 use alloc::{
@@ -16,7 +16,10 @@ use crate::{
     driver::{base::device::device_number::DeviceNumber, block::loop_device::LoopDevice},
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
-        vfs::{utils::DName, IndexNode, InodeMode, Metadata},
+        vfs::{
+            utils::DName, DelegatedWriteResult, FilePrivateData, IndexNode, Metadata,
+            OpenFileBehavior, PostWriteSyncPolicy, WriteSyncIntent,
+        },
     },
     libs::{mutex::MutexGuard, rwlock::RwLock},
 };
@@ -39,6 +42,24 @@ pub struct GenDisk {
     name: DName,
 }
 
+pub struct GenDiskMountGuard {
+    bdev: Arc<dyn BlockDevice>,
+}
+
+impl Debug for GenDiskMountGuard {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GenDiskMountGuard")
+            .field("device", self.bdev.dev_name())
+            .finish()
+    }
+}
+
+impl Drop for GenDiskMountGuard {
+    fn drop(&mut self) {
+        self.bdev.mount_holder_release();
+    }
+}
+
 impl GenDisk {
     /// 如果gendisk是整个磁盘，则idx为u32::MAX
     pub const ENTIRE_DISK_IDX: u32 = u32::MAX;
@@ -49,14 +70,16 @@ impl GenDisk {
         idx: Option<u32>,
         dev_name: DName,
     ) -> Arc<Self> {
-        let bsizelog2 = bdev.upgrade().unwrap().blk_size_log2();
+        let ptr = bdev
+            .upgrade()
+            .expect("backing block device disappeared while creating GenDisk");
+        let bsizelog2 = ptr.blk_size_log2();
 
         // 对应整块硬盘的情况
         let id = idx.unwrap_or(0);
         if id >= MINORS_PER_DISK {
             panic!("GenDisk index out of range: {}", id);
         }
-        let ptr = bdev.upgrade().unwrap();
         let meta = ptr.blkdev_meta();
         let major = meta.major;
 
@@ -74,14 +97,20 @@ impl GenDisk {
             fs: RwLock::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
-                InodeMode::from_bits_truncate(0o755),
+                ptr.devfs_mode(),
             ),
             name: dev_name,
         });
     }
 
-    pub fn block_device(&self) -> Arc<dyn BlockDevice> {
-        return self.bdev.upgrade().unwrap();
+    pub fn block_device(&self) -> Result<Arc<dyn BlockDevice>, SystemError> {
+        self.bdev.upgrade().ok_or(SystemError::ENODEV)
+    }
+
+    pub fn acquire_mount_holder(&self) -> Result<GenDiskMountGuard, SystemError> {
+        let bdev = self.block_device()?;
+        bdev.mount_holder_acquire()?;
+        Ok(GenDiskMountGuard { bdev })
     }
 
     /// # read_at
@@ -104,7 +133,7 @@ impl GenDisk {
         let blocks = buf.len() / (1 << self.block_size_log2 as usize);
         let lba = self.block_offset_2_disk_blkid(start_block_offset);
 
-        return self.block_device().read_at(lba, blocks, buf);
+        return self.block_device()?.read_at(lba, blocks, buf);
     }
 
     /// # read_at_bytes
@@ -119,7 +148,7 @@ impl GenDisk {
         let start_lba = self.range.lba_start;
         let bytes_offset = self.disk_blkid_2_bytes(start_lba) + bytes_offset;
         return self
-            .block_device()
+            .block_device()?
             .read_at_bytes(bytes_offset, buf.len(), buf);
     }
 
@@ -141,7 +170,7 @@ impl GenDisk {
         let start_lba = self.range.lba_start;
         let bytes_offset = self.disk_blkid_2_bytes(start_lba) + bytes_offset;
         return self
-            .block_device()
+            .block_device()?
             .write_at_bytes(bytes_offset, buf.len(), buf);
     }
 
@@ -160,7 +189,7 @@ impl GenDisk {
 
         let blocks = buf.len() / (1 << self.block_size_log2 as usize);
         let lba = self.block_offset_2_disk_blkid(start_block_offset);
-        return self.block_device().write_at(lba, blocks, buf);
+        return self.block_device()?.write_at(lba, blocks, buf);
     }
 
     #[inline]
@@ -179,8 +208,20 @@ impl GenDisk {
     }
 
     #[inline]
-    pub fn range(&self) -> &GeneralBlockRange {
-        &self.range
+    pub fn range(&self) -> GeneralBlockRange {
+        // A whole-disk node represents the current capacity of its backing
+        // block device.  This is especially important for loop devices: their
+        // GenDisk is registered while unbound and gains capacity only after
+        // LOOP_SET_FD.  Partitions, in contrast, keep the fixed range parsed
+        // from their partition table.
+        if self.idx.is_none() {
+            self.bdev
+                .upgrade()
+                .map(|bdev| bdev.disk_range())
+                .unwrap_or(self.range)
+        } else {
+            self.range
+        }
     }
 
     #[inline]
@@ -196,7 +237,7 @@ impl GenDisk {
     /// # sync
     /// 同步磁盘
     pub fn sync(&self) -> Result<(), SystemError> {
-        self.block_device().sync()
+        self.block_device()?.sync()
     }
 
     pub fn symlink_name(&self) -> String {
@@ -217,6 +258,23 @@ impl IndexNode for GenDisk {
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
+    }
+
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        if self
+            .block_device()
+            .is_ok_and(|bdev| bdev.uses_delegated_write_sync())
+        {
+            behavior.post_write_sync = PostWriteSyncPolicy::Delegated;
+        }
+    }
+
+    fn sync_file(
+        &self,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.sync()
     }
 
     fn read_at(
@@ -251,13 +309,33 @@ impl IndexNode for GenDisk {
         self.write_at_bytes(&buf[..len], offset)
     }
 
+    fn write_at_with_sync(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync_intent: WriteSyncIntent,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        if len > buf.len() {
+            return Err(SystemError::E2BIG);
+        }
+        let disk_offset = self
+            .disk_blkid_2_bytes(self.range().lba_start)
+            .checked_add(offset)
+            .ok_or(SystemError::EOVERFLOW)?;
+        self.block_device()?
+            .write_at_bytes_with_sync(disk_offset, len, &buf[..len], sync_intent)
+    }
+
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
         Err(SystemError::ENOSYS)
     }
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         let mut meta = self.metadata.clone();
-        let blocks = self.range.lba_end.saturating_sub(self.range.lba_start);
+        let range = self.range();
+        let blocks = range.lba_end.saturating_sub(range.lba_start);
         let size_in_bytes = blocks.saturating_mul(LBA_SIZE);
 
         meta.size = i64::try_from(size_in_bytes).unwrap_or(i64::MAX);
@@ -281,17 +359,17 @@ impl IndexNode for GenDisk {
 
     fn close(
         &self,
-        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
-        Ok(())
+        self.block_device()?.file_close(data)
     }
 
     fn open(
         &self,
-        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-        _mode: &crate::filesystem::vfs::file::FileFlags,
+        data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
-        Ok(())
+        self.block_device()?.file_open(data, mode)
     }
 
     fn ioctl(
@@ -300,7 +378,7 @@ impl IndexNode for GenDisk {
         data: usize,
         private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let bdev = self.block_device();
+        let bdev = self.block_device()?;
         if let Some(loop_dev) = BlockDevice::as_any_ref(&*bdev).downcast_ref::<LoopDevice>() {
             loop_dev.ioctl(cmd, data, private_data)
         } else {
@@ -322,31 +400,24 @@ impl DeviceINode for GenDisk {
 #[derive(Default)]
 pub struct GenDiskMap {
     data: HashMap<u32, Arc<GenDisk>>,
-    max_idx: AtomicU32,
 }
 
 impl GenDiskMap {
     pub fn new() -> Self {
         GenDiskMap {
             data: HashMap::new(),
-            max_idx: AtomicU32::new(1),
         }
     }
 
-    #[inline]
-    #[allow(dead_code)]
-    pub fn max_idx(&self) -> u32 {
-        self.max_idx.load(Ordering::SeqCst)
-    }
-
-    #[inline]
-    pub fn alloc_idx(&self) -> u32 {
-        self.max_idx.fetch_add(1, Ordering::SeqCst)
-    }
-
-    pub fn intersects(&self, range: &GeneralBlockRange) -> bool {
-        for (_, v) in self.iter() {
-            if range.intersects_with(&v.range).is_some() {
+    /// Check overlap between partitions.  The whole-disk entry intentionally
+    /// covers every partition and therefore does not participate in this
+    /// validation.
+    pub fn intersects_partition(&self, range: &GeneralBlockRange) -> bool {
+        for (idx, v) in self.iter() {
+            if *idx == GenDisk::ENTIRE_DISK_IDX {
+                continue;
+            }
+            if range.intersects_with(&v.range()).is_some() {
                 return true;
             }
         }

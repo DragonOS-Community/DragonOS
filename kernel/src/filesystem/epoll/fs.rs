@@ -3,7 +3,10 @@ use alloc::string::String;
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        vfs::{file::FileFlags, FilePrivateData, IndexNode, Metadata, PollableInode},
+        vfs::{
+            file::FileFlags, FilePrivateData, IndexNode, Metadata, OpenFileBehavior, PollableInode,
+            PostWriteSyncPolicy,
+        },
     },
     libs::mutex::MutexGuard,
 };
@@ -27,6 +30,10 @@ impl EPollInode {
 }
 
 impl IndexNode for EPollInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+    }
+
     fn is_stream(&self) -> bool {
         // epollfd 不支持 seek/pread/pwrite，按流式对象处理，统一返回 ESPIPE。
         true

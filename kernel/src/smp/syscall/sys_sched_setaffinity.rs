@@ -6,7 +6,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_SETAFFINITY;
 use crate::libs::cpumask::CpuMask;
-use crate::process::{ProcessManager, RawPid};
+use crate::process::{ProcessFlags, ProcessManager, RawPid};
 use crate::sched::{
     request_task_migration, select_task_rq, syscall::util::has_sched_setaffinity_permission,
 };
@@ -57,13 +57,27 @@ impl Syscall for SysSchedSetaffinity {
             }
         }
 
-        {
-            let mut pi_guard = target_pcb.sched_info().pi_lock_irqsave();
-            pi_guard.set_cpus_allowed(mask.clone());
-        }
+        // Keep affinity publication and the corresponding placement decision
+        // in one pi_lock critical section. Otherwise two concurrent callers
+        // can publish masks in one order but execute their migrations in the
+        // opposite order.
+        let mut pi_guard = target_pcb.sched_info().pi_lock_irqsave();
+        pi_guard.set_cpus_allowed(mask.clone());
 
         if target_pcb.sched_info().is_new_task() {
             return Ok(0);
+        }
+
+        // A previous affinity request may have left a migration for a running
+        // task to be consumed in schedule tail. Do not let a newer mask retain
+        // an now-illegal destination.
+        if target_pcb
+            .sched_info()
+            .migrate_to()
+            .is_some_and(|cpu| !mask.get(cpu).unwrap_or(false))
+        {
+            target_pcb.sched_info().set_migrate_to(None);
+            target_pcb.flags().remove(ProcessFlags::NEED_MIGRATE);
         }
 
         if let Some(cpu) = target_pcb.sched_info().on_cpu() {

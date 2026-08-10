@@ -2029,6 +2029,7 @@ bitflags! {
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
+        const INOTIFY_MAGIC = 0x494E4F54; // "INOT" in ASCII
         const PIDFD_MAGIC = 0x50494446; // "PIDF" in ASCII
         // Linux UAPI: SOCKFS_MAGIC.
         const SOCKFS_MAGIC = 0x534f434b;

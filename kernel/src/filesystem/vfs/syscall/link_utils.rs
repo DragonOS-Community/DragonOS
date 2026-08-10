@@ -1,3 +1,4 @@
+use crate::filesystem::fsnotify::{self, FsEvent};
 use crate::filesystem::vfs::mount::MountFS;
 use crate::filesystem::vfs::permission::check_inode_permission;
 use crate::filesystem::vfs::permission::PermissionMask;
@@ -133,7 +134,17 @@ pub fn do_linkat(
         return Err(SystemError::EPERM);
     }
 
-    return new_parent.link(new_name, &old_inode).map(|_| 0);
+    let r = new_parent.link(new_name, &old_inode);
+    if r.is_ok() {
+        // fsnotify：父目录得 IN_CREATE（硬链接目标非目录，IN_ISDIR 不置位）。
+        fsnotify::fsnotify(
+            FsEvent::CREATE,
+            Some((&new_parent, new_name)),
+            Some(&old_inode),
+            0,
+        );
+    }
+    r.map(|_| 0)
 }
 
 /// 检查是否允许创建硬链接（对应Linux的may_linkat）

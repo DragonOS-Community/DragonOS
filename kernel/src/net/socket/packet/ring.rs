@@ -502,7 +502,9 @@ impl PacketRing {
         writer.write(sll_off, 17u16)?; // sll_family = AF_PACKET
         writer.write(sll_off.checked_add(2)?, meta.protocol.to_be())?;
         writer.write(sll_off.checked_add(4)?, meta.ifindex as i32)?;
-        writer.write(sll_off.checked_add(8)?, 1u16.to_be())?;
+        // sockaddr_ll scalar fields use native byte order. The protocol is
+        // the sole exception above because its UAPI type is __be16.
+        writer.write(sll_off.checked_add(8)?, meta.hatype)?;
         writer.write(sll_off.checked_add(10)?, meta.pkt_type as u8)?;
         writer.write(sll_off.checked_add(11)?, 6u8)?;
         writer.copy_slice(sll_off.checked_add(12)?, &meta.src_mac)?;

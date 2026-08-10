@@ -53,11 +53,15 @@
 #ifndef PACKET_STATISTICS
 #define PACKET_STATISTICS 6
 #endif
+#ifndef PACKET_OUTGOING
+#define PACKET_OUTGOING 4
+#endif
 
 namespace {
 
 constexpr int kEthPAll = 0x0003;
 constexpr uint16_t kPrivateEtherType = 0x88b5;
+constexpr uint16_t kVlanEtherType = 0x8100;
 constexpr size_t kTestFrameSize = 96;
 
 struct TpacketHdrV1 {
@@ -88,8 +92,19 @@ struct TpacketStats {
     uint32_t drops;
 };
 
+struct TpacketSockaddrLl {
+    uint16_t family;
+    uint16_t protocol;
+    int32_t ifindex;
+    uint16_t hatype;
+    uint8_t pkttype;
+    uint8_t halen;
+    uint8_t address[8];
+};
+
 static_assert(sizeof(TpacketHdrV1) == 32);
 static_assert(sizeof(TpacketHdrV2) == 32);
+static_assert(sizeof(TpacketSockaddrLl) == 20);
 
 struct TpacketReq {
     uint32_t block_size;
@@ -167,23 +182,25 @@ int InterfaceIndex(int fd, const char* name) {
     return request.ifr_ifindex;
 }
 
-void RunReceiveDataPath(int version) {
+void RunReceiveDataPath(int version, const char* interface, uint16_t hardware_type,
+                        int receiver_type = SOCK_RAW,
+                        uint16_t outer_protocol = kPrivateEtherType,
+                        uint16_t inner_protocol = kPrivateEtherType) {
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     ASSERT_GE(page, 4096U);
     const uint32_t frame_size = static_cast<uint32_t>(page / 2);
     const TpacketReq request{static_cast<uint32_t>(page), 1, frame_size, 2};
 
-    FdGuard receiver(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
-    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    FdGuard receiver(socket(AF_PACKET, receiver_type, htons(outer_protocol)));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(outer_protocol)));
     ASSERT_GE(receiver.Get(), 0) << Error();
     ASSERT_GE(sender.Get(), 0) << Error();
 
-    const int ifindex = InterfaceIndex(receiver.Get(), "veth1");
-    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic TPACKET RX testing";
-
+    const int ifindex = InterfaceIndex(receiver.Get(), interface);
+    ASSERT_GE(ifindex, 0) << interface << " must exist for deterministic TPACKET RX testing";
     struct sockaddr_ll bind_address {};
     bind_address.sll_family = AF_PACKET;
-    bind_address.sll_protocol = htons(kPrivateEtherType);
+    bind_address.sll_protocol = htons(outer_protocol);
     bind_address.sll_ifindex = ifindex;
     ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&bind_address),
                    sizeof(bind_address)),
@@ -202,15 +219,25 @@ void RunReceiveDataPath(int version) {
     std::memset(sent, 0xff, 6);
     const uint8_t source[6] = {0x02, 0x00, 0x00, 0x20, 0x96, 0x01};
     std::memcpy(sent + 6, source, sizeof(source));
-    sent[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
-    sent[13] = static_cast<uint8_t>(kPrivateEtherType);
-    std::memcpy(sent + 14, "DragonOS TPACKET dunitest", 25);
+    sent[12] = static_cast<uint8_t>(outer_protocol >> 8);
+    sent[13] = static_cast<uint8_t>(outer_protocol);
+    const bool vlan = outer_protocol != inner_protocol;
+    const size_t network_offset = vlan ? 18 : 14;
+    if (vlan) {
+        sent[14] = 0;
+        sent[15] = 7;
+        sent[16] = static_cast<uint8_t>(inner_protocol >> 8);
+        sent[17] = static_cast<uint8_t>(inner_protocol);
+    }
+    std::memcpy(sent + network_offset, "DragonOS TPACKET dunitest", 25);
 
     struct sockaddr_ll destination {};
     destination.sll_family = AF_PACKET;
-    destination.sll_protocol = htons(kPrivateEtherType);
+    destination.sll_protocol = htons(outer_protocol);
     destination.sll_ifindex = ifindex;
-    destination.sll_hatype = ARPHRD_ETHER;
+    // This is intentionally unrelated to the expected receive metadata. The
+    // ring must source sll_hatype from the ingress interface, not from sendto.
+    destination.sll_hatype = 0;
     destination.sll_halen = 6;
     std::memset(destination.sll_addr, 0xff, 6);
     ASSERT_EQ(sendto(sender.Get(), sent, sizeof(sent), 0,
@@ -251,11 +278,26 @@ void RunReceiveDataPath(int version) {
         const bool bounds_valid = mac <= frame_size && snaplen <= frame_size - mac;
         EXPECT_TRUE(bounds_valid) << "version=" << version << " mac=" << mac
                                   << " snaplen=" << snaplen;
-        EXPECT_EQ(packet_len, sizeof(sent));
-        EXPECT_EQ(snaplen, sizeof(sent));
-        EXPECT_GE(net, static_cast<uint16_t>(mac + 14));
-        if (bounds_valid && snaplen >= sizeof(sent) &&
-            std::memcmp(frame + mac, sent, sizeof(sent)) == 0) {
+        const size_t visible_offset = receiver_type == SOCK_DGRAM ? network_offset : 0;
+        const size_t visible_len = sizeof(sent) - visible_offset;
+        EXPECT_EQ(packet_len, visible_len);
+        EXPECT_EQ(snaplen, visible_len);
+        if (receiver_type == SOCK_DGRAM) {
+            EXPECT_EQ(net, mac);
+        } else {
+            EXPECT_GE(net, static_cast<uint16_t>(mac + network_offset));
+        }
+        auto* link_address = reinterpret_cast<TpacketSockaddrLl*>(frame + 32);
+        EXPECT_EQ(link_address->family, AF_PACKET);
+        EXPECT_EQ(link_address->protocol, htons(inner_protocol));
+        EXPECT_EQ(link_address->ifindex, ifindex);
+        EXPECT_EQ(link_address->hatype, hardware_type);
+        if (vlan && receiver_type == SOCK_DGRAM) {
+            EXPECT_EQ(link_address->pkttype, PACKET_OUTGOING);
+        }
+        EXPECT_EQ(link_address->halen, 6);
+        if (bounds_valid && snaplen >= visible_len &&
+            std::memcmp(frame + mac, sent + visible_offset, visible_len) == 0) {
             matched = true;
         }
 
@@ -285,11 +327,38 @@ void RunReceiveDataPath(int version) {
 }  // namespace
 
 TEST(AfPacketRing, V1ReceiveDataPath) {
-    RunReceiveDataPath(TPACKET_V1);
+    RunReceiveDataPath(TPACKET_V1, "veth1", ARPHRD_ETHER);
 }
 
 TEST(AfPacketRing, V2ReceiveDataPath) {
-    RunReceiveDataPath(TPACKET_V2);
+    RunReceiveDataPath(TPACKET_V2, "veth1", ARPHRD_ETHER);
+}
+
+TEST(AfPacketRing, LoopbackReportsNativeHardwareType) {
+    RunReceiveDataPath(TPACKET_V2, "lo", ARPHRD_LOOPBACK);
+}
+
+TEST(AfPacketRing, DgramOutgoingVlanReportsInnerProtocol) {
+    RunReceiveDataPath(TPACKET_V2, "veth1", ARPHRD_ETHER, SOCK_DGRAM, kVlanEtherType,
+                       kPrivateEtherType);
+}
+
+TEST(AfPacketRing, RingRequestValidatesLengthBeforePointer) {
+    FdGuard fd(MakeRingSocket());
+    ASSERT_GE(fd.Get(), 0) << Error();
+    for (socklen_t len = 0; len < sizeof(TpacketReq); ++len) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RX_RING,
+                             reinterpret_cast<const void*>(1), len),
+                  -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << len;
+    }
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RX_RING,
+                         reinterpret_cast<const void*>(1), sizeof(TpacketReq)),
+              -1);
+    EXPECT_EQ(errno, EINVAL) << "Linux maps a tpacket_req copy fault to EINVAL";
 }
 
 TEST(AfPacketRing, PartialMiddleMunmapKeepsBackingBusy) {

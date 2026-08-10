@@ -47,6 +47,7 @@ inline constexpr int kSoAttachFilter = 26;
 inline constexpr int kSoGetFilter = kSoAttachFilter;
 inline constexpr int kSoDetachFilter = 27;
 inline constexpr int kSoLockFilter = 44;
+inline constexpr int kTcpCongestion = 13;
 
 // Classic BPF encodings used here are kept local because DragonOS musl may
 // not ship linux/filter.h in every test image.
@@ -259,6 +260,58 @@ TEST(AfPacketSockopt, CreateRawSocket) {
 TEST(AfPacketSockopt, CreateDgramSocket) {
     FdGuard fd(socket(AF_PACKET, SOCK_DGRAM, htons(kEthPAll)));
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, ScalarOptionReadsOnlyItsConsumedPrefix) {
+    FdGuard fd(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto* mapping = static_cast<uint8_t*>(
+        mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(mapping, MAP_FAILED) << ErrnoString(errno);
+    ASSERT_EQ(mprotect(mapping + page, page, PROT_NONE), 0) << ErrnoString(errno);
+
+    auto* value = reinterpret_cast<int*>(mapping + page - sizeof(int));
+    *value = 16384;
+    constexpr socklen_t kOversizedOptlen = 16 * 1024 * 1024;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, SO_RCVBUF, value, kOversizedOptlen), 0)
+        << "a scalar option must not read or allocate its unused optlen tail: "
+        << ErrnoString(errno);
+
+    ASSERT_EQ(munmap(mapping, page * 2), 0) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, ScalarShortLengthWinsOverBadPointer) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    for (socklen_t len = 0; len < sizeof(int); ++len) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_AUXDATA,
+                             reinterpret_cast<const void*>(1), len),
+                  -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << len;
+    }
+}
+
+TEST(AfPacketSockopt, TcpCongestionStopsAtNulBeforeInaccessibleTail) {
+    FdGuard fd(socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto* mapping = static_cast<uint8_t*>(
+        mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(mapping, MAP_FAILED) << ErrnoString(errno);
+    ASSERT_EQ(mprotect(mapping + page, page, PROT_NONE), 0) << ErrnoString(errno);
+
+    constexpr char kReno[] = "reno";
+    auto* name = reinterpret_cast<char*>(mapping + page - sizeof(kReno));
+    std::memcpy(name, kReno, sizeof(kReno));
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_TCP, kTcpCongestion, name, 16), 0)
+        << "TCP_CONGESTION must stop at its NUL terminator: " << ErrnoString(errno);
+
+    ASSERT_EQ(munmap(mapping, page * 2), 0) << ErrnoString(errno);
 }
 
 // Linux 6.6 packet_do_bind() substitutes po->num when sll_protocol is zero.

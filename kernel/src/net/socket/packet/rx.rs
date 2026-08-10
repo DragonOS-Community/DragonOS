@@ -104,6 +104,18 @@ impl<'a> PacketFilterInput<'a> {
         }
     }
 
+    /// Protocol published through sockaddr_ll. Linux keeps the AF_PACKET hook
+    /// protocol (used for binding) at the outer VLAN TPID for outgoing frames,
+    /// but SOCK_DGRAM reports the decapsulated inner protocol to userspace.
+    #[inline]
+    fn sockaddr_protocol(&self, parsed: &ParsedFrame) -> u16 {
+        if self.data_offset != 0 && parsed.vlan.is_some() {
+            parsed.protocol
+        } else {
+            self.protocol
+        }
+    }
+
     #[inline]
     fn full_len(&self) -> usize {
         self.first.len().saturating_add(self.second.len())
@@ -814,7 +826,7 @@ impl PacketSocket {
             let metadata = PacketMetadata {
                 src_mac: parsed.src,
                 dst_mac: parsed.dst,
-                protocol: input.protocol,
+                protocol: input.sockaddr_protocol(&parsed),
                 ifindex: ingress.ifindex,
                 hatype: ingress.hatype,
                 pkt_type: ingress.pkt_type,
@@ -856,7 +868,7 @@ impl PacketSocket {
         let metadata = PacketMetadata {
             src_mac: parsed.src,
             dst_mac: parsed.dst,
-            protocol: input.protocol,
+            protocol: input.sockaddr_protocol(&parsed),
             ifindex: ingress.ifindex,
             hatype: ingress.hatype,
             pkt_type: ingress.pkt_type,

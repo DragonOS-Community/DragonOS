@@ -2,6 +2,7 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETSOCKOPT;
+use crate::net::socket::inet::stream::TcpOption;
 use crate::net::socket::packet::packet_option;
 use crate::net::socket::{IpOption, IFNAMSIZ, PIPV6, PSO, PSOL};
 use crate::process::ProcessManager;
@@ -234,7 +235,12 @@ impl SysSetsockoptHandle {
                     OptvalCopySpec::bytes(optlen.min(INT_LEN))
                 }
             }
-            PSOL::TCP if optname == 13 => {
+            PSOL::TCP
+                if matches!(
+                    TcpOption::try_from(optname as i32),
+                    Ok(TcpOption::Congestion | TcpOption::ULP)
+                ) =>
+            {
                 if optlen < 1 {
                     return Err(SystemError::EINVAL);
                 }

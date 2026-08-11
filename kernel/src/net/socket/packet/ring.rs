@@ -62,7 +62,19 @@ impl FileSystem for PacketFakeFs {
         SuperBlock::new(Magic::SOCKFS_MAGIC, PAGE_SIZE as u64, 255)
     }
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        PageFaultHandler::filemap_fault(pfm)
+        let inode_ref = {
+            let vma = pfm.vma();
+            let guard = vma.lock();
+            let file = guard.vm_file().expect("packet VMA has no file");
+            file.inode()
+        };
+        let Some(socket) = inode_ref.downcast_ref::<super::PacketSocket>() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let Some(layout) = crate::net::socket::base::Socket::mmap_layout(socket) else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        PageFaultHandler::filemap_fault_with_stable_size(pfm, layout.size)
     }
     unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         // Ring pages are pre-allocated PageType::Normal (not disk-backed), so

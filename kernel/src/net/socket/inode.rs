@@ -389,9 +389,6 @@ impl<T: Socket + 'static> IndexNode for T {
         let mut md = Metadata::new(FileType::Socket, InodeMode::from_bits_truncate(0o755));
         md.inode_id = self.socket_inode_id();
         md.mode |= InodeMode::S_IFSOCK;
-        if let Some(layout) = super::base::Socket::mmap_layout(self) {
-            md.size = layout.size as i64;
-        }
         Ok(md)
     }
 

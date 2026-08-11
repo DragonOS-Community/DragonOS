@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -695,6 +696,9 @@ TEST(AfPacketRing, FstatfsUsesSockfsBeforeAndAfterRingSetup) {
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     FdGuard fd(socket(AF_PACKET, SOCK_RAW, 0));
     ASSERT_GE(fd.Get(), 0) << Error();
+    struct stat socket_stat {};
+    ASSERT_EQ(fstat(fd.Get(), &socket_stat), 0) << Error();
+    EXPECT_EQ(socket_stat.st_size, 0);
     struct statfs stat {};
     ASSERT_EQ(fstatfs(fd.Get(), &stat), 0) << Error();
     EXPECT_EQ(stat.f_type, kSockfsMagic);
@@ -702,6 +706,9 @@ TEST(AfPacketRing, FstatfsUsesSockfsBeforeAndAfterRingSetup) {
     EXPECT_EQ(stat.f_namelen, 255);
 
     ASSERT_EQ(Configure(fd.Get(), Request(page, 1)), 0) << Error();
+    std::memset(&socket_stat, 0, sizeof(socket_stat));
+    ASSERT_EQ(fstat(fd.Get(), &socket_stat), 0) << Error();
+    EXPECT_EQ(socket_stat.st_size, 0);
     std::memset(&stat, 0, sizeof(stat));
     ASSERT_EQ(fstatfs(fd.Get(), &stat), 0) << Error();
     EXPECT_EQ(stat.f_type, kSockfsMagic);

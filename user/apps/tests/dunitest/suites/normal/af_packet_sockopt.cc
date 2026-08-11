@@ -43,6 +43,7 @@ inline constexpr int kSoRcvtimeoOld = 20;
 inline constexpr int kSoSndtimeoOld = 21;
 inline constexpr int kSoRcvtimeoNew = 66;
 inline constexpr int kSoSndtimeoNew = 67;
+inline constexpr int kTcpUlp = 31;
 inline constexpr int kSoAttachFilter = 26;
 inline constexpr int kSoGetFilter = kSoAttachFilter;
 inline constexpr int kSoDetachFilter = 27;
@@ -312,6 +313,18 @@ TEST(AfPacketSockopt, TcpCongestionStopsAtNulBeforeInaccessibleTail) {
         << "TCP_CONGESTION must stop at its NUL terminator: " << ErrnoString(errno);
 
     ASSERT_EQ(munmap(mapping, page * 2), 0) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, TcpUlpCopiesShortNameBeforeReportingUnsupported) {
+    FdGuard fd(socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    constexpr char kTls[] = {'t', 'l', 's'};
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_TCP, kTcpUlp, kTls, sizeof(kTls)), -1);
+    EXPECT_EQ(errno, ENOENT)
+        << "the three-byte ULP name must pass bounded-string copying before "
+           "the unavailable ULP is reported";
 }
 
 // Linux 6.6 packet_do_bind() substitutes po->num when sll_protocol is zero.

@@ -24,6 +24,10 @@ compile_commands.json
 dadk-manifest.generated.toml
 config/rootfs.generated.toml
 
+# Python
+__pycache__/
+*.pyc
+
 # initram
 *.cpio
 *.cpio.xz

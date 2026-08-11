@@ -10,20 +10,21 @@ import sys
 from typing import Any
 
 
+# 3-agent persona matrix. Each agent owns a distinct, non-overlapping defect
+# class; weights preserve the original "security/concurrency > correctness >
+# system/performance" ordering while keeping the lower tiers at parity.
 DEFAULT_WEIGHTS = {
-    "Security Sentinel": 5.0,
-    "Concurrency Engineer": 4.0,
-    "Performance Analyst": 3.0,
-    "Diverse Reviewer A": 2.0,
-    "Diverse Reviewer B": 2.0,
-    "Diverse Reviewer C": 2.0,
-    "Diverse Reviewer D": 2.0,
-    "Diverse Reviewer E": 2.0,
+    "Security & Concurrency Sentinel": 4.0,
+    "Logic & Correctness Reviewer": 3.0,
+    "System & Performance Reviewer": 3.0,
 }
+
+# Default agent name when a finding omits `agent`. Picked from the mid-weight
+# general-correctness persona so missing-agent findings get a neutral vote.
+DEFAULT_AGENT = "Logic & Correctness Reviewer"
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_PERSONA_MATRIX = ROOT.parent / "references" / "persona_matrix.json"
 
 
 def load_json(path: str) -> dict[str, Any]:
@@ -57,16 +58,6 @@ def normalize_weight_map(payload: dict[str, Any]) -> dict[str, float]:
     return mapped
 
 
-def load_default_weights(persona_matrix: str | None) -> dict[str, float]:
-    path = Path(persona_matrix) if persona_matrix else DEFAULT_PERSONA_MATRIX
-    if path.exists():
-        data = load_json(str(path))
-        weights = normalize_weight_map(data)
-        if weights:
-            return weights
-    return DEFAULT_WEIGHTS.copy()
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Weighted vote for semantic buckets")
     parser.add_argument("input", help="Buckets JSON from semantic_bucket.py")
@@ -77,11 +68,6 @@ def main() -> int:
         "--threshold", type=float, default=0.60, help="Accept threshold in [0,1]"
     )
     parser.add_argument("--weights", help="Optional JSON file for persona weights")
-    parser.add_argument(
-        "--persona-matrix",
-        default=str(DEFAULT_PERSONA_MATRIX),
-        help="Persona matrix JSON used as default weights",
-    )
     args = parser.parse_args()
     if not (0.0 <= args.threshold <= 1.0):
         raise ValueError("threshold must be in [0,1]")
@@ -90,7 +76,7 @@ def main() -> int:
     buckets = data.get("buckets", [])
     if not isinstance(buckets, list):
         raise ValueError("buckets must be a list")
-    weights = load_default_weights(args.persona_matrix)
+    weights = DEFAULT_WEIGHTS.copy()
     if args.weights:
         weights.update(normalize_weight_map(load_json(args.weights)))
     # Never allow non-positive or NaN-like effective weight in voting.
@@ -107,7 +93,7 @@ def main() -> int:
         for finding in bucket.get("findings", []):
             if not isinstance(finding, dict):
                 continue
-            agent = str(finding.get("agent", "Diverse Reviewer A"))
+            agent = str(finding.get("agent", DEFAULT_AGENT))
             conf = max(0.0, min(1.0, float(finding.get("confidence", 0.5))))
             weight = float(weights.get(agent, 1.0))
             penalty = 0.9 if not str(finding.get("fix_code", "")).strip() else 1.0

@@ -24,7 +24,7 @@ python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
 ## 2. 推荐参数
 
 - `--threshold 0.60`：默认通过阈值。
-- `--passes 8`：随机化轮次，适合中大型变更。
+- `--passes 4`：随机化轮次，适合中大型变更（应 ≥ agent 数 3 以保留输入多样性）。
 - `--strict-validation`：严格校验输入契约，发现错误立即失败。
 - `--weights`：指定历史学习产出的权重文件。
 - `--fail-on-severity critical`：若通过项出现 critical，命令返回非 0（CI 门禁）。

@@ -14,8 +14,6 @@ use crate::rcu::rcu_defer_drop;
 use super::ring::PacketRing;
 use super::uapi::tpacket_version;
 use super::{packet_option, PacketSocket};
-use crate::libs::mutex::Mutex;
-
 impl PacketSocket {
     fn socket_timeout_ticks(&self, name: usize) -> Result<&AtomicU64, SystemError> {
         match PSO::try_from(name as u32) {
@@ -210,8 +208,10 @@ impl PacketSocket {
 
                     let config =
                         super::ring::validate_ring_config(&req, version.hdrlen(), reserve)?;
-                    let (ring, _pc) = PacketRing::setup(config, version, self.sock_type, reserve)?;
-                    let ring = Arc::new(Mutex::new(ring));
+                    let (ring, page_cache) =
+                        PacketRing::setup(config, version, self.sock_type, reserve)?;
+                    let ring = Arc::try_new(super::ring::PacketRingInstance::new(ring, page_cache))
+                        .map_err(|_| SystemError::ENOMEM)?;
 
                     // The control lock keeps version/reserve/ring stable while
                     // the candidate is built. Publish the fully initialized

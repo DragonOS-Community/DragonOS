@@ -337,7 +337,7 @@ impl<'a> PageFaultMessage<'a> {
 /// 缺页中断处理结构体
 pub struct PageFaultHandler;
 
-enum FilemapMkwriteSize {
+enum FilemapSize {
     FetchFromInode,
     Stable(usize),
 }
@@ -1182,6 +1182,22 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn filemap_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        Self::filemap_fault_inner(pfm, FilemapSize::FetchFromInode)
+    }
+
+    /// Resolve a generic page-cache fault against an internal stable backing
+    /// size without exposing that size through user-visible inode metadata.
+    pub unsafe fn filemap_fault_with_stable_size(
+        pfm: &mut PageFaultMessage,
+        stable_size: usize,
+    ) -> VmFaultReason {
+        Self::filemap_fault_inner(pfm, FilemapSize::Stable(stable_size))
+    }
+
+    unsafe fn filemap_fault_inner(
+        pfm: &mut PageFaultMessage,
+        size_source: FilemapSize,
+    ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
@@ -1199,8 +1215,15 @@ impl PageFaultHandler {
         let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
         let mut ret = VmFaultReason::empty();
 
-        if let Ok(md) = file.inode().metadata() {
-            let size = md.size.max(0) as usize;
+        let size = match size_source {
+            FilemapSize::FetchFromInode => file
+                .inode()
+                .metadata()
+                .ok()
+                .map(|metadata| metadata.size.max(0) as usize),
+            FilemapSize::Stable(size) => Some(size),
+        };
+        if let Some(size) = size {
             if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
@@ -1227,7 +1250,7 @@ impl PageFaultHandler {
     }
 
     pub unsafe fn filemap_page_mkwrite(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        Self::filemap_page_mkwrite_inner(pfm, FilemapMkwriteSize::FetchFromInode)
+        Self::filemap_page_mkwrite_inner(pfm, FilemapSize::FetchFromInode)
     }
 
     /// Prepare a shared writable file-backed page using an inode size which
@@ -1238,12 +1261,12 @@ impl PageFaultHandler {
         pfm: &mut PageFaultMessage,
         stable_size: usize,
     ) -> VmFaultReason {
-        Self::filemap_page_mkwrite_inner(pfm, FilemapMkwriteSize::Stable(stable_size))
+        Self::filemap_page_mkwrite_inner(pfm, FilemapSize::Stable(stable_size))
     }
 
     unsafe fn filemap_page_mkwrite_inner(
         pfm: &mut PageFaultMessage,
-        size_source: FilemapMkwriteSize,
+        size_source: FilemapSize,
     ) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
@@ -1271,12 +1294,12 @@ impl PageFaultHandler {
         }
 
         let size = match size_source {
-            FilemapMkwriteSize::FetchFromInode => file
+            FilemapSize::FetchFromInode => file
                 .inode()
                 .metadata()
                 .ok()
                 .map(|metadata| metadata.size.max(0) as usize),
-            FilemapMkwriteSize::Stable(size) => Some(size),
+            FilemapSize::Stable(size) => Some(size),
         };
         if let Some(size) = size {
             if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {

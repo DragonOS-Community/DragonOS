@@ -1,16 +1,14 @@
 use super::{PerfEventOps, Result};
-use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::MMArch;
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::include::bindings::linux_bpf::{
     perf_event_header, perf_event_mmap_page, perf_event_type,
 };
-use crate::libs::align::page_align_up;
-use crate::libs::mutex::MutexGuard;
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::mm::allocator::page_frame::PageFrameCount;
-use crate::mm::page::{page_manager_lock, PageFlags, PageType};
+use crate::mm::page::{allocate_registered_intrinsic_unevictable_pages_exact, PageFlags};
 use crate::mm::MemoryManagementArch;
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;
@@ -23,6 +21,9 @@ const PAGE_SIZE: usize = MMArch::PAGE_SIZE;
 #[derive(Debug)]
 pub struct BpfPerfEvent {
     _args: PerfProbeArgs,
+    /// Serializes mmap backing construction without holding the event's
+    /// data-plane spinlock across allocation or zeroing.
+    setup_lock: Mutex<()>,
     data: SpinLock<BpfPerfEventData>,
 }
 
@@ -229,6 +230,7 @@ impl BpfPerfEvent {
     pub fn new(args: PerfProbeArgs) -> Self {
         BpfPerfEvent {
             _args: args,
+            setup_lock: Mutex::new(()),
             data: SpinLock::new(BpfPerfEventData {
                 enabled: false,
                 mmap_page: RingPage::empty(),
@@ -238,61 +240,53 @@ impl BpfPerfEvent {
         }
     }
     pub fn do_mmap(&self, _start: usize, len: usize, offset: usize) -> Result<()> {
-        let mut data = self.data.lock();
-        if data.mmap_page.size != 0 {
-            return if data.mmap_page.size == len && data.offset == offset {
-                // Additional VMAs of the same perf event share the original
-                // backing; replacing it would invalidate live mappings.
-                Ok(())
-            } else {
-                Err(SystemError::EINVAL)
-            };
+        // This implementation supports the normal perf data ring: one
+        // metadata page followed by a power-of-two number of data pages.
+        // Validate before constructing RingPage, whose internal invariants are
+        // not a userspace error boundary.
+        if offset != 0
+            || !len.is_multiple_of(PAGE_SIZE)
+            || len < 2 * PAGE_SIZE
+            || !(len / PAGE_SIZE - 1).is_power_of_two()
+        {
+            return Err(SystemError::EINVAL);
         }
+
+        let _setup = self.setup_lock.lock();
+        {
+            let data = self.data.lock();
+            if data.mmap_page.size != 0 {
+                return if data.mmap_page.size == len && data.offset == offset {
+                    // Additional VMAs of the same perf event share the original
+                    // backing; replacing it would invalidate live mappings.
+                    Ok(())
+                } else {
+                    Err(SystemError::EINVAL)
+                };
+            }
+        }
+
         let page_cache = PageCache::new(None, None);
-        let requested_pages = page_align_up(len) / PAGE_SIZE;
-        let (phy_addr, mut pages) = {
-            let mut page_manager_guard = page_manager_lock();
-            page_manager_guard.create_pages(
-                PageType::Normal,
-                PageFlags::PG_UNEVICTABLE,
-                &mut LockedFrameAllocator,
-                PageFrameCount::new(requested_pages),
-            )?
-        };
-        if pages.len() > requested_pages {
-            {
-                let mut page_manager_guard = page_manager_lock();
-                for page in &pages[requested_pages..] {
-                    page_manager_guard.remove_page(&page.phys_address());
-                }
-            }
-            pages.truncate(requested_pages);
-        }
-        for i in 0..pages.len() {
-            let page = pages.get(i).unwrap();
+        let batch = allocate_registered_intrinsic_unevictable_pages_exact(PageFrameCount::new(
+            len / PAGE_SIZE,
+        ))?;
+        let phy_addr = batch.start_paddr();
+        for page in batch.pages() {
             page.write().add_flags(PageFlags::PG_UPTODATE);
-            if let Err(error) = page_cache.insert_preallocated_unevictable_page(i, page.clone()) {
-                let mut page_manager_guard = page_manager_lock();
-                for page in &pages {
-                    page_manager_guard.remove_page(&page.phys_address());
-                }
-                drop(page_manager_guard);
-                return Err(error);
-            }
         }
-        let Some(virt_addr) = (unsafe { MMArch::phys_2_virt(phy_addr) }) else {
-            let mut page_manager_guard = page_manager_lock();
-            for page in &pages {
-                page_manager_guard.remove_page(&page.phys_address());
-            }
-            drop(page_manager_guard);
-            return Err(SystemError::EFAULT);
-        };
+        page_cache.adopt_preallocated_unevictable_batch(0, batch)?;
+        let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr) }.ok_or(SystemError::EFAULT)?;
         // create mmap page
         let mmap_page = RingPage::new_init(virt_addr.data(), len);
-        data.page_cache = page_cache;
+        let mut data = self.data.lock();
+        debug_assert_eq!(data.mmap_page.size, 0);
+        let old_page_cache = core::mem::replace(&mut data.page_cache, page_cache);
         data.mmap_page = mmap_page;
         data.offset = offset;
+        drop(data);
+        // PageCache destruction may take sleeping global MM locks; never run
+        // it while holding the event's data-plane spinlock.
+        drop(old_page_cache);
         Ok(())
     }
 
@@ -359,6 +353,10 @@ impl PerfEventOps for BpfPerfEvent {
     }
     fn readable(&self) -> bool {
         self.data.lock().mmap_page.readable()
+    }
+
+    fn mmap_size(&self) -> usize {
+        self.data.lock().mmap_page.size
     }
 }
 

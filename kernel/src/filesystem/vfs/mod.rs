@@ -2025,6 +2025,8 @@ bitflags! {
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
         const PIDFD_MAGIC = 0x50494446; // "PIDF" in ASCII
+        // Linux UAPI: SOCKFS_MAGIC.
+        const SOCKFS_MAGIC = 0x534f434b;
         const OVERLAYFS_MAGIC = 0x794c7630;
     }
 }

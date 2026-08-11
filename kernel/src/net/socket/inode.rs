@@ -365,10 +365,8 @@ impl<T: Socket + 'static> IndexNode for T {
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        match super::base::Socket::mmap_layout(self) {
-            Some(layout) => layout.fs,
-            None => unreachable!("Socket does not have a file system"),
-        }
+        super::base::Socket::mmap_fs(self)
+            .unwrap_or_else(|| unreachable!("Socket does not have a file system"))
     }
 
     fn try_fs(&self) -> Option<Arc<dyn crate::filesystem::vfs::FileSystem>> {

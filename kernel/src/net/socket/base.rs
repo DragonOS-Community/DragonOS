@@ -26,13 +26,10 @@ use super::{
 
 /// Layout information for mmap-backed sockets (e.g. AF_PACKET TPACKET rings).
 ///
-/// Returned by [`Socket::mmap_layout`] to supply everything the mmap page-fault
-/// path needs in a single call, avoiding repeated locking.
+/// Returned by [`Socket::mmap_layout`] to supply dynamic backing metadata.
 pub struct SocketMmapLayout {
     /// Page cache backing the mapped pages.
     pub page_cache: Arc<PageCache>,
-    /// Fake filesystem whose `fault`/`map_pages` delegate to `PageFaultHandler`.
-    pub fs: Arc<dyn FileSystem>,
     /// Logical size of the mapped region in bytes (for `filemap_fault` bounds check).
     pub size: usize,
 }
@@ -282,6 +279,13 @@ pub trait Socket: PollableInode + IndexNode {
     /// Default `None` — most sockets don't support mmap. AF_PACKET overrides this
     /// to expose the TPACKET ring buffer to the page-fault path.
     fn mmap_layout(&self) -> Option<SocketMmapLayout> {
+        None
+    }
+
+    /// Stable filesystem operations for mmap-backed socket inodes. Kept
+    /// separate from dynamic ring layout so fault dispatch does not lock the
+    /// ring writer or allocate a fresh ops object.
+    fn mmap_fs(&self) -> Option<Arc<dyn FileSystem>> {
         None
     }
 

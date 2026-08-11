@@ -840,7 +840,7 @@ impl PacketSocket {
                 vlan_tpid: input.vlan.map_or(0, |v| v.1),
             };
             let losing = self.stats_drops.load(Ordering::Relaxed) > 0;
-            let mut ring = ring_arc.lock();
+            let mut ring = ring_arc.writer().lock();
             match ring.write_frame(&input, &metadata, data_len, losing) {
                 RingWriteResult::Written => {
                     self.stats_packets.fetch_add(1, Ordering::Relaxed);
@@ -964,7 +964,7 @@ impl PacketSocket {
         // Linux packet_poll() combines normal receive-queue readiness with
         // RX-ring readiness; neither receive source may mask the other.
         let ring = self.ring_state.lock().ring.as_ref().cloned();
-        let ring_ready = ring.is_some_and(|ring| ring.lock().has_user_frames());
+        let ring_ready = ring.is_some_and(|ring| ring.writer().lock().has_user_frames());
         ring_ready || !self.rx_buffer.lock().is_empty()
     }
     fn dequeue(&self, peek: bool) -> Result<ReceivedPacket, SystemError> {

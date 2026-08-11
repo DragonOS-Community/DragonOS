@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -640,6 +641,70 @@ TEST(AfPacketRing, ReserveCannotChangeAfterRingCreation) {
     errno = 0;
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, &reserve, sizeof(reserve)), -1);
     EXPECT_EQ(errno, EBUSY) << Error();
+    EXPECT_EQ(Teardown(fd.Get()), 0) << Error();
+}
+
+TEST(AfPacketRing, BackingIsZeroedOnInitialAndRepeatedSetup) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t ring_size = page * 3;
+    // Protocol zero leaves the socket detached from packet delivery, so the
+    // kernel cannot legitimately publish a frame while zeroing is inspected.
+    FdGuard fd(socket(AF_PACKET, SOCK_RAW, 0));
+    ASSERT_GE(fd.Get(), 0) << Error();
+    const TpacketReq request{static_cast<uint32_t>(ring_size), 1,
+                             static_cast<uint32_t>(page), 3};
+
+    for (int iteration = 0; iteration < 2; ++iteration) {
+        ASSERT_EQ(Configure(fd.Get(), request), 0) << Error();
+        MappingGuard mapping(MapRing(fd.Get(), ring_size), ring_size);
+        ASSERT_NE(mapping.Get(), MAP_FAILED) << Error();
+        const auto* bytes = static_cast<const volatile uint8_t*>(mapping.Get());
+        for (size_t i = 0; i < ring_size; ++i) {
+            ASSERT_EQ(bytes[i], 0) << "iteration=" << iteration << ", offset=" << i;
+        }
+        // Make stale physical contents observable if a later setup ever omits
+        // the pre-publication zeroing step. This byte is outside frame headers.
+        static_cast<volatile uint8_t*>(mapping.Get())[ring_size - 1] = 0xa5;
+        ASSERT_EQ(mapping.Unmap(), 0) << Error();
+        ASSERT_EQ(Teardown(fd.Get()), 0) << Error();
+    }
+}
+
+TEST(AfPacketRing, MultipleMappingsShareOneBackingAndLifetime) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    FdGuard fd(socket(AF_PACKET, SOCK_RAW, 0));
+    ASSERT_GE(fd.Get(), 0) << Error();
+    ASSERT_EQ(Configure(fd.Get(), Request(page, 1)), 0) << Error();
+    auto* first = static_cast<volatile uint8_t*>(MapRing(fd.Get(), page));
+    auto* second = static_cast<volatile uint8_t*>(MapRing(fd.Get(), page));
+    ASSERT_NE(first, reinterpret_cast<volatile uint8_t*>(MAP_FAILED)) << Error();
+    ASSERT_NE(second, reinterpret_cast<volatile uint8_t*>(MAP_FAILED)) << Error();
+
+    first[page - 1] = 0x5a;
+    EXPECT_EQ(second[page - 1], 0x5a);
+    ASSERT_EQ(munmap(const_cast<uint8_t*>(first), page), 0) << Error();
+    errno = 0;
+    EXPECT_EQ(Teardown(fd.Get()), -1);
+    EXPECT_EQ(errno, EBUSY) << Error();
+    ASSERT_EQ(munmap(const_cast<uint8_t*>(second), page), 0) << Error();
+    EXPECT_EQ(Teardown(fd.Get()), 0) << Error();
+}
+
+TEST(AfPacketRing, FstatfsUsesSockfsBeforeAndAfterRingSetup) {
+    constexpr long kSockfsMagic = 0x534f434b;
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    FdGuard fd(socket(AF_PACKET, SOCK_RAW, 0));
+    ASSERT_GE(fd.Get(), 0) << Error();
+    struct statfs stat {};
+    ASSERT_EQ(fstatfs(fd.Get(), &stat), 0) << Error();
+    EXPECT_EQ(stat.f_type, kSockfsMagic);
+    EXPECT_EQ(stat.f_bsize, static_cast<long>(page));
+    EXPECT_EQ(stat.f_namelen, 255);
+
+    ASSERT_EQ(Configure(fd.Get(), Request(page, 1)), 0) << Error();
+    std::memset(&stat, 0, sizeof(stat));
+    ASSERT_EQ(fstatfs(fd.Get(), &stat), 0) << Error();
+    EXPECT_EQ(stat.f_type, kSockfsMagic);
     EXPECT_EQ(Teardown(fd.Get()), 0) << Error();
 }
 

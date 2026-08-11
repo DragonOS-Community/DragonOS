@@ -35,7 +35,10 @@ use crate::{
     libs::mutex::Mutex,
     mm::{
         mmu_gather::MmuGather,
-        page::{page_manager_lock, page_reclaimer_lock, InnerPage, Page, PageFlags},
+        page::{
+            detach_pages_from_manager_batched, detach_pages_from_reclaimer_batched,
+            page_manager_lock, page_reclaimer_lock, InnerPage, ManagedPageBatch, Page, PageFlags,
+        },
         ucontext::AddressSpace,
         MemoryManagementArch,
     },
@@ -1588,21 +1591,16 @@ impl InnerPageCache {
 
 impl Drop for InnerPageCache {
     fn drop(&mut self) {
-        // log::debug!("page cache drop");
-        let mut page_manager = page_manager_lock();
+        // Accounting/backend callbacks and final Arc destruction must never
+        // extend either global page-registry critical section.
         for entry in self.pages.values() {
             entry.account_remove();
             if let Some(backend) = self.accounting_backend.as_ref() {
                 backend.release_page();
             }
-            page_manager.remove_page(&entry.page.phys_address());
         }
-        drop(page_manager);
-
-        let mut reclaimer = page_reclaimer_lock();
-        for entry in self.pages.values() {
-            reclaimer.remove_page(&entry.page.phys_address());
-        }
+        detach_pages_from_manager_batched(self.pages.values().map(|entry| &entry.page));
+        detach_pages_from_reclaimer_batched(self.pages.values().map(|entry| &entry.page));
     }
 }
 
@@ -2898,6 +2896,66 @@ impl PageCache {
             entry.set_state(PageState::Dirty);
             entry.wait_queue.wake_all();
         }
+    }
+
+    /// Atomically adopt a registered batch of zeroed, intrinsically
+    /// unevictable Normal pages.
+    ///
+    /// This narrow API is for private in-kernel ring backings created with
+    /// `PageCache::new(None, None)`. Caches with an accounting backend are
+    /// rejected rather than exposing a partially reservable quota protocol.
+    /// Until the final commit, `ManagedPageBatch` rolls PageManager membership
+    /// back by identity on every error path.
+    pub fn adopt_preallocated_unevictable_batch(
+        &self,
+        start_page_index: usize,
+        batch: ManagedPageBatch,
+    ) -> Result<(), SystemError> {
+        let end_page_index = start_page_index
+            .checked_add(batch.pages().len())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(batch.pages().len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for page in batch.pages() {
+            let page_guard = page.read();
+            if !page_guard.flags().contains(PageFlags::PG_UNEVICTABLE)
+                || !page_guard.intrinsic_unevictable()
+                || !matches!(page_guard.page_type(), PageType::Normal)
+            {
+                return Err(SystemError::EINVAL);
+            }
+            drop(page_guard);
+            entries.push(
+                Arc::try_new(PageEntry::new(page.clone(), PageState::UpToDate))
+                    .map_err(|_| SystemError::ENOMEM)?,
+            );
+        }
+
+        let _reclassify_guard = self.reclassify_lock.lock();
+        let mut guard = self.inner.lock();
+        if guard.accounting_backend.is_some() {
+            return Err(SystemError::EINVAL);
+        }
+        guard
+            .pages
+            .try_reserve(entries.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        if (start_page_index..end_page_index).any(|index| guard.pages.contains_key(&index)) {
+            return Err(SystemError::EEXIST);
+        }
+
+        // Capacity and the complete target range were preflighted; publication
+        // below has no fallible step and therefore cannot expose a prefix.
+        for (index, entry) in (start_page_index..end_page_index).zip(entries) {
+            entry.account_insert(guard.kind, true);
+            guard.pages.insert(index, entry);
+        }
+        drop(guard);
+        drop(_reclassify_guard);
+        batch.commit();
+        Ok(())
     }
 
     /// Insert a pre-allocated page into page cache and mark it ready.

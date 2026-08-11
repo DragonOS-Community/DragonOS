@@ -15,14 +15,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::MMArch;
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::{FileSystem, FsInfo, IndexNode, SuperBlock, VmaOpenRollback};
+use crate::filesystem::vfs::{FileSystem, FsInfo, IndexNode, Magic, SuperBlock, VmaOpenRollback};
 use crate::mm::allocator::page_frame::PageFrameCount;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::page::{page_manager_lock, PageFlags, PageType};
+use crate::mm::page::{allocate_registered_intrinsic_unevictable_pages_exact, PageFlags};
 use crate::mm::MemoryManagementArch;
 use crate::mm::VmFaultReason;
 use crate::mm::{VirtRegion, VmFlags};
@@ -48,7 +47,10 @@ impl FileSystem for PacketFakeFs {
         panic!("PacketFakeFs has no root inode")
     }
     fn info(&self) -> FsInfo {
-        panic!("PacketFakeFs has no fs info")
+        FsInfo {
+            blk_dev_id: 0,
+            max_name_len: 255,
+        }
     }
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -57,7 +59,7 @@ impl FileSystem for PacketFakeFs {
         "packet"
     }
     fn super_block(&self) -> SuperBlock {
-        panic!("PacketFakeFs has no super block")
+        SuperBlock::new(Magic::SOCKFS_MAGIC, PAGE_SIZE as u64, 255)
     }
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         PageFaultHandler::filemap_fault(pfm)
@@ -169,7 +171,7 @@ pub enum RingWriteResult {
 pub struct RingState {
     pub version: TpacketVersion,
     pub reserve: u32,
-    pub ring: Option<Arc<Mutex<PacketRing>>>,
+    pub ring: Option<Arc<PacketRingInstance>>,
     /// Number of active VMA mappings covering the ring. Teardown returns EBUSY
     /// while this is non-zero, matching Linux `mapped` accounting.
     pub mapped: usize,
@@ -210,8 +212,6 @@ pub struct PacketRing {
     /// memory fragmentation (plan §5 Task 3, evaluation P2-4 fix).
     block_vaddrs: Vec<usize>,
     frames_per_block: usize,
-    total_size: usize,
-    page_cache: Arc<PageCache>,
     head: u32,
     reserve: usize,
 }
@@ -226,7 +226,6 @@ impl PacketRing {
         sock_type: PacketSocketType,
         reserve: usize,
     ) -> Result<(Self, Arc<PageCache>), SystemError> {
-        let total_size = config.block_nr * config.block_size;
         let pages_per_block = config.block_size / PAGE_SIZE;
         // PageCache::new already returns Arc<PageCache>.
         let page_cache: Arc<PageCache> = PageCache::new(None, None);
@@ -240,66 +239,18 @@ impl PacketRing {
         // large `block_nr * block_size` allocation that fails under fragmented
         // memory.
         for block_idx in 0..config.block_nr {
-            let (phy_addr, mut pages) = {
-                let mut pm = page_manager_lock();
-                pm.create_pages(
-                    PageType::Normal,
-                    PageFlags::PG_UNEVICTABLE,
-                    &mut LockedFrameAllocator,
-                    PageFrameCount::new(pages_per_block),
-                )?
-            };
-            if pages.len() < pages_per_block {
-                let mut pm = page_manager_lock();
-                for page in &pages {
-                    pm.remove_page(&page.phys_address());
-                }
-                drop(pm);
-                return Err(SystemError::ENOMEM);
-            }
-
-            // Buddy may round the allocation up. Detach the unused tail from
-            // PageManager under its lock, then drop the final references only
-            // after releasing the lock.
-            if pages.len() > pages_per_block {
-                {
-                    let mut pm = page_manager_lock();
-                    for page in &pages[pages_per_block..] {
-                        pm.remove_page(&page.phys_address());
-                    }
-                }
-                pages.truncate(pages_per_block);
-            }
-
-            let vaddr = match unsafe { MMArch::phys_2_virt(phy_addr) } {
-                Some(vaddr) => vaddr.data(),
-                None => {
-                    let mut pm = page_manager_lock();
-                    for page in &pages {
-                        pm.remove_page(&page.phys_address());
-                    }
-                    drop(pm);
-                    return Err(SystemError::EFAULT);
-                }
-            };
-
-            for j in 0..pages_per_block {
-                let page = &pages[j];
+            let batch = allocate_registered_intrinsic_unevictable_pages_exact(
+                PageFrameCount::new(pages_per_block),
+            )?;
+            let vaddr = unsafe { MMArch::phys_2_virt(batch.start_paddr()) }
+                .ok_or(SystemError::EFAULT)?
+                .data();
+            for page in batch.pages() {
                 page.write().add_flags(PageFlags::PG_UPTODATE);
-                if let Err(err) = page_cache.insert_preallocated_unevictable_page(
-                    block_idx * pages_per_block + j,
-                    page.clone(),
-                ) {
-                    let mut pm = page_manager_lock();
-                    for page in &pages {
-                        pm.remove_page(&page.phys_address());
-                    }
-                    drop(pm);
-                    return Err(err);
-                }
             }
-            // create_pages() zeroed the whole actual extent before publishing
-            // any Page object, so every frame already starts KERNEL-owned.
+            page_cache.adopt_preallocated_unevictable_batch(block_idx * pages_per_block, batch)?;
+            // The bulk allocator zeroed the exact visible extent before
+            // publishing any PageCache entry, so every frame starts KERNEL-owned.
             block_vaddrs.push(vaddr);
         }
 
@@ -309,20 +260,10 @@ impl PacketRing {
             raw: sock_type == PacketSocketType::Raw,
             block_vaddrs,
             frames_per_block: config.block_size / config.frame_size,
-            total_size,
-            page_cache: page_cache.clone(),
             head: 0,
             reserve,
         };
         Ok((ring, page_cache))
-    }
-
-    pub fn total_size(&self) -> usize {
-        self.total_size
-    }
-
-    pub fn page_cache(&self) -> &Arc<PageCache> {
-        &self.page_cache
     }
 
     /// Match Linux packet_poll(): readiness is determined from the frame just
@@ -532,6 +473,39 @@ impl PacketRing {
             status |= TP_STATUS_VLAN_VALID | TP_STATUS_VLAN_TPID_VALID;
         }
         Some(status)
+    }
+}
+
+/// One published RX-ring lifetime. The writer and immutable mmap backing are
+/// pinned by the same Arc so an in-flight ingress snapshot cannot outlive the
+/// pages it writes.
+#[derive(Debug)]
+pub struct PacketRingInstance {
+    writer: Mutex<PacketRing>,
+    page_cache: Arc<PageCache>,
+    total_size: usize,
+}
+
+impl PacketRingInstance {
+    pub fn new(ring: PacketRing, page_cache: Arc<PageCache>) -> Self {
+        let total_size = ring.config.block_nr * ring.config.block_size;
+        Self {
+            writer: Mutex::new(ring),
+            page_cache,
+            total_size,
+        }
+    }
+
+    pub fn writer(&self) -> &Mutex<PacketRing> {
+        &self.writer
+    }
+
+    pub fn page_cache(&self) -> &Arc<PageCache> {
+        &self.page_cache
+    }
+
+    pub fn total_size(&self) -> usize {
+        self.total_size
     }
 }
 

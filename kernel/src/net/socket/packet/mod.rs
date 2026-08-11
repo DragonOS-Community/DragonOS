@@ -134,6 +134,9 @@ pub struct PacketSocket {
     /// which only holds [`ring_state`] for short snapshots or commits.
     pub(super) ring_control_lock: Mutex<()>,
     pub(super) ring_state: Mutex<ring::RingState>,
+    /// Stable mmap fault operations. Dynamic backing remains owned by the
+    /// active `PacketRingInstance` in `ring_state`.
+    mmap_fs: Arc<ring::PacketFakeFs>,
 }
 
 impl PacketSocket {
@@ -179,6 +182,7 @@ impl PacketSocket {
             fasync_items: FAsyncItems::default(),
             ring_control_lock: Mutex::new(()),
             ring_state: Mutex::new(ring::RingState::new()),
+            mmap_fs: Arc::new(ring::PacketFakeFs),
         });
         socket
             .netns
@@ -363,14 +367,16 @@ impl Socket for PacketSocket {
     }
     fn mmap_layout(&self) -> Option<crate::net::socket::base::SocketMmapLayout> {
         let state = self.ring_state.lock();
-        state.ring.as_ref().map(|r| {
-            let inner = r.lock();
-            crate::net::socket::base::SocketMmapLayout {
-                page_cache: inner.page_cache().clone(),
-                fs: Arc::new(ring::PacketFakeFs),
-                size: inner.total_size(),
-            }
-        })
+        state
+            .ring
+            .as_ref()
+            .map(|ring| crate::net::socket::base::SocketMmapLayout {
+                page_cache: ring.page_cache().clone(),
+                size: ring.total_size(),
+            })
+    }
+    fn mmap_fs(&self) -> Option<Arc<dyn crate::filesystem::vfs::FileSystem>> {
+        Some(self.mmap_fs.clone())
     }
     fn mmap_validate(&self, len: usize, offset: usize) -> Result<(), SystemError> {
         let mut state = self.ring_state.lock();
@@ -379,7 +385,7 @@ impl Socket for PacketSocket {
         };
         // Linux packet_mmap(): offset must be 0 and length must equal the
         // total ring size. Partial mappings or non-zero offsets are EINVAL.
-        let ring_size = ring_arc.lock().total_size();
+        let ring_size = ring_arc.total_size();
         if offset != 0 || len != ring_size {
             return Err(SystemError::EINVAL);
         }

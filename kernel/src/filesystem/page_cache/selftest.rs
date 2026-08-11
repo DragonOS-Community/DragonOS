@@ -25,6 +25,60 @@ impl Drop for PageCacheAccountingSelftestGuard {
     }
 }
 
+#[inline(never)]
+fn run_preallocated_batch_lifecycle_selftest() -> Result<bool, SystemError> {
+    use crate::{
+        arch::MMArch,
+        mm::{
+            allocator::page_frame::PageFrameCount,
+            page::allocate_registered_intrinsic_unevictable_pages_exact, MemoryManagementArch as _,
+        },
+    };
+
+    // Three pages exercises the allocator-rounded-tail path on the x86 buddy
+    // allocator while the public batch must expose exactly the requested run.
+    let batch = allocate_registered_intrinsic_unevictable_pages_exact(PageFrameCount::new(3))?;
+    if batch.pages().len() != 3 {
+        return Ok(false);
+    }
+    let start = batch.start_paddr();
+    let addresses: Vec<_> = batch
+        .pages()
+        .iter()
+        .map(|page| page.phys_address())
+        .collect();
+    if addresses
+        .iter()
+        .enumerate()
+        .any(|(index, paddr)| paddr.data() != start.data() + index * MMArch::PAGE_SIZE)
+    {
+        return Ok(false);
+    }
+    let vaddr = unsafe { MMArch::phys_2_virt(start) }.ok_or(SystemError::EFAULT)?;
+    let bytes =
+        unsafe { core::slice::from_raw_parts(vaddr.data() as *const u8, 3 * MMArch::PAGE_SIZE) };
+    if bytes.iter().any(|byte| *byte != 0) {
+        return Ok(false);
+    }
+    for page in batch.pages() {
+        page.write().add_flags(PageFlags::PG_UPTODATE);
+    }
+
+    let cache = PageCache::new(None, None);
+    cache.adopt_preallocated_unevictable_batch(7, batch)?;
+    if cache.inner.lock().pages_count() != 3
+        || addresses
+            .iter()
+            .any(|paddr| !page_manager_lock().contains(paddr))
+    {
+        return Ok(false);
+    }
+    drop(cache);
+    Ok(addresses
+        .iter()
+        .all(|paddr| !page_manager_lock().contains(paddr)))
+}
+
 struct PageCacheCompletionSelftestState {
     generic_started: AtomicUsize,
     generic_released: AtomicUsize,
@@ -1587,6 +1641,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         return Err(SystemError::EBUSY);
     }
     let _running = PageCacheAccountingSelftestGuard;
+
+    if !run_preallocated_batch_lifecycle_selftest()? {
+        return Ok("status=fail stage=preallocated_batch_lifecycle\n".into());
+    }
 
     let fault_invalidate_retry_order = run_invalidate_retry_lock_order_selftest().unwrap_or(false);
     if !fault_invalidate_retry_order {
@@ -3422,6 +3480,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

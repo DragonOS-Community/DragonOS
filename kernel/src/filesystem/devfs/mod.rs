@@ -350,6 +350,34 @@ impl DevFS {
             .and_then(|entries| entries.first().cloned())
     }
 
+    fn create_symlink(
+        &self,
+        link_name: &str,
+        target: &str,
+    ) -> Result<Arc<LockedDevFSInode>, SystemError> {
+        let _guard = self.operation_lock.lock();
+        let path = DevNodePath::parse(link_name)?;
+        let parent = self.root_inode.ensure_kernel_parent_dir(&path)?;
+        parent.create_dev_symlink(target, path.basename.as_ref())
+    }
+
+    fn remove_symlink_if_same(
+        &self,
+        link_name: &str,
+        expected: &Arc<LockedDevFSInode>,
+    ) -> Result<(), SystemError> {
+        let _guard = self.operation_lock.lock();
+        let path = DevNodePath::parse(link_name)?;
+        let Some(parent) = self.root_inode.find_parent_dir_if_exists(&path)? else {
+            return Ok(());
+        };
+
+        if parent.unlink_if_same(path.basename.as_ref(), expected)? {
+            self.root_inode.prune_kernel_dirs(&path)?;
+        }
+        Ok(())
+    }
+
     /// @brief 在devfs内注册设备
     ///
     /// @param name 设备名称
@@ -625,15 +653,23 @@ impl LockedDevFSInode {
     /// - `path`: 符号链接指向的路径
     /// - `symlink_name`: 符号链接的名称
     pub fn add_dev_symlink(&self, path: &str, symlink_name: &str) -> Result<(), SystemError> {
-        let new_inode =
-            self.create_with_data(symlink_name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
-
-        let buf = path.as_bytes();
-        let len = buf.len();
-        let devfs_inode = new_inode.downcast_ref::<LockedDevFSInode>().unwrap();
-        devfs_inode.write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
-        devfs_inode.0.lock().kernel_managed = true;
+        self.create_dev_symlink(path, symlink_name)?;
         Ok(())
+    }
+
+    fn create_dev_symlink(
+        &self,
+        path: &str,
+        symlink_name: &str,
+    ) -> Result<Arc<LockedDevFSInode>, SystemError> {
+        self.do_create_with_data(
+            symlink_name,
+            FileType::SymLink,
+            InodeMode::S_IRWXUGO,
+            0,
+            path.as_bytes().to_vec(),
+            true,
+        )
     }
 
     fn remove_if_same(&self, name: &str, expected: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
@@ -651,14 +687,55 @@ impl LockedDevFSInode {
         Ok(())
     }
 
+    fn unlink_if_same(
+        &self,
+        name: &str,
+        expected: &Arc<LockedDevFSInode>,
+    ) -> Result<bool, SystemError> {
+        let mut inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        let dname = DName::from(name);
+        let Some(child) = inode.children.get(&dname).cloned() else {
+            return Ok(false);
+        };
+        let expected_node: Arc<dyn IndexNode> = expected.clone();
+        if !Arc::ptr_eq(&child, &expected_node) {
+            return Ok(false);
+        }
+
+        let mut child_inode = expected.0.lock();
+        if child_inode.metadata.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+
+        child_inode.metadata.nlinks = child_inode
+            .metadata
+            .nlinks
+            .checked_sub(1)
+            .ok_or(SystemError::EINVAL)?;
+        let now = PosixTimeSpec::now();
+        child_inode.metadata.ctime = now;
+        drop(child_inode);
+
+        inode.children.remove(&dname);
+        inode.metadata.mtime = now;
+        inode.metadata.ctime = now;
+        Ok(true)
+    }
+
     fn do_create_with_data(
         &self,
-        mut guard: MutexGuard<DevFSInode>,
         name: &str,
         file_type: FileType,
         mode: InodeMode,
         dev: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        initial_data: Vec<u8>,
+        kernel_managed: bool,
+    ) -> Result<Arc<LockedDevFSInode>, SystemError> {
+        let mut guard = self.0.lock();
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -673,11 +750,11 @@ impl LockedDevFSInode {
             parent: guard.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
-            kernel_managed: false,
+            kernel_managed,
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
-                size: 0,
+                size: initial_data.len() as i64,
                 blk_size: 0,
                 blocks: 0,
                 atime: PosixTimeSpec::default(),
@@ -694,7 +771,7 @@ impl LockedDevFSInode {
             },
             fs: guard.fs.clone(),
             dname: name.clone(),
-            data: Vec::new(),
+            data: initial_data,
         })));
 
         // 初始化inode的自引用的weak指针
@@ -730,10 +807,7 @@ impl IndexNode for LockedDevFSInode {
         mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 获取当前inode
-        let guard: MutexGuard<DevFSInode> = self.0.lock();
-        // 如果当前inode不是文件夹，则返回
-        return self.do_create_with_data(guard, name, file_type, mode, data);
+        return Ok(self.do_create_with_data(name, file_type, mode, data, Vec::new(), false)?);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -1081,11 +1155,18 @@ pub fn devfs_create_node_dyn(
 }
 
 /// 在 /dev 下创建符号链接
-#[allow(dead_code)]
-pub fn devfs_add_symlink(link_name: &str, target: &str) -> Result<(), SystemError> {
-    devfs_global_instance()
-        .root_inode
-        .add_dev_symlink(target, link_name)
+pub fn devfs_add_symlink(
+    link_name: &str,
+    target: &str,
+) -> Result<Arc<LockedDevFSInode>, SystemError> {
+    devfs_global_instance().create_symlink(link_name, target)
+}
+
+pub fn devfs_remove_symlink_if_same(
+    link_name: &str,
+    expected: &Arc<LockedDevFSInode>,
+) -> Result<(), SystemError> {
+    devfs_global_instance().remove_symlink_if_same(link_name, expected)
 }
 
 /// @brief devfs的设备卸载函数

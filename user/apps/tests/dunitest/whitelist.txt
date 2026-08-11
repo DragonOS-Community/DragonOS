@@ -62,6 +62,7 @@ normal/proc_self_exec_cmdline
 normal/proc_thread_accounting
 normal/user_namespace_id_map
 normal/tty_tcflush
+normal/tty_console_device
 normal/hvc_console_backpressure
 normal/signal_fpstate_sigreturn
 normal/general_protection_signal

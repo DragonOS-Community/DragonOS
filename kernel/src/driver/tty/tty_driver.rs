@@ -312,21 +312,30 @@ impl TtyDriver {
     }
 
     pub fn init_tty_device(&self, index: Option<usize>) -> Result<Arc<TtyCore>, SystemError> {
-        // 如果传入的index为None，那么就自动分配index
-        let idx: usize;
-        if let Some(i) = index {
+        // Dynamic drivers (PTY, serial and virtio console) own explicit index
+        // lifetimes outside this IDA. Only an automatically allocated index is
+        // owned by this call and can be rolled back here.
+        let (idx, auto_allocated) = if let Some(i) = index {
+            if i >= self.device_count as usize {
+                return Err(SystemError::EINVAL);
+            }
             if self.ida.lock().exists(i) {
                 return Err(SystemError::EINVAL);
             }
-            idx = i;
+            (i, false)
         } else {
-            idx = self.ida.lock().alloc().ok_or(SystemError::EBUSY)?;
-        }
+            (self.ida.lock().alloc().ok_or(SystemError::EBUSY)?, true)
+        };
         // log::debug!("init_tty_device: create TtyCore");
         let tty = TtyCore::new(self.self_ref(), idx);
 
         // log::debug!("init_tty_device: to driver_install_tty");
-        self.driver_install_tty(tty.clone())?;
+        if let Err(err) = self.driver_install_tty(tty.clone()) {
+            if auto_allocated {
+                self.ida.lock().free(idx);
+            }
+            return Err(err);
+        }
         // log::debug!(
         //     "init_tty_device: driver_install_tty done, index: {}, dev_name: {:?}",
         //     idx,

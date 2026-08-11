@@ -1,4 +1,5 @@
 use super::*;
+use crate::filesystem::vfs::VmaOpenRollback;
 
 impl InnerAddressSpace {
     /// Remap a memory region
@@ -378,9 +379,9 @@ impl InnerAddressSpace {
 
         // Like Linux vm_ops->open, this is a lifetime notification for the new
         // VMA, not another filesystem mmap admission check.
-        if let Some(file) = vm_file.as_ref() {
-            file.with_io_fs(|fs| fs.vma_open(file, new_region, vm_flags));
-        }
+        let target_vma_open_rollback = vm_file
+            .as_ref()
+            .map(|file| file.with_io_fs(|fs| fs.vma_open(file, new_region, vm_flags)));
         self.mappings.insert_vma(new_vma.clone());
         let move_len = core::cmp::min(source_len, new_len);
 
@@ -447,7 +448,9 @@ impl InnerAddressSpace {
                 self.mappings.remove_vma(&new_region);
                 drop(page_manager_guard);
                 tlb.finish();
-                if let Some(file) = vm_file.as_ref() {
+                if let (Some(file), Some(VmaOpenRollback::Close)) =
+                    (vm_file.as_ref(), target_vma_open_rollback)
+                {
                     notifications.vma.push(VmaCloseNotification {
                         file: file.clone(),
                         region: new_region,

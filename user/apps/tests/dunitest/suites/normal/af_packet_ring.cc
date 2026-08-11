@@ -12,6 +12,7 @@
 #include <net/if_arp.h>
 #include <netpacket/packet.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -375,6 +376,85 @@ TEST(AfPacketRing, RingRequestValidatesLengthBeforePointer) {
     EXPECT_EQ(errno, EINVAL) << "Linux maps a tpacket_req copy fault to EINVAL";
 }
 
+TEST(AfPacketRing, TeardownRequestMatchesLinuxFieldSemantics) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    FdGuard fd(MakeRingSocket());
+    ASSERT_GE(fd.Get(), 0) << Error();
+    ASSERT_EQ(Configure(fd.Get(), Request(page, 1)), 0) << Error();
+
+    const TpacketReq malformed{UINT32_MAX, 0, UINT32_MAX, 1};
+    errno = 0;
+    EXPECT_EQ(Configure(fd.Get(), malformed), -1);
+    EXPECT_EQ(errno, EINVAL) << Error();
+
+    void* mapping = MapRing(fd.Get(), page);
+    ASSERT_NE(mapping, MAP_FAILED) << "a malformed teardown must preserve the ring: " << Error();
+    errno = 0;
+    EXPECT_EQ(Configure(fd.Get(), malformed), -1);
+    EXPECT_EQ(errno, EBUSY) << Error();
+
+    const TpacketReq teardown_with_ignored_sizes{UINT32_MAX, 0, UINT32_MAX, 0};
+    errno = 0;
+    EXPECT_EQ(Configure(fd.Get(), teardown_with_ignored_sizes), -1);
+    EXPECT_EQ(errno, EBUSY) << Error();
+
+    ASSERT_EQ(munmap(mapping, page), 0) << Error();
+    EXPECT_EQ(Configure(fd.Get(), teardown_with_ignored_sizes), 0) << Error();
+    EXPECT_EQ(Configure(fd.Get(), teardown_with_ignored_sizes), 0) << Error();
+}
+
+TEST(AfPacketRing, RingSetupPurgesLegacyReceiveQueue) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    FdGuard receiver(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(receiver.Get(), 0) << Error();
+    ASSERT_GE(sender.Get(), 0) << Error();
+
+    const int ifindex = InterfaceIndex(receiver.Get(), "veth1");
+    ASSERT_GE(ifindex, 0) << Error();
+    struct sockaddr_ll bind_address {};
+    bind_address.sll_family = AF_PACKET;
+    bind_address.sll_protocol = htons(kPrivateEtherType);
+    bind_address.sll_ifindex = ifindex;
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&bind_address),
+                   sizeof(bind_address)),
+              0)
+        << Error();
+
+    uint8_t sent[kTestFrameSize]{};
+    std::memset(sent, 0xff, 6);
+    sent[6] = 0x02;
+    sent[11] = 0x42;
+    sent[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    sent[13] = static_cast<uint8_t>(kPrivateEtherType);
+    struct sockaddr_ll destination {};
+    destination.sll_family = AF_PACKET;
+    destination.sll_protocol = htons(kPrivateEtherType);
+    destination.sll_ifindex = ifindex;
+    destination.sll_halen = 6;
+    std::memset(destination.sll_addr, 0xff, 6);
+    ASSERT_EQ(sendto(sender.Get(), sent, sizeof(sent), 0,
+                     reinterpret_cast<sockaddr*>(&destination), sizeof(destination)),
+              static_cast<ssize_t>(sizeof(sent)))
+        << Error();
+
+    struct pollfd poll_fd { receiver.Get(), POLLIN, 0 };
+    ASSERT_EQ(poll(&poll_fd, 1, 3000), 1) << Error();
+    ASSERT_NE(poll_fd.revents & POLLIN, 0);
+
+    ASSERT_EQ(Configure(receiver.Get(), Request(page, 1)), 0) << Error();
+    MappingGuard mapping(MapRing(receiver.Get(), page), page);
+    ASSERT_NE(mapping.Get(), MAP_FAILED) << Error();
+
+    uint8_t received[kTestFrameSize]{};
+    errno = 0;
+    EXPECT_EQ(recv(receiver.Get(), received, sizeof(received), MSG_DONTWAIT), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << Error();
+
+    ASSERT_EQ(mapping.Unmap(), 0) << Error();
+    EXPECT_EQ(Teardown(receiver.Get()), 0) << Error();
+}
+
 TEST(AfPacketRing, PartialMiddleMunmapKeepsBackingBusy) {
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     FdGuard fd(MakeRingSocket());
@@ -475,6 +555,39 @@ TEST(AfPacketRing, MremapMoveTransfersOneVmaReference) {
     EXPECT_EQ(Teardown(fd.Get()), -1);
     EXPECT_EQ(errno, EBUSY) << Error();
     ASSERT_EQ(munmap(moved, page), 0) << Error();
+    EXPECT_EQ(Teardown(fd.Get()), 0) << Error();
+}
+
+TEST(AfPacketRing, MremapExpansionFaultsBeyondRingBacking) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    FdGuard fd(MakeRingSocket());
+    ASSERT_GE(fd.Get(), 0) << Error();
+    ASSERT_EQ(Configure(fd.Get(), Request(page, 1)), 0) << Error();
+    void* mapping = MapRing(fd.Get(), page);
+    ASSERT_NE(mapping, MAP_FAILED) << Error();
+
+    void* expanded = mremap(mapping, page, page * 2, MREMAP_MAYMOVE);
+    ASSERT_NE(expanded, MAP_FAILED) << Error();
+    const uint8_t first_byte = *static_cast<volatile uint8_t*>(expanded);
+    (void)first_byte;
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << Error();
+    if (child == 0) {
+        const auto* beyond_ring = static_cast<volatile uint8_t*>(expanded) + page;
+        const uint8_t value = *beyond_ring;
+        (void)value;
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(WTERMSIG(status), SIGBUS);
+
+    errno = 0;
+    EXPECT_EQ(Teardown(fd.Get()), -1);
+    EXPECT_EQ(errno, EBUSY) << Error();
+    ASSERT_EQ(munmap(expanded, page * 2), 0) << Error();
     EXPECT_EQ(Teardown(fd.Get()), 0) << Error();
 }
 

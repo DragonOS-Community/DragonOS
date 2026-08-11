@@ -138,6 +138,7 @@ impl PacketSocket {
                         tpacket_version::TPACKET_V2 => super::ring::TpacketVersion::V2,
                         _ => return Err(SystemError::EINVAL),
                     };
+                    let _control = self.ring_control_lock.lock();
                     let mut state = self.ring_state.lock();
                     if state.ring.is_some() {
                         return Err(SystemError::EBUSY);
@@ -150,6 +151,7 @@ impl PacketSocket {
                     if v > i32::MAX as u32 {
                         return Err(SystemError::EINVAL);
                     }
+                    let _control = self.ring_control_lock.lock();
                     let mut state = self.ring_state.lock();
                     if state.ring.is_some() {
                         return Err(SystemError::EBUSY);
@@ -167,21 +169,35 @@ impl PacketSocket {
                         tp_frame_size: u32::from_ne_bytes(value[8..12].try_into().unwrap()),
                         tp_frame_nr: u32::from_ne_bytes(value[12..16].try_into().unwrap()),
                     };
+                    // Match Linux lock_sock(): serialize control-plane changes
+                    // while keeping slow allocation and destruction off the
+                    // ring_state lock used by ingress and poll.
+                    let _control = self.ring_control_lock.lock();
+                    // The queue-to-state order is shared with the legacy RX
+                    // commit path, making ring cutover and final enqueue one
+                    // atomic state transition.
+                    let mut queue = self.rx_buffer.lock();
                     let mut state = self.ring_state.lock();
-                    // Linux teardown path: all-zero tpacket_req removes the
-                    // ring. Returns EBUSY if still mmaped or in use.
-                    let is_teardown = req.tp_block_nr == 0 && req.tp_frame_nr == 0;
-                    if is_teardown {
-                        if state.mapped > 0 {
-                            return Err(SystemError::EBUSY);
+                    // Linux checks mapped before classifying or validating any
+                    // setup/teardown request.
+                    if state.mapped > 0 {
+                        return Err(SystemError::EBUSY);
+                    }
+                    // A zero block count selects teardown. Only frame_nr must
+                    // also be zero; the two size fields are ignored.
+                    if req.tp_block_nr == 0 {
+                        if req.tp_frame_nr != 0 {
+                            return Err(SystemError::EINVAL);
                         }
-                        if state.ring.is_some() {
-                            // Remove ring from ingress visibility. The old
-                            // Arc is dropped here; any in-flight cloned writer
-                            // that already holds the inner lock will finish
-                            // safely.
-                            state.ring = None;
-                        }
+                        let old_ring = state.ring.take();
+                        let old_queue = core::mem::take(&mut *queue);
+                        state.advance_rx_generation();
+                        drop(state);
+                        drop(queue);
+                        // Page-cache/ring destruction may be expensive. Arc
+                        // snapshots held by in-flight ingress remain valid.
+                        self.release_rx_queue(old_queue);
+                        drop(old_ring);
                         return Ok(());
                     }
                     if state.ring.is_some() {
@@ -189,10 +205,26 @@ impl PacketSocket {
                     }
                     let version = state.version;
                     let reserve = state.reserve as usize;
+                    drop(state);
+                    drop(queue);
+
                     let config =
                         super::ring::validate_ring_config(&req, version.hdrlen(), reserve)?;
                     let (ring, _pc) = PacketRing::setup(config, version, self.sock_type, reserve)?;
-                    state.ring = Some(Arc::new(Mutex::new(ring)));
+                    let ring = Arc::new(Mutex::new(ring));
+
+                    // The control lock keeps version/reserve/ring stable while
+                    // the candidate is built. Publish the fully initialized
+                    // ring in one short data-plane-visible critical section.
+                    let mut queue = self.rx_buffer.lock();
+                    let mut state = self.ring_state.lock();
+                    debug_assert!(state.ring.is_none() && state.mapped == 0);
+                    let old_queue = core::mem::take(&mut *queue);
+                    state.ring = Some(ring);
+                    state.advance_rx_generation();
+                    drop(state);
+                    drop(queue);
+                    self.release_rx_queue(old_queue);
                     Ok(())
                 }
                 packet_option::PACKET_COPY_THRESH => {

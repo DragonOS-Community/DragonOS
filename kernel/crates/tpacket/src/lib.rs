@@ -183,7 +183,7 @@ pub struct RingConfig {
 /// Error returned by [`validate_ring_config`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RingConfigError {
-    /// block_size == 0 or not page-aligned.
+    /// block_size is not positive as a signed 32-bit value, or is not page-aligned.
     InvalidBlockSize,
     /// block_nr * block_size overflows or is zero.
     InvalidTotalSize,
@@ -198,7 +198,10 @@ pub enum RingConfigError {
 impl fmt::Display for RingConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RingConfigError::InvalidBlockSize => write!(f, "block_size is 0 or not page-aligned"),
+            RingConfigError::InvalidBlockSize => write!(
+                f,
+                "block_size is not positive as i32 or is not page-aligned"
+            ),
             RingConfigError::InvalidTotalSize => {
                 write!(f, "block_nr * block_size overflows or is 0")
             }
@@ -220,7 +223,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 4096;
 /// Validate a `tpacket_req` against the Linux `packet_setring` rules.
 ///
 /// Mirrors the validation in Linux `packet_set_ring()`:
-/// 1. `block_size` must be non-zero and a multiple of the page size.
+/// 1. `block_size` must be positive as a signed 32-bit value and page-aligned.
 /// 2. `block_nr * block_size` must not overflow and must be non-zero.
 /// 3. `frame_size` must be >= `hdrlen + reserve` and 16-byte aligned.
 /// 4. `frame_size` must be <= `block_size`.
@@ -236,7 +239,10 @@ pub fn validate_ring_config(
     let frame_size = req.tp_frame_size as usize;
     let frame_nr = req.tp_frame_nr as usize;
 
-    if block_size == 0 || !block_size.is_multiple_of(page_size) {
+    if req.tp_block_size == 0
+        || req.tp_block_size > i32::MAX as u32
+        || !block_size.is_multiple_of(page_size)
+    {
         return Err(RingConfigError::InvalidBlockSize);
     }
 

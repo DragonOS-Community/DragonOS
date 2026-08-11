@@ -130,6 +130,9 @@ pub struct PacketSocket {
     registry_active: AtomicBool,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
+    /// Serializes slow RX-ring control transactions without blocking ingress,
+    /// which only holds [`ring_state`] for short snapshots or commits.
+    pub(super) ring_control_lock: Mutex<()>,
     pub(super) ring_state: Mutex<ring::RingState>,
 }
 
@@ -174,6 +177,7 @@ impl PacketSocket {
             filter: RcuOptionArcSlot::new_none(),
             filter_locked: Mutex::new(false),
             fasync_items: FAsyncItems::default(),
+            ring_control_lock: Mutex::new(()),
             ring_state: Mutex::new(ring::RingState::new()),
         });
         socket

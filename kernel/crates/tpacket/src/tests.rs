@@ -145,6 +145,20 @@ fn reject_non_page_aligned_block_size() {
 }
 
 #[test]
+fn reject_block_size_negative_as_i32() {
+    let req = TpacketReq {
+        tp_block_size: 0x8000_0000,
+        tp_block_nr: 1,
+        tp_frame_size: DEFAULT_PAGE_SIZE as u32,
+        tp_frame_nr: 0x8000_0000 / DEFAULT_PAGE_SIZE as u32,
+    };
+    assert_eq!(
+        validate_ring_config(&req, TPACKET_HDRLEN, 0, DEFAULT_PAGE_SIZE),
+        Err(RingConfigError::InvalidBlockSize)
+    );
+}
+
+#[test]
 fn reject_block_nr_zero() {
     let req = TpacketReq {
         tp_block_size: 4096,

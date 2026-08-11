@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use core::cell::Cell;
 use core::sync::atomic::Ordering;
 use system_error::SystemError;
@@ -821,7 +821,10 @@ impl PacketSocket {
         // When an RX ring is active, deliver directly into the ring instead of
         // the rx_buffer queue.  Clone the Arc and release the outer lock so
         // concurrent delivers from other NICs are not blocked by setup/teardown.
-        let ring_arc = self.ring_state.lock().ring.as_ref().cloned();
+        let (ring_arc, rx_generation) = {
+            let state = self.ring_state.lock();
+            (state.ring.as_ref().cloned(), state.rx_generation)
+        };
         if let Some(ring_arc) = ring_arc {
             let metadata = PacketMetadata {
                 src_mac: parsed.src,
@@ -916,10 +919,46 @@ impl PacketSocket {
             self.stats_drops.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // Serialize the final legacy-queue commit with RX-ring cutover. A
+        // packet that observed no ring before allocating must not enter the
+        // queue after any setup/teardown cutover. Checking the generation also
+        // closes the None -> Some -> None ABA case.
+        let state = self.ring_state.lock();
+        if state.ring.is_some() || state.rx_generation != rx_generation {
+            drop(state);
+            drop(queue);
+            self.rx_buffer_bytes
+                .fetch_sub(accounted_bytes, Ordering::AcqRel);
+            // Linux accounts packet_rcv before packet_set_ring() purges its
+            // receive queue. Preserve that statistic while withholding a
+            // wakeup for data discarded at the cutover boundary.
+            self.stats_packets.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         queue.push_back(packet);
+        drop(state);
         drop(queue);
         self.stats_packets.fetch_add(1, Ordering::Relaxed);
         self.wait_queue.wakeup(None);
+    }
+
+    /// Release packets detached from the legacy receive queue at a ring
+    /// cutover. Accounting and object destruction run outside the queue/state
+    /// locks so packet buffers cannot lengthen the data-plane critical section.
+    pub(super) fn release_rx_queue(&self, packets: VecDeque<ReceivedPacket>) {
+        let accounted_bytes = packets.iter().fold(0usize, |total, packet| {
+            total
+                .checked_add(packet.accounted_bytes)
+                .expect("AF_PACKET receive accounting overflow")
+        });
+        if accounted_bytes != 0 {
+            self.rx_buffer_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_sub(accounted_bytes)
+                })
+                .expect("AF_PACKET receive accounting underflow during ring cutover");
+        }
+        drop(packets);
     }
     pub(super) fn can_recv(&self) -> bool {
         // Linux packet_poll() combines normal receive-queue readiness with

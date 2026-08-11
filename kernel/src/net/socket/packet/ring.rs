@@ -173,6 +173,10 @@ pub struct RingState {
     /// Number of active VMA mappings covering the ring. Teardown returns EBUSY
     /// while this is non-zero, matching Linux `mapped` accounting.
     pub mapped: usize,
+    /// Changes at every successful RX-ring cutover. Legacy ingress snapshots
+    /// this value so a None -> Some -> None transition cannot be mistaken for
+    /// an unchanged no-ring state when it finally commits to the queue.
+    pub rx_generation: u64,
 }
 
 impl RingState {
@@ -182,7 +186,15 @@ impl RingState {
             reserve: 0,
             ring: None,
             mapped: 0,
+            rx_generation: 0,
         }
+    }
+
+    pub fn advance_rx_generation(&mut self) {
+        self.rx_generation = self
+            .rx_generation
+            .checked_add(1)
+            .expect("AF_PACKET RX-ring generation overflow");
     }
 }
 /// V1/V2 receive ring buffer.

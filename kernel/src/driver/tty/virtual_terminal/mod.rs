@@ -10,11 +10,8 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::base::device::{
-        device_number::{DeviceNumber, Major},
-        device_register, IdTable,
-    },
-    filesystem::devfs::{devfs_register, devfs_unregister},
+    driver::base::device::device_number::{DeviceNumber, Major},
+    filesystem::devfs::{devfs_add_symlink, devfs_remove_symlink_if_same, LockedDevFSInode},
     init::initcall::INITCALL_LATE,
     libs::{lazy_init::Lazy, rwlock::RwLock, spinlock::SpinLock},
 };
@@ -25,7 +22,6 @@ use super::{
     console::ConsoleSwitch,
     termios::{InputMode, TTY_STD_TERMIOS},
     tty_core::{TtyCore, TtyCoreData},
-    tty_device::{TtyDevice, TtyType},
     tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
     tty_port::{DefaultTtyPort, TtyPort},
 };
@@ -71,7 +67,7 @@ pub struct VirtConsole {
 }
 
 struct InnerVirtConsole {
-    vcdev: Option<Arc<TtyDevice>>,
+    vc_alias: Option<(String, Arc<LockedDevFSInode>)>,
     devfs_removing: bool,
 }
 
@@ -82,7 +78,7 @@ impl VirtConsole {
             port: Arc::new(DefaultTtyPort::new()),
             index: Lazy::new(),
             inner: SpinLock::new(InnerVirtConsole {
-                vcdev: None,
+                vc_alias: None,
                 devfs_removing: false,
             }),
         })
@@ -107,41 +103,31 @@ impl VirtConsole {
             .internal_tty()
             .ok_or(SystemError::ENODEV)?;
         let tty_core_data = tty_core.core();
-        let devnum = *tty_core_data.device_number();
-        let vcname = format!("vc{}", self.index.get());
-
-        // 注册虚拟终端设备并将虚拟终端设备加入到文件系统
-        let vcdev = TtyDevice::new(
-            vcname.clone(),
-            IdTable::new(vcname, Some(devnum)),
-            TtyType::Tty,
-        );
-
-        device_register(vcdev.clone())?;
-        devfs_register(vcdev.name_ref(), vcdev.clone())?;
+        let vcname = format!("vc{}", tty_core_data.index());
+        let alias = devfs_add_symlink(&vcname, tty_core_data.name())?;
         tty_core_data.set_vc_index(*self.index.get());
-        self.inner.lock().vcdev = Some(vcdev);
+        self.inner.lock().vc_alias = Some((vcname, alias));
 
         Ok(())
     }
 
     fn devfs_remove(&self) -> Result<bool, SystemError> {
-        let vcdev = {
+        let vc_alias = {
             let mut inner = self.inner.lock();
             if inner.devfs_removing {
                 return Ok(false);
             }
-            let Some(vcdev) = inner.vcdev.take() else {
+            let Some(vc_alias) = inner.vc_alias.take() else {
                 return Ok(true);
             };
             inner.devfs_removing = true;
-            vcdev
+            vc_alias
         };
-        let result = devfs_unregister(vcdev.name_ref(), vcdev.clone());
+        let result = devfs_remove_symlink_if_same(&vc_alias.0, &vc_alias.1);
         let mut inner = self.inner.lock();
         inner.devfs_removing = false;
         if let Err(e) = result {
-            inner.vcdev = Some(vcdev);
+            inner.vc_alias = Some(vc_alias);
             return Err(e);
         }
         Ok(true)
@@ -333,7 +319,7 @@ impl Color {
 }
 
 pub struct TtyConsoleDriverInner {
-    console: Arc<dyn ConsoleSwitch>,
+    console: SpinLock<Option<Arc<dyn ConsoleSwitch>>>,
 }
 
 impl core::fmt::Debug for TtyConsoleDriverInner {
@@ -343,27 +329,54 @@ impl core::fmt::Debug for TtyConsoleDriverInner {
 }
 
 impl TtyConsoleDriverInner {
-    pub fn new() -> Result<Self, SystemError> {
-        let console = {
+    pub fn new() -> Self {
+        Self {
+            console: SpinLock::new(None),
+        }
+    }
+
+    fn select_console(&self) -> Result<Arc<dyn ConsoleSwitch>, SystemError> {
+        if let Some(console) = self.console.lock().as_ref().cloned() {
+            return Ok(console);
+        }
+
+        let candidate: Arc<dyn ConsoleSwitch> = {
             #[cfg(not(target_arch = "riscv64"))]
             {
-                Arc::new(crate::driver::video::fbdev::base::fbcon::framebuffer_console::BlittingFbConsole::new()?)
+                use crate::driver::video::fbdev::base::{
+                    fbcon::framebuffer_console::BlittingFbConsole, fbmem::frame_buffer_manager,
+                    FbId,
+                };
+
+                match frame_buffer_manager().find_fb_by_id(FbId::new(0))? {
+                    Some(fb) => Arc::new(BlittingFbConsole::new(fb)),
+                    None => crate::driver::video::console::dummycon::dummy_console(),
+                }
             }
 
             #[cfg(target_arch = "riscv64")]
             crate::driver::video::console::dummycon::dummy_console()
         };
 
-        Ok(Self { console })
+        let mut console = self.console.lock();
+        if console.is_none() {
+            *console = Some(candidate);
+        }
+        Ok(console.as_ref().unwrap().clone())
     }
 
-    fn do_install(&self, tty: Arc<TtyCore>, vc: &Arc<VirtConsole>) -> Result<(), SystemError> {
+    fn do_install(
+        &self,
+        tty: Arc<TtyCore>,
+        vc: &Arc<VirtConsole>,
+        console: &Arc<dyn ConsoleSwitch>,
+    ) -> Result<(), SystemError> {
         let tty_core = tty.core();
 
         let binding = vc.vc_data().unwrap();
         let mut vc_data = binding.lock();
 
-        self.console.con_init(vc, &mut vc_data, true)?;
+        console.con_init(vc, &mut vc_data, true)?;
         if vc_data.complement_mask == 0 {
             vc_data.complement_mask = if vc_data.color_mode { 0x7700 } else { 0x0800 };
         }
@@ -371,10 +384,6 @@ impl TtyConsoleDriverInner {
         // vc_data.bytes_per_row = vc_data.cols << 1;
         vc_data.index = tty_core.index();
         vc_data.bottom = vc_data.rows;
-        vc_data.set_driver_funcs(Arc::downgrade(
-            &(self.console.clone() as Arc<dyn ConsoleSwitch>),
-        ));
-
         // todo: unicode字符集处理？
 
         if vc_data.cols > VC_MAXCOL || vc_data.rows > VC_MAXROW {
@@ -409,11 +418,12 @@ impl TtyConsoleDriverInner {
 
 impl TtyOperation for TtyConsoleDriverInner {
     fn install(&self, _driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        let vc = VirtConsole::new(Some(Arc::new(SpinLock::new(VirtualConsoleData::new(
-            usize::MAX,
-        )))));
+        let console = self.select_console()?;
+        let vc_data = Arc::new(SpinLock::new(VirtualConsoleData::new(usize::MAX)));
+        vc_data.lock().set_driver_funcs(Arc::downgrade(&console));
+        let vc = VirtConsole::new(Some(vc_data));
         vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
-        self.do_install(tty, &vc)
+        self.do_install(tty, &vc, &console)
             .inspect_err(|_| vc_manager().free(vc.index().unwrap()))?;
 
         Ok(())
@@ -501,24 +511,22 @@ pub struct DrawRegion {
 // 初始化虚拟终端
 #[inline(never)]
 pub fn vty_init() -> Result<(), SystemError> {
-    if let Ok(tty_console_driver_inner) = TtyConsoleDriverInner::new() {
-        const NAME: &str = "tty";
-        let console_driver = TtyDriver::new(
-            MAX_NR_CONSOLES,
-            NAME,
-            0,
-            Major::TTY_MAJOR,
-            0,
-            TtyDriverType::Console,
-            *TTY_STD_TERMIOS,
-            Arc::new(tty_console_driver_inner),
-            None,
-        );
+    const NAME: &str = "tty";
+    let console_driver = TtyDriver::new(
+        MAX_NR_CONSOLES,
+        NAME,
+        0,
+        Major::TTY_MAJOR,
+        0,
+        TtyDriverType::Console,
+        *TTY_STD_TERMIOS,
+        Arc::new(TtyConsoleDriverInner::new()),
+        None,
+    );
 
-        TtyDriverManager::tty_register_driver(console_driver).inspect_err(|e| {
-            log::error!("tty console: register driver {} failed: {:?}", NAME, e);
-        })?;
-    }
+    TtyDriverManager::tty_register_driver(console_driver).inspect_err(|e| {
+        log::error!("tty console: register driver {} failed: {:?}", NAME, e);
+    })?;
 
     Ok(())
 }
@@ -528,8 +536,8 @@ fn vty_late_init() -> Result<(), SystemError> {
     let (_, console_driver) =
         TtyDriverManager::lookup_tty_driver(DeviceNumber::new(Major::TTY_MAJOR, 0))
             .ok_or(SystemError::ENODEV)?;
-    console_driver.init_tty_device(None).ok();
+    let tty_result = console_driver.init_tty_device(None).map(|_| ());
 
     vc_manager().setup_default_vc();
-    Ok(())
+    tty_result
 }

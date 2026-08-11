@@ -19,6 +19,8 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -256,6 +258,8 @@ void RunReceiveDataPath(int version, const char* interface, uint16_t hardware_ty
         uint64_t status;
         uint32_t packet_len;
         uint32_t snaplen;
+        uint32_t sec;
+        uint32_t subsec;
         uint16_t mac;
         uint16_t net;
         if (version == TPACKET_V1) {
@@ -263,6 +267,8 @@ void RunReceiveDataPath(int version, const char* interface, uint16_t hardware_ty
             status = __atomic_load_n(&header->status, __ATOMIC_ACQUIRE);
             packet_len = header->len;
             snaplen = header->snaplen;
+            sec = header->sec;
+            subsec = header->usec;
             mac = header->mac;
             net = header->net;
         } else {
@@ -270,6 +276,8 @@ void RunReceiveDataPath(int version, const char* interface, uint16_t hardware_ty
             status = __atomic_load_n(&header->status, __ATOMIC_ACQUIRE);
             packet_len = header->len;
             snaplen = header->snaplen;
+            sec = header->sec;
+            subsec = header->nsec;
             mac = header->mac;
             net = header->net;
         }
@@ -296,6 +304,12 @@ void RunReceiveDataPath(int version, const char* interface, uint16_t hardware_ty
             EXPECT_EQ(link_address->pkttype, PACKET_OUTGOING);
         }
         EXPECT_EQ(link_address->halen, 6);
+        const std::time_t realtime = std::time(nullptr);
+        EXPECT_LE(std::llabs(static_cast<long long>(sec) -
+                             static_cast<long long>(realtime)),
+                  5)
+            << "TPACKET timestamps must use realtime rather than monotonic uptime";
+        EXPECT_LT(subsec, version == TPACKET_V1 ? 1000000U : 1000000000U);
         if (bounds_valid && snaplen >= visible_len &&
             std::memcmp(frame + mac, sent + visible_offset, visible_len) == 0) {
             matched = true;

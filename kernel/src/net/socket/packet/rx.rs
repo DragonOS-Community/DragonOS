@@ -922,12 +922,11 @@ impl PacketSocket {
         self.wait_queue.wakeup(None);
     }
     pub(super) fn can_recv(&self) -> bool {
-        // Ring mode: check for TP_STATUS_USER frames.
-        if let Some(r) = self.ring_state.lock().ring.as_ref() {
-            return r.lock().has_user_frames();
-        }
-        // Queue mode (default).
-        !self.rx_buffer.lock().is_empty()
+        // Linux packet_poll() combines normal receive-queue readiness with
+        // RX-ring readiness; neither receive source may mask the other.
+        let ring = self.ring_state.lock().ring.as_ref().cloned();
+        let ring_ready = ring.is_some_and(|ring| ring.lock().has_user_frames());
+        ring_ready || !self.rx_buffer.lock().is_empty()
     }
     fn dequeue(&self, peek: bool) -> Result<ReceivedPacket, SystemError> {
         let mut queue = self.rx_buffer.lock();

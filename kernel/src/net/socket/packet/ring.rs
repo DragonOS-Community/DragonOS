@@ -457,12 +457,14 @@ impl PacketRing {
         // within that block. The ring Arc and lock keep the backing alive and
         // serialize kernel writers while userspace follows status ownership.
         let writer = unsafe { FrameWriter::new(base, self.config.frame_size) };
+        // Linux timestamps every TPACKET version from CLOCK_REALTIME. Sample
+        // once so the V1/V2 encodings share the same source and instant.
+        let ts = crate::time::PosixTimeSpec::now();
 
         match self.version {
             TpacketVersion::V1 => {
-                let now_micros = crate::time::Instant::now().total_micros();
-                let tp_sec = (now_micros / 1_000_000) as u32;
-                let tp_usec = (now_micros % 1_000_000) as u32;
+                let tp_sec = ts.tv_sec as u32;
+                let tp_usec = (ts.tv_nsec / 1_000) as u32;
                 // Clear the complete ABI object, including its four padding
                 // bytes, so a recycled frame cannot disclose stale data.
                 writer.zero(0, core::mem::size_of::<TpacketHdr>())?;
@@ -474,7 +476,6 @@ impl PacketRing {
                 writer.write(core::mem::offset_of!(TpacketHdr, tp_usec), tp_usec)?;
             }
             TpacketVersion::V2 => {
-                let ts = crate::time::PosixTimeSpec::now();
                 let tp_sec = ts.tv_sec as u32;
                 let tp_nsec = ts.tv_nsec as u32;
                 writer.zero(0, core::mem::size_of::<Tpacket2Hdr>())?;

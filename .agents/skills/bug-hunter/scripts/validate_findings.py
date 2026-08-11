@@ -140,7 +140,7 @@ def normalize_item(
         if require_agent:
             errors.append(f"item[{idx}] agent is required in strict mode")
         else:
-            normalized["agent"] = "Diverse Reviewer A"
+            normalized["agent"] = "Logic & Correctness Reviewer"
     elif not isinstance(agent, str):
         errors.append(f"item[{idx}] agent must be string")
     else:

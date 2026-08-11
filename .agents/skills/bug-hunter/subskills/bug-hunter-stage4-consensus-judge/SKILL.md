@@ -9,7 +9,7 @@ description: bug-hunter 阶段 4 技能。负责对缺陷桶执行加权共识�
 
 1. 读取 `artifacts/buckets.json`。
 2. 根据 persona 权重运行 `scripts/weighted_vote.py --threshold 0.6`。
-   - 默认从 `references/persona_matrix.json` 读取权重。
+   - 默认使用脚本内置 `DEFAULT_WEIGHTS`（3 个角色：Security & Concurrency Sentinel 4.0、Logic & Correctness Reviewer 3.0、System & Performance Reviewer 3.0）。
    - 可用 `--weights` 叠加历史学习权重（兼容扁平映射与 `suggested_weights` 包装格式）。
 3. 运行 `scripts/render_report.py` 生成 Markdown 报告。
 4. 输出：

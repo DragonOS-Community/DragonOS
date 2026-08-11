@@ -20,7 +20,7 @@
 
 ## Developer TODO
 
-- [ ] `BUG-001` `major` `kernel/src/foo.rs:42` owner=`Concurrency Engineer`: ... | 修复建议: ...
+- [ ] `BUG-001` `major` `kernel/src/foo.rs:42` owner=`Security & Concurrency Sentinel`: ... | 修复建议: ...
 
 ## Disputed Findings
 

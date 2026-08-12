@@ -790,10 +790,113 @@ impl Page {
 }
 
 #[derive(Debug)]
+enum PageVmaSet {
+    Empty,
+    One(Arc<LockedVMA>),
+    Two(Arc<LockedVMA>, Arc<LockedVMA>),
+    Many(HashSet<Arc<LockedVMA>>),
+}
+
+impl PageVmaSet {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Two(_, _) => 2,
+            Self::Many(vmas) => vmas.len(),
+        }
+    }
+
+    fn contains(&self, vma: &LockedVMA) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(existing) => existing.as_ref() == vma,
+            Self::Two(first, second) => first.as_ref() == vma || second.as_ref() == vma,
+            Self::Many(vmas) => vmas.contains(vma),
+        }
+    }
+
+    fn insert(&mut self, vma: Arc<LockedVMA>) -> bool {
+        match self {
+            Self::Empty => {
+                *self = Self::One(vma);
+                true
+            }
+            Self::One(existing) => {
+                if existing.as_ref() == vma.as_ref() {
+                    false
+                } else {
+                    let Self::One(existing) = mem::replace(self, Self::Empty) else {
+                        unreachable!();
+                    };
+                    *self = Self::Two(existing, vma);
+                    true
+                }
+            }
+            Self::Two(first, second) => {
+                if first.as_ref() == vma.as_ref() || second.as_ref() == vma.as_ref() {
+                    return false;
+                }
+
+                // Allocate before taking the inline state so allocation failure cannot discard
+                // either existing reverse mapping.
+                let mut vmas = HashSet::with_capacity(3);
+                let Self::Two(first, second) = mem::replace(self, Self::Empty) else {
+                    unreachable!();
+                };
+                vmas.insert(first);
+                vmas.insert(second);
+                vmas.insert(vma);
+                *self = Self::Many(vmas);
+                true
+            }
+            Self::Many(vmas) => vmas.insert(vma),
+        }
+    }
+
+    fn remove(&mut self, vma: &LockedVMA) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(existing) => {
+                if existing.as_ref() != vma {
+                    return false;
+                }
+                *self = Self::Empty;
+                true
+            }
+            Self::Two(first, second) => {
+                let remove_first = first.as_ref() == vma;
+                let remove_second = second.as_ref() == vma;
+                if !remove_first && !remove_second {
+                    return false;
+                }
+
+                let Self::Two(first, second) = mem::replace(self, Self::Empty) else {
+                    unreachable!();
+                };
+                *self = Self::One(if remove_first { second } else { first });
+                true
+            }
+            Self::Many(vmas) => {
+                let removed = vmas.remove(vma);
+                if removed && vmas.is_empty() {
+                    *self = Self::Empty;
+                }
+                removed
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 /// 物理页面信息
 pub struct InnerPage {
     /// 映射到当前page的VMA
-    vma_set: HashSet<Arc<LockedVMA>>,
+    vma_set: PageVmaSet,
     /// 当前对该页贡献 mlock/unevictable 原因的 VMA 子集。
     ///
     /// 该集合必须始终是 `vma_set` 的子集。它让 page-cache reclassify
@@ -820,7 +923,7 @@ impl InnerPage {
         let intrinsic_unevictable =
             flags.contains(PageFlags::PG_UNEVICTABLE) && !matches!(page_type, PageType::File(_));
         Self {
-            vma_set: HashSet::new(),
+            vma_set: PageVmaSet::new(),
             mlocked_vmas: HashSet::new(),
             intrinsic_unevictable,
             backing_lifetime_pins: 0,
@@ -884,7 +987,7 @@ impl InnerPage {
     }
 
     pub fn add_mlocked_vma_ref(&mut self, vma: &Arc<LockedVMA>) {
-        if self.vma_set.contains(vma) && self.mlocked_vmas.insert(vma.clone()) {
+        if self.vma_set.contains(vma.as_ref()) && self.mlocked_vmas.insert(vma.clone()) {
             self.flags.insert(PageFlags::PG_UNEVICTABLE);
         }
     }
@@ -950,11 +1053,6 @@ impl InnerPage {
 
     pub fn set_page_type(&mut self, page_type: PageType) {
         self.page_type = page_type;
-    }
-
-    #[inline(always)]
-    pub fn vma_set(&self) -> &HashSet<Arc<LockedVMA>> {
-        &self.vma_set
     }
 
     #[inline(always)]

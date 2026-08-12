@@ -821,11 +821,14 @@ impl PacketSocket {
         // When an RX ring is active, deliver directly into the ring instead of
         // the rx_buffer queue.  Clone the Arc and release the outer lock so
         // concurrent delivers from other NICs are not blocked by setup/teardown.
-        let (ring_arc, rx_generation) = {
-            let state = self.ring_state.lock();
-            (state.ring.as_ref().cloned(), state.rx_generation)
-        };
-        if let Some(ring_arc) = ring_arc {
+        let state = self.ring_state.lock();
+        let rx_generation = state.rx_generation;
+        if let Some(ring_arc) = state.ring.as_ref().cloned() {
+            // Register while the instance is still published. Teardown first
+            // removes it under ring_state and then waits for this guard, so it
+            // cannot return before the write, statistics, and wakeups finish.
+            let _access = ring_arc.begin_access();
+            drop(state);
             let metadata = PacketMetadata {
                 src_mac: parsed.src,
                 dst_mac: parsed.dst,
@@ -858,6 +861,7 @@ impl PacketSocket {
             }
             return;
         }
+        drop(state);
         // Linux runs the socket filter before checking sk_rmem_alloc: a packet
         // rejected by cBPF is not counted as a receive-buffer drop. Keep this
         // cheap precheck after the filter and the atomic reservation below as
@@ -964,6 +968,9 @@ impl PacketSocket {
         // Linux packet_poll() combines normal receive-queue readiness with
         // RX-ring readiness; neither receive source may mask the other.
         let ring = self.ring_state.lock().ring.as_ref().cloned();
+        // A read-only readiness snapshot only needs the Arc to pin its
+        // backing. The teardown grace period is reserved for ingress, whose
+        // writes, statistics, and wakeups must finish before teardown returns.
         let ring_ready = ring.is_some_and(|ring| ring.writer().lock().has_user_frames());
         ring_ready || !self.rx_buffer.lock().is_empty()
     }

@@ -54,6 +54,13 @@ fn run_preallocated_batch_lifecycle_selftest() -> Result<bool, SystemError> {
     {
         return Ok(false);
     }
+    if !batch
+        .pages()
+        .windows(2)
+        .all(|pair| pair[0].shares_contiguous_frame_owner(&pair[1]))
+    {
+        return Ok(false);
+    }
     let vaddr = unsafe { MMArch::phys_2_virt(start) }.ok_or(SystemError::EFAULT)?;
     let bytes =
         unsafe { core::slice::from_raw_parts(vaddr.data() as *const u8, 3 * MMArch::PAGE_SIZE) };

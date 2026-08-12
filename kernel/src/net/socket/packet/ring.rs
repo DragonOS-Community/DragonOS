@@ -8,9 +8,10 @@
 //! kernel virtual address returned by `phys_2_virt`, sharing the same physical
 //! pages with userspace — zero-copy packet capture.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::libs::mutex::Mutex;
+use crate::libs::wait_queue::WaitQueue;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -496,6 +497,22 @@ pub struct PacketRingInstance {
     writer: Mutex<PacketRing>,
     page_cache: Arc<PageCache>,
     total_size: usize,
+    inflight: AtomicUsize,
+    inflight_wait: WaitQueue,
+}
+
+pub struct PacketRingAccessGuard<'a> {
+    instance: &'a PacketRingInstance,
+}
+
+impl Drop for PacketRingAccessGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.instance.inflight.fetch_sub(1, Ordering::Release);
+        debug_assert_ne!(previous, 0);
+        if previous == 1 {
+            self.instance.inflight_wait.wake_all();
+        }
+    }
 }
 
 impl PacketRingInstance {
@@ -505,7 +522,29 @@ impl PacketRingInstance {
             writer: Mutex::new(ring),
             page_cache,
             total_size,
+            inflight: AtomicUsize::new(0),
+            inflight_wait: WaitQueue::default(),
         }
+    }
+
+    /// Register an operation while this instance is still published in
+    /// `RingState`. Callers must invoke this before releasing `ring_state`, so
+    /// teardown cannot remove the instance without observing the reference.
+    pub fn begin_access(&self) -> PacketRingAccessGuard<'_> {
+        self.inflight
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .expect("AF_PACKET ring in-flight count overflow");
+        PacketRingAccessGuard { instance: self }
+    }
+
+    /// Wait for every operation that registered before the instance was
+    /// removed from `RingState`. No new registrations are possible after that
+    /// removal, making this the local equivalent of Linux synchronize_net().
+    pub fn synchronize_access(&self) {
+        self.inflight_wait
+            .wait_until(|| (self.inflight.load(Ordering::Acquire) == 0).then_some(()));
     }
 
     pub fn writer(&self) -> &Mutex<PacketRing> {

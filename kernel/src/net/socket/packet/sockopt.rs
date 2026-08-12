@@ -192,8 +192,15 @@ impl PacketSocket {
                         state.advance_rx_generation();
                         drop(state);
                         drop(queue);
-                        // Page-cache/ring destruction may be expensive. Arc
-                        // snapshots held by in-flight ingress remain valid.
+                        // Match Linux synchronize_net(): once the instance is
+                        // no longer published, wait for all operations that
+                        // registered under ring_state before returning from
+                        // teardown or allowing a new setup transaction.
+                        if let Some(ring) = old_ring.as_ref() {
+                            ring.synchronize_access();
+                        }
+                        // Page-cache/ring destruction may be expensive and
+                        // remains outside the data-plane state locks.
                         self.release_rx_queue(old_queue);
                         drop(old_ring);
                         return Ok(());

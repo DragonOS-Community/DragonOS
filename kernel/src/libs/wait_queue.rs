@@ -123,7 +123,7 @@ impl WaitQueue {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.num_waiters.fetch_add(0, Ordering::Acquire) == 0
+        self.num_waiters.load(Ordering::Acquire) == 0
     }
 
     // ==================== Core API: wait_until family ====================

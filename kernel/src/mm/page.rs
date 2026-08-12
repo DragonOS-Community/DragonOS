@@ -112,15 +112,8 @@ impl RawFrameExtent {
         }
     }
 
-    /// Transfer one frame before entering the fallible `Page` constructor.
-    /// `Arc::try_new` drops its value on failure, so the resulting `InnerPage`
-    /// is then the unique owner responsible for freeing this frame.
-    fn transfer_next(&mut self) -> PhysAddr {
-        debug_assert_ne!(self.remaining, 0);
-        let frame = self.next;
-        self.next = PhysAddr::new(self.next.data() + MMArch::PAGE_SIZE);
-        self.remaining -= 1;
-        frame
+    fn transfer_to_extent_owner(&mut self) {
+        self.remaining = 0;
     }
 }
 
@@ -129,6 +122,24 @@ impl Drop for RawFrameExtent {
         if self.remaining != 0 {
             unsafe { free_aligned_frame_range(self.next, self.remaining) };
         }
+    }
+}
+
+/// Owns one exact physically-contiguous allocation after raw construction.
+///
+/// Every `Page` created from the run pins this object. The final pin returns
+/// the run as aligned buddy blocks, avoiding one global allocator lock per
+/// 4-KiB page while still delaying reuse until all transient page references
+/// have disappeared.
+#[derive(Debug)]
+struct ContiguousFrameOwner {
+    start: PhysAddr,
+    pages: usize,
+}
+
+impl Drop for ContiguousFrameOwner {
+    fn drop(&mut self) {
+        unsafe { free_aligned_frame_range(self.start, self.pages) };
     }
 }
 
@@ -209,15 +220,22 @@ pub fn allocate_registered_intrinsic_unevictable_pages_exact(
     unsafe { MMArch::write_bytes(vaddr, 0, bytes) };
     raw.trim_to(requested_pages);
 
-    for _ in 0..requested_pages {
-        let paddr = raw.transfer_next();
-        pages.push(Page::try_new(
+    let extent_owner = Arc::try_new(ContiguousFrameOwner {
+        start: start_paddr,
+        pages: requested_pages,
+    })
+    .map_err(|_| SystemError::ENOMEM)?;
+    raw.transfer_to_extent_owner();
+
+    for index in 0..requested_pages {
+        let paddr = PhysAddr::new(start_paddr.data() + index * MMArch::PAGE_SIZE);
+        pages.push(Page::try_new_with_contiguous_owner(
             paddr,
             PageType::Normal,
             PageFlags::PG_UNEVICTABLE,
+            extent_owner.clone(),
         )?);
     }
-    debug_assert_eq!(raw.remaining, 0);
 
     let mut batch = ManagedPageBatch {
         start_paddr,
@@ -993,6 +1011,9 @@ pub struct Page {
     inner: RwSem<InnerPage>,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
+    /// Pins a bulk allocation when this page is one member of a contiguous
+    /// run. Ordinary pages own and release their frame individually.
+    contiguous_owner: Option<Arc<ContiguousFrameOwner>>,
 }
 
 impl Page {
@@ -1013,16 +1034,32 @@ impl Page {
         page_type: PageType,
         flags: PageFlags,
     ) -> Result<Arc<Page>, SystemError> {
-        let inner = InnerPage::new(phys_addr, page_type, flags);
+        let inner = InnerPage::new(phys_addr, page_type, flags, true);
         let page = Arc::try_new(Self {
             inner: RwSem::new(inner),
             phys_addr,
+            contiguous_owner: None,
         })
         .map_err(|_| SystemError::ENOMEM)?;
         if page.read().flags == PageFlags::PG_LRU {
             page_reclaimer_lock().insert_page(phys_addr, &page);
         };
         Ok(page)
+    }
+
+    fn try_new_with_contiguous_owner(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+        owner: Arc<ContiguousFrameOwner>,
+    ) -> Result<Arc<Page>, SystemError> {
+        let inner = InnerPage::new(phys_addr, page_type, flags, false);
+        Arc::try_new(Self {
+            inner: RwSem::new(inner),
+            phys_addr,
+            contiguous_owner: Some(owner),
+        })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
     /// # 拷贝页面及内容
@@ -1042,7 +1079,7 @@ impl Page {
     ) -> Result<Arc<Page>, SystemError> {
         let page_type = old_guard.page_type().clone();
         let flags = *old_guard.flags();
-        let inner = InnerPage::new(new_phys, page_type, flags);
+        let inner = InnerPage::new(new_phys, page_type, flags, true);
         unsafe {
             let old_vaddr =
                 MMArch::phys_2_virt(old_guard.phys_address()).ok_or(SystemError::EFAULT)?;
@@ -1053,6 +1090,7 @@ impl Page {
         Ok(Arc::new(Self {
             inner: RwSem::new(inner),
             phys_addr: new_phys,
+            contiguous_owner: None,
         }))
     }
 
@@ -1080,6 +1118,13 @@ impl Page {
     pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, InnerPage>> {
         self.inner.try_write()
     }
+
+    pub(crate) fn shares_contiguous_frame_owner(&self, other: &Self) -> bool {
+        match (&self.contiguous_owner, &other.contiguous_owner) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1106,10 +1151,18 @@ pub struct InnerPage {
     phys_addr: PhysAddr,
     /// 页面类型
     page_type: PageType,
+    /// Ordinary pages return their own frame. Bulk pages instead pin a shared
+    /// contiguous owner stored by `Page`.
+    individually_owns_frame: bool,
 }
 
 impl InnerPage {
-    pub fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Self {
+    pub fn new(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+        individually_owns_frame: bool,
+    ) -> Self {
         let intrinsic_unevictable =
             flags.contains(PageFlags::PG_UNEVICTABLE) && !matches!(page_type, PageType::File(_));
         Self {
@@ -1120,6 +1173,7 @@ impl InnerPage {
             flags,
             phys_addr,
             page_type,
+            individually_owns_frame,
         }
     }
 
@@ -1335,9 +1389,11 @@ impl Drop for InnerPage {
             "page drop when map count is non-zero"
         );
 
-        unsafe {
-            deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
-        };
+        if self.individually_owns_frame {
+            unsafe {
+                deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
+            };
+        }
     }
 }
 

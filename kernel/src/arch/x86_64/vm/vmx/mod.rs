@@ -355,25 +355,27 @@ impl VmxKvmFunc {
 
         if !already_loaded {
             Self::loaded_vmcs_clear(&vmx.loaded_vmcs);
-            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-            current_loaded_vmcs_list_mut().push_back(vmx.loaded_vmcs.clone());
         }
 
-        if let Some(prev) = current_vmcs() {
+        {
+            // The remote-clear IPI accesses both per-CPU structures. Keep the
+            // list update and active-VMCS transition in one IRQ-safe section.
+            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+            if !already_loaded {
+                current_loaded_vmcs_list_mut().push_back(vmx.loaded_vmcs.clone());
+            }
+
             let vmcs = vmx.loaded_vmcs.lock().vmcs.clone();
-            if !Arc::ptr_eq(&vmcs, prev) {
+            if !current_vmcs()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &vmcs))
+            {
                 VmxAsm::vmcs_load(vmcs.phys_addr());
                 *current_vmcs_mut() = Some(vmcs);
 
                 // TODO:buddy barrier?
             }
-        } else {
-            let vmcs = vmx.loaded_vmcs.lock().vmcs.clone();
-            VmxAsm::vmcs_load(vmcs.phys_addr());
-            *current_vmcs_mut() = Some(vmcs);
-
-            // TODO:buddy barrier?
         }
 
         if !already_loaded {
@@ -383,7 +385,6 @@ impl VmxKvmFunc {
                 x86::dtables::sgdt(&mut pseudo_descriptpr);
             };
 
-            vmx.loaded_vmcs.set_owner_cpu(cpu);
             let id = vmx.loaded_vmcs.lock().vmcs.lock().revision_id();
             debug!(
                 "revision_id {id} req {:?}",
@@ -407,6 +408,9 @@ impl VmxKvmFunc {
             VmxAsm::vmx_vmwrite(host::IA32_SYSENTER_ESP, unsafe {
                 rdmsr(msr::IA32_SYSENTER_ESP)
             });
+
+            // Publish ownership only after the VMCS and host state are ready.
+            vcpu.vmx().loaded_vmcs.set_owner_cpu(cpu);
         }
     }
 

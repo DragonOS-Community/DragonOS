@@ -7,6 +7,7 @@ use crate::filesystem::vfs::{
     InodeFlags, Metadata,
 };
 use crate::libs::mutex::MutexGuard;
+use crate::mm::VmFlags;
 use crate::{libs::mutex::Mutex, time::PosixTimeSpec};
 use alloc::{
     string::String,
@@ -162,6 +163,10 @@ impl IndexNode for LockedZeroInode {
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         // /dev/zero 支持 mmap，语义等同匿名零页映射
         Ok(())
+    }
+
+    fn mmap_uses_shared_anon(&self, vm_flags: VmFlags) -> bool {
+        vm_flags.contains(VmFlags::VM_SHARED)
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

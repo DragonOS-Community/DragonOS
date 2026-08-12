@@ -168,7 +168,11 @@ impl FileSystem for DevFS {
         if !is_zero_inode(pfm) {
             return VmFaultReason::VM_FAULT_SIGBUS;
         }
-        PageFaultHandler::zero_fault(pfm)
+        if pfm.vma().lock().shared_anon.is_some() {
+            PageFaultHandler::shared_anon_fault(pfm)
+        } else {
+            PageFaultHandler::zero_fault(pfm)
+        }
     }
 
     unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
@@ -187,7 +191,11 @@ impl FileSystem for DevFS {
         if !is_zero_inode(pfm) {
             return VmFaultReason::VM_FAULT_SIGBUS;
         }
-        PageFaultHandler::zero_map_pages(pfm, start_pgoff, end_pgoff)
+        if pfm.vma().lock().shared_anon.is_some() {
+            PageFaultHandler::shared_anon_map_pages(pfm, start_pgoff, end_pgoff)
+        } else {
+            PageFaultHandler::zero_map_pages(pfm, start_pgoff, end_pgoff)
+        }
     }
 }
 

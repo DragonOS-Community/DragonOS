@@ -571,6 +571,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(vm_flags)
     }
 
+    /// Whether this file mapping should use MM's per-mmap shared-anonymous backing.
+    fn mmap_uses_shared_anon(&self, _vm_flags: VmFlags) -> bool {
+        false
+    }
+
     fn mmap_effective_file(&self, file: &Arc<File>) -> Result<Arc<File>, SystemError> {
         Ok(file.clone())
     }

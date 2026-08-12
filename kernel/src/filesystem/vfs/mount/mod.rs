@@ -3725,6 +3725,10 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.mmap_vm_flags(file, vm_flags)
     }
 
+    fn mmap_uses_shared_anon(&self, vm_flags: VmFlags) -> bool {
+        self.dentry.inode.mmap_uses_shared_anon(vm_flags)
+    }
+
     fn mmap_effective_file(
         &self,
         file: &Arc<super::file::File>,

@@ -604,57 +604,23 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_anonymous_page(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        if crate::mm::oom::should_inject_fault_oom() {
-            return VmFaultReason::VM_FAULT_OOM | VmFaultReason::VM_FAULT_OOM_INJECTED;
-        }
         let address = pfm.address_aligned_down();
         let vm_flags = pfm.vm_flags();
-        let backing_pgoff = pfm.backing_pgoff();
         let vma = pfm.vma.clone();
-        let mm = pfm.mm().clone();
-        let _pt_edit = mm.page_table_edit();
-        let mapper = &mut pfm.mapper;
 
         // Shared anonymous mappings must always use their shared backing. A
         // missing backing is a malformed shared VMA, not a private fallback.
         if vm_flags.contains(VmFlags::VM_SHARED) {
-            let (shared, flags, mlocked) = {
-                let guard = vma.lock();
-                (
-                    guard.shared_anon.clone(),
-                    guard.flags(),
-                    guard.vm_flags().contains(VmFlags::VM_LOCKED),
-                )
-            };
-            let Some(shared) = shared else {
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            };
-            let Some(pgoff) = backing_pgoff else {
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            };
-
-            // Linux semantics: access beyond the backing size should SIGBUS.
-            if pgoff >= shared.size_pages() {
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            }
-
-            // Atomically get or create the shared page to avoid races.
-            let page = match shared.get_or_create_page(pgoff) {
-                Ok(p) => p,
-                Err(_) => return VmFaultReason::VM_FAULT_OOM,
-            };
-
-            if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
-                flush.flush();
-                Self::account_new_present_mapping(pfm.mm());
-                Self::attach_fault_mapped_page(&page, &vma, mlocked);
-                return VmFaultReason::VM_FAULT_COMPLETED;
-            } else {
-                return VmFaultReason::VM_FAULT_OOM;
-            }
+            return Self::shared_anon_fault(pfm);
         }
 
         // Private anonymous page.
+        if crate::mm::oom::should_inject_fault_oom() {
+            return VmFaultReason::VM_FAULT_OOM | VmFaultReason::VM_FAULT_OOM_INJECTED;
+        }
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
+        let mapper = &mut pfm.mapper;
         let (flags, mlocked) = {
             let guard = vma.lock();
             (guard.flags(), guard.vm_flags().contains(VmFlags::VM_LOCKED))
@@ -675,6 +641,90 @@ impl PageFaultHandler {
         } else {
             VmFaultReason::VM_FAULT_OOM
         }
+    }
+
+    /// Fault one page from a VMA's shared-anonymous backing.
+    pub unsafe fn shared_anon_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if crate::mm::oom::should_inject_fault_oom() {
+            return VmFaultReason::VM_FAULT_OOM | VmFaultReason::VM_FAULT_OOM_INJECTED;
+        }
+        let address = pfm.address_aligned_down();
+        let pgoff = match pfm.backing_pgoff() {
+            Some(pgoff) => pgoff,
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+        let vma = pfm.vma();
+        let (shared, flags, mlocked) = {
+            let guard = vma.lock();
+            (
+                guard.shared_anon.clone(),
+                guard.flags(),
+                guard.vm_flags().contains(VmFlags::VM_LOCKED),
+            )
+        };
+        let Some(shared) = shared else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        if pgoff >= shared.size_pages() {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        let page = match shared.get_or_create_page(pgoff) {
+            Ok(page) => page,
+            Err(_) => return VmFaultReason::VM_FAULT_OOM,
+        };
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
+        if let Some(flush) = pfm.mapper.map_phys(address, page.phys_address(), flags) {
+            flush.flush();
+            Self::account_new_present_mapping(&mm);
+            Self::attach_fault_mapped_page(&page, &vma, mlocked);
+            VmFaultReason::VM_FAULT_COMPLETED
+        } else {
+            VmFaultReason::VM_FAULT_OOM
+        }
+    }
+
+    /// Map resident neighbours from a shared-anonymous backing without
+    /// allocating cold pages.
+    pub unsafe fn shared_anon_map_pages(
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        let vma = pfm.vma();
+        let (shared, base_pgoff, base, flags, mlocked) = {
+            let guard = vma.lock();
+            (
+                guard.shared_anon.clone(),
+                guard.backing_page_offset(),
+                guard.region().start(),
+                guard.flags(),
+                guard.vm_flags().contains(VmFlags::VM_LOCKED),
+            )
+        };
+        let (Some(shared), Some(base_pgoff)) = (shared, base_pgoff) else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
+        for pgoff in start_pgoff..end_pgoff {
+            if pgoff < base_pgoff || pgoff >= shared.size_pages() {
+                continue;
+            }
+            let addr = VirtAddr::new(base.data() + ((pgoff - base_pgoff) << MMArch::PAGE_SHIFT));
+            if pfm.mapper.get_entry(addr, 0).is_some() {
+                continue;
+            }
+            let Some(page) = shared.lookup_page(pgoff) else {
+                continue;
+            };
+            if let Some(flush) = pfm.mapper.map_phys(addr, page.phys_address(), flags) {
+                flush.flush();
+                Self::account_new_present_mapping(&mm);
+                Self::attach_fault_mapped_page(&page, &vma, mlocked);
+            }
+        }
+        VmFaultReason::empty()
     }
 
     /// 处理文件映射页的缺页异常

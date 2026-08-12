@@ -608,70 +608,67 @@ impl PageFaultHandler {
             return VmFaultReason::VM_FAULT_OOM | VmFaultReason::VM_FAULT_OOM_INJECTED;
         }
         let address = pfm.address_aligned_down();
+        let vm_flags = pfm.vm_flags();
+        let backing_pgoff = pfm.backing_pgoff();
         let vma = pfm.vma.clone();
         let mm = pfm.mm().clone();
         let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
 
-        // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
-        {
-            let guard = vma.lock();
-            if guard.vm_flags().contains(VmFlags::VM_SHARED) {
-                let shared = guard.shared_anon.clone();
-                if let Some(shared) = shared {
-                    // Compute page index within the shared-anon backing object.
-                    // Base offset is stored in VMA.backing_pgoff.
-                    let base = guard.backing_page_offset().unwrap_or(0);
-                    let pgoff = base
-                        + ((address.data() - guard.region().start().data()) >> MMArch::PAGE_SHIFT);
+        // Shared anonymous mappings must always use their shared backing. A
+        // missing backing is a malformed shared VMA, not a private fallback.
+        if vm_flags.contains(VmFlags::VM_SHARED) {
+            let (shared, flags, mlocked) = {
+                let guard = vma.lock();
+                (
+                    guard.shared_anon.clone(),
+                    guard.flags(),
+                    guard.vm_flags().contains(VmFlags::VM_LOCKED),
+                )
+            };
+            let Some(shared) = shared else {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            };
+            let Some(pgoff) = backing_pgoff else {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            };
 
-                    // Linux semantics: access beyond the backing size should SIGBUS.
-                    if pgoff >= shared.size_pages() {
-                        drop(guard);
-                        return VmFaultReason::VM_FAULT_SIGBUS;
-                    }
-                    drop(guard);
+            // Linux semantics: access beyond the backing size should SIGBUS.
+            if pgoff >= shared.size_pages() {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
 
-                    // Atomically get or create the shared page to avoid races
-                    let page = match shared.get_or_create_page(pgoff) {
-                        Ok(p) => p,
-                        Err(_) => return VmFaultReason::VM_FAULT_OOM,
-                    };
+            // Atomically get or create the shared page to avoid races.
+            let page = match shared.get_or_create_page(pgoff) {
+                Ok(p) => p,
+                Err(_) => return VmFaultReason::VM_FAULT_OOM,
+            };
 
-                    // Map the shared page into current process
-                    let flags = vma.lock().flags();
-                    let mlocked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
-                    if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
-                        flush.flush();
-                        Self::account_new_present_mapping(pfm.mm());
-                        Self::attach_fault_mapped_page(&page, &vma, mlocked);
-                        return VmFaultReason::VM_FAULT_COMPLETED;
-                    } else {
-                        return VmFaultReason::VM_FAULT_OOM;
-                    }
-                }
+            if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
+                flush.flush();
+                Self::account_new_present_mapping(pfm.mm());
+                Self::attach_fault_mapped_page(&page, &vma, mlocked);
+                return VmFaultReason::VM_FAULT_COMPLETED;
+            } else {
+                return VmFaultReason::VM_FAULT_OOM;
             }
         }
 
-        // Fallback: private anonymous page (MAP_PRIVATE or non-shared anon)
-        let guard = vma.lock();
-        let flags = guard.flags();
-        let mlocked = guard.vm_flags().contains(VmFlags::VM_LOCKED);
-        drop(guard);
-        if let Some(flush) = mapper.map(address, flags) {
+        // Private anonymous page.
+        let (flags, mlocked) = {
+            let guard = vma.lock();
+            (guard.flags(), guard.vm_flags().contains(VmFlags::VM_LOCKED))
+        };
+        if let Some((page, flush)) = mapper.map_new_page(address, flags) {
             flush.flush();
             crate::debug::klog::mm::mm_debug_log(
                 klog_types::AllocatorLogType::LazyAlloc(klog_types::AllocLogItem::new(
                     Layout::from_size_align(MMArch::PAGE_SIZE, MMArch::PAGE_SIZE).unwrap(),
                     Some(address.data()),
-                    Some(mapper.translate(address).unwrap().0.data()),
+                    Some(page.phys_address().data()),
                 )),
                 klog_types::LogSource::Buddy,
             );
-            let paddr = mapper.translate(address).unwrap().0;
-            let mut page_manager_guard = page_manager_lock();
-            let page = page_manager_guard.get_unwrap(&paddr);
-            drop(page_manager_guard);
             Self::account_new_present_mapping(pfm.mm());
             Self::attach_fault_mapped_page(&page, &vma, mlocked);
             VmFaultReason::VM_FAULT_COMPLETED
@@ -692,7 +689,7 @@ impl PageFaultHandler {
     pub unsafe fn do_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         if !pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE) {
             Self::do_read_fault(pfm)
-        } else if !pfm.vma().lock().vm_flags().contains(VmFlags::VM_SHARED) {
+        } else if !pfm.vm_flags().contains(VmFlags::VM_SHARED) {
             Self::do_cow_fault(pfm)
         } else {
             Self::do_shared_fault(pfm)
@@ -1496,12 +1493,8 @@ impl PageFaultHandler {
         let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
 
-        if let Some(flush) = mapper.map(address, flags) {
+        if let Some((page, flush)) = mapper.map_new_page(address, flags) {
             flush.flush();
-            let mut pm = page_manager_lock();
-            let paddr = mapper.translate(address).unwrap().0;
-            let page = pm.get_unwrap(&paddr);
-            drop(pm);
             Self::account_new_present_mapping(pfm.mm());
             Self::attach_fault_mapped_page(&page, &vma, mlocked);
             VmFaultReason::VM_FAULT_COMPLETED
@@ -1535,12 +1528,11 @@ impl PageFaultHandler {
         let mapper = &mut pfm.mapper;
         for pgoff in start_pgoff..end_pgoff {
             let addr = VirtAddr::new(base.data() + ((pgoff - backing_pgoff) << MMArch::PAGE_SHIFT));
-            if let Some(flush) = mapper.map(addr, flags) {
+            if mapper.get_entry(addr, 0).is_some() {
+                continue;
+            }
+            if let Some((page, flush)) = mapper.map_new_page(addr, flags) {
                 flush.flush();
-                let mut pm = page_manager_lock();
-                let paddr = mapper.translate(addr).unwrap().0;
-                let page = pm.get_unwrap(&paddr);
-                drop(pm);
                 Self::account_new_present_mapping(&mm);
                 Self::attach_fault_mapped_page(&page, &vma, mlocked);
             } else {

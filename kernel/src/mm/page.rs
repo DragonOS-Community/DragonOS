@@ -1797,12 +1797,38 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         return &mut self.frame_allocator;
     }
 
-    /// 从当前PageMapper的页分配器中分配一个物理页，并将其映射到指定的虚拟地址
+    /// Allocate a physical page from this mapper's allocator and map it at the
+    /// specified virtual address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the mapper's required page-table edit serialization
+    /// and ensure that the target leaf entry is empty.
     pub unsafe fn map(
         &mut self,
         virt: VirtAddr,
         flags: EntryFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
+        self.map_new_page(virt, flags).map(|(_, flush)| flush)
+    }
+
+    /// Allocate a managed normal page and map it into an empty leaf entry.
+    ///
+    /// The returned [`Arc<Page>`] is the same object registered in the global
+    /// page manager. Callers can use it directly for rmap/LRU accounting
+    /// instead of translating the new PTE and looking the page up again.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the mapper's required page-table edit serialization
+    /// and must have established that the target leaf entry is empty. This
+    /// method deliberately does not repeat that lookup on the anonymous-fault
+    /// hot path.
+    pub(crate) unsafe fn map_new_page(
+        &mut self,
+        virt: VirtAddr,
+        flags: EntryFlags<Arch>,
+    ) -> Option<(Arc<Page>, PageFlush<Arch>)> {
         let mut page_manager_guard = page_manager_lock();
         let page = page_manager_guard
             .create_one_page(
@@ -1813,11 +1839,13 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             .ok()?;
         drop(page_manager_guard);
         let phys = page.phys_address();
-        let mapped = self.map_phys(virt, phys, flags);
-        if mapped.is_none() {
-            let _ = page_manager_lock().remove_page(&phys);
+        match self.map_phys(virt, phys, flags) {
+            Some(flush) => Some((page, flush)),
+            None => {
+                let _ = page_manager_lock().remove_page(&phys);
+                None
+            }
         }
-        return mapped;
     }
 
     /// 映射一个物理页到指定的虚拟地址

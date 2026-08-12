@@ -88,6 +88,12 @@ impl LockedVMA {
             let guard = self.lock();
             let pgoff = ((start_addr.data() - guard.region().start().data()) >> MMArch::PAGE_SHIFT)
                 + guard.backing_page_offset().unwrap();
+            if let Some(shared) = guard.shared_anon.as_ref() {
+                for i in 0..nr {
+                    vec[vec_offset + i] = u8::from(shared.lookup_page(pgoff + i).is_some());
+                }
+                return nr;
+            }
             if guard.vm_file().is_none() {
                 vec[vec_offset..vec_offset + nr].fill(0);
                 return nr;

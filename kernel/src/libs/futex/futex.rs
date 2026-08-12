@@ -672,7 +672,20 @@ impl Futex {
         let page_index =
             ((uaddr.data() - vma_guard.region().start().data()) >> MMArch::PAGE_SHIFT) as u64;
 
-        if let Some(file) = vma_guard.vm_file() {
+        if let Some(shared_anon) = &vma_guard.shared_anon {
+            let base_pgoff = vma_guard.backing_page_offset().unwrap_or(0) as u64;
+            let shared = SharedKey {
+                kind: SharedKeyKind::SharedAnon { id: shared_anon.id },
+                page_offset: base_pgoff + page_index,
+            };
+            let key = FutexKey {
+                ptr: 0,
+                word: 0,
+                offset: offset as u32,
+                key: InnerFutexKey::Shared(shared),
+            };
+            return Ok(key);
+        } else if let Some(file) = vma_guard.vm_file() {
             // 共享文件映射：使用 inode 唯一标识 + 文件页偏移
             let md = file.metadata()?;
             let dev = md.dev_id as u64;
@@ -691,57 +704,42 @@ impl Futex {
             return Ok(key);
         } else {
             // 匿名映射（包括栈、堆、匿名mmap等）
-            if let Some(shared_anon) = &vma_guard.shared_anon {
-                // 显式共享的匿名映射（MAP_SHARED | MAP_ANONYMOUS）
-                let shared = SharedKey {
-                    kind: SharedKeyKind::SharedAnon { id: shared_anon.id },
-                    page_offset: page_index,
-                };
-                let key = FutexKey {
-                    ptr: 0,
-                    word: 0,
-                    offset: offset as u32,
-                    key: InnerFutexKey::Shared(shared),
-                };
-                return Ok(key);
-            } else {
-                // 私有匿名映射（栈、堆等）+ FUTEX_SHARED 标志
-                //
-                // 按照 Linux 内核的实际实现（kernel/futex/core.c: get_futex_key）：
-                // 对于匿名页的 FUTEX_SHARED，Linux 仍然使用 mm + 虚拟地址作为 key
-                // （只是添加了一个 FUT_OFF_MMSHARED 标记）
-                //
-                // 这种设计的原因：
-                // 1. 栈/堆这种私有匿名映射本质上不能跨进程共享
-                // 2. 只能在同一进程的线程间同步（它们共享地址空间）
-                // 3. 使用虚拟地址而非物理地址，与 swap 机制兼容
-                //
-                // DragonOS 的实现：
-                // 使用 AddressSpace 的全局唯一 ID + 虚拟页号作为 shared key
-                // - 同一进程的线程共享 AddressSpace，因此会生成相同的 key
-                // - 不同进程的 AddressSpace 有不同的 ID，即使虚拟地址相同也不会冲突
-                // - AddressSpace ID 是递增分配的，永不重复，避免了地址重用问题
+            // 私有匿名映射（栈、堆等）+ FUTEX_SHARED 标志
+            //
+            // 按照 Linux 内核的实际实现（kernel/futex/core.c: get_futex_key）：
+            // 对于匿名页的 FUTEX_SHARED，Linux 仍然使用 mm + 虚拟地址作为 key
+            // （只是添加了一个 FUT_OFF_MMSHARED 标记）
+            //
+            // 这种设计的原因：
+            // 1. 栈/堆这种私有匿名映射本质上不能跨进程共享
+            // 2. 只能在同一进程的线程间同步（它们共享地址空间）
+            // 3. 使用虚拟地址而非物理地址，与 swap 机制兼容
+            //
+            // DragonOS 的实现：
+            // 使用 AddressSpace 的全局唯一 ID + 虚拟页号作为 shared key
+            // - 同一进程的线程共享 AddressSpace，因此会生成相同的 key
+            // - 不同进程的 AddressSpace 有不同的 ID，即使虚拟地址相同也不会冲突
+            // - AddressSpace ID 是递增分配的，永不重复，避免了地址重用问题
 
-                let address_space = AddressSpace::current()?;
-                let as_id = address_space.id();
+            let address_space = AddressSpace::current()?;
+            let as_id = address_space.id();
 
-                drop(vma_guard);
-                drop(as_guard);
+            drop(vma_guard);
+            drop(as_guard);
 
-                let shared = SharedKey {
-                    kind: SharedKeyKind::PrivateAnonShared { as_id },
-                    // 使用虚拟页号（不是物理页号！）
-                    page_offset: (address >> MMArch::PAGE_SHIFT) as u64,
-                };
+            let shared = SharedKey {
+                kind: SharedKeyKind::PrivateAnonShared { as_id },
+                // 使用虚拟页号（不是物理页号！）
+                page_offset: (address >> MMArch::PAGE_SHIFT) as u64,
+            };
 
-                let key = FutexKey {
-                    ptr: 0,
-                    word: 0,
-                    offset: offset as u32,
-                    key: InnerFutexKey::Shared(shared),
-                };
-                return Ok(key);
-            }
+            let key = FutexKey {
+                ptr: 0,
+                word: 0,
+                offset: offset as u32,
+                key: InnerFutexKey::Shared(shared),
+            };
+            return Ok(key);
         }
     }
 

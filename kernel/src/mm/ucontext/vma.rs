@@ -665,8 +665,8 @@ pub struct AnonSharedMapping {
     /// Linux semantics: mremap() expanding a MAP_SHARED|MAP_ANONYMOUS mapping does not grow the
     /// underlying shmem object; access beyond this size should SIGBUS.
     size_pages: usize,
-    // Per-page cache keyed by page index within the backing object; store physical address.
-    pages: SpinLock<HashMap<usize, PhysAddr>>,
+    // Per-page cache keyed by page index within the backing object.
+    pages: SpinLock<HashMap<usize, Arc<Page>>>,
 }
 
 impl AnonSharedMapping {
@@ -691,39 +691,60 @@ impl AnonSharedMapping {
     /// Get or create a shared page for the given offset atomically.
     /// This prevents the double-allocation race when multiple processes fault the same page.
     pub fn get_or_create_page(&self, pgoff: usize) -> Result<Arc<Page>, SystemError> {
-        let mut guard = self.pages.lock_irqsave();
-        if let Some(paddr) = guard.get(&pgoff).copied() {
-            let mut pm = page_manager_lock();
-            return Ok(pm.get_unwrap(&paddr));
+        if let Some(page) = self.lookup_page(pgoff) {
+            return Ok(page);
         }
 
-        // Allocate while holding the map lock to avoid duplicate creations.
+        // Page allocation may sleep, so it must not run under the backing's
+        // irqsave spinlock. Publish under the spinlock afterwards; a racing
+        // loser discards its still-unmapped candidate.
         let mut pm = page_manager_lock();
         let mut allocator = LockedFrameAllocator;
-        let page = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
-        page.write().add_backing_lifetime_pin();
-        guard.insert(pgoff, page.phys_address());
-        Ok(page)
+        let candidate = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
+        candidate.write().add_backing_lifetime_pin();
+        drop(pm);
+
+        let existing = {
+            let mut guard = self.pages.lock_irqsave();
+            if let Some(existing) = guard.get(&pgoff) {
+                Some(existing.clone())
+            } else {
+                guard.insert(pgoff, candidate.clone());
+                None
+            }
+        };
+        if let Some(existing) = existing {
+            candidate.write().remove_backing_lifetime_pin();
+            page_manager_lock().remove_page(&candidate.phys_address());
+            Ok(existing)
+        } else {
+            Ok(candidate)
+        }
+    }
+
+    /// Look up an already instantiated backing page without allocating it.
+    pub fn lookup_page(&self, pgoff: usize) -> Option<Arc<Page>> {
+        let guard = self.pages.lock_irqsave();
+        guard.get(&pgoff).cloned()
     }
 }
 
 impl Drop for AnonSharedMapping {
     fn drop(&mut self) {
         // When the backing object is destroyed, allow cached pages to be freed.
-        let pages: alloc::vec::Vec<PhysAddr> = {
+        let pages: alloc::vec::Vec<Arc<Page>> = {
             let guard = self.pages.lock_irqsave();
-            guard.values().copied().collect()
+            guard.values().cloned().collect()
         };
 
         let mut pm = page_manager_lock();
-        for paddr in pages {
-            if let Some(page) = pm.get(&paddr) {
-                let mut pg = page.write();
-                pg.remove_backing_lifetime_pin();
-                if pg.can_deallocate() {
-                    drop(pg);
-                    pm.remove_page(&paddr);
-                }
+        for page in pages {
+            let paddr = page.phys_address();
+            let mut pg = page.write();
+            pg.remove_backing_lifetime_pin();
+            if pg.can_deallocate() {
+                drop(pg);
+                pm.remove_page(&paddr);
             }
         }
     }

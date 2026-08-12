@@ -2,12 +2,16 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/futex.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
@@ -214,6 +218,158 @@ TEST(DevtmpfsSemantics, PrivateZeroMmapPreservesPagesAcrossFaultAroundWindows) {
         EXPECT_EQ(static_cast<unsigned char>(0xa0 + page), populated[page * kPageSize]);
     }
     EXPECT_EQ(0, munmap(const_cast<unsigned char*>(populated), kLength));
+    EXPECT_EQ(0, close(fd));
+}
+
+TEST(DevtmpfsSemantics, SharedZeroLazyFaultsRemainSharedAcrossFork) {
+    constexpr size_t kPageSize = 4096;
+    int fd = open("/dev/zero", O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    auto* mapping = static_cast<volatile unsigned char*>(
+        mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    ASSERT_NE(MAP_FAILED, const_cast<unsigned char*>(mapping)) << strerror(errno);
+
+    int parent_to_child[2];
+    int child_to_parent[2];
+    ASSERT_EQ(0, pipe(parent_to_child)) << strerror(errno);
+    ASSERT_EQ(0, pipe(child_to_parent)) << strerror(errno);
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        close(parent_to_child[1]);
+        close(child_to_parent[0]);
+        unsigned char token = 0;
+        if (read(parent_to_child[0], &token, 1) != 1 || mapping[0] != 0x31) {
+            _exit(1);
+        }
+        mapping[kPageSize] = 0x52;
+        token = 1;
+        if (write(child_to_parent[1], &token, 1) != 1) {
+            _exit(2);
+        }
+        _exit(0);
+    }
+
+    close(parent_to_child[0]);
+    close(child_to_parent[1]);
+    mapping[0] = 0x31;
+    unsigned char token = 1;
+    ASSERT_EQ(1, write(parent_to_child[1], &token, 1));
+    ASSERT_EQ(1, read(child_to_parent[0], &token, 1));
+
+    // The child instantiated page 1. It must be resident in the common
+    // backing even though this VMA does not yet have a PTE for it.
+    unsigned char residency[2] = {};
+    ASSERT_EQ(0, mincore(const_cast<unsigned char*>(mapping), 2 * kPageSize, residency))
+        << strerror(errno);
+    EXPECT_NE(0, residency[1] & 1);
+    EXPECT_EQ(0x52, mapping[kPageSize]);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_EQ(0, close(parent_to_child[1]));
+    EXPECT_EQ(0, close(child_to_parent[0]));
+    EXPECT_EQ(0, munmap(const_cast<unsigned char*>(mapping), 2 * kPageSize));
+    EXPECT_EQ(0, close(fd));
+}
+
+TEST(DevtmpfsSemantics, SharedZeroMappingsHavePerMmapIdentity) {
+    constexpr size_t kPageSize = 4096;
+    int first_fd = open("/dev/zero", O_RDWR);
+    int second_fd = open("/dev/zero", O_RDWR);
+    ASSERT_GE(first_fd, 0) << strerror(errno);
+    ASSERT_GE(second_fd, 0) << strerror(errno);
+    auto* first = static_cast<unsigned char*>(
+        mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, first_fd, 0));
+    auto* same_fd = static_cast<unsigned char*>(
+        mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, first_fd, 0));
+    auto* other_fd = static_cast<unsigned char*>(
+        mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, second_fd, 0));
+    ASSERT_NE(MAP_FAILED, first) << strerror(errno);
+    ASSERT_NE(MAP_FAILED, same_fd) << strerror(errno);
+    ASSERT_NE(MAP_FAILED, other_fd) << strerror(errno);
+
+    first[0] = 0xa5;
+    EXPECT_EQ(0, same_fd[0]);
+    EXPECT_EQ(0, other_fd[0]);
+    EXPECT_EQ(0, msync(first, kPageSize, MS_SYNC)) << strerror(errno);
+    EXPECT_EQ(0, msync(first, kPageSize, MS_ASYNC)) << strerror(errno);
+
+    EXPECT_EQ(0, munmap(first, kPageSize));
+    EXPECT_EQ(0, munmap(same_fd, kPageSize));
+    EXPECT_EQ(0, munmap(other_fd, kPageSize));
+    EXPECT_EQ(0, close(first_fd));
+    EXPECT_EQ(0, close(second_fd));
+}
+
+TEST(DevtmpfsSemantics, SharedZeroUsesBackingIdentityForFutex) {
+    constexpr size_t kPageSize = 4096;
+    int fd = open("/dev/zero", O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    auto* futex_word = static_cast<int*>(
+        mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    ASSERT_NE(MAP_FAILED, futex_word) << strerror(errno);
+    *futex_word = 0;
+
+    int ready[2];
+    ASSERT_EQ(0, pipe(ready)) << strerror(errno);
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        close(ready[0]);
+        unsigned char token = 1;
+        if (write(ready[1], &token, 1) != 1) {
+            _exit(1);
+        }
+        int ret = syscall(SYS_futex, futex_word, FUTEX_WAIT, 0, nullptr, nullptr, 0);
+        _exit(ret == 0 ? 0 : 2);
+    }
+
+    close(ready[1]);
+    unsigned char token = 0;
+    ASSERT_EQ(1, read(ready[0], &token, 1));
+    int wake_count = 0;
+    for (int attempt = 0; attempt < 10000 && wake_count == 0; ++attempt) {
+        wake_count = syscall(SYS_futex, futex_word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+        if (wake_count == 0) {
+            sched_yield();
+        }
+    }
+    if (wake_count != 1) {
+        kill(child, SIGKILL);
+    }
+    EXPECT_EQ(1, wake_count);
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    EXPECT_TRUE(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        EXPECT_EQ(0, WEXITSTATUS(status));
+    }
+    EXPECT_EQ(0, close(ready[0]));
+    EXPECT_EQ(0, munmap(futex_word, kPageSize));
+    EXPECT_EQ(0, close(fd));
+}
+
+TEST(DevtmpfsSemantics, SharedZeroFaultAroundDoesNotAllocateColdPages) {
+    constexpr size_t kPageSize = 4096;
+    constexpr size_t kPages = 33;
+    int fd = open("/dev/zero", O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    auto* mapping = static_cast<volatile unsigned char*>(
+        mmap(nullptr, kPages * kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    ASSERT_NE(MAP_FAILED, const_cast<unsigned char*>(mapping)) << strerror(errno);
+
+    EXPECT_EQ(0, mapping[16 * kPageSize]);
+    unsigned char residency[kPages] = {};
+    ASSERT_EQ(0, mincore(const_cast<unsigned char*>(mapping), kPages * kPageSize, residency))
+        << strerror(errno);
+    for (size_t page = 0; page < kPages; ++page) {
+        EXPECT_EQ(page == 16, (residency[page] & 1) != 0) << "page=" << page;
+    }
+
+    EXPECT_EQ(0, munmap(const_cast<unsigned char*>(mapping), kPages * kPageSize));
     EXPECT_EQ(0, close(fd));
 }
 

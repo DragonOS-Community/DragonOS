@@ -759,6 +759,7 @@ impl AddressSpace {
         let may_write =
             !map_flags.contains(MapFlags::MAP_SHARED) || file_mode.contains(FileMode::FMODE_WRITE);
         let vma_file = file.inode().mmap_effective_file(&file)?;
+        let mut shared_anon = None;
 
         loop {
             let mut guard = self.write();
@@ -838,6 +839,9 @@ impl AddressSpace {
                 Ok(flags) => flags,
                 Err(err) => map_fail!(err),
             };
+            if vma_file.inode().mmap_uses_shared_anon(vm_flags) && shared_anon.is_none() {
+                shared_anon = Some(AnonSharedMapping::new(page_count.data()));
+            }
 
             if vm_flags.contains(VmFlags::VM_LOCKED) {
                 let error = if map_flags.contains(MapFlags::MAP_LOCKED)
@@ -913,6 +917,9 @@ impl AddressSpace {
                 ));
                 if let Some(sysv_shm) = sysv_shm.clone() {
                     vma.lock().set_sysv_shm(Some(sysv_shm));
+                }
+                if let Some(shared_anon) = shared_anon.clone() {
+                    vma.lock().shared_anon = Some(shared_anon);
                 }
                 Some(vma)
             } else {
@@ -994,6 +1001,9 @@ impl AddressSpace {
                     Ok(vma) => {
                         if let Some(sysv_shm) = sysv_shm.clone() {
                             vma.lock().set_sysv_shm(Some(sysv_shm));
+                        }
+                        if let Some(shared_anon) = shared_anon.clone() {
+                            vma.lock().shared_anon = Some(shared_anon);
                         }
                         vma
                     }

@@ -69,7 +69,7 @@ impl Syscall for SysMsyncHandle {
         loop {
             if let Some(vma) = next_vma.clone() {
                 // 读取VMA信息，确保在调用find_nearest前释放锁
-                let (vm_start, vm_end, vm_flags, file, backing_pgoff);
+                let (vm_start, vm_end, vm_flags, file, backing_pgoff, has_shared_anon);
                 {
                     let guard = vma.lock();
                     vm_start = guard.region().start().data();
@@ -77,6 +77,7 @@ impl Syscall for SysMsyncHandle {
                     vm_flags = *guard.vm_flags();
                     file = guard.vm_file();
                     backing_pgoff = guard.backing_page_offset();
+                    has_shared_anon = guard.shared_anon.is_some();
 
                     if start < vm_start {
                         if flags == MsFlags::MS_ASYNC {
@@ -101,7 +102,10 @@ impl Syscall for SysMsyncHandle {
                 let sync_end = end.min(vm_end);
                 start = vm_end;
 
-                if flags.contains(MsFlags::MS_SYNC) && vm_flags.contains(VmFlags::VM_SHARED) {
+                if flags.contains(MsFlags::MS_SYNC)
+                    && vm_flags.contains(VmFlags::VM_SHARED)
+                    && !has_shared_anon
+                {
                     if let Some(file) = file {
                         if sync_start < sync_end {
                             let file_start = backing_pgoff

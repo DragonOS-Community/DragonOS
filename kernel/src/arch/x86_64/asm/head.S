@@ -638,7 +638,9 @@ GDT_Table:
     .quad 0x00affb000000ffff // 6 用户64位代码段描述符 0x30
     .quad 0x00cf9a000000ffff // 7 内核32位代码段描述符 0x38
     .quad 0x00cf92000000ffff // 8 内核32位数据段描述符 0x40
-    .fill 100, 8, 0           // 10-11 TSS(跳过了第9段)  重复十次填充8字节的空间，赋值为0   长模式下，每个TSS长度为128bit
+    // Entry 9 is reserved. Entries 10..265 hold 128 per-CPU TSS descriptors.
+    .fill 257, 8, 0
+.global GDT_END
 GDT_END:
 
 .global GDT_POINTER
@@ -733,4 +735,3 @@ gdt64_pointer:
 gdt64_pointer64:
     .short gdt64_pointer-gdt64-1
     .quad gdt64
-    

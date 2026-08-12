@@ -218,6 +218,9 @@ pub trait KvmFunc: Send + Sync + Debug {
 
     fn handle_exit_irqoff(&self, vcpu: &mut VirtCpu);
 
+    /// Caches VM-exit fields that are consumed after migration is allowed again.
+    fn cache_exit_info(&self, vcpu: &mut VirtCpu);
+
     fn handle_exit(
         &self,
         vcpu: &mut VirtCpu,

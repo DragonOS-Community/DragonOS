@@ -15,7 +15,7 @@ use crate::{
             entry::arch_setup_interrupt_gate,
             ipi::{
                 arch_ipi_handler_init, send_ipi, IPI_NUM_FLUSH_TLB, IPI_NUM_KICK_CPU,
-                IPI_NUM_STOP_CPU,
+                IPI_NUM_LOADED_VMCS_CLEAR, IPI_NUM_STOP_CPU,
             },
             msi::{X86MsiAddrHi, X86MsiAddrLoNormal, X86MsiDataNormal, X86_MSI_BASE_ADDRESS_LOW},
         },
@@ -268,6 +268,7 @@ pub fn arch_early_irq_init() -> Result<(), SystemError> {
             IPI_NUM_KICK_CPU,
             IPI_NUM_FLUSH_TLB,
             IPI_NUM_STOP_CPU,
+            IPI_NUM_LOADED_VMCS_CLEAR,
         ]);
     }
     return Ok(());

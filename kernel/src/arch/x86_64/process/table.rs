@@ -1,4 +1,4 @@
-use core::cmp;
+use core::{cmp, ptr::addr_of};
 
 use x86::{current::task::TaskStateSegment, segmentation::SegmentSelector, Ring};
 
@@ -8,7 +8,7 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    mm::{percpu::PerCpu, VirtAddr},
+    mm::{percpu::PerCpu, MemoryManagementArch, VirtAddr},
     process::ProcessManager,
     smp::core::smp_get_processor_id,
 };
@@ -29,17 +29,23 @@ const IO_BITMAP_OFFSET_VALID: u16 = HARDWARE_TSS_SIZE as u16;
 const IO_BITMAP_TOTAL_BYTES: usize = IO_BITMAP_BYTES + IO_BITMAP_TERMINATOR_BYTES;
 const TSS_LIMIT: u16 = (HARDWARE_TSS_SIZE + IO_BITMAP_TOTAL_BYTES - 1) as u16;
 const IO_BITMAP_OFFSET_INVALID: u16 = TSS_LIMIT + 1;
+const TSS_GDT_BASE_INDEX: usize = 10;
+const TSS_GDT_ENTRY_STRIDE: usize = 2;
+const GDT_ENTRY_COUNT: usize =
+    TSS_GDT_BASE_INDEX + PerCpu::MAX_CPU_NUM as usize * TSS_GDT_ENTRY_STRIDE;
 
 const _: () = assert!(HARDWARE_TSS_SIZE <= u16::MAX as usize);
 const _: () = assert!(HARDWARE_TSS_SIZE + IO_BITMAP_TOTAL_BYTES <= u16::MAX as usize);
 const _: () = assert!(TSS_LIMIT as usize <= 0x000f_ffff);
+const _: () = assert!(GDT_ENTRY_COUNT <= u16::MAX as usize);
 
 static mut TSS_MANAGER: TSSManager = TSSManager {
     tss: [DragonOsTss::new(); PerCpu::MAX_CPU_NUM as usize],
 };
 
 extern "C" {
-    static mut GDT_Table: [u64; 512];
+    static mut GDT_Table: [u64; GDT_ENTRY_COUNT];
+    static GDT_END: u8;
 }
 
 /// 切换fs和gs段寄存器
@@ -106,6 +112,84 @@ pub struct TSSManager {
 }
 
 impl TSSManager {
+    #[inline]
+    fn selector_index(cpu: u32) -> Option<usize> {
+        let cpu = usize::try_from(cpu).ok()?;
+        if cpu >= PerCpu::MAX_CPU_NUM as usize {
+            return None;
+        }
+
+        TSS_GDT_BASE_INDEX.checked_add(cpu.checked_mul(TSS_GDT_ENTRY_STRIDE)?)
+    }
+
+    /// Returns the logical CPU encoded by a DragonOS-owned task register.
+    ///
+    /// The descriptor identity check rejects selectors left by firmware or a
+    /// bootloader. Callers must retain their bootstrap fallback until SMP boot
+    /// data is initialized and this CPU has loaded its DragonOS TSS.
+    #[inline]
+    pub fn current_cpu_from_tr() -> Option<crate::smp::cpu::ProcessorId> {
+        let selector = unsafe { x86::task::tr() }.bits();
+        if selector & 0x7 != 0 {
+            return None;
+        }
+
+        let index = usize::from(selector >> 3);
+        let relative = index.checked_sub(TSS_GDT_BASE_INDEX)?;
+        if relative % TSS_GDT_ENTRY_STRIDE != 0 {
+            return None;
+        }
+
+        let cpu = relative / TSS_GDT_ENTRY_STRIDE;
+        if cpu >= PerCpu::MAX_CPU_NUM as usize {
+            return None;
+        }
+
+        let (low, high) = unsafe {
+            let gdt = Self::gdt_virtual_base().data() as *const u64;
+            (
+                gdt.add(index).read_volatile(),
+                gdt.add(index + 1).read_volatile(),
+            )
+        };
+        let descriptor_type = (low >> 40) & 0xf;
+        let system = (low >> 44) & 1;
+        let present = (low >> 47) & 1;
+        if descriptor_type != 0xb || system != 0 || present == 0 {
+            return None;
+        }
+
+        let base = ((low >> 16) & 0xffff)
+            | (((low >> 32) & 0xff) << 16)
+            | (((low >> 56) & 0xff) << 24)
+            | ((high & 0xffff_ffff) << 32);
+        let expected = unsafe { addr_of!(TSS_MANAGER.tss).cast::<DragonOsTss>().add(cpu) as u64 };
+        if base != expected {
+            return None;
+        }
+
+        Some(crate::smp::cpu::ProcessorId::new(cpu as u32))
+    }
+
+    #[inline]
+    fn gdt_entry_count() -> usize {
+        let start = addr_of!(GDT_Table) as usize;
+        let end = addr_of!(GDT_END) as usize;
+        let bytes = end.checked_sub(start).expect("GDT_END precedes GDT_Table");
+        assert_eq!(bytes % core::mem::size_of::<u64>(), 0);
+        let entries = bytes / core::mem::size_of::<u64>();
+        assert_eq!(
+            entries, GDT_ENTRY_COUNT,
+            "assembly and Rust GDT sizes differ"
+        );
+        entries
+    }
+
+    #[inline]
+    fn gdt_virtual_base() -> VirtAddr {
+        VirtAddr::new(addr_of!(GDT_Table) as usize + crate::arch::MMArch::PHYS_OFFSET)
+    }
+
     /// 获取当前CPU的TSS
     pub unsafe fn current_tss() -> &'static mut DragonOsTss {
         &mut TSS_MANAGER.tss[smp_get_processor_id().data() as usize]
@@ -113,7 +197,8 @@ impl TSSManager {
 
     /// 加载当前CPU的TSS
     pub unsafe fn load_tr() {
-        let index = (10 + smp_get_processor_id().data() * 2) as u16;
+        let cpu = smp_get_processor_id();
+        let index = Self::selector_index(cpu.data()).expect("CPU ID exceeds the TSS table") as u16;
         let selector = SegmentSelector::new(index, Ring::Ring0);
 
         Self::set_tss_descriptor(index, VirtAddr::new(Self::current_tss() as *mut _ as usize));
@@ -141,12 +226,12 @@ impl TSSManager {
         }
     }
 
-    #[allow(static_mut_refs)]
     unsafe fn set_tss_descriptor(index: u16, vaddr: VirtAddr) {
         let limit = TSS_LIMIT as u64;
-        let gdt_vaddr = VirtAddr::new(&GDT_Table as *const _ as usize);
-
-        let gdt: &mut [u64] = core::slice::from_raw_parts_mut(gdt_vaddr.data() as *mut u64, 512);
+        let entries = Self::gdt_entry_count();
+        assert!((index as usize + 1) < entries);
+        let gdt =
+            core::slice::from_raw_parts_mut(Self::gdt_virtual_base().data() as *mut u64, entries);
 
         let vaddr = vaddr.data() as u64;
         gdt[index as usize] = (limit & 0xffff)

@@ -696,30 +696,20 @@ impl AnonSharedMapping {
         }
 
         // Page allocation may sleep, so it must not run under the backing's
-        // irqsave spinlock. Publish under the spinlock afterwards; a racing
-        // loser discards its still-unmapped candidate.
+        // irqsave spinlock. Keep the existing PageManager mutex until the
+        // candidate is published, and recheck after acquiring it: this closes
+        // the allocate-before-publish window without adding another sleeping
+        // lock or per-index in-flight state.
         let mut pm = page_manager_lock();
+        if let Some(page) = self.lookup_page(pgoff) {
+            return Ok(page);
+        }
+
         let mut allocator = LockedFrameAllocator;
         let candidate = pm.create_one_page(PageType::Normal, PageFlags::empty(), &mut allocator)?;
         candidate.write().add_backing_lifetime_pin();
-        drop(pm);
-
-        let existing = {
-            let mut guard = self.pages.lock_irqsave();
-            if let Some(existing) = guard.get(&pgoff) {
-                Some(existing.clone())
-            } else {
-                guard.insert(pgoff, candidate.clone());
-                None
-            }
-        };
-        if let Some(existing) = existing {
-            candidate.write().remove_backing_lifetime_pin();
-            page_manager_lock().remove_page(&candidate.phys_address());
-            Ok(existing)
-        } else {
-            Ok(candidate)
-        }
+        self.pages.lock_irqsave().insert(pgoff, candidate.clone());
+        Ok(candidate)
     }
 
     /// Look up an already instantiated backing page without allocating it.

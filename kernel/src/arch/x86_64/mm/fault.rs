@@ -244,13 +244,10 @@ impl X86_64MMArch {
             Self::page_fault_oops(regs, error_code, address);
         }
 
-        let feature = x86::cpuid::CpuId::new()
-            .get_extended_feature_info()
-            .unwrap();
         if unlikely(
-            feature.has_smap()
-                && !error_code.contains(X86PfErrorCode::X86_PF_USER)
-                && rflags.contains(RFlags::FLAGS_AC),
+            !error_code.contains(X86PfErrorCode::X86_PF_USER)
+                && unsafe { x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_SMAP) }
+                && !rflags.contains(RFlags::FLAGS_AC),
         ) {
             Self::page_fault_oops(regs, error_code, address);
         }

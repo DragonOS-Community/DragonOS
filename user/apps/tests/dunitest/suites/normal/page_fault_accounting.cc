@@ -250,6 +250,87 @@ TEST(PageFaultAccounting, ReapedChildUpdatesChildrenUsage) {
             static_cast<uint64_t>(waited.ru_minflt));
 }
 
+TEST(PageFaultAccounting, SharedAnonymousDelayedFaultsRemainVisibleAcrossFork) {
+  constexpr size_t kLength = 2 * kPageSize;
+  void* raw_mapping =
+      mmap(nullptr, kLength, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(MAP_FAILED, raw_mapping) << strerror(errno);
+  auto* mapping = static_cast<volatile uint8_t*>(raw_mapping);
+
+  FaultStat before {};
+  FaultStat after {};
+  const std::string stat_path = "/proc/self/task/" + std::to_string(getpid()) + "/stat";
+  if (!ReadProcStat(stat_path, &before)) {
+    munmap(const_cast<uint8_t*>(mapping), kLength);
+    FAIL() << "failed to read parent task stat";
+    return;
+  }
+
+  int child_ready[2];
+  int parent_ready[2];
+  if (pipe(child_ready) != 0) {
+    const int saved_errno = errno;
+    munmap(const_cast<uint8_t*>(mapping), kLength);
+    FAIL() << strerror(saved_errno);
+    return;
+  }
+  if (pipe(parent_ready) != 0) {
+    const int saved_errno = errno;
+    close(child_ready[0]);
+    close(child_ready[1]);
+    munmap(const_cast<uint8_t*>(mapping), kLength);
+    FAIL() << strerror(saved_errno);
+    return;
+  }
+
+  pid_t child = fork();
+  if (child < 0) {
+    const int saved_errno = errno;
+    close(child_ready[0]);
+    close(child_ready[1]);
+    close(parent_ready[0]);
+    close(parent_ready[1]);
+    munmap(const_cast<uint8_t*>(mapping), kLength);
+    FAIL() << strerror(saved_errno);
+    return;
+  }
+  if (child == 0) {
+    close(child_ready[0]);
+    close(parent_ready[1]);
+    mapping[kPageSize] = 0x22;
+    if (!WriteByte(child_ready[1]) || !ReadByte(parent_ready[0])) _exit(2);
+    _exit(mapping[0] == 0x11 ? 0 : 3);
+  }
+
+  close(child_ready[1]);
+  close(parent_ready[0]);
+  const bool child_faulted = ReadByte(child_ready[0]);
+  const bool child_value_visible = child_faulted && mapping[kPageSize] == 0x22;
+  bool parent_faulted = false;
+  if (child_faulted) {
+    mapping[0] = 0x11;
+    parent_faulted = WriteByte(parent_ready[1]);
+  }
+  close(parent_ready[1]);
+
+  int status = 0;
+  const pid_t waited = waitpid(child, &status, 0);
+  close(child_ready[0]);
+  const bool stat_ok = ReadProcStat(stat_path, &after);
+  const int unmap_result = munmap(const_cast<uint8_t*>(mapping), kLength);
+
+  ASSERT_TRUE(child_faulted);
+  ASSERT_TRUE(child_value_visible);
+  ASSERT_TRUE(parent_faulted);
+  ASSERT_EQ(child, waited) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(0, WEXITSTATUS(status));
+  ASSERT_TRUE(stat_ok);
+  ASSERT_GE(after.minflt, before.minflt);
+  EXPECT_GE(after.minflt - before.minflt, 2u);
+  EXPECT_EQ(0, unmap_result);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

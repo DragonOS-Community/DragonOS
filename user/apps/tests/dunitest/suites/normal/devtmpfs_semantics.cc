@@ -5,12 +5,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -137,6 +139,82 @@ TEST(DevtmpfsSemantics, BuiltinDeviceNumbersAndLinks) {
 
     EXPECT_EQ("/proc/self/fd", ReadLink("/dev/fd"));
     ExpectReadZeros("/dev/zero");
+}
+
+TEST(DevtmpfsSemantics, PrivateZeroMmapPreservesPagesAcrossFaultAroundWindows) {
+    constexpr size_t kPageSize = 4096;
+    constexpr size_t kPages = 33;
+    constexpr size_t kLength = kPages * kPageSize;
+    // 32 divides the 512-entry x86 PTE table. Offset 5 leaves enough room for
+    // two complete 16-page fault-around windows without crossing its end.
+    constexpr size_t kAlignmentPages = 32;
+    constexpr size_t kReservePages = kPages + kAlignmentPages - 1;
+    constexpr uintptr_t kDesiredPteOffset = 5;
+
+    int fd = open("/dev/zero", O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+
+    void* reservation = mmap(nullptr, kReservePages * kPageSize, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE, fd, 0);
+    if (reservation == MAP_FAILED) {
+        const int saved_errno = errno;
+        close(fd);
+        FAIL() << strerror(saved_errno);
+        return;
+    }
+    const uintptr_t first_page = reinterpret_cast<uintptr_t>(reservation) / kPageSize;
+    const size_t prefix_pages = (kDesiredPteOffset + kAlignmentPages -
+                                 (first_page & (kAlignmentPages - 1))) &
+                                (kAlignmentPages - 1);
+    const size_t suffix_pages = kReservePages - prefix_pages - kPages;
+    auto* raw_mapping = static_cast<unsigned char*>(reservation) + prefix_pages * kPageSize;
+    if (prefix_pages != 0 && munmap(reservation, prefix_pages * kPageSize) != 0) {
+        const int saved_errno = errno;
+        munmap(reservation, kReservePages * kPageSize);
+        close(fd);
+        FAIL() << strerror(saved_errno);
+        return;
+    }
+    if (suffix_pages != 0 && munmap(raw_mapping + kLength, suffix_pages * kPageSize) != 0) {
+        const int saved_errno = errno;
+        munmap(raw_mapping, (kPages + suffix_pages) * kPageSize);
+        close(fd);
+        FAIL() << strerror(saved_errno);
+        return;
+    }
+    EXPECT_EQ(kDesiredPteOffset,
+              (reinterpret_cast<uintptr_t>(raw_mapping) / kPageSize) & (kAlignmentPages - 1));
+    auto* mapping = static_cast<volatile unsigned char*>(raw_mapping);
+
+    // A deliberately unaligned VMA makes consecutive fault-around windows
+    // overlap. Later faults must preserve pages populated by an earlier window.
+    for (size_t page = 0; page < kPages; ++page) {
+        EXPECT_EQ(0, mapping[page * kPageSize]);
+        mapping[page * kPageSize] = static_cast<unsigned char>(page + 1);
+    }
+    for (size_t page = 0; page < kPages; ++page) {
+        EXPECT_EQ(static_cast<unsigned char>(page + 1), mapping[page * kPageSize]);
+    }
+    EXPECT_EQ(0, munmap(const_cast<unsigned char*>(mapping), kLength));
+
+    void* raw_populated =
+        mmap(nullptr, kLength, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    if (raw_populated == MAP_FAILED) {
+        const int saved_errno = errno;
+        close(fd);
+        FAIL() << strerror(saved_errno);
+        return;
+    }
+    auto* populated = static_cast<volatile unsigned char*>(raw_populated);
+    for (size_t page = 0; page < kPages; ++page) {
+        EXPECT_EQ(0, populated[page * kPageSize]);
+        populated[page * kPageSize] = static_cast<unsigned char>(0xa0 + page);
+    }
+    for (size_t page = 0; page < kPages; ++page) {
+        EXPECT_EQ(static_cast<unsigned char>(0xa0 + page), populated[page * kPageSize]);
+    }
+    EXPECT_EQ(0, munmap(const_cast<unsigned char*>(populated), kLength));
+    EXPECT_EQ(0, close(fd));
 }
 
 TEST(DevtmpfsSemantics, PublicMountReusesKernelInstance) {

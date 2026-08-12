@@ -205,7 +205,7 @@ impl TidDirOps {
         fn(&TidDirOps, Weak<dyn IndexNode>) -> Arc<dyn IndexNode>,
     )] = &[
         ("stat", |ops, parent| {
-            StatFileOps::new_inode(ops.target.clone(), parent)
+            StatFileOps::new_inode(ops.target.clone(), super::stat::StatScope::Thread, parent)
         }),
         ("ns", |ops, parent| {
             NsDirOps::new_inode(ops.target.clone(), parent)

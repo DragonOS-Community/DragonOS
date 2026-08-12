@@ -78,6 +78,7 @@ normal/dma_allocator_selftest
 normal/mknod_socket
 normal/pmem_block
 normal/page_cache_accounting
+normal/page_fault_accounting
 normal/pipe_release_wakeup
 normal/pipe_waitqueue_wakeup
 normal/oom_killer_semantics

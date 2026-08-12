@@ -90,6 +90,7 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
 
         let mm = AddressSpace::current()?;
         let mut current = start_page;
+        let mut retried = false;
         'retry: loop {
             let mut space_guard = mm.write_guard_no_reservation_conflict(region);
             loop {
@@ -107,11 +108,14 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
                     return Err(SystemError::EFAULT);
                 }
 
-                let fault_flags = if write {
+                let mut fault_flags = if write {
                     FaultFlags::FAULT_FLAG_WRITE
                 } else {
                     FaultFlags::empty()
                 };
+                if retried {
+                    fault_flags |= FaultFlags::FAULT_FLAG_TRIED;
+                }
                 let fault = unsafe {
                     let message = PageFaultMessage::new(
                         vma,
@@ -126,10 +130,19 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
                     return Err(SystemError::ENOMEM);
                 }
                 if fault.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
+                    retried = true;
                     let wait = fault.retry_wait;
                     drop(space_guard);
                     if let Some(wait) = wait {
-                        wait.wait().map_err(|_| SystemError::EFAULT)?;
+                        if let Err(error) = wait.wait() {
+                            if !matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
+                                crate::mm::fault::account_fault_result(
+                                    fault_flags,
+                                    VmFaultReason::VM_FAULT_SIGBUS,
+                                );
+                            }
+                            return Err(SystemError::EFAULT);
+                        }
                     }
                     continue 'retry;
                 }
@@ -146,6 +159,7 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
                 if current == end_page {
                     return Ok(());
                 }
+                retried = false;
                 current = VirtAddr::new(
                     current
                         .data()

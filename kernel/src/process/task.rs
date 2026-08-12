@@ -193,6 +193,10 @@ pub struct ProcessControlBlock {
 
     /// CPU time accounting.
     pub(super) cpu_time: Arc<ProcessCpuTime>,
+    /// Minor page faults completed by this task.
+    pub(super) min_flt: AtomicU64,
+    /// Major page faults completed by this task.
+    pub(super) maj_flt: AtomicU64,
     /// Raw CPU time accumulated from threads that have left this thread group.
     ///
     /// This remains in nanoseconds for CLOCK_PROCESS_CPUTIME_ID.  The separate
@@ -369,6 +373,8 @@ impl ProcessControlBlock {
                 itimers: SpinLock::new(ProcessItimers::default()),
                 posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
                 cpu_time: Arc::new(ProcessCpuTime::default()),
+                min_flt: AtomicU64::new(0),
+                maj_flt: AtomicU64::new(0),
                 exited_thread_group_cputime_ns: SpinLock::new(0),
                 exited_thread_group_rusage: SpinLock::new(RUsage::default()),
                 children_rusage: SpinLock::new(RUsage::default()),

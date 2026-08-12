@@ -14,7 +14,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{pid::PidType, ProcessState, RawPid},
+    process::{pid::PidType, resource::RUsageWho, ProcessState, RawPid},
     sched::{cputime::ns_to_clock_t, prio::PrioUtil},
 };
 use alloc::{
@@ -28,11 +28,22 @@ use system_error::SystemError;
 #[derive(Debug)]
 pub struct StatFileOps {
     target: ProcPidTarget,
+    scope: StatScope,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum StatScope {
+    ThreadGroup,
+    Thread,
 }
 
 impl StatFileOps {
-    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
+    pub fn new_inode(
+        target: ProcPidTarget,
+        scope: StatScope,
+        parent: Weak<dyn IndexNode>,
+    ) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target, scope }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -76,6 +87,10 @@ struct ProcStatSnapshot {
     processor: i32,
     utime: u64,
     stime: u64,
+    minflt: usize,
+    cminflt: usize,
+    majflt: usize,
+    cmajflt: usize,
 }
 
 /// 生成 Linux 风格的 /proc/[pid]/stat 行
@@ -88,11 +103,6 @@ fn generate_linux_proc_stat_line(snapshot: ProcStatSnapshot) -> String {
     let session: usize = 0;
     let tpgid: i32 = 0;
     let flags: u64 = 0;
-    let minflt: u64 = 0;
-    let cminflt: u64 = 0;
-    let majflt: u64 = 0;
-    let cmajflt: u64 = 0;
-
     let cutime: i64 = 0;
     let cstime: i64 = 0;
 
@@ -110,6 +120,10 @@ fn generate_linux_proc_stat_line(snapshot: ProcStatSnapshot) -> String {
         tty_nr = snapshot.tty_nr,
         utime = snapshot.utime,
         stime = snapshot.stime,
+        minflt = snapshot.minflt,
+        cminflt = snapshot.cminflt,
+        majflt = snapshot.majflt,
+        cmajflt = snapshot.cmajflt,
         priority = snapshot.priority,
         nice = snapshot.nice,
         num_threads = snapshot.num_threads,
@@ -143,6 +157,14 @@ impl FileOps for StatFileOps {
         let cpu_time = pcb.cputime();
         let utime = ns_to_clock_t(cpu_time.utime.load(Ordering::Relaxed));
         let stime = ns_to_clock_t(cpu_time.stime.load(Ordering::Relaxed));
+        let fault_usage = match self.scope {
+            StatScope::ThreadGroup => pcb.get_rusage(RUsageWho::RUsageSelf),
+            StatScope::Thread => pcb.get_rusage(RUsageWho::RusageThread),
+        }
+        .unwrap_or_default();
+        let child_usage = pcb
+            .get_rusage(RUsageWho::RUsageChildren)
+            .unwrap_or_default();
         let priority = pcb.sched_info().prio() as i64;
         let nice = PrioUtil::prio_to_nice(pcb.sched_info().static_prio()) as i64;
         let num_threads = pcb
@@ -183,6 +205,10 @@ impl FileOps for StatFileOps {
             processor,
             utime,
             stime,
+            minflt: fault_usage.ru_minflt,
+            cminflt: child_usage.ru_minflt,
+            majflt: fault_usage.ru_majflt,
+            cmajflt: child_usage.ru_majflt,
         });
         proc_read(offset, len, buf, content.as_bytes())
     }

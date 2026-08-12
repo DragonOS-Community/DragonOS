@@ -307,7 +307,15 @@ impl Futex {
                 let wait = fault.retry_wait;
                 drop(space_guard);
                 if let Some(wait) = wait {
-                    wait.wait().map_err(|_| SystemError::EFAULT)?;
+                    if let Err(error) = wait.wait() {
+                        if !matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
+                            crate::mm::fault::account_fault_result(
+                                flags,
+                                VmFaultReason::VM_FAULT_SIGBUS,
+                            );
+                        }
+                        return Err(SystemError::EFAULT);
+                    }
                 }
                 continue;
             }

@@ -35,6 +35,7 @@ use crate::{
         },
     },
     mm::VirtAddr,
+    process::preempt::PreemptGuard,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     virt::vm::{
         kvm_host::{
@@ -634,8 +635,9 @@ impl VirtCpu {
 
         self.arch.pat = MSR_IA32_CR_PAT_DEFAULT;
 
-        self.load();
+        let preempt_guard = self.load();
         self.vcpu_reset(vm, false)?;
+        drop(preempt_guard);
         self.arch.kvm_init_mmu();
 
         Ok(())
@@ -652,7 +654,7 @@ impl VirtCpu {
     }
 
     pub fn run(&mut self) -> Result<usize, SystemError> {
-        self.load();
+        let preempt_guard = self.load();
 
         if unlikely(self.arch.mp_state == MutilProcessorState::Uninitialized) {
             todo!()
@@ -671,6 +673,8 @@ impl VirtCpu {
         if !self.arch.lapic_in_kernel() {
             self.kvm_set_cr8(self.kvm_run().cr8);
         }
+
+        drop(preempt_guard);
 
         // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#11174 - 11196
 
@@ -699,196 +703,219 @@ impl VirtCpu {
     }
 
     fn enter_guest(&mut self, vm: &Vm) -> Result<(), SystemError> {
-        let req_immediate_exit = false;
-
-        warn!("request {:?}", self.request);
-        if !self.request.is_empty() {
-            if self.check_request(VirtCpuRequest::KVM_REQ_VM_DEAD) {
-                return Err(SystemError::EIO);
-            }
-
-            // TODO: kvm_dirty_ring_check_request
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_MMU_FREE_OBSOLETE_ROOTS) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_MIGRATE_TIMER) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_MASTERCLOCK_UPDATE) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_GLOBAL_CLOCK_UPDATE) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_CLOCK_UPDATE) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_MMU_SYNC) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_LOAD_MMU_PGD) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_TLB_FLUSH) {
-                self.flush_tlb_all();
-            }
-
-            self.service_local_tlb_flush_requests();
-
-            // TODO: KVM_REQ_HV_TLB_FLUSH) && kvm_hv_vcpu_flush_tlb(vcpu)
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_REPORT_TPR_ACCESS) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_TRIPLE_FAULT) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_STEAL_UPDATE) {
-                // todo!()
-                warn!("VirtCpuRequest::KVM_REQ_STEAL_UPDATE TODO!");
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_SMI) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_NMI) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_PMU) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_PMI) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_IOAPIC_EOI_EXIT) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_SCAN_IOAPIC) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_LOAD_EOI_EXITMAP) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD) {
-                // todo!()
-                warn!("VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD TODO!");
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_HV_CRASH) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_HV_RESET) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_HV_EXIT) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_HV_STIMER) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_APICV_UPDATE) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_APF_READY) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_MSR_FILTER_CHANGED) {
-                todo!()
-            }
-
-            if self.check_request(VirtCpuRequest::KVM_REQ_UPDATE_CPU_DIRTY_LOGGING) {
-                todo!()
-            }
-        }
-
-        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10661
-        if self.check_request(VirtCpuRequest::KVM_REQ_EVENT) {
-            // TODO
-        }
-
-        self.kvm_mmu_reload(vm)?;
-
-        x86_kvm_ops().prepare_switch_to_guest(self);
-        // warn!(
-        //     "mode {:?} req {:?} mode_cond {} !is_empty {} cond {}",
-        //     self.mode,
-        //     self.request,
-        //     self.mode == VcpuMode::ExitingGuestMode,
-        //     !self.request.is_empty(),
-        //     (self.mode == VcpuMode::ExitingGuestMode) || (!self.request.is_empty())
-        // );
-        warn!(
-            "req bit {} empty bit {}",
-            self.request.bits,
-            VirtCpuRequest::empty().bits
-        );
-        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10730
-        if self.mode == VcpuMode::ExitingGuestMode || !self.request.is_empty() {
-            self.mode = VcpuMode::OutsideGuestMode;
-            return Err(SystemError::EINVAL);
-        }
-
-        if req_immediate_exit {
-            self.request(VirtCpuRequest::KVM_REQ_EVENT);
-            todo!();
-        }
-
-        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10749 - 10766
-
-        let exit_fastpath;
+        let mut mmu_pgd_needs_commit = false;
         loop {
-            exit_fastpath = x86_kvm_ops().vcpu_run(self);
-            if likely(exit_fastpath != ExitFastpathCompletion::ExitHandled) {
-                break;
+            let req_immediate_exit = false;
+
+            warn!("request {:?}", self.request);
+            if !self.request.is_empty() {
+                if self.check_request(VirtCpuRequest::KVM_REQ_VM_DEAD) {
+                    return Err(SystemError::EIO);
+                }
+
+                // TODO: kvm_dirty_ring_check_request
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_MMU_FREE_OBSOLETE_ROOTS) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_MIGRATE_TIMER) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_MASTERCLOCK_UPDATE) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_GLOBAL_CLOCK_UPDATE) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_CLOCK_UPDATE) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_MMU_SYNC) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_LOAD_MMU_PGD) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_TLB_FLUSH) {
+                    self.flush_tlb_all();
+                }
+
+                self.service_local_tlb_flush_requests();
+
+                // TODO: KVM_REQ_HV_TLB_FLUSH) && kvm_hv_vcpu_flush_tlb(vcpu)
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_REPORT_TPR_ACCESS) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_TRIPLE_FAULT) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_STEAL_UPDATE) {
+                    // todo!()
+                    warn!("VirtCpuRequest::KVM_REQ_STEAL_UPDATE TODO!");
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_SMI) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_NMI) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_PMU) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_PMI) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_IOAPIC_EOI_EXIT) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_SCAN_IOAPIC) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_LOAD_EOI_EXITMAP) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD) {
+                    // todo!()
+                    warn!("VirtCpuRequest::KVM_REQ_APIC_PAGE_RELOAD TODO!");
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_HV_CRASH) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_HV_RESET) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_HV_EXIT) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_HV_STIMER) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_APICV_UPDATE) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_APF_READY) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_MSR_FILTER_CHANGED) {
+                    todo!()
+                }
+
+                if self.check_request(VirtCpuRequest::KVM_REQ_UPDATE_CPU_DIRTY_LOGGING) {
+                    todo!()
+                }
             }
 
-            todo!();
-        }
+            // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10661
+            if self.check_request(VirtCpuRequest::KVM_REQ_EVENT) {
+                // TODO
+            }
 
-        // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10799 - 10814
+            mmu_pgd_needs_commit |= self.kvm_mmu_reload(vm)?;
 
-        self.arch.last_vmentry_cpu = self.cpu;
+            let preempt_guard = PreemptGuard::new();
+            let current_cpu = smp_get_processor_id();
+            if current_cpu != self.cpu {
+                self.arch_vcpu_load(current_cpu);
+                drop(preempt_guard);
+                continue;
+            }
 
-        // TODO: last_guest_tsc
+            // CPU identity alone is insufficient: another vCPU may have replaced
+            // this CPU's active VMCS while this task was preempted.
+            x86_kvm_ops().vcpu_load(self, current_cpu);
 
-        self.mode = VcpuMode::OutsideGuestMode;
+            if mmu_pgd_needs_commit {
+                self.kvm_mmu_load_pgd(vm);
+            }
 
-        barrier::mfence();
+            x86_kvm_ops().prepare_switch_to_guest(self);
+            // warn!(
+            //     "mode {:?} req {:?} mode_cond {} !is_empty {} cond {}",
+            //     self.mode,
+            //     self.request,
+            //     self.mode == VcpuMode::ExitingGuestMode,
+            //     !self.request.is_empty(),
+            //     (self.mode == VcpuMode::ExitingGuestMode) || (!self.request.is_empty())
+            // );
+            warn!(
+                "req bit {} empty bit {}",
+                self.request.bits,
+                VirtCpuRequest::empty().bits
+            );
+            // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10730
+            if self.mode == VcpuMode::ExitingGuestMode || !self.request.is_empty() {
+                self.mode = VcpuMode::OutsideGuestMode;
+                drop(preempt_guard);
+                return Err(SystemError::EINVAL);
+            }
 
-        // TODO: xfd
+            if req_immediate_exit {
+                self.request(VirtCpuRequest::KVM_REQ_EVENT);
+                todo!();
+            }
 
-        x86_kvm_ops().handle_exit_irqoff(self);
+            // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10749 - 10766
 
-        // todo: xfd
+            let exit_fastpath;
+            loop {
+                exit_fastpath = x86_kvm_ops().vcpu_run(self);
+                if likely(exit_fastpath != ExitFastpathCompletion::ExitHandled) {
+                    break;
+                }
 
-        // TODO: 一些中断或者tsc操作
+                todo!();
+            }
 
-        match x86_kvm_ops().handle_exit(self, vm, exit_fastpath) {
-            Err(err) => return Err(err),
-            Ok(_) => Ok(()),
+            // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10799 - 10814
+
+            self.arch.last_vmentry_cpu = self.cpu;
+
+            // TODO: last_guest_tsc
+
+            self.mode = VcpuMode::OutsideGuestMode;
+
+            barrier::mfence();
+
+            // TODO: xfd
+
+            x86_kvm_ops().handle_exit_irqoff(self);
+            x86_kvm_ops().cache_exit_info(self);
+
+            drop(preempt_guard);
+
+            // todo: xfd
+
+            // TODO: Handle the remaining interrupt and TSC state updates.
+
+            return match x86_kvm_ops().handle_exit(self, vm, exit_fastpath) {
+                Err(err) => return Err(err),
+                Ok(_) => Ok(()),
+            };
         }
     }
 
@@ -946,8 +973,10 @@ impl VirtCpu {
     }
 
     #[inline]
-    fn load(&mut self) {
-        self.arch_vcpu_load(smp_get_processor_id())
+    fn load(&mut self) -> PreemptGuard {
+        let preempt_guard = PreemptGuard::new();
+        self.arch_vcpu_load(smp_get_processor_id());
+        preempt_guard
     }
 
     fn arch_vcpu_load(&mut self, cpu: ProcessorId) {
@@ -1151,7 +1180,7 @@ impl VirtCpu {
     }
 
     pub fn get_regs(&mut self) -> KvmCommonRegs {
-        self.load();
+        let _preempt_guard = self.load();
         return self._get_regs();
     }
 
@@ -1179,7 +1208,7 @@ impl VirtCpu {
     }
 
     pub fn get_segment_regs(&mut self) -> UapiKvmSegmentRegs {
-        self.load();
+        let _preempt_guard = self.load();
         return self._get_segment_regs();
     }
 
@@ -1251,7 +1280,7 @@ impl VirtCpu {
     }
 
     pub fn set_segment_regs(&mut self, sregs: &mut UapiKvmSegmentRegs) -> Result<(), SystemError> {
-        self.load();
+        let _preempt_guard = self.load();
         self._set_segmenet_regs(&self.kvm().lock(), sregs)?;
         Ok(())
     }
@@ -1426,7 +1455,7 @@ impl VirtCpu {
     }
 
     pub fn set_regs(&mut self, regs: &KvmCommonRegs) -> Result<(), SystemError> {
-        self.load();
+        let _preempt_guard = self.load();
         self._set_regs(regs);
         Ok(())
     }

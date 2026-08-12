@@ -1,4 +1,4 @@
-use core::intrinsics::unlikely;
+use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
 use alloc::{boxed::Box, collections::LinkedList, sync::Arc};
 use bitmap::{traits::BitMapOps, AllocBitmap};
@@ -18,7 +18,7 @@ use crate::{
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
     mm::{percpu::PerCpuVar, MemoryManagementArch, PhysAddr, VirtAddr},
-    smp::cpu::ProcessorId,
+    smp::cpu::{AtomicProcessorId, ProcessorId},
 };
 
 use super::vmx_info;
@@ -204,7 +204,6 @@ pub struct VmcsControlsShadow {
 pub struct LoadedVmcs {
     pub vmcs: Arc<LockedVMControlStructure>,
     pub shadow_vmcs: Option<Arc<LockedVMControlStructure>>,
-    pub cpu: ProcessorId,
     /// 是否已经执行了 VMLAUNCH 指令
     pub launched: bool,
     /// NMI 是否已知未被屏蔽
@@ -305,6 +304,7 @@ impl LoadedVmcs {
 #[derive(Debug)]
 pub struct LockedLoadedVmcs {
     inner: SpinLock<LoadedVmcs>,
+    owner_cpu: AtomicProcessorId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -334,7 +334,6 @@ impl LockedLoadedVmcs {
             inner: SpinLock::new(LoadedVmcs {
                 vmcs,
                 shadow_vmcs: None,
-                cpu: ProcessorId::INVALID,
                 launched: false,
                 hv_timer_soft_disabled: false,
                 msr_bitmap: bitmap,
@@ -345,11 +344,22 @@ impl LockedLoadedVmcs {
                 entry_time: 0,
                 vnmi_blocked_time: 0,
             }),
+            owner_cpu: AtomicProcessorId::new(ProcessorId::INVALID),
         })
     }
 
     pub fn lock(&self) -> SpinLockGuard<'_, LoadedVmcs> {
         self.inner.lock()
+    }
+
+    #[inline]
+    pub fn owner_cpu(&self) -> ProcessorId {
+        self.owner_cpu.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_owner_cpu(&self, cpu: ProcessorId) {
+        self.owner_cpu.store(cpu, Ordering::Release);
     }
 }
 

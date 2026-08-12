@@ -2,14 +2,12 @@ use crate::{arch::vm::mmu::kvm_mmu::PAGE_SHIFT, mm::page::EntryFlags};
 use alloc::sync::Arc;
 use core::{intrinsics::unlikely, ops::Index};
 use log::{debug, warn};
-use x86::vmx::vmcs::{guest, host};
 
 use system_error::SystemError;
 
 use crate::{
     arch::{
         vm::{
-            asm::VmxAsm,
             kvm_host::{EmulType, KVM_PFN_NOSLOT},
             mmu::kvm_mmu::{PFRet, PageLevel},
             mtrr::kvm_mtrr_check_gfn_range_consistency,
@@ -361,9 +359,6 @@ impl VirtCpu {
         }
 
         // 尝试将 GFN 转换为 PFN
-        let guest_cr3 = VmxAsm::vmx_vmread(guest::CR3);
-        let host_cr3 = VmxAsm::vmx_vmread(host::CR3);
-        debug!("guest_cr3={:x}, host_cr3={:x}", guest_cr3, host_cr3);
         page_fault.pfn = __gfn_to_pfn_memslot(
             Some(&slot),
             page_fault.gfn,

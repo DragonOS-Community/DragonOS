@@ -10,6 +10,7 @@ use log::warn;
 use x86_64::registers::control::Cr3Flags;
 use x86_64::structures::paging::PhysFrame;
 
+use crate::arch::interrupt::ipi::{send_ipi, IPI_NUM_LOADED_VMCS_CLEAR};
 use crate::arch::process::table::USER_DS;
 use crate::arch::vm::mmu::kvm_mmu::KvmMmu;
 use crate::arch::vm::uapi::kvm_exit;
@@ -17,6 +18,10 @@ use crate::arch::vm::uapi::{
     AC_VECTOR, BP_VECTOR, DB_VECTOR, GP_VECTOR, MC_VECTOR, NM_VECTOR, PF_VECTOR, UD_VECTOR,
 };
 use crate::arch::vm::vmx::vmcs::VmcsIntrHelper;
+use crate::exception::{
+    ipi::{IpiKind, IpiTarget},
+    HardwareIrqNumber,
+};
 use crate::libs::spinlock::SpinLockGuard;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
@@ -36,7 +41,10 @@ use crate::{
         percpu::{PerCpu, PerCpuVar},
         MemoryManagementArch,
     },
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, ProcessorId},
+    },
     virt::vm::{kvm_dev::kvm_init, kvm_host::vcpu::VirtCpu, user_api::UapiKvmSegment},
 };
 use alloc::{alloc::Global, boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
@@ -311,6 +319,20 @@ impl KvmInitFunc for VmxKvmInitFunc {
 #[derive(Debug)]
 pub struct VmxKvmFunc;
 
+#[derive(Clone)]
+struct RemoteLoadedVmcsClear {
+    loaded_vmcs: Arc<LockedLoadedVmcs>,
+    vmcs: Arc<self::vmcs::LockedVMControlStructure>,
+    shadow_vmcs: Option<Arc<self::vmcs::LockedVMControlStructure>>,
+    launched: bool,
+    owner: ProcessorId,
+}
+
+static REMOTE_LOADED_VMCS_CLEAR_SERIAL: SpinLock<()> = SpinLock::new(());
+static REMOTE_LOADED_VMCS_CLEAR_REQUEST: SpinLock<Option<RemoteLoadedVmcsClear>> =
+    SpinLock::new(None);
+static REMOTE_LOADED_VMCS_CLEAR_DONE: AtomicBool = AtomicBool::new(false);
+
 pub struct VmxKvmFuncConfig {
     pub have_set_apic_access_page_addr: bool,
     pub have_update_cr8_intercept: bool,
@@ -329,29 +351,31 @@ impl VmxKvmFunc {
         _buddy: Option<Arc<LockedLoadedVmcs>>,
     ) {
         let vmx = vcpu.vmx();
-        let already_loaded = vmx.loaded_vmcs.lock().cpu == cpu;
+        let already_loaded = vmx.loaded_vmcs.owner_cpu() == cpu;
 
         if !already_loaded {
             Self::loaded_vmcs_clear(&vmx.loaded_vmcs);
-            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-            current_loaded_vmcs_list_mut().push_back(vmx.loaded_vmcs.clone());
         }
 
-        if let Some(prev) = current_vmcs() {
+        {
+            // The remote-clear IPI accesses both per-CPU structures. Keep the
+            // list update and active-VMCS transition in one IRQ-safe section.
+            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+            if !already_loaded {
+                current_loaded_vmcs_list_mut().push_back(vmx.loaded_vmcs.clone());
+            }
+
             let vmcs = vmx.loaded_vmcs.lock().vmcs.clone();
-            if !Arc::ptr_eq(&vmcs, prev) {
+            if !current_vmcs()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &vmcs))
+            {
                 VmxAsm::vmcs_load(vmcs.phys_addr());
                 *current_vmcs_mut() = Some(vmcs);
 
                 // TODO:buddy barrier?
             }
-        } else {
-            let vmcs = vmx.loaded_vmcs.lock().vmcs.clone();
-            VmxAsm::vmcs_load(vmcs.phys_addr());
-            *current_vmcs_mut() = Some(vmcs);
-
-            // TODO:buddy barrier?
         }
 
         if !already_loaded {
@@ -361,7 +385,6 @@ impl VmxKvmFunc {
                 x86::dtables::sgdt(&mut pseudo_descriptpr);
             };
 
-            vmx.loaded_vmcs.lock().cpu = cpu;
             let id = vmx.loaded_vmcs.lock().vmcs.lock().revision_id();
             debug!(
                 "revision_id {id} req {:?}",
@@ -369,12 +392,14 @@ impl VmxKvmFunc {
             );
             vcpu.request(VirtCpuRequest::KVM_REQ_TLB_FLUSH);
 
+            let tr_selector = unsafe { x86::task::tr().bits() };
+            VmxAsm::vmx_vmwrite(host::TR_SELECTOR, tr_selector as u64);
             VmxAsm::vmx_vmwrite(
                 host::TR_BASE,
                 KvmX86Asm::get_segment_base(
                     pseudo_descriptpr.base,
                     pseudo_descriptpr.limit,
-                    unsafe { x86::task::tr().bits() },
+                    tr_selector,
                 ),
             );
 
@@ -383,16 +408,24 @@ impl VmxKvmFunc {
             VmxAsm::vmx_vmwrite(host::IA32_SYSENTER_ESP, unsafe {
                 rdmsr(msr::IA32_SYSENTER_ESP)
             });
+
+            // Publish ownership only after the VMCS and host state are ready.
+            vcpu.vmx().loaded_vmcs.set_owner_cpu(cpu);
         }
     }
 
     pub fn loaded_vmcs_clear(loaded_vmcs: &Arc<LockedLoadedVmcs>) {
-        let mut guard = loaded_vmcs.lock();
-        if guard.cpu == ProcessorId::INVALID {
+        let owner = loaded_vmcs.owner_cpu();
+        if owner == ProcessorId::INVALID {
             return;
         }
 
-        if guard.cpu == smp_get_processor_id() {
+        if owner == smp_get_processor_id() {
+            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            let mut guard = loaded_vmcs.lock();
+            if loaded_vmcs.owner_cpu() != owner {
+                return;
+            }
             if let Some(vmcs) = current_vmcs() {
                 if Arc::ptr_eq(vmcs, &guard.vmcs) {
                     *current_vmcs_mut() = None;
@@ -407,14 +440,90 @@ impl VmxKvmFunc {
                 }
             }
 
-            let _ = current_loaded_vmcs_list_mut().extract_if(|x| Arc::ptr_eq(x, loaded_vmcs));
+            current_loaded_vmcs_list_mut()
+                .extract_if(|x| Arc::ptr_eq(x, loaded_vmcs))
+                .for_each(drop);
 
-            guard.cpu = ProcessorId::INVALID;
             guard.launched = false;
+            loaded_vmcs.set_owner_cpu(ProcessorId::INVALID);
         } else {
-            // 交由对应cpu处理
-            todo!()
+            Self::remote_loaded_vmcs_clear(loaded_vmcs, owner);
         }
+    }
+
+    fn remote_loaded_vmcs_clear(loaded_vmcs: &Arc<LockedLoadedVmcs>, owner: ProcessorId) {
+        let _serial = REMOTE_LOADED_VMCS_CLEAR_SERIAL.lock();
+        if loaded_vmcs.owner_cpu() != owner {
+            return;
+        }
+        assert!(
+            smp_cpu_manager().is_online_cpu(owner),
+            "VMCS owner CPU is offline"
+        );
+
+        let request = {
+            let guard = loaded_vmcs.lock();
+            if loaded_vmcs.owner_cpu() != owner {
+                return;
+            }
+            RemoteLoadedVmcsClear {
+                loaded_vmcs: loaded_vmcs.clone(),
+                vmcs: guard.vmcs.clone(),
+                shadow_vmcs: guard.shadow_vmcs.clone(),
+                launched: guard.launched,
+                owner,
+            }
+        };
+        REMOTE_LOADED_VMCS_CLEAR_DONE.store(false, Ordering::Relaxed);
+        {
+            let mut slot = REMOTE_LOADED_VMCS_CLEAR_REQUEST.lock();
+            assert!(slot.is_none());
+            *slot = Some(request);
+        }
+
+        send_ipi(
+            IpiKind::SpecVector(HardwareIrqNumber::new(IPI_NUM_LOADED_VMCS_CLEAR.data())),
+            IpiTarget::Specified(owner),
+        );
+        while !REMOTE_LOADED_VMCS_CLEAR_DONE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        *REMOTE_LOADED_VMCS_CLEAR_REQUEST.lock() = None;
+
+        assert_eq!(loaded_vmcs.owner_cpu(), ProcessorId::INVALID);
+        loaded_vmcs.lock().launched = false;
+    }
+
+    /// Clears a loaded VMCS on its owning CPU from the dedicated IPI context.
+    pub fn handle_remote_loaded_vmcs_clear() {
+        let request = REMOTE_LOADED_VMCS_CLEAR_REQUEST.lock().clone();
+        let Some(request) = request else {
+            return;
+        };
+        if request.owner != smp_get_processor_id()
+            || request.loaded_vmcs.owner_cpu() != request.owner
+        {
+            REMOTE_LOADED_VMCS_CLEAR_DONE.store(true, Ordering::Release);
+            return;
+        }
+
+        if current_vmcs()
+            .as_ref()
+            .is_some_and(|vmcs| Arc::ptr_eq(vmcs, &request.vmcs))
+        {
+            *current_vmcs_mut() = None;
+        }
+        VmxAsm::vmclear(request.vmcs.phys_addr());
+        if request.launched {
+            if let Some(shadow) = &request.shadow_vmcs {
+                VmxAsm::vmclear(shadow.phys_addr());
+            }
+        }
+        current_loaded_vmcs_list_mut()
+            .extract_if(|entry| Arc::ptr_eq(entry, &request.loaded_vmcs))
+            .for_each(drop);
+        request.loaded_vmcs.set_owner_cpu(ProcessorId::INVALID);
+        REMOTE_LOADED_VMCS_CLEAR_DONE.store(true, Ordering::Release);
     }
 
     pub fn seg_setup(&self, seg: VcpuSegment) {
@@ -1210,6 +1319,31 @@ impl KvmFunc for VmxKvmFunc {
         }
     }
 
+    fn cache_exit_info(&self, vcpu: &mut VirtCpu) {
+        if vcpu.vmx().emulation_required || vcpu.vmx().exit_reason.failed_vmentry() {
+            return;
+        }
+
+        if VmxExitReasonBasic::from(vcpu.vmx().exit_reason.basic())
+            == VmxExitReasonBasic::EPT_VIOLATION
+        {
+            let qualification = VmxAsm::vmx_vmread(ro::EXIT_QUALIFICATION);
+            let gpa = VmxAsm::vmx_vmread(ro::GUEST_PHYSICAL_ADDR_FULL);
+            vcpu.vmx_mut().exit_qualification = qualification;
+            vcpu.vmx_mut().exit_gpa = gpa;
+            vcpu.arch
+                .mark_register_available(KvmReg::VcpuExregExitInfo1);
+
+            if vcpu.vmx().idt_vectoring_info.bits() & IntrInfo::INTR_INFO_VALID_MASK.bits() == 0
+                && vmx_info().enable_vnmi
+                && qualification & IntrInfo::INTR_INFO_UNBLOCK_NMI.bits() as u64 != 0
+            {
+                let state = VmxAsm::vmx_vmread(guest::INTERRUPTIBILITY_STATE);
+                VmxAsm::vmx_vmwrite(guest::INTERRUPTIBILITY_STATE, state | (1 << 3));
+            }
+        }
+    }
+
     fn handle_exit(
         //vmx_handle_exit
         &self,
@@ -1904,6 +2038,7 @@ impl Vmx {
     }
 
     /// 打印VMCS信息用于debug
+    #[allow(dead_code)]
     pub fn dump_vmcs(&self, vcpu: &VirtCpu) {
         let vmentry_ctl = unsafe {
             EntryControls::from_bits_unchecked(self.vmread(control::VMENTRY_CONTROLS) as u32)
@@ -2218,6 +2353,7 @@ impl Vmx {
         }
     }
 
+    #[allow(dead_code)]
     pub fn dump_sel(&self, name: &'static str, sel: u32) {
         error!(
             "{name} sel = 0x{:x}, attr = 0x{:x}, limit = 0x{:x}, base = 0x{:x}",
@@ -2228,6 +2364,7 @@ impl Vmx {
         );
     }
 
+    #[allow(dead_code)]
     pub fn dump_dtsel(&self, name: &'static str, limit: u32) {
         error!(
             "{name} limit = 0x{:x}, base = 0x{:x}",
@@ -2236,6 +2373,7 @@ impl Vmx {
         );
     }
 
+    #[allow(dead_code)]
     pub fn dump_msrs(&self, name: &'static str, msr: &VmxMsrs) {
         error!("MSR {name}:");
         for (idx, msr) in msr.val.iter().enumerate() {
@@ -2244,6 +2382,7 @@ impl Vmx {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn vmread(&self, field: u32) -> u64 {
         VmxAsm::vmx_vmread(field)
     }
@@ -3006,14 +3145,9 @@ impl Vmx {
     ) -> Result<i32, SystemError> {
         let exit_reason = vcpu.vmx().exit_reason;
         // self.dump_vmcs(vcpu);
-        {
-            let reason = self.vmread(ro::EXIT_REASON);
-            debug!("vm_exit reason 0x{:x}\n", reason);
-        }
+        debug!("vm_exit reason {:?}\n", exit_reason);
         let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<i32, SystemError> {
             error!("vmx: unexpected exit reason {:?}\n", exit_reason);
-
-            self.dump_vmcs(vcpu);
 
             let cpu = vcpu.arch.last_vmentry_cpu.into() as u64;
             let run = vcpu.kvm_run_mut();
@@ -3047,12 +3181,10 @@ impl Vmx {
         }
 
         if exit_reason.failed_vmentry() {
-            self.dump_vmcs(vcpu);
             todo!()
         }
 
         if unlikely(vcpu.vmx().fail != 0) {
-            self.dump_vmcs(vcpu);
             todo!()
         }
 
@@ -3272,6 +3404,7 @@ pub struct VmxVCpuPriv {
     guest_state_loaded: bool,
 
     exit_qualification: u64, //暂时不知道用处fztodo
+    exit_gpa: u64,
 }
 
 #[derive(Debug, Default)]
@@ -3333,6 +3466,7 @@ impl VmxVCpuPriv {
             exit_intr_info: IntrInfo::empty(),
             msr_autostore: VmxMsrs::default(),
             exit_qualification: 0, //fztodo
+            exit_gpa: 0,
         };
 
         vmx.vpid = vmx_info().alloc_vpid().unwrap_or_default() as u16;
@@ -3637,6 +3771,11 @@ impl VmxVCpuPriv {
     pub fn get_exit_qual(&self) -> u64 {
         self.exit_qualification
     }
+
+    pub fn get_exit_gpa(&self) -> u64 {
+        self.exit_gpa
+    }
+
     pub fn vmread_exit_qual(&mut self) {
         self.exit_qualification = VmxAsm::vmx_vmread(ro::EXIT_QUALIFICATION);
     }

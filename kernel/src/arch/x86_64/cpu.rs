@@ -3,13 +3,20 @@ use core::hint::spin_loop;
 use raw_cpuid::CpuId;
 use x86::msr::{rdmsr, IA32_APIC_BASE, IA32_X2APIC_APICID};
 
-use crate::{arch::smp::SMP_BOOT_DATA, smp::cpu::ProcessorId};
+use crate::{
+    arch::{process::table::TSSManager, smp::SMP_BOOT_DATA},
+    smp::cpu::ProcessorId,
+};
 
 /// 获取当前CPU的逻辑编号
 #[inline]
 pub fn current_cpu_id() -> ProcessorId {
     if !SMP_BOOT_DATA.is_initialized() {
         return ProcessorId::new(0);
+    }
+
+    if let Some(cpu) = TSSManager::current_cpu_from_tr() {
+        return cpu;
     }
 
     let x2apic_id = current_x2apic_physical_id();

@@ -610,6 +610,68 @@ TEST(SysvShmSemantics, ShmNattchTracksAttachDetach) {
     EXPECT_EQ(0, ShmNattch(shm.id()));
 }
 
+TEST(SysvShmSemantics, ThreeAliasesRemainCoherentWhileDetachedIndividually) {
+    ShmSegment shm(SegmentSize());
+    ASSERT_TRUE(shm.valid()) << "shmget failed: errno=" << errno << " (" << strerror(errno)
+                             << ")";
+
+    char* aliases[3] = {nullptr, nullptr, nullptr};
+    size_t attached = 0;
+    for (; attached < 3; ++attached) {
+        aliases[attached] = static_cast<char*>(Attach(shm.id()));
+        if (aliases[attached] == MAP_FAILED) {
+            break;
+        }
+    }
+    if (attached != 3) {
+        const int attach_errno = errno;
+        while (attached > 0) {
+            --attached;
+            (void)shmdt(aliases[attached]);
+        }
+        ADD_FAILURE() << "shmat failed: errno=" << attach_errno << " ("
+                      << strerror(attach_errno) << ")";
+        return;
+    }
+
+    const size_t ps = PageSize();
+    for (size_t page = 0; page < SegmentSize() / ps; ++page) {
+        aliases[0][page * ps] = static_cast<char>('a' + page);
+        EXPECT_EQ(aliases[0][page * ps], aliases[1][page * ps]);
+        EXPECT_EQ(aliases[0][page * ps], aliases[2][page * ps]);
+    }
+
+    if (shmdt(aliases[0]) == 0) {
+        aliases[0] = nullptr;
+    } else {
+        ADD_FAILURE() << "shmdt(first alias) failed: errno=" << errno << " (" << strerror(errno)
+                      << ")";
+    }
+    aliases[1][ps] = 'x';
+    EXPECT_EQ('x', aliases[2][ps]);
+
+    if (shmdt(aliases[1]) == 0) {
+        aliases[1] = nullptr;
+    } else {
+        ADD_FAILURE() << "shmdt(second alias) failed: errno=" << errno << " (" << strerror(errno)
+                      << ")";
+    }
+    EXPECT_EQ('x', aliases[2][ps]);
+
+    if (shmdt(aliases[2]) == 0) {
+        aliases[2] = nullptr;
+    } else {
+        ADD_FAILURE() << "shmdt(third alias) failed: errno=" << errno << " (" << strerror(errno)
+                      << ")";
+    }
+
+    for (char* alias : aliases) {
+        if (alias != nullptr) {
+            (void)shmdt(alias);
+        }
+    }
+}
+
 TEST(SysvShmSemantics, DetachedSegmentPersists) {
     ShmSegment shm(SegmentSize());
     ASSERT_TRUE(shm.valid());

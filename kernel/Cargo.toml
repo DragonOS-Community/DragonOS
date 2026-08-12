@@ -87,6 +87,7 @@ system_error = { path = "crates/system_error" }
 unified-init = { path = "crates/unified-init" }
 virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "82d783c935084a67c2e0a3bead0266a66aed80fd" }
 wait_queue_macros = { path = "crates/wait_queue_macros" }
+tpacket = { path = "crates/tpacket" }
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"

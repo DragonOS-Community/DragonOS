@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -42,10 +43,12 @@ inline constexpr int kSoRcvtimeoOld = 20;
 inline constexpr int kSoSndtimeoOld = 21;
 inline constexpr int kSoRcvtimeoNew = 66;
 inline constexpr int kSoSndtimeoNew = 67;
+inline constexpr int kTcpUlp = 31;
 inline constexpr int kSoAttachFilter = 26;
 inline constexpr int kSoGetFilter = kSoAttachFilter;
 inline constexpr int kSoDetachFilter = 27;
 inline constexpr int kSoLockFilter = 44;
+inline constexpr int kTcpCongestion = 13;
 
 // Classic BPF encodings used here are kept local because DragonOS musl may
 // not ship linux/filter.h in every test image.
@@ -104,6 +107,9 @@ static_assert(sizeof(TestFanoutArgs) == 8);
 #endif
 #ifndef PACKET_VERSION
 #define PACKET_VERSION 10
+#endif
+#ifndef PACKET_HDRLEN
+#define PACKET_HDRLEN 11
 #endif
 #ifndef PACKET_RESERVE
 #define PACKET_RESERVE 12
@@ -257,6 +263,70 @@ TEST(AfPacketSockopt, CreateDgramSocket) {
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
 }
 
+TEST(AfPacketSockopt, ScalarOptionReadsOnlyItsConsumedPrefix) {
+    FdGuard fd(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto* mapping = static_cast<uint8_t*>(
+        mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(mapping, MAP_FAILED) << ErrnoString(errno);
+    ASSERT_EQ(mprotect(mapping + page, page, PROT_NONE), 0) << ErrnoString(errno);
+
+    auto* value = reinterpret_cast<int*>(mapping + page - sizeof(int));
+    *value = 16384;
+    constexpr socklen_t kOversizedOptlen = 16 * 1024 * 1024;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, SO_RCVBUF, value, kOversizedOptlen), 0)
+        << "a scalar option must not read or allocate its unused optlen tail: "
+        << ErrnoString(errno);
+
+    ASSERT_EQ(munmap(mapping, page * 2), 0) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, ScalarShortLengthWinsOverBadPointer) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    for (socklen_t len = 0; len < sizeof(int); ++len) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_AUXDATA,
+                             reinterpret_cast<const void*>(1), len),
+                  -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << len;
+    }
+}
+
+TEST(AfPacketSockopt, TcpCongestionStopsAtNulBeforeInaccessibleTail) {
+    FdGuard fd(socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto* mapping = static_cast<uint8_t*>(
+        mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(mapping, MAP_FAILED) << ErrnoString(errno);
+    ASSERT_EQ(mprotect(mapping + page, page, PROT_NONE), 0) << ErrnoString(errno);
+
+    constexpr char kReno[] = "reno";
+    auto* name = reinterpret_cast<char*>(mapping + page - sizeof(kReno));
+    std::memcpy(name, kReno, sizeof(kReno));
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_TCP, kTcpCongestion, name, 16), 0)
+        << "TCP_CONGESTION must stop at its NUL terminator: " << ErrnoString(errno);
+
+    ASSERT_EQ(munmap(mapping, page * 2), 0) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, TcpUlpCopiesShortNameBeforeReportingUnsupported) {
+    FdGuard fd(socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    constexpr char kTls[] = {'t', 'l', 's'};
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_TCP, kTcpUlp, kTls, sizeof(kTls)), -1);
+    EXPECT_EQ(errno, ENOENT)
+        << "the three-byte ULP name must pass bounded-string copying before "
+           "the unavailable ULP is reported";
+}
+
 // Linux 6.6 packet_do_bind() substitutes po->num when sll_protocol is zero.
 // Binding with protocol zero therefore selects only the interface and keeps
 // the protocol supplied to socket(), rather than disabling packet delivery.
@@ -304,8 +374,10 @@ TEST(AfPacketSockopt, AuxdataDisableRoundtrip) {
 TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
-    const int options[] = {PACKET_COPY_THRESH, PACKET_ORIGDEV, PACKET_VERSION,
-                           PACKET_RESERVE, PACKET_VNET_HDR, PACKET_TX_TIMESTAMP,
+    // PACKET_VERSION is now a validated option (accepts V1/V2, rejects others).
+    // PACKET_COPY_THRESH now returns ENOPROTOOPT (Phase 1: not implemented).
+    const int options[] = {PACKET_ORIGDEV,
+                           PACKET_VNET_HDR, PACKET_TX_TIMESTAMP,
                            PACKET_TIMESTAMP, PACKET_QDISC_BYPASS, 9999};
     for (int option : options) {
         ASSERT_EQ(SetIntOpt(fd.Get(), option, 999), 0)
@@ -315,6 +387,114 @@ TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
         EXPECT_EQ(GetIntOpt(fd.Get(), option, &got), -1) << "option=" << option;
         EXPECT_EQ(errno, ENOPROTOOPT) << "option=" << option << ": " << ErrnoString(errno);
     }
+}
+
+TEST(AfPacketSockopt, PacketReserveFollowsUnsignedIntAbi) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    for (uint32_t value : {0U, static_cast<uint32_t>(INT32_MAX)}) {
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, &value, sizeof(value)), 0)
+            << ErrnoString(errno);
+        uint32_t got = UINT32_MAX;
+        socklen_t len = sizeof(got);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, &got, &len), 0)
+            << ErrnoString(errno);
+        EXPECT_EQ(len, sizeof(got));
+        EXPECT_EQ(got, value);
+    }
+
+    for (uint32_t value : {static_cast<uint32_t>(INT32_MAX) + 1U, UINT32_MAX}) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, &value, sizeof(value)), -1);
+        EXPECT_EQ(errno, EINVAL) << value;
+    }
+
+    uint8_t value_bytes[5] = {1, 0, 0, 0, 0};
+    for (socklen_t len : {0U, 3U, 5U}) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, value_bytes, len), -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << len;
+
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE,
+                             reinterpret_cast<void*>(1), len), -1);
+        EXPECT_EQ(errno, EINVAL) << "bad pointer, len=" << len;
+    }
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE,
+                         reinterpret_cast<void*>(1), sizeof(uint32_t)), -1);
+    EXPECT_EQ(errno, EFAULT);
+
+    socklen_t len = sizeof(uint32_t);
+    errno = 0;
+    EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, nullptr, &len), -1);
+    EXPECT_EQ(errno, EFAULT);
+    len = 0;
+    EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_RESERVE, nullptr, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(len, 0U);
+}
+
+TEST(AfPacketSockopt, GetsockoptReadsOnlyPacketHdrlenInput) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    auto* pages = static_cast<uint8_t*>(mmap(nullptr, page_size * 2, PROT_READ | PROT_WRITE,
+                                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(pages, MAP_FAILED) << ErrnoString(errno);
+    ASSERT_EQ(mprotect(pages + page_size, page_size, PROT_NONE), 0);
+    auto* tail = reinterpret_cast<int*>(pages + page_size - sizeof(int));
+
+    *tail = -1;
+    socklen_t len = static_cast<socklen_t>(page_size);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_VERSION, tail, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(len, sizeof(int));
+    EXPECT_EQ(*tail, TPACKET_V1);
+
+    *tail = TPACKET_V2;
+    len = static_cast<socklen_t>(page_size * 4);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_HDRLEN, tail, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(len, sizeof(int));
+    EXPECT_EQ(*tail, static_cast<int>(sizeof(uint32_t) * 8));
+
+    int version = TPACKET_V1;
+    for (socklen_t short_len : {0U, 1U, 2U, 3U}) {
+        len = short_len;
+        errno = 0;
+        EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_HDRLEN, &version, &len), -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << short_len;
+    }
+    len = sizeof(int);
+    errno = 0;
+    EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_HDRLEN, nullptr, &len), -1);
+    EXPECT_EQ(errno, EFAULT);
+
+    ASSERT_EQ(munmap(pages, page_size * 2), 0);
+}
+
+// PACKET_VERSION is now a validated setsockopt: accepts TPACKET_V1/V2,
+// rejects out-of-range values with EINVAL (matching Linux 6.6 behavior).
+TEST(AfPacketSockopt, PacketVersionAcceptsValidRejectsInvalid) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    // Valid versions succeed
+    EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, TPACKET_V1), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, TPACKET_V2), 0)
+        << ErrnoString(errno);
+    // Invalid version returns EINVAL
+    errno = 0;
+    EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, 999), -1);
+    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+    // getsockopt(PACKET_VERSION) returns the current version (Linux behavior)
+    int got = -1;
+    EXPECT_EQ(GetIntOpt(fd.Get(), PACKET_VERSION, &got), 0);
+    EXPECT_EQ(got, TPACKET_V2);
 }
 
 // ===== Test 15: PACKET_STATISTICS returns 8-byte struct =====

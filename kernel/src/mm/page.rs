@@ -69,6 +69,260 @@ pub fn page_manager_lock() -> MutexGuard<'static, PageManager> {
     unsafe { PAGE_MANAGER.as_ref().unwrap().lock() }
 }
 
+/// Maximum number of page identities changed while holding a global page
+/// registry lock. This bounds work by element count; HashMap growth itself is
+/// not a hard real-time operation.
+const PAGE_MANAGER_BULK_BATCH: usize = 64;
+
+/// Release an allocator-owned physical range as aligned buddy blocks.
+///
+/// The range may be a non-power-of-two suffix of a larger allocation. Splitting
+/// it into the largest aligned blocks avoids both invalid buddy frees and an
+/// O(n) one-frame-at-a-time teardown.
+unsafe fn free_aligned_frame_range(mut start: PhysAddr, mut pages: usize) {
+    while pages != 0 {
+        let pfn = start.data() / MMArch::PAGE_SIZE;
+        let alignment_pages = if pfn == 0 {
+            usize::MAX
+        } else {
+            1usize << pfn.trailing_zeros()
+        };
+        let length_pages = 1usize << (usize::BITS - 1 - pages.leading_zeros());
+        let block_pages = alignment_pages.min(length_pages);
+        LockedFrameAllocator.free(start, PageFrameCount::new(block_pages));
+        start = PhysAddr::new(start.data() + block_pages * MMArch::PAGE_SIZE);
+        pages -= block_pages;
+    }
+}
+
+/// Owns the part of a raw buddy allocation not yet transferred to `Page`.
+struct RawFrameExtent {
+    next: PhysAddr,
+    remaining: usize,
+}
+
+impl RawFrameExtent {
+    fn trim_to(&mut self, requested: usize) {
+        debug_assert!(requested <= self.remaining);
+        let tail = self.remaining - requested;
+        if tail != 0 {
+            let tail_start = PhysAddr::new(self.next.data() + requested * MMArch::PAGE_SIZE);
+            unsafe { free_aligned_frame_range(tail_start, tail) };
+            self.remaining = requested;
+        }
+    }
+
+    fn transfer_to_extent_owner(&mut self) {
+        self.remaining = 0;
+    }
+}
+
+impl Drop for RawFrameExtent {
+    fn drop(&mut self) {
+        if self.remaining != 0 {
+            unsafe { free_aligned_frame_range(self.next, self.remaining) };
+        }
+    }
+}
+
+/// Owns one exact physically-contiguous allocation after raw construction.
+///
+/// Every `Page` created from the run pins this object. The final pin returns
+/// the run as aligned buddy blocks, avoiding one global allocator lock per
+/// 4-KiB page while still delaying reuse until all transient page references
+/// have disappeared.
+#[derive(Debug)]
+struct ContiguousFrameOwner {
+    start: PhysAddr,
+    pages: usize,
+}
+
+impl Drop for ContiguousFrameOwner {
+    fn drop(&mut self) {
+        unsafe { free_aligned_frame_range(self.start, self.pages) };
+    }
+}
+
+/// Registered, zeroed, intrinsically unevictable pages awaiting adoption by a
+/// private PageCache. Until `commit`, this guard owns PageManager membership
+/// and rolls it back by page identity on every failure path.
+pub struct ManagedPageBatch {
+    start_paddr: PhysAddr,
+    pages: Vec<Arc<Page>>,
+    registered: usize,
+    committed: bool,
+}
+
+impl ManagedPageBatch {
+    pub fn start_paddr(&self) -> PhysAddr {
+        self.start_paddr
+    }
+
+    pub fn pages(&self) -> &[Arc<Page>] {
+        &self.pages
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ManagedPageBatch {
+    fn drop(&mut self) {
+        if !self.committed && self.registered != 0 {
+            detach_pages_from_manager_batched(self.pages[..self.registered].iter());
+            self.registered = 0;
+        }
+    }
+}
+
+/// Allocate an exact user-visible run of zeroed Normal/PG_UNEVICTABLE pages.
+/// Slow allocation, zeroing, and `Arc<Page>` construction happen outside the
+/// global PageManager lock; only identity registration is performed there in
+/// bounded batches.
+pub fn allocate_registered_intrinsic_unevictable_pages_exact(
+    requested: PageFrameCount,
+) -> Result<ManagedPageBatch, SystemError> {
+    let requested_pages = requested.data();
+    if requested_pages == 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let allocator_pages = requested_pages
+        .checked_next_power_of_two()
+        .ok_or(SystemError::ENOMEM)?;
+
+    let (start_paddr, actual) = unsafe {
+        LockedFrameAllocator
+            .allocate(PageFrameCount::new(allocator_pages))
+            .ok_or(SystemError::ENOMEM)?
+    };
+    let mut raw = RawFrameExtent {
+        next: start_paddr,
+        remaining: actual.data(),
+    };
+    // FrameAllocator does not promise that an implementation returns at least
+    // the requested extent. Validate before zeroing or trimming so a short
+    // allocation cannot become an out-of-bounds write or arithmetic underflow.
+    if raw.remaining < requested_pages {
+        return Err(SystemError::ENOMEM);
+    }
+    let mut pages = Vec::new();
+    pages
+        .try_reserve_exact(requested_pages)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let bytes = requested_pages
+        .checked_mul(MMArch::PAGE_SIZE)
+        .ok_or(SystemError::ENOMEM)?;
+    let vaddr = unsafe { MMArch::phys_2_virt(start_paddr) }.ok_or(SystemError::EFAULT)?;
+
+    // Zero before PageManager/PageCache publication so recycled kernel data is
+    // never observable through a userspace mapping.
+    unsafe { MMArch::write_bytes(vaddr, 0, bytes) };
+    raw.trim_to(requested_pages);
+
+    let extent_owner = Arc::try_new(ContiguousFrameOwner {
+        start: start_paddr,
+        pages: requested_pages,
+    })
+    .map_err(|_| SystemError::ENOMEM)?;
+    raw.transfer_to_extent_owner();
+
+    for index in 0..requested_pages {
+        let paddr = PhysAddr::new(start_paddr.data() + index * MMArch::PAGE_SIZE);
+        pages.push(Page::try_new_with_contiguous_owner(
+            paddr,
+            PageType::Normal,
+            PageFlags::PG_UNEVICTABLE,
+            extent_owner.clone(),
+        )?);
+    }
+
+    let mut batch = ManagedPageBatch {
+        start_paddr,
+        pages,
+        registered: 0,
+        committed: false,
+    };
+    while batch.registered < batch.pages.len() {
+        let end = (batch.registered + PAGE_MANAGER_BULK_BATCH).min(batch.pages.len());
+        let chunk = &batch.pages[batch.registered..end];
+        {
+            let mut manager = page_manager_lock();
+            manager
+                .phys2page
+                .try_reserve(chunk.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            if chunk
+                .iter()
+                .any(|page| manager.phys2page.contains_key(&page.phys_address()))
+            {
+                return Err(SystemError::EEXIST);
+            }
+            for page in chunk {
+                manager.phys2page.insert(page.phys_address(), page.clone());
+            }
+        }
+        batch.registered = end;
+    }
+    Ok(batch)
+}
+
+/// Remove pinned pages from PageManager only when the registered identity is
+/// the expected `Arc<Page>`. Removed manager references are released after the
+/// global lock; callers retain their own page references for the whole call.
+pub fn detach_pages_from_manager_batched<'a>(pages: impl IntoIterator<Item = &'a Arc<Page>>) {
+    let mut pages = pages.into_iter();
+    let mut removed: [Option<Arc<Page>>; PAGE_MANAGER_BULK_BATCH] = core::array::from_fn(|_| None);
+    loop {
+        let mut count = 0;
+        let mut exhausted = false;
+        {
+            let mut manager = page_manager_lock();
+            while count < PAGE_MANAGER_BULK_BATCH {
+                let Some(page) = pages.next() else {
+                    exhausted = true;
+                    break;
+                };
+                removed[count] = manager.remove_page_if_same(page);
+                count += 1;
+            }
+        }
+        for slot in &mut removed[..count] {
+            drop(slot.take());
+        }
+        if exhausted {
+            break;
+        }
+    }
+}
+
+/// Identity-safe, bounded counterpart for the global page reclaimer registry.
+pub fn detach_pages_from_reclaimer_batched<'a>(pages: impl IntoIterator<Item = &'a Arc<Page>>) {
+    let mut pages = pages.into_iter();
+    let mut removed: [Option<Arc<Page>>; PAGE_MANAGER_BULK_BATCH] = core::array::from_fn(|_| None);
+    loop {
+        let mut count = 0;
+        let mut exhausted = false;
+        {
+            let mut reclaimer = page_reclaimer_lock();
+            while count < PAGE_MANAGER_BULK_BATCH {
+                let Some(page) = pages.next() else {
+                    exhausted = true;
+                    break;
+                };
+                removed[count] = reclaimer.remove_page_if_same(page);
+                count += 1;
+            }
+        }
+        for slot in &mut removed[..count] {
+            drop(slot.take());
+        }
+        if exhausted {
+            break;
+        }
+    }
+}
+
 // 物理页管理器
 pub struct PageManager {
     phys2page: HashMap<PhysAddr, Arc<Page>>,
@@ -116,6 +370,15 @@ impl PageManager {
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
         self.phys2page.remove(paddr)
+    }
+
+    fn remove_page_if_same(&mut self, expected: &Arc<Page>) -> Option<Arc<Page>> {
+        let paddr = expected.phys_address();
+        let current = self.phys2page.get(&paddr)?;
+        if !Arc::ptr_eq(current, expected) {
+            return None;
+        }
+        self.phys2page.remove(&paddr)
     }
 
     /// # 创建一个新页面并加入管理器
@@ -169,15 +432,49 @@ impl PageManager {
         let (start_paddr, count) = unsafe { allocator.allocate(count).ok_or(SystemError::ENOMEM)? };
         compiler_fence(Ordering::SeqCst);
 
+        let mut ret: Vec<Arc<Page>> = Vec::new();
+        if ret.try_reserve_exact(count.data()).is_err()
+            || self.phys2page.try_reserve(count.data()).is_err()
+        {
+            // No Page object exists yet, so the allocator still owns this
+            // extent as one unit. Reserve both metadata containers before
+            // publishing any Page, then return exactly what allocate() supplied
+            // if either reservation fails.
+            unsafe { allocator.free(start_paddr, count) };
+            return Err(SystemError::ENOMEM);
+        }
+
         unsafe {
             let vaddr = MMArch::phys_2_virt(start_paddr).unwrap();
             MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE * count.data());
         }
 
         let mut cur_phys = PhysPageFrame::new(start_paddr);
-        let mut ret: Vec<Arc<Page>> = Vec::new();
-        for _ in 0..count.data() {
-            let page = Page::new(cur_phys.phys_address(), page_type.clone(), flags);
+        for created in 0..count.data() {
+            let page = match Page::try_new(cur_phys.phys_address(), page_type.clone(), flags) {
+                Ok(page) => page,
+                Err(err) => {
+                    // Arc::try_new drops the just-constructed InnerPage on
+                    // failure, which releases the current frame. Published
+                    // prefix pages release individually after detaching from
+                    // PageManager; the untouched suffix still belongs to the
+                    // original extent and is returned as one range.
+                    for insert_page in ret {
+                        self.remove_page(&insert_page.read().phys_addr);
+                    }
+                    let remaining = count.data() - created - 1;
+                    let mut suffix = cur_phys.next();
+                    for _ in 0..remaining {
+                        // A failed Arc construction splits the original buddy
+                        // extent into individually owned/freed prefix pages.
+                        // Return the untouched suffix one page at a time so
+                        // arbitrary non-power-of-two tails coalesce safely.
+                        unsafe { allocator.free(suffix.phys_address(), PageFrameCount::ONE) };
+                        suffix = suffix.next();
+                    }
+                    return Err(err);
+                }
+            };
             if let Err(e) = self.insert(&page) {
                 for insert_page in ret {
                     self.remove_page(&insert_page.read().phys_addr);
@@ -350,6 +647,15 @@ impl PageReclaimer {
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
         self.lru.pop(paddr)
+    }
+
+    fn remove_page_if_same(&mut self, expected: &Arc<Page>) -> Option<Arc<Page>> {
+        let paddr = expected.phys_address();
+        let current = self.lru.peek(&paddr)?;
+        if !Arc::ptr_eq(current, expected) {
+            return None;
+        }
+        self.lru.pop(&paddr)
     }
 
     /// lru链表缩减（对外接口，内部自行获取/释放回收器锁）
@@ -705,6 +1011,9 @@ pub struct Page {
     inner: RwSem<InnerPage>,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
+    /// Pins a bulk allocation when this page is one member of a contiguous
+    /// run. Ordinary pages own and release their frame individually.
+    contiguous_owner: Option<Arc<ContiguousFrameOwner>>,
 }
 
 impl Page {
@@ -720,16 +1029,37 @@ impl Page {
     /// ## 返回值
     ///
     /// - `Arc<Page>`: 新页面
-    fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
-        let inner = InnerPage::new(phys_addr, page_type, flags);
-        let page = Arc::new(Self {
+    fn try_new(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+    ) -> Result<Arc<Page>, SystemError> {
+        let inner = InnerPage::new(phys_addr, page_type, flags, true);
+        let page = Arc::try_new(Self {
             inner: RwSem::new(inner),
             phys_addr,
-        });
+            contiguous_owner: None,
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
         if page.read().flags == PageFlags::PG_LRU {
             page_reclaimer_lock().insert_page(phys_addr, &page);
         };
-        page
+        Ok(page)
+    }
+
+    fn try_new_with_contiguous_owner(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+        owner: Arc<ContiguousFrameOwner>,
+    ) -> Result<Arc<Page>, SystemError> {
+        let inner = InnerPage::new(phys_addr, page_type, flags, false);
+        Arc::try_new(Self {
+            inner: RwSem::new(inner),
+            phys_addr,
+            contiguous_owner: Some(owner),
+        })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
     /// # 拷贝页面及内容
@@ -749,7 +1079,7 @@ impl Page {
     ) -> Result<Arc<Page>, SystemError> {
         let page_type = old_guard.page_type().clone();
         let flags = *old_guard.flags();
-        let inner = InnerPage::new(new_phys, page_type, flags);
+        let inner = InnerPage::new(new_phys, page_type, flags, true);
         unsafe {
             let old_vaddr =
                 MMArch::phys_2_virt(old_guard.phys_address()).ok_or(SystemError::EFAULT)?;
@@ -760,6 +1090,7 @@ impl Page {
         Ok(Arc::new(Self {
             inner: RwSem::new(inner),
             phys_addr: new_phys,
+            contiguous_owner: None,
         }))
     }
 
@@ -787,6 +1118,13 @@ impl Page {
     pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, InnerPage>> {
         self.inner.try_write()
     }
+
+    pub(crate) fn shares_contiguous_frame_owner(&self, other: &Self) -> bool {
+        match (&self.contiguous_owner, &other.contiguous_owner) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -813,10 +1151,18 @@ pub struct InnerPage {
     phys_addr: PhysAddr,
     /// 页面类型
     page_type: PageType,
+    /// Ordinary pages return their own frame. Bulk pages instead pin a shared
+    /// contiguous owner stored by `Page`.
+    individually_owns_frame: bool,
 }
 
 impl InnerPage {
-    pub fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Self {
+    pub fn new(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+        individually_owns_frame: bool,
+    ) -> Self {
         let intrinsic_unevictable =
             flags.contains(PageFlags::PG_UNEVICTABLE) && !matches!(page_type, PageType::File(_));
         Self {
@@ -827,6 +1173,7 @@ impl InnerPage {
             flags,
             phys_addr,
             page_type,
+            individually_owns_frame,
         }
     }
 
@@ -914,6 +1261,10 @@ impl InnerPage {
                 .page_cache()
                 .map(|page_cache| page_cache.mapping_unevictable())
                 .unwrap_or(false)
+    }
+
+    pub(crate) fn intrinsic_unevictable(&self) -> bool {
+        self.intrinsic_unevictable
     }
 
     pub fn clear_mapping_unevictable_source_for_cow(&mut self) {
@@ -1038,9 +1389,11 @@ impl Drop for InnerPage {
             "page drop when map count is non-zero"
         );
 
-        unsafe {
-            deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
-        };
+        if self.individually_owns_frame {
+            unsafe {
+                deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
+            };
+        }
     }
 }
 

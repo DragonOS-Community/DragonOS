@@ -436,6 +436,11 @@ impl super::TcpSocket {
                 self.apply_congestion_control(cc);
                 Ok(())
             }
+            // The copy layer accepts TCP_ULP's bounded string ABI, but no ULP
+            // registry or attachment mechanism exists yet. Linux reports
+            // ENOENT when the requested ULP cannot be found; never claim that
+            // an unsupported transport transform was installed.
+            Options::ULP => Err(SystemError::ENOENT),
             Options::MaxSegment => {
                 let v = byte_parser::read_u32(val)?;
                 if !(constants::TCP_MIN_MSS..=constants::MAX_TCP_WINDOW).contains(&v) {

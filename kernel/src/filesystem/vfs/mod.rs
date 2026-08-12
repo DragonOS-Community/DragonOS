@@ -2025,6 +2025,8 @@ bitflags! {
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
         const PIDFD_MAGIC = 0x50494446; // "PIDF" in ASCII
+        // Linux UAPI: SOCKFS_MAGIC.
+        const SOCKFS_MAGIC = 0x534f434b;
         const OVERLAYFS_MAGIC = 0x794c7630;
     }
 }
@@ -2236,6 +2238,20 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         Ok(())
     }
 
+    /// Called before a cloned or split file-backed VMA becomes visible.
+    ///
+    /// This callback is deliberately infallible and must be limited to VMA
+    /// lifetime accounting. Implementations must not access userspace, fault,
+    /// re-enter the MM, or acquire an address-space lock.
+    fn vma_open(
+        &self,
+        _file: &Arc<File>,
+        _region: VirtRegion,
+        _vm_flags: VmFlags,
+    ) -> VmaOpenRollback {
+        VmaOpenRollback::NotRequired
+    }
+
     /// Called when a file-backed VMA range is genuinely detached from an address space.
     ///
     /// This is not called for VMA split/reinsert used by mprotect-like metadata
@@ -2254,6 +2270,14 @@ pub trait FileSystem: Any + Sync + Send + Debug {
             crate::libs::name::get_type_name(&self)
         )
     }
+}
+
+/// Whether an infallible `vma_open` changed filesystem state that must be
+/// undone if a not-yet-visible VMA is rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmaOpenRollback {
+    NotRequired,
+    Close,
 }
 
 impl DowncastArc for dyn FileSystem {

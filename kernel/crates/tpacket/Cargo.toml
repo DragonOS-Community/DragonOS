@@ -1,0 +1,9 @@
+[package]
+name = "tpacket"
+version = "0.1.0"
+edition = "2021"
+description = "TPACKET ring buffer UAPI types and configuration validation (Linux if_packet.h compatible)"
+
+# See more keys at their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]

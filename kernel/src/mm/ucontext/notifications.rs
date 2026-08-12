@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Debug)]
 pub(crate) struct VmaCloseNotification {
     pub(crate) file: Arc<File>,
     pub(crate) region: VirtRegion,
@@ -133,6 +134,7 @@ pub(super) struct MadviseVmaPlan {
 pub(super) struct VmaSplitLifecycle {
     pub(super) sysv_shm: Option<Arc<SysVShmAttach>>,
     pub(super) open_count: usize,
+    pub(super) file_opens: Vec<VmaCloseNotification>,
     pub(super) committed: bool,
 }
 
@@ -141,6 +143,7 @@ impl VmaSplitLifecycle {
         Self {
             sysv_shm: None,
             open_count: 0,
+            file_opens: Vec::new(),
             committed: false,
         }
     }
@@ -158,6 +161,7 @@ impl VmaSplitLifecycle {
                 notifications.sysv.push(sysv_shm.clone());
             }
         }
+        notifications.vma.append(&mut self.file_opens);
         self.open_count = 0;
         self.committed = true;
     }
@@ -176,7 +180,7 @@ impl Drop for VmaSplitLifecycle {
             return;
         }
         error!(
-            "VmaSplitLifecycle dropped without explicit commit/rollback; SysV SHM close must be routed through VmaCloseNotifications"
+            "VmaSplitLifecycle dropped without explicit commit/rollback; VMA closes must be routed through VmaCloseNotifications"
         );
     }
 }

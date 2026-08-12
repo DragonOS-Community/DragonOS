@@ -135,6 +135,7 @@ impl InnerAddressSpace {
                 let region = *vma_guard.region();
                 let page_flags = vma_guard.flags();
                 let sysv_shm = vma_guard.sysv_shm();
+                let vm_file = vma_guard.vm_file();
 
                 // Create new VMA
                 let mut child_vma = vma_guard.clone_info_only();
@@ -150,6 +151,17 @@ impl InnerAddressSpace {
                         }
                         return Err(err);
                     }
+                }
+
+                if let Some(file) = vm_file {
+                    // The VMA has already been inserted into the private child
+                    // mm, so its lifetime is owned by that complete address
+                    // space even if page-table cloning later fails. Dropping a
+                    // failed child runs normal unmap_all()/vma_close for every
+                    // installed VMA, matching Linux dup_mmap()/exit_mmap().
+                    // VmaOpenRollback is only for a local speculative VMA that
+                    // has not been transferred into any VMA collection.
+                    let _rollback = file.with_io_fs(|fs| fs.vma_open(&file, region, vm_flags));
                 }
 
                 // Apply different page copy strategies based on VMA type

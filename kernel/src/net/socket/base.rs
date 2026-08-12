@@ -1,7 +1,10 @@
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        vfs::{fasync::FAsyncItems, FilePrivateData, IndexNode, InodeId, PollableInode},
+        page_cache::PageCache,
+        vfs::{
+            fasync::FAsyncItems, FilePrivateData, FileSystem, IndexNode, InodeId, PollableInode,
+        },
     },
     libs::wait_queue::WaitQueue,
     net::{
@@ -21,9 +24,19 @@ use super::{
     posix::{PMSG, PSOL},
 };
 
+/// Layout information for mmap-backed sockets (e.g. AF_PACKET TPACKET rings).
+///
+/// Returned by [`Socket::mmap_layout`] to supply dynamic backing metadata.
+pub struct SocketMmapLayout {
+    /// Page cache backing the mapped pages.
+    pub page_cache: Arc<PageCache>,
+    /// Logical size of the mapped region in bytes (for `filemap_fault` bounds check).
+    pub size: usize,
+}
+
 /// # `Socket` methods
 /// ## Reference
-/// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
+/// - [Posix standard](https://pubs.opengion.org/onlinepubs/9699919799/)
 pub trait Socket: PollableInode + IndexNode {
     /// Open-file refcount for this socket.
     ///
@@ -260,6 +273,33 @@ pub trait Socket: PollableInode + IndexNode {
     /// # `write`
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
         self.send(buffer, PMSG::empty())
+    }
+    /// Returns mmap layout for mmap-backed sockets.
+    ///
+    /// Default `None` — most sockets don't support mmap. AF_PACKET overrides this
+    /// to expose the TPACKET ring buffer to the page-fault path.
+    fn mmap_layout(&self) -> Option<SocketMmapLayout> {
+        None
+    }
+
+    /// Stable filesystem operations for mmap-backed socket inodes. Kept
+    /// separate from dynamic ring layout so fault dispatch does not lock the
+    /// ring writer or allocate a fresh ops object.
+    fn mmap_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        None
+    }
+
+    /// Validate an mmap request before the VMA is installed.
+    ///
+    /// Default implementation checks the bounds against `mmap_layout().size`.
+    /// AF_PACKET overrides this to enforce Linux's `offset == 0 && len == ring_size`
+    /// contract and track the VMA for teardown EBUSY accounting.
+    fn mmap_validate(&self, len: usize, offset: usize) -> Result<(), SystemError> {
+        let layout = self.mmap_layout().ok_or(SystemError::EINVAL)?;
+        if offset.checked_add(len).is_none_or(|end| end > layout.size) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(())
     }
 }
 

@@ -11,8 +11,9 @@ use crate::net::socket::common::{
 use crate::net::socket::{PSO, PSOL};
 use crate::rcu::rcu_defer_drop;
 
+use super::ring::PacketRing;
+use super::uapi::tpacket_version;
 use super::{packet_option, PacketSocket};
-
 impl PacketSocket {
     fn socket_timeout_ticks(&self, name: usize) -> Result<&AtomicU64, SystemError> {
         match PSO::try_from(name as u32) {
@@ -27,6 +28,13 @@ impl PacketSocket {
             return Err(SystemError::EINVAL);
         }
         Ok(i32::from_ne_bytes(value[..4].try_into().unwrap()))
+    }
+
+    fn parse_u32_exact(value: &[u8]) -> Result<u32, SystemError> {
+        if value.len() != core::mem::size_of::<u32>() {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(u32::from_ne_bytes(value.try_into().unwrap()))
     }
 
     fn parse_fanout(value: &[u8]) -> Result<(u32, u32), SystemError> {
@@ -58,9 +66,11 @@ impl PacketSocket {
                     if value.len() < 8 {
                         return Err(SystemError::EINVAL);
                     }
-                    let accepted = self.stats_packets.swap(0, Ordering::Relaxed);
+                    // Linux clear-on-read semantics: tp_packets = accepted + drops.
                     let drops = self.stats_drops.swap(0, Ordering::Relaxed);
-                    value[..4].copy_from_slice(&accepted.wrapping_add(drops).to_ne_bytes());
+                    let packets = self.stats_packets.swap(0, Ordering::Relaxed);
+                    let total = packets.wrapping_add(drops);
+                    value[..4].copy_from_slice(&total.to_ne_bytes());
                     value[4..8].copy_from_slice(&drops.to_ne_bytes());
                     Ok(8)
                 }
@@ -68,6 +78,32 @@ impl PacketSocket {
                     value,
                     self.options.read().auxdata as i32,
                 )),
+                packet_option::PACKET_VERSION => {
+                    let v = match self.ring_state.lock().version {
+                        super::ring::TpacketVersion::V1 => tpacket_version::TPACKET_V1,
+                        super::ring::TpacketVersion::V2 => tpacket_version::TPACKET_V2,
+                    };
+                    Ok(write_i32_getsockopt(value, v))
+                }
+                packet_option::PACKET_RESERVE => {
+                    Ok(write_u32_getsockopt(value, self.ring_state.lock().reserve))
+                }
+                packet_option::PACKET_HDRLEN => {
+                    // Linux in/out semantics: the caller passes the TPACKET
+                    // version in optval[0..4]; we return sizeof(hdr) for that
+                    // version (V1=32 on the supported 64-bit ABI, V2=32).
+                    let v = Self::parse_i32(value)?;
+                    let hdrlen = match v {
+                        tpacket_version::TPACKET_V1 => {
+                            core::mem::size_of::<super::uapi::TpacketHdr>() as i32
+                        }
+                        tpacket_version::TPACKET_V2 => {
+                            core::mem::size_of::<super::uapi::Tpacket2Hdr>() as i32
+                        }
+                        _ => return Err(SystemError::EINVAL),
+                    };
+                    Ok(write_i32_getsockopt(value, hdrlen))
+                }
                 packet_option::PACKET_FANOUT => {
                     // Linux packet_getsockopt: an unjoined socket reports 0.
                     let val = self.fanout_getsockopt_value().unwrap_or(0) as i32;
@@ -92,6 +128,117 @@ impl PacketSocket {
                 packet_option::PACKET_AUXDATA => {
                     self.options.write().auxdata = Self::parse_i32(value)? != 0;
                     Ok(())
+                }
+                packet_option::PACKET_VERSION => {
+                    let v = Self::parse_i32(value)?;
+                    let new_version = match v {
+                        tpacket_version::TPACKET_V1 => super::ring::TpacketVersion::V1,
+                        tpacket_version::TPACKET_V2 => super::ring::TpacketVersion::V2,
+                        _ => return Err(SystemError::EINVAL),
+                    };
+                    let _control = self.ring_control_lock.lock();
+                    let mut state = self.ring_state.lock();
+                    if state.ring.is_some() {
+                        return Err(SystemError::EBUSY);
+                    }
+                    state.version = new_version;
+                    Ok(())
+                }
+                packet_option::PACKET_RESERVE => {
+                    let v = Self::parse_u32_exact(value)?;
+                    if v > i32::MAX as u32 {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let _control = self.ring_control_lock.lock();
+                    let mut state = self.ring_state.lock();
+                    if state.ring.is_some() {
+                        return Err(SystemError::EBUSY);
+                    }
+                    state.reserve = v;
+                    Ok(())
+                }
+                packet_option::PACKET_RX_RING => {
+                    if value.len() < 16 {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let req = super::uapi::TpacketReq {
+                        tp_block_size: u32::from_ne_bytes(value[0..4].try_into().unwrap()),
+                        tp_block_nr: u32::from_ne_bytes(value[4..8].try_into().unwrap()),
+                        tp_frame_size: u32::from_ne_bytes(value[8..12].try_into().unwrap()),
+                        tp_frame_nr: u32::from_ne_bytes(value[12..16].try_into().unwrap()),
+                    };
+                    // Match Linux lock_sock(): serialize control-plane changes
+                    // while keeping slow allocation and destruction off the
+                    // ring_state lock used by ingress and poll.
+                    let _control = self.ring_control_lock.lock();
+                    // The queue-to-state order is shared with the legacy RX
+                    // commit path, making ring cutover and final enqueue one
+                    // atomic state transition.
+                    let mut queue = self.rx_buffer.lock();
+                    let mut state = self.ring_state.lock();
+                    // Linux checks mapped before classifying or validating any
+                    // setup/teardown request.
+                    if state.mapped > 0 {
+                        return Err(SystemError::EBUSY);
+                    }
+                    // A zero block count selects teardown. Only frame_nr must
+                    // also be zero; the two size fields are ignored.
+                    if req.tp_block_nr == 0 {
+                        if req.tp_frame_nr != 0 {
+                            return Err(SystemError::EINVAL);
+                        }
+                        let old_ring = state.ring.take();
+                        let old_queue = core::mem::take(&mut *queue);
+                        state.advance_rx_generation();
+                        drop(state);
+                        drop(queue);
+                        // Match Linux synchronize_net(): once the instance is
+                        // no longer published, wait for all operations that
+                        // registered under ring_state before returning from
+                        // teardown or allowing a new setup transaction.
+                        if let Some(ring) = old_ring.as_ref() {
+                            ring.synchronize_access();
+                        }
+                        // Page-cache/ring destruction may be expensive and
+                        // remains outside the data-plane state locks.
+                        self.release_rx_queue(old_queue);
+                        drop(old_ring);
+                        return Ok(());
+                    }
+                    if state.ring.is_some() {
+                        return Err(SystemError::EBUSY);
+                    }
+                    let version = state.version;
+                    let reserve = state.reserve as usize;
+                    drop(state);
+                    drop(queue);
+
+                    let config =
+                        super::ring::validate_ring_config(&req, version.hdrlen(), reserve)?;
+                    let (ring, page_cache) =
+                        PacketRing::setup(config, version, self.sock_type, reserve)?;
+                    let ring = Arc::try_new(super::ring::PacketRingInstance::new(ring, page_cache))
+                        .map_err(|_| SystemError::ENOMEM)?;
+
+                    // The control lock keeps version/reserve/ring stable while
+                    // the candidate is built. Publish the fully initialized
+                    // ring in one short data-plane-visible critical section.
+                    let mut queue = self.rx_buffer.lock();
+                    let mut state = self.ring_state.lock();
+                    debug_assert!(state.ring.is_none() && state.mapped == 0);
+                    let old_queue = core::mem::take(&mut *queue);
+                    state.ring = Some(ring);
+                    state.advance_rx_generation();
+                    drop(state);
+                    drop(queue);
+                    self.release_rx_queue(old_queue);
+                    Ok(())
+                }
+                packet_option::PACKET_COPY_THRESH => {
+                    // PACKET_COPY_THRESH is not implemented in Phase 1. Return
+                    // ENOPROTOOPT so userspace knows the option is unavailable
+                    // rather than being silently accepted without effect.
+                    Err(SystemError::ENOPROTOOPT)
                 }
                 packet_option::PACKET_FANOUT => {
                     let (raw, max_num_members) = Self::parse_fanout(value)?;

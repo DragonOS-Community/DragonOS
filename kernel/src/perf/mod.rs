@@ -58,6 +58,14 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
     }
     /// Whether the perf event is readable
     fn readable(&self) -> bool;
+
+    /// Internal size of the currently published mmap backing.
+    ///
+    /// This bounds generic filemap faults without changing the anonymous perf
+    /// inode's user-visible `st_size`.
+    fn mmap_size(&self) -> usize {
+        0
+    }
 }
 
 pub struct JITMem {
@@ -181,6 +189,10 @@ impl PerfEventInode {
         let pollflag = EPollEventType::from_bits_truncate(self.do_poll()? as u32);
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&self.epitems, pollflag)
+    }
+
+    fn mmap_size(&self) -> usize {
+        self.event.mmap_size()
     }
 }
 
@@ -341,8 +353,17 @@ impl FileSystem for PerfFakeFs {
         panic!("PerfFakeFs does not have a super block")
     }
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let res = PageFaultHandler::filemap_fault(pfm);
-        res
+        let inode_ref = {
+            let vma = pfm.vma();
+            let guard = vma.lock();
+            let file = guard.vm_file().expect("perf VMA has no file");
+            file.inode()
+        };
+        let Some(inode) = inode_ref.downcast_ref::<PerfEventInode>() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let stable_size = inode.mmap_size();
+        PageFaultHandler::filemap_fault_with_stable_size(pfm, stable_size)
     }
 
     unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {

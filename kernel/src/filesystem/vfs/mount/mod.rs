@@ -3,7 +3,7 @@ use super::{
     utils::DName,
     DelegatedWriteResult, DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode,
     InodeId, InodeMode, InodeRetentionKind, PollableInode, SetMetadataMask, SuperBlock,
-    WriteSyncIntent, XattrFlags,
+    VmaOpenRollback, WriteSyncIntent, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -4618,6 +4618,15 @@ impl FileSystem for MountFS {
 
     fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
         self.inner_filesystem.mprotect(old_vm_flags, new_vm_flags)
+    }
+
+    fn vma_open(
+        &self,
+        file: &Arc<super::file::File>,
+        region: VirtRegion,
+        vm_flags: VmFlags,
+    ) -> VmaOpenRollback {
+        self.inner_filesystem.vma_open(file, region, vm_flags)
     }
 
     fn vma_close(&self, file: &Arc<super::file::File>, region: VirtRegion, vm_flags: VmFlags) {

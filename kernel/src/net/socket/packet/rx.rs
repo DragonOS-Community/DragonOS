@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use core::cell::Cell;
 use core::sync::atomic::Ordering;
 use system_error::SystemError;
@@ -17,8 +17,11 @@ use crate::net::socket::PMSG;
 use super::uapi::{SOL_PACKET, TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID};
 use super::{
     eth_protocol, packet_option, PacketIngressMetadata, PacketMetadata, PacketSocket,
-    PacketSocketType, PacketType, ReceivedPacket, SockAddrLl, TpacketAuxdata,
+    PacketSocketType, PacketType, ReceivedPacket, RingWriteResult, SockAddrLl, TpacketAuxdata,
 };
+use crate::filesystem::epoll::event_poll::EventPoll;
+use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::fasync::FASYNC_POLL_IN;
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const MAX_FLOW_DISSECT_HDRS: u8 = 15;
@@ -41,8 +44,8 @@ struct BasicFlowKeys {
 }
 
 struct ParsedFrame {
-    dst: [u8; 6],
     src: [u8; 6],
+    dst: [u8; 6],
     protocol: u16,
     vlan: Option<(u16, u16)>,
 }
@@ -51,7 +54,7 @@ struct ParsedFrame {
 /// into skb metadata, while outgoing taps retain an inline VLAN header. This
 /// view models both layouts with at most two borrowed segments and is shared
 /// by cBPF loads and the eventual queue copy.
-struct PacketFilterInput<'a> {
+pub(super) struct PacketFilterInput<'a> {
     first: &'a [u8],
     second: &'a [u8],
     data_offset: usize,
@@ -98,6 +101,18 @@ impl<'a> PacketFilterInput<'a> {
             vlan,
             ingress,
             payload_offset_cache: Cell::new(None),
+        }
+    }
+
+    /// Protocol published through sockaddr_ll. Linux keeps the AF_PACKET hook
+    /// protocol (used for binding) at the outer VLAN TPID for outgoing frames,
+    /// but SOCK_DGRAM reports the decapsulated inner protocol to userspace.
+    #[inline]
+    fn sockaddr_protocol(&self, parsed: &ParsedFrame) -> u16 {
+        if self.data_offset != 0 && parsed.vlan.is_some() {
+            parsed.protocol
+        } else {
+            self.protocol
         }
     }
 
@@ -167,6 +182,27 @@ impl<'a> PacketFilterInput<'a> {
             let second_start = self.data_offset.saturating_sub(self.first.len());
             let second_end = end - self.first.len();
             output.extend_from_slice(&self.second[second_start..second_end]);
+        }
+    }
+
+    /// Return the socket-visible prefix as at most two immutable segments.
+    /// The mmap writer retains sole responsibility for validating its raw
+    /// destination; this type never manufactures a mutable reference to the
+    /// userspace-shared ring.
+    pub(super) fn visible_segments(&self, len: usize) -> Option<(&[u8], &[u8])> {
+        if len > self.data_len() {
+            return None;
+        }
+        let end = self.data_offset.checked_add(len)?;
+        let first_start = self.data_offset.min(self.first.len());
+        let first_end = end.min(self.first.len());
+        let first = &self.first[first_start..first_end];
+        if end > self.first.len() {
+            let second_start = self.data_offset.saturating_sub(self.first.len());
+            let second_end = end.checked_sub(self.first.len())?;
+            Some((first, self.second.get(second_start..second_end)?))
+        } else {
+            Some((first, &[]))
         }
     }
 
@@ -780,6 +816,52 @@ impl PacketSocket {
             Some(snaplen) => wire_len.min(snaplen as usize),
             None => wire_len,
         };
+
+        // --- TPACKET ring buffer path ---
+        // When an RX ring is active, deliver directly into the ring instead of
+        // the rx_buffer queue.  Clone the Arc and release the outer lock so
+        // concurrent delivers from other NICs are not blocked by setup/teardown.
+        let state = self.ring_state.lock();
+        let rx_generation = state.rx_generation;
+        if let Some(ring_arc) = state.ring.as_ref().cloned() {
+            // Register while the instance is still published. Teardown first
+            // removes it under ring_state and then waits for this guard, so it
+            // cannot return before the write, statistics, and wakeups finish.
+            let _access = ring_arc.begin_access();
+            drop(state);
+            let metadata = PacketMetadata {
+                src_mac: parsed.src,
+                dst_mac: parsed.dst,
+                protocol: input.sockaddr_protocol(&parsed),
+                ifindex: ingress.ifindex,
+                hatype: ingress.hatype,
+                pkt_type: ingress.pkt_type,
+                wire_len,
+                mac_offset: 0,
+                net_offset: input.network_offset,
+                vlan_tci: input.vlan.map_or(0, |v| v.0),
+                vlan_tpid: input.vlan.map_or(0, |v| v.1),
+            };
+            let losing = self.stats_drops.load(Ordering::Relaxed) > 0;
+            let mut ring = ring_arc.writer().lock();
+            match ring.write_frame(&input, &metadata, data_len, losing) {
+                RingWriteResult::Written => {
+                    self.stats_packets.fetch_add(1, Ordering::Relaxed);
+                    drop(ring);
+                    self.wait_queue.wakeup(None);
+                    let _ = EventPoll::wakeup_epoll(
+                        self.epoll_items.as_ref(),
+                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+                    );
+                    self.fasync_items.send_sigio(FASYNC_POLL_IN);
+                }
+                RingWriteResult::Dropped => {
+                    self.stats_drops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        drop(state);
         // Linux runs the socket filter before checking sk_rmem_alloc: a packet
         // rejected by cBPF is not counted as a receive-buffer drop. Keep this
         // cheap precheck after the filter and the atomic reservation below as
@@ -793,7 +875,7 @@ impl PacketSocket {
         let metadata = PacketMetadata {
             src_mac: parsed.src,
             dst_mac: parsed.dst,
-            protocol: input.protocol,
+            protocol: input.sockaddr_protocol(&parsed),
             ifindex: ingress.ifindex,
             hatype: ingress.hatype,
             pkt_type: ingress.pkt_type,
@@ -841,13 +923,56 @@ impl PacketSocket {
             self.stats_drops.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // Serialize the final legacy-queue commit with RX-ring cutover. A
+        // packet that observed no ring before allocating must not enter the
+        // queue after any setup/teardown cutover. Checking the generation also
+        // closes the None -> Some -> None ABA case.
+        let state = self.ring_state.lock();
+        if state.ring.is_some() || state.rx_generation != rx_generation {
+            drop(state);
+            drop(queue);
+            self.rx_buffer_bytes
+                .fetch_sub(accounted_bytes, Ordering::AcqRel);
+            // Linux accounts packet_rcv before packet_set_ring() purges its
+            // receive queue. Preserve that statistic while withholding a
+            // wakeup for data discarded at the cutover boundary.
+            self.stats_packets.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         queue.push_back(packet);
+        drop(state);
         drop(queue);
         self.stats_packets.fetch_add(1, Ordering::Relaxed);
         self.wait_queue.wakeup(None);
     }
+
+    /// Release packets detached from the legacy receive queue at a ring
+    /// cutover. Accounting and object destruction run outside the queue/state
+    /// locks so packet buffers cannot lengthen the data-plane critical section.
+    pub(super) fn release_rx_queue(&self, packets: VecDeque<ReceivedPacket>) {
+        let accounted_bytes = packets.iter().fold(0usize, |total, packet| {
+            total
+                .checked_add(packet.accounted_bytes)
+                .expect("AF_PACKET receive accounting overflow")
+        });
+        if accounted_bytes != 0 {
+            self.rx_buffer_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_sub(accounted_bytes)
+                })
+                .expect("AF_PACKET receive accounting underflow during ring cutover");
+        }
+        drop(packets);
+    }
     pub(super) fn can_recv(&self) -> bool {
-        !self.rx_buffer.lock().is_empty()
+        // Linux packet_poll() combines normal receive-queue readiness with
+        // RX-ring readiness; neither receive source may mask the other.
+        let ring = self.ring_state.lock().ring.as_ref().cloned();
+        // A read-only readiness snapshot only needs the Arc to pin its
+        // backing. The teardown grace period is reserved for ingress, whose
+        // writes, statistics, and wakeups must finish before teardown returns.
+        let ring_ready = ring.is_some_and(|ring| ring.writer().lock().has_user_frames());
+        ring_ready || !self.rx_buffer.lock().is_empty()
     }
     fn dequeue(&self, peek: bool) -> Result<ReceivedPacket, SystemError> {
         let mut queue = self.rx_buffer.lock();

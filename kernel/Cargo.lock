@@ -510,6 +510,7 @@ dependencies = [
  "static-keys",
  "syscall_table_macros",
  "system_error",
+ "tpacket",
  "uefi",
  "uefi-raw",
  "unified-init",
@@ -1755,6 +1756,10 @@ dependencies = [
  "toml_datetime",
  "winnow",
 ]
+
+[[package]]
+name = "tpacket"
+version = "0.1.0"
 
 [[package]]
 name = "trybuild"

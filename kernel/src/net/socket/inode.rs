@@ -353,9 +353,20 @@ impl<T: Socket + 'static> IndexNode for T {
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         Ok(())
     }
+    fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        super::base::Socket::mmap_layout(self).map(|l| l.page_cache)
+    }
+
+    /// Validate the mmap request via the socket-specific handler. This checks
+    /// ring size/offset bounds and updates the mapped count for teardown
+    /// EBUSY accounting.
+    fn mmap(&self, _start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
+        super::base::Socket::mmap_validate(self, len, offset)
+    }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        unreachable!("Socket does not have a file system")
+        super::base::Socket::mmap_fs(self)
+            .unwrap_or_else(|| unreachable!("Socket does not have a file system"))
     }
 
     fn try_fs(&self) -> Option<Arc<dyn crate::filesystem::vfs::FileSystem>> {

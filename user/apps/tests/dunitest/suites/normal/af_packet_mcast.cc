@@ -16,6 +16,7 @@
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -472,6 +473,24 @@ TEST(AfPacketMcast, MembershipPayloadValidationMatchesLinux) {
     mreq.mr_ifindex = ifindex;
     mreq.mr_type = PACKET_MR_MULTICAST;
     mreq.mr_alen = 6;
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+                         reinterpret_cast<const void*>(1), sizeof(mreq) - 1),
+              -1);
+    EXPECT_EQ(errno, EINVAL) << "short optlen must win over an invalid pointer";
+
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto* pages = static_cast<uint8_t*>(
+        mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(pages, MAP_FAILED) << ErrnoString(errno);
+    auto* tail_mreq = reinterpret_cast<PacketMreq*>(pages + page - sizeof(PacketMreq));
+    *tail_mreq = mreq;
+    ASSERT_EQ(mprotect(pages + page, page, PROT_NONE), 0) << ErrnoString(errno);
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, tail_mreq, 40), -1);
+    EXPECT_EQ(errno, EFAULT) << "packet_mreq_max copy must cover the declared extension";
+    ASSERT_EQ(munmap(pages, page * 2), 0) << ErrnoString(errno);
+
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq,
                          sizeof(mreq) - 1),
               -1);

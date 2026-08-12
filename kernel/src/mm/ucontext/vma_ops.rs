@@ -343,15 +343,11 @@ impl InnerAddressSpace {
             (file, *guard.vm_flags())
         };
 
-        if vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
-            Some(VmaCloseNotification {
-                file,
-                region,
-                vm_flags,
-            })
-        } else {
-            None
-        }
+        Some(VmaCloseNotification {
+            file,
+            region,
+            vm_flags,
+        })
     }
 
     pub(super) fn notify_vma_close(notification: VmaCloseNotification) {

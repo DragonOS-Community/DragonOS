@@ -9,12 +9,17 @@ pub mod eth_protocol {
 pub mod packet_option {
     pub const PACKET_ADD_MEMBERSHIP: usize = 1;
     pub const PACKET_DROP_MEMBERSHIP: usize = 2;
+    pub const PACKET_RECV_OUTPUT: usize = 3;
+    pub const PACKET_RX_RING: usize = 5;
     pub const PACKET_STATISTICS: usize = 6;
     pub const PACKET_COPY_THRESH: usize = 7;
     pub const PACKET_AUXDATA: usize = 8;
     pub const PACKET_ORIGDEV: usize = 9;
     pub const PACKET_VERSION: usize = 10;
+    pub const PACKET_HDRLEN: usize = 11;
     pub const PACKET_RESERVE: usize = 12;
+    pub const PACKET_TX_RING: usize = 13;
+    pub const PACKET_LOSS: usize = 14;
     pub const PACKET_VNET_HDR: usize = 15;
     pub const PACKET_TX_TIMESTAMP: usize = 16;
     pub const PACKET_TIMESTAMP: usize = 17;
@@ -93,3 +98,14 @@ pub const SOL_PACKET: i32 = 263;
 pub const TP_STATUS_USER: u32 = 1;
 pub const TP_STATUS_VLAN_VALID: u32 = 1 << 4;
 pub const TP_STATUS_VLAN_TPID_VALID: u32 = 1 << 6;
+pub const TP_STATUS_LOSING: u32 = 1 << 2;
+
+// ---------------------------------------------------------------------------
+// TPACKET ring buffer UAPI — re-exported from the standalone `tpacket` crate.
+// The crate carries the `#[repr(C)]` structs, constants, and validation logic
+// so they can be unit-tested on the host without booting the kernel.
+// Layout matches Linux include/uapi/linux/if_packet.h (Linux 6.6 semantics).
+// ---------------------------------------------------------------------------
+
+pub use tpacket::tpacket_version;
+pub use tpacket::{Tpacket2Hdr, TpacketHdr, TpacketReq, TP_STATUS_KERNEL};

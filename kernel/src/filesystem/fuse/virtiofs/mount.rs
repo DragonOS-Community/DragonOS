@@ -8,7 +8,7 @@ use crate::{
     driver::virtio::virtio_fs::{virtio_fs_find_instance, VirtioFsInstance},
     filesystem::vfs::{
         file::File, mount::MountFS, FilePrivateData, FileSystem, FileSystemMakerData, FsInfo,
-        IndexNode, MountableFileSystem, SuperBlock, FSMAKER,
+        IndexNode, MountableFileSystem, SuperBlock, VmaOpenRollback, FSMAKER,
     },
     mm::{
         fault::{FaultFlags, PageFaultMessage},
@@ -276,6 +276,10 @@ impl FileSystem for VirtioFsFs {
 
     fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
         self.inner.mprotect(old_vm_flags, new_vm_flags)
+    }
+
+    fn vma_open(&self, file: &Arc<File>, region: VirtRegion, vm_flags: VmFlags) -> VmaOpenRollback {
+        self.inner.vma_open(file, region, vm_flags)
     }
 
     fn vma_close(&self, file: &Arc<File>, region: VirtRegion, vm_flags: VmFlags) {

@@ -191,7 +191,7 @@ impl PidDirOps {
             NsDirOps::new_inode(ops.target.clone(), parent)
         }),
         ("stat", |ops, parent| {
-            StatFileOps::new_inode(ops.target.clone(), parent)
+            StatFileOps::new_inode(ops.target.clone(), stat::StatScope::ThreadGroup, parent)
         }),
         ("statm", |ops, parent| {
             StatmFileOps::new_inode(ops.target.clone(), parent)

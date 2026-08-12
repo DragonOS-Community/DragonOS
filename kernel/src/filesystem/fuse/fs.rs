@@ -785,6 +785,7 @@ impl FileSystem for FuseFS {
             .unwrap_or(true);
 
         if major {
+            crate::mm::fault::account_major_fault_event();
             let can_retry = pfm.flags().contains(FaultFlags::FAULT_FLAG_ALLOW_RETRY)
                 && !pfm.flags().contains(FaultFlags::FAULT_FLAG_RETRY_NOWAIT);
             if can_retry {

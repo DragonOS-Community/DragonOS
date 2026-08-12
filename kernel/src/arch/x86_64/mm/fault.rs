@@ -538,11 +538,13 @@ impl X86_64MMArch {
                             }
                             Err(SystemError::ENOMEM) => {
                                 fault = VmFaultReason::VM_FAULT_OOM;
+                                crate::mm::fault::account_fault_result(flags, fault);
                                 space_guard = current_address_space.write();
                                 break;
                             }
                             Err(_) => {
                                 fault = VmFaultReason::VM_FAULT_SIGBUS;
+                                crate::mm::fault::account_fault_result(flags, fault);
                                 space_guard = current_address_space.write();
                                 break;
                             }
@@ -587,7 +589,6 @@ impl X86_64MMArch {
                         crate::mm::page::PageReclaimer::shrink_list(
                             <crate::mm::allocator::page_frame::PageFrameCount>::new(64),
                         );
-                        flags |= FaultFlags::FAULT_FLAG_TRIED;
                         continue;
                     }
 
@@ -608,7 +609,6 @@ impl X86_64MMArch {
                     };
                     match crate::mm::oom::pagefault_out_of_memory(ctx) {
                         OomOutcome::Retry => {
-                            flags |= FaultFlags::FAULT_FLAG_TRIED;
                             continue;
                         }
                         OomOutcome::CurrentTaskKilled => {

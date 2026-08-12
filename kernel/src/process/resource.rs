@@ -193,6 +193,13 @@ impl TryFrom<usize> for RLimitID {
 }
 
 impl ProcessControlBlock {
+    /// Account one successfully completed page fault to this task.
+    #[inline]
+    pub(crate) fn account_page_fault(&self, major: bool) {
+        let counter = if major { &self.maj_flt } else { &self.min_flt };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn leader_for_rusage(&self) -> Arc<ProcessControlBlock> {
         if self.is_thread_group_leader() {
             return self
@@ -212,6 +219,8 @@ impl ProcessControlBlock {
         RUsage {
             ru_utime: RUsageTimeval::from_ns(ct.utime.load(Ordering::Relaxed)),
             ru_stime: RUsageTimeval::from_ns(ct.stime.load(Ordering::Relaxed)),
+            ru_minflt: self.min_flt.load(Ordering::Relaxed) as usize,
+            ru_majflt: self.maj_flt.load(Ordering::Relaxed) as usize,
             ..RUsage::default()
         }
     }

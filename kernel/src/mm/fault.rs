@@ -3,6 +3,7 @@ use core::{
     cmp::{max, min},
     intrinsics::unlikely,
     panic,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use alloc::sync::Arc;
@@ -14,6 +15,7 @@ use crate::{
     libs::align::align_down,
     mm::{
         page::{page_manager_lock, EntryFlags},
+        percpu::PerCpu,
         ucontext::{AddressSpace, InnerAddressSpace, LockedVMA},
         PhysAddr, VirtAddr, VmFaultReason, VmFlags,
     },
@@ -23,6 +25,85 @@ use crate::{
 use crate::mm::MemoryManagementArch;
 
 use super::page::{Page, PageFlags, PageType};
+
+#[repr(align(64))]
+struct FaultEventShard {
+    faults: AtomicU64,
+    major_faults: AtomicU64,
+}
+
+impl FaultEventShard {
+    const fn new() -> Self {
+        Self {
+            faults: AtomicU64::new(0),
+            major_faults: AtomicU64::new(0),
+        }
+    }
+}
+
+static FAULT_EVENTS: [FaultEventShard; PerCpu::MAX_CPU_NUM as usize] =
+    [const { FaultEventShard::new() }; PerCpu::MAX_CPU_NUM as usize];
+
+#[inline]
+fn fault_event_shard_for(pcb: &crate::process::ProcessControlBlock) -> &'static FaultEventShard {
+    let index = pcb
+        .sched_info()
+        .statistics_cpu_hint()
+        .map(|cpu| cpu.data() as usize)
+        .filter(|index| *index < FAULT_EVENTS.len())
+        .unwrap_or(0);
+    &FAULT_EVENTS[index]
+}
+
+/// Record a major-fault event at the point where backing I/O is required.
+#[inline]
+pub(crate) fn account_major_fault_event() {
+    let pcb = ProcessManager::current_pcb();
+    fault_event_shard_for(&pcb)
+        .major_faults
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Apply Linux mm_account_fault() semantics to one final MM fault outcome.
+#[inline]
+pub(crate) fn account_fault_result(flags: FaultFlags, reason: VmFaultReason) {
+    let pcb = ProcessManager::current_pcb();
+    account_fault_result_for(&pcb, flags, reason);
+}
+
+#[inline]
+fn account_fault_result_for(
+    pcb: &crate::process::ProcessControlBlock,
+    flags: FaultFlags,
+    reason: VmFaultReason,
+) {
+    if reason.contains(VmFaultReason::VM_FAULT_RETRY) {
+        return;
+    }
+
+    fault_event_shard_for(pcb)
+        .faults
+        .fetch_add(1, Ordering::Relaxed);
+    if reason.intersects(VmFaultReason::VM_FAULT_ERROR) {
+        return;
+    }
+
+    let major = reason.contains(VmFaultReason::VM_FAULT_MAJOR)
+        || flags.contains(FaultFlags::FAULT_FLAG_TRIED);
+    pcb.account_page_fault(major);
+}
+
+pub fn page_fault_count() -> u64 {
+    FAULT_EVENTS.iter().fold(0u64, |total, shard| {
+        total.wrapping_add(shard.faults.load(Ordering::Relaxed))
+    })
+}
+
+pub fn page_major_fault_count() -> u64 {
+    FAULT_EVENTS.iter().fold(0u64, |total, shard| {
+        total.wrapping_add(shard.major_faults.load(Ordering::Relaxed))
+    })
+}
 
 pub trait FaultRetryWait: core::fmt::Debug + Send + Sync {
     fn wait(&self) -> Result<(), SystemError>;
@@ -395,33 +476,29 @@ impl PageFaultHandler {
             current_pcb.sched_info().set_state(ProcessState::Runnable);
         }
 
-        if !MMArch::vma_access_permitted(
+        let reason = if !MMArch::vma_access_permitted(
             vma.clone(),
             flags.contains(FaultFlags::FAULT_FLAG_WRITE),
             flags.contains(FaultFlags::FAULT_FLAG_INSTRUCTION),
             flags.contains(FaultFlags::FAULT_FLAG_REMOTE),
         ) {
-            return VmFaultOutcome {
-                reason: VmFaultReason::VM_FAULT_SIGSEGV,
-                retry_wait: None,
-            };
-        }
-
-        let guard = vma.lock();
-        let vm_flags = *guard.vm_flags();
-        drop(guard);
-        if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
-            //TODO: 添加handle_hugetlb_fault处理大页缺页异常
+            VmFaultReason::VM_FAULT_SIGSEGV
         } else {
-            let reason = Self::handle_normal_fault(&mut pfm);
-            return VmFaultOutcome {
-                reason,
-                retry_wait: pfm.retry_wait.take(),
-            };
-        }
+            let guard = vma.lock();
+            let vm_flags = *guard.vm_flags();
+            drop(guard);
+            if unlikely(vm_flags.contains(VmFlags::VM_HUGETLB)) {
+                // TODO: 添加 handle_hugetlb_fault 处理大页缺页异常。
+                VmFaultReason::VM_FAULT_COMPLETED
+            } else {
+                Self::handle_normal_fault(&mut pfm)
+            }
+        };
+
+        account_fault_result_for(&current_pcb, flags, reason);
 
         VmFaultOutcome {
-            reason: VmFaultReason::VM_FAULT_COMPLETED,
+            reason,
             retry_wait: pfm.retry_wait.take(),
         }
     }
@@ -1207,6 +1284,7 @@ impl PageFaultHandler {
         }
 
         if !page_cache.is_page_ready(backing_pgoff) {
+            account_major_fault_event();
             ret = VmFaultReason::VM_FAULT_MAJOR;
         }
 

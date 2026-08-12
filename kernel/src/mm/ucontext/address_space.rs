@@ -86,7 +86,7 @@ impl AddressSpace {
         let mut addr = start;
         let mut retried = false;
         while addr.data() < end {
-            let retry_wait = {
+            let (retry_wait, retry_flags) = {
                 let mut guard = self.write();
                 let Some(vma) = guard.mappings.contains(addr) else {
                     addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
@@ -152,7 +152,7 @@ impl AddressSpace {
                     continue;
                 }
                 if outcome.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
-                    outcome.retry_wait
+                    (outcome.retry_wait, fault_flags)
                 } else if outcome.reason.contains(VmFaultReason::VM_FAULT_OOM) {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 } else {
@@ -165,7 +165,15 @@ impl AddressSpace {
             // PageCache invalidation read guard may now acquire the mm read
             // side and complete before this population retry blocks.
             if let Some(wait) = retry_wait {
-                wait.wait()?;
+                if let Err(error) = wait.wait() {
+                    if !matches!(error, SystemError::EINTR | SystemError::ERESTARTSYS) {
+                        crate::mm::fault::account_fault_result(
+                            retry_flags,
+                            VmFaultReason::VM_FAULT_SIGBUS,
+                        );
+                    }
+                    return Err(error);
+                }
             } else {
                 // A legacy retry (for example, a changed backing index) has
                 // no blocking predicate.  The guard is still released, and

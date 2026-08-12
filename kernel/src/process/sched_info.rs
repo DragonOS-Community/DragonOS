@@ -146,6 +146,14 @@ impl ProcessSchedulerInfo {
         }
     }
 
+    /// Best-effort task CPU hint for sharding statistics only.
+    ///
+    /// This must not be used for scheduling or task ownership decisions.
+    pub(crate) fn statistics_cpu_hint(&self) -> Option<ProcessorId> {
+        let on_cpu = self.on_cpu.load(Ordering::Relaxed);
+        (on_cpu != ProcessorId::INVALID).then_some(on_cpu)
+    }
+
     pub fn set_on_cpu(&self, on_cpu: Option<ProcessorId>) {
         if let Some(cpu_id) = on_cpu {
             self.on_cpu.store(cpu_id, Ordering::SeqCst);

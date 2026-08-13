@@ -1594,23 +1594,33 @@ impl Ext4 {
         Ok(root)
     }
 
-    /// Free an allocated inode and all data blocks allocated for it
+    /// Roll back an allocated inode that has not been published in a directory.
+    ///
+    /// The validated in-memory extent tree is authoritative here: an inode
+    /// write may fail after the tree was updated but before `i_blocks` was
+    /// recomputed, so the transient on-disk count is not a rollback precondition.
     pub(super) fn free_inode(&self, inode: &mut InodeRef) -> Result<()> {
         let inode_id = inode.id;
-        // Free the data blocks allocated for the inode
-        let pblocks = self.extent_all_data_blocks(inode)?;
-        for pblock in pblocks {
-            self.dealloc_block(inode, pblock)?;
-        }
-        // Free extent tree
-        let pblocks = self.extent_all_tree_blocks(inode)?;
-        for pblock in pblocks {
-            self.dealloc_block(inode, pblock)?;
+        if inode.inode.uses_extents() {
+            let data_blocks = self.extent_all_data_blocks(inode)?;
+            let tree_blocks = self.extent_all_tree_blocks(inode)?;
+            for pblock in data_blocks {
+                self.dealloc_block(inode, pblock)?;
+            }
+            for pblock in tree_blocks {
+                self.dealloc_block(inode, pblock)?;
+            }
+            // dealloc_block updates allocation metadata, not the in-memory
+            // inode that is about to be released.
+            inode.inode.set_fs_block_count(0);
+        } else if inode.inode.fs_block_count() != 0 {
+            return_error!(ErrCode::EIO, "Inline inode owns unexplained blocks");
         }
         // Free xattr block
         let xattr_block = inode.inode.xattr_block();
         if xattr_block != 0 {
             self.dealloc_block(inode, xattr_block)?;
+            inode.inode.set_xattr_block(0);
         }
         // Deallocate the inode
         self.dealloc_inode(inode)?;

@@ -424,6 +424,26 @@ impl Inode {
         self.extent_root_mut().init(0, 0);
     }
 
+    /// Initialize the inline representation of a fast symbolic link.
+    ///
+    /// The trailing NUL is stored on disk but is not included in `i_size`.
+    pub(crate) fn set_fast_symlink(&mut self, target: &[u8]) -> Result<()> {
+        let disk_len = target
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| Ext4Error::new(ErrCode::ENAMETOOLONG))?;
+        if !self.is_softlink() || disk_len > self.block.len() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+
+        self.block.fill(0);
+        self.block[..target.len()].copy_from_slice(target);
+        self.flags &= !Self::FLAG_EXTENTS;
+        self.set_size(target.len() as u64);
+        self.set_fs_block_count(0);
+        Ok(())
+    }
+
     /// Check if this inode is a device node (character or block device).
     pub fn is_device(&self) -> bool {
         matches!(
@@ -648,6 +668,29 @@ mod tests {
 
         inode.set_dtime(456);
         assert_eq!(inode.next_orphan(), 456);
+    }
+
+    #[test]
+    fn fast_symlink_reserves_one_byte_for_the_trailing_nul() {
+        let mut inode = Inode::default();
+        inode.set_mode(InodeMode::SOFTLINK | InodeMode::ALL_RWX);
+        inode.extent_init();
+
+        let fast = [b'a'; 59];
+        inode.set_fast_symlink(&fast).unwrap();
+        assert_eq!(inode.size(), 59);
+        assert_eq!(inode.fs_block_count(), 0);
+        assert!(!inode.uses_extents());
+        assert_eq!(&inode.inline_block()[..59], &fast);
+        assert_eq!(inode.inline_block()[59], 0);
+
+        let mut boundary = Inode::default();
+        boundary.set_mode(InodeMode::SOFTLINK | InodeMode::ALL_RWX);
+        boundary.extent_init();
+        assert_eq!(
+            boundary.set_fast_symlink(&[b'b'; 60]).unwrap_err().code(),
+            ErrCode::EINVAL
+        );
     }
 
     #[test]

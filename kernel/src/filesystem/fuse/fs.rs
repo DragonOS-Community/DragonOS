@@ -689,7 +689,7 @@ impl FileSystem for FuseFS {
         Some(&self.writeback_domain)
     }
 
-    fn prepare_page_cache_retirement(&self) -> Result<(), SystemError> {
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
         if !self.is_submount {
             self.conn.begin_dax_quiesce();
             self.conn.wait_dax_drained();

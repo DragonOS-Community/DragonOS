@@ -224,8 +224,8 @@ impl FileSystem for VirtioFsFs {
         self.inner.page_cache_writeback_domain()
     }
 
-    fn prepare_page_cache_retirement(&self) -> Result<(), SystemError> {
-        self.inner.prepare_page_cache_retirement()
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
+        self.inner.quiesce_page_cache_producers()
     }
 
     fn root_inode(&self) -> Arc<dyn IndexNode> {

@@ -2161,7 +2161,7 @@ pub trait FileSystem: Any + Sync + Send + Debug {
 
     /// Stop filesystem-private page-cache producers before the generic
     /// writeback domain is closed and retired.
-    fn prepare_page_cache_retirement(&self) -> Result<(), SystemError> {
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
         Ok(())
     }
 

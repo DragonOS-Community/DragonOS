@@ -2607,7 +2607,7 @@ impl MountFS {
             log::warn!("final superblock sync failed during umount: {:?}", err);
             sb_state.record_wb_error(err);
         }
-        if let Err(err) = self.inner_filesystem.prepare_page_cache_retirement() {
+        if let Err(err) = self.inner_filesystem.quiesce_page_cache_producers() {
             log::warn!("final page-cache producer quiesce failed: {:?}", err);
             sb_state.record_wb_error(err);
         }

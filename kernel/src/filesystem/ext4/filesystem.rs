@@ -337,7 +337,7 @@ impl FileSystem for Ext4FileSystem {
         Some(&self.writeback_domain)
     }
 
-    fn prepare_page_cache_retirement(&self) -> Result<(), SystemError> {
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
         if self._mount_options.read_only {
             return Ok(());
         }

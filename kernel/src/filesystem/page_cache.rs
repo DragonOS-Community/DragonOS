@@ -61,8 +61,8 @@ pub(crate) use writeback::{
 };
 use writeback::{
     run_async_writeback_budget_retry_selftest, ClaimedWritebackBatch, TaggedWritebackBudgetRetry,
-    TaggedWritebackIncarnationRetry, TaggedWritebackSubmission, WritebackClaimOutcome,
-    WritebackSubmitOutcome, PAGECACHE_WRITEBACK_WQS,
+    TaggedWritebackIncarnationRetry, TaggedWritebackSubmission, WritebackBatchRange,
+    WritebackClaimOutcome, WritebackSubmitOutcome, PAGECACHE_WRITEBACK_WQS,
 };
 pub use writeback::{
     AsyncPageCacheBackend, PageCacheBackend, PageCacheWritebackAdmissionOrder,

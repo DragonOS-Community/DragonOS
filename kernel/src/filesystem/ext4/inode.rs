@@ -457,9 +457,7 @@ impl Ext4DelallocProgress {
                                 .ready_prefix_end(pending.offset, usize::MAX)
                                 .unwrap_or(pending.offset)
                                 / MMArch::PAGE_SIZE;
-                            Ext4DelallocProducerAction::Dispatch(
-                                page_cache, first_page, last_page,
-                            )
+                            Ext4DelallocProducerAction::Dispatch(page_cache, first_page, last_page)
                         }
                         ProductionDelallocEntryState::Prepared(_)
                         | ProductionDelallocEntryState::Claimed { .. } => {
@@ -508,11 +506,7 @@ impl Ext4DelallocProgress {
                         | PageCacheWritebackDispatchOutcome::Deferred
                 )) | Ext4DelallocProducerRunOutcome::Passive
             ) {
-                Self::schedule_if_demanded_admitted(
-                    &progress,
-                    &inode_weak,
-                    domain_io.derive(),
-                );
+                Self::schedule_if_demanded_admitted(&progress, &inode_weak, domain_io.derive());
             }
 
             match outcome {

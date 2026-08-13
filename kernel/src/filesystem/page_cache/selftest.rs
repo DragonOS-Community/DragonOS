@@ -2179,8 +2179,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         &mut || {
             snapshot_error_outcome = Some(PageCacheManager::claim_and_snapshot_locked_with(
                 &submission_cache,
-                0,
-                0,
+                WritebackBatchRange::new(0, 0),
                 token_file_size,
                 None,
                 true,
@@ -2466,8 +2465,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         &mut || {
             tagged_snapshot_error_outcome = Some(PageCacheManager::claim_and_snapshot_locked_with(
                 &submission_cache,
-                0,
-                0,
+                WritebackBatchRange::new(0, 0),
                 token_file_size,
                 Some((0, &tagged_entry, tagged_epoch)),
                 true,
@@ -2716,8 +2714,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let split_blocking_submit = match PageCacheManager::claim_and_snapshot_after_admission_with(
         &split_cache,
         &split_backend_dyn,
-        0,
-        0,
+        WritebackBatchRange::new(0, 0),
         None,
         None,
         || Ok(MMArch::PAGE_SIZE),
@@ -2736,8 +2733,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         PageCacheManager::claim_and_snapshot_after_admission_with(
             &split_cache,
             &split_backend_dyn,
-            0,
-            0,
+            WritebackBatchRange::new(0, 0),
             None,
             None,
             || Ok(MMArch::PAGE_SIZE),
@@ -2771,8 +2767,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         PageCacheManager::claim_and_snapshot_after_admission_with(
             &split_cache,
             &split_backend_dyn,
-            0,
-            0,
+            WritebackBatchRange::new(0, 0),
             None,
             None,
             || Ok(MMArch::PAGE_SIZE),
@@ -2997,8 +2992,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
             &mut || {
                 claimed = PageCacheManager::claim_and_snapshot_locked_with(
                     &tagged_worker_cache,
-                    0,
-                    0,
+                    WritebackBatchRange::new(0, 0),
                     token_file_size,
                     Some((0, &tagged_worker_entry, tagged_submission_epoch)),
                     true,

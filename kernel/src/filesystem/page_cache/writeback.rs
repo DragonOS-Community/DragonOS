@@ -236,15 +236,9 @@ pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
         entry.set_writeback_tag(0x6a04);
         inner.dirty_pages.insert(0);
     }
-    let drop_ticket = PageCacheManager::arm_tagged_writeback_budget_retry(
-        &drop_cache,
-        None,
-        0,
-        0,
-        0x6a04,
-        0,
-    )
-    .expect("drop selftest must create its ticket");
+    let drop_ticket =
+        PageCacheManager::arm_tagged_writeback_budget_retry(&drop_cache, None, 0, 0, 0x6a04, 0)
+            .expect("drop selftest must create its ticket");
     AsyncWritebackPermit::register_retry(drop_ticket.clone());
     drop(drop_page);
     drop(drop_cache);
@@ -1017,9 +1011,29 @@ pub(super) struct ClaimedWritebackBatch {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct WritebackBatchRange {
+    start_index: usize,
+    end_index: usize,
+}
+
+impl WritebackBatchRange {
+    pub(super) const fn new(start_index: usize, end_index: usize) -> Self {
+        Self {
+            start_index,
+            end_index,
+        }
+    }
+}
+
 /// Internal result of inspecting one dirty run.  A deferred claim has not
 /// altered any page state, while a deferred submission has already restored
 /// its claimed batch to Dirty.
+///
+/// Keep the claimed batch inline. It is consumed immediately and already
+/// owns the buffers used by writeback; boxing it would add an allocation to
+/// every actual I/O batch and deepen the PageCache/workqueue auto-trait cycle.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum WritebackClaimOutcome {
     NoBatch,
     Claimed(ClaimedWritebackBatch),
@@ -1841,8 +1855,7 @@ impl PageCacheManager {
     /// machine rather than an obligation of individual claim callers.
     pub(super) fn claim_and_snapshot_locked_with(
         cache: &Arc<PageCache>,
-        start_index: usize,
-        end_index: usize,
+        range: WritebackBatchRange,
         file_size: usize,
         required_first: Option<(usize, &Arc<PageEntry>, u64)>,
         bind_submission: bool,
@@ -1851,8 +1864,8 @@ impl PageCacheManager {
     ) -> Result<WritebackClaimOutcome, SystemError> {
         let claim = Self::claim_next_writeback_batch(
             cache,
-            start_index,
-            end_index,
+            range.start_index,
+            range.end_index,
             file_size,
             required_first,
             bind_submission,
@@ -1875,8 +1888,7 @@ impl PageCacheManager {
     ) -> Result<WritebackClaimOutcome, SystemError> {
         Self::claim_and_snapshot_locked_with(
             cache,
-            start_index,
-            end_index,
+            WritebackBatchRange::new(start_index, end_index),
             file_size,
             None,
             bind_submission,
@@ -1887,8 +1899,7 @@ impl PageCacheManager {
 
     fn claim_and_snapshot_tagged_locked(
         cache: &Arc<PageCache>,
-        start_index: usize,
-        end_index: usize,
+        range: WritebackBatchRange,
         file_size: usize,
         required_entry: &Arc<PageEntry>,
         epoch: u64,
@@ -1897,10 +1908,9 @@ impl PageCacheManager {
     ) -> Result<WritebackClaimOutcome, SystemError> {
         Self::claim_and_snapshot_locked_with(
             cache,
-            start_index,
-            end_index,
+            range,
             file_size,
-            Some((start_index, required_entry, epoch)),
+            Some((range.start_index, required_entry, epoch)),
             bind_submission,
             admitted,
             Self::snapshot_writeback_batch,
@@ -1990,8 +2000,7 @@ impl PageCacheManager {
     pub(super) fn claim_and_snapshot_after_admission_with(
         cache: &Arc<PageCache>,
         backend: &Arc<dyn PageCacheBackend>,
-        start_index: usize,
-        end_index: usize,
+        range: WritebackBatchRange,
         required_first: Option<(usize, &Arc<PageEntry>, u64)>,
         admitted: Option<&super::PageCacheDomainIoPermit>,
         mut stable_size: impl FnMut() -> Result<usize, SystemError>,
@@ -2007,8 +2016,8 @@ impl PageCacheManager {
             let file_size = stable_size()?;
             claim = Self::claim_next_writeback_batch(
                 cache,
-                start_index,
-                end_index,
+                range.start_index,
+                range.end_index,
                 file_size,
                 required_first,
                 true,
@@ -2099,8 +2108,7 @@ impl PageCacheManager {
             let file_size = inode.metadata()?.size.max(0) as usize;
             return Self::claim_and_snapshot_locked_with(
                 cache,
-                start_index,
-                end_index,
+                WritebackBatchRange::new(start_index, end_index),
                 file_size,
                 None,
                 false,
@@ -2117,8 +2125,7 @@ impl PageCacheManager {
             return Self::claim_and_snapshot_after_admission_with(
                 cache,
                 &backend,
-                start_index,
-                end_index,
+                WritebackBatchRange::new(start_index, end_index),
                 None,
                 admitted,
                 || backend.stable_writeback_size(inode),
@@ -2130,8 +2137,7 @@ impl PageCacheManager {
             let file_size = backend.stable_writeback_size(inode)?;
             claimed = Self::claim_and_snapshot_locked_with(
                 cache,
-                start_index,
-                end_index,
+                WritebackBatchRange::new(start_index, end_index),
                 file_size,
                 None,
                 true,
@@ -2154,8 +2160,7 @@ impl PageCacheManager {
         &self,
         cache: &Arc<PageCache>,
         inode: &Arc<dyn IndexNode>,
-        start_index: usize,
-        end_index: usize,
+        range: WritebackBatchRange,
         required_entry: &Arc<PageEntry>,
         epoch: u64,
         admitted: Option<&super::PageCacheDomainIoPermit>,
@@ -2165,8 +2170,7 @@ impl PageCacheManager {
             let file_size = inode.metadata()?.size.max(0) as usize;
             return Self::claim_and_snapshot_tagged_locked(
                 cache,
-                start_index,
-                end_index,
+                range,
                 file_size,
                 required_entry,
                 epoch,
@@ -2183,9 +2187,8 @@ impl PageCacheManager {
             return Self::claim_and_snapshot_after_admission_with(
                 cache,
                 &backend,
-                start_index,
-                end_index,
-                Some((start_index, required_entry, epoch)),
+                range,
+                Some((range.start_index, required_entry, epoch)),
                 admitted,
                 || backend.stable_writeback_size(inode),
                 Self::snapshot_writeback_batch,
@@ -2196,8 +2199,7 @@ impl PageCacheManager {
             let file_size = backend.stable_writeback_size(inode)?;
             claimed = Self::claim_and_snapshot_tagged_locked(
                 cache,
-                start_index,
-                end_index,
+                range,
                 file_size,
                 required_entry,
                 epoch,
@@ -2288,8 +2290,7 @@ impl PageCacheManager {
             };
             claimed = Self::claim_and_snapshot_locked_with(
                 cache,
-                start_index,
-                end_index,
+                WritebackBatchRange::new(start_index, end_index),
                 file_size,
                 None,
                 true,
@@ -2601,13 +2602,7 @@ impl PageCacheManager {
             .inode()
             .and_then(|inode| inode.upgrade())
             .ok_or(SystemError::EIO)?;
-        match self.writeback_next_batch(
-            &cache,
-            &inode,
-            start_index,
-            end_index,
-            Some(admitted),
-        )? {
+        match self.writeback_next_batch(&cache, &inode, start_index, end_index, Some(admitted))? {
             WritebackNextBatchOutcome::NoBatch => Ok(PageCacheWritebackDispatchOutcome::Idle),
             WritebackNextBatchOutcome::Completed => Ok(PageCacheWritebackDispatchOutcome::Progress),
             WritebackNextBatchOutcome::Deferred(_) => {
@@ -3586,8 +3581,7 @@ impl PageCacheManager {
             let claim = match self.claim_tagged_batch_with_admission(
                 cache,
                 inode,
-                target_index,
-                tagged_end,
+                WritebackBatchRange::new(target_index, tagged_end),
                 &target_entry,
                 epoch,
                 domain_io.as_ref(),
@@ -3982,8 +3976,7 @@ impl PageCacheManager {
             let claim = match self.claim_tagged_batch_with_admission(
                 &cache,
                 &inode,
-                target_index,
-                tagged_end,
+                WritebackBatchRange::new(target_index, tagged_end),
                 &target_entry,
                 epoch,
                 _domain_io.as_ref(),
@@ -4160,15 +4153,13 @@ impl PageCacheManager {
             // again behind the cursor is intentionally left for a later scan.
             let mut cursor = start_index;
             while cursor <= end_index {
-                let claim = match manager
-                    .try_claim_next_batch_with_admission(
-                        &cache,
-                        &inode,
-                        cursor,
-                        end_index,
-                        _domain_io.as_ref(),
-                    )
-                {
+                let claim = match manager.try_claim_next_batch_with_admission(
+                    &cache,
+                    &inode,
+                    cursor,
+                    end_index,
+                    _domain_io.as_ref(),
+                ) {
                     Ok(claim) => claim,
                     Err(_) => break,
                 };

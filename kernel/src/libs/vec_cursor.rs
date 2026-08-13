@@ -135,7 +135,7 @@ impl VecCursor {
             SeekFrom::SeekCurrent(offset) => self.pos as i64 + offset,
             // 请注意，此处的offset应小于等于0，否则肯定是不合法的
             SeekFrom::SeekEnd(offset) => self.data.len() as i64 + offset,
-            SeekFrom::Invalid => {
+            SeekFrom::SeekData(_) | SeekFrom::SeekHole(_) | SeekFrom::Invalid => {
                 return Err(SystemError::EINVAL);
             }
         };

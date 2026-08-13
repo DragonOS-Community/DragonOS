@@ -1835,14 +1835,18 @@ impl File {
             return Err(SystemError::ESPIPE);
         }
 
-        let file_type = self.inode.metadata()?.file_type;
+        let metadata = self.inode.metadata()?;
+        let file_type = metadata.file_type;
         // Check for procfs private data. If this is a procfs pseudo-file, disallow SEEK_END
         // and other unsupported seek modes.
         {
             let pdata = self.private_data.lock();
             if let FilePrivateData::Procfs(_) = &*pdata {
                 match origin {
-                    SeekFrom::SeekEnd(_) | SeekFrom::Invalid => {
+                    SeekFrom::SeekEnd(_)
+                    | SeekFrom::SeekData(_)
+                    | SeekFrom::SeekHole(_)
+                    | SeekFrom::Invalid => {
                         return Err(SystemError::EINVAL);
                     }
                     _ => {}
@@ -1858,6 +1862,9 @@ impl File {
                 SeekFrom::SeekEnd(_) => {
                     // Preserve the existing directory SEEK_END behavior.
                     return Ok(MAX_LFS_FILESIZE as usize);
+                }
+                SeekFrom::SeekData(_) | SeekFrom::SeekHole(_) => {
+                    return Err(SystemError::EINVAL);
                 }
                 SeekFrom::Invalid => return Err(SystemError::EINVAL),
             };
@@ -1877,9 +1884,24 @@ impl File {
         let pos: i64 = match origin {
             SeekFrom::SeekSet(offset) => offset,
             SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
-            SeekFrom::SeekEnd(offset) => {
-                let metadata = self.metadata()?;
-                metadata.size + offset
+            SeekFrom::SeekEnd(offset) => metadata.size + offset,
+            SeekFrom::SeekData(offset) => {
+                if file_type != FileType::File {
+                    return Err(SystemError::EINVAL);
+                }
+                if offset < 0 || offset >= metadata.size {
+                    return Err(SystemError::ENXIO);
+                }
+                offset
+            }
+            SeekFrom::SeekHole(offset) => {
+                if file_type != FileType::File {
+                    return Err(SystemError::EINVAL);
+                }
+                if offset < 0 || offset >= metadata.size {
+                    return Err(SystemError::ENXIO);
+                }
+                metadata.size
             }
             SeekFrom::Invalid => {
                 return Err(SystemError::EINVAL);

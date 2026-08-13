@@ -347,18 +347,18 @@ impl X86_64MMArch {
                             continue;
                         }
 
-                        log::error!(
-                        "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
-                        ProcessManager::current_pid().data(),
-                        error_code,
-                        address.data(),
-                        regs.rip,
-                    );
-
-                        // VMA不存在，检查是否需要异常表修复
+                        // No VMA exists, so try an exception-table fixup first.
                         if handle_kernel_access_failed(regs) {
-                            return; // 已通过异常表修复
+                            return;
                         }
+
+                        log::error!(
+                            "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
+                            ProcessManager::current_pid().data(),
+                            error_code,
+                            address.data(),
+                            regs.rip,
+                        );
 
                         send_segv_maperr();
                         return;
@@ -469,18 +469,19 @@ impl X86_64MMArch {
                         drop(space_guard);
                         continue 'fault_retry;
                     } else {
-                        log::error!(
-                        "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
-                        ProcessManager::current_pid().data(),
-                        error_code,
-                        regs.rip,
-                        address.data(),
-                        flags
-                    );
-                        // 地址不在VMA范围内，检查是否需要异常表修复
+                        // The address is outside every VMA; try an exception-table fixup first.
                         if handle_kernel_access_failed(regs) {
-                            return; // 已通过异常表修复
+                            return;
                         }
+
+                        log::error!(
+                            "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
+                            ProcessManager::current_pid().data(),
+                            error_code,
+                            regs.rip,
+                            address.data(),
+                            flags
+                        );
 
                         send_segv_maperr();
                         return;

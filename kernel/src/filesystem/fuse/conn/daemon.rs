@@ -107,18 +107,12 @@ impl FuseConn {
     }
 
     pub fn add_epitem(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-        self.epitems.lock().push_back(epitem);
+        self.epitems.add(epitem);
         Ok(())
     }
 
     pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
+        self.epitems.remove(epitem)
     }
 
     fn calc_min_read_buffer(max_write: usize) -> usize {

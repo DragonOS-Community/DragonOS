@@ -13,7 +13,7 @@ use crate::{
     arch::ipc::signal::Signal,
     driver::base::device::device_number::DeviceNumber,
     filesystem::epoll::{
-        event_poll::{EventPoll, LockedEPItemLinkedList},
+        event_poll::{EPollItemList, EventPoll},
         EPollEventType, EPollItem,
     },
     filesystem::vfs::fasync::{FAsyncItem, FAsyncItems},
@@ -150,7 +150,7 @@ impl TtyCore {
             hangup_generation: AtomicUsize::new(0),
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
-            epitems: LockedEPItemLinkedList::default(),
+            epitems: EPollItemList::default(),
             fasync_items: FAsyncItems::new(),
             device_number,
             privete_fields: SpinLock::new(None),
@@ -677,7 +677,7 @@ pub struct TtyCoreData {
     /// 链接tty
     link: RwLock<Weak<TtyCore>>,
     /// epitems
-    epitems: LockedEPItemLinkedList,
+    epitems: EPollItemList,
     /// Open file descriptions registered for asynchronous TTY notification.
     fasync_items: FAsyncItems,
     /// 设备号
@@ -954,20 +954,14 @@ impl TtyCoreData {
 
     #[inline]
     pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
-        self.epitems.lock().push_back(epitem)
+        self.epitems.add(epitem)
     }
 
     pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
+        self.epitems.remove(epitem)
     }
 
-    pub fn epitems(&self) -> &LockedEPItemLinkedList {
+    pub fn epitems(&self) -> &EPollItemList {
         &self.epitems
     }
 

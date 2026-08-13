@@ -460,7 +460,7 @@ impl<T: Socket + 'static> PollableInode for T {
         epitm: &Arc<crate::filesystem::epoll::EPollItem>,
         _: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let _ = self.epoll_items().remove(&epitm.epoll());
+        let _ = self.epoll_items().remove(epitm);
         return Ok(());
     }
 

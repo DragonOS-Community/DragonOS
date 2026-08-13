@@ -1,5 +1,6 @@
+use alloc::collections::LinkedList;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::mem::size_of;
@@ -8,13 +9,14 @@ use bitflags::bitflags;
 
 use crate::arch::ipc::signal::{SigSet, Signal};
 use crate::arch::MMArch;
-use crate::filesystem::epoll::event_poll::{EventPoll, LockedEPItemLinkedList};
+use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::{
     vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags,
     InodeMode, Magic, Metadata, PollableInode, SuperBlock,
 };
+use crate::ipc::sighand::SigHand;
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::mm::MemoryManagementArch;
@@ -99,7 +101,13 @@ struct SignalFdState {
 #[derive(Debug)]
 pub struct SignalFdInode {
     state: SpinLock<SignalFdState>,
-    epitems: LockedEPItemLinkedList,
+    epitems: SpinLock<LinkedList<SignalFdEPollRegistration>>,
+}
+
+#[derive(Debug)]
+struct SignalFdEPollRegistration {
+    epitem: Arc<EPollItem>,
+    sighand: Weak<SigHand>,
 }
 
 impl SignalFdInode {
@@ -128,7 +136,7 @@ impl SignalFdInode {
                 flags,
                 metadata,
             }),
-            epitems: LockedEPItemLinkedList::default(),
+            epitems: SpinLock::new(LinkedList::new()),
         }
     }
 
@@ -184,14 +192,14 @@ impl PollableInode for SignalFdInode {
         epitem: Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        self.epitems.lock().push_back(epitem.clone());
-        // 同时注册到 sighand 的 signalfd_epitems，使信号投递路径
-        // 可以在 hardirq 中直接 wakeup_epoll 而无需遍历 fd_table。
-        let pcb = ProcessManager::current_pcb();
-        pcb.sighand()
-            .signalfd_epitems()
+        let sighand = ProcessManager::current_pcb().sighand();
+        self.epitems
             .lock_irqsave()
-            .push_back(epitem);
+            .push_back(SignalFdEPollRegistration {
+                epitem: epitem.clone(),
+                sighand: Arc::downgrade(&sighand),
+            });
+        sighand.signalfd_epitems().add(epitem);
         Ok(())
     }
 
@@ -200,21 +208,26 @@ impl PollableInode for SignalFdInode {
         epitem: &Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if guard.len() != len {
-            drop(guard);
-            // 同时从 sighand 的 signalfd_epitems 中移除
-            let pcb = ProcessManager::current_pcb();
-            pcb.sighand()
-                .signalfd_epitems()
-                .lock_irqsave()
-                .retain(|x| !Arc::ptr_eq(x, epitem));
-            Ok(())
-        } else {
-            Err(SystemError::ENOENT)
+        let owner = {
+            let mut registrations = self.epitems.lock_irqsave();
+            let mut owner = None;
+            registrations.retain(|registration| {
+                if Arc::ptr_eq(&registration.epitem, epitem) {
+                    owner = Some(registration.sighand.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            owner
+        };
+        let Some(owner) = owner else {
+            return Err(SystemError::ENOENT);
+        };
+        if let Some(sighand) = owner.upgrade() {
+            let _ = sighand.signalfd_epitems().remove(epitem);
         }
+        Ok(())
     }
 }
 

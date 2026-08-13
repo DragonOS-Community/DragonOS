@@ -2,7 +2,8 @@ use super::{poll::PollFlags, vfs::file::File};
 use crate::libs::{mutex::Mutex, spinlock::SpinLock};
 use alloc::sync::Weak;
 use core::fmt::Debug;
-use event_poll::{EventPoll, LockedEPItemLinkedList, ReadyState};
+use core::sync::atomic::{AtomicBool, Ordering};
+use event_poll::{EPollItemList, EPollKey, EventPoll, ReadyState};
 use system_error::SystemError;
 
 pub mod event_poll;
@@ -58,17 +59,18 @@ pub struct EPollItem {
     /// 对标 Linux 中 ep_poll_callback 仅获取 ep->lock 而不获取 ep->mtx 的设计。
     ready_state: Weak<SpinLock<ReadyState>>,
     /// 直接引用 EventPoll 的 poll_epitems，使嵌套 epoll 的向上传播无需获取外层 Mutex。
-    poll_epitems: Weak<LockedEPItemLinkedList>,
+    poll_epitems: Weak<EPollItemList>,
     /// 用户注册的事件
     /// 使用 irqsave SpinLock 而非 RwSem，因为 wakeup_epoll 回调路径可能在
     /// hardirq 上下文中执行（例如 timer IRQ → signal → signalfd → epoll），
     /// RwSem 是可睡眠锁，在 hardirq 中使用会导致死锁。
     /// 对标 Linux 中 epitem.event 由 ep->lock (spin_lock_irqsave) 保护的设计。
     event: SpinLock<EPollEvent>,
-    /// 监听的描述符
-    fd: i32,
     /// 对应的文件
     file: Weak<File>,
+    key: EPollKey,
+    /// Whether callbacks may still publish this registration to the ready list.
+    active: AtomicBool,
 }
 
 impl EPollItem {
@@ -76,18 +78,19 @@ impl EPollItem {
     pub(super) fn new(
         epoll: Weak<Mutex<EventPoll>>,
         ready_state: Weak<SpinLock<ReadyState>>,
-        poll_epitems: Weak<LockedEPItemLinkedList>,
+        poll_epitems: Weak<EPollItemList>,
+        key: EPollKey,
         events: EPollEvent,
-        fd: i32,
         file: Weak<File>,
     ) -> Self {
         Self {
             epoll,
             ready_state,
             poll_epitems,
+            key,
             event: SpinLock::new(events),
-            fd,
             file,
+            active: AtomicBool::new(true),
         }
     }
 
@@ -103,8 +106,16 @@ impl EPollItem {
 
     /// 获取 poll_epitems 的 Weak 引用，用于嵌套 epoll 的向上传播。
     #[allow(dead_code)]
-    pub(crate) fn poll_epitems(&self) -> Weak<LockedEPItemLinkedList> {
+    pub(crate) fn poll_epitems(&self) -> Weak<EPollItemList> {
         self.poll_epitems.clone()
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn deactivate(&self) {
+        self.active.store(false, Ordering::Relaxed);
     }
 
     pub fn event(&self) -> &SpinLock<EPollEvent> {
@@ -115,8 +126,8 @@ impl EPollItem {
         self.file.clone()
     }
 
-    pub fn fd(&self) -> i32 {
-        self.fd
+    pub(crate) fn key(&self) -> EPollKey {
+        self.key
     }
 
     /// ## 通过epoll_item来执行绑定文件的poll方法，并获取到感兴趣的事件

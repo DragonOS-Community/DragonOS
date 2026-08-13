@@ -1,6 +1,6 @@
 use super::vfs::PollableInode;
 use crate::arch::MMArch;
-use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
+use crate::filesystem::epoll::event_poll::EPollItemList;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::{InodeMode, OpenFileBehavior, PostWriteSyncPolicy};
 use crate::filesystem::{
@@ -101,7 +101,7 @@ impl EventFd {
 pub struct EventFdInode {
     eventfd: Mutex<EventFd>,
     wait_queue: WaitQueue,
-    epitems: LockedEPItemLinkedList,
+    epitems: EPollItemList,
 }
 
 impl EventFdInode {
@@ -109,7 +109,7 @@ impl EventFdInode {
         EventFdInode {
             eventfd: Mutex::new(eventfd),
             wait_queue: WaitQueue::default(),
-            epitems: LockedEPItemLinkedList::default(),
+            epitems: EPollItemList::default(),
         }
     }
     fn readable(&self) -> bool {
@@ -147,7 +147,7 @@ impl PollableInode for EventFdInode {
         epitem: Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        self.epitems.lock().push_back(epitem);
+        self.epitems.add(epitem);
         Ok(())
     }
 
@@ -156,13 +156,7 @@ impl PollableInode for EventFdInode {
         epitem: &Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
+        self.epitems.remove(epitem)
     }
 }
 

@@ -117,7 +117,7 @@ impl PollableInode for EPollInode {
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         let poll_epitems = { self.epoll.0.lock().poll_epitems.clone() };
-        poll_epitems.lock_irqsave().push_back(epitem);
+        poll_epitems.add(epitem);
         Ok(())
     }
 
@@ -127,13 +127,6 @@ impl PollableInode for EPollInode {
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         let poll_epitems = { self.epoll.0.lock().poll_epitems.clone() };
-        let mut guard = poll_epitems.lock_irqsave();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if guard.len() != len {
-            Ok(())
-        } else {
-            Err(SystemError::ENOENT)
-        }
+        poll_epitems.remove(epitem)
     }
 }

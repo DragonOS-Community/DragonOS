@@ -27,7 +27,10 @@ use super::{
     FuseReplyCapacity, FuseReplyCapacitySource, FuseReplyContract, FuseRequest, FuseRequestCred,
 };
 use crate::filesystem::fuse::reply::FuseReply;
-use crate::filesystem::{fuse::reply::FuseReadPagesReply, page_cache::PageCacheReadDmaReservation};
+use crate::filesystem::{
+    fuse::reply::FuseReadPagesReply,
+    page_cache::{PageCacheDomainIoPermit, PageCacheReadDmaReservation},
+};
 
 /// How the reply for a request being built should be delivered back.
 ///
@@ -61,6 +64,7 @@ pub(crate) struct BackgroundReadPagesCtx {
     pub observed_size: usize,
     pub observed_attr_version: u64,
     pub open_pin: super::super::private_data::FuseOpenLifetimePin,
+    pub domain_io: Option<PageCacheDomainIoPermit>,
 }
 
 impl FuseConn {
@@ -316,6 +320,7 @@ impl FuseConn {
                 observed_size: ctx.observed_size,
                 observed_attr_version: ctx.observed_attr_version,
                 open_pin: crate::libs::mutex::Mutex::new(Some(ctx.open_pin)),
+                domain_io: crate::libs::mutex::Mutex::new(ctx.domain_io),
             }),
         ));
         let req = self.build_request(

@@ -1533,6 +1533,7 @@ impl FuseNode {
             }
 
             let speculative = run_start >= demand_end_page;
+            let domain_io = page_cache.try_acquire_domain_io()?;
             let track_direct_read_stats = super::super::stats::optional_read_stats_enabled();
             let target = match page_cache.manager().reserve_read_dma(
                 run_start,
@@ -1581,6 +1582,7 @@ impl FuseNode {
                 observed_size: file_ctx.file_size,
                 observed_attr_version,
                 open_pin,
+                domain_io,
             };
             let pending = if async_read {
                 self.conn().enqueue_background_read_pages(

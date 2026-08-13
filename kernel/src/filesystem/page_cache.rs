@@ -578,6 +578,10 @@ impl Drop for PageCacheDomainIoPermit {
 }
 
 impl PageCacheDomainIoPermit {
+    pub(crate) fn belongs_to(&self, domain: &Arc<PageCacheWritebackDomain>) -> bool {
+        Arc::ptr_eq(&self.domain, domain)
+    }
+
     /// Derive a child permit from an already admitted I/O lineage.
     ///
     /// Closing a domain rejects new producers, but it must not revoke work

@@ -690,6 +690,8 @@ impl FileSystem for FuseFS {
     }
 
     fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
+        self.writeback_domain.close_background_admission();
+        self.conn.cancel_page_cache_reads(&self.writeback_domain);
         if !self.is_submount {
             self.conn.begin_dax_quiesce();
             self.conn.wait_dax_drained();

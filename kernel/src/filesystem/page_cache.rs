@@ -1866,10 +1866,27 @@ impl PageCache {
         backend: Arc<dyn PageCacheBackend>,
         domain: &Arc<PageCacheWritebackDomain>,
     ) -> Result<Arc<PageCache>, SystemError> {
+        Self::new_filesystem_mapping(inode, backend, PageCacheKind::File, domain)
+    }
+
+    pub fn new_filesystem_shmem(
+        inode: Weak<dyn IndexNode>,
+        backend: Arc<dyn PageCacheBackend>,
+        domain: &Arc<PageCacheWritebackDomain>,
+    ) -> Result<Arc<PageCache>, SystemError> {
+        Self::new_filesystem_mapping(inode, backend, PageCacheKind::Shmem, domain)
+    }
+
+    fn new_filesystem_mapping(
+        inode: Weak<dyn IndexNode>,
+        backend: Arc<dyn PageCacheBackend>,
+        kind: PageCacheKind,
+        domain: &Arc<PageCacheWritebackDomain>,
+    ) -> Result<Arc<PageCache>, SystemError> {
         let cache = Self::new_with_kind(
             Some(inode),
             Some(backend),
-            PageCacheKind::File,
+            kind,
             Some(Arc::downgrade(domain)),
         );
         domain.register(&cache)?;

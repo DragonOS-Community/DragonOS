@@ -14,7 +14,6 @@ use core::{
     intrinsics::{likely, unlikely},
     mem,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU32, Ordering},
 };
 use log::warn;
 
@@ -813,6 +812,132 @@ impl Futex {
         unsafe { Self::arch_futex_atomic_op_inuser_nofault(op, oparg, uaddr.as_ptr::<u32>()) }
     }
 
+    fn futex_cmpxchg_user(uaddr: VirtAddr, expected: u32, new: u32) -> Result<u32, SystemError> {
+        if uaddr.data() & (core::mem::align_of::<u32>() - 1) != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        access_ok(uaddr, core::mem::size_of::<u32>()).map_err(|_| SystemError::EFAULT)?;
+
+        let _pagefault_guard = PageFaultDisabledGuard::new();
+        unsafe { Self::arch_futex_cmpxchg_nofault(uaddr.as_ptr::<u32>(), expected, new) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn arch_futex_cmpxchg_nofault(
+        uaddr: *mut u32,
+        mut expected: u32,
+        new: u32,
+    ) -> Result<u32, SystemError> {
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "lock cmpxchg dword ptr [{ptr}], {new:e}",
+            "jmp 3f",
+            "4:",
+            "mov {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            new = in(reg) new,
+            inout("eax") expected,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(expected)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe fn arch_futex_cmpxchg_nofault(
+        uaddr: *mut u32,
+        expected: u32,
+        new: u32,
+    ) -> Result<u32, SystemError> {
+        let mut observed: usize;
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "lr.w.aq {observed}, ({ptr})",
+            "bne {observed}, {expected}, 5f",
+            "3:",
+            "sc.w.rl {status}, {new}, ({ptr})",
+            "bnez {status}, 2b",
+            "j 5f",
+            "4:",
+            "li {fault}, 1",
+            "5:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".quad 3b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            expected = in(reg) expected as i32 as isize as usize,
+            new = in(reg) new as usize,
+            observed = out(reg) observed,
+            status = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(observed as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe fn arch_futex_cmpxchg_nofault(
+        uaddr: *mut u32,
+        expected: u32,
+        new: u32,
+    ) -> Result<u32, SystemError> {
+        let mut observed: usize;
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "ll.w {observed}, {ptr}, 0",
+            "bne {observed}, {expected}, 5f",
+            "or {status}, {new}, $zero",
+            "3:",
+            "sc.w {status}, {ptr}, 0",
+            "beqz {status}, 2b",
+            "b 5f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "5:",
+            "dbar 0x700",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".dword 3b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            expected = in(reg) expected as i32 as isize as usize,
+            new = in(reg) new as usize,
+            observed = out(reg) observed,
+            status = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(observed as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     unsafe fn arch_futex_atomic_op_inuser_nofault(
         op: FutexOP,
@@ -1458,20 +1583,6 @@ impl DerefMut for RobustListHead {
 }
 
 impl RobustListHead {
-    /// # 获得futex的用户空间地址
-    pub fn futex_uaddr(&self, entry: VirtAddr) -> VirtAddr {
-        return VirtAddr::new(entry.data() + self.futex_offset as usize);
-    }
-
-    /// #获得list_op_peding的用户空间地址
-    pub fn pending_uaddr(&self) -> Option<VirtAddr> {
-        if self.list_op_pending.is_null() {
-            return None;
-        } else {
-            return Some(self.futex_uaddr(self.list_op_pending));
-        }
-    }
-
     /// # 在内核注册robust list
     /// ## 参数
     /// - head_uaddr：robust list head用户空间地址
@@ -1569,19 +1680,17 @@ impl RobustListHead {
         return Ok(0);
     }
 
-    /// # 进程/线程退出时清理工作
-    /// ## 参数
-    /// - current：当前进程/线程的pcb
-    /// - pid：当前进程/线程的pid
-    pub fn exit_robust_list(pcb: Arc<ProcessControlBlock>) {
-        //指向当前进程的robust list头部的指针
-        let head_info = match *pcb.get_robust_list() {
-            Some(rl) => rl,
-            None => {
-                return;
-            }
+    pub fn cleanup_robust_list(pcb: &Arc<ProcessControlBlock>) {
+        let Some(head) = pcb.take_robust_list() else {
+            return;
         };
+        Self::cleanup_robust_list_head(pcb, head);
+    }
 
+    pub(crate) fn cleanup_robust_list_head(
+        pcb: &Arc<ProcessControlBlock>,
+        head_info: RobustListHead,
+    ) {
         // 重新从用户空间读取 robust list head 的最新内容
         // 因为用户态可能在锁定 mutex 后已经更新了链表
         let user_buffer_reader = match UserBufferReader::new(
@@ -1610,20 +1719,17 @@ impl RobustListHead {
             uaddr: head_info.uaddr,
         };
 
-        // 遍历当前进程/线程的robust list
-        for futex_uaddr in head.futexes() {
-            let pid = pcb.raw_pid().into() as u32;
-            match Self::handle_pi_futex_death(futex_uaddr, pid) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(_) => return,
-            }
-            let ret = Self::handle_futex_death(futex_uaddr, pid);
-            if ret.is_err() {
+        let pid = pcb.task_pid_vnr().data() as u32;
+        for entry in head.futexes() {
+            let result = if entry.pi {
+                Self::handle_pi_futex_death(entry.uaddr, pid).map(|_| ())
+            } else {
+                Self::handle_futex_death(entry.uaddr, pid, entry.pending).map(|_| ())
+            };
+            if result.is_err() {
                 return;
             }
         }
-        pcb.set_robust_list(None);
     }
 
     /// # 返回robust list的迭代器，将robust list list_op_pending 放到最后（如果存在）
@@ -1653,26 +1759,31 @@ impl RobustListHead {
     /// ## 参数
     /// - futex_uaddr：futex的用户空间地址
     /// - pid: 当前进程/线程的pid
-    fn handle_futex_death(futex_uaddr: VirtAddr, pid: u32) -> Result<usize, SystemError> {
+    fn handle_futex_death(
+        futex_uaddr: VirtAddr,
+        pid: u32,
+        pending: bool,
+    ) -> Result<usize, SystemError> {
         // 安全地读取futex值
         let futex_val = match Self::safe_read_u32(futex_uaddr) {
             Some(val) => val,
-            None => {
-                // 地址无效，跳过此futex
-                return Ok(0);
-            }
+            None => return Err(SystemError::EFAULT),
         };
 
         let mut uval = futex_val;
 
-        // 获取futex的原子操作指针
-        // 使用 AtomicU32::from_ptr() 从原始指针创建原子操作对象
-        // 注意：这里我们已经通过safe_read验证了地址的有效性
-        let atomic_futex = unsafe { AtomicU32::from_ptr(futex_uaddr.as_ptr::<u32>()) };
-
         loop {
             // 该futex可能被其他进程占有
             let owner = uval & FUTEX_TID_MASK;
+            if pending && owner == 0 {
+                let _ = Futex::futex_wake(
+                    futex_uaddr,
+                    FutexFlag::FLAGS_SHARED,
+                    1,
+                    FUTEX_BITSET_MATCH_ANY,
+                );
+                break;
+            }
             if owner != pid {
                 break;
             }
@@ -1681,8 +1792,8 @@ impl RobustListHead {
             let mval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
 
             // 使用真正的原子CAS操作
-            match atomic_futex.compare_exchange(uval, mval, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => {
+            match Futex::futex_cmpxchg_user(futex_uaddr, uval, mval) {
+                Ok(observed) if observed == uval => {
                     // CAS成功，检查是否需要唤醒等待者
                     if mval & FUTEX_WAITERS != 0 {
                         let mut flags = FutexFlag::FLAGS_MATCH_NONE;
@@ -1692,11 +1803,11 @@ impl RobustListHead {
                     }
                     break;
                 }
-                Err(current) => {
-                    // CAS失败，说明值被其他线程修改了，更新uval并重试
-                    uval = current;
+                Ok(observed) => {
+                    uval = observed;
                     continue;
                 }
+                Err(err) => return Err(err),
             }
         }
 
@@ -1711,12 +1822,10 @@ impl RobustListHead {
     fn handle_pi_futex_death(futex_uaddr: VirtAddr, pid: u32) -> Result<bool, SystemError> {
         let futex_val = match Self::safe_read_u32(futex_uaddr) {
             Some(val) => val,
-            None => return Ok(false),
+            None => return Err(SystemError::EFAULT),
         };
 
         let mut uval = futex_val;
-        let atomic_futex = unsafe { AtomicU32::from_ptr(futex_uaddr.as_ptr::<u32>()) };
-
         let key_private = Futex::get_futex_key(futex_uaddr, false, FutexAccess::FutexWrite).ok();
         let key_shared = Futex::get_futex_key(futex_uaddr, true, FutexAccess::FutexWrite).ok();
 
@@ -1752,17 +1861,13 @@ impl RobustListHead {
                     None => {
                         drop(futex_map_guard);
                         let mval = FUTEX_OWNER_DIED;
-                        match atomic_futex.compare_exchange(
-                            uval,
-                            mval,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        ) {
-                            Ok(_) => return Ok(true),
-                            Err(current) => {
-                                uval = current;
+                        match Futex::futex_cmpxchg_user(futex_uaddr, uval, mval) {
+                            Ok(observed) if observed == uval => return Ok(true),
+                            Ok(observed) => {
+                                uval = observed;
                                 continue;
                             }
+                            Err(err) => return Err(err),
                         }
                     }
                 };
@@ -1774,22 +1879,18 @@ impl RobustListHead {
 
                 if bucket.pi_waiters.is_empty() {
                     let mval = FUTEX_OWNER_DIED;
-                    match atomic_futex.compare_exchange(
-                        uval,
-                        mval,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    ) {
-                        Ok(_) => {
+                    match Futex::futex_cmpxchg_user(futex_uaddr, uval, mval) {
+                        Ok(observed) if observed == uval => {
                             bucket.pi_owner = 0;
                             drop(futex_map_guard);
                             FutexData::try_remove(key);
                             return Ok(true);
                         }
-                        Err(current) => {
-                            uval = current;
+                        Ok(observed) => {
+                            uval = observed;
                             continue;
                         }
+                        Err(err) => return Err(err),
                     }
                 }
 
@@ -1799,23 +1900,22 @@ impl RobustListHead {
                     let new_val = next_waiter.tid
                         | FUTEX_OWNER_DIED
                         | if has_more { FUTEX_WAITERS } else { 0 };
-                    match atomic_futex.compare_exchange(
-                        uval,
-                        new_val,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    ) {
-                        Ok(_) => {
+                    match Futex::futex_cmpxchg_user(futex_uaddr, uval, new_val) {
+                        Ok(observed) if observed == uval => {
                             bucket.pi_owner = next_waiter.tid;
                             drop(futex_map_guard);
                             next_waiter.waker.wake();
                             return Ok(true);
                         }
-                        Err(current) => {
+                        Ok(observed) => {
                             bucket.pi_waiters.push_front(next_waiter);
                             drop(futex_map_guard);
-                            uval = current;
+                            uval = observed;
                             continue;
+                        }
+                        Err(err) => {
+                            bucket.pi_waiters.push_front(next_waiter);
+                            return Err(err);
                         }
                     }
                 }
@@ -1825,21 +1925,29 @@ impl RobustListHead {
             }
 
             let mval = FUTEX_OWNER_DIED;
-            match atomic_futex.compare_exchange(uval, mval, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => return Ok(true),
-                Err(current) => {
-                    uval = current;
+            match Futex::futex_cmpxchg_user(futex_uaddr, uval, mval) {
+                Ok(observed) if observed == uval => return Ok(true),
+                Ok(observed) => {
+                    uval = observed;
                     continue;
                 }
+                Err(err) => return Err(err),
             }
         }
     }
 }
 
-pub struct FutexIterator<'a> {
+struct FutexIterator<'a> {
     robust_list_head: &'a RobustListHead,
     entry: VirtAddr,
     count: isize,
+    stop_after_current: bool,
+}
+
+struct RobustFutexEntry {
+    uaddr: VirtAddr,
+    pi: bool,
+    pending: bool,
 }
 
 impl<'a> FutexIterator<'a> {
@@ -1848,7 +1956,37 @@ impl<'a> FutexIterator<'a> {
             robust_list_head,
             entry: robust_list_head.list.next,
             count: 0,
+            stop_after_current: false,
         };
+    }
+
+    fn decode_entry(
+        &self,
+        encoded: VirtAddr,
+        pending: bool,
+    ) -> Result<RobustFutexEntry, SystemError> {
+        if encoded.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+        let pi = encoded.data() & 1 != 0;
+        let base = encoded.data() & !1;
+        let address = base
+            .checked_add_signed(self.robust_list_head.futex_offset)
+            .ok_or(SystemError::EFAULT)?;
+        if address & (core::mem::align_of::<u32>() - 1) != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let uaddr = VirtAddr::new(address);
+        access_ok(uaddr, core::mem::size_of::<u32>()).map_err(|_| SystemError::EFAULT)?;
+        Ok(RobustFutexEntry { uaddr, pi, pending })
+    }
+
+    fn pending_entry(&self) -> Option<RobustFutexEntry> {
+        if self.robust_list_head.list_op_pending.is_null() {
+            return None;
+        }
+        self.decode_entry(self.robust_list_head.list_op_pending, true)
+            .ok()
     }
 
     fn is_end(&mut self) -> bool {
@@ -1859,52 +1997,68 @@ impl<'a> FutexIterator<'a> {
     fn is_sentinel(&self) -> bool {
         // 链表的哨兵是 &head.list，其地址就是 head.uaddr
         // 因为 list 是 head 结构的第一个字段
-        self.entry.data() == self.robust_list_head.uaddr.data()
+        (self.entry.data() & !1) == self.robust_list_head.uaddr.data()
     }
 }
 
 impl Iterator for FutexIterator<'_> {
-    type Item = VirtAddr;
+    type Item = RobustFutexEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.is_end() {
+        if self.is_end() || self.stop_after_current {
+            self.count = -1;
             return None;
         }
 
         // 如果初始 entry 就是哨兵，说明链表为空
         if self.count == 0 && self.is_sentinel() {
             self.count = -1;
-            return self.robust_list_head.pending_uaddr();
+            return self.pending_entry();
         }
 
         while !self.is_sentinel() {
             if self.count >= ROBUST_LIST_LIMIT {
                 break;
             }
-            if self.entry.is_null() {
+            let encoded_entry = self.entry;
+            if encoded_entry.is_null() {
                 return None;
             }
 
+            let entry_address = VirtAddr::new(encoded_entry.data() & !1);
+            let pending_address = self.robust_list_head.list_op_pending.data() & !1;
+
             //获取futex val地址
-            let futex_uaddr = if self.entry.data() != self.robust_list_head.list_op_pending.data() {
-                Some(self.robust_list_head.futex_uaddr(self.entry))
+            let futex_entry = if entry_address.data() != pending_address {
+                match self.decode_entry(encoded_entry, false) {
+                    Ok(entry) => Some(entry),
+                    Err(_) => {
+                        self.count = -1;
+                        return None;
+                    }
+                }
             } else {
                 None
             };
 
             // 安全地读取下一个entry
-            let next_entry = RobustListHead::safe_read::<PosixRobustList>(self.entry)
-                .and_then(|reader| reader.read_one_from_user::<PosixRobustList>(0).ok())?;
+            let next_entry = RobustListHead::safe_read::<PosixRobustList>(entry_address)
+                .and_then(|reader| reader.read_one_from_user::<PosixRobustList>(0).ok());
+
+            let Some(next_entry) = next_entry else {
+                self.stop_after_current = true;
+                return futex_entry;
+            };
 
             self.entry = next_entry.next;
             self.count += 1;
 
-            if futex_uaddr.is_some() {
-                return futex_uaddr;
+            if futex_entry.is_some() {
+                return futex_entry;
             }
         }
 
         self.count = -1;
-        self.robust_list_head.pending_uaddr()
+        self.pending_entry()
     }
 }

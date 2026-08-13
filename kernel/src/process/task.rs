@@ -1347,6 +1347,11 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    pub fn take_robust_list(&self) -> Option<RobustListHead> {
+        self.robust_list.write_irqsave().take()
+    }
+
+    #[inline(always)]
     pub fn alarm_timer_irqsave(&self) -> SpinLockGuard<'_, Option<AlarmTimer>> {
         return self.alarm_timer.lock_irqsave();
     }

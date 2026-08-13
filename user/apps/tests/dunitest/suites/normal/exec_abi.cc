@@ -3,11 +3,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -59,6 +63,43 @@ constexpr unsigned char kCheckRdxElf[] = {
     0x0f, 0x05,
 };
 
+constexpr unsigned char kCheckRobustListClearedElf[] = {
+    0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+
+    0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb6, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xb6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    // get_robust_list(0, rsp, rsp + 8); require a NULL head and sizeof(head).
+    0x48, 0x83, 0xec, 0x20, 0x31, 0xff, 0x48, 0x8d, 0x34, 0x24, 0x48, 0x8d,
+    0x54, 0x24, 0x08, 0xb8, 0x12, 0x01, 0x00, 0x00, 0x0f, 0x05, 0x85, 0xc0,
+    0x75, 0x18, 0x48, 0x83, 0x3c, 0x24, 0x00, 0x75, 0x11, 0x48, 0x83, 0x7c,
+    0x24, 0x08, 0x18, 0x75, 0x09, 0x31, 0xff, 0xb8, 0x3c, 0x00, 0x00, 0x00,
+    0x0f, 0x05, 0xbf, 0x2a, 0x00, 0x00, 0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00,
+    0x0f, 0x05,
+};
+
+struct TestRobustListHead {
+    uintptr_t next;
+    intptr_t futex_offset;
+    uintptr_t list_op_pending;
+};
+
+struct TestRobustNode {
+    uintptr_t next;
+    uint32_t futex;
+};
+
+constexpr uint32_t kFutexTidMask = 0x3fffffffU;
+constexpr uint32_t kFutexOwnerDied = 0x40000000U;
+
 void write_all(int fd, const void* data, size_t size) {
     const char* p = static_cast<const char*>(data);
     while (size > 0) {
@@ -80,6 +121,25 @@ void write_check_rdx_elf(char* path, size_t path_size) {
                             << strerror(errno) << ")";
     ASSERT_EQ(0, chmod(path, 0755)) << "chmod(" << path << ") failed: errno=" << errno << " ("
                                     << strerror(errno) << ")";
+}
+
+void write_executable(const char* path, const void* data, size_t size) {
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0755);
+    ASSERT_GE(fd, 0) << "open(" << path << ") failed: errno=" << errno << " ("
+                     << strerror(errno) << ")";
+    write_all(fd, data, size);
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, chmod(path, 0755));
+}
+
+int set_test_robust_list(TestRobustListHead* head, TestRobustNode* node) {
+    const pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+    node->next = reinterpret_cast<uintptr_t>(head);
+    node->futex = static_cast<uint32_t>(tid);
+    head->next = reinterpret_cast<uintptr_t>(node);
+    head->futex_offset = offsetof(TestRobustNode, futex);
+    head->list_op_pending = 0;
+    return static_cast<int>(syscall(SYS_set_robust_list, head, sizeof(*head)));
 }
 
 #endif
@@ -128,6 +188,132 @@ TEST(ExecAbi, X86_64ExecClearsRdxWhenEnvpIsNonNull) {
     ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally, status=" << status;
     EXPECT_EQ(0, WEXITSTATUS(status))
         << "exec entry %rdx was not cleared; exit 42 means old envp leaked into %rdx";
+}
+
+TEST(ExecAbi, SuccessfulExecCleansOldRobustList) {
+    ensure_tmp_dir();
+    char path[128] = {};
+    snprintf(path, sizeof(path), "/tmp/exec_abi_robust_%d", getpid());
+    write_executable(path, kCheckRobustListClearedElf, sizeof(kCheckRobustListClearedElf));
+
+    auto* node = static_cast<TestRobustNode*>(
+        mmap(nullptr, sizeof(TestRobustNode), PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, node);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        TestRobustListHead head = {};
+        if (set_test_robust_list(&head, node) != 0) {
+            _exit(90);
+        }
+        char* const argv[] = {path, nullptr};
+        char* const envp[] = {nullptr};
+        execve(path, argv, envp);
+        _exit(91);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    const uint32_t futex = __atomic_load_n(&node->futex, __ATOMIC_SEQ_CST);
+    EXPECT_EQ(0U, futex & kFutexTidMask);
+    EXPECT_NE(0U, futex & kFutexOwnerDied);
+
+    EXPECT_EQ(0, munmap(node, sizeof(TestRobustNode)));
+    EXPECT_EQ(0, unlink(path));
+}
+
+TEST(ExecAbi, SuccessfulExecToleratesReadOnlyRobustFutex) {
+    ensure_tmp_dir();
+    char path[128] = {};
+    snprintf(path, sizeof(path), "/tmp/exec_abi_robust_ro_%d", getpid());
+    write_executable(path, kCheckRobustListClearedElf, sizeof(kCheckRobustListClearedElf));
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    auto* node = static_cast<TestRobustNode*>(
+        mmap(nullptr, static_cast<size_t>(page_size), PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, node);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        TestRobustListHead head = {};
+        if (set_test_robust_list(&head, node) != 0) {
+            _exit(96);
+        }
+        if (mprotect(node, static_cast<size_t>(page_size), PROT_READ) != 0) {
+            _exit(97);
+        }
+        char* const argv[] = {path, nullptr};
+        char* const envp[] = {nullptr};
+        execve(path, argv, envp);
+        _exit(98);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    const uint32_t futex = __atomic_load_n(&node->futex, __ATOMIC_SEQ_CST);
+    EXPECT_NE(0U, futex & kFutexTidMask);
+    EXPECT_EQ(0U, futex & kFutexOwnerDied);
+
+    EXPECT_EQ(0, munmap(node, static_cast<size_t>(page_size)));
+    EXPECT_EQ(0, unlink(path));
+}
+
+TEST(ExecAbi, FailedExecPreservesRobustList) {
+    ensure_tmp_dir();
+    char early_path[128] = {};
+    char late_path[128] = {};
+    snprintf(early_path, sizeof(early_path), "/tmp/exec_abi_bad_early_%d", getpid());
+    snprintf(late_path, sizeof(late_path), "/tmp/exec_abi_bad_late_%d", getpid());
+    static constexpr char kNotElf[] = "not an executable";
+    write_executable(early_path, kNotElf, sizeof(kNotElf));
+
+    unsigned char malformed[sizeof(kCheckRdxElf)] = {};
+    memcpy(malformed, kCheckRdxElf, sizeof(malformed));
+    malformed[96] += 1;  // p_filesz > p_memsz, rejected after begin_new_exec().
+    write_executable(late_path, malformed, sizeof(malformed));
+
+    for (const char* path : {early_path, late_path}) {
+        pid_t child = fork();
+        ASSERT_GE(child, 0);
+        if (child == 0) {
+            TestRobustListHead head = {};
+            TestRobustNode node = {};
+            if (set_test_robust_list(&head, &node) != 0) {
+                _exit(92);
+            }
+            char* const argv[] = {const_cast<char*>(path), nullptr};
+            char* const envp[] = {nullptr};
+            if (execve(path, argv, envp) == 0) {
+                _exit(93);
+            }
+            TestRobustListHead* observed = nullptr;
+            size_t observed_size = 0;
+            if (syscall(SYS_get_robust_list, 0, &observed, &observed_size) != 0) {
+                _exit(94);
+            }
+            if (observed != &head || observed_size != sizeof(head) ||
+                (node.futex & kFutexOwnerDied) != 0) {
+                _exit(95);
+            }
+            _exit(0);
+        }
+        int status = 0;
+        ASSERT_EQ(child, waitpid(child, &status, 0));
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(0, WEXITSTATUS(status));
+    }
+
+    EXPECT_EQ(0, unlink(early_path));
+    EXPECT_EQ(0, unlink(late_path));
 }
 
 #endif

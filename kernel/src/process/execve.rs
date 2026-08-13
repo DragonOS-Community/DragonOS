@@ -2,6 +2,7 @@ use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::open::{do_open_execat, do_open_execat_with_flags};
+use crate::libs::futex::futex::RobustListHead;
 use crate::libs::rwsem::RwSem;
 use crate::process::exec::{
     load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
@@ -155,6 +156,8 @@ fn do_execve_internal(
 
             let pcb = ProcessManager::current_pcb();
 
+            commit_exec_robust_list(&pcb, old_vm.as_ref(), &address_space);
+
             // unshare fd_table if it's shared (CLONE_FILES case)
             // 参考 Linux: https://elixir.bootlin.com/linux/v6.1.9/source/fs/exec.c#L1857
             // "Ensure the files table is not shared"
@@ -267,14 +270,9 @@ fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpac
     // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
     let old_address_space = basic_info.user_vm();
 
-    // INV-1: when execve switches mm, first clear this CPU from the old mm's active_cpus,
-    // then switch the hardware page table, then add this CPU to the new mm's active_cpus,
-    // and finally update per-CPU TlbState.
-    // Note: on the execve path the old/new mm are always different (the new mm is a freshly
-    // created AddressSpace::new result).
-    if let Some(old_vm) = old_address_space.as_ref() {
-        old_vm.active_cpus_clear(cpu);
-    }
+    // Match the scheduler's address-space switch invariant. The temporary
+    // double membership can cause an extra shootdown, but cannot miss one.
+    new_vm.active_cpus_set(cpu);
 
     // 在pcb中原来的用户地址空间
     unsafe {
@@ -296,10 +294,38 @@ fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpac
     // 切换到新的用户地址空间
     unsafe { new_vm.make_current() };
 
-    new_vm.active_cpus_set(cpu);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    if let Some(old_vm) = old_address_space.as_ref() {
+        if !Arc::ptr_eq(old_vm, &new_vm) {
+            old_vm.active_cpus_clear(cpu);
+        }
+    }
     unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(new_vm.clone()) };
 
     drop(irq_guard);
 
     old_address_space
+}
+
+fn commit_exec_robust_list(
+    pcb: &Arc<ProcessControlBlock>,
+    old_vm: Option<&Arc<AddressSpace>>,
+    new_vm: &Arc<AddressSpace>,
+) {
+    let Some(head) = pcb.take_robust_list() else {
+        return;
+    };
+    let Some(old_vm) = old_vm else {
+        return;
+    };
+
+    let replaced = do_execve_switch_user_vm(old_vm.clone())
+        .expect("successful user exec must replace the new address space");
+    assert!(Arc::ptr_eq(&replaced, new_vm));
+
+    RobustListHead::cleanup_robust_list_head(pcb, head);
+
+    let replaced = do_execve_switch_user_vm(new_vm.clone())
+        .expect("robust-list cleanup must leave the old address space installed");
+    assert!(Arc::ptr_eq(&replaced, old_vm));
 }

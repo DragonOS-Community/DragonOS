@@ -437,7 +437,7 @@ impl ProcessManager {
             }
             compiler_fence(Ordering::SeqCst);
 
-            RobustListHead::exit_robust_list(pcb.clone());
+            RobustListHead::cleanup_robust_list(&pcb);
             // If this process was created via vfork, complete the completion.
             if let Some(vd) = vfork_done {
                 vd.complete_all();

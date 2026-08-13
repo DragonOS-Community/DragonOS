@@ -11,5 +11,7 @@ pub enum SeekFrom {
     SeekSet(i64),
     SeekCurrent(i64),
     SeekEnd(i64),
+    SeekData(i64),
+    SeekHole(i64),
     Invalid,
 }

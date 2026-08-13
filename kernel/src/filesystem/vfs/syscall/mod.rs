@@ -146,7 +146,9 @@ mod xattr_utils;
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
-pub const SEEK_MAX: u32 = 3;
+pub const SEEK_DATA: u32 = 3;
+pub const SEEK_HOLE: u32 = 4;
+pub const SEEK_MAX: u32 = SEEK_HOLE;
 
 bitflags! {
     /// Flags used in the `renameat2` system call.

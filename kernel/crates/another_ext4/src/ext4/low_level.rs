@@ -3052,7 +3052,7 @@ impl Ext4 {
 
         let mode = InodeMode::SOFTLINK | InodeMode::ALL_RWX;
         let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
-        let initialized = if target.len() + 1 <= child.inode.inline_block().len() {
+        let initialized = if target.len() < child.inode.inline_block().len() {
             child
                 .inode
                 .set_fast_symlink(target.as_bytes())
@@ -5437,11 +5437,7 @@ mod tests {
         let initial_sb_free_inodes = fs.read_super_block_cached().free_inodes_count();
         let initial_bg_free_inodes = fs.read_block_group(0).unwrap().desc.free_inodes_count();
         let mut inode = fs
-            .create_inode_with_owner(
-                InodeMode::SOFTLINK | InodeMode::ALL_RWX,
-                0,
-                0,
-            )
+            .create_inode_with_owner(InodeMode::SOFTLINK | InodeMode::ALL_RWX, 0, 0)
             .unwrap();
         assert!(fs.inode_is_allocated(inode.id).unwrap());
         block_device.fail_once_on_write(TEST_INODE_TABLE);
@@ -5457,7 +5453,10 @@ mod tests {
 
         assert_eq!(err.code(), ErrCode::EIO);
         assert_eq!(inode.inode.fs_block_count(), 0);
-        assert_eq!(fs.extent_all_data_blocks(&inode).unwrap(), vec![TEST_XATTR_BLOCK]);
+        assert_eq!(
+            fs.extent_all_data_blocks(&inode).unwrap(),
+            vec![TEST_XATTR_BLOCK]
+        );
         assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
 
         fs.free_inode(&mut inode).unwrap();

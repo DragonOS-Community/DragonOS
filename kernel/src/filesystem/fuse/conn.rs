@@ -14,9 +14,7 @@ use system_error::SystemError;
 use crate::filesystem::page_cache::PageCacheReadDmaReservation;
 use crate::{
     arch::MMArch,
-    filesystem::epoll::{
-        event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType,
-    },
+    filesystem::epoll::{event_poll::EPollItemList, event_poll::EventPoll, EPollEventType},
     libs::{
         mutex::Mutex,
         wait_queue::{WaitQueue, Waiter},
@@ -778,7 +776,7 @@ pub struct FuseConn {
     read_wait: WaitQueue,
     init_wait: WaitQueue,
     bridge_wake: FuseBridgeWake,
-    epitems: LockedEPItemLinkedList,
+    epitems: EPollItemList,
     backend_reply_limit: Option<usize>,
     reply_layout_minor: AtomicU32,
     background: Arc<FuseBackgroundState>,
@@ -920,7 +918,7 @@ impl FuseConn {
             read_wait: WaitQueue::default(),
             init_wait: WaitQueue::default(),
             bridge_wake: FuseBridgeWake::new(),
-            epitems: LockedEPItemLinkedList::default(),
+            epitems: EPollItemList::default(),
             backend_reply_limit,
             reply_layout_minor: AtomicU32::new(0),
             background: FuseBackgroundState::new(),

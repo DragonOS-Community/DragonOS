@@ -4,7 +4,7 @@ use crate::{
     arch::{ipc::signal::Signal, MMArch},
     filesystem::{
         epoll::{
-            event_poll::{EventPoll, LockedEPItemLinkedList},
+            event_poll::{EPollItemList, EventPoll},
             EPollEventType, EPollItem,
         },
         vfs::{
@@ -239,7 +239,7 @@ pub struct LockedPipeInode {
     write_wait_queue: WaitQueue,
     /// 用于 FIFO 打开时的阻塞等待（等待另一端打开）
     open_wait_queue: WaitQueue,
-    epitems: LockedEPItemLinkedList,
+    epitems: EPollItemList,
     read_fasync_items: FAsyncItems,
     write_fasync_items: FAsyncItems,
 }
@@ -617,7 +617,7 @@ impl LockedPipeInode {
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
             open_wait_queue: WaitQueue::default(),
-            epitems: LockedEPItemLinkedList::default(),
+            epitems: EPollItemList::default(),
             read_fasync_items: FAsyncItems::default(),
             write_fasync_items: FAsyncItems::default(),
         });
@@ -1773,7 +1773,7 @@ impl PollableInode for LockedPipeInode {
         epitem: Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        self.epitems.lock().push_back(epitem);
+        self.epitems.add(epitem);
         Ok(())
     }
 
@@ -1782,13 +1782,7 @@ impl PollableInode for LockedPipeInode {
         epitem: &Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
+        self.epitems.remove(epitem)
     }
 
     fn add_fasync(

@@ -26,11 +26,13 @@ use system_error::SystemError;
 
 use super::{fs::EPollInode, EPollCtlOption, EPollEvent, EPollEventType, EPollItem};
 
-/// epoll 就绪状态，由独立的 irqsave SpinLock 保护。
+/// Epoll ready state protected by a dedicated irqsave spin lock.
 ///
-/// 对标 Linux 6.6 中由 `ep->lock`（rwlock_t）保护的 `rdllist` + `ovflist` + `wq`。
-/// 回调路径（`wakeup_epoll`，等价于 Linux `ep_poll_callback`）仅获取此 SpinLock，
-/// 不碰外层 Mutex，因此完全 hardirq-safe。
+/// This corresponds to Linux 6.6's `ep->lock`, which protects `rdllist`,
+/// `ovflist`, and the wait queue. The callback path does not acquire the outer
+/// sleeping mutex. The source registration snapshot still allocates and scans
+/// entries in hardirq context; that existing latency concern is separate from
+/// this lock-discipline guarantee.
 pub(crate) struct ReadyState {
     /// 就绪列表（正常路径）
     ready_list: LinkedList<Arc<EPollItem>>,
@@ -44,6 +46,21 @@ pub(crate) struct ReadyState {
     ovflist: Option<Vec<Arc<EPollItem>>>,
     /// epoll_wait 等待者
     epoll_wq: WaitQueue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EPollKey {
+    open_file_id: usize,
+    fd: i32,
+}
+
+impl EPollKey {
+    pub(super) fn new(file: &File, fd: i32) -> Self {
+        Self {
+            open_file_id: file.open_file_id(),
+            fd,
+        }
+    }
 }
 
 impl Debug for ReadyState {
@@ -69,11 +86,11 @@ impl Debug for ReadyState {
 #[derive(Debug)]
 pub struct EventPoll {
     /// 维护所有添加进来的socket的红黑树（由外层 Mutex 保护）
-    ep_items: RBTree<i32, Arc<EPollItem>>,
+    ep_items: RBTree<EPollKey, Arc<EPollItem>>,
     /// 就绪状态（由内层 irqsave SpinLock 保护）
     ready_state: Arc<SpinLock<ReadyState>>,
     /// 监听本 epollfd 的 epitems（用于支持 epoll 嵌套：epollfd 被加入另一个 epoll）
-    pub(super) poll_epitems: Arc<LockedEPItemLinkedList>,
+    pub(super) poll_epitems: Arc<EPollItemList>,
     self_ref: Option<Weak<Mutex<EventPoll>>>,
 }
 
@@ -90,25 +107,23 @@ impl EventPoll {
                 ovflist: None,
                 epoll_wq: WaitQueue::default(),
             })),
-            poll_epitems: Arc::new(LockedEPItemLinkedList::default()),
+            poll_epitems: Arc::new(EPollItemList::default()),
             self_ref: None,
         }
     }
 
     /// 关闭epoll时，执行的逻辑
     pub(super) fn close(&mut self) -> Result<(), SystemError> {
-        let fds: Vec<i32> = self.ep_items.keys().cloned().collect::<Vec<_>>();
-        // 清理红黑树里面的epitems
-        for fd in fds {
-            let fdtable = ProcessManager::current_pcb().basic().try_fd_table().clone();
-            let file = fdtable.and_then(|fdtable| fdtable.read().get_file_by_fd(fd));
-
-            if let Some(file) = file {
-                let epitm = self.ep_items.get(&fd).unwrap();
-                // 尝试移除epitem，忽略错误（对于普通文件，我们没有添加epitem，所以会失败）
-                let _ = file.remove_epitem(epitm);
+        let keys: Vec<EPollKey> = self.ep_items.keys().copied().collect();
+        for key in keys {
+            let Some(epitem) = self.ep_items.get(&key).cloned() else {
+                continue;
+            };
+            if let Some(file) = epitem.file().upgrade() {
+                let _ = file.remove_epitem(&epitem);
             }
-            self.ep_items.remove(&fd);
+            Self::deactivate_and_remove_ready(self, &epitem);
+            self.ep_items.remove(&key);
         }
 
         Ok(())
@@ -252,7 +267,8 @@ impl EventPoll {
                 }
             };
 
-            let ep_item = epoll_guard.ep_items.get(&dstfd).cloned();
+            let key = EPollKey::new(&dst_file, dstfd);
+            let ep_item = epoll_guard.ep_items.get(&key).cloned();
             let notify_nested = match op {
                 EPollCtlOption::Add => {
                     // 如果已经存在，则返回错误
@@ -265,8 +281,8 @@ impl EventPoll {
                         Arc::downgrade(&epoll_data.epoll.0),
                         Arc::downgrade(&epoll_guard.ready_state),
                         Arc::downgrade(&epoll_guard.poll_epitems),
+                        key,
                         epds,
-                        dstfd,
                         Arc::downgrade(&dst_file),
                     ));
                     Self::ep_insert(&mut epoll_guard, dst_file, epitem)?
@@ -274,7 +290,7 @@ impl EventPoll {
                 EPollCtlOption::Del => match ep_item {
                     Some(ref ep_item) => {
                         // 删除
-                        Self::ep_remove(&mut epoll_guard, dstfd, Some(dst_file), ep_item)?;
+                        Self::ep_remove(&mut epoll_guard, key, Some(dst_file), ep_item)?;
                         false
                     }
                     None => {
@@ -700,13 +716,13 @@ impl EventPoll {
             return Err(SystemError::ENOSYS);
         }
 
-        epoll_guard.ep_items.insert(epitem.fd, epitem.clone());
+        epoll_guard.ep_items.insert(epitem.key(), epitem.clone());
 
         // 先将 epitem 添加到目标文件的 epoll_items 中，这样之后的 notify/wakeup_epoll
         // 才能找到并唤醒这个 epitem。
         if let Err(e) = dst_file.add_epitem(epitem.clone()) {
             // 如果添加失败，需要清理 ep_items 中已插入的项
-            epoll_guard.ep_items.remove(&epitem.fd);
+            epoll_guard.ep_items.remove(&epitem.key());
             return Err(e);
         }
 
@@ -726,18 +742,16 @@ impl EventPoll {
         Ok(notify_nested)
     }
 
-    pub fn ep_remove(
+    fn ep_remove(
         epoll: &mut MutexGuard<EventPoll>,
-        fd: i32,
+        key: EPollKey,
         dst_file: Option<Arc<File>>,
         epitem: &Arc<EPollItem>,
     ) -> Result<(), SystemError> {
+        let removed = epoll.ep_items.remove(&key).ok_or(SystemError::ENOENT)?;
+        Self::deactivate_and_remove_ready(epoll, &removed);
         if let Some(dst_file) = dst_file {
-            dst_file.remove_epitem(epitem)?;
-        }
-
-        if let Some(removed) = epoll.ep_items.remove(&fd) {
-            Self::remove_ready_item(epoll, &removed);
+            let _ = dst_file.remove_epitem(epitem);
         }
 
         Ok(())
@@ -752,20 +766,21 @@ impl EventPoll {
             return;
         };
         let mut epoll = epoll.lock();
-        let fd = epitem.fd();
-        let Some(current) = epoll.ep_items.get(&fd).cloned() else {
+        let key = epitem.key();
+        let Some(current) = epoll.ep_items.get(&key).cloned() else {
             return;
         };
         if !Arc::ptr_eq(&current, epitem) {
             return;
         }
 
-        epoll.ep_items.remove(&fd);
-        Self::remove_ready_item(&mut epoll, &current);
+        epoll.ep_items.remove(&key);
+        Self::deactivate_and_remove_ready(&epoll, &current);
     }
 
-    fn remove_ready_item(epoll: &mut MutexGuard<EventPoll>, epitem: &Arc<EPollItem>) {
+    fn deactivate_and_remove_ready(epoll: &EventPoll, epitem: &Arc<EPollItem>) {
         let mut rs = epoll.ready_state.lock_irqsave();
+        epitem.deactivate();
         rs.ready_list.retain(|item| !Arc::ptr_eq(item, epitem));
         if let Some(ovflist) = rs.ovflist.as_mut() {
             ovflist.retain(|item| !Arc::ptr_eq(item, epitem));
@@ -859,23 +874,19 @@ impl EventPoll {
         Ok(())
     }
 
-    /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
+    /// Processes notifications from files that support epoll.
     ///
-    /// 对标 Linux `ep_poll_callback()`。仅获取内层 SpinLock（irqsave），
-    /// **不获取外层 Mutex**，因此完全 hardirq-safe。
-    ///
-    /// 回调路径通过 `EPollItem::ready_state()` 直接访问 `ReadyState`，
-    /// 绕过 `Mutex<EventPoll>`。
+    /// Like Linux `ep_poll_callback()`, this path never acquires the outer
+    /// sleeping `Mutex<EventPoll>`. Registration and ready-state locks use
+    /// irqsave discipline. The registration snapshot's existing allocation and
+    /// O(N) scan remain a separately documented hardirq latency risk.
     pub fn wakeup_epoll(
-        epitems: &LockedEPItemLinkedList,
+        epitems: &EPollItemList,
         pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
         // 在 epitems 锁下复制一份快照，然后释放锁，再逐个处理。
         // 避免持有 epitems 锁时再去获取其他锁导致 ABBA 死锁。
-        let epitems_snapshot: Vec<Arc<EPollItem>> = {
-            let epitems_guard = epitems.lock_irqsave();
-            epitems_guard.iter().cloned().collect()
-        };
+        let epitems_snapshot = epitems.snapshot();
 
         for epitem in epitems_snapshot.iter() {
             // 通过 EPollItem 的 ready_state Weak 直接访问 ReadyState — 不需要 Mutex
@@ -907,6 +918,9 @@ impl EventPoll {
             {
                 // 仅获取 SpinLock（irqsave）— hardirq-safe
                 let mut rs = rs_arc.lock_irqsave();
+                if !epitem.is_active() {
+                    continue;
+                }
 
                 if let Some(ref mut ovflist) = rs.ovflist {
                     // 扫描进行中 — 推入溢出列表
@@ -941,16 +955,45 @@ impl EventPoll {
     }
 }
 
-/// LockedEPItemLinkedList — 使用 irqsave SpinLock 保护的 epitem 链表。
+/// An IRQ-safe list of epoll registrations attached to a pollable source.
 ///
-/// 从 Mutex 改为 SpinLock 使得 `wakeup_epoll` 中的快照操作在 hardirq
-/// 上下文中也是安全的。链表操作（push_back、retain、snapshot clone）
-/// 临界区都很短，适合 SpinLock。
-pub type LockedEPItemLinkedList = SpinLock<LinkedList<Arc<EPollItem>>>;
+/// The inner lock is deliberately private: wakeups can run in hardirq context,
+/// so task-context registration updates must use the same irqsave discipline.
+#[derive(Debug)]
+pub struct EPollItemList {
+    items: SpinLock<LinkedList<Arc<EPollItem>>>,
+}
 
-impl Default for LockedEPItemLinkedList {
+impl EPollItemList {
+    pub fn add(&self, epitem: Arc<EPollItem>) {
+        self.items.lock_irqsave().push_back(epitem);
+    }
+
+    pub fn remove(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let mut items = self.items.lock_irqsave();
+        let old_len = items.len();
+        items.retain(|item| !Arc::ptr_eq(item, epitem));
+        if items.len() != old_len {
+            Ok(())
+        } else {
+            Err(SystemError::ENOENT)
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Arc<EPollItem>> {
+        self.items.lock_irqsave().iter().cloned().collect()
+    }
+
+    pub fn take_all(&self) -> LinkedList<Arc<EPollItem>> {
+        core::mem::take(&mut *self.items.lock_irqsave())
+    }
+}
+
+impl Default for EPollItemList {
     fn default() -> Self {
-        SpinLock::new(LinkedList::new())
+        Self {
+            items: SpinLock::new(LinkedList::new()),
+        }
     }
 }
 

@@ -6,7 +6,7 @@ mod util;
 
 use crate::arch::MMArch;
 use crate::bpf::prog::BpfProg;
-use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
+use crate::filesystem::epoll::event_poll::EPollItemList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileFlags};
@@ -168,14 +168,14 @@ impl Drop for BasicPerfEbpfCallBack {
 #[derive(Debug)]
 pub struct PerfEventInode {
     event: Box<dyn PerfEventOps>,
-    epitems: LockedEPItemLinkedList,
+    epitems: EPollItemList,
 }
 
 impl PerfEventInode {
     pub fn new(event: Box<dyn PerfEventOps>) -> Self {
         Self {
             event,
-            epitems: LockedEPItemLinkedList::default(),
+            epitems: EPollItemList::default(),
         }
     }
     fn do_poll(&self) -> Result<usize> {
@@ -310,7 +310,7 @@ impl PollableInode for PerfEventInode {
     }
 
     fn add_epitem(&self, epitem: Arc<EPollItem>, _private_data: &FilePrivateData) -> Result<()> {
-        self.epitems.lock().push_back(epitem);
+        self.epitems.add(epitem);
         Ok(())
     }
 
@@ -319,13 +319,7 @@ impl PollableInode for PerfEventInode {
         epitem: &Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<()> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
+        self.epitems.remove(epitem)
     }
 }
 

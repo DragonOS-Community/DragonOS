@@ -1,62 +1,25 @@
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
-use crate::{
-    filesystem::epoll::{
-        event_poll::{EventPoll, LockedEPItemLinkedList},
-        EPollItem,
-    },
-    libs::mutex::Mutex,
-};
+use crate::filesystem::epoll::{event_poll::EPollItemList, EPollItem};
 
 #[derive(Debug, Default)]
 pub struct EPollItems {
-    items: LockedEPItemLinkedList,
+    items: EPollItemList,
 }
 
-impl AsRef<LockedEPItemLinkedList> for EPollItems {
-    fn as_ref(&self) -> &LockedEPItemLinkedList {
+impl AsRef<EPollItemList> for EPollItems {
+    fn as_ref(&self) -> &EPollItemList {
         &self.items
     }
 }
 
 impl EPollItems {
     pub fn add(&self, item: Arc<EPollItem>) {
-        self.items.lock().push_back(item);
+        self.items.add(item);
     }
 
-    pub fn remove(&self, item: &Weak<Mutex<EventPoll>>) -> Result<(), SystemError> {
-        let to_remove = self
-            .items
-            .lock()
-            .extract_if(|x| Weak::ptr_eq(&x.epoll(), item))
-            .collect::<Vec<_>>();
-
-        let result = if !to_remove.is_empty() {
-            Ok(())
-        } else {
-            Err(SystemError::ENOENT)
-        };
-
-        drop(to_remove);
-        return result;
-    }
-
-    pub fn clear(&self) -> Result<(), SystemError> {
-        let mut guard = self.items.lock();
-        let mut result = Ok(());
-        guard.iter().for_each(|item| {
-            if let Some(epoll) = item.epoll().upgrade() {
-                let _ =
-                    EventPoll::ep_remove(&mut epoll.lock(), item.fd(), None, item).map_err(|e| {
-                        result = Err(e);
-                    });
-            }
-        });
-        guard.clear();
-        return result;
+    pub fn remove(&self, item: &Arc<EPollItem>) -> Result<(), SystemError> {
+        self.items.remove(item)
     }
 }

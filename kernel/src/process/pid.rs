@@ -2,7 +2,7 @@ use core::fmt::Debug;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::filesystem::epoll::{
-    event_poll::{EventPoll, LockedEPItemLinkedList},
+    event_poll::{EPollItemList, EventPoll},
     EPollEventType, EPollItem,
 };
 use crate::libs::rwlock::RwLock;
@@ -77,7 +77,7 @@ pub struct Pid {
     /// 在各个namespace中的PID值
     numbers: SpinLock<Vec<Option<UPid>>>,
     /// pidfd poll/epoll waiters. Linux keeps this wakeup edge on struct pid.
-    pidfd_epitems: LockedEPItemLinkedList,
+    pidfd_epitems: EPollItemList,
 }
 
 impl Debug for Pid {
@@ -94,7 +94,7 @@ impl Pid {
             level,
             tasks: core::array::from_fn(|_| SpinLock::new(Vec::new())),
             numbers: SpinLock::new(vec![None; level as usize + 1]),
-            pidfd_epitems: LockedEPItemLinkedList::default(),
+            pidfd_epitems: EPollItemList::default(),
         });
 
         pid
@@ -109,18 +109,11 @@ impl Pid {
     }
 
     pub(crate) fn add_pidfd_epitem(&self, epitem: Arc<EPollItem>) {
-        self.pidfd_epitems.lock().push_back(epitem);
+        self.pidfd_epitems.add(epitem);
     }
 
     pub(crate) fn remove_pidfd_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
-        let mut guard = self.pidfd_epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            Ok(())
-        } else {
-            Err(SystemError::ENOENT)
-        }
+        self.pidfd_epitems.remove(epitem)
     }
 
     pub(crate) fn wake_pidfd_pollers(&self) {

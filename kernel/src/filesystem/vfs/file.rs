@@ -26,7 +26,7 @@ use crate::{
     filesystem::{
         devfs::{devfs_lookup_device_by_devnum, LockedDevFSInode},
         epoll::{
-            event_poll::{EPollPrivateData, EventPoll, LockedEPItemLinkedList},
+            event_poll::{EPollItemList, EPollPrivateData, EventPoll},
             EPollItem,
         },
         ext4::inode::LockedExt4Inode,
@@ -675,7 +675,7 @@ pub struct File {
     /// Linux removes these from their owning epoll instances during `__fput()`
     /// via `eventpoll_release(file)`.  DragonOS keeps the same lifetime edge
     /// here so fd numbers can be safely reused after close.
-    epitems: Arc<LockedEPItemLinkedList>,
+    epitems: Arc<EPollItemList>,
     /// One semantic inode pin per open file description. Duplicated file
     /// descriptors and VMAs share this `File`, while `O_PATH` still owns it.
     /// Declared last so the explicit `Drop` body runs `close()` before release.
@@ -1275,7 +1275,7 @@ impl File {
             ra_state: Mutex::new(FileReadaheadState::new()),
             wb_error_seq: Mutex::new(wb_error_seq),
             sb_error_seq: Mutex::new(sb_error_seq),
-            epitems: Arc::new(LockedEPItemLinkedList::default()),
+            epitems: Arc::new(EPollItemList::default()),
             _inode_retention: inode_retention,
             _mount_guard: mount_guard,
         };
@@ -2139,7 +2139,7 @@ impl File {
             ra_state: Mutex::new(self.ra_state.lock().clone()),
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),
-            epitems: Arc::new(LockedEPItemLinkedList::default()),
+            epitems: Arc::new(EPollItemList::default()),
             _inode_retention: inode_retention,
             _mount_guard: mount_guard,
         };
@@ -2325,7 +2325,7 @@ impl File {
         self.inode
             .as_pollable_inode()?
             .add_epitem(epitem.clone(), &private_data)?;
-        self.epitems.lock_irqsave().push_back(epitem);
+        self.epitems.add(epitem);
         Ok(())
     }
 
@@ -2336,9 +2336,7 @@ impl File {
             .inode
             .as_pollable_inode()?
             .remove_epitem(epitem, &private_data);
-        self.epitems
-            .lock_irqsave()
-            .retain(|x| !Arc::ptr_eq(x, epitem));
+        let _ = self.epitems.remove(epitem);
         result
     }
 
@@ -2421,12 +2419,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        let epitems = {
-            let mut guard = self.epitems.lock_irqsave();
-            let snapshot = guard.iter().cloned().collect::<Vec<_>>();
-            guard.clear();
-            snapshot
-        };
+        let epitems = self.epitems.take_all();
         for epitem in epitems {
             EventPoll::release_file_epitem(&epitem);
             let _ = self.remove_epitem(&epitem);

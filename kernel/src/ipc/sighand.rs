@@ -7,7 +7,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
-    filesystem::epoll::event_poll::LockedEPItemLinkedList,
+    filesystem::epoll::event_poll::EPollItemList,
     ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     libs::wait_queue::WaitQueue,
@@ -73,7 +73,7 @@ pub struct SigHand {
     /// 信号投递路径（包括 hardirq）直接对此列表调用 `wakeup_epoll`，
     /// 避免遍历 fd_table（涉及 RwLock/RwSem，在 hardirq 中不安全）。
     /// 使用 irqsave SpinLock，hardirq 安全。
-    signalfd_epitems: LockedEPItemLinkedList,
+    signalfd_epitems: EPollItemList,
 }
 
 impl Debug for SigHand {
@@ -123,7 +123,7 @@ impl SigHand {
             inner: RwLock::new(InnerSigHand::default()),
             group_exec_wait_queue: WaitQueue::default(),
             signalfd_wqh: WaitQueue::default(),
-            signalfd_epitems: LockedEPItemLinkedList::default(),
+            signalfd_epitems: EPollItemList::default(),
         })
     }
 
@@ -156,7 +156,7 @@ impl SigHand {
     /// signalfd 的 `add_epitem` 将 EPollItem 同时注册到此列表中，
     /// 信号投递路径通过 `wakeup_epoll(&signalfd_epitems, ...)` 直接通知 epoll，
     /// 避免在 hardirq 中遍历 fd_table。
-    pub fn signalfd_epitems(&self) -> &LockedEPItemLinkedList {
+    pub fn signalfd_epitems(&self) -> &EPollItemList {
         &self.signalfd_epitems
     }
 

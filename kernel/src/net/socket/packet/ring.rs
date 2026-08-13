@@ -44,6 +44,12 @@ const PAGE_SIZE: usize = MMArch::PAGE_SIZE;
 pub struct PacketFakeFs;
 
 impl FileSystem for PacketFakeFs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         panic!("PacketFakeFs has no root inode")
     }
@@ -241,7 +247,7 @@ impl PacketRing {
     ) -> Result<(Self, Arc<PageCache>), SystemError> {
         let pages_per_block = config.block_size / PAGE_SIZE;
         // PageCache::new already returns Arc<PageCache>.
-        let page_cache: Arc<PageCache> = PageCache::new(None, None);
+        let page_cache: Arc<PageCache> = PageCache::new_unowned(None, None);
         let mut block_vaddrs = Vec::new();
         block_vaddrs
             .try_reserve_exact(config.block_nr)

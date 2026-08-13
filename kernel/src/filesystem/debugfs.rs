@@ -29,6 +29,12 @@ impl DebugFs {
 }
 
 impl FileSystem for DebugFs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root.clone()
     }

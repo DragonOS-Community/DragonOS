@@ -35,6 +35,12 @@ pub struct KernFS {
 }
 
 impl FileSystem for KernFS {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }

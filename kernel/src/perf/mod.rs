@@ -327,6 +327,12 @@ impl PollableInode for PerfEventInode {
 struct PerfFakeFs;
 
 impl FileSystem for PerfFakeFs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         panic!("PerfFakeFs does not have a root inode")
     }

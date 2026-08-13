@@ -38,6 +38,12 @@ impl SignalFdFs {
 }
 
 impl FileSystem for SignalFdFs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         // signalfd 为伪文件系统（anon_inode 风格），root inode 不会被真正使用。
         Arc::new(SignalFdInode::new(SigSet::empty(), SignalFdFlags::empty()))

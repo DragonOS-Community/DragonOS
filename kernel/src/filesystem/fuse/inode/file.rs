@@ -548,7 +548,11 @@ impl FuseNode {
         let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
         let inode: Arc<dyn IndexNode> = node;
         let backend = Arc::new(FusePageCacheBackend::new(self.self_ref.clone()));
-        let cache = PageCache::new(Some(Arc::downgrade(&inode)), Some(backend));
+        let domain = self
+            .try_fs()
+            .and_then(|fs| fs.page_cache_writeback_domain().cloned())
+            .ok_or(SystemError::ESTALE)?;
+        let cache = PageCache::new_file(Arc::downgrade(&inode), backend, &domain)?;
         *guard = Some(cache.clone());
         Ok(cache)
     }

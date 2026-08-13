@@ -117,7 +117,7 @@ fn migrate_virtual_filesystem(
         Some(&current_mntns),
         root_mount_flags,
         old_mntfs.mount_source(),
-    );
+    )?;
 
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();

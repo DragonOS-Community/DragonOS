@@ -453,6 +453,12 @@ impl FileSystemMakerData for TmpfsMountData {
 }
 
 impl FileSystem for Tmpfs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn supports_reliable_flush(&self) -> bool {
         // tmpfs has no crash-surviving backing state. A loop image stored here
         // disappears as a whole on power loss, so there is no partially

@@ -14,8 +14,8 @@ use system_error::SystemError;
 
 use super::vfs::{
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
-    mount::record_writeback_error_for_fs,
-    FilePrivateData, IndexNode, WritebackControl,
+    mount::SuperBlockState,
+    FilePrivateData, FileSystem, IndexNode, WritebackControl,
 };
 use crate::exception::workqueue::{schedule_work, Work, WorkQueue};
 use crate::libs::errseq::{ErrSeq, ErrSeqValue};
@@ -351,6 +351,255 @@ lazy_static! {
     static ref PAGECACHE_REGISTRY: SpinLock<Vec<Weak<PageCache>>> = SpinLock::new(Vec::new());
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DomainAdmission {
+    Active,
+    Closed,
+}
+
+struct PageCacheWritebackDomainBinding {
+    owner: Weak<dyn FileSystem>,
+    superblock: Weak<SuperBlockState>,
+}
+
+struct PageCacheWritebackDomainState {
+    binding: Option<PageCacheWritebackDomainBinding>,
+    admission: DomainAdmission,
+    io_in_flight: usize,
+    registrations_in_flight: usize,
+}
+
+/// Stable ownership and shutdown domain for file-backed page caches.
+///
+/// The registry is deliberately separate from `state`: registry compaction
+/// may scan and allocate, while I/O admission and completion require a short,
+/// non-allocating spin critical section.
+pub struct PageCacheWritebackDomain {
+    registry: Mutex<Vec<Weak<dyn PageCacheDomainMember>>>,
+    state: SpinLock<PageCacheWritebackDomainState>,
+    drained: Completion,
+}
+
+pub(crate) trait PageCacheDomainMember: Send + Sync {
+    fn has_dirty_or_writeback_work(&self) -> bool;
+    fn sync_for_domain(&self) -> Result<(), SystemError>;
+    fn retire_for_domain(&self) -> Result<(), SystemError>;
+}
+
+impl core::fmt::Debug for PageCacheWritebackDomain {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let state = self.state.lock_irqsave();
+        f.debug_struct("PageCacheWritebackDomain")
+            .field("admission", &state.admission)
+            .field("io_in_flight", &state.io_in_flight)
+            .field("registrations_in_flight", &state.registrations_in_flight)
+            .finish()
+    }
+}
+
+impl PageCacheWritebackDomain {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            registry: Mutex::new(Vec::new()),
+            state: SpinLock::new(PageCacheWritebackDomainState {
+                binding: None,
+                admission: DomainAdmission::Active,
+                io_in_flight: 0,
+                registrations_in_flight: 0,
+            }),
+            drained: Completion::new(),
+        })
+    }
+
+    pub fn bind(
+        &self,
+        owner: &Arc<dyn FileSystem>,
+        superblock: &Arc<SuperBlockState>,
+    ) -> Result<(), SystemError> {
+        let mut state = self.state.lock_irqsave();
+        match state.binding.as_ref() {
+            None if state.admission == DomainAdmission::Active => {
+                state.binding = Some(PageCacheWritebackDomainBinding {
+                    owner: Arc::downgrade(owner),
+                    superblock: Arc::downgrade(superblock),
+                });
+                Ok(())
+            }
+            Some(binding)
+                if Weak::ptr_eq(&binding.owner, &Arc::downgrade(owner))
+                    && Weak::ptr_eq(&binding.superblock, &Arc::downgrade(superblock)) =>
+            {
+                Ok(())
+            }
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
+    fn finish_registration(&self) {
+        let complete = {
+            let mut state = self.state.lock_irqsave();
+            state.registrations_in_flight -= 1;
+            state.admission == DomainAdmission::Closed
+                && state.io_in_flight == 0
+                && state.registrations_in_flight == 0
+        };
+        if complete {
+            self.drained.complete();
+        }
+    }
+
+    fn register(&self, cache: &Arc<PageCache>) -> Result<(), SystemError> {
+        {
+            let mut state = self.state.lock_irqsave();
+            if state.admission != DomainAdmission::Active {
+                return Err(SystemError::ESTALE);
+            }
+            state.registrations_in_flight = state
+                .registrations_in_flight
+                .checked_add(1)
+                .expect("page-cache domain registration count overflow");
+        }
+
+        {
+            let mut registry = self.registry.lock();
+            if registry.len() == registry.capacity() {
+                registry.retain(|entry| entry.strong_count() != 0);
+                let slack = core::cmp::max(8, registry.len() / 4);
+                registry.reserve(slack);
+            }
+            let member: Arc<dyn PageCacheDomainMember> = cache.clone();
+            registry.push(Arc::downgrade(&member));
+        }
+        self.finish_registration();
+        Ok(())
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<Arc<dyn PageCacheDomainMember>> {
+        let mut registry = self.registry.lock();
+        let mut result = Vec::new();
+        registry.retain(|entry| {
+            if let Some(cache) = entry.upgrade() {
+                result.push(cache);
+                true
+            } else {
+                false
+            }
+        });
+        result
+    }
+
+    pub fn record_writeback_error(&self, error: SystemError) {
+        let superblock = self
+            .state
+            .lock_irqsave()
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.superblock.upgrade());
+        if let Some(superblock) = superblock {
+            superblock.record_wb_error(error);
+        }
+    }
+
+    pub fn close_background_admission(&self) {
+        let complete = {
+            let mut state = self.state.lock_irqsave();
+            state.admission = DomainAdmission::Closed;
+            state.io_in_flight == 0 && state.registrations_in_flight == 0
+        };
+        if complete {
+            self.drained.complete();
+        }
+    }
+
+    pub fn wait_drained(&self) -> Result<(), SystemError> {
+        self.drained.wait_for_completion().map(|_| ())
+    }
+
+    fn try_acquire_io_classified(
+        self: &Arc<Self>,
+    ) -> Result<PageCacheDomainIoPermit, PageCacheDomainIoAdmissionError> {
+        let owner = {
+            let mut state = self.state.lock_irqsave();
+            if state.admission != DomainAdmission::Active {
+                return Err(PageCacheDomainIoAdmissionError::Closed);
+            }
+            let owner = state
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.owner.upgrade())
+                .ok_or(PageCacheDomainIoAdmissionError::Unavailable(
+                    SystemError::ESTALE,
+                ))?;
+            state.io_in_flight = state
+                .io_in_flight
+                .checked_add(1)
+                .expect("page-cache domain I/O count overflow");
+            owner
+        };
+        Ok(PageCacheDomainIoPermit {
+            domain: self.clone(),
+            _owner: owner,
+        })
+    }
+
+    pub fn try_acquire_io(self: &Arc<Self>) -> Result<PageCacheDomainIoPermit, SystemError> {
+        self.try_acquire_io_classified()
+            .map_err(|error| match error {
+                PageCacheDomainIoAdmissionError::Closed => SystemError::ESTALE,
+                PageCacheDomainIoAdmissionError::Unavailable(error) => error,
+            })
+    }
+}
+
+#[derive(Debug)]
+pub struct PageCacheDomainIoPermit {
+    domain: Arc<PageCacheWritebackDomain>,
+    _owner: Arc<dyn FileSystem>,
+}
+
+pub(crate) enum PageCacheDomainIoAdmissionError {
+    Closed,
+    Unavailable(SystemError),
+}
+
+impl Drop for PageCacheDomainIoPermit {
+    fn drop(&mut self) {
+        let complete = {
+            let mut state = self.domain.state.lock_irqsave();
+            state.io_in_flight -= 1;
+            state.admission == DomainAdmission::Closed
+                && state.io_in_flight == 0
+                && state.registrations_in_flight == 0
+        };
+        if complete {
+            self.domain.drained.complete();
+        }
+    }
+}
+
+impl PageCacheDomainIoPermit {
+    /// Derive a child permit from an already admitted I/O lineage.
+    ///
+    /// Closing a domain rejects new producers, but it must not revoke work
+    /// accepted before the close linearization point.  A child permit keeps
+    /// the same owner alive and extends the in-flight count without
+    /// consulting the public admission state.
+    pub(crate) fn derive(&self) -> Self {
+        {
+            let mut state = self.domain.state.lock_irqsave();
+            debug_assert!(state.io_in_flight != 0);
+            state.io_in_flight = state
+                .io_in_flight
+                .checked_add(1)
+                .expect("page-cache domain I/O count overflow");
+        }
+        Self {
+            domain: self.domain.clone(),
+            _owner: self._owner.clone(),
+        }
+    }
+}
+
 pub(crate) fn schedule_pagecache_io(work: Arc<Work>) {
     let idx = PAGECACHE_IO_RR.fetch_add(1, Ordering::Relaxed) % PAGECACHE_IO_WQS.len();
     PAGECACHE_IO_WQS[idx].enqueue(work);
@@ -387,6 +636,7 @@ pub struct PageCache {
     inner: Mutex<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
     backend: Lazy<Arc<dyn PageCacheBackend>>,
+    writeback_domain: Option<Weak<PageCacheWritebackDomain>>,
     i_mmap_rwsem: RwSem<()>,
     invalidate_lock: RwSem<()>,
     file_vma_seq: AtomicU64,
@@ -1607,24 +1857,40 @@ impl Drop for InnerPageCache {
 impl PageCache {
     // Lock order: page_cache -> page_manager -> page_reclaimer.
     // Avoid holding page_cache lock while acquiring page_manager when possible.
-    pub fn new(
+    pub fn new_file(
+        inode: Weak<dyn IndexNode>,
+        backend: Arc<dyn PageCacheBackend>,
+        domain: &Arc<PageCacheWritebackDomain>,
+    ) -> Result<Arc<PageCache>, SystemError> {
+        let cache = Self::new_with_kind(
+            Some(inode),
+            Some(backend),
+            PageCacheKind::File,
+            Some(Arc::downgrade(domain)),
+        );
+        domain.register(&cache)?;
+        Ok(cache)
+    }
+
+    pub fn new_unowned(
         inode: Option<Weak<dyn IndexNode>>,
         backend: Option<Arc<dyn PageCacheBackend>>,
     ) -> Arc<PageCache> {
-        Self::new_with_kind(inode, backend, PageCacheKind::File)
+        Self::new_with_kind(inode, backend, PageCacheKind::File, None)
     }
 
     pub fn new_shmem(
         inode: Option<Weak<dyn IndexNode>>,
         backend: Option<Arc<dyn PageCacheBackend>>,
     ) -> Arc<PageCache> {
-        Self::new_with_kind(inode, backend, PageCacheKind::Shmem)
+        Self::new_with_kind(inode, backend, PageCacheKind::Shmem, None)
     }
 
     fn new_with_kind(
         inode: Option<Weak<dyn IndexNode>>,
         backend: Option<Arc<dyn PageCacheBackend>>,
         kind: PageCacheKind,
+        writeback_domain: Option<Weak<PageCacheWritebackDomain>>,
     ) -> Arc<PageCache> {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
         let instance_id = PAGE_CACHE_INSTANCE_ID
@@ -1664,6 +1930,7 @@ impl PageCache {
                 }
                 v
             },
+            writeback_domain,
             i_mmap_rwsem: RwSem::new(()),
             invalidate_lock: RwSem::new(()),
             file_vma_seq: AtomicU64::new(0),
@@ -1712,9 +1979,37 @@ impl PageCache {
     /// asynchronous writeback completion.
     pub fn record_writeback_error_with_superblock(&self, error: SystemError) {
         self.record_writeback_error(error.clone());
-        if let Some(inode) = self.inode().and_then(|w| w.upgrade()) {
-            if let Some(fs) = inode.try_fs() {
-                record_writeback_error_for_fs(&fs, error);
+        if let Some(domain) = self.writeback_domain.as_ref().and_then(Weak::upgrade) {
+            domain.record_writeback_error(error);
+        }
+    }
+
+    pub fn has_dirty_or_writeback_pages(&self) -> bool {
+        let inner = self.inner.lock();
+        !inner.dirty_pages.is_empty() || !inner.writeback_pages.is_empty()
+    }
+
+    pub fn try_acquire_domain_io(&self) -> Result<Option<PageCacheDomainIoPermit>, SystemError> {
+        self.try_acquire_domain_io_classified()
+            .map_err(|error| match error {
+                PageCacheDomainIoAdmissionError::Closed => SystemError::ESTALE,
+                PageCacheDomainIoAdmissionError::Unavailable(error) => error,
+            })
+    }
+
+    pub(crate) fn try_acquire_domain_io_classified(
+        &self,
+    ) -> Result<Option<PageCacheDomainIoPermit>, PageCacheDomainIoAdmissionError> {
+        match self.writeback_domain.as_ref() {
+            None => Ok(None),
+            Some(domain) => {
+                let domain =
+                    domain
+                        .upgrade()
+                        .ok_or(PageCacheDomainIoAdmissionError::Unavailable(
+                            SystemError::ESTALE,
+                        ))?;
+                domain.try_acquire_io_classified().map(Some)
             }
         }
     }
@@ -2009,6 +2304,7 @@ impl PageCache {
         page_index: usize,
         page: &Arc<Page>,
     ) -> Result<(), SystemError> {
+        let _domain_io = self.try_acquire_domain_io()?;
         let backend = self.backend();
         if let Some(backend) = backend {
             let waiter = backend.read_page_async(page_index, page);
@@ -2240,6 +2536,8 @@ impl PageCache {
             return Ok(());
         }
 
+        let domain_io = self.try_acquire_domain_io()?;
+
         let entry = {
             let guard = self.inner.lock();
             if guard.get_entry(page_index).is_some() {
@@ -2270,7 +2568,11 @@ impl PageCache {
         let entry_clone = entry.clone();
         let page = entry.page.clone();
 
+        let work_state = Mutex::new(Some(domain_io));
         let work = Work::new(move || {
+            let Some(_domain_io) = work_state.lock().take() else {
+                return;
+            };
             let read_len = if let Some(backend) = backend.as_ref() {
                 backend.read_page_async(page_index, &page).wait()
             } else if let Some(inode) = inode.as_ref().and_then(|inode| inode.upgrade()) {
@@ -2902,7 +3204,7 @@ impl PageCache {
     /// unevictable Normal pages.
     ///
     /// This narrow API is for private in-kernel ring backings created with
-    /// `PageCache::new(None, None)`. Caches with an accounting backend are
+    /// `PageCache::new_unowned(None, None)`. Caches with an accounting backend are
     /// rejected rather than exposing a partially reservable quota protocol.
     /// Until the final commit, `ManagedPageBatch` rolls PageManager membership
     /// back by identity on every error path.
@@ -3389,5 +3691,19 @@ impl PageCache {
         }
 
         Ok(ret)
+    }
+}
+
+impl PageCacheDomainMember for PageCache {
+    fn has_dirty_or_writeback_work(&self) -> bool {
+        self.has_dirty_or_writeback_pages()
+    }
+
+    fn sync_for_domain(&self) -> Result<(), SystemError> {
+        self.manager.sync()
+    }
+
+    fn retire_for_domain(&self) -> Result<(), SystemError> {
+        self.manager.resize(0)
     }
 }

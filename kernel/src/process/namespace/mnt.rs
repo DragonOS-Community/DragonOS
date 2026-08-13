@@ -231,7 +231,8 @@ impl MntNamespace {
             None,
             MountFlags::empty(),
             None,
-        );
+        )
+        .expect("a fresh mount namespace root has a unique superblock");
 
         let result = Arc::new_cyclic(|self_ref| Self {
             ns_common: NsCommon::new(0, NamespaceType::Mount),
@@ -1007,6 +1008,7 @@ mod tests {
             MountFlags::empty(),
             None,
         )
+        .unwrap()
     }
 
     fn install_attached_root(namespace: &Arc<MntNamespace>) -> Arc<MountFS> {
@@ -1018,7 +1020,8 @@ mod tests {
             Some(namespace),
             MountFlags::empty(),
             None,
-        );
+        )
+        .unwrap();
         root.activate().unwrap();
         namespace.force_change_root_mountfs(root.clone(), RootMountAttachment::Attached);
         root

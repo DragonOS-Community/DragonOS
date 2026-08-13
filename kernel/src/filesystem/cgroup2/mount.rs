@@ -52,6 +52,12 @@ impl Cgroup2Fs {
 }
 
 impl FileSystem for Cgroup2Fs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn crate::filesystem::vfs::IndexNode> {
         self.root_inode.clone()
     }

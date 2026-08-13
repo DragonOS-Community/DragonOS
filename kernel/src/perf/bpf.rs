@@ -234,7 +234,7 @@ impl BpfPerfEvent {
             data: SpinLock::new(BpfPerfEventData {
                 enabled: false,
                 mmap_page: RingPage::empty(),
-                page_cache: PageCache::new(None, None),
+                page_cache: PageCache::new_unowned(None, None),
                 offset: 0,
             }),
         }
@@ -266,7 +266,7 @@ impl BpfPerfEvent {
             }
         }
 
-        let page_cache = PageCache::new(None, None);
+        let page_cache = PageCache::new_unowned(None, None);
         let batch = allocate_registered_intrinsic_unevictable_pages_exact(PageFrameCount::new(
             len / PAGE_SIZE,
         ))?;

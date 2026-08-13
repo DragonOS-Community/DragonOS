@@ -9,7 +9,6 @@ use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
     exception::workqueue::{schedule_work, Work},
     filesystem::{
-        page_cache::list_page_caches,
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
@@ -1253,13 +1252,16 @@ impl MountFS {
         mnt_ns: Option<&Arc<MntNamespace>>,
         mount_flags: MountFlags,
         mount_source: Option<String>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, SystemError> {
         let super_block_state = Arc::new(SuperBlockState::new(mount_flags));
+        if let Some(domain) = inner_filesystem.page_cache_writeback_domain() {
+            domain.bind(&inner_filesystem, &super_block_state)?;
+        }
         assert!(
             super_block_state.try_add_external_pin(),
             "a fresh superblock accepts its construction reservation"
         );
-        Self::new_with_super_block_state(
+        Ok(Self::new_with_super_block_state(
             inner_filesystem,
             root_inner_inode,
             None,
@@ -1272,7 +1274,7 @@ impl MountFS {
                 mount_source,
                 construction_reserved: true,
             },
-        )
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1286,6 +1288,11 @@ impl MountFS {
         mount_flags: MountFlags,
         state_init: MountStateInit,
     ) -> Arc<Self> {
+        if let Some(domain) = inner_filesystem.page_cache_writeback_domain() {
+            domain
+                .bind(&inner_filesystem, &state_init.super_block_state)
+                .expect("MountFS domain identity must be validated before construction");
+        }
         let root_inner_inode = root_inner_inode.unwrap_or_else(|| inner_filesystem.root_inode());
         let root_dentry = root_dentry.unwrap_or_else(|| {
             state_init
@@ -1331,6 +1338,9 @@ impl MountFS {
         &self,
         self_mountpoint: Option<Arc<MountFSInode>>,
     ) -> Result<Arc<Self>, SystemError> {
+        if let Some(domain) = self.inner_filesystem.page_cache_writeback_domain() {
+            domain.bind(&self.inner_filesystem, &self.super_block_state)?;
+        }
         if !self.super_block_state.try_add_external_pin() {
             return Err(SystemError::ESTALE);
         }
@@ -2597,6 +2607,23 @@ impl MountFS {
             log::warn!("final superblock sync failed during umount: {:?}", err);
             sb_state.record_wb_error(err);
         }
+        if let Err(err) = self.inner_filesystem.prepare_page_cache_retirement() {
+            log::warn!("final page-cache producer quiesce failed: {:?}", err);
+            sb_state.record_wb_error(err);
+        }
+        if let Some(domain) = self.inner_filesystem.page_cache_writeback_domain() {
+            domain.close_background_admission();
+            if let Err(err) = domain.wait_drained() {
+                log::warn!("final page-cache I/O drain failed: {:?}", err);
+                sb_state.record_wb_error(err);
+            }
+            for cache in domain.snapshot() {
+                if let Err(err) = cache.retire_for_domain() {
+                    log::warn!("final page-cache retirement failed: {:?}", err);
+                    sb_state.record_wb_error(err);
+                }
+            }
+        }
         if let Err(err) = self.inner_filesystem.shrink_inode_cache_for_shutdown() {
             log::warn!("final inode cache shrink failed: {:?}", err);
             sb_state.record_wb_error(err);
@@ -2778,28 +2805,19 @@ impl MountFS {
     }
 
     /// Corresponds to Linux `sync_inodes_sb()`: write back all dirty page caches under the specified mount.
-    /// DragonOS has no per-sb dirty inode list, so it iterates the global `PAGECACHE_REGISTRY` to find matches.
+    /// Page caches are registered in their filesystem's stable writeback domain.
     fn sync_inodes_of_mount(&self) -> Result<(), SystemError> {
-        let inner_fs = self.inner_filesystem();
-        let caches = list_page_caches();
+        let Some(domain) = self.inner_filesystem.page_cache_writeback_domain() else {
+            return Ok(());
+        };
         let mut last_err = Ok(());
-        for page_cache in caches {
-            // Fast-skip page caches with no dirty pages, avoiding unnecessary inode.upgrade() and Arc::ptr_eq.
-            if !page_cache.has_dirty_pages() {
+        for page_cache in domain.snapshot() {
+            if !page_cache.has_dirty_or_writeback_work() {
                 continue;
             }
-
-            let belongs = page_cache
-                .inode()
-                .and_then(|weak| weak.upgrade())
-                .is_some_and(|inode| Arc::ptr_eq(&inode.fs(), &inner_fs));
-
-            if belongs {
-                if let Err(e) = page_cache.manager().sync() {
-                    log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", e);
-                    self.record_wb_error(e.clone());
-                    last_err = Err(e);
-                }
+            if let Err(e) = page_cache.sync_for_domain() {
+                log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", e);
+                last_err = Err(e);
             }
         }
         last_err
@@ -2957,14 +2975,6 @@ pub fn list_unique_mounted_superblocks() -> Vec<Arc<MountFS>> {
         }
     });
     mounts
-}
-
-pub fn record_writeback_error_for_fs(inner_fs: &Arc<dyn FileSystem>, error: SystemError) {
-    for mount in list_unique_mounted_superblocks() {
-        if Arc::ptr_eq(&mount.inner_filesystem(), inner_fs) {
-            mount.record_wb_error(error.clone());
-        }
-    }
 }
 
 /// Query the canonical SB_SYNCHRONOUS state for a filesystem operation which
@@ -3283,22 +3293,17 @@ impl MountFSInode {
         // publication; a bind source may install an existing group below.
         let new_propagation = MountPropagation::new_private();
 
-        let (super_block_state, construction_reserved) = match super_block_state {
-            Some(super_block_state) => {
-                if !super_block_state.try_add_external_pin() {
-                    return Err(SystemError::ESTALE);
-                }
-                (super_block_state, true)
-            }
-            None => {
-                let super_block_state = Arc::new(SuperBlockState::new(mount_flags));
-                assert!(
-                    super_block_state.try_add_external_pin(),
-                    "a fresh superblock accepts its construction reservation"
-                );
-                (super_block_state, true)
-            }
+        let super_block_state = match super_block_state {
+            Some(super_block_state) => super_block_state,
+            None => Arc::new(SuperBlockState::new(mount_flags)),
         };
+        if let Some(domain) = inner_fs.page_cache_writeback_domain() {
+            domain.bind(&inner_fs, &super_block_state)?;
+        }
+        if !super_block_state.try_add_external_pin() {
+            return Err(SystemError::ESTALE);
+        }
+        let construction_reserved = true;
         let new_mount_fs = MountFS::new_with_super_block_state(
             inner_fs,
             Some(root_inner_inode),
@@ -4389,16 +4394,17 @@ impl IndexNode for MountFSInode {
         fs: Arc<dyn FileSystem>,
         mount_flags: MountFlags,
     ) -> Result<Arc<MountFS>, SystemError> {
-        let (to_mount_fs, root_inner_inode) = fs
-            .clone()
-            .downcast_arc::<MountFS>()
-            .map(|it| (it.inner_filesystem(), it.root_inner_inode()))
-            .unwrap_or_else(|| {
-                let root_inner_inode = fs.root_inode();
-                (fs, root_inner_inode)
-            });
-
-        self.mount_subtree(to_mount_fs, root_inner_inode, mount_flags)
+        if let Some(existing) = fs.clone().downcast_arc::<MountFS>() {
+            return self.mount_subtree_with_state(
+                existing.inner_filesystem(),
+                existing.root_inner_inode(),
+                mount_flags,
+                Some(existing.super_block_state()),
+                Some(&existing),
+            );
+        }
+        let root_inner_inode = fs.root_inode();
+        self.mount_subtree(fs, root_inner_inode, mount_flags)
     }
 
     fn mount_from(&self, from: Arc<dyn IndexNode>) -> Result<Arc<MountFS>, SystemError> {
@@ -4561,6 +4567,12 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        self.inner_filesystem.page_cache_writeback_domain()
+    }
+
     fn supports_reliable_flush(&self) -> bool {
         self.inner_filesystem.supports_reliable_flush()
     }

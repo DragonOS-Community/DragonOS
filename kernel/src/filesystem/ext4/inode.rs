@@ -1414,6 +1414,46 @@ impl IndexNode for LockedExt4Inode {
         Err(SystemError::ENOSYS)
     }
 
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let _operation = self.begin_operation()?;
+        let _io = self.io_lock.lock();
+        let _namespace = self.namespace_lock.lock();
+        let parent_metadata = self.metadata()?;
+        let init = vfs::permission::child_inode_init(
+            &parent_metadata,
+            vfs::FileType::SymLink,
+            InodeMode::S_IRWXUGO,
+        );
+        let mut guard = self.inner.lock();
+        let fs = guard.concret_fs();
+        let _reuse = fs.begin_allocation()?;
+        let ext4 = &fs.fs;
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+
+        let attr = fs.retry_metadata_contention(|| {
+            ext4.symlink_with_owner_and_attr(
+                guard.inner_inode_num,
+                name,
+                target,
+                another_ext4::InodeOwner {
+                    uid: init.uid as u32,
+                    gid: init.gid as u32,
+                },
+            )
+        })?;
+
+        let dname = DName::from(name);
+        let inode = fs.publish_allocated_inode(
+            attr,
+            dname.clone(),
+            Some(Arc::downgrade(&self_arc)),
+            &_reuse,
+        )?;
+        guard.children.insert(dname, inode.clone());
+        drop(guard);
+        Ok(inode as Arc<dyn IndexNode>)
+    }
+
     fn read_at(
         &self,
         offset: usize,

@@ -3,6 +3,19 @@ use super::Ext4;
 use crate::ext4_defs::*;
 use crate::prelude::*;
 
+pub(super) enum LinkFailure {
+    Unmodified(Ext4Error),
+    Indeterminate(Ext4Error),
+}
+
+impl LinkFailure {
+    pub(super) fn into_error(self) -> Ext4Error {
+        match self {
+            Self::Unmodified(error) | Self::Indeterminate(error) => error,
+        }
+    }
+}
+
 /// Whether removing one published namespace entry makes the inode an orphan.
 /// Directories cannot have hard-link aliases: once rmdir/rename has verified
 /// that the directory is empty, Linux clears even an unexpectedly high nlink.
@@ -19,35 +32,55 @@ impl Ext4 {
         name: &str,
         allow_orphan_relink: bool,
     ) -> Result<()> {
-        self.ensure_mutable()?;
+        self.link_inode_classified(parent, child, name, allow_orphan_relink)
+            .map_err(LinkFailure::into_error)
+    }
+
+    pub(super) fn link_inode_classified(
+        &self,
+        parent: &mut InodeRef,
+        child: &mut InodeRef,
+        name: &str,
+        allow_orphan_relink: bool,
+    ) -> core::result::Result<(), LinkFailure> {
+        self.ensure_mutable().map_err(LinkFailure::Unmodified)?;
         let child_link_count = child.inode.link_count();
         let parent_link_count = parent.inode.link_count();
         if child_link_count == 0 && allow_orphan_relink {
-            if self.legacy_orphan_membership(child)?
+            if self
+                .legacy_orphan_membership(child)
+                .map_err(LinkFailure::Unmodified)?
                 != super::orphan::LegacyOrphanMembership::ZeroLink
             {
-                return Err(Ext4Error::new(ErrCode::EINVAL));
+                return Err(LinkFailure::Unmodified(Ext4Error::new(ErrCode::EINVAL)));
             }
             if child.inode.is_dir() {
-                return Err(Ext4Error::new(ErrCode::EPERM));
+                return Err(LinkFailure::Unmodified(Ext4Error::new(ErrCode::EPERM)));
             }
-            if !self.dir_has_insert_space(parent, child, name)? {
-                self.prepare_empty_dir_slot(parent)?;
+            if !self
+                .dir_has_insert_space(parent, child, name)
+                .map_err(LinkFailure::Unmodified)?
+            {
+                self.prepare_empty_dir_slot(parent)
+                    .map_err(LinkFailure::Indeterminate)?;
             }
             // A zero-link inode is discoverable through the durable orphan
             // chain.  Linux removes it from that chain in the same handle that
             // publishes the new name and link count; otherwise a crash could
             // reclaim a newly reachable inode.
-            let mut transaction = self.transaction_start(3)?;
+            let mut transaction = self.transaction_start(3).map_err(LinkFailure::Unmodified)?;
             let mut sb = self.read_super_block_cached();
-            self.transaction_orphan_del(&mut transaction, child, &mut sb)?;
-            self.transaction_dir_add_existing(&mut transaction, parent, child, name)?;
+            self.transaction_orphan_del(&mut transaction, child, &mut sb)
+                .map_err(LinkFailure::Unmodified)?;
+            self.transaction_dir_add_existing(&mut transaction, parent, child, name)
+                .map_err(LinkFailure::Unmodified)?;
             child.inode.set_link_count(1);
             child.inode.set_next_orphan(0);
-            self.transaction_stage_inode_with_csum(&mut transaction, child)?;
+            self.transaction_stage_inode_with_csum(&mut transaction, child)
+                .map_err(LinkFailure::Unmodified)?;
             if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
                 self.poison(ErrCode::EIO);
-                return Err(error.error);
+                return Err(LinkFailure::Indeterminate(error.error));
             }
             return Ok(());
         }
@@ -55,25 +88,50 @@ impl Ext4 {
             // Prepare all inode metadata before publishing parent/name.  A
             // failure before the final dir_add_entry cannot leave a namespace
             // entry pointing at an inode that cleanup may release.
-            self.dir_add_entry(child, parent, "..")?;
+            match self.dir_add_entry_classified(child, parent, "..") {
+                Ok(()) => {}
+                Err(super::dir::DirAddFailure::Unmodified(error)) => {
+                    return Err(LinkFailure::Unmodified(error));
+                }
+                Err(super::dir::DirAddFailure::Indeterminate(error)) => {
+                    self.poison(ErrCode::EIO);
+                    return Err(LinkFailure::Indeterminate(error));
+                }
+            }
             parent.inode.set_link_count(parent_link_count + 1);
-            self.write_inode_with_csum(parent)?;
+            if let Err(error) = self.write_inode_with_csum(parent) {
+                self.poison(ErrCode::EIO);
+                return Err(LinkFailure::Indeterminate(error));
+            }
         }
         child.inode.set_link_count(child_link_count + 1);
-        self.write_inode_with_csum(child)?;
-        if let Err(error) = self.dir_add_entry(parent, child, name) {
-            child.inode.set_link_count(child_link_count);
-            let mut rollback_ok = self.write_inode_with_csum(child).is_ok();
+        if let Err(error) = self.write_inode_with_csum(child) {
             if child.inode.is_dir() {
-                parent.inode.set_link_count(parent_link_count);
-                rollback_ok &= self.write_inode_with_csum(parent).is_ok();
-            }
-            if !rollback_ok {
                 self.poison(ErrCode::EIO);
+                return Err(LinkFailure::Indeterminate(error));
             }
-            return Err(error);
+            return Err(LinkFailure::Unmodified(error));
         }
-        Ok(())
+        match self.dir_add_entry_classified(parent, child, name) {
+            Ok(()) => Ok(()),
+            Err(super::dir::DirAddFailure::Indeterminate(error)) => {
+                self.poison(ErrCode::EIO);
+                Err(LinkFailure::Indeterminate(error))
+            }
+            Err(super::dir::DirAddFailure::Unmodified(error)) => {
+                child.inode.set_link_count(child_link_count);
+                let mut rollback_ok = self.write_inode_with_csum(child).is_ok();
+                if child.inode.is_dir() {
+                    parent.inode.set_link_count(parent_link_count);
+                    rollback_ok &= self.write_inode_with_csum(parent).is_ok();
+                }
+                if !rollback_ok {
+                    self.poison(ErrCode::EIO);
+                    return Err(LinkFailure::Indeterminate(error));
+                }
+                Err(LinkFailure::Unmodified(error))
+            }
+        }
     }
 
     /// Unlink a child inode from a parent directory.

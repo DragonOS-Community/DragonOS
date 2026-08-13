@@ -22,6 +22,7 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifndef __NR_syncfs
 #if defined(__x86_64__)
@@ -1287,6 +1288,87 @@ TEST(Ext4InodeIdentity, BufferedPartialTailWritebackSerializesWithTruncate) {
     ASSERT_EQ(0, close(sync_fd)) << strerror(errno);
     ASSERT_EQ(0, close(writer_fd)) << strerror(errno);
     ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, SymbolicLinksPersistAcrossRemountAndReclaimResources) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    struct statvfs before = {};
+    ASSERT_EQ(0, statvfs(fs.mount_point().c_str(), &before)) << strerror(errno);
+
+    const std::string target_59(59, 'a');
+    const std::string target_60(60, 'b');
+    const std::vector<std::pair<std::string, std::string>> links = {
+        {"short_relative", "x"},
+        {"certificate", "/etc/ssl/certs/ca-certificates.crt"},
+        {"fast_boundary", target_59},
+        {"long_boundary", target_60},
+    };
+
+    for (const auto& [name, target] : links) {
+        const std::string path = fs.mount_point() + "/" + name;
+        ASSERT_EQ(0, symlink(target.c_str(), path.c_str())) << name << ": " << strerror(errno);
+    }
+
+    auto expect_link = [&](const std::string& name, const std::string& target) {
+        const std::string path = fs.mount_point() + "/" + name;
+        struct stat st = {};
+        ASSERT_EQ(0, lstat(path.c_str(), &st)) << name << ": " << strerror(errno);
+        EXPECT_TRUE(S_ISLNK(st.st_mode));
+        EXPECT_EQ(static_cast<off_t>(target.size()), st.st_size);
+        char observed[4096] = {};
+        ASSERT_LT(target.size(), sizeof(observed));
+        ssize_t count = readlink(path.c_str(), observed, sizeof(observed));
+        ASSERT_EQ(static_cast<ssize_t>(target.size()), count) << name << ": " << strerror(errno);
+        EXPECT_EQ(target, std::string(observed, static_cast<size_t>(count)));
+    };
+
+    for (const auto& [name, target] : links) {
+        expect_link(name, target);
+    }
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    for (const auto& [name, target] : links) {
+        expect_link(name, target);
+    }
+
+    int sync_fd = open(fs.mount_point().c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(sync_fd, 0) << strerror(errno);
+    for (const auto& [name, target] : links) {
+        (void)target;
+        const std::string path = fs.mount_point() + "/" + name;
+        ASSERT_EQ(0, unlink(path.c_str())) << name << ": " << strerror(errno);
+    }
+    ASSERT_EQ(0, syscall(__NR_syncfs, sync_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(sync_fd)) << strerror(errno);
+
+    struct statvfs after = {};
+    bool reclaimed = false;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        ASSERT_EQ(0, statvfs(fs.mount_point().c_str(), &after)) << strerror(errno);
+        if (after.f_ffree >= before.f_ffree && after.f_bfree >= before.f_bfree) {
+            reclaimed = true;
+            break;
+        }
+        usleep(5 * 1000);
+    }
+    EXPECT_TRUE(reclaimed) << "free inodes before=" << before.f_ffree
+                           << " after=" << after.f_ffree
+                           << " free blocks before=" << before.f_bfree
+                           << " after=" << after.f_bfree;
+
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    for (const auto& [name, target] : links) {
+        (void)target;
+        const std::string path = fs.mount_point() + "/" + name;
+        struct stat st = {};
+        EXPECT_EQ(-1, lstat(path.c_str(), &st));
+        EXPECT_EQ(ENOENT, errno);
+    }
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 

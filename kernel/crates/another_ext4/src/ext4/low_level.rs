@@ -2944,20 +2944,27 @@ impl Ext4 {
         child: &mut InodeRef,
         name: &str,
     ) -> Result<()> {
-        if let Err(link_err) = self.link_inode(parent, child, name, false) {
-            if let Err(cleanup_err) = self.free_inode(child) {
-                trace!(
-                    "link failed for new inode {} (name {}), cleanup failed: {:?}; original link error: {:?}",
-                    child.id,
-                    name,
-                    cleanup_err,
-                    link_err
-                );
-                return Err(cleanup_err);
+        match self.link_inode_classified(parent, child, name, false) {
+            Ok(()) => Ok(()),
+            Err(super::link::LinkFailure::Indeterminate(link_err)) => {
+                self.poison(ErrCode::EIO);
+                Err(link_err)
             }
-            return Err(link_err);
+            Err(super::link::LinkFailure::Unmodified(link_err)) => {
+                if let Err(cleanup_err) = self.free_inode(child) {
+                    trace!(
+                        "link failed for new inode {} (name {}), cleanup failed: {:?}; original link error: {:?}",
+                        child.id,
+                        name,
+                        cleanup_err,
+                        link_err
+                    );
+                    self.poison(ErrCode::EIO);
+                    return Err(cleanup_err);
+                }
+                Err(link_err)
+            }
         }
-        Ok(())
     }
 
     /// Create a file. This function will not check the existence of
@@ -3014,6 +3021,60 @@ impl Ext4 {
         }
         // Create child inode and link it to parent directory
         let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
+        self.link_new_inode_or_free(&mut parent, &mut child, name)?;
+        Ok(Self::file_attr(&child))
+    }
+
+    /// Create a symbolic link whose target is initialized before its name is
+    /// published in the parent directory.
+    pub fn symlink_with_owner_and_attr(
+        &self,
+        parent: InodeId,
+        name: &str,
+        target: &str,
+        owner: InodeOwner,
+    ) -> Result<FileAttr> {
+        self.ensure_mutable()?;
+        if target.is_empty() {
+            return_error!(ErrCode::ENOENT, "Symbolic link target is empty");
+        }
+        if target.len() >= PATH_MAX {
+            return_error!(ErrCode::ENAMETOOLONG, "Symbolic link target is too long");
+        }
+
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let _mutation_guards = self.lock_inode_mutations(&[parent]);
+        let mut parent = self.read_inode(parent)?;
+        if !parent.inode.is_dir() {
+            return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
+        }
+
+        let mode = InodeMode::SOFTLINK | InodeMode::ALL_RWX;
+        let mut child = self.create_inode_with_owner(mode, owner.uid, owner.gid)?;
+        let initialized = if target.len() + 1 <= child.inode.inline_block().len() {
+            child
+                .inode
+                .set_fast_symlink(target.as_bytes())
+                .and_then(|_| self.write_inode_with_csum(&mut child))
+        } else {
+            let mut image = Box::new([0; BLOCK_SIZE]);
+            image[..target.len()].copy_from_slice(target.as_bytes());
+            self.extent_query_or_create_initialized(&mut child, 0, 1, Some(image))
+                .and_then(|_| self.recompute_inode_block_count(&mut child))
+                .and_then(|_| {
+                    child.inode.set_size(target.len() as u64);
+                    self.write_inode_with_csum(&mut child)
+                })
+        };
+        if let Err(init_error) = initialized {
+            if let Err(cleanup_error) = self.free_inode(&mut child) {
+                self.poison(ErrCode::EIO);
+                return Err(cleanup_error);
+            }
+            return Err(init_error);
+        }
+
         self.link_new_inode_or_free(&mut parent, &mut child, name)?;
         Ok(Self::file_attr(&child))
     }
@@ -5033,6 +5094,7 @@ mod tests {
                 BASE_OFFSET + 12,
                 TEST_INITIAL_FREE_BLOCKS as u32,
             );
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 16, 15);
             Self::write_u32(&mut sb_block, BASE_OFFSET + 20, 0);
             Self::write_u32(&mut sb_block, BASE_OFFSET + 24, 2);
             Self::write_u32(&mut sb_block, BASE_OFFSET + 28, 2);
@@ -5050,11 +5112,16 @@ mod tests {
             Self::write_u32(&mut bgdt, 4, TEST_INODE_BITMAP as u32);
             Self::write_u32(&mut bgdt, 8, TEST_INODE_TABLE as u32);
             Self::write_u16(&mut bgdt, 12, TEST_INITIAL_FREE_BLOCKS as u16);
+            Self::write_u16(&mut bgdt, 14, 15);
             blocks.insert(1, bgdt);
 
             let mut bitmap = blocks.remove(&TEST_BLOCK_BITMAP).unwrap();
             bitmap.data[0] = 0b0001_1111;
             blocks.insert(TEST_BLOCK_BITMAP, bitmap);
+
+            let mut inode_bitmap = blocks.remove(&TEST_INODE_BITMAP).unwrap();
+            inode_bitmap.data[0] = 0b0000_0010;
+            blocks.insert(TEST_INODE_BITMAP, inode_bitmap);
 
             let mut inode_table = blocks.remove(&TEST_INODE_TABLE).unwrap();
             let mut inode = Inode::default();
@@ -5362,6 +5429,48 @@ mod tests {
         assert_eq!(err.code(), ErrCode::EIO);
         assert_allocation_state(&fs, &block_device, false, TEST_INITIAL_FREE_BLOCKS);
         assert!(!block_device.block_is_zero(TEST_XATTR_BLOCK));
+    }
+
+    #[test]
+    fn unpublished_extent_rollback_uses_the_tree_before_i_blocks_is_recomputed() {
+        let (block_device, fs) = load_failing_test_fs();
+        let initial_sb_free_inodes = fs.read_super_block_cached().free_inodes_count();
+        let initial_bg_free_inodes = fs.read_block_group(0).unwrap().desc.free_inodes_count();
+        let mut inode = fs
+            .create_inode_with_owner(
+                InodeMode::SOFTLINK | InodeMode::ALL_RWX,
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(fs.inode_is_allocated(inode.id).unwrap());
+        block_device.fail_once_on_write(TEST_INODE_TABLE);
+
+        let err = fs
+            .extent_query_or_create_initialized(
+                &mut inode,
+                0,
+                1,
+                Some(Box::new([0x5a; BLOCK_SIZE])),
+            )
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_eq!(inode.inode.fs_block_count(), 0);
+        assert_eq!(fs.extent_all_data_blocks(&inode).unwrap(), vec![TEST_XATTR_BLOCK]);
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
+
+        fs.free_inode(&mut inode).unwrap();
+        assert_allocation_state(&fs, &block_device, false, TEST_INITIAL_FREE_BLOCKS);
+        assert!(!fs.inode_is_allocated(inode.id).unwrap());
+        assert_eq!(
+            fs.read_super_block_cached().free_inodes_count(),
+            initial_sb_free_inodes
+        );
+        assert_eq!(
+            fs.read_block_group(0).unwrap().desc.free_inodes_count(),
+            initial_bg_free_inodes
+        );
     }
 
     #[test]

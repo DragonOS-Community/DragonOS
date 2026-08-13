@@ -13,6 +13,10 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 SERVER_PID=""
 
 cleanup() {
+    # Explicitly stop the daemon: -s double-forks, so $! is the launcher (already
+    # dead) and kill $SERVER_PID misses the daemon.  -S is the canonical shutdown
+    # and is a harmless no-op if the daemon already exited.
+    ${LMBENCH_BIN_DIR}/bw_tcp -S 127.0.0.1 2>/dev/null || true
     if [ ! -z "$SERVER_PID" ]; then
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true

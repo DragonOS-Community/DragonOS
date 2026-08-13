@@ -15,6 +15,7 @@ WEB_DIR="${LMBENCH_TMP_DIR:-/tmp}/lmbench_http"
 PORT=8080
 
 cleanup() {
+    ${LMBENCH_BIN_DIR}/lat_http -S 127.0.0.1 $PORT 2>/dev/null || true
     if [ ! -z "$SERVER_PID" ]; then
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true

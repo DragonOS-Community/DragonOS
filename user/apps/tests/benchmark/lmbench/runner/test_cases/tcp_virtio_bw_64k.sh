@@ -13,6 +13,7 @@ ENV_PATH="$SCRIPT_DIR/../env.sh"
 SERVER_PID=""
 
 cleanup() {
+    ${LMBENCH_BIN_DIR}/bw_tcp -S 10.0.2.15 2>/dev/null || true
     if [ ! -z "$SERVER_PID" ]; then
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true

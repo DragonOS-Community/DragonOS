@@ -387,22 +387,36 @@ impl TcpSocket {
                 inner::Inner::SelfConnected(sc) => {
                     // Self-connect: data path is a local queue.
                     let mut current_buf = &mut buf[total_read..];
+                    let mut recv_exhausted = false;
                     if self.is_recv_shutdown() {
                         let remaining = self.recv_shutdown.remaining_limit();
                         if remaining == 0 {
                             sc.discard_all();
-                            return Ok(0);
+                            recv_exhausted = true;
+                        } else {
+                            let cap = core::cmp::min(current_buf.len(), remaining);
+                            current_buf = &mut current_buf[..cap];
                         }
-                        let cap = core::cmp::min(current_buf.len(), remaining);
-                        current_buf = &mut current_buf[..cap];
                     }
-                    let peek = flags.contains(PMSG::PEEK);
-                    let trunc = flags.contains(PMSG::TRUNC);
-                    let n = sc.recv_into(current_buf, peek, trunc)?;
-                    if self.is_recv_shutdown() && !peek && self.recv_shutdown.record_read(n) {
-                        sc.discard_all();
+
+                    if recv_exhausted {
+                        Ok(0)
+                    } else {
+                        let peek = flags.contains(PMSG::PEEK);
+                        let trunc = flags.contains(PMSG::TRUNC);
+                        match sc.recv_into(current_buf, peek, trunc) {
+                            Ok(n) => {
+                                if self.is_recv_shutdown()
+                                    && !peek
+                                    && self.recv_shutdown.record_read(n)
+                                {
+                                    sc.discard_all();
+                                }
+                                Ok(n)
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
-                    Ok(n)
                 }
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.failure_reason() {
@@ -495,19 +509,30 @@ impl TcpSocket {
                 }),
                 inner::Inner::SelfConnected(sc) => {
                     let mut limit = user_buffer.len().saturating_sub(total_read);
+                    let mut recv_exhausted = false;
                     if self.is_recv_shutdown() {
                         let remaining = self.recv_shutdown.remaining_limit();
                         if remaining == 0 {
                             sc.discard_all();
-                            return Ok(0);
+                            recv_exhausted = true;
+                        } else {
+                            limit = core::cmp::min(limit, remaining);
                         }
-                        limit = core::cmp::min(limit, remaining);
                     }
-                    let n = sc.recv_to_user(user_buffer, total_read, limit)?;
-                    if self.is_recv_shutdown() && self.recv_shutdown.record_read(n) {
-                        sc.discard_all();
+
+                    if recv_exhausted {
+                        Ok(0)
+                    } else {
+                        match sc.recv_to_user(user_buffer, total_read, limit) {
+                            Ok(n) => {
+                                if self.is_recv_shutdown() && self.recv_shutdown.record_read(n) {
+                                    sc.discard_all();
+                                }
+                                Ok(n)
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
-                    Ok(n)
                 }
                 inner::Inner::Connecting(connecting) => {
                     if let Some(err) = connecting.failure_reason() {

@@ -548,7 +548,11 @@ impl FuseNode {
         let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
         let inode: Arc<dyn IndexNode> = node;
         let backend = Arc::new(FusePageCacheBackend::new(self.self_ref.clone()));
-        let cache = PageCache::new(Some(Arc::downgrade(&inode)), Some(backend));
+        let domain = self
+            .try_fs()
+            .and_then(|fs| fs.page_cache_writeback_domain().cloned())
+            .ok_or(SystemError::ESTALE)?;
+        let cache = PageCache::new_file(Arc::downgrade(&inode), backend, &domain)?;
         *guard = Some(cache.clone());
         Ok(cache)
     }
@@ -1529,6 +1533,7 @@ impl FuseNode {
             }
 
             let speculative = run_start >= demand_end_page;
+            let domain_io = page_cache.try_acquire_domain_io()?;
             let track_direct_read_stats = super::super::stats::optional_read_stats_enabled();
             let target = match page_cache.manager().reserve_read_dma(
                 run_start,
@@ -1577,6 +1582,7 @@ impl FuseNode {
                 observed_size: file_ctx.file_size,
                 observed_attr_version,
                 open_pin,
+                domain_io,
             };
             let pending = if async_read {
                 self.conn().enqueue_background_read_pages(

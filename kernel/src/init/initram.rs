@@ -106,7 +106,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
         None,
         MountFlags::empty(),
         None,
-    );
+    )?;
     let root_inode = mount_fs.root_inode();
     unsafe {
         __INIT_ROOT_INODE = Some(root_inode.clone());

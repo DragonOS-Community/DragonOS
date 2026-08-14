@@ -41,6 +41,12 @@ impl EventFdFs {
 }
 
 impl FileSystem for EventFdFs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         // EventFdFs 没有真正的根 inode，但我们需要实现这个方法
         // 返回一个空的 eventfd inode 作为占位符

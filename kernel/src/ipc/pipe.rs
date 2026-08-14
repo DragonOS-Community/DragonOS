@@ -177,6 +177,12 @@ lazy_static! {
 pub struct PipeFS;
 
 impl FileSystem for PipeFS {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         // PipeFS 没有真正的根 inode，但我们需要实现这个方法
         // 返回一个空的 pipe inode 作为占位符

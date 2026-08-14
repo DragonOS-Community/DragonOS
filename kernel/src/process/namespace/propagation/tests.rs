@@ -77,7 +77,8 @@ fn new_test_mount(propagation: Arc<MountPropagation>) -> Arc<MountFS> {
         None,
         MountFlags::empty(),
         None,
-    );
+    )
+    .unwrap();
     // Test fixtures represent mounts that have already been published.
     // Production constructors intentionally remain in Constructing until
     // their topology/namespace insertion commits.

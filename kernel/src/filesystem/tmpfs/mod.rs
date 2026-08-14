@@ -3,7 +3,7 @@ use core::fmt::Write;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::filesystem::page_cache::{PageCache, PageCacheBackend};
+use crate::filesystem::page_cache::{PageCache, PageCacheBackend, PageCacheWritebackDomain};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwsem::RwSem;
@@ -101,6 +101,18 @@ impl PageCacheBackend for TmpfsPageCacheBackend {
         if let Some(fs) = self.fs.upgrade() {
             fs.decrease_size(MMArch::PAGE_SIZE);
         }
+    }
+}
+
+fn new_tmpfs_page_cache(
+    inode: Weak<dyn IndexNode>,
+    backend: Arc<dyn PageCacheBackend>,
+    fs: &Weak<Tmpfs>,
+) -> Result<Arc<PageCache>, SystemError> {
+    let fs = fs.upgrade().ok_or(SystemError::EIO)?;
+    match fs.writeback_domain.as_ref() {
+        Some(domain) => PageCache::new_filesystem_shmem(inode, backend, domain),
+        None => Ok(PageCache::new_shmem(Some(inode), Some(backend))),
     }
 }
 
@@ -313,6 +325,7 @@ impl LockedTmpfsInode {
 #[derive(Debug)]
 pub struct Tmpfs {
     root_inode: Arc<LockedTmpfsInode>,
+    writeback_domain: Option<Arc<PageCacheWritebackDomain>>,
     super_block: RwSem<SuperBlock>,
     size_limit: RwSem<Option<u64>>,
     current_size: AtomicU64,
@@ -453,6 +466,10 @@ impl FileSystemMakerData for TmpfsMountData {
 }
 
 impl FileSystem for Tmpfs {
+    fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
+        self.writeback_domain.as_ref()
+    }
+
     fn supports_reliable_flush(&self) -> bool {
         // tmpfs has no crash-surviving backing state. A loop image stored here
         // disappears as a whole on power loss, so there is no partially
@@ -577,10 +594,18 @@ impl Tmpfs {
         let size_limit = mount_data
             .size_bytes
             .or_else(|| Some(Self::default_size_bytes() as u64));
-        Self::new_with_size_limit(mount_data.mode, size_limit)
+        Self::new_with_size_limit(
+            mount_data.mode,
+            size_limit,
+            Some(PageCacheWritebackDomain::new()),
+        )
     }
 
-    fn new_with_size_limit(mode: Option<InodeMode>, size_limit: Option<u64>) -> Arc<Self> {
+    fn new_with_size_limit(
+        mode: Option<InodeMode>,
+        size_limit: Option<u64>,
+        writeback_domain: Option<Arc<PageCacheWritebackDomain>>,
+    ) -> Arc<Self> {
         let mut sb = SuperBlock::new(
             Magic::TMPFS_MAGIC,
             TMPFS_BLOCK_SIZE,
@@ -598,6 +623,7 @@ impl Tmpfs {
 
         let result: Arc<Tmpfs> = Arc::new(Tmpfs {
             root_inode: root,
+            writeback_domain,
             super_block: RwSem::new(sb),
             size_limit: RwSem::new(size_limit),
             current_size: AtomicU64::new(0),
@@ -614,8 +640,8 @@ impl Tmpfs {
         result
     }
 
-    pub fn new_unlimited(mode: Option<InodeMode>) -> Arc<Self> {
-        Self::new_with_size_limit(mode, None)
+    fn new_internal_shmem(mode: Option<InodeMode>) -> Arc<Self> {
+        Self::new_with_size_limit(mode, None, None)
     }
 
     /// 原子地增加文件系统使用的大小
@@ -732,7 +758,7 @@ impl Tmpfs {
             Arc::downgrade(&inode_dyn),
             Arc::downgrade(self),
         ));
-        let pc = PageCache::new_shmem(Some(Arc::downgrade(&inode_dyn)), Some(backend));
+        let pc = new_tmpfs_page_cache(Arc::downgrade(&inode_dyn), backend, &Arc::downgrade(self))?;
         result.0.lock().page_cache = Some(pc.clone());
 
         Ok(Arc::new(TmpfsShmemFile {
@@ -746,7 +772,7 @@ impl Tmpfs {
 }
 
 lazy_static! {
-    static ref SYSV_SHMEM_TMPFS: Arc<Tmpfs> = Tmpfs::new_unlimited(Some(InodeMode::S_IRWXUGO));
+    static ref SYSV_SHMEM_TMPFS: Arc<Tmpfs> = Tmpfs::new_internal_shmem(Some(InodeMode::S_IRWXUGO));
 }
 
 pub fn create_unlinked_shmem_file(size: usize) -> Result<Arc<TmpfsShmemFile>, SystemError> {
@@ -1276,7 +1302,7 @@ impl IndexNode for LockedTmpfsInode {
                 Arc::downgrade(&inode_dyn),
                 parent.fs.clone(),
             ));
-            let page_cache = PageCache::new_shmem(Some(Arc::downgrade(&inode_dyn)), Some(backend));
+            let page_cache = new_tmpfs_page_cache(Arc::downgrade(&inode_dyn), backend, &parent.fs)?;
             result.0.lock().page_cache = Some(page_cache.clone());
             let page = page_cache.manager().commit_overwrite(0)?;
             let mut page_guard = page.write();
@@ -1351,10 +1377,11 @@ impl IndexNode for LockedTmpfsInode {
                 Arc::downgrade(&result) as Weak<dyn IndexNode>,
                 inode.fs.clone(),
             ));
-            let pc = PageCache::new_shmem(
-                Some(Arc::downgrade(&result) as Weak<dyn IndexNode>),
-                Some(backend),
-            );
+            let pc = new_tmpfs_page_cache(
+                Arc::downgrade(&result) as Weak<dyn IndexNode>,
+                backend,
+                &inode.fs,
+            )?;
             result.0.lock().page_cache = Some(pc);
         }
 

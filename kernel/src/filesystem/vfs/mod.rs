@@ -2086,6 +2086,12 @@ impl WritebackControl {
 
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
+    /// Return the stable writeback/shutdown domain for file-backed mappings.
+    /// In-memory and pseudo filesystems must explicitly return `None`.
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>>;
+
     /// Whether `sync_fs(true)` reaches a power-loss-safe backing barrier.
     fn supports_reliable_flush(&self) -> bool {
         false
@@ -2150,6 +2156,12 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// Stop or finish asynchronous retention producers before the eviction
     /// queue is sealed.
     fn quiesce_async_inode_work(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Stop filesystem-private page-cache producers before the generic
+    /// writeback domain is closed and retired.
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
         Ok(())
     }
 

@@ -34,6 +34,12 @@ impl PidFdFs {
 }
 
 impl FileSystem for PidFdFs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         Arc::new(PidFdInode::new())
     }

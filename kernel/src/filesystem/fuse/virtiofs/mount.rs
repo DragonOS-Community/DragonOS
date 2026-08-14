@@ -218,6 +218,16 @@ impl VirtioFsFs {
 }
 
 impl FileSystem for VirtioFsFs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        self.inner.page_cache_writeback_domain()
+    }
+
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
+        self.inner.quiesce_page_cache_producers()
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.inner.root_inode()
     }

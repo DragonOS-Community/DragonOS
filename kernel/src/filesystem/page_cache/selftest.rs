@@ -25,6 +25,53 @@ impl Drop for PageCacheAccountingSelftestGuard {
     }
 }
 
+fn run_writeback_domain_lifecycle_selftest() -> bool {
+    let domain = PageCacheWritebackDomain::new();
+    let cache = PageCache::new_unowned(None, None);
+    if domain.register(&cache).is_err() || domain.snapshot().len() != 1 {
+        return false;
+    }
+    domain.close_background_admission();
+    if domain.wait_drained().is_err()
+        || domain.try_acquire_io().is_ok()
+        || domain.register(&cache).is_ok()
+    {
+        return false;
+    }
+    drop(cache);
+    if !domain.snapshot().is_empty() {
+        return false;
+    }
+
+    let owner: Arc<dyn crate::filesystem::vfs::FileSystem> = crate::filesystem::ramfs::RamFS::new();
+    let owner_weak = Arc::downgrade(&owner);
+    let superblock = Arc::new(crate::filesystem::vfs::mount::SuperBlockState::new(
+        crate::filesystem::vfs::mount::MountFlags::empty(),
+    ));
+    let active = PageCacheWritebackDomain::new();
+    if active.bind(&owner, &superblock).is_err() {
+        return false;
+    }
+    let permit = match active.try_acquire_io() {
+        Ok(permit) => permit,
+        Err(_) => return false,
+    };
+    active.close_background_admission();
+    let child = permit.derive();
+    drop(owner);
+    if owner_weak.upgrade().is_none() || active.state.lock_irqsave().io_in_flight != 2 {
+        return false;
+    }
+    drop(permit);
+    if owner_weak.upgrade().is_none() || active.state.lock_irqsave().io_in_flight != 1 {
+        return false;
+    }
+    drop(child);
+    owner_weak.upgrade().is_none()
+        && active.state.lock_irqsave().io_in_flight == 0
+        && active.wait_drained().is_ok()
+}
+
 #[inline(never)]
 fn run_preallocated_batch_lifecycle_selftest() -> Result<bool, SystemError> {
     use crate::{
@@ -71,7 +118,7 @@ fn run_preallocated_batch_lifecycle_selftest() -> Result<bool, SystemError> {
         page.write().add_flags(PageFlags::PG_UPTODATE);
     }
 
-    let cache = PageCache::new(None, None);
+    let cache = PageCache::new_unowned(None, None);
     cache.adopt_preallocated_unevictable_batch(7, batch)?;
     if cache.inner.lock().pages_count() != 3
         || addresses
@@ -867,7 +914,7 @@ pub(crate) fn run_completion_domain_debug_selftest() -> Result<alloc::string::St
 fn run_invalidate_retry_lock_order_selftest() -> Result<bool, SystemError> {
     const SELFTEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-    let cache = PageCache::new(None, None);
+    let cache = PageCache::new_unowned(None, None);
     let mm = Arc::new(RwSem::new(()));
     let state = Arc::new(PageCacheInvalidateRetrySelftestState::new());
 
@@ -1029,7 +1076,7 @@ fn run_tag_scan_chunk_release_selftest() -> Result<bool, SystemError> {
     const SELFTEST_PAGES: usize = 513;
     const SELFTEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-    let cache = PageCache::new(None, None);
+    let cache = PageCache::new_unowned(None, None);
     let mut pages = Vec::with_capacity(SELFTEST_PAGES);
     for index in 0..SELFTEST_PAGES {
         let page = cache.get_or_create_page_zero(index)?;
@@ -1323,6 +1370,7 @@ fn run_dirty_incarnation_snapshot_successor_selftest() -> Result<bool, SystemErr
         MMArch::PAGE_SIZE,
         None,
         false,
+        None,
     )? {
         WritebackClaimOutcome::Claimed(batch) => batch,
         _ => return Ok(false),
@@ -1649,6 +1697,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
     let _running = PageCacheAccountingSelftestGuard;
 
+    if !run_writeback_domain_lifecycle_selftest() {
+        return Ok("status=fail stage=writeback_domain_lifecycle\n".into());
+    }
+
     if !run_preallocated_batch_lifecycle_selftest()? {
         return Ok("status=fail stage=preallocated_batch_lifecycle\n".into());
     }
@@ -1734,7 +1786,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         true,
     ));
     let admission_backend_dyn: Arc<dyn PageCacheBackend> = admission_backend.clone();
-    let admission_cache = PageCache::new(None, Some(admission_backend_dyn.clone()));
+    let admission_cache = PageCache::new_unowned(None, Some(admission_backend_dyn.clone()));
     *admission_backend.cache.lock() = Arc::downgrade(&admission_cache);
     let admission_page = admission_cache.get_or_create_page_zero(0)?;
     let mark_admission_dirty = || -> Result<(), SystemError> {
@@ -1831,6 +1883,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
             &admission_backend_dyn,
             0,
             0,
+            None,
             || Ok(None),
         )?,
         WritebackClaimOutcome::NoBatch
@@ -1887,7 +1940,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         false,
     ));
     let legacy_backend_dyn: Arc<dyn PageCacheBackend> = legacy_backend.clone();
-    let legacy_cache = PageCache::new(None, Some(legacy_backend_dyn.clone()));
+    let legacy_cache = PageCache::new_unowned(None, Some(legacy_backend_dyn.clone()));
     *legacy_backend.cache.lock() = Arc::downgrade(&legacy_cache);
     let mut legacy_blocking_claim = || Ok(());
     let legacy_blocking = PageCacheManager::with_writeback_admission(
@@ -2126,11 +2179,11 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         &mut || {
             snapshot_error_outcome = Some(PageCacheManager::claim_and_snapshot_locked_with(
                 &submission_cache,
-                0,
-                0,
+                WritebackBatchRange::new(0, 0),
                 token_file_size,
                 None,
                 true,
+                None,
                 |_batch| Err(SystemError::EIO),
             )?);
             Ok(())
@@ -2412,11 +2465,11 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         &mut || {
             tagged_snapshot_error_outcome = Some(PageCacheManager::claim_and_snapshot_locked_with(
                 &submission_cache,
-                0,
-                0,
+                WritebackBatchRange::new(0, 0),
                 token_file_size,
                 Some((0, &tagged_entry, tagged_epoch)),
                 true,
+                None,
                 |_batch| Err(SystemError::EIO),
             )?);
             Ok(())
@@ -2513,7 +2566,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
             admission_order: PageCacheWritebackAdmissionOrder::AdmissionBeforeInvalidate,
             snapshot_phase: PageCacheWritebackSnapshotPhase::WithinAdmission,
         });
-    let overflow_cache = PageCache::new(None, Some(overflow_backend.clone()));
+    let overflow_cache = PageCache::new_unowned(None, Some(overflow_backend.clone()));
     let overflow_page = overflow_cache.get_or_create_page_zero(0)?;
     let overflow_entry = {
         let inner = overflow_cache.inner.lock();
@@ -2605,6 +2658,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
             &submission_backend_dyn,
             0,
             0,
+            None,
             || Ok(Some(token_file_size)),
         ),
         Ok(WritebackClaimOutcome::FailedRecorded(SystemError::EIO))
@@ -2660,8 +2714,8 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     let split_blocking_submit = match PageCacheManager::claim_and_snapshot_after_admission_with(
         &split_cache,
         &split_backend_dyn,
-        0,
-        0,
+        WritebackBatchRange::new(0, 0),
+        None,
         None,
         || Ok(MMArch::PAGE_SIZE),
         snapshot_after_admission,
@@ -2679,8 +2733,8 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         PageCacheManager::claim_and_snapshot_after_admission_with(
             &split_cache,
             &split_backend_dyn,
-            0,
-            0,
+            WritebackBatchRange::new(0, 0),
+            None,
             None,
             || Ok(MMArch::PAGE_SIZE),
             |_batch| {
@@ -2713,8 +2767,8 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         PageCacheManager::claim_and_snapshot_after_admission_with(
             &split_cache,
             &split_backend_dyn,
-            0,
-            0,
+            WritebackBatchRange::new(0, 0),
+            None,
             None,
             || Ok(MMArch::PAGE_SIZE),
             snapshot_after_admission,
@@ -2734,6 +2788,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         &split_backend_dyn,
         0,
         0,
+        None,
         || Ok(Some(MMArch::PAGE_SIZE)),
         snapshot_after_admission,
     )? {
@@ -2755,6 +2810,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
             &split_backend_dyn,
             0,
             0,
+            None,
             || Ok(Some(MMArch::PAGE_SIZE)),
             snapshot_after_admission,
         ),
@@ -2776,6 +2832,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
                 &split_backend_dyn,
                 0,
                 0,
+                None,
                 || Ok(Some(MMArch::PAGE_SIZE)),
                 snapshot_after_admission,
             ),
@@ -2935,11 +2992,11 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
             &mut || {
                 claimed = PageCacheManager::claim_and_snapshot_locked_with(
                     &tagged_worker_cache,
-                    0,
-                    0,
+                    WritebackBatchRange::new(0, 0),
                     token_file_size,
                     Some((0, &tagged_worker_entry, tagged_submission_epoch)),
                     true,
+                    None,
                     |batch| {
                         tagged_worker_gate
                             .snapshot_entered
@@ -3110,7 +3167,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     // Ordinary file membership: insert, explicit remove, and duplicate remove.
-    let file_cache = PageCache::new(None, None);
+    let file_cache = PageCache::new_unowned(None, None);
     let file_page = file_cache.get_or_create_page_zero(0)?;
     let file_entry = file_cache
         .inner
@@ -3169,7 +3226,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
 
     // Loading rollback consumes membership once; a late state publication on
     // the detached entry must not revive it.
-    let state_cache = PageCache::new(None, None);
+    let state_cache = PageCache::new_unowned(None, None);
     let loading_page = state_cache.allocate_page(Arc::downgrade(&state_cache), 0)?;
     let loading_entry = Arc::new(PageEntry::new(loading_page.clone(), PageState::Loading));
     state_cache
@@ -3191,7 +3248,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     // Exercise the production writeback claim/completion state machine. A
     // successful completion returns to UpToDate; an error completion redirties
     // the same attached entry before normal removal closes the accounting.
-    let writeback_cache = PageCache::new(None, None);
+    let writeback_cache = PageCache::new_unowned(None, None);
     let writeback_page = writeback_cache.get_or_create_page_zero(0)?;
     let writeback_entry = writeback_cache
         .inner
@@ -3322,7 +3379,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     // Exhaustion must fail before publishing any Legacy state transition.
     // Wrapping to zero would make a later frozen waiter indistinguishable
     // from an old incarnation.
-    let overflow_cache = PageCache::new(None, None);
+    let overflow_cache = PageCache::new_unowned(None, None);
     let overflow_page = overflow_cache.get_or_create_page_zero(0)?;
     let overflow_entry = overflow_cache
         .inner
@@ -3347,7 +3404,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     // Generic asynchronous reads may leave a Loading entry at final drop. A
     // late completion owns only the detached entry and must not revive its
     // mapping accounting or physical manager/reclaimer membership.
-    let drop_cache = PageCache::new(None, None);
+    let drop_cache = PageCache::new_unowned(None, None);
     let drop_page = drop_cache.allocate_page(Arc::downgrade(&drop_cache), 0)?;
     let drop_paddr = drop_page.phys_address();
     let drop_entry = Arc::new(PageEntry::new(drop_page, PageState::Loading));
@@ -3487,6 +3544,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

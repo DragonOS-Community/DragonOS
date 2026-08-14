@@ -141,6 +141,12 @@ fn is_zero_inode(pfm: &PageFaultMessage) -> bool {
 }
 
 impl FileSystem for DevFS {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }

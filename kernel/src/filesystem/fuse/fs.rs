@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use system_error::SystemError;
 
 use crate::{
+    filesystem::page_cache::PageCacheWritebackDomain,
     filesystem::vfs::{
         file::File, FilePrivateData, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode,
         InodeFlags, InodeId, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
@@ -95,6 +96,7 @@ impl FileSystemMakerData for FuseMountData {
 
 #[derive(Debug)]
 pub struct FuseFS {
+    writeback_domain: Arc<PageCacheWritebackDomain>,
     root: Arc<FuseNode>,
     super_block: SuperBlock,
     conn: Arc<FuseConn>,
@@ -421,6 +423,7 @@ impl FuseFS {
         let conn = parent.conn.clone();
         let parent_nodeid = root_parent.nodeid();
         let fs = Arc::new_cyclic(|weak| FuseFS {
+            writeback_domain: PageCacheWritebackDomain::new(),
             root: FuseNode::new(
                 weak.clone(),
                 conn.clone(),
@@ -647,6 +650,7 @@ impl MountableFileSystem for FuseFS {
         );
 
         let fs = Arc::new_cyclic(|weak_fs| FuseFS {
+            writeback_domain: PageCacheWritebackDomain::new(),
             root: FuseNode::new(
                 weak_fs.clone(),
                 conn.clone(),
@@ -681,6 +685,19 @@ impl MountableFileSystem for FuseFS {
 register_mountable_fs!(FuseFS, FUSEFSMAKER, "fuse");
 
 impl FileSystem for FuseFS {
+    fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
+        Some(&self.writeback_domain)
+    }
+
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
+        self.writeback_domain.close_background_admission();
+        self.conn.cancel_page_cache_reads(&self.writeback_domain);
+        if !self.is_submount {
+            self.conn.begin_dax_quiesce();
+            self.conn.wait_dax_drained();
+        }
+        Ok(())
+    }
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root.clone()
     }
@@ -919,10 +936,6 @@ impl FileSystem for FuseFS {
     }
 
     fn on_umount(&self) {
-        if !self.is_submount {
-            self.conn.begin_dax_quiesce();
-            self.conn.wait_dax_drained();
-        }
         self.teardown_nodes();
         if !self.is_submount {
             self.conn.on_umount();

@@ -387,10 +387,15 @@ impl Ext4DelallocProgress {
         })
     }
 
-    fn ticket(self: &Arc<Self>, inode: Weak<LockedExt4Inode>) -> Arc<Ext4DelallocProgressTicket> {
+    fn ticket(
+        self: &Arc<Self>,
+        inode: Weak<LockedExt4Inode>,
+        page_cache: Weak<PageCache>,
+    ) -> Arc<Ext4DelallocProgressTicket> {
         Arc::new(Ext4DelallocProgressTicket {
             progress: self.clone(),
             inode,
+            page_cache,
             observed: self.sequence.load(Ordering::Acquire),
         })
     }
@@ -407,7 +412,11 @@ impl Ext4DelallocProgress {
         }
     }
 
-    fn schedule_if_demanded(progress: &Arc<Self>, inode: &Weak<LockedExt4Inode>) {
+    fn schedule_if_demanded_admitted(
+        progress: &Arc<Self>,
+        inode: &Weak<LockedExt4Inode>,
+        domain_io: crate::filesystem::page_cache::PageCacheDomainIoPermit,
+    ) {
         if !progress.demand.load(Ordering::Acquire)
             || progress
                 .work_scheduled
@@ -417,58 +426,88 @@ impl Ext4DelallocProgress {
             return;
         }
 
+        let Some(inode) = inode.upgrade() else {
+            progress.work_scheduled.store(false, Ordering::Release);
+            progress.publish(PageCacheWritebackProgressOutcome::Cancelled);
+            return;
+        };
         let progress = progress.clone();
-        let inode = inode.clone();
+        let inode_weak = Arc::downgrade(&inode);
+        let work_state = Mutex::new(Some((inode, domain_io)));
         schedule_work(Work::new(move || {
+            let Some((inode, domain_io)) = work_state.lock().take() else {
+                return;
+            };
+            // This producer is an admitted filesystem-I/O lineage. Keep the
+            // permit through state publication, callback execution, and the
+            // lost-wakeup handoff below; a dormant callback never owns it.
             // Consume only the demand observed by this invocation. A
             // concurrent arm() sets it again and is handed off below.
             progress.demand.store(false, Ordering::Release);
-            let outcome =
-                inode
-                    .upgrade()
-                    .map_or(Ext4DelallocProducerRunOutcome::Cancelled, |inode| {
-                        let head = {
-                            let guard = inode.inner.lock();
-                            guard.delalloc.production.head().map(|(_, head)| {
-                                let page_cache = guard.page_cache.clone();
-                                match &head.state {
-                                    ProductionDelallocEntryState::Ready(pending) => {
-                                        let first_page = pending.offset / MMArch::PAGE_SIZE;
-                                        let last_page = guard
-                                            .delalloc
-                                            .production
-                                            .ready_prefix_end(pending.offset, usize::MAX)
-                                            .unwrap_or(pending.offset)
-                                            / MMArch::PAGE_SIZE;
-                                        Ext4DelallocProducerAction::Dispatch(
-                                            page_cache, first_page, last_page,
-                                        )
-                                    }
-                                    ProductionDelallocEntryState::Prepared(_)
-                                    | ProductionDelallocEntryState::Claimed { .. } => {
-                                        Ext4DelallocProducerAction::Passive
-                                    }
-                                }
-                            })
-                        };
-                        match head {
-                            Some(Ext4DelallocProducerAction::Dispatch(
-                                Some(page_cache),
-                                first_page,
-                                last_page,
-                            )) => Ext4DelallocProducerRunOutcome::Dispatch(
-                                page_cache
-                                    .manager()
-                                    .dispatch_writeback_once(first_page, last_page),
-                            ),
-                            Some(Ext4DelallocProducerAction::Dispatch(None, _, _)) | None => {
-                                Ext4DelallocProducerRunOutcome::Cancelled
-                            }
-                            Some(Ext4DelallocProducerAction::Passive) => {
-                                Ext4DelallocProducerRunOutcome::Passive
-                            }
+            let head = {
+                let guard = inode.inner.lock();
+                guard.delalloc.production.head().map(|(_, head)| {
+                    let page_cache = guard.page_cache.clone();
+                    match &head.state {
+                        ProductionDelallocEntryState::Ready(pending) => {
+                            let first_page = pending.offset / MMArch::PAGE_SIZE;
+                            let last_page = guard
+                                .delalloc
+                                .production
+                                .ready_prefix_end(pending.offset, usize::MAX)
+                                .unwrap_or(pending.offset)
+                                / MMArch::PAGE_SIZE;
+                            Ext4DelallocProducerAction::Dispatch(page_cache, first_page, last_page)
                         }
-                    });
+                        ProductionDelallocEntryState::Prepared(_)
+                        | ProductionDelallocEntryState::Claimed { .. } => {
+                            Ext4DelallocProducerAction::Passive
+                        }
+                    }
+                })
+            };
+            let outcome = match head {
+                Some(Ext4DelallocProducerAction::Dispatch(
+                    Some(page_cache),
+                    first_page,
+                    last_page,
+                )) => Ext4DelallocProducerRunOutcome::Dispatch(
+                    page_cache
+                        .manager()
+                        .dispatch_writeback_once(first_page, last_page, &domain_io),
+                ),
+                Some(Ext4DelallocProducerAction::Dispatch(None, _, _)) | None => {
+                    Ext4DelallocProducerRunOutcome::Cancelled
+                }
+                Some(Ext4DelallocProducerAction::Passive) => {
+                    Ext4DelallocProducerRunOutcome::Passive
+                }
+            };
+
+            // Publish terminal progress only after this producer has released
+            // its scheduling ownership and handed off any demand observed
+            // during the run. The producer permit remains held through this
+            // entire block; dormant callbacks never own a permit.
+            if matches!(
+                &outcome,
+                Ext4DelallocProducerRunOutcome::Dispatch(Ok(
+                    PageCacheWritebackDispatchOutcome::Deferred
+                ))
+            ) {
+                progress.demand.store(true, Ordering::Release);
+            }
+            progress.work_scheduled.store(false, Ordering::Release);
+            // Lost-wakeup handoff: arm-before-clear leaves demand set and this
+            // side schedules it; arm-after-clear wins the CAS on its own.
+            if matches!(
+                &outcome,
+                Ext4DelallocProducerRunOutcome::Dispatch(Ok(
+                    PageCacheWritebackDispatchOutcome::Progress
+                        | PageCacheWritebackDispatchOutcome::Deferred
+                )) | Ext4DelallocProducerRunOutcome::Passive
+            ) {
+                Self::schedule_if_demanded_admitted(&progress, &inode_weak, domain_io.derive());
+            }
 
             match outcome {
                 Ext4DelallocProducerRunOutcome::Dispatch(Ok(
@@ -479,12 +518,7 @@ impl Ext4DelallocProgress {
                 }
                 Ext4DelallocProducerRunOutcome::Dispatch(Ok(
                     PageCacheWritebackDispatchOutcome::Deferred,
-                )) => {
-                    // EAGAIN left the same head Ready. This producer must make
-                    // another non-blocking attempt; it must never wait on the
-                    // ticket whose progress it owns.
-                    progress.demand.store(true, Ordering::Release);
-                }
+                )) => {}
                 Ext4DelallocProducerRunOutcome::Dispatch(Ok(
                     PageCacheWritebackDispatchOutcome::Idle,
                 ))
@@ -499,11 +533,6 @@ impl Ext4DelallocProgress {
                 }
                 Ext4DelallocProducerRunOutcome::Passive => {}
             }
-
-            progress.work_scheduled.store(false, Ordering::Release);
-            // Lost-wakeup handoff: arm-before-clear leaves demand set and this
-            // side schedules it; arm-after-clear wins the CAS on its own.
-            Self::schedule_if_demanded(&progress, &inode);
         }));
     }
 }
@@ -522,6 +551,7 @@ enum Ext4DelallocProducerRunOutcome {
 struct Ext4DelallocProgressTicket {
     progress: Arc<Ext4DelallocProgress>,
     inode: Weak<LockedExt4Inode>,
+    page_cache: Weak<PageCache>,
     observed: u64,
 }
 
@@ -556,7 +586,29 @@ impl Ext4DelallocProgressTicket {
 impl PageCacheWritebackProgress for Ext4DelallocProgressTicket {
     fn arm(&self) {
         self.progress.demand.store(true, Ordering::Release);
-        Ext4DelallocProgress::schedule_if_demanded(&self.progress, &self.inode);
+        let Some(page_cache) = self.page_cache.upgrade() else {
+            self.progress
+                .publish(PageCacheWritebackProgressOutcome::Cancelled);
+            return;
+        };
+        match page_cache.try_acquire_domain_io_classified() {
+            Ok(Some(permit)) => Ext4DelallocProgress::schedule_if_demanded_admitted(
+                &self.progress,
+                &self.inode,
+                permit,
+            ),
+            Ok(None) => self
+                .progress
+                .publish(PageCacheWritebackProgressOutcome::Cancelled),
+            Err(crate::filesystem::page_cache::PageCacheDomainIoAdmissionError::Closed) => self
+                .progress
+                .publish(PageCacheWritebackProgressOutcome::Cancelled),
+            Err(crate::filesystem::page_cache::PageCacheDomainIoAdmissionError::Unavailable(
+                error,
+            )) => self
+                .progress
+                .publish(PageCacheWritebackProgressOutcome::Failed(error)),
+        }
     }
 
     fn wait_for_progress(&self) -> PageCacheWritebackProgressOutcome {
@@ -1018,8 +1070,17 @@ impl PageCacheWritebackSubmission for Ext4DelayedSubmission {
                 another_ext4::ErrCode::EAGAIN,
             ) => {
                 self.restore_ready(false)?;
+                let page_cache = self
+                    .inode
+                    .inner
+                    .lock()
+                    .page_cache
+                    .as_ref()
+                    .map(Arc::downgrade)
+                    .unwrap_or_default();
                 Ok(PageCacheWritebackSubmitResult::Deferred(
-                    self.progress.ticket(Arc::downgrade(&self.inode)),
+                    self.progress
+                        .ticket(Arc::downgrade(&self.inode), page_cache),
                 ))
             }
             another_ext4::DelallocAppendBlockSubmitOutcome::RetryableNotPublished(error) => {
@@ -1293,9 +1354,16 @@ impl PageCacheBackend for Ext4PageCacheBackend {
             if !matches_certificate {
                 return Err(SystemError::EIO);
             }
+            let page_cache = guard
+                .page_cache
+                .as_ref()
+                .map(Arc::downgrade)
+                .unwrap_or_default();
             drop(guard);
             return Ok(PageCacheWritebackBindResult::Deferred(
-                inode.delalloc_progress.ticket(Arc::downgrade(&inode)),
+                inode
+                    .delalloc_progress
+                    .ticket(Arc::downgrade(&inode), page_cache),
             ));
         }
         {
@@ -3029,7 +3097,14 @@ impl LockedExt4Inode {
                     return Ok(None);
                 }
                 if guard.delalloc.production.head_is_claimed() {
-                    let progress = self.delalloc_progress.ticket(guard.self_ref.clone());
+                    let page_cache = guard
+                        .page_cache
+                        .as_ref()
+                        .map(Arc::downgrade)
+                        .unwrap_or_default();
+                    let progress = self
+                        .delalloc_progress
+                        .ticket(guard.self_ref.clone(), page_cache);
                     drop(guard);
                     drop(_io);
                     drop(_size);
@@ -3812,10 +3887,11 @@ impl LockedExt4Inode {
                     Arc::downgrade(&inode) as Weak<dyn IndexNode>
                 ))
             };
-        let page_cache = PageCache::new(
-            Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>),
-            Some(backend),
-        );
+        let page_cache = PageCache::new_file(
+            Arc::downgrade(&inode) as Weak<dyn IndexNode>,
+            backend,
+            &fs.writeback_domain,
+        )?;
         guard.page_cache = Some(page_cache);
 
         // 对于 FIFO，创建 pipe inode

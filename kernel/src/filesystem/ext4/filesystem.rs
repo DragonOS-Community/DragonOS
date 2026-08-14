@@ -8,6 +8,7 @@ use crate::{
         ext4::inode::{
             Ext4Inode, Ext4InodeLifecycle, Ext4InodeLifecycleState, Ext4InodeTimes, InodeDirtyState,
         },
+        page_cache::PageCacheWritebackDomain,
         vfs::{
             self,
             fcntl::AtFlags,
@@ -186,6 +187,7 @@ impl another_ext4::MetadataMutationWaker for Ext4MetadataMutationWait {
 }
 
 pub struct Ext4FileSystem {
+    pub(super) writeback_domain: Arc<PageCacheWritebackDomain>,
     /// 对应 another_ext4 中的实际文件系统
     pub(super) fs: another_ext4::Ext4,
     /// 当前文件系统对应的设备号
@@ -331,6 +333,22 @@ impl Ext4MountOptions {
 }
 
 impl FileSystem for Ext4FileSystem {
+    fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
+        Some(&self.writeback_domain)
+    }
+
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
+        if self._mount_options.read_only {
+            return Ok(());
+        }
+        self.close_delalloc_admission();
+        if let Err(error) = self.drain_registered_delalloc() {
+            self.fail_stop_lifecycle();
+            self.terminalize_idle_delalloc_after_fail_stop();
+            return Err(error);
+        }
+        Ok(())
+    }
     fn reconfigure(&self, request: FsReconfigureRequest<'_>) -> Result<MountFlags, SystemError> {
         if request.raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
             return Err(SystemError::EINVAL);
@@ -435,16 +453,6 @@ impl FileSystem for Ext4FileSystem {
 
     fn on_umount(&self) {
         if self._mount_options.read_only {
-            return;
-        }
-        self.close_delalloc_admission();
-        if let Err(error) = self.drain_registered_delalloc() {
-            log::error!(
-                "ext4: failed to drain delayed mappings on unmount: {:?}",
-                error
-            );
-            self.fail_stop_lifecycle();
-            self.terminalize_idle_delalloc_after_fail_stop();
             return;
         }
         if let Err(error) = self.flush_dirty_inodes() {
@@ -1339,6 +1347,7 @@ impl Ext4FileSystem {
             });
 
         let fs = Arc::new(Ext4FileSystem {
+            writeback_domain: PageCacheWritebackDomain::new(),
             fs,
             raw_dev,
             _device_mount_holder: device_mount_holder,

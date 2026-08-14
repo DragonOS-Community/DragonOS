@@ -11,7 +11,9 @@ use core::{
 
 use system_error::SystemError;
 
-use crate::filesystem::page_cache::PageCacheReadDmaReservation;
+use crate::filesystem::page_cache::{
+    PageCacheDomainIoPermit, PageCacheReadDmaReservation, PageCacheWritebackDomain,
+};
 use crate::{
     arch::MMArch,
     filesystem::epoll::{event_poll::EPollItemList, event_poll::EventPoll, EPollEventType},
@@ -297,11 +299,20 @@ struct FuseReadCompletion {
     observed_size: usize,
     observed_attr_version: u64,
     open_pin: Mutex<Option<super::private_data::FuseOpenLifetimePin>>,
+    domain_io: Mutex<Option<PageCacheDomainIoPermit>>,
 }
 
 impl FuseReadCompletion {
-    fn release_open_pin(&self) {
+    fn belongs_to_domain(&self, domain: &Arc<PageCacheWritebackDomain>) -> bool {
+        self.domain_io
+            .lock()
+            .as_ref()
+            .is_some_and(|permit| permit.belongs_to(domain))
+    }
+
+    fn release_io_ownership(&self) {
         self.open_pin.lock().take();
+        self.domain_io.lock().take();
     }
 
     fn finish(&self, result: &Result<FusePendingResult, SystemError>) -> Result<(), SystemError> {
@@ -474,6 +485,12 @@ enum FuseReadWaitOutcome {
 }
 
 impl FusePendingState {
+    fn belongs_to_page_cache_domain(&self, domain: &Arc<PageCacheWritebackDomain>) -> bool {
+        self.read_completion
+            .as_ref()
+            .is_some_and(|completion| completion.belongs_to_domain(domain))
+    }
+
     pub fn new(unique: u64, opcode: u32) -> Self {
         Self::new_with_credit(unique, opcode, None, None)
     }
@@ -563,7 +580,7 @@ impl FusePendingState {
                 v = Err(error);
                 kind = FuseCompletionKind::OutcomeUnknown;
             }
-            completion.release_open_pin();
+            completion.release_io_ownership();
         }
         let mut guard = self.response.lock();
         *guard = PendingCompletion::Ready(v, kind);
@@ -1654,6 +1671,53 @@ impl FuseConn {
             return;
         }
         self.wake_bridge(stats::VirtioFsBridgeWakeSource::Teardown);
+    }
+
+    /// Cancel page-cache reads owned by one filesystem shutdown domain.
+    ///
+    /// FUSE readahead may leave speculative READs outstanding after the
+    /// foreground read has completed.  Those requests own Loading page-cache
+    /// entries, so they must reach a terminal state before generic cache
+    /// retirement can wait on and remove the entries.  Domain admission is
+    /// closed by the caller before this scan, which prevents a new matching
+    /// request from being published after the cancellation snapshot.
+    pub(crate) fn cancel_page_cache_reads(&self, domain: &Arc<PageCacheWritebackDomain>) {
+        let (pending_reads, queued_count) = {
+            let mut inner = self.inner.lock();
+            let read_uniques = inner
+                .processing
+                .iter()
+                .filter_map(|(unique, pending)| {
+                    pending
+                        .belongs_to_page_cache_domain(domain)
+                        .then_some(*unique)
+                })
+                .collect::<Vec<_>>();
+
+            let queued_count = inner
+                .hiprio_pending
+                .iter()
+                .chain(inner.pending.iter())
+                .filter(|request| read_uniques.contains(&request.unique))
+                .count();
+            inner
+                .hiprio_pending
+                .retain(|request| !read_uniques.contains(&request.unique));
+            inner
+                .pending
+                .retain(|request| !read_uniques.contains(&request.unique));
+            let pending_reads = read_uniques
+                .into_iter()
+                .filter_map(|unique| inner.processing.remove(&unique))
+                .collect::<Vec<_>>();
+            (pending_reads, queued_count)
+        };
+
+        stats::on_fuse_requests_dropped_umount(queued_count);
+        stats::on_fuse_requests_aborted(pending_reads.len().saturating_sub(queued_count));
+        for pending in pending_reads {
+            pending.complete_disconnected(SystemError::ENOTCONN);
+        }
     }
 
     /// Acquire a new `/dev/fuse` file handle reference to this connection.

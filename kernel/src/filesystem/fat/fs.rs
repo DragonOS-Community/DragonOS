@@ -18,7 +18,7 @@ use system_error::SystemError;
 
 use crate::driver::base::block::gendisk::{GenDisk, GenDiskMountGuard};
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::page_cache::{AsyncPageCacheBackend, PageCache};
+use crate::filesystem::page_cache::{AsyncPageCacheBackend, PageCache, PageCacheWritebackDomain};
 use crate::filesystem::vfs::mount::filesystem_is_synchronous;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
@@ -93,6 +93,7 @@ impl Eq for Cluster {}
 
 #[derive(Debug)]
 pub struct FATFileSystem {
+    writeback_domain: Arc<PageCacheWritebackDomain>,
     /// 当前文件系统所在的分区
     pub gendisk: Arc<GenDisk>,
     /// Prevents loop clear/remove for the complete filesystem lifetime.
@@ -263,7 +264,7 @@ impl FATInode {
                     self.fs.upgrade().unwrap(),
                     self.self_ref.clone(),
                     fat_entry,
-                );
+                )?;
                 // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
                 self.children
                     .insert(search_name.clone(), entry_inode.clone());
@@ -289,7 +290,7 @@ impl LockedFATInode {
         fs: Arc<FATFileSystem>,
         parent: Weak<LockedFATInode>,
         inode_type: FATDirEntry,
-    ) -> Arc<LockedFATInode> {
+    ) -> Result<Arc<LockedFATInode>, SystemError> {
         let file_type = if let FATDirEntry::Dir(_) = inode_type {
             FileType::Dir
         } else {
@@ -337,10 +338,11 @@ impl LockedFATInode {
             let backend = Arc::new(AsyncPageCacheBackend::new(
                 Arc::downgrade(&inode) as Weak<dyn IndexNode>
             ));
-            let page_cache = PageCache::new(
-                Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>),
-                Some(backend),
-            );
+            let page_cache = PageCache::new_file(
+                Arc::downgrade(&inode) as Weak<dyn IndexNode>,
+                backend,
+                &fs.writeback_domain,
+            )?;
             inode.0.lock().page_cache = Some(page_cache);
         }
 
@@ -348,7 +350,7 @@ impl LockedFATInode {
 
         inode.0.lock().synchronize_metadata();
 
-        return inode;
+        Ok(inode)
     }
 
     #[inline(never)]
@@ -507,6 +509,9 @@ pub struct FATFsInfo {
 }
 
 impl FileSystem for FATFileSystem {
+    fn page_cache_writeback_domain(&self) -> Option<&Arc<PageCacheWritebackDomain>> {
+        Some(&self.writeback_domain)
+    }
     fn root_inode(&self) -> Arc<dyn crate::filesystem::vfs::IndexNode> {
         return self.root_inode.clone();
     }
@@ -775,6 +780,7 @@ impl FATFileSystem {
         ));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
+            writeback_domain: PageCacheWritebackDomain::new(),
             gendisk,
             _device_mount_holder: device_mount_holder,
             bpb,
@@ -2264,7 +2270,7 @@ impl IndexNode for LockedFATInode {
                             guard.fs.upgrade().unwrap(),
                             guard.self_ref.clone(),
                             ent,
-                        );
+                        )?;
                         // 加入缓存区, 由于FAT文件系统的大小写不敏感问题，因此存入缓存区的key应当是全大写的
                         guard.negative_children.pop(&search_name);
                         guard.children.insert(search_name, entry_inode.clone());
@@ -2480,7 +2486,7 @@ impl IndexNode for LockedFATInode {
             inode.fs.upgrade().unwrap(),
             inode.self_ref.clone(),
             FATDirEntry::File(FATFile::default()),
-        );
+        )?;
 
         if file_type == FileType::Pipe {
             nod.0.lock().metadata.file_type = FileType::Pipe;

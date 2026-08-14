@@ -7,3 +7,4 @@ normal/open_dangling_symlink
 normal/rtnetlink_link_semantics
 normal/socket_getsockopt_semantics
 normal/tcp_self_connect_semantics
+normal/poll_timeout_semantics

@@ -202,11 +202,14 @@ impl<'a> PollAdapter<'a> {
     }
 
     fn poll_all_fds(&mut self, timeout: Option<Instant>) -> Result<usize, SystemError> {
-        // 如果没有添加任何有效 fd 到 epoll，直接计算已有 revents 的数量并返回
-        // 这处理了所有 fd 都无效（POLLNVAL）的情况
+        // No epoll registration can mean either an immediate result (for example,
+        // POLLNVAL) or no wait source at all (for example, all negative fds).
         if self.added_fds.is_empty() {
             let count = self.poll_fds.iter().filter(|pfd| pfd.revents != 0).count();
-            return Ok(count);
+            if count != 0 {
+                return Ok(count);
+            }
+            return poll_wait_timeout_only(timeout);
         }
 
         // 检查是否已经有无效 fd（POLLNVAL）
@@ -284,20 +287,14 @@ pub fn do_sys_poll(
     Ok(nevents)
 }
 
-/// 处理 nfds=0 的情况：纯等待超时或信号
+/// Handle a poll request with no ready result and no event source.
 ///
 /// 根据 Linux 语义：
-/// - 如果 timeout=0，立即返回 0
+/// - 如果存在未屏蔽的 pending signal，返回 ERESTARTNOHAND
+/// - 如果 timeout=0，且没有上述 signal，立即返回 0
 /// - 如果 timeout>0，等待指定时间后返回 0
 /// - 如果 timeout=-1(None)，无限等待直到被信号中断，返回 ERESTARTNOHAND
 fn poll_wait_timeout_only(timeout: Option<Instant>) -> Result<usize, SystemError> {
-    // 如果有超时时间且已过期，直接返回
-    if let Some(end_time) = timeout {
-        if Instant::now() >= end_time {
-            return Ok(0);
-        }
-    }
-
     loop {
         // 检查是否有未被掩码屏蔽的待处理信号
         // ppoll 应该只被未被屏蔽的信号中断，被屏蔽的信号应保持 pending 状态

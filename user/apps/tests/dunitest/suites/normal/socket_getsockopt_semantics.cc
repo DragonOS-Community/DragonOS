@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -32,6 +33,23 @@ class FdGuard {
 
   private:
     int fd_;
+};
+
+class MappingGuard {
+  public:
+    MappingGuard(void* address, size_t length) : address_(address), length_(length) {}
+    MappingGuard(const MappingGuard&) = delete;
+    MappingGuard& operator=(const MappingGuard&) = delete;
+
+    ~MappingGuard() {
+        if (address_ != MAP_FAILED) {
+            munmap(address_, length_);
+        }
+    }
+
+  private:
+    void* address_;
+    size_t length_;
 };
 
 std::string ErrnoString(int err) {
@@ -230,6 +248,130 @@ TEST(SocketGetsockoptSemantics, Ipv4IntOptionsKeepOneByteShortBufferSpecialCase)
     EXPECT_EQ(len, 1u);
     EXPECT_EQ(value[0], static_cast<unsigned char>(ttl));
     EXPECT_EQ(value[1], 0xaa);
+}
+
+TEST(SocketGetsockoptSemantics, RawIpv6ChecksumRejectsShortValuesBeforeCopying) {
+    FdGuard fd(socket(AF_INET6, SOCK_RAW, IPPROTO_UDP));
+    ASSERT_GE(fd.Get(), 0) << "socket(AF_INET6, SOCK_RAW, IPPROTO_UDP) failed: "
+                           << ErrnoString(errno);
+
+    const int configured_offset = 2;
+    const int alternate_offset = 4;
+    ASSERT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, &configured_offset,
+                         sizeof(configured_offset)),
+              0)
+            << "setsockopt(IPV6_CHECKSUM) failed: " << ErrnoString(errno);
+
+    for (socklen_t len = 0; len < sizeof(alternate_offset); ++len) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, &alternate_offset, len), -1)
+                << "optlen=" << len;
+        EXPECT_EQ(errno, EINVAL) << "optlen=" << len;
+    }
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, nullptr, 1), -1);
+    EXPECT_EQ(errno, EINVAL);
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    const size_t mapping_size = static_cast<size_t>(page_size) * 2;
+    void* mapping = mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mapping, MAP_FAILED) << "mmap failed: " << ErrnoString(errno);
+    MappingGuard mapping_guard(mapping, mapping_size);
+    auto* second_page = static_cast<unsigned char*>(mapping) + page_size;
+    ASSERT_EQ(mprotect(second_page, page_size, PROT_NONE), 0)
+            << "mprotect failed: " << ErrnoString(errno);
+
+    auto* three_accessible_bytes = second_page - 3;
+    std::memcpy(three_accessible_bytes, &alternate_offset, 3);
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, second_page, 3), -1);
+    EXPECT_EQ(errno, EINVAL);
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, three_accessible_bytes, 3), -1);
+    EXPECT_EQ(errno, EINVAL);
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, three_accessible_bytes,
+                         sizeof(alternate_offset)),
+              -1);
+    EXPECT_EQ(errno, EFAULT);
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, nullptr,
+                         sizeof(alternate_offset)),
+              -1);
+    EXPECT_EQ(errno, EFAULT);
+
+    int actual = -1;
+    socklen_t actual_len = sizeof(actual);
+    ASSERT_EQ(getsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, &actual, &actual_len), 0)
+            << "getsockopt(IPV6_CHECKSUM) failed: " << ErrnoString(errno);
+    EXPECT_EQ(actual_len, sizeof(actual));
+    EXPECT_EQ(actual, configured_offset);
+
+    auto* four_accessible_bytes = second_page - sizeof(alternate_offset);
+    std::memcpy(four_accessible_bytes, &alternate_offset, sizeof(alternate_offset));
+    ASSERT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, four_accessible_bytes,
+                         sizeof(alternate_offset) * 2),
+              0)
+            << "setsockopt(IPV6_CHECKSUM, oversized optlen) failed: " << ErrnoString(errno);
+
+    actual = -1;
+    actual_len = sizeof(actual);
+    ASSERT_EQ(getsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, &actual, &actual_len), 0)
+            << "getsockopt(IPV6_CHECKSUM) failed: " << ErrnoString(errno);
+    EXPECT_EQ(actual_len, sizeof(actual));
+    EXPECT_EQ(actual, alternate_offset);
+}
+
+TEST(SocketGetsockoptSemantics, RawIpv6ChecksumPreservesStateAndErrorOrdering) {
+    int checksum_offset = 2;
+
+    errno = 0;
+    EXPECT_EQ(setsockopt(-1, IPPROTO_IPV6, IPV6_CHECKSUM, nullptr, 1), -1);
+    EXPECT_EQ(errno, EBADF);
+
+    int pipe_fds[2] = {-1, -1};
+    ASSERT_EQ(pipe(pipe_fds), 0) << "pipe failed: " << ErrnoString(errno);
+    FdGuard pipe_read(pipe_fds[0]);
+    FdGuard pipe_write(pipe_fds[1]);
+    errno = 0;
+    EXPECT_EQ(setsockopt(pipe_read.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, nullptr, 1), -1);
+    EXPECT_EQ(errno, ENOTSOCK);
+
+    FdGuard fd(socket(AF_INET6, SOCK_RAW, IPPROTO_UDP));
+    ASSERT_GE(fd.Get(), 0) << "socket(AF_INET6, SOCK_RAW, IPPROTO_UDP) failed: "
+                           << ErrnoString(errno);
+    ASSERT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, &checksum_offset,
+                         sizeof(checksum_offset)),
+              0)
+            << "setsockopt(IPV6_CHECKSUM) failed: " << ErrnoString(errno);
+
+    int actual = -1;
+    socklen_t actual_len = sizeof(actual);
+    ASSERT_EQ(getsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, &actual, &actual_len), 0)
+            << "getsockopt(IPV6_CHECKSUM) failed: " << ErrnoString(errno);
+    EXPECT_EQ(actual_len, sizeof(actual));
+    EXPECT_EQ(actual, checksum_offset);
+
+    const int odd_offset = 3;
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, &odd_offset,
+                         sizeof(odd_offset)),
+              -1);
+    EXPECT_EQ(errno, EINVAL);
+
+    actual = -1;
+    actual_len = sizeof(actual);
+    ASSERT_EQ(getsockopt(fd.Get(), IPPROTO_IPV6, IPV6_CHECKSUM, &actual, &actual_len), 0)
+            << "getsockopt(IPV6_CHECKSUM) failed: " << ErrnoString(errno);
+    EXPECT_EQ(actual_len, sizeof(actual));
+    EXPECT_EQ(actual, checksum_offset);
 }
 
 int main(int argc, char** argv) {

@@ -1,0 +1,5 @@
+# This test requires Linux behavior from before fb7bc9204095, which read a
+# full int even when optlen was shorter. Linux 6.6 returns EINVAL before
+# touching optval. The current behavior is covered by the non-skippable
+# SocketGetsockoptSemantics.RawIpv6Checksum* dunitests.
+RawSocketTest.SetIPv6ChecksumError_ReadShort

@@ -50,7 +50,7 @@ macro_rules! interrupt_handler {
                 core::arch::naked_asm!(
                     concat!(
                         "
-                        push 0x0
+                        push -1
                         ",
                         save_all_regs!(),
                         "\n",

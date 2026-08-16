@@ -19,7 +19,7 @@ use crate::{
         ucontext::{AddressSpace, InnerAddressSpace, LockedVMA},
         PhysAddr, VirtAddr, VmFaultReason, VmFlags,
     },
-    process::{ProcessManager, ProcessState},
+    process::ProcessManager,
 };
 
 use crate::mm::MemoryManagementArch;
@@ -471,11 +471,8 @@ impl PageFaultHandler {
     pub unsafe fn handle_mm_fault(mut pfm: PageFaultMessage) -> VmFaultOutcome {
         let flags = pfm.flags();
         let vma = pfm.vma();
-        // 仅在真实硬件缺页上下文（非 remote）执行 set_state(Runnable)。
-        if !flags.contains(FaultFlags::FAULT_FLAG_REMOTE) {
-            let current_pcb = ProcessManager::current_pcb();
-            current_pcb.sched_info().set_state(ProcessState::Runnable);
-        }
+        let current_pcb = ProcessManager::current_pcb();
+        current_pcb.sched_info().restore_runnable_if_blocked();
 
         let reason = if !MMArch::vma_access_permitted(
             vma.clone(),

@@ -589,11 +589,6 @@ impl SigInfo {
         self.sig_no == sig as i32
     }
 
-    /// 设置信号号
-    pub fn set_signo(&mut self, sig: Signal) {
-        self.sig_no = sig as i32;
-    }
-
     pub fn set_sig_type(&mut self, sig_type: SigType) {
         self.sig_type = sig_type;
     }

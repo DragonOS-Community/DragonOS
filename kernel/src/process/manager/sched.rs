@@ -399,14 +399,40 @@ impl ProcessManager {
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
         );
         let pcb = ProcessManager::current_pcb();
-        if !pcb.sched_info().state().is_exited() {
-            pcb.sched_info()
-                .set_state(ProcessState::Blocked(interruptable));
-            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-            fence(Ordering::SeqCst);
+        let _pi_guard = pcb.sched_info().pi_lock_irqsave();
+        let state = pcb.sched_info().state();
+        if state.is_exited() {
+            return Err(SystemError::EINTR);
+        }
+        if state.is_stopped() {
             return Ok(());
         }
-        return Err(SystemError::EINTR);
+        pcb.sched_info()
+            .set_state(ProcessState::Blocked(interruptable));
+        pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+        fence(Ordering::SeqCst);
+        return Ok(());
+    }
+
+    /// 撤销刚完成的 Self::mark_sleep：处理“prepare_sleep 与 mark_sleep 之间到达的唤醒”。
+    pub fn undo_mark_sleep() {
+        let pcb = ProcessManager::current_pcb();
+        let _pi_guard = pcb.sched_info().pi_lock_irqsave();
+        let state = pcb.sched_info().state();
+        if state.is_stopped() {
+            // 保留 Stopped 与停机写入的 NEED_SCHEDULE。
+            return;
+        }
+        if state.is_blocked() {
+            // 仅从本次 mark_sleep 写入的 Blocked 提升回 Runnable。
+            pcb.sched_info().set_state(ProcessState::Runnable);
+            fence(Ordering::SeqCst);
+        }
+        if pcb.sched_info().state().is_runnable() {
+            // 锁内读到非 Stopped 意味着不存在未落地的停机请求，
+            // 撤销本次睡眠的调度请求是安全的。
+            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
+        }
     }
 
     /// Mark the current process as stopped. The caller is responsible for

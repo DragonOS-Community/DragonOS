@@ -1109,10 +1109,6 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
 }
 
 /// Write a single `Copy` value to user space with exception-table protection.
-///
-/// Semantics match Linux `put_user()`: writable VMA is checked up front; the actual
-/// write may fault to resolve COW or lazy allocation. Returns `EFAULT` if the
-/// destination remains inaccessible.
 pub unsafe fn write_one_to_user_protected<T: Copy>(
     dest: VirtAddr,
     value: &T,
@@ -1120,6 +1116,16 @@ pub unsafe fn write_one_to_user_protected<T: Copy>(
     let src =
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>());
     copy_to_user_protected(dest, src).map(|_| ())
+}
+
+/// Read a single `Copy` value from user space with exception-table protection.
+pub unsafe fn read_one_from_user_protected<T: Copy>(
+    src: VirtAddr,
+    dst: &mut T,
+) -> Result<(), SystemError> {
+    let bytes =
+        core::slice::from_raw_parts_mut((dst as *mut T).cast::<u8>(), core::mem::size_of::<T>());
+    copy_from_user_protected(bytes, src).map(|_| ())
 }
 
 /// Compute the contiguous accessible length starting at `addr`.

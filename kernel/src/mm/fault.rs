@@ -471,8 +471,9 @@ impl PageFaultHandler {
     pub unsafe fn handle_mm_fault(mut pfm: PageFaultMessage) -> VmFaultOutcome {
         let flags = pfm.flags();
         let vma = pfm.vma();
-        let current_pcb = ProcessManager::current_pcb();
-        {
+        // 仅在真实硬件缺页上下文（非 remote）执行 set_state(Runnable)。
+        if !flags.contains(FaultFlags::FAULT_FLAG_REMOTE) {
+            let current_pcb = ProcessManager::current_pcb();
             current_pcb.sched_info().set_state(ProcessState::Runnable);
         }
 

@@ -378,6 +378,8 @@ impl ProcessManager {
             }
         }
 
+        current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
+
         let pid: Arc<Pid>;
         let raw_pid = current_pcb.raw_pid();
         // log::debug!("[exit: {}]", raw_pid.data());

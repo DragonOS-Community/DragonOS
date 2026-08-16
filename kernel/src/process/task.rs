@@ -30,7 +30,6 @@ use crate::{
     },
     libs::{
         futex::futex::RobustListHead,
-        lock_free_flags::LockFreeFlags,
         mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         rwsem::RwSem,
@@ -44,9 +43,9 @@ use crate::{
         pid::{Pid, PidLink, PidType},
         resource::{RLimit64, RLimitID, RUsage},
         timer::AlarmTimer,
-        AtomicRawPid, ExitState, KernelStack, ProcessBasicInfo, ProcessCpuTime, ProcessFlags,
-        ProcessItimers, ProcessManager, ProcessSchedulerInfo, ProcessSignalInfo, ProcessState,
-        RawPid, ThreadInfo, PTRACE_RELATION_LOCK,
+        AtomicProcessFlags, AtomicRawPid, ExitState, KernelStack, ProcessBasicInfo, ProcessCpuTime,
+        ProcessFlags, ProcessItimers, ProcessManager, ProcessSchedulerInfo, ProcessSignalInfo,
+        ProcessState, RawPid, ThreadInfo, PTRACE_RELATION_LOCK,
     },
     rcu::RcuArcSlot,
 };
@@ -71,14 +70,14 @@ pub struct ProcessControlBlock {
     pub(super) task_cgroup: RwLock<TaskCgroupRef>,
 
     pub(super) basic: RwLock<ProcessBasicInfo>,
-    /// Spinlock hold count of the current process.
+    pub(super) exec_update_lock: RwSem<()>,
     pub(super) preempt_count: AtomicUsize,
     /// Nesting count for no-fault user access sections.
     pub(super) pagefault_disabled: AtomicUsize,
     /// RCU read-side nesting depth of the current process.
     pub(super) rcu_read_depth: AtomicUsize,
 
-    pub(super) flags: LockFreeFlags<ProcessFlags>,
+    pub(super) flags: AtomicProcessFlags,
     /// Whether the current task has been counted in the global visible thread
     /// count.
     pub(super) visible_thread_accounted: AtomicBool,
@@ -168,6 +167,9 @@ pub struct ProcessControlBlock {
     pub(super) ptraced: RwLock<Vec<RawPid>>,
     /// Current tracer if this process is ptraced.
     pub(super) ptracer_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// Per-tracee ptrace stop/event state machine (Linux task_struct ptrace/jobctl
+    /// analog). SpinLock because it is touched in irqsave critical sections.
+    pub(crate) ptrace_state: SpinLock<ptrace::PtraceState>,
 
     /// Wait queue.
     pub(super) wait_queue: WaitQueue,
@@ -306,7 +308,7 @@ impl ProcessControlBlock {
         let preempt_count = AtomicUsize::new(0);
         let pagefault_disabled = AtomicUsize::new(0);
         let rcu_read_depth = AtomicUsize::new(0);
-        let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
+        let flags = AtomicProcessFlags::new();
         let initial_sighand = SigHand::new();
         initial_sighand.attach_task_ref();
 
@@ -324,10 +326,11 @@ impl ProcessControlBlock {
                 pid: AtomicRawPid::new(raw_pid),
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
+                basic: basic_info,
+                exec_update_lock: RwSem::new(()),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RcuArcSlot::new(nsproxy),
                 task_cgroup: RwLock::new(task_cgroup),
-                basic: basic_info,
                 preempt_count,
                 pagefault_disabled,
                 rcu_read_depth,
@@ -364,6 +367,7 @@ impl ProcessControlBlock {
                 children: RwLock::new(Vec::new()),
                 ptraced: RwLock::new(Vec::new()),
                 ptracer_pcb: RwLock::new(Weak::new()),
+                ptrace_state: SpinLock::new(ptrace::PtraceState::new()),
                 wait_queue: WaitQueue::default(),
                 cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
@@ -626,8 +630,8 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> &mut ProcessFlags {
-        return self.flags.get_mut();
+    pub fn flags(&self) -> &AtomicProcessFlags {
+        &self.flags
     }
 
     #[inline(always)]
@@ -645,6 +649,17 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn basic(&self) -> RwLockReadGuard<'_, ProcessBasicInfo> {
         return self.basic.read_irqsave();
+    }
+
+    /// 获取 exec_update_lock 读锁
+    pub fn exec_update_read(&self) -> crate::libs::rwsem::RwSemReadGuard<'_, ()> {
+        self.exec_update_lock.read()
+    }
+
+    /// 获取 exec_update_lock 写锁：execve 切换 mm/cred/dumpable 的临界区持此锁。
+    #[inline(always)]
+    pub fn exec_update_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
+        self.exec_update_lock.write()
     }
 
     #[inline(always)]
@@ -1311,7 +1326,7 @@ impl ProcessControlBlock {
 
     /// Fast check using PCB flags: whether the current process has any pending signals.
     pub fn has_pending_signal_fast(&self) -> bool {
-        self.flags.get().contains(ProcessFlags::HAS_PENDING_SIGNAL)
+        self.flags.contains(ProcessFlags::HAS_PENDING_SIGNAL)
     }
 
     /// Checks whether the current process has pending signals that are not

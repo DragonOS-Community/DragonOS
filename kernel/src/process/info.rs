@@ -134,6 +134,9 @@ pub struct ProcessBasicInfo {
 
     /// File descriptor table.
     fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
+
+    /// 进程执行域标志（personality），GDB 经 SYS_personality 设置 ADDR_NO_RANDOMIZE 等位。
+    personality: u32,
 }
 
 impl ProcessBasicInfo {
@@ -151,6 +154,7 @@ impl ProcessBasicInfo {
             cwd,
             user_vm,
             fd_table: Some(fd_table),
+            personality: 0,
         });
     }
 
@@ -212,6 +216,16 @@ impl ProcessBasicInfo {
         let old = self.fd_table.take();
         self.fd_table = fd_table;
         return old;
+    }
+
+    pub fn personality(&self) -> u32 {
+        self.personality
+    }
+
+    pub fn set_personality(&mut self, new: u32) -> u32 {
+        let old = self.personality;
+        self.personality = new;
+        old
     }
 }
 

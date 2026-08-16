@@ -153,7 +153,7 @@ impl StatusFileOps {
         }
 
         pdata.append(
-            &mut format!("\nflags: {:?}\n", pcb.flags().clone())
+            &mut format!("\nflags: {:?}\n", pcb.flags())
                 .as_bytes()
                 .to_owned(),
         );

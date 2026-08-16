@@ -1,22 +1,22 @@
 #![allow(function_casts_as_integer)]
 
-use log::{error, trace, warn};
-use system_error::SystemError;
-
 use super::{
     entry::{set_intr_gate, set_system_trap_gate},
     TrapFrame,
 };
-use crate::exception::debug::DebugException;
-use crate::exception::ebreak::EBreak;
 use crate::{
-    arch::{ipc::signal::Signal, CurrentIrqArch, MMArch},
-    exception::InterruptArch,
-    ipc::signal::force_kernel_signal_to_current,
+    arch::{
+        ipc::signal::{Signal, X86_64SignalArch},
+        CurrentIrqArch, MMArch,
+    },
+    exception::{debug::DebugException, ebreak::EBreak, InterruptArch},
+    ipc::{signal::force_kernel_signal_to_current, signal_types::SignalArch},
     mm::VirtAddr,
-    process::ProcessManager,
+    process::{ptrace, ProcessControlBlock, ProcessManager},
     smp::core::smp_get_processor_id,
 };
+use log::{error, trace, warn};
+use system_error::SystemError;
 
 extern "C" {
     fn trap_divide_error();
@@ -139,6 +139,42 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
         ProcessManager::current_pid()
     );
     DebugException::handle(regs).unwrap();
+
+    let dr6: u64;
+    unsafe { core::arch::asm!("mov {0}, dr6", out(reg) dr6, options(nomem, nostack)) };
+    unsafe { core::arch::asm!("mov dr6, {0}", in(reg) 0xffff_0ff0u64, options(nomem, nostack)) };
+
+    // ptrace 单步/硬件断点 stop；非 traced 用户态补发 SIGTRAP
+    let current = ProcessManager::current_pcb();
+    if regs.is_from_user() {
+        let si_code = if dr6 & ptrace::X86_DR_BS != 0 {
+            ptrace::TRAP_TRACE
+        } else if dr6 & ptrace::X86_DR_B_MASK != 0 {
+            ptrace::TRAP_HWBKPT
+        } else {
+            ptrace::TRAP_BRKPT
+        };
+        if current.is_traced() {
+            // exit_code = SIGTRAP；si_code 写入 siginfo。重新注入 ptrace_stop 返回的信号。
+            if let Ok(signr) = ProcessControlBlock::ptrace_notify(Signal::SIGTRAP as usize, si_code)
+            {
+                ProcessControlBlock::reinject_ptrace_signal(signr);
+            }
+        } else {
+            let _ = crate::ipc::signal::force_sig_fault_to_current(
+                Signal::SIGTRAP,
+                si_code,
+                crate::mm::VirtAddr::new(regs.rip as usize),
+            );
+        }
+    }
+
+    // 返回用户态前处理挂起信号（含 ptrace 注入的信号）
+    if regs.is_from_user() {
+        unsafe {
+            <X86_64SignalArch as SignalArch>::do_signal_or_restart(regs);
+        }
+    }
 }
 
 /// 处理NMI中断 2 NMI
@@ -167,6 +203,30 @@ unsafe extern "C" fn do_int3(regs: &'static mut TrapFrame, error_code: u64) {
         ProcessManager::current_pid()
     );
     EBreak::handle(regs).unwrap();
+    // ptrace 软件断点 stop；非 traced 用户态补发 SIGTRAP。
+    let current = ProcessManager::current_pcb();
+    if regs.is_from_user() {
+        if current.is_traced() {
+            if let Ok(signr) =
+                ProcessControlBlock::ptrace_notify(Signal::SIGTRAP as usize, ptrace::SI_KERNEL)
+            {
+                ProcessControlBlock::reinject_ptrace_signal(signr);
+            }
+        } else {
+            let _ = crate::ipc::signal::force_sig_fault_to_current(
+                Signal::SIGTRAP,
+                ptrace::SI_KERNEL,
+                crate::mm::VirtAddr::new(regs.rip as usize),
+            );
+        }
+    }
+    // 返回用户态前处理挂起信号（含 ptrace 注入的信号），对齐 Linux
+    // irqentry_exit_to_user_mode→do_signal。
+    if regs.is_from_user() {
+        unsafe {
+            <X86_64SignalArch as SignalArch>::do_signal_or_restart(regs);
+        }
+    }
 }
 
 /// 处理溢出异常 4 #OF

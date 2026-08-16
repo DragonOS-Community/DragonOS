@@ -237,6 +237,8 @@ impl SigHand {
     pub fn copy_process_state_from(&self, other: &Arc<SigHand>) {
         let other_guard = other.inner();
         let mut self_guard = self.inner_mut();
+        self_guard.shared_pending = other_guard.shared_pending.clone();
+        self_guard.curr_target = other_guard.curr_target.clone();
         self_guard.flags = other_guard.flags;
         // Group-exec is a transaction owned by the original shared sighand;
         // copying only its flag would create an active state without owner,
@@ -412,6 +414,21 @@ impl SigHand {
             return false;
         }
 
+        g.stop_signal = sig;
+        g.flags.remove(SignalFlags::STOP_MASK);
+        g.flags
+            .insert(SignalFlags::STOP_STOPPED | SignalFlags::CLD_STOPPED);
+        true
+    }
+
+    pub fn ptrace_participate_group_stop(&self, sig: Signal) -> bool {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) {
+            return false;
+        }
+        if g.flags.contains(SignalFlags::STOP_STOPPED) {
+            return false;
+        }
         g.stop_signal = sig;
         g.flags.remove(SignalFlags::STOP_MASK);
         g.flags
@@ -941,10 +958,10 @@ impl Default for InnerSigHand {
             handlers: default_sighandlers(),
             pids: core::array::from_fn(|_| None),
             shared_pending: SigPending::default(),
-            curr_target: None,
-            flags: SignalFlags::empty(),
             group_exit_code: 0,
             stop_signal: Signal::SIGSTOP,
+            curr_target: None,
+            flags: SignalFlags::empty(),
             group_exec_task: None,
             group_exec_notify_count: 0,
             group_exec_old_leader: None,

@@ -91,6 +91,9 @@ pub struct ArchPCBInfo {
 
 #[allow(dead_code)]
 impl ArchPCBInfo {
+    pub fn kernel_rsp(&self) -> usize {
+        self.rsp
+    }
     /// 创建一个新的ArchPCBInfo
     ///
     /// ## 参数

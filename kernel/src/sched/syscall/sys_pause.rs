@@ -23,8 +23,8 @@ impl Syscall for SysPauseHandle {
 
         // 检查是否已经有待处理的信号
         if current_pcb.has_pending_signal_fast() {
-            // 如果已经有待处理的信号，直接返回EINTR
-            return Err(SystemError::EINTR);
+            // 由 arch 层 do_signal_or_restart 的 try_restart_syscall 决定 restart/转 EINTR。
+            return Err(SystemError::ERESTARTNOHAND);
         }
 
         // 禁用中断
@@ -39,8 +39,8 @@ impl Syscall for SysPauseHandle {
         // 调度出去，等待信号唤醒
         crate::sched::schedule(crate::sched::SchedMode::SM_NONE);
 
-        // 如果到达这里，说明被信号唤醒，返回EINTR
-        Err(SystemError::EINTR)
+        // POKEUSER 改 rax 后 try_restart_syscall 据此决定 restart。
+        Err(SystemError::ERESTARTNOHAND)
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

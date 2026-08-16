@@ -868,11 +868,15 @@ fn tracees_of_locked(tracer: &Arc<ProcessControlBlock>) -> Vec<RawPid> {
 }
 
 pub fn ptracer_of(tracee: &Arc<ProcessControlBlock>) -> Option<Arc<ProcessControlBlock>> {
+    // 快路径：PTRACED 位只在关系锁临界区内成对地与 ptracer 一起写入
+    // 位为空时必然没有 tracer，无需获取全局锁。
+    if !tracee.flags().contains(ProcessFlags::PTRACED) {
+        return None;
+    }
     let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
     ptracer_of_locked(tracee)
 }
 
-/// Return the tracee's ptracer while the caller holds `PTRACE_RELATION_LOCK`.
 pub(crate) fn ptracer_of_locked(
     tracee: &Arc<ProcessControlBlock>,
 ) -> Option<Arc<ProcessControlBlock>> {
@@ -880,6 +884,10 @@ pub(crate) fn ptracer_of_locked(
 }
 
 pub fn is_ptraced(tracee: &ProcessControlBlock) -> bool {
+    // 快路径同 ptracer_of：未被跟踪时避免全局锁。
+    if !tracee.flags().contains(ProcessFlags::PTRACED) {
+        return false;
+    }
     let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
     is_ptraced_locked(tracee)
 }
@@ -1065,6 +1073,10 @@ impl ProcessControlBlock {
 
     /// 当前是否被跟踪。
     pub fn is_traced(&self) -> bool {
+        // 快路径：PTRACED 位只在关系锁临界区内置位/清除，无需获取全局锁。
+        if !self.flags().contains(ProcessFlags::PTRACED) {
+            return false;
+        }
         let _g = PTRACE_RELATION_LOCK.lock_irqsave();
         is_ptraced_locked(self)
     }
@@ -1103,8 +1115,8 @@ impl ProcessControlBlock {
 
     /// 若 tracee 当前处于 group-stop（Stopped），将其直接转换为 ptrace-stop。
     fn ptrace_arm_attach_trap_if_stopped(&self) -> bool {
-        // 临界区内仅做 state 重判 + ptrace_state 提交；notify 移出 pi_lock
-        let stop_sig;
+        // 临界区内仅做 state 重判 + ptrace_state 提交；notify 移出 pi_lock。
+        let stop_sig = self.sighand().stop_signal();
         #[cfg(target_arch = "x86_64")]
         let on_syscall_stack;
         #[cfg(not(target_arch = "x86_64"))]
@@ -1116,8 +1128,6 @@ impl ProcessControlBlock {
                 return false;
             }
             self.ptrace_set_trapping();
-            // 用 group-stop 的信号作为 exit_code（低 7 位）。
-            stop_sig = self.sighand().stop_signal();
 
             #[cfg(target_arch = "x86_64")]
             {
@@ -1270,12 +1280,12 @@ impl ProcessControlBlock {
             return Ok(());
         }
         // LISTEN 状态下不可操作
-        if self.ptrace_state.lock_irqsave().listening {
-            return Err(SystemError::ESRCH);
-        }
         // 其余请求要求 tracee 处于 ptrace-stop。
         let in_stop = {
             let ps = self.ptrace_state.lock_irqsave();
+            if ps.listening {
+                return Err(SystemError::ESRCH);
+            }
             ps.in_ptrace_stop && self.sched_info().state().is_stopped()
         };
         if !in_stop {
@@ -1334,6 +1344,11 @@ impl ProcessControlBlock {
     /// 根据 stop_frame_on_syscall_stack 选择正确的栈和偏移。
     fn tracee_trap_frame_ptr(&self) -> *mut TrapFrame {
         let on_syscall_stack = self.ptrace_state.lock_irqsave().stop_frame_on_syscall_stack;
+        self.trap_frame_ptr_for(on_syscall_stack)
+    }
+
+    /// 按给定的栈选择计算 TrapFrame 指针。
+    fn trap_frame_ptr_for(&self, on_syscall_stack: bool) -> *mut TrapFrame {
         if on_syscall_stack {
             #[cfg(target_arch = "x86_64")]
             {
@@ -1351,6 +1366,13 @@ impl ProcessControlBlock {
         }
     }
 
+    /// 在 ptrace_state 锁内复验 tracee 仍处于 ptrace-stop（帧稳定）。
+    /// 致命信号可能在 check_attach 与此处之间唤醒 tracee，届时帧已失效，
+    /// 调用方应放弃写入并返回 ESRCH。
+    fn trap_frame_stable_locked(&self, ps: &PtraceState) -> bool {
+        ps.in_ptrace_stop && self.sched_info().state().is_stopped()
+    }
+
     /// 读 tracee 的用户寄存器（PTRACE_GETREGS）。
     #[cfg(target_arch = "x86_64")]
     pub fn tracee_user_regs(&self) -> UserRegsStruct {
@@ -1365,10 +1387,13 @@ impl ProcessControlBlock {
 
     #[cfg(target_arch = "x86_64")]
     pub fn write_tracee_user_regs(&self, regs: &UserRegsStruct) -> Result<(), SystemError> {
-        // SAFETY: tracee 处于 ptrace-stop。
-        let frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
-        regs.write_to_trap_frame(frame)?;
         let mut ps = self.ptrace_state.lock_irqsave();
+        if !Self::trap_frame_stable_locked(self, &ps) {
+            return Err(SystemError::ESRCH);
+        }
+        // SAFETY: tracee 仍处于 ptrace-stop，TrapFrame 稳定。
+        let frame = unsafe { &mut *self.trap_frame_ptr_for(ps.stop_frame_on_syscall_stack) };
+        regs.write_to_trap_frame(frame)?;
         if frame.rflags & X86_EFLAGS_TF != 0 {
             ps.forced_trap_flag = false;
         } else if ps.forced_trap_flag {
@@ -2255,19 +2280,36 @@ impl ProcessControlBlock {
     /// 清除调试器为单步置位的 RFLAGS.TF
     #[cfg(target_arch = "x86_64")]
     fn disable_single_step(&self) {
+        // 全程持锁：清标志、复验与写帧在同一临界区内完成
         let mut ps = self.ptrace_state.lock_irqsave();
-        if ps.forced_trap_flag {
-            ps.forced_trap_flag = false;
-            // 仅在 tracee 处于 ptTrapFrame 是race-stop（Stopped，TrapFrame 稳定）时才写 frame.rflags。
-            // 运行中 tracee 的 陈旧的（stop_frame_on_syscall_stack 为上次 stop 的值），
-            // 写它既无效又与该 CPU 的 entry 路径并发写 rflags 竞争。
-            let stopped = ps.in_ptrace_stop;
-            drop(ps);
-            if stopped {
-                let frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
-                frame.rflags &= !X86_EFLAGS_TF; // 清 X86_EFLAGS_TF
-            }
+        if !ps.forced_trap_flag {
+            return;
         }
+        ps.forced_trap_flag = false;
+        // 仅在 tracee 仍处于 ptrace-stop（TrapFrame 稳定）时才写 frame.rflags；
+        // 运行中 tracee 的 stop_frame_on_syscall_stack 是陈旧值，
+        // 写它既无效又与该 CPU 的 entry 路径并发写 rflags 竞争。
+        if Self::trap_frame_stable_locked(self, &ps) {
+            // SAFETY: 复验通过，帧稳定。
+            let frame = unsafe { &mut *self.trap_frame_ptr_for(ps.stop_frame_on_syscall_stack) };
+            frame.rflags &= !X86_EFLAGS_TF; // 清 X86_EFLAGS_TF
+        }
+    }
+
+    /// 在 ptrace_state 锁内复验 tracee 仍处于 ptrace-stop 后置 RFLAGS.TF，
+    /// 并记录 forced_trap_flag。致命信号可能在请求校验之后唤醒 tracee，
+    /// 届时 stop 帧已失效，拒绝写入。
+    #[cfg(target_arch = "x86_64")]
+    fn arm_trap_flag_single_step(&self) -> Result<(), SystemError> {
+        let mut ps = self.ptrace_state.lock_irqsave();
+        if !Self::trap_frame_stable_locked(self, &ps) {
+            return Err(SystemError::ESRCH);
+        }
+        // SAFETY: 复验通过，帧稳定。
+        let frame = unsafe { &mut *self.trap_frame_ptr_for(ps.stop_frame_on_syscall_stack) };
+        frame.rflags |= X86_EFLAGS_TF; // 置 X86_EFLAGS_TF
+        ps.forced_trap_flag = true;
+        Ok(())
     }
 
     /// 非x86_64架构无硬件单步机制，清除单步为空操作。
@@ -2292,16 +2334,13 @@ impl ProcessControlBlock {
         // 设置/清除 syscall-trace / 单步工作位。
         match request {
             PtraceRequest::Singlestep => {
+                // 置 RFLAGS.TF 前在锁内复验 tracee 仍处于 ptrace-stop：
+                // 致命信号可能已将其唤醒，stop 帧随之失效。
+                #[cfg(target_arch = "x86_64")]
+                self.arm_trap_flag_single_step()?;
                 self.flags().insert(ProcessFlags::TRACE_SINGLESTEP);
                 self.flags()
                     .remove(ProcessFlags::TRACE_SYSCALL | ProcessFlags::TRACE_SYSEMU);
-                // 置 RFLAGS.TF（单步）+ 记录 forced_trap_flag
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
-                    frame.rflags |= X86_EFLAGS_TF; // X86_EFLAGS_TF
-                    self.ptrace_state.lock_irqsave().forced_trap_flag = true;
-                }
             }
             PtraceRequest::Syscall => {
                 self.flags().insert(ProcessFlags::TRACE_SYSCALL);
@@ -2313,13 +2352,9 @@ impl ProcessControlBlock {
                 self.flags().insert(ProcessFlags::TRACE_SYSEMU);
                 if request == PtraceRequest::SysemuSinglestep {
                     self.flags().insert(ProcessFlags::TRACE_SINGLESTEP);
-                    // SYSEMU_SINGLESTEP 也需置硬件单步
+                    // SYSEMU_SINGLESTEP 也需置硬件单步（锁内复验后写入）
                     #[cfg(target_arch = "x86_64")]
-                    {
-                        let frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
-                        frame.rflags |= X86_EFLAGS_TF; // X86_EFLAGS_TF
-                        self.ptrace_state.lock_irqsave().forced_trap_flag = true;
-                    }
+                    self.arm_trap_flag_single_step()?;
                 } else {
                     self.flags().remove(ProcessFlags::TRACE_SINGLESTEP);
                     self.disable_single_step();

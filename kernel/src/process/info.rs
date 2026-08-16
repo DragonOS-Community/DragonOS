@@ -89,6 +89,11 @@ impl ThreadInfo {
         self.group_tasks.clone()
     }
 
+    /// 组内是否只有组长一个线程（组列表为空即单线程组）。
+    pub fn group_tasks_is_empty(&self) -> bool {
+        self.group_tasks.is_empty()
+    }
+
     pub fn thread_group_empty(&self) -> bool {
         let group_leader = self.group_leader();
         if let Some(leader) = group_leader {

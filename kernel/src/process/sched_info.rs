@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -285,11 +285,28 @@ impl ProcessSchedulerInfo {
         self.state_atomic.store(state.to_u32(), Ordering::Release);
     }
 
-    /// Acquire pi_lock (SpinLock), disabling interrupts and preemption.
-    /// Lock ordering: pi_lock may nest rq_lock (pi_lock → rq_lock); the reverse
-    /// is prohibited.
+    /// 获取 pi_lock（自旋锁），关中断并禁止抢占。
+    /// 锁序：pi_lock 可嵌套 rq_lock（pi_lock → rq_lock），反向禁止。
+    /// 同样禁止在持有 pi_lock 时获取 sighand 锁，全局锁序为 sighand → pi_lock
     pub fn pi_lock_irqsave(&self) -> SpinLockGuard<'_, PiProtected> {
         self.pi_lock.lock_irqsave()
+    }
+
+    /// 条件恢复运行态：仅当状态确实为 `Blocked`（可中断/不可中断睡眠）时，
+    /// 在 pi_lock 临界区内将其提升为 `Runnable`；
+    #[inline]
+    pub(crate) fn restore_runnable_if_blocked(&self) {
+        // 快路径：绝大多数调用发生在 Runnable 态（如缺页异常入口），一次 Acquire 原子读即返回，零锁开销。
+        if !self.state().is_blocked() {
+            return;
+        }
+
+        // 慢路径：疑似 Blocked，进 pi_lock 复检后再定论。
+        let _pi_guard = self.pi_lock_irqsave();
+        if self.state().is_blocked() {
+            self.set_state(ProcessState::Runnable);
+            fence(Ordering::SeqCst);
+        }
     }
 
     // pub fn virtual_runtime(&self) -> isize {

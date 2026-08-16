@@ -371,21 +371,20 @@ impl TimerFunction for PosixTimerHelper {
                     PidType::TGID
                 };
 
-                // 根据信号类型选择检查的 pending 队列
-                // - 线程级信号 (PidType::PID)：检查 target 的 sig_pending
-                // - 进程级信号 (PidType::TGID)：检查 shared_pending
+                // 根据信号类型选择操作的 pending 队列：
+                // - 线程级信号（SIGEV_THREAD_ID）：操作 target 的 sig_pending
+                // - 进程级信号：操作 shared_pending
                 let is_thread_target = matches!(pt, PidType::PID);
 
-                // 获取 target 的 sig_info 锁
-                let mut siginfo_guard = target.sig_info_mut();
-
-                // 计算"是否未阻塞且 handler=SIG_IGN"
+                // 避免持 sig_info 锁再去获取 sighand 锁造成锁序倒置。
                 let ignored_and_unblocked = {
-                    let mut blocked = *siginfo_guard.sig_blocked();
+                    let siginfo = target.sig_info_irqsave();
+                    let mut blocked = *siginfo.sig_blocked();
                     if target.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
-                        blocked.insert(*siginfo_guard.saved_sigmask());
+                        blocked.insert(*siginfo.saved_sigmask());
                     }
                     let is_blocked = blocked.contains(signo.into_sigset());
+                    drop(siginfo);
                     if is_blocked {
                         false
                     } else {
@@ -397,56 +396,32 @@ impl TimerFunction for PosixTimerHelper {
                     }
                 };
 
-                // 根据信号类型检查对应的 pending 队列
-                let timer_exists = if is_thread_target {
-                    // 线程级信号：检查 target 的 sig_pending
-                    siginfo_guard
+                if is_thread_target {
+                    // 线程级：存在性检查、overrun 累加与入队都在同一
+                    // sig_info 写临界区内完成。
+                    let mut siginfo_guard = target.sig_info_mut();
+                    if siginfo_guard
                         .sig_pending_mut()
                         .posix_timer_exists(signo, self.timerid)
-                } else {
-                    // 进程级信号：检查 shared_pending
-                    target
-                        .sighand()
-                        .shared_pending_posix_timer_exists(signo, self.timerid)
-                };
-
-                // 1) 若已有该 timer 的信号：在队列项上累加 overrun
-                if timer_exists {
-                    let bump = 1i32.saturating_add(t.pending_overrun_acc);
-                    t.pending_overrun_acc = 0;
-                    if is_thread_target {
+                    {
+                        let bump = 1i32.saturating_add(t.pending_overrun_acc);
+                        t.pending_overrun_acc = 0;
                         siginfo_guard.sig_pending_mut().posix_timer_bump_overrun(
                             signo,
                             self.timerid,
                             bump,
                         );
-                    } else {
-                        target.sighand().shared_pending_posix_timer_bump_overrun(
-                            signo,
-                            self.timerid,
-                            bump,
-                        );
-                    }
-                } else {
-                    // 检查是否有其他来源的 pending 信号
-                    let has_other_pending = if is_thread_target {
-                        siginfo_guard.sig_pending().queue().find(signo).0.is_some()
-                    } else {
-                        target.sighand().shared_pending_queue_has(signo)
-                    };
-
-                    // 2) 若 signo 已有其他来源的 pending（如 tgkill 提前排队）：本次无法入队，记为 overrun
-                    if has_other_pending {
-                        t.pending_overrun_acc = t.pending_overrun_acc.saturating_add(1);
-                    } else if ignored_and_unblocked {
-                        // 3) 未阻塞且 handler=SIG_IGN：Linux 语义下会丢弃；tests 期望这也计入 overrun
+                    } else if siginfo_guard.sig_pending().queue().find(signo).0.is_some()
+                        || ignored_and_unblocked
+                    {
+                        // signo 已有其他来源的 pending，或未阻塞且被忽略：
+                        // 本次无法入队，记为 overrun。
                         t.pending_overrun_acc = t.pending_overrun_acc.saturating_add(1);
                     } else {
-                        // 4) 可以入队：构造 SI_TIMER siginfo（确保只入队一次）
+                        // 可以入队：构造 SI_TIMER siginfo（确保只入队一次）
                         let overrun = t.pending_overrun_acc;
                         t.pending_overrun_acc = 0;
                         t.last_overrun = overrun;
-
                         let info = SigInfo::new(
                             signo,
                             0,
@@ -457,8 +432,53 @@ impl TimerFunction for PosixTimerHelper {
                                 sigval,
                             },
                         );
-
                         signo.enqueue_signal_locked(info, target.clone(), pt, siginfo_guard);
+                    }
+                } else {
+                    // 进程级：全部操作在 sighand 侧完成，避免与 sig_info
+                    // 产生任何嵌套。
+                    if target
+                        .sighand()
+                        .shared_pending_posix_timer_exists(signo, self.timerid)
+                    {
+                        let bump = 1i32.saturating_add(t.pending_overrun_acc);
+                        t.pending_overrun_acc = 0;
+                        target.sighand().shared_pending_posix_timer_bump_overrun(
+                            signo,
+                            self.timerid,
+                            bump,
+                        );
+                    } else if ignored_and_unblocked {
+                        // 未阻塞且 handler=SIG_IGN：Linux 语义下丢弃，
+                        // 计入 overrun。
+                        t.pending_overrun_acc = t.pending_overrun_acc.saturating_add(1);
+                    } else {
+                        // 先读取累计值构造 siginfo；只有入队成功才消费它，
+                        // 失败时原值保留并追加本次到期，避免丢失累计。
+                        let overrun = t.pending_overrun_acc;
+                        let info = SigInfo::new(
+                            signo,
+                            0,
+                            SigCode::Timer,
+                            SigType::PosixTimer {
+                                timerid: self.timerid,
+                                overrun,
+                                sigval,
+                            },
+                        );
+                        // 存在性检查与入队在同一写临界区内原子完成：
+                        // 若 signo 已有其他来源的 pending（如并发 kill），
+                        // 返回 false，本次记为 overrun，避免重复入队。
+                        if target
+                            .sighand()
+                            .shared_pending_push_posix_timer(signo, info)
+                        {
+                            t.pending_overrun_acc = 0;
+                            t.last_overrun = overrun;
+                            signo.complete_signal(target.clone(), pt, true);
+                        } else {
+                            t.pending_overrun_acc = overrun.saturating_add(1);
+                        }
                     }
                 }
             }

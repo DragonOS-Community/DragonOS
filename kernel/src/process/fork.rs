@@ -1,29 +1,3 @@
-use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
-
-use crate::arch::MMArch;
-use crate::cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src};
-use crate::filesystem::cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node};
-use crate::filesystem::vfs::file::{File, FileDescriptorTable, FileFlags, ReservedFd};
-use crate::filesystem::vfs::FileType;
-use crate::mm::access_ok;
-use crate::mm::MemoryManagementArch;
-use crate::process::pidfd::PidFd;
-use alloc::{string::ToString, sync::Arc};
-use log::{error, warn};
-use system_error::SystemError;
-
-use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal},
-    ipc::signal_types::SignalFlags,
-    libs::cpumask::CpuMask,
-    mm::VirtAddr,
-    process::ProcessFlags,
-    sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
-    smp::cpu::{smp_cpu_manager_initialized, ProcessorId},
-    syscall::user_access::UserBufferWriter,
-};
-
 use super::{
     account_successful_fork, alloc_pid, inc_visible_thread_count,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
@@ -32,6 +6,33 @@ use super::{
     FsRefsReadGuard, KernelStack, ProcessControlBlock, ProcessManager, RawPid,
     PTRACE_RELATION_LOCK,
 };
+use crate::{
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, MMArch},
+    cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src},
+    filesystem::{
+        cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node},
+        vfs::{
+            file::{File, FileDescriptorTable, FileFlags, ReservedFd},
+            FileType,
+        },
+    },
+    ipc::signal_types::SignalFlags,
+    libs::cpumask::CpuMask,
+    mm::{access_ok, MemoryManagementArch, VirtAddr},
+    process::{
+        pidfd::PidFd,
+        ptrace::{ptracer_of, PtraceEvent},
+        ProcessFlags,
+    },
+    sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
+    smp::cpu::{smp_cpu_manager_initialized, ProcessorId},
+    syscall::user_access::UserBufferWriter,
+};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
+use log::{error, warn};
+use system_error::SystemError;
+
 pub const MAX_PID_NS_LEVEL: usize = 32;
 
 bitflags! {
@@ -278,6 +279,8 @@ impl ProcessManager {
 
         let name = current_pcb.basic().name().to_string();
 
+        let clone_flags = args.flags;
+        let exit_signal = args.exit_signal;
         args.verify()?;
         let pcb = ProcessControlBlock::new(name, new_kstack);
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
@@ -306,6 +309,8 @@ impl ProcessManager {
                 e
             )
         });
+        // wake_up_new_task 之后才上报 ptrace 事件，
+        Self::ptrace_report_fork_event(&current_pcb, &pcb, clone_flags, exit_signal);
 
         if ProcessManager::current_pid().data() == 0 {
             return Ok(pcb.raw_pid());
@@ -321,7 +326,7 @@ impl ProcessManager {
         kthread: bool,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        let parent_flags = *ProcessManager::current_pcb().flags();
+        let parent_flags = ProcessManager::current_pcb().flags().load();
         let mut child_flags = parent_flags.fork_inherited();
 
         // KTHREAD 不通过继承传递，而是由创建参数显式赋予。
@@ -334,7 +339,7 @@ impl ProcessManager {
         }
         child_flags.insert(ProcessFlags::FORKNOEXEC);
 
-        *new_pcb.flags.get_mut() = child_flags;
+        new_pcb.flags.store(child_flags);
 
         return Ok(());
     }
@@ -972,6 +977,10 @@ impl ProcessManager {
                         .unwrap_or(RawPid::new(0));
                     pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
                 }
+                // 子进程继承父进程的执行域标志（personality）
+                pcb.basic
+                    .write_irqsave()
+                    .set_personality(current_pcb.basic().personality());
 
                 let pid = pcb.pid();
                 if pcb.raw_pid() == RawPid(1) {
@@ -1097,7 +1106,88 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
+        // ptrace 子侧 attach 仅建关系 + 继承标志/选项 + 注初始 stop。
+        // 父侧的 ptrace_event 上报必须在 wake_up_new_task 之后由调用方执行，
+        // 否则父进程在 copy_process 内就 ptrace_stop 阻塞，子进程未被唤醒，tracer wait(子) 永久阻塞。
+        if !clone_flags.contains(CloneFlags::CLONE_UNTRACED) {
+            // 事件分类用 exit_signal!=SIGCHLD 区分 CLONE/FORK（对齐 fork.c:2898-2903），
+            // 而非 CLONE_THREAD：非线程但 exit_signal!=SIGCHLD 也应报 CLONE。
+            let event = if clone_flags.contains(CloneFlags::CLONE_VFORK) {
+                PtraceEvent::VFork
+            } else if clone_args.exit_signal != Signal::SIGCHLD as i32 {
+                PtraceEvent::Clone
+            } else {
+                PtraceEvent::Fork
+            };
+            // attach 条件：对应 TRACE 选项开启，或显式 CLONE_PTRACE（对齐 ptrace_init_task）。
+            if clone_flags.contains(CloneFlags::CLONE_PTRACE)
+                || current_pcb.ptrace_event_enabled(event)
+            {
+                // 先 attach + 继承标志/选项 + 注 stop，最后才 notify。
+                if let Some(tracer) = ptracer_of(current_pcb) {
+                    // 用 inherit 变体：不重新检查权限
+                    pcb.ptrace_link_inherit(&tracer)?;
+                    if !pcb.flags().contains(ProcessFlags::PTRACED) {
+                        // tracer 已退出、链接被跳过：子进程保持普通未跟踪进程。
+                    } else {
+                        let is_seized = current_pcb.flags().contains(ProcessFlags::PT_SEIZED);
+                        if is_seized {
+                            pcb.flags().insert(ProcessFlags::PT_SEIZED);
+                        }
+                        let opts = current_pcb.ptrace_state.lock_irqsave().options;
+                        pcb.ptrace_state.lock_irqsave().options = opts;
+                        if is_seized {
+                            // seized 子进程的初始 PTRACE_EVENT_STOP 报告 SIGTRAP
+                            pcb.ptrace_state.lock_irqsave().pending_event_stop =
+                                Some(Signal::SIGTRAP);
+                            pcb.flags().insert(ProcessFlags::PENDING_PTRACE_STOP);
+                        } else {
+                            Signal::SIGSTOP
+                                .send_signal_info_to_pcb(None, pcb.clone(), PidType::PID)
+                                .inspect_err(|_e| {
+                                    // link 已成功，send 失败须回滚关系。
+                                    let _ = pcb.ptrace_unlink();
+                                })?;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// 上报 ptrace FORK/CLONE/VFORK 事件（父侧 ptrace-stop）。
+    ///
+    /// 调用——父进程在此处进入 ptrace_stop 阻塞并通知 tracer。
+    /// 若在 wake_up_new_task 之前调用，子进程未被唤醒，tracer wait(子) 会永久阻塞。
+    pub fn ptrace_report_fork_event(
+        current_pcb: &Arc<ProcessControlBlock>,
+        pcb: &Arc<ProcessControlBlock>,
+        clone_flags: CloneFlags,
+        exit_signal: i32,
+    ) {
+        if clone_flags.contains(CloneFlags::CLONE_UNTRACED) {
+            return;
+        }
+        // 事件分类用 exit_signal!=SIGCHLD 区分 CLONE/FORK（与子侧 copy_process 一致，
+        // 对齐 fork.c:2897-2903），而非 CLONE_THREAD。
+        let event = if clone_flags.contains(CloneFlags::CLONE_VFORK) {
+            PtraceEvent::VFork
+        } else if exit_signal != Signal::SIGCHLD as i32 {
+            PtraceEvent::Clone
+        } else {
+            PtraceEvent::Fork
+        };
+        if !current_pcb.ptrace_event_enabled(event) {
+            return;
+        }
+        // event_message(子 pid) 按 ptracer 所在 pid namespace 翻译。
+        let child_vpid = ptracer_of(current_pcb)
+            .and_then(|tracer| pcb.task_pid_nr_ns(PidType::PID, Some(tracer.active_pid_ns())))
+            .map(|p| p.data())
+            .unwrap_or(0);
+        current_pcb.ptrace_event(event, child_vpid);
     }
 
     fn rollback_failed_fork(

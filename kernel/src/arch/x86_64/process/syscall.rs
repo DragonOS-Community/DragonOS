@@ -1,6 +1,3 @@
-use alloc::sync::Arc;
-use system_error::SystemError;
-
 use crate::{
     arch::{
         interrupt::TrapFrame,
@@ -14,6 +11,8 @@ use crate::{
     },
     syscall::{user_access::UserBufferWriter, Syscall},
 };
+use alloc::sync::Arc;
+use system_error::SystemError;
 
 impl Syscall {
     pub fn arch_do_execve(
@@ -41,7 +40,7 @@ impl Syscall {
         regs.rip = load_result.entry_point().data() as u64;
 
         regs.cs = USER_CS.bits() as u64;
-        regs.ds = USER_DS.bits() as u64;
+        regs.ds = 0;
         regs.ss = USER_DS.bits() as u64;
         regs.es = 0;
         regs.rflags = 0x200;

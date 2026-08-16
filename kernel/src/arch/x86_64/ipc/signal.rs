@@ -1,36 +1,37 @@
-use core::sync::atomic::{compiler_fence, Ordering};
-use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
-
-use defer::defer;
-use log::error;
-use system_error::SystemError;
-
 pub use crate::ipc::generic_signal::AtomicGenericSignal as AtomicSignal;
 pub use crate::ipc::generic_signal::GenericSigChildCode as SigChildCode;
 pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
 pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
-
-use crate::process::rseq::Rseq;
 use crate::{
     arch::{
         fpu::{FpState, XFEATURE_AVX, XFEATURE_SSE, XFEATURE_X87},
         interrupt::TrapFrame,
-        process::table::{USER_CS, USER_DS},
+        process::table::USER_CS,
         syscall::nr::SYS_RESTART_SYSCALL,
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
     ipc::{
+        kill::send_signal_to_pid,
         signal::{restore_saved_sigmask, set_current_blocked},
         signal_types::{
             PosixSigInfo, SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags,
         },
     },
-    mm::MemoryManagementArch,
-    process::{ProcessFlags, ProcessManager},
+    mm::{MemoryManagementArch, VirtAddr},
+    process::{ptrace, rseq::Rseq, ProcessFlags, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
+use core::{
+    ffi::c_void,
+    intrinsics::unlikely,
+    mem::size_of,
+    sync::atomic::{compiler_fence, Ordering},
+};
+use defer::defer;
+use log::error;
+use system_error::SystemError;
 
 /// 信号处理的栈的栈指针的最小对齐数量
 pub const STACK_ALIGN: u64 = 16;
@@ -563,7 +564,11 @@ impl UserUContext {
                 gs: 0, // Linux 不保存 gs/fs 寄存器值
                 fs: 0,
                 ss: frame.ss as u16,
-                err: frame.errcode,
+                err: if frame.errcode == u64::MAX {
+                    0
+                } else {
+                    frame.errcode
+                },
                 trapno: 0,
                 oldmask: oldset.bits(),
                 cr2,
@@ -755,6 +760,13 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         return;
     }
 
+    // 先读进程级 shared_pending 位图（sighand 读锁获取后立即释放）。
+    // 必须在取 sig_info 读锁之前完成：否则 do_signal 持 sig_info 读锁时再取
+    // sighand 读锁，与 recalc_sigpending_tsk（sender 上下文）的 sighand(读)→sig_info(读)
+    // 锁序冲突。DragonOS RwLock 为 writer-preferring，在有 sighand 待写者（sigaction）
+    // 与 sig_info 待写者（sigprocmask）并发时可构成 AB-BA 死锁。
+    let shared_pending = pcb.sighand().shared_pending_signal().bits();
+
     let siginfo = pcb.try_siginfo_irqsave(5);
 
     if unlikely(siginfo.is_none()) {
@@ -766,7 +778,6 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
 
     // 检查 sigpending 是否为 0（需要同时检查线程级 pending 和进程级 shared_pending）
     let thread_pending = siginfo_read_guard.sig_pending().signal().bits();
-    let shared_pending = pcb.sighand().shared_pending_signal().bits();
     if (thread_pending == 0 && shared_pending == 0) || !frame.is_from_user() {
         // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
         drop(siginfo_read_guard);
@@ -777,8 +788,9 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let mut sig_number: Signal;
     let mut info: Option<SigInfo>;
     let mut sigaction: Option<Sigaction>;
-    let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
-    let frame_oldset = if pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+    let mut first_iter = true;
+    let mut sig_block: SigSet = *siginfo_read_guard.sig_blocked();
+    let mut frame_oldset: SigSet = if pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
         *siginfo_read_guard.saved_sigmask()
     } else {
         sig_block
@@ -786,11 +798,37 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     drop(siginfo_read_guard);
 
     loop {
+        if !first_iter {
+            let g = pcb.sig_info_irqsave();
+            sig_block = *g.sig_blocked();
+            if !pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+                frame_oldset = sig_block;
+            }
+        }
+        first_iter = false;
         (sig_number, info) = pcb.dequeue_pending_signal(&sig_block);
 
         // 如果信号非法，则直接返回
         if sig_number == Signal::INVALID {
             return;
+        }
+
+        // ptrace signal-delivery-stop
+        if pcb.is_traced() && sig_number != Signal::SIGKILL {
+            match ptrace::ptrace_signal(&pcb, sig_number, &mut info) {
+                None => continue,
+                Some(new_sig) => {
+                    sig_number = new_sig;
+                }
+            }
+        }
+
+        if !sig_number.kernel_only() {
+            let g = pcb.sig_info_irqsave();
+            sig_block = *g.sig_blocked();
+            if !pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+                frame_oldset = sig_block;
+            }
         }
 
         // 对 kernel-only 信号（如 SIGKILL/SIGSTOP）直接使用默认处理，避免任何用户帧构造
@@ -951,6 +989,22 @@ impl SignalArch for X86_64SignalArch {
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#865
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame) {
+        // 在返回用户态前检查 JOBCTL_TRAP_STOP，发起 PTRACE_EVENT_STOP ptrace_stop。
+        // 触发源：fork 的 seized 子进程初始 stop、PTRACE_INTERRUPT、ptraced group-stop。
+        let pcb = ProcessManager::current_pcb();
+        // 返回用户态前检查 PENDING_PTRACE_STOP，发起 PTRACE_EVENT_STOP ptrace_stop。
+        while pcb.flags().contains(ProcessFlags::PT_SEIZED)
+            && pcb.flags().contains(ProcessFlags::PENDING_PTRACE_STOP)
+        {
+            pcb.flags().remove(ProcessFlags::PENDING_PTRACE_STOP);
+            let pending_sig = {
+                let mut ps = pcb.ptrace_state.lock_irqsave();
+                ps.pending_event_stop.take().unwrap_or(Signal::SIGTRAP)
+            };
+            // ptrace_event_stop 内部计算 exit_code = (EVENT_STOP<<8)|pending_sig，
+            let _ = pcb.ptrace_event_stop(pending_sig);
+        }
+
         let mut got_signal = false;
         do_signal(frame, &mut got_signal);
 
@@ -980,6 +1034,28 @@ impl SignalArch for X86_64SignalArch {
         // restart block should degrade to no-restart state. Subsequent manual calls to
         // restart_syscall should only get EINTR and must not continue consuming the old restart context.
         let _ = ProcessManager::current_pcb().restart_block().take();
+
+        // 走异常表保护读取用户信号栈帧，坏指针返回 badframe 路径（SIGSEGV）。
+        let frame_ptr_vaddr = VirtAddr::new(frame_ptr as usize);
+        let mut frame: SigFrame = unsafe { core::mem::zeroed() };
+        if unsafe {
+            crate::syscall::user_access::copy_from_user_protected(
+                core::slice::from_raw_parts_mut(
+                    &mut frame as *mut SigFrame as *mut u8,
+                    size_of::<SigFrame>(),
+                ),
+                frame_ptr_vaddr,
+            )
+        }
+        .is_err()
+        {
+            error!(
+                "sys_rt_sigreturn: bad sigframe at {:#x}",
+                frame_ptr_vaddr.data()
+            );
+            let _ = crate::ipc::signal::force_kernel_default_signal_to_current(Signal::SIGSEGV);
+            return 0;
+        }
 
         // 1. 恢复信号掩码（从 1024-bit 用户态格式转换到 64-bit 内核格式）
         let mut sigmask = ucontext.uc_sigmask.to_kernel_sigset();
@@ -1090,7 +1166,7 @@ fn setup_frame(
                 // 如果handler地址大于等于用户空间末尾，说明它在内核空间，这是非法的。
                 if handler >= MMArch::USER_END_VADDR {
                     error!("attempting to execute a signal handler from kernel");
-                    let _ = crate::ipc::kill::send_signal_to_pid(
+                    let _ = send_signal_to_pid(
                         ProcessManager::current_pcb().raw_pid(),
                         Signal::SIGSEGV,
                     );
@@ -1105,7 +1181,7 @@ fn setup_frame(
                             ProcessManager::current_pcb().raw_pid(),
                             sig as i32
                         );
-                        let _ = crate::ipc::kill::send_signal_to_pid(
+                        let _ = send_signal_to_pid(
                             ProcessManager::current_pcb().raw_pid(),
                             Signal::SIGSEGV,
                         );
@@ -1128,24 +1204,25 @@ fn setup_frame(
     let frame_location = get_stack(sigaction, trap_frame, size_of::<SigFrame>());
     let frame_ptr = frame_location.frame;
 
-    // 验证地址位于用户空间
-    let mut frame_writer =
-        UserBufferWriter::new(frame_ptr, size_of::<SigFrame>(), true).map_err(|_| {
-            error!("In setup_frame: access check failed");
-            let _ = crate::ipc::kill::send_signal_to_pid(
-                ProcessManager::current_pcb().raw_pid(),
-                Signal::SIGSEGV,
-            );
-            SystemError::EFAULT
-        })?;
-    UserBufferWriter::new(frame_location.fpstate, FPSTATE_FRAME_SIZE, true).map_err(|_| {
-        error!("In setup_frame: fpstate access check failed");
+    // 验证地址位于用户空间（access check；整帧随后由 copy_to_user_protected 写入）。
+    UserBufferWriter::new(frame_ptr, size_of::<SigFrame>(), true).map_err(|_| {
+        error!("In setup_frame: access check failed");
         let _ = crate::ipc::kill::send_signal_to_pid(
             ProcessManager::current_pcb().raw_pid(),
             Signal::SIGSEGV,
         );
         SystemError::EFAULT
     })?;
+    UserBufferWriter::new(frame_location.fpstate, FPSTATE_FRAME_SIZE, true).map_err(|_| {
+        error!("In setup_frame: fpstate access check failed");
+        let _ = send_signal_to_pid(ProcessManager::current_pcb().raw_pid(), Signal::SIGSEGV);
+        SystemError::EFAULT
+    })?;
+
+    // 在内核栈上构造完整 SigFrame，最后一次性走异常表保护写入用户栈。
+    // 这样所有用户指针访问都集中在受保护的 copy_to_user_protected 调用上，
+    // 坏用户栈指针返回 EFAULT/SIGSEGV 而非 panic。
+    let mut frame: SigFrame = unsafe { core::mem::zeroed() };
 
     // 1. 读取 arch 信息并生成用户态数据（避免持锁访问用户内存）
     let pcb = ProcessManager::current_pcb();
@@ -1164,53 +1241,76 @@ fn setup_frame(
     archinfo_guard.clear_fp_state();
     drop(archinfo_guard);
 
-    // 3. 写入用户栈（可能触发缺页，必须在释放锁后进行）
+    // 3. 填充栈帧字段（纯内核态写入，无 user deref）
+    frame.ucontext = user_ucontext;
     if let Some(fpstate) = user_fpstate {
-        let mut fp_writer =
-            UserBufferWriter::new(frame_location.fpstate, size_of::<UserXState>(), true)?;
-        fp_writer.copy_one_to_user(&fpstate, 0)?;
-        let mut magic_writer = UserBufferWriter::new(
-            unsafe { (frame_location.fpstate as *mut u8).add(size_of::<UserXState>()) as *mut u32 },
-            FP_XSTATE_MAGIC2_SIZE,
-            true,
-        )?;
-        magic_writer.copy_one_to_user(&FP_XSTATE_MAGIC2, 0)?;
+        unsafe {
+            crate::syscall::user_access::write_one_to_user_protected(
+                VirtAddr::new(frame_location.fpstate as usize),
+                &fpstate,
+            )?;
+        }
+        // FP_XSTATE_MAGIC2 尾随 fpstate 之后。
+        let magic2_addr =
+            unsafe { (frame_location.fpstate as *mut u8).add(size_of::<UserXState>()) as usize };
+        unsafe {
+            crate::syscall::user_access::write_one_to_user_protected(
+                VirtAddr::new(magic2_addr),
+                &FP_XSTATE_MAGIC2,
+            )?;
+        }
     }
 
-    let mut user_frame = SigFrame {
-        ret_code_ptr,
-        ucontext: user_ucontext,
-        siginfo: info.convert_to_posix_siginfo(),
-    };
-    // 设置 fpstate 指针指向栈帧内的 fpstate
-    user_frame.setup_fpstate_pointer(frame_location.fpstate);
-
-    // 4. Copy sigframe
-    frame_writer
-        .copy_one_to_user(&user_frame, 0)
-        .inspect_err(|_| {
-            error!("In setup_frame: failed to copy sigframe");
-            let _ = crate::ipc::kill::send_signal_to_pid(
-                ProcessManager::current_pcb().raw_pid(),
-                Signal::SIGSEGV,
-            );
-        })?;
+    // 4. 填充栈帧剩余字段（栈上写入，随后整帧受保护写入用户栈）。
+    frame.siginfo = info.convert_to_posix_siginfo();
+    frame.ret_code_ptr = ret_code_ptr;
+    // 设置 fpstate 指针指向栈帧内的 fpstate。
+    frame.setup_fpstate_pointer(frame_location.fpstate);
 
     if sig_altstack.flags.contains(SigStackFlags::SS_AUTODISARM) {
         let pcb = ProcessManager::current_pcb();
         pcb.sig_altstack_mut().reset_for_autodisarm();
     }
 
-    // 6. 设置 trap_frame，准备进入信号处理函数
+    // 6. 一次性把整帧写入用户栈（走异常表保护）
+    let frame_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            &frame as *const SigFrame as *const u8,
+            size_of::<SigFrame>(),
+        )
+    };
+    unsafe {
+        crate::syscall::user_access::copy_to_user_protected(
+            VirtAddr::new(frame_ptr as usize),
+            frame_bytes,
+        )
+        .map_err(|_| {
+            error!("In setup_frame: failed to write sigframe to user stack");
+            let _ = send_signal_to_pid(ProcessManager::current_pcb().raw_pid(), Signal::SIGSEGV);
+            SystemError::EFAULT
+        })?;
+    }
+
+    // 7. 设置 trap_frame，准备进入信号处理函数。
+    // rsi/rdx 指向用户栈上的 siginfo/ucontext（SigFrame 偏移已在编译期断言）。
+    let frame_base = frame_ptr as usize;
+    let siginfo_uaddr = frame_base + core::mem::offset_of!(SigFrame, siginfo);
+    let ucontext_uaddr = frame_base + core::mem::offset_of!(SigFrame, ucontext);
     trap_frame.rdi = sig as u64; // 参数1: 信号编号
     trap_frame.rax = 0; // Linux x86_64: support handlers declared without prototypes
-    trap_frame.rsi = (frame_ptr as usize + core::mem::offset_of!(SigFrame, siginfo)) as u64; // arg2: siginfo_t*
-    trap_frame.rdx = (frame_ptr as usize + core::mem::offset_of!(SigFrame, ucontext)) as u64; // arg3: ucontext_t*
+    trap_frame.rsi = siginfo_uaddr as u64; // siginfo_t*
+    trap_frame.rdx = ucontext_uaddr as u64; // ucontext_t*
     trap_frame.rsp = frame_ptr as u64;
     trap_frame.rip = handler_addr as u64;
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
-    trap_frame.ds = (USER_DS.bits() | 0x3) as u64;
+    trap_frame.ds = 0;
     trap_frame.rflags &= !(X86_EFLAGS_DF | X86_EFLAGS_RF | X86_EFLAGS_TF);
+    // 若当前处于 ptrace 单步，sigframe 建好后须重新置 TF，使信号 handler 第一条指令即触发单步陷阱。
+    let current_pcb = ProcessManager::current_pcb();
+    let stepping = current_pcb.ptrace_state.lock_irqsave().forced_trap_flag;
+    if stepping {
+        trap_frame.rflags |= X86_EFLAGS_TF;
+    }
 
     Ok(0)
 }

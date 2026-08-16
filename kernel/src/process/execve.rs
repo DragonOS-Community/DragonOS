@@ -1,19 +1,23 @@
 use super::trace::trace_sched_process_exec;
-use crate::arch::ipc::signal::Signal;
-use crate::arch::CurrentIrqArch;
-use crate::exception::InterruptArch;
-use crate::filesystem::vfs::fcntl::AtFlags;
-use crate::filesystem::vfs::open::{do_open_execat, do_open_execat_with_flags};
-use crate::libs::futex::futex::RobustListHead;
-use crate::process::exec::{
-    load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
-    ExecStartInfo, LoadBinaryResult,
+use crate::{
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, CurrentIrqArch},
+    exception::InterruptArch,
+    filesystem::vfs::{
+        fcntl::AtFlags,
+        open::{do_open_execat, do_open_execat_with_flags},
+    },
+    libs::{futex::futex::RobustListHead, rand::rand_bytes},
+    mm::ucontext::AddressSpace,
+    process::{
+        exec::{
+            load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
+            ExecStartInfo, LoadBinaryResult,
+        },
+        pid::PidType,
+        ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
+    },
+    syscall::Syscall,
 };
-use crate::process::{ProcessControlBlock, ProcessManager};
-use crate::syscall::Syscall;
-use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
-
-use crate::arch::interrupt::TrapFrame;
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -142,6 +146,8 @@ fn do_execve_internal(
     regs: &mut TrapFrame,
     ctx: ExecContext,
 ) -> Result<(), ExecFailure> {
+    let exec_pcb = ProcessManager::current_pcb();
+    let exec_guard = exec_pcb.exec_update_write();
     let address_space = AddressSpace::new(true).expect("Failed to create new address space");
 
     let mut param = ExecParam::new(
@@ -164,7 +170,19 @@ fn do_execve_internal(
     // 交换 current 与旧 thread-group leader 的 raw_pid（对齐 Linux fs/exec.c:1770）。
     let old_pid = ProcessManager::current_pcb().raw_pid().data() as i32;
 
-    // 尝试加载二进制文件
+    let pre_exec_pcb = ProcessManager::current_pcb();
+    let old_vpid = if !pre_exec_pcb.is_traced() {
+        0
+    } else {
+        ptrace::ptracer_of(&pre_exec_pcb)
+            .and_then(|tracer| {
+                pre_exec_pcb.task_pid_nr_ns(PidType::PID, Some(tracer.active_pid_ns()))
+            })
+            .map(|p| p.data())
+            .unwrap_or(0)
+    };
+
+    // 尝试加载二进制文件（内部 begin_new_exec → de_thread 会交换 PID）
     let load_result = load_binary_file_with_context(&mut param, &ctx);
 
     match load_result {
@@ -233,6 +251,9 @@ fn do_execve_internal(
             if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
                 completion.complete_all();
             }
+            // exec_update 锁覆盖整个提交阶段；对外发布 trace/ptrace 事件前释放，
+            // 避免 tracer 回调与 exec 状态更新互相等待。
+            drop(exec_guard);
             // Linux keeps bprm->filename as the original exec-visible name
             // across shebang/interpreter rewrites. Complete vfork first so
             // trace callbacks cannot delay the parent after exec committed.
@@ -241,6 +262,28 @@ fn do_execve_internal(
                 pcb.raw_pid().data() as i32,
                 old_pid,
             );
+
+            // ptrace EVENT_EXEC：必须在 arch_do_execve 写入新入口寄存器（rip/rsp/rflags/cs）之后触发。
+            // EXEC-stop 期间 GETREGS 读到新 rip（新程序入口），SETREGS 不会被 arch_do_execve 覆盖。
+            if pcb.ptrace_event_enabled(ptrace::PtraceEvent::Exec) {
+                pcb.ptrace_event(ptrace::PtraceEvent::Exec, old_vpid);
+            } else if pcb.is_traced() && !pcb.flags().contains(ProcessFlags::PT_SEIZED) {
+                // 非 SEIZE 模式传统 attach：execve 成功后发裸 SIGTRAP（SI_KERNEL）。
+                let mut info = crate::ipc::signal_types::SigInfo::new(
+                    Signal::SIGTRAP,
+                    0,
+                    crate::ipc::signal_types::SigCode::Kernel,
+                    crate::ipc::signal_types::SigType::Kill {
+                        pid: RawPid(0),
+                        uid: 0,
+                    },
+                );
+                let _ = Signal::SIGTRAP.send_signal_info_to_pcb(
+                    Some(&mut info),
+                    pcb.clone(),
+                    PidType::PID,
+                );
+            }
             Ok(())
         }
 
@@ -250,7 +293,7 @@ fn do_execve_internal(
             if let Some(old_vm) = old_vm {
                 do_execve_switch_user_vm(old_vm);
             }
-
+            drop(exec_guard);
             // 增加递归深度并递归调用
             let new_ctx = ctx.increment_depth();
 

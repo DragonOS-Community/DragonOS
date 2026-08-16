@@ -177,6 +177,12 @@ impl TrapFrame {
         self.rax = value as u64;
     }
 
+    /// 读取系统调用返回值寄存器（x86_64 为 rax）。
+    #[inline]
+    pub fn get_syscall_return(&self) -> usize {
+        self.rax as usize
+    }
+
     /// 判断当前中断是否来自用户模式
     pub fn is_from_user(&self) -> bool {
         return (self.cs & 0x3) != 0;
@@ -227,6 +233,12 @@ impl TrapFrame {
     pub unsafe fn syscall_error(&self) -> Option<SystemError> {
         let val = self.rax as i32;
         SystemError::from_posix_errno(val)
+    }
+
+    /// x86_64 的 rax 既是 syscall 号输入又是返回值
+    #[inline]
+    pub fn get_orig_syscall_nr(&self) -> i64 {
+        self.errcode as i64
     }
 }
 

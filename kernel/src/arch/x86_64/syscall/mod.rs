@@ -70,6 +70,9 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     // 系统调用进入时，把系统调用号存入errcode字段，以便在syscall_handler退出后，仍能获取到系统调用号
     frame.errcode = frame.rax;
     let syscall_num = frame.rax as usize;
+    // syscall 入口无条件把 pt_regs->ax 置 -ENOSYS（errcode 字段已保存 syscall 号）。
+    // 先于任何 ptrace/seccomp 检查。SYSEMU skip 或正常 dispatch 都不依赖 frame.rax 作为输入。
+    frame.rax = SystemError::ENOSYS.to_posix_errno() as i64 as u64;
     // 防止sys_sched由于超时无法退出导致的死锁
     if syscall_num == SYS_SCHED {
         unsafe {
@@ -103,29 +106,40 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     }
 
     // Arch specific syscall
-    match syscall_num {
+    let current_pcb = ProcessManager::current_pcb();
+    let nr = syscall_num as u64;
+    let arch_ret: usize = match syscall_num {
         SYS_RT_SIGRETURN => {
-            syscall_return!(
-                X86_64SignalArch::sys_rt_sigreturn(frame) as usize,
-                frame,
-                show
-            );
+            // entry-stop 必须在 sys_rt_sigreturn 修改 frame 之前完成。
+            let _ = current_pcb.ptrace_report_syscall(true, nr, &args);
+            let r = X86_64SignalArch::sys_rt_sigreturn(frame) as usize;
+            // exit-stop 在 frame 已恢复为新信号上下文后报告
+            let _ = current_pcb.ptrace_report_syscall(false, nr, &args);
+            syscall_return!(r, frame, show);
         }
         SYS_ARCH_PRCTL => {
-            syscall_return!(
-                Syscall::arch_prctl(args[0], args[1])
-                    .unwrap_or_else(|e| e.to_posix_errno() as usize),
-                frame,
-                show
-            );
+            let _ = current_pcb.ptrace_report_syscall(true, nr, &args);
+            let r = Syscall::arch_prctl(args[0], args[1])
+                .unwrap_or_else(|e| e.to_posix_errno() as usize);
+            frame.rax = r as u64;
+            let _ = current_pcb.ptrace_report_syscall(false, nr, &args);
+            syscall_return!(r, frame, show);
         }
-        _ => {}
-    }
+        _ => 0,
+    };
+    let _ = arch_ret;
+    // syscall 执行（catch_handle 内部已把返回值写入 frame.rax）
     let mut syscall_handle = || -> u64 {
         Syscall::catch_handle(syscall_num, &args, frame)
             .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
     };
-    syscall_return!(syscall_handle(), frame, show);
+    let _ = syscall_handle();
+
+    // 返回用户态前处理信号/ptrace-stop
+    unsafe {
+        <X86_64SignalArch as SignalArch>::do_signal_or_restart(frame);
+    }
+    syscall_return!(frame.rax as usize, frame, show);
 }
 
 /// 系统调用初始化
@@ -150,5 +164,5 @@ pub(super) unsafe fn init_syscall_64() {
 
     // 初始化LSTAR,该寄存器存储syscall指令入口
     x86::msr::wrmsr(x86::msr::IA32_LSTAR, syscall_64 as usize as u64);
-    x86::msr::wrmsr(x86::msr::IA32_FMASK, 0xfffffffe);
+    x86::msr::wrmsr(x86::msr::IA32_FMASK, 0x47700);
 }

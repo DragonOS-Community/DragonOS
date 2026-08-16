@@ -365,8 +365,7 @@ impl KernelThreadMechanism {
             unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 由于当前是pid=0的idle进程,而__inner_create要求当前是kthread,所以先临时设置为kthread
         ProcessManager::current_pcb()
-            .flags
-            .get_mut()
+            .flags()
             .insert(ProcessFlags::KTHREAD);
         create_info
             .set_to_mark_sleep(false)
@@ -379,8 +378,7 @@ impl KernelThreadMechanism {
         .unwrap_or_else(|e| panic!("Failed to create initial kernel thread, error: {:?}", e));
 
         ProcessManager::current_pcb()
-            .flags
-            .get_mut()
+            .flags()
             .remove(ProcessFlags::KTHREAD);
 
         drop(irq_guard);

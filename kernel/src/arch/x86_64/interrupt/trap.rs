@@ -1,22 +1,19 @@
 #![allow(function_casts_as_integer)]
 
-use log::{error, trace, warn};
-use system_error::SystemError;
-
 use super::{
     entry::{set_intr_gate, set_system_intr_gate, set_system_trap_gate},
     TrapFrame,
 };
-use crate::exception::debug::DebugException;
-use crate::exception::ebreak::EBreak;
 use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch, MMArch},
-    exception::InterruptArch,
+    exception::{debug::DebugException, ebreak::EBreak, InterruptArch},
     ipc::signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
     mm::VirtAddr,
     process::ProcessManager,
     smp::core::smp_get_processor_id,
 };
+use log::{error, trace, warn};
+use system_error::SystemError;
 
 extern "C" {
     fn trap_divide_error();
@@ -164,7 +161,7 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
     );
     if regs.is_from_user() {
         // 用户态 #DB：uprobe XOL 单步完成优先（handler 返回是否消费，评审 R4）；
-        // 未消费的用户态单步进入 SIGTRAP/ptrace 路径。DebugException 只查
+        // 未消费的用户态单步通过统一信号路径进入 SIGTRAP/ptrace。DebugException 只查
         // 内核 kprobe 表，不能处理用户态 #DB，否则会静默吞掉调试异常。
         if crate::exception::uprobe::uprobe_debug_handler(regs, dr6).unwrap() {
             // 已被 uprobe 消费（精确 XOL 完成）。

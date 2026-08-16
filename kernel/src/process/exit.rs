@@ -1,25 +1,25 @@
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use core::sync::atomic::Ordering;
-use system_error::SystemError;
-
-use crate::{
-    arch::ipc::signal::{SigChildCode, Signal},
-    driver::tty::tty_core::TtyCore,
-    ipc::sighand::ReapTransition,
-    ipc::signal_types::SignalFlags,
-    process::{namespace::user_namespace::map_id_up, pid::PidType, ptrace, wait::WaitSelector},
-    syscall::user_access::UserBufferWriter,
-};
-
 use super::{
     abi::WaitOption,
     dec_visible_thread_count,
     resource::{RUsage, RUsageWho},
     ProcessControlBlock, ProcessFlags, ProcessManager, RawPid, PTRACE_RELATION_LOCK,
 };
+use crate::{
+    arch::ipc::signal::{SigChildCode, SigFlags, Signal},
+    driver::tty::tty_core::TtyCore,
+    ipc::{sighand::ReapTransition, signal_types::SignalFlags},
+    process::{
+        namespace::user_namespace::map_id_up, pid::PidType, ptrace, wait::WaitSelector,
+        ProcessState,
+    },
+    syscall::user_access::UserBufferWriter,
+};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::sync::atomic::Ordering;
+use system_error::SystemError;
 
 const DEFAULT_OVERFLOW_UID: u32 = 65534;
 
@@ -45,7 +45,76 @@ pub(crate) fn wstatus_to_waitid_exit_info(raw_wstatus: i32) -> (i32, i32) {
     }
 }
 
-/// mt-exec: de_thread 正在接管旧线程组时，禁止 wait 路径提前回收其他线程。
+fn notify_real_parent_after_ptrace_ack(child_pcb: &Arc<ProcessControlBlock>) {
+    let Some(real_parent) = child_pcb.real_parent_pcb() else {
+        return;
+    };
+    let exit_signal = child_pcb.exit_signal.load(Ordering::SeqCst);
+
+    let (autoreap, send_sigchld) = if exit_signal == Signal::SIGCHLD as i32 {
+        let disp = real_parent.sighand().handler(Signal::SIGCHLD);
+        let ignored = disp.as_ref().map(|sa| sa.is_ignore()).unwrap_or(false);
+        let no_cldwait = disp
+            .as_ref()
+            .map(|sa| sa.flags().contains(SigFlags::SA_NOCLDWAIT))
+            .unwrap_or(false);
+        if ignored {
+            (true, false)
+        } else if no_cldwait {
+            (true, true)
+        } else {
+            (false, true)
+        }
+    } else if exit_signal > 0 {
+        (false, true)
+    } else {
+        (false, false)
+    };
+
+    // autoreap 必须在唤醒 real_parent wait_queue 之前完成 release，
+    // 否则 real_parent 被唤醒后 wait 命中已 Dead 子进程。CAS 保证仅释放一次。
+    if autoreap && child_pcb.try_mark_dead_from_zombie() {
+        unsafe { ProcessManager::release(child_pcb.raw_pid()) };
+    }
+    if send_sigchld {
+        if let Err(e) =
+            crate::ipc::kill::send_signal_to_pcb(real_parent.clone(), Signal::from(exit_signal))
+        {
+            log::warn!(
+                "notify_real_parent_after_ptrace_ack: deliver {:?} to {:?} failed: {:?}",
+                Signal::from(exit_signal),
+                real_parent.raw_pid(),
+                e
+            );
+        }
+    }
+
+    real_parent
+        .wait_queue
+        .wakeup_all(Some(ProcessState::Blocked(true)));
+    // 线程组 leader 的 wait_queue 也要唤醒（__WNOTHREAD 语义对称）。
+    let parent_leader = real_parent.thread.read_irqsave().group_leader();
+    if let Some(leader) = parent_leader {
+        if !Arc::ptr_eq(&leader, &real_parent) {
+            leader
+                .wait_queue
+                .wakeup_all(Some(ProcessState::Blocked(true)));
+        }
+    }
+}
+
+/// 判断 tracee 的 ptracer 与 real_parent 是否不在同一线程组。
+fn ptrace_reparented(child_pcb: &Arc<ProcessControlBlock>) -> bool {
+    let Some(ptracer) = child_pcb.ptracer_pcb() else {
+        return false;
+    };
+    let Some(real_parent) = child_pcb.real_parent_pcb() else {
+        return false;
+    };
+    ptracer.raw_tgid() != real_parent.raw_tgid()
+}
+
+/// mt-exec: de_thread 正在等待旧 leader 完成 PID/TID 交换时，禁止提前回收
 fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
     child_pcb.sighand().reap_blocked_by_group_exec(child_pcb)
 }
@@ -497,6 +566,12 @@ fn report_wait_event(
                 WaitRelation::Natural => child_pcb.sighand().natural_reap_blocked(child_pcb),
                 WaitRelation::Ptraced => reap_blocked_by_group_exec(child_pcb),
             });
+    // 可见性门控：ptraced zombie 在 tracer ack（Ptraced 关系）之前对 natural parent
+    // 不可见。对齐 Linux wait_task_zombie：ptraced 子进程只能由 tracer 先 reap，
+    // real_parent 在 tracer 解除关系前不可 reap（否则抢先回收，tracer 见不到退出）。
+    if is_zombie && !delayed_zombie && child_pcb.is_ptraced() && relation != WaitRelation::Ptraced {
+        return CandidateDecision::Pending { can_change: true };
+    }
     if is_zombie && !delayed_zombie && kwo.options.contains(WaitOption::WEXITED) {
         let Some(task_wstatus) = state.raw_wstatus().map(|status| status as i32) else {
             return CandidateDecision::Pending { can_change: false };
@@ -509,39 +584,57 @@ fn report_wait_event(
             .map(|status| status as i32)
             .unwrap_or(task_wstatus);
         let consume = !kwo.options.contains(WaitOption::WNOWAIT);
-        match relation {
-            WaitRelation::Natural => {
-                let transition = child_pcb
-                    .sighand()
-                    .try_reap_natural_child(child_pcb, consume);
-                let expected = if consume {
-                    ReapTransition::Reaped
-                } else {
-                    ReapTransition::Reportable
-                };
-                if transition == ReapTransition::Blocked {
+
+        if child_pcb.is_ptraced()
+            && relation == WaitRelation::Ptraced
+            && !kwo.options.contains(WaitOption::WNOWAIT)
+        {
+            // 先判定是否需要级联通知 real_parent（必须在 ptrace_unlink 之前，
+            // 因为 ptrace_unlink 会清空 ptracer_pcb，导致 ptracer_pcb() 返回 None）。
+            let need_cascade = ptrace_reparented(child_pcb);
+            // 解除 ptrace 关系（zombie 状态不变，仍 Zombie）。
+            let _ = child_pcb.ptrace_unlink();
+
+            let pid = wait_visible_pid(child_pcb);
+            let (status, cause) = wstatus_to_waitid_exit_info(raw_wstatus);
+            fill_wait_rusage(child_pcb, kwo);
+            kwo.no_task_error = None;
+            kwo.ret_status = raw_wstatus;
+            kwo.ret_info = Some(waitid_info(child_pcb, status, cause));
+
+            if need_cascade {
+                // ptracer != real_parent（外部调试器）：通知 real_parent 并保留 zombie，
+                // 等 real_parent 走 Natural 分支二次 reap。
+                notify_real_parent_after_ptrace_ack(child_pcb);
+            } else {
+                // ptracer == real_parent（strace fork-then-trace 场景）：立即 reap+release，
+                // 只上报一次，不保留 zombie 避免二次 Natural reap。
+                let transition = child_pcb.sighand().try_reap_natural_child(child_pcb, true);
+                if transition != ReapTransition::Reaped {
                     return CandidateDecision::Pending { can_change: true };
                 }
-                if transition != expected {
-                    return CandidateDecision::Ineligible;
-                }
+                let rusage = fill_wait_rusage(child_pcb, kwo);
+                account_reaped_child_rusage(&rusage);
+                unsafe { ProcessManager::release(child_pcb.raw_pid()) };
             }
-            WaitRelation::Ptraced => {
-                let transition = child_pcb
-                    .sighand()
-                    .try_reap_ptraced_child(child_pcb, consume);
-                let expected = if consume {
-                    ReapTransition::Reaped
-                } else {
-                    ReapTransition::Reportable
-                };
-                if transition == ReapTransition::Blocked {
-                    return CandidateDecision::Pending { can_change: true };
-                }
-                if transition != expected {
-                    return CandidateDecision::Ineligible;
-                }
-            }
+            return CandidateDecision::Ready(Ok(pid.into()));
+        }
+
+        // Natural reap（含已 unlink 的原 ptraced zombie）：用事务化 try_reap_natural_child
+        //（内部处理 autoreap / group-exec 仲裁 / mark-dead）。
+        let transition = child_pcb
+            .sighand()
+            .try_reap_natural_child(child_pcb, consume);
+        let expected = if consume {
+            ReapTransition::Reaped
+        } else {
+            ReapTransition::Reportable
+        };
+        if transition == ReapTransition::Blocked {
+            return CandidateDecision::Pending { can_change: true };
+        }
+        if transition != expected {
+            return CandidateDecision::Ineligible;
         }
 
         let pid = wait_visible_pid(child_pcb);
@@ -559,28 +652,45 @@ fn report_wait_event(
         return CandidateDecision::Ready(Ok(pid.into()));
     }
 
-    let consume = !kwo.options.contains(WaitOption::WNOWAIT);
-    let stop_signal = match relation {
-        WaitRelation::Natural if kwo.options.contains(WaitOption::WSTOPPED) => {
-            child_pcb.sighand().group_stop_event(consume)
+    // ptrace-stop 分支：纯 ptrace-trap（syscall-stop 的 SIGTRAP|0x80、EVENT_STOP 的
+    // (event<<8)|SIGTRAP、signal-delivery-stop）的 exit_code 比 sighand 的 stop_signal
+    // 丰富，须取自 per-tracee 的 PtraceState（对齐 Linux task->exit_code）。
+    // LISTENING 由 consume_stop_report 内部抑制（对齐 exit.c:1232 JOBCTL_LISTENING）。
+    if relation == WaitRelation::Ptraced && state.is_stopped() {
+        let consume = !kwo.options.contains(WaitOption::WNOWAIT);
+        if let Some(exit_code) = child_pcb
+            .ptrace_state
+            .lock_irqsave()
+            .consume_stop_report(consume)
+        {
+            let cause = SigChildCode::Trapped.into();
+            kwo.no_task_error = None;
+            kwo.ret_info = Some(waitid_info(child_pcb, exit_code, cause));
+            kwo.ret_status = (exit_code << 8) | 0x7f;
+            fill_wait_rusage(child_pcb, kwo);
+            return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
         }
-        WaitRelation::Ptraced => child_pcb
-            .sighand()
-            .ptrace_stop_event(consume, || child_pcb.sched_info().state().is_stopped()),
-        _ => None,
-    };
-    if let Some(stop_signal) = stop_signal {
-        let stopsig = stop_signal as i32;
-        let cause = if relation == WaitRelation::Ptraced {
-            SigChildCode::Trapped.into()
-        } else {
-            SigChildCode::Stopped.into()
-        };
-        kwo.no_task_error = None;
-        kwo.ret_info = Some(waitid_info(child_pcb, stopsig, cause));
-        kwo.ret_status = (stopsig << 8) | 0x7f;
-        fill_wait_rusage(child_pcb, kwo);
-        return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
+    }
+
+    // group-stop 分支（Natural 关系）：用 sighand 事务化 group_stop_event（替代
+    // stop_consume_test——sighand 无 stop_exit_code 字段，stop 信号号存于 stop_signal）。
+    // in_ptrace_stop 门控：避免 attach 到 group-stopped tracee 后同一 stop 被 tracer
+    // （ptrace-stop 分支）和 real_parent（本分支）双重消费。
+    let stop_requested =
+        relation == WaitRelation::Ptraced || kwo.options.contains(WaitOption::WSTOPPED);
+    let in_ptrace_stop = child_pcb.ptrace_state.lock_irqsave().in_ptrace_stop;
+    if state.is_stopped() && stop_requested && relation != WaitRelation::Ptraced && !in_ptrace_stop
+    {
+        let consume = !kwo.options.contains(WaitOption::WNOWAIT);
+        if let Some(stop_signal) = child_pcb.sighand().group_stop_event(consume) {
+            let stopsig = stop_signal as i32;
+            let cause = SigChildCode::Stopped.into();
+            kwo.no_task_error = None;
+            kwo.ret_info = Some(waitid_info(child_pcb, stopsig, cause));
+            kwo.ret_status = (stopsig << 8) | 0x7f;
+            fill_wait_rusage(child_pcb, kwo);
+            return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
+        }
     }
 
     if kwo.options.contains(WaitOption::WCONTINUED)

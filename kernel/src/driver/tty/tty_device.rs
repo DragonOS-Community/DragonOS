@@ -593,13 +593,25 @@ impl IndexNode for TtyDevice {
             | TtyIoctlCmd::TCSBRKP => {
                 TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
                 if cmd != TtyIoctlCmd::TIOCCBRK {
-                    todo!()
+                    tty.wait_until_sent(tty.core())?;
                 }
             }
             _ => {}
         }
-
         match cmd {
+            TtyIoctlCmd::TIOCSBRK
+            | TtyIoctlCmd::TIOCCBRK
+            | TtyIoctlCmd::TCSBRK
+            | TtyIoctlCmd::TCSBRKP => return Ok(0),
+            TtyIoctlCmd::TIOCSETD => {
+                let reader =
+                    UserBufferReader::new(arg as *const i32, core::mem::size_of::<i32>(), true)?;
+                let disc = reader.read_one_from_user::<i32>(0)?;
+                if disc != 0 {
+                    return Err(SystemError::ENODEV);
+                }
+                return Ok(0);
+            }
             TtyIoctlCmd::TIOCGPTPEER => {
                 let flags = FileFlags::from_bits(arg as u32).ok_or(SystemError::EINVAL)?;
                 let cloexec = flags.contains(FileFlags::O_CLOEXEC);

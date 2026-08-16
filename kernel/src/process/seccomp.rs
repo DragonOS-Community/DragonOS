@@ -330,59 +330,96 @@ pub fn secure_computing(
             }
         }
 
-        SeccompMode::Filter => {
-            let data = SeccompData {
-                nr: syscall_num as i32,
-                arch: seccomp_arch(),
-                instruction_pointer: instruction_pointer(frame),
-                args: [
-                    args[0] as u64,
-                    args[1] as u64,
-                    args[2] as u64,
-                    args[3] as u64,
-                    args[4] as u64,
-                    args[5] as u64,
-                ],
-            };
+        SeccompMode::Filter => filter_decision(pcb.clone(), syscall_num, args, frame, false),
+    }
+}
 
-            let filter_guard = pcb.seccomp_filter.lock();
-            let result = seccomp_run_filters(&data, &filter_guard);
-            drop(filter_guard);
+/// 执行 Filter 模式的过滤决策
+fn filter_decision(
+    pcb: Arc<ProcessControlBlock>,
+    syscall_num: usize,
+    args: &[usize; 6],
+    frame: &mut TrapFrame,
+    recheck_after_trace: bool,
+) -> Result<SeccompDecision, SystemError> {
+    let data = SeccompData {
+        nr: syscall_num as i32,
+        arch: seccomp_arch(),
+        instruction_pointer: instruction_pointer(frame),
+        args: [
+            args[0] as u64,
+            args[1] as u64,
+            args[2] as u64,
+            args[3] as u64,
+            args[4] as u64,
+            args[5] as u64,
+        ],
+    };
 
-            let action = result & SECCOMP_RET_ACTION_FULL;
-            let data_val = result & SECCOMP_RET_DATA;
+    let filter_guard = pcb.seccomp_filter.lock();
+    let result = seccomp_run_filters(&data, &filter_guard);
+    drop(filter_guard);
 
-            match action {
-                SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
-                    kill_current(action);
-                }
-                SECCOMP_RET_TRAP => {
-                    rollback_syscall(frame, syscall_num);
-                    send_seccomp_sigsys(&data, data_val);
-                    Ok(SeccompDecision::Skip(frame_syscall_return(frame)))
-                }
-                SECCOMP_RET_ERRNO => {
-                    let errno = data_val.min(MAX_ERRNO);
-                    Ok(SeccompDecision::Skip((-(errno as i32)) as usize))
-                }
-                SECCOMP_RET_TRACE => Ok(SeccompDecision::Skip(
-                    SystemError::ENOSYS.to_posix_errno() as usize,
-                )),
-                SECCOMP_RET_LOG => {
-                    log::info!(
-                        "seccomp: pid={:?} syscall={} action=LOG",
-                        pcb.raw_pid(),
-                        syscall_num
-                    );
-                    Ok(SeccompDecision::Allow)
-                }
-                SECCOMP_RET_ALLOW => Ok(SeccompDecision::Allow),
+    let action = result & SECCOMP_RET_ACTION_FULL;
+    let data_val = result & SECCOMP_RET_DATA;
 
-                _ => {
-                    // 未知动作，默认 KILL
-                    kill_current(SECCOMP_RET_KILL_PROCESS);
-                }
+    match action {
+        SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
+            kill_current(action);
+        }
+        SECCOMP_RET_TRAP => {
+            rollback_syscall(frame, syscall_num);
+            send_seccomp_sigsys(&data, data_val);
+            Ok(SeccompDecision::Skip(frame_syscall_return(frame)))
+        }
+        SECCOMP_RET_ERRNO => {
+            let errno = data_val.min(MAX_ERRNO);
+            Ok(SeccompDecision::Skip((-(errno as i32)) as usize))
+        }
+        SECCOMP_RET_TRACE => {
+            // 重入保护：recheck_after_trace 时再次命中 TRACE 直接放行
+            if recheck_after_trace {
+                return Ok(SeccompDecision::Allow);
             }
+            // 无 tracer 或 TRACESECCOMP 未开启时，跳过系统调用并返回 -ENOSYS
+            if !pcb.ptrace_event_enabled(crate::process::ptrace::PtraceEvent::Seccomp) {
+                rollback_syscall(frame, syscall_num);
+                return Ok(SeccompDecision::Skip(
+                    SystemError::ENOSYS.to_posix_errno() as usize
+                ));
+            }
+            pcb.ptrace_event(
+                crate::process::ptrace::PtraceEvent::Seccomp,
+                data_val as usize,
+            );
+            // ptrace_event 返回后若有致命信号挂起，强制跳过 syscall 以免产生副作用。
+            if Signal::fatal_signal_pending(&pcb) {
+                rollback_syscall(frame, syscall_num);
+                return Ok(SeccompDecision::Skip(frame_syscall_return(frame)));
+            }
+            // ptrace_event 返回后，tracer 可能已通过 POKEUSER/SETREGS 修改 TrapFrame。
+            let nr_after = frame.get_orig_syscall_nr();
+            if nr_after < 0 {
+                // 负 syscall 号 = tracer 请求跳过。返回值取 tracer 写入返回寄存器的值
+                return Ok(SeccompDecision::Skip(frame_syscall_return(frame)));
+            }
+            // 重入时从 frame 重新装载全部参数
+            let args_after = frame_syscall_args(frame);
+            filter_decision(pcb, nr_after as usize, &args_after, frame, true)
+        }
+        SECCOMP_RET_LOG => {
+            log::info!(
+                "seccomp: pid={:?} syscall={} action=LOG",
+                pcb.raw_pid(),
+                syscall_num
+            );
+            Ok(SeccompDecision::Allow)
+        }
+        SECCOMP_RET_ALLOW => Ok(SeccompDecision::Allow),
+
+        _ => {
+            // 未知动作，默认 KILL
+            kill_current(SECCOMP_RET_KILL_PROCESS);
         }
     }
 }
@@ -546,6 +583,29 @@ fn frame_syscall_return(frame: &TrapFrame) -> usize {
     frame.a0
 }
 
+/// 从 trap frame 读取 6 个系统调用参数。
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn frame_syscall_args(frame: &TrapFrame) -> [usize; 6] {
+    [
+        frame.rdi as usize,
+        frame.rsi as usize,
+        frame.rdx as usize,
+        frame.r10 as usize,
+        frame.r8 as usize,
+        frame.r9 as usize,
+    ]
+}
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub(crate) fn frame_syscall_args(frame: &TrapFrame) -> [usize; 6] {
+    [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5]
+}
+#[cfg(target_arch = "loongarch64")]
+#[inline(always)]
+pub(crate) fn frame_syscall_args(frame: &TrapFrame) -> [usize; 6] {
+    [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5]
+}
 // ============ Seccomp 模式操作 ============
 
 /// 设置 strict 模式

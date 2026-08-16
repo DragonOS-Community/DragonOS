@@ -378,6 +378,8 @@ impl ProcessManager {
             }
         }
 
+        current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
+
         // 退出不再返回旧用户态上下文；先释放 ActiveXol 对 site/slot/consumer
         // 的强引用，再进入 mm teardown。该清理不需要也不应改 trapframe。
         #[cfg(target_arch = "x86_64")]

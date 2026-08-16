@@ -134,6 +134,9 @@ pub struct ProcessBasicInfo {
 
     /// File descriptor table.
     fd_table: Option<FdTableAttachment>,
+
+    /// 进程执行域标志（personality），GDB 经 SYS_personality 设置 ADDR_NO_RANDOMIZE 等位。
+    personality: u32,
 }
 
 /// A PCB slot's ownership of a files table.
@@ -205,6 +208,7 @@ impl ProcessBasicInfo {
             cwd,
             user_vm,
             fd_table: Some(FdTableAttachment::new(fd_table)),
+            personality: 0,
         });
     }
 
@@ -278,6 +282,16 @@ impl ProcessBasicInfo {
         self.fd_table = fd_table;
         old.map(FdTableAttachment::retire)
     }
+
+    pub fn personality(&self) -> u32 {
+        self.personality
+    }
+
+    pub fn set_personality(&mut self, new: u32) -> u32 {
+        let old = self.personality;
+        self.personality = new;
+        old
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +318,7 @@ mod fd_table_attachment_tests {
         drop(observer);
         drop(owner);
     }
+
 }
 
 #[derive(Debug)]

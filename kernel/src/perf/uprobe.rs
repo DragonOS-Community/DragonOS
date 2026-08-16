@@ -21,7 +21,11 @@ use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
-use crate::mm::ucontext::{noop_handler, uprobe_register, AddressSpace, LockedVMA, UprobeHandle};
+use crate::mm::ucontext::{
+    noop_handler, uprobe_new_consumer_id, uprobe_register, uprobe_registry_add,
+    uprobe_registry_remove_consumer, uprobe_registry_set_callback, AddressSpace, LockedVMA,
+    UprobeConsumerReg, UprobeHandle,
+};
 use crate::mm::MemoryManagementArch;
 use crate::perf::util::PerfProbeArgs;
 use crate::perf::{BasicPerfEbpfCallBack, PerfEventOps};
@@ -44,8 +48,18 @@ use uprobe::{CallBackFunc, ProbeArgs};
 pub struct UprobePerfEvent {
     _args: PerfProbeArgs,
     handles: Vec<UprobeHandle>,
+    /// 消费者 id（评审 R9）：全局注册表与迟到句柄的归属键。
+    consumer_id: u64,
 }
 
+impl Drop for UprobePerfEvent {
+    /// 消费者关闭（fd 释放）：从注册表移除（杜绝后续迟到安装）+ drop 迟到句柄
+    /// （fork/mmap 路径安装的，逐 mm 注销）。直接安装的 `handles` 随本结构
+    /// drop 自动注销（评审 R9）。
+    fn drop(&mut self) {
+        uprobe_registry_remove_consumer(self.consumer_id);
+    }
+}
 impl core::fmt::Debug for UprobePerfEvent {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UprobePerfEvent")
@@ -99,7 +113,8 @@ impl UprobePerfEvent {
             callback = Arc::new(UprobePerfCallBack(basic_callback));
         }
 
-        // 注入到每一个 per-mm 实例（多 handle 共享同一回调）。
+        // 注入到每一个 per-mm 实例（多 handle 共享同一回调），
+        // 并更新全局注册表（评审 R9：迟到安装的实例据此取得同一回调）。
         for handle in &self.handles {
             if let Some(instance) = handle.instance() {
                 instance
@@ -108,6 +123,7 @@ impl UprobePerfEvent {
                     .update_event_callback(callback.clone());
             }
         }
+        uprobe_registry_set_callback(self.consumer_id, callback.clone());
         Ok(())
     }
 }
@@ -231,7 +247,8 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         SystemError::EINVAL
     })?;
 
-    // pid 语义：>=0 单 mm；-1 全量。
+    // pid 语义（评审 R1）：>=0 单 mm（需 ptrace 访问检查）；==-1 全量（需特权）；
+    // 其他负值非法（EINVAL）。
     let target_mm: Option<Arc<AddressSpace>> = if args.pid >= 0 {
         let pid = if args.pid == 0 {
             // pid==0 = 当前进程（Linux perf 语义）
@@ -245,14 +262,38 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         crate::mm::syscall::sys_process_vm::check_process_vm_access(&pcb)?;
         let mm = pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
         Some(mm)
-    } else {
+    } else if args.pid == -1 {
+        // 系统级模式：向**所有**映射该文件的进程（含其他用户的）安装断点，
+        // 必须要求特权（CAP_SYS_PTRACE，与 ptrace 跨用户访问同级），否则拒绝。
+        if !crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_PTRACE) {
+            log::warn!("uprobe: system-wide (pid=-1) requires CAP_SYS_PTRACE, refusing");
+            return Err(SystemError::EPERM);
+        }
         None
+    } else {
+        // pid < -1：Linux perf 语义不存在（-1 之外无系统级变体），EINVAL。
+        return Err(SystemError::EINVAL);
     };
+
+    // 消费者身份 + 注册表登记（评审 R9：fork/后续 mmap 迟到安装的依据）。
+    let consumer_id = uprobe_new_consumer_id();
+    let inode_id = inode.metadata().map(|md| md.inode_id.data()).unwrap_or(0);
+    uprobe_registry_add(
+        inode_id,
+        offset,
+        consumer_id,
+        Arc::new(UprobeConsumerReg {
+            pre_handler: noop_handler,
+            post_handler: noop_handler,
+            event_callback: crate::libs::rwlock::RwLock::new(None),
+        }),
+    );
 
     // inode rmap：所有映射该 inode 的 VMA（跨所有进程）。
     let vmas = page_cache.collect_file_vmas();
     if vmas.is_empty() {
         log::warn!("uprobe: no VMAs currently map {path}");
+        uprobe_registry_remove_consumer(consumer_id);
         return Err(SystemError::EINVAL);
     }
 
@@ -263,7 +304,7 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         };
         // 注册到该 mm。非可执行映射（如只读数据段）返回 EACCES，跳过；
         // 其余错误向上传播。
-        match uprobe_register(&mm, probe_vaddr, noop_handler, noop_handler) {
+        match uprobe_register(&mm, probe_vaddr, noop_handler, noop_handler, consumer_id) {
             Ok(handle) => handles.push(handle),
             Err(SystemError::EACCES) => {
                 log::debug!(
@@ -272,7 +313,10 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
                 );
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                uprobe_registry_remove_consumer(consumer_id);
+                return Err(e);
+            }
         }
     }
 
@@ -281,20 +325,27 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
             "uprobe: no executable mapping of {path} at offset {:#x} covers the probe",
             offset
         );
+        uprobe_registry_remove_consumer(consumer_id);
         return Err(SystemError::EINVAL);
+    }
+
+    // 评审 R11a：尊重 perf_event_attr.disabled——初始即为禁用状态，
+    // 待 PERF_EVENT_IOC_ENABLE 后才开始触发回调。
+    if args.disabled {
+        for handle in &handles {
+            if let Some(instance) = handle.instance() {
+                instance.write().basic.disable();
+            }
+        }
     }
 
     Ok(UprobePerfEvent {
         _args: args,
         handles,
+        consumer_id,
     })
 }
-
 /// 对单个 VMA：判定 pid 过滤 + 文件偏移覆盖，命中则返回 (mm, probe_vaddr)。
-///
-/// - pid 过滤：`target_mm` 为 `Some` 时仅接受属于该 mm 的 VMA（`Arc::ptr_eq`）。
-/// - 偏移覆盖：VMA 映射文件字节区间 `[backing_pgoff*PAGE_SIZE, +vma_size)`，
-///   `offset` 落在其中才接受；`probe_vaddr = vma_start + (offset - file_start_byte)`。
 fn resolve_target(
     vma: &Arc<LockedVMA>,
     offset: usize,

@@ -90,6 +90,16 @@ impl UprobeBasic {
         self.enable
     }
 
+    /// （pre/post）处理器函数指针（供 fork 继承读取）。
+    pub fn handlers(&self) -> (crate::arch::HandlerFn, crate::arch::HandlerFn) {
+        (self.pre_handler.func(), self.post_handler.func())
+    }
+
+    /// 事件回调克隆（供 fork 继承读取）。
+    pub fn event_callback_arc(&self) -> Option<Arc<dyn CallBackFunc>> {
+        self.event_callback.clone()
+    }
+
     /// 被探测的用户态虚拟地址。
     pub fn probe_vaddr(&self) -> usize {
         self.probe_vaddr

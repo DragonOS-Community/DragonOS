@@ -125,7 +125,10 @@ pub use stack::UserStack;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use uprobe::{
-    noop_handler, uprobe_register, uprobe_unregister, UprobeHandle, UprobeInstance, XolArea,
+    fork_inherit_uprobes, noop_handler, uprobe_apply_to_new_vma, uprobe_new_consumer_id,
+    uprobe_register, uprobe_registry_add, uprobe_registry_remove_consumer,
+    uprobe_registry_set_callback, uprobe_unregister, UprobeConsumerReg, UprobeHandle,
+    UprobeInstance, XolArea,
 };
 #[allow(unused_imports)]
 pub use vma::{

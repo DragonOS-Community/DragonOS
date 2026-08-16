@@ -29,6 +29,9 @@ pub enum UprobeInsnError {
     /// 控制流指令（call/jmp/ret/jcc/loop/int 等）——XOL 执行会跳出 slot，
     /// 后续 #DB 无法反推探针址，且可能损坏栈/控制流。注册时拒绝。
     UnsupportedControlFlow,
+    /// 指令抑制 #DB（MOV SS/POP SS）或整体改写 RFLAGS（POPF*）——
+    /// XOL 单步窗口会断裂。注册时拒绝。
+    UnsafeForXol,
 }
 
 /// RIP-relative 重定位信息（静态分析得出，运行时用真实 slot 地址套用）。
@@ -75,11 +78,18 @@ pub fn analyze_insn(bytes: &[u8]) -> Result<InsnAnalysis, UprobeInsnError> {
     if bytes.len() < insn_len {
         return Err(UprobeInsnError::Truncated);
     }
-    // 控制流指令从 XOL slot 执行会跳出 slot，后续 #DB 无法反推探针址，
-    // 且 call/ret 会损坏用户栈。注册时拒绝（与 Linux uprobe 一致：
-    // boost/add_on_return 机制不属于阶段一范围）。
+    // 控制流/不安全指令从 XOL slot 执行会破坏单步窗口，注册时拒绝：
+    // - 控制流（跳转/调用/返回/循环/中断/系统调用）：跳出 slot，#DB 无法
+    //   在 slot 内捕获，call/ret 还会损坏用户栈（与 Linux uprobe 阶段一致：
+    //   boost/add_on_return 不在本范围）。
+    // - MOV SS / POP SS：Intel SDM 规定其后的指令边界抑制 #DB——XOL 单步
+    //   完成的 #DB 会丢失（评审 R10）。
+    // - POPF：整体覆写 RFLAGS，清掉 uprobe 置的 TF，单步窗口断裂（评审 R10）。
     if is_control_flow(&inst) {
         return Err(UprobeInsnError::UnsupportedControlFlow);
+    }
+    if suppresses_debug_or_rewrites_flags(&inst) {
+        return Err(UprobeInsnError::UnsafeForXol);
     }
 
     let rip_relative = find_rip_relative(&inst, insn_len)?;
@@ -113,6 +123,22 @@ fn is_control_flow(inst: &Instruction) -> bool {
             | Opcode::SYSCALL
             | Opcode::SYSRET
     ) || inst.opcode().is_jcc()
+}
+
+fn suppresses_debug_or_rewrites_flags(inst: &Instruction) -> bool {
+    use yaxpeax_x86::amd64::{Opcode, RegSpec};
+    if matches!(inst.opcode(), Opcode::POPF) {
+        return true;
+    }
+    // `MOV SS, r/m16`（8e /r）：装载 SS 后到下一条指令边界之间 #DB 被抑制。
+    // yaxpeax 将其解码为 `Opcode::MOV` + 目标操作数为 ss 段寄存器。
+    // （`POP SS` 0x17 在 64 位模式为非法编码，解码器直接报错，无需处理。）
+    if inst.opcode() == Opcode::MOV {
+        if let Operand::Register { reg } = inst.operand(0) {
+            return reg == RegSpec::ss();
+        }
+    }
+    false
 }
 
 /// 在已解码指令中查找 RIP-relative 内存操作数，返回重定位信息。
@@ -276,6 +302,40 @@ mod tests {
         assert_eq!(r.disp, 0x10);
     }
 
+    #[test]
+    fn control_flow_rejected() {
+        // call rel32 (e8), jmp rel8 (eb), ret (c3), je rel8 (74), syscall (0f 05)
+        for bytes in [
+            &[0xe8, 0x00, 0x00, 0x00, 0x00][..],
+            &[0xeb, 0xfe][..],
+            &[0xc3][..],
+            &[0x74, 0x02][..],
+            &[0x0f, 0x05][..],
+        ] {
+            assert_eq!(
+                analyze_insn(bytes).unwrap_err(),
+                UprobeInsnError::UnsupportedControlFlow,
+                "bytes={bytes:x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_suppressing_rejected() {
+        // popfq (9d)；mov ss, rax (8e d0)
+        assert_eq!(
+            analyze_insn(&[0x9d]).unwrap_err(),
+            UprobeInsnError::UnsafeForXol
+        );
+        assert_eq!(
+            analyze_insn(&[0x8e, 0xd0]).unwrap_err(),
+            UprobeInsnError::UnsafeForXol
+        );
+        // 对照：mov ds, eax（8e d8，段编码 3=DS 非 SS）不抑制 #DB，可接受
+        assert!(analyze_insn(&[0x8e, 0xd8]).is_ok());
+        // 对照：普通 mov（非 SS 目标）可接受
+        assert!(analyze_insn(&[0x48, 0x89, 0xe5]).is_ok());
+    }
     #[test]
     fn build_slot_relocates_disp() {
         // lea rax, [rip+0]  ->  48 8d 05 00 00 00 00

@@ -16,10 +16,14 @@
 //!   0xcc 发布前任何路径查该 vaddr 必须能找到就绪 uprobe 表项。
 #![allow(dead_code)] // 公开 API 供 batch3/batch4 调用，当前批次尚未引用
 
+use crate::libs::spinlock::SpinLock;
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     sync::{Arc, Weak},
+    vec::Vec,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use system_error::SystemError;
 
@@ -27,7 +31,7 @@ use crate::{
     arch::{mm::PageMapper, MMArch},
     libs::rwlock::RwLock,
     mm::{
-        page::{page_manager_lock, EntryFlags as PageEntryFlags, Page, PageEntry},
+        page::{page_manager_lock, Page, PageEntry},
         syscall::{MapFlags, ProtFlags},
         MemoryManagementArch, PhysAddr, VirtAddr, VmFlags,
     },
@@ -141,6 +145,9 @@ pub struct UprobeInstance {
     pub basic: UprobeBasic,
     /// x86 指令静态分析（命中时供 `build_xol_slot` 用）。
     pub insn_analysis: InsnAnalysis,
+    /// 拥有此实例的消费者（perf event fd）id（评审 R9）。
+    /// fork 继承的子实例沿用父实例的 id，使消费者 close 时一并注销。
+    pub consumer_id: u64,
 }
 
 impl core::fmt::Debug for UprobeInstance {
@@ -151,29 +158,14 @@ impl core::fmt::Debug for UprobeInstance {
             .finish()
     }
 }
-
-// ──────────────────── per-page 断点页追踪 ────────────────────
-
-/// 某个页上已安装断点的状态（用于注销时恢复原页）。
+/// 某个页上已安装断点的状态标记。
 ///
 /// 以页基地址（`probe_vaddr & !(PAGE_SIZE-1)`）为键。多个 uprobe 命中同一页时共享
-/// 一个 COW 副本，`refcount` 记录活跃断点数；降到 0 时恢复原页。
+/// 一个 COW 副本，`refcount` 记录活跃断点数。注销在**当前映射页**上恢复字节、
+/// 不换页（评审 R8），故此处仅保留计数标记（供安装路径判定「页已私有化」）。
 pub(crate) struct UprobePageState {
-    /// 原始物理页（COW 之前的共享/文件页）。
-    original_page: Arc<Page>,
-    /// COW 副本（已 patch 0xcc）。
-    cow_page: Arc<Page>,
-    /// 原始 PTE flags（恢复时用）。
-    original_flags: PageEntryFlags<MMArch>,
     /// 活跃断点数。
     refcount: usize,
-}
-
-impl UprobePageState {
-    /// 原始物理页地址（供 try_clone 替换子进程的断点页）。
-    pub(crate) fn original_paddr(&self) -> PhysAddr {
-        self.original_page.phys_address()
-    }
 }
 
 impl core::fmt::Debug for UprobePageState {
@@ -243,14 +235,12 @@ impl Drop for UprobeHandle {
 /// `Ok(UprobeHandle)` 或错误码（`EINVAL`=地址非法/指令不支持，`EFAULT`=页未映射，
 /// `ENOMEM`=内存不足/XOL 区满，`EACCES`=VMA 不可执行）。
 ///
-/// ## pid 语义
-/// 本函数操作**单个** mm。`pid == -1`（经 inode rmap 全量 mm）留待 batch4 协调；
-/// 届时 batch4 遍历目标 inode 的所有 VMA，对每个 mm 调用本函数。
 pub fn uprobe_register(
     mm: &Arc<AddressSpace>,
     probe_vaddr: usize,
     pre_handler: fn(&dyn ProbeArgs),
     post_handler: fn(&dyn ProbeArgs),
+    consumer_id: u64,
 ) -> Result<UprobeHandle, SystemError> {
     // ── 持有 inner.write() 整个注册过程 ──
     let mut inner = mm.write();
@@ -298,10 +288,11 @@ pub fn uprobe_register(
             );
             SystemError::EINVAL
         })?;
+        // 评审 R6：read_user_insn_bytes 已跨页补全真实字节（非零填充），
+        // 这里必须拷贝**整条**指令（insn_len ≤ 15 < 16），而不是仅本页剩余
+        // 字节——否则 XOL 副本尾部是零，执行为另一条指令。
         let mut old_instruction = [0u8; UPROBE_INSN_COPY_SIZE];
-        let avail = MMArch::PAGE_SIZE - page_offset;
-        let copy_len = avail.min(analysis.insn_len);
-        old_instruction[..copy_len].copy_from_slice(&insn_bytes[..copy_len]);
+        old_instruction[..analysis.insn_len].copy_from_slice(&insn_bytes[..analysis.insn_len]);
         (old_instruction, analysis)
     };
 
@@ -361,6 +352,7 @@ pub fn uprobe_register(
     let entry = Arc::new(RwLock::new(UprobeInstance {
         basic,
         insn_analysis: analysis,
+        consumer_id,
     }));
 
     // ── Step 4: 插入 uprobe_list（表项在 0xcc 发布前就绪 — F6）──
@@ -537,14 +529,21 @@ fn install_breakpoint_page(
     let end = VirtAddr::new(page_base_addr + MMArch::PAGE_SIZE);
 
     // ── 检查页是否已有断点（同页多 uprobe）──
-    let existing_cow = {
+    let already_cowed = {
         let pb = mm.uprobe_page_state.lock_irqsave();
-        pb.get(&page_base_addr).map(|s| s.cow_page.clone())
+        pb.contains_key(&page_base_addr)
     };
 
-    if let Some(cow_page) = existing_cow {
-        // 页已有 COW 副本：只需在副本中 patch 额外 0xcc 字节
-        patch_byte_in_phys(&cow_page, page_offset, 0xcc)?;
+    if already_cowed {
+        // 页已私有化：在**当前映射页** patch 额外 0xcc 字节（translate 取实时
+        // paddr——写缺页二次 COW 后仍是正确页），refcount++。
+        let _pt_edit = mm.page_table_edit();
+        let mapper = &mut inner.user_mapper.utable;
+        let (paddr, _) = mapper.translate(address).ok_or(SystemError::EFAULT)?;
+        let kva = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
+        unsafe {
+            core::ptr::write_volatile((kva.data() + page_offset) as *mut u8, 0xcc);
+        }
         let mut pb = mm.uprobe_page_state.lock_irqsave();
         if let Some(state) = pb.get_mut(&page_base_addr) {
             state.refcount += 1;
@@ -596,17 +595,9 @@ fn install_breakpoint_page(
     }
     InnerAddressSpace::remove_page_unevictable_if_unneeded(&old_page);
 
-    // 记录页状态（供注销恢复）
+    // 记录页状态（页已私有化的标记）
     let mut pb = mm.uprobe_page_state.lock_irqsave();
-    pb.insert(
-        page_base_addr,
-        UprobePageState {
-            original_page: old_page,
-            cow_page: new_page,
-            original_flags: entry_flags,
-            refcount: 1,
-        },
-    );
+    pb.insert(page_base_addr, UprobePageState { refcount: 1 });
 
     Ok(())
 }
@@ -620,25 +611,31 @@ fn patch_byte_in_phys(page: &Arc<Page>, offset: usize, byte: u8) -> Result<(), S
     Ok(())
 }
 
-/// 注销内部实现（反序：移除表项 → 恢复页 → 回收 slot）。
+/// 注销内部实现（评审 R7/R8 重做）。
+///
+/// 顺序：移除表项 → **仅当该地址无剩余实例时**恢复断点字节 → 回收 slot →
+/// 页级状态清理。
 fn uprobe_unregister_internal(
     mm: &Arc<AddressSpace>,
     probe_vaddr: usize,
     entry: &Arc<RwLock<UprobeInstance>>,
 ) {
-    // ── 1. 从 uprobe_list 移除（断点不再命中）──
-    let removed = {
+    // ── 1. 从 uprobe_list 移除本实例（评审 R7：同址其他 consumer 的
+    //    共享断点必须保留，仅当该地址变空才恢复字节）──
+    let (removed, addr_now_empty) = {
         let mut list = mm.uprobe_list.lock_irqsave();
         let mut removed = false;
+        let mut now_empty = false;
         if let Some(entries) = list.get_mut(&probe_vaddr) {
             let before = entries.len();
             entries.retain(|x| !Arc::ptr_eq(x, entry));
             removed = entries.len() < before;
             if entries.is_empty() {
                 list.remove(&probe_vaddr);
+                now_empty = true;
             }
         }
-        removed
+        (removed, now_empty)
     };
     if !removed {
         return;
@@ -656,113 +653,414 @@ fn uprobe_unregister_internal(
         (first_byte, offset)
     };
 
-    // ── 2. 恢复断点页 ──
     let page_base_addr = probe_vaddr & !(MMArch::PAGE_SIZE - 1);
     let page_offset = probe_vaddr & (MMArch::PAGE_SIZE - 1);
 
-    {
+    // ── 2. 恢复断点字节（评审 R7/R8）──
+    // R7：仅当该地址的最后一个实例被注销（addr_now_empty）才清除 0xcc，
+    //    剩余 consumer 的探针继续命中。
+    // R8：在**当前映射页**上恢复原字节，不把注册时的旧页映射回来——
+    //    程序在探针活跃期间对该页其他字节的写入全部保留（私有映射语义）。
+    if addr_now_empty {
         let mut inner = mm.write();
-        restore_breakpoint_page(mm, &mut inner, page_base_addr, page_offset, orig_first_byte);
+        restore_breakpoint_byte(mm, &mut inner, page_base_addr, page_offset, orig_first_byte);
     }
 
-    // ── 3. 回收 XOL slot ──
+    // ── 3. 回收本实例的 XOL slot ──
     if let Some(offset) = xol_slot_offset {
         free_xol_slot(mm, offset);
     }
+
+    // ── 4. 页级状态：refcount--；归零则移除标记（页保持当前映射，
+    //    不回写、不换页）──
+    let mut pb = mm.uprobe_page_state.lock_irqsave();
+    if let Some(state) = pb.get_mut(&page_base_addr) {
+        state.refcount = state.refcount.saturating_sub(1);
+        if state.refcount == 0 {
+            pb.remove(&page_base_addr);
+        }
+    }
 }
 
-/// 恢复断点页（注销时调用）。
+/// 在**当前映射页**上恢复断点原字节（评审 R8）。
 ///
-/// 1. 在 COW 副本中恢复该偏移处的原指令首字节（清除 0xcc）。
-/// 2. refcount--；若降到 0，恢复原始物理页（set_entry + rmap + flush_tlb）。
-fn restore_breakpoint_page(
+/// 经 `translate` 取当前 paddr（可能是断点安装时的 COW 副本，也可能是程序
+/// 写缺页二次 COW 后的页），直接写回原首字节。不交换页映射——页上其他字节
+/// 的任何程序写入都保留。无 PTE 变更 → 无需 TLB flush（TLB 缓存翻译而非
+/// 内容；跨修改代码的串行化由 #BP 中断返回后的取指重取保证）。
+fn restore_breakpoint_byte(
     mm: &Arc<AddressSpace>,
     inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
     page_base_addr: usize,
     page_offset: usize,
     orig_first_byte: u8,
 ) {
-    // 决定是否需要恢复整页
-    let restore_info = {
-        let mut pb = mm.uprobe_page_state.lock_irqsave();
-        let Some(state) = pb.get_mut(&page_base_addr) else {
-            return; // 页无断点状态——可能已被 munmap 清理
-        };
-
-        // 先在 COW 副本中恢复该字节（清除 0xcc，不影响同页其他 uprobe）
-        if let Some(kva) = unsafe { MMArch::phys_2_virt(state.cow_page.phys_address()) } {
+    let _pt_edit = mm.page_table_edit();
+    let mapper = &mut inner.user_mapper.utable;
+    if let Some((paddr, _)) = mapper.translate(VirtAddr::new(page_base_addr)) {
+        if let Some(kva) = unsafe { MMArch::phys_2_virt(paddr) } {
             unsafe {
                 core::ptr::write_volatile((kva.data() + page_offset) as *mut u8, orig_first_byte);
             }
         }
-
-        state.refcount = state.refcount.saturating_sub(1);
-        if state.refcount > 0 {
-            return; // 仍有其他 uprobe 在此页
-        }
-
-        // refcount == 0：取出状态，恢复整页
-        pb.remove(&page_base_addr).unwrap()
-    };
-
-    // 恢复原始物理页
-    let address = VirtAddr::new(page_base_addr);
-    let end = VirtAddr::new(page_base_addr + MMArch::PAGE_SIZE);
-
-    // 检查 PTE 是否仍存在（可能已被 munmap）
-    let _pt_edit = mm.page_table_edit();
-    let mapper = &mut inner.user_mapper.utable;
-
-    let table = match mapper.get_table(address, 0) {
-        Some(t) => t,
-        None => return, // 页表已被拆除（munmap），无需恢复 PTE
-    };
-    let i = match table.index_of(address) {
-        Some(i) => i,
-        None => return,
-    };
-
-    // 确认当前 PTE 指向 COW 副本（否则可能已被其他操作替换）
-    let current_entry = unsafe { table.entry(i) };
-    if let Some(entry) = current_entry {
-        if entry.address() != Ok(restore_info.cow_page.phys_address()) {
-            // PTE 已不指向 COW 副本——可能是 write fault 已做了二次 COW。
-            // 不恢复，仅清理 page_state（已 remove）。COW 副本 Arc drop 后回收。
-            return;
-        }
     }
-
-    // 单次 set_entry 恢复原页
-    unsafe {
-        table.set_entry(
-            i,
-            PageEntry::new(
-                restore_info.original_page.phys_address(),
-                restore_info.original_flags,
-            ),
-        );
-    }
-
-    mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
-
-    // rmap：尝试 attach 原页、detach COW 副本（需要 VMA）
-    let vma = inner.mappings.contains(address);
-    if let Some(vma) = vma {
-        let vm_locked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
-        restore_info
-            .original_page
-            .write()
-            .insert_vma(vma.clone(), vm_locked);
-        {
-            let mut cow_guard = restore_info.cow_page.write();
-            cow_guard.remove_vma(vma.as_ref());
-        }
-        InnerAddressSpace::remove_page_unevictable_if_unneeded(&restore_info.cow_page);
-    }
-    // 若 VMA 不存在（已 munmap），原页 rmap 不变，COW 副本 Arc drop 后回收。
+    // 页已被 munmap（translate 失败）：无需恢复。
 }
 
 // ──────────────────────── 辅助：空操作 handler ────────────────────────
 
 /// 空操作 handler（供 batch4 在仅需 event_callback 时占位）。
 pub fn noop_handler(_args: &dyn ProbeArgs) {}
+
+// ──────────────── 全局注册表与迟到应用（评审 R9） ────────────────
+//
+// 注册的探针身份 = 文件 inode + 偏移（而非 open 时的映射快照）。新映射
+// （dlopen/mmap）、fork 产生新地址空间时，据此把已注册的探针**迟到安装**
+// 到新的 mm；exec 换新 AddressSpace，实例表自然为空（探针不跨 exec）。
+//
+// 消费者（perf event fd）close 时：
+// 1. 从注册表移除该消费者（杜绝后续迟到安装）；
+// 2. drop 其「迟到句柄」（fork/mmap 路径安装的），复用 `UprobeHandle::Drop`
+//    的逐 mm 注销（含评审 R7 的地址级字节恢复）。
+// 直接安装（open 时）的句柄仍由 `UprobePerfEvent::handles` 持有，drop 同理。
+
+pub struct UprobeConsumerReg {
+    pub pre_handler: fn(&dyn ProbeArgs),
+    pub post_handler: fn(&dyn ProbeArgs),
+    /// BPF 事件回调（可后期经 PERF_EVENT_IOC_SET_BPF 注入，故 RwLock）。
+    pub event_callback: RwLock<Option<Arc<dyn uprobe::CallBackFunc>>>,
+}
+
+/// 全局注册表：inode id → 文件偏移 → （消费者 id，回调）。
+/// 注册表值类型：某（inode, offset）上的消费者列表。
+type ConsumerList = Vec<(u64, Arc<UprobeConsumerReg>)>;
+/// 注册表类型：inode id → （文件偏移 → 消费者列表）。
+type RegistryMap = BTreeMap<usize, BTreeMap<usize, ConsumerList>>;
+
+static UPROBE_REGISTRY: SpinLock<RegistryMap> = SpinLock::new(BTreeMap::new());
+
+/// 迟到安装（fork/mmap）产生的句柄，按消费者 id 归档。
+/// 消费者 close 时 drop → 逐 mm 注销。
+static CONSUMER_LATE_HANDLES: SpinLock<BTreeMap<u64, Vec<UprobeHandle>>> =
+    SpinLock::new(BTreeMap::new());
+
+static NEXT_CONSUMER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 分配新的消费者 id（每次 perf_event_open(uprobe) 一次）。
+pub fn uprobe_new_consumer_id() -> u64 {
+    NEXT_CONSUMER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 注册一个消费者探测点（inode + offset）。
+pub fn uprobe_registry_add(
+    inode_id: usize,
+    offset: usize,
+    consumer_id: u64,
+    reg: Arc<UprobeConsumerReg>,
+) {
+    let mut r = UPROBE_REGISTRY.lock_irqsave();
+    r.entry(inode_id)
+        .or_default()
+        .entry(offset)
+        .or_default()
+        .push((consumer_id, reg));
+}
+
+/// 更新某消费者的 BPF 事件回调（PERF_EVENT_IOC_SET_BPF 时调用）。
+/// 迟到安装的实例据此取得与直接安装一致的回调。
+pub fn uprobe_registry_set_callback(consumer_id: u64, cb: Arc<dyn uprobe::CallBackFunc>) {
+    let r = UPROBE_REGISTRY.lock_irqsave();
+    for (_, offsets) in r.iter() {
+        for (_, consumers) in offsets.iter() {
+            for (id, reg) in consumers.iter() {
+                if *id == consumer_id {
+                    *reg.event_callback.write() = Some(cb.clone());
+                }
+            }
+        }
+    }
+}
+/// 消费者关闭：移除注册表项 + drop 迟到句柄（逐 mm 注销）。
+pub fn uprobe_registry_remove_consumer(consumer_id: u64) {
+    {
+        let mut r = UPROBE_REGISTRY.lock_irqsave();
+        for (_, offsets) in r.iter_mut() {
+            for (_, consumers) in offsets.iter_mut() {
+                consumers.retain(|(id, _)| *id != consumer_id);
+            }
+        }
+    }
+    // 取出迟到句柄（锁内只做 remove，drop 在锁外——Drop 路径会取 mm.write()）。
+    let late = { CONSUMER_LATE_HANDLES.lock_irqsave().remove(&consumer_id) };
+    drop(late);
+}
+
+/// 对新映射的文件 VMA 迟到应用注册表中的探针（评审 R9：dlopen / 后续 mmap）。
+///
+/// 在 mmap 提交且地址空间写锁释放后调用（本函数内部自取 `mm.write()`）。
+/// `region_start/size` 为 VMA 的用户地址区间；`file_start_byte` 为 VMA 起始
+/// 地址对应的文件偏移（= `backing_pgoff << PAGE_SHIFT`）。
+pub fn uprobe_apply_to_new_vma(
+    mm: &Arc<AddressSpace>,
+    file: &Arc<crate::filesystem::vfs::file::File>,
+    region_start: usize,
+    region_size: usize,
+    file_start_byte: usize,
+) {
+    let inode_id = match file.inode().metadata() {
+        Ok(md) => md.inode_id.data(),
+        Err(_) => return,
+    };
+    // 锁内快照：落在新 VMA 文件区间内的消费者列表
+    let matches: Vec<(usize, ConsumerList)> = {
+        let r = UPROBE_REGISTRY.lock_irqsave();
+        let Some(offsets) = r.get(&inode_id) else {
+            return;
+        };
+        offsets
+            .iter()
+            .filter(|(off, _)| **off >= file_start_byte && **off < file_start_byte + region_size)
+            .map(|(off, c)| (*off, c.clone()))
+            .collect()
+    };
+    if matches.is_empty() {
+        return;
+    }
+
+    for (offset, consumers) in matches {
+        let probe_vaddr = region_start + (offset - file_start_byte);
+        for (consumer_id, reg) in consumers {
+            // 该消费者在此 mm 的该地址是否已有实例（fork 继承可能已装）？
+            let already = {
+                let list = mm.uprobe_list.lock_irqsave();
+                list.get(&probe_vaddr)
+                    .is_some_and(|es| es.iter().any(|e| e.read().consumer_id == consumer_id))
+            };
+            if already {
+                continue;
+            }
+            let basic_pre = reg.pre_handler;
+            let basic_post = reg.post_handler;
+            match uprobe_register(mm, probe_vaddr, basic_pre, basic_post, consumer_id) {
+                Ok(handle) => {
+                    // 注入 event_callback + 对齐使能状态
+                    if let Some(inst) = handle.instance() {
+                        let mut g = inst.write();
+                        if let Some(cb) = reg.event_callback.read().clone() {
+                            g.basic.update_event_callback(cb);
+                        }
+                    }
+                    let mut late = CONSUMER_LATE_HANDLES.lock_irqsave();
+                    late.entry(consumer_id).or_default().push(handle);
+                }
+                Err(e) => {
+                    log::debug!(
+                        "uprobe late-apply {:x}+{:#x} in new vma failed: {:?}",
+                        inode_id,
+                        offset,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// fork 时把父 mm 的探针继承到子 mm（评审 R9）。
+///
+/// 在 clone 完成、父 mm 全部锁释放后调用；子 mm 尚无运行线程。
+/// 子页经 fork 已含父页的 0xcc（共享只读映射），此处将其私有化并重建
+/// per-mm 实例（slot/表项），沿用父实例的 consumer_id（消费者 close 一并注销）。
+pub fn fork_inherit_uprobes(parent_mm: &Arc<AddressSpace>, child_mm: &Arc<AddressSpace>) {
+    // 1. 快照父表
+    let snapshot: Vec<(usize, Vec<Arc<RwLock<UprobeInstance>>>)> = {
+        let list = parent_mm.uprobe_list.lock_irqsave();
+        list.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    if snapshot.is_empty() {
+        return;
+    }
+
+    let mut late_by_consumer: BTreeMap<u64, Vec<UprobeHandle>> = BTreeMap::new();
+    let mut child_inner = child_mm.write();
+
+    for (probe_vaddr, entries) in snapshot {
+        for entry in entries {
+            let inst = entry.read();
+            let (pre, post) = inst.basic.handlers();
+            let cb = inst.basic.event_callback_arc();
+            let enabled = inst.basic.is_enabled();
+            let Some(pp) = inst.basic.probe_point() else {
+                continue;
+            };
+            match uprobe_inherit_instance(
+                child_mm,
+                &mut child_inner,
+                probe_vaddr,
+                pp.old_instruction,
+                pp.insn_len,
+                inst.insn_analysis,
+                pre,
+                post,
+                cb,
+                enabled,
+                inst.consumer_id,
+            ) {
+                Ok(handle) => late_by_consumer
+                    .entry(inst.consumer_id)
+                    .or_default()
+                    .push(handle),
+                Err(e) => log::warn!(
+                    "uprobe fork-inherit {:#x} (consumer {}) failed: {:?}",
+                    probe_vaddr,
+                    inst.consumer_id,
+                    e
+                ),
+            }
+        }
+    }
+    drop(child_inner);
+
+    // 2. 句柄归档（消费者 close 时逐 mm 注销）
+    if !late_by_consumer.is_empty() {
+        let mut late = CONSUMER_LATE_HANDLES.lock_irqsave();
+        for (cid, handles) in late_by_consumer {
+            late.entry(cid).or_default().extend(handles);
+        }
+    }
+}
+
+/// 在子 mm 重建一个继承的 uprobe 实例（不重读指令——子页含 0xcc）。
+#[allow(clippy::too_many_arguments)]
+fn uprobe_inherit_instance(
+    mm: &Arc<AddressSpace>,
+    inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+    probe_vaddr: usize,
+    old_instruction: [u8; UPROBE_INSN_COPY_SIZE],
+    insn_len: usize,
+    insn_analysis: InsnAnalysis,
+    pre_handler: fn(&dyn ProbeArgs),
+    post_handler: fn(&dyn ProbeArgs),
+    event_callback: Option<Arc<dyn uprobe::CallBackFunc>>,
+    enabled: bool,
+    consumer_id: u64,
+) -> Result<UprobeHandle, SystemError> {
+    // ── slot 分配 + 预填（镜像 uprobe_register Step 2/P2）──
+    let xol_slot_offset = ensure_xol_and_alloc_slot(mm, inner)?;
+    {
+        let (slot_vaddr, page_paddr) = {
+            let guard = mm.xol_area.lock_irqsave();
+            let area = guard.as_ref().ok_or(SystemError::EFAULT)?;
+            (area.slot_vaddr(xol_slot_offset), area.page_paddr())
+        };
+        let mut slot_buf = [0u8; UPROBE_INSN_COPY_SIZE];
+        if let Err(e) = build_xol_slot(
+            &insn_analysis,
+            probe_vaddr,
+            slot_vaddr.data(),
+            &old_instruction,
+            &mut slot_buf,
+        ) {
+            log::warn!("uprobe fork-inherit: build_xol_slot failed: {:?}", e);
+            free_xol_slot(mm, xol_slot_offset);
+            return Err(SystemError::EINVAL);
+        }
+        let kva = unsafe { MMArch::phys_2_virt(page_paddr) }.ok_or_else(|| {
+            free_xol_slot(mm, xol_slot_offset);
+            SystemError::EFAULT
+        })?;
+        unsafe {
+            let dst = (kva.data() + xol_slot_offset) as *mut u8;
+            core::ptr::copy_nonoverlapping(slot_buf.as_ptr(), dst, UPROBE_INSN_COPY_SIZE);
+        }
+    }
+
+    // ── 实体 ──
+    let mut point = UprobePoint::new(probe_vaddr);
+    point.old_instruction = old_instruction;
+    point.insn_len = insn_len;
+    point.xol_slot_offset = xol_slot_offset;
+    let mut builder = UprobeBuilder::new(probe_vaddr, pre_handler, post_handler, enabled)
+        .with_probe_point(Arc::new(point));
+    if let Some(cb) = event_callback {
+        builder = builder.with_event_callback(cb);
+    }
+    let basic = builder.build();
+    let entry = Arc::new(RwLock::new(UprobeInstance {
+        basic,
+        insn_analysis,
+        consumer_id,
+    }));
+
+    // ── 表项（0xcc 已在页上——fork 继承，发布顺序无窗口）──
+    {
+        let mut list = mm.uprobe_list.lock_irqsave();
+        list.entry(probe_vaddr).or_default().push(entry.clone());
+    }
+
+    // ── 页私有化：子页当前与父共享（含 0xcc）；COW 为子私有副本，
+    //    使后续子 mm 的注销恢复字节不写入共享页 ──
+    privatize_inherited_page(mm, inner, probe_vaddr)?;
+
+    Ok(UprobeHandle {
+        mm: Arc::downgrade(mm),
+        probe_vaddr,
+        entry: Some(entry),
+    })
+}
+
+/// 把子 mm 中一个继承断点页私有化（copy → set_entry → rmap）。
+///
+/// 若该页已私有化（同页多探针），仅 refcount++。0xcc 字节随拷贝带入，
+/// 无需再 patch。
+fn privatize_inherited_page(
+    mm: &Arc<AddressSpace>,
+    inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+    probe_vaddr: usize,
+) -> Result<(), SystemError> {
+    let page_base_addr = probe_vaddr & !(MMArch::PAGE_SIZE - 1);
+    let address = VirtAddr::new(page_base_addr);
+    let end = VirtAddr::new(page_base_addr + MMArch::PAGE_SIZE);
+
+    {
+        let mut pb = mm.uprobe_page_state.lock_irqsave();
+        if let Some(state) = pb.get_mut(&page_base_addr) {
+            state.refcount += 1;
+            return Ok(());
+        }
+    }
+
+    let _pt_edit = mm.page_table_edit();
+    let mapper = &mut inner.user_mapper.utable;
+    let (old_paddr, entry_flags) = mapper.translate(address).ok_or(SystemError::EFAULT)?;
+    let old_page = {
+        let mut pm = page_manager_lock();
+        pm.get(&old_paddr).ok_or(SystemError::EFAULT)?
+    };
+    let new_page = {
+        let mut pm = page_manager_lock();
+        pm.copy_page_as_normal(&old_paddr, mapper.allocator_mut())
+            .map_err(|_| SystemError::ENOMEM)?
+    };
+    let table = mapper.get_table(address, 0).ok_or(SystemError::EFAULT)?;
+    let i = table.index_of(address).ok_or(SystemError::EFAULT)?;
+    unsafe {
+        table.set_entry(i, PageEntry::new(new_page.phys_address(), entry_flags));
+    }
+    mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+
+    // rmap 账簿
+    if let Some(vma) = inner.mappings.contains(address) {
+        let vm_locked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
+        new_page.write().insert_vma(vma.clone(), vm_locked);
+        {
+            let mut old_guard = old_page.write();
+            old_guard.remove_vma(vma.as_ref());
+        }
+        InnerAddressSpace::remove_page_unevictable_if_unneeded(&old_page);
+    }
+
+    let mut pb = mm.uprobe_page_state.lock_irqsave();
+    pb.insert(page_base_addr, UprobePageState { refcount: 1 });
+    Ok(())
+}

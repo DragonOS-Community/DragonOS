@@ -43,6 +43,8 @@ pub struct PerfProbeArgs {
     pub group_fd: i32,
     pub flags: PerfEventOpenFlags,
     pub sample_type: Option<perf_event_sample_format>,
+    /// `perf_event_attr.disabled`：事件初始是否禁用（评审 R11a）。
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +88,7 @@ impl PerfProbeArgs {
             group_fd,
             flags: PerfEventOpenFlags::from_bits_truncate(flags),
             sample_type: sample_ty,
+            disabled: attr.disabled() != 0,
         };
         Ok(args)
     }

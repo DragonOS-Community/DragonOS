@@ -117,13 +117,6 @@ impl InnerAddressSpace {
 
         let mut parent_cow_remaps: Vec<(VirtAddr, EntryFlags<MMArch>)> = Vec::new();
         let mut child_present_pages = 0usize;
-        // Collect uprobe breakpoint page → original-paddr mappings.
-        // Child must NOT inherit COW copies (which contain 0xcc); map original pages instead.
-        #[cfg(target_arch = "x86_64")]
-        let uprobe_bp_originals: BTreeMap<usize, PhysAddr> = {
-            let pb = parent_mm.uprobe_page_state.lock_irqsave();
-            pb.iter().map(|(&k, v)| (k, v.original_paddr())).collect()
-        };
 
         let clone_result: Result<(), SystemError> = (|| {
             // Iterate over each VMA of the parent process and perform appropriate copying based on VMA attributes
@@ -186,11 +179,6 @@ impl InnerAddressSpace {
 
                     while current_page < end_page {
                         if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
-                            // uprobe: 若此页有断点（COW 副本含 0xcc），子进程映射原页而非副本
-                            #[cfg(target_arch = "x86_64")]
-                            let phys_addr = uprobe_bp_originals
-                                .get(&current_page.data())
-                                .map_or(phys_addr, |&orig| orig);
                             unsafe {
                                 if is_shared {
                                     let child_flags =
@@ -268,6 +256,12 @@ impl InnerAddressSpace {
         // Complete the parent mm's mm-aware shootdown: INV-3 requires TLB completion before continuing with subsequent logic;
         // since no pages enter pending_pages here, this actually only triggers flush_tlb_mm_range.
         parent_tlb.finish();
+
+        // uprobe：把父 mm 的探针继承到子 mm（评审 R9——fork 后探针存活；
+        // 子页经上面的正常 fork 拷贝已含 0xcc，这里私有化并重建 per-mm 实例）。
+        #[cfg(target_arch = "x86_64")]
+        super::uprobe::fork_inherit_uprobes(&parent_mm, &new_addr_space);
+
         return Ok(new_addr_space);
     }
 

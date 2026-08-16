@@ -1083,6 +1083,17 @@ impl AddressSpace {
                     Some(expected_vma),
                 );
             }
+            // uprobe：新文件映射提交后，迟到应用注册表中的探针（评审 R9：
+            // dlopen / 后续 mmap 的文件获得已注册的 uprobe）。写锁已释放，
+            // 函数内部自取锁；注册表为空时为一次快速查表。
+            #[cfg(target_arch = "x86_64")]
+            super::uprobe::uprobe_apply_to_new_vma(
+                self,
+                &vma_file,
+                region.start().data(),
+                region.size(),
+                offset,
+            );
             return Ok(page);
         }
     }

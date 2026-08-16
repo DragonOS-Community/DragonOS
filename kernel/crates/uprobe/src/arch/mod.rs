@@ -65,6 +65,9 @@ impl UprobeOps for UprobePoint {
     }
 }
 
+/// 处理器函数指针类型。
+pub type HandlerFn = fn(&dyn ProbeArgs);
+
 /// 函数指针形式的（pre/post）处理器包装。
 pub(crate) struct ProbeHandler {
     func: fn(&dyn ProbeArgs),
@@ -77,6 +80,11 @@ impl ProbeHandler {
     /// 调用处理器。
     pub fn call(&self, trap_frame: &dyn ProbeArgs) {
         (self.func)(trap_frame);
+    }
+
+    /// 包装的函数指针（供 fork 继承等场景读取）。
+    pub fn func(&self) -> fn(&dyn ProbeArgs) {
+        self.func
     }
 }
 

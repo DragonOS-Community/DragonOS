@@ -139,8 +139,14 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
         ProcessManager::current_pid()
     );
     if regs.is_from_user() {
-        // 用户态 #DB：uprobe XOL 单步完成（NEED_UPROBE 判别）或 ptrace/硬件断点。
-        crate::exception::uprobe::uprobe_debug_handler(regs).unwrap();
+        // 用户态 #DB：uprobe XOL 单步完成优先（handler 返回是否消费，评审 R4）；
+        // 未消费的（ptrace 单步 / 硬件断点）回落到正常 debug 路径，
+        // 恢复本 PR 之前 master 的行为（DebugException::handle 对用户态同样适用）。
+        if crate::exception::uprobe::uprobe_debug_handler(regs).unwrap() {
+            // 已被 uprobe 消费（XOL 完成或 abort）。
+        } else {
+            DebugException::handle(regs).unwrap();
+        }
     } else {
         // 内核态 #DB：kprobe 单步完成。
         DebugException::handle(regs).unwrap();

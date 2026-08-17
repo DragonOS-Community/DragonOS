@@ -595,8 +595,12 @@ impl Ext4 {
             return Err(Ext4Error::new(ErrCode::ENOTSUP));
         }
 
+        // Shape validation, all ledger claims, and any local rollback share a
+        // single direct-metadata ownership window.  Re-entering the public
+        // reservation/release APIs here would race a transactional owner and
+        // could turn ordinary EAGAIN into a leaked partial capability set.
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let (inode_generation, expected_lblock, mut projection) = {
-            let _metadata_guard = self.lock_direct_metadata_mutation()?;
             let _mutation_guard =
                 self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
             let inode = self.read_inode(id)?;
@@ -621,31 +625,28 @@ impl Ext4 {
         };
         let new_nodes = projection.append_nonmerge_at(expected_lblock, 1)?;
 
-        let mut data_lease = self.reserve_delalloc_lease(1, 0)?;
+        let mut data_lease = self.reserve_delalloc_lease_in_direct_mutation_domain(1, 0)?;
         if let Err(error) = data_lease.bind_append_block_certificate(
             id,
             inode_generation,
             offset,
             expected_durable_eof_before,
         ) {
-            let _ = self.release_delalloc_lease_batch(&mut [&mut data_lease]);
-            return Err(error);
+            return match self
+                .rollback_projected_delalloc_leases_in_direct_domain(&mut [&mut data_lease])
+            {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error),
+            };
         }
         let mut new_metadata = Vec::new();
         for _ in 0..new_nodes {
-            match self.reserve_delalloc_lease(0, 1) {
+            match self.reserve_delalloc_lease_in_direct_mutation_domain(0, 1) {
                 Ok(lease) => new_metadata.push(lease),
                 Err(error) => {
                     let mut leases: Vec<&mut DelallocLease> = new_metadata.iter_mut().collect();
                     leases.push(&mut data_lease);
-                    if self.release_delalloc_lease_batch(&mut leases).is_err() {
-                        self.poison(ErrCode::EIO);
-                        for lease in &mut new_metadata {
-                            lease.deactivate();
-                        }
-                        data_lease.deactivate();
-                        return Err(Ext4Error::new(ErrCode::EIO));
-                    }
+                    self.rollback_projected_delalloc_leases_in_direct_domain(&mut leases)?;
                     return Err(error);
                 }
             }
@@ -661,6 +662,32 @@ impl Ext4 {
             pool_checkpoint: Some(checkpoint),
             journal_credits_bound: DELALLOC_APPEND_MAX_JOURNAL_CREDITS,
         })
+    }
+
+    /// Roll back capabilities created by projected admission while the caller
+    /// still owns the direct metadata domain.  A concurrent fail-stop is not
+    /// excluded by that domain; once observed, consume every local capability
+    /// through the terminal path rather than letting an active lease drop.
+    fn rollback_projected_delalloc_leases_in_direct_domain(
+        &self,
+        leases: &mut [&mut DelallocLease],
+    ) -> Result<()> {
+        if self
+            .release_delalloc_lease_batch_in_direct_mutation_domain(leases)
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        if !self.metadata_mutations_terminal() {
+            self.poison(ErrCode::EIO);
+        }
+        for lease in leases.iter_mut() {
+            if lease.active {
+                self.abandon_delalloc_lease_after_fail_stop(lease)?;
+            }
+        }
+        Err(Ext4Error::new(ErrCode::EIO))
     }
 
     #[cfg(any(test, feature = "test-api"))]
@@ -1681,6 +1708,14 @@ impl Ext4 {
         pool: &mut DelallocExtentNodePool,
     ) -> Result<()> {
         self.validate_delalloc_append_mapper_authority(authority)?;
+        self.cancel_projected_delalloc_append_block_inner(reservation, pool)
+    }
+
+    fn cancel_projected_delalloc_append_block_inner(
+        &self,
+        reservation: &mut DelallocAppendBlockReservation,
+        pool: &mut DelallocExtentNodePool,
+    ) -> Result<()> {
         let checkpoint = reservation
             .pool_checkpoint
             .as_ref()
@@ -1738,6 +1773,15 @@ impl Ext4 {
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
         pool.projection = checkpoint.before;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn test_cancel_projected_delalloc_append_block(
+        &self,
+        reservation: &mut DelallocAppendBlockReservation,
+        pool: &mut DelallocExtentNodePool,
+    ) -> Result<()> {
+        self.cancel_projected_delalloc_append_block_inner(reservation, pool)
     }
 
     pub fn release_delalloc_append_block_authorized(
@@ -4877,6 +4921,141 @@ mod tests {
         let allocation = fs.alloc_lock.lock();
         assert_eq!(allocation.reserved_data_blocks, 1);
         assert_eq!(allocation.delalloc_claims.len(), 1);
+    }
+
+    #[test]
+    fn empty_delalloc_release_is_a_noop_under_transactional_metadata_owner() {
+        let fs = make_test_fs(16);
+        let _transaction = fs
+            .lock_transactional_metadata_mutation()
+            .expect("fixture must acquire the transactional metadata owner");
+        let mut empty: [&mut DelallocLease; 0] = [];
+
+        fs.release_delalloc_lease_batch(&mut empty)
+            .expect("an empty release must not enter the metadata gate");
+    }
+
+    #[test]
+    fn nonempty_delalloc_release_preserves_capability_across_gate_contention() {
+        let fs = make_test_fs(16);
+        let mut lease = fs
+            .test_reserve_clean_delalloc_lease_with_hook(|| {})
+            .expect("fixture must reserve one delayed-allocation lease");
+        let transaction = fs
+            .lock_transactional_metadata_mutation()
+            .expect("fixture must acquire the transactional metadata owner");
+
+        assert_eq!(
+            fs.release_delalloc_lease_batch(&mut [&mut lease])
+                .expect_err("a real release must report gate contention")
+                .code(),
+            ErrCode::EAGAIN
+        );
+        assert!(lease.active, "EAGAIN must preserve exact lease ownership");
+
+        drop(transaction);
+        fs.release_delalloc_lease_batch(&mut [&mut lease])
+            .expect("the preserved lease must release after gate progress");
+        assert!(!lease.active);
+    }
+
+    #[test]
+    fn projected_cancel_preserves_checkpoint_across_gate_contention() {
+        let fs = make_test_fs(16);
+        let inode_id: InodeId = 2;
+        let before = super::super::extent::ExtentRightSpineProjection::test_empty(0);
+        let after = super::super::extent::ExtentRightSpineProjection::test_empty(1);
+        let mut data_lease = fs
+            .test_reserve_clean_delalloc_lease_counts(1, 0)
+            .expect("fixture must reserve the data lease");
+        data_lease
+            .bind_append_block_certificate(inode_id, 1, 0, 0)
+            .expect("fresh data lease must accept its append certificate");
+        let metadata_lease = fs
+            .test_reserve_clean_delalloc_lease_counts(0, 1)
+            .expect("fixture must reserve the projected metadata lease");
+        let mut reservation = DelallocAppendBlockReservation {
+            lease: data_lease,
+            pool_checkpoint: Some(DelallocPoolCheckpoint {
+                before: before.clone(),
+                after: after.clone(),
+                added_metadata_leases: 1,
+            }),
+            journal_credits_bound: DELALLOC_APPEND_MAX_JOURNAL_CREDITS,
+        };
+        let mut pool = DelallocExtentNodePool {
+            inode_id,
+            inode_generation: 1,
+            projection: after.clone(),
+            leases: vec![metadata_lease],
+        };
+        let transaction = fs
+            .lock_transactional_metadata_mutation()
+            .expect("fixture must acquire the transactional metadata owner");
+
+        assert_eq!(
+            fs.test_cancel_projected_delalloc_append_block(&mut reservation, &mut pool)
+                .expect_err("cancel must report gate contention")
+                .code(),
+            ErrCode::EAGAIN
+        );
+        assert!(reservation.lease.active);
+        assert_eq!(pool.projection, after);
+        assert_eq!(pool.leases.len(), 1);
+        assert!(pool.leases[0].active);
+
+        drop(transaction);
+        fs.test_cancel_projected_delalloc_append_block(&mut reservation, &mut pool)
+            .expect("the intact checkpoint must cancel after gate progress");
+        assert!(!reservation.lease.active);
+        assert!(reservation.pool_checkpoint.is_none());
+        assert_eq!(pool.projection, before);
+        assert!(pool.leases.is_empty());
+    }
+
+    #[test]
+    fn projected_local_rollback_consumes_all_leases_in_healthy_domain() {
+        let fs = make_test_fs(16);
+        let mut data = fs
+            .test_reserve_clean_delalloc_lease_counts(1, 0)
+            .expect("fixture must reserve data");
+        let mut metadata = fs
+            .test_reserve_clean_delalloc_lease_counts(0, 1)
+            .expect("fixture must reserve metadata");
+        let _direct = fs
+            .lock_direct_metadata_mutation()
+            .expect("fixture must enter the direct domain");
+
+        fs.rollback_projected_delalloc_leases_in_direct_domain(&mut [&mut data, &mut metadata])
+            .expect("healthy in-domain rollback must release the whole local set");
+        assert!(!data.active);
+        assert!(!metadata.active);
+    }
+
+    #[test]
+    fn projected_local_rollback_abandons_all_leases_after_concurrent_fail_stop() {
+        let fs = make_test_fs(16);
+        let mut data = fs
+            .test_reserve_clean_delalloc_lease_counts(1, 0)
+            .expect("fixture must reserve data");
+        let mut metadata = fs
+            .test_reserve_clean_delalloc_lease_counts(0, 1)
+            .expect("fixture must reserve metadata");
+        let _direct = fs
+            .lock_direct_metadata_mutation()
+            .expect("fixture must enter the direct domain");
+        fs.fail_stop_mutations();
+
+        assert_eq!(
+            fs.rollback_projected_delalloc_leases_in_direct_domain(
+                &mut [&mut data, &mut metadata,]
+            )
+            .expect_err("terminal rollback reports the fail-stop")
+            .code(),
+            ErrCode::EIO
+        );
+        assert!(!data.active);
+        assert!(!metadata.active);
     }
 
     #[test]

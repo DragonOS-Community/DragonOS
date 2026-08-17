@@ -583,7 +583,7 @@ impl Ext4FileSystem {
         }
     }
 
-    fn terminalize_idle_delalloc_after_fail_stop(&self) {
+    pub(super) fn terminalize_idle_delalloc_after_fail_stop(&self) {
         loop {
             let owners: Vec<_> = self.delalloc_inodes.lock().values().cloned().collect();
             let mut progressed = false;

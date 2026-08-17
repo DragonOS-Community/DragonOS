@@ -45,11 +45,14 @@ impl Syscall for SysSemopHandle {
             return Err(SystemError::E2BIG);
         }
 
-        let mut sops: Vec<PosixSemBuf> = vec![PosixSemBuf {
-            sem_num: 0,
-            sem_op: 0,
-            sem_flg: 0,
-        }; nsops];
+        let mut sops: Vec<PosixSemBuf> = vec![
+            PosixSemBuf {
+                sem_num: 0,
+                sem_op: 0,
+                sem_flg: 0,
+            };
+            nsops
+        ];
         let sops_reader = UserBufferReader::new(
             args[1] as *const u8,
             core::mem::size_of::<PosixSemBuf>() * nsops,

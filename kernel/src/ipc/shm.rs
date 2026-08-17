@@ -16,10 +16,7 @@ use crate::{
     mm::MemoryManagementArch,
     process::{
         cred::{capable, ns_capable, CAPFlags, Cred, Kgid, Kuid},
-        namespace::{
-            ipc_namespace::IpcNamespace,
-            user_namespace::UserNamespace,
-        },
+        namespace::{ipc_namespace::IpcNamespace, user_namespace::UserNamespace},
         resource::RLimitID,
         ProcessManager, RawPid,
     },
@@ -847,7 +844,9 @@ impl ShmManager {
             }
         };
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-        if let Err(err) = ipc_perm::check_lock_permission(&kernel_shm.kern_ipc_perm, &target_user_ns) {
+        if let Err(err) =
+            ipc_perm::check_lock_permission(&kernel_shm.kern_ipc_perm, &target_user_ns)
+        {
             token.release();
             return Err(err);
         }

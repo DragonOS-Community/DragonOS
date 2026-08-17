@@ -93,11 +93,14 @@ impl Syscall for SysSemtimedopHandle {
             return Err(SystemError::E2BIG);
         }
 
-        let mut sops: Vec<PosixSemBuf> = vec![PosixSemBuf {
-            sem_num: 0,
-            sem_op: 0,
-            sem_flg: 0,
-        }; nsops];
+        let mut sops: Vec<PosixSemBuf> = vec![
+            PosixSemBuf {
+                sem_num: 0,
+                sem_op: 0,
+                sem_flg: 0,
+            };
+            nsops
+        ];
         let sops_reader = UserBufferReader::new(
             sops_ptr,
             core::mem::size_of::<PosixSemBuf>() * nsops,
@@ -112,8 +115,11 @@ impl Syscall for SysSemtimedopHandle {
             None
         } else {
             let mut ts = PosixTimeSpec::new(0, 0);
-            let ts_reader =
-                UserBufferReader::new(timeout_ptr, core::mem::size_of::<PosixTimeSpec>(), from_user)?;
+            let ts_reader = UserBufferReader::new(
+                timeout_ptr,
+                core::mem::size_of::<PosixTimeSpec>(),
+                from_user,
+            )?;
             ts_reader.copy_one_from_user(&mut ts, 0)?;
             Some(ts)
         };

@@ -2959,6 +2959,7 @@ impl LockedExt4Inode {
     ) -> Result<(), SystemError> {
         let mut first_error = None;
         let mut terminal = terminal_only;
+        let mut fail_stopped = terminal_only;
 
         if !terminal {
             match cleanup.pool.as_mut() {
@@ -2985,6 +2986,7 @@ impl LockedExt4Inode {
 
         if terminal {
             fs.fail_stop_lifecycle();
+            fail_stopped = true;
             if let Some(reservation) = reservation {
                 let _ = fs
                     .fs
@@ -3007,6 +3009,7 @@ impl LockedExt4Inode {
             }) {
                 first_error = Some(error);
                 fs.fail_stop_lifecycle();
+                fail_stopped = true;
                 let _ = fs
                     .fs
                     .terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(
@@ -3020,6 +3023,18 @@ impl LockedExt4Inode {
         }
         drop(cleanup.owner.take());
         drop(cleanup);
+        // An unrelated thread may have fail-stopped the mount before this
+        // helper entered.  Empty pool release remains a successful no-op in
+        // that state, so sample the terminal state after releasing the local
+        // admission guard to ensure the remaining idle registry is drained.
+        fail_stopped |= fs.fs.metadata_mutations_terminal();
+        if fail_stopped {
+            // The current bundle no longer owns inode locks, admission, or a
+            // registry entry.  Only now is it safe to drain other idle
+            // Prepared/Ready owners through the filesystem-wide fail-stop
+            // terminalizer; claimed owners remain with their live submission.
+            fs.terminalize_idle_delalloc_after_fail_stop();
+        }
         first_error.map_or(Ok(()), Err)
     }
 
@@ -3556,9 +3571,6 @@ impl LockedExt4Inode {
                         duplicate_owner,
                     );
                     drop(pending);
-                    if duplicate_owner {
-                        fs.terminalize_idle_delalloc_after_fail_stop();
-                    }
                     cleanup_result?;
                     return Err(error);
                 }

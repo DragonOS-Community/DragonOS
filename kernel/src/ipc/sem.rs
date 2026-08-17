@@ -326,9 +326,7 @@ impl KernelSemSet {
     pub fn new(kern_ipc_perm: IpcPerm, nsems: usize) -> Self {
         KernelSemSet {
             kern_ipc_perm,
-            sems: core::iter::repeat(KernelSem { val: 0, pid: None })
-                .take(nsems)
-                .collect(),
+            sems: core::iter::repeat_n(KernelSem { val: 0, pid: None }, nsems).collect(),
             sem_otime: 0,
             sem_ctime: PosixTimeSpec::now().tv_sec,
             waiters: VecDeque::new(),

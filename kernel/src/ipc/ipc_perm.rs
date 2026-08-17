@@ -150,8 +150,7 @@ pub fn ipc_permission<P: IpcPermView>(
         granted >>= 3;
     }
 
-    if (requested & !(granted & 0o7)) != 0 && !ns_capable(target_user_ns, CAPFlags::CAP_IPC_OWNER)
-    {
+    if (requested & !(granted & 0o7)) != 0 && !ns_capable(target_user_ns, CAPFlags::CAP_IPC_OWNER) {
         return Err(SystemError::EACCES);
     }
 

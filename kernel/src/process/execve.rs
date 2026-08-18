@@ -1,4 +1,4 @@
-use super::trace::{trace_sched_process_exec, trace_sched_process_exec_enabled};
+use super::trace::trace_sched_process_exec;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
@@ -229,33 +229,16 @@ fn do_execve_internal(
                     completion.complete_all();
                 }
 
-                // sched_process_exec：arch_do_execve 成功、用户态寄存器就绪后触发，
-                // 对齐 Linux fs/exec.c:1803（trace 在 start_thread 之后、所有失败点之后）。
-                //
-                // Thread5：disabled 路径零开销。Rust 在调用函数前即求值参数，因此即便
-                // trace_sched_process_exec() 内部有 static-key 检查，comm 的取锁 /
-                // UTF-8 扫描 / 拷贝在每个成功 exec 上仍会发生。这里用只读的 _enabled()
-                // 守卫：tracepoint 未启用时完全跳过字段构造与触发，不为禁用路径付出
-                // 取 irqsave basic 读锁、扫 UTF-8 边界、拷贝 name 的开销。
-                if trace_sched_process_exec_enabled() {
-                    let pid = pcb.raw_pid().data() as i32;
-                    // 先把 comm 复制到栈缓冲并释放 basic 读锁：trace 默认回调内部的
-                    // trace_cmdline_push 会再次获取 basic 读锁，持锁重入有 deadlock 风险。
-                    let mut comm_buf = [0u8; 16];
-                    let mut comm_len;
-                    {
-                        let basic_guard = pcb.basic();
-                        let name = basic_guard.name();
-                        comm_len = name.len().min(15);
-                        // 回退到 UTF-8 字符边界，避免在多字节字符中间截断导致 from_utf8 失败。
-                        while comm_len > 0 && !name.is_char_boundary(comm_len) {
-                            comm_len -= 1;
-                        }
-                        comm_buf[..comm_len].copy_from_slice(&name.as_bytes()[..comm_len]);
-                    }
-                    let comm = core::str::from_utf8(&comm_buf[..comm_len]).unwrap_or("");
-                    trace_sched_process_exec(comm, pid, old_pid);
-                }
+                // Linux keeps bprm->filename as the original exec-visible name
+                // across shebang/interpreter rewrites. DragonOS's execfn has the
+                // same lifetime and meaning; filename tracks the current loader.
+                // All dynamic sizing/allocation remains behind the macro's static
+                // branch, while these borrowed bytes and integers are O(1).
+                trace_sched_process_exec(
+                    param.execfn().as_bytes(),
+                    pcb.raw_pid().data() as i32,
+                    old_pid,
+                );
             }
             exec_ret
         }

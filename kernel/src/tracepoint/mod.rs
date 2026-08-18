@@ -17,7 +17,8 @@ use core::{
     sync::atomic::AtomicUsize,
 };
 pub use point::{
-    CommonTracePointMeta, TraceEntry, TracePoint, TracePointCallBackFunc, TracePointFunc,
+    CommonTracePointMeta, TraceEntry, TraceEventField, TracePoint, TracePointCallBackFunc,
+    TracePointFunc,
 };
 use system_error::SystemError;
 pub use trace_pipe::{
@@ -216,7 +217,7 @@ impl TracePointEnableFile {
     ///
     /// Returns true if the tracepoint is enabled, false otherwise.
     pub fn read(&self) -> &'static str {
-        if self.tracepoint.is_enabled() {
+        if self.tracepoint.is_trace_pipe_enabled() {
             "1\n"
         } else {
             "0\n"
@@ -225,8 +226,8 @@ impl TracePointEnableFile {
     /// Enable or disable the tracepoint
     pub fn write(&self, enable: char) {
         match enable {
-            '1' => self.tracepoint.enable(),
-            '0' => self.tracepoint.disable(),
+            '1' => self.tracepoint.set_trace_pipe_enabled(true),
+            '0' => self.tracepoint.set_trace_pipe_enabled(false),
             _ => {
                 log::warn!("Invalid value for tracepoint enable: {}", enable);
             }

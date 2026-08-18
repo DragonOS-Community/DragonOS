@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -85,7 +86,9 @@ class DebugfsMount {
         if (!enable_path_.empty()) {
             write_file(enable_path_.c_str(), "0");
         }
-        umount(root_.c_str());
+        if (mounted_) {
+            umount(root_.c_str());
+        }
         rmdir(root_.c_str());
     }
 
@@ -94,11 +97,73 @@ class DebugfsMount {
 
     // 在事件成功 enable 后调用：析构时把该文件写回 "0"。
     void arm_enable(const char* enable_path) { enable_path_ = enable_path; }
+    void mark_mounted() { mounted_ = true; }
 
  private:
     std::string root_;
     std::string enable_path_;
+    bool mounted_ = false;
 };
+
+class TemporaryPath {
+ public:
+    explicit TemporaryPath(const char* path) : path_(path) {}
+    ~TemporaryPath() { unlink(path_.c_str()); }
+    TemporaryPath(const TemporaryPath&) = delete;
+    TemporaryPath& operator=(const TemporaryPath&) = delete;
+
+ private:
+    std::string path_;
+};
+
+std::string record_for_pid(const std::string& trace, pid_t pid) {
+    const std::string pid_field = " pid=" + std::to_string(pid) + " old_pid=";
+    size_t start = 0;
+    while (start < trace.size()) {
+        size_t end = trace.find('\n', start);
+        if (end == std::string::npos) end = trace.size();
+        std::string line = trace.substr(start, end - start);
+        if (line.find("sched_process_exec(") != std::string::npos &&
+            line.find(pid_field) != std::string::npos) {
+            return line;
+        }
+        start = end + 1;
+    }
+    return {};
+}
+
+bool copy_file(const char* source, const char* destination) {
+    int in = open(source, O_RDONLY);
+    if (in < 0) return false;
+    int out = open(destination, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (out < 0) {
+        close(in);
+        return false;
+    }
+    bool ok = true;
+    char buf[4096];
+    while (true) {
+        ssize_t n = read(in, buf, sizeof(buf));
+        if (n == 0) break;
+        if (n < 0) {
+            ok = false;
+            break;
+        }
+        ssize_t written = 0;
+        while (written < n) {
+            ssize_t part = write(out, buf + written, static_cast<size_t>(n - written));
+            if (part <= 0) {
+                ok = false;
+                break;
+            }
+            written += part;
+        }
+        if (!ok) break;
+    }
+    close(in);
+    close(out);
+    return ok;
+}
 
 // 子模式：被 execve 进来后立即退出 0。
 [[noreturn]] void helper_exec_exit0() {
@@ -111,16 +176,22 @@ class DebugfsMount {
 }
 
 // non-leader exec 辅助：sibling 线程（非 leader）执行 execve。
-void* sibling_exec_thread(void*) {
+void* sibling_exec_thread(void* arg) {
+    int notify_fd = *static_cast<int*>(arg);
+    pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+    if (write(notify_fd, &tid, sizeof(tid)) != sizeof(tid)) {
+        _exit(2);
+    }
+    close(notify_fd);
     helper_exec_exit0();
     return nullptr;
 }
 
 // 子模式：创建 sibling 线程（非 leader）执行 execve，主线程（leader）永久挂起。
 // 触发内核 de_thread 的 raw_pid 交换路径（old_pid ≠ pid）。
-[[noreturn]] void helper_sibling_exec_exit0() {
+[[noreturn]] void helper_sibling_exec_exit0(int notify_fd) {
     pthread_t thread;
-    if (pthread_create(&thread, nullptr, sibling_exec_thread, nullptr) != 0) {
+    if (pthread_create(&thread, nullptr, sibling_exec_thread, &notify_fd) != 0) {
         _exit(1);
     }
     for (;;) {
@@ -136,8 +207,9 @@ TEST(SchedProcessExecTp, EventFilesExist) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_events_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
+    DebugfsMount guard(root);
     ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
-    DebugfsMount guard(root);          // Thread8：RAII，任意提前 return 都 umount + rmdir。
+    guard.mark_mounted();
 
     const char* base_rel = "/tracing/events/sched/sched_process_exec";
     char base[256] = {};
@@ -158,8 +230,9 @@ TEST(SchedProcessExecTp, EventFilesExist) {
     snprintf(file, sizeof(file), "%s/format", base);
     std::string fmt = read_all(file);
     ASSERT_FALSE(fmt.empty());
-    for (const char* needle :
-         {"sched_process_exec", "common_pid", "comm", "pid", "old_pid"}) {
+    for (const char* needle : {"sched_process_exec", "common_pid", "__data_loc char[] filename",
+                               "offset:8", "i32 pid", "offset:12", "i32 old_pid",
+                               "offset:16", "filename=%s pid=%d old_pid=%d"}) {
         EXPECT_NE(std::string::npos, fmt.find(needle))
             << "format missing \"" << needle << "\"\n"
             << fmt;
@@ -191,8 +264,9 @@ TEST(SchedProcessExecTp, FiresOnExecve) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_fire_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
+    DebugfsMount guard(root);
     ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
-    DebugfsMount guard(root);          // Thread8：RAII，析构 umount + rmdir。
+    guard.mark_mounted();
 
     const char* base_rel = "/tracing/events/sched/sched_process_exec";
     char base[256] = {};
@@ -224,15 +298,111 @@ TEST(SchedProcessExecTp, FiresOnExecve) {
     // 读 trace 快照，断言含 sched_process_exec 记录。
     std::string trace = read_all(trace_path);
     ASSERT_FALSE(trace.empty()) << "trace empty after execve";
-    EXPECT_NE(std::string::npos, trace.find("sched_process_exec("))
-        << "no sched_process_exec record in trace:\n"
-        << trace;
-    // TP_printk 输出的字段。
-    EXPECT_NE(std::string::npos, trace.find("comm="))
-        << "trace missing comm= field:\n"
-        << trace;
+    std::string record = record_for_pid(trace, child);
+    ASSERT_FALSE(record.empty()) << "no sched_process_exec record for child:\n" << trace;
+    EXPECT_NE(std::string::npos, record.find("filename=/proc/self/exe")) << record;
+    EXPECT_EQ(std::string::npos, record.find("comm=")) << record;
 
     // 清理由 RAII guard 析构完成（disable + umount + rmdir）。
+}
+
+TEST(SchedProcessExecTp, ShebangReportsOriginalScriptFilename) {
+    char root[128] = {};
+    snprintf(root, sizeof(root), "/tmp/sched_tp_shebang_mount_%d", getpid());
+    ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
+    DebugfsMount guard(root);
+    ASSERT_TRUE(mount_debugfs(root));
+    guard.mark_mounted();
+
+    char base[256] = {};
+    snprintf(base, sizeof(base), "%s/tracing/events/sched/sched_process_exec", root);
+    char enable_path[320] = {};
+    snprintf(enable_path, sizeof(enable_path), "%s/enable", base);
+    ASSERT_TRUE(write_file(enable_path, "1"));
+    guard.arm_enable(enable_path);
+    char trace_path[256] = {};
+    snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
+    ASSERT_TRUE(write_file(trace_path, "1"));
+
+    char script_path[160] = {};
+    snprintf(script_path, sizeof(script_path), "/tmp/sched_tp_script_%d", getpid());
+    TemporaryPath script_cleanup(script_path);
+    int script = open(script_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    ASSERT_GE(script, 0) << strerror(errno);
+    // Use this test binary as the interpreter. The optional shebang argument
+    // switches main() into the immediate-exit helper, so the test exercises
+    // shebang rewriting without depending on an unrelated shell implementation.
+    const char script_body[] = "#!/proc/self/exe --sched-tp-helper-exit0\n";
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(script_body) - 1),
+              write(script, script_body, sizeof(script_body) - 1));
+    close(script);
+    ASSERT_EQ(0, chmod(script_path, 0755));
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        char* const argv[] = {script_path, nullptr};
+        char* const envp[] = {nullptr};
+        execve(script_path, argv, envp);
+        _exit(127);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+
+    std::string trace = read_all(trace_path);
+    std::string record = record_for_pid(trace, child);
+    ASSERT_FALSE(record.empty()) << trace;
+    EXPECT_NE(std::string::npos, record.find("filename=" + std::string(script_path))) << record;
+    EXPECT_EQ(std::string::npos, record.find("filename=/proc/self/exe")) << record;
+}
+
+TEST(SchedProcessExecTp, LongUnicodeExecNameDoesNotCorruptCmdlineCache) {
+    char root[128] = {};
+    snprintf(root, sizeof(root), "/tmp/sched_tp_unicode_mount_%d", getpid());
+    ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
+    DebugfsMount guard(root);
+    ASSERT_TRUE(mount_debugfs(root));
+    guard.mark_mounted();
+
+    char base[256] = {};
+    snprintf(base, sizeof(base), "%s/tracing/events/sched/sched_process_exec", root);
+    char enable_path[320] = {};
+    snprintf(enable_path, sizeof(enable_path), "%s/enable", base);
+    ASSERT_TRUE(write_file(enable_path, "1"));
+    guard.arm_enable(enable_path);
+    char trace_path[256] = {};
+    snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
+    ASSERT_TRUE(write_file(trace_path, "1"));
+
+    // Fourteen ASCII bytes place the following three-byte UTF-8 character
+    // across the old arbitrary 16-byte cache truncation boundary.
+    char executable_path[192] = {};
+    snprintf(executable_path, sizeof(executable_path), "/tmp/abcdefghijklmn界_exec_%d", getpid());
+    TemporaryPath executable_cleanup(executable_path);
+    ASSERT_TRUE(copy_file("/proc/self/exe", executable_path)) << strerror(errno);
+    ASSERT_EQ(0, chmod(executable_path, 0755));
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        char arg1[] = "--sched-tp-helper-exit0";
+        char* const argv[] = {executable_path, arg1, nullptr};
+        char* const envp[] = {nullptr};
+        execve(executable_path, argv, envp);
+        _exit(127);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+
+    // Reading trace exercises TraceCmdLineCache::get(), the former panic site.
+    std::string trace = read_all(trace_path);
+    std::string record = record_for_pid(trace, child);
+    ASSERT_FALSE(record.empty()) << trace;
+    EXPECT_NE(std::string::npos, record.find("filename=" + std::string(executable_path))) << record;
 }
 
 // 默认 disabled 时 execve 不应在 trace 留下 sched_process_exec 记录。
@@ -242,8 +412,9 @@ TEST(SchedProcessExecTp, DefaultDisabledNoRecords) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_disabled_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
+    DebugfsMount guard(root);
     ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
-    DebugfsMount guard(root);          // Thread8：RAII，析构 umount + rmdir（本测例不 enable）。
+    guard.mark_mounted();
 
     char trace_path[256] = {};
     snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
@@ -278,8 +449,9 @@ TEST(SchedProcessExecTp, DisableStopsFiring) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_disable_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
+    DebugfsMount guard(root);
     ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
-    DebugfsMount guard(root);          // Thread8：RAII，析构 umount + rmdir。
+    guard.mark_mounted();
 
     const char* base_rel = "/tracing/events/sched/sched_process_exec";
     char base[256] = {};
@@ -292,6 +464,7 @@ TEST(SchedProcessExecTp, DisableStopsFiring) {
 
     // 基线：enable 后触发。
     ASSERT_TRUE(write_file(enable_path, "1")) << "enable write failed";
+    ASSERT_TRUE(write_file(enable_path, "1")) << "repeated enable write failed";
     guard.arm_enable(enable_path);  // Thread8：任意提前 return 析构都会写回 "0"。
     ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
     {
@@ -315,6 +488,7 @@ TEST(SchedProcessExecTp, DisableStopsFiring) {
 
     // disable 后清 buffer 再触发：不应再记录。
     ASSERT_TRUE(write_file(enable_path, "0")) << "disable write failed";
+    ASSERT_TRUE(write_file(enable_path, "0")) << "repeated disable write failed";
     ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
     {
         pid_t child = fork();
@@ -344,8 +518,9 @@ TEST(SchedProcessExecTp, NonLeaderExecFiresWithDistinctOldPid) {
     snprintf(root, sizeof(root), "/tmp/sched_tp_nonleader_%d", getpid());
     ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
 
+    DebugfsMount guard(root);
     ASSERT_TRUE(mount_debugfs(root));  // Thread7：mount 失败终止测试。
-    DebugfsMount guard(root);          // Thread8：RAII，析构 umount + rmdir。
+    guard.mark_mounted();
 
     const char* base_rel = "/tracing/events/sched/sched_process_exec";
     char base[256] = {};
@@ -360,12 +535,22 @@ TEST(SchedProcessExecTp, NonLeaderExecFiresWithDistinctOldPid) {
     guard.arm_enable(enable_path);  // Thread8：任意提前 return 析构都会写回 "0"。
     ASSERT_TRUE(write_file(trace_path, "1")) << "trace clear write failed";
 
+    int tid_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(tid_pipe)) << "pipe failed: " << strerror(errno);
+
     // fork child：child 创建 sibling 线程（非 leader）执行 execve，leader 永久挂起。
     pid_t child = fork();
     ASSERT_GE(child, 0) << "fork failed: " << strerror(errno);
     if (child == 0) {
-        helper_sibling_exec_exit0();
+        close(tid_pipe[0]);
+        helper_sibling_exec_exit0(tid_pipe[1]);
     }
+    close(tid_pipe[1]);
+    pid_t sibling_tid = -1;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(sibling_tid)),
+              read(tid_pipe[0], &sibling_tid, sizeof(sibling_tid)))
+        << "failed to receive sibling tid";
+    close(tid_pipe[0]);
 
     int status = 0;
     ASSERT_EQ(child, waitpid(child, &status, 0)) << "waitpid failed: " << strerror(errno);
@@ -375,16 +560,10 @@ TEST(SchedProcessExecTp, NonLeaderExecFiresWithDistinctOldPid) {
     std::string trace = read_all(trace_path);
     ASSERT_FALSE(trace.empty()) << "trace empty after non-leader execve";
 
-    // 找到包含 sched_process_exec 的记录行。
-    size_t rec = trace.find("sched_process_exec");
-    ASSERT_NE(std::string::npos, rec)
-        << "no sched_process_exec record after non-leader execve:\n"
+    std::string record = record_for_pid(trace, child);
+    ASSERT_FALSE(record.empty())
+        << "no sched_process_exec record for non-leader child:\n"
         << trace;
-    size_t line_end = trace.find('\n', rec);
-    if (line_end == std::string::npos) {
-        line_end = trace.size();
-    }
-    std::string record = trace.substr(rec, line_end - rec);
 
     // 解析 old_pid=N。注意 "old_pid=" 含 "pid=" 子串，先取 old_pid。
     size_t old_pos = record.find("old_pid=");
@@ -397,9 +576,8 @@ TEST(SchedProcessExecTp, NonLeaderExecFiresWithDistinctOldPid) {
     long pid_val = strtol(record.c_str() + pid_pos + strlen(" pid="), nullptr, 10);
 
     // non-leader exec 触发 de_thread 交换：old_pid（调用 execve 线程原 PID）≠ pid（交换后 leader PID）。
-    EXPECT_NE(old_pid_val, pid_val)
-        << "non-leader exec should produce distinct old_pid vs pid:\n"
-        << record;
+    EXPECT_EQ(child, pid_val) << record;
+    EXPECT_EQ(sibling_tid, old_pid_val) << record;
 
     // 清理由 RAII guard 析构完成（disable + umount + rmdir）。
 }

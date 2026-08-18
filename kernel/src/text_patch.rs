@@ -9,6 +9,30 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use system_error::SystemError;
 
+/// Stop the machine without unwinding after an executable-text invariant is
+/// lost. Continuing could execute corrupted text or free a still-reachable
+/// callback, while DragonOS's ordinary panic path may only exit the current
+/// kernel thread.
+#[cold]
+pub(crate) fn fatal_text_invariant() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::{
+            arch::{interrupt::ipi::send_ipi, CurrentIrqArch},
+            exception::{ipi::IpiKind, ipi::IpiTarget, InterruptArch},
+        };
+
+        unsafe { CurrentIrqArch::interrupt_disable() };
+        send_ipi(IpiKind::StopCpu, IpiTarget::Other);
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    panic!("executable-text invariant violated");
+}
+
 use crate::{
     arch::CurrentIrqArch, exception::InterruptArch, libs::mutex::Mutex, mm::VirtAddr,
     process::ProcessManager,

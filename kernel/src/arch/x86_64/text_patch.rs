@@ -13,7 +13,10 @@ use core::{
 use crate::arch::MMArch;
 use crate::{
     arch::{
-        driver::apic::{CurrentApic, LocalAPIC},
+        driver::{
+            apic::{CurrentApic, LocalAPIC},
+            tsc::TSCManager,
+        },
         interrupt::ipi::{send_ipi, IPI_NUM_TEXT_PATCH},
         mm::X86_64MMArch,
         CurrentIrqArch,
@@ -47,8 +50,7 @@ const PHASE_RELEASE: u64 = 3;
 const PHASE_CANCEL: u64 = 4;
 
 const STATE_BITS: u32 = 3;
-const TSC_PARK_TIMEOUT_CYCLES: u64 = 2_000_000_000;
-const PARK_TIMEOUT_SPINS: usize = 100_000_000;
+const PARK_TIMEOUT_MS: u64 = 1_000;
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static PHASE: AtomicU64 = AtomicU64::new(0);
@@ -98,7 +100,7 @@ pub(crate) fn init() -> Result<(), TextPatchError> {
     let has_tsc = raw_cpuid::CpuId::new()
         .get_feature_info()
         .is_some_and(|features| features.has_tsc());
-    if X86_64MMArch::is_xd_reserved() || !has_tsc {
+    if X86_64MMArch::is_xd_reserved() || !has_tsc || TSCManager::tsc_khz() == 0 {
         return Err(TextPatchError::Unavailable);
     }
 
@@ -189,7 +191,11 @@ pub(crate) fn commit(patches: &[PreparedTextPatch]) -> Result<(), TextPatchError
     }
 
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let generation = begin_rendezvous(&targets)?;
+    // Once the boot-time probe has made text patching Live, every online CPU
+    // is known to service this IPI and the topology is immutable. Like Linux
+    // stop-machine, a real patch has strong completion semantics: host vCPU
+    // scheduling delay is not a recoverable patch failure.
+    let generation = begin_rendezvous(&targets, None)?;
 
     // Commit point: no recoverable operation follows. Parent page tables and
     // physical translations were prepared while remote CPUs were still running.
@@ -206,7 +212,8 @@ fn rendezvous_probe() -> Result<(), TextPatchError> {
     let _preempt = PreemptGuard::new();
     let targets = online_remote_cpus();
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let generation = begin_rendezvous(&targets)?;
+    let timeout_cycles = TSCManager::tsc_khz().saturating_mul(PARK_TIMEOUT_MS);
+    let generation = begin_rendezvous(&targets, Some(timeout_cycles))?;
     serialize_core();
     finish_rendezvous(generation, &targets);
     drop(irq_guard);
@@ -222,7 +229,10 @@ fn online_remote_cpus() -> Vec<ProcessorId> {
         .collect()
 }
 
-fn begin_rendezvous(targets: &[ProcessorId]) -> Result<u64, TextPatchError> {
+fn begin_rendezvous(
+    targets: &[ProcessorId],
+    timeout_cycles: Option<u64>,
+) -> Result<u64, TextPatchError> {
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     PHASE.store(tagged(generation, PHASE_PARK), Ordering::Release);
     for cpu in targets {
@@ -236,17 +246,13 @@ fn begin_rendezvous(targets: &[ProcessorId]) -> Result<u64, TextPatchError> {
     }
 
     let start = unsafe { _rdtsc() };
-    let mut spins = 0usize;
     loop {
         if targets.iter().all(|cpu| {
             MAILBOX[cpu.data() as usize].load(Ordering::Acquire) == tagged(generation, STATE_PARKED)
         }) {
             return Ok(generation);
         }
-        spins += 1;
-        if spins >= PARK_TIMEOUT_SPINS
-            || unsafe { _rdtsc() }.wrapping_sub(start) > TSC_PARK_TIMEOUT_CYCLES
-        {
+        if timeout_cycles.is_some_and(|timeout| unsafe { _rdtsc() }.wrapping_sub(start) > timeout) {
             abort_rendezvous(generation, targets);
             return Err(TextPatchError::RendezvousTimeout);
         }
@@ -266,10 +272,9 @@ fn abort_rendezvous(generation: u64, targets: &[ProcessorId]) {
         );
     }
     while !targets.iter().all(|cpu| {
-        matches!(
-            tag_value(MAILBOX[cpu.data() as usize].load(Ordering::Acquire)),
-            STATE_CANCELLED | STATE_RELEASED
-        )
+        let state = MAILBOX[cpu.data() as usize].load(Ordering::Acquire);
+        tag_generation(state) == generation
+            && matches!(tag_value(state), STATE_CANCELLED | STATE_RELEASED)
     }) {
         core::hint::spin_loop();
     }

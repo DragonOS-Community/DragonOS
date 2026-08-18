@@ -77,7 +77,7 @@ pub(crate) fn enable_maskable_key(
     // backend serializes updates and performs an all-CPU instruction sync.
     match unsafe { key.enable() } {
         Err(TextPatchError::ExpectedMismatch | TextPatchError::Architecture) => {
-            panic!("static-key text invariant violated")
+            crate::text_patch::fatal_text_invariant()
         }
         result => result,
     }
@@ -100,7 +100,7 @@ pub(crate) fn disable_maskable_key(
     // SAFETY: see `enable_maskable_key`.
     match unsafe { key.disable() } {
         Err(TextPatchError::ExpectedMismatch | TextPatchError::Architecture) => {
-            panic!("static-key text invariant violated")
+            crate::text_patch::fatal_text_invariant()
         }
         result => result,
     }

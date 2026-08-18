@@ -30,6 +30,13 @@ pub unsafe trait CodePatchBackend {
 pub unsafe trait CodePatchTransaction {
     type Error;
 
+    /// Queue one instruction replacement in this transaction.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be the instruction address associated with `expected` and
+    /// `replacement`, and both byte sequences must encode complete valid
+    /// instructions for that site.
     unsafe fn queue<const L: usize>(
         &mut self,
         addr: *mut core::ffi::c_void,

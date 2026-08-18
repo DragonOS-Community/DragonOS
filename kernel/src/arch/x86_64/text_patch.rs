@@ -116,7 +116,7 @@ pub(crate) fn init() -> Result<(), TextPatchError> {
         return Err(TextPatchError::Unavailable);
     }
 
-    for slot in 0..2 {
+    for (slot, alias_pte) in ALIAS_PTE.iter().enumerate() {
         if mapper_mut.translate(alias(slot)).is_some() {
             return Err(TextPatchError::Architecture);
         }
@@ -133,7 +133,7 @@ pub(crate) fn init() -> Result<(), TextPatchError> {
         if unsafe { MMArch::read::<usize>(pte) } != 0 {
             return Err(TextPatchError::Architecture);
         }
-        ALIAS_PTE[slot].store(pte.data(), Ordering::Release);
+        alias_pte.store(pte.data(), Ordering::Release);
     }
     drop(mapper);
     drop(_preempt);

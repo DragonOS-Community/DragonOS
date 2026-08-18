@@ -49,9 +49,7 @@ pub(super) fn enqueue(node: Box<PerfReleaseNode>) {
 }
 
 pub(crate) fn init() {
-    let closure = Box::new(worker_loop as fn() -> i32);
-    let closure = Box::new(move || closure());
-    let kt_closure = KernelThreadClosure::EmptyClosure((closure, ()));
+    let kt_closure = KernelThreadClosure::EmptyClosure((Box::new(worker_loop), ()));
     KernelThreadMechanism::create_and_run(kt_closure, "perf_release".into())
         .expect("failed to create perf release worker");
 }

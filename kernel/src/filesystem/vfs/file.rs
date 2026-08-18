@@ -2529,6 +2529,32 @@ struct FdTableClonePlan {
     copy_len: usize,
 }
 
+impl FdTableClonePlan {
+    fn from_retained_highest(retained_highest: Option<usize>, source_len: usize) -> Self {
+        let required = retained_highest.map_or(0, |fd| fd + 1);
+        Self {
+            target_len: core::cmp::max(FileDescriptorVec::INITIAL_CAPACITY, required),
+            // The minimum table layout must not expand the File population
+            // bound. In particular, a tail punch-hole clone should never
+            // clone files in the range only to close/flush them afterwards.
+            copy_len: core::cmp::min(required, source_len),
+        }
+    }
+}
+
+#[cfg(test)]
+mod fd_table_clone_plan_tests {
+    use super::{FdTableClonePlan, FileDescriptorVec};
+
+    #[test]
+    fn minimum_layout_does_not_expand_tail_punch_copy_bound() {
+        let plan = FdTableClonePlan::from_retained_highest(Some(63), 1024);
+
+        assert_eq!(plan.target_len, FileDescriptorVec::INITIAL_CAPACITY);
+        assert_eq!(plan.copy_len, 64);
+    }
+}
+
 /// One bounded step of `close_range()` scanning.
 ///
 /// The caller owns the fd-table write guard while this value is produced, then
@@ -2601,12 +2627,7 @@ impl FileDescriptorVec {
             (highest, _) => highest,
         };
 
-        let required = retained_highest.map_or(0, |fd| fd + 1);
-        let target_len = core::cmp::max(Self::INITIAL_CAPACITY, required);
-        FdTableClonePlan {
-            target_len,
-            copy_len: core::cmp::min(target_len, self.fds.len()),
-        }
+        FdTableClonePlan::from_retained_highest(retained_highest, self.fds.len())
     }
 
     fn try_allocate_empty_clone_layout(target_len: usize) -> Result<Self, SystemError> {

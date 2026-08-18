@@ -20,7 +20,7 @@ Please report issues via [Community Channel](https://github.com/DragonOS-Communi
 > Email: chenlinfeng25@outlook.com
 
 ## Overview
-Tracepoints are a tracing mechanism provided by the Linux kernel, allowing developers to insert probe points at specific locations in the kernel code to collect runtime information. Unlike kprobes, tracepoints are predefined and are typically used for collecting performance data or debugging information without modifying the kernel code.
+Tracepoints are a tracing mechanism provided by the Linux kernel. They let developers define probe points at specific locations in kernel code to collect runtime information. Unlike kprobes, tracepoints do not require users to inject probes into arbitrary locations at runtime. DragonOS controls these predefined paths with static keys and uses [runtime text patching](text_patching.md) to switch them safely on multiprocessor systems.
 
 ## Workflow
 1. **Define Tracepoint**: Kernel developers define tracepoints in the code using the macro ``define_event_trace``.

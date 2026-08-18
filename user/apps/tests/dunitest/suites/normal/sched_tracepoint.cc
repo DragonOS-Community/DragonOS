@@ -119,6 +119,23 @@ class TemporaryPath {
     std::string path_;
 };
 
+class ScopedAffinity {
+ public:
+    explicit ScopedAffinity(const cpu_set_t& original) : original_(original) {}
+
+    ~ScopedAffinity() {
+        if (sched_setaffinity(0, sizeof(original_), &original_) != 0) {
+            ADD_FAILURE() << "failed to restore CPU affinity: " << strerror(errno);
+        }
+    }
+
+    ScopedAffinity(const ScopedAffinity&) = delete;
+    ScopedAffinity& operator=(const ScopedAffinity&) = delete;
+
+ private:
+    cpu_set_t original_;
+};
+
 std::string record_for_pid(const std::string& trace, pid_t pid) {
     const std::string pid_field = " pid=" + std::to_string(pid) + " old_pid=";
     size_t start = 0;
@@ -573,6 +590,7 @@ TEST(SchedProcessExecTp, SmpToggleHasStableEpochs) {
     cpu_set_t available;
     CPU_ZERO(&available);
     ASSERT_EQ(0, sched_getaffinity(0, sizeof(available), &available)) << strerror(errno);
+    ScopedAffinity affinity_guard(available);
     int control_cpu = -1;
     int worker_cpu = -1;
     for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {

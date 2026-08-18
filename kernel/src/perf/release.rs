@@ -79,24 +79,22 @@ fn worker_loop() -> i32 {
             let node = unsafe { Box::from_raw(reversed) };
             reversed = node.next.load(Ordering::Relaxed);
             node.next.store(ptr::null_mut(), Ordering::Relaxed);
-            loop {
-                match super::PerfEventOps::release(node.core.event.as_ref()) {
-                    Ok(()) => break,
-                    Err(system_error::SystemError::ETIMEDOUT) => {
-                        // The rendezvous aborts before changing text or owner
-                        // state. Keep the node and callbacks alive, then retry
-                        // from this sleepable worker after a short backoff.
-                        let _ = nanosleep(PosixTimeSpec::new(0, RETRY_DELAY_NS));
-                    }
-                    Err(error) => {
-                        // Other failures indicate an invariant breach. Dropping
-                        // callbacks while a static branch remains enabled would
-                        // be memory unsafe.
-                        panic!("perf event release failed: {:?}", error);
-                    }
+            match super::PerfEventOps::release(node.core.event.as_ref()) {
+                Ok(()) => drop(node),
+                Err(system_error::SystemError::ETIMEDOUT) => {
+                    // The rendezvous aborts before changing text or owner
+                    // state. Keep the node and callbacks alive, then retry
+                    // after a short backoff without blocking unrelated releases.
+                    let _ = nanosleep(PosixTimeSpec::new(0, RETRY_DELAY_NS));
+                    enqueue(node);
+                }
+                Err(error) => {
+                    // Other failures indicate an invariant breach. Dropping
+                    // callbacks while a static branch remains enabled would
+                    // be memory unsafe.
+                    panic!("perf event release failed: {:?}", error);
                 }
             }
-            drop(node);
         }
     }
 }

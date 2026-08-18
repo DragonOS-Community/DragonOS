@@ -10,12 +10,14 @@ use core::{
 use crate::{
     libs::wait_queue::WaitQueue,
     process::kthread::{KernelThreadClosure, KernelThreadMechanism},
+    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
 use super::PerfEventCore;
 
 static HEAD: AtomicPtr<PerfReleaseNode> = AtomicPtr::new(ptr::null_mut());
 static WAIT: WaitQueue = WaitQueue::default();
+const RETRY_DELAY_NS: i64 = 10_000_000;
 
 /// The node is a separate stable allocation. Ownership moves only in the
 /// direction inode -> intrusive queue -> worker; `PerfEventCore` never owns a
@@ -77,11 +79,22 @@ fn worker_loop() -> i32 {
             let node = unsafe { Box::from_raw(reversed) };
             reversed = node.next.load(Ordering::Relaxed);
             node.next.store(ptr::null_mut(), Ordering::Relaxed);
-            if let Err(error) = super::PerfEventOps::release(node.core.event.as_ref()) {
-                // A successfully published event must always be releasable. A
-                // failure here is an invariant breach; dropping callbacks while
-                // a static branch remains enabled would be memory unsafe.
-                panic!("perf event release failed: {:?}", error);
+            loop {
+                match super::PerfEventOps::release(node.core.event.as_ref()) {
+                    Ok(()) => break,
+                    Err(system_error::SystemError::ETIMEDOUT) => {
+                        // The rendezvous aborts before changing text or owner
+                        // state. Keep the node and callbacks alive, then retry
+                        // from this sleepable worker after a short backoff.
+                        let _ = nanosleep(PosixTimeSpec::new(0, RETRY_DELAY_NS));
+                    }
+                    Err(error) => {
+                        // Other failures indicate an invariant breach. Dropping
+                        // callbacks while a static branch remains enabled would
+                        // be memory unsafe.
+                        panic!("perf event release failed: {:?}", error);
+                    }
+                }
             }
             drop(node);
         }

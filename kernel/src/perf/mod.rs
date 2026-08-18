@@ -59,6 +59,11 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
     }
     /// Sleepable final release. It is always run by the perf release worker,
     /// never by `File::drop` or an event destructor.
+    ///
+    /// Returning `ETIMEDOUT` promises that no externally visible release state
+    /// changed and that calling `release` again on the same object is safe.
+    /// Implementations that cannot provide that guarantee must return a
+    /// different error.
     fn release(&self) -> Result<()> {
         match self.disable() {
             Err(SystemError::ENOSYS) => Ok(()),

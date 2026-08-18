@@ -1,13 +1,14 @@
 use alloc::format;
 
-use crate::define_event_trace;
+use crate::unsafe_define_event_trace;
 
 pub const VIRTIOFS_QUEUE_HIPRIO: u8 = 0;
 pub const VIRTIOFS_QUEUE_REQUEST: u8 = 1;
 
 pub const VIRTIOFS_RETRY_QUEUE_FULL: u8 = 1;
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
 fuse_request_queue,
 TP_system(fuse),
 TP_PROTO(unique: u64, opcode: u32, len: u64, no_reply: u8),
@@ -36,7 +37,8 @@ TP_printk({
 })
 );
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
     virtiofs_bridge_wait_enter,
     TP_system(fuse),
     TP_PROTO(pending: u8, inflight: u8, can_pop: u8, queue_full_blocked: u8),
@@ -65,7 +67,8 @@ define_event_trace!(
     })
 );
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
     virtiofs_bridge_wait_exit,
     TP_system(fuse),
     TP_PROTO(reason: u8, events: u32),
@@ -85,7 +88,8 @@ define_event_trace!(
     })
 );
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
     virtiofs_bridge_wake,
     TP_system(fuse),
     TP_PROTO(source: u8),
@@ -102,7 +106,8 @@ define_event_trace!(
     })
 );
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
     fuse_request_dequeue,
     TP_system(fuse),
     TP_PROTO(unique: u64, opcode: u32, len: u64),
@@ -125,7 +130,8 @@ define_event_trace!(
     })
 );
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
     fuse_reply_complete,
     TP_system(fuse),
     TP_PROTO(unique: u64, opcode: u32, error: i32, payload_len: u64),
@@ -154,7 +160,8 @@ define_event_trace!(
     })
 );
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
     virtiofs_submit,
     TP_system(fuse),
     TP_PROTO(unique: u64, opcode: u32, queue_kind: u8, queue_slot: u16, token: u16, req_len: u64),
@@ -189,7 +196,8 @@ define_event_trace!(
     })
 );
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
     virtiofs_queue_retry,
     TP_system(fuse),
     TP_PROTO(unique: u64, opcode: u32, queue_kind: u8, queue_slot: u16, reason: u8),
@@ -221,7 +229,8 @@ define_event_trace!(
     })
 );
 
-define_event_trace!(
+// SAFETY: this virtio-fs event is emitted by request processing, never NMI/MCE.
+unsafe_define_event_trace!(
     virtiofs_complete,
     TP_system(fuse),
     TP_PROTO(unique: u64, opcode: u32, queue_kind: u8, queue_slot: u16, token: u16, used_len: u64),

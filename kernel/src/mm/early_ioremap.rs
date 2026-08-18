@@ -25,7 +25,8 @@ static SLOTS: SpinLock<[Slot; EarlyIoRemap::SLOT_CNT]> =
 pub struct EarlyIoRemap;
 
 impl EarlyIoRemap {
-    const SLOT_CNT: usize = MMArch::FIXMAP_SIZE / MMArch::PAGE_SIZE;
+    const SLOT_CNT: usize =
+        MMArch::FIXMAP_SIZE / MMArch::PAGE_SIZE - MMArch::FIXMAP_RESERVED_TOP_PAGES;
 
     /// 把物理内存映射到虚拟内存中（物理地址不要求对齐
     ///

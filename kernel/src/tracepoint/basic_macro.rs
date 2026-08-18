@@ -12,7 +12,7 @@
 ///
 /// # Example
 /// ```rust
-/// define_event_trace!(
+/// unsafe_define_event_trace!(
 ///     TEST2,
 ///     TP_PROTO(a: u32, b: u32),
 ///     TP_STRUCT__entry{
@@ -33,8 +33,15 @@
 ///     })
 /// );
 /// ```
+/// Define a trace event backed by the maskable-only text-patch backend.
+///
+/// # Safety
+///
+/// This is an unsafe declaration despite `macro_rules!` having no unsafe-call
+/// syntax. Every invocation must document that the emitted branch site is not
+/// reachable from NMI/MCE context.
 #[macro_export]
-macro_rules! define_event_trace{
+macro_rules! unsafe_define_event_trace{
     (
         $name:ident,
         TP_system($system:ident),
@@ -49,7 +56,7 @@ macro_rules! define_event_trace{
         TP_print_fmt($print_fmt: expr)
     ) => {
         paste::paste!{
-            static_keys::define_static_key_false!([<__ $name _KEY>]);
+            $crate::unsafe_define_maskable_static_key_false!([<__ $name _KEY>]);
             #[allow(non_upper_case_globals)]
             #[used]
             static [<__ $name>]: $crate::tracepoint::TracePoint = $crate::tracepoint::TracePoint::new(
@@ -299,7 +306,7 @@ macro_rules! define_event_trace{
         TP_printk($fmt_expr: expr)
     ) => {
         paste::paste!{
-            static_keys::define_static_key_false!([<__ $name _KEY>]);
+            $crate::unsafe_define_maskable_static_key_false!([<__ $name _KEY>]);
             #[allow(non_upper_case_globals)]
             #[used]
             static [<__ $name>]: $crate::tracepoint::TracePoint = $crate::tracepoint::TracePoint::new(&[<__ $name _KEY>],stringify!($name), stringify!($system),[<trace_fmt_ $name>], [<trace_fmt_show $name>]);

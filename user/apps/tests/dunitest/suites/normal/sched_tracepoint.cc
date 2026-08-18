@@ -10,11 +10,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/perf_event.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -132,6 +135,8 @@ std::string record_for_pid(const std::string& trace, pid_t pid) {
     return {};
 }
 
+[[noreturn]] void helper_exec_exit0();
+
 bool copy_file(const char* source, const char* destination) {
     int in = open(source, O_RDONLY);
     if (in < 0) return false;
@@ -163,6 +168,18 @@ bool copy_file(const char* source, const char* destination) {
     close(in);
     close(out);
     return ok;
+}
+
+pid_t run_exec_on_cpu(int cpu) {
+    pid_t child = fork();
+    if (child == 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        if (sched_setaffinity(0, sizeof(set), &set) != 0) _exit(126);
+        helper_exec_exit0();
+    }
+    return child;
 }
 
 // 子模式：被 execve 进来后立即退出 0。
@@ -256,6 +273,42 @@ TEST(SchedProcessExecTp, EventFilesExist) {
     EXPECT_GE(idval, 0) << "invalid id: " << id;
 
     // 清理由 RAII guard 析构完成（umount + rmdir；本测例未 enable，无需 disable）。
+}
+
+TEST(SchedProcessExecTp, PerfCloseQueuesDeferredRelease) {
+    char root[128] = {};
+    snprintf(root, sizeof(root), "/tmp/sched_tp_perf_close_%d", getpid());
+    ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
+    DebugfsMount guard(root);
+    ASSERT_TRUE(mount_debugfs(root));
+    guard.mark_mounted();
+
+    char id_path[320] = {};
+    char enable_path[320] = {};
+    snprintf(id_path, sizeof(id_path),
+             "%s/tracing/events/sched/sched_process_exec/id", root);
+    snprintf(enable_path, sizeof(enable_path),
+             "%s/tracing/events/sched/sched_process_exec/enable", root);
+    const long id = strtol(read_all(id_path).c_str(), nullptr, 10);
+    ASSERT_GE(id, 0);
+
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        perf_event_attr attr {};
+        attr.type = PERF_TYPE_TRACEPOINT;
+        attr.size = sizeof(attr);
+        attr.config = static_cast<uint64_t>(id);
+        int fd = static_cast<int>(syscall(SYS_perf_event_open, &attr, -1, 0, -1, 0));
+        ASSERT_GE(fd, 0) << strerror(errno);
+        ASSERT_EQ(0, ioctl(fd, PERF_EVENT_IOC_ENABLE, 0)) << strerror(errno);
+        EXPECT_NE(std::string::npos, read_all(enable_path).find("0"))
+            << "tracefs ownership must remain independent of perf ownership";
+        ASSERT_EQ(0, close(fd));
+    }
+    // This is an enqueue/non-blocking smoke test. Worker completion is an
+    // internal lifetime invariant; this user-visible test does not pretend a
+    // fixed sleep can prove that the asynchronous queue has drained.
+    ASSERT_TRUE(write_file(enable_path, "1"));
+    ASSERT_TRUE(write_file(enable_path, "0"));
 }
 
 // enable 后 execve 应触发事件，trace 文件留下记录。
@@ -509,6 +562,70 @@ TEST(SchedProcessExecTp, DisableStopsFiring) {
     }
 
     // 清理由 RAII guard 析构完成（disable + umount + rmdir；析构再次写 "0" 对已 disable 状态幂等）。
+}
+
+// The control thread and executing task run on different online CPUs. This
+// validates tracefs behavior in stable epochs; the kernel static-key selftest
+// separately observes the raw branch on a pinned remote CPU without the
+// trace_pipe_enabled secondary gate. Fewer than two available CPUs is an unmet
+// SMP test environment.
+TEST(SchedProcessExecTp, SmpToggleHasStableEpochs) {
+    cpu_set_t available;
+    CPU_ZERO(&available);
+    ASSERT_EQ(0, sched_getaffinity(0, sizeof(available), &available)) << strerror(errno);
+    int control_cpu = -1;
+    int worker_cpu = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &available)) continue;
+        if (control_cpu < 0) control_cpu = cpu;
+        else {
+            worker_cpu = cpu;
+            break;
+        }
+    }
+    ASSERT_GE(worker_cpu, 0) << "SMP acceptance requires at least two available CPUs";
+    cpu_set_t control_set;
+    CPU_ZERO(&control_set);
+    CPU_SET(control_cpu, &control_set);
+    ASSERT_EQ(0, sched_setaffinity(0, sizeof(control_set), &control_set)) << strerror(errno);
+
+    char root[128] = {};
+    snprintf(root, sizeof(root), "/tmp/sched_tp_smp_%d", getpid());
+    ASSERT_EQ(0, mkdir(root, 0755)) << strerror(errno);
+    DebugfsMount guard(root);
+    ASSERT_TRUE(mount_debugfs(root));
+    guard.mark_mounted();
+
+    char enable_path[320] = {};
+    char trace_path[256] = {};
+    snprintf(enable_path, sizeof(enable_path),
+             "%s/tracing/events/sched/sched_process_exec/enable", root);
+    snprintf(trace_path, sizeof(trace_path), "%s/tracing/trace", root);
+    guard.arm_enable(enable_path);
+
+    for (int epoch = 0; epoch < 16; ++epoch) {
+        ASSERT_TRUE(write_file(enable_path, "1"));
+        ASSERT_TRUE(write_file(trace_path, "1"));
+        pid_t enabled_child = run_exec_on_cpu(worker_cpu);
+        ASSERT_GT(enabled_child, 0);
+        int status = 0;
+        ASSERT_EQ(enabled_child, waitpid(enabled_child, &status, 0));
+        ASSERT_TRUE(WIFEXITED(status));
+        ASSERT_EQ(0, WEXITSTATUS(status));
+        ASSERT_FALSE(record_for_pid(read_all(trace_path), enabled_child).empty())
+            << "remote CPU missed enabled epoch " << epoch;
+
+        ASSERT_TRUE(write_file(enable_path, "0"));
+        ASSERT_TRUE(write_file(trace_path, "1"));
+        pid_t disabled_child = run_exec_on_cpu(worker_cpu);
+        ASSERT_GT(disabled_child, 0);
+        status = 0;
+        ASSERT_EQ(disabled_child, waitpid(disabled_child, &status, 0));
+        ASSERT_TRUE(WIFEXITED(status));
+        ASSERT_EQ(0, WEXITSTATUS(status));
+        EXPECT_TRUE(record_for_pid(read_all(trace_path), disabled_child).empty())
+            << "remote CPU observed stale enabled branch in epoch " << epoch;
+    }
 }
 
 // non-leader 线程 execve：触发 de_thread 的 raw_pid 交换，old_pid ≠ pid。

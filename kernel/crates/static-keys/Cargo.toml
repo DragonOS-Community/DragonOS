@@ -1,0 +1,24 @@
+[package]
+name = "static-keys"
+version = "0.8.2"
+edition = "2024"
+rust-version = "1.87"
+authors = ["Evian-Zhang <evianzhang1999@163.com>"]
+license = "MIT OR Apache-2.0"
+description = "Reimplement Linux kernel static keys for Rust userland applications."
+homepage = "https://evian-zhang.github.io/static-keys/en/"
+documentation = "https://docs.rs/static-keys"
+repository = "https://github.com/Evian-Zhang/static-keys"
+readme = "README.md"
+keywords = ["static-keys", "Linux-kernel"]
+categories = ["rust-patterns", "no-std"]
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[package.metadata.dragonos]
+upstream-version = "0.8.2"
+upstream-repository = "https://github.com/Evian-Zhang/static-keys"
+
+# DragonOS only builds this maintained copy for bare-metal targets. Keeping
+# hosted-OS dependencies here would needlessly perturb the kernel lockfile.

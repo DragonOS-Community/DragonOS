@@ -1,11 +1,14 @@
-use crate::libs::spinlock::SpinLock;
+use crate::{
+    debug::jump_label::{disable_maskable_key, enable_maskable_key, MaskableStaticFalseKey},
+    libs::{mutex::Mutex, spinlock::SpinLock},
+};
 use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     fmt::Debug,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use static_keys::StaticFalseKey;
+use system_error::SystemError;
 
 #[derive(Debug)]
 #[repr(C, packed)]
@@ -40,11 +43,11 @@ impl TraceEntry {
 pub struct TracePoint {
     name: &'static str,
     system: &'static str,
-    key: &'static StaticFalseKey,
+    key: &'static MaskableStaticFalseKey,
     id: AtomicU32,
     callback: SpinLock<Option<Arc<[TracePointFunc]>>>,
     raw_callback: SpinLock<BTreeMap<usize, Arc<dyn TracePointCallBackFunc>>>,
-    enable_state: SpinLock<TracePointEnableState>,
+    enable_state: Mutex<TracePointEnableState>,
     trace_pipe_enabled: AtomicBool,
     trace_entry_fmt_func: fn(&[u8]) -> String,
     trace_print_func: fn() -> String,
@@ -128,8 +131,8 @@ macro_rules! impl_trace_event_field {
 impl_trace_event_field!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
 
 impl TracePoint {
-    pub const fn new(
-        key: &'static StaticFalseKey,
+    pub(crate) const fn new(
+        key: &'static MaskableStaticFalseKey,
         name: &'static str,
         system: &'static str,
         fmt_func: fn(&[u8]) -> String,
@@ -145,7 +148,7 @@ impl TracePoint {
             trace_print_func,
             callback: SpinLock::new(None),
             raw_callback: SpinLock::new(BTreeMap::new()),
-            enable_state: SpinLock::new(TracePointEnableState {
+            enable_state: Mutex::new(TracePointEnableState {
                 users: 0,
                 trace_pipe_enabled: false,
             }),
@@ -275,35 +278,41 @@ impl TracePoint {
     }
 
     /// Acquire one active consumer reference.
-    pub fn acquire_enable(&self) {
+    pub fn acquire_enable(&self) -> Result<(), SystemError> {
+        crate::text_patch::validate_control_context().map_err(SystemError::from)?;
         let mut state = self.enable_state.lock();
         let users = state
             .users
             .checked_add(1)
             .expect("tracepoint enable reference overflow");
         if state.users == 0 {
-            unsafe { self.key.enable() };
+            enable_maskable_key(self.key).map_err(SystemError::from)?;
         }
         state.users = users;
+        Ok(())
     }
 
     /// Release one active consumer reference.
-    pub fn release_enable(&self) {
+    pub fn release_enable(&self) -> Result<(), SystemError> {
+        crate::text_patch::validate_control_context().map_err(SystemError::from)?;
         let mut state = self.enable_state.lock();
-        state.users = state
+        let users = state
             .users
             .checked_sub(1)
             .expect("tracepoint enable reference underflow");
-        if state.users == 0 {
-            unsafe { self.key.disable() };
+        if users == 0 {
+            disable_maskable_key(self.key).map_err(SystemError::from)?;
         }
+        state.users = users;
+        Ok(())
     }
 
     /// Set the tracefs recording owner state. Repeated writes are idempotent.
-    pub fn set_trace_pipe_enabled(&self, enabled: bool) {
+    pub fn set_trace_pipe_enabled(&self, enabled: bool) -> Result<(), SystemError> {
+        crate::text_patch::validate_control_context().map_err(SystemError::from)?;
         let mut state = self.enable_state.lock();
         if state.trace_pipe_enabled == enabled {
-            return;
+            return Ok(());
         }
 
         if enabled {
@@ -312,22 +321,24 @@ impl TracePoint {
                 .checked_add(1)
                 .expect("tracepoint enable reference overflow");
             if state.users == 0 {
-                unsafe { self.key.enable() };
+                enable_maskable_key(self.key).map_err(SystemError::from)?;
             }
             state.users = users;
             state.trace_pipe_enabled = true;
             self.trace_pipe_enabled.store(true, Ordering::Release);
         } else {
-            self.trace_pipe_enabled.store(false, Ordering::Release);
-            state.trace_pipe_enabled = false;
-            state.users = state
+            let users = state
                 .users
                 .checked_sub(1)
                 .expect("tracepoint enable reference underflow");
-            if state.users == 0 {
-                unsafe { self.key.disable() };
+            if users == 0 {
+                disable_maskable_key(self.key).map_err(SystemError::from)?;
             }
+            state.users = users;
+            state.trace_pipe_enabled = false;
+            self.trace_pipe_enabled.store(false, Ordering::Release);
         }
+        Ok(())
     }
 
     /// Whether tracefs owns an active recording reference.

@@ -4,17 +4,23 @@
 //! module.  The upstream default backend is intentionally not used because it
 //! performs an unsynchronised `memcpy` into executable text.
 
+#[cfg(target_arch = "x86_64")]
 use static_keys::{
     code_manipulate::{CodePatchBackend, CodePatchTransaction},
     RawStaticFalseKey,
 };
 
-use crate::text_patch::{TextPatchError, TextPatchTransaction};
+use crate::text_patch::TextPatchError;
+#[cfg(target_arch = "x86_64")]
+use crate::text_patch::TextPatchTransaction;
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) struct DragonOsTextPatchBackend;
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) struct DragonOsStaticKeyTransaction(TextPatchTransaction);
 
+#[cfg(target_arch = "x86_64")]
 unsafe impl CodePatchBackend for DragonOsTextPatchBackend {
     type Error = TextPatchError;
     type Transaction = DragonOsStaticKeyTransaction;
@@ -24,6 +30,7 @@ unsafe impl CodePatchBackend for DragonOsTextPatchBackend {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe impl CodePatchTransaction for DragonOsStaticKeyTransaction {
     type Error = TextPatchError;
 
@@ -41,8 +48,27 @@ unsafe impl CodePatchTransaction for DragonOsStaticKeyTransaction {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) type MaskableStaticFalseKey = RawStaticFalseKey<DragonOsTextPatchBackend>;
 
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) struct MaskableStaticFalseKey(core::sync::atomic::AtomicBool);
+
+#[cfg(not(target_arch = "x86_64"))]
+impl MaskableStaticFalseKey {
+    pub(crate) const fn new() -> Self {
+        Self(core::sync::atomic::AtomicBool::new(false))
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_enabled(&self) -> bool {
+        // This is a reachability hint, not a data-publication barrier. Callback
+        // snapshots retain their own SpinLock/Arc synchronization.
+        self.0.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn enable_maskable_key(
     key: &'static MaskableStaticFalseKey,
@@ -57,6 +83,16 @@ pub(crate) fn enable_maskable_key(
     }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn enable_maskable_key(
+    key: &'static MaskableStaticFalseKey,
+) -> Result<(), TextPatchError> {
+    key.0.store(true, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn disable_maskable_key(
     key: &'static MaskableStaticFalseKey,
@@ -70,6 +106,15 @@ pub(crate) fn disable_maskable_key(
     }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn disable_maskable_key(
+    key: &'static MaskableStaticFalseKey,
+) -> Result<(), TextPatchError> {
+    key.0.store(false, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 /// Declare a static key whose branch site is unreachable from NMI/MCE paths.
 ///
 /// # Safety
@@ -81,14 +126,34 @@ pub(crate) fn disable_maskable_key(
 #[macro_export]
 macro_rules! unsafe_define_maskable_static_key_false {
     ($key:ident) => {
+        #[cfg(target_arch = "x86_64")]
         static_keys::define_static_key_false_generic!(
             $key,
             $crate::debug::jump_label::DragonOsTextPatchBackend
         );
+        #[cfg(not(target_arch = "x86_64"))]
+        #[allow(non_upper_case_globals)]
+        static $key: $crate::debug::jump_label::MaskableStaticFalseKey =
+            $crate::debug::jump_label::MaskableStaticFalseKey::new();
     };
 }
 
-#[cfg(feature = "static_keys_test")]
+/// Evaluate a maskable static branch using the architecture's safe backend.
+#[macro_export]
+macro_rules! maskable_static_branch_unlikely {
+    ($key:ident) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            static_keys::static_branch_unlikely!($key)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            $key.is_enabled()
+        }
+    }};
+}
+
+#[cfg(all(feature = "static_keys_test", target_arch = "x86_64"))]
 mod tests {
     use alloc::{boxed::Box, sync::Arc};
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -228,11 +293,12 @@ mod tests {
 pub fn static_keys_init() {
     // Metadata initialization only; runtime text writes remain gated until
     // `text_patch::init_live()` completes after SMP bring-up.
+    #[cfg(target_arch = "x86_64")]
     static_keys::global_init();
 }
 
 pub(crate) fn static_keys_live_selftest() -> Result<(), TextPatchError> {
-    #[cfg(feature = "static_keys_test")]
+    #[cfg(all(feature = "static_keys_test", target_arch = "x86_64"))]
     tests::run()?;
     Ok(())
 }

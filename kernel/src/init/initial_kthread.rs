@@ -105,11 +105,16 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
     smp_init();
-    if let Err(error) = crate::text_patch::init_live() {
-        log::warn!("runtime text patching unavailable: {:?}", error);
-    } else if let Err(error) = crate::debug::jump_label::static_keys_live_selftest() {
-        panic!("static-key live selftest failed: {:?}", error);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Err(error) = crate::text_patch::init_live() {
+            log::warn!("runtime text patching unavailable: {:?}", error);
+        } else if let Err(error) = crate::debug::jump_label::static_keys_live_selftest() {
+            panic!("static-key live selftest failed: {:?}", error);
+        }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = crate::text_patch::init_live();
     crate::exception::workqueue::workqueue_init();
     crate::perf::release::init();
     return Ok(());

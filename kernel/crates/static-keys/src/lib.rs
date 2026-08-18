@@ -229,7 +229,7 @@ pub fn global_init() {
         UNINITIALIZED,
         INITIALIZING,
         core::sync::atomic::Ordering::Acquire,
-        core::sync::atomic::Ordering::Relaxed,
+        core::sync::atomic::Ordering::Acquire,
     ) {
         Ok(UNINITIALIZED) => {
             global_init_inner();
@@ -237,7 +237,7 @@ pub fn global_init() {
             // Successful init
         }
         Err(INITIALIZING) => {
-            while GLOBAL_INIT_STATE.load(core::sync::atomic::Ordering::Relaxed) == INITIALIZING {
+            while GLOBAL_INIT_STATE.load(core::sync::atomic::Ordering::Acquire) == INITIALIZING {
                 core::hint::spin_loop();
             }
             // Other has inited
@@ -433,20 +433,12 @@ unsafe fn static_key_update<M: CodePatchBackend, const S: bool>(
             break;
         }
 
-        let replacement = arch::arch_jump_entry_instruction(
-            jump_label_type(jump_entry, enabled),
-            jump_entry,
-        );
-        let expected = arch::arch_jump_entry_instruction(
-            jump_label_type(jump_entry, !enabled),
-            jump_entry,
-        );
+        let replacement =
+            arch::arch_jump_entry_instruction(jump_label_type(jump_entry, enabled), jump_entry);
+        let expected =
+            arch::arch_jump_entry_instruction(jump_label_type(jump_entry, !enabled), jump_entry);
         unsafe {
-            transaction.queue(
-                jump_entry.code_addr() as *mut _,
-                &expected,
-                &replacement,
-            )?;
+            transaction.queue(jump_entry.code_addr() as *mut _, &expected, &replacement)?;
             jump_entry_addr = jump_entry_addr.add(1);
         };
     }

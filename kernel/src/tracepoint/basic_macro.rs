@@ -70,7 +70,7 @@ macro_rules! unsafe_define_event_trace{
             #[inline(always)]
             #[allow(non_snake_case)]
             pub fn [<trace_ $name>]($($arg:$arg_type),*) {
-                if static_keys::static_branch_unlikely!([<__ $name _KEY>]) {
+                if $crate::maskable_static_branch_unlikely!([<__ $name _KEY>]) {
                     let mut f = |trace_func: &$crate::tracepoint::TracePointFunc| {
                         let func = trace_func.func;
                         let data = trace_func.data.as_ref();
@@ -314,7 +314,7 @@ macro_rules! unsafe_define_event_trace{
             #[inline(always)]
             #[allow(non_snake_case)]
             pub fn [<trace_ $name>]( $($arg:$arg_type),* ){
-                if static_keys::static_branch_unlikely!([<__ $name _KEY>]){
+                if $crate::maskable_static_branch_unlikely!([<__ $name _KEY>]) {
                     let mut f = |trace_func: &$crate::tracepoint::TracePointFunc |{
                         let func = trace_func.func;
                         let data = trace_func.data.as_ref();

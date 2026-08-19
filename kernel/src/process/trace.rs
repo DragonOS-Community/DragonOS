@@ -2,9 +2,11 @@
 //!
 //! 字段与 raw ABI 对齐 Linux 6.6 `include/trace/events/sched.h`。
 
-use crate::define_event_trace;
+use crate::unsafe_define_event_trace;
 
-define_event_trace!(
+// SAFETY: sched_process_exec is emitted from the process exec path and is not
+// reachable from x86 NMI/MCE handlers.
+unsafe_define_event_trace!(
     sched_process_exec,
     TP_system(sched),
     TP_PROTO(filename: &[u8], pid: i32, old_pid: i32),

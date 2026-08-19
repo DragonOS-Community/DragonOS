@@ -3,27 +3,30 @@ use crate::bpf::helper::BPF_HELPER_FUN_SET;
 use crate::bpf::prog::BpfProg;
 use crate::filesystem::page_cache::PageCache;
 use crate::libs::casting::DowncastArc;
-use crate::libs::mutex::MutexGuard;
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::perf::util::PerfProbeConfig;
-use crate::perf::{BasicPerfEbpfCallBack, JITMem};
+use crate::perf::BasicPerfEbpfCallBack;
+#[cfg(target_arch = "x86_64")]
+use crate::perf::JITMem;
 use crate::tracepoint::{TracePoint, TracePointCallBackFunc};
 use crate::{
     filesystem::vfs::{file::File, FilePrivateData, FileSystem, IndexNode},
     perf::{util::PerfProbeArgs, PerfEventOps},
 };
+#[cfg(target_arch = "x86_64")]
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 use core::any::Any;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use rbpf::EbpfVmRaw;
 use system_error::SystemError;
 
 pub struct TracepointPerfEvent {
     _args: PerfProbeArgs,
     tp: &'static TracePoint,
-    state: SpinLock<PerfTracepointState>,
+    state: Mutex<PerfTracepointState>,
+    enable_ref_held: AtomicBool,
 }
 
 struct PerfTracepointState {
@@ -45,10 +48,11 @@ impl TracepointPerfEvent {
         TracepointPerfEvent {
             _args: args,
             tp,
-            state: SpinLock::new(PerfTracepointState {
+            state: Mutex::new(PerfTracepointState {
                 enabled: false,
                 callbacks: Vec::new(),
             }),
+            enable_ref_held: AtomicBool::new(false),
         }
     }
 }
@@ -181,8 +185,14 @@ impl PerfEventOps for TracepointPerfEvent {
         for (id, callback) in state.callbacks.iter() {
             self.tp.register_raw_callback(*id, callback.clone());
         }
-        self.tp.acquire_enable();
+        if let Err(error) = self.tp.acquire_enable() {
+            for (id, _) in state.callbacks.iter() {
+                self.tp.unregister_raw_callback(*id);
+            }
+            return Err(error);
+        }
         state.enabled = true;
+        self.enable_ref_held.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -191,11 +201,14 @@ impl PerfEventOps for TracepointPerfEvent {
         if !state.enabled {
             return Ok(());
         }
+        // Disable the branch first. Existing callback snapshots retain their
+        // Arc references and may finish; no new snapshot can start afterward.
+        self.tp.release_enable()?;
         for (id, _) in state.callbacks.iter() {
             self.tp.unregister_raw_callback(*id);
         }
-        self.tp.release_enable();
         state.enabled = false;
+        self.enable_ref_held.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -206,15 +219,9 @@ impl PerfEventOps for TracepointPerfEvent {
 
 impl Drop for TracepointPerfEvent {
     fn drop(&mut self) {
-        let mut state = self.state.lock();
-        if state.enabled {
-            for (id, _) in state.callbacks.iter() {
-                self.tp.unregister_raw_callback(*id);
-            }
-            self.tp.release_enable();
-            state.enabled = false;
+        if self.enable_ref_held.load(Ordering::Acquire) {
+            panic!("enabled tracepoint perf event dropped before sleepable release");
         }
-        state.callbacks.clear();
     }
 }
 

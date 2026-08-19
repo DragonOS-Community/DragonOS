@@ -597,6 +597,8 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const FIXMAP_START_VADDR: VirtAddr;
     /// 内核的固定映射区的大小
     const FIXMAP_SIZE: usize;
+    /// Architecture-owned fixmap pages excluded from `EarlyIoRemap`.
+    const FIXMAP_RESERVED_TOP_PAGES: usize = 0;
     /// 内核的固定映射区的结束地址
     const FIXMAP_END_VADDR: VirtAddr =
         VirtAddr::new(Self::FIXMAP_START_VADDR.data() + Self::FIXMAP_SIZE);

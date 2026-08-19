@@ -224,14 +224,16 @@ impl TracePointEnableFile {
         }
     }
     /// Enable or disable the tracepoint
-    pub fn write(&self, enable: char) {
+    pub fn write(&self, enable: char) -> Result<(), SystemError> {
         match enable {
-            '1' => self.tracepoint.set_trace_pipe_enabled(true),
-            '0' => self.tracepoint.set_trace_pipe_enabled(false),
+            '1' => self.tracepoint.set_trace_pipe_enabled(true)?,
+            '0' => self.tracepoint.set_trace_pipe_enabled(false)?,
             _ => {
                 log::warn!("Invalid value for tracepoint enable: {}", enable);
+                return Err(SystemError::EINVAL);
             }
         }
+        Ok(())
     }
 }
 

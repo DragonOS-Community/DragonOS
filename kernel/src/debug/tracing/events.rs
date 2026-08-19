@@ -45,7 +45,7 @@ impl KernFSCallback for EnableCallBack {
         if buf.is_empty() {
             return Err(SystemError::EINVAL);
         }
-        tracepoint.enable_file().write(buf[0] as _);
+        tracepoint.enable_file().write(buf[0] as _)?;
         Ok(buf.len())
     }
 

@@ -2,9 +2,9 @@ use super::trace::trace_sched_process_exec;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
+use crate::filesystem::vfs::file::FileDescriptorTable;
 use crate::filesystem::vfs::open::{do_open_execat, do_open_execat_with_flags};
 use crate::libs::futex::futex::RobustListHead;
-use crate::libs::rwsem::RwSem;
 use crate::process::exec::{
     load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
     ExecStartInfo, LoadBinaryResult,
@@ -168,15 +168,14 @@ fn do_execve_internal(
             // 参考 Linux: https://elixir.bootlin.com/linux/v6.1.9/source/fs/exec.c#L1857
             // "Ensure the files table is not shared"
             {
-                // 注意：不能先调用 pcb.fd_table() 再判断 strong_count，
-                // 因为 fd_table() 会克隆 Arc，导致计数至少 +1，误判为“被共享”。
-                let need_unshare = pcb.basic().fd_table_is_shared();
+                let snapshot = pcb.basic().fd_table_snapshot();
+                let (fd_table, need_unshare) = snapshot.expect("exec task has no fd table");
                 if need_unshare {
                     // fd_table 被共享，需要创建私有副本
-                    let fd_table = pcb.fd_table();
                     let new_fd_table = fd_table.read().clone();
-                    let new_fd_table = Arc::new(RwSem::new(new_fd_table));
-                    pcb.basic_mut().set_fd_table(Some(new_fd_table));
+                    let new_fd_table = Arc::new(FileDescriptorTable::new(new_fd_table));
+                    let replaced = pcb.basic_mut().set_fd_table(Some(new_fd_table));
+                    drop(replaced);
                 }
             }
 

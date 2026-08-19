@@ -22,7 +22,10 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        vfs::{file::FileDescriptorVec, FileType, IndexNode},
+        vfs::{
+            file::{FileDescriptorTable, FileDescriptorVec},
+            FileType, IndexNode,
+        },
     },
     ipc::{
         sighand::{NaturalParentNotifyPhase, SigHand},
@@ -33,7 +36,6 @@ use crate::{
         lock_free_flags::LockFreeFlags,
         mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
-        rwsem::RwSem,
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -838,7 +840,7 @@ impl ProcessControlBlock {
 
     /// Returns an `Arc` pointer to the file descriptor table.
     #[inline(always)]
-    pub fn fd_table(&self) -> Arc<RwSem<FileDescriptorVec>> {
+    pub fn fd_table(&self) -> Arc<FileDescriptorTable> {
         return self.basic.read().try_fd_table().unwrap();
     }
 

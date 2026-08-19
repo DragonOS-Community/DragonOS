@@ -1,5 +1,6 @@
 use core::{
     fmt,
+    ops::Deref,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -2507,6 +2508,62 @@ impl ReservedFd {
     }
 }
 
+/// A Linux-style files-table identity.
+///
+/// `Arc` references may also be held temporarily by procfs, BPF verification,
+/// or an in-flight syscall. `task_users` deliberately counts only PCB fd-table
+/// slots, so observers cannot make a private table look shared through
+/// `CLONE_FILES`.
+#[derive(Debug)]
+pub struct FileDescriptorTable {
+    inner: RwSem<FileDescriptorVec>,
+    task_users: AtomicUsize,
+}
+
+impl FileDescriptorTable {
+    pub fn new(inner: FileDescriptorVec) -> Self {
+        Self {
+            inner: RwSem::new(inner),
+            task_users: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn attach_task(&self) {
+        self.task_users
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |users| {
+                users.checked_add(1)
+            })
+            .expect("fd-table task-user count overflow");
+    }
+
+    pub(crate) fn detach_task(&self) {
+        self.task_users
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |users| {
+                users.checked_sub(1)
+            })
+            .expect("fd-table task-user count underflow");
+    }
+
+    #[inline]
+    pub(crate) fn is_shared_by_tasks(&self) -> bool {
+        self.task_users.load(Ordering::Acquire) > 1
+    }
+}
+
+impl Deref for FileDescriptorTable {
+    type Target = RwSem<FileDescriptorVec>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for FileDescriptorTable {
+    fn drop(&mut self) {
+        debug_assert_eq!(self.task_users.load(Ordering::Relaxed), 0);
+    }
+}
+
 /// @brief pcb里面的文件描述符数组
 #[derive(Debug)]
 pub struct FileDescriptorVec {
@@ -2696,14 +2753,15 @@ impl FileDescriptorVec {
     /// are not blocked by potentially large allocations and allocation failure
     /// cannot run close side effects for an unpublished clone.
     pub(crate) fn try_clone_for_close_range(
-        source: &Arc<RwSem<Self>>,
+        source: &Arc<FileDescriptorTable>,
         punch_hole: Option<(u32, u32)>,
-    ) -> Result<Arc<RwSem<Self>>, SystemError> {
+    ) -> Result<Arc<FileDescriptorTable>, SystemError> {
         let mut target_len = source.read().clone_plan(punch_hole).target_len;
 
         loop {
             let layout = Self::try_allocate_empty_clone_layout(target_len)?;
-            let destination = Arc::try_new(RwSem::new(layout)).map_err(|_| SystemError::ENOMEM)?;
+            let destination =
+                Arc::try_new(FileDescriptorTable::new(layout)).map_err(|_| SystemError::ENOMEM)?;
 
             let source_guard = source.read();
             let current_plan = source_guard.clone_plan(punch_hole);

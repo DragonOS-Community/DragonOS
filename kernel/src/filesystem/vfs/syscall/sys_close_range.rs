@@ -6,8 +6,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_CLOSE_RANGE},
-    filesystem::vfs::file::FileDescriptorVec,
-    libs::rwsem::RwSem,
+    filesystem::vfs::file::{FileDescriptorTable, FileDescriptorVec},
     process::ProcessManager,
     sched::sched_yield,
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -46,7 +45,7 @@ impl Syscall for SysCloseRangeHandle {
 
 syscall_table_macros::declare_syscall!(SYS_CLOSE_RANGE, SysCloseRangeHandle);
 
-fn close_range_in_table(table: &Arc<RwSem<FileDescriptorVec>>, first: u32, last: u32) {
+fn close_range_in_table(table: &Arc<FileDescriptorTable>, first: u32, last: u32) {
     let Some(end) = table.read().close_range_end(last) else {
         return;
     };
@@ -79,7 +78,7 @@ fn close_range_in_table(table: &Arc<RwSem<FileDescriptorVec>>, first: u32, last:
     }
 }
 
-fn set_cloexec_in_table(table: &Arc<RwSem<FileDescriptorVec>>, first: u32, last: u32) {
+fn set_cloexec_in_table(table: &Arc<FileDescriptorTable>, first: u32, last: u32) {
     table.write().set_cloexec_range(first, last);
 }
 
@@ -90,11 +89,11 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> Result<usize, SystemErro
     }
 
     let current = ProcessManager::current_pcb();
-    // This check must precede current.fd_table(), whose returned Arc would make
-    // an otherwise private table appear shared.
-    let must_unshare =
-        flags.contains(CloseRangeFlags::UNSHARE) && current.basic().fd_table_is_shared();
-    let old_table = current.fd_table();
+    let (old_table, shared_by_tasks) = current
+        .basic()
+        .fd_table_snapshot()
+        .expect("close_range task has no fd table");
+    let must_unshare = flags.contains(CloseRangeFlags::UNSHARE) && shared_by_tasks;
 
     if must_unshare {
         let punch_hole = if flags.contains(CloseRangeFlags::CLOEXEC) {

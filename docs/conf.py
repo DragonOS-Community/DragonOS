@@ -91,7 +91,7 @@ myst_enable_extensions = [
     "linkify"
 ]
 
-# sphinx-multiversion 指定哪个分支为 lastest 版本
+# sphinx-multiversion 指定哪个分支为 latest 版本
 smv_latest_version = 'master'
 smv_released_pattern = r'^tags/.*$'           # Tags only
 smv_tag_whitelist = r'^(V.*|v.*)$'

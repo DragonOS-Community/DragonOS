@@ -25,13 +25,13 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::CurrentIrqArch;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::Signal;
+use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::ipc::signal::force_sig_fault_to_current;
-use crate::mm::VirtAddr;
 use crate::mm::ucontext::{UprobeConsumerRuntimeSnapshot, XolSlotLease};
+use crate::mm::VirtAddr;
 use crate::process::{ProcessControlBlock, ProcessFlags, ProcessManager};
 use kprobe::ProbeArgs;
 use log::{debug, warn};
@@ -108,7 +108,7 @@ impl core::fmt::Debug for ActiveXol {
 /// 调用方（`do_int3`）已保证 `is_from_user()` 为真。
 pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemError> {
     let break_addr = frame.break_address(); // = rip - 1 = probe_vaddr（raw rip 保留，
-    // 供 BPF 回调经 break_address() 取得原探针址——batch3↔batch4 运行时契约）。
+                                            // 供 BPF 回调经 break_address() 取得原探针址——batch3↔batch4 运行时契约）。
 
     // F5：回调执行期间 rip 必须保持 raw（probe_vaddr+1），绝不在此预设为原探针址，
     // 否则回调内 `break_address()=rip-1` 会得到 probe_vaddr-1 而非 probe_vaddr。
@@ -152,9 +152,18 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
         (xol_lease, slot_vaddr, slot_end, return_addr, participants)
     }; // uprobe_list 释放
 
+    // #BP uses a DPL=3 interrupt gate so teardown cannot observe this CPU's
+    // shootdown acknowledgement before the hit-table lookup and slot lease
+    // capture are complete. The XOL VMA is immutable, so callbacks may run
+    // from this point with normal user-exception interrupt semantics.
+    unsafe { CurrentIrqArch::interrupt_enable() };
+
     // ── Phase 1.5：锁外跑 pre_handler + event_callback（评审 R12）──
     // rip 保持 raw（probe_vaddr+1）：BPF 回调经 break_address()=rip-1 取得原探针址。
     for participant in participants.iter() {
+        if !participant.permits_task(&pcb) {
+            continue;
+        }
         (participant.pre_handler)(frame);
         if let Some(callback) = participant.event_callback.as_ref() {
             callback.call(frame);
@@ -242,6 +251,9 @@ pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, Sys
     // post 使用 #BP 时的 participant 快照。并发 close 可从 mm 表移除实例，
     // 但不能让已经执行过 pre 的 consumer 丢失配对的 post。
     for participant in state.participants.iter() {
+        if !participant.permits_task(&pcb) {
+            continue;
+        }
         (participant.post_handler)(frame);
     }
 

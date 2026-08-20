@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +23,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <thread>
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -152,11 +154,11 @@ constexpr unsigned char RAW_TARGET_CODE[] = {
     0xc3,                    // ret
 };
 
-int create_raw_target(char* path_template) {
+int create_raw_code(char* path_template, const unsigned char* code,
+                    size_t code_size) {
     int fd = mkstemp(path_template);
     if (fd < 0) return -1;
-    if (write(fd, RAW_TARGET_CODE, sizeof(RAW_TARGET_CODE)) !=
-        static_cast<ssize_t>(sizeof(RAW_TARGET_CODE))) {
+    if (write(fd, code, code_size) != static_cast<ssize_t>(code_size)) {
         const int saved_errno = errno;
         close(fd);
         unlink(path_template);
@@ -164,6 +166,11 @@ int create_raw_target(char* path_template) {
         return -1;
     }
     return fd;
+}
+
+int create_raw_target(char* path_template) {
+    return create_raw_code(path_template, RAW_TARGET_CODE,
+                           sizeof(RAW_TARGET_CODE));
 }
 
 }  // namespace
@@ -549,6 +556,83 @@ TEST(UprobeTest, SameAddressConsumersCloseIndependently) {
         EXPECT_EQ(uprobe_target(i + 400), (i + 400) * 2 + 1)
             << "最后一个 consumer 关闭后第 " << i << " 次执行错误";
     }
+}
+
+TEST(UprobeTest, RepeatedStringInstructionIsRejected) {
+    constexpr unsigned char rep_movsb[] = {
+        0xf3, 0xa4,  // rep movsb
+        0xc3,        // ret
+    };
+    char path[] = "/tmp/uprobe_rep_XXXXXX";
+    FdGuard file(create_raw_code(path, rep_movsb, sizeof(rep_movsb)));
+    ASSERT_GE(file.get(), 0);
+
+    errno = 0;
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    EXPECT_LT(event.get(), 0)
+        << "phase-1 XOL must reject repeated string instructions";
+    EXPECT_EQ(errno, EINVAL);
+    unlink(path);
+}
+
+// Exercise the exact window where one CPU has executed INT3 while another
+// CPU disables or closes the last consumer. A leaked ordinary SIGTRAP or a
+// reused XOL slot terminates the test or produces a wrong result.
+TEST(UprobeTest, ConcurrentTeardownDoesNotExposeRetiredBreakpoint) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uprobe_target), path, offset))
+        << "无法解析目标函数偏移";
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> bad_results{0};
+    std::atomic<unsigned long> completed_calls{0};
+    std::thread runner([&]() {
+        int value = 1;
+        while (!stop.load(std::memory_order_acquire)) {
+            if (uprobe_target(value) != value * 2 + 1) {
+                bad_results.fetch_add(1, std::memory_order_relaxed);
+            }
+            completed_calls.fetch_add(1, std::memory_order_release);
+            value = value == 1000 ? 1 : value + 1;
+        }
+    });
+
+    int setup_failure_iteration = -1;
+    int setup_failure_errno = 0;
+    for (int i = 0; i < 200; ++i) {
+        FdGuard event(open_uprobe_perf_event(path, offset));
+        if (event.get() < 0 || ioctl(event.get(), PERF_EVENT_IOC_ENABLE, 0) < 0) {
+            setup_failure_iteration = i;
+            setup_failure_errno = errno;
+            break;
+        }
+        const auto before = completed_calls.load(std::memory_order_acquire);
+        bool made_progress = false;
+        for (int spin = 0; spin < 10000; ++spin) {
+            if (completed_calls.load(std::memory_order_acquire) != before) {
+                made_progress = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        if (!made_progress ||
+            ((i & 1) == 0 && ioctl(event.get(), PERF_EVENT_IOC_DISABLE, 0) < 0)) {
+            setup_failure_iteration = i;
+            setup_failure_errno = made_progress ? errno : ETIMEDOUT;
+            break;
+        }
+        // FdGuard closes the enabled or disabled final consumer here while
+        // the sibling continues to execute the target.
+    }
+
+    stop.store(true, std::memory_order_release);
+    runner.join();
+    EXPECT_EQ(setup_failure_iteration, -1)
+        << "iteration=" << setup_failure_iteration
+        << ", errno=" << setup_failure_errno;
+    EXPECT_EQ(bad_results.load(std::memory_order_relaxed), 0);
 }
 
 int main(int argc, char** argv) {

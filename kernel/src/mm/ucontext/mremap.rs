@@ -391,7 +391,25 @@ impl InnerAddressSpace {
         // reapplies the unchanged source mapping instead.
         #[cfg(target_arch = "x86_64")]
         if old_len != 0 {
-            super::uprobe::uprobe_disarm_range_locked(&mm, self, source_region);
+            if let Err(err) = super::uprobe::uprobe_disarm_range_locked(&mm, self, source_region) {
+                self.mappings.remove_vma(&new_region);
+                if let (Some(file), Some(VmaOpenRollback::Close)) =
+                    (vm_file.as_ref(), target_vma_open_rollback)
+                {
+                    notifications.vma.push(VmaCloseNotification {
+                        file: file.clone(),
+                        region: new_region,
+                        vm_flags,
+                    });
+                }
+                if let Some(sysv_shm) = sysv_shm.as_ref() {
+                    notifications.sysv.push(sysv_shm.clone());
+                }
+                if let Some(lifecycle) = source_split_lifecycle.take() {
+                    lifecycle.rollback_into(&mut notifications);
+                }
+                mremap_fail!(err);
+            }
         }
 
         // mremap does not free physical pages; old PTEs are migrated to the new VMA, while

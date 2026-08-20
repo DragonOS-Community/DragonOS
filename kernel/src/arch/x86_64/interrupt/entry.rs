@@ -575,6 +575,13 @@ pub unsafe fn set_system_trap_gate(irq: u32, ist: u8, vaddr: VirtAddr) {
     set_gate(idt_entry, 0xEF, ist, vaddr);
 }
 
+/// 设置中断门(DPL=3)
+#[allow(dead_code)]
+pub unsafe fn set_system_intr_gate(irq: u32, ist: u8, vaddr: VirtAddr) {
+    let idt_entry = get_idt_entry(irq);
+    set_gate(idt_entry, 0xEE, ist, vaddr);
+}
+
 #[allow(static_mut_refs)]
 unsafe fn get_idt_entry(irq: u32) -> &'static mut [u64] {
     assert!(irq < 256);

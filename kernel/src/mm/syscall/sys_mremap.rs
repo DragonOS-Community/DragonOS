@@ -106,6 +106,13 @@ impl Syscall for SysMremapHandle {
             (*g.vm_flags(), *g.region())
         };
 
+        // Linux vma_to_resize() rejects special mappings before
+        // MREMAP_FIXED destroys the destination. The uprobe XOL trampoline is
+        // VM_DONTEXPAND and must remain kernel-owned.
+        if vm_flags.intersects(VmFlags::VM_DONTEXPAND | VmFlags::VM_PFNMAP) {
+            return Err(SystemError::EINVAL);
+        }
+
         // Linux vma_to_resize() semantics:
         // With MREMAP_FIXED, the *source span being remapped* must be within a single VMA.
         // - For shrinking, Linux unmaps the tail first and then checks the shrunken length.

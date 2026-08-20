@@ -32,6 +32,10 @@ pub enum UprobeInsnError {
     /// 指令抑制 #DB（MOV SS/POP SS）或整体改写 RFLAGS（POPF*）——
     /// XOL 单步窗口会断裂。注册时拒绝。
     UnsafeForXol,
+    /// REP/REPE/REPNE string instructions may report an intermediate #DB
+    /// with RIP still at the copied instruction. The phase-1 exact-end XOL
+    /// state machine cannot complete those iterations safely.
+    UnsupportedRepeatedString,
 }
 
 /// RIP-relative 重定位信息（静态分析得出，运行时用真实 slot 地址套用）。
@@ -91,12 +95,31 @@ pub fn analyze_insn(bytes: &[u8]) -> Result<InsnAnalysis, UprobeInsnError> {
     if suppresses_debug_or_rewrites_flags(&inst) {
         return Err(UprobeInsnError::UnsafeForXol);
     }
+    if is_repeated_string(&inst) {
+        return Err(UprobeInsnError::UnsupportedRepeatedString);
+    }
 
     let rip_relative = find_rip_relative(&inst, insn_len)?;
     Ok(InsnAnalysis {
         insn_len,
         rip_relative,
     })
+}
+
+fn is_repeated_string(inst: &Instruction) -> bool {
+    use yaxpeax_x86::amd64::Opcode;
+
+    inst.prefixes.rep_any()
+        && matches!(
+            inst.opcode(),
+            Opcode::CMPS
+                | Opcode::SCAS
+                | Opcode::MOVS
+                | Opcode::LODS
+                | Opcode::STOS
+                | Opcode::INS
+                | Opcode::OUTS
+        )
 }
 
 /// 判断指令是否为控制流指令（不可从 XOL slot 安全执行）。
@@ -335,6 +358,25 @@ mod tests {
         assert!(analyze_insn(&[0x8e, 0xd8]).is_ok());
         // 对照：普通 mov（非 SS 目标）可接受
         assert!(analyze_insn(&[0x48, 0x89, 0xe5]).is_ok());
+    }
+
+    #[test]
+    fn repeated_string_instructions_are_rejected() {
+        for bytes in [
+            &[0xf3, 0xa4][..], // rep movsb
+            &[0xf2, 0xa6][..], // repne cmpsb
+            &[0xf3, 0xae][..], // repe scasb
+        ] {
+            assert_eq!(
+                analyze_insn(bytes).unwrap_err(),
+                UprobeInsnError::UnsupportedRepeatedString,
+                "bytes={bytes:x?}"
+            );
+        }
+
+        // F3 is also a mandatory/semantic prefix for non-string instructions.
+        // Do not reject PAUSE merely because it shares the REP byte.
+        assert!(analyze_insn(&[0xf3, 0x90]).is_ok());
     }
     #[test]
     fn build_slot_relocates_disp() {

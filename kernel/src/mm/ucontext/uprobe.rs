@@ -20,18 +20,18 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use system_error::SystemError;
 
 use crate::{
-    arch::{MMArch, mm::PageMapper},
+    arch::{mm::PageMapper, MMArch},
     filesystem::{page_cache::PageCache, vfs::IndexNode},
     libs::{mutex::Mutex, rwlock::RwLock},
     mm::{
-        MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion, VmFlags,
-        page::{Page, PageEntry, page_manager_lock},
+        page::{page_manager_lock, Page, PageEntry},
         syscall::{MapFlags, ProtFlags},
+        MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion, VmFlags,
     },
     process::ProcessControlBlock,
 };
@@ -40,7 +40,7 @@ use super::RwSemWriteGuard;
 use super::{AddressSpace, InnerAddressSpace, LockedVMA};
 
 use uprobe::{
-    InsnAnalysis, ProbeArgs, UPROBE_INSN_COPY_SIZE, UprobePoint, analyze_insn, build_xol_slot,
+    analyze_insn, build_xol_slot, InsnAnalysis, ProbeArgs, UprobePoint, UPROBE_INSN_COPY_SIZE,
 };
 
 // ──────────────────────────── XOL 区 ────────────────────────────
@@ -271,17 +271,22 @@ impl Drop for UprobeDefinition {
     }
 }
 
-/// consumer 的安装权限在创建时冻结；exec 后旧 mm 不会被自动重新授权。
-struct UprobeTaskScopeToken(u64);
+#[derive(Clone)]
+pub struct UprobeTaskScope(Arc<UprobeTaskScopeToken>);
+
+/// The global weak reference keeps the PCB allocation from being reused while
+/// a scope exists. The pointer cookie can therefore be compared on the hit
+/// path without taking the global scope lock.
+struct UprobeTaskScopeToken {
+    id: u64,
+    target_ptr: usize,
+}
 
 impl Drop for UprobeTaskScopeToken {
     fn drop(&mut self) {
-        UPROBE_TASK_SCOPES.lock_irqsave().remove(&self.0);
+        UPROBE_TASK_SCOPES.lock_irqsave().remove(&self.id);
     }
 }
-
-#[derive(Clone)]
-pub struct UprobeTaskScope(Arc<UprobeTaskScopeToken>);
 
 impl UprobeTaskScope {
     pub fn new(target: &Arc<ProcessControlBlock>) -> Self {
@@ -289,7 +294,14 @@ impl UprobeTaskScope {
         UPROBE_TASK_SCOPES
             .lock_irqsave()
             .insert(id, Arc::downgrade(target));
-        Self(Arc::new(UprobeTaskScopeToken(id)))
+        Self(Arc::new(UprobeTaskScopeToken {
+            id,
+            target_ptr: Arc::as_ptr(target) as usize,
+        }))
+    }
+
+    fn permits_task(&self, current: &Arc<ProcessControlBlock>) -> bool {
+        Arc::as_ptr(current) as usize == self.0.target_ptr
     }
 }
 
@@ -302,13 +314,20 @@ impl UprobeConsumerScope {
     fn permits(&self, mm: &Arc<AddressSpace>) -> bool {
         match self {
             Self::Task(target) => {
-                let target = { UPROBE_TASK_SCOPES.lock_irqsave().get(&target.0.0).cloned() };
+                let target = { UPROBE_TASK_SCOPES.lock_irqsave().get(&target.0.id).cloned() };
                 target
                     .and_then(|target| target.upgrade())
                     .and_then(|task| task.basic().user_vm())
                     .is_some_and(|target_mm| Arc::ptr_eq(&target_mm, mm))
             }
             Self::SystemWideAuthorized => true,
+        }
+    }
+
+    fn task_scope(&self) -> Option<UprobeTaskScope> {
+        match self {
+            Self::Task(scope) => Some(scope.clone()),
+            Self::SystemWideAuthorized => None,
         }
     }
 }
@@ -325,6 +344,15 @@ pub struct UprobeConsumerRuntimeSnapshot {
     pub pre_handler: fn(&dyn ProbeArgs),
     pub post_handler: fn(&dyn ProbeArgs),
     pub event_callback: Option<Arc<dyn uprobe::CallBackFunc>>,
+    task_scope: Option<UprobeTaskScope>,
+}
+
+impl UprobeConsumerRuntimeSnapshot {
+    pub fn permits_task(&self, current: &Arc<ProcessControlBlock>) -> bool {
+        self.task_scope
+            .as_ref()
+            .is_none_or(|scope| scope.permits_task(current))
+    }
 }
 
 struct InstalledSiteRef {
@@ -423,6 +451,7 @@ impl UprobeConsumer {
             pre_handler: runtime.pre_handler,
             post_handler: runtime.post_handler,
             event_callback: runtime.event_callback.clone(),
+            task_scope: self.scope.task_scope(),
         })
     }
 }
@@ -1044,8 +1073,19 @@ fn uprobe_unregister_consumer_from_site(
         }
         *site.participants.write() = Arc::new(Vec::new());
         // Disarming 期间表项仍可命中；先恢复指令，再撤销 hit table。
-        if site_mapping_still_matches(&inner, site) {
-            restore_breakpoint_byte(mm, &mut inner, page_base_addr, page_offset, orig_first_byte);
+        if site_mapping_still_matches(&inner, site)
+            && restore_breakpoint_byte(mm, &mut inner, page_base_addr, page_offset, orig_first_byte)
+        {
+            // The table remains visible while the original opcode is restored.
+            // A synchronous shootdown is also a CPU rendezvous: a CPU which
+            // already executed INT3 cannot acknowledge it until its irq-off
+            // #BP handler has acquired the table and its XOL execution guard.
+            mm.flush_tlb_range(
+                VirtAddr::new(page_base_addr),
+                VirtAddr::new(page_base_addr + MMArch::PAGE_SIZE),
+                MMArch::PAGE_SHIFT as u8,
+                false,
+            );
         }
     }
     {
@@ -1149,11 +1189,11 @@ fn site_mapping_still_matches(inner: &InnerAddressSpace, site: &UprobeSite) -> b
 /// 内容；跨修改代码的串行化由 #BP 中断返回后的取指重取保证）。
 fn restore_breakpoint_byte(
     mm: &Arc<AddressSpace>,
-    inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+    inner: &mut InnerAddressSpace,
     page_base_addr: usize,
     page_offset: usize,
     orig_first_byte: u8,
-) {
+) -> bool {
     let _pt_edit = mm.page_table_edit();
     let mapper = &mut inner.user_mapper.utable;
     if let Some((paddr, _)) = mapper.translate(VirtAddr::new(page_base_addr)) {
@@ -1161,44 +1201,43 @@ fn restore_breakpoint_byte(
             unsafe {
                 core::ptr::write_volatile((kva.data() + page_offset) as *mut u8, orig_first_byte);
             }
+            return true;
         }
     }
     // 页已被 munmap（translate 失败）：无需恢复。
+    false
 }
 
 /// Remove every uprobe site whose instruction lies in `region` before a VMA/PTE
 /// mutation commits.  The caller owns `AddressSpace::write()`, so mapping
 /// identity and the restored byte are checked against one stable VMA view.
 ///
-/// If the range covers the XOL VMA, all sites are removed: existing leases keep
-/// the old physical page alive for an in-flight XOL transaction, while taking
-/// `mm.xol_area` prevents any later registration from jumping into the unmapped
-/// user address.  A subsequent apply lazily creates a fresh area/generation.
+/// The XOL VMA is kernel-owned and immutable while the address space lives.
+/// User VMA operations which overlap it are rejected before any probe byte or
+/// mapping is changed.
 pub(crate) fn uprobe_disarm_range_locked(
     mm: &Arc<AddressSpace>,
     inner: &mut InnerAddressSpace,
     region: VirtRegion,
-) {
-    let invalidate_xol = {
-        let mut area = mm.xol_area.lock_irqsave();
-        let hit = area.as_ref().is_some_and(|area| {
+) -> Result<(), SystemError> {
+    let overlaps_xol = {
+        let area = mm.xol_area.lock_irqsave();
+        area.as_ref().is_some_and(|area| {
             let xol = VirtRegion::new(area.page_base(), MMArch::PAGE_SIZE);
             xol.collide(&region)
-        });
-        if hit {
-            area.take();
-            mm.uprobe_needs_full_reapply.store(true, Ordering::Release);
-        }
-        hit
+        })
     };
+    // This VM_IO|VM_DONTEXPAND mapping is an execution trampoline, not a
+    // user-remappable allocation. Rejecting overlap avoids both waiting under
+    // mm.write() and a rollback window in which all probes are withdrawn.
+    if overlaps_xol {
+        return Err(SystemError::EBUSY);
+    }
 
     let targets: Vec<(usize, Arc<UprobeSite>, u8)> = {
         let list = mm.uprobe_list.lock_irqsave();
         list.iter()
-            .filter(|(vaddr, _)| {
-                invalidate_xol
-                    || (**vaddr >= region.start().data() && **vaddr < region.end().data())
-            })
+            .filter(|(vaddr, _)| **vaddr >= region.start().data() && **vaddr < region.end().data())
             .filter_map(|(vaddr, entries)| {
                 let entry = entries.first()?.read();
                 let old = entry.point.old_instruction[0];
@@ -1207,6 +1246,7 @@ pub(crate) fn uprobe_disarm_range_locked(
             .collect()
     };
 
+    let mut disarmed = Vec::new();
     for (probe_vaddr, site, old_byte) in targets {
         if site
             .state
@@ -1220,24 +1260,39 @@ pub(crate) fn uprobe_disarm_range_locked(
         {
             continue;
         }
-        *site.participants.write() = Arc::new(Vec::new());
 
         // Keep the hit-table entry visible until the original byte is restored.
         // A concurrent old #BP can therefore still find the site and execute its
-        // strongly held XOL lease while new callbacks are suppressed.
+        // strongly held XOL lease. VMA withdrawal does not suppress callbacks
+        // for an instruction which already trapped before the mapping change.
         if site_mapping_still_matches(inner, &site) {
             let page_base = probe_vaddr & !(MMArch::PAGE_SIZE - 1);
             let page_offset = probe_vaddr & (MMArch::PAGE_SIZE - 1);
-            let _pt_edit = mm.page_table_edit();
-            if let Some((paddr, _)) = inner.user_mapper.utable.translate(VirtAddr::new(page_base)) {
-                if let Some(kva) = unsafe { MMArch::phys_2_virt(paddr) } {
-                    unsafe {
-                        core::ptr::write_volatile((kva.data() + page_offset) as *mut u8, old_byte);
-                    }
-                }
-            }
+            restore_breakpoint_byte(mm, inner, page_base, page_offset, old_byte);
         }
+        disarmed.push((probe_vaddr, site, old_byte));
+    }
 
+    if !disarmed.is_empty() {
+        // Besides invalidating translations, this synchronous shootdown is the
+        // grace point for CPUs which executed INT3 before the bytes above were
+        // restored. Such a CPU runs #BP with interrupts disabled and cannot
+        // acknowledge the IPI until it has acquired the hit-table entry and
+        // its strongly held XOL slot lease.
+        // The acknowledgement, not the flushed address coverage, provides
+        // the grace point. Flush one affected page here; the VMA operation
+        // performs its own range-wide TLB invalidation when it commits.
+        let rendezvous_page = disarmed[0].0 & !(MMArch::PAGE_SIZE - 1);
+        mm.flush_tlb_range(
+            VirtAddr::new(rendezvous_page),
+            VirtAddr::new(rendezvous_page + MMArch::PAGE_SIZE),
+            MMArch::PAGE_SHIFT as u8,
+            false,
+        );
+    }
+
+    for (probe_vaddr, site, _) in disarmed {
+        *site.participants.write() = Arc::new(Vec::new());
         {
             let mut list = mm.uprobe_list.lock_irqsave();
             // Conditional removal prevents an old lifecycle delta from deleting
@@ -1265,6 +1320,7 @@ pub(crate) fn uprobe_disarm_range_locked(
             debug_assert!(false, "armed uprobe site without page state");
         }
     }
+    Ok(())
 }
 
 // ──────────────────────── 辅助：空操作 handler ────────────────────────

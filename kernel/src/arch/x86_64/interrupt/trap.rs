@@ -4,7 +4,7 @@ use log::{error, trace, warn};
 use system_error::SystemError;
 
 use super::{
-    entry::{set_intr_gate, set_system_trap_gate},
+    entry::{set_intr_gate, set_system_intr_gate, set_system_trap_gate},
     TrapFrame,
 };
 use crate::exception::debug::DebugException;
@@ -87,7 +87,12 @@ pub fn arch_trap_init() -> Result<(), SystemError> {
         set_intr_gate(0, 0, VirtAddr::new(trap_divide_error as usize));
         set_intr_gate(1, 0, VirtAddr::new(trap_debug as usize));
         set_intr_gate(2, 0, VirtAddr::new(trap_nmi as usize));
-        set_system_trap_gate(3, 0, VirtAddr::new(trap_int3 as usize));
+        // #BP must enter with maskable interrupts disabled. Uprobe teardown
+        // uses a synchronous IPI as the grace point between restoring the
+        // opcode and removing its hit-table entry; a trap gate could
+        // acknowledge that IPI before do_int3 acquires the entry. The user
+        // uprobe path reenables interrupts after capturing its XOL slot lease.
+        set_system_intr_gate(3, 0, VirtAddr::new(trap_int3 as usize));
         set_system_trap_gate(4, 0, VirtAddr::new(trap_overflow as usize));
         set_system_trap_gate(5, 0, VirtAddr::new(trap_bounds as usize));
         set_intr_gate(6, 0, VirtAddr::new(trap_undefined_opcode as usize));
@@ -218,6 +223,13 @@ unsafe extern "C" fn do_int3(regs: &'static mut TrapFrame, error_code: u64) {
         // 用户态 #BP：uprobe 命中或未消费 #BP（→ SIGTRAP）。
         crate::exception::uprobe::uprobe_breakpoint_handler(regs).unwrap();
     } else {
+        // Vector 3 is now an interrupt gate for the user-uprobe entry race.
+        // Preserve the old trap-gate behavior for kernel breakpoints: a
+        // context entered with IF set may run kprobe callbacks with interrupts
+        // enabled, while an irq-off context remains irq-off.
+        if regs.rflags & (1 << 9) != 0 {
+            CurrentIrqArch::interrupt_enable();
+        }
         // 内核态 #BP：kprobe 命中。
         EBreak::handle(regs).unwrap();
     }

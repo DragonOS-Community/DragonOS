@@ -129,7 +129,12 @@ impl InnerAddressSpace {
         // their sites while that identity and its PTEs are still present;
         // MAP_FIXED and mremap target replacement both converge here.
         #[cfg(target_arch = "x86_64")]
-        super::uprobe::uprobe_disarm_range_locked(&mm, self, region_to_unmap);
+        if let Err(err) = super::uprobe::uprobe_disarm_range_locked(&mm, self, region_to_unmap) {
+            for plan in plans {
+                plan.split_lifecycle.rollback_into(&mut notifications);
+            }
+            return Err(VmaOpFailure { err, notifications });
+        }
 
         plans.reverse();
         while let Some(plan) = plans.pop() {
@@ -451,7 +456,16 @@ impl InnerAddressSpace {
 
         if !plans.is_empty() {
             #[cfg(target_arch = "x86_64")]
-            super::uprobe::uprobe_disarm_range_locked(&mm, self, region);
+            if let Err(err) = super::uprobe::uprobe_disarm_range_locked(&mm, self, region) {
+                for plan in plans {
+                    plan.split_lifecycle
+                        .rollback_into(&mut rollback_notifications);
+                }
+                return Err(VmaOpFailure {
+                    err,
+                    notifications: rollback_notifications,
+                });
+            }
         }
 
         let mapper = &mut self.user_mapper.utable;
@@ -925,7 +939,9 @@ impl InnerAddressSpace {
                 }
             }
             #[cfg(target_arch = "x86_64")]
-            super::uprobe::uprobe_disarm_range_locked(&mm, self, region);
+            if let Err(err) = super::uprobe::uprobe_disarm_range_locked(&mm, self, region) {
+                return Err(err.into());
+            }
         }
 
         let mapper = &mut self.user_mapper.utable;

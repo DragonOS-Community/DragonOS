@@ -24,6 +24,8 @@ mod resend;
 pub mod softirq;
 pub mod sysfs;
 pub mod tasklet;
+#[cfg(target_arch = "x86_64")]
+pub mod uprobe;
 pub mod workqueue;
 
 pub(crate) use interrupt_context::enter_hardirq;

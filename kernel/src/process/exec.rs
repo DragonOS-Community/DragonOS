@@ -311,6 +311,12 @@ impl ExecParam {
         // TODO: Implement the remaining Linux logic.
         de_thread(&me).map_err(ExecError::SystemError)?;
 
+        // exec no longer returns to the old user context.  Drop any in-flight
+        // XOL transaction before the old mm can be replaced so its site and
+        // slot lease cannot survive into the new image.
+        #[cfg(target_arch = "x86_64")]
+        crate::exception::uprobe::cleanup_task_active_xol(&me);
+
         me.flags().remove(ProcessFlags::FORKNOEXEC);
 
         exec_task_namespaces().map_err(ExecError::SystemError)?;

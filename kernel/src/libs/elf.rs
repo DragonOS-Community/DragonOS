@@ -250,7 +250,15 @@ impl ElfLoader {
             prot
         };
         let start_page = user_vm_guard
-            .map_anonymous(addr_to_map, map_len, tmp_prot, map_flags, false, true)
+            .map_file_backed(
+                addr_to_map,
+                map_len,
+                tmp_prot,
+                map_flags,
+                false,
+                param.file(),
+                file_page_offset,
+            )
             .map_err(map_err_handler)?;
         let mapped = start_page.virt_address();
 
@@ -1257,6 +1265,13 @@ impl BinaryLoader for ElfLoader {
         user_vm.end_data = end_data.unwrap_or(VirtAddr::new(0));
 
         let result = BinaryLoaderResult::new(interp_load_addr.unwrap_or(program_entrypoint));
+        drop(user_vm);
+        // ELF segments are installed through locked InnerAddressSpace helpers,
+        // bypassing the ordinary mmap post-commit hook.  Reconcile definitions
+        // only after the final write guard is released so fault-in cannot
+        // recurse on the address-space lock.
+        #[cfg(target_arch = "x86_64")]
+        crate::mm::ucontext::uprobe::uprobe_apply_to_all_vmas(&binding);
         // kdebug!("elf load OK!!!");
         return Ok(result);
     }

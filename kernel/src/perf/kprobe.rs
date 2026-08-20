@@ -154,7 +154,7 @@ impl PerfEventOps for KprobePerfEvent {
     }
 
     fn readable(&self) -> bool {
-        true
+        false
     }
 }
 

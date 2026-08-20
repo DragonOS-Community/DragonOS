@@ -1210,8 +1210,17 @@ impl FuseNode {
             let mut guard = self.cached_metadata.lock();
             if let Some(md) = guard.as_mut() {
                 md.size = 0;
+                let now = PosixTimeSpec::now();
+                md.mtime = now;
+                md.ctime = now;
                 self.bump_attr_version();
             }
+            // The daemon owns the atomic truncate and any negotiated killpriv
+            // transition. Force the next attribute read to observe its mode
+            // and timestamps instead of retaining the pre-open TTL snapshot.
+            self.cached_metadata_deadline_ticks
+                .store(0, Ordering::Release);
+            drop(guard);
         } else if (fopen_flags & FOPEN_KEEP_CACHE) == 0 {
             self.invalidate_clean_page_cache()?;
         }

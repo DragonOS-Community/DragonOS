@@ -3129,8 +3129,12 @@ impl Drop for MountSnapshotGuard {
 }
 
 impl MountFSInode {
+    pub(crate) fn same_mount_ref(&self, other: &MountFSInode) -> bool {
+        Arc::ptr_eq(&self.mount_fs, &other.mount_fs)
+    }
+
     pub(crate) fn same_path_ref(&self, other: &MountFSInode) -> bool {
-        Arc::ptr_eq(&self.mount_fs, &other.mount_fs) && self.dentry.id == other.dentry.id
+        self.same_mount_ref(other) && self.dentry.id == other.dentry.id
     }
 
     pub(crate) fn is_disconnected(&self) -> bool {
@@ -3494,17 +3498,18 @@ impl MountFSInode {
         operation: impl FnOnce(Arc<Mutex<FsNotifyDeleteState>>) -> Result<T, SystemError>,
     ) -> Result<T, SystemError> {
         let lifecycle = self.dentry.fsnotify_delete_lifecycle.clone();
+        let object_id = FsNotifyObjectId {
+            superblock: self.dentry.fsnotify_superblock,
+            inode: self.dentry.registry_child,
+            generation: self.dentry.registry_generation,
+        };
         let state = lifecycle.lock();
         let result = operation(lifecycle.clone());
-        let committed = state.committed() && result.is_ok();
-        drop(state);
-        if committed {
-            let target = self.fsnotify_target();
-            fsnotify::notify_object_delete(FsNotifyObjectId {
-                superblock: target.0,
-                inode: target.1,
-                generation: target.2,
-            });
+        if state.committed() && result.is_ok() {
+            // Keep the committed check and deletion notification in the same
+            // object lifecycle epoch. A concurrent linkat(AT_EMPTY_PATH)
+            // cannot relink the inode and publish a new watch between them.
+            fsnotify::notify_object_delete(object_id);
         }
         result
     }
@@ -3938,8 +3943,8 @@ impl IndexNode for MountFSInode {
             .mmap_file(file, start, len, offset, vm_flags)
     }
 
-    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
-        self.dentry.inode.truncate_before_open(flags)
+    fn requires_separate_open_truncate(&self, flags: &FileFlags) -> bool {
+        self.dentry.inode.requires_separate_open_truncate(flags)
     }
 
     fn sync(&self) -> Result<(), SystemError> {

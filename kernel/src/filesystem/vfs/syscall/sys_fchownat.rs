@@ -29,6 +29,10 @@ impl Syscall for SysFchownatHandle {
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         let pathname = pathname.as_str().trim();
+        let allowed = AtFlags::AT_SYMLINK_NOFOLLOW.bits() | AtFlags::AT_EMPTY_PATH.bits();
+        if flags & !allowed != 0 {
+            return Err(SystemError::EINVAL);
+        }
         let flags = AtFlags::from_bits_truncate(flags);
         return do_fchownat(dirfd, pathname, uid, gid, flags);
     }

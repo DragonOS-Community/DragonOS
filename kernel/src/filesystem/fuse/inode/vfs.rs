@@ -249,7 +249,7 @@ impl IndexNode for FuseNode {
         }
     }
 
-    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
+    fn requires_separate_open_truncate(&self, flags: &FileFlags) -> bool {
         flags.contains(FileFlags::O_TRUNC)
             && !self
                 .conn

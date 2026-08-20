@@ -1,4 +1,5 @@
 use crate::filesystem::fsnotify::{self, FsEvent};
+use crate::filesystem::vfs::mount::MountFSInode;
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::is_ancestor;
@@ -7,6 +8,7 @@ use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::SystemError;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::filesystem::vfs::{MAX_PATHLEN, NAME_MAX};
+use crate::libs::casting::DowncastArc;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::sync::Arc;
@@ -68,6 +70,18 @@ pub fn do_renameat2(
         Some(p) => new_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)?,
     };
 
+    // Linux rejects rename across mount objects even when two bind mounts
+    // expose the same superblock and inode. Check this before final lookup and
+    // same-inode no-op handling so a cross-mount alias cannot hide EXDEV.
+    if let (Some(old_mount), Some(new_mount)) = (
+        old_parent_inode.clone().downcast_arc::<MountFSInode>(),
+        new_parent_inode.clone().downcast_arc::<MountFSInode>(),
+    ) {
+        if !old_mount.same_mount_ref(&new_mount) {
+            return Err(SystemError::EXDEV);
+        }
+    }
+
     // 检查单个文件名长度
     if old_filename.len() > NAME_MAX || new_filename.len() > NAME_MAX {
         return Err(SystemError::ENAMETOOLONG);
@@ -77,23 +91,12 @@ pub fn do_renameat2(
         return Err(SystemError::EEXIST);
     }
 
-    // RENAME_EXCHANGE: 目标必须存在
-    if flags.contains(RenameFlags::EXCHANGE) && new_parent_inode.find(new_filename).is_err() {
-        return Err(SystemError::ENOENT);
-    }
-
     if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {
         return Err(SystemError::EBUSY);
     }
 
     let old_inode = old_parent_inode.lookup(old_filename)?;
     let old_inode_type = old_inode.metadata()?.file_type;
-    if old_inode_type == crate::filesystem::vfs::FileType::Dir {
-        // 仅当把目录移动到其自身或其子树下时拦截
-        if is_ancestor(&old_inode, &new_parent_inode) {
-            return Err(SystemError::EINVAL);
-        }
-    }
 
     // RENAME_EXCHANGE 目标必须存在；预先 lookup 供事件投递复用（move_to 后原位置查不到）。
     let exchange_new_inode = if flags.contains(RenameFlags::EXCHANGE) {
@@ -114,6 +117,48 @@ pub fn do_renameat2(
         }
     }
 
+    // 非 EXCHANGE：预先取出可能被覆盖的目标 inode（move_to 会静默销毁它），
+    // 否则其上的 watch 会沦为持续产生事件的「幽灵 watch」。只有 ENOENT
+    // 表示目标不存在；I/O、权限等 lookup 错误必须原样返回。
+    let displaced = if !flags.contains(RenameFlags::EXCHANGE) {
+        match new_parent_inode.find(new_filename) {
+            Ok(inode) => Some(inode),
+            Err(SystemError::ENOENT) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+
+    // Linux resolves the destination and handles NOREPLACE/same-inode no-op
+    // before checking directory mutation permissions.
+    if flags.contains(RenameFlags::NOREPLACE) && displaced.is_some() {
+        return Err(SystemError::EEXIST);
+    }
+
+    if !flags.contains(RenameFlags::EXCHANGE)
+        && Arc::ptr_eq(&old_parent_inode, &new_parent_inode)
+        && old_filename == new_filename
+    {
+        return Ok(0);
+    }
+
+    if let Some(target) = displaced.as_ref() {
+        let source_id = fsnotify::target_for_inode(&old_inode)?.id;
+        let target_id = fsnotify::target_for_inode(target)?.id;
+        if source_id == target_id {
+            return Ok(0);
+        }
+    }
+
+    // Ancestor traps are evaluated after a positive NOREPLACE destination and
+    // same-inode no-op, matching Linux's lookup/error precedence.
+    if old_inode_type == crate::filesystem::vfs::FileType::Dir
+        && is_ancestor(&old_inode, &new_parent_inode)
+    {
+        return Err(SystemError::EINVAL);
+    }
+
     // 不要在这里检查 new_parent 是否是 old 的祖先：
     // 这会把同目录/向上移动的合法情况误判为 ENOTEMPTY。
     // 非空目录覆盖应由具体文件系统在 move_to/rename 实现中返回 ENOTEMPTY。
@@ -132,31 +177,6 @@ pub fn do_renameat2(
         &new_parent_metadata,
         PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
     )?;
-
-    // 非 EXCHANGE：预先取出可能被覆盖的目标 inode（move_to 会静默销毁它），
-    // 否则其上的 watch 会沦为持续产生事件的「幽灵 watch」。
-    let displaced = if !flags.contains(RenameFlags::EXCHANGE) {
-        new_parent_inode.find(new_filename).ok()
-    } else {
-        None
-    };
-
-    if !flags.contains(RenameFlags::EXCHANGE)
-        && Arc::ptr_eq(&old_parent_inode, &new_parent_inode)
-        && old_filename == new_filename
-    {
-        return Ok(0);
-    }
-
-    // Linux treats rename onto another hard-link alias of the same inode as a
-    // complete no-op. This test must precede the filesystem mutation.
-    if let Some(target) = displaced.as_ref() {
-        let source_md = old_inode.metadata()?;
-        let target_md = target.metadata()?;
-        if source_md.inode_id == target_md.inode_id && source_md.dev_id == target_md.dev_id {
-            return Ok(0);
-        }
-    }
 
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
 

@@ -1,19 +1,18 @@
 use crate::filesystem::fsnotify::{self, FsEvent};
-use crate::libs::casting::DowncastArc;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
     file::{File, FileFlags, PreopenedFile},
-    mount::{MountFSInode, MountFlags},
+    mount::MountFlags,
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{
         should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, OwnedLookupOutcome,
         ResolvedPath,
     },
-    vcore::{check_parent_dir_permission_inode, vfs_truncate},
+    vcore::{check_parent_dir_permission_inode, current_file_lock_owner_id, vfs_truncate_file},
     FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -148,34 +147,28 @@ pub fn do_fchownat(
     flag: AtFlags,
 ) -> Result<usize, SystemError> {
     // 检查flag是否合法
-    if flag.contains(!(AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH)) {
+    let allowed_flags = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+    if flag.intersects(!allowed_flags) {
         return Err(SystemError::EINVAL);
     }
 
-    let follow_symlink = flag.contains(!AtFlags::AT_SYMLINK_NOFOLLOW);
+    let follow_symlink = !flag.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-    // 如果找不到文件，则返回错误码ENOENT
     let inode = if follow_symlink {
-        inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+        inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
     } else {
-        inode.lookup(path.as_str())
-    };
-
-    if inode.is_err() {
-        let errno = inode.clone().unwrap_err();
-        // 文件不存在
-        if errno == SystemError::ENOENT {
-            return Err(SystemError::ENOENT);
-        }
-    }
-
-    let inode = inode.unwrap();
+        inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+    }?;
 
     return chown_common(inode, uid, gid);
 }
 
 fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    // The syscall ABI declares these arguments as 32-bit uid_t/gid_t. Truncate
+    // register-width inputs before interpreting (uid_t)-1 as "no change".
+    let uid = uid as u32 as usize;
+    let gid = gid as u32 as usize;
     let mut meta = inode.metadata()?;
     let cred = ProcessManager::current_pcb().cred();
     let current_uid = cred.uid.data();
@@ -185,11 +178,10 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         group_info = info.clone();
     }
 
-    // Linux 语义：uid/gid 传入 -1 表示“不更改”。在 syscall 入口处参数被提升为 usize，
-    // 因此这里以 usize::MAX 代表 (uid_t/gid_t)-1。
-    let change_uid = uid != usize::MAX;
-    let change_gid = gid != usize::MAX;
-    let old_uid = meta.uid;
+    // Linux 语义：uid/gid 传入 (uid_t)-1/(gid_t)-1 表示“不更改”。
+    let is_no_change = |id: usize| id == u32::MAX as usize;
+    let change_uid = !is_no_change(uid);
+    let change_gid = !is_no_change(gid);
     let old_gid = meta.gid;
     let old_mode = meta.mode;
 
@@ -222,8 +214,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     // - chown 普通文件：总是清除 suid；sgid 按 Linux setattr_should_drop_sgid 规则清理
     //   - 若 S_IXGRP 置位：无条件清除 sgid
     //   - 否则（mandatory locking 语义）：仅当调用者不在文件所属组且无 CAP_FSETID 时清除
-    let ownership_changed = meta.uid != old_uid || meta.gid != old_gid;
-    if ownership_changed && meta.file_type != FileType::Dir {
+    if meta.file_type != FileType::Dir {
         // suid always must be killed on chown for non-directories
         meta.mode.remove(InodeMode::S_ISUID);
 
@@ -241,13 +232,14 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     if meta.mode != old_mode {
         mask.insert(SetMetadataMask::MODE);
     }
-    if !mask.is_empty() {
-        meta.ctime = PosixTimeSpec::now();
-        mask.insert(SetMetadataMask::CTIME);
-    }
+    // Linux chown always updates ctime, even for chown(-1, -1). A ctime-only
+    // update is not, however, exposed as IN_ATTRIB.
+    meta.ctime = PosixTimeSpec::now();
+    mask.insert(SetMetadataMask::CTIME);
     inode.set_metadata_masked(&meta, mask)?;
-    // fsnotify：属主/属性变更 → IN_ATTRIB。
-    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
+    if mask.intersects(SetMetadataMask::UID | SetMetadataMask::GID | SetMetadataMask::MODE) {
+        fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
+    }
 
     return Ok(0);
 }
@@ -477,13 +469,12 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
             return Err(SystemError::ENXIO);
         }
 
-        // 如果O_TRUNC，并且是普通文件，清空文件
-        // 注意：必须在创建 File 对象之前截断
-        // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
-        // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
-        if file_type == FileType::File && inode.truncate_before_open(&how.o_flags) {
-            vfs_truncate(inode.clone(), 0)?;
-        }
+        // Existing regular files opened with O_TRUNC are modified after the
+        // filesystem open succeeds. Newly created files are already empty and
+        // Linux clears O_TRUNC for this phase.
+        let do_truncate =
+            !created && file_type == FileType::File && how.o_flags.contains(FileFlags::O_TRUNC);
+        let truncate_in_vfs = do_truncate && inode.requires_separate_open_truncate(&how.o_flags);
         let (inode, mount_guard, operation_guard) = resolved.into_parts();
         let file: File = match preopened {
             Some(opened) => File::new_preopened_with_mount_guard(
@@ -494,6 +485,22 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
             )?,
             None => File::new_with_mount_guard(inode, how.o_flags, mount_guard, operation_guard)?,
         };
+
+        // Linux emits OPEN from do_dentry_open() before handle_truncate().
+        // Filesystems with atomic O_TRUNC have already completed the resize by
+        // this point, but the externally visible events retain that ordering.
+        file.notify_open_event();
+        if do_truncate {
+            if truncate_in_vfs {
+                vfs_truncate_file(file.inode(), 0, current_file_lock_owner_id(), || {
+                    file.private_data.lock()
+                })?;
+            } else {
+                // open(O_TRUNC) metadata notification is a dentry-data event,
+                // unlike read/write path-data events subject to EXCL_UNLINK.
+                fsnotify::fsnotify_inode(FsEvent::MODIFY, &file.inode());
+            }
+        }
         Ok(file)
     })();
 
@@ -504,38 +511,11 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
             return Err(error);
         }
     };
-    let opened_inode = file.inode();
-    let r = fd_table
+    let result = fd_table
         .write()
         .install_reserved_fd(reservation, file)
         .map(|fd| fd as usize);
-    // fsnotify：打开成功 → 被打开 inode 得 IN_OPEN。
-    if r.is_ok() && !how.o_flags.contains(FileFlags::O_PATH) {
-        // 同时通知父目录 watch（带子名，issue B）与被打开 inode 自身 watch。
-        if fsnotify::has_any_watch() {
-            match opened_inode.clone().downcast_arc::<MountFSInode>() {
-                Some(mounted) => {
-                    let (child, parent) = mounted.fsnotify_snapshot();
-                    if let Some((parent, name)) = parent.as_ref() {
-                        fsnotify::fsnotify_targets(
-                            FsEvent::OPEN,
-                            Some((parent, name.0.as_str())),
-                            Some(&child),
-                            0,
-                            true,
-                        );
-                    } else {
-                        fsnotify::fsnotify_targets(FsEvent::OPEN, None, Some(&child), 0, true);
-                    }
-                }
-                None => fsnotify::fsnotify(FsEvent::OPEN, None, Some(&opened_inode), 0),
-            }
-        } else {
-            fsnotify::fsnotify(FsEvent::OPEN, None, Some(&opened_inode), 0);
-        }
-    }
-
-    r
+    result
 }
 
 /// 为exec打开可执行文件
@@ -602,10 +582,10 @@ pub fn do_open_execat_with_flags(
     }
 
     super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_EXEC)?;
-    super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_READ)?;
 
     // 创建File对象，使用O_RDONLY | O_CLOEXEC
     let file = File::new(inode, FileFlags::O_RDONLY | FileFlags::O_CLOEXEC)?;
+    file.notify_open_event();
 
     Ok(Arc::new(file))
 }

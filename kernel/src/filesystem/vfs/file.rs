@@ -1312,6 +1312,17 @@ impl File {
         }
     }
 
+    /// Notify a successful userspace-visible open. Callers decide which File
+    /// constructions represent VFS open/exec rather than internal kernel I/O.
+    pub(crate) fn notify_open_event(&self) {
+        let mode = *self.mode.read();
+        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
+            && fsnotify::has_any_watch()
+        {
+            self.notify_fs_event(FsEvent::OPEN);
+        }
+    }
+
     /// Create a file object for sockets created by socket syscalls.
     ///
     /// These should not be subject to open(2) pathname semantics.

@@ -547,7 +547,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         !self.is_stream()
     }
 
-    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
+    /// Whether VFS must issue a separate truncate after a successful open.
+    /// `false` means the filesystem's open operation completed O_TRUNC
+    /// atomically and VFS must only publish the resulting metadata event.
+    fn requires_separate_open_truncate(&self, flags: &FileFlags) -> bool {
         flags.contains(FileFlags::O_TRUNC)
     }
 

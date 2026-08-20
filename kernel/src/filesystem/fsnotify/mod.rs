@@ -521,7 +521,9 @@ pub(crate) fn fsnotify_targets(
             if !mask_matches {
                 continue;
             }
-            // IN_EXCL_UNLINK：仅对子项的「内容类」事件、且子项已 unlink 时抑制。
+            // IN_EXCL_UNLINK: suppress path-data content events for an
+            // unlinked dentry on both parent and direct inode marks. Dentry
+            // data events such as ftruncate remain visible, matching Linux.
             if mark.excl_unlink.load(Ordering::Relaxed)
                 && path_event
                 && routed.intersects(content_type)

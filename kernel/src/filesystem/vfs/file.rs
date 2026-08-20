@@ -2548,6 +2548,43 @@ impl FileDescriptorTable {
     pub(crate) fn is_shared_by_tasks(&self) -> bool {
         self.task_users.load(Ordering::Acquire) > 1
     }
+
+    /// Fallibly clone a files table, optionally omitting an open tail covered
+    /// by a `close_range(CLOSE_RANGE_UNSHARE)` operation.
+    ///
+    /// All allocations finish while the destination contains no files. The
+    /// source is then rechecked under its read guard before an infallible
+    /// populate step, so ENOMEM cannot trigger close side effects for an
+    /// unpublished clone.
+    pub(crate) fn try_clone(
+        source: &Arc<Self>,
+        punch_hole: Option<(u32, u32)>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let mut target_len = source.read().clone_plan(punch_hole).target_len;
+
+        loop {
+            let layout = FileDescriptorVec::try_allocate_empty_clone_layout(target_len)?;
+            let destination = Arc::try_new(Self::new(layout)).map_err(|_| SystemError::ENOMEM)?;
+
+            let source_guard = source.read();
+            let current_plan = source_guard.clone_plan(punch_hole);
+            let capacity = destination.read().empty_layout_capacity();
+            if current_plan.target_len > capacity {
+                target_len = current_plan.target_len;
+                drop(source_guard);
+                drop(destination);
+                continue;
+            }
+
+            {
+                let mut destination_guard = destination.write();
+                destination_guard.resize_empty_clone_layout(current_plan.target_len);
+                source_guard.populate_clone(&mut destination_guard, current_plan.copy_len);
+            }
+            drop(source_guard);
+            return Ok(destination);
+        }
+    }
 }
 
 impl Deref for FileDescriptorTable {
@@ -2655,22 +2692,6 @@ impl FileDescriptorVec {
         };
     }
 
-    /// @brief 克隆一个文件描述符数组
-    ///
-    /// 语义对齐 Linux dup_fd/new files_struct：
-    /// - 复制 fd 与 cloexec 状态
-    /// - 分配新的 record-lock owner（POSIX 锁 owner 绑定 files table）
-    ///   因此 fork 出来的新进程不会与父进程共享 POSIX record lock owner。
-    ///
-    /// @return FileDescriptorVec 克隆后的文件描述符数组
-    pub fn clone(&self) -> FileDescriptorVec {
-        let plan = self.clone_plan(None);
-        let mut res = Self::try_allocate_empty_clone_layout(plan.target_len)
-            .expect("failed to allocate cloned fd table");
-        self.populate_clone(&mut res, plan.copy_len);
-        res
-    }
-
     fn clone_plan(&self, punch_hole: Option<(u32, u32)>) -> FdTableClonePlan {
         let highest_open = self.fds.iter().rposition(Option::is_some);
         let retained_highest = match (highest_open, punch_hole) {
@@ -2734,57 +2755,17 @@ impl FileDescriptorVec {
     fn populate_clone(&self, destination: &mut Self, copy_len: usize) {
         debug_assert!(destination.fds.iter().all(Option::is_none));
         let copy_len = copy_len.min(self.fds.len()).min(destination.fds.len());
+        let mut next_fd = None;
         for index in 0..copy_len {
             if let Some(file) = &self.fds[index] {
                 destination.fds[index] = Some(file.clone());
                 destination.cloexec[index] = self.cloexec[index];
+            } else if next_fd.is_none() {
+                next_fd = Some(index);
             }
         }
         // A reserved slot belongs to the old files table and is never copied.
-        destination.next_fd = destination
-            .first_available_fd_from(0)
-            .unwrap_or(destination.fds.len());
-    }
-
-    /// Fallibly clone a shared fd table for `close_range(CLOSE_RANGE_UNSHARE)`.
-    ///
-    /// All allocations happen while the destination contains no files. The
-    /// source is rechecked after allocation, like Linux `dup_fd()`, so writers
-    /// are not blocked by potentially large allocations and allocation failure
-    /// cannot run close side effects for an unpublished clone.
-    pub(crate) fn try_clone_for_close_range(
-        source: &Arc<FileDescriptorTable>,
-        punch_hole: Option<(u32, u32)>,
-    ) -> Result<Arc<FileDescriptorTable>, SystemError> {
-        let mut target_len = source.read().clone_plan(punch_hole).target_len;
-
-        loop {
-            let layout = Self::try_allocate_empty_clone_layout(target_len)?;
-            let destination =
-                Arc::try_new(FileDescriptorTable::new(layout)).map_err(|_| SystemError::ENOMEM)?;
-
-            let source_guard = source.read();
-            let current_plan = source_guard.clone_plan(punch_hole);
-            let capacity = destination.read().empty_layout_capacity();
-            if current_plan.target_len > capacity {
-                target_len = current_plan.target_len;
-                drop(source_guard);
-                drop(destination);
-                continue;
-            }
-
-            {
-                let mut destination_guard = destination.write();
-                destination_guard.resize_empty_clone_layout(current_plan.target_len);
-                source_guard.populate_clone(&mut destination_guard, current_plan.copy_len);
-            }
-            drop(source_guard);
-            return Ok(destination);
-        }
-    }
-
-    fn first_available_fd_from(&self, start: usize) -> Option<usize> {
-        (start..self.fds.len()).find(|&i| self.fds[i].is_none() && !self.reserved[i])
+        destination.next_fd = next_fd.unwrap_or(copy_len);
     }
 
     /// 返回当前已占用的最高文件描述符索引（若无则为None）

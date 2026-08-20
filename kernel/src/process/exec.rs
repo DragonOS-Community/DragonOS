@@ -6,8 +6,12 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::Signal,
     driver::base::block::SeekFrom,
-    filesystem::vfs::{fcntl::AtFlags, file::File, open::do_open_execat},
-    ipc::sighand::GroupExecCancelResult,
+    filesystem::vfs::{
+        fcntl::AtFlags,
+        file::{File, FileDescriptorTable},
+        open::do_open_execat,
+    },
+    ipc::sighand::{GroupExecCancelResult, SigHand},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -208,6 +212,9 @@ pub struct ExecParam {
     /// Information used to initialize the process. Filled jointly by the binary
     /// loader and the exec mechanism.
     init_info: ProcInitInfo,
+    /// Whether exec has crossed the point where the old program may no longer
+    /// resume. Errors after this point must terminate the current task.
+    point_of_no_return: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -244,6 +251,7 @@ impl ExecParam {
             execfn,
             interp_flags,
             init_info,
+            point_of_no_return: false,
         }
     }
 
@@ -261,6 +269,10 @@ impl ExecParam {
 
     pub fn init_info_mut(&mut self) -> &mut ProcInitInfo {
         &mut self.init_info
+    }
+
+    pub fn point_of_no_return(&self) -> bool {
+        self.point_of_no_return
     }
 
     /// Returns the load mode.
@@ -309,7 +321,32 @@ impl ExecParam {
     pub fn begin_new_exec(&mut self) -> Result<(), ExecError> {
         let me = ProcessManager::current_pcb();
         // TODO: Implement the remaining Linux logic.
-        de_thread(&me).map_err(ExecError::SystemError)?;
+        de_thread(&me, &mut self.point_of_no_return).map_err(ExecError::SystemError)?;
+        // A successful de_thread has committed the exec transaction even when
+        // there were no sibling threads to signal.
+        self.point_of_no_return = true;
+
+        if me.sighand().is_shared() {
+            let old_sighand = me.sighand();
+            let new_sighand = SigHand::try_new().map_err(ExecError::SystemError)?;
+            new_sighand.copy_handlers_from(&old_sighand);
+            new_sighand.copy_process_state_from(&old_sighand);
+            me.replace_sighand_sync(new_sighand);
+        }
+
+        let (fd_table, shared) = me
+            .basic()
+            .fd_table_snapshot()
+            .expect("exec task has no fd table");
+        if shared {
+            let private =
+                FileDescriptorTable::try_clone(&fd_table, None).map_err(ExecError::SystemError)?;
+            let replaced = me.basic_mut().set_fd_table(Some(private));
+            // Dropping a final table reference can flush files. Never do that
+            // while holding the PCB basic-info or an fd-table guard.
+            drop(replaced);
+        }
+        drop(fd_table);
 
         me.flags().remove(ProcessFlags::FORKNOEXEC);
 
@@ -324,7 +361,10 @@ impl ExecParam {
 }
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
-fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+fn de_thread(
+    pcb: &Arc<ProcessControlBlock>,
+    point_of_no_return: &mut bool,
+) -> Result<(), SystemError> {
     let current = ProcessManager::current_pcb();
     if !Arc::ptr_eq(&current, pcb) {
         return Err(SystemError::EINVAL);
@@ -400,6 +440,13 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             }
         }
     }
+
+    // From this point the published group-exec transaction may be observed by
+    // the old leader, and the loop below can queue irreversible SIGKILLs. Any
+    // later error must terminate the current task instead of resuming the old
+    // program. Transaction-acquisition and invalid-leader failures above are
+    // still fully cancelable and remain ordinary exec errors.
+    *point_of_no_return = true;
 
     for task in kill_list {
         Signal::queue_private_sigkill_to_thread(&task);
@@ -743,24 +790,24 @@ impl ProcInitInfo {
         self.push_str(ustack, &self.proc_name)?;
 
         // Then push the environment variables onto the stack.
-        let envps = self
-            .envs
-            .iter()
-            .map(|s| {
-                self.push_str(ustack, s).expect("push_str failed");
-                ustack.sp()
-            })
-            .collect::<Vec<_>>();
+        let mut envps = Vec::new();
+        envps
+            .try_reserve_exact(self.envs.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for env in &self.envs {
+            self.push_str(ustack, env)?;
+            envps.push(ustack.sp());
+        }
 
         // Then push the arguments onto the stack.
-        let argps = self
-            .args
-            .iter()
-            .map(|s| {
-                self.push_str(ustack, s).expect("push_str failed");
-                ustack.sp()
-            })
-            .collect::<Vec<_>>();
+        let mut argps = Vec::new();
+        argps
+            .try_reserve_exact(self.args.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for arg in &self.args {
+            self.push_str(ustack, arg)?;
+            argps.push(ustack.sp());
+        }
 
         // Push the random number and store its pointer in auxv.
         self.push_slice(ustack, &[self.rand_num])?;

@@ -6,9 +6,9 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_CLOSE_RANGE},
-    filesystem::vfs::file::{FileDescriptorTable, FileDescriptorVec},
+    filesystem::vfs::file::FileDescriptorTable,
     process::ProcessManager,
-    sched::sched_yield,
+    sched::cond_resched,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -66,13 +66,17 @@ fn close_range_in_table(table: &Arc<FileDescriptorTable>, first: u32, last: u32)
         if let Some(dropped) = scan.dropped {
             // Linux ignores individual filp_close() errors in __range_close().
             let _ = dropped.finish_close();
+            cond_resched();
+            // The fixed budget only covers a continuous run of empty slots;
+            // real close work gets its own reschedule check above.
+            work = 0;
         }
 
         if scan.done {
             break;
         }
         if work >= CLOSE_RANGE_WORK_BUDGET {
-            sched_yield();
+            cond_resched();
             work = 0;
         }
     }
@@ -101,7 +105,7 @@ fn do_close_range(first: u32, last: u32, flags: u32) -> Result<usize, SystemErro
         } else {
             Some((first, last))
         };
-        let new_table = FileDescriptorVec::try_clone_for_close_range(&old_table, punch_hole)?;
+        let new_table = FileDescriptorTable::try_clone(&old_table, punch_hole)?;
 
         if flags.contains(CloseRangeFlags::CLOEXEC) {
             set_cloexec_in_table(&new_table, first, last);

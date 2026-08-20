@@ -48,4 +48,30 @@ impl ProcessControlBlock {
             crate::rcu::rcu_defer_drop(old);
         });
     }
+
+    /// Replace the task's sighand and reclaim the removed slot reference after
+    /// a synchronous RCU grace period.
+    ///
+    /// Exec uses this after its point of no return: the replacement itself must
+    /// not allocate another deferred-callback node after a fallible private
+    /// sighand has already been prepared.
+    pub(crate) fn replace_sighand_sync(&self, new: Arc<SigHand>) {
+        let old = self.with_task_lock_irqsave(|| {
+            new.attach_task_ref();
+            // SAFETY: task_lock serializes sighand writers; `old` remains held
+            // by this function until the grace period completes.
+            let old = unsafe { self.sighand.swap(new.clone()) };
+            if Arc::ptr_eq(&old, &new) {
+                new.detach_task_ref();
+                return None;
+            }
+            old.detach_task_ref();
+            Some(old)
+        });
+
+        if let Some(old) = old {
+            crate::rcu::synchronize_rcu();
+            drop(old);
+        }
+    }
 }

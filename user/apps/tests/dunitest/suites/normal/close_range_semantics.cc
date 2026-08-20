@@ -11,8 +11,10 @@
 #include <unistd.h>
 
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #ifndef SYS_close_range
@@ -99,6 +101,19 @@ int RunCloneFilesChild(SharedChildArgs* args) {
   if (waitpid(pid, &status, 0) != pid) return -1;
   if (!WIFEXITED(status)) return -1;
   return WEXITSTATUS(status);
+}
+
+struct SharedExecArgs {
+  int close_on_exec_fd;
+};
+
+int SharedExecChild(void* opaque) {
+  auto* args = static_cast<SharedExecArgs*>(opaque);
+  char fd_text[32] = {};
+  snprintf(fd_text, sizeof(fd_text), "%d", args->close_on_exec_fd);
+  execl("/proc/self/exe", "close_range_semantics", "--check-exec-closed", fd_text,
+        nullptr);
+  return 41;
 }
 
 TEST(CloseRangeSemantics, ValidationBoundsHolesAndRawU32Abi) {
@@ -190,6 +205,26 @@ TEST(CloseRangeSemantics, SharedAndUnsharedTableSemantics) {
   ASSERT_EQ(0, RunCloneFilesChild(&shared_close));
   EXPECT_FALSE(IsOpen(target.get()));
   EXPECT_TRUE(IsOpen(preserved.get()));
+}
+
+TEST(CloseRangeSemantics, SharedFilesExecUnsharesBeforeCloseOnExec) {
+  FdGuard target(open("/dev/null", O_RDWR | O_CLOEXEC));
+  ASSERT_GE(target.get(), 0);
+
+  SharedExecArgs args = {target.get()};
+  constexpr size_t kStackSize = 64 * 1024;
+  std::vector<unsigned char> stack(kStackSize);
+  pid_t child = clone(SharedExecChild, stack.data() + stack.size(), CLONE_FILES | SIGCHLD,
+                      &args);
+  ASSERT_GE(child, 0);
+
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0));
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+
+  EXPECT_TRUE(IsOpen(target.get()));
+  EXPECT_TRUE(HasCloexec(target.get()));
 }
 
 int SparseNextFdProcess() {
@@ -303,6 +338,14 @@ TEST(CloseRangeSemantics, UnshareOnPrivateTablePreservesPosixLockOwner) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 3 && strcmp(argv[1], "--check-exec-closed") == 0) {
+    char* end = nullptr;
+    long fd = strtol(argv[2], &end, 10);
+    if (end == argv[2] || *end != '\0' || fd < 0 || fd > INT_MAX) return 42;
+    errno = 0;
+    return fcntl(static_cast<int>(fd), F_GETFD) == -1 && errno == EBADF ? 0 : 43;
+  }
+
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

@@ -385,6 +385,15 @@ impl InnerAddressSpace {
         self.mappings.insert_vma(new_vma.clone());
         let move_len = core::cmp::min(source_len, new_len);
 
+        // The site identity includes its virtual address.  Detach source sites
+        // before moving PTEs; after commit the outer AddressSpace owner reapplies
+        // matching definitions at the destination file offset.  On rollback it
+        // reapplies the unchanged source mapping instead.
+        #[cfg(target_arch = "x86_64")]
+        if old_len != 0 {
+            super::uprobe::uprobe_disarm_range_locked(&mm, self, source_region);
+        }
+
         // mremap does not free physical pages; old PTEs are migrated to the new VMA, while
         // old_len==0 keeps the legacy duplicate-mapping behavior.
         // using MmuGather here is solely for a unified cross-core TLB shootdown at the end.

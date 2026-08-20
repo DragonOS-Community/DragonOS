@@ -12,7 +12,7 @@ use crate::exception::ebreak::EBreak;
 use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    ipc::signal::force_kernel_signal_to_current,
+    ipc::signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
     mm::VirtAddr,
     process::ProcessManager,
     smp::core::smp_get_processor_id,
@@ -115,7 +115,21 @@ pub fn arch_trap_init() -> Result<(), SystemError> {
 
 /// 处理除法错误 0 #DE
 #[no_mangle]
-unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_divide_error(regs: &'static mut TrapFrame, error_code: u64) {
+    if regs.is_from_user() {
+        // A divide fault from an XOL instruction is a synchronous user fault,
+        // not a kernel failure.  Mark the transaction trapped so the signal
+        // gate restores the original probe context before building sigframe.
+        crate::exception::uprobe::mark_current_xol_trapped();
+        CurrentIrqArch::interrupt_enable();
+        const FPE_INTDIV: i32 = 1;
+        if let Err(err) =
+            force_sig_fault_to_current(Signal::SIGFPE, FPE_INTDIV, VirtAddr::new(regs.rip as usize))
+        {
+            error!("failed to send SIGFPE for user divide error: {:?}", err);
+        }
+        return;
+    }
     error!(
         "do_divide_error(0), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -130,9 +144,13 @@ unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) 
 /// 处理调试异常 1 #DB
 #[no_mangle]
 unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
+    // DR6 可同时报告 BS(single-step) 与 B0-B3(hardware breakpoint)。必须在
+    // 任何 handler 前保存并复位，避免旧 cause 污染下一次 #DB。
+    let dr6 = read_and_reset_dr6();
     trace!(
-        "do_debug(1), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
+        "do_debug(1), \tError code: {:#x},\tdr6: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
+        dr6,
         regs.rsp,
         regs.rip,
         smp_get_processor_id().data(),
@@ -140,17 +158,35 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
     );
     if regs.is_from_user() {
         // 用户态 #DB：uprobe XOL 单步完成优先（handler 返回是否消费，评审 R4）；
-        // 未消费的（ptrace 单步 / 硬件断点）回落到正常 debug 路径，
-        // 恢复本 PR 之前 master 的行为（DebugException::handle 对用户态同样适用）。
-        if crate::exception::uprobe::uprobe_debug_handler(regs).unwrap() {
-            // 已被 uprobe 消费（XOL 完成或 abort）。
+        // 未消费的用户态单步进入 SIGTRAP/ptrace 路径。DebugException 只查
+        // 内核 kprobe 表，不能处理用户态 #DB，否则会静默吞掉调试异常。
+        if crate::exception::uprobe::uprobe_debug_handler(regs, dr6).unwrap() {
+            // 已被 uprobe 消费（精确 XOL 完成）。
         } else {
-            DebugException::handle(regs).unwrap();
+            crate::exception::uprobe::send_user_debug_sigtrap(regs.rip as usize, dr6).unwrap();
         }
     } else {
         // 内核态 #DB：kprobe 单步完成。
         DebugException::handle(regs).unwrap();
     }
+}
+
+#[inline]
+unsafe fn read_and_reset_dr6() -> u64 {
+    let dr6: u64;
+    core::arch::asm!(
+        "mov {}, dr6",
+        out(reg) dr6,
+        options(nomem, nostack, preserves_flags)
+    );
+    // Intel/Linux 要求保留 DR6 的固定 1 位并清除可写状态位。
+    const DR6_RESET: u64 = 0xffff_0ff0;
+    core::arch::asm!(
+        "mov dr6, {}",
+        in(reg) DR6_RESET,
+        options(nomem, nostack, preserves_flags)
+    );
+    dr6
 }
 
 /// 处理NMI中断 2 NMI
@@ -217,8 +253,11 @@ unsafe extern "C" fn do_bounds(regs: &'static TrapFrame, error_code: u64) {
 
 /// 处理未定义操作码异常 6 #UD
 #[no_mangle]
-unsafe extern "C" fn do_undefined_opcode(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_undefined_opcode(regs: &'static mut TrapFrame, error_code: u64) {
     if regs.is_from_user() {
+        // #UD 不可恢复且下面确定投递 SIGILL；若发生在 XOL，signal frame 必须
+        // 看到原探针址，而不是 slot 地址。
+        crate::exception::uprobe::mark_current_xol_trapped();
         CurrentIrqArch::interrupt_enable();
         if let Err(err) = force_kernel_signal_to_current(Signal::SIGILL) {
             error!(
@@ -351,8 +390,11 @@ unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code
 
 /// 处理一般保护异常 13 #GP
 #[no_mangle]
-unsafe extern "C" fn do_general_protection(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_general_protection(regs: &'static mut TrapFrame, error_code: u64) {
     if regs.is_from_user() {
+        // 用户 #GP 在这里确定转换为 SIGSEGV；不要在异常入口无条件 abort，
+        // 只标记实际信号递送路径。
+        crate::exception::uprobe::mark_current_xol_trapped();
         CurrentIrqArch::interrupt_enable();
         if let Err(err) = force_kernel_signal_to_current(Signal::SIGSEGV) {
             error!(

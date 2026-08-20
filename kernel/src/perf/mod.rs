@@ -6,13 +6,15 @@ mod tracepoint;
 mod uprobe;
 mod util;
 
+pub(crate) use util::{PERF_TYPE_KPROBE, PERF_TYPE_UPROBE};
+
 use crate::arch::MMArch;
 use crate::bpf::prog::BpfProg;
 use crate::filesystem::epoll::event_poll::EPollItemList;
-use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
+use crate::filesystem::epoll::{EPollEventType, EPollItem, event_poll::EventPoll};
 use crate::filesystem::page_cache::PageCache;
-use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
+use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };
@@ -22,7 +24,7 @@ use crate::include::bindings::linux_bpf::{
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
 use crate::mm::allocator::page_frame::{
-    allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
+    PageFrameCount, PhysPageFrame, allocate_page_frames, deallocate_page_frames,
 };
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::{MemoryManagementArch, VirtAddr, VmFaultReason};
@@ -223,7 +225,7 @@ impl IndexNode for PerfEventInode {
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
-        panic!("read_at not implemented for PerfEvent");
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn write_at(
@@ -233,7 +235,7 @@ impl IndexNode for PerfEventInode {
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
-        panic!("write_at not implemented for PerfEvent");
+        Err(SystemError::EINVAL)
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -387,9 +389,17 @@ pub fn perf_event_open(
     pid: i32,
     cpu: i32,
     group_fd: i32,
-    flags: u32,
+    flags: usize,
 ) -> Result<usize> {
     let args = PerfProbeArgs::try_from(attr, pid, cpu, group_fd, flags)?;
+    if args.type_ == PERF_TYPE_KPROBE || args.type_ == PERF_TYPE_UPROBE {
+        let unsupported = PerfEventOpenFlags::PERF_FLAG_FD_NO_GROUP
+            | PerfEventOpenFlags::PERF_FLAG_FD_OUTPUT
+            | PerfEventOpenFlags::PERF_FLAG_PID_CGROUP;
+        if args.group_fd != -1 || args.flags.intersects(unsupported) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+    }
     log::info!("perf_event_process: {:#?}", args);
     let file_mode = if args
         .flags
@@ -402,28 +412,24 @@ pub fn perf_event_open(
     let cloexec = file_mode.contains(FileFlags::O_CLOEXEC);
 
     let event: Box<dyn PerfEventOps> = match args.type_ {
-        // Kprobe / uprobe（复用 PERF_TYPE_MAX，评审 F9）
-        // See /sys/bus/event_source/devices/kprobe/type
-        perf_type_id::PERF_TYPE_MAX => {
-            if args.name.contains('/') {
-                // config1 含 '/'：用户态路径 → uprobe（config2 = 文件偏移）
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let uprobe_event = uprobe::perf_event_open_uprobe(args)?;
-                    Box::new(uprobe_event)
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    // uprobe 仅支持 x86_64（需要 int3/XOL 机制）
-                    return Err(SystemError::ENOSYS);
-                }
-            } else {
-                // config1 为内核符号名 → kprobe（现有行为）
-                let kprobe_event = kprobe::perf_event_open_kprobe(args);
-                Box::new(kprobe_event)
+        // Dynamic software PMUs are routed solely by their sysfs-advertised
+        // type. Probe names and paths are data, never dispatch metadata.
+        PERF_TYPE_KPROBE => {
+            let kprobe_event = kprobe::perf_event_open_kprobe(args);
+            Box::new(kprobe_event)
+        }
+        PERF_TYPE_UPROBE => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let uprobe_event = uprobe::perf_event_open_uprobe(args)?;
+                Box::new(uprobe_event)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                return Err(SystemError::ENOSYS);
             }
         }
-        perf_type_id::PERF_TYPE_SOFTWARE => {
+        ty if ty == perf_type_id::PERF_TYPE_SOFTWARE as u32 => {
             // For bpf prog output
             assert_eq!(
                 args.config,
@@ -436,13 +442,11 @@ pub fn perf_event_open(
             let bpf_event = bpf::perf_event_open_bpf(args);
             Box::new(bpf_event)
         }
-        perf_type_id::PERF_TYPE_TRACEPOINT => {
+        ty if ty == perf_type_id::PERF_TYPE_TRACEPOINT as u32 => {
             let tracepoint_event = tracepoint::perf_event_open_tracepoint(args)?;
             Box::new(tracepoint_event)
         }
-        _ => {
-            unimplemented!("perf_event_process: unknown type: {:?}", args);
-        }
+        _ => return Err(SystemError::ENOENT),
     };
 
     let page_cache = event.page_cache();

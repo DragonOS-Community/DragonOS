@@ -260,7 +260,7 @@ impl InnerAddressSpace {
         // uprobe：把父 mm 的探针继承到子 mm（评审 R9——fork 后探针存活；
         // 子页经上面的正常 fork 拷贝已含 0xcc，这里私有化并重建 per-mm 实例）。
         #[cfg(target_arch = "x86_64")]
-        super::uprobe::fork_inherit_uprobes(&parent_mm, &new_addr_space);
+        super::uprobe::fork_inherit_uprobes(&parent_mm, &new_addr_space)?;
 
         return Ok(new_addr_space);
     }

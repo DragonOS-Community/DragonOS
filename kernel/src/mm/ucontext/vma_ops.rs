@@ -125,6 +125,12 @@ impl InnerAddressSpace {
             });
         }
 
+        // Uprobe bytes belong to the old VMA identity.  Restore and detach
+        // their sites while that identity and its PTEs are still present;
+        // MAP_FIXED and mremap target replacement both converge here.
+        #[cfg(target_arch = "x86_64")]
+        super::uprobe::uprobe_disarm_range_locked(&mm, self, region_to_unmap);
+
         plans.reverse();
         while let Some(plan) = plans.pop() {
             let cur_vma = match self.mappings.remove_vma(&plan.original_region) {
@@ -374,7 +380,6 @@ impl InnerAddressSpace {
         let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
         let mut tlb = MmuGather::gather(&mm);
 
-        let mapper = &mut self.user_mapper.utable;
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
         // debug!("mprotect: region: {:?}", region);
 
@@ -443,6 +448,13 @@ impl InnerAddressSpace {
                 split_lifecycle,
             });
         }
+
+        if !plans.is_empty() {
+            #[cfg(target_arch = "x86_64")]
+            super::uprobe::uprobe_disarm_range_locked(&mm, self, region);
+        }
+
+        let mapper = &mut self.user_mapper.utable;
 
         for plan in plans {
             let r = match self.mappings.remove_vma(&plan.original_region) {
@@ -881,8 +893,6 @@ impl InnerAddressSpace {
         let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
         let mut tlb = MmuGather::gather(&mm);
 
-        let mapper = &mut self.user_mapper.utable;
-
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
         let (regions, has_unmapped) = self.mappings.conflicts_with_unmapped(region);
 
@@ -900,6 +910,25 @@ impl InnerAddressSpace {
                 Err(SystemError::EINVAL.into())
             };
         }
+
+        let drops_present_pages =
+            behavior == MadvFlags::MADV_DONTNEED || behavior == MadvFlags::MADV_DONTNEED_LOCKED;
+        if drops_present_pages {
+            // Validate the complete request before withdrawing any site.  The
+            // actual zap below is infallible for these already accepted VMAs.
+            for vma in &regions {
+                let flags = *vma.lock().vm_flags();
+                if flags.contains(VmFlags::VM_PFNMAP)
+                    || (behavior == MadvFlags::MADV_DONTNEED && flags.contains(VmFlags::VM_LOCKED))
+                {
+                    return Err(SystemError::EINVAL.into());
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            super::uprobe::uprobe_disarm_range_locked(&mm, self, region);
+        }
+
+        let mapper = &mut self.user_mapper.utable;
 
         if Self::madvise_uses_range_without_vma_split(behavior) {
             for r in regions {

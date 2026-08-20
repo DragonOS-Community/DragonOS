@@ -63,10 +63,15 @@ pub struct AddressSpace {
     pub uprobe_list: SpinLock<BTreeMap<usize, Vec<Arc<RwLock<UprobeInstance>>>>>,
     /// Per-mm XOL 区（懒初始化，首次注册 uprobe 时创建）。
     #[cfg(target_arch = "x86_64")]
-    pub xol_area: SpinLock<Option<Box<XolArea>>>,
+    pub xol_area: SpinLock<Option<Arc<XolArea>>>,
     /// Per-page 断点状态（追踪 COW 副本 + refcount，供注销恢复原页）。
     #[cfg(target_arch = "x86_64")]
     pub(crate) uprobe_page_state: SpinLock<BTreeMap<usize, UprobePageState>>,
+    /// A lifecycle operation removed the XOL VMA and therefore all sites;
+    /// the post-commit path must reconcile every file VMA, not only the user
+    /// supplied range (which may contain only the anonymous XOL mapping).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) uprobe_needs_full_reapply: AtomicBool,
 }
 
 impl AddressSpace {
@@ -78,7 +83,7 @@ impl AddressSpace {
     /// retry.  Do not move this loop back into `InnerAddressSpace`: doing so
     /// would turn a normal PageCache invalidation conflict into a false
     /// population failure or recreate the mmap/writeback lock cycle.
-    fn populate_range_post_commit(
+    pub(crate) fn populate_range_post_commit(
         self: &Arc<Self>,
         start: VirtAddr,
         len: usize,
@@ -272,6 +277,8 @@ impl AddressSpace {
             xol_area: SpinLock::new(None),
             #[cfg(target_arch = "x86_64")]
             uprobe_page_state: SpinLock::new(BTreeMap::new()),
+            #[cfg(target_arch = "x86_64")]
+            uprobe_needs_full_reapply: AtomicBool::new(false),
         });
         // Back-fill the Weak<AddressSpace> so that InnerAddressSpace methods can obtain
         // the outer Arc to construct MmuGather / initiate TLB shootdown.
@@ -634,6 +641,8 @@ impl AddressSpace {
                     Some(expected_vma),
                 );
             }
+            #[cfg(target_arch = "x86_64")]
+            super::uprobe::uprobe_apply_to_range(self, VirtRegion::new(page.virt_address(), len));
             return Ok(page);
         }
     }
@@ -1087,13 +1096,7 @@ impl AddressSpace {
             // dlopen / 后续 mmap 的文件获得已注册的 uprobe）。写锁已释放，
             // 函数内部自取锁；注册表为空时为一次快速查表。
             #[cfg(target_arch = "x86_64")]
-            super::uprobe::uprobe_apply_to_new_vma(
-                self,
-                &vma_file,
-                region.start().data(),
-                region.size(),
-                offset,
-            );
+            super::uprobe::uprobe_apply_to_range(self, region);
             return Ok(page);
         }
     }
@@ -1115,11 +1118,15 @@ impl AddressSpace {
                 Ok(notifications) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(notifications);
+                    #[cfg(target_arch = "x86_64")]
+                    super::uprobe::uprobe_apply_to_range(self, region);
                     return Ok(());
                 }
                 Err(failure) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
+                    #[cfg(target_arch = "x86_64")]
+                    super::uprobe::uprobe_apply_to_range(self, region);
                     return Err(failure.err);
                 }
             }
@@ -1150,10 +1157,17 @@ impl AddressSpace {
                 continue;
             }
             match guard.mprotect_collect(start_page, page_count, prot_flags) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    drop(guard);
+                    #[cfg(target_arch = "x86_64")]
+                    super::uprobe::uprobe_apply_to_range(self, region);
+                    return Ok(());
+                }
                 Err(failure) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
+                    #[cfg(target_arch = "x86_64")]
+                    super::uprobe::uprobe_apply_to_range(self, region);
                     return Err(failure.err);
                 }
             }
@@ -1175,10 +1189,28 @@ impl AddressSpace {
                 continue;
             }
             match guard.madvise_collect(start_page, page_count, behavior) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    drop(guard);
+                    #[cfg(target_arch = "x86_64")]
+                    if behavior == MadvFlags::MADV_DONTNEED
+                        || behavior == MadvFlags::MADV_DONTNEED_LOCKED
+                    {
+                        // MADV_DONTNEED is advice: refault only pages that host
+                        // persistent probes, so the VMA remains observable
+                        // without retaining unrelated pages.
+                        super::uprobe::uprobe_apply_to_range(self, region);
+                    }
+                    return Ok(());
+                }
                 Err(failure) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
+                    #[cfg(target_arch = "x86_64")]
+                    if behavior == MadvFlags::MADV_DONTNEED
+                        || behavior == MadvFlags::MADV_DONTNEED_LOCKED
+                    {
+                        super::uprobe::uprobe_apply_to_range(self, region);
+                    }
                     return Err(failure.err);
                 }
             }
@@ -1293,6 +1325,14 @@ impl AddressSpace {
                             Some(expected_vma),
                         );
                     }
+                    #[cfg(target_arch = "x86_64")]
+                    super::uprobe::uprobe_apply_to_mremap_ranges(
+                        self,
+                        old_vaddr,
+                        old_len,
+                        outcome.addr,
+                        new_len,
+                    );
                     return Ok(outcome.addr);
                 }
                 Err(failure) if failure.err == SystemError::EAGAIN_OR_EWOULDBLOCK => {
@@ -1317,16 +1357,28 @@ impl AddressSpace {
                     {
                         drop(guard);
                         InnerAddressSpace::notify_close_notifications(failure.notifications);
+                        #[cfg(target_arch = "x86_64")]
+                        super::uprobe::uprobe_apply_to_mremap_ranges(
+                            self, old_vaddr, old_len, new_vaddr, new_len,
+                        );
                         self.wait_for_no_reservation_conflict(retry_region);
                         continue;
                     }
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
+                    #[cfg(target_arch = "x86_64")]
+                    super::uprobe::uprobe_apply_to_mremap_ranges(
+                        self, old_vaddr, old_len, new_vaddr, new_len,
+                    );
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 Err(failure) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
+                    #[cfg(target_arch = "x86_64")]
+                    super::uprobe::uprobe_apply_to_mremap_ranges(
+                        self, old_vaddr, old_len, new_vaddr, new_len,
+                    );
                     return Err(failure.err);
                 }
             }

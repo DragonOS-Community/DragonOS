@@ -278,7 +278,13 @@ impl X86_64MMArch {
             flags |= FaultFlags::FAULT_FLAG_INSTRUCTION;
         }
 
+        let fault_from_user = regs.is_from_user();
         let send_fault_signal = |sig: Signal, code: i32, addr: VirtAddr| {
+            // 只有走到最终 fault->signal 分支才标记 Trapped；可恢复的缺页、
+            // retry 和 exception-table fixup 均保持 Running，继续完成同一 XOL。
+            if fault_from_user {
+                crate::exception::uprobe::mark_current_xol_trapped();
+            }
             if let Err(e) = force_sig_fault_to_current(sig, code, addr) {
                 error!(
                     "failed to force {:?} fault to current process: pid={:?}, code={}, addr={:#x}, err={:?}",

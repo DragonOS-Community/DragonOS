@@ -5,10 +5,10 @@ use super::Result;
 use crate::bpf::map::BpfMap;
 use crate::bpf::prog::util::{BpfProgMeta, BpfProgVerifierInfo};
 use crate::bpf::prog::verifier::BpfProgVerifier;
-use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
+use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
-use crate::include::bindings::linux_bpf::bpf_attr;
+use crate::include::bindings::linux_bpf::{BPF_F_SLEEPABLE, bpf_attr, bpf_prog_type};
 use crate::libs::mutex::MutexGuard;
 use crate::process::ProcessManager;
 use alloc::string::String;
@@ -37,6 +37,14 @@ impl BpfProg {
 
     pub fn insns_mut(&mut self) -> &mut [u8] {
         &mut self.meta.insns
+    }
+
+    pub fn prog_type(&self) -> bpf_prog_type {
+        self.meta.prog_type
+    }
+
+    pub fn is_sleepable(&self) -> bool {
+        self.meta.prog_flags & BPF_F_SLEEPABLE != 0
     }
 
     pub fn insert_map(&mut self, map_ptr: usize) {

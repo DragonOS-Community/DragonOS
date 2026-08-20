@@ -749,6 +749,12 @@ struct SignalFrameLocation {
 unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let pcb = ProcessManager::current_pcb();
 
+    // Linux uprobe_deny_signal(): 普通异步信号不能在 XOL 单条指令中间构造
+    // signal frame；同步陷阱或 fatal signal 则必须先把 RIP 恢复到原探针址。
+    if !crate::exception::uprobe::signal_gate(frame) {
+        return;
+    }
+
     let siginfo = pcb.try_siginfo_irqsave(5);
 
     if unlikely(siginfo.is_none()) {

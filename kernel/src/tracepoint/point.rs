@@ -1,7 +1,14 @@
-use crate::libs::spinlock::SpinLock;
-use alloc::{boxed::Box, collections::BTreeMap, format, string::String};
-use core::{any::Any, fmt::Debug, sync::atomic::AtomicU32};
-use static_keys::StaticFalseKey;
+use crate::{
+    debug::jump_label::{disable_maskable_key, enable_maskable_key, MaskableStaticFalseKey},
+    libs::{mutex::Mutex, spinlock::SpinLock},
+};
+use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+use core::{
+    any::Any,
+    fmt::Debug,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+};
+use system_error::SystemError;
 
 #[derive(Debug)]
 #[repr(C, packed)]
@@ -36,13 +43,21 @@ impl TraceEntry {
 pub struct TracePoint {
     name: &'static str,
     system: &'static str,
-    key: &'static StaticFalseKey,
+    key: &'static MaskableStaticFalseKey,
     id: AtomicU32,
-    callback: SpinLock<BTreeMap<usize, TracePointFunc>>,
-    raw_callback: SpinLock<BTreeMap<usize, Box<dyn TracePointCallBackFunc>>>,
+    callback: SpinLock<Option<Arc<[TracePointFunc]>>>,
+    raw_callback: SpinLock<BTreeMap<usize, Arc<dyn TracePointCallBackFunc>>>,
+    enable_state: Mutex<TracePointEnableState>,
+    trace_pipe_enabled: AtomicBool,
     trace_entry_fmt_func: fn(&[u8]) -> String,
     trace_print_func: fn() -> String,
     flags: u8,
+}
+
+#[derive(Debug)]
+struct TracePointEnableState {
+    users: usize,
+    trace_pipe_enabled: bool,
 }
 
 impl core::fmt::Debug for TracePoint {
@@ -63,19 +78,61 @@ pub struct CommonTracePointMeta {
     pub print_func: fn(),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TracePointFunc {
     pub func: fn(),
-    pub data: Box<dyn Any + Send + Sync>,
+    pub data: Arc<dyn Any + Send + Sync>,
 }
 
 pub trait TracePointCallBackFunc: Send + Sync {
     fn call(&self, entry: &[u8]);
 }
 
+/// Scalar field types supported by dynamically-sized trace records.
+///
+/// The codec writes fields explicitly instead of copying a Rust structure's
+/// object representation, so padding bytes never become part of the ABI.
+pub trait TraceEventField: Copy {
+    const SIZE: usize;
+    const ALIGN: usize;
+    const SIGNED: bool;
+    const TYPE_NAME: &'static str;
+
+    fn write_ne(self, dst: &mut [u8]) -> bool;
+    fn read_ne(src: &[u8]) -> Option<Self>;
+}
+
+macro_rules! impl_trace_event_field {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl TraceEventField for $ty {
+                const SIZE: usize = core::mem::size_of::<Self>();
+                const ALIGN: usize = core::mem::align_of::<Self>();
+                const SIGNED: bool = <$ty>::MIN != 0;
+                const TYPE_NAME: &'static str = stringify!($ty);
+
+                fn write_ne(self, dst: &mut [u8]) -> bool {
+                    let bytes = self.to_ne_bytes();
+                    if dst.len() != bytes.len() {
+                        return false;
+                    }
+                    dst.copy_from_slice(&bytes);
+                    true
+                }
+
+                fn read_ne(src: &[u8]) -> Option<Self> {
+                    Some(<$ty>::from_ne_bytes(src.try_into().ok()?))
+                }
+            }
+        )*
+    };
+}
+
+impl_trace_event_field!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
 impl TracePoint {
-    pub const fn new(
-        key: &'static StaticFalseKey,
+    pub(crate) const fn new(
+        key: &'static MaskableStaticFalseKey,
         name: &'static str,
         system: &'static str,
         fmt_func: fn(&[u8]) -> String,
@@ -89,8 +146,13 @@ impl TracePoint {
             flags: 0,
             trace_entry_fmt_func: fmt_func,
             trace_print_func,
-            callback: SpinLock::new(BTreeMap::new()),
+            callback: SpinLock::new(None),
             raw_callback: SpinLock::new(BTreeMap::new()),
+            enable_state: Mutex::new(TracePointEnableState {
+                users: 0,
+                trace_pipe_enabled: false,
+            }),
+            trace_pipe_enabled: AtomicBool::new(false),
         }
     }
 
@@ -135,22 +197,55 @@ impl TracePoint {
 
     /// Register a callback function to the tracepoint
     pub fn register(&self, func: fn(), data: Box<dyn Any + Sync + Send>) {
-        let trace_point_func = TracePointFunc { func, data };
         let ptr = func as usize;
-        self.callback.lock().entry(ptr).or_insert(trace_point_func);
+        let mut callbacks = self.callback.lock();
+        if callbacks
+            .as_deref()
+            .is_some_and(|current| current.iter().any(|item| item.func as usize == ptr))
+        {
+            return;
+        }
+
+        let mut updated = callbacks
+            .as_deref()
+            .map(<[TracePointFunc]>::to_vec)
+            .unwrap_or_default();
+        updated.push(TracePointFunc {
+            func,
+            data: data.into(),
+        });
+        *callbacks = Some(updated.into());
     }
 
     /// Unregister a callback function from the tracepoint
     pub fn unregister(&self, func: fn()) {
         let func_ptr = func as usize;
-        self.callback.lock().remove(&func_ptr);
+        let mut callbacks = self.callback.lock();
+        let Some(current) = callbacks.as_deref() else {
+            return;
+        };
+        let updated: Vec<_> = current
+            .iter()
+            .filter(|item| item.func as usize != func_ptr)
+            .cloned()
+            .collect();
+        if updated.len() == current.len() {
+            return;
+        }
+        *callbacks = if updated.is_empty() {
+            None
+        } else {
+            Some(updated.into())
+        };
     }
 
     /// Iterate over all registered callback functions
     pub fn callback_list(&self, f: &dyn Fn(&TracePointFunc)) {
-        let callback = self.callback.lock();
-        for trace_func in callback.values() {
-            f(trace_func);
+        let callbacks = self.callback.lock().clone();
+        if let Some(callbacks) = callbacks {
+            for trace_func in callbacks.iter() {
+                f(trace_func);
+            }
         }
     }
 
@@ -160,7 +255,7 @@ impl TracePoint {
     pub fn register_raw_callback(
         &self,
         callback_id: usize,
-        callback: Box<dyn TracePointCallBackFunc>,
+        callback: Arc<dyn TracePointCallBackFunc>,
     ) {
         self.raw_callback
             .lock()
@@ -173,30 +268,81 @@ impl TracePoint {
         self.raw_callback.lock().remove(&callback_id);
     }
 
-    /// Iterate over all registered raw callback functions
-    pub fn raw_callback_list(&self, f: &dyn Fn(&Box<dyn TracePointCallBackFunc>)) {
-        let raw_callback = self.raw_callback.lock();
-        for callback in raw_callback.values() {
-            f(callback);
-        }
+    /// Snapshot all registered raw callbacks.
+    ///
+    /// Callback execution may allocate and run arbitrary BPF code, so it must
+    /// not happen while the registry spin lock is held. `Arc` keeps callbacks
+    /// alive when an owner unregisters after this snapshot was taken.
+    pub fn raw_callbacks_snapshot(&self) -> Vec<Arc<dyn TracePointCallBackFunc>> {
+        self.raw_callback.lock().values().cloned().collect()
     }
 
-    /// Enable the tracepoint
-    pub fn enable(&self) {
-        unsafe {
-            self.key.enable();
+    /// Acquire one active consumer reference.
+    pub fn acquire_enable(&self) -> Result<(), SystemError> {
+        crate::text_patch::validate_control_context().map_err(SystemError::from)?;
+        let mut state = self.enable_state.lock();
+        let users = state
+            .users
+            .checked_add(1)
+            .expect("tracepoint enable reference overflow");
+        if state.users == 0 {
+            enable_maskable_key(self.key).map_err(SystemError::from)?;
         }
+        state.users = users;
+        Ok(())
     }
 
-    /// Disable the tracepoint
-    pub fn disable(&self) {
-        unsafe {
-            self.key.disable();
+    /// Release one active consumer reference.
+    pub fn release_enable(&self) -> Result<(), SystemError> {
+        crate::text_patch::validate_control_context().map_err(SystemError::from)?;
+        let mut state = self.enable_state.lock();
+        let users = state
+            .users
+            .checked_sub(1)
+            .expect("tracepoint enable reference underflow");
+        if users == 0 {
+            disable_maskable_key(self.key).map_err(SystemError::from)?;
         }
+        state.users = users;
+        Ok(())
     }
 
-    /// Check if the tracepoint is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.key.is_enabled()
+    /// Set the tracefs recording owner state. Repeated writes are idempotent.
+    pub fn set_trace_pipe_enabled(&self, enabled: bool) -> Result<(), SystemError> {
+        crate::text_patch::validate_control_context().map_err(SystemError::from)?;
+        let mut state = self.enable_state.lock();
+        if state.trace_pipe_enabled == enabled {
+            return Ok(());
+        }
+
+        if enabled {
+            let users = state
+                .users
+                .checked_add(1)
+                .expect("tracepoint enable reference overflow");
+            if state.users == 0 {
+                enable_maskable_key(self.key).map_err(SystemError::from)?;
+            }
+            state.users = users;
+            state.trace_pipe_enabled = true;
+            self.trace_pipe_enabled.store(true, Ordering::Release);
+        } else {
+            let users = state
+                .users
+                .checked_sub(1)
+                .expect("tracepoint enable reference underflow");
+            if users == 0 {
+                disable_maskable_key(self.key).map_err(SystemError::from)?;
+            }
+            state.users = users;
+            state.trace_pipe_enabled = false;
+            self.trace_pipe_enabled.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Whether tracefs owns an active recording reference.
+    pub fn is_trace_pipe_enabled(&self) -> bool {
+        self.trace_pipe_enabled.load(Ordering::Acquire)
     }
 }

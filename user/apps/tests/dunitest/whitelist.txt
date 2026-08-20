@@ -99,3 +99,4 @@ normal/rtnetlink_link_semantics
 normal/tty_termios
 normal/inotify_dir_watch
 normal/inotify_events
+normal/sched_tracepoint

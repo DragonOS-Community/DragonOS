@@ -1,5 +1,6 @@
 mod bpf;
 mod kprobe;
+pub(crate) mod release;
 mod sys_perf_event_open;
 mod tracepoint;
 mod util;
@@ -55,6 +56,14 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
     /// Disable the perf event
     fn disable(&self) -> Result<()> {
         Err(SystemError::ENOSYS)
+    }
+    /// Sleepable final release. It is always run by the perf release worker,
+    /// never by `File::drop` or an event destructor.
+    fn release(&self) -> Result<()> {
+        match self.disable() {
+            Err(SystemError::ENOSYS) => Ok(()),
+            result => result,
+        }
     }
     /// Whether the perf event is readable
     fn readable(&self) -> bool;
@@ -166,21 +175,31 @@ impl Drop for BasicPerfEbpfCallBack {
 }
 
 #[derive(Debug)]
-pub struct PerfEventInode {
+pub(super) struct PerfEventCore {
     event: Box<dyn PerfEventOps>,
+}
+
+#[derive(Debug)]
+pub struct PerfEventInode {
+    core: Arc<PerfEventCore>,
+    release_node: crate::libs::spinlock::SpinLock<Option<Box<release::PerfReleaseNode>>>,
     epitems: EPollItemList,
 }
 
 impl PerfEventInode {
     pub fn new(event: Box<dyn PerfEventOps>) -> Self {
+        let core = Arc::new(PerfEventCore { event });
         Self {
-            event,
+            release_node: crate::libs::spinlock::SpinLock::new(Some(Box::new(
+                release::PerfReleaseNode::new(core.clone()),
+            ))),
+            core,
             epitems: EPollItemList::default(),
         }
     }
     fn do_poll(&self) -> Result<usize> {
         let mut events = EPollEventType::empty();
-        if self.event.readable() {
+        if self.core.event.readable() {
             events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
         }
         return Ok(events.bits() as usize);
@@ -192,7 +211,7 @@ impl PerfEventInode {
     }
 
     fn mmap_size(&self) -> usize {
-        self.event.mmap_size()
+        self.core.event.mmap_size()
     }
 }
 
@@ -200,18 +219,21 @@ impl Deref for PerfEventInode {
     type Target = Box<dyn PerfEventOps>;
 
     fn deref(&self) -> &Self::Target {
-        &self.event
+        &self.core.event
     }
 }
 
 impl IndexNode for PerfEventInode {
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
-        self.event.mmap(start, len, offset)
+        self.core.event.mmap(start, len, offset)
     }
     fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
+        if let Some(node) = self.release_node.lock_irqsave().take() {
+            release::enqueue(node);
+        }
         Ok(())
     }
     fn read_at(
@@ -257,11 +279,11 @@ impl IndexNode for PerfEventInode {
         info!("perf_event_ioctl: request: {:?}, arg: {}", req, data);
         match req {
             PerfEventIoc::Enable => {
-                self.event.enable()?;
+                self.core.event.enable()?;
                 Ok(0)
             }
             PerfEventIoc::Disable => {
-                self.event.disable()?;
+                self.core.event.disable()?;
                 Ok(0)
             }
             PerfEventIoc::SetBpf => {
@@ -272,7 +294,7 @@ impl IndexNode for PerfEventInode {
                     .read()
                     .get_file_by_fd(bpf_prog_fd as _)
                     .ok_or(SystemError::EBADF)?;
-                self.event.set_bpf_prog(file)?;
+                self.core.event.set_bpf_prog(file)?;
                 Ok(0)
             }
         }
@@ -292,7 +314,7 @@ impl IndexNode for PerfEventInode {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        self.event.page_cache()
+        self.core.event.page_cache()
     }
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode> {

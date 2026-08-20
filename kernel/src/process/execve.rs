@@ -1,3 +1,4 @@
+use super::trace::trace_sched_process_exec;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
@@ -129,6 +130,11 @@ fn do_execve_internal(
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
+    // 捕获 sched_process_exec 的 old_pid：必须在 load_binary_file_with_context 之前，
+    // 因为该函数内的 begin_new_exec → de_thread 会在「非 leader 线程 execve」时
+    // 交换 current 与旧 thread-group leader 的 raw_pid（对齐 Linux fs/exec.c:1770）。
+    let old_pid = ProcessManager::current_pcb().raw_pid().data() as i32;
+
     // 尝试加载二进制文件
     let load_result = load_binary_file_with_context(&mut param, &ctx);
 
@@ -217,9 +223,25 @@ fn do_execve_internal(
             let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
             let exec_ret = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr);
             if exec_ret.is_ok() {
+                // Thread4：先 complete vfork parent，再触发 trace。
+                // 对齐 Linux：exec_mmap()/exec_mm_release() 内更早完成 vfork_done，
+                // 而 trace_sched_process_exec() 在 exec 成功提交尾部才执行。若先 trace
+                // 再 complete，父进程会被所有 tracepoint 回调阻塞，违反“child 完成 exec
+                // commit 即恢复父进程”的语义，给 exec 热路径引入不必要的 trace 回调延迟。
                 if let Some(completion) = vfork_done {
                     completion.complete_all();
                 }
+
+                // Linux keeps bprm->filename as the original exec-visible name
+                // across shebang/interpreter rewrites. DragonOS's execfn has the
+                // same lifetime and meaning; filename tracks the current loader.
+                // All dynamic sizing/allocation remains behind the macro's static
+                // branch, while these borrowed bytes and integers are O(1).
+                trace_sched_process_exec(
+                    param.execfn().as_bytes(),
+                    pcb.raw_pid().data() as i32,
+                    old_pid,
+                );
             }
             exec_ret
         }

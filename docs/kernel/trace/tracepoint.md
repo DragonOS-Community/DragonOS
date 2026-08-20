@@ -6,7 +6,7 @@
 
 
 ## 概述
-Tracepoints 是 Linux 内核提供的一种跟踪机制，允许开发者在内核代码的特定位置插入探测点，以便收集运行时信息。与 kprobes 不同，tracepoints 是预定义的，并且通常用于收集性能数据或调试信息，而不需要修改内核代码。
+Tracepoints 是 Linux 内核提供的一种跟踪机制，允许开发者在内核代码的特定位置预先定义探测点，以便收集运行时信息。与 kprobes 不同，tracepoints 不需要用户在运行时向任意位置注入探针。DragonOS 使用 static key 控制这些预定义路径，并通过[运行时文本修补](text_patching.md)在多核系统中安全地切换启用状态。
 
 ## 工作流程
 1. **定义 Tracepoint**: 内核开发者在代码中定义 tracepoint，使用宏 `define_event_trace`。

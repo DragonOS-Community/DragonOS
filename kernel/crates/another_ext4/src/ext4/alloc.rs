@@ -787,6 +787,17 @@ impl Ext4 {
     }
 
     #[cfg(test)]
+    pub(super) fn test_reserve_clean_delalloc_lease_counts(
+        &self,
+        data_blocks: u64,
+        metadata_blocks: u64,
+    ) -> Result<DelallocLease> {
+        self.mutate_clean_delalloc_ledger(|allocation| {
+            allocation.reserve_delalloc(8, data_blocks, metadata_blocks)
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn test_release_clean_delalloc_lease(
         &self,
         lease: &mut DelallocLease,
@@ -869,8 +880,29 @@ impl Ext4 {
     /// inactive before this method returns.  This is a low-level primitive for
     /// a consuming VFS bridge, not a permission to release a partial mapping.
     pub fn release_delalloc_lease_batch(&self, leases: &mut [&mut DelallocLease]) -> Result<()> {
+        // Releasing no capability is a semantic no-op.  In particular it must
+        // not contend with a transactional metadata owner: callers use this
+        // boundary while tearing down an empty delayed-allocation pool.
+        if leases.is_empty() {
+            return Ok(());
+        }
         self.ensure_mutable()?;
         let _mutation_guard = self.lock_direct_metadata_mutation()?;
+        self.mutate_clean_delalloc_ledger(|allocation| allocation.release_delalloc_batch(leases))
+    }
+
+    /// Release leases while the caller already owns the direct metadata
+    /// exclusion domain.  Keeping projected admission and its local rollback
+    /// in one domain prevents ordinary gate contention from stranding a
+    /// partially constructed capability set.
+    pub(super) fn release_delalloc_lease_batch_in_direct_mutation_domain(
+        &self,
+        leases: &mut [&mut DelallocLease],
+    ) -> Result<()> {
+        if leases.is_empty() {
+            return Ok(());
+        }
+        self.ensure_mutable()?;
         self.mutate_clean_delalloc_ledger(|allocation| allocation.release_delalloc_batch(leases))
     }
 

@@ -9,6 +9,7 @@ use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
     exception::workqueue::{schedule_work, Work},
     filesystem::{
+        fsnotify::{self, FsNotifyDeleteState, FsNotifyObjectId, FsNotifyTarget},
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
@@ -62,6 +63,7 @@ use system_error::SystemError;
 /// mount's propagation state -> propagation group allocator.
 /// A lower layer must never acquire the lifecycle/topology layers in reverse.
 pub(crate) static MOUNT_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_SUPERBLOCK_FSNOTIFY_ID: AtomicUsize = AtomicUsize::new(1);
 
 lazy_static! {
     /// Serializes pathname rendering against alias rename/disconnect. Mount
@@ -663,6 +665,10 @@ unsafe impl Sync for MountExternalGuard {}
 
 #[derive(Debug)]
 pub struct SuperBlockState {
+    /// Monotonic identity used by fsnotify; unlike an Arc address it cannot be
+    /// confused after allocator address reuse.
+    fsnotify_id: usize,
+    fsnotify_object_locks: Mutex<HashMap<(InodeId, u64), Weak<Mutex<FsNotifyDeleteState>>>>,
     /// User namespace that owns this superblock, matching Linux `s_user_ns`.
     /// Bind mounts and mount-namespace copies retain the same owner.
     owner_user_ns: Arc<UserNamespace>,
@@ -723,6 +729,9 @@ pub struct VfsDentry {
     /// follow later FUSE invalidations, otherwise the original key could no
     /// longer be removed deterministically.
     registry_generation: u64,
+    fsnotify_superblock: usize,
+    fsnotify_delete_lifecycle: Arc<Mutex<FsNotifyDeleteState>>,
+    file_type: FileType,
     /// Serializes exact-edge attach/detach against rename/unlink/rmdir of this
     /// alias without holding a global mount lock across filesystem I/O.
     mount_gate: Mutex<()>,
@@ -777,7 +786,12 @@ impl VfsDentry {
     /// Magic-link targets use this to retain a mount projection for open and
     /// bind mount. Anonymous dentries deliberately never enter the ordinary
     /// dentry registry and therefore cannot participate in lookup or rename.
-    fn new_anonymous(inode: Arc<dyn IndexNode>, dname: DName) -> Result<Arc<Self>, SystemError> {
+    fn new_anonymous(
+        inode: Arc<dyn IndexNode>,
+        dname: DName,
+        fsnotify_superblock: usize,
+        fsnotify_delete_lifecycle: Arc<Mutex<FsNotifyDeleteState>>,
+    ) -> Result<Arc<Self>, SystemError> {
         let metadata = inode.metadata()?;
         let generation = inode.inode_generation();
         Ok(Arc::new(Self {
@@ -785,6 +799,9 @@ impl VfsDentry {
             inode,
             registry_child: metadata.inode_id,
             registry_generation: generation,
+            fsnotify_superblock,
+            fsnotify_delete_lifecycle,
+            file_type: metadata.file_type,
             mount_gate: Mutex::new(()),
             children_gate: Mutex::new(()),
             mount_edges: AtomicUsize::new(0),
@@ -796,6 +813,23 @@ impl VfsDentry {
                 disconnected: false,
             }),
         }))
+    }
+}
+
+impl Drop for VfsDentry {
+    fn drop(&mut self) {
+        if !self.state.lock().disconnected {
+            return;
+        }
+        let mut lifecycle = self.fsnotify_delete_lifecycle.lock();
+        fsnotify::notify_dentry_detach(
+            FsNotifyObjectId {
+                superblock: self.fsnotify_superblock,
+                inode: self.registry_child,
+                generation: self.registry_generation,
+            },
+            &mut lifecycle,
+        );
     }
 }
 
@@ -872,6 +906,8 @@ impl SuperBlockState {
     pub fn new(flags: MountFlags) -> Self {
         let flags = flags & MountFlags::SB_SETTABLE_MASK;
         Self {
+            fsnotify_id: NEXT_SUPERBLOCK_FSNOTIFY_ID.fetch_add(1, Ordering::Relaxed),
+            fsnotify_object_locks: Mutex::new(HashMap::new()),
             owner_user_ns: ProcessManager::current_user_ns(),
             flags: RwSem::new(flags),
             synchronous: AtomicBool::new(flags.contains(MountFlags::SYNCHRONOUS)),
@@ -892,6 +928,37 @@ impl SuperBlockState {
 
     pub fn owner_user_ns(&self) -> &Arc<UserNamespace> {
         &self.owner_user_ns
+    }
+
+    fn fsnotify_object_lock(
+        &self,
+        inode: InodeId,
+        generation: u64,
+        nlinks: usize,
+    ) -> Result<Arc<Mutex<FsNotifyDeleteState>>, SystemError> {
+        let mut locks = self.fsnotify_object_locks.lock();
+        if let Some(lock) = locks.get(&(inode, generation)).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        locks.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        let lock = Arc::try_new(Mutex::new(FsNotifyDeleteState::new(nlinks)))
+            .map_err(|_| SystemError::ENOMEM)?;
+        locks.insert((inode, generation), Arc::downgrade(&lock));
+        if locks.len().is_multiple_of(256) {
+            locks.retain(|_, lock| lock.strong_count() != 0);
+        }
+        Ok(lock)
+    }
+
+    fn fsnotify_object_state(
+        &self,
+        inode: InodeId,
+        generation: u64,
+    ) -> Option<Arc<Mutex<FsNotifyDeleteState>>> {
+        self.fsnotify_object_locks
+            .lock()
+            .get(&(inode, generation))
+            .and_then(Weak::upgrade)
     }
 
     fn activate_mount(&self, construction_reserved: bool) -> Result<(), SystemError> {
@@ -965,7 +1032,8 @@ impl SuperBlockState {
         inode: Arc<dyn IndexNode>,
         name: Option<DName>,
     ) -> Result<Arc<VfsDentry>, SystemError> {
-        let child = inode.metadata()?.inode_id;
+        let metadata = inode.metadata()?;
+        let child = metadata.inode_id;
         let child_generation = inode.inode_generation();
         let key = DentryRegistryKey {
             parent: parent.map(|dentry| dentry.id),
@@ -973,6 +1041,20 @@ impl SuperBlockState {
             child_generation,
             name: name.clone(),
         };
+        {
+            let registry = self.dentry_registry.lock();
+            if let Some(dentry) = registry.get(&key).and_then(Weak::upgrade) {
+                if !dentry.is_disconnected() {
+                    return Ok(dentry);
+                }
+            }
+        }
+
+        // Only a registry miss needs to consult or allocate the shared
+        // fsnotify lifecycle state. Recheck the registry afterwards because a
+        // concurrent lookup may have installed the same edge meanwhile.
+        let delete_lifecycle =
+            self.fsnotify_object_lock(child, child_generation, metadata.nlinks)?;
         let mut registry = self.dentry_registry.lock();
         if let Some(dentry) = registry.get(&key).and_then(Weak::upgrade) {
             if !dentry.is_disconnected() {
@@ -987,6 +1069,9 @@ impl SuperBlockState {
             inode,
             registry_child: child,
             registry_generation: child_generation,
+            fsnotify_superblock: self.fsnotify_id,
+            fsnotify_delete_lifecycle: delete_lifecycle,
+            file_type: metadata.file_type,
             mount_gate: Mutex::new(()),
             children_gate: Mutex::new(()),
             mount_edges: AtomicUsize::new(0),
@@ -1126,6 +1211,13 @@ impl SuperBlockState {
                 );
             } else {
                 dentry.state.lock().disconnected = true;
+                if let Some(fuse) = dentry
+                    .inode
+                    .as_any_ref()
+                    .downcast_ref::<crate::filesystem::fuse::inode::FuseNode>()
+                {
+                    let _ = fuse.note_link_removed(false);
+                }
             }
         }
     }
@@ -2637,6 +2729,7 @@ impl MountFS {
             log::warn!("final superblock eviction drain failed: {:?}", err);
             sb_state.record_wb_error(err);
         }
+        fsnotify::notify_unmount(sb_state.fsnotify_id);
         self.inner_filesystem.on_umount();
         sb_state.finish_shutdown();
     }
@@ -3117,7 +3210,18 @@ impl MountFSInode {
         dname: DName,
         mount_fs: Arc<MountFS>,
     ) -> Result<Arc<Self>, SystemError> {
-        let dentry = VfsDentry::new_anonymous(inner_inode, dname)?;
+        let metadata = inner_inode.metadata()?;
+        let delete_lifecycle = mount_fs.super_block_state.fsnotify_object_lock(
+            metadata.inode_id,
+            inner_inode.inode_generation(),
+            metadata.nlinks,
+        )?;
+        let dentry = VfsDentry::new_anonymous(
+            inner_inode,
+            dname,
+            mount_fs.super_block_state.fsnotify_id,
+            delete_lifecycle,
+        )?;
         // Anonymous magic-link targets have no directory edge and therefore
         // cannot be rediscovered by dentry ID. Caching their wrappers would
         // retain one stale Weak key for every namespace-link traversal.
@@ -3373,6 +3477,50 @@ impl MountFSInode {
         self.dentry.inode.clone()
     }
 
+    /// Stable, metadata-I/O-free identity for fsnotify.
+    pub(crate) fn fsnotify_target(&self) -> (usize, InodeId, u64, FileType, bool) {
+        let disconnected = self.dentry.state.lock().disconnected;
+        (
+            self.mount_fs.super_block_state.fsnotify_id,
+            self.dentry.registry_child,
+            self.dentry.registry_generation,
+            self.dentry.file_type,
+            disconnected,
+        )
+    }
+
+    pub(crate) fn with_fsnotify_watch_lifecycle<T>(
+        &self,
+        operation: impl FnOnce(Arc<Mutex<FsNotifyDeleteState>>) -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        let lifecycle = self.dentry.fsnotify_delete_lifecycle.clone();
+        let state = lifecycle.lock();
+        let result = operation(lifecycle.clone());
+        let committed = state.committed() && result.is_ok();
+        drop(state);
+        if committed {
+            let target = self.fsnotify_target();
+            fsnotify::notify_object_delete(FsNotifyObjectId {
+                superblock: target.0,
+                inode: target.1,
+                generation: target.2,
+            });
+        }
+        result
+    }
+
+    pub(crate) fn with_fsnotify_admission<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        let state = &self.mount_fs.super_block_state;
+        let _admission = state.umount_read();
+        if state.lifecycle.lock().state != SuperBlockLifecycleState::Active {
+            return Err(SystemError::ESTALE);
+        }
+        operation()
+    }
+
     /// @brief Wrap a MountFSInode object in an Arc pointer.
     /// The main purpose of this function is to initialize the self-referencing Weak pointer within the MountFSInode object.
     /// This function should only be called in constructors.
@@ -3546,23 +3694,40 @@ impl MountFSInode {
         }
     }
 
-    /// 供 fsnotify 内容事件 hook 解析「该 inode 的父目录 + 自身 dentry 名」。
-    ///
-    /// 在 File 构造期（open）调用一次，结果快照存入 File，供 do_write/do_read/Drop/
-    /// IN_OPEN 向父目录 watch 投递子项内容事件（IN_MODIFY/ACCESS/OPEN/CLOSE/ATTRIB）。
-    /// - 根或断连 dentry（`do_parent` 返回自身）→ None，避免把内容事件误投给自身 watch；
-    /// - 非 MountFSInode（设备/套接字等）由调用方 downcast 判定，本方法不涉及。
-    pub fn fsnotify_parent_and_name(&self) -> Option<(Arc<dyn IndexNode>, alloc::string::String)> {
-        let parent = self.do_parent().ok()?;
-        // do_parent 对根/无父 dentry 返回自身：必须排除，否则内容事件以 parent=自身 投递，
-        // fsnotify 用自身 inode_id 反查会把 MODIFY 当作「父目录的子项事件」误投给自身 watch。
-        if let Some(self_arc) = self.self_ref.upgrade() {
-            if Arc::ptr_eq(&parent, &self_arc) {
+    /// Capture child identity and its current parent/name from dentry state.
+    /// This avoids path walking and String allocation on read/write/close.
+    pub(crate) fn fsnotify_snapshot(&self) -> (FsNotifyTarget, Option<(FsNotifyTarget, DName)>) {
+        let (parent_dentry, name, disconnected) = {
+            let state = self.dentry.state.lock();
+            (state.parent.clone(), state.name.clone(), state.disconnected)
+        };
+        let child = FsNotifyTarget {
+            id: FsNotifyObjectId {
+                superblock: self.dentry.fsnotify_superblock,
+                inode: self.dentry.registry_child,
+                generation: self.dentry.registry_generation,
+            },
+            is_dir: self.dentry.file_type == FileType::Dir,
+            disconnected,
+        };
+        let parent = parent_dentry.zip(name).and_then(|(parent, name)| {
+            if Arc::ptr_eq(&parent, &self.dentry) {
                 return None;
             }
-        }
-        let name = self.dname().ok()?;
-        Some((parent as Arc<dyn IndexNode>, name.0.as_str().to_string()))
+            Some((
+                FsNotifyTarget {
+                    id: FsNotifyObjectId {
+                        superblock: parent.fsnotify_superblock,
+                        inode: parent.registry_child,
+                        generation: parent.registry_generation,
+                    },
+                    is_dir: parent.file_type == FileType::Dir,
+                    disconnected: false,
+                },
+                name,
+            ))
+        });
+        (child, parent)
     }
 
     fn do_absolute_path(&self) -> Result<String, SystemError> {
@@ -4115,7 +4280,18 @@ impl IndexNode for MountFSInode {
             .map(|mnt| mnt.dentry.inode.clone())
             .unwrap_or_else(|| other.clone());
 
-        return self.dentry.inode.link(name, &other_inner);
+        let object_state = other
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|inode| inode.dentry.fsnotify_delete_lifecycle.clone());
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.lock());
+        let result = self.dentry.inode.link(name, &other_inner);
+        if result.is_ok() {
+            if let Some(state) = delete_lifecycle.as_mut() {
+                fsnotify::note_link_added(state);
+            }
+        }
+        result
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -4171,8 +4347,28 @@ impl IndexNode for MountFSInode {
         {
             return Err(SystemError::EBUSY);
         }
-        // Delegate to the inner inode's unlink method to delete this inode
+        // Serialize last-link publication against relink and final dentry
+        // detach for this lifecycle protocol.
+        let object_state = child
+            .as_ref()
+            .map(|child| child.fsnotify_delete_lifecycle.clone())
+            .or_else(|| {
+                self.mount_fs.super_block_state.fsnotify_object_state(
+                    inner.metadata().ok()?.inode_id,
+                    inner.inode_generation(),
+                )
+            });
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.lock());
         self.dentry.inode.unlink_with_context(name, context)?;
+        let last_link = delete_lifecycle
+            .as_mut()
+            .is_some_and(|state| fsnotify::note_link_removed(state));
+        if let Some(fuse) = inner
+            .as_any_ref()
+            .downcast_ref::<crate::filesystem::fuse::inode::FuseNode>()
+        {
+            let _ = fuse.note_link_removed(false);
+        }
         context.ensure_locked();
         let _namespace_guard = self
             .mount_fs
@@ -4181,9 +4377,16 @@ impl IndexNode for MountFSInode {
             .write();
         drop(inner);
         if let Some(child) = child.as_ref() {
+            if last_link {
+                fsnotify::mark_delete_pending(
+                    delete_lifecycle
+                        .as_mut()
+                        .expect("last link has lifecycle state"),
+                );
+            }
             self.mount_fs.super_block_state.disconnect_dentry(child);
         }
-        return Ok(());
+        Ok(())
     }
 
     #[inline]
@@ -4220,8 +4423,23 @@ impl IndexNode for MountFSInode {
         {
             return Err(SystemError::EBUSY);
         }
-        // Delegate to the inner inode's rmdir method to delete this inode
+        let object_state = child
+            .as_ref()
+            .map(|child| child.fsnotify_delete_lifecycle.clone())
+            .or_else(|| {
+                self.mount_fs.super_block_state.fsnotify_object_state(
+                    inner.metadata().ok()?.inode_id,
+                    inner.inode_generation(),
+                )
+            });
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.lock());
         self.dentry.inode.rmdir_with_context(name, context)?;
+        if let Some(fuse) = inner
+            .as_any_ref()
+            .downcast_ref::<crate::filesystem::fuse::inode::FuseNode>()
+        {
+            let _ = fuse.note_link_removed(true);
+        }
         context.ensure_locked();
         let _namespace_guard = self
             .mount_fs
@@ -4230,9 +4448,12 @@ impl IndexNode for MountFSInode {
             .write();
         drop(inner);
         if let Some(child) = child.as_ref() {
+            if let Some(state) = delete_lifecycle.as_mut() {
+                fsnotify::mark_delete_pending(state);
+            }
             self.mount_fs.super_block_state.disconnect_dentry(child);
         }
-        return Ok(());
+        Ok(())
     }
 
     #[inline]
@@ -4310,6 +4531,10 @@ impl IndexNode for MountFSInode {
                 {
                     return Err(SystemError::EBUSY);
                 }
+                let object_state = target_dentry
+                    .as_ref()
+                    .map(|target| target.fsnotify_delete_lifecycle.clone());
+                let mut delete_lifecycle = object_state.as_ref().map(|state| state.lock());
                 self.dentry.inode.move_to_with_context(
                     old_name,
                     &target_inner,
@@ -4317,6 +4542,11 @@ impl IndexNode for MountFSInode {
                     flags,
                     context,
                 )?;
+                if !flags.contains(RenameFlags::EXCHANGE) {
+                    if let Some(state) = delete_lifecycle.as_mut() {
+                        fsnotify::note_link_removed(state);
+                    }
+                }
                 context.ensure_locked();
                 let _namespace_guard = self
                     .mount_fs

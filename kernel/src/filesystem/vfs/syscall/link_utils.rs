@@ -143,6 +143,7 @@ pub fn do_linkat(
             Some(&old_inode),
             0,
         );
+        fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&old_inode), 0);
     }
     r.map(|_| 0)
 }

@@ -1297,6 +1297,25 @@ impl FuseNode {
             .store(0, Ordering::Release);
     }
 
+    /// Publish a successful namespace link-count mutation locally. FUSE
+    /// unlink/rmdir replies carry no attributes, so waiting for GETATTR would
+    /// leave stale nlink state and race an older reply over the mutation.
+    pub(crate) fn note_link_removed(&self, directory: bool) -> Option<usize> {
+        let mut metadata = self.cached_metadata.lock();
+        let nlinks = metadata.as_mut().map(|md| {
+            md.nlinks = if directory {
+                0
+            } else {
+                md.nlinks.saturating_sub(1)
+            };
+            md.nlinks
+        });
+        self.bump_attr_version();
+        self.cached_metadata_deadline_ticks
+            .store(0, Ordering::Release);
+        nlinks
+    }
+
     /// 累计该 inode 在 userspace daemon 侧持有的 LOOKUP 引用。
     ///
     /// 对齐 Linux：每个成功的 LOOKUP/READDIRPLUS entry 都必须被记账，并在 inode

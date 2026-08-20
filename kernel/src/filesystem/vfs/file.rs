@@ -4,12 +4,7 @@ use core::{
 };
 
 use crate::filesystem::fsnotify::{self, FsEvent};
-use alloc::{
-    boxed::Box,
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
@@ -682,10 +677,6 @@ pub struct File {
     /// via `eventpoll_release(file)`.  DragonOS keeps the same lifetime edge
     /// here so fd numbers can be safely reused after close.
     epitems: Arc<EPollItemList>,
-    /// fsnotify 内容事件用：open 时解析的父目录(Weak)+子项名。仅当系统存在 watch 时填充，
-    /// 供 do_write/do_read/Drop/IN_OPEN 向父目录 watch 投递子项内容事件（issue B 修复）。
-    /// 局限：open 后 rename 会使快照 stale（dentry.parent 原地变更）；EXCL_UNLINK 覆盖 unlink。
-    inotify_parent: Option<(Weak<dyn IndexNode>, Box<str>)>,
     /// One semantic inode pin per open file description. Duplicated file
     /// descriptors and VMAs share this `File`, while `O_PATH` still owns it.
     /// Declared last so the explicit `Drop` body runs `close()` before release.
@@ -1082,13 +1073,7 @@ impl File {
             && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
             && fsnotify::has_any_watch()
         {
-            // 同时通知父目录 watch（带子名，issue B）与子项自身 watch。
-            match self.inotify_parent_for_fsnotify() {
-                Some((parent, name)) => {
-                    fsnotify::fsnotify(FsEvent::MODIFY, Some((&parent, name)), Some(&self.inode), 0)
-                }
-                None => fsnotify::fsnotify(FsEvent::MODIFY, None, Some(&self.inode), 0),
-            }
+            self.notify_fs_event(FsEvent::MODIFY);
         }
         Ok(written_len)
     }
@@ -1279,19 +1264,6 @@ impl File {
             .downcast_arc::<MountFSInode>()
             .map(|mnt_inode| mnt_inode.mount_fs() as Arc<dyn FileSystem>);
 
-        // fsnotify：解析父目录+子项名快照存入 File，供内容事件 hook 向父目录 watch
-        // 投递子项 IN_MODIFY/ACCESS/OPEN/CLOSE（issue B）。
-        // 始终解析（不门控 has_any_watch）：若 open 时无 watch 则设为 None，之后加 watch
-        // 也不生效——watch 永远收不到已 open 文件的内容事件。解析本身轻量（一次 downcast
-        // + do_parent/dname），非 MountFSInode 直接 None。
-        // 设备/套接字等非 MountFSInode 解析为 None。
-        // 注意：MountFSInode::as_any_ref() 返回内部 inode 的 Any，因此
-        // downcast_ref::<MountFSInode>() 永远失败。必须用 downcast_arc。
-        let inotify_parent = inode
-            .clone()
-            .downcast_arc::<MountFSInode>()
-            .and_then(|mnt| mnt.fsnotify_parent_and_name())
-            .map(|(parent, name)| (Arc::downgrade(&parent), name.into_boxed_str()));
         let f = File {
             open_file_id: alloc_open_file_id(),
             inode,
@@ -1312,7 +1284,6 @@ impl File {
             wb_error_seq: Mutex::new(wb_error_seq),
             sb_error_seq: Mutex::new(sb_error_seq),
             epitems: Arc::new(EPollItemList::default()),
-            inotify_parent,
             _inode_retention: inode_retention,
             _mount_guard: mount_guard,
         };
@@ -1320,12 +1291,25 @@ impl File {
         return Ok(f);
     }
 
-    /// 解析 fsnotify 内容事件的 parent 参数：upgrade 构造期存储的 Weak 父目录。
-    /// 返回 (owned Arc 父目录, 借用的子项名)；调用方须绑定返回值以延长大 Arc 生命周期。
-    /// 仅对 MountFSInode 上的普通文件返回 Some。
-    fn inotify_parent_for_fsnotify(&self) -> Option<(Arc<dyn IndexNode>, &str)> {
-        let (parent, name) = self.inotify_parent.as_ref()?;
-        Some((parent.upgrade()?, name.as_ref()))
+    /// Dispatch using one coherent dentry snapshot. This keeps the read/write
+    /// hot path free of namespace walks and temporary String allocations.
+    pub(crate) fn notify_fs_event(&self, mask: FsEvent) {
+        if let Some(mounted) = self.inode.clone().downcast_arc::<MountFSInode>() {
+            let (child, parent) = mounted.fsnotify_snapshot();
+            if let Some((parent, name)) = parent.as_ref() {
+                fsnotify::fsnotify_targets(
+                    mask,
+                    Some((parent, name.0.as_str())),
+                    Some(&child),
+                    0,
+                    true,
+                );
+            } else {
+                fsnotify::fsnotify_targets(mask, None, Some(&child), 0, true);
+            }
+        } else {
+            fsnotify::fsnotify(mask, None, Some(&self.inode), 0);
+        }
     }
 
     /// Create a file object for sockets created by socket syscalls.
@@ -1612,13 +1596,7 @@ impl File {
             && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
             && fsnotify::has_any_watch()
         {
-            // 同时通知父目录 watch（带子名，issue B）与子项自身 watch。
-            match self.inotify_parent_for_fsnotify() {
-                Some((parent, name)) => {
-                    fsnotify::fsnotify(FsEvent::ACCESS, Some((&parent, name)), Some(&self.inode), 0)
-                }
-                None => fsnotify::fsnotify(FsEvent::ACCESS, None, Some(&self.inode), 0),
-            }
+            self.notify_fs_event(FsEvent::ACCESS);
         }
         Ok(len)
     }
@@ -2035,6 +2013,13 @@ impl File {
         // read_dir_impl has released readdir_state before this metadata update,
         // avoiding a cross-filesystem lock-order dependency.
         self.touch_atime_after_access();
+        if !self
+            .mode
+            .read()
+            .intersects(FileMode::FMODE_PATH | FileMode::FMODE_NONOTIFY)
+        {
+            self.notify_fs_event(FsEvent::ACCESS);
+        }
         result
     }
 
@@ -2221,7 +2206,6 @@ impl File {
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),
             epitems: Arc::new(EPollItemList::default()),
-            inotify_parent: self.inotify_parent.clone(),
             _inode_retention: inode_retention,
             _mount_guard: mount_guard,
         };
@@ -2520,19 +2504,16 @@ impl Drop for File {
         }
         // fsnotify：最后一次 close → IN_CLOSE_WRITE / IN_CLOSE_NOWRITE（FMODE_NONOTIFY 短路）。
         // 此时 self.inode 仍存活（Drop 在 inode.close() 之前），可安全取 inode_id。
-        if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) && fsnotify::has_any_watch() {
-            let m = if self.mode.read().contains(FileMode::FMODE_WRITER) {
+        let mode = *self.mode.read();
+        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
+            && fsnotify::has_any_watch()
+        {
+            let m = if mode.contains(FileMode::FMODE_WRITE) {
                 FsEvent::CLOSE_WRITE
             } else {
                 FsEvent::CLOSE_NOWRITE
             };
-            // 同时通知父目录 watch（带子名，issue B）与子项自身 watch。
-            match self.inotify_parent_for_fsnotify() {
-                Some((parent, name)) => {
-                    fsnotify::fsnotify(m, Some((&parent, name)), Some(&self.inode), 0)
-                }
-                None => fsnotify::fsnotify(m, None, Some(&self.inode), 0),
-            }
+            self.notify_fs_event(m);
         }
 
         if self.flags().contains(FileFlags::FASYNC) {

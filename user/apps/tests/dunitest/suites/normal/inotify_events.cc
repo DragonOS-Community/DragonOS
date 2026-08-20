@@ -215,6 +215,132 @@ TEST(InotifySelfEvents, UnlinkWatchedFileDeliversDeleteSelfAndIgnored) {
     close(ifd);
 }
 
+TEST(InotifySelfEvents, OpenUnlinkDefersDeleteSelfUntilClose) {
+    const std::string path = "/tmp/dunitest_inotify_delself_open";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_ATTRIB | IN_MODIFY | IN_DELETE_SELF), 0);
+
+    ASSERT_EQ(unlink(path.c_str()), 0);
+    ASSERT_EQ(write(fd, "x", 1), 1);
+    auto before_close = drain_events(ifd);
+    EXPECT_TRUE(saw_self(before_close, IN_ATTRIB));
+    EXPECT_TRUE(saw_self(before_close, IN_MODIFY));
+    EXPECT_FALSE(saw_self(before_close, IN_DELETE_SELF));
+    EXPECT_FALSE(saw_self(before_close, IN_IGNORED));
+
+    ASSERT_EQ(close(fd), 0);
+    auto after_close = drain_events(ifd);
+    EXPECT_TRUE(saw_self(after_close, IN_DELETE_SELF));
+    EXPECT_TRUE(saw_self(after_close, IN_IGNORED));
+    close(ifd);
+}
+
+TEST(InotifySelfEvents, HardLinkCreatedBeforeWatchKeepsWatchAlive) {
+    const std::string first = "/tmp/dunitest_inotify_link_watch_a";
+    const std::string second = "/tmp/dunitest_inotify_link_watch_b";
+    int fd = open(first.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+    ASSERT_EQ(link(first.c_str(), second.c_str()), 0);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, first.c_str(), IN_DELETE_SELF), 0);
+
+    ASSERT_EQ(unlink(first.c_str()), 0);
+    auto after_first = drain_events(ifd);
+    EXPECT_FALSE(saw_self(after_first, IN_DELETE_SELF));
+    EXPECT_FALSE(saw_self(after_first, IN_IGNORED));
+
+    ASSERT_EQ(unlink(second.c_str()), 0);
+    auto after_second = drain_events(ifd);
+    EXPECT_TRUE(saw_self(after_second, IN_DELETE_SELF));
+    EXPECT_TRUE(saw_self(after_second, IN_IGNORED));
+    close(ifd);
+}
+
+TEST(InotifySelfEvents, WatchUnlinkedOpenFileThroughProcFd) {
+    const std::string path = "/tmp/dunitest_inotify_procfd_unlinked";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(unlink(path.c_str()), 0);
+
+    char procfd[64];
+    snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", fd);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, procfd, IN_DELETE_SELF), 0)
+        << "watching unlinked proc fd: " << strerror(errno);
+
+    ASSERT_EQ(close(fd), 0);
+    auto evs = drain_events(ifd);
+    EXPECT_TRUE(saw_self(evs, IN_DELETE_SELF));
+    EXPECT_TRUE(saw_self(evs, IN_IGNORED));
+    close(ifd);
+}
+
+TEST(InotifyExcludeUnlinked, FtruncateRemainsADentryEvent) {
+    const std::string path = "/tmp/dunitest_inotify_excl_ftruncate";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_MODIFY | IN_EXCL_UNLINK), 0);
+
+    ASSERT_EQ(unlink(path.c_str()), 0);
+    ASSERT_EQ(ftruncate(fd, 4096), 0);
+    auto evs = drain_events(ifd);
+    EXPECT_TRUE(saw_self(evs, IN_MODIFY));
+
+    close(fd);
+    close(ifd);
+}
+
+TEST(InotifyRenameEvents, SameInodeAliasIsNoOp) {
+    const std::string first = "/tmp/dunitest_inotify_alias_a";
+    const std::string second = "/tmp/dunitest_inotify_alias_b";
+    int fd = open(first.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+    ASSERT_EQ(link(first.c_str(), second.c_str()), 0);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, "/tmp", IN_MOVED_FROM | IN_MOVED_TO), 0);
+    ASSERT_EQ(rename(first.c_str(), second.c_str()), 0);
+    auto evs = drain_events(ifd);
+    EXPECT_FALSE(saw(evs, IN_MOVED_FROM, "dunitest_inotify_alias_a"));
+    EXPECT_FALSE(saw(evs, IN_MOVED_TO, "dunitest_inotify_alias_b"));
+
+    close(ifd);
+    unlink(first.c_str());
+    unlink(second.c_str());
+}
+
+TEST(InotifyOpenEvents, OPathProducesNoOpenOrClose) {
+    const std::string path = "/tmp/dunitest_inotify_opath";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_OPEN | IN_CLOSE), 0);
+
+    int pathfd = open(path.c_str(), O_PATH);
+    ASSERT_GE(pathfd, 0);
+    close(pathfd);
+    auto evs = drain_events(ifd);
+    EXPECT_FALSE(saw_self(evs, IN_OPEN));
+    EXPECT_FALSE(saw_self(evs, IN_CLOSE_WRITE));
+    EXPECT_FALSE(saw_self(evs, IN_CLOSE_NOWRITE));
+
+    close(ifd);
+    unlink(path.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // IN_MOVE_SELF: renaming a watched file delivers IN_MOVE_SELF.
 // ---------------------------------------------------------------------------

@@ -7,14 +7,15 @@
 //!
 //! 详见 `docs/kernel/filesystem/inotify.md` §4。
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::boxed::Box;
+use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
@@ -26,7 +27,8 @@ use crate::arch::MMArch;
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::fsnotify::{
-    self, mark, FsEvent, FsNotifyBackend, FsNotifyGroup, FsNotifyMark,
+    self, mark, EnqueueResult, FsEvent, FsNotifyBackend, FsNotifyDeleteState, FsNotifyGroup,
+    FsNotifyMark,
 };
 use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::file::{File, FileFlags, FileMode, FilePrivateData};
@@ -36,9 +38,10 @@ use crate::filesystem::vfs::{
     FileSystem, FileType, FsInfo, IndexNode, InodeMode, Magic, Metadata, PollableInode, SuperBlock,
     NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::{Mutex, MutexGuard};
-use crate::libs::spinlock::SpinLock;
 use crate::mm::MemoryManagementArch;
+use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
@@ -76,9 +79,8 @@ mod user_mask {
     /// add_watch 传入的合法控制位集合（用于 `from_bits` 校验）。
     pub const WATCH_CONTROL: u32 =
         IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_CREATE | IN_MASK_ADD | IN_ONESHOT;
-
-    /// 仅 add-time 控制位（更新/订阅时应从 mask 剥离）。
-    pub const ADD_TIME_ONLY: u32 = IN_ONLYDIR | IN_DONT_FOLLOW | IN_MASK_CREATE | IN_MASK_ADD;
+    pub const ALL_INOTIFY_BITS: u32 =
+        WATCH_CONTROL | 0x0000_0fff | IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED | IN_ISDIR;
 }
 
 bitflags::bitflags! {
@@ -97,8 +99,63 @@ const MAX_USER_INSTANCES: usize = 128;
 const MAX_USER_WATCHES: usize = 8192;
 const MAX_QUEUED_EVENTS: usize = 16384;
 
-/// 全局 inotify 实例计数（近似 per-user；DragonOS 当前单用户语义）。
-static TOTAL_INSTANCES: AtomicUsize = AtomicUsize::new(0);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct InotifyQuotaKey {
+    user_namespace: usize,
+    euid: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InotifyQuotaCounts {
+    instances: usize,
+    watches: usize,
+}
+
+lazy_static::lazy_static! {
+    static ref INOTIFY_QUOTAS: Mutex<HashMap<InotifyQuotaKey, InotifyQuotaCounts>> =
+        Mutex::new(HashMap::new());
+}
+
+fn current_quota_key() -> InotifyQuotaKey {
+    let cred = ProcessManager::current_pcb().cred();
+    InotifyQuotaKey {
+        user_namespace: cred.user_ns.ns_common().nsid.data(),
+        euid: cred.euid.data(),
+    }
+}
+
+fn reserve_instance(key: InotifyQuotaKey) -> Result<(), SystemError> {
+    let mut quotas = INOTIFY_QUOTAS.lock();
+    quotas.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+    let counts = quotas.entry(key).or_default();
+    if counts.instances >= MAX_USER_INSTANCES {
+        return Err(SystemError::EMFILE);
+    }
+    counts.instances += 1;
+    Ok(())
+}
+
+fn reserve_watch(key: InotifyQuotaKey) -> Result<(), SystemError> {
+    let mut quotas = INOTIFY_QUOTAS.lock();
+    quotas.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+    let counts = quotas.entry(key).or_default();
+    if counts.watches >= MAX_USER_WATCHES {
+        return Err(SystemError::ENOSPC);
+    }
+    counts.watches += 1;
+    Ok(())
+}
+
+fn release_quota(key: InotifyQuotaKey, instances: usize, watches: usize) {
+    let mut quotas = INOTIFY_QUOTAS.lock();
+    if let Some(counts) = quotas.get_mut(&key) {
+        counts.instances = counts.instances.saturating_sub(instances);
+        counts.watches = counts.watches.saturating_sub(watches);
+        if counts.instances == 0 && counts.watches == 0 {
+            quotas.remove(&key);
+        }
+    }
+}
 
 // ============================================================================
 // 后端数据结构
@@ -112,15 +169,19 @@ struct InotifyEventInfo {
     mask: u32,
     cookie: u32,
     /// 子项名（目录 watch 的子事件才有）。
-    name: Option<Box<str>>,
+    name: Option<String>,
 }
 
 /// 事件队列。受 `events` 锁保护。
 #[derive(Debug)]
 struct InotifyQueue {
     list: VecDeque<InotifyEventInfo>,
-    /// 置位后已插入一个 `IN_Q_OVERFLOW(wd=-1)`；消费该事件时清零。
-    overflowed: bool,
+    /// A logical overflow record.  It cannot be stored in `list`: queue
+    /// overflow and allocator failure are exactly the cases where growing the
+    /// deque is not reliable.  `pre_overflow_remaining` preserves its position
+    /// relative to ordinary records accepted before and after the loss.
+    overflow_pending: bool,
+    pre_overflow_remaining: usize,
 }
 
 /// watch descriptor 表。受 `wd` 锁保护。
@@ -128,7 +189,7 @@ struct InotifyQueue {
 struct WdTable {
     /// 单调分配 wd（1..=i32::MAX-1，饱和见 §6.2；-1 被 Q_OVERFLOW 占用）。
     counter: i32,
-    map: BTreeMap<i32, Weak<FsNotifyMark>>,
+    map: HashMap<i32, Weak<FsNotifyMark>>,
 }
 
 /// inotify 后端共享状态：同时被 `InotifyBackend`（在 group 内）与 `InotifyInode`（read 入口）持有。
@@ -136,25 +197,32 @@ struct WdTable {
 /// 事件锁与 wd 锁分离，使 read（消费）与 add_watch/rm_watch（wd 管理）互不阻塞。
 #[derive(Debug)]
 pub struct InotifyState {
-    /// 事件锁：handle_event(生产) 与 read(消费) 竞争。irqsave：fsnotify 可在持 VFS 锁时调用。
-    events: SpinLock<InotifyQueue>,
+    /// 事件锁：所有 hook 都来自可睡眠的 VFS/file 操作上下文。
+    events: Mutex<InotifyQueue>,
+    /// One read must consume a contiguous queue prefix even though events are
+    /// serialized outside `events`.
+    read_consumer: Mutex<()>,
     max_queued_events: usize,
     /// wd 锁：add_watch/rm_watch 竞争。
     wd: Mutex<WdTable>,
+    quota_key: InotifyQuotaKey,
 }
 
 impl InotifyState {
-    fn new() -> Self {
+    fn new(quota_key: InotifyQuotaKey) -> Self {
         Self {
-            events: SpinLock::new(InotifyQueue {
+            events: Mutex::new(InotifyQueue {
                 list: VecDeque::new(),
-                overflowed: false,
+                overflow_pending: false,
+                pre_overflow_remaining: 0,
             }),
+            read_consumer: Mutex::new(()),
             max_queued_events: MAX_QUEUED_EVENTS,
             wd: Mutex::new(WdTable {
                 counter: 0,
-                map: BTreeMap::new(),
+                map: HashMap::new(),
             }),
+            quota_key,
         }
     }
 }
@@ -166,28 +234,43 @@ struct InotifyBackend {
 }
 
 impl InotifyBackend {
-    /// 事件是否可合并（仅 ACCESS/MODIFY 且无 name，见 §6.3）。
-    fn mergeable(mask: FsEvent) -> bool {
-        let core = mask - FsEvent::ISDIR;
-        core == FsEvent::ACCESS || core == FsEvent::MODIFY
-    }
-
     /// 入队一个事件（调用方已持 events 锁）。
-    fn enqueue_locked(q: &mut InotifyQueue, max: usize, ev: InotifyEventInfo) {
-        if q.list.len() >= max {
-            // 队列满：丢弃当前事件，置 overflow 标志并插入单个 Q_OVERFLOW（仅一次）。
-            if !q.overflowed {
-                q.overflowed = true;
-                q.list.push_back(InotifyEventInfo {
-                    wd: -1,
-                    mask: user_mask::IN_Q_OVERFLOW,
-                    cookie: 0,
-                    name: None,
-                });
+    fn enqueue_locked(q: &mut InotifyQueue, max: usize, ev: InotifyEventInfo) -> EnqueueResult {
+        // Linux compares wd/mask/name, but deliberately not the move cookie.
+        // IN_IGNORED is never merged.  Do not merge across a pending logical
+        // overflow boundary.
+        if ev.mask != user_mask::IN_IGNORED
+            && (!q.overflow_pending || q.pre_overflow_remaining < q.list.len())
+            && q.list.back().is_some_and(|tail| {
+                tail.wd == ev.wd && tail.mask == ev.mask && tail.name == ev.name
+            })
+        {
+            return EnqueueResult::Merged;
+        }
+
+        if q.list.len().saturating_add(usize::from(q.overflow_pending)) >= max {
+            if !q.overflow_pending {
+                q.overflow_pending = true;
+                q.pre_overflow_remaining = q.list.len();
+                return EnqueueResult::DroppedQueueFull;
             }
-            return;
+            return EnqueueResult::DroppedQueueFull;
+        }
+        if q.list.try_reserve(1).is_err() {
+            Self::record_overflow(q);
+            return EnqueueResult::AllocationFailed;
         }
         q.list.push_back(ev);
+        EnqueueResult::Queued
+    }
+
+    fn record_overflow(q: &mut InotifyQueue) -> bool {
+        if q.overflow_pending {
+            return false;
+        }
+        q.overflow_pending = true;
+        q.pre_overflow_remaining = q.list.len();
+        true
     }
 }
 
@@ -199,68 +282,118 @@ impl FsNotifyBackend for InotifyBackend {
         mask: FsEvent,
         name: Option<&str>,
         cookie: u32,
-    ) {
+    ) -> EnqueueResult {
         // 用户订阅 mask（ISDIR 始终保留，由 dispatch 设置）。
         let subscribed = mark.mask.load(Ordering::Relaxed);
         let user_mask = mask.bits() & (subscribed | FsEvent::ISDIR.bits());
         if user_mask == 0 {
-            return;
+            return EnqueueResult::Filtered;
         }
 
-        // name 截断到 NAME_MAX。
+        // Truncate without allocating. Most events merge or hit a full queue;
+        // decide those cases using the borrowed name before making a copy.
         let name = name.map(|n| {
-            if n.len() > NAME_MAX {
-                &n[..NAME_MAX]
-            } else {
-                n
+            let mut end = core::cmp::min(n.len(), NAME_MAX);
+            while !n.is_char_boundary(end) {
+                end -= 1;
             }
+            &n[..end]
         });
+        let early = {
+            let mut queue = self.state.events.lock();
+            let readable_before = !queue.list.is_empty() || queue.overflow_pending;
+            let merge = user_mask != user_mask::IN_IGNORED
+                && (!queue.overflow_pending || queue.pre_overflow_remaining < queue.list.len())
+                && queue.list.back().is_some_and(|tail| {
+                    tail.wd == mark.wd && tail.mask == user_mask && tail.name.as_deref() == name
+                });
+            let result = if merge {
+                Some(EnqueueResult::Merged)
+            } else if queue
+                .list
+                .len()
+                .saturating_add(usize::from(queue.overflow_pending))
+                >= self.state.max_queued_events
+            {
+                Self::record_overflow(&mut queue);
+                Some(EnqueueResult::DroppedQueueFull)
+            } else {
+                None
+            };
+            let wake = !readable_before && (!queue.list.is_empty() || queue.overflow_pending);
+            (result, wake)
+        };
+        if early.1 {
+            group.wait_queue.wakeup_all(None);
+            let _ = EventPoll::wakeup_epoll(
+                &group.epitems,
+                EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        if let Some(result) = early.0 {
+            return result;
+        }
+
+        let name = match name {
+            Some(n) => {
+                let mut owned = String::new();
+                if owned.try_reserve_exact(n.len()).is_err() {
+                    let wake = Self::record_overflow(&mut self.state.events.lock());
+                    if wake {
+                        group.wait_queue.wakeup_all(None);
+                        let _ = EventPoll::wakeup_epoll(
+                            &group.epitems,
+                            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+                        );
+                    }
+                    return EnqueueResult::AllocationFailed;
+                }
+                owned.push_str(n);
+                Some(owned)
+            }
+            None => None,
+        };
 
         let ev = InotifyEventInfo {
             wd: mark.wd,
             mask: user_mask,
             cookie,
-            name: name.map(Box::<str>::from),
+            name,
         };
 
-        let wake = {
-            let mut q = self.state.events.lock_irqsave();
-            // 合并：末尾事件 (wd, mask, cookie, name) 完全相同且可合并类 → 丢弃。
-            if Self::mergeable(mask) && ev.name.is_none() {
-                if let Some(tail) = q.list.back() {
-                    if tail.wd == ev.wd
-                        && tail.mask == ev.mask
-                        && tail.cookie == ev.cookie
-                        && tail.name.is_none()
-                    {
-                        return;
-                    }
-                }
-            }
-            Self::enqueue_locked(&mut q, self.state.max_queued_events, ev);
-            true
+        let (result, wake) = {
+            let mut queue = self.state.events.lock();
+            let readable_before = !queue.list.is_empty() || queue.overflow_pending;
+            let result = Self::enqueue_locked(&mut queue, self.state.max_queued_events, ev);
+            let readable_after = !queue.list.is_empty() || queue.overflow_pending;
+            (result, !readable_before && readable_after)
         };
 
         // 唤醒 read 等待者与 epoll。
-        group.wait_queue.wakeup_all(None);
-        let _ = EventPoll::wakeup_epoll(
-            &group.epitems,
-            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-        );
-        let _ = wake;
+        if wake {
+            group.wait_queue.wakeup_all(None);
+            let _ = EventPoll::wakeup_epoll(
+                &group.epitems,
+                EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        result
     }
 
     fn free_mark(&self, mark: &FsNotifyMark) {
         let mut t = self.state.wd.lock();
-        t.map.remove(&mark.wd);
+        if t.map.remove(&mark.wd).is_some() {
+            release_quota(self.state.quota_key, 0, 1);
+        }
     }
 
     fn notify_ignored(&self, group: &FsNotifyGroup, mark: &FsNotifyMark) {
         // 投递 IN_IGNORED（watch 被撤销：rm_watch/oneshot/DELETE_SELF/UNMOUNT）。
         let wake = {
-            let mut q = self.state.events.lock_irqsave();
-            Self::enqueue_locked(
-                &mut q,
+            let mut queue = self.state.events.lock();
+            let readable_before = !queue.list.is_empty() || queue.overflow_pending;
+            let _ = Self::enqueue_locked(
+                &mut queue,
                 self.state.max_queued_events,
                 InotifyEventInfo {
                     wd: mark.wd,
@@ -269,18 +402,20 @@ impl FsNotifyBackend for InotifyBackend {
                     name: None,
                 },
             );
-            true
+            !readable_before && (!queue.list.is_empty() || queue.overflow_pending)
         };
-        group.wait_queue.wakeup_all(None);
-        let _ = EventPoll::wakeup_epoll(
-            &group.epitems,
-            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-        );
-        let _ = wake;
+        if wake {
+            group.wait_queue.wakeup_all(None);
+            let _ = EventPoll::wakeup_epoll(
+                &group.epitems,
+                EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
     }
 
     fn queue_nonempty(&self) -> bool {
-        !self.state.events.lock_irqsave().list.is_empty()
+        let q = self.state.events.lock();
+        !q.list.is_empty() || q.overflow_pending
     }
 }
 
@@ -310,7 +445,13 @@ impl FileSystem for InotifyFs {
     }
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         // 不会被真正调用：inotify 不挂载。
-        Arc::new(InotifyInode::new(false))
+        Arc::new(InotifyInode::new(
+            false,
+            InotifyQuotaKey {
+                user_namespace: 0,
+                euid: 0,
+            },
+        ))
     }
 
     fn info(&self) -> FsInfo {
@@ -348,9 +489,17 @@ pub struct InotifyInode {
 }
 
 impl InotifyInode {
+    fn validate_watch_mask(mask: u32) -> Result<(), SystemError> {
+        if mask == 0 || (mask & !user_mask::ALL_INOTIFY_BITS) != 0 {
+            Err(SystemError::EINVAL)
+        } else {
+            Ok(())
+        }
+    }
+
     /// 创建一个新的 inotify 实例（inotify_init1 用）。
-    pub fn new(nonblock: bool) -> Self {
-        let state = Arc::new(InotifyState::new());
+    fn new(nonblock: bool, quota_key: InotifyQuotaKey) -> Self {
+        let state = Arc::new(InotifyState::new(quota_key));
         let backend = Box::new(InotifyBackend {
             state: state.clone(),
         });
@@ -407,29 +556,34 @@ impl InotifyInode {
 
     /// `inotify_add_watch`：在 `inode` 上建立（或更新）一个 watch。
     pub fn add_watch(&self, inode: Arc<dyn IndexNode>, mask: u32) -> Result<i32, SystemError> {
-        // mask 校验：仅允许已知位。
-        if (mask
-            & !(user_mask::WATCH_CONTROL
-            | 0x00000fff // IN_ALL_EVENTS 低 12 位
-            | user_mask::IN_UNMOUNT
-            | user_mask::IN_Q_OVERFLOW
-            | user_mask::IN_IGNORED))
-            != 0
+        if let Some(mounted) = inode
+            .clone()
+            .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
         {
-            return Err(SystemError::EINVAL);
+            return mounted.with_fsnotify_admission(|| {
+                mounted.with_fsnotify_watch_lifecycle(|lifecycle| {
+                    self.add_watch_inner(inode, mask, Some(lifecycle))
+                })
+            });
         }
+        self.add_watch_inner(inode, mask, None)
+    }
 
-        // mask 必须含至少一个事件位（低 12 位 IN_ALL_EVENTS）。
-        if (mask & 0x0000_0fff) == 0 {
-            return Err(SystemError::EINVAL);
-        }
+    fn add_watch_inner(
+        &self,
+        inode: Arc<dyn IndexNode>,
+        mask: u32,
+        delete_lifecycle: Option<Arc<Mutex<FsNotifyDeleteState>>>,
+    ) -> Result<i32, SystemError> {
+        // mask 校验：仅允许已知位。
+        Self::validate_watch_mask(mask)?;
         // IN_MASK_ADD 与 IN_MASK_CREATE 互斥。
         if (mask & user_mask::IN_MASK_ADD) != 0 && (mask & user_mask::IN_MASK_CREATE) != 0 {
             return Err(SystemError::EINVAL);
         }
 
         let md = inode.metadata()?;
-        let target_identity = (md.inode_id, md.dev_id);
+        let target_identity = fsnotify::target_for_inode(&inode)?.id;
 
         // IN_ONLYDIR：目标必须是目录。
         if (mask & user_mask::IN_ONLYDIR) != 0 && md.file_type != FileType::Dir {
@@ -439,8 +593,10 @@ impl InotifyInode {
         // 读权限检查（防止通过监听泄露文件名/元数据）。
         check_inode_permission(&inode, &md, PermissionMask::MAY_READ)?;
 
-        // 订阅位：剥离 add-time 控制位，保留 ONESHOT/EXCL_UNLINK。
-        let event_mask = mask & !user_mask::ADD_TIME_ONLY;
+        // Linux stores only user event bits and adds UNMOUNT implicitly;
+        // ONESHOT/EXCL_UNLINK are mark flags, while ISDIR/Q_OVERFLOW/IGNORED
+        // are output-only bits even though the syscall accepts them.
+        let event_mask = (mask & 0x0000_0fff) | user_mask::IN_UNMOUNT;
 
         // 查找同 inode 上已有 mark（同 group）；若无，则在**同一把 marks 锁**内完成
         // 新建与插入，避免并发 add_watch 同一 inode 产生重复 mark（TOCTOU：查重与插入
@@ -449,9 +605,17 @@ impl InotifyInode {
         // 锁序 marks → wd → FSNOTIFY 为此处引入的嵌套；全代码库无反向获取
         // （destroy_mark/dispatch 均先释放 marks 再取 wd/FSNOTIFY），故无死锁。
         let mut marks = self.group.marks.lock();
-        if let Some(existing) = marks.iter().find(|m| m.identity() == target_identity) {
+        if let Some(existing) = marks.get(&target_identity) {
             if (mask & user_mask::IN_MASK_CREATE) != 0 {
                 return Err(SystemError::EEXIST);
+            }
+            let _dispatch = existing.dispatch_lock.lock();
+            if !existing.active.load(Ordering::Acquire) {
+                let stale = existing.clone();
+                drop(_dispatch);
+                drop(marks);
+                mark::destroy_mark(&stale);
+                return self.add_watch_inner(inode, mask, delete_lifecycle);
             }
             if (mask & user_mask::IN_MASK_ADD) != 0 {
                 existing.mask.fetch_or(event_mask, Ordering::Relaxed);
@@ -459,43 +623,68 @@ impl InotifyInode {
                 if (mask & user_mask::IN_ONESHOT) != 0 {
                     existing.oneshot.store(true, Ordering::Relaxed);
                 }
+                if (mask & user_mask::IN_EXCL_UNLINK) != 0 {
+                    existing.excl_unlink.store(true, Ordering::Relaxed);
+                }
             } else {
                 existing.mask.store(event_mask, Ordering::Relaxed);
                 existing
                     .oneshot
                     .store((mask & user_mask::IN_ONESHOT) != 0, Ordering::Relaxed);
+                existing
+                    .excl_unlink
+                    .store((mask & user_mask::IN_EXCL_UNLINK) != 0, Ordering::Relaxed);
             }
             return Ok(existing.wd);
         }
 
-        // watch 上限（唯一全局计数器：同时服务快速路径与上限检查）。
-        fsnotify::try_reserve_watch(MAX_USER_WATCHES)?;
+        // Reserve every fallible container allocation before publication.
+        marks.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
 
         // 分配 wd（饱和到 i32::MAX-1；-1 被 Q_OVERFLOW 占用）。
         let wd = {
             let mut t = self.state.wd.lock();
             if t.counter >= i32::MAX - 1 {
-                fsnotify::adjust_total_watches(-1);
                 return Err(SystemError::ENOSPC);
             }
+            t.map.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
             t.counter += 1;
             t.counter
         };
 
-        let mark = Arc::new(FsNotifyMark {
+        let mark = Arc::try_new(FsNotifyMark {
             wd,
             group: Arc::downgrade(&self.group),
-            inode: inode.clone(),
+            _inode: fsnotify::canonical_inode(inode.clone()),
+            _delete_lifecycle: delete_lifecycle,
+            object_id: target_identity,
+            dispatch_lock: Mutex::new(()),
+            active: AtomicBool::new(true),
             mask: AtomicU32::new(event_mask),
             oneshot: AtomicBool::new((mask & user_mask::IN_ONESHOT) != 0),
-            excl_unlink: (mask & user_mask::IN_EXCL_UNLINK) != 0,
-        });
+            excl_unlink: AtomicBool::new((mask & user_mask::IN_EXCL_UNLINK) != 0),
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+
+        // Quota is committed only after all local allocations succeeded. Any
+        // failure at the final global-index publication is rolled back below.
+        reserve_watch(self.state.quota_key)?;
+        fsnotify::adjust_total_watches(1);
 
         // 持 marks 锁完成全部插入（wd 表 / group.marks / 全局索引）。
         self.state.wd.lock().map.insert(wd, Arc::downgrade(&mark));
-        marks.push(mark.clone());
+        marks.insert(target_identity, mark.clone());
+        // The global index insertion is the publication point. Keep the group
+        // management lock held until every structure dispatch relies on is
+        // complete, so there is no visible-but-half-initialized window.
+        if let Err(error) = fsnotify::index_add(&mark) {
+            marks.remove(&target_identity);
+            self.state.wd.lock().map.remove(&wd);
+            fsnotify::adjust_total_watches(-1);
+            release_quota(self.state.quota_key, 0, 1);
+            return Err(error);
+        }
         drop(marks);
-        fsnotify::index_add(&mark);
         // 注：watch 计数已由 try_reserve_watch 原子 +1（含上限检查），此处不可再次 +1，
         // 否则每次 add 会 +2 而 destroy 仅 -1，导致 TOTAL_WATCHES 永不归零（fast-path 短路
         // 失效，read/write/close 热路径永久付出 fsnotify 锁开销）且上限提前触顶。
@@ -506,8 +695,8 @@ impl InotifyInode {
     /// `inotify_rm_watch`：按 wd 移除一个 watch。
     pub fn rm_watch(&self, wd: i32) -> Result<(), SystemError> {
         let mark = {
-            let mut t = self.state.wd.lock();
-            match t.map.remove(&wd) {
+            let t = self.state.wd.lock();
+            match t.map.get(&wd) {
                 Some(w) => w.upgrade().ok_or(SystemError::EINVAL),
                 None => Err(SystemError::EINVAL),
             }
@@ -524,14 +713,18 @@ impl InotifyInode {
             core::mem::take(&mut *g)
         };
         let n = marks.len();
-        for m in &marks {
+        for m in marks.values() {
+            let dispatch = m.dispatch_lock.lock();
+            m.active.store(false, Ordering::Release);
+            drop(dispatch);
             fsnotify::index_remove(m);
             self.state.wd.lock().map.remove(&m.wd);
         }
         if n > 0 {
             fsnotify::adjust_total_watches(-(n as i32));
+            release_quota(self.state.quota_key, 0, n);
         }
-        TOTAL_INSTANCES.fetch_sub(1, Ordering::Relaxed);
+        release_quota(self.state.quota_key, 1, 0);
         // 唤醒任何阻塞在 read 的线程（队列不再增长）。
         self.group.wait_queue.wakeup_all(None);
     }
@@ -599,13 +792,60 @@ impl IndexNode for InotifyInode {
             return Err(SystemError::EINVAL);
         }
 
+        let _consumer = self.state.read_consumer.lock();
+
         loop {
-            let mut written;
-            {
-                let mut q = self.state.events.lock_irqsave();
-                if q.list.is_empty() {
+            let mut written = 0;
+            loop {
+                let mut blocked_by_size = false;
+                let next = {
+                    let mut q = self.state.events.lock();
+                    if q.overflow_pending && q.pre_overflow_remaining == 0 {
+                        if written + 16 > len {
+                            blocked_by_size = true;
+                            None
+                        } else {
+                            q.overflow_pending = false;
+                            q.pre_overflow_remaining = 0;
+                            Some(InotifyEventInfo {
+                                wd: -1,
+                                mask: user_mask::IN_Q_OVERFLOW,
+                                cookie: 0,
+                                name: None,
+                            })
+                        }
+                    } else if let Some(front) = q.list.front() {
+                        let record_len = Self::record_len(front.name.as_deref());
+                        if written + record_len > len {
+                            blocked_by_size = true;
+                            None
+                        } else {
+                            let ev = q.list.pop_front().expect("front existed under events lock");
+                            if q.overflow_pending && q.pre_overflow_remaining > 0 {
+                                q.pre_overflow_remaining -= 1;
+                            }
+                            Some(ev)
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let Some(ev) = next else {
+                    let _ = blocked_by_size;
+                    break;
+                };
+                let rl = Self::record_len(ev.name.as_deref());
+                written += Self::serialize(&ev, &mut buf[written..written + rl]);
+            }
+
+            if written == 0 {
+                let empty = {
+                    let q = self.state.events.lock();
+                    q.list.is_empty() && !q.overflow_pending
+                };
+                if empty {
                     // 空队列
-                    drop(q);
                     if self.nonblock.load(Ordering::Relaxed) {
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
@@ -619,23 +859,6 @@ impl IndexNode for InotifyInode {
                     )?;
                     continue;
                 }
-
-                // 逐个从头部打包完整事件，放不下的留在队列下次读。
-                written = 0;
-                while let Some(front) = q.list.front() {
-                    let rl = Self::record_len(front.name.as_deref());
-                    if written + rl > len {
-                        break;
-                    }
-                    let ev = q.list.pop_front().unwrap();
-                    if ev.mask == user_mask::IN_Q_OVERFLOW {
-                        q.overflowed = false;
-                    }
-                    written += Self::serialize(&ev, &mut buf[written..written + rl]);
-                }
-            }
-
-            if written == 0 {
                 // 首个事件即放不下（name 过大）。
                 return Err(SystemError::EINVAL);
             }
@@ -694,14 +917,11 @@ impl IndexNode for InotifyInode {
 pub fn do_inotify_init1(flags: u32) -> Result<usize, SystemError> {
     let flags = InotifyInitFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
 
-    // 实例上限。
-    if TOTAL_INSTANCES.fetch_add(1, Ordering::Relaxed) >= MAX_USER_INSTANCES {
-        TOTAL_INSTANCES.fetch_sub(1, Ordering::Relaxed);
-        return Err(SystemError::EMFILE);
-    }
+    let quota_key = current_quota_key();
+    reserve_instance(quota_key)?;
 
     let nonblock = flags.contains(InotifyInitFlags::IN_NONBLOCK);
-    let inode = Arc::new(InotifyInode::new(nonblock));
+    let inode = Arc::new(InotifyInode::new(nonblock, quota_key));
     let file_flags = FileFlags::O_RDONLY
         | (if nonblock {
             FileFlags::O_NONBLOCK
@@ -710,7 +930,7 @@ pub fn do_inotify_init1(flags: u32) -> Result<usize, SystemError> {
         });
     let file = File::new(inode, file_flags).inspect_err(|_| {
         // File::new 失败：file 未创建，不会 drop→shutdown，需手动回退实例计数。
-        TOTAL_INSTANCES.fetch_sub(1, Ordering::Relaxed);
+        release_quota(quota_key, 1, 0);
     })?;
     // 防递归：inotify fd 自身的 read/write 不应产生事件。
     file.set_mode_flags(FileMode::FMODE_NONOTIFY);
@@ -792,9 +1012,9 @@ impl Syscall for SysInotifyAddWatchHandle {
         let path_ptr = Self::pathname(args);
         let mask = Self::mask(args);
 
-        let path = vfs_check_and_clone_cstr(path_ptr, Some(crate::filesystem::vfs::MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
+        // Linux validates unknown/zero masks before fdget. Pathname copying is
+        // deliberately later, after fd/type/control validation.
+        InotifyInode::validate_watch_mask(mask)?;
 
         // 取 inotify fd 对应的 InotifyInode（file Arc 保活，ino 借用其 inode）。
         let file: Arc<File> = {
@@ -805,10 +1025,18 @@ impl Syscall for SysInotifyAddWatchHandle {
                 .ok_or(SystemError::EBADF)?
         };
         let inode = file.inode();
+        // IN_MASK_ADD and IN_MASK_CREATE are checked after fdget but before
+        // verifying the descriptor type, matching Linux error priority.
+        if (mask & user_mask::IN_MASK_ADD) != 0 && (mask & user_mask::IN_MASK_CREATE) != 0 {
+            return Err(SystemError::EINVAL);
+        }
         let inotify_inode = inode
             .as_any_ref()
             .downcast_ref::<InotifyInode>()
             .ok_or(SystemError::EINVAL)?;
+        let path = vfs_check_and_clone_cstr(path_ptr, Some(crate::filesystem::vfs::MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
         // 解析路径（IN_DONT_FOLLOW：不跟随末尾 symlink）。
         let pcb = ProcessManager::current_pcb();
         let (inode_begin, remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;

@@ -1,11 +1,14 @@
 //! [`FsNotifyMark`]：一个 watch（group + inode + mask + wd）及其生命周期管理。
 
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicU32};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::filesystem::vfs::{IndexNode, InodeId};
+use crate::filesystem::vfs::IndexNode;
 
-use super::{adjust_total_watches, index_remove, FsNotifyGroup};
+use super::{
+    adjust_total_watches, index_remove, FsNotifyDeleteState, FsNotifyGroup, FsNotifyObjectId,
+};
+use crate::libs::mutex::Mutex;
 
 /// 一个 watch：连接 group 与 inode。
 ///
@@ -18,13 +21,21 @@ pub struct FsNotifyMark {
     /// 所属 group（弱引用，避免环引用）。
     pub group: Weak<FsNotifyGroup>,
     /// 强引用：watch 期间 pin 住 inode（防 evict，保证 InodeId 不复用）。
-    pub inode: Arc<dyn IndexNode>,
+    pub _inode: Arc<dyn IndexNode>,
+    /// Keeps per-object delete state alive without retaining a dentry.
+    pub(crate) _delete_lifecycle: Option<Arc<Mutex<FsNotifyDeleteState>>>,
+    /// Captured once at watch creation; removal never performs metadata I/O.
+    pub object_id: FsNotifyObjectId,
+    /// Serializes dispatch with update/removal. This closes the one-shot and
+    /// rm_watch race without a packed atomic state machine.
+    pub dispatch_lock: Mutex<()>,
+    pub active: AtomicBool,
     /// 订阅 mask（`IN_MASK_ADD` 并发改，必须原子读）。
     pub mask: AtomicU32,
     /// `IN_ONESHOT`：触发一次后自动撤销。
     pub oneshot: AtomicBool,
     /// `IN_EXCL_UNLINK`：已 unlink 子项不再产生事件。
-    pub excl_unlink: bool,
+    pub excl_unlink: AtomicBool,
 }
 
 impl FsNotifyMark {
@@ -33,11 +44,8 @@ impl FsNotifyMark {
     /// FUSE 等多挂载场景可能复用相同 inode 号（如 FUSE_ROOT_ID=1），
     /// 必须用 (inode_id, dev_id) 组合区分不同挂载上的 inode，否则会跨挂载
     /// 误匹配 mark，导致事件泄露或误判已有 watch。
-    pub fn identity(&self) -> (InodeId, usize) {
-        self.inode
-            .metadata()
-            .map(|m| (m.inode_id, m.dev_id))
-            .unwrap_or((InodeId::new(0), 0))
+    pub fn identity(&self) -> FsNotifyObjectId {
+        self.object_id
     }
 }
 
@@ -52,11 +60,20 @@ pub fn destroy_mark(mark: &Arc<FsNotifyMark>) {
         return;
     };
 
+    // Stop dispatch before removing any lookup path. A snapshot that already
+    // owns the Arc will observe inactive after acquiring this lock.
+    let dispatch = mark.dispatch_lock.lock();
+    mark.active.store(false, Ordering::Release);
+    drop(dispatch);
+
     // 从 group.marks 移除（按指针相等）。
     let mut marks = group.marks.lock();
-    let before = marks.len();
-    marks.retain(|m| !Arc::ptr_eq(m, mark));
-    let removed = before != marks.len();
+    let removed = marks
+        .get(&mark.object_id)
+        .is_some_and(|candidate| Arc::ptr_eq(candidate, mark));
+    if removed {
+        marks.remove(&mark.object_id);
+    }
     drop(marks);
 
     if removed {

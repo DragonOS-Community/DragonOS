@@ -107,6 +107,11 @@ pub fn do_renameat2(
         {
             return Err(SystemError::EINVAL);
         }
+        let old_id = fsnotify::target_for_inode(&old_inode)?.id;
+        let new_id = fsnotify::target_for_inode(new_inode)?.id;
+        if old_id == new_id {
+            return Ok(0);
+        }
     }
 
     // 不要在这里检查 new_parent 是否是 old 的祖先：
@@ -136,13 +141,22 @@ pub fn do_renameat2(
         None
     };
 
-    // 缓存 displaced 的 nlinks（move_to 前，displaced 还活着）。
-    // move_to 会静默销毁 displaced 的目录项，之后的 metadata 可能失败或返回过时值。
-    // nlinks <= 1 表示这是最后一个链接，覆盖后 inode 被销毁。
-    let displaced_nlinks = displaced
-        .as_ref()
-        .and_then(|d| d.metadata().ok())
-        .map(|m| m.nlinks);
+    if !flags.contains(RenameFlags::EXCHANGE)
+        && Arc::ptr_eq(&old_parent_inode, &new_parent_inode)
+        && old_filename == new_filename
+    {
+        return Ok(0);
+    }
+
+    // Linux treats rename onto another hard-link alias of the same inode as a
+    // complete no-op. This test must precede the filesystem mutation.
+    if let Some(target) = displaced.as_ref() {
+        let source_md = old_inode.metadata()?;
+        let target_md = target.metadata()?;
+        if source_md.inode_id == target_md.inode_id && source_md.dev_id == target_md.dev_id {
+            return Ok(0);
+        }
+    }
 
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
 
@@ -155,7 +169,7 @@ pub fn do_renameat2(
             .expect("RENAME_EXCHANGE requires target to exist (checked above)");
         let cookie1 = fsnotify::next_cookie();
         fsnotify::fsnotify(
-            FsEvent::MOVED_FROM | FsEvent::MOVE_SELF,
+            FsEvent::MOVED_FROM,
             Some((&old_parent_inode, old_filename)),
             Some(&old_inode),
             cookie1,
@@ -166,9 +180,10 @@ pub fn do_renameat2(
             Some(&old_inode),
             cookie1,
         );
+        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(&old_inode), 0);
         let cookie2 = fsnotify::next_cookie();
         fsnotify::fsnotify(
-            FsEvent::MOVED_FROM | FsEvent::MOVE_SELF,
+            FsEvent::MOVED_FROM,
             Some((&new_parent_inode, new_filename)),
             Some(new_inode),
             cookie2,
@@ -179,15 +194,12 @@ pub fn do_renameat2(
             Some(new_inode),
             cookie2,
         );
+        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(new_inode), 0);
     } else {
         // 普通 rename（可能覆盖目标）：单 cookie 配对 MOVED_FROM/MOVED_TO + MOVE_SELF。
-        // No-op rename：同父目录 + 同文件名 → 无实际变更，跳过事件投递。
-        if Arc::ptr_eq(&old_parent_inode, &new_parent_inode) && old_filename == new_filename {
-            return Ok(0);
-        }
         let cookie = fsnotify::next_cookie();
         fsnotify::fsnotify(
-            FsEvent::MOVED_FROM | FsEvent::MOVE_SELF,
+            FsEvent::MOVED_FROM,
             Some((&old_parent_inode, old_filename)),
             Some(&old_inode),
             cookie,
@@ -198,30 +210,12 @@ pub fn do_renameat2(
             Some(&old_inode),
             cookie,
         );
-        // 覆盖了已存在目标：补投 IN_DELETE（目标父目录）。
-        // 仅当被覆盖的是不同 inode 且 nlinks 归零（最后一个硬链接）时才发
-        // IN_DELETE_SELF（随之撤销 mark 并投递 IN_IGNORED）。
-        // - 若 old_inode 与 displaced 是同一 inode（rename 覆盖自身别名），inode 未销毁；
-        // - 若 displaced 有多个硬链接（nlinks > 1），覆盖一个链接后 inode 仍存活。
+        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(&old_inode), 0);
+        // Replacing a target is part of the rename pair, not a parent DELETE.
+        // Linux reports ATTRIB on the displaced inode; DELETE_SELF is tied to
+        // the later dentry/inode detach lifecycle.
         if let Some(displaced) = &displaced {
-            // 容错：metadata 读失败（如 FUSE）不影响 rename 的成功返回值；
-            // 失败时按「不同 inode + nlinks 未知」处理（保守发 DELETE_SELF）。
-            let same_inode = displaced
-                .metadata()
-                .ok()
-                .zip(old_inode.metadata().ok())
-                .map(|(d, o)| d.inode_id == o.inode_id)
-                .unwrap_or(false);
-            let mut mask = FsEvent::DELETE;
-            if !same_inode && displaced_nlinks.is_none_or(|n| n <= 1) {
-                mask |= FsEvent::DELETE_SELF;
-            }
-            fsnotify::fsnotify(
-                mask,
-                Some((&new_parent_inode, new_filename)),
-                Some(displaced),
-                0,
-            );
+            fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(displaced), 0);
         }
     }
     return Ok(0);

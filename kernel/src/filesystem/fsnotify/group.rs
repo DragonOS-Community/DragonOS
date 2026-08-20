@@ -2,14 +2,14 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+use hashbrown::HashMap;
 
 use crate::filesystem::epoll::event_poll::EPollItemList;
 use crate::libs::mutex::Mutex;
 use crate::libs::wait_queue::WaitQueue;
 
 use super::mark::FsNotifyMark;
-use super::FsNotifyBackend;
+use super::{FsNotifyBackend, FsNotifyObjectId};
 
 /// 一个通知消费者。一个 inotify fd 对应一个 group。
 ///
@@ -19,7 +19,7 @@ use super::FsNotifyBackend;
 #[derive(Debug)]
 pub struct FsNotifyGroup {
     pub backend: Box<dyn FsNotifyBackend>,
-    pub marks: Mutex<Vec<Arc<FsNotifyMark>>>,
+    pub marks: Mutex<HashMap<FsNotifyObjectId, Arc<FsNotifyMark>>>,
     pub wait_queue: WaitQueue,
     pub epitems: EPollItemList,
 }
@@ -28,7 +28,7 @@ impl FsNotifyGroup {
     pub fn new(backend: Box<dyn FsNotifyBackend>) -> Arc<Self> {
         Arc::new(Self {
             backend,
-            marks: Mutex::new(Vec::new()),
+            marks: Mutex::new(HashMap::new()),
             wait_queue: WaitQueue::default(),
             epitems: EPollItemList::default(),
         })

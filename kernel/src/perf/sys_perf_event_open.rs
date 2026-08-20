@@ -1,5 +1,5 @@
 use crate::arch::syscall::nr::SYS_PERF_EVENT_OPEN;
-use crate::arch::{MMArch, interrupt::TrapFrame};
+use crate::arch::{interrupt::TrapFrame, MMArch};
 use crate::include::bindings::linux_bpf::perf_event_attr;
 use crate::mm::MemoryManagementArch;
 use crate::perf::perf_event_open;

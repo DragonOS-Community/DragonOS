@@ -927,24 +927,6 @@ impl InnerAddressSpace {
 
         let drops_present_pages =
             behavior == MadvFlags::MADV_DONTNEED || behavior == MadvFlags::MADV_DONTNEED_LOCKED;
-        if drops_present_pages {
-            // Validate the complete request before withdrawing any site.  The
-            // actual zap below is infallible for these already accepted VMAs.
-            for vma in &regions {
-                let flags = *vma.lock().vm_flags();
-                if flags.contains(VmFlags::VM_PFNMAP)
-                    || (behavior == MadvFlags::MADV_DONTNEED && flags.contains(VmFlags::VM_LOCKED))
-                {
-                    return Err(SystemError::EINVAL.into());
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            if let Err(err) = super::uprobe::uprobe_disarm_range_locked(&mm, self, region) {
-                return Err(err.into());
-            }
-        }
-
-        let mapper = &mut self.user_mapper.utable;
 
         if Self::madvise_uses_range_without_vma_split(behavior) {
             for r in regions {
@@ -954,7 +936,6 @@ impl InnerAddressSpace {
                 };
                 let intersection = original_region.intersect(&region).unwrap();
 
-                let _pt_edit = mm.page_table_edit();
                 match behavior {
                     MadvFlags::MADV_DONTNEED | MadvFlags::MADV_DONTNEED_LOCKED => {
                         if vm_flags.contains(VmFlags::VM_PFNMAP)
@@ -964,9 +945,24 @@ impl InnerAddressSpace {
                             tlb.finish();
                             return Err(SystemError::EINVAL.into());
                         }
+                        #[cfg(target_arch = "x86_64")]
+                        if drops_present_pages {
+                            if let Err(err) =
+                                super::uprobe::uprobe_disarm_range_locked(&mm, self, intersection)
+                            {
+                                tlb.finish();
+                                return Err(err.into());
+                            }
+                        }
+                        let _pt_edit = mm.page_table_edit();
+                        let mapper = &mut self.user_mapper.utable;
                         r.unmap_range(intersection, mapper, &mut tlb, UnmapMappingMode::EvenCow);
                     }
-                    _ => r.do_madvise(behavior, mapper, &mut tlb),
+                    _ => {
+                        let _pt_edit = mm.page_table_edit();
+                        let mapper = &mut self.user_mapper.utable;
+                        r.do_madvise(behavior, mapper, &mut tlb)
+                    }
                 }
             }
             tlb.finish();
@@ -977,6 +973,7 @@ impl InnerAddressSpace {
             };
         }
 
+        let mapper = &mut self.user_mapper.utable;
         let mut plans: Vec<MadviseVmaPlan> = Vec::with_capacity(regions.len());
         let mut rollback_notifications = VmaCloseNotifications::default();
         for r in &regions {

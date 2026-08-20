@@ -29,8 +29,8 @@ pub enum UprobeInsnError {
     /// 控制流指令（call/jmp/ret/jcc/loop/int 等）——XOL 执行会跳出 slot，
     /// 后续 #DB 无法反推探针址，且可能损坏栈/控制流。注册时拒绝。
     UnsupportedControlFlow,
-    /// 指令抑制 #DB（MOV SS/POP SS）或整体改写 RFLAGS（POPF*）——
-    /// XOL 单步窗口会断裂。注册时拒绝。
+    /// 指令抑制 #DB（MOV SS/POP SS）、观察临时 TF（PUSHF*）或整体改写
+    /// RFLAGS（POPF*）——XOL 单步会改变用户可见状态或丢失 #DB。注册时拒绝。
     UnsafeForXol,
     /// REP/REPE/REPNE string instructions may report an intermediate #DB
     /// with RIP still at the copied instruction. The phase-1 exact-end XOL
@@ -88,6 +88,7 @@ pub fn analyze_insn(bytes: &[u8]) -> Result<InsnAnalysis, UprobeInsnError> {
     //   boost/add_on_return 不在本范围）。
     // - MOV SS / POP SS：Intel SDM 规定其后的指令边界抑制 #DB——XOL 单步
     //   完成的 #DB 会丢失（评审 R10）。
+    // - PUSHF：会把 uprobe 临时设置的 TF 压入用户栈，改变用户可见结果。
     // - POPF：整体覆写 RFLAGS，清掉 uprobe 置的 TF，单步窗口断裂（评审 R10）。
     if is_control_flow(&inst) {
         return Err(UprobeInsnError::UnsupportedControlFlow);
@@ -150,7 +151,7 @@ fn is_control_flow(inst: &Instruction) -> bool {
 
 fn suppresses_debug_or_rewrites_flags(inst: &Instruction) -> bool {
     use yaxpeax_x86::amd64::{Opcode, RegSpec};
-    if matches!(inst.opcode(), Opcode::POPF) {
+    if matches!(inst.opcode(), Opcode::PUSHF | Opcode::POPF) {
         return true;
     }
     // `MOV SS, r/m16`（8e /r）：装载 SS 后到下一条指令边界之间 #DB 被抑制。
@@ -345,7 +346,11 @@ mod tests {
 
     #[test]
     fn debug_suppressing_rejected() {
-        // popfq (9d)；mov ss, rax (8e d0)
+        // pushfq (9c)；popfq (9d)；mov ss, rax (8e d0)
+        assert_eq!(
+            analyze_insn(&[0x9c]).unwrap_err(),
+            UprobeInsnError::UnsafeForXol
+        );
         assert_eq!(
             analyze_insn(&[0x9d]).unwrap_err(),
             UprobeInsnError::UnsafeForXol

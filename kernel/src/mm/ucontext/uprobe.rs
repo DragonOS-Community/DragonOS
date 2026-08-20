@@ -670,13 +670,13 @@ fn uprobe_register(
         let list = mm.uprobe_list.lock_irqsave();
         list.get(&probe_vaddr)
             .and_then(|entries| entries.first())
-            .and_then(|entry| {
+            .map(|entry| {
                 let inst = entry.read();
-                Some((
+                (
                     inst.point.old_instruction,
                     inst.insn_analysis,
                     inst.site.clone(),
-                ))
+                )
             })
     };
 
@@ -730,7 +730,7 @@ fn uprobe_register(
         }
 
         // 写入 XOL slot 物理页（复刻 batch3 fill_xol_slot / patch_byte_in_phys 写法）。
-        let kva = unsafe { MMArch::phys_2_virt(page_paddr) }.ok_or_else(|| SystemError::EFAULT)?;
+        let kva = unsafe { MMArch::phys_2_virt(page_paddr) }.ok_or(SystemError::EFAULT)?;
         unsafe {
             let dst = (kva.data() + xol_slot_offset) as *mut u8;
             core::ptr::copy_nonoverlapping(slot_buf.as_ptr(), dst, UPROBE_INSN_COPY_SIZE);
@@ -1114,20 +1114,27 @@ fn uprobe_unregister_consumer_from_site(
 }
 
 fn rebuild_site_participants(mm: &AddressSpace, probe_vaddr: usize, site: &Arc<UprobeSite>) {
-    let participants = {
-        let list = mm.uprobe_list.lock_irqsave();
-        list.get(&probe_vaddr)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let instance = entry.read();
-                Arc::ptr_eq(&instance.site, site)
-                    .then(|| instance.consumer.runtime_snapshot())
-                    .flatten()
-            })
-            .collect()
-    };
-    *site.participants.write() = Arc::new(participants);
+    // Keep collection and publication in the same membership critical
+    // section. Otherwise an older refresh can publish after a newer
+    // SET_BPF/enable/disable/close refresh and resurrect stale callbacks.
+    let list = mm.uprobe_list.lock_irqsave();
+    let participants = list
+        .get(&probe_vaddr)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let instance = entry.read();
+            Arc::ptr_eq(&instance.site, site)
+                .then(|| instance.consumer.runtime_snapshot())
+                .flatten()
+        })
+        .collect();
+    // Publish while membership is still serialized, but defer destruction of
+    // the old callbacks until after the IRQ-off hit-table lock is released.
+    let old_participants =
+        core::mem::replace(&mut *site.participants.write(), Arc::new(participants));
+    drop(list);
+    drop(old_participants);
 }
 
 fn refresh_consumer_sites(consumer: &UprobeConsumer) {
@@ -1236,8 +1243,7 @@ pub(crate) fn uprobe_disarm_range_locked(
 
     let targets: Vec<(usize, Arc<UprobeSite>, u8)> = {
         let list = mm.uprobe_list.lock_irqsave();
-        list.iter()
-            .filter(|(vaddr, _)| **vaddr >= region.start().data() && **vaddr < region.end().data())
+        list.range(region.start().data()..region.end().data())
             .filter_map(|(vaddr, entries)| {
                 let entry = entries.first()?.read();
                 let old = entry.point.old_instruction[0];

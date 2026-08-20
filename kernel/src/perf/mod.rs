@@ -11,10 +11,10 @@ pub(crate) use util::{PERF_TYPE_KPROBE, PERF_TYPE_UPROBE};
 use crate::arch::MMArch;
 use crate::bpf::prog::BpfProg;
 use crate::filesystem::epoll::event_poll::EPollItemList;
-use crate::filesystem::epoll::{EPollEventType, EPollItem, event_poll::EventPoll};
+use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
-use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
     FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };
@@ -24,7 +24,7 @@ use crate::include::bindings::linux_bpf::{
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
 use crate::mm::allocator::page_frame::{
-    PageFrameCount, PhysPageFrame, allocate_page_frames, deallocate_page_frames,
+    allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
 };
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::{MemoryManagementArch, VirtAddr, VmFaultReason};

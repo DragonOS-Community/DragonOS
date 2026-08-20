@@ -7,9 +7,9 @@ use crate::include::bindings::linux_bpf::{
 };
 use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::spinlock::SpinLock;
-use crate::mm::MemoryManagementArch;
 use crate::mm::allocator::page_frame::PageFrameCount;
-use crate::mm::page::{PageFlags, allocate_registered_intrinsic_unevictable_pages_exact};
+use crate::mm::page::{allocate_registered_intrinsic_unevictable_pages_exact, PageFlags};
+use crate::mm::MemoryManagementArch;
 use crate::perf::util::{LostSamples, PerfProbeArgs, PerfSample, SampleHeader};
 use alloc::string::String;
 use alloc::sync::Arc;

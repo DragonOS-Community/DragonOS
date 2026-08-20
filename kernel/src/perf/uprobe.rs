@@ -18,24 +18,24 @@ use crate::bpf::prog::BpfProg;
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::{
-    FilePrivateData, FileSystem, IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     fcntl::AtFlags,
-    utils::{ResolvedPath, user_resolved_path_at},
+    utils::{user_resolved_path_at, ResolvedPath},
+    FilePrivateData, FileSystem, IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::include::bindings::linux_bpf::bpf_prog_type;
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
-use crate::mm::MemoryManagementArch;
 use crate::mm::ucontext::{
-    UprobeConsumerReg, UprobeConsumerScope, UprobeDefinition, UprobeTaskScope, noop_handler,
-    uprobe_apply_to_existing_vma, uprobe_new_consumer_id, uprobe_registry_add,
+    noop_handler, uprobe_apply_to_existing_vma, uprobe_new_consumer_id, uprobe_registry_add,
     uprobe_registry_remove_consumer, uprobe_registry_set_callback, uprobe_registry_set_enabled,
+    UprobeConsumerReg, UprobeConsumerScope, UprobeDefinition, UprobeTaskScope,
 };
+use crate::mm::MemoryManagementArch;
 use crate::perf::util::{PerfProbeArgs, PerfProbeConfig};
 use crate::perf::{BasicPerfEbpfCallBack, PerfEventOps};
 use crate::process::{ProcessManager, RawPid};
 use crate::smp::core::smp_get_processor_id;
-use crate::smp::cpu::{ProcessorId, smp_cpu_manager};
+use crate::smp::cpu::{smp_cpu_manager, ProcessorId};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;

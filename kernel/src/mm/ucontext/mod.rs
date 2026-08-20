@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, compiler_fence},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -21,13 +21,13 @@ use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
-    arch::{CurrentIrqArch, MMArch, mm::PageMapper},
+    arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
     filesystem::{
         page_cache::UnmapMappingMode,
         vfs::{
-            FileType, InodeId,
             file::{File, FileMode},
+            FileType, InodeId,
         },
     },
     ipc::shm::SysVShmAttach,
@@ -41,25 +41,25 @@ use crate::{
         wait_queue::WaitQueue,
     },
     mm::{
-        PhysAddr,
         mmu_gather::MmuGather,
-        page::{PageManager, page_manager_lock, page_reclaimer_lock},
+        page::{page_manager_lock, page_reclaimer_lock, PageManager},
+        PhysAddr,
     },
     process::{
-        ProcessManager,
-        cred::{CAPFlags, capable},
+        cred::{capable, CAPFlags},
         resource::RLimitID,
+        ProcessManager,
     },
 };
 
 use super::{
-    MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFaultReason, VmFlags,
     allocator::page_frame::{
-        PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter, deallocate_page_frames,
+        deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
     fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
     page::{EntryFlags, Flusher, Page, PageFlags, PageType},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
+    MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFaultReason, VmFlags,
 };
 use crate::arch::mm::LockedFrameAllocator;
 
@@ -124,14 +124,14 @@ pub use stack::UserStack;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use uprobe::{
-    UprobeConsumer, UprobeConsumerReg, UprobeConsumerRuntime, UprobeConsumerRuntimeSnapshot,
-    UprobeConsumerScope, UprobeDefinition, UprobeHandle, UprobeInstance, UprobeSite,
-    UprobeSiteState, UprobeTaskScope, XolArea, XolSlotLease, fork_inherit_uprobes, noop_handler,
-    uprobe_apply_to_existing_vma, uprobe_apply_to_new_vma, uprobe_new_consumer_id,
-    uprobe_registry_add, uprobe_registry_remove_consumer, uprobe_registry_set_callback,
-    uprobe_registry_set_enabled,
+    fork_inherit_uprobes, noop_handler, uprobe_apply_to_existing_vma, uprobe_apply_to_new_vma,
+    uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_remove_consumer,
+    uprobe_registry_set_callback, uprobe_registry_set_enabled, UprobeConsumer, UprobeConsumerReg,
+    UprobeConsumerRuntime, UprobeConsumerRuntimeSnapshot, UprobeConsumerScope, UprobeDefinition,
+    UprobeHandle, UprobeInstance, UprobeSite, UprobeSiteState, UprobeTaskScope, XolArea,
+    XolSlotLease,
 };
 #[allow(unused_imports)]
 pub use vma::{
-    AnonSharedMapping, LockedVMA, PhysmapParams, PresentPfn, Provider, VMA, VMASplitResult,
+    AnonSharedMapping, LockedVMA, PhysmapParams, PresentPfn, Provider, VMASplitResult, VMA,
 };

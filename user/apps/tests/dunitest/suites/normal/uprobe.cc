@@ -575,6 +575,24 @@ TEST(UprobeTest, RepeatedStringInstructionIsRejected) {
     unlink(path);
 }
 
+TEST(UprobeTest, PushfInstructionIsRejected) {
+    constexpr unsigned char pushfq[] = {
+        0x9c,  // pushfq would expose the XOL single-step TF bit
+        0x58,  // pop rax
+        0xc3,  // ret
+    };
+    char path[] = "/tmp/uprobe_pushf_XXXXXX";
+    FdGuard file(create_raw_code(path, pushfq, sizeof(pushfq)));
+    ASSERT_GE(file.get(), 0);
+
+    errno = 0;
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    EXPECT_LT(event.get(), 0)
+        << "phase-1 XOL must reject PUSHF because TF is instrumentation state";
+    EXPECT_EQ(errno, EINVAL);
+    unlink(path);
+}
+
 // Exercise the exact window where one CPU has executed INT3 while another
 // CPU disables or closes the last consumer. A leaked ordinary SIGTRAP or a
 // reused XOL slot terminates the test or produces a wrong result.

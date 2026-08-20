@@ -3,6 +3,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::filesystem::fsnotify::{self, FsEvent};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
@@ -1067,6 +1068,13 @@ impl File {
             }
         }
 
+        // fsnotify：写成功后投递 IN_MODIFY（FMODE_NONOTIFY 短路，防 inotify fd 递归）。
+        if written_len > 0
+            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
+            && fsnotify::has_any_watch()
+        {
+            self.notify_fs_event(FsEvent::MODIFY);
+        }
         Ok(written_len)
     }
     /// @brief 创建一个新的文件对象
@@ -1281,6 +1289,38 @@ impl File {
         };
 
         return Ok(f);
+    }
+
+    /// Dispatch using one coherent dentry snapshot. This keeps the read/write
+    /// hot path free of namespace walks and temporary String allocations.
+    pub(crate) fn notify_fs_event(&self, mask: FsEvent) {
+        if let Some(mounted) = self.inode.clone().downcast_arc::<MountFSInode>() {
+            let (child, parent) = mounted.fsnotify_snapshot();
+            if let Some((parent, name)) = parent.as_ref() {
+                fsnotify::fsnotify_targets(
+                    mask,
+                    Some((parent, name.0.as_str())),
+                    Some(&child),
+                    0,
+                    true,
+                );
+            } else {
+                fsnotify::fsnotify_targets(mask, None, Some(&child), 0, true);
+            }
+        } else {
+            fsnotify::fsnotify(mask, None, Some(&self.inode), 0);
+        }
+    }
+
+    /// Notify a successful userspace-visible open. Callers decide which File
+    /// constructions represent VFS open/exec rather than internal kernel I/O.
+    pub(crate) fn notify_open_event(&self) {
+        let mode = *self.mode.read();
+        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
+            && fsnotify::has_any_watch()
+        {
+            self.notify_fs_event(FsEvent::OPEN);
+        }
     }
 
     /// Create a file object for sockets created by socket syscalls.
@@ -1560,6 +1600,14 @@ impl File {
         // request, including EOF. Zero-count reads returned above are exempt.
         if len > 0 || self.file_type == FileType::File {
             self.touch_atime_after_access();
+        }
+        // fsnotify：仅在实际读到数据（len > 0）时投递 IN_ACCESS（FMODE_NONOTIFY 短路）。
+        // EOF 读（len==0）不投递——与 atime 语义独立。
+        if len > 0
+            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
+            && fsnotify::has_any_watch()
+        {
+            self.notify_fs_event(FsEvent::ACCESS);
         }
         Ok(len)
     }
@@ -1976,6 +2024,13 @@ impl File {
         // read_dir_impl has released readdir_state before this metadata update,
         // avoiding a cross-filesystem lock-order dependency.
         self.touch_atime_after_access();
+        if !self
+            .mode
+            .read()
+            .intersects(FileMode::FMODE_PATH | FileMode::FMODE_NONOTIFY)
+        {
+            self.notify_fs_event(FsEvent::ACCESS);
+        }
         result
     }
 
@@ -2262,6 +2317,18 @@ impl File {
         self.private_data.lock().update_flags(new_flags)?;
         // 更新文件的打开模式
         *self.flags.write() = new_flags;
+
+        // 将 O_NONBLOCK 变更同步到 inotify fd（其 read_at 查内部 AtomicBool 而非 FileFlags，
+        // 与 socket 的 set_nonblocking 同理）。
+        if new_flags.contains(FileFlags::O_NONBLOCK) != old_flags.contains(FileFlags::O_NONBLOCK) {
+            if let Some(ino) = self
+                .inode
+                .as_any_ref()
+                .downcast_ref::<crate::filesystem::inotify::InotifyInode>()
+            {
+                ino.set_nonblocking(new_flags.contains(FileFlags::O_NONBLOCK));
+            }
+        }
         return Ok(());
     }
 
@@ -2445,6 +2512,19 @@ impl Drop for File {
         for epitem in epitems {
             EventPoll::release_file_epitem(&epitem);
             let _ = self.remove_epitem(&epitem);
+        }
+        // fsnotify：最后一次 close → IN_CLOSE_WRITE / IN_CLOSE_NOWRITE（FMODE_NONOTIFY 短路）。
+        // 此时 self.inode 仍存活（Drop 在 inode.close() 之前），可安全取 inode_id。
+        let mode = *self.mode.read();
+        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
+            && fsnotify::has_any_watch()
+        {
+            let m = if mode.contains(FileMode::FMODE_WRITE) {
+                FsEvent::CLOSE_WRITE
+            } else {
+                FsEvent::CLOSE_NOWRITE
+            };
+            self.notify_fs_event(m);
         }
 
         if self.flags().contains(FileFlags::FASYNC) {

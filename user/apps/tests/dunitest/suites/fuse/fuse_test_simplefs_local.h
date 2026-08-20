@@ -736,6 +736,7 @@ struct fuse_daemon_args {
     volatile uint32_t *init_in_max_readahead;
     volatile uint32_t *access_count;
     volatile uint32_t *lookup_count;
+    volatile uint32_t *getattr_count;
     volatile uint32_t *flush_count;
     volatile uint32_t *write_count_at_flush;
     volatile uint32_t *last_flush_uid;
@@ -1067,6 +1068,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
     }
     case FUSE_GETATTR: {
         (void)payload;
+        if (a->getattr_count)
+            (*a->getattr_count)++;
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
         if (!node) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);

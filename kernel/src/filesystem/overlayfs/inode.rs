@@ -325,7 +325,7 @@ impl IndexNode for OvlInode {
         file::open(self, data, flags)
     }
 
-    fn truncate_before_open(&self, _flags: &FileFlags) -> bool {
+    fn requires_separate_open_truncate(&self, _flags: &FileFlags) -> bool {
         false
     }
 

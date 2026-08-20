@@ -1,3 +1,5 @@
+use crate::filesystem::fsnotify::{self, FsEvent};
+use crate::filesystem::vfs::mount::MountFSInode;
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::is_ancestor;
@@ -6,8 +8,10 @@ use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::SystemError;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::filesystem::vfs::{MAX_PATHLEN, NAME_MAX};
+use crate::libs::casting::DowncastArc;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
+use alloc::sync::Arc;
 /// # 修改文件名
 ///
 ///
@@ -66,6 +70,18 @@ pub fn do_renameat2(
         Some(p) => new_inode_begin.lookup_follow_symlink(p, VFS_MAX_FOLLOW_SYMLINK_TIMES)?,
     };
 
+    // Linux rejects rename across mount objects even when two bind mounts
+    // expose the same superblock and inode. Check this before final lookup and
+    // same-inode no-op handling so a cross-mount alias cannot hide EXDEV.
+    if let (Some(old_mount), Some(new_mount)) = (
+        old_parent_inode.clone().downcast_arc::<MountFSInode>(),
+        new_parent_inode.clone().downcast_arc::<MountFSInode>(),
+    ) {
+        if !old_mount.same_mount_ref(&new_mount) {
+            return Err(SystemError::EXDEV);
+        }
+    }
+
     // 检查单个文件名长度
     if old_filename.len() > NAME_MAX || new_filename.len() > NAME_MAX {
         return Err(SystemError::ENAMETOOLONG);
@@ -75,31 +91,72 @@ pub fn do_renameat2(
         return Err(SystemError::EEXIST);
     }
 
-    // RENAME_EXCHANGE: 目标必须存在
-    if flags.contains(RenameFlags::EXCHANGE) && new_parent_inode.find(new_filename).is_err() {
-        return Err(SystemError::ENOENT);
-    }
-
     if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {
         return Err(SystemError::EBUSY);
     }
 
     let old_inode = old_parent_inode.lookup(old_filename)?;
     let old_inode_type = old_inode.metadata()?.file_type;
-    if old_inode_type == crate::filesystem::vfs::FileType::Dir {
-        // 仅当把目录移动到其自身或其子树下时拦截
-        if is_ancestor(&old_inode, &new_parent_inode) {
-            return Err(SystemError::EINVAL);
-        }
-    }
 
-    if flags.contains(RenameFlags::EXCHANGE) {
-        let new_inode = new_parent_inode.lookup(new_filename)?;
+    // RENAME_EXCHANGE 目标必须存在；预先 lookup 供事件投递复用（move_to 后原位置查不到）。
+    let exchange_new_inode = if flags.contains(RenameFlags::EXCHANGE) {
+        Some(new_parent_inode.lookup(new_filename)?)
+    } else {
+        None
+    };
+    if let Some(new_inode) = &exchange_new_inode {
         if new_inode.metadata()?.file_type == crate::filesystem::vfs::FileType::Dir
-            && is_ancestor(&new_inode, &old_parent_inode)
+            && is_ancestor(new_inode, &old_parent_inode)
         {
             return Err(SystemError::EINVAL);
         }
+        let old_id = fsnotify::target_for_inode(&old_inode)?.id;
+        let new_id = fsnotify::target_for_inode(new_inode)?.id;
+        if old_id == new_id {
+            return Ok(0);
+        }
+    }
+
+    // 非 EXCHANGE：预先取出可能被覆盖的目标 inode（move_to 会静默销毁它），
+    // 否则其上的 watch 会沦为持续产生事件的「幽灵 watch」。只有 ENOENT
+    // 表示目标不存在；I/O、权限等 lookup 错误必须原样返回。
+    let displaced = if !flags.contains(RenameFlags::EXCHANGE) {
+        match new_parent_inode.find(new_filename) {
+            Ok(inode) => Some(inode),
+            Err(SystemError::ENOENT) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+
+    // Linux resolves the destination and handles NOREPLACE/same-inode no-op
+    // before checking directory mutation permissions.
+    if flags.contains(RenameFlags::NOREPLACE) && displaced.is_some() {
+        return Err(SystemError::EEXIST);
+    }
+
+    if !flags.contains(RenameFlags::EXCHANGE)
+        && Arc::ptr_eq(&old_parent_inode, &new_parent_inode)
+        && old_filename == new_filename
+    {
+        return Ok(0);
+    }
+
+    if let Some(target) = displaced.as_ref() {
+        let source_id = fsnotify::target_for_inode(&old_inode)?.id;
+        let target_id = fsnotify::target_for_inode(target)?.id;
+        if source_id == target_id {
+            return Ok(0);
+        }
+    }
+
+    // Ancestor traps are evaluated after a positive NOREPLACE destination and
+    // same-inode no-op, matching Linux's lookup/error precedence.
+    if old_inode_type == crate::filesystem::vfs::FileType::Dir
+        && is_ancestor(&old_inode, &new_parent_inode)
+    {
+        return Err(SystemError::EINVAL);
     }
 
     // 不要在这里检查 new_parent 是否是 old 的祖先：
@@ -122,5 +179,64 @@ pub fn do_renameat2(
     )?;
 
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
+
+    if flags.contains(RenameFlags::EXCHANGE) {
+        // EXCHANGE：两个 inode 互换位置 → 两组配对事件、两个 cookie、双方各 IN_MOVE_SELF。
+        // - old_inode: old_dir/old_name → new_dir/new_name（cookie1）
+        // - new_inode: new_dir/new_name → old_dir/old_name（cookie2）
+        let new_inode = exchange_new_inode
+            .as_ref()
+            .expect("RENAME_EXCHANGE requires target to exist (checked above)");
+        let cookie1 = fsnotify::next_cookie();
+        fsnotify::fsnotify(
+            FsEvent::MOVED_FROM,
+            Some((&old_parent_inode, old_filename)),
+            Some(&old_inode),
+            cookie1,
+        );
+        fsnotify::fsnotify(
+            FsEvent::MOVED_TO,
+            Some((&new_parent_inode, new_filename)),
+            Some(&old_inode),
+            cookie1,
+        );
+        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(&old_inode), 0);
+        let cookie2 = fsnotify::next_cookie();
+        fsnotify::fsnotify(
+            FsEvent::MOVED_FROM,
+            Some((&new_parent_inode, new_filename)),
+            Some(new_inode),
+            cookie2,
+        );
+        fsnotify::fsnotify(
+            FsEvent::MOVED_TO,
+            Some((&old_parent_inode, old_filename)),
+            Some(new_inode),
+            cookie2,
+        );
+        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(new_inode), 0);
+    } else {
+        // 普通 rename（可能覆盖目标）：单 cookie 配对 MOVED_FROM/MOVED_TO + MOVE_SELF。
+        let cookie = fsnotify::next_cookie();
+        fsnotify::fsnotify(
+            FsEvent::MOVED_FROM,
+            Some((&old_parent_inode, old_filename)),
+            Some(&old_inode),
+            cookie,
+        );
+        fsnotify::fsnotify(
+            FsEvent::MOVED_TO,
+            Some((&new_parent_inode, new_filename)),
+            Some(&old_inode),
+            cookie,
+        );
+        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(&old_inode), 0);
+        // Replacing a target is part of the rename pair, not a parent DELETE.
+        // Linux reports ATTRIB on the displaced inode; DELETE_SELF is tied to
+        // the later dentry/inode detach lifecycle.
+        if let Some(displaced) = &displaced {
+            fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(displaced), 0);
+        }
+    }
     return Ok(0);
 }

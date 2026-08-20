@@ -1,5 +1,6 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
+use crate::filesystem::fsnotify::{self, FsEvent};
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use log::{error, info, warn};
 use system_error::SystemError;
@@ -592,9 +593,18 @@ pub fn do_mkdir_at(
     }
     let umask = pcb.fs_struct().umask();
     let final_mode = InodeMode::from_bits_truncate(final_mode_bits) & !umask;
-
     // 执行创建
-    return current_inode.mkdir(name, final_mode);
+    let r = current_inode.mkdir(name, final_mode);
+    if let Ok(new_inode) = &r {
+        // fsnotify：父目录得 IN_CREATE（子项是目录 → IN_ISDIR 由 dispatch 依据子项设置）。
+        fsnotify::fsnotify(
+            FsEvent::CREATE,
+            Some((&current_inode, name)),
+            Some(new_inode),
+            0,
+        );
+    }
+    return r;
 }
 
 /// 解析父目录inode
@@ -672,6 +682,14 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     // 删除文件夹
     parent_inode.rmdir(filename)?;
+    // DELETE_SELF is emitted later when the disconnected dentry finally
+    // detaches from the inode.
+    fsnotify::fsnotify(
+        FsEvent::DELETE,
+        Some((&parent_inode, filename)),
+        Some(&target_inode),
+        0,
+    );
 
     return Ok(0);
 }
@@ -713,7 +731,15 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     // 在父目录上执行 unlink 操作
     parent_inode.unlink(filename)?;
-
+    // Linux publishes the link-count ATTRIB before the parent DELETE record.
+    // DELETE_SELF remains deferred to final dentry detach.
+    fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&target_inode), 0);
+    fsnotify::fsnotify(
+        FsEvent::DELETE,
+        Some((&parent_inode, filename)),
+        Some(&target_inode),
+        0,
+    );
     return Ok(0);
 }
 
@@ -782,7 +808,11 @@ where
     }
 
     let (md, mask) = prepare_write_side_effect_metadata(md, len);
-    do_resize(&inode, &md, mask)
+    let r = do_resize(&inode, &md, mask);
+    if r.is_ok() {
+        fsnotify::fsnotify_inode(FsEvent::MODIFY, &inode);
+    }
+    r
 }
 
 pub(crate) fn prepare_write_side_effect_metadata(
@@ -920,6 +950,12 @@ pub fn vfs_fallocate_file(
     if len == 0 || offset > isize::MAX as usize || len > isize::MAX as usize {
         return Err(SystemError::EINVAL);
     }
+    // VFS 层 s_maxbytes 上限守卫（对齐 Linux do_fallocate）：offset+len 不得溢出或超过 isize::MAX。
+    // 具体文件系统实现各自再校验，但 VFS 层不应留缺口。
+    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+    if new_size > isize::MAX as usize {
+        return Err(SystemError::EFBIG);
+    }
 
     let mode_bits = mode as u32;
     if mode < 0 || (mode_bits & !FALLOC_FL_SUPPORTED_MASK) != 0 {
@@ -982,16 +1018,16 @@ pub fn vfs_fallocate_file(
         _ => return Err(SystemError::ENODEV),
     }
 
-    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
-    if new_size > isize::MAX as usize {
-        return Err(SystemError::EFBIG);
-    }
-
-    inode.fallocate_file(
+    let r = inode.fallocate_file(
         mode,
         offset,
         len,
         current_file_lock_owner_id(),
         file.private_data.lock(),
-    )
+    );
+    // Linux reports successful fallocate, including KEEP_SIZE, as MODIFY.
+    if r.is_ok() {
+        file.notify_fs_event(FsEvent::MODIFY);
+    }
+    r
 }

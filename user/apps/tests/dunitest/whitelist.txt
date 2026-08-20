@@ -97,4 +97,6 @@ normal/af_packet_e2e
 normal/af_packet_mcast
 normal/rtnetlink_link_semantics
 normal/tty_termios
+normal/inotify_dir_watch
+normal/inotify_events
 normal/sched_tracepoint

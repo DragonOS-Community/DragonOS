@@ -1,0 +1,90 @@
+//! [`FsNotifyMark`]：一个 watch（group + inode + mask + wd）及其生命周期管理。
+
+use alloc::sync::{Arc, Weak};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use crate::filesystem::vfs::IndexNode;
+
+use super::{
+    adjust_total_watches, index_remove, FsNotifyDeleteState, FsNotifyGroup, FsNotifyObjectId,
+};
+use crate::libs::mutex::Mutex;
+
+/// 一个 watch：连接 group 与 inode。
+///
+/// 生命周期：由 `group.marks` 持有强引用（pin 住被监听 inode），全局索引持 `Weak`。
+/// 撤销时机：`rm_watch`、`IN_DELETE_SELF`/`IN_UNMOUNT` 触发、group 销毁。
+#[derive(Debug)]
+pub struct FsNotifyMark {
+    /// watch descriptor，group 内唯一。
+    pub wd: i32,
+    /// 所属 group（弱引用，避免环引用）。
+    pub group: Weak<FsNotifyGroup>,
+    /// 强引用：watch 期间 pin 住 inode（防 evict，保证 InodeId 不复用）。
+    pub _inode: Arc<dyn IndexNode>,
+    /// Keeps per-object delete state alive without retaining a dentry.
+    pub(crate) _delete_lifecycle: Option<Arc<Mutex<FsNotifyDeleteState>>>,
+    /// Captured once at watch creation; removal never performs metadata I/O.
+    pub object_id: FsNotifyObjectId,
+    /// Serializes dispatch with update/removal. This closes the one-shot and
+    /// rm_watch race without a packed atomic state machine.
+    pub dispatch_lock: Mutex<()>,
+    pub active: AtomicBool,
+    /// 订阅 mask（`IN_MASK_ADD` 并发改，必须原子读）。
+    pub mask: AtomicU32,
+    /// `IN_ONESHOT`：触发一次后自动撤销。
+    pub oneshot: AtomicBool,
+    /// `IN_EXCL_UNLINK`：已 unlink 子项不再产生事件。
+    pub excl_unlink: AtomicBool,
+}
+
+impl FsNotifyMark {
+    /// 取被监听 inode 的标识：(inode_id, dev_id) 复合键。
+    ///
+    /// FUSE 等多挂载场景可能复用相同 inode 号（如 FUSE_ROOT_ID=1），
+    /// 必须用 (inode_id, dev_id) 组合区分不同挂载上的 inode，否则会跨挂载
+    /// 误匹配 mark，导致事件泄露或误判已有 watch。
+    pub fn identity(&self) -> FsNotifyObjectId {
+        self.object_id
+    }
+}
+
+/// 撤销一个 mark：从 group.marks、全局索引移除，并维护全局计数。
+///
+/// 在 `rm_watch`、`DELETE_SELF`/`UNMOUNT` dispatch、group 销毁时调用。
+/// 注意：不取 events 锁，故与 read 路径互不阻塞（锁族分离）。
+pub fn destroy_mark(mark: &Arc<FsNotifyMark>) {
+    let Some(group) = mark.group.upgrade() else {
+        // group 已销毁，mark 仅可能残留在 snapshot 中；直接清索引即可。
+        index_remove(mark);
+        return;
+    };
+
+    // Stop dispatch before removing any lookup path. A snapshot that already
+    // owns the Arc will observe inactive after acquiring this lock.
+    let dispatch = mark.dispatch_lock.lock();
+    mark.active.store(false, Ordering::Release);
+    drop(dispatch);
+
+    // 从 group.marks 移除（按指针相等）。
+    let mut marks = group.marks.lock();
+    let removed = marks
+        .get(&mark.object_id)
+        .is_some_and(|candidate| Arc::ptr_eq(candidate, mark));
+    if removed {
+        marks.remove(&mark.object_id);
+    }
+    drop(marks);
+
+    if removed {
+        // 投递 IN_IGNORED：watch 被撤销（rm_watch/oneshot/DELETE_SELF/UNMOUNT 均经此路径）。
+        // shutdown(fd close) 不调用 destroy_mark，故不误发。
+        group.backend.notify_ignored(&group, mark);
+        // 通知后端从其内部结构（wd 表）移除。
+        group.backend.free_mark(mark);
+        // 从全局索引移除。
+        index_remove(mark);
+        // 维护全局 watch 计数（唯一计数器，覆盖上限检查 + 快速路径）。
+        adjust_total_watches(-1);
+    }
+}

@@ -1,4 +1,8 @@
-use core::{fmt, str::FromStr};
+use core::{
+    fmt,
+    str::FromStr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use super::RawPid;
 
@@ -197,6 +201,23 @@ bitflags! {
         const PID_UNHASHED = 1 << 15;
         /// Task is currently traced by another task.
         const PTRACED = 1 << 16;
+        /// PTRACE_SEIZE was used to attach (not PTRACE_ATTACH/TRACEME).
+        const PT_SEIZED = 1 << 17;
+        /// A ptrace stop/attach transition is in flight; guards re-entrancy.
+        const TRAPPING = 1 << 18;
+        /// A deferred ptrace stop is pending; consumed on return-to-user path.
+        const PENDING_PTRACE_STOP = 1 << 19;
+        /// Tracee is reporting a PTRACE_EVENT_STOP (seized initial/event stop).
+        const PTRACE_EVENT_STOP = 1 << 20;
+        /// PTRACE_O_TRACESYSGOOD-style syscall-stop reporting (0x80 in status).
+        const TRACE_SYSCALL = 1 << 21;
+        /// Single-step (TF) tracing requested by the debugger.
+        const TRACE_SINGLESTEP = 1 << 22;
+        /// PTRACE_SYSEMU: skip the syscall on resume.
+        const TRACE_SYSEMU = 1 << 23;
+        /// Task has hardware debug registers (DR0-3/DR7) configured via
+        /// PTRACE_POKEUSER; context switch loads/clears them accordingly.
+        const HW_DEBUG_REGS = 1 << 24;
     }
 }
 
@@ -206,10 +227,14 @@ impl ProcessFlags {
     }
 
     pub const fn exit_to_user_mode_work(&self) -> Self {
-        Self::from_bits_truncate(
-            self.bits
-                & (Self::NEED_SCHEDULE.bits | Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits),
-        )
+        Self::from_bits_truncate(self.bits & Self::exit_to_user_mode_mask())
+    }
+
+    pub const fn exit_to_user_mode_mask() -> usize {
+        Self::NEED_SCHEDULE.bits
+            | Self::HAS_PENDING_SIGNAL.bits
+            | Self::NEED_RSEQ.bits
+            | Self::PENDING_PTRACE_STOP.bits
     }
 
     /// Test and clear flags.
@@ -225,5 +250,54 @@ impl ProcessFlags {
         let r = (self.bits & rhs.bits) != 0;
         self.bits &= !rhs.bits;
         r
+    }
+}
+
+/// 进程标志位的原子存储。
+#[derive(Debug, Default)]
+pub struct AtomicProcessFlags {
+    bits: AtomicUsize,
+}
+impl AtomicProcessFlags {
+    pub const fn new() -> Self {
+        Self {
+            bits: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn insert(&self, flags: ProcessFlags) {
+        self.bits.fetch_or(flags.bits(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn remove(&self, flags: ProcessFlags) {
+        self.bits.fetch_and(!flags.bits(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn contains(&self, flags: ProcessFlags) -> bool {
+        (self.bits.load(Ordering::Relaxed) & flags.bits()) == flags.bits()
+    }
+
+    #[inline]
+    pub fn test_and_clear(&self, flags: ProcessFlags) -> bool {
+        let old = self.bits.fetch_and(!flags.bits(), Ordering::Relaxed);
+        (old & flags.bits()) != 0
+    }
+
+    #[inline]
+    pub fn intersects(&self, flags: ProcessFlags) -> bool {
+        (self.bits.load(Ordering::Relaxed) & flags.bits()) != 0
+    }
+
+    #[inline]
+    pub fn load(&self) -> ProcessFlags {
+        ProcessFlags::from_bits_truncate(self.bits.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn store(&self, flags: ProcessFlags) {
+        self.bits.store(flags.bits(), Ordering::Relaxed);
     }
 }

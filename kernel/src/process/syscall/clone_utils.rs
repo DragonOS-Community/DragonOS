@@ -63,6 +63,7 @@ pub fn do_clone(
     clone_args.verify()?;
     let flags = clone_args.flags;
     let parent_tid = clone_args.parent_tid;
+    let exit_signal = clone_args.exit_signal;
 
     let vfork = Arc::new(Completion::new());
 
@@ -105,10 +106,23 @@ pub fn do_clone(
             e
         )
     });
+    // wake_up_new_task 之后才上报 ptrace 事件。
+    ProcessManager::ptrace_report_fork_event(&current_pcb, &pcb, flags, exit_signal);
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
-        // 等待子进程结束或者exec;
-        vfork.wait_for_completion_interruptible()?;
+        // 等待子进程结束或 exec
+        // 仅致命信号可打断
+        if vfork.wait_for_completion_killable().is_err() {
+            // 清除子进程的 vfork_done：等待方已放弃，避免子进程
+            // exec/exit 时对已弃置的 completion 调用 complete。
+            pcb.thread.write_irqsave().vfork_done = None;
+            return Ok(child_vpid);
+        }
+        let done_vpid = crate::process::ptrace::ptracer_of(&current_pcb)
+            .and_then(|tracer| pcb.task_pid_nr_ns(PidType::PID, Some(tracer.active_pid_ns())))
+            .map(|p| p.data())
+            .unwrap_or(child_vpid);
+        current_pcb.ptrace_event(crate::process::ptrace::PtraceEvent::VForkDone, done_vpid);
     }
 
     return Ok(child_vpid);

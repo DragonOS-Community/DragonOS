@@ -337,7 +337,20 @@ impl MemoryManagementArch for X86_64MMArch {
         if execute {
             return true;
         }
+        // 仅在 VMA 无 VM_WRITE 时才受限——此时只允许私有可写映射（COW，is_cow_mapping），
+        // 拒绝写只读共享映射（防篡改后端文件）。VM_WRITE 已置位的映射（共享或私有）直接放行。
         if foreign | vma.is_foreign() {
+            if write {
+                let vm_flags = *vma.lock().vm_flags();
+                if !vm_flags.contains(VmFlags::VM_WRITE) {
+                    // is_cow_mapping: (flags & (VM_SHARED|VM_MAYWRITE)) == VM_MAYWRITE
+                    let is_cow = !vm_flags.contains(VmFlags::VM_SHARED)
+                        && vm_flags.contains(VmFlags::VM_MAYWRITE);
+                    if !is_cow {
+                        return false;
+                    }
+                }
+            }
             return true;
         }
         pkru::pkru_allows_pkey(pkru::vma_pkey(vma), write)

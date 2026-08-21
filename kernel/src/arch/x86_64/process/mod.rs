@@ -4,7 +4,7 @@ use core::{
     arch::asm,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicU64, Ordering},
 };
 
 use alloc::sync::{Arc, Weak};
@@ -18,7 +18,7 @@ use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
     libs::spinlock::{SpinLock, SpinLockGuard},
-    mm::VirtAddr,
+    mm::{percpu::PerCpu, VirtAddr},
     process::{
         fork::{CloneFlags, KernelCloneArgs},
         KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
@@ -63,6 +63,39 @@ static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {
     idle_stack: [0; 32768],
 };
 
+/// x86 调试寄存器访问原语（ptrace 硬件断点支持）。
+///
+/// 配置寄存器（DR0-3 地址、DR7 控制）由上下文切换按任务的
+pub mod debugreg {
+    /// 写指定调试寄存器（仅支持 DR0-3/DR7）。
+    #[inline]
+    pub unsafe fn write_dr(n: usize, val: u64) {
+        match n {
+            0 => unsafe { core::arch::asm!("mov dr0, {0}", in(reg) val, options(nomem, nostack)) },
+            1 => unsafe { core::arch::asm!("mov dr1, {0}", in(reg) val, options(nomem, nostack)) },
+            2 => unsafe { core::arch::asm!("mov dr2, {0}", in(reg) val, options(nomem, nostack)) },
+            3 => unsafe { core::arch::asm!("mov dr3, {0}", in(reg) val, options(nomem, nostack)) },
+            7 => unsafe { core::arch::asm!("mov dr7, {0}", in(reg) val, options(nomem, nostack)) },
+            _ => {}
+        }
+    }
+    /// 写 DR7（控制寄存器）。写 DR7 是串行化指令，仅在确有必要时调用。
+    #[inline]
+    pub unsafe fn write_dr7(val: u64) {
+        unsafe { core::arch::asm!("mov dr7, {0}", in(reg) val, options(nomem, nostack)) }
+    }
+}
+
+/// 各 CPU 当前硬件 DR7 的影子值
+static CPU_DR7: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
+
+/// 取本 CPU 的 DR7 影子槽位。仅在 IRQ 关闭的切换/#DB 路径访问本 CPU 槽位。
+#[inline]
+pub(crate) fn cpu_dr7() -> &'static AtomicU64 {
+    &CPU_DR7[crate::smp::core::smp_get_processor_id().data() as usize]
+}
+
 /// PCB中与架构相关的信息
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -91,6 +124,9 @@ pub struct ArchPCBInfo {
 
 #[allow(dead_code)]
 impl ArchPCBInfo {
+    pub fn kernel_rsp(&self) -> usize {
+        self.rsp
+    }
     /// 创建一个新的ArchPCBInfo
     ///
     /// ## 参数
@@ -202,12 +238,38 @@ impl ArchPCBInfo {
         }
     }
 
+    /// 在内核上下文（syscall/异常入口已 swapgs）保存用户态 GS base
+    pub unsafe fn save_user_gsbase(&mut self) {
+        self.gsbase = x86::msr::rdmsr(x86::msr::IA32_KERNEL_GSBASE) as usize;
+    }
+
+    /// 在内核上下文写用户态 GS base：写入 IA32_KERNEL_GSBASE
+    pub unsafe fn restore_user_gsbase(&mut self) {
+        x86::msr::wrmsr(x86::msr::IA32_KERNEL_GSBASE, self.gsbase as u64);
+    }
+
     pub unsafe fn restore_fsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             x86::current::segmentation::wrfsbase(self.fsbase as u64);
         } else {
             x86::msr::wrmsr(x86::msr::IA32_FS_BASE, self.fsbase as u64);
         }
+    }
+
+    /// 将 FS 段选择子清零（同时清硬件寄存器与字段）
+    pub unsafe fn load_fs_selector_zero(&mut self) {
+        self.fs = SegmentSelector::new(0, x86::Ring::Ring0);
+        unsafe {
+            core::arch::asm!("mov fs, {0:x}", in(reg) 0u16, options(nostack, preserves_flags))
+        };
+    }
+
+    /// 将 GS 段选择子清零
+    pub unsafe fn load_gs_selector_zero(&mut self) {
+        self.gs = SegmentSelector::new(0, x86::Ring::Ring0);
+        unsafe {
+            core::arch::asm!("mov gs, {0:x}", in(reg) 0u16, options(nostack, preserves_flags))
+        };
     }
 
     pub unsafe fn restore_gsbase(&mut self) {
@@ -237,6 +299,16 @@ impl ArchPCBInfo {
 
     pub fn gsbase(&self) -> usize {
         self.gsbase
+    }
+
+    /// 设置用户态 FS base（ptrace SETREGS 写路径）。
+    pub fn set_fsbase(&mut self, base: usize) {
+        self.fsbase = base;
+    }
+
+    /// 设置用户态 GS base（语义同 set_fsbase）。
+    pub fn set_gsbase(&mut self, base: usize) {
+        self.gsbase = base;
     }
 
     pub fn cr2_mut(&mut self) -> &mut usize {
@@ -276,9 +348,18 @@ impl ArchPCBInfo {
             gsbase: self.gsbase,
             fs: self.fs,
             gs: self.gs,
-            gsdata: self.gsdata.clone(),
             fp_state: self.fp_state,
+            gsdata: self.gsdata.clone(),
             io_bitmap: self.io_bitmap.clone(),
+        }
+    }
+
+    pub fn sync_current_state_before_fork(&mut self) {
+        unsafe {
+            self.save_fsbase();
+            // fork 处于 syscall 内核上下文（已 swapgs），用户 gs 真值在 IA32_KERNEL_GSBASE
+            // 必须用 save_user_gsbase 才能继承正确值。
+            self.save_user_gsbase();
         }
     }
 
@@ -287,15 +368,6 @@ impl ArchPCBInfo {
         let gsdata = self.gsdata.clone();
         *self = from.clone_all();
         self.gsdata = gsdata;
-    }
-
-    /// Synchronize hardware-backed current-thread state before common fork code
-    /// clones `ArchPCBInfo`.
-    pub fn sync_current_state_before_fork(&mut self) {
-        unsafe {
-            self.save_fsbase();
-            self.save_gsbase();
-        }
     }
 }
 
@@ -366,13 +438,14 @@ impl ProcessManager {
             *trap_frame_ptr = child_trapframe;
         }
 
-        // 获取并拷贝父进程的架构信息
-        // 注意：需要使用mut guard以便保存FP状态
         let mut current_arch_guard = current_pcb.arch_info_irqsave();
 
+        // 获取并拷贝父进程的架构信息
+        // 注意：需要使用mut guard以便保存FP状态
         unsafe {
             current_arch_guard.save_fsbase();
-            current_arch_guard.save_gsbase();
+            // 同步 fork：内核上下文读 IA32_KERNEL_GSBASE 取用户 gs 真值
+            current_arch_guard.save_user_gsbase();
         }
 
         // 在拷贝FP状态之前，先从硬件寄存器保存当前的FP状态
@@ -430,6 +503,37 @@ impl ProcessManager {
 
         // 切换gsbase
         Self::switch_gsbase(&prev, &next);
+
+        // 切换硬件调试寄存器（ptrace POKEUSER 设置的硬件断点）：
+        // 置有 HW_DEBUG_REGS 标志的任务切入时加载其 DR0-3/DR7；
+        {
+            let next_has_dr = next.flags().contains(ProcessFlags::HW_DEBUG_REGS);
+            if next_has_dr {
+                let dr = {
+                    let ps = next.ptrace_state.lock_irqsave();
+                    let mut dr = ps.debug_regs;
+                    // DR6 是 sticky 状态位，由 #DB 路径维护，不加载；
+                    // DR7 掩掉保留位（含 GD 位）后加载。
+                    dr[6] = 0;
+                    dr[7] &= !crate::process::ptrace::DR_CONTROL_RESERVED;
+                    dr
+                };
+
+                cpu_dr7().store(dr[7], Ordering::Relaxed);
+                compiler_fence(Ordering::SeqCst);
+                unsafe {
+                    debugreg::write_dr(0, dr[0]);
+                    debugreg::write_dr(1, dr[1]);
+                    debugreg::write_dr(2, dr[2]);
+                    debugreg::write_dr(3, dr[3]);
+                    debugreg::write_dr(7, dr[7]);
+                }
+            } else if cpu_dr7().load(Ordering::Relaxed) != 0 {
+                // 清零方向：先写硬件、再写影子
+                unsafe { debugreg::write_dr7(0) };
+                cpu_dr7().store(0, Ordering::Relaxed);
+            }
+        }
 
         // 切换地址空间（无锁快速路径）
         let next_addr_space = next.basic().user_vm();

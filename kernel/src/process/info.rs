@@ -89,6 +89,11 @@ impl ThreadInfo {
         self.group_tasks.clone()
     }
 
+    /// 组内是否只有组长一个线程（组列表为空即单线程组）。
+    pub fn group_tasks_is_empty(&self) -> bool {
+        self.group_tasks.is_empty()
+    }
+
     pub fn thread_group_empty(&self) -> bool {
         let group_leader = self.group_leader();
         if let Some(leader) = group_leader {
@@ -134,6 +139,9 @@ pub struct ProcessBasicInfo {
 
     /// File descriptor table.
     fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
+
+    /// 进程执行域标志（personality），GDB 经 SYS_personality 设置 ADDR_NO_RANDOMIZE 等位。
+    personality: u32,
 }
 
 impl ProcessBasicInfo {
@@ -151,6 +159,7 @@ impl ProcessBasicInfo {
             cwd,
             user_vm,
             fd_table: Some(fd_table),
+            personality: 0,
         });
     }
 
@@ -212,6 +221,16 @@ impl ProcessBasicInfo {
         let old = self.fd_table.take();
         self.fd_table = fd_table;
         return old;
+    }
+
+    pub fn personality(&self) -> u32 {
+        self.personality
+    }
+
+    pub fn set_personality(&mut self, new: u32) -> u32 {
+        let old = self.personality;
+        self.personality = new;
+        old
     }
 }
 

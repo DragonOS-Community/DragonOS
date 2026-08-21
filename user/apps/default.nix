@@ -73,6 +73,8 @@ in
   static.curl
   static.dropbear
   cross.glibc
+  static.strace
+  static.gdb
 
   # Simple C utilities
   (static.callPackage ./about { })

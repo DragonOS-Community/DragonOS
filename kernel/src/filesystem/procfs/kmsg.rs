@@ -117,6 +117,9 @@ impl Kmsg {
 
     /// 设置输出到控制台的日志级别
     pub fn set_level(&mut self, log_level: usize) -> Result<usize, SystemError> {
+        if !(1..=8).contains(&log_level) {
+            return Err(SystemError::EINVAL);
+        }
         let log_level = log_level - 1;
 
         self.console_loglevel = match log_level {

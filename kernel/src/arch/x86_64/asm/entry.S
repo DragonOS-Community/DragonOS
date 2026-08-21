@@ -115,6 +115,7 @@ Err_Code:
     cld
     
     movq ERRCODE(%rsp), %rsi    // 把错误码装进rsi，作为函数的第二个参数
+    movq $-1, ERRCODE(%rsp)     // orig_rax 哨兵
     movq FUNC(%rsp), %rdx
     
     movq $0x10, %rdi    // 加载内核段的地址
@@ -144,7 +145,7 @@ __entry_err_code_to_ret_from_exception:
 // 0 #DE 除法错误
 ENTRY(trap_divide_error)
     
-    pushq $0    //由于#DE不会产生错误码，但是为了保持弹出结构的一致性，故也压入一个错误码0
+    pushq $-1    // #DE 无错误码；压入 -1 作为 orig_rax 哨兵（对齐 Linux：非系统调用）
     pushq %rax  // 先将rax入栈
     leaq do_divide_error(%rip), %rax    // 获取中断服务程序的地址
     
@@ -153,7 +154,7 @@ ENTRY(trap_divide_error)
 
 // 1 #DB 调试异常
 ENTRY(trap_debug)
-    pushq $0    
+    pushq $-1
     pushq %rax  
     leaq do_debug(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -172,7 +173,7 @@ ENTRY(trap_nmi)
 
 // 3 #BP 断点异常
 ENTRY(trap_int3)
-    pushq $0
+    pushq $-1
     pushq %rax
     leaq do_int3(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -180,7 +181,7 @@ ENTRY(trap_int3)
 
 // 4 #OF 溢出异常
 ENTRY(trap_overflow)
-    pushq $0
+    pushq $-1    // #OF 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_overflow(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -188,7 +189,7 @@ ENTRY(trap_overflow)
 
 // 5 #BR 越界异常
 ENTRY(trap_bounds)
-    pushq $0
+    pushq $-1    // #BR 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_bounds(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -196,7 +197,7 @@ ENTRY(trap_bounds)
 
 // 6 #UD 无效/未定义的机器码
 ENTRY(trap_undefined_opcode)
-    pushq $0
+    pushq $-1    // #UD 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_undefined_opcode(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -204,7 +205,7 @@ ENTRY(trap_undefined_opcode)
 
 // 7 #NM 设备异常（FPU不存在）
 ENTRY(trap_dev_not_avaliable)
-    pushq $0
+    pushq $-1    // #NM 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_dev_not_avaliable(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -219,7 +220,7 @@ ENTRY(trap_double_fault)
 
 // 9 协处理器越界（保留）
 ENTRY(trap_coprocessor_segment_overrun)
-    pushq $0
+    pushq $-1    // 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_coprocessor_segment_overrun(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -268,7 +269,7 @@ ENTRY(trap_page_fault)
 
 // 16 #MF X87 FPU错误（计算错误）
 ENTRY(trap_x87_FPU_error)
-    pushq $0
+    pushq $-1    // #MF 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_x87_FPU_error(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -283,7 +284,7 @@ ENTRY(trap_alignment_check)
 
 // 18 #MC 机器检测
 ENTRY(trap_machine_check)
-    pushq $0
+    pushq $-1    // #MC 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_machine_check(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -291,7 +292,7 @@ ENTRY(trap_machine_check)
 
 // 19 #XM SIMD浮点异常
 ENTRY(trap_SIMD_exception)
-    pushq $0
+    pushq $-1    // #XM 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_SIMD_exception(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -299,7 +300,7 @@ ENTRY(trap_SIMD_exception)
 
 // 20 #VE 虚拟化异常
 ENTRY(trap_virtualization_exception)
-    pushq $0
+    pushq $-1    // #VE 无错误码；orig_rax 哨兵
     pushq %rax
     leaq do_virtualization_exception(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中

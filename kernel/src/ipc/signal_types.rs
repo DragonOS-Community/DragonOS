@@ -1,4 +1,4 @@
-use core::{ffi::c_void, mem::size_of};
+use core::ffi::c_void;
 
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -11,7 +11,6 @@ use crate::{
     },
     mm::VirtAddr,
     process::RawPid,
-    syscall::user_access::UserBufferWriter,
 };
 
 /// siginfo中的si_code的可选值
@@ -349,6 +348,14 @@ pub struct PosixSigInfo {
     pub _sifields: PosixSiginfoFields,
 }
 
+/// `PosixSigInfo` 全零是有效表示（si_signo=0, si_code=0 等）。
+/// 用于 `copy_from_user` 等需要 Default 的场景。
+impl Default for PosixSigInfo {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union PosixSiginfoFields {
@@ -477,6 +484,86 @@ const _: [(); 8] = [(); core::mem::size_of::<PosixSigval>()];
 impl SigInfo {
     pub fn sig_code(&self) -> SigCode {
         self.sig_code
+    }
+
+    /// 从用户态 PosixSigInfo 完整转换为 SigInfo。
+    pub fn from_posix(posix: &PosixSigInfo) -> Self {
+        let sig_code = SigCode::try_from_i32(posix.si_code).unwrap_or(SigCode::Raw(posix.si_code));
+        let sig_type = unsafe {
+            match posix.si_code {
+                // SI_USER(0)/SI_TKILL(-6)：Kill{pid,uid}
+                0 | -6 => SigType::Kill {
+                    pid: RawPid::new(posix._sifields._kill.si_pid as usize),
+                    uid: posix._sifields._kill.si_uid,
+                },
+                // SI_QUEUE(-1)/SI_MESGQ(-3)：Rt{pid,uid,sigval}
+                -1 | -3 => SigType::Rt {
+                    pid: RawPid::new(posix._sifields._rt.si_pid as usize),
+                    uid: posix._sifields._rt.si_uid,
+                    sigval: posix._sifields._rt.si_sigval,
+                },
+                // SI_TIMER(-2)：PosixTimer{timerid,overrun,sigval}
+                -2 => SigType::PosixTimer {
+                    timerid: posix._sifields._timer.si_tid,
+                    overrun: posix._sifields._timer.si_overrun,
+                    sigval: posix._sifields._timer.si_sigval,
+                },
+                // SIGCHLD：SigChild{pid,uid,status,utime,stime}
+                _ if posix.si_signo == Signal::SIGCHLD as i32 => SigType::SigChild {
+                    pid: RawPid::new(posix._sifields._sigchld.si_pid as usize),
+                    uid: posix._sifields._sigchld.si_uid,
+                    status: posix._sifields._sigchld.si_status,
+                    utime: posix._sifields._sigchld.si_utime,
+                    stime: posix._sifields._sigchld.si_stime,
+                },
+                // 同步故障信号（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGTRAP，si_code>0）：
+                // Fault{addr,addr_lsb}
+                _ if posix.si_code > 0
+                    && matches!(
+                        posix.si_signo,
+                        4 | 5
+                            | 7
+                            | 8
+                            | 9
+                            | 10
+                            | 11
+                            | 12
+                            | 13
+                            | 14
+                            | 16
+                            | 17
+                            | 18
+                            | 23
+                            | 24
+                            | 26
+                            | 27
+                            | 31
+                    ) =>
+                {
+                    SigType::Fault {
+                        addr: posix._sifields._sigfault.si_addr,
+                        addr_lsb: posix._sifields._sigfault.si_addr_lsb,
+                    }
+                }
+                // SIGSYS（seccomp）：SigSys{call_addr,syscall,arch}
+                _ if posix.si_signo == Signal::SIGSYS as i32 => SigType::SigSys {
+                    call_addr: posix._sifields._sigsys._call_addr,
+                    syscall: posix._sifields._sigsys._syscall,
+                    arch: posix._sifields._sigsys._arch,
+                },
+                // 其余情况：退化为 Kill 类型（保留 si_pid/si_uid）。
+                _ => SigType::Kill {
+                    pid: RawPid::new(posix._sifields._kill.si_pid as usize),
+                    uid: posix._sifields._kill.si_uid,
+                },
+            }
+        };
+        Self {
+            sig_no: posix.si_signo,
+            errno: posix.si_errno,
+            sig_code,
+            sig_type,
+        }
     }
 
     pub fn has_pid_and_uid(&self) -> bool {
@@ -675,14 +762,15 @@ impl SigInfo {
     /// 该函数对应Linux中的https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c#3323
     #[inline(never)]
     pub fn copy_posix_siginfo_to_user(&self, to: *mut PosixSigInfo) -> Result<i32, SystemError> {
-        // 验证目标地址是否为用户空间
         let posix_siginfo = self.convert_to_posix_siginfo();
-        let mut user_buffer = UserBufferWriter::new(to, size_of::<PosixSigInfo>(), true)?;
-
-        let retval: Result<i32, SystemError> = Ok(0);
-
-        user_buffer.copy_one_to_user(&posix_siginfo, 0)?;
-        return retval;
+        // 走异常表保护写入用户 siginfo，坏指针返回 EFAULT 而非 panic。
+        unsafe {
+            crate::syscall::user_access::write_one_to_user_protected(
+                VirtAddr::new(to as usize),
+                &posix_siginfo,
+            )?;
+        }
+        Ok(0)
     }
 }
 
@@ -751,7 +839,7 @@ impl SigInfo {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SigPending {
     signal: SigSet,
     queue: SigQueue,

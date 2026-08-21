@@ -21,6 +21,7 @@ mod sys_gettid;
 mod sys_getuid;
 mod sys_groups;
 mod sys_init_module;
+mod sys_personality;
 mod sys_pidfdopen;
 mod sys_prctl;
 pub mod sys_prlimit64;

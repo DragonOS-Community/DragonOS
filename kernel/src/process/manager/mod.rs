@@ -220,7 +220,8 @@ impl ProcessManager {
             let Some(task) = weak.upgrade() else {
                 continue;
             };
-            if tasks.iter().any(|existing| Arc::ptr_eq(existing, &task)) {
+            // 组列表由组长维护且不包含组长自身
+            if Arc::ptr_eq(&task, &leader) {
                 continue;
             }
             tasks.push(task);

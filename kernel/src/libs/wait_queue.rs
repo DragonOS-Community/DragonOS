@@ -26,7 +26,7 @@ use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
     libs::mutex::MutexGuard,
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{ProcessControlBlock, ProcessManager, ProcessState},
     sched::{io_schedule, schedule, SchedMode},
     time::{
         timer::{clock, next_n_us_timer_jiffies, Timer},
@@ -1032,11 +1032,7 @@ fn block_current_impl(
 
         // Handle a wake racing between prepare_sleep and mark_sleep.
         if waiter.waker.consume_notification() {
-            let pcb = ProcessManager::current_pcb();
-            if pcb.sched_info().state().is_blocked() {
-                pcb.sched_info().set_state(ProcessState::Runnable);
-            }
-            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
+            ProcessManager::undo_mark_sleep();
             drop(irq_guard);
             return Ok(());
         }
@@ -1076,11 +1072,7 @@ fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
         ProcessManager::mark_sleep(true)?;
 
         if waiter.waker.consume_notification() {
-            let pcb = ProcessManager::current_pcb();
-            if pcb.sched_info().state().is_blocked() {
-                pcb.sched_info().set_state(ProcessState::Runnable);
-            }
-            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
+            ProcessManager::undo_mark_sleep();
             drop(irq_guard);
             return Ok(());
         }

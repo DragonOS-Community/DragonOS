@@ -9,7 +9,6 @@ pub mod int_like;
 pub mod keyboard_parser;
 pub mod lazy_init;
 pub mod lib_ui;
-pub mod lock_free_flags;
 pub mod mutex;
 pub mod notifier;
 pub mod once;

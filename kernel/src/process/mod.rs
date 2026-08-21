@@ -63,7 +63,7 @@ pub(crate) use process_group::Pgid;
 pub(crate) use sched_info::NewTaskPlacement;
 #[allow(unused_imports)]
 pub use sched_info::{PiProtected, ProcessSchedulerInfo, SchedInfo};
-pub use state::{ExitState, ProcessFlags, ProcessState};
+pub use state::{AtomicProcessFlags, ExitState, ProcessFlags, ProcessState};
 pub use task::ProcessControlBlock;
 
 pub fn process_init() {

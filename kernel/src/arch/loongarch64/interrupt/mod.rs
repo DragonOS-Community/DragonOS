@@ -115,6 +115,22 @@ impl TrapFrame {
         let x = core::mem::MaybeUninit::<Self>::zeroed();
         unsafe { x.assume_init() }
     }
+
+    /// 设置系统调用返回值寄存器（loongarch64 为 a0）。
+    #[inline]
+    pub fn set_return_value(&mut self, value: usize) {
+        self.a0 = value;
+    }
+
+    /// 读取系统调用返回值寄存器（loongarch64 为 a0）。
+    pub fn get_syscall_return(&self) -> usize {
+        self.a0
+    }
+
+    #[inline]
+    pub fn get_orig_syscall_nr(&self) -> i64 {
+        self.a7 as i64
+    }
 }
 
 impl ProbeArgs for TrapFrame {

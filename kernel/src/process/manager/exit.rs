@@ -22,7 +22,7 @@ use crate::{
         constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
         futex::{Futex, RobustListHead},
     },
-    mm::IDLE_PROCESS_ADDRESS_SPACE,
+    mm::{ucontext::AddressSpace, IDLE_PROCESS_ADDRESS_SPACE},
     process::{
         exit::wstatus_to_waitid_exit_info,
         kthread::KernelThreadMechanism,
@@ -378,6 +378,8 @@ impl ProcessManager {
             }
         }
 
+        current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
+
         let pid: Arc<Pid>;
         let raw_pid = current_pcb.raw_pid();
         // log::debug!("[exit: {}]", raw_pid.data());
@@ -466,15 +468,7 @@ impl ProcessManager {
                 drop(irq_guard);
                 old_vm
             });
-            if let Some(old_vm) = old_user_vm.as_ref() {
-                let last_user = !Self::mm_has_user_tasks(old_vm);
-                if last_user {
-                    unsafe {
-                        old_vm.write().unmap_all();
-                    }
-                    crate::mm::oom::note_oom_victim_mm_released(old_vm.id());
-                }
-            }
+            Self::release_old_user_vm_if_last(old_user_vm.as_ref());
             drop(old_user_vm);
 
             pcb.exit_files();
@@ -723,6 +717,21 @@ impl ProcessManager {
                     .wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
             }
+        }
+    }
+
+    /// 释放旧用户地址空间：当没有任何任务还在使用它时，立即拆除全部映射
+    pub(crate) fn release_old_user_vm_if_last(old_vm: Option<&Arc<AddressSpace>>) {
+        let Some(old_vm) = old_vm else {
+            return;
+        };
+        if !Self::mm_has_user_tasks(old_vm) {
+            unsafe {
+                // 先持写锁拆除映射，再置 torn_down。与读者形成临界区边界。
+                old_vm.write().unmap_all();
+            }
+            old_vm.mark_torn_down();
+            crate::mm::oom::note_oom_victim_mm_released(old_vm.id());
         }
     }
 }

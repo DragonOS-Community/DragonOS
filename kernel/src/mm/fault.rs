@@ -19,7 +19,7 @@ use crate::{
         ucontext::{AddressSpace, InnerAddressSpace, LockedVMA},
         PhysAddr, VirtAddr, VmFaultReason, VmFlags,
     },
-    process::{ProcessManager, ProcessState},
+    process::ProcessManager,
 };
 
 use crate::mm::MemoryManagementArch;
@@ -472,9 +472,7 @@ impl PageFaultHandler {
         let flags = pfm.flags();
         let vma = pfm.vma();
         let current_pcb = ProcessManager::current_pcb();
-        {
-            current_pcb.sched_info().set_state(ProcessState::Runnable);
-        }
+        current_pcb.sched_info().restore_runnable_if_blocked();
 
         let reason = if !MMArch::vma_access_permitted(
             vma.clone(),

@@ -1,24 +1,21 @@
-use core::sync::atomic::compiler_fence;
-
-use num_traits::FromPrimitive;
-
-use crate::ipc::signal_types::SignalFlags;
 use crate::{
     arch::{
-        ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
+        ipc::signal::{SigChildCode, SigSet, Signal, MAX_SIG_NUM},
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    process::ProcessManager,
+    ipc::signal_types::SignalFlags,
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
 };
 use alloc::sync::Arc;
+use core::sync::atomic::compiler_fence;
+use num_traits::FromPrimitive;
 
 /// 信号处理的栈的栈指针的最小对齐
 #[allow(dead_code)]
 pub const GENERIC_STACK_ALIGN: u64 = 16;
 /// 信号最大值
-#[allow(dead_code)]
 pub const GENERIC_MAX_SIG_NUM: usize = 64;
 
 #[allow(dead_code)]
@@ -412,10 +409,10 @@ fn sig_terminate(sig: Signal) {
             if let Some(exec_task) = sighand.group_exec_task() {
                 if !Arc::ptr_eq(&exec_task, &current) {
                     // de_thread() privately injects SIGKILL into the siblings
-                    // that the exec owner is replacing. Only those siblings
-                    // exit individually; an externally delivered SIGKILL
-                    // targeting the exec owner remains process-fatal.
-                    ProcessManager::exit(sig as usize);
+                    // that the exec owner is replacing. They exit with code 0,
+                    // mirroring Linux do_group_exit() group_exec_task override
+                    // so PTRACE_EVENT_EXIT reports WIFEXITED(0).
+                    ProcessManager::exit(0);
                 }
             }
         }
@@ -448,18 +445,35 @@ fn sig_terminate_dump(sig: Signal) {
 fn sig_stop(sig: Signal) {
     // 在接收者上下文设置停止标志，并让当前任务进入 Stopped
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let fresh_stop = {
-        let pcb = ProcessManager::current_pcb();
-        pcb.sighand()
-            .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok())
-    };
+    let pcb = ProcessManager::current_pcb();
+    if pcb.sighand().flags_contains(SignalFlags::GROUP_EXIT) {
+        drop(guard);
+        return;
+    }
+    // 被 ptrace 跟踪的 tracee：stop 信号不上报 real_parent 的 group-stop，而是上报 tracer
+    if pcb.flags().contains(ProcessFlags::PTRACED) {
+        if pcb.flags().contains(ProcessFlags::PT_SEIZED) {
+            drop(guard);
+            let _ = pcb.ptrace_event_stop(sig);
+            return;
+        }
+        // 非 SEIZED ptraced：经 ptrace_stop 上报 group-stop 给 tracer（CLD_STOPPED）
+        let signr = pcb.ptrace_stop(sig as usize, SigChildCode::Stopped, None);
+        drop(guard);
+        ProcessControlBlock::reinject_ptrace_signal(signr);
+        return;
+    }
+    // 非 ptraced 的普通进程：走 transition_group_stop（持 sighand 锁原子设置
+    // STOP_STOPPED | CLD_STOPPED + stop_signal），上报 real_parent。
+    let fresh_stop = pcb
+        .sighand()
+        .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok());
     drop(guard);
     log::debug!(
         "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",
-        ProcessManager::current_pcb().raw_pid()
+        pcb.raw_pid()
     );
     // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
-    let pcb = ProcessManager::current_pcb();
     if fresh_stop {
         if let Some(parent) = pcb.parent_pcb() {
             let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);

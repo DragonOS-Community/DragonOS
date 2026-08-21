@@ -1,5 +1,6 @@
 use core::{
     fmt,
+    ops::Deref,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -2507,6 +2508,99 @@ impl ReservedFd {
     }
 }
 
+/// A Linux-style files-table identity.
+///
+/// `Arc` references may also be held temporarily by procfs, BPF verification,
+/// or an in-flight syscall. `task_users` deliberately counts only PCB fd-table
+/// slots, so observers cannot make a private table look shared through
+/// `CLONE_FILES`.
+#[derive(Debug)]
+pub struct FileDescriptorTable {
+    inner: RwSem<FileDescriptorVec>,
+    task_users: AtomicUsize,
+}
+
+impl FileDescriptorTable {
+    pub fn new(inner: FileDescriptorVec) -> Self {
+        Self {
+            inner: RwSem::new(inner),
+            task_users: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn attach_task(&self) {
+        self.task_users
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |users| {
+                users.checked_add(1)
+            })
+            .expect("fd-table task-user count overflow");
+    }
+
+    pub(crate) fn detach_task(&self) {
+        self.task_users
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |users| {
+                users.checked_sub(1)
+            })
+            .expect("fd-table task-user count underflow");
+    }
+
+    #[inline]
+    pub(crate) fn is_shared_by_tasks(&self) -> bool {
+        self.task_users.load(Ordering::Acquire) > 1
+    }
+
+    /// Fallibly clone a files table, optionally omitting an open tail covered
+    /// by a `close_range(CLOSE_RANGE_UNSHARE)` operation.
+    ///
+    /// All allocations finish while the destination contains no files. The
+    /// source is then rechecked under its read guard before an infallible
+    /// populate step, so ENOMEM cannot trigger close side effects for an
+    /// unpublished clone.
+    pub(crate) fn try_clone(
+        source: &Arc<Self>,
+        punch_hole: Option<(u32, u32)>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let mut target_len = source.read().clone_plan(punch_hole).target_len;
+
+        loop {
+            let layout = FileDescriptorVec::try_allocate_empty_clone_layout(target_len)?;
+            let destination = Arc::try_new(Self::new(layout)).map_err(|_| SystemError::ENOMEM)?;
+
+            let source_guard = source.read();
+            let current_plan = source_guard.clone_plan(punch_hole);
+            let capacity = destination.read().empty_layout_capacity();
+            if current_plan.target_len > capacity {
+                target_len = current_plan.target_len;
+                drop(source_guard);
+                drop(destination);
+                continue;
+            }
+
+            {
+                let mut destination_guard = destination.write();
+                destination_guard.resize_empty_clone_layout(current_plan.target_len);
+                source_guard.populate_clone(&mut destination_guard, current_plan.copy_len);
+            }
+            drop(source_guard);
+            return Ok(destination);
+        }
+    }
+}
+
+impl Deref for FileDescriptorTable {
+    type Target = RwSem<FileDescriptorVec>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for FileDescriptorTable {
+    fn drop(&mut self) {
+        debug_assert_eq!(self.task_users.load(Ordering::Relaxed), 0);
+    }
+}
+
 /// @brief pcb里面的文件描述符数组
 #[derive(Debug)]
 pub struct FileDescriptorVec {
@@ -2522,6 +2616,50 @@ pub struct FileDescriptorVec {
     /// 类似于 Linux 的 fd_next_fd
     next_fd: usize,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct FdTableClonePlan {
+    target_len: usize,
+    copy_len: usize,
+}
+
+impl FdTableClonePlan {
+    fn from_retained_highest(retained_highest: Option<usize>, source_len: usize) -> Self {
+        let required = retained_highest.map_or(0, |fd| fd + 1);
+        Self {
+            target_len: core::cmp::max(FileDescriptorVec::INITIAL_CAPACITY, required),
+            // The minimum table layout must not expand the File population
+            // bound. In particular, a tail punch-hole clone should never
+            // clone files in the range only to close/flush them afterwards.
+            copy_len: core::cmp::min(required, source_len),
+        }
+    }
+}
+
+#[cfg(test)]
+mod fd_table_clone_plan_tests {
+    use super::{FdTableClonePlan, FileDescriptorVec};
+
+    #[test]
+    fn minimum_layout_does_not_expand_tail_punch_copy_bound() {
+        let plan = FdTableClonePlan::from_retained_highest(Some(63), 1024);
+
+        assert_eq!(plan.target_len, FileDescriptorVec::INITIAL_CAPACITY);
+        assert_eq!(plan.copy_len, 64);
+    }
+}
+
+/// One bounded step of `close_range()` scanning.
+///
+/// The caller owns the fd-table write guard while this value is produced, then
+/// drops that guard before finishing `dropped` or yielding the scheduler.
+pub(crate) struct FdRangeScan {
+    pub(crate) next: usize,
+    pub(crate) scanned: usize,
+    pub(crate) dropped: Option<DroppedFd>,
+    pub(crate) done: bool,
+}
+
 impl Default for FileDescriptorVec {
     fn default() -> Self {
         Self::new()
@@ -2554,35 +2692,80 @@ impl FileDescriptorVec {
         };
     }
 
-    /// @brief 克隆一个文件描述符数组
-    ///
-    /// 语义对齐 Linux dup_fd/new files_struct：
-    /// - 复制 fd 与 cloexec 状态
-    /// - 分配新的 record-lock owner（POSIX 锁 owner 绑定 files table）
-    ///   因此 fork 出来的新进程不会与父进程共享 POSIX record lock owner。
-    ///
-    /// @return FileDescriptorVec 克隆后的文件描述符数组
-    pub fn clone(&self) -> FileDescriptorVec {
-        let mut res = FileDescriptorVec::new();
-        // 调整容量以匹配源文件描述符表
-        let _ = res.resize_to_capacity(self.fds.len());
-
-        for i in 0..self.fds.len() {
-            if let Some(file) = &self.fds[i] {
-                res.fds[i] = Some(file.clone());
-                res.cloexec[i] = self.cloexec[i];
+    fn clone_plan(&self, punch_hole: Option<(u32, u32)>) -> FdTableClonePlan {
+        let highest_open = self.fds.iter().rposition(Option::is_some);
+        let retained_highest = match (highest_open, punch_hole) {
+            (Some(highest), Some((first, last)))
+                if highest >= first as usize && highest <= last as usize =>
+            {
+                self.fds[..core::cmp::min(first as usize, self.fds.len())]
+                    .iter()
+                    .rposition(Option::is_some)
             }
-        }
-        // reserved fd 不属于已经安装的 open file description，clone 时不复制。
-        // 因此 next_fd 必须按 clone 后的真实空闲槽重新计算。
-        res.next_fd = res.first_available_fd_from(0).unwrap_or(res.fds.len());
-        // 新 fd table 必须拥有新的 record-lock owner（对齐 Linux 新 files_struct）。
-        res.lock_owner_id = alloc_lock_owner_id();
-        return res;
+            (highest, _) => highest,
+        };
+
+        FdTableClonePlan::from_retained_highest(retained_highest, self.fds.len())
     }
 
-    fn first_available_fd_from(&self, start: usize) -> Option<usize> {
-        (start..self.fds.len()).find(|&i| self.fds[i].is_none() && !self.reserved[i])
+    fn try_allocate_empty_clone_layout(target_len: usize) -> Result<Self, SystemError> {
+        let mut fds = Vec::new();
+        let mut cloexec = Vec::new();
+        let mut reserved = Vec::new();
+
+        fds.try_reserve_exact(target_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        cloexec
+            .try_reserve_exact(target_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        reserved
+            .try_reserve_exact(target_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+
+        fds.resize(target_len, None);
+        cloexec.resize(target_len, false);
+        reserved.resize(target_len, false);
+
+        Ok(Self {
+            fds,
+            cloexec,
+            reserved,
+            lock_owner_id: alloc_lock_owner_id(),
+            next_fd: 0,
+        })
+    }
+
+    fn empty_layout_capacity(&self) -> usize {
+        debug_assert!(self.fds.iter().all(Option::is_none));
+        debug_assert!(self.cloexec.iter().all(|flag| !flag));
+        debug_assert!(self.reserved.iter().all(|reserved| !reserved));
+        self.fds
+            .capacity()
+            .min(self.cloexec.capacity())
+            .min(self.reserved.capacity())
+    }
+
+    fn resize_empty_clone_layout(&mut self, target_len: usize) {
+        debug_assert!(target_len <= self.empty_layout_capacity());
+        self.fds.resize(target_len, None);
+        self.cloexec.resize(target_len, false);
+        self.reserved.resize(target_len, false);
+    }
+
+    fn populate_clone(&self, destination: &mut Self, copy_len: usize) {
+        debug_assert!(destination.fds.iter().all(Option::is_none));
+        let copy_len = copy_len.min(self.fds.len()).min(destination.fds.len());
+        let mut next_fd = None;
+        for index in 0..copy_len {
+            if let Some(file) = &self.fds[index] {
+                destination.fds[index] = Some(file.clone());
+                destination.cloexec[index] = self.cloexec[index];
+            } else if next_fd.is_none() {
+                next_fd = Some(index);
+            }
+        }
+        // A reserved slot belongs to the old files table and is never copied.
+        destination.next_fd = next_fd.unwrap_or(copy_len);
     }
 
     /// 返回当前已占用的最高文件描述符索引（若无则为None）
@@ -2974,6 +3157,79 @@ impl FileDescriptorVec {
         }
 
         return Ok(DroppedFd::new(file, self.lock_owner_id));
+    }
+
+    /// Return the last currently addressable fd in an inclusive range.
+    pub(crate) fn close_range_end(&self, last: u32) -> Option<usize> {
+        self.fds
+            .len()
+            .checked_sub(1)
+            .map(|table_end| core::cmp::min(last as usize, table_end))
+    }
+
+    /// Scan a bounded portion of an inclusive fd range and detach the next
+    /// installed file, if any.
+    ///
+    /// Empty and reserved slots are skipped without changing their ownership.
+    /// The caller must finish the returned `DroppedFd` after releasing the
+    /// fd-table guard.
+    pub(crate) fn take_next_open_in_range(
+        &mut self,
+        cursor: usize,
+        end: usize,
+        scan_budget: usize,
+    ) -> FdRangeScan {
+        debug_assert!(scan_budget > 0);
+        if cursor > end || cursor >= self.fds.len() {
+            return FdRangeScan {
+                next: cursor,
+                scanned: 0,
+                dropped: None,
+                done: true,
+            };
+        }
+
+        let effective_end = end.min(self.fds.len() - 1);
+        let scan_end = effective_end.min(cursor.saturating_add(scan_budget - 1));
+        for index in cursor..=scan_end {
+            if let Some(file) = self.fds[index].take() {
+                self.cloexec[index] = false;
+                if index < self.next_fd {
+                    self.next_fd = index;
+                }
+                let next = index + 1;
+                return FdRangeScan {
+                    next,
+                    scanned: next - cursor,
+                    dropped: Some(DroppedFd::new(file, self.lock_owner_id)),
+                    done: next > end,
+                };
+            }
+        }
+
+        let next = scan_end + 1;
+        FdRangeScan {
+            next,
+            scanned: next - cursor,
+            dropped: None,
+            done: next > end || next >= self.fds.len(),
+        }
+    }
+
+    /// Set `FD_CLOEXEC` for every fd slot in an inclusive range.
+    ///
+    /// Reserved slots are deliberately included so a later fd installation
+    /// preserves the flag. A future allocation into an ordinary empty slot
+    /// overwrites it with that allocation's requested cloexec state.
+    pub(crate) fn set_cloexec_range(&mut self, first: u32, last: u32) {
+        let Some(end) = self.close_range_end(last) else {
+            return;
+        };
+        let first = first as usize;
+        if first > end {
+            return;
+        }
+        self.cloexec[first..=end].fill(true);
     }
 
     #[allow(dead_code)]

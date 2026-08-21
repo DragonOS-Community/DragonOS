@@ -8,9 +8,9 @@ use core::sync::atomic::AtomicUsize;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     driver::tty::tty_core::TtyCore,
-    filesystem::vfs::file::FileDescriptorVec,
+    filesystem::vfs::file::{FileDescriptorTable, FileDescriptorVec},
     ipc::signal_types::{SigInfo, SigPending},
-    libs::{rwlock::RwLock, rwsem::RwSem},
+    libs::rwlock::RwLock,
     mm::{ucontext::AddressSpace, VirtAddr},
     process::{ProcessControlBlock, ProcessManager, RawPid},
     sched::completion::Completion,
@@ -133,7 +133,61 @@ pub struct ProcessBasicInfo {
     user_vm: Option<Arc<AddressSpace>>,
 
     /// File descriptor table.
-    fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
+    fd_table: Option<FdTableAttachment>,
+}
+
+/// A PCB slot's ownership of a files table.
+///
+/// This type intentionally does not implement `Clone`: only
+/// `share_for_task()` may create another task attachment. Ordinary table
+/// observers receive only an `Arc<FileDescriptorTable>`.
+#[derive(Debug)]
+pub(crate) struct FdTableAttachment {
+    table: Option<Arc<FileDescriptorTable>>,
+}
+
+impl FdTableAttachment {
+    fn new(table: Arc<FileDescriptorTable>) -> Self {
+        table.attach_task();
+        Self { table: Some(table) }
+    }
+
+    fn share_for_task(&self) -> Self {
+        Self::new(
+            self.table
+                .as_ref()
+                .expect("retired fd-table attachment")
+                .clone(),
+        )
+    }
+
+    fn observer(&self) -> Arc<FileDescriptorTable> {
+        self.table
+            .as_ref()
+            .expect("retired fd-table attachment")
+            .clone()
+    }
+
+    fn is_shared(&self) -> bool {
+        self.table
+            .as_ref()
+            .expect("retired fd-table attachment")
+            .is_shared_by_tasks()
+    }
+
+    fn retire(mut self) -> Arc<FileDescriptorTable> {
+        let table = self.table.take().expect("retired fd-table attachment");
+        table.detach_task();
+        table
+    }
+}
+
+impl Drop for FdTableAttachment {
+    fn drop(&mut self) {
+        if let Some(table) = self.table.take() {
+            table.detach_task();
+        }
+    }
 }
 
 impl ProcessBasicInfo {
@@ -144,13 +198,13 @@ impl ProcessBasicInfo {
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
-        let fd_table = Arc::new(RwSem::new(FileDescriptorVec::new()));
+        let fd_table = Arc::new(FileDescriptorTable::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
             ppid,
             name,
             cwd,
             user_vm,
-            fd_table: Some(fd_table),
+            fd_table: Some(FdTableAttachment::new(fd_table)),
         });
     }
 
@@ -193,25 +247,62 @@ impl ProcessBasicInfo {
         old
     }
 
-    pub fn try_fd_table(&self) -> Option<Arc<RwSem<FileDescriptorVec>>> {
-        return self.fd_table.clone();
+    pub fn try_fd_table(&self) -> Option<Arc<FileDescriptorTable>> {
+        self.fd_table.as_ref().map(FdTableAttachment::observer)
     }
 
-    #[inline]
-    pub fn fd_table_is_shared(&self) -> bool {
+    pub(crate) fn fd_table_snapshot(&self) -> Option<(Arc<FileDescriptorTable>, bool)> {
         self.fd_table
             .as_ref()
-            .map(|t| Arc::strong_count(t) > 1)
-            .unwrap_or(false)
+            .map(|attachment| (attachment.observer(), attachment.is_shared()))
+    }
+
+    pub(crate) fn share_fd_table_for_task(&self) -> Option<FdTableAttachment> {
+        self.fd_table
+            .as_ref()
+            .map(FdTableAttachment::share_for_task)
     }
 
     pub fn set_fd_table(
         &mut self,
-        fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
-    ) -> Option<Arc<RwSem<FileDescriptorVec>>> {
+        fd_table: Option<Arc<FileDescriptorTable>>,
+    ) -> Option<Arc<FileDescriptorTable>> {
+        self.set_fd_table_attachment(fd_table.map(FdTableAttachment::new))
+    }
+
+    pub(crate) fn set_fd_table_attachment(
+        &mut self,
+        fd_table: Option<FdTableAttachment>,
+    ) -> Option<Arc<FileDescriptorTable>> {
         let old = self.fd_table.take();
         self.fd_table = fd_table;
-        return old;
+        old.map(FdTableAttachment::retire)
+    }
+}
+
+#[cfg(test)]
+mod fd_table_attachment_tests {
+    use alloc::sync::Arc;
+
+    use super::FdTableAttachment;
+    use crate::filesystem::vfs::file::{FileDescriptorTable, FileDescriptorVec};
+
+    #[test]
+    fn observer_arcs_do_not_count_as_task_sharing() {
+        let table = Arc::new(FileDescriptorTable::new(FileDescriptorVec::new()));
+        let owner = FdTableAttachment::new(table);
+        let observer = owner.observer();
+        let another_observer = observer.clone();
+
+        assert!(!owner.is_shared());
+        let shared_owner = owner.share_for_task();
+        assert!(owner.is_shared());
+        drop(shared_owner);
+        assert!(!owner.is_shared());
+
+        drop(another_observer);
+        drop(observer);
+        drop(owner);
     }
 }
 

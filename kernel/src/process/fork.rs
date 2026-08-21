@@ -4,9 +4,7 @@ use core::sync::atomic::Ordering;
 use crate::arch::MMArch;
 use crate::cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src};
 use crate::filesystem::cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node};
-use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::file::ReservedFd;
+use crate::filesystem::vfs::file::{File, FileDescriptorTable, FileFlags, ReservedFd};
 use crate::filesystem::vfs::FileType;
 use crate::mm::access_ok;
 use crate::mm::MemoryManagementArch;
@@ -18,7 +16,7 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     ipc::signal_types::SignalFlags,
-    libs::{cpumask::CpuMask, rwsem::RwSem},
+    libs::cpumask::CpuMask,
     mm::VirtAddr,
     process::ProcessFlags,
     sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
@@ -383,14 +381,21 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         // 如果不共享文件描述符表，则拷贝文件描述符表
         if !clone_flags.contains(CloneFlags::CLONE_FILES) {
-            let new_fd_table = current_pcb.basic().try_fd_table().unwrap().read().clone();
-            let new_fd_table = Arc::new(RwSem::new(new_fd_table));
-            new_pcb.basic_mut().set_fd_table(Some(new_fd_table));
+            let source = current_pcb
+                .basic()
+                .try_fd_table()
+                .expect("fork parent has no fd table");
+            let new_fd_table = FileDescriptorTable::try_clone(&source, None)?;
+            let replaced = new_pcb.basic_mut().set_fd_table(Some(new_fd_table));
+            drop(replaced);
         } else {
             // 如果共享文件描述符表，则直接拷贝指针
-            new_pcb
-                .basic_mut()
-                .set_fd_table(current_pcb.basic().try_fd_table().clone());
+            let shared = current_pcb
+                .basic()
+                .share_fd_table_for_task()
+                .expect("fork parent has no fd table");
+            let replaced = new_pcb.basic_mut().set_fd_table_attachment(Some(shared));
+            drop(replaced);
         }
 
         return Ok(());
@@ -711,12 +716,7 @@ impl ProcessManager {
         );
 
         // 拷贝文件描述符表
-        Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy files from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
+        Self::copy_files(&clone_flags, current_pcb, pcb)?;
 
         // 拷贝信号相关数据
         Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {

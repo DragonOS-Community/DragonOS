@@ -1,4 +1,5 @@
 # Focused conformance binaries that must never report a skipped gtest case.
+normal/close_range_semantics
 normal/test_pivot_root
 normal/mount_propagation
 normal/mount_object_topology

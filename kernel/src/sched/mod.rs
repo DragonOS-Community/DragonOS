@@ -1509,6 +1509,20 @@ pub fn sched_yield() {
     schedule(SchedMode::SM_NONE);
 }
 
+/// Reschedule at a preemptible kernel boundary only when the scheduler has
+/// already requested it. Unlike `sched_yield()`, this does not voluntarily
+/// give up the CPU or alter scheduling-class yield state when no reschedule is
+/// pending.
+#[inline]
+pub fn cond_resched() {
+    if ProcessManager::current_pcb()
+        .flags()
+        .contains(ProcessFlags::NEED_SCHEDULE)
+    {
+        schedule(SchedMode::SM_PREEMPT);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::loadavg;

@@ -1,11 +1,7 @@
 #![allow(function_casts_as_integer)]
 
 use crate::{
-    arch::{
-        ipc::signal::X86_64SignalArch,
-        syscall::nr::{SYS_ARCH_PRCTL, SYS_RT_SIGRETURN},
-        CurrentIrqArch,
-    },
+    arch::{ipc::signal::X86_64SignalArch, CurrentIrqArch},
     exception::InterruptArch,
     ipc::signal_types::SignalArch,
     libs::align::SafeForZero,
@@ -22,6 +18,8 @@ use super::{
 };
 
 pub mod nr;
+mod sys_arch_prctl;
+mod sys_rt_sigreturn;
 
 /// ### 存储PCB系统调用栈以及在syscall过程中暂存用户态rsp的结构体
 ///
@@ -105,29 +103,6 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         debug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
     }
 
-    // Arch specific syscall
-    let current_pcb = ProcessManager::current_pcb();
-    let nr = syscall_num as u64;
-    let arch_ret: usize = match syscall_num {
-        SYS_RT_SIGRETURN => {
-            // entry-stop 必须在 sys_rt_sigreturn 修改 frame 之前完成。
-            let _ = current_pcb.ptrace_report_syscall(true, nr, &args);
-            let r = X86_64SignalArch::sys_rt_sigreturn(frame) as usize;
-            // exit-stop 在 frame 已恢复为新信号上下文后报告
-            let _ = current_pcb.ptrace_report_syscall(false, nr, &args);
-            syscall_return!(r, frame, show);
-        }
-        SYS_ARCH_PRCTL => {
-            let _ = current_pcb.ptrace_report_syscall(true, nr, &args);
-            let r = Syscall::arch_prctl(args[0], args[1])
-                .unwrap_or_else(|e| e.to_posix_errno() as usize);
-            frame.rax = r as u64;
-            let _ = current_pcb.ptrace_report_syscall(false, nr, &args);
-            syscall_return!(r, frame, show);
-        }
-        _ => 0,
-    };
-    let _ = arch_ret;
     // syscall 执行（catch_handle 内部已把返回值写入 frame.rax）
     let mut syscall_handle = || -> u64 {
         Syscall::catch_handle(syscall_num, &args, frame)

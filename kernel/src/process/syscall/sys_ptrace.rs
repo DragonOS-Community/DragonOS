@@ -146,7 +146,7 @@ impl Syscall for SysPtrace {
             // GETREGS / SETREGS：读写 x86_64 用户寄存器。
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Getregs => {
-                let regs = tracee.tracee_user_regs();
+                let regs = tracee.tracee_user_regs()?;
                 copy_to_user(data, &regs)?;
                 0
             }
@@ -217,7 +217,7 @@ impl Syscall for SysPtrace {
                     return Err(SystemError::EINVAL);
                 }
                 let (iov_base, iov_len) = read_iovec(data)?;
-                let regs = tracee.tracee_user_regs();
+                let regs = tracee.tracee_user_regs()?;
                 let len = iov_len.min(core::mem::size_of::<ptrace::UserRegsStruct>());
                 // 走异常表保护，坏 iov_base 返回 EFAULT 而非 panic。
                 let regs_bytes: &[u8] = unsafe {
@@ -247,7 +247,7 @@ impl Syscall for SysPtrace {
                 }
                 let len = iov_len.min(core::mem::size_of::<ptrace::UserRegsStruct>());
                 // 读出当前寄存器，仅覆盖 iov 提供的前 len 字节，未覆盖字段（如 cs/ss）原样保留。
-                let mut regs = tracee.tracee_user_regs();
+                let mut regs = tracee.tracee_user_regs()?;
                 let regs_bytes: &mut [u8] = unsafe {
                     core::slice::from_raw_parts_mut(
                         &mut regs as *mut ptrace::UserRegsStruct as *mut u8,
@@ -265,21 +265,20 @@ impl Syscall for SysPtrace {
                 0
             }
             // GET_SYSCALL_INFO：读最近 syscall-stop 的 op/nr/args。
-            // addr 是输出指针，data 是用户缓冲区大小。
+            // Linux ABI：addr 是用户缓冲区大小，data 是输出缓冲区指针。
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Getsyscallinfo => {
-                let user_size = data;
-                let info = tracee.ptrace_get_syscall_info(user_size)?;
+                let user_size = addr;
+                let info = tracee.ptrace_get_syscall_info()?;
                 let actual: usize = match info.op {
                     ptrace::PtraceSyscallInfoOp::None => {
-                        core::mem::offset_of!(ptrace::PtraceSyscallInfo, arch)
-                            + core::mem::size_of::<u32>()
+                        core::mem::offset_of!(ptrace::PtraceSyscallInfo, data)
                     }
                     ptrace::PtraceSyscallInfoOp::Entry => 80,
                     ptrace::PtraceSyscallInfoOp::Exit => 33,
                     ptrace::PtraceSyscallInfoOp::Seccomp => 84,
                 };
-                // 截断到用户缓冲区大小，避免溢出。
+                // 截断到用户缓冲区大小，避免溢出；返回值是“可提供的字节数”。
                 let write_size = actual.min(user_size);
                 let info_bytes: &[u8] = unsafe {
                     core::slice::from_raw_parts(
@@ -289,7 +288,7 @@ impl Syscall for SysPtrace {
                 };
                 unsafe {
                     crate::syscall::user_access::copy_to_user_protected(
-                        VirtAddr::new(addr),
+                        VirtAddr::new(data),
                         &info_bytes[..write_size],
                     )?;
                 }

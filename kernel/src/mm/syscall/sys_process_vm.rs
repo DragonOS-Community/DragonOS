@@ -13,7 +13,6 @@ use crate::arch::syscall::nr::{SYS_PROCESS_VM_READV, SYS_PROCESS_VM_WRITEV};
 use crate::arch::MMArch;
 use crate::filesystem::vfs::iov::IoVec;
 use crate::mm::{access_ok, KernelWpGuard, MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion};
-use crate::process::cred::CAPFlags;
 use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -140,48 +139,13 @@ fn find_target_process(pid: usize) -> Result<Arc<ProcessControlBlock>, SystemErr
     Ok(target_pcb)
 }
 
-/// Check if current process has permission to access target process's memory
-///
-/// This implements a simplified version of Linux's ptrace_may_access() check.
-/// Access is allowed if:
-/// 1. Target is the same process as current (self-access)
-/// 2. Current process has CAP_SYS_PTRACE capability
-/// 3. Current process's uid/gid match target's euid/suid/uid and egid/sgid/gid
-///
-/// See Linux kernel: kernel/ptrace.c __ptrace_may_access()
+/// 检查当前进程是否有权访问目标进程内存。
 fn check_process_vm_access(target_pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     let current_pcb = ProcessManager::current_pcb();
-
-    // Self-access is always allowed
-    if Arc::ptr_eq(&current_pcb, target_pcb) {
-        return Ok(());
+    if !current_pcb.has_permission_to_trace(target_pcb) {
+        return Err(SystemError::EPERM);
     }
-
-    let current_cred = current_pcb.cred();
-    let target_cred = target_pcb.cred();
-
-    // CAP_SYS_PTRACE allows access to any process
-    if current_cred.has_capability(CAPFlags::CAP_SYS_PTRACE) {
-        return Ok(());
-    }
-
-    // Check uid/gid match (using real uid/gid as per PTRACE_MODE_REALCREDS)
-    // All of target's uid variants must match current's uid
-    // All of target's gid variants must match current's gid
-    let uid_match = current_cred.uid == target_cred.euid
-        && current_cred.uid == target_cred.suid
-        && current_cred.uid == target_cred.uid;
-
-    let gid_match = current_cred.gid == target_cred.egid
-        && current_cred.gid == target_cred.sgid
-        && current_cred.gid == target_cred.gid;
-
-    if uid_match && gid_match {
-        return Ok(());
-    }
-
-    // Permission denied - map to EPERM as Linux does for process_vm_* syscalls
-    Err(SystemError::EPERM)
+    Ok(())
 }
 
 /// Read iovec array from user space

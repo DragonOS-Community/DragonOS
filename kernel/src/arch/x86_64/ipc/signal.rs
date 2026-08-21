@@ -1076,15 +1076,12 @@ impl SignalArch for X86_64SignalArch {
         // 3. 恢复通用寄存器
         ucontext.restore_to_trapframe(trap_frame);
 
-        // 4. 恢复 FP 状态
+        // 4. 恢复 FP 状态。
         if let Some(kernel_fp) = kernel_fp {
             let pcb = ProcessManager::current_pcb();
             let mut archinfo_guard = pcb.arch_info_irqsave();
             *archinfo_guard.fp_state_mut() = Some(kernel_fp);
             archinfo_guard.restore_fp_state();
-
-            // 恢复 cr2
-            *archinfo_guard.cr2_mut() = ucontext.uc_mcontext.cr2 as usize;
         }
 
         // 返回恢复后的 rax 值

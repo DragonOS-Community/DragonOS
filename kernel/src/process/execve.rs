@@ -236,6 +236,10 @@ fn do_execve_internal(
             let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
             let exec_ret = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr);
             if exec_ret.is_ok() {
+                // exec 提交后的清理
+                exec_pcb.flush_ptrace_hw_debug_regs();
+                ProcessManager::release_old_user_vm_if_last(old_vm.as_ref());
+
                 if let Some(completion) = vfork_done {
                     completion.complete_all();
                 }

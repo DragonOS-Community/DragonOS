@@ -1,4 +1,5 @@
 use super::*;
+use core::sync::atomic::AtomicBool;
 
 pub struct FileMappingWithFileArgs {
     pub file: Arc<File>,
@@ -48,6 +49,11 @@ pub struct AddressSpace {
     /// OOM waiters must not treat the earlier resident-page accounting decrement
     /// as reclaim progress.
     oom_reclaim_generation: AtomicU64,
+    /// 已显式拆除标志
+    /// 最后一个活跃用户退出/exec 换走后，即使仍有外部引用
+    /// （如 /proc/[pid]/mem 钉住的 fd），映射也已被拆除。
+    /// 后续对钉住引用的读写应返回 EOF。
+    torn_down: AtomicBool,
     /// Uses RwSem instead of RwLock because address space operations may require I/O (e.g., file reads on page faults)
     inner: RwSem<InnerAddressSpace>,
     /// Wait for pending mmap reservations to be committed or cancelled.
@@ -249,6 +255,7 @@ impl AddressSpace {
             page_table_edit_lock: Mutex::new(()),
             resident_user_pages: AtomicUsize::new(0),
             oom_reclaim_generation: AtomicU64::new(0),
+            torn_down: AtomicBool::new(false),
             inner: RwSem::new(inner),
             reservation_wait: WaitQueue::default(),
         });
@@ -287,6 +294,20 @@ impl AddressSpace {
             .expect("Current process has no address space");
 
         return Ok(vm);
+    }
+
+    /// 标记本地址空间已被显式拆除
+    /// 读者要么在拆除前完成，要么观察到 torn_down
+    #[inline]
+    pub fn mark_torn_down(&self) {
+        self.torn_down
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// 地址空间是否已被显式拆除。
+    #[inline]
+    pub fn is_torn_down(&self) -> bool {
+        self.torn_down.load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// Check whether this address space belongs to the current process

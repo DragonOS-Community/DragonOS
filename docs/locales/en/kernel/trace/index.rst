@@ -14,12 +14,13 @@
 Kernel Tracing Mechanism
 ====================================
 
-   The kernel tracing mechanism consists of many features, such as kprobe, uprobe, tracepoint, and ftrace, as well as eBPF for extending kernel observability. The kernel currently supports kprobe and eBPF, and this chapter will introduce these two mechanisms.
+   Kernel tracing facilities make system runtime behavior observable. They include predefined tracepoints, dynamic kprobes, eBPF-based extensibility, and runtime text patching for low-overhead feature switches. This chapter describes the tracing facilities currently implemented by DragonOS and how they work.
 
 .. toctree::
    :maxdepth: 1
    :caption: Contents
 
-   eBPF
-   kprobe
    tracepoint
+   text_patching
+   kprobe
+   eBPF

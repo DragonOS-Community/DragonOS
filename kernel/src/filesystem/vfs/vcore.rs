@@ -6,7 +6,6 @@ use system_error::SystemError;
 
 use crate::libs::casting::DowncastArc;
 use crate::{
-    define_event_trace,
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
@@ -32,6 +31,7 @@ use crate::{
         resource::RLimitID,
         ProcessManager,
     },
+    unsafe_define_event_trace,
 };
 
 use crate::arch::ipc::signal::Signal;
@@ -500,7 +500,9 @@ pub fn change_root_fs() -> Result<(), SystemError> {
     return Ok(());
 }
 
-define_event_trace!(
+// SAFETY: this VFS mkdir event is emitted from syscall process context and is
+// not reachable from x86 NMI/MCE handlers.
+unsafe_define_event_trace!(
     do_mkdir_at,
     TP_system(vfs),
     TP_PROTO(path:&str, mode: InodeMode),

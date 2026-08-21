@@ -13,7 +13,9 @@ use crate::{
             ExecStartInfo, LoadBinaryResult,
         },
         pid::PidType,
-        ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
+        ptrace,
+        trace::trace_sched_process_exec,
+        ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
     },
     syscall::Syscall,
 };
@@ -135,6 +137,8 @@ fn do_execve_internal(
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
+    // 捕获 exec 前的进程标识：
+    let old_pid = ProcessManager::current_pcb().raw_pid().data() as i32;
     let pre_exec_pcb = ProcessManager::current_pcb();
     let old_vpid = if !pre_exec_pcb.is_traced() {
         0
@@ -240,12 +244,27 @@ fn do_execve_internal(
                 exec_pcb.flush_ptrace_hw_debug_regs();
                 ProcessManager::release_old_user_vm_if_last(old_vm.as_ref());
 
+                // Thread4：先 complete vfork parent，再触发 trace。
+                // 对齐 Linux：exec_mmap()/exec_mm_release() 内更早完成 vfork_done，
+                // 而 trace_sched_process_exec() 在 exec 成功提交尾部才执行。若先 trace
+                // 再 complete，父进程会被所有 tracepoint 回调阻塞，违反“child 完成 exec
+                // commit 即恢复父进程”的语义，给 exec 热路径引入不必要的 trace 回调延迟。
                 if let Some(completion) = vfork_done {
                     completion.complete_all();
                 }
 
-                // ptrace EVENT_EXEC：必须在 arch_do_execve 写入新入口寄存器（rip/rsp/rflags/cs）之后触发。
-                // EXEC-stop 期间 GETREGS 读到新 rip（新程序入口），SETREGS 不会被 arch_do_execve 覆盖。
+                // Linux keeps bprm->filename as the original exec-visible name
+                // across shebang/interpreter rewrites. DragonOS's execfn has the
+                // same lifetime and meaning; filename tracks the current loader.
+                // All dynamic sizing/allocation remains behind the macro's static
+                // branch, while these borrowed bytes and integers are O(1).
+                trace_sched_process_exec(
+                    param.execfn().as_bytes(),
+                    pcb.raw_pid().data() as i32,
+                    old_pid,
+                );
+
+                // ptrace EVENT_EXEC
                 if pcb.ptrace_event_enabled(ptrace::PtraceEvent::Exec) {
                     pcb.ptrace_event(ptrace::PtraceEvent::Exec, old_vpid);
                 } else if pcb.is_traced() && !pcb.flags().contains(ProcessFlags::PT_SEIZED) {

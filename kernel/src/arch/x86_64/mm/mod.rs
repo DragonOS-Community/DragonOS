@@ -55,6 +55,8 @@ pub struct X86_64MMBootstrapInfo {
     kernel_data_end: usize,
     kernel_rodata_start: usize,
     kernel_rodata_end: usize,
+    static_keys_start: usize,
+    static_keys_end: usize,
     start_brk: usize,
 }
 
@@ -135,6 +137,7 @@ impl MemoryManagementArch for X86_64MMArch {
     const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffffb00000000000);
     /// 设置FIXMAP区域大小为16M
     const FIXMAP_SIZE: usize = 256 * 4096 * 16;
+    const FIXMAP_RESERVED_TOP_PAGES: usize = 2;
 
     const MMIO_BASE: VirtAddr = VirtAddr::new(0xffffa10000000000);
     const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
@@ -147,6 +150,8 @@ impl MemoryManagementArch for X86_64MMArch {
             fn _edata();
             fn _rodata();
             fn _erodata();
+            fn __start___static_keys();
+            fn __stop___static_keys();
             fn _end();
             fn _default_kernel_load_base();
         }
@@ -160,6 +165,8 @@ impl MemoryManagementArch for X86_64MMArch {
             kernel_data_end: _edata as usize,
             kernel_rodata_start: _rodata as usize,
             kernel_rodata_end: _erodata as usize,
+            static_keys_start: __start___static_keys as usize,
+            static_keys_end: __stop___static_keys as usize,
             start_brk: _end as usize,
         };
 
@@ -844,11 +851,14 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> Entr
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
-        // Remap kernel code  execute
-        return EntryFlags::new().set_execute(true).set_write(true);
+        // Core text is executable through this read-only mapping. Runtime
+        // patching uses a short-lived, non-executable fixmap alias.
+        return EntryFlags::new().set_execute(true).set_write(false);
+    } else if virt.data() >= info.static_keys_start && virt.data() < info.static_keys_end {
+        return EntryFlags::new().set_write(true).set_execute(false);
     } else if virt.data() >= info.kernel_rodata_start && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only
-        return EntryFlags::new().set_execute(true);
+        return EntryFlags::new().set_execute(false);
     } else {
         return EntryFlags::new().set_write(true).set_execute(true);
     }

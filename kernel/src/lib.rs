@@ -68,6 +68,7 @@ mod rcu;
 mod sched;
 mod smp;
 mod syscall;
+mod text_patch;
 mod time;
 mod tracepoint;
 #[cfg(target_arch = "x86_64")]

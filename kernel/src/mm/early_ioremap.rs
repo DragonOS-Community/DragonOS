@@ -2,10 +2,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
-    libs::{
-        align::{page_align_down, page_align_up},
-        spinlock::SpinLock,
-    },
+    libs::{align::page_align_down, spinlock::SpinLock},
     mm::no_init::{pseudo_map_phys, pseudo_map_phys_ro, pseudo_unmap_phys},
 };
 
@@ -25,7 +22,8 @@ static SLOTS: SpinLock<[Slot; EarlyIoRemap::SLOT_CNT]> =
 pub struct EarlyIoRemap;
 
 impl EarlyIoRemap {
-    const SLOT_CNT: usize = MMArch::FIXMAP_SIZE / MMArch::PAGE_SIZE;
+    const SLOT_CNT: usize =
+        MMArch::FIXMAP_SIZE / MMArch::PAGE_SIZE - MMArch::FIXMAP_RESERVED_TOP_PAGES;
 
     /// 把物理内存映射到虚拟内存中（物理地址不要求对齐
     ///
@@ -47,8 +45,11 @@ impl EarlyIoRemap {
     ) -> Result<VirtAddr, SystemError> {
         // debug!("map not aligned phys:{phys:?}, size:{size:?}, read_only:{read_only:?}");
 
+        if size == 0 {
+            return Err(SystemError::EINVAL);
+        }
         let offset = phys.data() - page_align_down(phys.data());
-        size += offset;
+        size = size.checked_add(offset).ok_or(SystemError::ENOMEM)?;
         phys -= offset;
 
         let (map_vaddr, _) = Self::map(phys, size, read_only)?;
@@ -81,17 +82,28 @@ impl EarlyIoRemap {
         if !phys.check_aligned(MMArch::PAGE_SIZE) {
             return Err(SystemError::EINVAL);
         }
+        if size == 0 {
+            return Err(SystemError::EINVAL);
+        }
 
         // debug!("Early io remap:{phys:?}, size:{size}");
 
-        let mut slot_guard = SLOTS.lock();
+        let aligned_size = size
+            .checked_add(MMArch::PAGE_SIZE - 1)
+            .map(page_align_down)
+            .ok_or(SystemError::ENOMEM)?;
+        phys.data()
+            .checked_add(aligned_size - 1)
+            .ok_or(SystemError::ENOMEM)?;
+        let slot_count = PageFrameCount::from_bytes(aligned_size).unwrap().data();
+        if slot_count > Self::SLOT_CNT {
+            return Err(SystemError::ENOMEM);
+        }
 
-        let slot_count = PageFrameCount::from_bytes(page_align_up(size))
-            .unwrap()
-            .data();
+        let mut slot_guard = SLOTS.lock();
         // 寻找连续的slot
         let mut start_slot = None;
-        for i in 0..(Self::SLOT_CNT - slot_count + 1) {
+        for i in 0..=(Self::SLOT_CNT - slot_count) {
             let mut is_continuous = true;
 
             for j in 0..slot_count {

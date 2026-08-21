@@ -215,6 +215,9 @@ bitflags! {
         const TRACE_SINGLESTEP = 1 << 22;
         /// PTRACE_SYSEMU: skip the syscall on resume.
         const TRACE_SYSEMU = 1 << 23;
+        /// Task has hardware debug registers (DR0-3/DR7) configured via
+        /// PTRACE_POKEUSER; context switch loads/clears them accordingly.
+        const HW_DEBUG_REGS = 1 << 24;
     }
 }
 

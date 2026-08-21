@@ -76,11 +76,13 @@ impl FileOps for MemFileOps {
         if len == 0 {
             return Ok(0);
         }
-        // 只访问打开时钉住的地址空间；若目标已 execve/exit 释放 mm，
-        // pinned_vm 仍存活，读写其旧地址空间
+        // 只访问打开时钉住的地址空间。
         let Some(pinned_vm) = Self::pinned_vm_from_data(&data) else {
             return Ok(0);
         };
+        if pinned_vm.is_torn_down() {
+            return Ok(0);
+        }
         let actual_len = len.min(buf.len());
         // 批量跨进程读：单次 AddressSpace 读锁内按页整段拷贝，避免逐字节取锁+走查页表。
         let n = ProcessControlBlock::access_user_chunk_on_vm_read(
@@ -88,6 +90,10 @@ impl FileOps for MemFileOps {
             offset,
             &mut buf[..actual_len],
         )?;
+        // 读到 0 字节可能是“恰在拆除临界区边界”的竞态。复判一次，拆除已成事实则按 EOF 处理
+        if n == 0 && actual_len > 0 && pinned_vm.is_torn_down() {
+            return Ok(0);
+        }
         // 首字节即不可访问（含 offset 越过 USER_END）：返回 EIO，mem_rw
         if n == 0 && actual_len > 0 {
             return Err(SystemError::EIO);
@@ -108,12 +114,19 @@ impl FileOps for MemFileOps {
         let Some(pinned_vm) = Self::pinned_vm_from_data(&data) else {
             return Ok(0);
         };
+        // 拆除后写同样按 EOF（0）处理
+        if pinned_vm.is_torn_down() {
+            return Ok(0);
+        }
         let actual_len = len.min(buf.len());
         let n = ProcessControlBlock::access_user_chunk_on_vm_write(
             &pinned_vm,
             offset,
             &buf[..actual_len],
         )?;
+        if n == 0 && actual_len > 0 && pinned_vm.is_torn_down() {
+            return Ok(0);
+        }
         // 首字节即不可访问：返回 EIO，mem_rw。
         if n == 0 && actual_len > 0 {
             return Err(SystemError::EIO);

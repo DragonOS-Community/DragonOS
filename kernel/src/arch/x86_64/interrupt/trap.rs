@@ -5,11 +5,15 @@ use super::{
     TrapFrame,
 };
 use crate::{
-    arch::{ipc::signal::Signal, CurrentIrqArch, MMArch},
+    arch::{
+        ipc::signal::Signal,
+        x86_64::process::debugreg,
+        CurrentIrqArch, MMArch,
+    },
     exception::{debug::DebugException, ebreak::EBreak, InterruptArch},
     ipc::signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
     mm::VirtAddr,
-    process::ProcessManager,
+    process::{ptrace, ProcessFlags, ProcessManager},
     smp::core::smp_get_processor_id,
 };
 use log::{error, trace, warn};
@@ -150,6 +154,22 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
     // DR6 可同时报告 BS(single-step) 与 B0-B3(hardware breakpoint)。必须在
     // 任何 handler 前保存并复位，避免旧 cause 污染下一次 #DB。
     let dr6 = read_and_reset_dr6();
+    let from_user = regs.is_from_user();
+    let dr7 = if from_user {
+        let dr7: u64;
+        core::arch::asm!(
+            "mov {}, dr7",
+            out(reg) dr7,
+            options(nomem, nostack, preserves_flags)
+        );
+        // 用户调试寄存器在处理 #DB 期间保持禁用，避免内核信号路径递归命中。
+        // 清零方向必须先硬件、后 CPU 影子，与上下文切换协议一致。
+        debugreg::write_dr7(0);
+        crate::arch::process::cpu_dr7().store(0, core::sync::atomic::Ordering::Relaxed);
+        dr7
+    } else {
+        0
+    };
     trace!(
         "do_debug(1), \tError code: {:#x},\tdr6: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -159,14 +179,37 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
         smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
-    if regs.is_from_user() {
+    if from_user {
         // 用户态 #DB：uprobe XOL 单步完成优先（handler 返回是否消费，评审 R4）；
         // 未消费的用户态单步通过统一信号路径进入 SIGTRAP/ptrace。DebugException 只查
         // 内核 kprobe 表，不能处理用户态 #DB，否则会静默吞掉调试异常。
         if crate::exception::uprobe::uprobe_debug_handler(regs, dr6).unwrap() {
             // 已被 uprobe 消费（精确 XOL 完成）。
         } else {
+            let current = ProcessManager::current_pcb();
+            // PEEKUSER(DR6) 使用正极性虚拟 DR6；硬件保留位不属于命中原因。
+            current.ptrace_state.lock_irqsave().debug_regs[6] = dr6 & !ptrace::DR6_RESERVED;
             crate::exception::uprobe::send_user_debug_sigtrap(regs.rip as usize, dr6).unwrap();
+        }
+
+        let current = ProcessManager::current_pcb();
+        let was_armed = (dr7 & !ptrace::DR_CONTROL_RESERVED) != 0;
+        if was_armed || current.flags().contains(ProcessFlags::HW_DEBUG_REGS) {
+            let dr = {
+                let ps = current.ptrace_state.lock_irqsave();
+                let mut dr = ps.debug_regs;
+                dr[6] = 0;
+                dr[7] &= !ptrace::DR_CONTROL_RESERVED;
+                dr
+            };
+            // 武装方向必须先 CPU 影子、再硬件，避免调度切换观察到半提交状态。
+            crate::arch::process::cpu_dr7().store(dr[7], core::sync::atomic::Ordering::Relaxed);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            debugreg::write_dr(0, dr[0]);
+            debugreg::write_dr(1, dr[1]);
+            debugreg::write_dr(2, dr[2]);
+            debugreg::write_dr(3, dr[3]);
+            debugreg::write_dr(7, dr[7]);
         }
     } else {
         // 内核态 #DB：kprobe 单步完成。

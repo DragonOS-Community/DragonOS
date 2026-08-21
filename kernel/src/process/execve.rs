@@ -244,10 +244,14 @@ fn do_execve_internal(
             if let Err(err) = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr) {
                 return finish_exec_error(&param, old_vm.as_ref(), err);
             }
+            // 成功 exec 不继承 ptrace 硬件调试寄存器状态。
+            exec_pcb.flush_ptrace_hw_debug_regs();
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_apply_to_exec_mm(&pcb, &address_space);
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_registry_task_exec(&pcb, old_vm.as_ref());
+            // uprobe 必须先从旧 mm 脱离，再释放该 mm 的最后一个用户引用。
+            ProcessManager::release_old_user_vm_if_last(old_vm.as_ref());
             if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
                 completion.complete_all();
             }

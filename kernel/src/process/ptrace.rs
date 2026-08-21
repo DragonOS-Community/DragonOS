@@ -204,7 +204,10 @@ pub const X86_DR_B_MASK: u64 = 0x0f;
 /// x86 EFLAGS Trap Flag（单步）位。
 pub const X86_EFLAGS_TF: u64 = 0x100;
 /// x86 DR6 保留位。ptrace 对外暴露正极性 virtual_dr6，与硬件 DR6 互转时按此掩码翻转。
-const DR6_RESERVED: u64 = 0xffff_0ff0;
+pub(crate) const DR6_RESERVED: u64 = 0xffff_0ff0;
+/// x86_64 DR7 保留位掩码（含 GD 位）
+/// 加载到硬件前必须清除：保留位置 1 行为未定义，GD 位置 1 会在内核访问调试寄存器时触发 #DB。
+pub(crate) const DR_CONTROL_RESERVED: u64 = 0xffff_ffff_0000_fc00;
 
 // ptrace exit_code / si_code 编码
 const EXITCODE_SIG_MASK: usize = 0x7f;
@@ -499,6 +502,10 @@ pub struct PtraceState {
     /// 当前 ptrace-stop 的用户 TrapFrame 是否位于 syscall 栈。
     /// 调度上下文保存的 rsp 不能用来猜 TrapFrame 位置。
     pub stop_frame_on_syscall_stack: bool,
+    /// EXITKILL 判定位（doom 位）：旧 tracer 退出且本会话设了
+    /// PTRACE_O_EXITKILL 时，在关系清除的同一临界区内置位，
+    /// 表示“该 tracee 已被旧会话判死，SIGKILL 待发”。
+    pub exitkill_pending: bool,
     /// 调试寄存器（DR0-DR7）的 ptrace 侧存储。
     pub debug_regs: [u64; 8],
 }
@@ -517,6 +524,7 @@ impl Default for PtraceState {
             pending_event_stop: None,
             forced_trap_flag: false,
             stop_frame_on_syscall_stack: false,
+            exitkill_pending: false,
             debug_regs: [0; 8],
         }
     }
@@ -572,26 +580,30 @@ fn traceme_parent_for(
 }
 
 pub fn traceme_current() -> Result<(), SystemError> {
-    let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
     let current = ProcessManager::current_pcb();
-    let tracer = traceme_parent_for(&current)?;
-    traceme_allowed(&tracer, &current)?;
-
-    let raw_pid = current.raw_pid();
     {
-        let mut ptracer = current.ptracer_pcb.write_irqsave();
-        if ptracer.upgrade().is_some() {
-            return Err(SystemError::EPERM);
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        let tracer = traceme_parent_for(&current)?;
+        traceme_allowed(&tracer, &current)?;
+
+        let raw_pid = current.raw_pid();
+        {
+            let mut ptracer = current.ptracer_pcb.write_irqsave();
+            if ptracer.upgrade().is_some() {
+                return Err(SystemError::EPERM);
+            }
+            *ptracer = Arc::downgrade(&tracer);
+            current.flags().insert(ProcessFlags::PTRACED);
         }
-        *ptracer = Arc::downgrade(&tracer);
-        current.flags().insert(ProcessFlags::PTRACED);
-    }
 
-    let mut ptraced = tracer.ptraced.write_irqsave();
-    if !ptraced.contains(&raw_pid) {
-        ptraced.push(raw_pid);
+        let mut ptraced = tracer.ptraced.write_irqsave();
+        if !ptraced.contains(&raw_pid) {
+            ptraced.push(raw_pid);
+        }
     }
-
+    // 关系锁已随上块释放：若本进程携带旧 tracer 退出时遗留的 EXITKILL
+    // 判定，在此接管执行（不可持锁发送，见 carry_out_pending_exitkill）。
+    carry_out_pending_exitkill(&current);
     Ok(())
 }
 
@@ -716,6 +728,33 @@ struct ExitPtracePending {
     real_parent: Option<Arc<ProcessControlBlock>>,
 }
 
+/// 消费 tracee 的 EXITKILL doom 位（读并清）。
+/// 调用方必须已持有 `PTRACE_RELATION_LOCK`：消费与关系状态的变更
+/// 在同一临界区内互斥，保证 doom 位在全部消费方之间恰好被一方取得。
+fn consume_exitkill_doom_locked(tracee: &ProcessControlBlock) -> bool {
+    let mut ps = tracee.ptrace_state.lock_irqsave();
+    core::mem::take(&mut ps.exitkill_pending)
+}
+
+/// 接管并执行旧会话遗留的 EXITKILL 判定。
+/// 在新跟踪关系建立（attach/seize/traceme 成功）或 attach 失败回滚之后调用：
+/// 若被跟踪者携带旧 tracer 退出时判定的 doom 位，在此消费并向其发送
+/// SIGKILL——对应 Linux 中 attach 到已 SIGKILL-pending 的任务：attach 成功、
+/// 任务随后死亡。必须在 `PTRACE_RELATION_LOCK` 之外调用（内部自行获取；
+/// SIGKILL 发送链含内存分配与调度器锁，不能在关 IRQ 自旋临界区内执行）。
+fn carry_out_pending_exitkill(tracee: &ProcessControlBlock) {
+    let doomed = {
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        consume_exitkill_doom_locked(tracee)
+    };
+    if !doomed {
+        return;
+    }
+    if let Some(strong) = tracee.self_ref.upgrade() {
+        let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, strong, PidType::PID);
+    }
+}
+
 /// 退出/销毁 tracer 时解除其所有 tracee 的跟踪关系。
 pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
     // 阶段一：持 PTRACE_RELATION_LOCK（关 IRQ 自旋锁）完成全部关系/状态变更，
@@ -788,6 +827,12 @@ pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
                 // 清空 ptrace 选项，与 ptrace_unlink 对称：避免 tracee 被新 tracer
                 // attach 后继承本会话遗留选项（EXITKILL 等）。
                 ps.options = PtraceOptions::empty();
+                // EXITKILL 判定与关系清除在同一临界区发布：doom 位置位后，
+                // SIGKILL 的发送权交给消费到该位的一方（阶段二，或随后建立
+                // 新跟踪关系的 attach/seize/traceme）。
+                if exitkill {
+                    ps.exitkill_pending = true;
+                }
             }
             tracee.flags().remove(
                 ProcessFlags::PTRACE_EVENT_STOP
@@ -813,9 +858,12 @@ pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
     // 阶段二：脱离 PTRACE_RELATION_LOCK 后执行发 SIGKILL 与唤醒副作用。
     // 注意：phase1 清除关系后、phase2 执行前，并发 PTRACE_ATTACH 可能重新 attach 该 tracee。
     // PTRACE_RELATION_LOCK 是关 IRQ 自旋锁，不能跨 send_signal/wakeup 持有（会调度/取其它锁），
-    // 故无法像 Linux tasklist_lock 那样跨整个 exit_ptrace 原子化。此处每个 tracee 处理前
-    // 重新取锁验证未被 re-attach——缩小竞争窗口（虽不能完全闭合 lock-drop-recheck TOCTOU，
-    // 但避免对已属新 tracer 的 tracee 发 SIGKILL/wakeup 的常见情况）。
+    // 故无法像 Linux tasklist_lock 那样跨整个 exit_ptrace 原子化。
+    // EXITKILL 的判定与发送因此用 doom 位事务化：阶段一在清除关系的同一临界区
+    // 置 exitkill_pending，发送权属于消费到该位的一方。此处消费时同时要求
+    // 仍是 orphan（未被并发 attach 接管）——doom 消费与关系检查在同一
+    // 临界区内原子完成，若已被 re-attach 则消费权留给 attach 侧
+    // （carry_out_pending_exitkill），本会话不再发送，闭合误杀窗口。
     for p in pending {
         let ExitPtracePending {
             tracee,
@@ -824,15 +872,18 @@ pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
             group_stop_active,
             real_parent,
         } = p;
-        let still_orphan = {
+        let (still_orphan, doomed) = {
             let _g = super::PTRACE_RELATION_LOCK.lock_irqsave();
-            !super::ptrace::is_ptraced_locked(&tracee)
+            let orphan = !super::ptrace::is_ptraced_locked(&tracee);
+            // 仅 orphan 时才消费 doom：被 re-attach 的 tracee 由 attach 侧接管。
+            let doomed = orphan && exitkill && consume_exitkill_doom_locked(&tracee);
+            (orphan, doomed)
         };
         if !still_orphan {
             // 已被并发 ATTACH 重新跟踪：新 tracer 拥有该 tracee，跳过本会话的副作用。
             continue;
         }
-        if exitkill {
+        if doomed {
             // SIGKILL 不可阻塞/忽略，tracee 将被终止
             let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, tracee.clone(), PidType::PID);
         }
@@ -918,32 +969,54 @@ pub fn is_wait_tracee_of(
 
 // PCB ptrace 方法 —— 关系建立/解除、attach/seize/detach、TRAPPING 同步
 impl ProcessControlBlock {
-    /// 是否有权限跟踪目标。简化版：
-    /// 同线程组允许（自省）；否则要求 uid/gid 全匹配且 dumpable；或 CAP_SYS_PTRACE。
+    /// 是否有权限跟踪/访问目标进程。对齐 Linux 判定链：
+    /// 1. 同线程组允许（自省）；
+    /// 2. 凭证匹配：uid/gid 各三项（euid/suid/uid、egid/sgid/gid）全等且目标可 dump。
+    ///    数值 uid/gid 仅在同一 user namespace 内可比——跨 namespace 数值相等
+    ///    不代表同一内核身份，保守拒绝（持 CAP_SYS_PTRACE 者不受影响）；
+    /// 3. 或在目标（tracee）的 user_ns 持有 CAP_SYS_PTRACE；
+    /// 4. 最后统一过 capability 子集门（对应 Linux commoncap 的 ptrace 钩子，
+    ///    对上述全部放行分支生效）：同一 user namespace 且目标的 permitted 集
+    ///    是调用者 permitted 集的子集，否则必须持 CAP_SYS_PTRACE。
+    ///
+    /// 已知残余差异（待凭证子系统补齐，此处如实声明）：
+    /// - dumpable 旁路与子集门使用目标当前 cred 的 user_ns（Linux 用目标 mm
+    ///   创建时的 user_ns）；
+    /// - Linux 在 cred 变更（提权/降权/cap 非子集）时将目标置为不可 dump，
+    ///   DragonOS 尚无该联动，降权进程仍可被同 uid 调用者跟踪。
     pub fn has_permission_to_trace(&self, tracee: &Self) -> bool {
         // 1. 同一线程组允许访问（自省）
         if self.tgid == tracee.tgid {
             return true;
         }
 
-        // 2. 凭证匹配 + dumpable
         let caller_cred = self.cred();
         let tracee_cred = tracee.cred();
+        let same_user_ns = Arc::ptr_eq(&caller_cred.user_ns, &tracee_cred.user_ns);
+        // 2. 凭证匹配 + dumpable
         let uid_match = caller_cred.uid == tracee_cred.euid
             && caller_cred.uid == tracee_cred.suid
             && caller_cred.uid == tracee_cred.uid;
         let gid_match = caller_cred.gid == tracee_cred.egid
             && caller_cred.gid == tracee_cred.sgid
             && caller_cred.gid == tracee_cred.gid;
-        if uid_match && gid_match && tracee.dumpable() != 0 {
-            return true;
-        }
         // 3. CAP_SYS_PTRACE：在目标（tracee）的 user_ns
         // 判定 capability，而非调用者自身 ns，避免子 user namespace 越权跟踪父 ns 进程。
-        caller_cred.has_capability_in_ns(
-            &tracee_cred.user_ns,
-            crate::process::cred::CAPFlags::CAP_SYS_PTRACE,
-        )
+        let has_cap = || {
+            caller_cred.has_capability_in_ns(
+                &tracee_cred.user_ns,
+                crate::process::cred::CAPFlags::CAP_SYS_PTRACE,
+            )
+        };
+
+        if !((same_user_ns && uid_match && gid_match && tracee.dumpable() != 0) || has_cap()) {
+            return false;
+        }
+
+        // 4. capability 子集门：目标 permitted ⊆ 调用者 permitted（同一 user_ns）。
+        (same_user_ns
+            && (tracee_cred.cap_permitted.bits() & !caller_cred.cap_permitted.bits()) == 0)
+            || has_cap()
     }
 
     /// 建立跟踪关系（tracee 侧调用）。
@@ -1201,10 +1274,18 @@ impl ProcessControlBlock {
                 strong_ref.clone(),
                 PidType::PID,
             ) {
+                // attach 失败回滚：目标可能携带旧会话遗留的 EXITKILL 判定
+                // （exit_ptrace 阶段二已因本次 link 而跳过），在此接管执行，
+                // 避免 doom 位搁浅无人消费。
                 let _ = self.ptrace_unlink();
+                carry_out_pending_exitkill(self);
                 return Err(e);
             }
         }
+        // 停止协议完成后接管旧会话遗留的 EXITKILL 判定（若存在）：
+        // 对应 Linux 中 attach 到已 SIGKILL-pending 的任务——attach 成功、
+        // 任务随后死亡。放在此处而非 link 内，避免 TRAPPING 等待与死亡交错。
+        carry_out_pending_exitkill(self);
 
         Ok(0)
     }
@@ -1236,6 +1317,8 @@ impl ProcessControlBlock {
             let mut ps = self.ptrace_state.lock_irqsave();
             ps.options = options;
         }
+        // 接管旧会话遗留的 EXITKILL 判定（若存在），语义同 attach 尾部。
+        carry_out_pending_exitkill(self);
         Ok(0)
     }
 
@@ -1340,13 +1423,6 @@ impl ProcessControlBlock {
         ptr as *mut TrapFrame
     }
 
-    /// 返回 tracee 当前 stop 对应的用户态 TrapFrame 指针。
-    /// 根据 stop_frame_on_syscall_stack 选择正确的栈和偏移。
-    fn tracee_trap_frame_ptr(&self) -> *mut TrapFrame {
-        let on_syscall_stack = self.ptrace_state.lock_irqsave().stop_frame_on_syscall_stack;
-        self.trap_frame_ptr_for(on_syscall_stack)
-    }
-
     /// 按给定的栈选择计算 TrapFrame 指针。
     fn trap_frame_ptr_for(&self, on_syscall_stack: bool) -> *mut TrapFrame {
         if on_syscall_stack {
@@ -1373,33 +1449,74 @@ impl ProcessControlBlock {
         ps.in_ptrace_stop && self.sched_info().state().is_stopped()
     }
 
+    /// 等待 tracee 真正调度切出
+    fn wait_tracee_descheduled(&self) {
+        while self.sched_info().is_running() && self.sched_info().state().is_stopped() {
+            core::hint::spin_loop();
+        }
+    }
+
     /// 读 tracee 的用户寄存器（PTRACE_GETREGS）。
     #[cfg(target_arch = "x86_64")]
-    pub fn tracee_user_regs(&self) -> UserRegsStruct {
-        // SAFETY: tracee 处于 ptrace-stop，TrapFrame 稳定。
-        let frame = unsafe { &*self.tracee_trap_frame_ptr() };
-        let mut regs = UserRegsStruct::from_trap_frame(frame);
-        if self.ptrace_state.lock_irqsave().forced_trap_flag {
-            regs.flags &= !X86_EFLAGS_TF;
+    pub fn tracee_user_regs(&self) -> Result<UserRegsStruct, SystemError> {
+        loop {
+            self.wait_tracee_descheduled();
+            let ps = self.ptrace_state.lock_irqsave();
+            if !Self::trap_frame_stable_locked(self, &ps) {
+                return Err(SystemError::ESRCH);
+            }
+            if self.sched_info().is_running() {
+                // 等待后 tracee 又被唤醒并再次停在调度前窗口，重试。
+                continue;
+            }
+            // SAFETY: 复验通过，tracee 仍处于 ptrace-stop，TrapFrame 稳定。
+            let frame = unsafe { &*self.trap_frame_ptr_for(ps.stop_frame_on_syscall_stack) };
+            let mut regs = UserRegsStruct::from_trap_frame(frame);
+            // fs/gs base 不在 TrapFrame 中：从 ArchPCBInfo 权威存储读取（切出时已回读最新值）。
+            {
+                let arch = self.arch_info_irqsave();
+                regs.fs_base = arch.fsbase() as u64;
+                regs.gs_base = arch.gsbase() as u64;
+            }
+            if ps.forced_trap_flag {
+                regs.flags &= !X86_EFLAGS_TF;
+            }
+            return Ok(regs);
         }
-        regs
     }
 
     #[cfg(target_arch = "x86_64")]
     pub fn write_tracee_user_regs(&self, regs: &UserRegsStruct) -> Result<(), SystemError> {
-        let mut ps = self.ptrace_state.lock_irqsave();
-        if !Self::trap_frame_stable_locked(self, &ps) {
-            return Err(SystemError::ESRCH);
+        loop {
+            self.wait_tracee_descheduled();
+            let mut ps = self.ptrace_state.lock_irqsave();
+            if !Self::trap_frame_stable_locked(self, &ps) {
+                return Err(SystemError::ESRCH);
+            }
+            if self.sched_info().is_running() {
+                continue;
+            }
+            // fs/gs base 校验
+            let user_end = MMArch::USER_END_VADDR.data() as u64;
+            if regs.fs_base >= user_end || regs.gs_base >= user_end {
+                return Err(SystemError::EIO);
+            }
+            // SAFETY: tracee 仍处于 ptrace-stop，TrapFrame 稳定。
+            let frame = unsafe { &mut *self.trap_frame_ptr_for(ps.stop_frame_on_syscall_stack) };
+            regs.write_to_trap_frame(frame)?;
+            // fs/gs base 写入 ArchPCBInfo 权威存储；只写内存不碰硬件，
+            {
+                let mut arch = self.arch_info_irqsave();
+                arch.set_fsbase(regs.fs_base as usize);
+                arch.set_gsbase(regs.gs_base as usize);
+            }
+            if frame.rflags & X86_EFLAGS_TF != 0 {
+                ps.forced_trap_flag = false;
+            } else if ps.forced_trap_flag {
+                frame.rflags |= X86_EFLAGS_TF;
+            }
+            return Ok(());
         }
-        // SAFETY: tracee 仍处于 ptrace-stop，TrapFrame 稳定。
-        let frame = unsafe { &mut *self.trap_frame_ptr_for(ps.stop_frame_on_syscall_stack) };
-        regs.write_to_trap_frame(frame)?;
-        if frame.rflags & X86_EFLAGS_TF != 0 {
-            ps.forced_trap_flag = false;
-        } else if ps.forced_trap_flag {
-            frame.rflags |= X86_EFLAGS_TF;
-        }
-        Ok(())
     }
     #[cfg(target_arch = "x86_64")]
     pub fn ptrace_peek_user(&self, offset: usize) -> Result<usize, SystemError> {
@@ -1418,7 +1535,7 @@ impl ProcessControlBlock {
         }
         // 通用寄存器区：offset 0..GP_REGS_SIZE
         if offset < GP_REGS_SIZE {
-            let regs = self.tracee_user_regs();
+            let regs = self.tracee_user_regs()?;
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     &regs as *const UserRegsStruct as *const u8,
@@ -1462,7 +1579,7 @@ impl ProcessControlBlock {
         let val = value as u64;
         // 通用寄存器区：经 putreg 校验后写回 trap frame。
         if offset < GP_REGS_SIZE {
-            let mut regs = self.tracee_user_regs();
+            let mut regs = self.tracee_user_regs()?;
             let bytes = unsafe {
                 core::slice::from_raw_parts_mut(
                     &mut regs as *mut UserRegsStruct as *mut u8,
@@ -1480,14 +1597,45 @@ impl ProcessControlBlock {
             if idx == 4 || idx == 5 {
                 return Err(SystemError::EIO);
             }
-            let mut ps = self.ptrace_state.lock_irqsave();
-            // DR6(slot6) 存储正极性 virtual_dr6，写入时翻转。
-            let stored = if idx == 6 { val ^ DR6_RESERVED } else { val };
-            ps.debug_regs[idx] = stored;
+
+            if idx < 4
+                && val as usize >= MMArch::USER_END_VADDR.data()
+                && !crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_ADMIN)
+            {
+                return Err(SystemError::EPERM);
+            }
+
+            let has_dr = {
+                let mut ps = self.ptrace_state.lock_irqsave();
+                // DR6(slot6) 存储正极性 virtual_dr6，写入时翻转。
+                let stored = if idx == 6 { val ^ DR6_RESERVED } else { val };
+                ps.debug_regs[idx] = stored;
+                // 维护硬件断点快路径标志：任一地址寄存器（DR0-3）或控制寄存器（DR7）非零即视为有配置，上下文切换据此加载/清除。
+                ps.debug_regs[0..4].iter().any(|&v| v != 0) || ps.debug_regs[7] != 0
+            };
+            if has_dr {
+                self.flags().insert(ProcessFlags::HW_DEBUG_REGS);
+            } else {
+                self.flags().remove(ProcessFlags::HW_DEBUG_REGS);
+            }
             return Ok(());
         }
         // 间隙区拒绝写入。
         Err(SystemError::EIO)
+    }
+
+    /// exec 成功后清空硬件断点配置
+    pub fn flush_ptrace_hw_debug_regs(&self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            unsafe { crate::arch::x86_64::process::debugreg::write_dr7(0) };
+            crate::arch::x86_64::process::cpu_dr7().store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+        {
+            let mut ps = self.ptrace_state.lock_irqsave();
+            ps.debug_regs = [0; 8];
+        }
+        self.flags().remove(ProcessFlags::HW_DEBUG_REGS);
     }
 
     /// PTRACE_GETSIGINFO：读 last_siginfo。
@@ -1827,43 +1975,48 @@ impl ProcessControlBlock {
     /// PTRACE_GET_SYSCALL_INFO。
     /// 根据 last_siginfo 的 si_code（SIGTRAP|0x80 syscall，或 SIGTRAP|(SECCOMP<<8)）
     /// 和 event_message（ENTRY/EXIT）决定 op，读 trap frame 填 nr/args/ip/sp。
+    ///
+    /// 语义对齐说明（勿“修复”）：判定要求 si_code 低字节为 SIGTRAP|0x80，
+    /// 即 tracer 未设 PTRACE_O_TRACESYSGOOD 时，syscall-stop 的停止码是纯
+    /// SIGTRAP，此处只能返回 op=NONE——这与 Linux 一致，是既定 ABI 行为。
+    /// op 判定与帧读取在同一 ptrace_state 临界区内完成，且先复验 tracee
+    /// 仍处于 ptrace-stop（复验失败返回 ESRCH），避免两者来自不同时刻的
+    /// 拼凑快照；用户态拷贝由调用方在锁外进行。
     #[cfg(target_arch = "x86_64")]
-    pub fn ptrace_get_syscall_info(
-        &self,
-        _user_size: usize,
-    ) -> Result<PtraceSyscallInfo, SystemError> {
-        let (op, ret_data) = {
-            let ps = self.ptrace_state.lock_irqsave();
-            let code = ps
-                .last_siginfo
-                .as_ref()
-                .map(|i| i.sig_code().as_i32())
-                .unwrap_or(0);
-            let msg = ps.event_message;
-            let op = match (code, msg) {
-                (c, PTRACE_EVENTMSG_SYSCALL_ENTRY)
-                    if (c & 0xff) == (Signal::SIGTRAP as i32 | PTRACE_SYSGOOD_BIT as i32) =>
-                {
-                    PtraceSyscallInfoOp::Entry
-                }
-                (c, PTRACE_EVENTMSG_SYSCALL_EXIT)
-                    if (c & 0xff) == (Signal::SIGTRAP as i32 | PTRACE_SYSGOOD_BIT as i32) =>
-                {
-                    PtraceSyscallInfoOp::Exit
-                }
-                _ if (code >> 8) == PtraceEvent::Seccomp as i32 => PtraceSyscallInfoOp::Seccomp,
-                _ => PtraceSyscallInfoOp::None,
-            };
-            // Seccomp 停止时 ret_data = SECCOMP_RET_DATA
-            let ret_data = if op == PtraceSyscallInfoOp::Seccomp {
-                msg as u32
-            } else {
-                0
-            };
-            (op, ret_data)
+    pub fn ptrace_get_syscall_info(&self) -> Result<PtraceSyscallInfo, SystemError> {
+        let ps = self.ptrace_state.lock_irqsave();
+        if !Self::trap_frame_stable_locked(self, &ps) {
+            return Err(SystemError::ESRCH);
+        }
+        let code = ps
+            .last_siginfo
+            .as_ref()
+            .map(|i| i.sig_code().as_i32())
+            .unwrap_or(0);
+        let msg = ps.event_message;
+        let op = match (code, msg) {
+            (c, PTRACE_EVENTMSG_SYSCALL_ENTRY)
+                if (c & 0xff) == (Signal::SIGTRAP as i32 | PTRACE_SYSGOOD_BIT as i32) =>
+            {
+                PtraceSyscallInfoOp::Entry
+            }
+            (c, PTRACE_EVENTMSG_SYSCALL_EXIT)
+                if (c & 0xff) == (Signal::SIGTRAP as i32 | PTRACE_SYSGOOD_BIT as i32) =>
+            {
+                PtraceSyscallInfoOp::Exit
+            }
+            _ if (code >> 8) == PtraceEvent::Seccomp as i32 => PtraceSyscallInfoOp::Seccomp,
+            _ => PtraceSyscallInfoOp::None,
+        };
+        // Seccomp 停止时 ret_data = SECCOMP_RET_DATA
+        let ret_data = if op == PtraceSyscallInfoOp::Seccomp {
+            msg as u32
+        } else {
+            0
         };
         // 读 trap frame 填 ip/sp/nr/args。
-        let frame = unsafe { &*self.tracee_trap_frame_ptr() };
+        // SAFETY: 复验通过，tracee 仍处于 ptrace-stop，TrapFrame 稳定。
+        let frame = unsafe { &*self.trap_frame_ptr_for(ps.stop_frame_on_syscall_stack) };
         // AUDIT_ARCH_X86_64（x86_64 唯一支持架构；多架构时改为 arch 提供）。
         let arch: u32 = AUDIT_ARCH_X86_64;
         let mut info = PtraceSyscallInfo::new(arch, frame.rip, frame.rsp);

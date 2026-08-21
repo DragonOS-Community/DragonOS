@@ -12,7 +12,7 @@ use crate::{
     libs::{cpumask::CpuMask, spinlock::SpinLock, wait_queue::WaitQueue},
     mm::percpu::PerCpu,
     process::{kthread::KernelThreadClosure, kthread::KernelThreadMechanism, ProcessManager},
-    sched::SchedPolicy,
+    sched::{sched_yield, SchedPolicy},
     smp::{
         core::smp_get_processor_id,
         cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
@@ -588,18 +588,46 @@ fn report_quiescent_state(cpu: ProcessorId) {
     }
 }
 
+fn reserve_callback_capacity(inner: &mut RcuStateInner) {
+    let ready_additional = inner
+        .pending_callbacks
+        .len()
+        .checked_add(1)
+        .expect("RCU callback count overflow");
+    inner.pending_callbacks.reserve(1);
+    inner.ready_callbacks.reserve(ready_additional);
+}
+
+fn try_reserve_callback_capacity(inner: &mut RcuStateInner) -> Result<(), ()> {
+    let ready_additional = inner.pending_callbacks.len().checked_add(1).ok_or(())?;
+    inner.pending_callbacks.try_reserve(1).map_err(|_| ())?;
+    inner
+        .ready_callbacks
+        .try_reserve(ready_additional)
+        .map_err(|_| ())?;
+    Ok(())
+}
+
+fn enqueue_callback_locked(inner: &mut RcuStateInner, kind: CallbackKind) -> bool {
+    let target_gp = inner.request_future_gp();
+    let seq = inner.allocate_callback_seq();
+    inner.pending_callbacks.push_back(CallbackItem {
+        target_gp,
+        seq,
+        kind,
+    });
+    let ready_changed = RcuState::pump_grace_periods(inner);
+    ready_changed || inner.has_ready_work()
+}
+
 fn queue_callback(kind: CallbackKind) {
     let wake_worker = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        let target_gp = inner.request_future_gp();
-        let seq = inner.allocate_callback_seq();
-        inner.pending_callbacks.push_back(CallbackItem {
-            target_gp,
-            seq,
-            kind,
-        });
-        let ready_changed = RcuState::pump_grace_periods(&mut inner);
-        ready_changed || inner.has_ready_work()
+        // Admission reserves the destination capacity as well, so grace-period
+        // completion can move every pending callback to the ready queue without
+        // allocating in IRQ or other non-fallible progress paths.
+        reserve_callback_capacity(&mut inner);
+        enqueue_callback_locked(&mut inner, kind)
     };
 
     RCU_STATE.wake_state_waiters();
@@ -618,6 +646,24 @@ fn queue_raw_callback(head: NonNull<RcuHead>, func: RcuRawCallback) {
 
 fn queue_deferred_callback(call: Box<dyn DeferredCall>) {
     queue_callback(CallbackKind::Deferred(call));
+}
+
+fn try_queue_deferred_callback(call: Box<dyn DeferredCall>) -> Result<(), Box<dyn DeferredCall>> {
+    let mut call = Some(call);
+    let wake_worker = {
+        let mut inner = RCU_STATE.inner.lock_irqsave();
+        if try_reserve_callback_capacity(&mut inner).is_err() {
+            return Err(call.take().unwrap());
+        }
+        enqueue_callback_locked(&mut inner, CallbackKind::Deferred(call.take().unwrap()))
+    };
+
+    RCU_STATE.wake_state_waiters();
+    if wake_worker {
+        RCU_STATE.wake_worker();
+        RCU_STATE.maybe_process_ready_callbacks_inline();
+    }
+    Ok(())
 }
 
 fn worker_main() -> i32 {
@@ -764,6 +810,35 @@ where
     });
 }
 
+/// Tries to defer the drop of an `Arc` without invoking the allocator's
+/// infallible OOM path.
+///
+/// On failure, the original reference is returned and has not been published
+/// to the RCU callback queue. The caller must keep it alive through a grace
+/// period before dropping it.
+pub(crate) fn try_rcu_defer_drop_arc<T>(value: Arc<T>) -> Result<(), Arc<T>>
+where
+    T: Send + Sync + 'static,
+{
+    if !rcu_enabled() {
+        drop(value);
+        return Ok(());
+    }
+
+    let queued_value = value.clone();
+    let call: Box<dyn DeferredCall> = match Box::try_new(move || drop(queued_value)) {
+        Ok(call) => call,
+        Err(_) => return Err(value),
+    };
+
+    if let Err(call) = try_queue_deferred_callback(call) {
+        drop(call);
+        return Err(value);
+    }
+
+    Ok(())
+}
+
 pub fn synchronize_rcu() {
     if !rcu_enabled() {
         return;
@@ -792,6 +867,40 @@ pub fn synchronize_rcu() {
             None
         }
     });
+}
+
+/// Waits for a grace period without registering a waiter or allocating.
+///
+/// This is reserved for recovery after a fallible callback admission has
+/// already failed. Normal callers should use `synchronize_rcu()`, which sleeps
+/// efficiently on the RCU state wait queue.
+pub(crate) fn synchronize_rcu_noalloc() {
+    if !rcu_enabled() {
+        return;
+    }
+
+    if rcu_read_lock_held() {
+        warn!("synchronize_rcu_noalloc() called inside rcu_read_lock() region");
+        debug_assert!(!rcu_read_lock_held());
+    }
+
+    let target_gp = {
+        let mut inner = RCU_STATE.inner.lock_irqsave();
+        let target_gp = inner.request_future_gp();
+        RcuState::pump_grace_periods(&mut inner);
+        target_gp
+    };
+
+    RCU_STATE.wake_state_waiters();
+    RCU_STATE.wake_worker();
+
+    loop {
+        let completed = RCU_STATE.inner.lock_irqsave().completed_gp_seq;
+        if completed >= target_gp {
+            break;
+        }
+        sched_yield();
+    }
 }
 
 pub fn rcu_barrier() {

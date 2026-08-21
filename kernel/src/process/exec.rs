@@ -331,7 +331,7 @@ impl ExecParam {
             let new_sighand = SigHand::try_new().map_err(ExecError::SystemError)?;
             new_sighand.copy_handlers_from(&old_sighand);
             new_sighand.copy_process_state_from(&old_sighand);
-            me.replace_sighand_sync(new_sighand);
+            me.replace_sighand(new_sighand);
         }
 
         let (fd_table, shared) = me

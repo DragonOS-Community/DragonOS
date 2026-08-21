@@ -145,12 +145,13 @@ int set_test_robust_list(TestRobustListHead* head, TestRobustNode* node) {
     return static_cast<int>(syscall(SYS_set_robust_list, head, sizeof(*head)));
 }
 
-void shared_sighand_sigsegv_handler(int) {}
+void shared_sighand_handler(int) {}
 
 int shared_sighand_exec_child(void* opaque) {
     auto* path = static_cast<char*>(opaque);
     char* const argv[] = {path, nullptr};
-    char* const envp[] = {nullptr};
+    char child_mode[] = "DRAGONOS_EXEC_ABI_SHARED_CHILD=1";
+    char* const envp[] = {child_mode, nullptr};
     execve(path, argv, envp);
     return 97;
 }
@@ -360,7 +361,7 @@ TEST(ExecAbi, PostPonrFailureDoesNotChangeSharedSiblingHandler) {
     struct sigaction saved = {};
     struct sigaction custom = {};
     ASSERT_EQ(0, sigaction(SIGSEGV, nullptr, &saved));
-    custom.sa_handler = shared_sighand_sigsegv_handler;
+    custom.sa_handler = shared_sighand_handler;
     sigemptyset(&custom.sa_mask);
     ASSERT_EQ(0, sigaction(SIGSEGV, &custom, nullptr));
 
@@ -380,9 +381,38 @@ TEST(ExecAbi, PostPonrFailureDoesNotChangeSharedSiblingHandler) {
     ASSERT_TRUE(WIFSIGNALED(status));
     EXPECT_EQ(SIGSEGV, WTERMSIG(status));
     ASSERT_EQ(0, query_result);
-    EXPECT_EQ(shared_sighand_sigsegv_handler, observed.sa_handler);
+    EXPECT_EQ(shared_sighand_handler, observed.sa_handler);
     EXPECT_EQ(0, restore_result);
     EXPECT_EQ(0, unlink_result);
+}
+
+TEST(ExecAbi, SuccessfulExecDoesNotChangeSharedSiblingHandler) {
+    ASSERT_NE('\0', g_self_path[0]) << "self executable path was not initialized";
+
+    struct sigaction saved = {};
+    struct sigaction custom = {};
+    ASSERT_EQ(0, sigaction(SIGUSR1, nullptr, &saved));
+    custom.sa_handler = shared_sighand_handler;
+    sigemptyset(&custom.sa_mask);
+    ASSERT_EQ(0, sigaction(SIGUSR1, &custom, nullptr));
+
+    constexpr size_t kStackSize = 64 * 1024;
+    std::vector<unsigned char> stack(kStackSize);
+    pid_t child = clone(shared_sighand_exec_child, stack.data() + stack.size(),
+                        CLONE_VM | CLONE_SIGHAND | SIGCHLD, g_self_path);
+    int status = 0;
+    int waited = child < 0 ? -1 : waitpid(child, &status, 0);
+    struct sigaction observed = {};
+    int query_result = sigaction(SIGUSR1, nullptr, &observed);
+    int restore_result = sigaction(SIGUSR1, &saved, nullptr);
+
+    ASSERT_GE(child, 0);
+    ASSERT_EQ(child, waited);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    ASSERT_EQ(0, query_result);
+    EXPECT_EQ(shared_sighand_handler, observed.sa_handler);
+    EXPECT_EQ(0, restore_result);
 }
 
 #endif
@@ -415,6 +445,9 @@ TEST(ExecAbi, AuxvUidGidFollowCredentialsAtExec) {
 }
 
 int main(int argc, char** argv) {
+    if (getenv("DRAGONOS_EXEC_ABI_SHARED_CHILD") != nullptr) {
+        return 0;
+    }
     if (getenv("DRAGONOS_EXEC_ABI_CHECK_AUXV") != nullptr) {
         return check_auxv_credentials();
     }

@@ -1,0 +1,12 @@
+# Extraction/metadata for fifo_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=ipc
+BINARY=lat_fifo
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_fifo prints "Fifo latency: <N> microseconds" (prefix confirmed via strings;
+# lat_fifo did not run on host, to be confirmed in guest).
+SEARCH_PATTERN=Fifo latency
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=FIFO latency via lat_fifo

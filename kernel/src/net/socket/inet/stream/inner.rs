@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::filesystem::epoll::EPollEventType;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
-use crate::net::socket::{self, inet::Types};
+use crate::net::socket::{self};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::syscall::user_buffer::UserBuffer;
 use alloc::boxed::Box;
@@ -51,11 +51,13 @@ fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
 
 fn new_listen_smoltcp_socket<T>(
     local_endpoint: T,
+    reuseport: bool,
 ) -> Result<smoltcp::socket::tcp::Socket<'static>, SystemError>
 where
     T: Into<smoltcp::wire::IpListenEndpoint>,
 {
     let mut socket = new_smoltcp_socket();
+    socket.set_reuseport(reuseport);
     socket.listen(local_endpoint).map_err(|e| match e {
         tcp::ListenError::InvalidState => SystemError::EINVAL, // TODO: Check is right impl
         tcp::ListenError::Unaddressable => SystemError::EADDRINUSE,
@@ -112,6 +114,8 @@ impl Init {
         self,
         local_endpoint: smoltcp::wire::IpEndpoint,
         netns: Arc<NetNamespace>,
+        reuseaddr: bool,
+        reuseport: bool,
     ) -> Result<Self, (Self, SystemError)> {
         match self {
             Init::Unbound((socket, ver)) => {
@@ -128,7 +132,13 @@ impl Init {
 
                 // Handle ephemeral port assignment (port 0)
                 let bind_port = if local_endpoint.port == 0 {
-                    match bound.port_manager().bind_ephemeral_port(Types::Tcp) {
+                    match bound.port_manager().bind_tcp_ephemeral_port(
+                        local_endpoint.addr,
+                        reuseaddr,
+                        reuseport,
+                        bound.iface().nic_id(),
+                        bound.handle(),
+                    ) {
                         Ok(port) => port,
                         Err(err) => {
                             let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
@@ -138,10 +148,14 @@ impl Init {
                         }
                     }
                 } else {
-                    if let Err(err) = bound
-                        .port_manager()
-                        .bind_port(Types::Tcp, local_endpoint.port)
-                    {
+                    if let Err(err) = bound.port_manager().bind_tcp_port(
+                        local_endpoint.port,
+                        local_endpoint.addr,
+                        reuseaddr,
+                        reuseport,
+                        bound.iface().nic_id(),
+                        bound.handle(),
+                    ) {
                         let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
                             unreachable!("TCP BoundInner should contain a TCP socket");
                         };
@@ -178,7 +192,13 @@ impl Init {
                         return Err((Self::Unbound((Box::new(socket), ver)), err))
                     }
                 };
-                let bound_port = match bound.port_manager().bind_ephemeral_port(Types::Tcp) {
+                let bound_port = match bound.port_manager().bind_tcp_ephemeral_port(
+                    address,
+                    false,
+                    false,
+                    bound.iface().nic_id(),
+                    bound.handle(),
+                ) {
                     Ok(port) => port,
                     Err(err) => {
                         let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
@@ -230,6 +250,8 @@ impl Init {
         self,
         backlog: usize,
         netns: Arc<NetNamespace>,
+        reuseaddr: bool,
+        reuseport: bool,
     ) -> Result<Listening, (Self, SystemError)> {
         // If unbound, auto-bind to INADDR_ANY:ephemeral (Linux compat).
         let bound_self = if matches!(self, Init::Unbound(_)) {
@@ -246,7 +268,7 @@ impl Init {
                 }
             };
             let auto_bind_ep = smoltcp::wire::IpEndpoint::new(unspec_addr, 0);
-            match self.bind(auto_bind_ep, netns.clone()) {
+            match self.bind(auto_bind_ep, netns.clone(), reuseaddr, reuseport) {
                 Ok(bound) => bound,
                 Err((init, err)) => return Err((init, err)),
             }
@@ -298,7 +320,7 @@ impl Init {
                         continue; // primary inner already covers this iface
                     }
                     let new_listen = socket::inet::BoundInner::bind_on_iface(
-                        new_listen_smoltcp_socket(listen_addr)?,
+                        new_listen_smoltcp_socket(listen_addr, reuseport)?,
                         iface.clone(),
                         inner.netns(),
                     )?;
@@ -308,7 +330,7 @@ impl Init {
                 let remaining = backlog.saturating_sub(1 + inners.len());
                 for _ in 0..remaining {
                     let new_listen = socket::inet::BoundInner::bind_on_iface(
-                        new_listen_smoltcp_socket(listen_addr)?,
+                        new_listen_smoltcp_socket(listen_addr, reuseport)?,
                         inner.iface().clone(),
                         inner.netns(),
                     )?;
@@ -319,7 +341,7 @@ impl Init {
                 let additional_sockets = backlog.saturating_sub(1);
                 for _ in 0..additional_sockets {
                     let new_listen = socket::inet::BoundInner::bind(
-                        new_listen_smoltcp_socket(listen_addr)?,
+                        new_listen_smoltcp_socket(listen_addr, reuseport)?,
                         listen_addr
                             .addr
                             .as_ref()
@@ -337,6 +359,7 @@ impl Init {
         }
 
         if let Err(err) = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+            socket.set_reuseport(reuseport);
             socket.listen(listen_addr).map_err(|err| match err {
                 tcp::ListenError::InvalidState => SystemError::EINVAL,
                 tcp::ListenError::Unaddressable => SystemError::EINVAL,
@@ -350,6 +373,7 @@ impl Init {
             inners,
             connect: AtomicUsize::new(0),
             listen_addr,
+            reuseport,
         });
     }
 
@@ -357,7 +381,9 @@ impl Init {
         match self {
             Init::Unbound(_) => {}
             Init::Bound((inner, endpoint)) => {
-                inner.port_manager().unbind_port(Types::Tcp, endpoint.port);
+                inner
+                    .port_manager()
+                    .unbind_tcp_port(endpoint.port, inner.iface().nic_id(), inner.handle());
                 inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
             }
         }
@@ -434,9 +460,11 @@ impl Connecting {
             | ConnectResult::ShutdownReset
             | ConnectResult::ShutdownResetConsumed => {
                 // unbind port
-                self.inner
-                    .port_manager()
-                    .unbind_port(Types::Tcp, self.local.port);
+                self.inner.port_manager().unbind_tcp_port(
+                    self.local.port,
+                    self.inner.iface().nic_id(),
+                    self.inner.handle(),
+                );
                 let socket = self.inner.into_socket();
                 let socket = match socket {
                     smoltcp::socket::Socket::Tcp(s) => s,
@@ -690,6 +718,7 @@ pub struct Listening {
     pub inners: Vec<socket::inet::BoundInner>,
     connect: AtomicUsize,
     listen_addr: smoltcp::wire::IpListenEndpoint,
+    reuseport: bool,
 }
 
 impl Listening {
@@ -716,13 +745,13 @@ impl Listening {
         // where each interface has its own listen socket in the smoltcp SocketSet.
         let mut new_listen = if self.listen_addr.addr.is_none() {
             socket::inet::BoundInner::bind_on_iface(
-                new_listen_smoltcp_socket(self.listen_addr)?,
+                new_listen_smoltcp_socket(self.listen_addr, self.reuseport)?,
                 connected.iface().clone(),
                 connected.netns(),
             )?
         } else {
             socket::inet::BoundInner::bind(
-                new_listen_smoltcp_socket(self.listen_addr)?,
+                new_listen_smoltcp_socket(self.listen_addr, self.reuseport)?,
                 self.listen_addr
                     .addr
                     .as_ref()
@@ -782,12 +811,14 @@ impl Listening {
         // (pushed last during listen() construction). We must unbind from its
         // port_manager, not inners[0] which may belong to a different iface for
         // INADDR_ANY listeners.
-        self.inners
+        let owner = self
+            .inners
             .last()
-            .expect("Listening socket must have at least one inner")
+            .expect("Listening socket must have at least one inner");
+        owner
             .iface()
             .port_manager()
-            .unbind_port(Types::Tcp, port);
+            .unbind_tcp_port(port, owner.iface().nic_id(), owner.handle());
     }
 
     pub fn release(&mut self) {

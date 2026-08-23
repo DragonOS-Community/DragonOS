@@ -371,6 +371,154 @@ TEST(InotifyNamespaceEvents, ConcurrentOpenCreateDeletePreservesCommitOrder) {
     rmdir(dir.c_str());
 }
 
+TEST(InotifyNamespaceEvents, ConcurrentDeleteRecreatePreservesCommitOrder) {
+    const std::string dir = "/tmp/dunitest_inotify_delete_recreate_order";
+    ASSERT_EQ(mkdir(dir.c_str(), 0777), 0) << strerror(errno);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, dir.c_str(), IN_CREATE | IN_DELETE), 0);
+
+    auto run_case = [&](const std::string &prefix, bool is_dir, auto create, auto remove) {
+        constexpr int kEntries = 64;
+        for (int i = 0; i < kEntries; ++i) {
+            const std::string path = dir + "/" + prefix + std::to_string(i);
+            if (create(path) != 0) return errno;
+        }
+        drain_events(ifd);
+
+        std::atomic<int> worker_error{0};
+        std::atomic<bool> stop{false};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        std::thread remover([&]() {
+            for (int i = 0; i < kEntries; ++i) {
+                const std::string path = dir + "/" + prefix + std::to_string(i);
+                if (remove(path) != 0) {
+                    worker_error.store(errno);
+                    stop.store(true);
+                    return;
+                }
+            }
+        });
+
+        for (int i = 0; i < kEntries; ++i) {
+            const std::string path = dir + "/" + prefix + std::to_string(i);
+            struct stat st {};
+            while (lstat(path.c_str(), &st) == 0) {
+                if (worker_error.load() != 0 ||
+                    std::chrono::steady_clock::now() >= deadline) {
+                    if (worker_error.load() == 0) worker_error.store(ETIMEDOUT);
+                    stop.store(true);
+                    break;
+                }
+                sched_yield();
+            }
+            if (stop.load()) break;
+            if (errno != ENOENT || create(path) != 0) {
+                worker_error.store(errno);
+                stop.store(true);
+                break;
+            }
+        }
+        remover.join();
+        if (worker_error.load() != 0) return worker_error.load();
+
+        auto evs = drain_events(ifd);
+        for (int i = 0; i < kEntries; ++i) {
+            const std::string name = prefix + std::to_string(i);
+            int deleted = -1;
+            int created = -1;
+            uint32_t delete_mask = 0;
+            uint32_t create_mask = 0;
+            for (size_t j = 0; j < evs.size(); ++j) {
+                if (evs[j].name != name) continue;
+                if (deleted < 0 && (evs[j].mask & IN_DELETE)) {
+                    deleted = static_cast<int>(j);
+                    delete_mask = evs[j].mask;
+                }
+                if (created < 0 && (evs[j].mask & IN_CREATE)) {
+                    created = static_cast<int>(j);
+                    create_mask = evs[j].mask;
+                }
+            }
+            if (deleted < 0 || created < 0 || deleted >= created) return EPROTO;
+            if (!!(delete_mask & IN_ISDIR) != is_dir ||
+                !!(create_mask & IN_ISDIR) != is_dir) {
+                return EPROTO;
+            }
+        }
+
+        for (int i = 0; i < kEntries; ++i) {
+            const std::string path = dir + "/" + prefix + std::to_string(i);
+            if (remove(path) != 0) return errno;
+        }
+        drain_events(ifd);
+        return 0;
+    };
+
+    auto create_file = [](const std::string &path) {
+        int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd < 0) return -1;
+        return close(fd);
+    };
+    EXPECT_EQ(run_case("file_", false, create_file,
+                       [](const std::string &path) { return unlink(path.c_str()); }),
+              0);
+    EXPECT_EQ(run_case("dir_", true,
+                       [](const std::string &path) { return mkdir(path.c_str(), 0700); },
+                       [](const std::string &path) { return rmdir(path.c_str()); }),
+              0);
+    EXPECT_EQ(run_case("link_", false,
+                       [](const std::string &path) { return symlink("target", path.c_str()); },
+                       [](const std::string &path) { return unlink(path.c_str()); }),
+              0);
+
+    close(ifd);
+    rmdir(dir.c_str());
+}
+
+TEST(InotifyNamespaceEvents, ConcurrentMkdirPublishesOneCreate) {
+    const std::string dir = "/tmp/dunitest_inotify_concurrent_mkdir";
+    const std::string name = "child";
+    const std::string path = dir + "/" + name;
+    ASSERT_EQ(mkdir(dir.c_str(), 0777), 0) << strerror(errno);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, dir.c_str(), IN_CREATE), 0);
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    int results[2] = {};
+    auto worker = [&](int index) {
+        ready.fetch_add(1);
+        while (!go.load()) sched_yield();
+        results[index] = mkdir(path.c_str(), 0700) == 0 ? 0 : errno;
+    };
+    std::thread first(worker, 0);
+    std::thread second(worker, 1);
+    while (ready.load() != 2) sched_yield();
+    go.store(true);
+    first.join();
+    second.join();
+
+    EXPECT_TRUE((results[0] == 0 && results[1] == EEXIST) ||
+                (results[1] == 0 && results[0] == EEXIST));
+    auto evs = drain_events(ifd);
+    int creates = 0;
+    for (const auto &event : evs) {
+        if ((event.mask & IN_CREATE) && event.name == name) {
+            ++creates;
+            EXPECT_NE(event.mask & IN_ISDIR, 0U);
+        }
+    }
+    EXPECT_EQ(creates, 1);
+
+    close(ifd);
+    rmdir(path.c_str());
+    rmdir(dir.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // IN_ATTRIB: changing file metadata (chmod) delivers IN_ATTRIB.
 // ---------------------------------------------------------------------------

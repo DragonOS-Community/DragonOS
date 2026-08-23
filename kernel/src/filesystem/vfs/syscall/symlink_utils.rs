@@ -1,6 +1,8 @@
 use system_error::SystemError;
 
 use crate::filesystem::fsnotify::{self, FsEvent};
+use crate::filesystem::vfs::mount::MountFSInode;
+use crate::libs::casting::DowncastArc;
 use crate::{
     filesystem::vfs::{
         fcntl::AtFlags,
@@ -66,9 +68,16 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     }
     check_inode_permission(&new_parent, &parent_metadata, PermissionMask::MAY_WRITE)?;
 
-    new_parent.symlink(new_name, from)?;
-    // fsnotify：父目录得 IN_CREATE（符号链接非目录，IN_ISDIR 不置位）。
-    fsnotify::fsnotify(FsEvent::CREATE, Some((&new_parent, new_name)), None, 0);
+    let notify = || {
+        // fsnotify：父目录得 IN_CREATE（符号链接非目录，IN_ISDIR 不置位）。
+        fsnotify::fsnotify(FsEvent::CREATE, Some((&new_parent, new_name)), None, 0);
+    };
+    if let Some(mounted) = new_parent.clone().downcast_arc::<MountFSInode>() {
+        mounted.symlink_with_post_commit(new_name, from, notify)?;
+    } else {
+        new_parent.symlink(new_name, from)?;
+        notify();
+    }
 
     return Ok(0);
 }

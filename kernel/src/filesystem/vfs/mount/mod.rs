@@ -3228,6 +3228,238 @@ impl MountFSInode {
         Ok((inode, preopened))
     }
 
+    /// Create a directory and publish its namespace event while the parent
+    /// gate still orders it against rmdir and same-name mutations.
+    pub(crate) fn mkdir_with_post_commit(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        post_commit: impl FnOnce(),
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        match self.dentry.inode.find(name) {
+            Ok(_) => return Err(SystemError::EEXIST),
+            Err(SystemError::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        let inner_inode = self.dentry.inode.mkdir(name, mode)?;
+        post_commit();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        Ok(MountFSInode::new_child(
+            inner_inode,
+            self.mount_fs.clone(),
+            &parent,
+            DName::from(name),
+        )?)
+    }
+
+    /// Create a symbolic link and publish its namespace event while the
+    /// parent gate still serializes same-name mutations.
+    pub(crate) fn symlink_with_post_commit(
+        &self,
+        name: &str,
+        target: &str,
+        post_commit: impl FnOnce(),
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let inner_inode = self.dentry.inode.symlink(name, target)?;
+        post_commit();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        Ok(MountFSInode::new_child(
+            inner_inode,
+            self.mount_fs.clone(),
+            &parent,
+            DName::from(name),
+        )?)
+    }
+
+    /// Publish unlink notifications after the namespace and delete lifecycle
+    /// are committed, before another mutation of this parent can overtake it.
+    pub(crate) fn unlink_with_post_commit(
+        &self,
+        name: &str,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        let mut post_commit = Some(post_commit);
+        let mut run_post_commit = || {
+            post_commit
+                .take()
+                .expect("unlink post-commit callback runs once")();
+        };
+        self.unlink_with_context_impl(name, &context, Some(&mut run_post_commit))
+    }
+
+    /// Publish rmdir notifications at the same parent-directory commit
+    /// boundary used for unlink.
+    pub(crate) fn rmdir_with_post_commit(
+        &self,
+        name: &str,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        let mut post_commit = Some(post_commit);
+        let mut run_post_commit = || {
+            post_commit
+                .take()
+                .expect("rmdir post-commit callback runs once")();
+        };
+        self.rmdir_with_context_impl(name, &context, Some(&mut run_post_commit))
+    }
+
+    fn unlink_with_context_impl(
+        &self,
+        name: &str,
+        context: &DentryMutationContext<'_>,
+        post_commit: Option<&mut dyn FnMut()>,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        let inner = self.dentry.inode.find(name)?;
+        let dname = DName::from(name);
+        let child =
+            self.mount_fs
+                .super_block_state
+                .get_registered_dentry(&self.dentry, &dname, &inner)?;
+        let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
+        drop(namespace_guard);
+
+        if child
+            .as_ref()
+            .is_some_and(|dentry| dentry.is_local_mountpoint())
+        {
+            return Err(SystemError::EBUSY);
+        }
+        let object_state = child
+            .as_ref()
+            .map(|child| child.fsnotify_object_state.clone())
+            .or_else(|| {
+                self.mount_fs.super_block_state.fsnotify_object_state(
+                    inner.metadata().ok()?.inode_id,
+                    inner.inode_generation(),
+                )
+            });
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
+        self.dentry.inode.unlink_with_context(name, context)?;
+        let last_link = delete_lifecycle
+            .as_mut()
+            .is_some_and(|state| fsnotify::note_link_removed(state));
+        if let Some(fuse) = inner
+            .as_any_ref()
+            .downcast_ref::<crate::filesystem::fuse::inode::FuseNode>()
+        {
+            let _ = fuse.note_link_removed(false);
+        }
+        context.ensure_locked();
+        let namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        drop(inner);
+        if let Some(child) = child.as_ref() {
+            if last_link {
+                fsnotify::mark_delete_pending(
+                    delete_lifecycle
+                        .as_mut()
+                        .expect("last link has lifecycle state"),
+                );
+            }
+            self.mount_fs.super_block_state.disconnect_dentry(child);
+        }
+        if let Some(post_commit) = post_commit {
+            drop(namespace_guard);
+            context.release_locked();
+            drop(delete_lifecycle);
+            post_commit();
+        }
+        Ok(())
+    }
+
+    fn rmdir_with_context_impl(
+        &self,
+        name: &str,
+        context: &DentryMutationContext<'_>,
+        post_commit: Option<&mut dyn FnMut()>,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        let inner = self.dentry.inode.find(name)?;
+        let dname = DName::from(name);
+        let child =
+            self.mount_fs
+                .super_block_state
+                .get_registered_dentry(&self.dentry, &dname, &inner)?;
+        let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
+        drop(namespace_guard);
+
+        if child
+            .as_ref()
+            .is_some_and(|dentry| dentry.is_local_mountpoint())
+        {
+            return Err(SystemError::EBUSY);
+        }
+        let object_state = child
+            .as_ref()
+            .map(|child| child.fsnotify_object_state.clone())
+            .or_else(|| {
+                self.mount_fs.super_block_state.fsnotify_object_state(
+                    inner.metadata().ok()?.inode_id,
+                    inner.inode_generation(),
+                )
+            });
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
+        self.dentry.inode.rmdir_with_context(name, context)?;
+        if let Some(fuse) = inner
+            .as_any_ref()
+            .downcast_ref::<crate::filesystem::fuse::inode::FuseNode>()
+        {
+            let _ = fuse.note_link_removed(true);
+        }
+        context.ensure_locked();
+        let namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        drop(inner);
+        if let Some(child) = child.as_ref() {
+            if let Some(state) = delete_lifecycle.as_mut() {
+                fsnotify::mark_delete_pending(state);
+            }
+            self.mount_fs.super_block_state.disconnect_dentry(child);
+        }
+        if let Some(post_commit) = post_commit {
+            drop(namespace_guard);
+            context.release_locked();
+            drop(delete_lifecycle);
+            post_commit();
+        }
+        Ok(())
+    }
+
     /// Publish a successful hard link after its link-count state is updated,
     /// while the destination parent gate still orders it against unlink and
     /// other namespace mutations in that directory.
@@ -4525,28 +4757,14 @@ impl IndexNode for MountFSInode {
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_mount_writable()?;
-        let _children_guard = self.dentry.children_gate.lock();
-        let inner_inode = self.dentry.inode.symlink(name, target)?;
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        Ok(MountFSInode::new_child(
-            inner_inode,
-            self.mount_fs.clone(),
-            &parent,
-            DName::from(name),
-        )?)
+        self.symlink_with_post_commit(name, target, || {})
     }
 
     /// @brief Delete a file/directory in the mounted filesystem
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let context = DentryMutationContext::new();
-        self.unlink_with_context(name, &context)
+        self.unlink_with_context_impl(name, &context, None)
     }
 
     fn unlink_with_context(
@@ -4554,75 +4772,13 @@ impl IndexNode for MountFSInode {
         name: &str,
         context: &DentryMutationContext<'_>,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        let _children_guard = self.dentry.children_gate.lock();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        let inner = self.dentry.inode.find(name)?;
-        let dname = DName::from(name);
-        let child =
-            self.mount_fs
-                .super_block_state
-                .get_registered_dentry(&self.dentry, &dname, &inner)?;
-        let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
-        drop(_namespace_guard);
-
-        // First check if this inode is a mount point; if so, it cannot be deleted
-        if child
-            .as_ref()
-            .is_some_and(|dentry| dentry.is_local_mountpoint())
-        {
-            return Err(SystemError::EBUSY);
-        }
-        // Serialize last-link publication against relink and final dentry
-        // detach for this lifecycle protocol.
-        let object_state = child
-            .as_ref()
-            .map(|child| child.fsnotify_object_state.clone())
-            .or_else(|| {
-                self.mount_fs.super_block_state.fsnotify_object_state(
-                    inner.metadata().ok()?.inode_id,
-                    inner.inode_generation(),
-                )
-            });
-        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
-        self.dentry.inode.unlink_with_context(name, context)?;
-        let last_link = delete_lifecycle
-            .as_mut()
-            .is_some_and(|state| fsnotify::note_link_removed(state));
-        if let Some(fuse) = inner
-            .as_any_ref()
-            .downcast_ref::<crate::filesystem::fuse::inode::FuseNode>()
-        {
-            let _ = fuse.note_link_removed(false);
-        }
-        context.ensure_locked();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        drop(inner);
-        if let Some(child) = child.as_ref() {
-            if last_link {
-                fsnotify::mark_delete_pending(
-                    delete_lifecycle
-                        .as_mut()
-                        .expect("last link has lifecycle state"),
-                );
-            }
-            self.mount_fs.super_block_state.disconnect_dentry(child);
-        }
-        Ok(())
+        self.unlink_with_context_impl(name, context, None)
     }
 
     #[inline]
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let context = DentryMutationContext::new();
-        self.rmdir_with_context(name, &context)
+        self.rmdir_with_context_impl(name, &context, None)
     }
 
     fn rmdir_with_context(
@@ -4630,60 +4786,7 @@ impl IndexNode for MountFSInode {
         name: &str,
         context: &DentryMutationContext<'_>,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        let _children_guard = self.dentry.children_gate.lock();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        let inner = self.dentry.inode.find(name)?;
-        let dname = DName::from(name);
-        let child =
-            self.mount_fs
-                .super_block_state
-                .get_registered_dentry(&self.dentry, &dname, &inner)?;
-        let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
-        drop(_namespace_guard);
-
-        // First check if this inode is a mount point; if so, it cannot be deleted
-        if child
-            .as_ref()
-            .is_some_and(|dentry| dentry.is_local_mountpoint())
-        {
-            return Err(SystemError::EBUSY);
-        }
-        let object_state = child
-            .as_ref()
-            .map(|child| child.fsnotify_object_state.clone())
-            .or_else(|| {
-                self.mount_fs.super_block_state.fsnotify_object_state(
-                    inner.metadata().ok()?.inode_id,
-                    inner.inode_generation(),
-                )
-            });
-        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
-        self.dentry.inode.rmdir_with_context(name, context)?;
-        if let Some(fuse) = inner
-            .as_any_ref()
-            .downcast_ref::<crate::filesystem::fuse::inode::FuseNode>()
-        {
-            let _ = fuse.note_link_removed(true);
-        }
-        context.ensure_locked();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        drop(inner);
-        if let Some(child) = child.as_ref() {
-            if let Some(state) = delete_lifecycle.as_mut() {
-                fsnotify::mark_delete_pending(state);
-            }
-            self.mount_fs.super_block_state.disconnect_dentry(child);
-        }
-        Ok(())
+        self.rmdir_with_context_impl(name, context, None)
     }
 
     #[inline]

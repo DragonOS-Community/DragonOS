@@ -17,7 +17,7 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{
             file::{File, FileMode, FilePrivateData},
-            mount::{MountFlags, MOUNT_LIFECYCLE_LOCK},
+            mount::{MountFSInode, MountFlags, MOUNT_LIFECYCLE_LOCK},
             permission::PermissionMask,
             AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, Metadata, MountFS,
             SetMetadataMask,
@@ -593,18 +593,21 @@ pub fn do_mkdir_at(
     }
     let umask = pcb.fs_struct().umask();
     let final_mode = InodeMode::from_bits_truncate(final_mode_bits) & !umask;
-    // 执行创建
-    let r = current_inode.mkdir(name, final_mode);
-    if let Ok(new_inode) = &r {
-        // fsnotify：父目录得 IN_CREATE（子项是目录 → IN_ISDIR 由 dispatch 依据子项设置）。
+    let notify = || {
         fsnotify::fsnotify(
-            FsEvent::CREATE,
+            FsEvent::CREATE | FsEvent::ISDIR,
             Some((&current_inode, name)),
-            Some(new_inode),
+            None,
             0,
         );
+    };
+    if let Some(mounted) = current_inode.clone().downcast_arc::<MountFSInode>() {
+        mounted.mkdir_with_post_commit(name, final_mode, notify)
+    } else {
+        let inode = current_inode.mkdir(name, final_mode)?;
+        notify();
+        Ok(inode)
     }
-    return r;
 }
 
 /// 解析父目录inode
@@ -680,16 +683,22 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::ENOTDIR);
     }
 
-    // 删除文件夹
-    parent_inode.rmdir(filename)?;
-    // DELETE_SELF is emitted later when the disconnected dentry finally
-    // detaches from the inode.
-    fsnotify::fsnotify(
-        FsEvent::DELETE,
-        Some((&parent_inode, filename)),
-        Some(&target_inode),
-        0,
-    );
+    let notify = || {
+        // DELETE_SELF is emitted later when the disconnected dentry finally
+        // detaches from the inode.
+        fsnotify::fsnotify(
+            FsEvent::DELETE,
+            Some((&parent_inode, filename)),
+            Some(&target_inode),
+            0,
+        );
+    };
+    if let Some(mounted) = parent_inode.clone().downcast_arc::<MountFSInode>() {
+        mounted.rmdir_with_post_commit(filename, notify)?;
+    } else {
+        parent_inode.rmdir(filename)?;
+        notify();
+    }
 
     return Ok(0);
 }
@@ -729,17 +738,23 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EISDIR);
     }
 
-    // 在父目录上执行 unlink 操作
-    parent_inode.unlink(filename)?;
-    // Linux publishes the link-count ATTRIB before the parent DELETE record.
-    // DELETE_SELF remains deferred to final dentry detach.
-    fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&target_inode), 0);
-    fsnotify::fsnotify(
-        FsEvent::DELETE,
-        Some((&parent_inode, filename)),
-        Some(&target_inode),
-        0,
-    );
+    let notify = || {
+        // Linux publishes the link-count ATTRIB before the parent DELETE
+        // record. DELETE_SELF remains deferred to final dentry detach.
+        fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&target_inode), 0);
+        fsnotify::fsnotify(
+            FsEvent::DELETE,
+            Some((&parent_inode, filename)),
+            Some(&target_inode),
+            0,
+        );
+    };
+    if let Some(mounted) = parent_inode.clone().downcast_arc::<MountFSInode>() {
+        mounted.unlink_with_post_commit(filename, notify)?;
+    } else {
+        parent_inode.unlink(filename)?;
+        notify();
+    }
     return Ok(0);
 }
 

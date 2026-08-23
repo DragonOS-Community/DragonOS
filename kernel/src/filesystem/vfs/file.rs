@@ -851,23 +851,24 @@ impl File {
         inode.flush_file(self.private_data.lock(), lock_owner)
     }
 
-    fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
+    fn maybe_kill_suid_sgid_after_write(&self) -> Result<bool, SystemError> {
         // 仅对普通文件生效。
         if self.file_type != FileType::File {
-            return Ok(());
+            return Ok(false);
         }
 
         // Linux 语义：若调用者具备 CAP_FSETID，则写/截断不会清除 suid/sgid。
         let cred = ProcessManager::current_pcb().cred();
         if cred.has_capability(CAPFlags::CAP_FSETID) {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut md = self.inode.metadata()?;
         if !md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID) {
-            return Ok(());
+            return Ok(false);
         }
 
+        let original_mode = md.mode;
         // suid always must be killed on write/truncate when no CAP_FSETID.
         md.mode.remove(InodeMode::S_ISUID);
 
@@ -877,12 +878,15 @@ impl File {
         if should_remove_sgid(md.mode, md.gid, &cred) {
             md.mode.remove(InodeMode::S_ISGID);
         }
+        if md.mode == original_mode {
+            return Ok(false);
+        }
 
         self.inode.set_metadata_masked(
             &md,
             SetMetadataMask::MODE | SetMetadataMask::WRITE_SIDE_EFFECT,
         )?;
-        Ok(())
+        Ok(true)
     }
 
     #[inline(never)]
@@ -1050,9 +1054,7 @@ impl File {
         written_len: usize,
         config: WriteConfig,
     ) -> Result<usize, SystemError> {
-        if written_len > 0 {
-            self.maybe_kill_suid_sgid_after_write()?;
-        }
+        let mode_changed = written_len > 0 && self.maybe_kill_suid_sgid_after_write()?;
 
         if config.update_offset {
             match config.offset_update {
@@ -1074,6 +1076,11 @@ impl File {
             && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
             && fsnotify::has_any_watch()
         {
+            // Linux publishes the ATTR_MODE change from file_remove_privs
+            // before the successful write's MODIFY event.
+            if mode_changed {
+                self.notify_fs_event(FsEvent::ATTRIB);
+            }
             self.notify_fs_event(FsEvent::MODIFY);
         }
         Ok(written_len)

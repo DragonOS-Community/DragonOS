@@ -126,9 +126,13 @@ pub fn target_for_inode(inode: &Arc<dyn IndexNode>) -> Result<FsNotifyTarget, Sy
         },
         is_dir: md.file_type == FileType::Dir,
         disconnected: md.nlinks == 0,
-        // Non-mounted kernel objects do not own a shared MountFS object state.
-        // Keep their uncommon dispatch path conservative.
-        watched: true,
+        // Anonymous inodes may expose a local presence hint. Unknown inode
+        // implementations remain conservative so this optimization cannot
+        // suppress notifications.
+        watched: inode
+            .fsnotify_watch_count()
+            .map(|count| count.load(Ordering::Acquire) != 0)
+            .unwrap_or(true),
     })
 }
 

@@ -32,24 +32,20 @@ struct Ev {
     std::string name;
 };
 
-// Drain all queued inotify events within a short time budget (nonblocking fd).
-// Returns the parsed events (mask + child name).
+// VFS notifications are queued before the triggering syscall returns. Drain
+// the currently queued prefix and stop as soon as the nonblocking fd is empty.
 std::vector<Ev> drain_events(int ifd) {
     std::vector<Ev> out;
     char buf[4096] __attribute__((aligned(8)));
-    for (int spins = 0; spins < 2000; spins++) {
+    for (;;) {
         ssize_t n = read(ifd, buf, sizeof(buf));
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(2000);
-                continue;
+                break;
             }
             break;
         }
-        if (n == 0) {
-            usleep(2000);
-            continue;
-        }
+        if (n == 0) break;
         for (char *p = buf; p + sizeof(struct inotify_event) <= buf + n;) {
             struct inotify_event *e = reinterpret_cast<struct inotify_event *>(p);
             out.push_back(Ev{e->mask, e->len ? std::string(e->name) : std::string()});

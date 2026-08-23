@@ -704,12 +704,10 @@ impl InotifyInode {
         reserve_watch(&self.state.quota_keys)?;
         fsnotify::adjust_total_watches(1);
 
-        if let Some(state) = mark.object_state.as_ref() {
-            // Publish the local presence hint before the mark can become
-            // visible in the global index. A concurrent removal therefore
-            // cannot observe and destroy an uncharged mark.
-            state.watch_added();
-        }
+        // Publish the local presence hint before the mark can become visible
+        // in the global index. A concurrent removal therefore cannot observe
+        // and destroy an uncharged mark.
+        mark.watch_added();
 
         // 持 marks 锁完成全部插入（wd 表 / group.marks / 全局索引）。
         self.state.wd.lock().map.insert(wd, Arc::downgrade(&mark));
@@ -720,9 +718,7 @@ impl InotifyInode {
         if let Err(error) = fsnotify::index_add(&mark) {
             marks.remove(&target_identity);
             self.state.wd.lock().map.remove(&wd);
-            if let Some(state) = mark.object_state.as_ref() {
-                state.watch_removed();
-            }
+            mark.watch_removed();
             fsnotify::adjust_total_watches(-1);
             release_quota(&self.state.quota_keys, 0, 1);
             return Err(error);
@@ -761,9 +757,7 @@ impl InotifyInode {
             m.active.store(false, Ordering::Release);
             drop(dispatch);
             fsnotify::index_remove(m);
-            if let Some(state) = m.object_state.as_ref() {
-                state.watch_removed();
-            }
+            m.watch_removed();
             self.state.wd.lock().map.remove(&m.wd);
         }
         if n > 0 {
@@ -838,12 +832,14 @@ impl IndexNode for InotifyInode {
             return Err(SystemError::EINVAL);
         }
 
-        let _consumer = self.state.read_consumer.lock();
-
         loop {
+            // Serialize one queue extraction, but never keep this mutex while
+            // sleeping. Other readers must still be able to observe a later
+            // O_NONBLOCK update or their own pending signal.
+            let consumer = self.state.read_consumer.lock();
             let mut written = 0;
+            let mut blocked_by_size = false;
             loop {
-                let mut blocked_by_size = false;
                 let next = {
                     let mut q = self.state.events.lock();
                     if q.overflow_pending && q.pre_overflow_remaining == 0 {
@@ -878,7 +874,6 @@ impl IndexNode for InotifyInode {
                 };
 
                 let Some(ev) = next else {
-                    let _ = blocked_by_size;
                     break;
                 };
                 let rl = Self::record_len(ev.name.as_deref());
@@ -886,11 +881,17 @@ impl IndexNode for InotifyInode {
             }
 
             if written == 0 {
+                if blocked_by_size {
+                    // The first queued record cannot fit in the caller's
+                    // buffer. This is the only zero-byte EINVAL case.
+                    return Err(SystemError::EINVAL);
+                }
                 let empty = {
                     let q = self.state.events.lock();
                     q.list.is_empty() && !q.overflow_pending
                 };
                 if empty {
+                    drop(consumer);
                     // 空队列
                     if self.nonblock.load(Ordering::Relaxed) {
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -905,8 +906,10 @@ impl IndexNode for InotifyInode {
                     )?;
                     continue;
                 }
-                // 首个事件即放不下（name 过大）。
-                return Err(SystemError::EINVAL);
+                // An event arrived after the extraction observed an empty
+                // queue. Restart instead of misreporting a size error.
+                drop(consumer);
+                continue;
             }
             return Ok(written);
         }

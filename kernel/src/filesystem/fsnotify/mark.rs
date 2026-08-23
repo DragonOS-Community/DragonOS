@@ -48,6 +48,25 @@ impl FsNotifyMark {
     pub fn identity(&self) -> FsNotifyObjectId {
         self.object_id
     }
+
+    pub(crate) fn watch_added(&self) {
+        if let Some(state) = self.object_state.as_ref() {
+            state.watch_added();
+        } else if let Some(count) = self._inode.fsnotify_watch_count() {
+            count.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn watch_removed(&self) {
+        if let Some(state) = self.object_state.as_ref() {
+            state.watch_removed();
+        } else if let Some(count) = self._inode.fsnotify_watch_count() {
+            let result = count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            });
+            debug_assert!(result.is_ok(), "fsnotify inode watch count underflow");
+        }
+    }
 }
 
 /// 撤销一个 mark：从 group.marks、全局索引移除，并维护全局计数。
@@ -85,9 +104,7 @@ pub fn destroy_mark(mark: &Arc<FsNotifyMark>) {
         group.backend.free_mark(mark);
         // 从全局索引移除。
         index_remove(mark);
-        if let Some(state) = mark.object_state.as_ref() {
-            state.watch_removed();
-        }
+        mark.watch_removed();
         // 维护全局 watch 计数（唯一计数器，覆盖上限检查 + 快速路径）。
         adjust_total_watches(-1);
     }

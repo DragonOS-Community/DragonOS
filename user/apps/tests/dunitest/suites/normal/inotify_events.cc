@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/inotify.h>
@@ -28,6 +29,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -39,23 +41,20 @@ struct Ev {
     std::string name;
 };
 
-// Drain all queued inotify events within a short time budget (nonblocking fd).
+// VFS notifications are queued before the triggering syscall returns. Drain
+// the currently queued prefix and stop as soon as the nonblocking fd is empty.
 std::vector<Ev> drain_events(int ifd) {
     std::vector<Ev> out;
     char buf[4096] __attribute__((aligned(8)));
-    for (int spins = 0; spins < 300; spins++) {
+    for (;;) {
         ssize_t n = read(ifd, buf, sizeof(buf));
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(2000);
-                continue;
+                break;
             }
             break;
         }
-        if (n == 0) {
-            usleep(2000);
-            continue;
-        }
+        if (n == 0) break;
         for (char *p = buf; p + sizeof(struct inotify_event) <= buf + n;) {
             struct inotify_event *e = reinterpret_cast<struct inotify_event *>(p);
             out.push_back(Ev{e->mask, e->cookie, e->len ? std::string(e->name) : std::string()});
@@ -468,6 +467,51 @@ TEST(InotifySelfEvents, WatchUnlinkedOpenFileThroughProcFd) {
     close(ifd);
 }
 
+TEST(InotifySelfEvents, RenameOverEmptyDirectoryDeletesTargetWatch) {
+    const std::string root = "/tmp/dunitest_inotify_rename_dir_target";
+    const std::string source = root + "/source";
+    const std::string target = root + "/target";
+    mkdir(root.c_str(), 0777);
+    mkdir(source.c_str(), 0777);
+    mkdir(target.c_str(), 0777);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, target.c_str(), IN_DELETE_SELF), 0);
+
+    ASSERT_EQ(rename(source.c_str(), target.c_str()), 0) << strerror(errno);
+    auto evs = drain_events(ifd);
+    EXPECT_TRUE(saw_self(evs, IN_DELETE_SELF));
+    EXPECT_TRUE(saw_self(evs, IN_IGNORED));
+
+    close(ifd);
+    rmdir(target.c_str());
+    rmdir(root.c_str());
+}
+
+TEST(InotifyAnonymousObjects, PipeProcFdWatchEnablesEvents) {
+    int pipefd[2];
+    ASSERT_EQ(pipe(pipefd), 0);
+    char procfd[64];
+    snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", pipefd[0]);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, procfd, IN_ACCESS | IN_MODIFY), 0)
+        << strerror(errno);
+
+    ASSERT_EQ(write(pipefd[1], "x", 1), 1);
+    char byte = 0;
+    ASSERT_EQ(read(pipefd[0], &byte, 1), 1);
+    auto evs = drain_events(ifd);
+    EXPECT_TRUE(saw_self(evs, IN_MODIFY));
+    EXPECT_TRUE(saw_self(evs, IN_ACCESS));
+
+    close(ifd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+}
+
 TEST(InotifyExcludeUnlinked, FtruncateRemainsADentryEvent) {
     const std::string path = "/tmp/dunitest_inotify_excl_ftruncate";
     int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
@@ -483,6 +527,91 @@ TEST(InotifyExcludeUnlinked, FtruncateRemainsADentryEvent) {
 
     close(fd);
     close(ifd);
+}
+
+TEST(InotifyMetadataEvents, KillPrivReportsWriteAndTruncateModeChanges) {
+    const std::string path = "/tmp/dunitest_inotify_killpriv";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0755);
+    ASSERT_GE(fd, 0);
+    close(fd);
+    ASSERT_EQ(chown(path.c_str(), 65534, 65534), 0);
+    ASSERT_EQ(chmod(path.c_str(), 04755), 0);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_ATTRIB | IN_MODIFY), 0);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (setgid(65534) != 0 || setuid(65534) != 0) _exit(10);
+        int child_fd = open(path.c_str(), O_WRONLY);
+        if (child_fd < 0) _exit(11);
+        if (write(child_fd, "x", 1) != 1) _exit(12);
+        close(child_fd);
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    auto write_events = drain_events(ifd);
+    int attrib_index = first_event_index(write_events, IN_ATTRIB);
+    int modify_index = first_event_index(write_events, IN_MODIFY);
+    ASSERT_GE(attrib_index, 0);
+    ASSERT_GE(modify_index, 0);
+    EXPECT_LT(attrib_index, modify_index);
+
+    ASSERT_EQ(chmod(path.c_str(), 04755), 0);
+    (void)drain_events(ifd);
+    child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (setgid(65534) != 0 || setuid(65534) != 0) _exit(20);
+        int child_fd = open(path.c_str(), O_WRONLY);
+        if (child_fd < 0) _exit(21);
+        if (ftruncate(child_fd, 2) != 0) _exit(22);
+        close(child_fd);
+        _exit(0);
+    }
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    auto truncate_events = drain_events(ifd);
+    bool saw_combined = false;
+    for (const auto &event : truncate_events) {
+        if ((event.mask & (IN_ATTRIB | IN_MODIFY)) == (IN_ATTRIB | IN_MODIFY)) {
+            saw_combined = true;
+        }
+    }
+    EXPECT_TRUE(saw_combined);
+
+    // A non-executable SGID bit is preserved when the writer belongs to the
+    // file's group; no mode change means no ATTRIB event.
+    ASSERT_EQ(chmod(path.c_str(), 02644), 0);
+    (void)drain_events(ifd);
+    child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (setgid(65534) != 0 || setuid(65534) != 0) _exit(30);
+        int child_fd = open(path.c_str(), O_WRONLY);
+        if (child_fd < 0) _exit(31);
+        if (write(child_fd, "y", 1) != 1) _exit(32);
+        close(child_fd);
+        _exit(0);
+    }
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    auto preserved_sgid_events = drain_events(ifd);
+    EXPECT_FALSE(saw_self(preserved_sgid_events, IN_ATTRIB));
+    EXPECT_TRUE(saw_self(preserved_sgid_events, IN_MODIFY));
+    struct stat st = {};
+    ASSERT_EQ(stat(path.c_str(), &st), 0);
+    EXPECT_NE(st.st_mode & S_ISGID, 0);
+
+    close(ifd);
+    unlink(path.c_str());
 }
 
 TEST(InotifyExcludeUnlinked, PathEventsAreSuppressedForDirectAndParentMarks) {
@@ -863,6 +992,57 @@ TEST(InotifyPollReady, FdBecomesReadableAfterEvent) {
     EXPECT_TRUE(saw_self(evs, IN_ATTRIB)) << "should see IN_ATTRIB after poll-ready";
 
     inotify_rm_watch(ifd, wd);
+    close(ifd);
+    unlink(path.c_str());
+}
+
+TEST(InotifyConcurrentReaders, BlockingReaderDoesNotHideNonblockingState) {
+    const std::string path = "/tmp/dunitest_inotify_readers";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+
+    int ifd = inotify_init1(IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_ATTRIB), 0);
+
+    struct ReadAttempt {
+        int fd;
+        std::atomic<bool> entered{false};
+        std::atomic<bool> done{false};
+        ssize_t result = 0;
+        int error = 0;
+    } first{ifd}, second{ifd};
+    auto reader = [](void *opaque) -> void * {
+        auto *attempt = static_cast<ReadAttempt *>(opaque);
+        char buf[64] __attribute__((aligned(8)));
+        attempt->entered.store(true);
+        attempt->result = read(attempt->fd, buf, sizeof(buf));
+        attempt->error = errno;
+        attempt->done.store(true);
+        return nullptr;
+    };
+
+    pthread_t first_thread;
+    ASSERT_EQ(pthread_create(&first_thread, nullptr, reader, &first), 0);
+    while (!first.entered.load()) usleep(1000);
+    usleep(20000);
+
+    int flags = fcntl(ifd, F_GETFL);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(fcntl(ifd, F_SETFL, flags | O_NONBLOCK), 0);
+    pthread_t second_thread;
+    ASSERT_EQ(pthread_create(&second_thread, nullptr, reader, &second), 0);
+    for (int i = 0; i < 500 && !second.done.load(); ++i) usleep(1000);
+    EXPECT_TRUE(second.done.load())
+        << "a sleeping reader kept the shared consumer lock";
+
+    ASSERT_EQ(chmod(path.c_str(), 0600), 0);
+    ASSERT_EQ(pthread_join(first_thread, nullptr), 0);
+    ASSERT_EQ(pthread_join(second_thread, nullptr), 0);
+    EXPECT_EQ(second.result, -1);
+    EXPECT_TRUE(second.error == EAGAIN || second.error == EWOULDBLOCK);
+
     close(ifd);
     unlink(path.c_str());
 }

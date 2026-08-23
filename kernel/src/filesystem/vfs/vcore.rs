@@ -810,7 +810,12 @@ where
     let (md, mask) = prepare_write_side_effect_metadata(md, len);
     let r = do_resize(&inode, &md, mask);
     if r.is_ok() {
-        fsnotify::fsnotify_inode(FsEvent::MODIFY, &inode);
+        let mut event = FsEvent::MODIFY;
+        if mask.contains(SetMetadataMask::MODE) {
+            // notify_change emits one combined event for ATTR_SIZE|ATTR_MODE.
+            event |= FsEvent::ATTRIB;
+        }
+        fsnotify::fsnotify_inode(event, &inode);
     }
     r
 }

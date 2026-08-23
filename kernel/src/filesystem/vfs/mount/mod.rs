@@ -3240,8 +3240,16 @@ impl MountFSInode {
                     context,
                 )?;
                 if !flags.contains(RenameFlags::EXCHANGE) {
-                    if let Some(state) = delete_lifecycle.as_mut() {
-                        fsnotify::note_link_removed(state);
+                    if let (Some(target), Some(state)) =
+                        (target_dentry.as_ref(), delete_lifecycle.as_mut())
+                    {
+                        if target.file_type == FileType::Dir {
+                            // An overwritten empty directory loses both its
+                            // parent edge and implicit `.` link in one rename.
+                            fsnotify::mark_delete_pending(state);
+                        } else {
+                            fsnotify::note_link_removed(state);
+                        }
                     }
                 }
                 context.ensure_locked();

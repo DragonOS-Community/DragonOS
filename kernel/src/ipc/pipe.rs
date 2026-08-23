@@ -26,7 +26,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::any::Any;
+use core::{any::Any, sync::atomic::AtomicUsize};
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -248,6 +248,8 @@ pub struct LockedPipeInode {
     epitems: EPollItemList,
     read_fasync_items: FAsyncItems,
     write_fasync_items: FAsyncItems,
+    /// Direct inotify marks reached through `/proc/<pid>/fd/<n>`.
+    fsnotify_watches: AtomicUsize,
 }
 
 /// A serialized writer transaction. Dropping it releases the writer mutex
@@ -623,6 +625,7 @@ impl LockedPipeInode {
             read_wait_queue: WaitQueue::default(),
             write_wait_queue: WaitQueue::default(),
             open_wait_queue: WaitQueue::default(),
+            fsnotify_watches: AtomicUsize::new(0),
             epitems: EPollItemList::default(),
             read_fasync_items: FAsyncItems::default(),
             write_fasync_items: FAsyncItems::default(),
@@ -1852,6 +1855,10 @@ impl PollableInode for LockedPipeInode {
 }
 
 impl IndexNode for LockedPipeInode {
+    fn fsnotify_watch_count(&self) -> Option<&AtomicUsize> {
+        Some(&self.fsnotify_watches)
+    }
+
     fn read_at(
         &self,
         _offset: usize,

@@ -454,6 +454,13 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
+    /// Optional watch-presence hint for anonymous inodes that do not pass
+    /// through MountFS object state. Implementations exposing this counter
+    /// let hot I/O paths avoid the global fsnotify index when unwatched.
+    fn fsnotify_watch_count(&self) -> Option<&AtomicUsize> {
+        None
+    }
+
     /// Optional VFS accounting embedded by this canonical inode.
     fn retention_state(&self) -> Option<&InodeRetentionState> {
         None

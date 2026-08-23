@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-/// 用于创建新的私有信号量集合
+/// Used to create a new private semaphore set
 pub const IPC_PRIVATE: SemKey = SemKey::new(0);
 
 int_like!(SemId, usize);
@@ -51,7 +51,7 @@ impl SemSetAllToken {
     }
 }
 
-// Linux include/uapi/linux/sem.h 的限制常量
+// Limit constants from Linux include/uapi/linux/sem.h
 pub const SEMMNI: usize = 32000;
 pub const SEMMSL: usize = 32000;
 pub const SEMMNS: usize = SEMMNI * SEMMSL;
@@ -68,36 +68,36 @@ bitflags! {
     }
 }
 
-/// 管理信号量集合信息的操作码（Linux x86_64 UAPI include/uapi/linux/sem.h）
+/// Semaphore-set control commands (Linux x86_64 UAPI include/uapi/linux/sem.h)
 #[derive(Eq, Clone, Copy)]
 pub enum SemCtlCmd {
-    /// 删除信号量集合
+    /// Remove the semaphore set
     IpcRmid = 0,
-    /// 设置权限
+    /// Set permissions
     IpcSet = 1,
-    /// 获取 SemIdDs
+    /// Retrieve `SemIdDs`
     IpcStat = 2,
-    /// 查看 SemInfo
+    /// Retrieve `SemInfo`
     IpcInfo = 3,
-    /// 获取最后操作指定信号量的进程pid
+    /// Get the PID of the last process to operate on the specified semaphore
     GetPid = 11,
-    /// 获取指定信号量的值
+    /// Get the specified semaphore value
     GetVal = 12,
-    /// 获取集合内所有信号量的值
+    /// Get values of all semaphores in the set
     GetAll = 13,
-    /// 获取等待指定信号量值增加的进程数
+    /// Get the number of processes waiting for the specified semaphore to increase
     GetNcnt = 14,
-    /// 获取等待指定信号量值为0的进程数
+    /// Get the number of processes waiting for the specified semaphore to reach zero
     GetZcnt = 15,
-    /// 设置指定信号量的值
+    /// Set the specified semaphore value
     SetVal = 16,
-    /// 设置集合内所有信号量的值
+    /// Set values of all semaphores in the set
     SetAll = 17,
-    /// 按索引获取 SemIdDs
+    /// Retrieve `SemIdDs` by index
     SemStat = 18,
-    /// 查看 SemInfo
+    /// Retrieve `SemInfo`
     SemInfo = 19,
-    /// 按索引获取 SemIdDs（无权限检查）
+    /// Retrieve `SemIdDs` by index without permission checks
     SemStatAny = 20,
 
     Default,
@@ -153,16 +153,16 @@ impl PartialEq for SemCtlCmd {
     }
 }
 
-/// 单个信号量（Linux struct sem 的字段）
+/// A single semaphore (fields of Linux `struct sem`)
 #[derive(Debug, Clone)]
 pub struct KernelSem {
     /// semval
     val: i32,
-    /// sempid：最后操作本信号量的进程
+    /// sempid: process that last operated on this semaphore
     pid: Option<Arc<Pid>>,
 }
 
-/// 用户态 sembuf（Linux struct sembuf，6 字节）
+/// Userspace `sembuf` (Linux `struct sembuf`, 6 bytes)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PosixSemBuf {
@@ -171,26 +171,26 @@ pub struct PosixSemBuf {
     pub sem_flg: i16,
 }
 
-/// 信号量集合信息，符合 Linux x86_64 struct semid64_ds（104 字节，带
-/// 32 位时间戳高半区字段）
+/// Semaphore-set information matching Linux x86_64 `struct semid64_ds` (104 bytes,
+/// including the high halves of 32-bit timestamp fields)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PosixSemIdDs {
-    /// 权限信息
+    /// Permission information
     pub sem_perm: PosixIpcPerm,
-    /// 最后一次 semop 的时间（64 位；高 32 位落入 __sem_otime_high）
+    /// Time of the last `semop` (64-bit; upper 32 bits are in `__sem_otime_high`)
     pub sem_otime: i64,
     _sem_otime_high: i64,
-    /// 最后一次更改信息的时间
+    /// Time of the last metadata change
     pub sem_ctime: i64,
     _sem_ctime_high: i64,
-    /// 集合内信号量数量
+    /// Number of semaphores in the set
     pub sem_nsems: usize,
     _unused1: usize,
     _unused2: usize,
 }
 
-/// 信号量系统信息，符合 Linux struct seminfo（40 字节）
+/// Semaphore system information matching Linux `struct seminfo` (40 bytes)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PosixSemInfo {
@@ -228,12 +228,12 @@ impl PosixSemInfo {
     }
 }
 
-/// 等待者阻塞的原因，决定唤醒时机与 GETNCNT/GETZCNT 统计
+/// Why a waiter is blocked, determining wakeup timing and GETNCNT/GETZCNT accounting
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemWaitType {
-    /// sem_op < 0：等待 semval 增加（GETNCNT）
+    /// `sem_op < 0`: wait for semval to increase (GETNCNT)
     Increase,
-    /// sem_op == 0：等待 semval 变为 0（GETZCNT）
+    /// `sem_op == 0`: wait for semval to reach zero (GETZCNT)
     Zero,
 }
 
@@ -307,18 +307,18 @@ impl SemQueueEntry {
     }
 }
 
-/// 信号量集合
+/// Semaphore set
 #[derive(Debug)]
 pub struct KernelSemSet {
-    /// 权限信息
+    /// Permission information
     pub kern_ipc_perm: IpcPerm,
-    /// 集合内信号量
+    /// Semaphores in the set
     pub sems: Vec<KernelSem>,
-    /// 最后一次 semop 的时间
+    /// Time of the last `semop`
     pub sem_otime: i64,
-    /// 最后一次更改信息的时间
+    /// Time of the last metadata change
     pub sem_ctime: i64,
-    /// 等待者队列
+    /// Waiter queue
     waiters: VecDeque<Arc<SemQueueEntry>>,
 }
 
@@ -369,23 +369,23 @@ struct SemopSimulation {
     values: HashMap<usize, i32>,
 }
 
-/// semop 尝试执行的结果
+/// Result of an attempted `semop` execution
 #[derive(Debug)]
 enum SemopOutcome {
     Ready(SemopSimulation),
     Blocked(SemBlockedOp),
 }
 
-/// 信号量管理器
+/// Semaphore manager
 #[derive(Debug)]
 pub struct SemManager {
-    /// SemId 分配器
+    /// SemId allocator
     id_allocator: IpcIdAllocator,
-    /// 低位 IPC idx 映射信号量集合表
+    /// Semaphore set table keyed by low IPC index
     id2sem: HashMap<usize, KernelSemSet>,
-    /// SemKey 映射 SemId 表
+    /// SemId table keyed by SemKey
     key2id: HashMap<SemKey, SemId>,
-    /// namespace 内信号量总数（Linux semmns 会计）
+    /// Total semaphores in the namespace (Linux semmns accounting)
     total_sems: usize,
 }
 
@@ -438,7 +438,7 @@ impl SemManager {
         self.id2sem.keys().copied().max().unwrap_or(0)
     }
 
-    /// # semget：创建或查找信号量集合
+    /// # semget: create or look up a semaphore set
     pub fn semget(
         &mut self,
         key: SemKey,
@@ -641,14 +641,14 @@ impl SemManager {
         Err(error)
     }
 
-    /// # semtimedop：原子执行 sops，必要时阻塞
+    /// # semtimedop: execute `sops` atomically, blocking if necessary
     ///
-    /// 锁由本函数内部管理（等待期间需要释放锁），调用方不得预先持有
-    /// `ipcns.sem` 锁。
+    /// This function manages the lock internally (it must release it while waiting);
+    /// callers must not hold the `ipcns.sem` lock in advance.
     ///
-    /// - timeout == None：无限等待（等价于 semop）
-    /// - timeout == Some(Duration::ZERO)：不阻塞
-    /// - 其余：阻塞至超时，超时返回 EAGAIN
+    /// - `timeout == None`: wait indefinitely (equivalent to `semop`)
+    /// - `timeout == Some(Duration::ZERO)`: do not block
+    /// - Otherwise: block until timeout and return EAGAIN
     pub fn semtimedop(
         ipcns: &Arc<IpcNamespace>,
         semid: SemId,
@@ -668,7 +668,8 @@ impl SemManager {
             return Err(SystemError::ENOSYS);
         }
         let non_blocking = timeout == Some(Duration::ZERO);
-        // 仅等待/等零（全部 sem_op == 0）时检查读权限，否则检查写权限（Linux 语义）
+        // Check read permission only for all-zero waits; otherwise check write permission
+        // to match Linux semantics.
         let alter = sops.iter().any(|op| op.sem_op != 0);
 
         let target_user_ns = ipcns.user_ns.clone();
@@ -682,7 +683,7 @@ impl SemManager {
         let entry = {
             let mut guard = ipcns.sem.lock();
             let set = guard.get_by_semid_checked_mut(semid)?;
-            // 与 Linux 一致：先检查 semnum 越界（EFBIG），再检查权限（EACCES）
+            // Match Linux: check semnum bounds (EFBIG) before permissions (EACCES).
             if sops.iter().any(|op| op.sem_num as usize >= set.sems.len()) {
                 return Err(SystemError::EFBIG);
             }
@@ -740,7 +741,7 @@ impl SemManager {
         guard.cancel_queued_entry(semid, &entry, error)
     }
 
-    /// # IPC_RMID：删除信号量集合并唤醒所有等待者（返回 EIDRM）
+    /// # IPC_RMID: remove the semaphore set and wake all waiters with EIDRM
     pub fn ipc_rmid(&mut self, id: SemId) -> Result<(), SystemError> {
         let decoded = IpcIdAllocator::decode(id.data())?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
@@ -760,7 +761,7 @@ impl SemManager {
         Ok(())
     }
 
-    /// # IPC_SET：更新权限（uid/gid/mode）并刷新 sem_ctime
+    /// # IPC_SET: update permissions (uid/gid/mode) and refresh `sem_ctime`
     pub fn ipc_set(&mut self, id: SemId, semid_ds: PosixSemIdDs) -> Result<(), SystemError> {
         let set = self.get_by_semid_checked_mut(id)?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
@@ -776,7 +777,7 @@ impl SemManager {
         Ok(())
     }
 
-    /// IPC_STAT/SEM_STAT/SEM_STAT_ANY：输出 semid_ds
+    /// IPC_STAT/SEM_STAT/SEM_STAT_ANY: return `semid_ds`
     pub fn sem_stat_data(
         &self,
         id_or_index: SemId,
@@ -811,7 +812,7 @@ impl SemManager {
         Ok((ret, semid_ds))
     }
 
-    /// IPC_INFO/SEM_INFO：输出系统信息
+    /// IPC_INFO/SEM_INFO: return system information
     pub fn sem_info_data(&self, cmd: SemCtlCmd) -> (usize, PosixSemInfo) {
         (
             self.current_max_index(),
@@ -819,7 +820,7 @@ impl SemManager {
         )
     }
 
-    /// GETVAL/GETPID/GETNCNT/GETZCNT：单信号量查询
+    /// GETVAL/GETPID/GETNCNT/GETZCNT: query a single semaphore
     pub fn sem_get_value(
         &self,
         id: SemId,
@@ -845,9 +846,10 @@ impl SemManager {
         }
     }
 
-    /// # SETVAL：设置单个信号量的值
+    /// # SETVAL: set a single semaphore value
     pub fn setval(&mut self, id: SemId, semnum: usize, val: i32) -> Result<(), SystemError> {
-        // 与 Linux 一致：先校验值（ERANGE），再 semnum（EINVAL），再权限（EACCES）
+        // Match Linux: validate the value (ERANGE), then semnum (EINVAL), then permissions
+        // (EACCES).
         if !(0..=SEMVMX).contains(&val) {
             return Err(SystemError::ERANGE);
         }
@@ -866,7 +868,7 @@ impl SemManager {
         Ok(())
     }
 
-    /// # SETALL：设置集合内所有信号量的值（校验失败时不改变任何值）
+    /// # SETALL: set values of all semaphores in the set without changes on validation failure
     pub fn setall(&mut self, token: SemSetAllToken, vals: &[u16]) -> Result<(), SystemError> {
         let set = self
             .get_by_semid_checked_mut(token.id)
@@ -889,7 +891,7 @@ impl SemManager {
         Ok(())
     }
 
-    /// # GETALL：获取集合内所有信号量的值
+    /// # GETALL: get values of all semaphores in the set
     pub fn getall(&self, id: SemId) -> Result<Vec<u16>, SystemError> {
         let set = self.get_by_semid_checked(id)?;
         let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();

@@ -14,20 +14,20 @@ use super::sys_semtimedop::do_kernel_semtimedop;
 
 pub struct SysSemopHandle;
 
-/// # SYS_SEMOP 系统调用：原子执行一组信号量操作（无限等待）
+/// # SYS_SEMOP syscall: atomically execute a group of semaphore operations indefinitely
 ///
-/// 与 SYS_SEMTIMEDOP 共享实现，timeout 为 NULL。
+/// Shares its implementation with SYS_SEMTIMEDOP with a NULL timeout.
 ///
-/// ## 参数
+/// ## Parameters
 ///
-/// - `semid`: 信号量集合 id
-/// - `sops`: 用户态 sembuf 数组指针
-/// - `nsops`: 操作数
+/// - `semid`: semaphore set ID
+/// - `sops`: userspace `sembuf` array pointer
+/// - `nsops`: number of operations
 ///
-/// ## 返回值
+/// ## Return value
 ///
-/// 成功：0
-/// 失败：错误码
+/// On success: 0.
+/// On failure: error code
 impl Syscall for SysSemopHandle {
     fn num_args(&self) -> usize {
         3

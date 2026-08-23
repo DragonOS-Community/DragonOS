@@ -13,19 +13,20 @@ use system_error::SystemError;
 
 pub struct SysSemctlHandle;
 
-/// # SYS_SEMCTL 系统调用：控制信号量集合
+/// # SYS_SEMCTL syscall: control a semaphore set
 ///
-/// ## 参数
+/// ## Parameters
 ///
-/// - `semid`: 信号量集合 id
-/// - `semnum`: 信号量索引（部分命令使用）
-/// - `cmd`: 操作码
-/// - `arg`: union semun 的地址（SETVAL 时直接为值）
+/// - `semid`: semaphore set ID
+/// - `semnum`: semaphore index (used by some commands)
+/// - `cmd`: command
+/// - `arg`: address of `union semun` (the value itself for SETVAL)
 ///
-/// ## 返回值
+/// ## Return value
 ///
-/// 成功：命令相关返回值（GETVAL 等返回查询值，其余返回 0）
-/// 失败：错误码
+/// On success: command-specific result (query commands such as GETVAL return a value; all
+/// others return 0).
+/// On failure: error code
 pub(super) fn do_kernel_semctl(
     semid: SemId,
     semnum: usize,
@@ -36,7 +37,7 @@ pub(super) fn do_kernel_semctl(
     let ipcns = ProcessManager::current_ipcns();
 
     match cmd {
-        // 查看信号量系统信息
+        // Retrieve semaphore system information
         SemCtlCmd::IpcInfo | SemCtlCmd::SemInfo => {
             let (ret, sem_info) = {
                 let guard = ipcns.sem.lock();
@@ -50,7 +51,7 @@ pub(super) fn do_kernel_semctl(
             user_buffer_writer.copy_one_to_user(&sem_info, 0)?;
             Ok(ret)
         }
-        // 查看 id 对应的信号量集合信息
+        // Retrieve information for the semaphore set identified by ID
         SemCtlCmd::IpcStat | SemCtlCmd::SemStat | SemCtlCmd::SemStatAny => {
             let (ret, sem_id_ds) = {
                 let guard = ipcns.sem.lock();
@@ -64,7 +65,7 @@ pub(super) fn do_kernel_semctl(
             user_buffer_writer.copy_one_to_user(&sem_id_ds, 0)?;
             Ok(ret)
         }
-        // 设置权限
+        // Set permissions
         SemCtlCmd::IpcSet => {
             let mut sem_id_ds = PosixSemIdDs::default();
             let user_buffer_reader = UserBufferReader::new(
@@ -77,25 +78,25 @@ pub(super) fn do_kernel_semctl(
             guard.ipc_set(semid, sem_id_ds)?;
             Ok(0)
         }
-        // 删除信号量集合
+        // Remove the semaphore set
         SemCtlCmd::IpcRmid => {
             let mut guard = ipcns.sem.lock();
             guard.ipc_rmid(semid)?;
             Ok(0)
         }
-        // 单信号量查询
+        // Query a single semaphore
         SemCtlCmd::GetVal | SemCtlCmd::GetPid | SemCtlCmd::GetNcnt | SemCtlCmd::GetZcnt => {
             let guard = ipcns.sem.lock();
             guard.sem_get_value(semid, semnum, cmd)
         }
-        // 设置单个信号量的值（arg 直接为数值，非指针）
+        // Set a single semaphore value (`arg` is a value, not a pointer)
         SemCtlCmd::SetVal => {
             let val = arg as u32 as i32;
             let mut guard = ipcns.sem.lock();
             guard.setval(semid, semnum, val)?;
             Ok(0)
         }
-        // 获取集合内所有信号量的值
+        // Get values of all semaphores in the set
         SemCtlCmd::GetAll => {
             let vals = {
                 let guard = ipcns.sem.lock();
@@ -111,7 +112,7 @@ pub(super) fn do_kernel_semctl(
             }
             Ok(0)
         }
-        // 设置集合内所有信号量的值
+        // Set values of all semaphores in the set
         SemCtlCmd::SetAll => {
             let token = {
                 let guard = ipcns.sem.lock();
@@ -130,7 +131,7 @@ pub(super) fn do_kernel_semctl(
             guard.setall(token, &vals)?;
             Ok(0)
         }
-        // 无效操作码
+        // Invalid command
         SemCtlCmd::Default => Err(SystemError::EINVAL),
     }
 }

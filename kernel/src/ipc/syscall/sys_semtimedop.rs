@@ -15,19 +15,20 @@ use system_error::SystemError;
 
 pub struct SysSemtimedopHandle;
 
-/// # SYS_SEMTIMEDOP 系统调用：原子执行一组信号量操作，可指定超时
+/// # SYS_SEMTIMEDOP syscall: atomically execute a group of semaphore operations with an
+/// optional timeout
 ///
-/// ## 参数
+/// ## Parameters
 ///
-/// - `semid`: 信号量集合 id
-/// - `sops`: 用户态 sembuf 数组指针
-/// - `nsops`: 操作数
-/// - `timeout`: 指向 struct timespec 的指针，为 NULL 时无限等待
+/// - `semid`: semaphore set ID
+/// - `sops`: userspace `sembuf` array pointer
+/// - `nsops`: number of operations
+/// - `timeout`: pointer to `struct timespec`; NULL waits indefinitely
 ///
-/// ## 返回值
+/// ## Return value
 ///
-/// 成功：0
-/// 失败：错误码（EAGAIN 超时、EINTR 被信号中断等）
+/// On success: 0.
+/// On failure: error code (EAGAIN on timeout, EINTR on signal interruption, etc.)
 pub(super) fn do_kernel_semtimedop(
     semid: SemId,
     sops: &[PosixSemBuf],
@@ -85,7 +86,7 @@ impl Syscall for SysSemtimedopHandle {
         let sops_ptr = Self::sops(args);
         let from_user = frame.is_from_user();
 
-        // 与 Linux 一致：先于任何分配校验 nsops 范围
+        // Match Linux: validate nsops before making any allocation.
         if nsops == 0 {
             return Err(SystemError::EINVAL);
         }

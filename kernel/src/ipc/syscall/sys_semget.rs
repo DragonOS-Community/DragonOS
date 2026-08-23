@@ -12,18 +12,18 @@ use system_error::SystemError;
 
 pub struct SysSemgetHandle;
 
-/// # SYS_SEMGET 系统调用：创建或获取信号量集合
+/// # SYS_SEMGET syscall: create or get a semaphore set
 ///
-/// ## 参数
+/// ## Parameters
 ///
-/// - `key`: 信号量集合键值
-/// - `nsems`: 集合内信号量数量
-/// - `semflg`: 标志位（IPC_CREAT/IPC_EXCL/权限位）
+/// - `key`: semaphore-set key
+/// - `nsems`: number of semaphores in the set
+/// - `semflg`: flags (IPC_CREAT/IPC_EXCL/permission bits)
 ///
-/// ## 返回值
+/// ## Return value
 ///
-/// 成功：信号量集合 id
-/// 失败：错误码
+/// On success: semaphore set ID.
+/// On failure: error code
 impl Syscall for SysSemgetHandle {
     fn num_args(&self) -> usize {
         3

@@ -67,7 +67,7 @@ class SemSet {
 
     SemSet(int nsems, int flags) : id_(SemGet(IPC_PRIVATE, nsems, flags)) {}
 
-    // 接管已存在的 id
+    // Adopt an existing ID
     SemSet(int existing_id, bool owns) : id_(existing_id), owns_(owns) {}
 
     ~SemSet() {
@@ -211,7 +211,8 @@ void WaitChildOk(ChildGuard* child) {
     EXPECT_EQ(0, WEXITSTATUS(status)) << "child failed, status=" << status;
 }
 
-// 等待指定信号量的等待者数量达到预期（用于确认子进程已阻塞）
+// Wait until the target semaphore has the expected number of waiters, confirming that
+// child processes have blocked.
 bool WaitForWaiters(int semid, int semnum, int expected, int timeout_ms = 5000) {
     const int deadline = timeout_ms * 1000;
     for (int elapsed = 0; elapsed < deadline; elapsed += 10000) {
@@ -467,7 +468,7 @@ TEST(SysVSem, SetAllAtomicRangeError) {
     EXPECT_EQ(-1, SemCtl(sem.id(), 0, SETALL, reinterpret_cast<unsigned long>(bad)));
     EXPECT_EQ(ERANGE, errno);
 
-    // 校验失败不得改变任何值
+    // Validation failure must not change any value.
     unsigned short out[3] = {0, 0, 0};
     ASSERT_EQ(0, SemCtl(sem.id(), 0, GETALL, reinterpret_cast<unsigned long>(out)));
     EXPECT_EQ(1u, out[0]);
@@ -530,7 +531,7 @@ TEST(SysVSem, IncrementOverflowIsErange) {
     ASSERT_TRUE(sem.valid());
     ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 32766));
 
-    // semval + op > SEMVMX：立即 ERANGE，不阻塞、不改变任何值
+    // semval + op > SEMVMX: return ERANGE immediately without blocking or modifying values.
     struct sembuf inc = {0, 2, 0};
     errno = 0;
     EXPECT_EQ(-1, SemOp(sem.id(), &inc, 1));
@@ -542,7 +543,7 @@ TEST(SysVSem, WaitForZero) {
     SemSet sem(1, IPC_CREAT | 0600);
     ASSERT_TRUE(sem.valid());
 
-    // val == 0：立即成功
+    // val == 0: succeed immediately
     struct sembuf op = {0, 0, 0};
     ASSERT_EQ(0, SemOp(sem.id(), &op, 1));
 
@@ -569,7 +570,8 @@ TEST(SysVSem, AtomicMultiOpRollback) {
     ASSERT_TRUE(sem.valid());
     ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 1));
 
-    // op1 成功（1-1=0），op2 失败（0-1<0，IPC_NOWAIT）→ 整体 EAGAIN，op1 回滚
+    // op1 succeeds (1 - 1 = 0), then op2 fails (0 - 1 < 0, IPC_NOWAIT): the whole
+    // group returns EAGAIN and rolls back op1.
     struct sembuf ops[2] = {{0, -1, 0}, {1, -1, IPC_NOWAIT}};
     errno = 0;
     EXPECT_EQ(-1, SemOp(sem.id(), ops, 2));
@@ -666,7 +668,7 @@ TEST(SysVSem, BlockingWakeup) {
     ASSERT_GE(child, 0) << "fork failed: errno=" << errno;
 
     if (child == 0) {
-        // 子进程阻塞在 -1（val==0）
+        // The child blocks on -1 while val == 0.
         struct sembuf dec = {0, -1, 0};
         if (SemOp(sem.id(), &dec, 1) != 0) {
             _exit(10);
@@ -691,7 +693,7 @@ TEST(SysVSem, BlockingWakeupZero) {
     ASSERT_GE(child, 0);
 
     if (child == 0) {
-        // 子进程等待 val 变 0
+        // The child waits for val to become zero.
         struct sembuf wait = {0, 0, 0};
         if (SemOp(sem.id(), &wait, 1) != 0) {
             _exit(10);
@@ -751,7 +753,7 @@ TEST(SysVSem, OneWakeAllMultiWaiters) {
     ASSERT_TRUE(WaitForWaiters(sem.id(), 0, kWaiters)) << "children did not block";
     EXPECT_EQ(kWaiters, SemCtl(sem.id(), 0, GETNCNT, 0));
 
-    // 一次 +kWaiters 唤醒全部等待者
+    // A single +kWaiters operation wakes all waiters.
     struct sembuf inc = {0, kWaiters, 0};
     ASSERT_EQ(0, SemOp(sem.id(), &inc, 1)) << "parent inc failed: errno=" << errno;
     for (int i = 0; i < kWaiters; ++i) {
@@ -828,7 +830,7 @@ TEST(SysVSem, SignalInterruptsBlockedSemop) {
 
         struct sembuf dec = {0, -1, 0};
         int ret = SemOp(sem.id(), &dec, 1);
-        // 阻塞被打断：必须返回 EINTR
+        // An interrupted blocked operation must return EINTR.
         if (ret == 0) {
             _exit(11);
         }
@@ -964,7 +966,8 @@ TEST(SysVSem, ConcurrentWorkers) {
         children[i] = fork();
         ASSERT_GE(children[i], 0);
         if (children[i] == 0) {
-            // 每对 (-1, +1)：-1 可能阻塞，+1 释放，并发竞争测原子性与唤醒
+            // Each (-1, +1) pair may block on -1 and release on +1; concurrent races
+            // exercise atomicity and wakeup behavior.
             struct sembuf dec = {0, -1, 0};
             struct sembuf inc = {0, 1, 0};
             for (int j = 0; j < 100; ++j) {

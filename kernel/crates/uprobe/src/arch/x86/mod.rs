@@ -139,7 +139,10 @@ fn is_control_flow(inst: &Instruction) -> bool {
             | Opcode::JMPF
             | Opcode::RETURN
             | Opcode::RETF
+            | Opcode::LOOPNZ
+            | Opcode::LOOPZ
             | Opcode::LOOP
+            | Opcode::JRCXZ
             | Opcode::XBEGIN
             | Opcode::INT
             | Opcode::IRET
@@ -330,12 +333,21 @@ mod tests {
     #[test]
     fn control_flow_rejected() {
         // call rel32 (e8), jmp rel8 (eb), ret (c3), je rel8 (74),
-        // xbegin rel32 (c7 f8), syscall (0f 05)
+        // loopnz/loopz/loop/jrcxz (e0..e3), xbegin rel32 (c7 f8),
+        // syscall (0f 05)
         for bytes in [
             &[0xe8, 0x00, 0x00, 0x00, 0x00][..],
             &[0xeb, 0xfe][..],
             &[0xc3][..],
             &[0x74, 0x02][..],
+            &[0xe0, 0x00][..],
+            &[0xe1, 0x00][..],
+            &[0xe2, 0x00][..],
+            &[0xe3, 0x00][..],
+            &[0x67, 0xe0, 0x00][..],
+            &[0x67, 0xe1, 0x00][..],
+            &[0x67, 0xe2, 0x00][..],
+            &[0x67, 0xe3, 0x00][..],
             &[0xc7, 0xf8, 0x00, 0x00, 0x00, 0x00][..],
             &[0x0f, 0x05][..],
         ] {

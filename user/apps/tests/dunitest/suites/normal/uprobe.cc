@@ -851,6 +851,30 @@ TEST(UprobeTest, RepeatedStringInstructionIsRejected) {
     unlink(path);
 }
 
+TEST(UprobeTest, LoopFamilyInstructionsAreRejected) {
+    constexpr unsigned char loop_family[] = {
+        0xe0, 0x00,        // loopnz rel8
+        0xe1, 0x00,        // loopz rel8
+        0xe2, 0x00,        // loop rel8
+        0xe3, 0x00,        // jrcxz rel8
+        0x67, 0xe3, 0x00,  // jecxz rel8 in 64-bit mode
+    };
+    constexpr unsigned long offsets[] = {0, 2, 4, 6, 8};
+    char path[] = "/tmp/uprobe_loop_family_XXXXXX";
+    FdGuard file(create_raw_code(path, loop_family, sizeof(loop_family)));
+    ASSERT_GE(file.get(), 0);
+
+    for (unsigned long offset : offsets) {
+        errno = 0;
+        FdGuard event(open_uprobe_perf_event(path, offset));
+        EXPECT_LT(event.get(), 0)
+            << "phase-1 XOL must reject LOOP-family control flow at offset "
+            << offset;
+        EXPECT_EQ(errno, EINVAL) << "unexpected errno at offset " << offset;
+    }
+    unlink(path);
+}
+
 TEST(UprobeTest, PushfInstructionIsRejected) {
     constexpr unsigned char pushfq[] = {
         0x9c,  // pushfq would expose the XOL single-step TF bit

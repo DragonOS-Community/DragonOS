@@ -74,16 +74,52 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
 
 pub struct JITMem {
     virt_addr: VirtAddr,
+    page_count: PageFrameCount,
 }
 
 impl JITMem {
     pub fn new() -> Self {
-        let vaddr = unsafe {
-            let (paddr, _count) =
-                allocate_page_frames(PageFrameCount::new(1)).expect("JITMem alloc failed");
-            MMArch::phys_2_virt(paddr).unwrap()
+        let (paddr, page_count) =
+            unsafe { allocate_page_frames(PageFrameCount::new(1)) }.expect("JITMem alloc failed");
+        Self {
+            virt_addr: unsafe { MMArch::phys_2_virt(paddr) }.unwrap(),
+            page_count,
+        }
+    }
+
+    /// Allocate enough executable memory for rbpf's current x86_64 emitter.
+    ///
+    /// Each eBPF instruction expands to less than 128 bytes in that emitter;
+    /// the one-page minimum also covers its fixed prologue and epilogue. Keep
+    /// this bound here, next to the allocation, so a larger program cannot
+    /// reach rbpf's fixed-buffer assertion.
+    pub fn try_for_bpf_program(program_len: usize) -> Result<Self> {
+        const BPF_INSN_SIZE: usize = 8;
+        const MAX_JIT_BYTES_PER_INSN: usize = 128;
+
+        if program_len == 0 || !program_len.is_multiple_of(BPF_INSN_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+        let instruction_count = program_len / BPF_INSN_SIZE;
+        let required = instruction_count
+            .checked_mul(MAX_JIT_BYTES_PER_INSN)
+            .ok_or(SystemError::E2BIG)?
+            .max(MMArch::PAGE_SIZE);
+        let allocation_size = required
+            .checked_add(MMArch::PAGE_SIZE - 1)
+            .ok_or(SystemError::E2BIG)?
+            & !(MMArch::PAGE_SIZE - 1);
+        let requested = PageFrameCount::new(allocation_size / MMArch::PAGE_SIZE);
+        let (paddr, page_count) =
+            unsafe { allocate_page_frames(requested) }.ok_or(SystemError::ENOMEM)?;
+        let Some(virt_addr) = (unsafe { MMArch::phys_2_virt(paddr) }) else {
+            unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), page_count) };
+            return Err(SystemError::ENOMEM);
         };
-        Self { virt_addr: vaddr }
+        Ok(Self {
+            virt_addr,
+            page_count,
+        })
     }
 }
 
@@ -93,7 +129,7 @@ impl Deref for JITMem {
     fn deref(&self) -> &Self::Target {
         unsafe {
             let ptr = self.virt_addr.as_ptr();
-            core::slice::from_raw_parts(ptr, 4096)
+            core::slice::from_raw_parts(ptr, self.page_count.bytes())
         }
     }
 }
@@ -102,7 +138,7 @@ impl DerefMut for JITMem {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
             let ptr = self.virt_addr.as_ptr();
-            core::slice::from_raw_parts_mut(ptr, 4096)
+            core::slice::from_raw_parts_mut(ptr, self.page_count.bytes())
         }
     }
 }
@@ -111,8 +147,7 @@ impl Drop for JITMem {
     fn drop(&mut self) {
         unsafe {
             let paddr = MMArch::virt_2_phys(self.virt_addr).expect("JITMem drop failed");
-            let count = PageFrameCount::new(1);
-            deallocate_page_frames(PhysPageFrame::new(paddr), count);
+            deallocate_page_frames(PhysPageFrame::new(paddr), self.page_count);
         }
     }
 }

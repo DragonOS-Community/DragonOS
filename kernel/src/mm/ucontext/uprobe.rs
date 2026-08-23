@@ -1441,12 +1441,25 @@ fn registry_consumer(consumer_id: u64) -> Option<Arc<UprobeConsumer>> {
 
 /// 更新某消费者的 BPF 事件回调（PERF_EVENT_IOC_SET_BPF 时调用）。
 /// 迟到安装的实例据此取得与直接安装一致的回调。
-pub fn uprobe_registry_set_callback(consumer_id: u64, cb: Arc<dyn uprobe::CallBackFunc>) {
-    // 不在 registry spinlock 内获取 consumer runtime 锁。
-    if let Some(consumer) = registry_consumer(consumer_id) {
-        consumer.runtime.write().event_callback = Some(cb);
-        refresh_consumer_sites(&consumer);
+pub fn uprobe_registry_attach_callback(
+    consumer_id: u64,
+    cb: Arc<dyn uprobe::CallBackFunc>,
+) -> Result<(), SystemError> {
+    // Do not take consumer locks while holding the registry spinlock.
+    let consumer = registry_consumer(consumer_id).ok_or(SystemError::ENOENT)?;
+    let _lifecycle = consumer.lifecycle.lock();
+    if consumer.closing.load(Ordering::Acquire) {
+        return Err(SystemError::ENOENT);
     }
+    {
+        let mut runtime = consumer.runtime.write();
+        if runtime.event_callback.is_some() {
+            return Err(SystemError::EEXIST);
+        }
+        runtime.event_callback = Some(cb);
+    }
+    refresh_consumer_sites(&consumer);
+    Ok(())
 }
 
 /// Update the single consumer-level enable state used by both already armed

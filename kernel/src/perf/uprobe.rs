@@ -27,7 +27,7 @@ use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
 use crate::mm::ucontext::{
     noop_handler, uprobe_apply_to_existing_vma, uprobe_new_consumer_id, uprobe_registry_add,
-    uprobe_registry_remove_consumer, uprobe_registry_set_callback, uprobe_registry_set_enabled,
+    uprobe_registry_attach_callback, uprobe_registry_remove_consumer, uprobe_registry_set_enabled,
     UprobeConsumerReg, UprobeConsumerScope, UprobeDefinition, UprobeTaskScope,
 };
 use crate::mm::MemoryManagementArch;
@@ -107,11 +107,17 @@ impl UprobePerfEvent {
             use crate::perf::JITMem;
 
             log::info!("Using JIT compilation for BPF program on x86_64 architecture (uprobe)");
-            let jit_mem = Box::new(JITMem::new());
-            let jit_mem = Box::leak(jit_mem);
-            let jit_mem_addr = core::ptr::from_ref::<JITMem>(jit_mem) as usize;
-            vm.set_jit_exec_memory(jit_mem).unwrap();
-            vm.jit_compile().unwrap();
+            let jit_mem = Box::new(JITMem::try_for_bpf_program(prog_slice.len())?);
+            let jit_mem_addr = Box::into_raw(jit_mem) as usize;
+            let jit_result = unsafe {
+                vm.set_jit_exec_memory(&mut *(jit_mem_addr as *mut JITMem))
+                    .and_then(|_| vm.jit_compile())
+            };
+            if let Err(err) = jit_result {
+                log::error!("uprobe BPF JIT compilation failed: {:?}", err);
+                unsafe { drop(Box::from_raw(jit_mem_addr as *mut JITMem)) };
+                return Err(SystemError::EINVAL);
+            }
             let basic_callback = BasicPerfEbpfCallBack::new(file, vm, jit_mem_addr);
             callback = Arc::new(UprobePerfCallBack {
                 inner: basic_callback,
@@ -129,8 +135,7 @@ impl UprobePerfEvent {
         }
 
         // callback 是 consumer 级单一事实源，现有与后续映射同时生效。
-        uprobe_registry_set_callback(self.consumer_id, callback.clone());
-        Ok(())
+        uprobe_registry_attach_callback(self.consumer_id, callback)
     }
 }
 

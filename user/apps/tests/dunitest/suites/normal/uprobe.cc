@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -34,6 +35,7 @@
 #include <unistd.h>
 
 #include <linux/perf_event.h>
+#include <linux/bpf.h>
 
 #ifndef SYS_perf_event_open
 #include <asm/unistd.h>
@@ -149,6 +151,35 @@ int open_uprobe_perf_event(const std::string& path, unsigned long offset,
     return static_cast<int>(syscall(SYS_perf_event_open, &pe, options.pid,
                                     options.cpu, options.group_fd,
                                     options.flags));
+}
+
+int load_kprobe_bpf_program(const std::vector<bpf_insn>& instructions) {
+    const char license[] = "GPL";
+    // DragonOS currently copies its complete generated bpf_attr binding.
+    // Leave versioning coverage to the BPF syscall suite and provide enough
+    // zero-filled tail bytes here so this uprobe test reaches SET_BPF.
+    alignas(union bpf_attr) unsigned char attr_storage[512] = {};
+    auto& attr = *reinterpret_cast<union bpf_attr*>(attr_storage);
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    attr.insn_cnt = instructions.size();
+    attr.insns = reinterpret_cast<__u64>(instructions.data());
+    attr.license = reinterpret_cast<__u64>(license);
+    return static_cast<int>(
+        syscall(SYS_bpf, BPF_PROG_LOAD, &attr, sizeof(attr_storage)));
+}
+
+bpf_insn bpf_mov64_imm(__s32 value) {
+    bpf_insn insn = {};
+    insn.code = BPF_ALU64 | BPF_MOV | BPF_K;
+    insn.dst_reg = BPF_REG_0;
+    insn.imm = value;
+    return insn;
+}
+
+bpf_insn bpf_exit() {
+    bpf_insn insn = {};
+    insn.code = BPF_JMP | BPF_EXIT;
+    return insn;
 }
 
 constexpr unsigned char RAW_TARGET_CODE[] = {
@@ -664,6 +695,41 @@ TEST(UprobeTest, DivideFaultReportsOriginalProbeAddress) {
     EXPECT_EQ(sigaction(SIGFPE, &old_action, nullptr), 0);
     munmap(executable, 4096);
     unlink(path);
+}
+
+TEST(UprobeTest, DuplicateBpfAttachReturnsEexist) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+    FdGuard event(open_uprobe_perf_event(path, offset));
+    ASSERT_GE(event.get(), 0);
+
+    const std::vector<bpf_insn> instructions = {bpf_mov64_imm(0), bpf_exit()};
+    FdGuard program(load_kprobe_bpf_program(instructions));
+    ASSERT_GE(program.get(), 0) << "BPF_PROG_LOAD failed, errno=" << errno;
+    ASSERT_EQ(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0)
+        << "first SET_BPF failed, errno=" << errno;
+
+    errno = 0;
+    EXPECT_LT(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0);
+    EXPECT_EQ(errno, EEXIST);
+}
+
+TEST(UprobeTest, LargeBpfJitProgramAttachesSafely) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+    FdGuard event(open_uprobe_perf_event(path, offset));
+    ASSERT_GE(event.get(), 0);
+
+    std::vector<bpf_insn> instructions(600, bpf_mov64_imm(0));
+    instructions.push_back(bpf_exit());
+    FdGuard program(load_kprobe_bpf_program(instructions));
+    ASSERT_GE(program.get(), 0) << "large BPF_PROG_LOAD failed, errno=" << errno;
+    EXPECT_EQ(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0)
+        << "large SET_BPF failed, errno=" << errno;
 }
 
 // Exercise the exact window where one CPU has executed INT3 while another

@@ -22,6 +22,8 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <setjmp.h>
+#include <signal.h>
 #include <string>
 #include <thread>
 
@@ -171,6 +173,18 @@ int create_raw_code(char* path_template, const unsigned char* code,
 int create_raw_target(char* path_template) {
     return create_raw_code(path_template, RAW_TARGET_CODE,
                            sizeof(RAW_TARGET_CODE));
+}
+
+sigjmp_buf divide_fault_jmp;
+volatile sig_atomic_t divide_fault_seen = 0;
+static_assert(std::atomic<uintptr_t>::is_always_lock_free);
+std::atomic<uintptr_t> divide_fault_addr{0};
+
+void capture_divide_fault(int, siginfo_t* info, void*) {
+    divide_fault_seen = 1;
+    divide_fault_addr.store(reinterpret_cast<uintptr_t>(info->si_addr),
+                            std::memory_order_relaxed);
+    siglongjmp(divide_fault_jmp, 1);
 }
 
 }  // namespace
@@ -607,6 +621,48 @@ TEST(UprobeTest, XbeginInstructionIsRejected) {
     EXPECT_LT(event.get(), 0)
         << "phase-1 XOL must reject XBEGIN relative control flow";
     EXPECT_EQ(errno, EINVAL);
+    unlink(path);
+}
+
+TEST(UprobeTest, DivideFaultReportsOriginalProbeAddress) {
+    constexpr unsigned char divide_by_zero[] = {
+        0x31, 0xd2,                          // xor edx,edx
+        0xb8, 0x01, 0x00, 0x00, 0x00,        // mov eax,1
+        0x31, 0xc9,                          // xor ecx,ecx
+        0x48, 0xf7, 0xf1,                    // div rcx
+        0xc3,                                // ret
+    };
+    constexpr unsigned long divide_offset = 9;
+    char path[] = "/tmp/uprobe_divide_XXXXXX";
+    FdGuard file(create_raw_code(path, divide_by_zero, sizeof(divide_by_zero)));
+    ASSERT_GE(file.get(), 0);
+    void* executable =
+        mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file.get(), 0);
+    ASSERT_NE(executable, MAP_FAILED);
+
+    FdGuard event(open_uprobe_perf_event(path, divide_offset));
+    ASSERT_GE(event.get(), 0) << "failed to install divide uprobe, errno=" << errno;
+
+    struct sigaction action = {};
+    struct sigaction old_action = {};
+    action.sa_sigaction = capture_divide_fault;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    ASSERT_EQ(sigaction(SIGFPE, &action, &old_action), 0);
+
+    divide_fault_seen = 0;
+    divide_fault_addr.store(0, std::memory_order_relaxed);
+    if (sigsetjmp(divide_fault_jmp, 1) == 0) {
+        reinterpret_cast<void (*)()>(executable)();
+        ADD_FAILURE() << "divide by zero unexpectedly returned";
+    }
+
+    EXPECT_EQ(divide_fault_seen, 1);
+    EXPECT_EQ(divide_fault_addr.load(std::memory_order_relaxed),
+              reinterpret_cast<uintptr_t>(executable) + divide_offset)
+        << "SIGFPE si_addr must identify the original probed instruction";
+    EXPECT_EQ(sigaction(SIGFPE, &old_action, nullptr), 0);
+    munmap(executable, 4096);
     unlink(path);
 }
 

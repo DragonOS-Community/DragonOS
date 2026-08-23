@@ -312,13 +312,18 @@ fn restore_after_abort(frame: &mut TrapFrame, state: &ActiveXol) {
 
 /// 把当前 XOL 标成已陷阱。幂等；只应在同步异常确定将投递信号后调用。
 pub fn mark_current_xol_trapped() -> bool {
+    mark_current_xol_trapped_and_get_probe_addr().is_some()
+}
+
+/// Mark the current XOL instruction as trapped and return the original
+/// instruction address. Synchronous fault handlers use this to build siginfo
+/// without exposing the private XOL slot address to userspace.
+pub fn mark_current_xol_trapped_and_get_probe_addr() -> Option<usize> {
     let pcb = ProcessManager::current_pcb();
     let mut active = pcb.uprobe_ss.lock_irqsave();
-    let Some(active) = active.as_mut() else {
-        return false;
-    };
+    let active = active.as_mut()?;
     active.state = ActiveXolState::Trapped;
-    true
+    Some(active.probe_vaddr)
 }
 
 /// 幂等中止当前 XOL，并把 trapframe 恢复为可重试原指令的状态。

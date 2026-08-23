@@ -616,12 +616,11 @@ fn uprobe_register(
     probe_vaddr: usize,
     _pre_handler: fn(&dyn ProbeArgs),
     _post_handler: fn(&dyn ProbeArgs),
-    consumer_id: u64,
+    consumer: &Arc<UprobeConsumer>,
     expected_vma: &ExpectedProbeVma,
 ) -> Result<Option<UprobeHandle>, SystemError> {
-    // registry 锁只用于取得稳定 Arc；后续 mm 锁内绝不再访问 registry。
-    let consumer = registry_consumer(consumer_id).ok_or(SystemError::ENOENT)?;
     let _install = consumer.begin_install(mm).ok_or(SystemError::ENOENT)?;
+    let consumer_id = consumer.id;
     // ── 持有 inner.write() 整个注册过程 ──
     let mut inner = mm.write();
 
@@ -1671,7 +1670,6 @@ fn uprobe_apply_to_new_vma_inner(
             if !consumer.scope.permits(mm) || consumer.closing.load(Ordering::Acquire) {
                 continue;
             }
-            let consumer_id = consumer.id;
             // Ordinary file mmap is lazy.  Fault in only the page containing
             // the breakpoint, and pin the retry to the VMA identity observed
             // here so MAP_FIXED cannot redirect installation to a replacement.
@@ -1722,7 +1720,7 @@ fn uprobe_apply_to_new_vma_inner(
                 probe_vaddr,
                 noop_handler,
                 noop_handler,
-                consumer_id,
+                &consumer,
                 &expected_vma,
             ) {
                 Ok(Some(handle)) => {

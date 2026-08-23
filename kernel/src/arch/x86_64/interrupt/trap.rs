@@ -125,11 +125,12 @@ unsafe extern "C" fn do_divide_error(regs: &'static mut TrapFrame, error_code: u
         // A divide fault from an XOL instruction is a synchronous user fault,
         // not a kernel failure.  Mark the transaction trapped so the signal
         // gate restores the original probe context before building sigframe.
-        crate::exception::uprobe::mark_current_xol_trapped();
+        let fault_addr = crate::exception::uprobe::mark_current_xol_trapped_and_get_probe_addr()
+            .unwrap_or(regs.rip as usize);
         CurrentIrqArch::interrupt_enable();
         const FPE_INTDIV: i32 = 1;
         if let Err(err) =
-            force_sig_fault_to_current(Signal::SIGFPE, FPE_INTDIV, VirtAddr::new(regs.rip as usize))
+            force_sig_fault_to_current(Signal::SIGFPE, FPE_INTDIV, VirtAddr::new(fault_addr))
         {
             error!("failed to send SIGFPE for user divide error: {:?}", err);
         }

@@ -403,6 +403,11 @@ impl ProcessManager {
                 assert_ne!(previous, 0, "thread-group live count underflow");
                 (group_leader, previous == 1)
             };
+            // Match Linux perf_event_exit_task(): terminal task events must be
+            // detached while the old mm and its original instruction bytes
+            // are still available. The perf fd retains its final count.
+            #[cfg(target_arch = "x86_64")]
+            crate::mm::ucontext::uprobe::uprobe_registry_task_exit(&pcb);
             pid = pcb.pid();
             if pid.is_child_reaper() {
                 pid.ns_of_pid().disable_pid_allocation();

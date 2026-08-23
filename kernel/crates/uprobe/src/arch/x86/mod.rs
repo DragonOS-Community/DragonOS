@@ -26,6 +26,9 @@ pub enum UprobeInsnError {
     TooLong,
     /// RIP-relative 重定位后的位移超出 i32 范围（disp32 装不下）。
     DisplacementOverflow,
+    /// Address-size override selected EIP-relative addressing. Phase one does
+    /// not implement the required 32-bit wrapping relocation semantics.
+    UnsupportedEipRelative,
     /// 控制流指令（call/jmp/ret/jcc/loop/int 等）——XOL 执行会跳出 slot，
     /// 后续 #DB 无法反推探针址，且可能损坏栈/控制流。注册时拒绝。
     UnsupportedControlFlow,
@@ -203,6 +206,9 @@ fn operand_rip_disp(op: &Operand) -> Result<Option<i32>, UprobeInsnError> {
     match op {
         Operand::MemDeref { base } if *base == RegSpec::RIP => Ok(Some(0)),
         Operand::Disp { base, disp } if *base == RegSpec::RIP => Ok(Some(*disp)),
+        Operand::MemDeref { base } | Operand::Disp { base, .. } if *base == RegSpec::eip() => {
+            Err(UprobeInsnError::UnsupportedEipRelative)
+        }
         // 标准 RIP-relative 不带 SIB index、不带掩码；命中这些形式即 fail-fast。
         Operand::DispMasked { base, .. }
         | Operand::MemDerefMasked { base, .. }
@@ -213,6 +219,16 @@ fn operand_rip_disp(op: &Operand) -> Result<Option<i32>, UprobeInsnError> {
             if *base == RegSpec::RIP =>
         {
             Err(UprobeInsnError::DecodeFailed)
+        }
+        Operand::DispMasked { base, .. }
+        | Operand::MemDerefMasked { base, .. }
+        | Operand::MemBaseIndexScale { base, .. }
+        | Operand::MemBaseIndexScaleDisp { base, .. }
+        | Operand::MemBaseIndexScaleMasked { base, .. }
+        | Operand::MemBaseIndexScaleDispMasked { base, .. }
+            if *base == RegSpec::eip() =>
+        {
+            Err(UprobeInsnError::UnsupportedEipRelative)
         }
         _ => Ok(None),
     }
@@ -321,6 +337,27 @@ mod tests {
         // disp occupies the last 4 bytes, no trailing immediate.
         assert_eq!(r.disp_offset, 3);
         assert_eq!(r.disp, 0x1234);
+    }
+
+    #[test]
+    fn eip_relative_addressing_is_rejected() {
+        for bytes in [
+            &[0x67, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00][..],
+            &[0x67, 0x8b, 0x05, 0x34, 0x12, 0x00, 0x00][..],
+            &[
+                0x67, 0xc7, 0x05, 0x10, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+            ][..],
+        ] {
+            assert_eq!(
+                analyze_insn(bytes).unwrap_err(),
+                UprobeInsnError::UnsupportedEipRelative,
+                "bytes={bytes:x?}"
+            );
+        }
+
+        // Address-size override alone is safe when the address is based on a
+        // general-purpose register rather than the slot-relative next EIP.
+        assert!(analyze_insn(&[0x67, 0x8b, 0x00]).is_ok());
     }
 
     #[test]

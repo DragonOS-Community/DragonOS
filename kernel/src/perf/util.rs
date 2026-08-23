@@ -25,6 +25,8 @@ pub enum PerfEventIoc {
     Enable = 9216,
     /// Equivalent to [crate::include::bindings::linux_bpf::AYA_PERF_EVENT_IOC_DISABLE].
     Disable = 9217,
+    /// Equivalent to Linux `PERF_EVENT_IOC_RESET` (`_IO('$', 3)`).
+    Reset = 9219,
     /// Equivalent to [crate::include::bindings::linux_bpf::AYA_PERF_EVENT_IOC_SET_BPF].
     SetBpf = 1074013192,
 }

@@ -33,7 +33,7 @@ use crate::{
         syscall::{MapFlags, ProtFlags},
         MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion, VmFlags,
     },
-    process::ProcessControlBlock,
+    process::{ProcessControlBlock, ProcessFlags},
 };
 
 use super::RwSemWriteGuard;
@@ -280,6 +280,7 @@ pub struct UprobeTaskScope(Arc<UprobeTaskScopeToken>);
 struct UprobeTaskScopeToken {
     id: u64,
     target_ptr: usize,
+    terminal: AtomicBool,
 }
 
 impl Drop for UprobeTaskScopeToken {
@@ -297,18 +298,37 @@ impl UprobeTaskScope {
         Self(Arc::new(UprobeTaskScopeToken {
             id,
             target_ptr: Arc::as_ptr(target) as usize,
+            terminal: AtomicBool::new(false),
         }))
     }
 
     fn permits_task(&self, current: &Arc<ProcessControlBlock>) -> bool {
-        Arc::as_ptr(current) as usize == self.0.target_ptr
+        !self.0.terminal.load(Ordering::Acquire)
+            && Arc::as_ptr(current) as usize == self.0.target_ptr
+    }
+
+    fn target(&self) -> Option<Arc<ProcessControlBlock>> {
+        let target = { UPROBE_TASK_SCOPES.lock_irqsave().get(&self.0.id).cloned() };
+        target.and_then(|target| target.upgrade())
     }
 
     fn target_mm(&self) -> Option<Arc<AddressSpace>> {
-        let target = { UPROBE_TASK_SCOPES.lock_irqsave().get(&self.0.id).cloned() };
-        target
-            .and_then(|target| target.upgrade())
-            .and_then(|task| task.basic().user_vm())
+        if self.0.terminal.load(Ordering::Acquire) {
+            return None;
+        }
+        self.target().and_then(|task| task.basic().user_vm())
+    }
+
+    fn target_ptr(&self) -> usize {
+        self.0.target_ptr
+    }
+
+    fn mark_terminal(&self) {
+        self.0.terminal.store(true, Ordering::Release);
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.0.terminal.load(Ordering::Acquire)
     }
 }
 
@@ -332,6 +352,10 @@ impl UprobeConsumerScope {
             Self::Task(scope) => Some(scope.clone()),
             Self::SystemWideAuthorized => None,
         }
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Task(scope) if scope.is_terminal())
     }
 }
 
@@ -360,8 +384,14 @@ impl UprobeConsumerRuntimeSnapshot {
 
 struct InstalledSiteRef {
     mm: Weak<AddressSpace>,
-    vaddr: usize,
     site: Weak<UprobeSite>,
+}
+
+struct DisarmTarget {
+    vaddr: usize,
+    site: Arc<UprobeSite>,
+    old_byte: u8,
+    consumers: Vec<Arc<UprobeConsumer>>,
 }
 
 pub struct UprobeConsumer {
@@ -374,7 +404,7 @@ pub struct UprobeConsumer {
     closing: AtomicBool,
     inflight: AtomicUsize,
     inflight_wait: WaitQueue,
-    sites: SpinLock<Vec<InstalledSiteRef>>,
+    sites: SpinLock<BTreeMap<(u64, usize), InstalledSiteRef>>,
 }
 
 struct ConsumerInstallGuard<'a>(&'a UprobeConsumer);
@@ -405,7 +435,7 @@ impl UprobeConsumer {
             closing: AtomicBool::new(false),
             inflight: AtomicUsize::new(0),
             inflight_wait: WaitQueue::default(),
-            sites: SpinLock::new(Vec::new()),
+            sites: SpinLock::new(BTreeMap::new()),
         })
     }
 
@@ -428,32 +458,35 @@ impl UprobeConsumer {
 
     fn remember_site(&self, mm: &Arc<AddressSpace>, vaddr: usize, site: &Arc<UprobeSite>) {
         let mut sites = self.sites.lock_irqsave();
-        let mut already_present = false;
-        sites.retain(|installed| {
-            let (Some(installed_mm), Some(installed_site)) =
-                (installed.mm.upgrade(), installed.site.upgrade())
-            else {
-                return false;
-            };
-            if installed_site.state() == UprobeSiteState::Dead {
-                return false;
-            }
-            if installed.vaddr == vaddr
-                && Arc::ptr_eq(&installed_mm, mm)
-                && Arc::ptr_eq(&installed_site, site)
-            {
-                already_present = true;
-            }
-            true
-        });
-        if already_present {
+        let key = (mm.id(), vaddr);
+        if sites.get(&key).is_some_and(|installed| {
+            installed
+                .site
+                .upgrade()
+                .is_some_and(|installed_site| Arc::ptr_eq(&installed_site, site))
+        }) {
             return;
         }
-        sites.push(InstalledSiteRef {
-            mm: Arc::downgrade(mm),
-            vaddr,
-            site: Arc::downgrade(site),
-        });
+        sites.insert(
+            key,
+            InstalledSiteRef {
+                mm: Arc::downgrade(mm),
+                site: Arc::downgrade(site),
+            },
+        );
+    }
+
+    fn forget_site(&self, mm_id: u64, vaddr: usize, site: &Arc<UprobeSite>) {
+        let mut sites = self.sites.lock_irqsave();
+        let key = (mm_id, vaddr);
+        if sites.get(&key).is_some_and(|installed| {
+            installed
+                .site
+                .upgrade()
+                .is_none_or(|installed_site| Arc::ptr_eq(&installed_site, site))
+        }) {
+            sites.remove(&key);
+        }
     }
 
     /// Runtime state belongs to the perf consumer, not to one particular VMA
@@ -905,6 +938,7 @@ fn uprobe_register(
                 list.remove(&probe_vaddr);
             }
         }
+        consumer.forget_site(mm.id(), probe_vaddr, &site);
         site.state
             .store(UprobeSiteState::Dead as u8, Ordering::Release);
         return Err(e);
@@ -1163,7 +1197,7 @@ fn uprobe_unregister_consumer_from_site(
     // the last membership, leave it published until the teardown owner has
     // restored the opcode. Two concurrent removals can therefore never both
     // decide they are non-last and strand an armed, ownerless breakpoint.
-    let (last_consumer, orig_first_byte) = {
+    let (last_consumer, orig_first_byte, removed_consumer) = {
         let mut list = mm.uprobe_list.lock_irqsave();
         let Some(entries) = list.get_mut(&probe_vaddr) else {
             return;
@@ -1179,11 +1213,13 @@ fn uprobe_unregister_consumer_from_site(
             .filter(|entry| Arc::ptr_eq(&entry.read().site, site))
             .count()
             == 1;
+        let removed_consumer = entries[remove_index].read().consumer.clone();
         if !last {
             entries.remove(remove_index);
         }
-        (last, site.definition.old_instruction[0])
+        (last, site.definition.old_instruction[0], removed_consumer)
     };
+    removed_consumer.forget_site(mm.id(), probe_vaddr, site);
 
     if !last_consumer {
         rebuild_site_participants(mm, probe_vaddr, site);
@@ -1357,7 +1393,7 @@ pub(crate) fn uprobe_disarm_range_locked(
         .start()
         .data()
         .saturating_sub(UPROBE_INSN_COPY_SIZE - 1);
-    let targets: Vec<(usize, Arc<UprobeSite>, u8)> = {
+    let targets: Vec<DisarmTarget> = {
         let list = mm.uprobe_list.lock_irqsave();
         list.range(candidate_start..region.end().data())
             .filter_map(|(vaddr, entries)| {
@@ -1367,13 +1403,33 @@ pub(crate) fn uprobe_disarm_range_locked(
                     return None;
                 }
                 let old = entry.point.old_instruction[0];
-                Some((*vaddr, entry.site.clone(), old))
+                let site = entry.site.clone();
+                drop(entry);
+                let consumers = entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let entry = entry.read();
+                        Arc::ptr_eq(&entry.site, &site).then(|| entry.consumer.clone())
+                    })
+                    .collect();
+                Some(DisarmTarget {
+                    vaddr: *vaddr,
+                    site,
+                    old_byte: old,
+                    consumers,
+                })
             })
             .collect()
     };
 
     let mut disarmed = Vec::new();
-    for (probe_vaddr, site, old_byte) in targets {
+    for DisarmTarget {
+        vaddr: probe_vaddr,
+        site,
+        old_byte,
+        consumers,
+    } in targets
+    {
         if site
             .state
             .compare_exchange(
@@ -1396,7 +1452,7 @@ pub(crate) fn uprobe_disarm_range_locked(
             let page_offset = probe_vaddr & (MMArch::PAGE_SIZE - 1);
             restore_breakpoint_byte(mm, inner, page_base, page_offset, old_byte);
         }
-        disarmed.push((probe_vaddr, site, old_byte));
+        disarmed.push((probe_vaddr, site, old_byte, consumers));
     }
 
     if !disarmed.is_empty() {
@@ -1417,7 +1473,7 @@ pub(crate) fn uprobe_disarm_range_locked(
         );
     }
 
-    for (probe_vaddr, site, _) in disarmed {
+    for (probe_vaddr, site, _, consumers) in disarmed {
         *site.participants.write() = Arc::new(Vec::new());
         {
             let mut list = mm.uprobe_list.lock_irqsave();
@@ -1430,6 +1486,9 @@ pub(crate) fn uprobe_disarm_range_locked(
             }) {
                 list.remove(&probe_vaddr);
             }
+        }
+        for consumer in consumers {
+            consumer.forget_site(mm.id(), probe_vaddr, &site);
         }
         site.state
             .store(UprobeSiteState::Dead as u8, Ordering::Release);
@@ -1447,6 +1506,25 @@ pub(crate) fn uprobe_disarm_range_locked(
         }
     }
     Ok(())
+}
+
+/// Remove reverse-index entries when an address space reaches final
+/// destruction. Its PTEs and hit table disappear together, so no opcode
+/// restoration is needed. Draining the per-mm table keeps the work
+/// proportional to live sites instead of scanning every consumer's history.
+pub(crate) fn uprobe_forget_address_space(mm: &AddressSpace) {
+    let instances = core::mem::take(&mut *mm.uprobe_list.lock_irqsave());
+    for (vaddr, entries) in instances {
+        for entry in entries {
+            let entry = entry.read();
+            entry.consumer.forget_site(mm.id(), vaddr, &entry.site);
+            *entry.site.participants.write() = Arc::new(Vec::new());
+            entry
+                .site
+                .state
+                .store(UprobeSiteState::Dead as u8, Ordering::Release);
+        }
+    }
 }
 
 // ──────────────────────── 辅助：空操作 handler ────────────────────────
@@ -1488,6 +1566,10 @@ static ACTIVE_UPROBE_CONSUMERS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_TASK_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 static UPROBE_TASK_SCOPES: SpinLock<BTreeMap<u64, Weak<ProcessControlBlock>>> =
     SpinLock::new(BTreeMap::new());
+/// Target PCB pointer -> task-scoped consumers. The target scope's Weak keeps
+/// the PCB allocation from being reused until the consumer is removed.
+static UPROBE_TASK_CONSUMERS: SpinLock<BTreeMap<usize, Vec<Weak<UprobeConsumer>>>> =
+    SpinLock::new(BTreeMap::new());
 static UPROBE_DEFINITIONS: SpinLock<BTreeMap<(usize, usize), Weak<UprobeDefinition>>> =
     SpinLock::new(BTreeMap::new());
 
@@ -1527,7 +1609,8 @@ pub fn uprobe_registry_add(
 }
 
 pub fn uprobe_registry_add_consumer(consumer: Arc<UprobeConsumer>) {
-    if consumer.enabled.load(Ordering::Acquire) {
+    register_task_consumer(&consumer);
+    if consumer.enabled.load(Ordering::Acquire) && !consumer.scope.is_terminal() {
         ACTIVE_UPROBE_CONSUMERS.fetch_add(1, Ordering::AcqRel);
     }
     let mut r = UPROBE_REGISTRY.lock_irqsave();
@@ -1536,6 +1619,46 @@ pub fn uprobe_registry_add_consumer(consumer: Arc<UprobeConsumer>) {
         .entry(consumer.definition.offset())
         .or_default()
         .push(consumer);
+}
+
+fn register_task_consumer(consumer: &Arc<UprobeConsumer>) {
+    let UprobeConsumerScope::Task(scope) = &consumer.scope else {
+        return;
+    };
+    let mut task_consumers = UPROBE_TASK_CONSUMERS.lock_irqsave();
+    let target_is_alive = scope.target().is_some_and(|target| {
+        !target.flags().contains(ProcessFlags::EXITING) && target.basic().user_vm().is_some()
+    });
+    if !target_is_alive {
+        scope.mark_terminal();
+        consumer.enabled.store(false, Ordering::Release);
+        consumer.runtime.write().enabled = false;
+        return;
+    }
+    task_consumers
+        .entry(scope.target_ptr())
+        .or_default()
+        .push(Arc::downgrade(consumer));
+}
+
+fn unregister_task_consumer(consumer: &UprobeConsumer) {
+    let UprobeConsumerScope::Task(scope) = &consumer.scope else {
+        return;
+    };
+    let mut task_consumers = UPROBE_TASK_CONSUMERS.lock_irqsave();
+    let remove_key = if let Some(consumers) = task_consumers.get_mut(&scope.target_ptr()) {
+        consumers.retain(|indexed| {
+            indexed
+                .upgrade()
+                .is_some_and(|indexed| indexed.id != consumer.id)
+        });
+        consumers.is_empty()
+    } else {
+        false
+    };
+    if remove_key {
+        task_consumers.remove(&scope.target_ptr());
+    }
 }
 
 fn registry_consumer(consumer_id: u64) -> Option<Arc<UprobeConsumer>> {
@@ -1559,6 +1682,9 @@ pub fn uprobe_registry_set_enabled(consumer_id: u64, enabled: bool) -> Result<()
         return Ok(());
     }
     if enabled {
+        if consumer.scope.is_terminal() {
+            return Ok(());
+        }
         consumer.runtime.write().enabled = true;
         if !consumer.enabled.swap(true, Ordering::AcqRel) {
             ACTIVE_UPROBE_CONSUMERS.fetch_add(1, Ordering::AcqRel);
@@ -1589,10 +1715,96 @@ pub fn uprobe_registry_set_enabled(consumer_id: u64, enabled: bool) -> Result<()
 
 fn detach_consumer_sites(consumer: &UprobeConsumer) {
     let installed = core::mem::take(&mut *consumer.sites.lock_irqsave());
-    for installed in installed {
+    for ((_, vaddr), installed) in installed {
         if let (Some(mm), Some(site)) = (installed.mm.upgrade(), installed.site.upgrade()) {
-            uprobe_unregister_consumer_from_site(&mm, installed.vaddr, &site, consumer.id);
+            uprobe_unregister_consumer_from_site(&mm, vaddr, &site, consumer.id);
         }
+    }
+}
+
+fn detach_consumer_from_mm(consumer: &UprobeConsumer, mm: &Arc<AddressSpace>) {
+    let mm_id = mm.id();
+    let installed = {
+        let mut sites = consumer.sites.lock_irqsave();
+        let keys: Vec<(u64, usize)> = sites
+            .range((mm_id, 0)..=(mm_id, usize::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| sites.remove(&key).map(|site| (key.1, site)))
+            .collect::<Vec<_>>()
+    };
+    for (vaddr, installed) in installed {
+        if let Some(site) = installed.site.upgrade() {
+            uprobe_unregister_consumer_from_site(mm, vaddr, &site, consumer.id);
+        }
+    }
+}
+
+/// Put task-scoped events into their terminal state before the target drops
+/// its mm. The perf fd and its final count stay alive, but no site can be
+/// installed or re-enabled afterwards.
+pub fn uprobe_registry_task_exit(target: &Arc<ProcessControlBlock>) {
+    let target_ptr = Arc::as_ptr(target) as usize;
+    let consumers = {
+        let mut task_consumers = UPROBE_TASK_CONSUMERS.lock_irqsave();
+        task_consumers
+            .remove(&target_ptr)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|consumer| {
+                let consumer = consumer.upgrade()?;
+                if let UprobeConsumerScope::Task(scope) = &consumer.scope {
+                    scope.mark_terminal();
+                }
+                Some(consumer)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for consumer in consumers {
+        let UprobeConsumerScope::Task(_) = &consumer.scope else {
+            continue;
+        };
+        let _lifecycle = consumer.lifecycle.lock();
+        if consumer.enabled.swap(false, Ordering::AcqRel) {
+            ACTIVE_UPROBE_CONSUMERS.fetch_sub(1, Ordering::AcqRel);
+        }
+        consumer.runtime.write().enabled = false;
+        consumer
+            .inflight_wait
+            .wait_until(|| (consumer.inflight.load(Ordering::Acquire) == 0).then_some(()));
+        detach_consumer_sites(&consumer);
+    }
+}
+
+/// A successful exec keeps a task event alive on the new mm. Remove only the
+/// old-mm memberships, which may otherwise remain armed when another
+/// CLONE_VM task still owns that address space.
+pub fn uprobe_registry_task_exec(
+    target: &Arc<ProcessControlBlock>,
+    old_mm: Option<&Arc<AddressSpace>>,
+) {
+    let Some(old_mm) = old_mm else { return };
+    let target_ptr = Arc::as_ptr(target) as usize;
+    let consumers = {
+        let task_consumers = UPROBE_TASK_CONSUMERS.lock_irqsave();
+        task_consumers
+            .get(&target_ptr)
+            .into_iter()
+            .flatten()
+            .filter_map(|consumer| consumer.upgrade())
+            .collect::<Vec<_>>()
+    };
+    for consumer in consumers {
+        let _lifecycle = consumer.lifecycle.lock();
+        if consumer.closing.load(Ordering::Acquire) || consumer.scope.is_terminal() {
+            continue;
+        }
+        consumer
+            .inflight_wait
+            .wait_until(|| (consumer.inflight.load(Ordering::Acquire) == 0).then_some(()));
+        detach_consumer_from_mm(&consumer, old_mm);
     }
 }
 
@@ -1682,13 +1894,15 @@ pub fn uprobe_registry_remove_consumer(consumer_id: u64) {
         removed
     };
     let Some(consumer) = removed else { return };
+    let _lifecycle = consumer.lifecycle.lock();
+    unregister_task_consumer(&consumer);
     consumer
         .inflight_wait
         .wait_until(|| (consumer.inflight.load(Ordering::Acquire) == 0).then_some(()));
     let sites = core::mem::take(&mut *consumer.sites.lock_irqsave());
-    for installed in sites {
+    for ((_, vaddr), installed) in sites {
         if let (Some(mm), Some(site)) = (installed.mm.upgrade(), installed.site.upgrade()) {
-            uprobe_unregister_consumer_from_site(&mm, installed.vaddr, &site, consumer.id);
+            uprobe_unregister_consumer_from_site(&mm, vaddr, &site, consumer.id);
         }
     }
 }

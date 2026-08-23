@@ -61,6 +61,10 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
     fn disable(&self) -> Result<()> {
         Err(SystemError::ENOSYS)
     }
+    /// Reset the event's accumulated count without changing enable state.
+    fn reset(&self) -> Result<()> {
+        Err(SystemError::ENOSYS)
+    }
     /// Read the event-specific perf counter payload.
     fn read_event(&self, _len: usize, _buf: &mut [u8]) -> Result<usize> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -335,6 +339,10 @@ impl IndexNode for PerfEventInode {
             }
             PerfEventIoc::Disable => {
                 self.core.event.disable()?;
+                Ok(0)
+            }
+            PerfEventIoc::Reset => {
+                self.core.event.reset()?;
                 Ok(0)
             }
             PerfEventIoc::SetBpf => {

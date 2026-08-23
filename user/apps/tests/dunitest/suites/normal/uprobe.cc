@@ -549,6 +549,61 @@ TEST(UprobeTest, CounterReadUsesRawSingletonFormat) {
     ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
               static_cast<ssize_t>(sizeof(count)));
     EXPECT_EQ(count, 3U) << "读取计数不应清零";
+
+    ASSERT_EQ(ioctl(fd.get(), PERF_EVENT_IOC_DISABLE, 0), 0);
+    ASSERT_EQ(ioctl(fd.get(), PERF_EVENT_IOC_RESET, 0), 0);
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 0U);
+    ASSERT_EQ(ioctl(fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
+    EXPECT_EQ(uprobe_target(4), 9);
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
+}
+
+TEST(UprobeTest, TargetThreadExitDetachesTaskScopedSites) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+    const auto* target_byte =
+        reinterpret_cast<const unsigned char*>(&uprobe_target);
+    const unsigned char original_byte = *target_byte;
+
+    std::atomic<pid_t> target_tid{0};
+    std::atomic<bool> run{false};
+    std::atomic<int> target_result{0};
+    std::thread target([&]() {
+        target_tid.store(static_cast<pid_t>(syscall(SYS_gettid)),
+                         std::memory_order_release);
+        while (!run.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        target_result.store(uprobe_target(21), std::memory_order_release);
+    });
+    while (target_tid.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+
+    UprobePerfEventOptions options;
+    options.pid = target_tid.load(std::memory_order_acquire);
+    FdGuard event(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    EXPECT_EQ(*target_byte, 0xcc);
+    run.store(true, std::memory_order_release);
+    target.join();
+    EXPECT_EQ(target_result.load(std::memory_order_acquire), 43);
+
+    EXPECT_EQ(*target_byte, original_byte)
+        << "target exit must detach task-scoped breakpoints";
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
+    ASSERT_EQ(ioctl(event.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
+    EXPECT_EQ(*target_byte, original_byte)
+        << "an exited task event must not be reactivated";
 }
 
 TEST(UprobeTest, UnsupportedReadFormatIsRejected) {
@@ -1128,6 +1183,22 @@ TEST(UprobeTest, XbeginInstructionIsRejected) {
     FdGuard event(open_uprobe_perf_event(path, 0));
     EXPECT_LT(event.get(), 0)
         << "phase-1 XOL must reject XBEGIN relative control flow";
+    EXPECT_EQ(errno, EINVAL);
+    unlink(path);
+}
+
+TEST(UprobeTest, EipRelativeAddressingIsRejected) {
+    constexpr unsigned char eip_relative[] = {
+        0x67, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00,  // mov eax,[eip]
+        0xc3,                                      // ret
+    };
+    char path[] = "/tmp/uprobe_eip_relative_XXXXXX";
+    FdGuard file(create_raw_code(path, eip_relative, sizeof(eip_relative)));
+    ASSERT_GE(file.get(), 0);
+
+    errno = 0;
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    EXPECT_LT(event.get(), 0);
     EXPECT_EQ(errno, EINVAL);
     unlink(path);
 }

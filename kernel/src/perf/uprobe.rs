@@ -201,6 +201,10 @@ impl UprobePerfCallBack {
         self.hit_count.load(Ordering::Relaxed)
     }
 
+    fn reset_count(&self) {
+        self.hit_count.store(0, Ordering::Relaxed);
+    }
+
     fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Release);
     }
@@ -326,6 +330,12 @@ impl PerfEventOps for UprobePerfEvent {
             return Err(err);
         }
         self.callback.wait_idle();
+        Ok(())
+    }
+
+    fn reset(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        self.callback.reset_count();
         Ok(())
     }
 

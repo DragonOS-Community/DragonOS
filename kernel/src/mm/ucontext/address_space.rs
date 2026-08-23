@@ -1498,6 +1498,9 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        super::uprobe::uprobe_forget_address_space(self);
+
         // Assert that no CPUs still reference this mm when it is dropped in debug builds.
         // In release builds, degrade gracefully to avoid false positives (a leak is better than a panic).
         #[cfg(debug_assertions)]

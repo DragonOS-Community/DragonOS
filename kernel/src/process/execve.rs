@@ -226,6 +226,8 @@ fn do_execve_internal(
             if let Err(err) = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr) {
                 return finish_exec_error(&param, old_vm.as_ref(), err);
             }
+            #[cfg(target_arch = "x86_64")]
+            crate::mm::ucontext::uprobe::uprobe_registry_task_exec(&pcb, old_vm.as_ref());
             if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
                 completion.complete_all();
             }

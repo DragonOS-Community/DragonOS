@@ -668,16 +668,29 @@ fn uprobe_register(
     // 复用其 old_instruction + insn_analysis（二者对所有同址实例一致），跳过读取。
     let reused = {
         let list = mm.uprobe_list.lock_irqsave();
-        list.get(&probe_vaddr)
-            .and_then(|entries| entries.first())
-            .map(|entry| {
-                let inst = entry.read();
-                (
-                    inst.point.old_instruction,
-                    inst.insn_analysis,
-                    inst.site.clone(),
-                )
-            })
+        match list.get(&probe_vaddr) {
+            Some(entries) => {
+                // All registration paths reach this point under mm.write().
+                // Keep the idempotence check in that serialization domain:
+                // an enable scan and a post-mmap apply cannot both insert the
+                // same consumer at this address.
+                if entries
+                    .iter()
+                    .any(|entry| entry.read().consumer_id == consumer_id)
+                {
+                    return Ok(None);
+                }
+                entries.first().map(|entry| {
+                    let inst = entry.read();
+                    (
+                        inst.point.old_instruction,
+                        inst.insn_analysis,
+                        inst.site.clone(),
+                    )
+                })
+            }
+            None => None,
+        }
     };
 
     let (old_instruction, analysis, existing_site) = if let Some((oi, an, site)) = reused {
@@ -1659,15 +1672,6 @@ fn uprobe_apply_to_new_vma_inner(
                 continue;
             }
             let consumer_id = consumer.id;
-            // 该消费者在此 mm 的该地址是否已有实例（fork 继承可能已装）？
-            let already = {
-                let list = mm.uprobe_list.lock_irqsave();
-                list.get(&probe_vaddr)
-                    .is_some_and(|es| es.iter().any(|e| e.read().consumer_id == consumer_id))
-            };
-            if already {
-                continue;
-            }
             // Ordinary file mmap is lazy.  Fault in only the page containing
             // the breakpoint, and pin the retry to the VMA identity observed
             // here so MAP_FIXED cannot redirect installation to a replacement.

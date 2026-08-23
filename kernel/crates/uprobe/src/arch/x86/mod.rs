@@ -126,7 +126,7 @@ fn is_repeated_string(inst: &Instruction) -> bool {
 /// 判断指令是否为控制流指令（不可从 XOL slot 安全执行）。
 ///
 /// 覆盖：直接跳转/调用/返回、条件跳转（Jcc）、循环（LOOP*）、
-/// 中断（INT/INT3/IRET*）、系统调用/返回（SYSCALL/SYSRET）。
+/// 事务分支（XBEGIN）、中断（INT/INT3/IRET*）、系统调用/返回（SYSCALL/SYSRET）。
 /// 这些指令改变 RIP 的方式使 XOL 单步后的 #DB 无法在 slot 内捕获，
 /// 或会向用户栈写入 XOL 地址损坏控制流。
 fn is_control_flow(inst: &Instruction) -> bool {
@@ -140,6 +140,7 @@ fn is_control_flow(inst: &Instruction) -> bool {
             | Opcode::RETURN
             | Opcode::RETF
             | Opcode::LOOP
+            | Opcode::XBEGIN
             | Opcode::INT
             | Opcode::IRET
             | Opcode::IRETD
@@ -328,12 +329,14 @@ mod tests {
 
     #[test]
     fn control_flow_rejected() {
-        // call rel32 (e8), jmp rel8 (eb), ret (c3), je rel8 (74), syscall (0f 05)
+        // call rel32 (e8), jmp rel8 (eb), ret (c3), je rel8 (74),
+        // xbegin rel32 (c7 f8), syscall (0f 05)
         for bytes in [
             &[0xe8, 0x00, 0x00, 0x00, 0x00][..],
             &[0xeb, 0xfe][..],
             &[0xc3][..],
             &[0x74, 0x02][..],
+            &[0xc7, 0xf8, 0x00, 0x00, 0x00, 0x00][..],
             &[0x0f, 0x05][..],
         ] {
             assert_eq!(
@@ -363,6 +366,9 @@ mod tests {
         assert!(analyze_insn(&[0x8e, 0xd8]).is_ok());
         // 对照：普通 mov（非 SS 目标）可接受
         assert!(analyze_insn(&[0x48, 0x89, 0xe5]).is_ok());
+        // Intel 明确规定 LSS 不具有 MOV SS/POP SS 的事件抑制行为；Linux 的
+        // insn_masking_exception() 也不拒绝它，不能在这里扩大拒绝范围。
+        assert!(analyze_insn(&[0x0f, 0xb2, 0x00]).is_ok());
     }
 
     #[test]

@@ -593,6 +593,23 @@ TEST(UprobeTest, PushfInstructionIsRejected) {
     unlink(path);
 }
 
+TEST(UprobeTest, XbeginInstructionIsRejected) {
+    constexpr unsigned char xbegin[] = {
+        0xc7, 0xf8, 0x00, 0x00, 0x00, 0x00,  // xbegin rel32
+        0xc3,                                // ret
+    };
+    char path[] = "/tmp/uprobe_xbegin_XXXXXX";
+    FdGuard file(create_raw_code(path, xbegin, sizeof(xbegin)));
+    ASSERT_GE(file.get(), 0);
+
+    errno = 0;
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    EXPECT_LT(event.get(), 0)
+        << "phase-1 XOL must reject XBEGIN relative control flow";
+    EXPECT_EQ(errno, EINVAL);
+    unlink(path);
+}
+
 // Exercise the exact window where one CPU has executed INT3 while another
 // CPU disables or closes the last consumer. A leaked ordinary SIGTRAP or a
 // reused XOL slot terminates the test or produces a wrong result.

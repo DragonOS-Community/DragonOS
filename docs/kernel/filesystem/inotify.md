@@ -101,7 +101,7 @@
 | `IN_MODIFY`（truncate） | `do_ftruncate`/`resize` 成功路径；`fallocate` 的写类模式（`FALLOC_FL_PUNCH_HOLE`/`ZERO_RANGE`/正常分配，非 `KEEP_SIZE`）成功后 | 被 setattr inode 的 watch | 无 |
 | `IN_ACCESS` | `File::do_read` 成功后 | 被读 inode 的 watch | 无 |
 | `IN_CLOSE_WRITE` / `IN_CLOSE_NOWRITE` | `File::drop`（= 最后一次 close，见 §2.4） | 被关闭 inode 的 watch | 无 |
-| `IN_ATTRIB` | `do_chmod`/`do_chown`/`do_utimensat`/`do_truncate`（setattr syscall-core）成功后；定位见 `kernel/src/filesystem/vfs/syscall/` 各 `do_*` | 被 setattr inode 的 watch | 无 |
+| `IN_ATTRIB` | `do_chmod`/`do_chown`/`do_utimensat`/`do_truncate` 以及 `xattr_utils.rs` 的 set/remove 公共成功路径 | 目标 inode 自身 watch；若 dentry 仍连接，同时通知当前父目录 watch | 自身无 name；父目录事件带当前文件名 |
 
 `do_symlinkat`(`symlink_utils.rs`)/`do_linkat`(`link_utils.rs`) 成功后 → 父目录 `IN_CREATE`（子项名）。
 
@@ -485,6 +485,7 @@ let fd = pcb.fd_table().alloc_fd(Arc::new(file), cloexec)?;
 | `kernel/src/filesystem/vfs/syscall/link_utils.rs` | 改 | do_linkat 后插 CREATE |
 | `kernel/src/filesystem/vfs/open.rs` | 改 | do_sys_open CREATE 后插 IN_CREATE；成功插 IN_OPEN |
 | `kernel/src/filesystem/vfs/file.rs` | 改 | do_read→ACCESS、do_write→MODIFY、Drop→CLOSE_*；FMODE_NONOTIFY 短路 |
+| `kernel/src/filesystem/vfs/syscall/xattr_utils.rs` | 改 | setxattr/removexattr 公共成功路径插 IN_ATTRIB |
 | chmod/chown/utimensat/truncate 入口 | 改 | IN_ATTRIB / (truncate)MODIFY |
 | syscall 注册文件 | 改 | declare_syscall! ×4 |
 

@@ -1,5 +1,8 @@
 use crate::{
-    filesystem::vfs::{syscall::AtFlags, utils::user_path_at, IndexNode, XattrFlags, MAX_PATHLEN},
+    filesystem::{
+        fsnotify::{self, FsEvent},
+        vfs::{syscall::AtFlags, utils::user_path_at, IndexNode, XattrFlags, MAX_PATHLEN},
+    },
     process::ProcessManager,
     syscall::user_access::{
         check_and_clone_cstr, vfs_check_and_clone_cstr, UserBufferReader, UserBufferWriter,
@@ -190,7 +193,9 @@ pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, Syst
 fn do_removexattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8) -> Result<usize, SystemError> {
     let name = clone_xattr_name(name_ptr)?;
 
-    inode.removexattr(&name)
+    let result = inode.removexattr(&name)?;
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
+    Ok(result)
 }
 
 fn do_getxattr(
@@ -273,5 +278,7 @@ pub(super) fn fd_setxattr(
 }
 
 fn do_setxattr(inode: Arc<dyn IndexNode>, xattr: SetxattrArgs) -> Result<usize, SystemError> {
-    inode.setxattr(&xattr.name, &xattr.value, xattr.flags)
+    let result = inode.setxattr(&xattr.name, &xattr.value, xattr.flags)?;
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
+    Ok(result)
 }

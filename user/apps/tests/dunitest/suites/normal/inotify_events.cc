@@ -24,6 +24,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -216,6 +217,71 @@ TEST(InotifyAttribEvent, ChmodDeliversAttrib) {
 
     inotify_rm_watch(ifd, wd);
     close(ifd);
+    unlink(path.c_str());
+}
+
+TEST(InotifyAttribEvent, XattrSuccessNotifiesSelfAndParent) {
+    const std::string dir = "/root";
+    const std::string name = "dunitest_inotify_xattr";
+    const std::string path = dir + "/" + name;
+    const char attr[] = "user.dunitest_inotify";
+    const char value[] = "value";
+    unlink(path.c_str());
+
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_ATTRIB), 0);
+    ASSERT_GE(inotify_add_watch(ifd, dir.c_str(), IN_ATTRIB), 0);
+
+    auto expect_self_and_parent = [&]() {
+        auto evs = drain_events(ifd);
+        EXPECT_TRUE(saw_self(evs, IN_ATTRIB));
+        EXPECT_TRUE(saw(evs, IN_ATTRIB, name));
+    };
+
+    int set_result = setxattr(path.c_str(), attr, value, sizeof(value), 0);
+    if (set_result == -1 && (errno == ENOSYS || errno == EOPNOTSUPP)) {
+        close(ifd);
+        close(fd);
+        unlink(path.c_str());
+        GTEST_SKIP() << "root filesystem does not support extended attributes";
+    }
+    ASSERT_EQ(set_result, 0) << strerror(errno);
+    expect_self_and_parent();
+
+    // Linux reports a successful set even when the value is unchanged.
+    ASSERT_EQ(setxattr(path.c_str(), attr, value, sizeof(value), 0), 0) << strerror(errno);
+    expect_self_and_parent();
+
+    errno = 0;
+    EXPECT_EQ(setxattr(path.c_str(), attr, value, sizeof(value), XATTR_CREATE), -1);
+    EXPECT_EQ(errno, EEXIST);
+    auto failed_set_events = drain_events(ifd);
+    EXPECT_FALSE(saw_self(failed_set_events, IN_ATTRIB));
+    EXPECT_FALSE(saw(failed_set_events, IN_ATTRIB, name));
+
+    ASSERT_EQ(fremovexattr(fd, attr), 0) << strerror(errno);
+    expect_self_and_parent();
+
+    errno = 0;
+    EXPECT_EQ(removexattr(path.c_str(), attr), -1);
+    EXPECT_EQ(errno, ENODATA);
+    auto failed_remove_events = drain_events(ifd);
+    EXPECT_FALSE(saw_self(failed_remove_events, IN_ATTRIB));
+    EXPECT_FALSE(saw(failed_remove_events, IN_ATTRIB, name));
+
+    ASSERT_EQ(fsetxattr(fd, attr, value, sizeof(value), 0), 0) << strerror(errno);
+    expect_self_and_parent();
+
+    ASSERT_EQ(lsetxattr(path.c_str(), attr, value, sizeof(value), 0), 0) << strerror(errno);
+    expect_self_and_parent();
+    ASSERT_EQ(lremovexattr(path.c_str(), attr), 0) << strerror(errno);
+    expect_self_and_parent();
+
+    close(ifd);
+    close(fd);
     unlink(path.c_str());
 }
 

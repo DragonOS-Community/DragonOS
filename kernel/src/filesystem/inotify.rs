@@ -516,6 +516,10 @@ impl FileSystem for InotifyFs {
 pub struct InotifyInode {
     group: Arc<FsNotifyGroup>,
     state: Arc<InotifyState>,
+    /// Anonymous inotify files cannot be reopened through `/proc/self/fd`.
+    /// Duplicated descriptors share the original `File` and do not call
+    /// `IndexNode::open` again.
+    opened: AtomicBool,
     /// `O_NONBLOCK`：read 空队列时立即返回 EAGAIN。
     /// 用 AtomicBool 以支持 fcntl(F_SETFL) 动态修改（由 File::set_flags 同步）。
     nonblock: AtomicBool,
@@ -540,6 +544,7 @@ impl InotifyInode {
         Self {
             group,
             state,
+            opened: AtomicBool::new(false),
             nonblock: AtomicBool::new(nonblock),
         }
     }
@@ -808,7 +813,10 @@ impl IndexNode for InotifyInode {
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        Ok(())
+        self.opened
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| SystemError::ENXIO)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {

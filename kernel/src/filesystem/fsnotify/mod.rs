@@ -302,6 +302,41 @@ pub(crate) fn notify_object_delete(id: FsNotifyObjectId, object: &FsNotifyObject
 }
 
 pub(crate) fn notify_unmount(superblock: usize) {
+    // Detach all keys for this superblock in one index pass.  Processing the
+    // marks outside the global lock keeps queueing and group teardown out of
+    // the index critical section, while avoiding a full-index scan per mark.
+    let snapshot = {
+        let mut idx = FSNOTIFY_MARKS.lock();
+        let key_count = idx.keys().filter(|id| id.superblock == superblock).count();
+        let mut entries = Vec::new();
+        if entries.try_reserve_exact(key_count).is_err() {
+            None
+        } else {
+            entries.extend(
+                idx.iter()
+                    .filter(|(id, _)| id.superblock == superblock)
+                    .map(|(id, marks)| (*id, marks.clone())),
+            );
+            for (id, _) in &entries {
+                idx.remove(id);
+            }
+            Some(entries)
+        }
+    };
+
+    if let Some(entries) = snapshot {
+        for mark in entries
+            .iter()
+            .flat_map(|(_, marks)| marks.iter())
+            .filter_map(|entry| entry.upgrade())
+        {
+            notify_unmount_mark(&mark);
+        }
+        return;
+    }
+
+    // Final unmount cannot fail with ENOMEM.  Keep an allocation-free fallback
+    // for memory pressure; normal operation uses the linear snapshot above.
     loop {
         let mark = {
             let mut idx = FSNOTIFY_MARKS.lock();
@@ -326,21 +361,23 @@ pub(crate) fn notify_unmount(superblock: usize) {
             }
         };
         let Some(mark) = mark else { break };
-        let guard = mark.dispatch_lock.lock();
-        if !mark.active.load(Ordering::Acquire) {
-            drop(guard);
-            mark::destroy_mark(&mark);
-            continue;
-        }
-        if let Some(group) = mark.group.upgrade() {
-            group
-                .backend
-                .handle_event(&group, &mark, FsEvent::UNMOUNT, None, 0);
-        }
-        mark.active.store(false, Ordering::Release);
-        drop(guard);
-        mark::destroy_mark(&mark);
+        notify_unmount_mark(&mark);
     }
+}
+
+fn notify_unmount_mark(mark: &Arc<FsNotifyMark>) {
+    let guard = mark.dispatch_lock.lock();
+    if !mark.active.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(group) = mark.group.upgrade() {
+        group
+            .backend
+            .handle_event(&group, mark, FsEvent::UNMOUNT, None, 0);
+    }
+    mark.active.store(false, Ordering::Release);
+    drop(guard);
+    mark::destroy_mark(mark);
 }
 
 /// 记录一次 watch 计数变更（add +1，撤销 -1）。

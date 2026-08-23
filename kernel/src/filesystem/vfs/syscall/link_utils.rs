@@ -1,5 +1,5 @@
 use crate::filesystem::fsnotify::{self, FsEvent};
-use crate::filesystem::vfs::mount::MountFS;
+use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
 use crate::filesystem::vfs::permission::check_inode_permission;
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::AtFlags;
@@ -134,8 +134,10 @@ pub fn do_linkat(
         return Err(SystemError::EPERM);
     }
 
-    let r = new_parent.link(new_name, &old_inode);
-    if r.is_ok() {
+    let notify = || {
+        // Linux reports the source inode's changed link count before the
+        // destination directory entry becomes visible to fsnotify consumers.
+        fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&old_inode), 0);
         // fsnotify：父目录得 IN_CREATE（硬链接目标非目录，IN_ISDIR 不置位）。
         fsnotify::fsnotify(
             FsEvent::CREATE,
@@ -143,9 +145,14 @@ pub fn do_linkat(
             Some(&old_inode),
             0,
         );
-        fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&old_inode), 0);
+    };
+    if let Some(mounted) = new_parent.clone().downcast_arc::<MountFSInode>() {
+        mounted.link_with_post_commit(new_name, &old_inode, notify)?;
+    } else {
+        new_parent.link(new_name, &old_inode)?;
+        notify();
     }
-    r.map(|_| 0)
+    Ok(0)
 }
 
 /// 检查是否允许创建硬链接（对应Linux的may_linkat）

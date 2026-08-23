@@ -3183,6 +3183,39 @@ impl MountFSInode {
         Ok(())
     }
 
+    /// Publish a successful hard link after its link-count state is updated,
+    /// while the destination parent gate still orders it against unlink and
+    /// other namespace mutations in that directory.
+    pub(crate) fn link_with_post_commit(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        // Backing filesystems expect their own inode type rather than the
+        // mount projection used by syscall paths.
+        let other_inner: Arc<dyn IndexNode> = other
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt| mnt.dentry.inode.clone())
+            .unwrap_or_else(|| other.clone());
+
+        let object_state = other
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|inode| inode.dentry.fsnotify_object_state.clone());
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
+        self.dentry.inode.link(name, &other_inner)?;
+        if let Some(state) = delete_lifecycle.as_mut() {
+            fsnotify::note_link_added(state);
+        }
+        drop(delete_lifecycle);
+        post_commit();
+        Ok(())
+    }
+
     fn move_to_with_context_impl(
         &self,
         old_name: &str,
@@ -4443,31 +4476,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        let _children_guard = self.dentry.children_gate.lock();
-        // Filesystem implementations expect `other` to be an inode of the same concrete filesystem (e.g. LockedExt4Inode).
-        // When VFS mount wrapping is enabled, `other` is typically a `MountFSInode`, which causes
-        // filesystem-level downcasts to fail and incorrectly return EINVAL.
-        //
-        // Therefore, before linking, we need to unwrap the mount wrapper (same as move_to).
-        let other_inner: Arc<dyn IndexNode> = other
-            .clone()
-            .downcast_arc::<MountFSInode>()
-            .map(|mnt| mnt.dentry.inode.clone())
-            .unwrap_or_else(|| other.clone());
-
-        let object_state = other
-            .clone()
-            .downcast_arc::<MountFSInode>()
-            .map(|inode| inode.dentry.fsnotify_object_state.clone());
-        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
-        let result = self.dentry.inode.link(name, &other_inner);
-        if result.is_ok() {
-            if let Some(state) = delete_lifecycle.as_mut() {
-                fsnotify::note_link_added(state);
-            }
-        }
-        result
+        self.link_with_post_commit(name, other, || {})
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

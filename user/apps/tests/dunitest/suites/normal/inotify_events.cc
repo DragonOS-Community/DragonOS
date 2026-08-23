@@ -546,6 +546,155 @@ TEST(InotifySelfEvents, HardLinkCreatedBeforeWatchKeepsWatchAlive) {
     close(ifd);
 }
 
+TEST(InotifySelfEvents, ProcFdReopenIsRejectedWithoutClosingOriginalInstance) {
+    const std::string path = "/tmp/dunitest_inotify_procfd_reopen";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_ATTRIB), 0);
+
+    char procfd[64];
+    snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", ifd);
+    errno = 0;
+    EXPECT_EQ(open(procfd, O_RDONLY), -1);
+    EXPECT_EQ(errno, ENXIO);
+
+    // dup() shares the original open file description and remains supported.
+    int duplicate = dup(ifd);
+    ASSERT_GE(duplicate, 0);
+    ASSERT_EQ(close(duplicate), 0);
+
+    ASSERT_EQ(chmod(path.c_str(), 0600), 0);
+    EXPECT_TRUE(saw_self(drain_events(ifd), IN_ATTRIB));
+
+    close(ifd);
+    close(fd);
+    unlink(path.c_str());
+}
+
+TEST(InotifyNamespaceEvents, HardLinkReportsAttribBeforeCreate) {
+    const std::string source = "/tmp/dunitest_inotify_link_order_source";
+    const std::string target = "/tmp/dunitest_inotify_link_order_target";
+    int fd = open(source.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    int source_wd = inotify_add_watch(ifd, source.c_str(), IN_ATTRIB);
+    ASSERT_GE(source_wd, 0);
+    int parent_wd = inotify_add_watch(ifd, "/tmp", IN_CREATE);
+    ASSERT_GE(parent_wd, 0);
+    (void)drain_events(ifd);
+
+    ASSERT_EQ(link(source.c_str(), target.c_str()), 0);
+    auto evs = drain_events(ifd);
+    int attrib = first_event_index(evs, source_wd, IN_ATTRIB);
+    int create = first_event_index(evs, parent_wd, IN_CREATE);
+    ASSERT_GE(attrib, 0);
+    ASSERT_GE(create, 0);
+    EXPECT_LT(attrib, create);
+    EXPECT_TRUE(saw(evs, IN_CREATE, "dunitest_inotify_link_order_target"));
+
+    close(ifd);
+    unlink(source.c_str());
+    unlink(target.c_str());
+}
+
+TEST(InotifyNamespaceEvents, ConcurrentHardLinkDeletePreservesCommitOrder) {
+    const std::string dir = "/tmp/dunitest_inotify_link_commit_order";
+    const std::string source = dir + "/source";
+    ASSERT_EQ(mkdir(dir.c_str(), 0777), 0) << strerror(errno);
+    int fd = open(source.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    int source_wd = inotify_add_watch(ifd, source.c_str(), IN_ATTRIB);
+    ASSERT_GE(source_wd, 0);
+    int parent_wd = inotify_add_watch(ifd, dir.c_str(), IN_CREATE | IN_DELETE);
+    ASSERT_GE(parent_wd, 0);
+    (void)drain_events(ifd);
+
+    constexpr int kLinks = 64;
+    std::atomic<int> worker_error{0};
+    std::atomic<bool> stop{false};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::thread remover([&]() {
+        for (int i = 0; i < kLinks; ++i) {
+            const std::string path = dir + "/link_" + std::to_string(i);
+            struct stat st {};
+            while (lstat(path.c_str(), &st) != 0) {
+                if (errno != ENOENT) {
+                    worker_error.store(errno);
+                    return;
+                }
+                if (stop.load()) return;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    worker_error.store(ETIMEDOUT);
+                    stop.store(true);
+                    return;
+                }
+                sched_yield();
+            }
+            if (unlink(path.c_str()) != 0) {
+                worker_error.store(errno);
+                return;
+            }
+        }
+    });
+
+    for (int i = 0; i < kLinks; ++i) {
+        const std::string path = dir + "/link_" + std::to_string(i);
+        if (link(source.c_str(), path.c_str()) != 0) {
+            worker_error.store(errno);
+            stop.store(true);
+            break;
+        }
+        struct stat st {};
+        while (lstat(path.c_str(), &st) == 0) {
+            if (worker_error.load() != 0 || std::chrono::steady_clock::now() >= deadline) {
+                if (worker_error.load() == 0) worker_error.store(ETIMEDOUT);
+                stop.store(true);
+                break;
+            }
+            sched_yield();
+        }
+        if (stop.load()) break;
+        if (errno != ENOENT) {
+            worker_error.store(errno);
+            stop.store(true);
+            break;
+        }
+    }
+    remover.join();
+    ASSERT_EQ(worker_error.load(), 0) << strerror(worker_error.load());
+
+    auto evs = drain_events(ifd);
+    for (int i = 0; i < kLinks; ++i) {
+        const std::string name = "link_" + std::to_string(i);
+        int created = -1;
+        int deleted = -1;
+        for (size_t j = 0; j < evs.size(); ++j) {
+            if (evs[j].wd != parent_wd || evs[j].name != name) continue;
+            if (created < 0 && (evs[j].mask & IN_CREATE)) created = static_cast<int>(j);
+            if (deleted < 0 && (evs[j].mask & IN_DELETE)) deleted = static_cast<int>(j);
+        }
+        ASSERT_GT(created, 0) << "missing IN_CREATE for " << name;
+        ASSERT_GE(deleted, 0) << "missing IN_DELETE for " << name;
+        EXPECT_EQ(evs[created - 1].wd, source_wd);
+        EXPECT_NE(evs[created - 1].mask & IN_ATTRIB, 0U);
+        EXPECT_LT(created, deleted) << "namespace events reordered for " << name;
+    }
+
+    close(ifd);
+    unlink(source.c_str());
+    rmdir(dir.c_str());
+}
+
 TEST(InotifySelfEvents, WatchUnlinkedOpenFileThroughProcFd) {
     const std::string path = "/tmp/dunitest_inotify_procfd_unlinked";
     int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);

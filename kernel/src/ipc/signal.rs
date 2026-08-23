@@ -494,11 +494,22 @@ impl Signal {
             .sighand()
             .start_group_exit_for_fatal_signal(*self as usize)
         {
-            return true;
+            // Linux only performs the O(n) fatal broadcast for the first
+            // transition to SIGNAL_GROUP_EXIT.  A later delivery still follows
+            // complete_signal()'s ordinary pending/wakeup path; consuming it
+            // here would make SIGKILL disappear without waking any task.
+            return false;
         }
 
-        let tasks = ProcessManager::thread_group_tasks_snapshot(target);
+        // Preserve the old ordering: collect the group before the first wake
+        // can let another CPU change membership.  The explicit target below
+        // remains independent of this second group-leader lookup.
+        let tasks = ProcessManager::thread_group_tasks_snapshot(target.clone());
+        Self::queue_private_sigkill_to_thread(&target);
         for task in tasks {
+            if Arc::ptr_eq(&task, &target) {
+                continue;
+            }
             Self::queue_private_sigkill_to_thread(&task);
         }
 

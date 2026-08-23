@@ -228,7 +228,12 @@ fn trailing_immediate_size(inst: &Instruction) -> usize {
             Operand::ImmediateI8 { .. } | Operand::ImmediateU8 { .. } => return 1,
             Operand::ImmediateI16 { .. } | Operand::ImmediateU16 { .. } => return 2,
             Operand::ImmediateI32 { .. } | Operand::ImmediateU32 { .. } => return 4,
-            Operand::ImmediateI64 { .. } | Operand::ImmediateU64 { .. } => return 8,
+            // In a RIP-relative ModRM instruction, an I64 immediate is an
+            // encoded imm32 that the decoder has widened to its signed
+            // execution value (for example REX.W IMUL/MOV r/m64, imm32).
+            // x86-64 has no RIP-relative memory form with an encoded imm64.
+            Operand::ImmediateI64 { .. } => return 4,
+            Operand::ImmediateU64 { .. } => return 8,
             _ => {}
         }
     }
@@ -328,6 +333,70 @@ mod tests {
         let r = a.rip_relative.expect("mov [rip+disp],imm must be detected");
         assert_eq!(r.disp_offset, 2);
         assert_eq!(r.disp, 0x10);
+    }
+
+    #[test]
+    fn rip_relative_sign_extended_imm32_uses_encoded_width() {
+        // In 64-bit operand mode yaxpeax exposes these sign-extended imm32
+        // values as ImmediateI64. Their encoded width is still four bytes.
+        for (bytes, expected_offset) in [
+            (
+                &[
+                    0x48, 0x69, 0x05, 0x10, 0x00, 0x00, 0x00, 0xfb, 0xff, 0xff, 0xff,
+                ][..],
+                3,
+            ),
+            (
+                &[
+                    0x2e, 0x48, 0x69, 0x05, 0x10, 0x00, 0x00, 0x00, 0xfb, 0xff, 0xff, 0xff,
+                ][..],
+                4,
+            ),
+            (
+                &[
+                    0x48, 0xc7, 0x05, 0x10, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+                ][..],
+                3,
+            ),
+            (
+                &[
+                    0x2e, 0x48, 0xc7, 0x05, 0x10, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+                ][..],
+                4,
+            ),
+        ] {
+            let analysis = analyze_insn(bytes).unwrap();
+            let reloc = analysis.rip_relative.expect("RIP-relative operand");
+            assert_eq!(reloc.disp_offset, expected_offset, "bytes={bytes:x?}");
+            assert_eq!(reloc.disp, 0x10, "bytes={bytes:x?}");
+        }
+    }
+
+    #[test]
+    fn xol_relocation_preserves_prefixed_opcode_and_immediate() {
+        for bytes in [
+            &[
+                0x2e, 0x48, 0x69, 0x05, 0x10, 0x00, 0x00, 0x00, 0xfb, 0xff, 0xff, 0xff,
+            ][..],
+            &[
+                0x2e, 0x48, 0xc7, 0x05, 0x10, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+            ][..],
+        ] {
+            let analysis = analyze_insn(bytes).unwrap();
+            let reloc = analysis.rip_relative.expect("RIP-relative operand");
+            let mut slot = [0xcc; MAX_INSN_SIZE];
+            build_xol_slot(&analysis, 0x2000, 0x1000, bytes, &mut slot).unwrap();
+
+            assert_eq!(&slot[..reloc.disp_offset], &bytes[..reloc.disp_offset]);
+            assert_eq!(
+                &slot[reloc.disp_offset + 4..analysis.insn_len],
+                &bytes[reloc.disp_offset + 4..analysis.insn_len]
+            );
+            assert_eq!(
+                &slot[reloc.disp_offset..reloc.disp_offset + 4],
+                &0x1010_i32.to_le_bytes()
+            );
+        }
     }
 
     #[test]

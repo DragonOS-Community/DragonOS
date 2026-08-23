@@ -81,6 +81,10 @@ impl PerfProbeArgs {
         if attr.read_format & !KNOWN_READ_FORMAT_BITS != 0 {
             return Err(SystemError::EINVAL);
         }
+        const KNOWN_SAMPLE_TYPE_BITS: u64 = perf_event_sample_format::PERF_SAMPLE_MAX as u64 - 1;
+        if attr.sample_type & !KNOWN_SAMPLE_TYPE_BITS != 0 {
+            return Err(SystemError::EINVAL);
+        }
         let ty = attr.type_;
         let config = match perf_type_id::from_u32(ty) {
             Some(perf_type_id::PERF_TYPE_SOFTWARE) => {

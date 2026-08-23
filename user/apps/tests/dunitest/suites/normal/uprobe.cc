@@ -57,6 +57,14 @@ struct UprobePerfEventOptions {
     bool remove_on_exec = false;
     __u64 config = 0;
     __u64 read_format = 0;
+    __u64 sample_period = 0;
+    __u64 sample_type = 0;
+    bool freq = false;
+    bool pinned = false;
+    bool exclusive = false;
+    bool exclude_user = false;
+    bool mmap_records = false;
+    int clockid = 0;
     int group_fd = -1;
     unsigned long flags = 0;
 };
@@ -147,6 +155,14 @@ int open_uprobe_perf_event(const std::string& path, unsigned long offset,
     pe.config1 = reinterpret_cast<__u64>(path.c_str());
     pe.config2 = offset;
     pe.read_format = options.read_format;
+    pe.sample_period = options.sample_period;
+    pe.sample_type = options.sample_type;
+    pe.freq = options.freq;
+    pe.pinned = options.pinned;
+    pe.exclusive = options.exclusive;
+    pe.exclude_user = options.exclude_user;
+    pe.mmap = options.mmap_records;
+    pe.clockid = options.clockid;
     pe.disabled = options.disabled;
     pe.inherit = options.inherit;
     pe.enable_on_exec = options.enable_on_exec;
@@ -554,6 +570,93 @@ TEST(UprobeTest, UnsupportedReadFormatIsRejected) {
     EXPECT_EQ(errno, EINVAL);
 }
 
+TEST(UprobeTest, UnsupportedSamplingAttributesAreRejected) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+
+    UprobePerfEventOptions options;
+    options.sample_period = 1;
+    errno = 0;
+    FdGuard period(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(period.get(), 0);
+    EXPECT_EQ(errno, EOPNOTSUPP);
+
+    options = {};
+    options.sample_period = 100;
+    options.freq = true;
+    errno = 0;
+    FdGuard frequency(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(frequency.get(), 0);
+    EXPECT_EQ(errno, EOPNOTSUPP);
+
+    options = {};
+    options.sample_type = PERF_SAMPLE_IP;
+    errno = 0;
+    FdGuard sample(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(sample.get(), 0);
+    EXPECT_EQ(errno, EOPNOTSUPP);
+
+    options = {};
+    options.mmap_records = true;
+    errno = 0;
+    FdGuard sideband(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(sideband.get(), 0);
+    EXPECT_EQ(errno, EOPNOTSUPP);
+
+    options = {};
+    options.pinned = true;
+    errno = 0;
+    FdGuard pinned(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(pinned.get(), 0);
+    EXPECT_EQ(errno, EOPNOTSUPP);
+
+    options = {};
+    options.exclusive = true;
+    errno = 0;
+    FdGuard exclusive(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(exclusive.get(), 0);
+    EXPECT_EQ(errno, EOPNOTSUPP);
+
+    options = {};
+    options.sample_type = 1ULL << 63;
+    errno = 0;
+    FdGuard unknown(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(unknown.get(), 0);
+    EXPECT_EQ(errno, EINVAL);
+}
+
+TEST(UprobeTest, ExcludeUserMatchesLinuxTraceUprobeBehavior) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+    UprobePerfEventOptions options;
+    options.exclude_user = true;
+    FdGuard fd(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(fd.get(), 0) << "errno=" << errno;
+
+    EXPECT_EQ(uprobe_target(20), 41);
+    __u64 count = 0;
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
+}
+
+TEST(UprobeTest, DormantSamplingPayloadIsIgnored) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+    UprobePerfEventOptions options;
+    // clockid is only meaningful when use_clockid is set. Linux ignores the
+    // dormant payload, so a plain counting uprobe must remain valid.
+    options.clockid = 123;
+    FdGuard fd(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(fd.get(), 0) << "errno=" << errno;
+}
+
 TEST(UprobeTest, ReadOnlyAliasIsSkippedAndLaterExecutableMapIsProbed) {
     char path[] = "/tmp/uprobe_vma_XXXXXX";
     FdGuard file(create_raw_target(path));
@@ -909,6 +1012,35 @@ TEST(UprobeTest, RepeatedStringInstructionIsRejected) {
     EXPECT_LT(event.get(), 0)
         << "phase-1 XOL must reject repeated string instructions";
     EXPECT_EQ(errno, EINVAL);
+    unlink(path);
+}
+
+TEST(UprobeTest, PrefixedRipRelativeImm32RelocatesWithoutCorruption) {
+    // cs; imul rax, qword ptr [rip+4], 5; ret; padding; qword 7
+    // The decoder exposes the sign-extended immediate as 64-bit even though
+    // its encoding is four bytes.  The displacement starts at byte four.
+    const unsigned char code[] = {
+        0x2e, 0x48, 0x69, 0x05, 0x04, 0x00, 0x00, 0x00,
+        0x05, 0x00, 0x00, 0x00, 0xc3, 0x90, 0x90, 0x90,
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    char path[] = "/tmp/uprobe_rip_imm32_XXXXXX";
+    FdGuard file(create_raw_code(path, code, sizeof(code)));
+    ASSERT_GE(file.get(), 0);
+    void* mapping = mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE,
+                         file.get(), 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    auto target = reinterpret_cast<long (*)()>(mapping);
+    EXPECT_EQ(target(), 35);
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
+
+    munmap(mapping, 4096);
     unlink(path);
 }
 

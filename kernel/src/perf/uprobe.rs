@@ -22,7 +22,7 @@ use crate::filesystem::vfs::{
     utils::{user_resolved_path_at, ResolvedPath},
     FilePrivateData, FileSystem, IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
-use crate::include::bindings::linux_bpf::bpf_prog_type;
+use crate::include::bindings::linux_bpf::{bpf_prog_type, perf_event_attr};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::wait_queue::WaitQueue;
@@ -478,4 +478,24 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         lifecycle: Mutex::new(()),
         released: AtomicBool::new(false),
     })
+}
+
+/// Reject perf features whose observable sampling or sideband semantics are
+/// not provided by the phase-one scalar uprobe counter.
+pub(super) fn validate_perf_event_attr(attr: &perf_event_attr) -> Result<()> {
+    let sample_period = unsafe { attr.__bindgen_anon_1.sample_period };
+    // Bits 8..=37 request ring-buffer records, sampling policy, clocks, or
+    // sideband streams.  Bits 0..=7 are scheduling/filter flags: disabled is
+    // implemented, inherit is rejected by the event constructor, and Linux's
+    // trace-uprobe path does not apply exclude_user to user-mode hits.
+    let unsupported_runtime_flags = attr._bitfield_1.get(8, 30);
+    if attr.pinned() != 0
+        || attr.exclusive() != 0
+        || sample_period != 0
+        || attr.sample_type != 0
+        || unsupported_runtime_flags != 0
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    Ok(())
 }

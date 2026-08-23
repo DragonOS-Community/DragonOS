@@ -461,6 +461,10 @@ pub fn perf_event_open(
     flags: usize,
 ) -> Result<usize> {
     let args = PerfProbeArgs::try_from(attr, pid, cpu, group_fd, flags)?;
+    #[cfg(target_arch = "x86_64")]
+    if args.type_ == PERF_TYPE_UPROBE {
+        uprobe::validate_perf_event_attr(attr)?;
+    }
     if args.type_ == PERF_TYPE_KPROBE || args.type_ == PERF_TYPE_UPROBE {
         let unsupported = PerfEventOpenFlags::PERF_FLAG_FD_NO_GROUP
             | PerfEventOpenFlags::PERF_FLAG_FD_OUTPUT

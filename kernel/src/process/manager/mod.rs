@@ -157,17 +157,6 @@ impl ProcessManager {
         OOM_SCORE_ADJ_LOCK.lock()
     }
 
-    fn mm_has_user_tasks(mm: &Arc<AddressSpace>) -> bool {
-        ProcessManager::get_all_processes()
-            .into_iter()
-            .filter_map(ProcessManager::find)
-            .any(|task| {
-                task.basic()
-                    .user_vm()
-                    .is_some_and(|task_mm| task_mm.id() == mm.id() || Arc::ptr_eq(&task_mm, mm))
-            })
-    }
-
     pub fn is_current(pcb: &Arc<ProcessControlBlock>) -> bool {
         Arc::ptr_eq(pcb, &Self::current_pcb())
     }

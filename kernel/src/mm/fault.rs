@@ -1036,7 +1036,8 @@ impl PageFaultHandler {
         if entry.address() != Ok(old_paddr) {
             return VmFaultReason::VM_FAULT_NOPAGE;
         }
-        let new_flags = entry.flags().set_write(true).set_dirty(true);
+        let vma_writable = vma.lock().vm_flags().contains(VmFlags::VM_WRITE);
+        let new_flags = entry.flags().set_write(vma_writable).set_dirty(true);
 
         // 统一为 do_wp_page 所有分支做 mm-aware shootdown：
         // 这里的 `mm` 可能被多个线程/CPU 共享（CLONE_VM / CLONE_THREAD），

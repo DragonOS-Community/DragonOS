@@ -438,7 +438,12 @@ impl ProcessManager {
                 // If *clear_child_tid cannot be cleared, avoid futex_wake as well
                 // (avoid further invalid userspace accesses).
                 if cleared_ok
-                    && Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1
+                    && pcb
+                        .basic()
+                        .user_vm()
+                        .expect("User VM Not found")
+                        .user_count()
+                        > 1
                 {
                     // Linux uses the FUTEX_SHARED flag to wake clear_child_tid.
                     // This allows cross-process/thread synchronization (e.g.
@@ -735,7 +740,7 @@ impl ProcessManager {
         let Some(old_vm) = old_vm else {
             return;
         };
-        if !Self::mm_has_user_tasks(old_vm) {
+        if old_vm.user_count_dec_and_test() {
             unsafe {
                 // 先持写锁拆除映射，再置 torn_down。与读者形成临界区边界。
                 old_vm.write().unmap_all();

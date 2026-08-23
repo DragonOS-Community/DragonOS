@@ -295,7 +295,7 @@ fn userns_install(
     // 5. 先准备新的 cred，全部校验通过后再提交
     let mut new_cred = (*current.cred()).clone();
     crate::process::cred::set_cred_user_ns(&mut new_cred, user_ns);
-    current.set_cred(Cred::new_arc(new_cred))?;
+    current.commit_cred(Cred::new_arc(new_cred))?;
 
     Ok(())
 }

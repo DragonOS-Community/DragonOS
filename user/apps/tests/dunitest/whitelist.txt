@@ -103,3 +103,5 @@ normal/tty_termios
 normal/inotify_dir_watch
 normal/inotify_events
 normal/sched_tracepoint
+normal/proc_mem_shared
+normal/ptrace_perm_dumpable

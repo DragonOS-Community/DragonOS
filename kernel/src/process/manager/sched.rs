@@ -428,11 +428,6 @@ impl ProcessManager {
             pcb.sched_info().set_state(ProcessState::Runnable);
             fence(Ordering::SeqCst);
         }
-        if pcb.sched_info().state().is_runnable() {
-            // 锁内读到非 Stopped 意味着不存在未落地的停机请求，
-            // 撤销本次睡眠的调度请求是安全的。
-            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
-        }
     }
 
     /// Mark the current process as stopped. The caller is responsible for

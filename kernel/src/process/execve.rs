@@ -9,6 +9,7 @@ use crate::{
     libs::{futex::futex::RobustListHead, rand::rand_bytes},
     mm::ucontext::AddressSpace,
     process::{
+        cred::{SUID_DUMPABLE, SUID_DUMP_USER},
         exec::{
             load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
             ExecStartInfo, LoadBinaryResult,
@@ -19,6 +20,7 @@ use crate::{
     syscall::Syscall,
 };
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 struct ExecFailure {
@@ -246,6 +248,14 @@ fn do_execve_internal(
             }
             // 成功 exec 不继承 ptrace 硬件调试寄存器状态。
             exec_pcb.flush_ptrace_hw_debug_regs();
+            // exec 成功提交后按新凭据重置可转储性。
+            let cred = exec_pcb.cred();
+            let dump = if cred.euid != cred.uid || cred.egid != cred.gid {
+                SUID_DUMPABLE.load(Ordering::SeqCst) as u8
+            } else {
+                SUID_DUMP_USER as u8
+            };
+            exec_pcb.set_dumpable(dump);
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_apply_to_exec_mm(&pcb, &address_space);
             #[cfg(target_arch = "x86_64")]

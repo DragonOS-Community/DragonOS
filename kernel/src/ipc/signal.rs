@@ -849,6 +849,10 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
         // 唤醒路径内部的调度器锁形成反向嵌套。
         {
             let mut ps = pcb.ptrace_state.lock_irqsave();
+            if ps.frozen {
+                ps.deferred_fatal_wake = true;
+                return;
+            }
             ps.in_ptrace_stop = false;
         }
         let r = if state.is_stopped() {

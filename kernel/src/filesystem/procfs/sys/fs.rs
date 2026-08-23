@@ -10,6 +10,7 @@ use crate::{
     },
     libs::mutex::MutexGuard,
     process::{
+        cred::SUID_DUMPABLE,
         namespace::mnt::{mount_max, set_mount_max},
         ProcessManager,
     },
@@ -19,6 +20,7 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 #[derive(Debug)]
@@ -39,23 +41,31 @@ impl DirOps for FsDirOps {
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if name != "mount-max" {
+        if name != "mount-max" && name != "suid_dumpable" {
             return Err(SystemError::ENOENT);
         }
         let mut cached_children = dir.cached_children().write();
         if let Some(child) = cached_children.get(name) {
             return Ok(child.clone());
         }
-        let inode = MountMaxFileOps::new_inode(dir.self_ref_weak().clone());
+        let inode = if name == "mount-max" {
+            MountMaxFileOps::new_inode(dir.self_ref_weak().clone())
+        } else {
+            SuidDumpableFileOps::new_inode(dir.self_ref_weak().clone())
+        };
         cached_children.insert(name.to_string(), inode.clone());
         Ok(inode)
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
         let mut cached_children = dir.cached_children().write();
+        let self_weak = dir.self_ref_weak().clone();
         cached_children
             .entry("mount-max".to_string())
-            .or_insert_with(|| MountMaxFileOps::new_inode(dir.self_ref_weak().clone()));
+            .or_insert_with(|| MountMaxFileOps::new_inode(self_weak.clone()));
+        cached_children
+            .entry("suid_dumpable".to_string())
+            .or_insert_with(|| SuidDumpableFileOps::new_inode(self_weak));
     }
 }
 
@@ -111,6 +121,61 @@ impl FileOps for MountMaxFileOps {
             return Err(SystemError::EINVAL);
         }
         set_mount_max(value as u32)?;
+        Ok(consumed)
+    }
+}
+
+#[derive(Debug)]
+struct SuidDumpableFileOps;
+
+impl SuidDumpableFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for SuidDumpableFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        // Numeric proc sysctls return EOF after the first read, regardless of
+        // where that non-zero offset falls in their textual representation.
+        if offset != 0 {
+            return Ok(0);
+        }
+        let content = format!("{}\n", SUID_DUMPABLE.load(Ordering::SeqCst));
+        proc_read(offset, len, buf, content.as_bytes())
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let cred = ProcessManager::current_pcb().cred();
+        if cred.fsuid.data() != 0
+            && !crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_DAC_OVERRIDE)
+        {
+            return Err(SystemError::EPERM);
+        }
+        if offset != 0 {
+            return Ok(buf.len());
+        }
+        let (value, consumed) = parse_mount_max(buf)?;
+        // 仅接受 0/1/2 三个合法取值
+        if !(0..=2).contains(&value) {
+            return Err(SystemError::EINVAL);
+        }
+        SUID_DUMPABLE.store(value as i32, Ordering::SeqCst);
         Ok(consumed)
     }
 }

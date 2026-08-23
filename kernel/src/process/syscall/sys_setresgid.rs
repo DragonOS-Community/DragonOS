@@ -77,7 +77,7 @@ impl Syscall for SysSetResGid {
             new_cred.setfsgid(new_egid);
         }
 
-        pcb.set_cred(Cred::new_arc(new_cred))?;
+        pcb.commit_cred(Cred::new_arc(new_cred))?;
         Ok(0)
     }
 

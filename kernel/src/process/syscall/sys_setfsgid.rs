@@ -32,7 +32,7 @@ impl Syscall for SysSetFsgid {
         if fsgid == old_cred.gid || fsgid == old_cred.egid || fsgid == old_cred.sgid {
             let mut new_cred: Cred = (*old_cred).clone();
             new_cred.setfsgid(fsgid.data());
-            pcb.set_cred(Cred::new_arc(new_cred))?;
+            pcb.commit_cred(Cred::new_arc(new_cred))?;
         }
 
         Ok(old_fsgid.data())

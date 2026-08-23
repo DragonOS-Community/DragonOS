@@ -294,21 +294,6 @@ impl SigHand {
         g.shared_pending.queue().find(sig).0.is_some()
     }
 
-    /// 查找并判断 shared pending 队列中是否已存在指定 timerid 的 POSIX timer 信号。
-    pub fn shared_pending_posix_timer_exists(&self, sig: Signal, timerid: i32) -> bool {
-        let mut g = self.inner_mut();
-        for info in g.shared_pending.queue_mut().q.iter_mut() {
-            // bump(0) 作为“匹配探测”，不会改变值
-            if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
-                && info.bump_posix_timer_overrun(timerid, 0)
-            {
-                return true;
-            }
-        }
-        false
-    }
-
     /// 若 shared pending 中已存在该 timer 的信号，则将其 si_overrun 增加 bump，并返回 true。
     pub fn shared_pending_posix_timer_bump_overrun(
         &self,

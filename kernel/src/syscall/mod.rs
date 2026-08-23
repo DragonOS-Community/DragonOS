@@ -75,7 +75,7 @@ impl Syscall {
         let nr = syscall_num as u64;
         let skip = current_pcb.ptrace_report_syscall(true, nr, &seccomp_args);
         if skip {
-            // SYSEMU：跳过真实 syscall 执行，回传当前返回值寄存器
+            // SYSEMU：跳过真实 syscall 执行，回传当前返回值寄存器。
             return Ok(frame.get_syscall_return());
         }
         // ptrace syscall-enter-stop 可能改写 syscall 号/参数，从 frame 重取。
@@ -89,10 +89,14 @@ impl Syscall {
         let args_after_ptrace = crate::process::seccomp::frame_syscall_args(frame);
         seccomp_args = args_after_ptrace;
         let mut seccomp_skipped = false;
-        match crate::process::seccomp::secure_computing(nr_after_ptrace, &seccomp_args, frame)? {
-            crate::process::seccomp::SeccompDecision::Allow => {}
-            crate::process::seccomp::SeccompDecision::Skip(ret) => {
+        match crate::process::seccomp::secure_computing(nr_after_ptrace, &seccomp_args, frame) {
+            Ok(crate::process::seccomp::SeccompDecision::Allow) => {}
+            Ok(crate::process::seccomp::SeccompDecision::Skip(ret)) => {
                 frame.set_return_value(ret);
+                seccomp_skipped = true;
+            }
+            Err(e) => {
+                frame.set_return_value(e.to_posix_errno() as i64 as u64 as usize);
                 seccomp_skipped = true;
             }
         }
@@ -162,10 +166,13 @@ impl Syscall {
                         if len == 0 {
                             Self::do_syslog(syslog_action_type, &mut [], 0)
                         } else {
-                            let mut writer =
-                                UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user)?;
-                            let buf = writer.buffer(0)?;
-                            Self::do_syslog(syslog_action_type, buf, len)
+                            match UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user) {
+                                Ok(mut writer) => match writer.buffer(0) {
+                                    Ok(buf) => Self::do_syslog(syslog_action_type, buf, len),
+                                    Err(e) => Err(e),
+                                },
+                                Err(e) => Err(e),
+                            }
                         }
                     }
                     SYS_FSYNC => {

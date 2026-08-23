@@ -54,11 +54,9 @@ impl ProcessManager {
             let idle_pcb = ProcessControlBlock::new_idle(i, kstack);
 
             assert!(idle_pcb.basic().user_vm().is_none());
-            unsafe {
-                idle_pcb
-                    .basic_mut()
-                    .set_user_vm(Some(IDLE_PROCESS_ADDRESS_SPACE()))
-            };
+            let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
+            idle_vm.user_count_inc();
+            unsafe { idle_pcb.basic_mut().set_user_vm(Some(idle_vm)) };
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
 

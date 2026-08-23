@@ -189,6 +189,15 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
             let current = ProcessManager::current_pcb();
             // PEEKUSER(DR6) 使用正极性虚拟 DR6；硬件保留位不属于命中原因。
             current.ptrace_state.lock_irqsave().debug_regs[6] = dr6 & !ptrace::DR6_RESERVED;
+            // 执行型硬件断点若不设置 RF，恢复同一条指令时会立即再次触发。
+            if dr6 & ptrace::X86_DR_BS == 0 {
+                for i in 0..4u32 {
+                    if (dr6 & (1u64 << i)) != 0 && ((dr7 >> (16 + i * 4)) & 0b11) == 0 {
+                        regs.rflags |= ptrace::X86_EFLAGS_RF;
+                        break;
+                    }
+                }
+            }
             crate::exception::uprobe::send_user_debug_sigtrap(regs.rip as usize, dr6).unwrap();
         }
 

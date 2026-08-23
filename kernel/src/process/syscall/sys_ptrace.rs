@@ -88,6 +88,14 @@ impl Syscall for SysPtrace {
         // 其余请求：要求 tracee 由 current 跟踪且处于可操作状态。
         tracee.ptrace_check_attach(request)?;
 
+        // 请求级冻结
+        if !matches!(request, PtraceRequest::Kill | PtraceRequest::Interrupt) {
+            tracee.ptrace_freeze()?;
+        }
+        defer::defer!({
+            tracee.ptrace_unfreeze();
+        });
+
         let result: isize = match request {
             // DETACH：解除关系。data 是要注入的信号号（0=不注入）。
             PtraceRequest::Detach => {

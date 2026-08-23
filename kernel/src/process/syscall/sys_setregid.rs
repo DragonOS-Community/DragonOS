@@ -90,7 +90,7 @@ impl Syscall for SysSetReGid {
             new_sgid,
         );
 
-        pcb.set_cred(Cred::new_arc(new_cred))?;
+        pcb.commit_cred(Cred::new_arc(new_cred))?;
         Ok(0)
     }
 

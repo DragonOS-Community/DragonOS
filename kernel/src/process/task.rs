@@ -39,7 +39,7 @@ use crate::{
         wait_queue::WaitQueue,
     },
     process::{
-        cred::{Cred, INIT_CRED},
+        cred::{cred_cap_issubset, Cred, INIT_CRED, SUID_DUMPABLE},
         kthread::WorkerPrivate,
         namespace::nsproxy::NsProxy,
         pid::{Pid, PidLink, PidType},
@@ -876,6 +876,27 @@ impl ProcessControlBlock {
     /// - Returns `Result` so that callers can extend error handling as needed.
     pub fn set_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
         let _task_guard = self.task_lock.lock_irqsave();
+        self.cred.store_deferred(new);
+        Ok(())
+    }
+
+    /// 提交新的真实凭据集，并联动 dumpability
+    pub fn commit_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        let _task_guard = self.task_lock.lock_irqsave();
+        let old = self.cred();
+        // 触发条件：euid/egid/fsuid/fsgid 任一变化，或新 permitted 不是旧 permitted 的子集（提权）
+        if old.euid != new.euid
+            || old.egid != new.egid
+            || old.fsuid != new.fsuid
+            || old.fsgid != new.fsgid
+            || !cred_cap_issubset(&old, &new)
+        {
+            // 先发布 dumpability 再发布凭据，配合读侧屏障保证访问检查不会看到"新凭据 + 旧 dumpable"的中间状态
+            self.set_dumpable(SUID_DUMPABLE.load(Ordering::SeqCst) as u8);
+            // 身份变化后父进程死亡信号一并清除
+            self.set_pdeath_signal(Signal::INVALID);
+            fence(Ordering::SeqCst);
+        }
         self.cred.store_deferred(new);
         Ok(())
     }

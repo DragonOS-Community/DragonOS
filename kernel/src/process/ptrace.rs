@@ -10,8 +10,10 @@ use crate::{
     },
     exception::InterruptArch,
     ipc::signal_types::{SigCode, SigInfo, SigType, SignalFlags},
-    mm::{fault, ucontext, MemoryManagementArch, PhysAddr, VirtAddr, VmFaultReason, VmFlags},
-    process::{namespace::user_namespace::map_id_up, pid::PidType, KernelStack, ProcessState},
+    mm::{remote_access::RemoteAccess, MemoryManagementArch},
+    process::{
+        cred, namespace::user_namespace::map_id_up, pid::PidType, KernelStack, ProcessState,
+    },
     sched::{schedule, SchedMode},
 };
 use alloc::{
@@ -203,11 +205,47 @@ pub const X86_DR_BS: u64 = 1 << 14;
 pub const X86_DR_B_MASK: u64 = 0x0f;
 /// x86 EFLAGS Trap Flag（单步）位。
 pub const X86_EFLAGS_TF: u64 = 0x100;
+/// x86 EFLAGS Resume Flag（恢复标志）位。
+pub const X86_EFLAGS_RF: u64 = 1 << 16;
 /// x86 DR6 保留位。ptrace 对外暴露正极性 virtual_dr6，与硬件 DR6 互转时按此掩码翻转。
 pub(crate) const DR6_RESERVED: u64 = 0xffff_0ff0;
 /// x86_64 DR7 保留位掩码（含 GD 位）
 /// 加载到硬件前必须清除：保留位置 1 行为未定义，GD 位置 1 会在内核访问调试寄存器时触发 #DB。
 pub(crate) const DR_CONTROL_RESERVED: u64 = 0xffff_ffff_0000_fc00;
+
+/// 校验一个硬件断点 slot 的配置与地址组合
+#[cfg(target_arch = "x86_64")]
+fn validate_dr_slot(nibble: u64, addr: u64) -> Result<(), SystemError> {
+    let rw = nibble & 0b11;
+    let len_bits = nibble & 0b1100;
+    if rw == 0b10 {
+        return Err(SystemError::EINVAL);
+    }
+    // 执行断点只支持 1 字节长度。
+    if rw == 0b00 && len_bits != 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let len = match len_bits {
+        0b00 => 1u64,
+        0b01 => 2,
+        0b10 => 8,
+        _ => 4,
+    };
+    let user_end = MMArch::USER_END_VADDR.data() as u64;
+    if addr >= user_end {
+        return Err(SystemError::EINVAL);
+    }
+    // 断点地址须按其长度对齐。
+    if addr & (len - 1) != 0 {
+        return Err(SystemError::EINVAL);
+    }
+    // 断点区间终点不得越过用户地址空间上界。
+    let end = addr.checked_add(len - 1).ok_or(SystemError::EINVAL)?;
+    if end >= user_end {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
+}
 
 // ptrace exit_code / si_code 编码
 const EXITCODE_SIG_MASK: usize = 0x7f;
@@ -495,6 +533,10 @@ pub struct PtraceState {
     pub stop_report_pending: bool,
     /// 持久标志：tracee 当前是否处于 ptrace-stop
     pub in_ptrace_stop: bool,
+    /// 请求级冻结
+    pub frozen: bool,
+    /// 冻结期间曾有致命信号被门控延迟
+    pub deferred_fatal_wake: bool,
     /// attach 到已 STOPPED 任务时挂起的 PTRACE_EVENT_STOP 信号。
     pub pending_event_stop: Option<Signal>,
     /// TIF_FORCED_TF：true 表示当前 TF 是调试器为 single-step 强制置位。
@@ -521,6 +563,8 @@ impl Default for PtraceState {
             listening: false,
             stop_report_pending: false,
             in_ptrace_stop: false,
+            frozen: false,
+            deferred_fatal_wake: false,
             pending_event_stop: None,
             forced_trap_flag: false,
             stop_frame_on_syscall_stack: false,
@@ -557,8 +601,13 @@ fn traceme_allowed(
     if parent.flags().contains(ProcessFlags::EXITING) {
         return Err(SystemError::EPERM);
     }
-    // 父进程须有权跟踪子进程。
-    if !parent.has_permission_to_trace(child) {
+    let parent_cred = parent.cred();
+    let child_cred = child.cred();
+    let allowed = parent_cred
+        .has_capability_in_ns(&child_cred.user_ns, cred::CAPFlags::CAP_SYS_PTRACE)
+        || (Arc::ptr_eq(&parent_cred.user_ns, &child_cred.user_ns)
+            && (child_cred.cap_permitted.bits() & !parent_cred.cap_permitted.bits()) == 0);
+    if !allowed {
         return Err(SystemError::EPERM);
     }
     Ok(())
@@ -821,6 +870,9 @@ pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
                 let mut ps = tracee.ptrace_state.lock_irqsave();
                 ps.stop_report_pending = false;
                 ps.in_ptrace_stop = false;
+                // 同临界区清请求级冻结：tracee 即将脱离本会话的 ptrace-stop，
+                // 冻结门控不得残留（tracer 可能正在请求中途中止）。
+                ps.frozen = false;
                 ps.listening = false;
                 ps.pending_event_stop = None;
                 ps.exit_code = 0;
@@ -967,24 +1019,18 @@ pub fn is_wait_tracee_of(
     tracees_of_locked(&tracer).contains(&tracee.raw_pid())
 }
 
+/// 访问检查所用的调用者凭据来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PtraceAccessCreds {
+    /// procfs 等文件系统路径：以 fsuid/fsgid 与 effective cap 集判定
+    FsCreds,
+    /// 显式系统调用：以 real uid/gid 与 permitted cap 集判定
+    RealCreds,
+}
+
 // PCB ptrace 方法 —— 关系建立/解除、attach/seize/detach、TRAPPING 同步
 impl ProcessControlBlock {
-    /// 是否有权限跟踪/访问目标进程。对齐 Linux 判定链：
-    /// 1. 同线程组允许（自省）；
-    /// 2. 凭证匹配：uid/gid 各三项（euid/suid/uid、egid/sgid/gid）全等且目标可 dump。
-    ///    数值 uid/gid 仅在同一 user namespace 内可比——跨 namespace 数值相等
-    ///    不代表同一内核身份，保守拒绝（持 CAP_SYS_PTRACE 者不受影响）；
-    /// 3. 或在目标（tracee）的 user_ns 持有 CAP_SYS_PTRACE；
-    /// 4. 最后统一过 capability 子集门（对应 Linux commoncap 的 ptrace 钩子，
-    ///    对上述全部放行分支生效）：同一 user namespace 且目标的 permitted 集
-    ///    是调用者 permitted 集的子集，否则必须持 CAP_SYS_PTRACE。
-    ///
-    /// 已知残余差异（待凭证子系统补齐，此处如实声明）：
-    /// - dumpable 旁路与子集门使用目标当前 cred 的 user_ns（Linux 用目标 mm
-    ///   创建时的 user_ns）；
-    /// - Linux 在 cred 变更（提权/降权/cap 非子集）时将目标置为不可 dump，
-    ///   DragonOS 尚无该联动，降权进程仍可被同 uid 调用者跟踪。
-    pub fn has_permission_to_trace(&self, tracee: &Self) -> bool {
+    pub fn has_permission_to_trace(&self, tracee: &Self, creds: PtraceAccessCreds) -> bool {
         // 1. 同一线程组允许访问（自省）
         if self.tgid == tracee.tgid {
             return true;
@@ -993,36 +1039,50 @@ impl ProcessControlBlock {
         let caller_cred = self.cred();
         let tracee_cred = tracee.cred();
         let same_user_ns = Arc::ptr_eq(&caller_cred.user_ns, &tracee_cred.user_ns);
+        // 调用者身份按凭据模式选取。
+        let (caller_uid, caller_gid) = match creds {
+            PtraceAccessCreds::FsCreds => (caller_cred.fsuid, caller_cred.fsgid),
+            PtraceAccessCreds::RealCreds => (caller_cred.uid, caller_cred.gid),
+        };
         // 2. 凭证匹配 + dumpable
-        let uid_match = caller_cred.uid == tracee_cred.euid
-            && caller_cred.uid == tracee_cred.suid
-            && caller_cred.uid == tracee_cred.uid;
-        let gid_match = caller_cred.gid == tracee_cred.egid
-            && caller_cred.gid == tracee_cred.sgid
-            && caller_cred.gid == tracee_cred.gid;
+        let uid_match = caller_uid == tracee_cred.euid
+            && caller_uid == tracee_cred.suid
+            && caller_uid == tracee_cred.uid;
+        let gid_match = caller_gid == tracee_cred.egid
+            && caller_gid == tracee_cred.sgid
+            && caller_gid == tracee_cred.gid;
         // 3. CAP_SYS_PTRACE：在目标（tracee）的 user_ns
         // 判定 capability，而非调用者自身 ns，避免子 user namespace 越权跟踪父 ns 进程。
         let has_cap = || {
-            caller_cred.has_capability_in_ns(
-                &tracee_cred.user_ns,
-                crate::process::cred::CAPFlags::CAP_SYS_PTRACE,
-            )
+            caller_cred.has_capability_in_ns(&tracee_cred.user_ns, cred::CAPFlags::CAP_SYS_PTRACE)
         };
 
-        if !((same_user_ns && uid_match && gid_match && tracee.dumpable() != 0) || has_cap()) {
+        // 读侧屏障：与凭据提交路径的写侧屏障配对——写侧先发布 dumpability
+        // 再发布新凭据，读侧读完 tracee 凭据后、读 dumpable 前插入屏障，
+        // 保证不会观察到"新凭据 + 旧 dumpable"的乱序窗口（降权瞬间 attach）。
+        fence(Ordering::SeqCst);
+
+        if !((same_user_ns
+            && uid_match
+            && gid_match
+            && tracee.dumpable() == cred::SUID_DUMP_USER as u8)
+            || has_cap())
+        {
             return false;
         }
 
-        // 4. capability 子集门：目标 permitted ⊆ 调用者 permitted（同一 user_ns）。
-        (same_user_ns
-            && (tracee_cred.cap_permitted.bits() & !caller_cred.cap_permitted.bits()) == 0)
-            || has_cap()
+        // 4. capability 子集门：目标 permitted ⊆ 调用者 cap 集（同一 user_ns）。
+        let caller_caps = match creds {
+            PtraceAccessCreds::FsCreds => caller_cred.cap_effective,
+            PtraceAccessCreds::RealCreds => caller_cred.cap_permitted,
+        };
+        (same_user_ns && (tracee_cred.cap_permitted.bits() & !caller_caps.bits()) == 0) || has_cap()
     }
 
     /// 建立跟踪关系（tracee 侧调用）。
     /// 调用者不必持 `PTRACE_RELATION_LOCK`函数会自行获取。
     pub fn ptrace_link(&self, tracer: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        if !tracer.has_permission_to_trace(self) {
+        if !tracer.has_permission_to_trace(self, PtraceAccessCreds::RealCreds) {
             return Err(SystemError::EPERM);
         }
         // 建立新跟踪关系时清空 ptrace 选项，保证 re-attach 不继承上一会话的选项。
@@ -1119,6 +1179,7 @@ impl ProcessControlBlock {
             let mut ps = self.ptrace_state.lock_irqsave();
             ps.stop_report_pending = false;
             ps.in_ptrace_stop = false;
+            ps.frozen = false;
             ps.listening = false;
             ps.pending_event_stop = None;
             ps.exit_code = 0;
@@ -1239,7 +1300,7 @@ impl ProcessControlBlock {
         let _exec_guard = self.exec_update_read();
         let is_same_thread_group = tracer.tgid == self.tgid;
 
-        if !tracer.has_permission_to_trace(self)
+        if !tracer.has_permission_to_trace(self, PtraceAccessCreds::RealCreds)
             || self.flags().contains(ProcessFlags::KTHREAD)
             || is_same_thread_group
         {
@@ -1299,7 +1360,7 @@ impl ProcessControlBlock {
     ) -> Result<isize, SystemError> {
         let _exec_guard = self.exec_update_read();
         let is_same_thread_group = tracer.tgid == self.tgid;
-        if !tracer.has_permission_to_trace(self)
+        if !tracer.has_permission_to_trace(self, PtraceAccessCreds::RealCreds)
             || self.flags().contains(ProcessFlags::KTHREAD)
             || is_same_thread_group
         {
@@ -1598,18 +1659,40 @@ impl ProcessControlBlock {
                 return Err(SystemError::EIO);
             }
 
-            if idx < 4
-                && val as usize >= MMArch::USER_END_VADDR.data()
-                && !crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_ADMIN)
-            {
-                return Err(SystemError::EPERM);
-            }
-
             let has_dr = {
                 let mut ps = self.ptrace_state.lock_irqsave();
-                // DR6(slot6) 存储正极性 virtual_dr6，写入时翻转。
-                let stored = if idx == 6 { val ^ DR6_RESERVED } else { val };
-                ps.debug_regs[idx] = stored;
+                match idx {
+                    // DR0-3：地址寄存器。禁止越界值
+                    0..=3 => {
+                        if val >= MMArch::USER_END_VADDR.data() as u64 {
+                            return Err(SystemError::EINVAL);
+                        }
+                        let dr7 = ps.debug_regs[7] & !DR_CONTROL_RESERVED;
+                        if ((dr7 >> (idx * 2)) & 3) != 0 {
+                            validate_dr_slot((dr7 >> (16 + idx * 4)) & 0xf, val)?;
+                        }
+                        ps.debug_regs[idx] = val;
+                    }
+                    // DR6(slot6) 存储正极性 virtual_dr6，写入时翻转。
+                    6 => {
+                        ps.debug_regs[6] = val ^ DR6_RESERVED;
+                    }
+                    // DR7：控制寄存器。同一临界区内"先全量校验、后提交
+                    _ => {
+                        let v = val & !DR_CONTROL_RESERVED;
+                        for i in 0..4usize {
+                            // 未启用且从未写过地址的 slot 没有可校验的
+                            // 组合，跳过；已写入地址的 slot（组合状态存在）
+                            // 无论启用与否都校验编码，保证任意写入顺序下
+                            // 组合状态始终有效。
+                            if ((v >> (i * 2)) & 3) == 0 && ps.debug_regs[i] == 0 {
+                                continue;
+                            }
+                            validate_dr_slot((v >> (16 + i * 4)) & 0xf, ps.debug_regs[i])?;
+                        }
+                        ps.debug_regs[7] = val;
+                    }
+                }
                 // 维护硬件断点快路径标志：任一地址寄存器（DR0-3）或控制寄存器（DR7）非零即视为有配置，上下文切换据此加载/清除。
                 ps.debug_regs[0..4].iter().any(|&v| v != 0) || ps.debug_regs[7] != 0
             };
@@ -1669,10 +1752,9 @@ impl ProcessControlBlock {
         *g.sig_block_mut() = new_set;
     }
 
-    // PEEKDATA / POKEDATA —— 通过页表翻译访问 tracee 用户内存
+    // PEEKDATA / POKEDATA —— 经 MM 层统一远程访问 API 读写 tracee 用户内存
 
     /// PTRACE_PEEKDATA/PEEKTEXT：读 tracee 用户空间一个 word。
-    /// 通过 tracee 的 AddressSpace 页表翻译虚拟地址→物理地址→内核可访问虚拟地址。
     /// 正确处理跨页 word（addr 位于页尾时 8 字节跨两页）。
     pub fn ptrace_peek_data(&self, addr: usize) -> Result<usize, SystemError> {
         // 防回绕校验
@@ -1682,9 +1764,10 @@ impl ProcessControlBlock {
         if last >= MMArch::USER_END_VADDR.data() {
             return Err(SystemError::EIO);
         }
+        let target_vm = self.basic().user_vm().clone().ok_or(SystemError::ESRCH)?;
         let mut bytes = [0u8; size_of::<usize>()];
-        // 整 word 在单次 AddressSpace 读锁内拷
-        let n = Self::access_user_chunk_read(self, addr, &mut bytes)?;
+        // 整 word 在单次 AddressSpace 读锁内拷（force=true：ptrace 越权语义）
+        let n = target_vm.access_remote_vm(addr, RemoteAccess::Read(&mut bytes), true)?;
         if n != size_of::<usize>() {
             return Err(SystemError::EIO);
         }
@@ -1699,276 +1782,12 @@ impl ProcessControlBlock {
         if last >= MMArch::USER_END_VADDR.data() {
             return Err(SystemError::EIO);
         }
+        let target_vm = self.basic().user_vm().clone().ok_or(SystemError::ESRCH)?;
         let bytes = value.to_ne_bytes();
-        let n = Self::access_user_chunk_write(self, addr, &bytes)?;
+        let n = target_vm.access_remote_vm(addr, RemoteAccess::Write(&bytes), true)?;
         if n != size_of::<usize>() {
             return Err(SystemError::EIO);
         }
-        Ok(())
-    }
-
-    /// 读 tracee 用户空间一段连续字节（用目标进程当前地址空间）。
-    /// 返回实际读取字节数；对未映射/不可访问页按 Linux mem_rw 短读语义终止。
-    pub(crate) fn access_user_chunk_read(
-        &self,
-        addr: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        let target_vm = self.basic().user_vm().clone().ok_or(SystemError::ESRCH)?;
-        Self::access_remote_chunk(&target_vm, addr, Some(buf), None)
-    }
-
-    /// 写 tracee 用户空间一段连续字节（用目标进程当前地址空间）。
-    /// 形参为不可变切片，避免调用方为凑可变形参而做无谓拷贝。
-    /// 返回实际写入字节数；对未映射/不可访问页按 Linux mem_rw 短写语义终止。
-    pub(crate) fn access_user_chunk_write(
-        &self,
-        addr: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        let target_vm = self.basic().user_vm().clone().ok_or(SystemError::ESRCH)?;
-        Self::access_remote_chunk(&target_vm, addr, None, Some(buf))
-    }
-
-    /// 在指定目标地址空间上读一段连续字节。
-    /// 供 /proc/[pid]/mem 使用：target_vm 来自打开时钉住的 AddressSpace，
-    /// 而非目标进程的 live mm，避免目标 execve 后访问到新地址空间。
-    pub(crate) fn access_user_chunk_on_vm_read(
-        target_vm: &Arc<ucontext::AddressSpace>,
-        addr: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        Self::access_remote_chunk(target_vm, addr, Some(buf), None)
-    }
-
-    /// 在指定目标地址空间上写一段连续字节（不可变形参，避免调用方拷贝）。
-    pub(crate) fn access_user_chunk_on_vm_write(
-        target_vm: &Arc<ucontext::AddressSpace>,
-        addr: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        Self::access_remote_chunk(target_vm, addr, None, Some(buf))
-    }
-
-    /// 跨进程批量读写一段连续字节的核心实现。
-    fn access_remote_chunk(
-        target_vm: &Arc<ucontext::AddressSpace>,
-        addr: usize,
-        mut read_buf: Option<&mut [u8]>,
-        write_buf: Option<&[u8]>,
-    ) -> Result<usize, SystemError> {
-        let total = match (
-            read_buf.as_ref().map(|b| b.len()),
-            write_buf.as_ref().map(|b| b.len()),
-        ) {
-            (Some(n), _) | (_, Some(n)) => n,
-            (None, None) => return Ok(0),
-        };
-        let write = write_buf.is_some();
-        if total == 0 {
-            return Ok(0);
-        }
-
-        let mut copied = 0usize;
-        // 每地址最多 fault-in 一次：记录上一次 fault-in 的地址，避免死循环。
-        let mut faulted_at: Option<usize> = None;
-
-        while copied < total {
-            let cur = match addr.checked_add(copied) {
-                Some(c) => c,
-                None => return Ok(copied),
-            };
-            if cur >= MMArch::USER_END_VADDR.data() {
-                return Ok(copied);
-            }
-
-            // 读锁内：连续拷尽可能多的已映射页（跨页不重取锁）。
-            let advanced = {
-                let target_guard = target_vm.read();
-                let mut local = 0usize;
-                while copied + local < total {
-                    let p = match addr.checked_add(copied + local) {
-                        Some(v) => v,
-                        None => break,
-                    };
-                    if p >= MMArch::USER_END_VADDR.data() {
-                        break;
-                    }
-                    let page_off = p & (MMArch::PAGE_SIZE - 1);
-                    // 本页内可拷字节：每页一次钳位（对齐 access_remote_vm）。
-                    let chunk =
-                        core::cmp::min(total - (copied + local), MMArch::PAGE_SIZE - page_off);
-                    let pvaddr = VirtAddr::new(p);
-                    // 每页一次 VMA 校验 + 一次页表 translate。
-                    let Some(_vma) = target_guard.mappings.contains(pvaddr) else {
-                        break;
-                    };
-                    let Some((phys_frame, entry_flags)) =
-                        target_guard.user_mapper.utable.translate(pvaddr)
-                    else {
-                        break;
-                    };
-                    if write && !entry_flags.has_write() {
-                        // 只读页：写需 COW，落到读锁外 fault-in。
-                        break;
-                    }
-                    let Some(kernel_base) = (unsafe {
-                        MMArch::phys_2_virt(PhysAddr::new(phys_frame.data() + page_off))
-                    }) else {
-                        break;
-                    };
-                    let kvptr = kernel_base.data() as *mut u8;
-                    unsafe {
-                        match (read_buf.as_deref_mut(), write_buf) {
-                            (Some(rb), _) => core::ptr::copy_nonoverlapping(
-                                kvptr as *const u8,
-                                rb[copied + local..copied + local + chunk].as_mut_ptr(),
-                                chunk,
-                            ),
-                            (_, Some(wb)) => core::ptr::copy_nonoverlapping(
-                                wb[copied + local..copied + local + chunk].as_ptr(),
-                                kvptr,
-                                chunk,
-                            ),
-                            // 不会到达：read_buf / write_buf 恰一为 Some。
-                            _ => {}
-                        }
-                    }
-                    local += chunk;
-                    // 跨页后不 break：同一读锁内继续处理下一页。
-                }
-                local
-            }; // 读锁 drop
-
-            if advanced > 0 {
-                copied += advanced;
-                faulted_at = None; // 有进展，重置 fault 记录。
-                continue;
-            }
-
-            // 当前页未映射/需 COW：drop 读锁后（上面已 drop）锁外 fault-in 再重试。
-            if faulted_at == Some(cur) {
-                // 本地址已 fault-in 过仍无推进：按 short-read 终止。
-                return if copied > 0 {
-                    Ok(copied)
-                } else {
-                    Err(SystemError::EIO)
-                };
-            }
-            match Self::fault_in_tracee_page(target_vm, VirtAddr::new(cur), write) {
-                Ok(()) => {
-                    faulted_at = Some(cur);
-                    continue; // 重新取读锁重试本页。
-                }
-                Err(_) => {
-                    return if copied > 0 {
-                        Ok(copied)
-                    } else {
-                        Err(SystemError::EIO)
-                    };
-                }
-            }
-        }
-        Ok(copied)
-    }
-
-    /// 在 tracee 地址空间中 fault-in 一个页。
-    /// 对 file-backed VMA 先 prefault page_cache，再 handle_mm_fault（设 FAULT_FLAG_REMOTE）。
-    fn fault_in_tracee_page(
-        target_vm: &Arc<ucontext::AddressSpace>,
-        address: VirtAddr,
-        write: bool,
-    ) -> Result<(), SystemError> {
-        let mut flags = fault::FaultFlags::FAULT_FLAG_REMOTE;
-        if write {
-            flags |= fault::FaultFlags::FAULT_FLAG_WRITE;
-        }
-
-        // 对 file-backed VMA 预建 page_cache，确保后续 handle_mm_fault 能命中。
-        let file_backed_vma = {
-            let space_guard = target_vm.read();
-            let vma = match space_guard.mappings.find_nearest(address) {
-                Some(vma) => vma,
-                None => return Err(SystemError::EIO),
-            };
-            let vma_guard = vma.lock();
-            if vma_guard.region().contains(address) && vma_guard.vm_file().is_some() {
-                Some(vma.clone())
-            } else {
-                None
-            }
-        };
-
-        if let Some(vma) = file_backed_vma {
-            Self::prefault_file_backing(&vma, address)?;
-        }
-
-        // handle_mm_fault
-        let mut space_guard = target_vm.write();
-        let vma = match space_guard.mappings.find_nearest(address) {
-            Some(vma) => vma,
-            None => return Err(SystemError::EIO),
-        };
-
-        let vma_guard = vma.lock();
-        let region = *vma_guard.region();
-        let vm_flags = *vma_guard.vm_flags();
-        drop(vma_guard);
-
-        if !region.contains(address) {
-            if !vm_flags.contains(VmFlags::VM_GROWSDOWN) {
-                return Err(SystemError::EIO);
-            }
-            let extension_size = region.start().data() - address.data();
-            let max_stack_limit = space_guard
-                .user_stack
-                .as_ref()
-                .map(|s| s.max_limit())
-                .unwrap_or(0);
-            if extension_size > max_stack_limit || !space_guard.can_extend_stack(extension_size) {
-                return Err(SystemError::EIO);
-            }
-            space_guard
-                .extend_stack(extension_size)
-                .map_err(|_| SystemError::EIO)?;
-        }
-
-        let fault = unsafe {
-            let mm = space_guard.outer_addr_space().ok_or(SystemError::EFAULT)?;
-            let mapper = &mut space_guard.user_mapper.utable;
-            fault::PageFaultHandler::handle_mm_fault(fault::PageFaultMessage::new(
-                vma, address, flags, mapper, mm,
-            ))
-        };
-
-        if fault.reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
-            Ok(())
-        } else {
-            Err(SystemError::EIO)
-        }
-    }
-
-    /// 预建 file-backed VMA 的 page_cache 页。
-    fn prefault_file_backing(
-        vma: &Arc<ucontext::LockedVMA>,
-        address: VirtAddr,
-    ) -> Result<(), SystemError> {
-        let (file, base_pgoff, region_start) = {
-            let vma_guard = vma.lock();
-            let file = vma_guard.vm_file().ok_or(SystemError::EIO)?;
-            let base_pgoff = vma_guard.backing_page_offset().ok_or(SystemError::EIO)?;
-            (file, base_pgoff, vma_guard.region().start().data())
-        };
-
-        let page_index = base_pgoff + ((address.data() - region_start) >> MMArch::PAGE_SHIFT);
-        let inode = file.inode();
-        let file_size = inode.metadata()?.size.max(0) as usize;
-        if file_size == 0 || page_index.saturating_mul(MMArch::PAGE_SIZE) >= file_size {
-            return Err(SystemError::EIO);
-        }
-
-        let page_cache = inode.page_cache().ok_or(SystemError::EIO)?;
-        let _ = page_cache.manager().commit_page(page_index)?;
         Ok(())
     }
 
@@ -2042,6 +1861,57 @@ impl ProcessControlBlock {
     }
 
     // 核心停止状态机
+
+    /// 请求级冻结 tracee 的 ptrace-stop
+    pub fn ptrace_freeze(&self) -> Result<(), SystemError> {
+        let sighand = self.sighand();
+        let sighand_g = sighand.inner_read();
+        let siginfo_g = self.sig_info_irqsave();
+        let fatal = siginfo_g
+            .sig_pending()
+            .signal()
+            .contains(Signal::SIGKILL.into())
+            || sighand_g
+                .shared_pending
+                .signal()
+                .contains(Signal::SIGKILL.into());
+        if fatal {
+            // SIGKILL 已挂起：拒绝冻结，tracee 将走死亡路径，
+            // tracer 侧表现为常见的 ESRCH。
+            return Err(SystemError::ESRCH);
+        }
+        {
+            let mut ps = self.ptrace_state.lock_irqsave();
+            // 复验 tracee 仍在 ptrace-stop：fatal 唤醒可能已抢先清位。
+            if !(ps.in_ptrace_stop && self.sched_info().state().is_stopped()) {
+                return Err(SystemError::ESRCH);
+            }
+            ps.frozen = true;
+        }
+        Ok(())
+        // 各守卫按声明逆序释放：ptrace_state → sig_info → sighand inner。
+    }
+
+    /// 解除请求级冻结并补发被延迟的致命唤醒。
+    pub fn ptrace_unfreeze(&self) {
+        let wake = {
+            let mut ps = self.ptrace_state.lock_irqsave();
+            ps.frozen = false;
+            let wake = ps.deferred_fatal_wake;
+            ps.deferred_fatal_wake = false;
+            if wake && ps.in_ptrace_stop {
+                ps.in_ptrace_stop = false;
+            }
+            wake
+        };
+        if wake {
+            if let Some(strong) = self.self_ref.upgrade() {
+                // 补发被门控延迟的死亡唤醒。wakeup_stop 对已 Runnable 目标
+                // （如 CONT 已将其唤醒）早退，不会造成双重唤醒。
+                let _ = ProcessManager::wakeup_stop(&strong);
+            }
+        }
+    }
 
     /// 进入 ptrace-stop
     pub fn ptrace_stop(
@@ -2180,6 +2050,7 @@ impl ProcessControlBlock {
         ps.listening = false;
         ps.stop_report_pending = false;
         ps.in_ptrace_stop = false;
+        ps.frozen = false;
         ps.last_siginfo = None;
         ps.event_message = 0;
         ps.exit_code = 0;
@@ -2376,6 +2247,8 @@ impl ProcessControlBlock {
         // 清 in_ptrace_stop：LISTEN 状态下 tracee 不在 ptrace-stop，
         // ptrace_check_attach 应返回 ESRCH
         ps.in_ptrace_stop = false;
+        // 同临界区清请求级冻结
+        ps.frozen = false;
         // 关键：清 stop_report_pending，使 wait 不再返回此 stop
         ps.stop_report_pending = false;
         drop(ps);
@@ -2531,7 +2404,8 @@ impl ProcessControlBlock {
             ps.injected_signal = resume_signal;
             ps.listening = false;
             ps.stop_report_pending = false;
-            ps.in_ptrace_stop = false; // 退出 ptrace-stop（修复 audit P0）
+            ps.in_ptrace_stop = false;
+            ps.frozen = false;
             self.sched_info().state().is_stopped()
         };
 

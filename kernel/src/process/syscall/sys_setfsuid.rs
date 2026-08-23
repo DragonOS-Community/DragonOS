@@ -32,7 +32,7 @@ impl Syscall for SysSetFsuid {
         if fsuid == old_cred.uid || fsuid == old_cred.euid || fsuid == old_cred.suid {
             let mut new_cred: Cred = (*old_cred).clone();
             new_cred.setfsuid(fsuid.data());
-            pcb.set_cred(Cred::new_arc(new_cred))?;
+            pcb.commit_cred(Cred::new_arc(new_cred))?;
         }
 
         Ok(old_fsuid.data())

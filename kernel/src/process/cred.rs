@@ -1,5 +1,5 @@
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicI32, AtomicUsize};
 
 use alloc::vec::Vec;
 
@@ -14,6 +14,17 @@ lazy_static::lazy_static! {
 
 int_like!(Kuid, AtomicKuid, usize, AtomicUsize);
 int_like!(Kgid, AtomicKgid, usize, AtomicUsize);
+
+/// suid_dumpable 取值：核心转储完全禁止
+pub const SUID_DUMP_DISABLE: i32 = 0;
+/// suid_dumpable 取值：按普通用户进程的常规规则允许转储
+pub const SUID_DUMP_USER: i32 = 1;
+/// suid_dumpable 取值：root 的 suid 程序也允许转储。
+#[allow(dead_code)]
+pub const SUID_DUMP_ROOT: i32 = 2;
+
+/// 全局 suid_dumpable 开关（/proc/sys/fs/suid_dumpable）。
+pub static SUID_DUMPABLE: AtomicI32 = AtomicI32::new(SUID_DUMP_DISABLE);
 
 bitflags! {
     pub struct CAPFlags:u64{
@@ -311,6 +322,30 @@ pub fn capable(cap: CAPFlags) -> bool {
 /// fallback for existing administrative callers.
 pub fn perfmon_capable() -> bool {
     capable(CAPFlags::CAP_PERFMON) || capable(CAPFlags::CAP_SYS_ADMIN)
+}
+
+/// 判断凭据 new 的 permitted 能力集是否为凭据 old 的子集（即不会发生提权）。
+pub fn cred_cap_issubset(old: &Cred, new: &Cred) -> bool {
+    let mut ns = new.user_ns.clone();
+    // 同一 namespace：直接比较能力集
+    if Arc::ptr_eq(&old.user_ns, &ns) {
+        return (new.cap_permitted.bits() & !old.cap_permitted.bits()) == 0;
+    }
+    // 跨 namespace：沿 parent 链上溯，逐级检查 owner 是否为 old 的 euid
+    while !Arc::ptr_eq(&ns, &INIT_USER_NAMESPACE) {
+        let ns_owner = ns.inner.lock().owner;
+        let Some(parent_weak) = ns.parent.as_ref() else {
+            return false;
+        };
+        let Some(parent_ns) = parent_weak.upgrade() else {
+            return false;
+        };
+        if Arc::ptr_eq(&old.user_ns, &parent_ns) && ns_owner == old.euid.data() {
+            return true;
+        }
+        ns = parent_ns;
+    }
+    false
 }
 
 /// 检查当前进程在指定 ns 中是否有某 capability（setid 上下文）

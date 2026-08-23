@@ -13,8 +13,8 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     libs::mutex::MutexGuard,
-    mm::ucontext::AddressSpace,
-    process::ProcessControlBlock,
+    mm::{remote_access::RemoteAccess, ucontext::AddressSpace},
+    process::{ptrace::PtraceAccessCreds, ProcessControlBlock},
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -36,7 +36,7 @@ impl MemFileOps {
     /// 权限检查（仅在 open 时调用一次）。
     fn check_access(target: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let current = crate::process::ProcessManager::current_pcb();
-        if current.has_permission_to_trace(target) {
+        if current.has_permission_to_trace(target, PtraceAccessCreds::FsCreds) {
             Ok(())
         } else {
             Err(SystemError::EACCES)
@@ -84,12 +84,9 @@ impl FileOps for MemFileOps {
             return Ok(0);
         }
         let actual_len = len.min(buf.len());
-        // 批量跨进程读：单次 AddressSpace 读锁内按页整段拷贝，避免逐字节取锁+走查页表。
-        let n = ProcessControlBlock::access_user_chunk_on_vm_read(
-            &pinned_vm,
-            offset,
-            &mut buf[..actual_len],
-        )?;
+        // 批量跨进程读
+        let n =
+            pinned_vm.access_remote_vm(offset, RemoteAccess::Read(&mut buf[..actual_len]), true)?;
         // 读到 0 字节可能是“恰在拆除临界区边界”的竞态。复判一次，拆除已成事实则按 EOF 处理
         if n == 0 && actual_len > 0 && pinned_vm.is_torn_down() {
             return Ok(0);
@@ -119,11 +116,8 @@ impl FileOps for MemFileOps {
             return Ok(0);
         }
         let actual_len = len.min(buf.len());
-        let n = ProcessControlBlock::access_user_chunk_on_vm_write(
-            &pinned_vm,
-            offset,
-            &buf[..actual_len],
-        )?;
+        let n =
+            pinned_vm.access_remote_vm(offset, RemoteAccess::Write(&buf[..actual_len]), true)?;
         if n == 0 && actual_len > 0 && pinned_vm.is_torn_down() {
             return Ok(0);
         }

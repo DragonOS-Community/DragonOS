@@ -437,17 +437,14 @@ impl TimerFunction for PosixTimerHelper {
                 } else {
                     // 进程级：全部操作在 sighand 侧完成，避免与 sig_info
                     // 产生任何嵌套。
-                    if target
-                        .sighand()
-                        .shared_pending_posix_timer_exists(signo, self.timerid)
-                    {
-                        let bump = 1i32.saturating_add(t.pending_overrun_acc);
+                    let bump = 1i32.saturating_add(t.pending_overrun_acc);
+                    if target.sighand().shared_pending_posix_timer_bump_overrun(
+                        signo,
+                        self.timerid,
+                        bump,
+                    ) {
+                        // 仅在累加真正成功后清零，失败路径保留原值。
                         t.pending_overrun_acc = 0;
-                        target.sighand().shared_pending_posix_timer_bump_overrun(
-                            signo,
-                            self.timerid,
-                            bump,
-                        );
                     } else if ignored_and_unblocked {
                         // 未阻塞且 handler=SIG_IGN：Linux 语义下丢弃，
                         // 计入 overrun。

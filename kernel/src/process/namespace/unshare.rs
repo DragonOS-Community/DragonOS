@@ -43,7 +43,7 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
     drop(fs_refs);
 
     if let Some(new_cred) = new_cred.take() {
-        current_pcb.set_cred(Cred::new_arc(new_cred))?;
+        current_pcb.commit_cred(Cred::new_arc(new_cred))?;
     }
 
     // TODO: 处理其他命名空间的 unshare 操作

@@ -87,7 +87,7 @@ impl Syscall for SysSetGroups {
         if size == 0 {
             // clear all supplementary groups
             cred.setgroups(Vec::new());
-            pcb.set_cred(Cred::new_arc(cred))?;
+            pcb.commit_cred(Cred::new_arc(cred))?;
             return Ok(0);
         }
         if size > NGROUPS_MAX {
@@ -112,7 +112,7 @@ impl Syscall for SysSetGroups {
             .map(|g| Kgid::from(g as usize))
             .collect();
         cred.setgroups(groups);
-        pcb.set_cred(Cred::new_arc(cred))?;
+        pcb.commit_cred(Cred::new_arc(cred))?;
         Ok(0)
     }
 

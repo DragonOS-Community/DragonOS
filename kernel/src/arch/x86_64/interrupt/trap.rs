@@ -162,8 +162,9 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
             out(reg) dr7,
             options(nomem, nostack, preserves_flags)
         );
-        // 用户调试寄存器在处理 #DB 期间保持禁用，避免内核信号路径递归命中。
-        // 清零方向必须先硬件、后 CPU 影子，与上下文切换协议一致。
+        // Keep user debug registers disabled while handling #DB to avoid
+        // recursively hitting them in the kernel signal path. Clear hardware
+        // first, then the CPU shadow, matching the context-switch protocol.
         debugreg::write_dr7(0);
         crate::arch::process::cpu_dr7().store(0, core::sync::atomic::Ordering::Relaxed);
         dr7
@@ -187,9 +188,11 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
             // 已被 uprobe 消费（精确 XOL 完成）。
         } else {
             let current = ProcessManager::current_pcb();
-            // PEEKUSER(DR6) 使用正极性虚拟 DR6；硬件保留位不属于命中原因。
+            // PEEKUSER(DR6) uses positive-polarity virtual DR6; hardware
+            // reserved bits are not part of the reported cause.
             current.ptrace_state.lock_irqsave().debug_regs[6] = dr6 & !ptrace::DR6_RESERVED;
-            // 执行型硬件断点若不设置 RF，恢复同一条指令时会立即再次触发。
+            // An execution breakpoint needs RF, otherwise resuming the same
+            // instruction immediately triggers the breakpoint again.
             if dr6 & ptrace::X86_DR_BS == 0 {
                 for i in 0..4u32 {
                     if (dr6 & (1u64 << i)) != 0 && ((dr7 >> (16 + i * 4)) & 0b11) == 0 {
@@ -211,7 +214,8 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
                 dr[7] &= !ptrace::DR_CONTROL_RESERVED;
                 dr
             };
-            // 武装方向必须先 CPU 影子、再硬件，避免调度切换观察到半提交状态。
+            // Arm the CPU shadow before hardware so a context switch cannot
+            // observe a partially committed state.
             crate::arch::process::cpu_dr7().store(dr[7], core::sync::atomic::Ordering::Relaxed);
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             debugreg::write_dr(0, dr[0]);

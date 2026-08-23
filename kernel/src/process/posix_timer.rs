@@ -443,7 +443,7 @@ impl TimerFunction for PosixTimerHelper {
                         self.timerid,
                         bump,
                     ) {
-                        // 仅在累加真正成功后清零，失败路径保留原值。
+                        // Reset only after the bump succeeds; keep the value on failure.
                         t.pending_overrun_acc = 0;
                     } else if ignored_and_unblocked {
                         // 未阻塞且 handler=SIG_IGN：Linux 语义下丢弃，

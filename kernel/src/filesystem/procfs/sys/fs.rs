@@ -171,7 +171,7 @@ impl FileOps for SuidDumpableFileOps {
             return Ok(buf.len());
         }
         let (value, consumed) = parse_mount_max(buf)?;
-        // 仅接受 0/1/2 三个合法取值
+        // Only 0/1/2 are valid values
         if !(0..=2).contains(&value) {
             return Err(SystemError::EINVAL);
         }

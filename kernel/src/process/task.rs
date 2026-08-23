@@ -880,20 +880,20 @@ impl ProcessControlBlock {
         Ok(())
     }
 
-    /// 提交新的真实凭据集，并联动 dumpability
+    /// Commit new creds, updating dumpability accordingly
     pub fn commit_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
         let _task_guard = self.task_lock.lock_irqsave();
         let old = self.cred();
-        // 触发条件：euid/egid/fsuid/fsgid 任一变化，或新 permitted 不是旧 permitted 的子集（提权）
+        // Trigger: any of euid/egid/fsuid/fsgid changes, or new permitted is not a subset of old (privilege raise)
         if old.euid != new.euid
             || old.egid != new.egid
             || old.fsuid != new.fsuid
             || old.fsgid != new.fsgid
             || !cred_cap_issubset(&old, &new)
         {
-            // 先发布 dumpability 再发布凭据，配合读侧屏障保证访问检查不会看到"新凭据 + 旧 dumpable"的中间状态
+            // Publish dumpability before creds; with the read-side fence, checks never see new creds with old dumpable
             self.set_dumpable(SUID_DUMPABLE.load(Ordering::SeqCst) as u8);
-            // 身份变化后父进程死亡信号一并清除
+            // Also clear the parent-death signal on identity change
             self.set_pdeath_signal(Signal::INVALID);
             fence(Ordering::SeqCst);
         }

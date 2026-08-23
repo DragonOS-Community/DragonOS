@@ -1,8 +1,8 @@
-//! `rt_sigreturn` 系统调用处理：从用户栈恢复信号上下文。
+//! `rt_sigreturn` syscall handler: restore the signal context from the user stack.
 //!
-//! 作为普通 syscall 表项走统一分发路径，自动获得 ptrace 的
-//! entry/exit-stop、SYSEMU 跳过与参数改写语义（与 Linux 一致，
-//! Linux 中 rt_sigreturn 就是 syscall 表普通表项，无任何特判）。
+//! Dispatched as a regular syscall table entry, so it automatically gets the
+//! ptrace entry/exit-stop, SYSEMU skip and arg-rewrite semantics
+//! without any special-casing.
 
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::X86_64SignalArch, syscall::nr::SYS_RT_SIGRETURN},
@@ -20,7 +20,7 @@ impl Syscall for SysRtSigreturnHandle {
     }
 
     fn handle(&self, _args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        // 返回恢复后的 rax——通用尾部的 set_return_value 写回同一值
+        // Return the restored rax — the common tail's set_return_value writes the same value
         let r = <X86_64SignalArch as SignalArch>::sys_rt_sigreturn(frame) as usize;
         Ok(r)
     }

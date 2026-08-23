@@ -63,12 +63,12 @@ pub struct AddressSpace {
     /// OOM waiters must not treat the earlier resident-page accounting decrement
     /// as reclaim progress.
     oom_reclaim_generation: AtomicU64,
-    /// 已显式拆除标志
-    /// 最后一个活跃用户退出/exec 换走后，即使仍有外部引用
-    /// （如 /proc/[pid]/mem 钉住的 fd），映射也已被拆除。
-    /// 后续对钉住引用的读写应返回 EOF。
+    /// Explicit tear-down flag
+    /// After the last active user exits/execs away, the mappings are already
+    /// gone even if external references (e.g. a /proc/[pid]/mem fd) remain.
+    /// Later reads/writes through pinned references return EOF.
     torn_down: AtomicBool,
-    /// 仍安装着本地址空间、且尚未经过退出/exec 释放路径的任务数。
+    /// Tasks that still have this address space installed and have not released it.
     user_count: AtomicUsize,
     /// Uses RwSem instead of RwLock because address space operations may require I/O (e.g., file reads on page faults)
     inner: RwSem<InnerAddressSpace>,
@@ -338,8 +338,8 @@ impl AddressSpace {
             resident_user_pages: AtomicUsize::new(0),
             oom_reclaim_generation: AtomicU64::new(0),
             torn_down: AtomicBool::new(false),
-            // 基线 1 代表首个安装本地址空间的任务（exec 换入的新表、深拷贝出的子任务）。
-            // IDLE 地址空间的基线 1 没有对应任务，属有意的永久保底，防止其被拆除。
+            // Baseline 1 stands for the first task installing this space (exec'd table or deep-copied child).
+            // The IDLE space's baseline 1 has no task; it is a deliberate floor preventing tear-down.
             user_count: AtomicUsize::new(1),
             inner: RwSem::new(inner),
             reservation_wait: WaitQueue::default(),
@@ -387,33 +387,33 @@ impl AddressSpace {
         return Ok(vm);
     }
 
-    /// 标记本地址空间已被显式拆除
-    /// 读者要么在拆除前完成，要么观察到 torn_down
+    /// Mark this address space as explicitly torn down
+    /// Readers either finish before tear-down or observe torn_down
     #[inline]
     pub fn mark_torn_down(&self) {
         self.torn_down.store(true, Ordering::Release);
     }
 
-    /// 地址空间是否已被显式拆除。
+    /// Whether this address space has been explicitly torn down.
     #[inline]
     pub fn is_torn_down(&self) -> bool {
         self.torn_down.load(Ordering::Acquire)
     }
 
-    /// 当前仍安装着本地址空间且未释放的任务数（语义见字段文档）。
+    /// Number of tasks still holding this space unreleased (see field docs).
     #[inline]
     pub fn user_count(&self) -> usize {
         self.user_count.load(Ordering::Acquire)
     }
 
-    /// 任务安装本地址空间时递增使用者计数
+    /// Increment the user count when a task installs this address space
     #[inline]
     pub fn user_count_inc(&self) {
         self.user_count.fetch_add(1, Ordering::Release);
     }
 
-    /// 任务释放本地址空间（退出或 exec 提交换走旧表）时递减；
-    /// 返回 true 表示调用者竟是最后一个使用者，由其负责拆除映射。
+    /// Decrement when a task releases it (exit or exec swap);
+    /// returns true if the caller is the last user and must tear down the mappings.
     #[inline]
     pub fn user_count_dec_and_test(&self) -> bool {
         let prev = self.user_count.fetch_sub(1, Ordering::AcqRel);

@@ -154,7 +154,7 @@ impl Syscall for SysCapset {
         new_cred.cap_ambient &= CAPFlags::from_bits_truncate(p_p_new);
         new_cred.cap_ambient &= CAPFlags::from_bits_truncate(p_i_new);
 
-        // 提交新 cred；若 permitted 能力集变化触发提权，会联动重置 dumpability
+        // Commit the new cred; a permitted-cap change that raises privileges also resets dumpability
         pcb.commit_cred(Cred::new_arc(new_cred))?;
 
         Ok(0)

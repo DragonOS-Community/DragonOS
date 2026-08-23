@@ -167,9 +167,9 @@ fn do_execve_internal(
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
-    // 捕获 sched_process_exec 的 old_pid：必须在 load_binary_file_with_context 之前，
-    // 因为该函数内的 begin_new_exec → de_thread 会在「非 leader 线程 execve」时
-    // 交换 current 与旧 thread-group leader 的 raw_pid（对齐 Linux fs/exec.c:1770）。
+    // Capture sched_process_exec's old_pid before load_binary_file_with_context:
+    // begin_new_exec -> de_thread may swap current's raw_pid with the old
+    // thread-group leader when a non-leader thread calls execve.
     let old_pid = ProcessManager::current_pcb().raw_pid().data() as i32;
 
     let pre_exec_pcb = ProcessManager::current_pcb();
@@ -246,9 +246,9 @@ fn do_execve_internal(
             if let Err(err) = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr) {
                 return finish_exec_error(&param, old_vm.as_ref(), err);
             }
-            // 成功 exec 不继承 ptrace 硬件调试寄存器状态。
+            // A successful exec does not inherit ptrace hardware debug state.
             exec_pcb.flush_ptrace_hw_debug_regs();
-            // exec 成功提交后按新凭据重置可转储性。
+            // After commit, reset dumpability according to the new credentials.
             let cred = exec_pcb.cred();
             let dump = if cred.euid != cred.uid || cred.egid != cred.gid {
                 SUID_DUMPABLE.load(Ordering::SeqCst) as u8

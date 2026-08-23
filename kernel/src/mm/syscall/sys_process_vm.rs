@@ -139,7 +139,7 @@ fn find_target_process(pid: usize) -> Result<Arc<ProcessControlBlock>, SystemErr
     Ok(target_pcb)
 }
 
-/// 检查当前进程是否有权访问目标进程内存。
+/// Check whether the current process may access the target's memory.
 fn check_process_vm_access(target_pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     let current_pcb = ProcessManager::current_pcb();
     if !current_pcb.has_permission_to_trace(target_pcb, PtraceAccessCreds::RealCreds) {
@@ -174,7 +174,7 @@ fn total_iov_len(iovecs: &[IoVec]) -> Result<usize, SystemError> {
     Ok(total)
 }
 
-/// 远程/本地访问失败时的统一收尾：已有拷贝进展则返回短计数，否则返回 EFAULT。
+/// Common failure exit: return a short count on progress, EFAULT otherwise.
 fn partial_or_fault(bytes_copied: usize) -> Result<usize, SystemError> {
     if bytes_copied > 0 {
         Ok(bytes_copied)
@@ -183,7 +183,7 @@ fn partial_or_fault(bytes_copied: usize) -> Result<usize, SystemError> {
     }
 }
 
-/// 双向量游走的公共推进：按本次拷贝字节数前进本地/远程游标。
+/// Advance the local/remote cursors by the number of bytes just copied.
 fn advance_cursors(
     local_iovecs: &[IoVec],
     remote_iovecs: &[IoVec],
@@ -248,7 +248,7 @@ fn do_process_vm_readv(
     // Determine how much data to transfer
     let transfer_len = min(local_len, remote_len);
 
-    // 页粒度弹跳缓冲：远程侧读入弹跳缓冲，再受异常保护地写入本地用户缓冲。
+    // Page-granular bounce buffer: read the remote side, then write the local user buffer with exception protection.
     let mut bounce: alloc::boxed::Box<[u8]> = vec![0u8; MMArch::PAGE_SIZE].into_boxed_slice();
 
     let mut bytes_copied = 0usize;
@@ -292,7 +292,7 @@ fn do_process_vm_readv(
         let local_addr = local_iov.iov_base as usize + local_offset;
         let remote_addr = remote_iov.iov_base as usize + remote_offset;
 
-        // 远程侧
+        // Remote side
         let n = match target_vm.access_remote_vm(
             remote_addr,
             RemoteAccess::Read(&mut bounce[..chunk_len]),
@@ -305,7 +305,7 @@ fn do_process_vm_readv(
             return partial_or_fault(bytes_copied);
         }
 
-        // 本地侧：异常表保护的写入（只读/COW 用户页走正常缺页处理）。
+        // Local side: exception-protected write (read-only/COW pages fault normally).
         let mut writer = match UserBufferWriter::new(local_addr as *mut u8, n, true) {
             Ok(writer) => writer,
             Err(_) => return partial_or_fault(bytes_copied),
@@ -325,7 +325,7 @@ fn do_process_vm_readv(
             n,
         );
 
-        // 远程短拷：本段可访问区间用尽，停止搬运（不跳洞）。
+        // Remote short copy: accessible range exhausted, stop (no hole skipping).
         if n < chunk_len {
             break;
         }
@@ -377,7 +377,7 @@ fn do_process_vm_writev(
     // Determine how much data to transfer
     let transfer_len = min(local_len, remote_len);
 
-    // 页粒度弹跳缓冲：先受异常保护地读出本地用户数据，再写往远程地址空间。
+    // Page-granular bounce buffer: read local user data with exception protection, then write remotely.
     let mut bounce: alloc::boxed::Box<[u8]> = vec![0u8; MMArch::PAGE_SIZE].into_boxed_slice();
 
     let mut bytes_copied = 0usize;
@@ -421,7 +421,7 @@ fn do_process_vm_writev(
         let local_addr = local_iov.iov_base as usize + local_offset;
         let remote_addr = remote_iov.iov_base as usize + remote_offset;
 
-        // 本地侧：异常表保护的读取（未映射/只读且不可 COW 的源按 EFAULT 处理）。
+        // Local side: exception-protected read (unmapped or non-COW-able sources yield EFAULT).
         let reader = match UserBufferReader::new(local_addr as *const u8, chunk_len, true) {
             Ok(reader) => reader,
             Err(_) => return partial_or_fault(bytes_copied),
@@ -433,7 +433,7 @@ fn do_process_vm_writev(
             return partial_or_fault(bytes_copied);
         }
 
-        // 远程侧：force=false——写无 VM_WRITE 的映射直接失败（不 COW）。
+        // Remote side: force=false — writing a mapping without VM_WRITE fails (no COW).
         let n = match target_vm.access_remote_vm(
             remote_addr,
             RemoteAccess::Write(&bounce[..chunk_len]),
@@ -454,7 +454,7 @@ fn do_process_vm_writev(
             n,
         );
 
-        // 远程短拷：本段可写区间用尽，停止搬运（不跳洞）。
+        // Remote short copy: writable range exhausted, stop (no hole skipping).
         if n < chunk_len {
             break;
         }

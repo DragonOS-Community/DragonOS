@@ -75,7 +75,7 @@ impl Syscall {
         let nr = syscall_num as u64;
         let skip = current_pcb.ptrace_report_syscall(true, nr, &seccomp_args);
         if skip {
-            // SYSEMU：跳过真实 syscall 执行，回传当前返回值寄存器。
+            // SYSEMU: skip the real syscall, return the current return register.
             return Ok(frame.get_syscall_return());
         }
         // ptrace syscall-enter-stop 可能改写 syscall 号/参数，从 frame 重取。

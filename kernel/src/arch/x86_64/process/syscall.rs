@@ -108,7 +108,7 @@ impl Syscall {
                 writer.copy_one_to_user(&arch_info.gsbase, 0)?;
             }
             ARCH_SET_FS => {
-                // 仅校验 base 不越过用户地址空间上限：允许任何用户地址，拒绝内核地址。
+                // Only reject kernel addresses; any user address is allowed.
                 if arg2 >= MMArch::USER_END_VADDR.data() {
                     return Err(SystemError::EPERM);
                 }

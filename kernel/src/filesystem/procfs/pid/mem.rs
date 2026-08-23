@@ -76,7 +76,7 @@ impl FileOps for MemFileOps {
         if len == 0 {
             return Ok(0);
         }
-        // 只访问打开时钉住的地址空间。
+        // Only touch the address space pinned at open time.
         let Some(pinned_vm) = Self::pinned_vm_from_data(&data) else {
             return Ok(0);
         };
@@ -84,10 +84,10 @@ impl FileOps for MemFileOps {
             return Ok(0);
         }
         let actual_len = len.min(buf.len());
-        // 批量跨进程读
+        // Batched cross-process read
         let n =
             pinned_vm.access_remote_vm(offset, RemoteAccess::Read(&mut buf[..actual_len]), true)?;
-        // 读到 0 字节可能是“恰在拆除临界区边界”的竞态。复判一次，拆除已成事实则按 EOF 处理
+        // A zero read may race with tear-down; re-check once and treat as EOF if done.
         if n == 0 && actual_len > 0 && pinned_vm.is_torn_down() {
             return Ok(0);
         }
@@ -111,7 +111,7 @@ impl FileOps for MemFileOps {
         let Some(pinned_vm) = Self::pinned_vm_from_data(&data) else {
             return Ok(0);
         };
-        // 拆除后写同样按 EOF（0）处理
+        // After tear-down, writes are also treated as EOF (0)
         if pinned_vm.is_torn_down() {
             return Ok(0);
         }

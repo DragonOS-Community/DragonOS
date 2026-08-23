@@ -1,7 +1,7 @@
-//! `arch_prctl` 系统调用处理：控制/查询 FS/GS base 等架构相关选项。
+//! `arch_prctl` syscall handler: control/query arch options such as FS/GS base.
 //!
-//! 作为普通 syscall 表项走统一分发路径：参数在 ptrace entry-stop
-//! 之后从 frame 重取，tracer 的改写得以生效（与 Linux 一致）。
+//! Dispatched as a regular syscall table entry: args are re-read from the
+//! frame after the ptrace entry-stop, so tracer rewrites take effect.
 
 use crate::syscall::Syscall as SyscallDispatcher;
 use crate::{

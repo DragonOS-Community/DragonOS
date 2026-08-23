@@ -735,14 +735,14 @@ impl ProcessManager {
         }
     }
 
-    /// 释放旧用户地址空间：当没有任何任务还在使用它时，立即拆除全部映射
+    /// Release the old user address space: if no task still uses it, tear down all mappings
     pub(crate) fn release_old_user_vm_if_last(old_vm: Option<&Arc<AddressSpace>>) {
         let Some(old_vm) = old_vm else {
             return;
         };
         if old_vm.user_count_dec_and_test() {
             unsafe {
-                // 先持写锁拆除映射，再置 torn_down。与读者形成临界区边界。
+                // Unmap under the write lock, then set torn_down. This bounds the reader critical section.
                 old_vm.write().unmap_all();
             }
             old_vm.mark_torn_down();

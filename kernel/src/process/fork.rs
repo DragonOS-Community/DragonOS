@@ -1154,8 +1154,8 @@ impl ProcessManager {
             }
         }
 
-        // 全部可失败步骤已通过：此刻递增共享地址空间的用户计数。
-        // 子任务由调用方在此之后唤醒，运行前计数必然就位。
+        // All fallible steps passed: bump the shared space's user count now.
+        // The child is woken after this point, so the count is set before it runs.
         if clone_flags.contains(CloneFlags::CLONE_VM) {
             if let Some(shared_vm) = pcb.basic().user_vm() {
                 shared_vm.user_count_inc();

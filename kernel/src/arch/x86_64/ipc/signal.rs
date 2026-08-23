@@ -1082,7 +1082,7 @@ impl SignalArch for X86_64SignalArch {
         // 3. 恢复通用寄存器
         ucontext.restore_to_trapframe(trap_frame);
 
-        // 4. 恢复 FP 状态。
+        // 4. Restore FP state.
         if let Some(kernel_fp) = kernel_fp {
             let pcb = ProcessManager::current_pcb();
             let mut archinfo_guard = pcb.arch_info_irqsave();

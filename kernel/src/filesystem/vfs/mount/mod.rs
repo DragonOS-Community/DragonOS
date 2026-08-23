@@ -3183,6 +3183,51 @@ impl MountFSInode {
         Ok(())
     }
 
+    /// Create a regular file and publish its namespace event before another
+    /// mutation of the same parent can overtake it.  Atomic create/open and
+    /// the generic create fallback share this commit boundary.
+    pub(crate) fn create_file_with_post_commit(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        flags: &FileFlags,
+        post_commit: impl FnOnce(),
+    ) -> Result<(Arc<dyn IndexNode>, Option<PreopenedFile>), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let (inner_inode, mut preopened) =
+            match self.dentry.inode.create_and_open(name, mode, flags) {
+                Ok(opened) => (opened.inode(), Some(opened)),
+                Err(SystemError::ENOSYS) => {
+                    (self.dentry.inode.create(name, FileType::File, mode)?, None)
+                }
+                Err(err) => return Err(err),
+            };
+        // The backing namespace mutation is now committed.  Publish CREATE
+        // before Mount wrapper construction, which may still fail just as a
+        // later file-open step may fail on Linux after successful creation.
+        post_commit();
+        let wrapped = {
+            let _namespace_guard = self
+                .mount_fs
+                .super_block_state
+                .dentry_namespace_lock
+                .write();
+            let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            MountFSInode::new_child(
+                inner_inode,
+                self.mount_fs.clone(),
+                &parent,
+                DName::from(name),
+            )?
+        };
+        if let Some(opened) = preopened.as_mut() {
+            opened.replace_inode(wrapped.clone());
+        }
+        let inode: Arc<dyn IndexNode> = wrapped;
+        Ok((inode, preopened))
+    }
+
     /// Publish a successful hard link after its link-count state is updated,
     /// while the destination parent gate still orders it against unlink and
     /// other namespace mutations in that directory.

@@ -5,7 +5,7 @@ use system_error::SystemError;
 use super::{
     fcntl::AtFlags,
     file::{File, FileFlags, PreopenedFile},
-    mount::MountFlags,
+    mount::{MountFSInode, MountFlags},
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{
@@ -16,6 +16,7 @@ use super::{
     FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+use crate::libs::casting::DowncastArc;
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
     process::cred::CAPFlags,
@@ -349,8 +350,31 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                     if create_flags.contains(FileFlags::O_EXCL) {
                         create_flags.remove(FileFlags::O_TRUNC);
                     }
-                    let inode: Arc<dyn IndexNode> =
-                        match parent_inode.create_and_open(&filename, create_mode, &create_flags) {
+                    let notify = || {
+                        fsnotify::fsnotify(
+                            FsEvent::CREATE,
+                            Some((&parent_inode, &filename)),
+                            None,
+                            0,
+                        );
+                    };
+                    let inode: Arc<dyn IndexNode> = if let Some(mounted) =
+                        parent_inode.clone().downcast_arc::<MountFSInode>()
+                    {
+                        let (inode, opened) = mounted.create_file_with_post_commit(
+                            &filename,
+                            create_mode,
+                            &create_flags,
+                            notify,
+                        )?;
+                        preopened = opened;
+                        inode
+                    } else {
+                        let inode = match parent_inode.create_and_open(
+                            &filename,
+                            create_mode,
+                            &create_flags,
+                        ) {
                             Ok(opened) => {
                                 let inode = opened.inode();
                                 preopened = Some(opened);
@@ -361,13 +385,14 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                             }
                             Err(err) => return Err(err),
                         };
-                    // fsnotify：创建成功 → 父目录得 IN_CREATE（子项是普通文件，IN_ISDIR 不置位）。
-                    fsnotify::fsnotify(
-                        FsEvent::CREATE,
-                        Some((&parent_inode, &filename)),
-                        Some(&inode),
-                        0,
-                    );
+                        fsnotify::fsnotify(
+                            FsEvent::CREATE,
+                            Some((&parent_inode, &filename)),
+                            Some(&inode),
+                            0,
+                        );
+                        inode
+                    };
                     created = true;
                     let created_path = ResolvedPath::new(inode)?;
                     drop(parent_resolved);

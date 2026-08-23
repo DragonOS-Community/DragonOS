@@ -288,6 +288,89 @@ TEST(InotifyNamespaceEvents, ConcurrentMknodDeletePreservesCommitOrder) {
     rmdir(dir.c_str());
 }
 
+TEST(InotifyNamespaceEvents, ConcurrentOpenCreateDeletePreservesCommitOrder) {
+    const std::string dir = "/tmp/dunitest_inotify_open_create_order";
+    ASSERT_EQ(mkdir(dir.c_str(), 0777), 0) << strerror(errno);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, dir.c_str(), IN_CREATE | IN_DELETE), 0);
+
+    constexpr int kFiles = 64;
+    std::atomic<int> worker_error{0};
+    std::atomic<bool> stop{false};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::thread remover([&]() {
+        for (int i = 0; i < kFiles; ++i) {
+            const std::string path = dir + "/file_" + std::to_string(i);
+            struct stat st {};
+            while (lstat(path.c_str(), &st) != 0) {
+                if (errno != ENOENT) {
+                    worker_error.store(errno);
+                    return;
+                }
+                if (stop.load()) return;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    worker_error.store(ETIMEDOUT);
+                    stop.store(true);
+                    return;
+                }
+                sched_yield();
+            }
+            if (unlink(path.c_str()) != 0) {
+                worker_error.store(errno);
+                return;
+            }
+        }
+    });
+
+    for (int i = 0; i < kFiles; ++i) {
+        const std::string path = dir + "/file_" + std::to_string(i);
+        int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd < 0) {
+            worker_error.store(errno);
+            stop.store(true);
+            break;
+        }
+        close(fd);
+        struct stat st {};
+        while (lstat(path.c_str(), &st) == 0) {
+            if (worker_error.load() != 0 || std::chrono::steady_clock::now() >= deadline) {
+                if (worker_error.load() == 0) worker_error.store(ETIMEDOUT);
+                stop.store(true);
+                break;
+            }
+            sched_yield();
+        }
+        if (stop.load()) break;
+        if (errno != ENOENT) {
+            worker_error.store(errno);
+            stop.store(true);
+            break;
+        }
+    }
+    remover.join();
+    ASSERT_EQ(worker_error.load(), 0) << strerror(worker_error.load());
+
+    auto evs = drain_events(ifd);
+    for (int i = 0; i < kFiles; ++i) {
+        const std::string name = "file_" + std::to_string(i);
+        int created = -1;
+        int deleted = -1;
+        for (size_t j = 0; j < evs.size(); ++j) {
+            if (evs[j].name != name) continue;
+            if (created < 0 && (evs[j].mask & IN_CREATE)) created = static_cast<int>(j);
+            if (deleted < 0 && (evs[j].mask & IN_DELETE)) deleted = static_cast<int>(j);
+        }
+        ASSERT_GE(created, 0) << "missing IN_CREATE for " << name;
+        ASSERT_GE(deleted, 0) << "missing IN_DELETE for " << name;
+        EXPECT_LT(created, deleted) << "namespace events reordered for " << name;
+    }
+
+    close(ifd);
+    rmdir(dir.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // IN_ATTRIB: changing file metadata (chmod) delivers IN_ATTRIB.
 // ---------------------------------------------------------------------------

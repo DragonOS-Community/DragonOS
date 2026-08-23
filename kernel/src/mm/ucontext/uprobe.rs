@@ -485,8 +485,7 @@ pub enum UprobeSiteState {
 pub struct UprobeSite {
     pub definition: Arc<UprobeDefinition>,
     pub probe_vaddr: usize,
-    mapping: Weak<LockedVMA>,
-    mapping_state_seq: u64,
+    mapping_lineage_id: u64,
     pub xol_lease: Arc<XolSlotLease>,
     /// Immutable hit-path snapshot. Writers rebuild it in process context;
     /// #BP only clones the Arc and never allocates.
@@ -855,8 +854,7 @@ fn uprobe_register(
         Arc::new(UprobeSite {
             definition: consumer.definition.clone(),
             probe_vaddr,
-            mapping: Arc::downgrade(&vma),
-            mapping_state_seq: vma.state_seq(),
+            mapping_lineage_id: vma.lineage_id(),
             xol_lease: xol_lease.clone(),
             participants: RwLock::new(Arc::new(Vec::new())),
             state: AtomicU8::new(UprobeSiteState::Prepared as u8),
@@ -1274,15 +1272,13 @@ fn rebuild_site_participants(mm: &AddressSpace, probe_vaddr: usize, site: &Arc<U
 }
 
 /// 注销前按 Linux `register_for_each_vma()` 的方式在 mm 写锁下重验映射身份，
-/// 防止 munmap 后同一虚址被无关文件复用时写坏新映射。
+/// 防止 munmap 后同一虚址被无关文件复用时写坏新映射。VMA split 会创建新的
+/// `LockedVMA` 对象，但保留相同的映射 lineage，因此不会丢失 retained segment。
 fn site_mapping_still_matches(inner: &InnerAddressSpace, site: &UprobeSite) -> bool {
     let Some(vma) = inner.mappings.contains(VirtAddr::new(site.probe_vaddr)) else {
         return false;
     };
-    let Some(original_vma) = site.mapping.upgrade() else {
-        return false;
-    };
-    if !Arc::ptr_eq(&vma, &original_vma) || vma.state_seq() != site.mapping_state_seq {
+    if vma.lineage_id() != site.mapping_lineage_id {
         return false;
     }
     let guard = vma.lock();

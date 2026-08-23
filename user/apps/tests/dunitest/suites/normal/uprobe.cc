@@ -963,6 +963,35 @@ TEST(UprobeTest, SameAddressConsumersCloseIndependently) {
     }
 }
 
+TEST(UprobeTest, PartialUnmapPreservesProbeMappingIdentity) {
+    char path[] = "/tmp/uprobe_split_identity_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    constexpr size_t kPageSize = 4096;
+    constexpr size_t kMappingSize = 3 * kPageSize;
+    void* mapping = mmap(nullptr, kMappingSize, PROT_READ | PROT_EXEC,
+                         MAP_PRIVATE, file.get(), 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    auto target = reinterpret_cast<int (*)(int)>(mapping);
+    EXPECT_EQ(target(12), 25);
+
+    // Removing an unrelated middle page splits the original VMA and replaces
+    // the retained prefix with a new VMA object. The persistent probe still
+    // belongs to the same file mapping and must survive disable/re-enable.
+    ASSERT_EQ(munmap(static_cast<char*>(mapping) + kPageSize, kPageSize), 0);
+    ASSERT_EQ(ioctl(event.get(), PERF_EVENT_IOC_DISABLE, 0), 0);
+    ASSERT_EQ(ioctl(event.get(), PERF_EVENT_IOC_ENABLE, 0), 0)
+        << "errno=" << errno;
+    EXPECT_EQ(target(13), 27);
+
+    munmap(mapping, kPageSize);
+    munmap(static_cast<char*>(mapping) + 2 * kPageSize, kPageSize);
+    unlink(path);
+}
+
 TEST(UprobeTest, DifferentAddressesOnSamePageRemainIndependent) {
     constexpr unsigned char two_targets[] = {
         0x8d, 0x44, 0x3f, 0x01,  // lea eax,[rdi+rdi+1]

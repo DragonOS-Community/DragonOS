@@ -92,6 +92,12 @@ pub fn check_mmap_min_addr(vaddr: VirtAddr, min_vaddr: VirtAddr) -> Result<(), S
 static LOCKEDVMA_ID_ALLOCATOR: SpinLock<IdAllocator> =
     SpinLock::new(IdAllocator::new(0, usize::MAX).unwrap());
 
+/// Monotonic identity for one logical mapping incarnation.
+///
+/// Unlike `LockedVMA::id`, this identity is inherited by VMA objects created
+/// when a mapping is split. A genuinely new mapping gets a fresh identity.
+static LOCKEDVMA_LINEAGE_ID_ALLOCATOR: AtomicU64 = AtomicU64::new(1);
+
 /// Global unique ID allocator for AddressSpace
 /// Used to assign a globally unique and monotonically increasing ID to each address space
 static ADDRESS_SPACE_ID_ALLOCATOR: AtomicU64 = AtomicU64::new(1);

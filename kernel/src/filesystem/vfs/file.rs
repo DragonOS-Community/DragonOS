@@ -2111,10 +2111,11 @@ impl File {
         // read_dir_impl has released readdir_state before this metadata update,
         // avoiding a cross-filesystem lock-order dependency.
         self.touch_atime_after_access();
-        if !self
-            .mode
-            .read()
-            .intersects(FileMode::FMODE_PATH | FileMode::FMODE_NONOTIFY)
+        if fsnotify::has_any_watch()
+            && !self
+                .mode
+                .read()
+                .intersects(FileMode::FMODE_PATH | FileMode::FMODE_NONOTIFY)
         {
             self.notify_fs_event(FsEvent::ACCESS);
         }

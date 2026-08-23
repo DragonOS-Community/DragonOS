@@ -3,14 +3,11 @@ use system_error::SystemError;
 use crate::{
     arch::interrupt::TrapFrame,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::{
-        fsnotify::{self, FsEvent},
-        vfs::{
-            fcntl::AtFlags,
-            utils::{rsplit_path, user_path_at},
-            vcore::resolve_parent_inode,
-            IndexNode, InodeMode, MAX_PATHLEN, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        },
+    filesystem::vfs::{
+        fcntl::AtFlags,
+        utils::{rsplit_path, user_path_at},
+        vcore::resolve_parent_inode,
+        IndexNode, InodeMode, MAX_PATHLEN, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     process::ProcessManager,
     syscall::{
@@ -82,8 +79,7 @@ impl Syscall for SysMknodHandle {
         let parent_inode: Arc<dyn IndexNode> = resolve_parent_inode(inode_begin, parent_path)?;
 
         // 创建节点
-        parent_inode.mknod(filename, mode, dev)?;
-        fsnotify::fsnotify(FsEvent::CREATE, Some((&parent_inode, filename)), None, 0);
+        super::mknod_utils::mknod_and_notify(&parent_inode, filename, mode, dev)?;
 
         Ok(0)
     }

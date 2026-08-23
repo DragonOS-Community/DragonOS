@@ -3167,6 +3167,22 @@ impl MountFSInode {
         )
     }
 
+    /// Publish a successful mknod while the parent gate still orders it
+    /// against unlink and another create of the same name.
+    pub(crate) fn mknod_with_post_commit(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        self.dentry.inode.mknod(filename, mode, dev_t)?;
+        post_commit();
+        Ok(())
+    }
+
     fn move_to_with_context_impl(
         &self,
         old_name: &str,

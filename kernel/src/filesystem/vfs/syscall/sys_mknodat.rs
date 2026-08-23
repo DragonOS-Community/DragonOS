@@ -2,7 +2,6 @@ use super::InodeMode;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_MKNODAT;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::fsnotify::{self, FsEvent};
 use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
@@ -75,8 +74,7 @@ impl Syscall for SysMknodatHandle {
         }
 
         // 在解析出的父目录上进行 mknod
-        current_inode.mknod(name, mode, dev)?;
-        fsnotify::fsnotify(FsEvent::CREATE, Some((&current_inode, name)), None, 0);
+        super::mknod_utils::mknod_and_notify(&current_inode, name, mode, dev)?;
 
         Ok(0)
     }

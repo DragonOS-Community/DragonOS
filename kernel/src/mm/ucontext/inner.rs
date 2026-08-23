@@ -230,6 +230,19 @@ impl InnerAddressSpace {
                     }
                 }
             }
+
+            // File-backed child VMAs are already present in file-rmap, so a
+            // system-wide uprobe registration can discover them as soon as
+            // this write guard is released. Reconcile inherited INT3 bytes
+            // while the child mm is still exclusively locked; otherwise a
+            // registration scan can observe an empty hit table with a stale
+            // breakpoint and reject a valid consumer.
+            #[cfg(target_arch = "x86_64")]
+            super::uprobe::fork_restore_inherited_uprobes_locked(
+                &parent_mm,
+                &new_addr_space,
+                &mut new_guard,
+            )?;
             Ok(())
         })();
 
@@ -257,10 +270,12 @@ impl InnerAddressSpace {
         // since no pages enter pending_pages here, this actually only triggers flush_tlb_mm_range.
         parent_tlb.finish();
 
-        // uprobe：把父 mm 的探针继承到子 mm（评审 R9——fork 后探针存活；
-        // 子页经上面的正常 fork 拷贝已含 0xcc，这里私有化并重建 per-mm 实例）。
+        // The inherited breakpoint bytes were restored before publishing the
+        // child mm above. Replay currently enabled, permitted consumers after
+        // releasing the child lock; concurrent registry scans are idempotent
+        // under the same mm.write() serialization domain.
         #[cfg(target_arch = "x86_64")]
-        super::uprobe::fork_inherit_uprobes(&parent_mm, &new_addr_space)?;
+        super::uprobe::fork_inherit_uprobes(&new_addr_space)?;
 
         return Ok(new_addr_space);
     }

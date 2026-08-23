@@ -32,6 +32,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <linux/perf_event.h>
@@ -730,6 +731,92 @@ TEST(UprobeTest, LargeBpfJitProgramAttachesSafely) {
     ASSERT_GE(program.get(), 0) << "large BPF_PROG_LOAD failed, errno=" << errno;
     EXPECT_EQ(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0)
         << "large SET_BPF failed, errno=" << errno;
+}
+
+// A forked child initially shares the parent's private breakpoint page.  A
+// concurrent system-wide registration must never observe the child's VMA
+// before the inherited INT3 has been reconciled with its empty hit table.
+TEST(UprobeTest, ConcurrentSystemWideRegistrationDuringFork) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+
+    FdGuard task_event(open_uprobe_perf_event(path, offset));
+    ASSERT_GE(task_event.get(), 0) << "task uprobe failed, errno=" << errno;
+
+    UprobePerfEventOptions system_options;
+    system_options.pid = -1;
+    system_options.cpu = 0;
+    system_options.disabled = true;
+    FdGuard system_event(
+        open_uprobe_perf_event(path, offset, system_options));
+    ASSERT_GE(system_event.get(), 0)
+        << "disabled system-wide uprobe failed, errno=" << errno;
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> ready{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> registration_errno{0};
+    std::atomic<unsigned int> registrations{0};
+    std::atomic<unsigned int> fork_epoch{0};
+    std::thread registrar([&]() {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        ready.store(true, std::memory_order_release);
+        unsigned int observed_epoch = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            const unsigned int current_epoch =
+                fork_epoch.load(std::memory_order_acquire);
+            if (current_epoch == observed_epoch) {
+                std::this_thread::yield();
+                continue;
+            }
+            observed_epoch = current_epoch;
+            if (ioctl(system_event.get(), PERF_EVENT_IOC_ENABLE, 0) < 0) {
+                registration_errno.store(errno, std::memory_order_release);
+                break;
+            }
+            registrations.fetch_add(1, std::memory_order_relaxed);
+            if (ioctl(system_event.get(), PERF_EVENT_IOC_DISABLE, 0) < 0) {
+                registration_errno.store(errno, std::memory_order_release);
+                break;
+            }
+        }
+    });
+
+    start.store(true, std::memory_order_release);
+    while (!ready.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    int child_failure = 0;
+    for (int i = 0; i < 200 &&
+                    registration_errno.load(std::memory_order_acquire) == 0;
+         ++i) {
+        fork_epoch.fetch_add(1, std::memory_order_release);
+        const pid_t child = fork();
+        if (child < 0) {
+            child_failure = errno;
+            break;
+        }
+        if (child == 0) {
+            _exit(uprobe_target(i) == i * 2 + 1 ? 0 : 1);
+        }
+        int status = 0;
+        if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0) {
+            child_failure = ECHILD;
+            break;
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    registrar.join();
+
+    EXPECT_GT(registrations.load(std::memory_order_relaxed), 0U);
+    EXPECT_EQ(child_failure, 0) << "forked child failed";
+    EXPECT_EQ(registration_errno.load(std::memory_order_acquire), 0)
+        << "concurrent system-wide registration failed";
 }
 
 // Exercise the exact window where one CPU has executed INT3 while another

@@ -1846,14 +1846,17 @@ fn uprobe_apply_to_all_vmas_strict(mm: &Arc<AddressSpace>) -> Result<(), SystemE
     Ok(())
 }
 
-/// fork 时把父 mm 的探针继承到子 mm（评审 R9）。
+/// Restore breakpoint bytes inherited through fork COW before the child mm is
+/// exposed without its write lock.
 ///
-/// 在 clone 完成、父 mm 全部锁释放后调用；子 mm 尚无运行线程。
-/// 子页经 fork 已含父页的 0xcc（共享只读映射），此处将其私有化并重建
-/// per-mm 实例（slot/表项），沿用父实例的 consumer_id（消费者 close 一并注销）。
-pub fn fork_inherit_uprobes(
+/// Child file VMAs are already linked into file-rmap at this point. Keeping
+/// their mm write-locked while replacing inherited breakpoint pages prevents
+/// a concurrent system-wide registry scan from observing `0xcc` without the
+/// corresponding child hit-table entry.
+pub(crate) fn fork_restore_inherited_uprobes_locked(
     parent_mm: &Arc<AddressSpace>,
     child_mm: &Arc<AddressSpace>,
+    inner: &mut InnerAddressSpace,
 ) -> Result<(), SystemError> {
     // The child initially shares the parent's private breakpoint pages through
     // normal fork COW.  Restore every inherited 0xcc in one private copy per
@@ -1882,7 +1885,6 @@ pub fn fork_inherit_uprobes(
         return Ok(());
     }
 
-    let mut inner = child_mm.write();
     for (page_base, patches) in snapshot {
         let address = VirtAddr::new(page_base);
         let Some(vma) = inner.mappings.contains(address) else {
@@ -1928,8 +1930,12 @@ pub fn fork_inherit_uprobes(
             false,
         );
     }
-    drop(inner);
-
-    uprobe_apply_to_all_vmas_strict(child_mm)?;
     Ok(())
+}
+
+/// Replay all currently enabled consumers after fork has published a clean
+/// child address space. Concurrent register scans are idempotent because both
+/// paths serialize installation with the child mm write lock.
+pub fn fork_inherit_uprobes(child_mm: &Arc<AddressSpace>) -> Result<(), SystemError> {
+    uprobe_apply_to_all_vmas_strict(child_mm)
 }

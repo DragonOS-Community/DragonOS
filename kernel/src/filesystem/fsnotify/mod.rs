@@ -46,6 +46,7 @@ pub struct FsNotifyTarget {
     pub id: FsNotifyObjectId,
     pub is_dir: bool,
     pub disconnected: bool,
+    pub watched: bool,
 }
 
 #[derive(Debug)]
@@ -53,6 +54,38 @@ pub(crate) struct FsNotifyDeleteState {
     pending: bool,
     committed: bool,
     nlinks: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct FsNotifyObjectState {
+    pub(crate) delete: Mutex<FsNotifyDeleteState>,
+    watches: AtomicUsize,
+}
+
+impl FsNotifyObjectState {
+    pub(crate) fn new(nlinks: usize) -> Self {
+        Self {
+            delete: Mutex::new(FsNotifyDeleteState::new(nlinks)),
+            watches: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn has_watches(&self) -> bool {
+        self.watches.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn watch_added(&self) {
+        self.watches.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn watch_removed(&self) {
+        let result = self
+            .watches
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
+        debug_assert!(result.is_ok(), "fsnotify object watch count underflow");
+    }
 }
 
 impl FsNotifyDeleteState {
@@ -71,7 +104,8 @@ impl FsNotifyDeleteState {
 
 pub fn target_for_inode(inode: &Arc<dyn IndexNode>) -> Result<FsNotifyTarget, SystemError> {
     if let Some(mounted) = inode.clone().downcast_arc::<MountFSInode>() {
-        let (superblock, ino, generation, file_type, disconnected) = mounted.fsnotify_target();
+        let (superblock, ino, generation, file_type, disconnected, watched) =
+            mounted.fsnotify_target();
         return Ok(FsNotifyTarget {
             id: FsNotifyObjectId {
                 superblock,
@@ -80,6 +114,7 @@ pub fn target_for_inode(inode: &Arc<dyn IndexNode>) -> Result<FsNotifyTarget, Sy
             },
             is_dir: file_type == FileType::Dir,
             disconnected,
+            watched,
         });
     }
     let md = inode.metadata()?;
@@ -91,6 +126,9 @@ pub fn target_for_inode(inode: &Arc<dyn IndexNode>) -> Result<FsNotifyTarget, Sy
         },
         is_dir: md.file_type == FileType::Dir,
         disconnected: md.nlinks == 0,
+        // Non-mounted kernel objects do not own a shared MountFS object state.
+        // Keep their uncommon dispatch path conservative.
+        watched: true,
     })
 }
 
@@ -221,16 +259,23 @@ pub(crate) fn note_link_removed(state: &mut FsNotifyDeleteState) -> bool {
 
 /// Called at the irreversible dentry/inode detach boundary. The first alias
 /// that observes a pending zero-link object commits DELETE_SELF exactly once.
-pub(crate) fn notify_dentry_detach(id: FsNotifyObjectId, state: &mut FsNotifyDeleteState) {
+pub(crate) fn notify_dentry_detach(
+    id: FsNotifyObjectId,
+    object: &FsNotifyObjectState,
+    state: &mut FsNotifyDeleteState,
+) {
     if !state.pending {
         return;
     }
     state.pending = false;
     state.committed = true;
-    notify_object_delete(id);
+    notify_object_delete(id, object);
 }
 
-pub(crate) fn notify_object_delete(id: FsNotifyObjectId) {
+pub(crate) fn notify_object_delete(id: FsNotifyObjectId, object: &FsNotifyObjectState) {
+    if !object.has_watches() {
+        return;
+    }
     let marks = FSNOTIFY_MARKS.lock().get(&id).cloned();
     for mark in marks
         .iter()
@@ -294,19 +339,19 @@ pub(crate) fn notify_unmount(superblock: usize) {
     }
 }
 
-/// 记录一次 watch 计数变更（add +1，撤销 -1）。仅用于短路，Relaxed 即可。
+/// 记录一次 watch 计数变更（add +1，撤销 -1）。
 pub(crate) fn adjust_total_watches(delta: i32) {
     if delta >= 0 {
-        TOTAL_WATCHES.fetch_add(delta as usize, Ordering::Relaxed);
+        TOTAL_WATCHES.fetch_add(delta as usize, Ordering::Release);
     } else {
-        TOTAL_WATCHES.fetch_sub((-delta) as usize, Ordering::Relaxed);
+        TOTAL_WATCHES.fetch_sub((-delta) as usize, Ordering::AcqRel);
     }
 }
 
 /// 系统中是否存在任意 inotify watch。供 VFS 热路径（open/read/write/close）做廉价短路：
 /// 无 watch 时完全跳过 parent 解析与 fsnotify 调用（零开销）。
 pub fn has_any_watch() -> bool {
-    TOTAL_WATCHES.load(Ordering::Relaxed) != 0
+    TOTAL_WATCHES.load(Ordering::Acquire) != 0
 }
 
 pub(crate) fn index_add(mark: &Arc<FsNotifyMark>) -> Result<(), SystemError> {
@@ -447,9 +492,15 @@ pub(crate) fn fsnotify_targets(
         return;
     }
     let (child_key, event_is_dir, child_unlinked) = child
-        .map(|target| (Some(target.id), target.is_dir, target.disconnected))
+        .map(|target| {
+            (
+                target.watched.then_some(target.id),
+                target.is_dir,
+                target.disconnected,
+            )
+        })
         .unwrap_or((None, false, false));
-    let parent_key = parent.map(|(target, _)| target.id);
+    let parent_key = parent.and_then(|(target, _)| target.watched.then_some(target.id));
 
     if child_key.is_none() && parent_key.is_none() {
         return;

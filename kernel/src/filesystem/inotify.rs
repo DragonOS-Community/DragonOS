@@ -27,8 +27,8 @@ use crate::arch::MMArch;
 use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::fsnotify::{
-    self, mark, EnqueueResult, FsEvent, FsNotifyBackend, FsNotifyDeleteState, FsNotifyGroup,
-    FsNotifyMark,
+    self, mark, EnqueueResult, FsEvent, FsNotifyBackend, FsNotifyGroup, FsNotifyMark,
+    FsNotifyObjectState,
 };
 use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::file::{File, FileFlags, FileMode, FilePrivateData};
@@ -606,7 +606,7 @@ impl InotifyInode {
         &self,
         inode: Arc<dyn IndexNode>,
         mask: u32,
-        delete_lifecycle: Option<Arc<Mutex<FsNotifyDeleteState>>>,
+        object_state: Option<Arc<FsNotifyObjectState>>,
     ) -> Result<i32, SystemError> {
         // mask 校验：仅允许已知位。
         Self::validate_watch_mask(mask)?;
@@ -648,7 +648,7 @@ impl InotifyInode {
                 drop(_dispatch);
                 drop(marks);
                 mark::destroy_mark(&stale);
-                return self.add_watch_inner(inode, mask, delete_lifecycle);
+                return self.add_watch_inner(inode, mask, object_state);
             }
             if (mask & user_mask::IN_MASK_ADD) != 0 {
                 existing.mask.fetch_or(event_mask, Ordering::Relaxed);
@@ -689,7 +689,7 @@ impl InotifyInode {
             wd,
             group: Arc::downgrade(&self.group),
             _inode: fsnotify::canonical_inode(inode.clone()),
-            _delete_lifecycle: delete_lifecycle,
+            object_state,
             object_id: target_identity,
             dispatch_lock: Mutex::new(()),
             active: AtomicBool::new(true),
@@ -704,6 +704,13 @@ impl InotifyInode {
         reserve_watch(&self.state.quota_keys)?;
         fsnotify::adjust_total_watches(1);
 
+        if let Some(state) = mark.object_state.as_ref() {
+            // Publish the local presence hint before the mark can become
+            // visible in the global index. A concurrent removal therefore
+            // cannot observe and destroy an uncharged mark.
+            state.watch_added();
+        }
+
         // 持 marks 锁完成全部插入（wd 表 / group.marks / 全局索引）。
         self.state.wd.lock().map.insert(wd, Arc::downgrade(&mark));
         marks.insert(target_identity, mark.clone());
@@ -713,6 +720,9 @@ impl InotifyInode {
         if let Err(error) = fsnotify::index_add(&mark) {
             marks.remove(&target_identity);
             self.state.wd.lock().map.remove(&wd);
+            if let Some(state) = mark.object_state.as_ref() {
+                state.watch_removed();
+            }
             fsnotify::adjust_total_watches(-1);
             release_quota(&self.state.quota_keys, 0, 1);
             return Err(error);
@@ -751,6 +761,9 @@ impl InotifyInode {
             m.active.store(false, Ordering::Release);
             drop(dispatch);
             fsnotify::index_remove(m);
+            if let Some(state) = m.object_state.as_ref() {
+                state.watch_removed();
+            }
             self.state.wd.lock().map.remove(&m.wd);
         }
         if n > 0 {

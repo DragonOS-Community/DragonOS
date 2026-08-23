@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::filesystem::vfs::IndexNode;
 
 use super::{
-    adjust_total_watches, index_remove, FsNotifyDeleteState, FsNotifyGroup, FsNotifyObjectId,
+    adjust_total_watches, index_remove, FsNotifyGroup, FsNotifyObjectId, FsNotifyObjectState,
 };
 use crate::libs::mutex::Mutex;
 
@@ -22,8 +22,9 @@ pub struct FsNotifyMark {
     pub group: Weak<FsNotifyGroup>,
     /// 强引用：watch 期间 pin 住 inode（防 evict，保证 InodeId 不复用）。
     pub _inode: Arc<dyn IndexNode>,
-    /// Keeps per-object delete state alive without retaining a dentry.
-    pub(crate) _delete_lifecycle: Option<Arc<Mutex<FsNotifyDeleteState>>>,
+    /// Keeps the shared per-object notification state alive without retaining
+    /// a dentry.
+    pub(crate) object_state: Option<Arc<FsNotifyObjectState>>,
     /// Captured once at watch creation; removal never performs metadata I/O.
     pub object_id: FsNotifyObjectId,
     /// Serializes dispatch with update/removal. This closes the one-shot and
@@ -84,6 +85,9 @@ pub fn destroy_mark(mark: &Arc<FsNotifyMark>) {
         group.backend.free_mark(mark);
         // 从全局索引移除。
         index_remove(mark);
+        if let Some(state) = mark.object_state.as_ref() {
+            state.watch_removed();
+        }
         // 维护全局 watch 计数（唯一计数器，覆盖上限检查 + 快速路径）。
         adjust_total_watches(-1);
     }

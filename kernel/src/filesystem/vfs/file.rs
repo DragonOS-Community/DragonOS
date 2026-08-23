@@ -633,6 +633,11 @@ pub struct File {
     /// 唯一 open file description id，用于 flock owner 标识。
     open_file_id: usize,
     inode: Arc<dyn IndexNode>,
+    /// Original pathname inode when open substitutes a runtime special inode
+    /// (for example, a named FIFO's LockedPipeInode).  Linux keeps this
+    /// identity in file->f_path for fsnotify even though I/O uses the special
+    /// inode.  Anonymous objects and ordinary files need no extra reference.
+    fsnotify_path_inode: Option<Arc<dyn IndexNode>>,
     /// Filesystem selected when this open file description was created.
     ///
     /// Mount wrappers retain the mount selected by path lookup. Cache that
@@ -1162,6 +1167,7 @@ impl File {
         mut preopened: Option<PreopenedFile>,
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
+        let path_inode = inode.clone();
         let mut file_type = inode.metadata()?.file_type;
         let is_path = flags.contains(FileFlags::O_PATH);
 
@@ -1274,6 +1280,7 @@ impl File {
 
         let f = File {
             open_file_id: alloc_open_file_id(),
+            fsnotify_path_inode: (!Arc::ptr_eq(&inode, &path_inode)).then_some(path_inode),
             inode,
             io_fs,
             offset: AtomicUsize::new(0),
@@ -1302,9 +1309,23 @@ impl File {
     /// Dispatch using one coherent dentry snapshot. This keeps the read/write
     /// hot path free of namespace walks and temporary String allocations.
     pub(crate) fn notify_fs_event(&self, mask: FsEvent) {
-        if let Some(mounted) = self.inode.clone().downcast_arc::<MountFSInode>() {
+        let event_inode = self.fsnotify_path_inode.as_ref().unwrap_or(&self.inode);
+        if let Some(mounted) = event_inode.clone().downcast_arc::<MountFSInode>() {
             let (child, parent) = mounted.fsnotify_snapshot();
-            if let Some((parent, name)) = parent.as_ref() {
+            // Linux deliberately withholds ACCESS/MODIFY child events from a
+            // special file's parent directory to avoid a side channel.  The
+            // special inode itself still receives the event through f_path.
+            let special_content_event = mask.intersects(FsEvent::ACCESS | FsEvent::MODIFY)
+                && matches!(
+                    self.file_type,
+                    FileType::BlockDevice
+                        | FileType::CharDevice
+                        | FileType::FramebufferDevice
+                        | FileType::KvmDevice
+                        | FileType::Pipe
+                        | FileType::Socket
+                );
+            if let Some((parent, name)) = parent.as_ref().filter(|_| !special_content_event) {
                 fsnotify::fsnotify_targets(
                     mask,
                     Some((parent, name.0.as_str())),
@@ -1316,7 +1337,21 @@ impl File {
                 fsnotify::fsnotify_targets(mask, None, Some(&child), 0, true);
             }
         } else {
-            fsnotify::fsnotify(mask, None, Some(&self.inode), 0);
+            fsnotify::fsnotify(mask, None, Some(event_inode), 0);
+        }
+    }
+
+    /// Publish an I/O event when this open file description participates in
+    /// userspace-visible I/O.  Internal FMODE_NONOTIFY users must not recurse
+    /// into fsnotify, and O_PATH descriptors never perform such I/O.
+    pub(crate) fn notify_io_event(&self, mask: FsEvent) {
+        if !self
+            .mode
+            .read()
+            .intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
+            && fsnotify::has_any_watch()
+        {
+            self.notify_fs_event(mask);
         }
     }
 
@@ -1401,6 +1436,16 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
     pub fn pread(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.pread_with_fsnotify(offset, len, buf, true)
+    }
+
+    fn pread_with_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        emit_fsnotify: bool,
+    ) -> Result<usize, SystemError> {
         // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
         let mode = *self.mode.read();
         if mode.contains(FileMode::FMODE_PATH) {
@@ -1429,7 +1474,29 @@ impl File {
             return Err(SystemError::EINVAL);
         }
 
-        self.do_read(offset, len, buf, false)
+        self.do_read_with_fsnotify(offset, len, buf, false, emit_fsnotify)
+    }
+
+    /// Read for splice while deferring ACCESS until the transfer commits.
+    /// This preserves the normal permission, readahead and atime behavior but
+    /// lets do_splice publish MODIFY(out) before ACCESS(in), as Linux does.
+    pub(crate) fn read_for_splice(
+        &self,
+        offset: Option<usize>,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        match offset {
+            Some(offset) => self.pread_with_fsnotify(offset, len, buf, false),
+            None => {
+                let offset = if self.mode.read().contains(FileMode::FMODE_STREAM) {
+                    0
+                } else {
+                    self.offset.load(Ordering::SeqCst)
+                };
+                self.do_read_with_fsnotify(offset, len, buf, false, false)
+            }
+        }
     }
 
     /// ## 从buf向文件中指定的偏移处写入指定的字节数的数据
@@ -1574,6 +1641,17 @@ impl File {
         buf: &mut [u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
+        self.do_read_with_fsnotify(offset, len, buf, update_offset, true)
+    }
+
+    fn do_read_with_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        update_offset: bool,
+        emit_fsnotify: bool,
+    ) -> Result<usize, SystemError> {
         self.readable()?;
         // Linux/POSIX: count==0 must not touch the buffer and must not block.
         if len == 0 {
@@ -1611,7 +1689,8 @@ impl File {
         }
         // fsnotify：仅在实际读到数据（len > 0）时投递 IN_ACCESS（FMODE_NONOTIFY 短路）。
         // EOF 读（len==0）不投递——与 atime 语义独立。
-        if len > 0
+        if emit_fsnotify
+            && len > 0
             && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
             && fsnotify::has_any_watch()
         {
@@ -2143,6 +2222,16 @@ impl File {
         return self.inode.clone();
     }
 
+    /// Inode selected by the pathname that opened this file. Special-file I/O
+    /// may use a substituted runtime inode, but procfs fd links and fsnotify
+    /// must retain Linux file->f_path identity.
+    #[inline]
+    pub(crate) fn path_inode(&self) -> Arc<dyn IndexNode> {
+        self.fsnotify_path_inode
+            .clone()
+            .unwrap_or_else(|| self.inode.clone())
+    }
+
     /// Invoke an operation on the filesystem selected for this open file.
     ///
     /// Pathname-backed files retain their selected mount and therefore avoid
@@ -2208,6 +2297,7 @@ impl File {
         let res = Self {
             open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
+            fsnotify_path_inode: self.fsnotify_path_inode.clone(),
             io_fs: self.io_fs.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
             flags: RwSem::new(flags),

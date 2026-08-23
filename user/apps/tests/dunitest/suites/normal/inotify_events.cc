@@ -36,6 +36,7 @@
 namespace {
 
 struct Ev {
+    int wd;
     uint32_t mask;
     uint32_t cookie;
     std::string name;
@@ -57,7 +58,8 @@ std::vector<Ev> drain_events(int ifd) {
         if (n == 0) break;
         for (char *p = buf; p + sizeof(struct inotify_event) <= buf + n;) {
             struct inotify_event *e = reinterpret_cast<struct inotify_event *>(p);
-            out.push_back(Ev{e->mask, e->cookie, e->len ? std::string(e->name) : std::string()});
+            out.push_back(
+                Ev{e->wd, e->mask, e->cookie, e->len ? std::string(e->name) : std::string()});
             p += sizeof(struct inotify_event) + e->len;
         }
     }
@@ -82,6 +84,19 @@ bool saw_self(const std::vector<Ev> &evs, uint32_t bit) {
 int first_event_index(const std::vector<Ev> &evs, uint32_t bit) {
     for (size_t i = 0; i < evs.size(); i++) {
         if (evs[i].mask & bit) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+int add_fd_watch(int ifd, int fd, uint32_t mask) {
+    char procfd[64];
+    snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", fd);
+    return inotify_add_watch(ifd, procfd, mask);
+}
+
+int first_event_index(const std::vector<Ev> &evs, int wd, uint32_t bit) {
+    for (size_t i = 0; i < evs.size(); i++) {
+        if (evs[i].wd == wd && (evs[i].mask & bit)) return static_cast<int>(i);
     }
     return -1;
 }
@@ -510,6 +525,165 @@ TEST(InotifyAnonymousObjects, PipeProcFdWatchEnablesEvents) {
     close(ifd);
     close(pipefd[0]);
     close(pipefd[1]);
+}
+
+TEST(InotifyAnonymousObjects, SpliceAndTeeNotifyBothPipeEndpoints) {
+    // pipe -> pipe: Linux publishes output MODIFY before input ACCESS.
+    int source[2];
+    int destination[2];
+    ASSERT_EQ(pipe(source), 0);
+    ASSERT_EQ(pipe(destination), 0);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    int source_wd = add_fd_watch(ifd, source[0], IN_ACCESS);
+    int destination_wd = add_fd_watch(ifd, destination[1], IN_MODIFY);
+    ASSERT_GE(source_wd, 0) << strerror(errno);
+    ASSERT_GE(destination_wd, 0) << strerror(errno);
+    ASSERT_EQ(write(source[1], "s", 1), 1);
+    drain_events(ifd);
+    ASSERT_EQ(splice(source[0], nullptr, destination[1], nullptr, 1, 0), 1)
+        << strerror(errno);
+    auto splice_events = drain_events(ifd);
+    int modify_index = first_event_index(splice_events, destination_wd, IN_MODIFY);
+    int access_index = first_event_index(splice_events, source_wd, IN_ACCESS);
+    ASSERT_GE(modify_index, 0);
+    ASSERT_GE(access_index, 0);
+    EXPECT_LT(modify_index, access_index);
+    close(ifd);
+    close(source[0]);
+    close(source[1]);
+    close(destination[0]);
+    close(destination[1]);
+
+    // tee duplicates data but is still an access of the source and a
+    // modification of the destination for fsnotify purposes.
+    ASSERT_EQ(pipe(source), 0);
+    ASSERT_EQ(pipe(destination), 0);
+    ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    source_wd = add_fd_watch(ifd, source[0], IN_ACCESS);
+    destination_wd = add_fd_watch(ifd, destination[1], IN_MODIFY);
+    ASSERT_GE(source_wd, 0) << strerror(errno);
+    ASSERT_GE(destination_wd, 0) << strerror(errno);
+    ASSERT_EQ(write(source[1], "t", 1), 1);
+    drain_events(ifd);
+    ASSERT_EQ(tee(source[0], destination[1], 1, 0), 1) << strerror(errno);
+    auto tee_events = drain_events(ifd);
+    access_index = first_event_index(tee_events, source_wd, IN_ACCESS);
+    modify_index = first_event_index(tee_events, destination_wd, IN_MODIFY);
+    ASSERT_GE(access_index, 0);
+    ASSERT_GE(modify_index, 0);
+    EXPECT_LT(access_index, modify_index);
+    close(ifd);
+    close(source[0]);
+    close(source[1]);
+    close(destination[0]);
+    close(destination[1]);
+}
+
+TEST(InotifyAnonymousObjects, SpliceNotifiesFileAndPipeSides) {
+    char path[] = "/tmp/dunitest_inotify_splice_XXXXXX";
+    int filefd = mkstemp(path);
+    ASSERT_GE(filefd, 0) << strerror(errno);
+    ASSERT_EQ(write(filefd, "xy", 2), 2);
+    ASSERT_EQ(lseek(filefd, 0, SEEK_SET), 0);
+
+    // file -> pipe: output MODIFY and input ACCESS are emitted only after the
+    // pipe accepts data.
+    int pipefd[2];
+    ASSERT_EQ(pipe(pipefd), 0);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    int file_wd = add_fd_watch(ifd, filefd, IN_ACCESS | IN_MODIFY);
+    int pipe_wd = add_fd_watch(ifd, pipefd[1], IN_ACCESS | IN_MODIFY);
+    ASSERT_GE(file_wd, 0) << strerror(errno);
+    ASSERT_GE(pipe_wd, 0) << strerror(errno);
+    ASSERT_EQ(splice(filefd, nullptr, pipefd[1], nullptr, 1, 0), 1)
+        << strerror(errno);
+    auto file_to_pipe_events = drain_events(ifd);
+    int modify_index = first_event_index(file_to_pipe_events, pipe_wd, IN_MODIFY);
+    int access_index = first_event_index(file_to_pipe_events, file_wd, IN_ACCESS);
+    ASSERT_GE(modify_index, 0);
+    ASSERT_GE(access_index, 0);
+    EXPECT_LT(modify_index, access_index);
+
+    // pipe -> file: the regular write already owns MODIFY; splice adds the
+    // missing ACCESS for the pipe source without duplicating file events.
+    drain_events(ifd);
+    ASSERT_EQ(lseek(filefd, 0, SEEK_SET), 0);
+    ASSERT_EQ(splice(pipefd[0], nullptr, filefd, nullptr, 1, 0), 1)
+        << strerror(errno);
+    auto pipe_to_file_events = drain_events(ifd);
+    modify_index = first_event_index(pipe_to_file_events, file_wd, IN_MODIFY);
+    access_index = first_event_index(pipe_to_file_events, pipe_wd, IN_ACCESS);
+    ASSERT_GE(modify_index, 0);
+    ASSERT_GE(access_index, 0);
+    EXPECT_LT(modify_index, access_index);
+
+    close(ifd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    close(filefd);
+    ASSERT_EQ(unlink(path), 0);
+}
+
+TEST(InotifyAnonymousObjects, NamedFifoSpliceUsesPathIdentity) {
+    const std::string root = "/tmp/dunitest_inotify_fifo_splice";
+    const std::string fifo_path = root + "/fifo";
+    ASSERT_EQ(mkdir(root.c_str(), 0700), 0) << strerror(errno);
+    ASSERT_EQ(mkfifo(fifo_path.c_str(), 0600), 0) << strerror(errno);
+
+    int fifo_read = open(fifo_path.c_str(), O_RDONLY | O_NONBLOCK);
+    ASSERT_GE(fifo_read, 0) << strerror(errno);
+    int fifo_write = open(fifo_path.c_str(), O_WRONLY | O_NONBLOCK);
+    ASSERT_GE(fifo_write, 0) << strerror(errno);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    int fifo_wd = inotify_add_watch(ifd, fifo_path.c_str(), IN_ACCESS | IN_MODIFY);
+    int parent_wd = inotify_add_watch(ifd, root.c_str(), IN_ACCESS | IN_MODIFY);
+    ASSERT_GE(fifo_wd, 0) << strerror(errno);
+    ASSERT_GE(parent_wd, 0) << strerror(errno);
+    int proc_ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(proc_ifd, 0) << strerror(errno);
+    ASSERT_GE(add_fd_watch(proc_ifd, fifo_read, IN_ACCESS | IN_MODIFY), 0)
+        << strerror(errno);
+
+    int destination[2];
+    ASSERT_EQ(pipe(destination), 0);
+    ASSERT_EQ(write(fifo_write, "f", 1), 1);
+    drain_events(ifd);
+    ASSERT_EQ(splice(fifo_read, nullptr, destination[1], nullptr, 1, 0), 1)
+        << strerror(errno);
+    auto access_events = drain_events(ifd);
+    EXPECT_GE(first_event_index(access_events, fifo_wd, IN_ACCESS), 0);
+    EXPECT_LT(first_event_index(access_events, parent_wd, IN_ACCESS), 0)
+        << "Linux suppresses special-file content events on the parent watch";
+    EXPECT_TRUE(saw_self(drain_events(proc_ifd), IN_ACCESS));
+
+    char file_path[] = "/tmp/dunitest_inotify_fifo_input_XXXXXX";
+    int filefd = mkstemp(file_path);
+    ASSERT_GE(filefd, 0) << strerror(errno);
+    ASSERT_EQ(write(filefd, "g", 1), 1);
+    ASSERT_EQ(lseek(filefd, 0, SEEK_SET), 0);
+    drain_events(ifd);
+    ASSERT_EQ(splice(filefd, nullptr, fifo_write, nullptr, 1, 0), 1)
+        << strerror(errno);
+    auto modify_events = drain_events(ifd);
+    EXPECT_GE(first_event_index(modify_events, fifo_wd, IN_MODIFY), 0);
+    EXPECT_LT(first_event_index(modify_events, parent_wd, IN_MODIFY), 0);
+    EXPECT_TRUE(saw_self(drain_events(proc_ifd), IN_MODIFY));
+
+    close(filefd);
+    unlink(file_path);
+    close(destination[0]);
+    close(destination[1]);
+    close(proc_ifd);
+    close(ifd);
+    close(fifo_read);
+    close(fifo_write);
+    unlink(fifo_path.c_str());
+    rmdir(root.c_str());
 }
 
 TEST(InotifyExcludeUnlinked, FtruncateRemainsADentryEvent) {

@@ -401,6 +401,29 @@ pub(crate) fn index_remove(mark: &FsNotifyMark) {
         let Some(old) = FSNOTIFY_MARKS.lock().get(&key).cloned() else {
             return;
         };
+
+        // Removing the last live mark must not depend on allocating a COW
+        // replacement.  Besides being the common case, this prevents an OOM
+        // during rm_watch/shutdown from retaining an otherwise empty index key
+        // indefinitely.  A concurrent publisher replaces `old`, so the
+        // pointer check below makes the allocation-free removal retry safely.
+        let has_survivor = old.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|arc| !core::ptr::eq(Arc::as_ptr(&arc), self_ptr))
+        });
+        if !has_survivor {
+            let mut idx = FSNOTIFY_MARKS.lock();
+            if !idx
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &old))
+            {
+                continue;
+            }
+            idx.remove(&key);
+            return;
+        }
+
         let mut compact = Vec::new();
         if compact.try_reserve_exact(old.len()).is_err() {
             return;

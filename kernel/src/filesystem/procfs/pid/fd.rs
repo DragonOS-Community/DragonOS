@@ -169,7 +169,7 @@ impl SymOps for FdSymOps {
             .unwrap_or_default();
 
         // 现在安全地获取文件的路径
-        let inode = file.inode();
+        let inode = file.path_inode();
         let path_result = if let Some(mount_inode) = inode
             .clone()
             .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>(
@@ -218,6 +218,6 @@ impl SymOps for FdSymOps {
         };
 
         // 返回文件的 inode 引用，使得 fstatat 等操作可以通过魔法链接工作
-        Some(SpecialNodeData::Reference(file.inode()))
+        Some(SpecialNodeData::Reference(file.path_inode()))
     }
 }

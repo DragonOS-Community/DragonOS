@@ -1101,7 +1101,7 @@ static int ext_test_p2_ops() {
     usleep(100 * 1000);
 
     if (access_count < 2 || flush_count == 0 || fsync_count == 0 || fsyncdir_count == 0 ||
-        create_count == 0 || rename2_count < 2) {
+        create_count == 0 || rename2_count != 1) {
         printf("[FAIL] counters access=%u flush=%u fsync=%u fsyncdir=%u create=%u rename2=%u\n",
                access_count, flush_count, fsync_count, fsyncdir_count, create_count,
                rename2_count);

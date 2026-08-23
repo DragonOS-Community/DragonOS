@@ -12,6 +12,18 @@ use crate::libs::casting::DowncastArc;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::sync::Arc;
+
+struct RenameNotification<'a> {
+    old_parent: &'a Arc<dyn crate::filesystem::vfs::IndexNode>,
+    old_name: &'a str,
+    new_parent: &'a Arc<dyn crate::filesystem::vfs::IndexNode>,
+    new_name: &'a str,
+    flags: RenameFlags,
+    moved: &'a Arc<dyn crate::filesystem::vfs::IndexNode>,
+    exchanged: Option<&'a Arc<dyn crate::filesystem::vfs::IndexNode>>,
+    displaced: Option<&'a Arc<dyn crate::filesystem::vfs::IndexNode>>,
+}
+
 /// # 修改文件名
 ///
 ///
@@ -178,65 +190,91 @@ pub fn do_renameat2(
         PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
     )?;
 
-    old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
-
-    if flags.contains(RenameFlags::EXCHANGE) {
-        // EXCHANGE：两个 inode 互换位置 → 两组配对事件、两个 cookie、双方各 IN_MOVE_SELF。
-        // - old_inode: old_dir/old_name → new_dir/new_name（cookie1）
-        // - new_inode: new_dir/new_name → old_dir/old_name（cookie2）
-        let new_inode = exchange_new_inode
-            .as_ref()
-            .expect("RENAME_EXCHANGE requires target to exist (checked above)");
-        let cookie1 = fsnotify::next_cookie();
-        fsnotify::fsnotify(
-            FsEvent::MOVED_FROM,
-            Some((&old_parent_inode, old_filename)),
-            Some(&old_inode),
-            cookie1,
-        );
-        fsnotify::fsnotify(
-            FsEvent::MOVED_TO,
-            Some((&new_parent_inode, new_filename)),
-            Some(&old_inode),
-            cookie1,
-        );
-        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(&old_inode), 0);
-        let cookie2 = fsnotify::next_cookie();
-        fsnotify::fsnotify(
-            FsEvent::MOVED_FROM,
-            Some((&new_parent_inode, new_filename)),
-            Some(new_inode),
-            cookie2,
-        );
-        fsnotify::fsnotify(
-            FsEvent::MOVED_TO,
-            Some((&old_parent_inode, old_filename)),
-            Some(new_inode),
-            cookie2,
-        );
-        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(new_inode), 0);
+    let notification = RenameNotification {
+        old_parent: &old_parent_inode,
+        old_name: old_filename,
+        new_parent: &new_parent_inode,
+        new_name: new_filename,
+        flags,
+        moved: &old_inode,
+        exchanged: exchange_new_inode.as_ref(),
+        displaced: displaced.as_ref(),
+    };
+    let notify = || notification.send();
+    if let Some(mounted) = old_parent_inode.clone().downcast_arc::<MountFSInode>() {
+        mounted.move_to_with_post_commit(
+            old_filename,
+            &new_parent_inode,
+            new_filename,
+            flags,
+            notify,
+        )?;
     } else {
-        // 普通 rename（可能覆盖目标）：单 cookie 配对 MOVED_FROM/MOVED_TO + MOVE_SELF。
-        let cookie = fsnotify::next_cookie();
-        fsnotify::fsnotify(
-            FsEvent::MOVED_FROM,
-            Some((&old_parent_inode, old_filename)),
-            Some(&old_inode),
-            cookie,
-        );
-        fsnotify::fsnotify(
-            FsEvent::MOVED_TO,
-            Some((&new_parent_inode, new_filename)),
-            Some(&old_inode),
-            cookie,
-        );
-        fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(&old_inode), 0);
-        // Replacing a target is part of the rename pair, not a parent DELETE.
-        // Linux reports ATTRIB on the displaced inode; DELETE_SELF is tied to
-        // the later dentry/inode detach lifecycle.
-        if let Some(displaced) = &displaced {
-            fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(displaced), 0);
+        old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;
+        notify();
+    }
+    Ok(0)
+}
+
+impl RenameNotification<'_> {
+    fn send(&self) {
+        if self.flags.contains(RenameFlags::EXCHANGE) {
+            // EXCHANGE：两个 inode 互换位置 → 两组配对事件、两个 cookie、双方各 IN_MOVE_SELF。
+            // - old_inode: old_dir/old_name → new_dir/new_name（cookie1）
+            // - new_inode: new_dir/new_name → old_dir/old_name（cookie2）
+            let new_inode = self
+                .exchanged
+                .expect("RENAME_EXCHANGE requires target to exist (checked above)");
+            let cookie1 = fsnotify::next_cookie();
+            fsnotify::fsnotify(
+                FsEvent::MOVED_FROM,
+                Some((self.old_parent, self.old_name)),
+                Some(self.moved),
+                cookie1,
+            );
+            fsnotify::fsnotify(
+                FsEvent::MOVED_TO,
+                Some((self.new_parent, self.new_name)),
+                Some(self.moved),
+                cookie1,
+            );
+            fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(self.moved), 0);
+            let cookie2 = fsnotify::next_cookie();
+            fsnotify::fsnotify(
+                FsEvent::MOVED_FROM,
+                Some((self.new_parent, self.new_name)),
+                Some(new_inode),
+                cookie2,
+            );
+            fsnotify::fsnotify(
+                FsEvent::MOVED_TO,
+                Some((self.old_parent, self.old_name)),
+                Some(new_inode),
+                cookie2,
+            );
+            fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(new_inode), 0);
+        } else {
+            // 普通 rename（可能覆盖目标）：单 cookie 配对 MOVED_FROM/MOVED_TO + MOVE_SELF。
+            let cookie = fsnotify::next_cookie();
+            fsnotify::fsnotify(
+                FsEvent::MOVED_FROM,
+                Some((self.old_parent, self.old_name)),
+                Some(self.moved),
+                cookie,
+            );
+            fsnotify::fsnotify(
+                FsEvent::MOVED_TO,
+                Some((self.new_parent, self.new_name)),
+                Some(self.moved),
+                cookie,
+            );
+            fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(self.moved), 0);
+            // Replacing a target is part of the rename pair, not a parent DELETE.
+            // Linux reports ATTRIB on the displaced inode; DELETE_SELF is tied to
+            // the later dentry/inode detach lifecycle.
+            if let Some(displaced) = self.displaced {
+                fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(displaced), 0);
+            }
         }
     }
-    return Ok(0);
 }

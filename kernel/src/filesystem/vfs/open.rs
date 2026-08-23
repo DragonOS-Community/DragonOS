@@ -12,7 +12,7 @@ use super::{
         should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, OwnedLookupOutcome,
         ResolvedPath,
     },
-    vcore::{check_parent_dir_permission_inode, current_file_lock_owner_id, vfs_truncate_file},
+    vcore::{check_parent_dir_permission_inode, vfs_truncate},
     FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -492,9 +492,10 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         file.notify_open_event();
         if do_truncate {
             if truncate_in_vfs {
-                vfs_truncate_file(file.inode(), 0, current_file_lock_owner_id(), || {
-                    file.private_data.lock()
-                })?;
+                // handle_truncate() follows open but remains a pathname
+                // setattr operation. In particular, FUSE must not receive an
+                // ftruncate-style FATTR_FH/FATTR_LOCKOWNER request here.
+                vfs_truncate(file.inode(), 0)?;
             } else {
                 // open(O_TRUNC) metadata notification is a dentry-data event,
                 // unlike read/write path-data events subject to EXCL_UNLINK.
@@ -735,6 +736,8 @@ pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, 
                 | SetMetadataMask::TIMES_BY_WRITE,
         )?;
     }
+    // fsnotify：成功的 utimes(2) 时间戳更新 → IN_ATTRIB。
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
 }
 

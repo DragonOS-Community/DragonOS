@@ -116,43 +116,76 @@ lazy_static::lazy_static! {
         Mutex::new(HashMap::new());
 }
 
-fn current_quota_key() -> InotifyQuotaKey {
+fn current_quota_keys() -> Result<Vec<InotifyQuotaKey>, SystemError> {
     let cred = ProcessManager::current_pcb().cred();
-    InotifyQuotaKey {
+    let mut namespace = cred.user_ns.clone();
+    let mut keys = Vec::new();
+    keys.try_reserve(namespace.level() as usize + 1)
+        .map_err(|_| SystemError::ENOMEM)?;
+    keys.push(InotifyQuotaKey {
         user_namespace: cred.user_ns.ns_common().nsid.data(),
         euid: cred.euid.data(),
+    });
+
+    // Linux ucounts charge the current (user namespace, euid) and every
+    // ancestor account that owns a namespace on the path to init_user_ns.
+    // This prevents creating nested user namespaces from resetting inotify
+    // limits while preserving the creator identity used at each boundary.
+    while let Some(parent) = namespace.parent_ns() {
+        keys.push(InotifyQuotaKey {
+            user_namespace: parent.ns_common().nsid.data(),
+            euid: namespace.inner.lock().owner,
+        });
+        namespace = parent;
     }
+    Ok(keys)
 }
 
-fn reserve_instance(key: InotifyQuotaKey) -> Result<(), SystemError> {
+fn reserve_instance(keys: &[InotifyQuotaKey]) -> Result<(), SystemError> {
     let mut quotas = INOTIFY_QUOTAS.lock();
-    quotas.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
-    let counts = quotas.entry(key).or_default();
-    if counts.instances >= MAX_USER_INSTANCES {
+    quotas
+        .try_reserve(keys.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    if keys.iter().any(|key| {
+        quotas
+            .get(key)
+            .is_some_and(|counts| counts.instances >= MAX_USER_INSTANCES)
+    }) {
         return Err(SystemError::EMFILE);
     }
-    counts.instances += 1;
+    for key in keys {
+        quotas.entry(*key).or_default().instances += 1;
+    }
     Ok(())
 }
 
-fn reserve_watch(key: InotifyQuotaKey) -> Result<(), SystemError> {
+fn reserve_watch(keys: &[InotifyQuotaKey]) -> Result<(), SystemError> {
     let mut quotas = INOTIFY_QUOTAS.lock();
-    quotas.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
-    let counts = quotas.entry(key).or_default();
-    if counts.watches >= MAX_USER_WATCHES {
+    quotas
+        .try_reserve(keys.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    if keys.iter().any(|key| {
+        quotas
+            .get(key)
+            .is_some_and(|counts| counts.watches >= MAX_USER_WATCHES)
+    }) {
         return Err(SystemError::ENOSPC);
     }
-    counts.watches += 1;
+    for key in keys {
+        quotas.entry(*key).or_default().watches += 1;
+    }
     Ok(())
 }
 
-fn release_quota(key: InotifyQuotaKey, instances: usize, watches: usize) {
+fn release_quota(keys: &[InotifyQuotaKey], instances: usize, watches: usize) {
     let mut quotas = INOTIFY_QUOTAS.lock();
-    if let Some(counts) = quotas.get_mut(&key) {
-        counts.instances = counts.instances.saturating_sub(instances);
-        counts.watches = counts.watches.saturating_sub(watches);
-        if counts.instances == 0 && counts.watches == 0 {
-            quotas.remove(&key);
+    for key in keys {
+        if let Some(counts) = quotas.get_mut(key) {
+            counts.instances = counts.instances.saturating_sub(instances);
+            counts.watches = counts.watches.saturating_sub(watches);
+            if counts.instances == 0 && counts.watches == 0 {
+                quotas.remove(key);
+            }
         }
     }
 }
@@ -205,11 +238,11 @@ pub struct InotifyState {
     max_queued_events: usize,
     /// wd 锁：add_watch/rm_watch 竞争。
     wd: Mutex<WdTable>,
-    quota_key: InotifyQuotaKey,
+    quota_keys: Vec<InotifyQuotaKey>,
 }
 
 impl InotifyState {
-    fn new(quota_key: InotifyQuotaKey) -> Self {
+    fn new(quota_keys: Vec<InotifyQuotaKey>) -> Self {
         Self {
             events: Mutex::new(InotifyQueue {
                 list: VecDeque::new(),
@@ -222,7 +255,7 @@ impl InotifyState {
                 counter: 0,
                 map: HashMap::new(),
             }),
-            quota_key,
+            quota_keys,
         }
     }
 }
@@ -383,7 +416,7 @@ impl FsNotifyBackend for InotifyBackend {
     fn free_mark(&self, mark: &FsNotifyMark) {
         let mut t = self.state.wd.lock();
         if t.map.remove(&mark.wd).is_some() {
-            release_quota(self.state.quota_key, 0, 1);
+            release_quota(&self.state.quota_keys, 0, 1);
         }
     }
 
@@ -447,10 +480,10 @@ impl FileSystem for InotifyFs {
         // 不会被真正调用：inotify 不挂载。
         Arc::new(InotifyInode::new(
             false,
-            InotifyQuotaKey {
+            vec![InotifyQuotaKey {
                 user_namespace: 0,
                 euid: 0,
-            },
+            }],
         ))
     }
 
@@ -498,8 +531,8 @@ impl InotifyInode {
     }
 
     /// 创建一个新的 inotify 实例（inotify_init1 用）。
-    fn new(nonblock: bool, quota_key: InotifyQuotaKey) -> Self {
-        let state = Arc::new(InotifyState::new(quota_key));
+    fn new(nonblock: bool, quota_keys: Vec<InotifyQuotaKey>) -> Self {
+        let state = Arc::new(InotifyState::new(quota_keys));
         let backend = Box::new(InotifyBackend {
             state: state.clone(),
         });
@@ -668,7 +701,7 @@ impl InotifyInode {
 
         // Quota is committed only after all local allocations succeeded. Any
         // failure at the final global-index publication is rolled back below.
-        reserve_watch(self.state.quota_key)?;
+        reserve_watch(&self.state.quota_keys)?;
         fsnotify::adjust_total_watches(1);
 
         // 持 marks 锁完成全部插入（wd 表 / group.marks / 全局索引）。
@@ -681,7 +714,7 @@ impl InotifyInode {
             marks.remove(&target_identity);
             self.state.wd.lock().map.remove(&wd);
             fsnotify::adjust_total_watches(-1);
-            release_quota(self.state.quota_key, 0, 1);
+            release_quota(&self.state.quota_keys, 0, 1);
             return Err(error);
         }
         drop(marks);
@@ -722,9 +755,9 @@ impl InotifyInode {
         }
         if n > 0 {
             fsnotify::adjust_total_watches(-(n as i32));
-            release_quota(self.state.quota_key, 0, n);
+            release_quota(&self.state.quota_keys, 0, n);
         }
-        release_quota(self.state.quota_key, 1, 0);
+        release_quota(&self.state.quota_keys, 1, 0);
         // 唤醒任何阻塞在 read 的线程（队列不再增长）。
         self.group.wait_queue.wakeup_all(None);
     }
@@ -917,11 +950,12 @@ impl IndexNode for InotifyInode {
 pub fn do_inotify_init1(flags: u32) -> Result<usize, SystemError> {
     let flags = InotifyInitFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
 
-    let quota_key = current_quota_key();
-    reserve_instance(quota_key)?;
+    let quota_keys = current_quota_keys()?;
+    reserve_instance(&quota_keys)?;
 
     let nonblock = flags.contains(InotifyInitFlags::IN_NONBLOCK);
-    let inode = Arc::new(InotifyInode::new(nonblock, quota_key));
+    let inode = Arc::new(InotifyInode::new(nonblock, quota_keys));
+    let quota_state = inode.state.clone();
     let file_flags = FileFlags::O_RDONLY
         | (if nonblock {
             FileFlags::O_NONBLOCK
@@ -930,7 +964,7 @@ pub fn do_inotify_init1(flags: u32) -> Result<usize, SystemError> {
         });
     let file = File::new(inode, file_flags).inspect_err(|_| {
         // File::new 失败：file 未创建，不会 drop→shutdown，需手动回退实例计数。
-        release_quota(quota_key, 1, 0);
+        release_quota(&quota_state.quota_keys, 1, 0);
     })?;
     // 防递归：inotify fd 自身的 read/write 不应产生事件。
     file.set_mode_flags(FileMode::FMODE_NONOTIFY);

@@ -21,6 +21,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -162,6 +163,32 @@ TEST(InotifyNamespaceEvents, CreateDeleteMoveOnDirWatch) {
     rmdir(dir.c_str());
 }
 
+TEST(InotifyNamespaceEvents, MknodAndMknodatDeliverCreate) {
+    const std::string dir = "/tmp/dunitest_inotify_mknod";
+    ASSERT_EQ(mkdir(dir.c_str(), 0777), 0) << strerror(errno);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, dir.c_str(), IN_CREATE), 0);
+
+    const std::string first = dir + "/direct_fifo";
+    ASSERT_EQ(syscall(SYS_mknod, first.c_str(), S_IFIFO | 0600, 0), 0) << strerror(errno);
+
+    int dfd = open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(dfd, 0);
+    ASSERT_EQ(syscall(SYS_mknodat, dfd, "at_fifo", S_IFIFO | 0600, 0), 0) << strerror(errno);
+
+    auto evs = drain_events(ifd);
+    EXPECT_TRUE(saw(evs, IN_CREATE, "direct_fifo"));
+    EXPECT_TRUE(saw(evs, IN_CREATE, "at_fifo"));
+
+    close(dfd);
+    close(ifd);
+    unlink(first.c_str());
+    unlink((dir + "/at_fifo").c_str());
+    rmdir(dir.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // IN_ATTRIB: changing file metadata (chmod) delivers IN_ATTRIB.
 // ---------------------------------------------------------------------------
@@ -188,6 +215,24 @@ TEST(InotifyAttribEvent, ChmodDeliversAttrib) {
     EXPECT_TRUE(saw_self(evs, IN_ATTRIB)) << "self watch missed IN_ATTRIB after chmod";
 
     inotify_rm_watch(ifd, wd);
+    close(ifd);
+    unlink(path.c_str());
+}
+
+TEST(InotifyAttribEvent, UtimesDeliversAttrib) {
+    const std::string path = "/tmp/dunitest_inotify_utimes";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_ATTRIB), 0);
+
+    struct timeval times[2] = {{.tv_sec = 100, .tv_usec = 0}, {.tv_sec = 200, .tv_usec = 0}};
+    ASSERT_EQ(utimes(path.c_str(), times), 0) << strerror(errno);
+    EXPECT_TRUE(saw_self(drain_events(ifd), IN_ATTRIB));
+
     close(ifd);
     unlink(path.c_str());
 }

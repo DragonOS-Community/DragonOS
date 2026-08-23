@@ -221,6 +221,10 @@ impl DentryMutationContext<'_> {
             *guard = Some(DENTRY_TOPOLOGY_LOCK.write());
         }
     }
+
+    fn release_locked(&self) {
+        self.guard.borrow_mut().take();
+    }
 }
 
 pub(crate) fn with_topology_snapshot<T>(f: impl FnOnce() -> T) -> T {
@@ -668,7 +672,7 @@ pub struct SuperBlockState {
     /// Monotonic identity used by fsnotify; unlike an Arc address it cannot be
     /// confused after allocator address reuse.
     fsnotify_id: usize,
-    fsnotify_object_locks: Mutex<HashMap<(InodeId, u64), Weak<Mutex<FsNotifyDeleteState>>>>,
+    fsnotify_object_locks: Mutex<FsNotifyObjectLocks>,
     /// User namespace that owns this superblock, matching Linux `s_user_ns`.
     /// Bind mounts and mount-namespace copies retain the same owner.
     owner_user_ns: Arc<UserNamespace>,
@@ -684,6 +688,8 @@ pub struct SuperBlockState {
     lifecycle: Mutex<SuperBlockLifecycle>,
     shutdown_wait: WaitQueue,
 }
+
+type FsNotifyObjectLocks = HashMap<(InodeId, u64), Weak<Mutex<FsNotifyDeleteState>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuperBlockLifecycleState {
@@ -3133,6 +3139,144 @@ impl MountFSInode {
         Arc::ptr_eq(&self.mount_fs, &other.mount_fs)
     }
 
+    /// Run a rename notification after every alias is committed and the
+    /// global topology writer is released, while the conflicting parent gates
+    /// still preserve the order in which successful renames become visible.
+    pub(crate) fn move_to_with_post_commit(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        let mut post_commit = Some(post_commit);
+        let mut run_post_commit = || {
+            post_commit
+                .take()
+                .expect("rename post-commit callback runs once")();
+        };
+        self.move_to_with_context_impl(
+            old_name,
+            target,
+            new_name,
+            flags,
+            &context,
+            Some(&mut run_post_commit),
+        )
+    }
+
+    fn move_to_with_context_impl(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: &DentryMutationContext<'_>,
+        post_commit: Option<&mut dyn FnMut()>,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        // Filesystem implementations generally expect `target` to be an inode
+        // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
+        // mount wrapping is enabled, unwrap it before delegating.
+        let target_mount = target.clone().downcast_arc::<MountFSInode>();
+        let target_inner: Arc<dyn IndexNode> = target_mount
+            .as_ref()
+            .map(|mnt| mnt.dentry.inode.clone())
+            .unwrap_or_else(|| target.clone());
+        let target_parent = target_mount
+            .as_ref()
+            .map(|mount| mount.dentry.clone())
+            .unwrap_or_else(|| self.dentry.clone());
+
+        with_dentry_children_gates(&self.dentry, &target_parent, || {
+            let namespace_guard = self
+                .mount_fs
+                .super_block_state
+                .dentry_namespace_lock
+                .write();
+            let (source_dentry, target_dentry) = if let Some(target_mount) = target_mount.as_ref() {
+                let sb = &self.mount_fs.super_block_state;
+                let source_inner = self.dentry.inode.find(old_name)?;
+                let source_dentry =
+                    sb.get_registered_dentry(&self.dentry, &DName::from(old_name), &source_inner)?;
+                let target_dentry = match target_inner.find(new_name) {
+                    Ok(target_child) => sb.get_registered_dentry(
+                        &target_mount.dentry,
+                        &DName::from(new_name),
+                        &target_child,
+                    )?,
+                    Err(SystemError::ENOENT) => None,
+                    Err(error) => return Err(error),
+                };
+                (source_dentry, target_dentry)
+            } else {
+                (None, None)
+            };
+            with_dentry_mount_gates(source_dentry.as_ref(), target_dentry.as_ref(), || {
+                // The parent directory gates keep both positive and negative
+                // names stable while the per-superblock registry lock is
+                // released for potentially long layered copy-up I/O.
+                drop(namespace_guard);
+                if source_dentry
+                    .as_ref()
+                    .is_some_and(|dentry| dentry.is_local_mountpoint())
+                    || target_dentry
+                        .as_ref()
+                        .is_some_and(|dentry| dentry.is_local_mountpoint())
+                {
+                    return Err(SystemError::EBUSY);
+                }
+                let object_state = target_dentry
+                    .as_ref()
+                    .map(|target| target.fsnotify_delete_lifecycle.clone());
+                let mut delete_lifecycle = object_state.as_ref().map(|state| state.lock());
+                self.dentry.inode.move_to_with_context(
+                    old_name,
+                    &target_inner,
+                    new_name,
+                    flags,
+                    context,
+                )?;
+                if !flags.contains(RenameFlags::EXCHANGE) {
+                    if let Some(state) = delete_lifecycle.as_mut() {
+                        fsnotify::note_link_removed(state);
+                    }
+                }
+                context.ensure_locked();
+                let namespace_guard = self
+                    .mount_fs
+                    .super_block_state
+                    .dentry_namespace_lock
+                    .write();
+                if let (Some(source), Some(target)) =
+                    (self.self_ref.upgrade(), target_mount.clone())
+                {
+                    Self::update_move_dentries(
+                        &source,
+                        DName::from(old_name),
+                        &target,
+                        DName::from(new_name),
+                        flags.contains(RenameFlags::EXCHANGE),
+                        source_dentry.clone(),
+                        target_dentry.clone(),
+                    );
+                }
+                if let Some(post_commit) = post_commit {
+                    // Alias publication is complete. Release the system-wide
+                    // topology writer before work proportional to watch count,
+                    // while the two parent gates still serialize conflicting
+                    // renames and therefore their notification order.
+                    drop(namespace_guard);
+                    context.release_locked();
+                    post_commit();
+                }
+                Ok(())
+            })
+        })
+    }
+
     pub(crate) fn same_path_ref(&self, other: &MountFSInode) -> bool {
         self.same_mount_ref(other) && self.dentry.id == other.dentry.id
     }
@@ -4469,8 +4613,7 @@ impl IndexNode for MountFSInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        let context = DentryMutationContext::new();
-        self.move_to_with_context(old_name, target, new_name, flags, &context)
+        self.move_to_with_post_commit(old_name, target, new_name, flags, || {})
     }
 
     fn move_to_with_context(
@@ -4481,99 +4624,7 @@ impl IndexNode for MountFSInode {
         flags: RenameFlags,
         context: &DentryMutationContext<'_>,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        // Filesystem implementations generally expect `target` to be an inode
-        // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
-        // mount wrapping is enabled, `target` is often a `MountFSInode`, which
-        // would make FS-level downcasts fail and incorrectly return EINVAL.
-        //
-        // So we unwrap the mount wrapper before delegating.
-        let target_mount = target.clone().downcast_arc::<MountFSInode>();
-        let target_inner: Arc<dyn IndexNode> = target_mount
-            .as_ref()
-            .map(|mnt| mnt.dentry.inode.clone())
-            .unwrap_or_else(|| target.clone());
-        let target_parent = target_mount
-            .as_ref()
-            .map(|mount| mount.dentry.clone())
-            .unwrap_or_else(|| self.dentry.clone());
-
-        with_dentry_children_gates(&self.dentry, &target_parent, || {
-            let namespace_guard = self
-                .mount_fs
-                .super_block_state
-                .dentry_namespace_lock
-                .write();
-            let (source_dentry, target_dentry) = if let Some(target_mount) = target_mount.as_ref() {
-                let sb = &self.mount_fs.super_block_state;
-                let source_inner = self.dentry.inode.find(old_name)?;
-                let source_dentry =
-                    sb.get_registered_dentry(&self.dentry, &DName::from(old_name), &source_inner)?;
-                let target_dentry = match target_inner.find(new_name) {
-                    Ok(target_child) => sb.get_registered_dentry(
-                        &target_mount.dentry,
-                        &DName::from(new_name),
-                        &target_child,
-                    )?,
-                    Err(SystemError::ENOENT) => None,
-                    Err(error) => return Err(error),
-                };
-                (source_dentry, target_dentry)
-            } else {
-                (None, None)
-            };
-            with_dentry_mount_gates(source_dentry.as_ref(), target_dentry.as_ref(), || {
-                // The parent directory gates keep both positive and negative
-                // names stable while the per-superblock registry lock is
-                // released for potentially long layered copy-up I/O.
-                drop(namespace_guard);
-                if source_dentry
-                    .as_ref()
-                    .is_some_and(|dentry| dentry.is_local_mountpoint())
-                    || target_dentry
-                        .as_ref()
-                        .is_some_and(|dentry| dentry.is_local_mountpoint())
-                {
-                    return Err(SystemError::EBUSY);
-                }
-                let object_state = target_dentry
-                    .as_ref()
-                    .map(|target| target.fsnotify_delete_lifecycle.clone());
-                let mut delete_lifecycle = object_state.as_ref().map(|state| state.lock());
-                self.dentry.inode.move_to_with_context(
-                    old_name,
-                    &target_inner,
-                    new_name,
-                    flags,
-                    context,
-                )?;
-                if !flags.contains(RenameFlags::EXCHANGE) {
-                    if let Some(state) = delete_lifecycle.as_mut() {
-                        fsnotify::note_link_removed(state);
-                    }
-                }
-                context.ensure_locked();
-                let _namespace_guard = self
-                    .mount_fs
-                    .super_block_state
-                    .dentry_namespace_lock
-                    .write();
-                if let (Some(source), Some(target)) =
-                    (self.self_ref.upgrade(), target_mount.clone())
-                {
-                    Self::update_move_dentries(
-                        &source,
-                        DName::from(old_name),
-                        &target,
-                        DName::from(new_name),
-                        flags.contains(RenameFlags::EXCHANGE),
-                        source_dentry.clone(),
-                        target_dentry.clone(),
-                    );
-                }
-                Ok(())
-            })
-        })
+        self.move_to_with_context_impl(old_name, target, new_name, flags, context, None)
     }
 
     fn check_access(

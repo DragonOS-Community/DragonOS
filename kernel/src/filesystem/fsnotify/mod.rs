@@ -543,7 +543,7 @@ pub(crate) fn fsnotify_targets(
         let enqueue_result = if let Some(group) = group.as_ref() {
             group
                 .backend
-                .handle_event(&group, &mark, delivered, name, cookie)
+                .handle_event(group, &mark, delivered, name, cookie)
         } else {
             EnqueueResult::Filtered
         };

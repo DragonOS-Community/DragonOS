@@ -573,6 +573,194 @@ TEST(UprobeTest, TmpfsExecutableUsesPageCacheInstructionBytes) {
     unlink(path);
 }
 
+TEST(UprobeTest, AdjacentUnrelatedMappingDoesNotChangeInstruction) {
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size_raw, 0);
+    const size_t page_size = static_cast<size_t>(page_size_raw);
+    constexpr unsigned char file_tail[] = {
+        0xb8, 0x2a, 0x00, 0x00, 0x00,  // mov eax,42
+        0xc3,                          // ret
+    };
+    constexpr unsigned char mapped_tail[] = {
+        0x07, 0x00, 0x00, 0x00,  // immediate used by the cross-VMA mov
+        0xc3,                    // ret
+    };
+
+    char path[] = "/tmp/uprobe_cross_vma_XXXXXX";
+    FdGuard file(mkstemp(path));
+    ASSERT_GE(file.get(), 0);
+    ASSERT_EQ(ftruncate(file.get(), static_cast<off_t>(page_size * 2)), 0);
+    ASSERT_EQ(pwrite(file.get(), file_tail, sizeof(file_tail),
+                     static_cast<off_t>(page_size - 1)),
+              static_cast<ssize_t>(sizeof(file_tail)));
+
+    void* reservation = mmap(nullptr, page_size * 2, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(reservation, MAP_FAILED);
+    void* first = mmap(reservation, page_size, PROT_READ | PROT_EXEC,
+                       MAP_PRIVATE | MAP_FIXED, file.get(), 0);
+    ASSERT_EQ(first, reservation);
+    auto* second_addr = static_cast<unsigned char*>(reservation) + page_size;
+    void* second = mmap(second_addr, page_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    ASSERT_EQ(second, second_addr);
+    std::memcpy(second, mapped_tail, sizeof(mapped_tail));
+    ASSERT_EQ(mprotect(second, page_size, PROT_READ | PROT_EXEC), 0);
+
+    auto target = reinterpret_cast<int (*)()>(second_addr - 1);
+    ASSERT_EQ(target(), 7) << "native execution must use the adjacent mapping";
+
+    FdGuard event(open_uprobe_perf_event(path, page_size - 1));
+    ASSERT_GE(event.get(), 0)
+        << "an incompatible alias must be skipped without rejecting the consumer";
+    EXPECT_EQ(target(), 7)
+        << "XOL must not substitute bytes from a different file mapping";
+
+    munmap(reservation, page_size * 2);
+    unlink(path);
+}
+
+TEST(UprobeTest, PrivateTailByteMismatchIsRejected) {
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size_raw, 0);
+    const size_t page_size = static_cast<size_t>(page_size_raw);
+    constexpr unsigned char file_tail[] = {
+        0xb8, 0x2a, 0x00, 0x00, 0x00,  // mov eax,42
+        0xc3,                          // ret
+    };
+    constexpr unsigned char private_tail[] = {
+        0x07, 0x00, 0x00, 0x00,  // private immediate
+        0xc3,                    // ret
+    };
+
+    char path[] = "/tmp/uprobe_private_tail_XXXXXX";
+    FdGuard file(mkstemp(path));
+    ASSERT_GE(file.get(), 0);
+    ASSERT_EQ(ftruncate(file.get(), static_cast<off_t>(page_size * 2)), 0);
+    ASSERT_EQ(pwrite(file.get(), file_tail, sizeof(file_tail),
+                     static_cast<off_t>(page_size - 1)),
+              static_cast<ssize_t>(sizeof(file_tail)));
+
+    void* reservation = mmap(nullptr, page_size * 2, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(reservation, MAP_FAILED);
+    ASSERT_EQ(mmap(reservation, page_size, PROT_READ | PROT_EXEC,
+                   MAP_PRIVATE | MAP_FIXED, file.get(), 0),
+              reservation);
+    auto* second_addr = static_cast<unsigned char*>(reservation) + page_size;
+    void* second = mmap(second_addr, page_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_FIXED, file.get(),
+                        static_cast<off_t>(page_size));
+    ASSERT_EQ(second, second_addr);
+    std::memcpy(second, private_tail, sizeof(private_tail));
+    ASSERT_EQ(mprotect(second, page_size, PROT_READ | PROT_EXEC), 0);
+
+    auto target = reinterpret_cast<int (*)()>(second_addr - 1);
+    ASSERT_EQ(target(), 7);
+    errno = 0;
+    FdGuard event(open_uprobe_perf_event(path, page_size - 1));
+    EXPECT_LT(event.get(), 0)
+        << "a private instruction tail must not execute file bytes through XOL";
+    EXPECT_EQ(errno, EINVAL);
+
+    munmap(reservation, page_size * 2);
+    unlink(path);
+}
+
+TEST(UprobeTest, NonExecutableTailIsSkippedUntilExecutable) {
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size_raw, 0);
+    const size_t page_size = static_cast<size_t>(page_size_raw);
+    constexpr unsigned char file_tail[] = {
+        0xb8, 0x2a, 0x00, 0x00, 0x00,  // mov eax,42
+        0xc3,                          // ret
+    };
+
+    char path[] = "/tmp/uprobe_nx_tail_XXXXXX";
+    FdGuard file(mkstemp(path));
+    ASSERT_GE(file.get(), 0);
+    ASSERT_EQ(ftruncate(file.get(), static_cast<off_t>(page_size * 2)), 0);
+    ASSERT_EQ(pwrite(file.get(), file_tail, sizeof(file_tail),
+                     static_cast<off_t>(page_size - 1)),
+              static_cast<ssize_t>(sizeof(file_tail)));
+
+    void* reservation = mmap(nullptr, page_size * 2, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(reservation, MAP_FAILED);
+    ASSERT_EQ(mmap(reservation, page_size, PROT_READ | PROT_EXEC,
+                   MAP_PRIVATE | MAP_FIXED, file.get(), 0),
+              reservation);
+    auto* second_addr = static_cast<unsigned char*>(reservation) + page_size;
+    void* second = mmap(second_addr, page_size, PROT_READ,
+                        MAP_PRIVATE | MAP_FIXED, file.get(),
+                        static_cast<off_t>(page_size));
+    ASSERT_EQ(second, second_addr);
+
+    FdGuard event(open_uprobe_perf_event(path, page_size - 1));
+    ASSERT_GE(event.get(), 0)
+        << "an NX alias should be skipped without rejecting the consumer";
+    ASSERT_EQ(mprotect(second, page_size, PROT_READ | PROT_EXEC), 0);
+    auto target = reinterpret_cast<int (*)()>(second_addr - 1);
+    EXPECT_EQ(target(), 42)
+        << "making the complete instruction executable must allow late apply";
+
+    munmap(reservation, page_size * 2);
+    unlink(path);
+}
+
+TEST(UprobeTest, AdjacentContinuousFileMappingsCanBeProbed) {
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size_raw, 0);
+    const size_t page_size = static_cast<size_t>(page_size_raw);
+    constexpr unsigned char file_tail[] = {
+        0xb8, 0x2a, 0x00, 0x00, 0x00,  // mov eax,42
+        0xc3,                          // ret
+    };
+    constexpr unsigned char replacement_tail[] = {
+        0x07, 0x00, 0x00, 0x00,  // mov immediate after the first byte
+        0xc3,                    // ret
+    };
+
+    char path[] = "/tmp/uprobe_cross_file_vma_XXXXXX";
+    FdGuard file(mkstemp(path));
+    ASSERT_GE(file.get(), 0);
+    ASSERT_EQ(ftruncate(file.get(), static_cast<off_t>(page_size * 2)), 0);
+    ASSERT_EQ(pwrite(file.get(), file_tail, sizeof(file_tail),
+                     static_cast<off_t>(page_size - 1)),
+              static_cast<ssize_t>(sizeof(file_tail)));
+
+    void* reservation = mmap(nullptr, page_size * 2, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(reservation, MAP_FAILED);
+    void* first = mmap(reservation, page_size, PROT_READ | PROT_EXEC,
+                       MAP_PRIVATE | MAP_FIXED, file.get(), 0);
+    ASSERT_EQ(first, reservation);
+    auto* second_addr = static_cast<unsigned char*>(reservation) + page_size;
+    void* second = mmap(second_addr, page_size, PROT_READ | PROT_EXEC,
+                        MAP_PRIVATE | MAP_FIXED, file.get(),
+                        static_cast<off_t>(page_size));
+    ASSERT_EQ(second, second_addr);
+
+    auto target = reinterpret_cast<int (*)()>(second_addr - 1);
+    ASSERT_EQ(target(), 42);
+    FdGuard event(open_uprobe_perf_event(path, page_size - 1));
+    ASSERT_GE(event.get(), 0)
+        << "continuous offsets across adjacent file VMAs must remain eligible";
+    EXPECT_EQ(target(), 42);
+
+    ASSERT_EQ(munmap(second, page_size), 0);
+    second = mmap(second_addr, page_size, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    ASSERT_EQ(second, second_addr);
+    std::memcpy(second, replacement_tail, sizeof(replacement_tail));
+    ASSERT_EQ(mprotect(second, page_size, PROT_READ | PROT_EXEC), 0);
+    EXPECT_EQ(target(), 7)
+        << "changing only the instruction tail VMA must disarm the probe";
+
+    munmap(reservation, page_size * 2);
+    unlink(path);
+}
+
 // 同址 consumer 必须共享 site 生命周期：关闭第一个不能拆除第二个仍需要的断点；
 // 关闭最后一个后继续执行不能触发无归属的 #BP。
 TEST(UprobeTest, SameAddressConsumersCloseIndependently) {
@@ -593,6 +781,13 @@ TEST(UprobeTest, SameAddressConsumersCloseIndependently) {
     ASSERT_GE(ioctl(second_fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
     EXPECT_EQ(uprobe_target(31), 63);
 
+    for (int i = 0; i < 128; ++i) {
+        ASSERT_GE(ioctl(first_fd.get(), PERF_EVENT_IOC_DISABLE, 0), 0);
+        EXPECT_EQ(uprobe_target(i), i * 2 + 1);
+        ASSERT_GE(ioctl(first_fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
+        EXPECT_EQ(uprobe_target(i + 1), (i + 1) * 2 + 1);
+    }
+
     first_fd.close_now();
     EXPECT_EQ(uprobe_target(32), 65)
         << "关闭一个 consumer 不应破坏剩余 consumer 的 XOL 路径";
@@ -602,6 +797,41 @@ TEST(UprobeTest, SameAddressConsumersCloseIndependently) {
         EXPECT_EQ(uprobe_target(i + 400), (i + 400) * 2 + 1)
             << "最后一个 consumer 关闭后第 " << i << " 次执行错误";
     }
+}
+
+TEST(UprobeTest, DifferentAddressesOnSamePageRemainIndependent) {
+    constexpr unsigned char two_targets[] = {
+        0x8d, 0x44, 0x3f, 0x01,  // lea eax,[rdi+rdi+1]
+        0xc3,                    // ret
+        0x90, 0x90, 0x90,       // padding
+        0x8d, 0x47, 0x03,  // lea eax,[rdi+3]
+        0xc3,              // ret
+    };
+    constexpr unsigned long second_offset = 8;
+    char path[] = "/tmp/uprobe_same_page_XXXXXX";
+    FdGuard file(create_raw_code(path, two_targets, sizeof(two_targets)));
+    ASSERT_GE(file.get(), 0);
+    void* executable =
+        mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file.get(), 0);
+    ASSERT_NE(executable, MAP_FAILED);
+
+    FdGuard first(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(first.get(), 0);
+    FdGuard second(open_uprobe_perf_event(path, second_offset));
+    ASSERT_GE(second.get(), 0);
+    auto first_target = reinterpret_cast<int (*)(int)>(executable);
+    auto second_target = reinterpret_cast<int (*)(int)>(
+        static_cast<unsigned char*>(executable) + second_offset);
+    EXPECT_EQ(first_target(9), 19);
+    EXPECT_EQ(second_target(9), 12);
+
+    second.close_now();
+    EXPECT_EQ(first_target(10), 21);
+    first.close_now();
+    EXPECT_EQ(second_target(10), 13);
+
+    munmap(executable, 4096);
+    unlink(path);
 }
 
 TEST(UprobeTest, RepeatedStringInstructionIsRejected) {

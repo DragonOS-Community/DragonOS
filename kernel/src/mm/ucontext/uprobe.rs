@@ -428,13 +428,27 @@ impl UprobeConsumer {
 
     fn remember_site(&self, mm: &Arc<AddressSpace>, vaddr: usize, site: &Arc<UprobeSite>) {
         let mut sites = self.sites.lock_irqsave();
+        let mut already_present = false;
         sites.retain(|installed| {
-            installed.mm.upgrade().is_some()
-                && installed
-                    .site
-                    .upgrade()
-                    .is_some_and(|site| site.state() != UprobeSiteState::Dead)
+            let (Some(installed_mm), Some(installed_site)) =
+                (installed.mm.upgrade(), installed.site.upgrade())
+            else {
+                return false;
+            };
+            if installed_site.state() == UprobeSiteState::Dead {
+                return false;
+            }
+            if installed.vaddr == vaddr
+                && Arc::ptr_eq(&installed_mm, mm)
+                && Arc::ptr_eq(&installed_site, site)
+            {
+                already_present = true;
+            }
+            true
         });
+        if already_present {
+            return;
+        }
         sites.push(InstalledSiteRef {
             mm: Arc::downgrade(mm),
             vaddr,
@@ -589,6 +603,101 @@ impl Drop for UprobeHandle {
 struct ExpectedProbeVma {
     vma: Weak<LockedVMA>,
     state_seq: u64,
+    region: VirtRegion,
+}
+
+struct ExpectedProbeMapping {
+    parts: Vec<ExpectedProbeVma>,
+}
+
+fn valid_probe_vma_flags(flags: VmFlags) -> bool {
+    let invalid = VmFlags::VM_HUGETLB | VmFlags::VM_MAYSHARE | VmFlags::VM_WRITE;
+    flags.contains(VmFlags::VM_EXEC)
+        && flags.contains(VmFlags::VM_MAYEXEC)
+        && !flags.intersects(invalid)
+}
+
+fn probe_mapping_parts(
+    inner: &InnerAddressSpace,
+    definition: &UprobeDefinition,
+    probe_vaddr: usize,
+) -> Option<Vec<(Arc<LockedVMA>, u64, VirtRegion)>> {
+    let instruction_end = probe_vaddr.checked_add(definition.analysis.insn_len)?;
+    let mut cursor = probe_vaddr;
+    let mut parts = Vec::new();
+
+    while cursor < instruction_end {
+        let vma = inner.mappings.contains(VirtAddr::new(cursor))?;
+        let guard = vma.lock();
+        if !valid_probe_vma_flags(*guard.vm_flags()) {
+            return None;
+        }
+        let file = guard.vm_file()?;
+        if !definition.matches_inode(&file.inode()) {
+            return None;
+        }
+        let pgoff = guard.backing_page_offset()?;
+        let mapped_offset = pgoff
+            .checked_mul(MMArch::PAGE_SIZE)?
+            .checked_add(cursor.checked_sub(guard.region().start().data())?)?;
+        let expected_offset = definition
+            .offset()
+            .checked_add(cursor.checked_sub(probe_vaddr)?)?;
+        if mapped_offset != expected_offset {
+            return None;
+        }
+        let part_end = guard.region().end().data().min(instruction_end);
+        if part_end <= cursor {
+            return None;
+        }
+        let state_seq = vma.state_seq();
+        drop(guard);
+        parts.push((
+            vma,
+            state_seq,
+            VirtRegion::new(VirtAddr::new(cursor), part_end - cursor),
+        ));
+        cursor = part_end;
+    }
+    Some(parts)
+}
+
+fn capture_probe_mapping(
+    inner: &InnerAddressSpace,
+    definition: &UprobeDefinition,
+    probe_vaddr: usize,
+) -> Option<ExpectedProbeMapping> {
+    let parts = probe_mapping_parts(inner, definition, probe_vaddr)?
+        .into_iter()
+        .map(|(vma, state_seq, region)| ExpectedProbeVma {
+            vma: Arc::downgrade(&vma),
+            state_seq,
+            region,
+        })
+        .collect();
+    Some(ExpectedProbeMapping { parts })
+}
+
+fn revalidate_probe_mapping(
+    inner: &InnerAddressSpace,
+    definition: &UprobeDefinition,
+    probe_vaddr: usize,
+    expected: &ExpectedProbeMapping,
+) -> Option<Arc<LockedVMA>> {
+    let current = probe_mapping_parts(inner, definition, probe_vaddr)?;
+    if current.len() != expected.parts.len() {
+        return None;
+    }
+    for ((vma, state_seq, region), expected) in current.iter().zip(&expected.parts) {
+        let expected_vma = expected.vma.upgrade()?;
+        if !Arc::ptr_eq(vma, &expected_vma)
+            || *state_seq != expected.state_seq
+            || *region != expected.region
+        {
+            return None;
+        }
+    }
+    current.first().map(|(vma, _, _)| vma.clone())
 }
 
 // ──────────────────────── 公开 API ────────────────────────
@@ -620,7 +729,7 @@ fn uprobe_register(
     _pre_handler: fn(&dyn ProbeArgs),
     _post_handler: fn(&dyn ProbeArgs),
     consumer: &Arc<UprobeConsumer>,
-    expected_vma: &ExpectedProbeVma,
+    expected_mapping: &ExpectedProbeMapping,
 ) -> Result<Option<UprobeHandle>, SystemError> {
     let _install = consumer.begin_install(mm).ok_or(SystemError::ENOENT)?;
     let consumer_id = consumer.id;
@@ -628,41 +737,17 @@ fn uprobe_register(
     let mut inner = mm.write();
 
     // ── Step 1: 定位 VMA + 读原指令 + 分析 ──
-    let vaddr = VirtAddr::new(probe_vaddr);
     let page_base_addr = probe_vaddr & !(MMArch::PAGE_SIZE - 1);
     let page_offset = probe_vaddr & (MMArch::PAGE_SIZE - 1);
 
-    // VMA 必须存在且可执行
-    let Some(vma) = inner.mappings.contains(vaddr) else {
+    // Fault-in runs without mm.write(), so MAP_FIXED/mprotect can replace any
+    // part of a cross-page instruction. Revalidate the complete executable,
+    // canonical-file, contiguous-offset mapping chain in this stable view.
+    let Some(vma) =
+        revalidate_probe_mapping(&inner, &consumer.definition, probe_vaddr, expected_mapping)
+    else {
         return Ok(None);
     };
-    let Some(expected) = expected_vma.vma.upgrade() else {
-        return Ok(None);
-    };
-    if !Arc::ptr_eq(&vma, &expected) || vma.state_seq() != expected_vma.state_seq {
-        return Ok(None);
-    }
-    {
-        let vma_guard = vma.lock();
-        let vm_flags = *vma_guard.vm_flags();
-        let valid_mask =
-            VmFlags::VM_HUGETLB | VmFlags::VM_MAYEXEC | VmFlags::VM_MAYSHARE | VmFlags::VM_WRITE;
-        if (vm_flags & valid_mask) != VmFlags::VM_MAYEXEC {
-            return Ok(None);
-        }
-        let file = vma_guard.vm_file().ok_or(SystemError::EINVAL)?;
-        let inode = file.inode();
-        let pgoff = vma_guard.backing_page_offset().ok_or(SystemError::EINVAL)?;
-        let mapped_offset = pgoff
-            .checked_mul(MMArch::PAGE_SIZE)
-            .and_then(|base| base.checked_add(probe_vaddr - vma_guard.region().start().data()))
-            .ok_or(SystemError::EINVAL)?;
-        if !consumer.definition.matches_inode(&inode)
-            || mapped_offset != consumer.definition.offset()
-        {
-            return Ok(None);
-        }
-    }
 
     // ── P1：重复注册同一 probe_vaddr 时复用已有指令信息（避免读到 0xcc）──
     // 第二个 consumer 注册同一地址时 PTE 已指向含 0xcc 的 COW 副本，
@@ -701,12 +786,18 @@ fn uprobe_register(
         }
         (oi, an, Some(site))
     } else {
-        // The definition comes from the file. As Linux verify_opcode() does,
-        // verify the target mapping still has the opcode we are about to
-        // replace so a private/COW modification is never overwritten.
-        let opcode = read_user_opcode(&inner.user_mapper.utable, probe_vaddr)?;
+        // XOL must execute the bytes that native instruction fetch would have
+        // observed. Linux verifies the software-breakpoint-sized opcode; we
+        // additionally compare the complete decoded instruction so a private
+        // alias or unrelated adjacent VMA cannot change execution semantics.
         let (old_instruction, analysis) = consumer.definition.instruction();
-        if opcode != old_instruction[0] {
+        let mut mapped_instruction = [0u8; UPROBE_INSN_COPY_SIZE];
+        read_user_instruction(
+            &inner.user_mapper.utable,
+            probe_vaddr,
+            &mut mapped_instruction[..analysis.insn_len],
+        )?;
+        if mapped_instruction[..analysis.insn_len] != old_instruction[..analysis.insn_len] {
             return Err(SystemError::EINVAL);
         }
         (old_instruction, analysis, None)
@@ -829,13 +920,30 @@ fn uprobe_register(
 ///
 /// `PageMapper::translate` 直接 walk 物理页表，不需要目标 mm 的 CR3 上下文，
 /// 因此可跨进程读取。若页未 present 返回 `EFAULT`。
-fn read_user_opcode(mapper: &PageMapper, probe_vaddr: usize) -> Result<u8, SystemError> {
-    let page_offset = probe_vaddr & (MMArch::PAGE_SIZE - 1);
-    let (paddr, _flags) = mapper
-        .translate(VirtAddr::new(probe_vaddr))
-        .ok_or(SystemError::EFAULT)?;
-    let kva = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
-    Ok(unsafe { *((kva.data() + page_offset) as *const u8) })
+fn read_user_instruction(
+    mapper: &PageMapper,
+    probe_vaddr: usize,
+    output: &mut [u8],
+) -> Result<(), SystemError> {
+    let mut copied = 0;
+    while copied < output.len() {
+        let vaddr = probe_vaddr.checked_add(copied).ok_or(SystemError::EFAULT)?;
+        let page_offset = vaddr & (MMArch::PAGE_SIZE - 1);
+        let (paddr, _flags) = mapper
+            .translate(VirtAddr::new(vaddr))
+            .ok_or(SystemError::EFAULT)?;
+        let kva = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
+        let count = (output.len() - copied).min(MMArch::PAGE_SIZE - page_offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (kva.data() + page_offset) as *const u8,
+                output[copied..].as_mut_ptr(),
+                count,
+            );
+        }
+        copied += count;
+    }
+    Ok(())
 }
 
 /// 确保 mm 有 XOL 区，并分配一个 slot，返回 slot 在页内偏移。
@@ -940,17 +1048,24 @@ fn install_breakpoint_page(
     if already_cowed {
         // 页已私有化：在**当前映射页** patch 额外 0xcc 字节（translate 取实时
         // paddr——写缺页二次 COW 后仍是正确页），refcount++。
-        let _pt_edit = mm.page_table_edit();
-        let mapper = &mut inner.user_mapper.utable;
-        let (paddr, _) = mapper.translate(address).ok_or(SystemError::EFAULT)?;
-        let kva = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
-        unsafe {
-            core::ptr::write_volatile((kva.data() + page_offset) as *mut u8, 0xcc);
-        }
-        let mut pb = mm.uprobe_page_state.lock_irqsave();
-        if let Some(state) = pb.get_mut(&page_base_addr) {
+        {
+            let _pt_edit = mm.page_table_edit();
+            let mapper = &mut inner.user_mapper.utable;
+            let (paddr, _) = mapper.translate(address).ok_or(SystemError::EFAULT)?;
+            let kva = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
+            let mut pb = mm.uprobe_page_state.lock_irqsave();
+            let state = pb.get_mut(&page_base_addr).ok_or(SystemError::EFAULT)?;
+            unsafe {
+                core::ptr::write_volatile((kva.data() + page_offset) as *mut u8, 0xcc);
+            }
             state.refcount += 1;
         }
+
+        // This branch edits an already mapped physical page, so there is no
+        // PTE replacement to serialize instruction fetch on remote CPUs.  A
+        // synchronous mm shootdown is the publication point for the new INT3.
+        // Do not wait for the IPI while holding page_table_edit or page-state.
+        mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
         return Ok(());
     }
 
@@ -1256,11 +1371,19 @@ pub(crate) fn uprobe_disarm_range_locked(
         return Err(SystemError::EBUSY);
     }
 
+    let candidate_start = region
+        .start()
+        .data()
+        .saturating_sub(UPROBE_INSN_COPY_SIZE - 1);
     let targets: Vec<(usize, Arc<UprobeSite>, u8)> = {
         let list = mm.uprobe_list.lock_irqsave();
-        list.range(region.start().data()..region.end().data())
+        list.range(candidate_start..region.end().data())
             .filter_map(|(vaddr, entries)| {
                 let entry = entries.first()?.read();
+                let instruction_end = vaddr.checked_add(entry.insn_analysis.insn_len)?;
+                if *vaddr >= region.end().data() || instruction_end <= region.start().data() {
+                    return None;
+                }
                 let old = entry.point.old_instruction[0];
                 Some((*vaddr, entry.site.clone(), old))
             })
@@ -1486,6 +1609,9 @@ pub fn uprobe_registry_set_enabled(consumer_id: u64, enabled: bool) -> Result<()
                 ACTIVE_UPROBE_CONSUMERS.fetch_sub(1, Ordering::AcqRel);
             }
             consumer.runtime.write().enabled = false;
+            consumer
+                .inflight_wait
+                .wait_until(|| (consumer.inflight.load(Ordering::Acquire) == 0).then_some(()));
             detach_consumer_sites(&consumer);
             return Err(e);
         }
@@ -1503,20 +1629,11 @@ pub fn uprobe_registry_set_enabled(consumer_id: u64, enabled: bool) -> Result<()
 }
 
 fn detach_consumer_sites(consumer: &UprobeConsumer) {
-    let installed: Vec<_> = consumer
-        .sites
-        .lock_irqsave()
-        .iter()
-        .filter_map(|installed| {
-            Some((
-                installed.mm.upgrade()?,
-                installed.vaddr,
-                installed.site.upgrade()?,
-            ))
-        })
-        .collect();
-    for (mm, vaddr, site) in installed {
-        uprobe_unregister_consumer_from_site(&mm, vaddr, &site, consumer.id);
+    let installed = core::mem::take(&mut *consumer.sites.lock_irqsave());
+    for installed in installed {
+        if let (Some(mm), Some(site)) = (installed.mm.upgrade(), installed.site.upgrade()) {
+            uprobe_unregister_consumer_from_site(&mm, installed.vaddr, &site, consumer.id);
+        }
     }
 }
 
@@ -1665,8 +1782,7 @@ fn uprobe_apply_to_new_vma_inner(
             return Ok(());
         };
         offsets
-            .iter()
-            .filter(|(off, _)| **off >= file_start_byte && **off < region_file_end)
+            .range(file_start_byte..region_file_end)
             .filter_map(|(off, consumers)| {
                 let consumers = if let Some(id) = only_consumer_id {
                     consumers
@@ -1693,40 +1809,44 @@ fn uprobe_apply_to_new_vma_inner(
             if !consumer.scope.permits(mm) || consumer.closing.load(Ordering::Acquire) {
                 continue;
             }
-            // Ordinary file mmap is lazy.  Fault in only the page containing
-            // the breakpoint, and pin the retry to the VMA identity observed
-            // here so MAP_FIXED cannot redirect installation to a replacement.
-            let expected_vma = {
+            // Ordinary file mmap is lazy. Fault in the one or two pages which
+            // contain the complete instruction, pinning each retry to the VMA
+            // identity observed here so MAP_FIXED cannot redirect installation.
+            let expected_mapping = {
                 let inner = mm.read();
-                inner
-                    .mappings
-                    .contains(VirtAddr::new(probe_vaddr))
-                    .and_then(|vma| {
-                        let flags = *vma.lock().vm_flags();
-                        let valid_mask = VmFlags::VM_HUGETLB
-                            | VmFlags::VM_MAYEXEC
-                            | VmFlags::VM_MAYSHARE
-                            | VmFlags::VM_WRITE;
-                        ((flags & valid_mask) == VmFlags::VM_MAYEXEC).then(|| ExpectedProbeVma {
-                            vma: Arc::downgrade(&vma),
-                            state_seq: vma.state_seq(),
-                        })
-                    })
+                capture_probe_mapping(&inner, &consumer.definition, probe_vaddr)
             };
-            let Some(expected_vma) = expected_vma else {
-                // A non-executable/shared/writable alias is not an install
-                // failure. Linux valid_vma() skips it and keeps the consumer
+            let Some(expected_mapping) = expected_mapping else {
+                // An incomplete, non-executable, non-contiguous, shared, or
+                // writable alias is not an install failure. Keep the consumer
                 // registered for a later eligible mapping.
                 continue;
             };
-            let page_base = VirtAddr::new(probe_vaddr & !(MMArch::PAGE_SIZE - 1));
-            if let Err(e) = mm.populate_range_post_commit(
-                page_base,
-                MMArch::PAGE_SIZE,
-                true,
-                false,
-                Some(expected_vma.vma.clone()),
-            ) {
+            let mut population_error = None;
+            for part in &expected_mapping.parts {
+                let page_start = part.region.start().data() & !(MMArch::PAGE_SIZE - 1);
+                let Some(page_end) = part
+                    .region
+                    .end()
+                    .data()
+                    .checked_add(MMArch::PAGE_SIZE - 1)
+                    .map(|end| end & !(MMArch::PAGE_SIZE - 1))
+                else {
+                    population_error = Some(SystemError::EINVAL);
+                    break;
+                };
+                if let Err(e) = mm.populate_range_post_commit(
+                    VirtAddr::new(page_start),
+                    page_end - page_start,
+                    true,
+                    false,
+                    Some(part.vma.clone()),
+                ) {
+                    population_error = Some(e);
+                    break;
+                }
+            }
+            if let Some(e) = population_error {
                 log::debug!(
                     "uprobe fault-in {:x}+{:#x} in new vma failed: {:?}",
                     inode_id,
@@ -1744,7 +1864,7 @@ fn uprobe_apply_to_new_vma_inner(
                 noop_handler,
                 noop_handler,
                 &consumer,
-                &expected_vma,
+                &expected_mapping,
             ) {
                 Ok(Some(handle)) => {
                     handle.persist();
@@ -1787,11 +1907,15 @@ fn collect_file_vma_snapshot(
                 let file = guard.vm_file()?;
                 let pgoff = guard.backing_page_offset()?;
                 let vma_region = *guard.region();
+                let intersection = vma_region.intersect(&region)?;
+                let file_start = pgoff
+                    .checked_mul(MMArch::PAGE_SIZE)?
+                    .checked_add(intersection.start().data() - vma_region.start().data())?;
                 Some((
                     file,
-                    vma_region.start().data(),
-                    vma_region.size(),
-                    pgoff.checked_mul(MMArch::PAGE_SIZE)?,
+                    intersection.start().data(),
+                    intersection.size(),
+                    file_start,
                 ))
             })
             .collect()
@@ -1807,7 +1931,15 @@ pub(crate) fn uprobe_apply_to_range(mm: &Arc<AddressSpace>, region: VirtRegion) 
     let region = if full_reapply {
         VirtRegion::new(VirtAddr::new(0), MMArch::USER_END_VADDR.data())
     } else {
-        region
+        // A variable-length x86 instruction can start on the preceding page
+        // or VMA and overlap this mutation with only its tail. Reconsider the
+        // maximum possible prefix so a disarmed cross-boundary site can be
+        // restored only after its complete mapping is valid again.
+        let start = region
+            .start()
+            .data()
+            .saturating_sub(UPROBE_INSN_COPY_SIZE - 1);
+        VirtRegion::new(VirtAddr::new(start), region.end().data() - start)
     };
     let mut retry_full = false;
     for (file, start, size, offset) in collect_file_vma_snapshot(mm, region) {

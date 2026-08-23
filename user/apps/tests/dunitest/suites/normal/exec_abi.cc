@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -15,6 +16,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <vector>
 
 namespace {
 
@@ -142,6 +145,17 @@ int set_test_robust_list(TestRobustListHead* head, TestRobustNode* node) {
     return static_cast<int>(syscall(SYS_set_robust_list, head, sizeof(*head)));
 }
 
+void shared_sighand_handler(int) {}
+
+int shared_sighand_exec_child(void* opaque) {
+    auto* path = static_cast<char*>(opaque);
+    char* const argv[] = {path, nullptr};
+    char child_mode[] = "DRAGONOS_EXEC_ABI_SHARED_CHILD=1";
+    char* const envp[] = {child_mode, nullptr};
+    execve(path, argv, envp);
+    return 97;
+}
+
 #endif
 
 void ensure_tmp_dir() {
@@ -267,53 +281,138 @@ TEST(ExecAbi, SuccessfulExecToleratesReadOnlyRobustFutex) {
     EXPECT_EQ(0, unlink(path));
 }
 
-TEST(ExecAbi, FailedExecPreservesRobustList) {
+TEST(ExecAbi, EarlyFailedExecPreservesRobustList) {
     ensure_tmp_dir();
     char early_path[128] = {};
-    char late_path[128] = {};
     snprintf(early_path, sizeof(early_path), "/tmp/exec_abi_bad_early_%d", getpid());
-    snprintf(late_path, sizeof(late_path), "/tmp/exec_abi_bad_late_%d", getpid());
     static constexpr char kNotElf[] = "not an executable";
     write_executable(early_path, kNotElf, sizeof(kNotElf));
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        TestRobustListHead head = {};
+        TestRobustNode node = {};
+        if (set_test_robust_list(&head, &node) != 0) {
+            _exit(92);
+        }
+        char* const argv[] = {early_path, nullptr};
+        char* const envp[] = {nullptr};
+        if (execve(early_path, argv, envp) == 0) {
+            _exit(93);
+        }
+        TestRobustListHead* observed = nullptr;
+        size_t observed_size = 0;
+        if (syscall(SYS_get_robust_list, 0, &observed, &observed_size) != 0) {
+            _exit(94);
+        }
+        if (observed != &head || observed_size != sizeof(head) ||
+            (node.futex & kFutexOwnerDied) != 0) {
+            _exit(95);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+
+    EXPECT_EQ(0, unlink(early_path));
+}
+
+TEST(ExecAbi, PostPointOfNoReturnExecFailureIsFatal) {
+    ensure_tmp_dir();
+    char path[128] = {};
+    snprintf(path, sizeof(path), "/tmp/exec_abi_bad_post_ponr_%d", getpid());
 
     unsigned char malformed[sizeof(kCheckRdxElf)] = {};
     memcpy(malformed, kCheckRdxElf, sizeof(malformed));
     malformed[96] += 1;  // p_filesz > p_memsz, rejected after begin_new_exec().
-    write_executable(late_path, malformed, sizeof(malformed));
+    write_executable(path, malformed, sizeof(malformed));
 
-    for (const char* path : {early_path, late_path}) {
-        pid_t child = fork();
-        ASSERT_GE(child, 0);
-        if (child == 0) {
-            TestRobustListHead head = {};
-            TestRobustNode node = {};
-            if (set_test_robust_list(&head, &node) != 0) {
-                _exit(92);
-            }
-            char* const argv[] = {const_cast<char*>(path), nullptr};
-            char* const envp[] = {nullptr};
-            if (execve(path, argv, envp) == 0) {
-                _exit(93);
-            }
-            TestRobustListHead* observed = nullptr;
-            size_t observed_size = 0;
-            if (syscall(SYS_get_robust_list, 0, &observed, &observed_size) != 0) {
-                _exit(94);
-            }
-            if (observed != &head || observed_size != sizeof(head) ||
-                (node.futex & kFutexOwnerDied) != 0) {
-                _exit(95);
-            }
-            _exit(0);
-        }
-        int status = 0;
-        ASSERT_EQ(child, waitpid(child, &status, 0));
-        ASSERT_TRUE(WIFEXITED(status));
-        EXPECT_EQ(0, WEXITSTATUS(status));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        char* const argv[] = {path, nullptr};
+        char* const envp[] = {nullptr};
+        execve(path, argv, envp);
+        _exit(96);
     }
 
-    EXPECT_EQ(0, unlink(early_path));
-    EXPECT_EQ(0, unlink(late_path));
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    EXPECT_TRUE(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) {
+        EXPECT_EQ(SIGSEGV, WTERMSIG(status));
+    }
+    EXPECT_EQ(0, unlink(path));
+}
+
+TEST(ExecAbi, PostPonrFailureDoesNotChangeSharedSiblingHandler) {
+    ensure_tmp_dir();
+    char path[128] = {};
+    snprintf(path, sizeof(path), "/tmp/exec_abi_bad_shared_sighand_%d", getpid());
+
+    unsigned char malformed[sizeof(kCheckRdxElf)] = {};
+    memcpy(malformed, kCheckRdxElf, sizeof(malformed));
+    malformed[96] += 1;
+    write_executable(path, malformed, sizeof(malformed));
+
+    struct sigaction saved = {};
+    struct sigaction custom = {};
+    ASSERT_EQ(0, sigaction(SIGSEGV, nullptr, &saved));
+    custom.sa_handler = shared_sighand_handler;
+    sigemptyset(&custom.sa_mask);
+    ASSERT_EQ(0, sigaction(SIGSEGV, &custom, nullptr));
+
+    constexpr size_t kStackSize = 64 * 1024;
+    std::vector<unsigned char> stack(kStackSize);
+    pid_t child = clone(shared_sighand_exec_child, stack.data() + stack.size(),
+                        CLONE_VM | CLONE_SIGHAND | SIGCHLD, path);
+    int status = 0;
+    int waited = child < 0 ? -1 : waitpid(child, &status, 0);
+    struct sigaction observed = {};
+    int query_result = sigaction(SIGSEGV, nullptr, &observed);
+    int restore_result = sigaction(SIGSEGV, &saved, nullptr);
+    int unlink_result = unlink(path);
+
+    ASSERT_GE(child, 0);
+    ASSERT_EQ(child, waited);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(SIGSEGV, WTERMSIG(status));
+    ASSERT_EQ(0, query_result);
+    EXPECT_EQ(shared_sighand_handler, observed.sa_handler);
+    EXPECT_EQ(0, restore_result);
+    EXPECT_EQ(0, unlink_result);
+}
+
+TEST(ExecAbi, SuccessfulExecDoesNotChangeSharedSiblingHandler) {
+    ASSERT_NE('\0', g_self_path[0]) << "self executable path was not initialized";
+
+    struct sigaction saved = {};
+    struct sigaction custom = {};
+    ASSERT_EQ(0, sigaction(SIGUSR1, nullptr, &saved));
+    custom.sa_handler = shared_sighand_handler;
+    sigemptyset(&custom.sa_mask);
+    ASSERT_EQ(0, sigaction(SIGUSR1, &custom, nullptr));
+
+    constexpr size_t kStackSize = 64 * 1024;
+    std::vector<unsigned char> stack(kStackSize);
+    pid_t child = clone(shared_sighand_exec_child, stack.data() + stack.size(),
+                        CLONE_VM | CLONE_SIGHAND | SIGCHLD, g_self_path);
+    int status = 0;
+    int waited = child < 0 ? -1 : waitpid(child, &status, 0);
+    struct sigaction observed = {};
+    int query_result = sigaction(SIGUSR1, nullptr, &observed);
+    int restore_result = sigaction(SIGUSR1, &saved, nullptr);
+
+    ASSERT_GE(child, 0);
+    ASSERT_EQ(child, waited);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    ASSERT_EQ(0, query_result);
+    EXPECT_EQ(shared_sighand_handler, observed.sa_handler);
+    EXPECT_EQ(0, restore_result);
 }
 
 #endif
@@ -346,6 +445,9 @@ TEST(ExecAbi, AuxvUidGidFollowCredentialsAtExec) {
 }
 
 int main(int argc, char** argv) {
+    if (getenv("DRAGONOS_EXEC_ABI_SHARED_CHILD") != nullptr) {
+        return 0;
+    }
     if (getenv("DRAGONOS_EXEC_ABI_CHECK_AUXV") != nullptr) {
         return check_auxv_credentials();
     }

@@ -1,10 +1,10 @@
 use super::trace::trace_sched_process_exec;
+use crate::arch::ipc::signal::Signal;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::open::{do_open_execat, do_open_execat_with_flags};
 use crate::libs::futex::futex::RobustListHead;
-use crate::libs::rwsem::RwSem;
 use crate::process::exec::{
     load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
     ExecStartInfo, LoadBinaryResult,
@@ -16,6 +16,20 @@ use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
 use crate::arch::interrupt::TrapFrame;
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
+
+struct ExecFailure {
+    error: SystemError,
+    post_point_of_no_return: bool,
+}
+
+impl From<SystemError> for ExecFailure {
+    fn from(error: SystemError) -> Self {
+        Self {
+            error,
+            post_point_of_no_return: false,
+        }
+    }
+}
 
 /// 执行execve系统调用
 ///
@@ -64,7 +78,22 @@ pub fn do_execve_with_info(
     envp: Vec<CString>,
     regs: &mut TrapFrame,
 ) -> Result<(), SystemError> {
-    do_execve_internal(start, argv, envp, regs, ExecContext::new())
+    match do_execve_internal(start, argv, envp, regs, ExecContext::new()) {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            if failure.post_point_of_no_return {
+                // The recursive loader stack has returned, so its ExecParam,
+                // File, address-space and argv/envp owners are gone before any
+                // divergent exit. Recheck here rather than caching the signal
+                // state before unwind, so a concurrent SIGKILL keeps priority.
+                let current = ProcessManager::current_pcb();
+                if !Signal::fatal_signal_pending(&current) {
+                    ProcessManager::exit(Signal::SIGSEGV as usize);
+                }
+            }
+            Err(failure.error)
+        }
+    }
 }
 
 pub fn exec_visible_name(dirfd: i32, path: &str) -> String {
@@ -112,7 +141,7 @@ fn do_execve_internal(
     envp: Vec<CString>,
     regs: &mut TrapFrame,
     ctx: ExecContext,
-) -> Result<(), SystemError> {
+) -> Result<(), ExecFailure> {
     let address_space = AddressSpace::new(true).expect("Failed to create new address space");
 
     let mut param = ExecParam::new(
@@ -152,33 +181,16 @@ fn do_execve_internal(
                     .expect("No user stack found")
                     .clone_info_only()
             };
-            let (user_sp, argv_ptr) = unsafe {
-                param
-                    .init_info_mut()
-                    .push_at(&mut ustack_message)
-                    .expect("Failed to push proc_init_info to user stack")
+            let stack_result = unsafe { param.init_info_mut().push_at(&mut ustack_message) };
+            let (user_sp, argv_ptr) = match stack_result {
+                Ok(stack) => stack,
+                Err(err) => return finish_exec_error(&param, old_vm.as_ref(), err),
             };
             address_space.write().user_stack = Some(ustack_message);
 
             let pcb = ProcessManager::current_pcb();
 
             commit_exec_robust_list(&pcb, old_vm.as_ref(), &address_space);
-
-            // unshare fd_table if it's shared (CLONE_FILES case)
-            // 参考 Linux: https://elixir.bootlin.com/linux/v6.1.9/source/fs/exec.c#L1857
-            // "Ensure the files table is not shared"
-            {
-                // 注意：不能先调用 pcb.fd_table() 再判断 strong_count，
-                // 因为 fd_table() 会克隆 Arc，导致计数至少 +1，误判为“被共享”。
-                let need_unshare = pcb.basic().fd_table_is_shared();
-                if need_unshare {
-                    // fd_table 被共享，需要创建私有副本
-                    let fd_table = pcb.fd_table();
-                    let new_fd_table = fd_table.read().clone();
-                    let new_fd_table = Arc::new(RwSem::new(new_fd_table));
-                    pcb.basic_mut().set_fd_table(Some(new_fd_table));
-                }
-            }
 
             // close-on-exec 必须属于成功 exec 的 commit 过程，不能留在 syscall wrapper 尾部。
             let dropped_fds = {
@@ -192,15 +204,6 @@ fn do_execve_internal(
                 }
             }
 
-            if pcb.sighand().is_shared() {
-                // Linux出于进程和线程隔离，要确保在execve时，对共享的 SigHand 进行深拷贝
-                // 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1187
-                let old_sighand = pcb.sighand();
-                let new_sighand = crate::ipc::sighand::SigHand::new();
-                new_sighand.copy_handlers_from(&old_sighand);
-                new_sighand.copy_process_state_from(&old_sighand);
-                pcb.replace_sighand(new_sighand);
-            }
             // 重置所有信号处理器为默认行为(SIG_DFL)，禁用并清空备用信号栈。
             pcb.flush_signal_handlers(false);
             *pcb.sig_altstack_mut() = crate::arch::SigStackArch::new();
@@ -220,30 +223,21 @@ fn do_execve_internal(
 
             // vfork 父进程必须在 child 完成 exec commit 后再恢复。
             // 否则父子仍可能共享 files_struct，child 的 close_on_exec() 会污染父进程。
-            let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
-            let exec_ret = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr);
-            if exec_ret.is_ok() {
-                // Thread4：先 complete vfork parent，再触发 trace。
-                // 对齐 Linux：exec_mmap()/exec_mm_release() 内更早完成 vfork_done，
-                // 而 trace_sched_process_exec() 在 exec 成功提交尾部才执行。若先 trace
-                // 再 complete，父进程会被所有 tracepoint 回调阻塞，违反“child 完成 exec
-                // commit 即恢复父进程”的语义，给 exec 热路径引入不必要的 trace 回调延迟。
-                if let Some(completion) = vfork_done {
-                    completion.complete_all();
-                }
-
-                // Linux keeps bprm->filename as the original exec-visible name
-                // across shebang/interpreter rewrites. DragonOS's execfn has the
-                // same lifetime and meaning; filename tracks the current loader.
-                // All dynamic sizing/allocation remains behind the macro's static
-                // branch, while these borrowed bytes and integers are O(1).
-                trace_sched_process_exec(
-                    param.execfn().as_bytes(),
-                    pcb.raw_pid().data() as i32,
-                    old_pid,
-                );
+            if let Err(err) = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr) {
+                return finish_exec_error(&param, old_vm.as_ref(), err);
             }
-            exec_ret
+            if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
+                completion.complete_all();
+            }
+            // Linux keeps bprm->filename as the original exec-visible name
+            // across shebang/interpreter rewrites. Complete vfork first so
+            // trace callbacks cannot delay the parent after exec committed.
+            trace_sched_process_exec(
+                param.execfn().as_bytes(),
+                pcb.raw_pid().data() as i32,
+                old_pid,
+            );
+            Ok(())
         }
 
         Ok(LoadBinaryResult::NeedReexec { next, new_argv }) => {
@@ -259,14 +253,29 @@ fn do_execve_internal(
             do_execve_internal(next, new_argv, envp, regs, new_ctx)
         }
 
-        Err(e) => {
-            // 加载失败，恢复旧的地址空间
-            if let Some(old_vm) = old_vm {
-                do_execve_switch_user_vm(old_vm);
-            }
-            Err(e)
-        }
+        Err(e) => finish_exec_error(&param, old_vm.as_ref(), e),
     }
+}
+
+/// Finish an exec error according to the point-of-no-return boundary.
+///
+/// DragonOS switches to the prospective address space before loading the
+/// binary, unlike Linux. Switch back to the old address space so fatal exit can
+/// clean the old robust list and clear_child_tid. A post-PONR error must still
+/// never resume the old userspace image.
+fn finish_exec_error(
+    param: &ExecParam,
+    old_vm: Option<&Arc<AddressSpace>>,
+    error: SystemError,
+) -> Result<(), ExecFailure> {
+    if let Some(old_vm) = old_vm {
+        do_execve_switch_user_vm(old_vm.clone());
+    }
+
+    Err(ExecFailure {
+        error,
+        post_point_of_no_return: param.point_of_no_return(),
+    })
 }
 
 /// 切换用户虚拟内存空间

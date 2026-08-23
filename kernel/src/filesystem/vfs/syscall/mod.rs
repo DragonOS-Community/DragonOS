@@ -12,6 +12,7 @@ mod rename_utils;
 mod sys_chdir;
 mod sys_chroot;
 mod sys_close;
+mod sys_close_range;
 mod sys_dup;
 mod sys_dup3;
 #[cfg(target_arch = "x86_64")]

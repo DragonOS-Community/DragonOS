@@ -119,12 +119,18 @@ pub struct InnerSigHand {
 
 impl SigHand {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: RwLock::new(InnerSigHand::default()),
+        Self::try_new().expect("failed to allocate signal-handler table")
+    }
+
+    pub fn try_new() -> Result<Arc<Self>, SystemError> {
+        let inner = InnerSigHand::try_default()?;
+        Arc::try_new(Self {
+            inner: RwLock::new(inner),
             group_exec_wait_queue: WaitQueue::default(),
             signalfd_wqh: WaitQueue::default(),
             signalfd_epitems: EPollItemList::default(),
         })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
     fn inner(&self) -> RwLockReadGuard<'_, InnerSigHand> {
@@ -231,7 +237,8 @@ impl SigHand {
     pub fn copy_handlers_from(&self, other: &Arc<SigHand>) {
         let other_guard = other.inner();
         let mut self_guard = self.inner_mut();
-        self_guard.handlers = other_guard.handlers.clone();
+        assert_eq!(self_guard.handlers.len(), other_guard.handlers.len());
+        self_guard.handlers.clone_from_slice(&other_guard.handlers);
     }
 
     pub fn copy_process_state_from(&self, other: &Arc<SigHand>) {
@@ -937,8 +944,14 @@ impl SigHand {
 
 impl Default for InnerSigHand {
     fn default() -> Self {
-        Self {
-            handlers: default_sighandlers(),
+        Self::try_default().expect("failed to allocate signal actions")
+    }
+}
+
+impl InnerSigHand {
+    fn try_default() -> Result<Self, SystemError> {
+        Ok(Self {
+            handlers: try_default_sighandlers()?,
             pids: core::array::from_fn(|_| None),
             shared_pending: SigPending::default(),
             curr_target: None,
@@ -954,12 +967,19 @@ impl Default for InnerSigHand {
             oom_mm_id: None,
             oom_mm: None,
             cnt: 0,
-        }
+        })
     }
 }
 
 fn default_sighandlers() -> Vec<Sigaction> {
-    let mut r = vec![Sigaction::default(); MAX_SIG_NUM];
+    try_default_sighandlers().expect("failed to allocate signal actions")
+}
+
+fn try_default_sighandlers() -> Result<Vec<Sigaction>, SystemError> {
+    let mut r = Vec::new();
+    r.try_reserve_exact(MAX_SIG_NUM)
+        .map_err(|_| SystemError::ENOMEM)?;
+    r.resize(MAX_SIG_NUM, Sigaction::default());
     let mut sig_ign = Sigaction::default();
     // 收到忽略的信号，重启系统调用
     // Linux ignores SIGURG/SIGWINCH by default; SIGCHLD is also ignored by default,
@@ -970,7 +990,7 @@ fn default_sighandlers() -> Vec<Sigaction> {
     r[Signal::SIGURG as usize - 1] = sig_ign;
     r[Signal::SIGWINCH as usize - 1] = sig_ign;
 
-    r
+    Ok(r)
 }
 
 impl ProcessControlBlock {

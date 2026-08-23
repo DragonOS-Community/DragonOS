@@ -897,8 +897,14 @@ fn uprobe_register(
         // 回滚：移除表项 + 释放 slot
         {
             let mut list = mm.uprobe_list.lock_irqsave();
-            if let Some(entries) = list.get_mut(&probe_vaddr) {
+            let remove_key = if let Some(entries) = list.get_mut(&probe_vaddr) {
                 entries.retain(|x| !Arc::ptr_eq(x, &entry));
+                entries.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                list.remove(&probe_vaddr);
             }
         }
         site.state
@@ -1267,26 +1273,6 @@ fn rebuild_site_participants(mm: &AddressSpace, probe_vaddr: usize, site: &Arc<U
     drop(old_participants);
 }
 
-fn refresh_consumer_sites(consumer: &UprobeConsumer) {
-    let installed: Vec<_> = consumer
-        .sites
-        .lock_irqsave()
-        .iter()
-        .filter_map(|installed| {
-            Some((
-                installed.mm.upgrade()?,
-                installed.vaddr,
-                installed.site.upgrade()?,
-            ))
-        })
-        .collect();
-    for (mm, vaddr, site) in installed {
-        if site.state() != UprobeSiteState::Dead {
-            rebuild_site_participants(&mm, vaddr, &site);
-        }
-    }
-}
-
 /// 注销前按 Linux `register_for_each_vma()` 的方式在 mm 写锁下重验映射身份，
 /// 防止 munmap 后同一虚址被无关文件复用时写坏新映射。
 fn site_mapping_still_matches(inner: &InnerAddressSpace, site: &UprobeSite) -> bool {
@@ -1563,29 +1549,6 @@ fn registry_consumer(consumer_id: u64) -> Option<Arc<UprobeConsumer>> {
         .flatten()
         .find(|consumer| consumer.id == consumer_id)
         .cloned()
-}
-
-/// 更新某消费者的 BPF 事件回调（PERF_EVENT_IOC_SET_BPF 时调用）。
-/// 迟到安装的实例据此取得与直接安装一致的回调。
-pub fn uprobe_registry_attach_callback(
-    consumer_id: u64,
-    cb: Arc<dyn uprobe::CallBackFunc>,
-) -> Result<(), SystemError> {
-    // Do not take consumer locks while holding the registry spinlock.
-    let consumer = registry_consumer(consumer_id).ok_or(SystemError::ENOENT)?;
-    let _lifecycle = consumer.lifecycle.lock();
-    if consumer.closing.load(Ordering::Acquire) {
-        return Err(SystemError::ENOENT);
-    }
-    {
-        let mut runtime = consumer.runtime.write();
-        if runtime.event_callback.is_some() {
-            return Err(SystemError::EEXIST);
-        }
-        runtime.event_callback = Some(cb);
-    }
-    refresh_consumer_sites(&consumer);
-    Ok(())
 }
 
 /// Update the single consumer-level enable state used by both already armed

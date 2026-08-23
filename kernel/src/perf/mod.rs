@@ -60,6 +60,10 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
     fn disable(&self) -> Result<()> {
         Err(SystemError::ENOSYS)
     }
+    /// Read the event-specific perf counter payload.
+    fn read_event(&self, _len: usize, _buf: &mut [u8]) -> Result<usize> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
     /// Whether the perf event is readable
     fn readable(&self) -> bool;
 
@@ -179,15 +183,23 @@ impl BasicPerfEbpfCallBack {
         }
     }
 
-    pub fn call(&self, entry: &mut [u8]) {
+    pub fn call_with_result(&self, entry: &mut [u8]) -> Option<u64> {
         let res = if cfg!(target_arch = "x86_64") {
             unsafe { self.vm.execute_program_jit(entry) }
         } else {
             self.vm.execute_program(entry)
         };
-        if res.is_err() {
-            log::error!("kprobe callback error: {:?}", res);
+        match res {
+            Ok(value) => Some(value),
+            Err(err) => {
+                log::error!("perf BPF callback error: {:?}", err);
+                None
+            }
         }
+    }
+
+    pub fn call(&self, entry: &mut [u8]) {
+        let _ = self.call_with_result(entry);
     }
 }
 
@@ -256,11 +268,11 @@ impl IndexNode for PerfEventInode {
     fn read_at(
         &self,
         _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
+        len: usize,
+        buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        self.event.read_event(len, buf)
     }
 
     fn write_at(

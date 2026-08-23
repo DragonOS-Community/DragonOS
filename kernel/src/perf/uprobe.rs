@@ -24,15 +24,17 @@ use crate::filesystem::vfs::{
 };
 use crate::include::bindings::linux_bpf::bpf_prog_type;
 use crate::libs::casting::DowncastArc;
-use crate::libs::mutex::MutexGuard;
+use crate::libs::mutex::{Mutex, MutexGuard};
+use crate::libs::wait_queue::WaitQueue;
 use crate::mm::ucontext::{
-    noop_handler, uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_attach_callback,
-    uprobe_registry_remove_consumer, uprobe_registry_set_enabled, UprobeConsumerReg,
-    UprobeConsumerScope, UprobeDefinition, UprobeTaskScope,
+    noop_handler, uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_remove_consumer,
+    uprobe_registry_set_enabled, UprobeConsumerReg, UprobeConsumerScope, UprobeDefinition,
+    UprobeTaskScope,
 };
 use crate::perf::util::{PerfProbeArgs, PerfProbeConfig};
 use crate::perf::{BasicPerfEbpfCallBack, PerfEventOps};
 use crate::process::{ProcessManager, RawPid};
+use crate::rcu::RcuOptionArcSlot;
 use crate::smp::core::smp_get_processor_id;
 use crate::smp::cpu::{smp_cpu_manager, ProcessorId};
 use alloc::boxed::Box;
@@ -41,6 +43,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use rbpf::EbpfVmRaw;
 use system_error::SystemError;
 use uprobe::{CallBackFunc, ProbeArgs};
@@ -48,12 +51,13 @@ use uprobe::{CallBackFunc, ProbeArgs};
 /// 一次 `perf_event_open(uprobe)` 对应一个持久 consumer。per-mm site 由
 /// AddressSpace 命中表拥有，consumer 只保存弱索引用于 close 撤销。
 pub struct UprobePerfEvent {
-    _args: PerfProbeArgs,
     // The mount owner must be released from perf-fd process context, never
     // when an IRQ-side ActiveXol releases its last site reference.
     _resolved_path: ResolvedPath,
     /// 消费者 id（评审 R9）：全局注册表与迟到句柄的归属键。
     consumer_id: u64,
+    callback: Arc<UprobePerfCallBack>,
+    lifecycle: Mutex<()>,
 }
 
 impl Drop for UprobePerfEvent {
@@ -61,7 +65,9 @@ impl Drop for UprobePerfEvent {
     /// （fork/mmap 路径安装的，逐 mm 注销）。直接安装的 `handles` 随本结构
     /// drop 自动注销（评审 R9）。
     fn drop(&mut self) {
+        self.callback.set_enabled(false);
         uprobe_registry_remove_consumer(self.consumer_id);
+        self.callback.wait_idle();
     }
 }
 impl core::fmt::Debug for UprobePerfEvent {
@@ -99,7 +105,7 @@ impl UprobePerfEvent {
                 .map_err(|_| SystemError::EINVAL)?;
         }
 
-        let callback: Arc<dyn CallBackFunc>;
+        let callback: Arc<BasicPerfEbpfCallBack>;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -118,23 +124,16 @@ impl UprobePerfEvent {
                 return Err(SystemError::EINVAL);
             }
             let basic_callback = BasicPerfEbpfCallBack::new(file, vm, jit_mem_addr);
-            callback = Arc::new(UprobePerfCallBack {
-                inner: basic_callback,
-                cpu: self._args.cpu,
-            });
+            callback = Arc::new(basic_callback);
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
             vm.register_allowed_memory(0..u64::MAX);
             let basic_callback = BasicPerfEbpfCallBack::new(file, vm);
-            callback = Arc::new(UprobePerfCallBack {
-                inner: basic_callback,
-                cpu: self._args.cpu,
-            });
+            callback = Arc::new(basic_callback);
         }
 
-        // callback 是 consumer 级单一事实源，现有与后续映射同时生效。
-        uprobe_registry_attach_callback(self.consumer_id, callback)
+        self.callback.attach_bpf(callback)
     }
 }
 
@@ -144,13 +143,85 @@ impl UprobePerfEvent {
 /// batch3 传入的 TrapFrame.rip 仍是 int3 故障点（probe_vaddr+1），此处也强制把
 /// 暴露给 BPF 的 rip 改为原探针址，XOL slot 地址绝不外泄。
 pub struct UprobePerfCallBack {
-    inner: BasicPerfEbpfCallBack,
     cpu: i32,
+    hit_count: AtomicU64,
+    enabled: AtomicBool,
+    inflight: AtomicUsize,
+    inflight_wait: WaitQueue,
+    bpf_attached: AtomicBool,
+    bpf_callback: RcuOptionArcSlot<BasicPerfEbpfCallBack>,
+}
+
+struct UprobePerfHitGuard<'a>(&'a UprobePerfCallBack);
+
+impl Drop for UprobePerfHitGuard<'_> {
+    fn drop(&mut self) {
+        if self.0.inflight.fetch_sub(1, Ordering::Release) == 1 {
+            self.0.inflight_wait.wakeup_all(None);
+        }
+    }
+}
+
+impl UprobePerfCallBack {
+    fn new(cpu: i32) -> Self {
+        Self {
+            cpu,
+            hit_count: AtomicU64::new(0),
+            enabled: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
+            inflight_wait: WaitQueue::default(),
+            bpf_attached: AtomicBool::new(false),
+            bpf_callback: RcuOptionArcSlot::new_none(),
+        }
+    }
+
+    fn attach_bpf(&self, callback: Arc<BasicPerfEbpfCallBack>) -> Result<()> {
+        self.bpf_attached
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| SystemError::EEXIST)?;
+        self.bpf_callback.store_deferred(Some(callback));
+        Ok(())
+    }
+
+    fn count(&self) -> u64 {
+        self.hit_count.load(Ordering::Relaxed)
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    fn begin_hit(&self) -> Option<UprobePerfHitGuard<'_>> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        if !self.enabled.load(Ordering::Acquire) {
+            if self.inflight.fetch_sub(1, Ordering::Release) == 1 {
+                self.inflight_wait.wakeup_all(None);
+            }
+            return None;
+        }
+        Some(UprobePerfHitGuard(self))
+    }
+
+    fn wait_idle(&self) {
+        self.inflight_wait
+            .wait_until(|| (self.inflight.load(Ordering::Acquire) == 0).then_some(()));
+    }
 }
 
 impl CallBackFunc for UprobePerfCallBack {
     fn call(&self, trap_frame: &dyn ProbeArgs) {
         if self.cpu >= 0 && smp_get_processor_id().data() != self.cpu as u32 {
+            return;
+        }
+        let Some(_hit_guard) = self.begin_hit() else {
+            return;
+        };
+        let bpf_callback = self.bpf_callback.load();
+        if bpf_callback.is_none() {
+            self.hit_count.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // F5：BPF 看到的 rip 是原探针址（break_address），不是 XOL slot、也不是 rip+1。
@@ -167,7 +238,13 @@ impl CallBackFunc for UprobePerfCallBack {
                 size_of::<KProbeContext>(),
             )
         };
-        self.inner.call(probe_context);
+        if bpf_callback
+            .as_ref()
+            .and_then(|callback| callback.call_with_result(probe_context))
+            .is_some_and(|result| result != 0)
+        {
+            self.hit_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -218,10 +295,33 @@ impl PerfEventOps for UprobePerfEvent {
         self.do_set_bpf_prog(bpf_prog)
     }
     fn enable(&self) -> Result<()> {
-        uprobe_registry_set_enabled(self.consumer_id, true)
+        let _lifecycle = self.lifecycle.lock();
+        self.callback.set_enabled(true);
+        if let Err(err) = uprobe_registry_set_enabled(self.consumer_id, true) {
+            self.callback.set_enabled(false);
+            self.callback.wait_idle();
+            return Err(err);
+        }
+        Ok(())
     }
     fn disable(&self) -> Result<()> {
-        uprobe_registry_set_enabled(self.consumer_id, false)
+        let _lifecycle = self.lifecycle.lock();
+        self.callback.set_enabled(false);
+        if let Err(err) = uprobe_registry_set_enabled(self.consumer_id, false) {
+            self.callback.set_enabled(true);
+            return Err(err);
+        }
+        self.callback.wait_idle();
+        Ok(())
+    }
+
+    fn read_event(&self, len: usize, buf: &mut [u8]) -> Result<usize> {
+        const COUNT_SIZE: usize = size_of::<u64>();
+        if len < COUNT_SIZE || buf.len() < COUNT_SIZE {
+            return Err(SystemError::ENOSPC);
+        }
+        buf[..COUNT_SIZE].copy_from_slice(&self.callback.count().to_ne_bytes());
+        Ok(COUNT_SIZE)
     }
 
     fn readable(&self) -> bool {
@@ -254,6 +354,12 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         return Err(SystemError::EACCES);
     }
     if args.inherit || args.enable_on_exec || args.remove_on_exec {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    // Phase one exposes the native singleton count. Advanced perf read
+    // layouts require generic PMU scheduling/time accounting and must not be
+    // silently encoded with incorrect values here.
+    if args.read_format != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     if args.config != PerfProbeConfig::Raw(0) {
@@ -316,6 +422,7 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     // 消费者身份 + 注册表登记（评审 R9：fork/后续 mmap 迟到安装的依据）。
     let consumer_id = uprobe_new_consumer_id();
     let inode_id = definition.inode_id();
+    let callback = Arc::new(UprobePerfCallBack::new(args.cpu));
     uprobe_registry_add(
         inode_id,
         offset,
@@ -325,7 +432,7 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
             scope,
             pre_handler: noop_handler,
             post_handler: noop_handler,
-            event_callback: None,
+            event_callback: Some(callback.clone()),
             // Initial activation uses the same scope-aware path as ioctl
             // ENABLE, so task events never need a global file-rmap scan.
             enabled: false,
@@ -336,15 +443,19 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     // is valid; future mmap/dlopen/exec hooks will install the persistent
     // consumer. A real initial installation failure rolls registration back.
     if !args.disabled {
+        callback.set_enabled(true);
         if let Err(e) = uprobe_registry_set_enabled(consumer_id, true) {
+            callback.set_enabled(false);
+            callback.wait_idle();
             uprobe_registry_remove_consumer(consumer_id);
             return Err(e);
         }
     }
 
     Ok(UprobePerfEvent {
-        _args: args,
         _resolved_path: resolved,
         consumer_id,
+        callback,
+        lifecycle: Mutex::new(()),
     })
 }

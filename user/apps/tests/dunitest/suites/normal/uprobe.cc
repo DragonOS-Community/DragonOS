@@ -56,6 +56,7 @@ struct UprobePerfEventOptions {
     bool enable_on_exec = false;
     bool remove_on_exec = false;
     __u64 config = 0;
+    __u64 read_format = 0;
     int group_fd = -1;
     unsigned long flags = 0;
 };
@@ -145,6 +146,7 @@ int open_uprobe_perf_event(const std::string& path, unsigned long offset,
     pe.config = options.config;
     pe.config1 = reinterpret_cast<__u64>(path.c_str());
     pe.config2 = offset;
+    pe.read_format = options.read_format;
     pe.disabled = options.disabled;
     pe.inherit = options.inherit;
     pe.enable_on_exec = options.enable_on_exec;
@@ -242,6 +244,11 @@ TEST(UprobeTest, RegisterAndTriggerSurvivesHit) {
     volatile int result = uprobe_target(21);
     EXPECT_EQ(result, 43);
 
+    __u64 count = 0;
+    ASSERT_EQ(read(fd, &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
+
     ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
     close(fd);
 }
@@ -316,8 +323,7 @@ TEST(UprobeTest, UnregisterRestoresNormalExecution) {
     }
 }
 
-// disabled 会撤销该 consumer；若它是最后一个，应恢复原指令。
-// 计数 ABI 尚未实现，这里只验证 disable/enable 生命周期不破坏控制流。
+// disabled 会撤销该 consumer；若它是最后一个，应恢复原指令，且命中计数冻结。
 TEST(UprobeTest, DisabledStillReturnsCorrectly) {
     std::string path;
     unsigned long offset = 0;
@@ -336,10 +342,18 @@ TEST(UprobeTest, DisabledStillReturnsCorrectly) {
         EXPECT_EQ(result, (i + 200) * 2 + 1) << "disabled 第 " << i << " 次结果错误";
     }
 
+    __u64 count = ~0ULL;
+    ASSERT_EQ(read(fd, &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 0U);
+
     // 重新 enable：回调恢复（此处 noop_handler），函数结果仍须正确。
     ASSERT_GE(ioctl(fd, PERF_EVENT_IOC_ENABLE, 0), 0);
     volatile int r = uprobe_target(7);
     EXPECT_EQ(r, 15);
+    ASSERT_EQ(read(fd, &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
 
     close(fd);
 }
@@ -351,8 +365,7 @@ TEST(UprobeTest, EventSourceTypeIsPublished) {
     EXPECT_GT(type, 0U);
 }
 
-// perf fd 暂无可读计数，因此这里只验证 disabled 的可观察控制流语义：
-// 事件以 disabled=1 创建后，被探测指令仍能正确执行，并可显式启用。
+// 事件以 disabled=1 创建后不计数，并可显式启用。
 TEST(UprobeTest, InitiallyDisabledCanBeEnabled) {
     std::string path;
     unsigned long offset = 0;
@@ -371,10 +384,18 @@ TEST(UprobeTest, InitiallyDisabledCanBeEnabled) {
         EXPECT_EQ(result, (i + 300) * 2 + 1);
     }
 
+    __u64 count = ~0ULL;
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 0U);
+
     ASSERT_GE(ioctl(fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0)
         << "初始 disabled 事件 ENABLE 失败，errno=" << errno;
     volatile int result = uprobe_target(17);
     EXPECT_EQ(result, 35);
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
 }
 
 TEST(UprobeTest, InvalidPidCpuCombinationsAreRejected) {
@@ -488,7 +509,7 @@ TEST(UprobeTest, RelativePathUsesCurrentWorkingDirectory) {
     ASSERT_EQ(fchdir(old_cwd.get()), 0);
 }
 
-TEST(UprobeTest, UnsupportedReadReturnsErrorInsteadOfPanicking) {
+TEST(UprobeTest, CounterReadUsesRawSingletonFormat) {
     std::string path;
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
@@ -496,10 +517,41 @@ TEST(UprobeTest, UnsupportedReadReturnsErrorInsteadOfPanicking) {
     FdGuard fd(open_uprobe_perf_event(path, offset));
     ASSERT_GE(fd.get(), 0);
 
-    __u64 count = 0;
+    unsigned char short_buffer = 0;
     errno = 0;
-    EXPECT_LT(read(fd.get(), &count, sizeof(count)), 0);
+    EXPECT_LT(read(fd.get(), &short_buffer, sizeof(short_buffer)), 0);
+    EXPECT_EQ(errno, ENOSPC);
+
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(uprobe_target(i), i * 2 + 1);
+    }
+    __u64 count = 0;
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 3U);
+    count = 0;
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 3U) << "读取计数不应清零";
+}
+
+TEST(UprobeTest, UnsupportedReadFormatIsRejected) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+    UprobePerfEventOptions options;
+    options.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED;
+    errno = 0;
+    FdGuard fd(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(fd.get(), 0);
     EXPECT_EQ(errno, EOPNOTSUPP);
+
+    options.read_format = 1ULL << 63;
+    errno = 0;
+    FdGuard unknown(open_uprobe_perf_event(path, offset, options));
+    EXPECT_LT(unknown.get(), 0);
+    EXPECT_EQ(errno, EINVAL);
 }
 
 TEST(UprobeTest, ReadOnlyAliasIsSkippedAndLaterExecutableMapIsProbed) {
@@ -788,6 +840,15 @@ TEST(UprobeTest, SameAddressConsumersCloseIndependently) {
         EXPECT_EQ(uprobe_target(i + 1), (i + 1) * 2 + 1);
     }
 
+    __u64 first_count = 0;
+    __u64 second_count = 0;
+    ASSERT_EQ(read(first_fd.get(), &first_count, sizeof(first_count)),
+              static_cast<ssize_t>(sizeof(first_count)));
+    ASSERT_EQ(read(second_fd.get(), &second_count, sizeof(second_count)),
+              static_cast<ssize_t>(sizeof(second_count)));
+    EXPECT_EQ(first_count, 129U);
+    EXPECT_EQ(second_count, 257U);
+
     first_fd.close_now();
     EXPECT_EQ(uprobe_target(32), 65)
         << "关闭一个 consumer 不应破坏剩余 consumer 的 XOL 路径";
@@ -969,6 +1030,31 @@ TEST(UprobeTest, DuplicateBpfAttachReturnsEexist) {
     errno = 0;
     EXPECT_LT(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0);
     EXPECT_EQ(errno, EEXIST);
+}
+
+TEST(UprobeTest, BpfReturnValueFiltersCounter) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+
+    auto run_filtered_event = [&](int return_value) {
+        FdGuard event(open_uprobe_perf_event(path, offset));
+        EXPECT_GE(event.get(), 0);
+        const std::vector<bpf_insn> instructions = {
+            bpf_mov64_imm(return_value), bpf_exit()};
+        FdGuard program(load_kprobe_bpf_program(instructions));
+        EXPECT_GE(program.get(), 0);
+        EXPECT_EQ(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0);
+        EXPECT_EQ(uprobe_target(11), 23);
+        __u64 count = ~0ULL;
+        EXPECT_EQ(read(event.get(), &count, sizeof(count)),
+                  static_cast<ssize_t>(sizeof(count)));
+        return count;
+    };
+
+    EXPECT_EQ(run_filtered_event(0), 0U);
+    EXPECT_EQ(run_filtered_event(1), 1U);
 }
 
 TEST(UprobeTest, LargeBpfJitProgramAttachesSafely) {

@@ -45,6 +45,8 @@ pub struct PerfProbeArgs {
     pub group_fd: i32,
     pub flags: PerfEventOpenFlags,
     pub sample_type: Option<perf_event_sample_format>,
+    /// Requested layout for read(2) on the perf event fd.
+    pub read_format: u64,
     /// `perf_event_attr.disabled`：事件初始是否禁用（评审 R11a）。
     pub disabled: bool,
     pub inherit: bool,
@@ -75,6 +77,10 @@ impl PerfProbeArgs {
         if attr.__reserved_1() != 0 || attr.__reserved_2 != 0 || attr.__reserved_3 != 0 {
             return Err(SystemError::EINVAL);
         }
+        const KNOWN_READ_FORMAT_BITS: u64 = (1 << 5) - 1;
+        if attr.read_format & !KNOWN_READ_FORMAT_BITS != 0 {
+            return Err(SystemError::EINVAL);
+        }
         let ty = attr.type_;
         let config = match perf_type_id::from_u32(ty) {
             Some(perf_type_id::PERF_TYPE_SOFTWARE) => {
@@ -103,6 +109,7 @@ impl PerfProbeArgs {
             group_fd,
             flags: PerfEventOpenFlags::from_bits(raw_flags).ok_or(SystemError::EINVAL)?,
             sample_type: sample_ty,
+            read_format: attr.read_format,
             disabled: attr.disabled() != 0,
             inherit: attr.inherit() != 0,
             enable_on_exec: attr.enable_on_exec() != 0,

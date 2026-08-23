@@ -9,6 +9,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <thread>
 
 namespace {
@@ -287,6 +289,168 @@ TEST(EpollCtlWaitConcurrency, ReusedFdNumberKeepsRegistrationsSeparatedByOpenFil
     close(replacement);
     close(epfd);
     close(keepalive);
+    close(sockets[1]);
+}
+
+TEST(EpollCtlWaitConcurrency, DoubleEpollOneShotExchangeMakesProgress) {
+    constexpr int kRounds = 1 << 14;
+    constexpr uint64_t kEventTag = 0x2202;
+    constexpr auto kStallTimeout = std::chrono::seconds(10);
+    constexpr char kRequest[] = "hello";
+    constexpr char kStop[] = "world";
+    static_assert(sizeof(kRequest) == sizeof(kStop));
+
+    int sockets[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) << strerror(errno);
+    const int epfds[2] = {epoll_create1(EPOLL_CLOEXEC), epoll_create1(EPOLL_CLOEXEC)};
+    ASSERT_GE(epfds[0], 0) << strerror(errno);
+    ASSERT_GE(epfds[1], 0) << strerror(errno);
+
+    for (int epfd : epfds) {
+        epoll_event event = {};
+        event.events = EPOLLIN | EPOLLONESHOT;
+        event.data.u64 = kEventTag;
+        ASSERT_EQ(0, epoll_ctl(epfd, EPOLL_CTL_ADD, sockets[1], &event)) << strerror(errno);
+    }
+
+    std::atomic<int> first_error{0};
+    std::atomic<int> completed_rounds{0};
+    std::atomic<bool> finished{false};
+    std::mutex socket_lock;
+
+    auto write_exact = [&](int fd, const char* data, size_t size) {
+        size_t done = 0;
+        while (done < size) {
+            const ssize_t written = send(fd, data + done, size - done, MSG_NOSIGNAL);
+            if (written > 0) {
+                done += static_cast<size_t>(written);
+                continue;
+            }
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            record_first_error(&first_error, errno != 0 ? errno : EIO);
+            return false;
+        }
+        return true;
+    };
+
+    auto read_exact = [&](int fd, char* data, size_t size) {
+        size_t done = 0;
+        while (done < size) {
+            const ssize_t received = read(fd, data + done, size - done);
+            if (received > 0) {
+                done += static_cast<size_t>(received);
+                continue;
+            }
+            if (received < 0 && errno == EINTR) {
+                continue;
+            }
+            record_first_error(&first_error,
+                               received == 0 ? EPIPE : (errno != 0 ? errno : EIO));
+            return false;
+        }
+        return true;
+    };
+
+    std::thread server([&]() {
+        char request[sizeof(kRequest)] = {};
+        for (int round = 0; round < kRounds && first_error.load() == 0; ++round) {
+            if (!read_exact(sockets[0], request, sizeof(request))) {
+                return;
+            }
+            if (memcmp(request, kRequest, sizeof(request)) != 0) {
+                record_first_error(&first_error, EPROTO);
+                return;
+            }
+            const char* response = round < kRounds - 2 ? kRequest : kStop;
+            if (!write_exact(sockets[0], response, sizeof(kRequest))) {
+                return;
+            }
+            completed_rounds.store(round + 1, std::memory_order_release);
+        }
+    });
+
+    auto client = [&](int epfd) {
+        bool rearm = false;
+        char response[sizeof(kRequest)] = {};
+        while (first_error.load() == 0) {
+            if (rearm) {
+                epoll_event event = {};
+                event.events = EPOLLIN | EPOLLONESHOT;
+                event.data.u64 = kEventTag;
+                if (epoll_ctl(epfd, EPOLL_CTL_MOD, sockets[1], &event) != 0) {
+                    record_first_error(&first_error, errno != 0 ? errno : EIO);
+                    return;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(socket_lock);
+                if (!write_exact(sockets[1], kRequest, sizeof(kRequest))) {
+                    return;
+                }
+            }
+
+            epoll_event event = {};
+            int ready;
+            do {
+                ready = epoll_wait(epfd, &event, 1, -1);
+            } while (ready < 0 && errno == EINTR);
+            if (ready != 1 || event.data.u64 != kEventTag) {
+                record_first_error(&first_error, ready < 0 && errno != 0 ? errno : EIO);
+                return;
+            }
+            rearm = true;
+
+            {
+                std::lock_guard<std::mutex> lock(socket_lock);
+                if (!read_exact(sockets[1], response, sizeof(response))) {
+                    return;
+                }
+            }
+            if (memcmp(response, kStop, sizeof(response)) == 0) {
+                return;
+            }
+            if (memcmp(response, kRequest, sizeof(response)) != 0) {
+                record_first_error(&first_error, EPROTO);
+                return;
+            }
+        }
+    };
+
+    std::thread client1(client, epfds[0]);
+    std::thread client2(client, epfds[1]);
+    std::thread watchdog([&]() {
+        int last_progress = completed_rounds.load(std::memory_order_acquire);
+        auto stall_deadline = std::chrono::steady_clock::now() + kStallTimeout;
+        while (!finished.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            const int progress = completed_rounds.load(std::memory_order_acquire);
+            if (progress != last_progress) {
+                last_progress = progress;
+                stall_deadline = std::chrono::steady_clock::now() + kStallTimeout;
+            } else if (std::chrono::steady_clock::now() >= stall_deadline) {
+                record_first_error(&first_error, ETIMEDOUT);
+                shutdown(sockets[0], SHUT_RDWR);
+                shutdown(sockets[1], SHUT_RDWR);
+                return;
+            }
+        }
+    });
+
+    server.join();
+    client1.join();
+    client2.join();
+    finished.store(true, std::memory_order_release);
+    watchdog.join();
+
+    EXPECT_EQ(0, first_error.load())
+        << "double EPOLLONESHOT exchange stalled or failed: " << strerror(first_error.load());
+
+    close(epfds[0]);
+    close(epfds[1]);
+    close(sockets[0]);
     close(sockets[1]);
 }
 

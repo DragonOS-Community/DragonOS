@@ -122,6 +122,11 @@ impl WaitQueue {
         drop(evicted);
     }
 
+    /// Returns a transient, lockless snapshot of whether the queue is empty.
+    ///
+    /// This is only an advisory hint. A negative result must not be used to
+    /// skip a correctness-critical, one-shot wakeup without an independent
+    /// synchronization protocol.
     pub fn is_empty(&self) -> bool {
         self.num_waiters.load(Ordering::Acquire) == 0
     }
@@ -642,10 +647,6 @@ impl WaitQueue {
     }
 
     pub fn wake_one(&self) -> bool {
-        if self.is_empty() {
-            return false;
-        }
-
         loop {
             let next = {
                 let mut guard = self.inner.lock_irqsave();
@@ -707,10 +708,6 @@ impl WaitQueue {
     }
 
     pub fn wake_all(&self) -> usize {
-        if self.is_empty() {
-            return 0;
-        }
-
         let drained;
         {
             let mut guard = self.inner.lock_irqsave();

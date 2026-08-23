@@ -27,7 +27,7 @@ use system_error::SystemError;
 
 use super::vfs::{
     file::FilePrivateData, utils::DName, FileSystem, FsInfo, FsReconfigureRequest, IndexNode,
-    InodeFlags, InodeId, InodeMode, Metadata, SpecialNodeData,
+    InodeFlags, InodeId, InodeMode, Metadata, SetMetadataMask, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -539,7 +539,7 @@ impl IndexNode for LockedRamFSInode {
         len: usize,
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<SetMetadataMask, SystemError> {
         drop(data);
         super::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
     }

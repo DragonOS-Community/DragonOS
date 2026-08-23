@@ -2407,7 +2407,7 @@ impl IndexNode for LockedExt4Inode {
         len: usize,
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<SetMetadataMask, SystemError> {
         drop(data);
         vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
     }

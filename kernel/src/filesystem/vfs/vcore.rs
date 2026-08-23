@@ -920,7 +920,7 @@ pub fn resize_based_fallocate(
     offset: usize,
     len: usize,
     lock_owner: u64,
-) -> Result<(), SystemError> {
+) -> Result<SetMetadataMask, SystemError> {
     if mode != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -937,13 +937,14 @@ pub fn resize_based_fallocate(
 
     let current_size = md.size.max(0) as usize;
     if new_size <= current_size {
-        return Ok(());
+        return Ok(SetMetadataMask::empty());
     }
 
     check_file_size_limit(new_size)?;
 
     let (metadata, mask) = prepare_write_side_effect_metadata(md, new_size);
-    inode.resize_with_metadata(new_size, lock_owner, &metadata, mask)
+    inode.resize_with_metadata(new_size, lock_owner, &metadata, mask)?;
+    Ok(mask)
 }
 
 /// 基于已打开文件执行 VFS fallocate 公共检查，再分派给具体文件系统。
@@ -1045,9 +1046,13 @@ pub fn vfs_fallocate_file(
         current_file_lock_owner_id(),
         file.private_data.lock(),
     );
-    // Linux reports successful fallocate, including KEEP_SIZE, as MODIFY.
-    if r.is_ok() {
+    // Linux file_modified() reports a committed privilege-bit removal before
+    // vfs_fallocate() reports the successful data modification.
+    if let Ok(mask) = r.as_ref() {
+        if mask.contains(SetMetadataMask::MODE) {
+            file.notify_fs_event(FsEvent::ATTRIB);
+        }
         file.notify_fs_event(FsEvent::MODIFY);
     }
-    r
+    r.map(|_| ())
 }

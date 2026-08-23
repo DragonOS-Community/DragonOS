@@ -805,7 +805,7 @@ impl IndexNode for FuseNode {
         len: usize,
         _lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<SetMetadataMask, SystemError> {
         const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
         const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
         const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
@@ -877,7 +877,7 @@ impl IndexNode for FuseNode {
                 drop(metadata);
                 self.cached_metadata_deadline_ticks
                     .store(0, Ordering::Relaxed);
-                Ok(())
+                Ok(SetMetadataMask::empty())
             }
             Err(SystemError::ENOSYS) => {
                 self.conn().mark_no_fallocate();

@@ -20,6 +20,7 @@
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/mount.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -1250,6 +1251,110 @@ TEST(InotifyMetadataEvents, KillPrivReportsWriteAndTruncateModeChanges) {
 
     close(ifd);
     unlink(path.c_str());
+}
+
+TEST(InotifyMetadataEvents, FallocateKillPrivPrecedesModify) {
+    const std::string path = "/tmp/dunitest_inotify_fallocate_killpriv";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0755);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, 1), 0);
+    close(fd);
+    ASSERT_EQ(chown(path.c_str(), 65534, 65534), 0);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_ATTRIB | IN_MODIFY), 0);
+
+    auto run_unprivileged_fallocate = [&](off_t offset, off_t len, int exit_base) {
+        pid_t child = fork();
+        ASSERT_GE(child, 0);
+        if (child == 0) {
+            if (setgid(65534) != 0 || setuid(65534) != 0) _exit(exit_base);
+            int child_fd = open(path.c_str(), O_RDWR);
+            if (child_fd < 0) _exit(exit_base + 1);
+            if (syscall(SYS_fallocate, child_fd, 0, offset, len) != 0)
+                _exit(exit_base + 2);
+            close(child_fd);
+            _exit(0);
+        }
+        int status = 0;
+        ASSERT_EQ(waitpid(child, &status, 0), child);
+        ASSERT_TRUE(WIFEXITED(status));
+        ASSERT_EQ(WEXITSTATUS(status), 0);
+    };
+
+    ASSERT_EQ(chmod(path.c_str(), 04755), 0);
+    (void)drain_events(ifd);
+    run_unprivileged_fallocate(0, 8192, 10);
+    auto extending = drain_events(ifd);
+    ASSERT_GE(first_event_index(extending, IN_ATTRIB), 0);
+    ASSERT_GE(first_event_index(extending, IN_MODIFY), 0);
+    EXPECT_LT(first_event_index(extending, IN_ATTRIB),
+              first_event_index(extending, IN_MODIFY));
+    struct stat st = {};
+    ASSERT_EQ(stat(path.c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & S_ISUID, 0);
+
+    (void)drain_events(ifd);
+    fd = open(path.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0);
+    errno = 0;
+    EXPECT_EQ(syscall(SYS_fallocate, fd, -1, 0, 4096), -1);
+    EXPECT_TRUE(drain_events(ifd).empty());
+    close(fd);
+    close(ifd);
+    unlink(path.c_str());
+}
+
+TEST(InotifyDataEvents, BulkCopiesPublishOneEventPerEndpoint) {
+    const std::string source = "/tmp/dunitest_inotify_bulk_source";
+    const std::string target = "/tmp/dunitest_inotify_bulk_target";
+    constexpr size_t kTransferSize = 12288;
+    std::vector<char> data(kTransferSize, 'x');
+
+    int source_fd = open(source.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    int target_fd = open(target.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(source_fd, 0);
+    ASSERT_GE(target_fd, 0);
+    ASSERT_EQ(write(source_fd, data.data(), data.size()),
+              static_cast<ssize_t>(data.size()));
+    ASSERT_EQ(lseek(source_fd, 0, SEEK_SET), 0);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    int source_wd = inotify_add_watch(ifd, source.c_str(), IN_ACCESS);
+    int target_wd = inotify_add_watch(ifd, target.c_str(), IN_MODIFY);
+    ASSERT_GE(source_wd, 0);
+    ASSERT_GE(target_wd, 0);
+
+    ASSERT_EQ(syscall(SYS_copy_file_range, source_fd, nullptr, target_fd, nullptr,
+                      kTransferSize, 0),
+              static_cast<ssize_t>(kTransferSize));
+    auto copy_events = drain_events(ifd);
+    ASSERT_EQ(copy_events.size(), 2u);
+    EXPECT_EQ(copy_events[0].wd, source_wd);
+    EXPECT_TRUE(copy_events[0].mask & IN_ACCESS);
+    EXPECT_EQ(copy_events[1].wd, target_wd);
+    EXPECT_TRUE(copy_events[1].mask & IN_MODIFY);
+
+    ASSERT_EQ(lseek(source_fd, 0, SEEK_SET), 0);
+    ASSERT_EQ(ftruncate(target_fd, 0), 0);
+    ASSERT_EQ(lseek(target_fd, 0, SEEK_SET), 0);
+    (void)drain_events(ifd);
+    ASSERT_EQ(syscall(SYS_sendfile, target_fd, source_fd, nullptr, kTransferSize),
+              static_cast<ssize_t>(kTransferSize));
+    auto sendfile_events = drain_events(ifd);
+    ASSERT_EQ(sendfile_events.size(), 2u);
+    EXPECT_EQ(sendfile_events[0].wd, source_wd);
+    EXPECT_TRUE(sendfile_events[0].mask & IN_ACCESS);
+    EXPECT_EQ(sendfile_events[1].wd, target_wd);
+    EXPECT_TRUE(sendfile_events[1].mask & IN_MODIFY);
+
+    close(ifd);
+    close(source_fd);
+    close(target_fd);
+    unlink(source.c_str());
+    unlink(target.c_str());
 }
 
 TEST(InotifyExcludeUnlinked, PathEventsAreSuppressedForDirectAndParentMarks) {

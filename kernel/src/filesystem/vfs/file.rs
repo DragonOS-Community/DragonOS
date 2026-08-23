@@ -209,6 +209,14 @@ struct WriteConfig {
     offset_update: OffsetUpdate,
     /// Only consumed by a delegated write operation.
     sync_intent: WriteSyncIntent,
+    /// Whether this operation owns the data-content MODIFY notification.
+    emit_data_fsnotify: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WriteCompletionPolicy {
+    sync_intent: WriteSyncIntent,
+    emit_data_fsnotify: bool,
 }
 
 /// Determines which write operation owns Linux post-write synchronous-I/O
@@ -1086,7 +1094,9 @@ impl File {
             if mode_changed {
                 self.notify_fs_event(FsEvent::ATTRIB);
             }
-            self.notify_fs_event(FsEvent::MODIFY);
+            if config.emit_data_fsnotify {
+                self.notify_fs_event(FsEvent::MODIFY);
+            }
         }
         Ok(written_len)
     }
@@ -1480,7 +1490,7 @@ impl File {
     /// Read for splice while deferring ACCESS until the transfer commits.
     /// This preserves the normal permission, readahead and atime behavior but
     /// lets do_splice publish MODIFY(out) before ACCESS(in), as Linux does.
-    pub(crate) fn read_for_splice(
+    pub(crate) fn read_for_transfer(
         &self,
         offset: Option<usize>,
         len: usize,
@@ -1547,7 +1557,17 @@ impl File {
             return Err(SystemError::EBADF);
         }
 
-        self.do_write_split(offset, len, buf, false, false, requested_sync)
+        self.do_write_split(
+            offset,
+            len,
+            buf,
+            false,
+            false,
+            WriteCompletionPolicy {
+                sync_intent: requested_sync,
+                emit_data_fsnotify: true,
+            },
+        )
     }
 
     /// 强制追加写（Linux `RWF_APPEND`/`IOCB_APPEND` 语义）：
@@ -1745,7 +1765,35 @@ impl File {
             buf,
             update_offset,
             force_append,
-            WriteSyncIntent::None,
+            WriteCompletionPolicy {
+                sync_intent: WriteSyncIntent::None,
+                emit_data_fsnotify: true,
+            },
+        )?;
+        result.sync_result?;
+        Ok(result.written_len)
+    }
+
+    /// Write one internal transfer chunk while deferring its data-content
+    /// notification to the syscall that owns the complete transfer. Metadata
+    /// side effects such as setid removal are still reported immediately.
+    pub(crate) fn write_for_transfer(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        update_offset: bool,
+    ) -> Result<usize, SystemError> {
+        let result = self.do_write_split(
+            offset,
+            len,
+            buf,
+            update_offset,
+            false,
+            WriteCompletionPolicy {
+                sync_intent: WriteSyncIntent::None,
+                emit_data_fsnotify: false,
+            },
         )?;
         result.sync_result?;
         Ok(result.written_len)
@@ -1758,7 +1806,7 @@ impl File {
         buf: &[u8],
         update_offset: bool,
         force_append: bool,
-        requested_sync: WriteSyncIntent,
+        completion: WriteCompletionPolicy,
     ) -> Result<DelegatedWriteResult, SystemError> {
         self.writeable()?;
 
@@ -1781,7 +1829,7 @@ impl File {
         let sync_intent = match self.post_write_sync {
             PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::Delegated => self
                 .post_write_sync_intent(flags, inode_flags)
-                .combine(requested_sync),
+                .combine(completion.sync_intent),
             PostWriteSyncPolicy::NotApplicable => WriteSyncIntent::None,
         };
 
@@ -1805,6 +1853,7 @@ impl File {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
                         sync_intent,
+                        emit_data_fsnotify: completion.emit_data_fsnotify,
                     },
                 )
                 .map(|result| (actual_offset, result))
@@ -1819,7 +1868,7 @@ impl File {
                 // inode flags already fetched before I/O.
                 let current_sync_intent = self
                     .post_write_sync_intent(flags, inode_flags)
-                    .combine(requested_sync);
+                    .combine(completion.sync_intent);
                 result.sync_result = self.generic_sync_after_write(
                     actual_offset,
                     result.written_len,
@@ -1840,12 +1889,13 @@ impl File {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
                 sync_intent,
+                emit_data_fsnotify: completion.emit_data_fsnotify,
             },
         )?;
         if result.sync_result.is_ok() {
             let current_sync_intent = self
                 .post_write_sync_intent(flags, inode_flags)
-                .combine(requested_sync);
+                .combine(completion.sync_intent);
             result.sync_result = self.generic_sync_after_write(
                 actual_offset,
                 result.written_len,
@@ -1899,6 +1949,7 @@ impl File {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
                         sync_intent,
+                        emit_data_fsnotify: true,
                     },
                 )
                 .map(|written_len| (actual_offset, written_len))
@@ -1923,6 +1974,7 @@ impl File {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
                 sync_intent,
+                emit_data_fsnotify: true,
             },
         )?;
         let current_sync_intent = self.post_write_sync_intent(flags, inode_flags);

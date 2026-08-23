@@ -1,4 +1,5 @@
 use crate::arch::syscall::nr::SYS_SENDFILE;
+use crate::filesystem::fsnotify::FsEvent;
 use crate::process::ProcessManager;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::UserBufferReader;
@@ -74,15 +75,8 @@ impl Syscall for SysSendfileHandle {
             // to reflect the number of bytes read from `in_file`.
             let max_readlen = buffer.len().min(count - total_len);
             // Read from `in_file`
-            let read_res = if let Some(offset) = offset.as_mut() {
-                let res = in_file.do_read(*offset, max_readlen, &mut buffer[..max_readlen], false);
-                if let Ok(len) = res.as_ref() {
-                    *offset += *len;
-                }
-                res
-            } else {
-                in_file.read(max_readlen, &mut buffer[..max_readlen])
-            };
+            let read_res =
+                in_file.read_for_transfer(offset, max_readlen, &mut buffer[..max_readlen]);
 
             let read_len = match read_res {
                 Ok(len) => len,
@@ -101,11 +95,17 @@ impl Syscall for SysSendfileHandle {
 
             // Note: `sendfile` allows sending partial data,
             // so short reads and short writes are all acceptable
-            let write_res = out_file.write(read_len, &buffer[..read_len]);
+            let write_res =
+                out_file.write_for_transfer(out_file.pos(), read_len, &buffer[..read_len], true);
 
             match write_res {
                 Ok(len) => {
                     total_len += len;
+                    if let Some(offset) = offset.as_mut() {
+                        *offset += len;
+                    } else {
+                        in_file.advance_pos(len);
+                    }
                     if len < 4096 {
                         break;
                     }
@@ -118,6 +118,11 @@ impl Syscall for SysSendfileHandle {
                     return Err(e);
                 }
             }
+        }
+
+        if total_len > 0 {
+            in_file.notify_io_event(FsEvent::ACCESS);
+            out_file.notify_io_event(FsEvent::MODIFY);
         }
 
         Ok(total_len)

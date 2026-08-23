@@ -32,7 +32,7 @@ use crate::{
     filesystem::vfs::{
         file::{FileFlags, FilePrivateData},
         vcore::generate_inode_id,
-        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
+        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata, SetMetadataMask,
     },
     libs::{
         mutex::{Mutex, MutexGuard},
@@ -2225,7 +2225,7 @@ impl IndexNode for LockedFATInode {
         len: usize,
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<SetMetadataMask, SystemError> {
         drop(data);
         crate::filesystem::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
     }

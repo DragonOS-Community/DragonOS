@@ -708,7 +708,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _len: usize,
         _lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<SetMetadataMask, SystemError> {
         drop(data);
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }

@@ -4,6 +4,7 @@
 //! 文档: https://man7.org/linux/man-pages/man2/copy_file_range.2.html
 
 use crate::arch::syscall::nr::SYS_COPY_FILE_RANGE;
+use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::file::{File, FileFlags, FileMode};
 use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
@@ -286,12 +287,14 @@ fn copy_file_range_impl(
         let to_copy = remaining.min(BUF_SIZE);
 
         // 读取数据
-        let read_len = if use_in_file_offset {
-            // 使用文件当前偏移读取，自动更新文件偏移
-            in_file.read(to_copy, &mut buffer[..to_copy])?
-        } else {
-            // 使用指定偏移读取，不更新文件偏移
-            in_file.do_read(current_pos_in, to_copy, &mut buffer[..to_copy], false)?
+        let read_len = match in_file.read_for_transfer(
+            (!use_in_file_offset).then_some(current_pos_in),
+            to_copy,
+            &mut buffer[..to_copy],
+        ) {
+            Ok(len) => len,
+            Err(_) if total_copied > 0 => break,
+            Err(error) => return Err(error),
         };
 
         if read_len == 0 {
@@ -299,21 +302,37 @@ fn copy_file_range_impl(
         }
 
         // 写入数据
-        let written = if use_out_file_offset {
-            // 使用文件当前偏移写入，自动更新文件偏移
-            out_file.write(read_len, &buffer[..read_len])?
+        let write_offset = if use_out_file_offset {
+            out_file.pos()
         } else {
-            // 使用指定偏移写入，不更新文件偏移
-            out_file.do_write(current_pos_out, read_len, &buffer[..read_len], false, false)?
+            current_pos_out
+        };
+        let written = match out_file.write_for_transfer(
+            write_offset,
+            read_len,
+            &buffer[..read_len],
+            use_out_file_offset,
+        ) {
+            Ok(len) => len,
+            Err(_) if total_copied > 0 => break,
+            Err(error) => return Err(error),
         };
 
         total_copied += written;
+        if use_in_file_offset {
+            in_file.advance_pos(written);
+        }
         current_pos_in += written;
         current_pos_out += written;
 
         if written < read_len {
             break; // 短写
         }
+    }
+
+    if total_copied > 0 {
+        in_file.notify_io_event(FsEvent::ACCESS);
+        out_file.notify_io_event(FsEvent::MODIFY);
     }
 
     Ok(total_copied)

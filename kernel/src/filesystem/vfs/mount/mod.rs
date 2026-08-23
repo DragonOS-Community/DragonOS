@@ -1222,7 +1222,7 @@ impl SuperBlockState {
                     .as_any_ref()
                     .downcast_ref::<crate::filesystem::fuse::inode::FuseNode>()
                 {
-                    let _ = fuse.note_link_removed(false);
+                    let _ = fuse.note_link_removed(dentry.file_type == FileType::Dir);
                 }
             }
         }
@@ -4688,7 +4688,7 @@ impl IndexNode for MountFSInode {
         len: usize,
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<SetMetadataMask, SystemError> {
         self.ensure_mount_writable()?;
         return self
             .dentry

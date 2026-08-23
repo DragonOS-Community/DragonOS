@@ -301,7 +301,7 @@ fn splice_file_to_pipe(
     // 为了满足 Linux 语义：若后续写入 pipe 被信号中断且未写入任何字节，
     // 则不应推进输入文件的 file position。
     let advance_file_pos = offset.is_none();
-    let read_len = file.read_for_splice(offset, buf_size, &mut buffer)?;
+    let read_len = file.read_for_transfer(offset, buf_size, &mut buffer)?;
 
     if read_len == 0 {
         return Ok(0);

@@ -36,7 +36,7 @@ use system_error::SystemError;
 use super::vfs::{
     file::FilePrivateData, mount::MountFlags, utils::DName, FileSystem, FsInfo,
     FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode, Metadata, OpenFileBehavior,
-    PostWriteSyncPolicy, SpecialNodeData,
+    PostWriteSyncPolicy, SetMetadataMask, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -1135,7 +1135,7 @@ impl IndexNode for LockedTmpfsInode {
         len: usize,
         lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<SetMetadataMask, SystemError> {
         drop(data);
         if mode != 0 {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -1222,7 +1222,7 @@ impl IndexNode for LockedTmpfsInode {
         inode.metadata.size = metadata.size;
         crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
         let _ = lock_owner;
-        Ok(())
+        Ok(mask)
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

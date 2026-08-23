@@ -198,6 +198,19 @@ pub(super) struct ProductionDelallocAdmissionGuard<'a> {
     inode: &'a LockedExt4Inode,
 }
 
+/// Owns every inode-local object that must outlive the queue-empty
+/// linearization point.  The admission guard prevents a new first entry from
+/// being published until the detached reservation/pool generation has been
+/// fully consumed.
+#[must_use]
+struct EmptyDelallocCleanup<'a> {
+    _admission: ProductionDelallocAdmissionGuard<'a>,
+    inode_num: u32,
+    pool: Option<another_ext4::DelallocExtentNodePool>,
+    owner: Option<Ext4InodeOperation>,
+    registered: bool,
+}
+
 impl Drop for ProductionDelallocAdmissionGuard<'_> {
     fn drop(&mut self) {
         let _io = self.inode.io_lock.lock();
@@ -805,6 +818,11 @@ impl Ext4DelayedSubmission {
         if self.entries.is_empty() {
             return Err(SystemError::EIO);
         }
+        let authority = self
+            .fs
+            .delalloc_mapper_authority
+            .as_ref()
+            .ok_or(SystemError::EIO)?;
         let entries = core::mem::take(&mut self.entries);
         let empty_cleanup = {
             let _io = self.inode.io_lock.lock();
@@ -815,9 +833,32 @@ impl Ext4DelayedSubmission {
                 self.claim_incarnation,
             ) {
                 drop(guard);
-                self.fs.fail_stop_lifecycle();
+                drop(_io);
+                self.entries = entries;
+                self.finish_terminal();
                 return Err(SystemError::EIO);
             }
+            let becomes_empty = guard.delalloc.production.entries.len() == entries.len();
+            if becomes_empty && guard.delalloc.production.queue_operation.is_none() {
+                drop(guard);
+                drop(_io);
+                self.entries = entries;
+                self.finish_terminal();
+                return Err(SystemError::EIO);
+            }
+            let admission = if becomes_empty {
+                if guard.delalloc.production.admission_closed == usize::MAX {
+                    drop(guard);
+                    drop(_io);
+                    self.entries = entries;
+                    self.finish_terminal();
+                    return Err(SystemError::EIO);
+                }
+                guard.delalloc.production.admission_closed += 1;
+                Some(ProductionDelallocAdmissionGuard { inode: &self.inode })
+            } else {
+                None
+            };
             for claimed in entries.iter() {
                 let removed = guard
                     .delalloc
@@ -826,28 +867,26 @@ impl Ext4DelayedSubmission {
                     .remove(&claimed.pending.offset);
                 debug_assert!(removed.is_some());
             }
-            if guard.delalloc.production.entries.is_empty() {
-                let owner = guard
-                    .delalloc
-                    .production
-                    .queue_operation
-                    .take()
-                    .ok_or(SystemError::EIO)?;
-                Some((guard.inner_inode_num, owner))
+            if becomes_empty {
+                let inode_num = guard.inner_inode_num;
+                let owner = guard.delalloc.production.queue_operation.take();
+                let admission = admission.expect("empty queue preflight produced admission guard");
+                drop(guard);
+                let pool = self.inode.delalloc_pool.lock().take();
+                Some(EmptyDelallocCleanup {
+                    _admission: admission,
+                    inode_num,
+                    pool,
+                    owner,
+                    registered: true,
+                })
             } else {
                 None
             }
         };
-        if let Some((inode_num, owner)) = empty_cleanup {
-            let authority = self
-                .fs
-                .delalloc_mapper_authority
-                .as_ref()
-                .ok_or(SystemError::EIO)?;
+        if let Some(cleanup) = empty_cleanup {
             self.inode
-                .release_empty_delalloc_pool(&self.fs, authority)?;
-            self.fs.unregister_delalloc_inode(inode_num);
-            drop(owner);
+                .finish_empty_delalloc_cleanup(&self.fs, authority, None, cleanup, false)?;
         }
         drop(entries);
         Ok(())
@@ -2888,18 +2927,115 @@ impl IndexNode for LockedExt4Inode {
 }
 
 impl LockedExt4Inode {
+    fn close_production_delalloc_admission_locked<'a>(
+        &'a self,
+        production: &mut ProductionDelallocState,
+    ) -> Result<ProductionDelallocAdmissionGuard<'a>, SystemError> {
+        production.admission_closed = production
+            .admission_closed
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(ProductionDelallocAdmissionGuard { inode: self })
+    }
+
     pub(super) fn close_production_delalloc_admission(
         &self,
     ) -> Result<ProductionDelallocAdmissionGuard<'_>, SystemError> {
         let _io = self.io_lock.lock();
         let mut guard = self.inner.lock();
-        guard.delalloc.production.admission_closed = guard
-            .delalloc
-            .production
-            .admission_closed
-            .checked_add(1)
-            .ok_or(SystemError::EOVERFLOW)?;
-        Ok(ProductionDelallocAdmissionGuard { inode: self })
+        self.close_production_delalloc_admission_locked(&mut guard.delalloc.production)
+    }
+
+    /// Consume a queue generation after its last entry has been detached.
+    /// This is deliberately finally-style: no cleanup error may bypass
+    /// registry removal or drop a still-active capability.
+    fn finish_empty_delalloc_cleanup(
+        &self,
+        fs: &Arc<Ext4FileSystem>,
+        authority: &another_ext4::DelallocAppendMapperAuthority,
+        mut reservation: Option<&mut another_ext4::DelallocAppendBlockReservation>,
+        mut cleanup: EmptyDelallocCleanup<'_>,
+        terminal_only: bool,
+    ) -> Result<(), SystemError> {
+        let mut first_error = None;
+        let mut terminal = terminal_only;
+        let mut fail_stopped = terminal_only;
+
+        if !terminal {
+            match cleanup.pool.as_mut() {
+                Some(pool) => {
+                    if let Some(reservation) = reservation.as_deref_mut() {
+                        if let Err(error) = fs.retry_metadata_contention(|| {
+                            fs.fs.cancel_projected_delalloc_append_block_authorized(
+                                authority,
+                                reservation,
+                                pool,
+                            )
+                        }) {
+                            first_error = Some(error);
+                            terminal = true;
+                        }
+                    }
+                }
+                None => {
+                    first_error = Some(SystemError::EIO);
+                    terminal = true;
+                }
+            }
+        }
+
+        if terminal {
+            fs.fail_stop_lifecycle();
+            fail_stopped = true;
+            if let Some(reservation) = reservation {
+                let _ = fs
+                    .fs
+                    .terminalize_delalloc_append_block_authorized_after_fail_stop(
+                        authority,
+                        reservation,
+                    );
+            }
+            if let Some(pool) = cleanup.pool.as_mut() {
+                let _ = fs
+                    .fs
+                    .terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(
+                        authority, pool,
+                    );
+            }
+        } else if let Some(pool) = cleanup.pool.as_mut() {
+            if let Err(error) = fs.retry_metadata_contention(|| {
+                fs.fs
+                    .release_delalloc_extent_node_pool_authorized(authority, pool)
+            }) {
+                first_error = Some(error);
+                fs.fail_stop_lifecycle();
+                fail_stopped = true;
+                let _ = fs
+                    .fs
+                    .terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(
+                        authority, pool,
+                    );
+            }
+        }
+
+        if cleanup.registered {
+            fs.unregister_delalloc_inode(cleanup.inode_num);
+        }
+        drop(cleanup.owner.take());
+        drop(cleanup);
+        // An unrelated thread may have fail-stopped the mount before this
+        // helper entered.  Empty pool release remains a successful no-op in
+        // that state, so sample the terminal state after releasing the local
+        // admission guard to ensure the remaining idle registry is drained.
+        fail_stopped |= fs.fs.metadata_mutations_terminal();
+        if fail_stopped {
+            // The current bundle no longer owns inode locks, admission, or a
+            // registry entry.  Only now is it safe to drain other idle
+            // Prepared/Ready owners through the filesystem-wide fail-stop
+            // terminalizer; claimed owners remain with their live submission.
+            fs.terminalize_idle_delalloc_after_fail_stop();
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn try_merge_delalloc_tail_segment(
@@ -3171,13 +3307,28 @@ impl LockedExt4Inode {
                 // this is internal metadata contention, not userspace
                 // nonblocking I/O, so keep the write admission pending until
                 // the owner releases the gate.
-                let pool = fs.retry_metadata_contention(|| {
-                    fs.fs
-                        .create_delalloc_extent_node_pool_authorized(authority, inode_num)
-                })?;
-                let mut slot = self.delalloc_pool.lock();
-                if slot.is_none() {
-                    *slot = Some(pool);
+                let observed = fs.fs.metadata_mutation_generation();
+                match fs
+                    .fs
+                    .create_delalloc_extent_node_pool_authorized(authority, inode_num)
+                {
+                    Ok(pool) => {
+                        let mut slot = self.delalloc_pool.lock();
+                        debug_assert!(slot.is_none());
+                        *slot = Some(pool);
+                    }
+                    Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
+                        // Never sleep for the metadata gate while holding the
+                        // PageCache/inode admission locks.  Sampling the
+                        // generation before the attempt also closes the
+                        // owner-release/lost-wakeup window.
+                        drop(_io);
+                        drop(_size);
+                        drop(_invalidate);
+                        fs.wait_metadata_mutation_progress(observed)?;
+                        continue 'admission;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
             let observed = fs.fs.metadata_mutation_generation();
@@ -3208,13 +3359,33 @@ impl LockedExt4Inode {
                     ) =>
                 {
                     if was_empty {
+                        let admission = {
+                            let mut guard = self.inner.lock();
+                            self.close_production_delalloc_admission_locked(
+                                &mut guard.delalloc.production,
+                            )?
+                        };
+                        drop(_io);
+                        drop(_size);
+                        drop(_invalidate);
                         self.release_empty_delalloc_pool(&fs, authority)?;
+                        drop(admission);
                     }
                     return Ok(None);
                 }
                 Err(error) => {
                     if was_empty {
+                        let admission = {
+                            let mut guard = self.inner.lock();
+                            self.close_production_delalloc_admission_locked(
+                                &mut guard.delalloc.production,
+                            )?
+                        };
+                        drop(_io);
+                        drop(_size);
+                        drop(_invalidate);
                         self.release_empty_delalloc_pool(&fs, authority)?;
+                        drop(admission);
                     }
                     return Err(error.into());
                 }
@@ -3232,6 +3403,7 @@ impl LockedExt4Inode {
                         ProductionDelallocEntryState::Claimed { durable_eof, .. } => *durable_eof,
                     })
                     .unwrap_or(old_size);
+                let operation_missing = was_empty && operation.is_none();
                 if guard.delalloc.production.admission_closed != 0
                     || guard.cached_file_size != Some(old_size)
                     || guard.cached_times.mtime != old_mtime
@@ -3239,31 +3411,67 @@ impl LockedExt4Inode {
                     || tail_eof != expected_durable_eof_before
                     || guard.delalloc.production.entries.contains_key(&page_start)
                     || guard.delalloc.production.entries.is_empty() != was_empty
+                    || guard.delalloc.production.next_sequence != sequence
+                    || operation_missing
                 {
-                    drop(guard);
-                    let mut reservation = reservation;
-                    self.cancel_projected_delalloc_reservation(&fs, authority, &mut reservation)?;
-                    return Ok(None);
-                }
-                if guard.delalloc.production.next_sequence != sequence {
-                    drop(guard);
-                    let mut reservation = reservation;
-                    self.cancel_projected_delalloc_reservation(&fs, authority, &mut reservation)?;
-                    return Ok(None);
-                }
-                guard.delalloc.production.next_sequence = sequence + 1;
-                if was_empty {
-                    let Some(queue_operation) = operation.take() else {
+                    let mut admission = Some(self.close_production_delalloc_admission_locked(
+                        &mut guard.delalloc.production,
+                    )?);
+                    let empty_cleanup = if was_empty {
+                        let inode_num = guard.inner_inode_num;
                         drop(guard);
-                        let mut reservation = reservation;
-                        self.cancel_projected_delalloc_reservation(
+                        let pool = self.delalloc_pool.lock().take();
+                        Some(EmptyDelallocCleanup {
+                            _admission: admission
+                                .take()
+                                .expect("empty rollback owns its admission guard"),
+                            inode_num,
+                            pool,
+                            owner: None,
+                            registered: false,
+                        })
+                    } else {
+                        drop(guard);
+                        None
+                    };
+                    drop(_io);
+                    drop(_size);
+                    drop(_invalidate);
+                    let mut reservation = reservation;
+                    let cleanup_result = if let Some(cleanup) = empty_cleanup {
+                        self.finish_empty_delalloc_cleanup(
+                            &fs,
+                            authority,
+                            Some(&mut reservation),
+                            cleanup,
+                            false,
+                        )
+                    } else {
+                        let result = self.cancel_projected_delalloc_reservation(
                             &fs,
                             authority,
                             &mut reservation,
-                        )?;
-                        return Err(SystemError::EIO);
+                        );
+                        drop(admission.take());
+                        if result.is_err() {
+                            fs.terminalize_idle_delalloc_after_fail_stop();
+                        }
+                        result
                     };
-                    guard.delalloc.production.queue_operation = Some(queue_operation);
+                    cleanup_result?;
+                    return if operation_missing {
+                        Err(SystemError::EIO)
+                    } else {
+                        Ok(None)
+                    };
+                }
+                guard.delalloc.production.next_sequence = sequence + 1;
+                if was_empty {
+                    guard.delalloc.production.queue_operation = Some(
+                        operation
+                            .take()
+                            .expect("first delayed entry preflighted its queue owner"),
+                    );
                 }
                 guard.delalloc.production.entries.insert(
                     page_start,
@@ -3285,34 +3493,85 @@ impl LockedExt4Inode {
             };
             if was_empty {
                 if let Err(error) = fs.register_delalloc_inode(inode_num, self_arc) {
-                    let (mut pending, owner) = {
+                    let detached = {
                         let mut guard = self.inner.lock();
-                        let entry = guard
+                        let matches_generation = guard
                             .delalloc
                             .production
                             .entries
-                            .remove(&page_start)
-                            .ok_or(SystemError::EIO)?;
-                        let owner = guard.delalloc.production.queue_operation.take();
-                        let pending = match entry {
+                            .get(&page_start)
+                            .is_some_and(|entry| {
+                                matches!(entry,
                             ProductionDelallocEntry {
                                 sequence: current,
-                                state: ProductionDelallocEntryState::Prepared(pending),
-                            } if current == sequence => pending,
-                            _ => return Err(SystemError::EIO),
-                        };
-                        (pending, owner)
+                                state: ProductionDelallocEntryState::Prepared(_),
+                            } if *current == sequence)
+                            });
+                        if !matches_generation
+                            || guard.delalloc.production.entries.len() != 1
+                            || guard.delalloc.production.queue_operation.is_none()
+                        {
+                            None
+                        } else {
+                            let admission = self
+                                .close_production_delalloc_admission_locked(
+                                    &mut guard.delalloc.production,
+                                )
+                                .ok();
+                            admission.map(|admission| {
+                                let entry = guard
+                                    .delalloc
+                                    .production
+                                    .entries
+                                    .remove(&page_start)
+                                    .expect("registration rollback preflighted its entry");
+                                let pending = match entry.state {
+                                    ProductionDelallocEntryState::Prepared(pending) => pending,
+                                    _ => unreachable!(),
+                                };
+                                let owner = guard.delalloc.production.queue_operation.take();
+                                let inode_num = guard.inner_inode_num;
+                                drop(guard);
+                                let pool = self.delalloc_pool.lock().take();
+                                (
+                                    pending,
+                                    EmptyDelallocCleanup {
+                                        _admission: admission,
+                                        inode_num,
+                                        pool,
+                                        owner,
+                                        registered: false,
+                                    },
+                                )
+                            })
+                        }
                     };
                     drop(_io);
                     drop(_size);
-                    self.cancel_projected_delalloc_reservation(
+                    drop(_invalidate);
+                    let Some((mut pending, cleanup)) = detached else {
+                        fs.fail_stop_lifecycle();
+                        self.terminalize_idle_delalloc_after_fail_stop_inner(&fs, false);
+                        fs.terminalize_idle_delalloc_after_fail_stop();
+                        return Err(SystemError::EIO);
+                    };
+                    let duplicate_owner = error == SystemError::EIO;
+                    if duplicate_owner {
+                        // A duplicate key is a structural ownership conflict,
+                        // not this generation's registry entry.  Freeze the
+                        // mount before consuming our local capabilities and
+                        // never remove the unknown owner by key.
+                        fs.fail_stop_lifecycle();
+                    }
+                    let cleanup_result = self.finish_empty_delalloc_cleanup(
                         &fs,
                         authority,
-                        &mut pending.reservation,
-                    )?;
-                    self.release_empty_delalloc_pool(&fs, authority)?;
+                        Some(&mut pending.reservation),
+                        cleanup,
+                        duplicate_owner,
+                    );
                     drop(pending);
-                    drop(owner);
+                    cleanup_result?;
                     return Err(error);
                 }
             }
@@ -3331,25 +3590,44 @@ impl LockedExt4Inode {
             return match publication {
                 Ok(written) => {
                     let Some(certificate) = published else {
+                        drop(_io);
+                        drop(_size);
+                        drop(_invalidate);
                         fs.fail_stop_lifecycle();
+                        fs.terminalize_idle_delalloc_after_fail_stop();
                         return Err(SystemError::EIO);
                     };
                     let mut guard = self.inner.lock();
+                    let matches_generation = guard
+                        .delalloc
+                        .production
+                        .entries
+                        .get(&page_start)
+                        .is_some_and(|entry| {
+                            matches!(entry,
+                        ProductionDelallocEntry {
+                            sequence: current,
+                            state: ProductionDelallocEntryState::Prepared(_),
+                        } if *current == sequence)
+                        });
+                    if !matches_generation {
+                        drop(guard);
+                        drop(_io);
+                        drop(_size);
+                        drop(_invalidate);
+                        fs.fail_stop_lifecycle();
+                        fs.terminalize_idle_delalloc_after_fail_stop();
+                        return Err(SystemError::EIO);
+                    }
                     let entry = guard
                         .delalloc
                         .production
                         .entries
                         .remove(&page_start)
-                        .ok_or(SystemError::EIO)?;
-                    let mut pending = match entry {
-                        ProductionDelallocEntry {
-                            sequence: current,
-                            state: ProductionDelallocEntryState::Prepared(pending),
-                        } if current == sequence => pending,
-                        _ => {
-                            fs.fail_stop_lifecycle();
-                            return Err(SystemError::EIO);
-                        }
+                        .expect("publication preflighted its prepared entry");
+                    let mut pending = match entry.state {
+                        ProductionDelallocEntryState::Prepared(pending) => pending,
+                        _ => unreachable!(),
                     };
                     pending.certificate = Some(certificate);
                     guard.cached_file_size = Some(new_eof);
@@ -3367,43 +3645,97 @@ impl LockedExt4Inode {
                     Ok(Some(written))
                 }
                 Err(error) => {
-                    let (mut pending, became_empty, owner) = {
+                    let detached = {
                         let mut guard = self.inner.lock();
-                        let entry = guard
+                        let matches_generation = guard
                             .delalloc
                             .production
                             .entries
-                            .remove(&page_start)
-                            .ok_or(SystemError::EIO)?;
-                        let pending = match entry {
+                            .get(&page_start)
+                            .is_some_and(|entry| {
+                                matches!(entry,
                             ProductionDelallocEntry {
                                 sequence: current,
-                                state: ProductionDelallocEntryState::Prepared(pending),
-                            } if current == sequence => pending,
-                            _ => {
-                                fs.fail_stop_lifecycle();
-                                return Err(SystemError::EIO);
+                                state: ProductionDelallocEntryState::Prepared(_),
+                            } if *current == sequence)
+                            });
+                        if !matches_generation {
+                            None
+                        } else {
+                            let became_empty = guard.delalloc.production.entries.len() == 1;
+                            if became_empty && guard.delalloc.production.queue_operation.is_none() {
+                                None
+                            } else {
+                                let admission = self
+                                    .close_production_delalloc_admission_locked(
+                                        &mut guard.delalloc.production,
+                                    )
+                                    .ok();
+                                admission.map(|admission| {
+                                    let entry = guard
+                                        .delalloc
+                                        .production
+                                        .entries
+                                        .remove(&page_start)
+                                        .expect("publication rollback preflighted its entry");
+                                    let pending = match entry.state {
+                                        ProductionDelallocEntryState::Prepared(pending) => pending,
+                                        _ => unreachable!(),
+                                    };
+                                    if became_empty {
+                                        let inode_num = guard.inner_inode_num;
+                                        let owner =
+                                            guard.delalloc.production.queue_operation.take();
+                                        drop(guard);
+                                        let pool = self.delalloc_pool.lock().take();
+                                        (
+                                            pending,
+                                            Some(EmptyDelallocCleanup {
+                                                _admission: admission,
+                                                inode_num,
+                                                pool,
+                                                owner,
+                                                registered: true,
+                                            }),
+                                            None,
+                                        )
+                                    } else {
+                                        (pending, None, Some(admission))
+                                    }
+                                })
                             }
-                        };
-                        let became_empty = guard.delalloc.production.entries.is_empty();
-                        let owner = became_empty
-                            .then(|| guard.delalloc.production.queue_operation.take())
-                            .flatten();
-                        (pending, became_empty, owner)
+                        }
                     };
                     drop(_io);
                     drop(_size);
-                    self.cancel_projected_delalloc_reservation(
-                        &fs,
-                        authority,
-                        &mut pending.reservation,
-                    )?;
-                    if became_empty {
-                        self.release_empty_delalloc_pool(&fs, authority)?;
-                        fs.unregister_delalloc_inode(inode_num);
-                    }
+                    drop(_invalidate);
+                    let Some((mut pending, empty_cleanup, admission)) = detached else {
+                        fs.fail_stop_lifecycle();
+                        fs.terminalize_idle_delalloc_after_fail_stop();
+                        return Err(SystemError::EIO);
+                    };
+                    let cleanup_result = if let Some(cleanup) = empty_cleanup {
+                        self.finish_empty_delalloc_cleanup(
+                            &fs,
+                            authority,
+                            Some(&mut pending.reservation),
+                            cleanup,
+                            false,
+                        )
+                    } else {
+                        let result = self.cancel_projected_delalloc_reservation(
+                            &fs,
+                            authority,
+                            &mut pending.reservation,
+                        );
+                        drop(admission);
+                        if result.is_err() {
+                            fs.terminalize_idle_delalloc_after_fail_stop();
+                        }
+                        result
+                    };
                     drop(pending);
-                    drop(owner);
+                    cleanup_result?;
                     if error == SystemError::EAGAIN_OR_EWOULDBLOCK {
                         Ok(None)
                     } else {
@@ -3420,21 +3752,23 @@ impl LockedExt4Inode {
         authority: &another_ext4::DelallocAppendMapperAuthority,
         reservation: &mut another_ext4::DelallocAppendBlockReservation,
     ) -> Result<(), SystemError> {
-        {
+        let result = fs.retry_metadata_contention(|| {
             let mut slot = self.delalloc_pool.lock();
-            let pool = slot.as_mut().ok_or(SystemError::EIO)?;
-            if fs
-                .fs
+            let pool = slot
+                .as_mut()
+                .ok_or_else(|| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))?;
+            fs.fs
                 .cancel_projected_delalloc_append_block_authorized(authority, reservation, pool)
-                .is_ok()
-            {
-                return Ok(());
-            }
+        });
+        if result.is_ok() {
+            return Ok(());
         }
         fs.fail_stop_lifecycle();
-        fs.fs
+        let terminal = fs
+            .fs
             .terminalize_delalloc_append_block_authorized_after_fail_stop(authority, reservation)
-            .map_err(SystemError::from)
+            .map_err(SystemError::from);
+        terminal.and(result)
     }
 
     fn release_empty_delalloc_pool(
@@ -3445,17 +3779,19 @@ impl LockedExt4Inode {
         let Some(mut pool) = self.delalloc_pool.lock().take() else {
             return Ok(());
         };
-        if fs
-            .fs
-            .release_delalloc_extent_node_pool_authorized(authority, &mut pool)
-            .is_ok()
-        {
+        let result = fs.retry_metadata_contention(|| {
+            fs.fs
+                .release_delalloc_extent_node_pool_authorized(authority, &mut pool)
+        });
+        if result.is_ok() {
             return Ok(());
         }
         fs.fail_stop_lifecycle();
-        fs.fs
+        let terminal = fs
+            .fs
             .terminalize_delalloc_extent_node_pool_authorized_after_fail_stop(authority, &mut pool)
-            .map_err(SystemError::from)
+            .map_err(SystemError::from);
+        terminal.and(result)
     }
 
     pub(super) fn drain_delalloc_before_eager(&self) -> Result<(), SystemError> {
@@ -3574,6 +3910,14 @@ impl LockedExt4Inode {
     /// holds the filesystem); Prepared/Ready heads have no other terminal
     /// owner and must be consumed here before filesystem teardown.
     pub(super) fn terminalize_idle_delalloc_after_fail_stop(&self, fs: &Ext4FileSystem) -> bool {
+        self.terminalize_idle_delalloc_after_fail_stop_inner(fs, true)
+    }
+
+    fn terminalize_idle_delalloc_after_fail_stop_inner(
+        &self,
+        fs: &Ext4FileSystem,
+        registered: bool,
+    ) -> bool {
         let (inode_num, pending, owner) =
             {
                 let _io = self.io_lock.lock();
@@ -3612,7 +3956,9 @@ impl LockedExt4Inode {
                     );
             }
         }
-        fs.unregister_delalloc_inode(inode_num);
+        if registered {
+            fs.unregister_delalloc_inode(inode_num);
+        }
         drop(owner);
         true
     }

@@ -76,7 +76,8 @@ pub(crate) fn machine_restart(_cmd: Option<&str>) -> ! {
     debug!("machine restart");
 
     if !(unsafe { REBOOT_FORCE }) {
-        machine_shutdown();
+        let _text_patch_guard = machine_shutdown();
+        emergency_restart()
     }
 
     emergency_restart()
@@ -86,15 +87,16 @@ pub(crate) fn machine_restart(_cmd: Option<&str>) -> ! {
 ///
 /// 执行系统停止操作
 pub(crate) fn machine_halt() -> ! {
-    machine_shutdown();
+    let _text_patch_guard = machine_shutdown();
 
     stop_this_cpu();
 }
 
 // 参考: https://elixir.bootlin.com/linux/v6.6/source/arch/x86/kernel/reboot.c#L782
 pub(crate) fn machine_power_off() -> ! {
+    let mut text_patch_guard = None;
     if !(unsafe { REBOOT_FORCE }) {
-        machine_shutdown();
+        text_patch_guard = Some(machine_shutdown());
     }
 
     if let Err(e) = do_machine_power_off() {
@@ -108,6 +110,7 @@ pub(crate) fn machine_power_off() -> ! {
         );
     }
 
+    let _text_patch_guard = text_patch_guard;
     stop_this_cpu();
 }
 
@@ -116,8 +119,11 @@ pub(crate) fn machine_power_off() -> ! {
 /// 执行系统关闭操作
 ///
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/reboot.c#675
-fn machine_shutdown() {
+fn machine_shutdown() -> crate::libs::mutex::MutexGuard<'static, ()> {
     debug!("machine shutdown");
+    // Close the patch gate and wait for an in-flight transaction before IRQs
+    // and peer CPUs are stopped. Keep this guard until reset/halt.
+    let text_patch_guard = crate::text_patch::quiesce();
     // 在禁用本地APIC之前禁用IO APIC
     IOAPIC().lock_irqsave().disable_all();
 
@@ -131,6 +137,7 @@ fn machine_shutdown() {
 
     // 禁用HPET
     hpet_disable();
+    text_patch_guard
 }
 
 /// Migrate the current shutdown task to the reboot CPU.

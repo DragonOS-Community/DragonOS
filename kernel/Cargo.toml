@@ -98,7 +98,7 @@ lru = "0.12.3"
 rbpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf", rev = "f31e471a29", default-features = false }
 printf-compat = { version = "=0.3.1", default-features = false }
 
-static-keys = { version = "=0.7" }
+static-keys = { path = "crates/static-keys" }
 
 cpio_reader = "0.1.2"
 xz4rust = { version = "0.2.1", default-features = false, features = ["alloc"] }

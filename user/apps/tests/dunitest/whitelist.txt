@@ -2,6 +2,7 @@
 # Format: test case names relative to bin/ (remove the _test suffix from executables)
 demo/gtest_demo
 normal/capability
+normal/close_range_semantics
 normal/fdatasync
 normal/loop_semantics
 normal/getrandom_bit_distribution
@@ -97,3 +98,4 @@ normal/af_packet_e2e
 normal/af_packet_mcast
 normal/rtnetlink_link_semantics
 normal/tty_termios
+normal/sched_tracepoint

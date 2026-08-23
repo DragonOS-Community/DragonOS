@@ -58,16 +58,15 @@ pub struct UprobePerfEvent {
     consumer_id: u64,
     callback: Arc<UprobePerfCallBack>,
     lifecycle: Mutex<()>,
+    released: AtomicBool,
 }
 
 impl Drop for UprobePerfEvent {
-    /// 消费者关闭（fd 释放）：从注册表移除（杜绝后续迟到安装）+ drop 迟到句柄
-    /// （fork/mmap 路径安装的，逐 mm 注销）。直接安装的 `handles` 随本结构
-    /// drop 自动注销（评审 R9）。
+    /// A published perf fd is released by the sleepable perf worker first.
+    /// This fallback only handles construction failures before a File can
+    /// enqueue that release work.
     fn drop(&mut self) {
-        self.callback.set_enabled(false);
-        uprobe_registry_remove_consumer(self.consumer_id);
-        self.callback.wait_idle();
+        self.release_consumer();
     }
 }
 impl core::fmt::Debug for UprobePerfEvent {
@@ -77,6 +76,21 @@ impl core::fmt::Debug for UprobePerfEvent {
 }
 
 impl UprobePerfEvent {
+    fn release_consumer(&self) {
+        // Once the worker has completed release, the eventual destructor may
+        // run in any context and must not acquire a sleepable lock.
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        let _lifecycle = self.lifecycle.lock();
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.callback.set_enabled(false);
+        uprobe_registry_remove_consumer(self.consumer_id);
+        self.callback.wait_idle();
+    }
+
     /// JIT 编译 BPF 程序并注入到每个 per-mm 实例的 `event_callback`。
     ///
     /// 同一个 `Arc<UprobePerfCallBack>` 共享给所有句柄（多 mm / 多映射共用一份 JIT
@@ -315,6 +329,11 @@ impl PerfEventOps for UprobePerfEvent {
         Ok(())
     }
 
+    fn release(&self) -> Result<()> {
+        self.release_consumer();
+        Ok(())
+    }
+
     fn read_event(&self, len: usize, buf: &mut [u8]) -> Result<usize> {
         const COUNT_SIZE: usize = size_of::<u64>();
         if len < COUNT_SIZE || buf.len() < COUNT_SIZE {
@@ -457,5 +476,6 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         consumer_id,
         callback,
         lifecycle: Mutex::new(()),
+        released: AtomicBool::new(false),
     })
 }

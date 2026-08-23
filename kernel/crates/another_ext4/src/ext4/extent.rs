@@ -53,6 +53,19 @@ pub(super) struct ExtentRightSpineProjection {
     inline_root_capacity: u16,
 }
 
+#[cfg(test)]
+impl ExtentRightSpineProjection {
+    pub(super) fn test_empty(next_lblock: LBlockId) -> Self {
+        Self {
+            next_lblock,
+            counts: Vec::new(),
+            capacities: Vec::new(),
+            external_capacity: 0,
+            inline_root_capacity: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct RightSpineAppendPlan {
     pub start_lblock: LBlockId,

@@ -383,6 +383,25 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
         return Err("rcu_defer_drop did not run after rcu_barrier");
     }
 
+    let fallible_deferred_drops = Arc::new(AtomicUsize::new(0));
+    try_rcu_defer_drop_arc(Arc::new(RcuSelftestDropProbe {
+        id: 2,
+        drops: fallible_deferred_drops.clone(),
+    }))
+    .map_err(|_| "try_rcu_defer_drop_arc could not reserve a callback")?;
+    rcu_barrier();
+
+    if fallible_deferred_drops.load(Ordering::SeqCst) != 1 {
+        return Err("try_rcu_defer_drop_arc did not run after rcu_barrier");
+    }
+
+    let completed_gp_before = RCU_STATE.inner.lock_irqsave().completed_gp_seq;
+    synchronize_rcu_noalloc();
+    let completed_gp_after = RCU_STATE.inner.lock_irqsave().completed_gp_seq;
+    if completed_gp_after <= completed_gp_before {
+        return Err("synchronize_rcu_noalloc did not complete a new grace period");
+    }
+
     let deferred_hits = Arc::new(AtomicUsize::new(0));
     rcu_defer({
         let deferred_hits = deferred_hits.clone();

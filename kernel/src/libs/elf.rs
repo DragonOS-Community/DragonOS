@@ -906,7 +906,6 @@ impl BinaryLoader for ElfLoader {
         // debug!("ehdr = {:?}", ehdr);
 
         let binding = param.vm().clone();
-        let mut user_vm = binding.write();
 
         // todo: 增加对user stack上的内存是否具有可执行权限的处理（方法：寻找phdr里面的PT_GNU_STACK段）
 
@@ -988,6 +987,10 @@ impl BinaryLoader for ElfLoader {
         Self::parse_gnu_property()?;
 
         param.begin_new_exec()?;
+        // begin_new_exec() may de-thread, clone/install the files table and
+        // drop old table references. None of those operations may run while an
+        // address-space write guard is held.
+        let mut user_vm = binding.write();
 
         // todo: 补充逻辑：https://code.dragonos.org.cn/xref/linux-6.6.21/fs/binfmt_elf.c#1007
         param.setup_new_exec();

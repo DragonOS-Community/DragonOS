@@ -124,12 +124,11 @@ pub use stack::UserStack;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use uprobe::{
-    fork_inherit_uprobes, noop_handler, uprobe_apply_to_existing_vma, uprobe_apply_to_new_vma,
-    uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_attach_callback,
-    uprobe_registry_remove_consumer, uprobe_registry_set_enabled, UprobeConsumer,
-    UprobeConsumerReg, UprobeConsumerRuntime, UprobeConsumerRuntimeSnapshot, UprobeConsumerScope,
-    UprobeDefinition, UprobeHandle, UprobeInstance, UprobeSite, UprobeSiteState, UprobeTaskScope,
-    XolArea, XolSlotLease,
+    fork_inherit_uprobes, noop_handler, uprobe_apply_to_new_vma, uprobe_new_consumer_id,
+    uprobe_registry_add, uprobe_registry_attach_callback, uprobe_registry_remove_consumer,
+    uprobe_registry_set_enabled, UprobeConsumer, UprobeConsumerReg, UprobeConsumerRuntime,
+    UprobeConsumerRuntimeSnapshot, UprobeConsumerScope, UprobeDefinition, UprobeHandle,
+    UprobeInstance, UprobeSite, UprobeSiteState, UprobeTaskScope, XolArea, XolSlotLease,
 };
 #[allow(unused_imports)]
 pub use vma::{

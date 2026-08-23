@@ -303,6 +303,13 @@ impl UprobeTaskScope {
     fn permits_task(&self, current: &Arc<ProcessControlBlock>) -> bool {
         Arc::as_ptr(current) as usize == self.0.target_ptr
     }
+
+    fn target_mm(&self) -> Option<Arc<AddressSpace>> {
+        let target = { UPROBE_TASK_SCOPES.lock_irqsave().get(&self.0.id).cloned() };
+        target
+            .and_then(|target| target.upgrade())
+            .and_then(|task| task.basic().user_vm())
+    }
 }
 
 pub enum UprobeConsumerScope {
@@ -313,13 +320,9 @@ pub enum UprobeConsumerScope {
 impl UprobeConsumerScope {
     fn permits(&self, mm: &Arc<AddressSpace>) -> bool {
         match self {
-            Self::Task(target) => {
-                let target = { UPROBE_TASK_SCOPES.lock_irqsave().get(&target.0.id).cloned() };
-                target
-                    .and_then(|target| target.upgrade())
-                    .and_then(|task| task.basic().user_vm())
-                    .is_some_and(|target_mm| Arc::ptr_eq(&target_mm, mm))
-            }
+            Self::Task(target) => target
+                .target_mm()
+                .is_some_and(|target_mm| Arc::ptr_eq(&target_mm, mm)),
             Self::SystemWideAuthorized => true,
         }
     }
@@ -1518,6 +1521,13 @@ fn detach_consumer_sites(consumer: &UprobeConsumer) {
 }
 
 fn apply_consumer_to_existing_mappings(consumer: &Arc<UprobeConsumer>) -> Result<(), SystemError> {
+    if let UprobeConsumerScope::Task(target) = &consumer.scope {
+        let Some(mm) = target.target_mm() else {
+            return Ok(());
+        };
+        return apply_consumer_to_mm(consumer, &mm);
+    }
+
     let page_cache = consumer
         .definition
         .inode()
@@ -1546,6 +1556,27 @@ fn apply_consumer_to_existing_mappings(consumer: &Arc<UprobeConsumer>) -> Result
             true,
             Some(consumer.id),
         )?;
+    }
+    Ok(())
+}
+
+fn apply_consumer_to_mm(
+    consumer: &Arc<UprobeConsumer>,
+    mm: &Arc<AddressSpace>,
+) -> Result<(), SystemError> {
+    let all = VirtRegion::new(VirtAddr::new(0), MMArch::USER_END_VADDR.data());
+    let definition_offset = consumer.definition.offset();
+    for (file, start, size, file_start) in collect_file_vma_snapshot(mm, all) {
+        if !consumer.definition.matches_inode(&file.inode()) {
+            continue;
+        }
+        let Some(file_end) = file_start.checked_add(size) else {
+            return Err(SystemError::EINVAL);
+        };
+        if definition_offset < file_start || definition_offset >= file_end {
+            continue;
+        }
+        uprobe_apply_to_new_vma_inner(mm, &file, start, size, file_start, true, Some(consumer.id))?;
     }
     Ok(())
 }
@@ -1607,27 +1638,6 @@ pub fn uprobe_apply_to_new_vma(
         false,
         None,
     );
-}
-
-/// Initial perf registration must report a real installation failure while
-/// still allowing registration when there is no matching mapping yet.
-pub fn uprobe_apply_to_existing_vma(
-    mm: &Arc<AddressSpace>,
-    file: &Arc<crate::filesystem::vfs::file::File>,
-    region_start: usize,
-    region_size: usize,
-    file_start_byte: usize,
-    consumer_id: u64,
-) -> Result<(), SystemError> {
-    uprobe_apply_to_new_vma_inner(
-        mm,
-        file,
-        region_start,
-        region_size,
-        file_start_byte,
-        true,
-        Some(consumer_id),
-    )
 }
 
 fn uprobe_apply_to_new_vma_inner(

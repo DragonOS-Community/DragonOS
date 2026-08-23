@@ -26,11 +26,10 @@ use crate::include::bindings::linux_bpf::bpf_prog_type;
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
 use crate::mm::ucontext::{
-    noop_handler, uprobe_apply_to_existing_vma, uprobe_new_consumer_id, uprobe_registry_add,
-    uprobe_registry_attach_callback, uprobe_registry_remove_consumer, uprobe_registry_set_enabled,
-    UprobeConsumerReg, UprobeConsumerScope, UprobeDefinition, UprobeTaskScope,
+    noop_handler, uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_attach_callback,
+    uprobe_registry_remove_consumer, uprobe_registry_set_enabled, UprobeConsumerReg,
+    UprobeConsumerScope, UprobeDefinition, UprobeTaskScope,
 };
-use crate::mm::MemoryManagementArch;
 use crate::perf::util::{PerfProbeArgs, PerfProbeConfig};
 use crate::perf::{BasicPerfEbpfCallBack, PerfEventOps};
 use crate::process::{ProcessManager, RawPid};
@@ -283,7 +282,7 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
             e
         })?;
     let inode = resolved.inode();
-    let page_cache = inode.page_cache().ok_or_else(|| {
+    inode.page_cache().ok_or_else(|| {
         log::warn!("uprobe: target {path} has no page cache (not a regular mapped file)");
         SystemError::EINVAL
     })?;
@@ -327,40 +326,19 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
             pre_handler: noop_handler,
             post_handler: noop_handler,
             event_callback: None,
-            enabled: !args.disabled,
+            // Initial activation uses the same scope-aware path as ioctl
+            // ENABLE, so task events never need a global file-rmap scan.
+            enabled: false,
         }),
     );
 
-    // Existing mappings are a strict initial apply. Absence of a VMA is
-    // valid: the persistent inode+offset consumer will be installed by a later
-    // mmap/dlopen/exec hook.  Installation failures cannot roll back an already
-    // valid perf event; they remain eligible for the next matching lifecycle.
+    // Activate through the common lifecycle path. Absence of a matching VMA
+    // is valid; future mmap/dlopen/exec hooks will install the persistent
+    // consumer. A real initial installation failure rolls registration back.
     if !args.disabled {
-        for vma in page_cache.collect_file_vmas() {
-            let mapping = {
-                let guard = vma.lock();
-                let Some(mm) = guard.address_space().and_then(|owner| owner.upgrade()) else {
-                    continue;
-                };
-                let Some(pgoff) = guard.backing_page_offset() else {
-                    continue;
-                };
-                let Some(file) = guard.vm_file() else {
-                    continue;
-                };
-                (mm, file, *guard.region(), pgoff)
-            };
-            if let Err(e) = uprobe_apply_to_existing_vma(
-                &mapping.0,
-                &mapping.1,
-                mapping.2.start().data(),
-                mapping.2.size(),
-                mapping.3 << crate::arch::MMArch::PAGE_SHIFT,
-                consumer_id,
-            ) {
-                uprobe_registry_remove_consumer(consumer_id);
-                return Err(e);
-            }
+        if let Err(e) = uprobe_registry_set_enabled(consumer_id, true) {
+            uprobe_registry_remove_consumer(consumer_id);
+            return Err(e);
         }
     }
 

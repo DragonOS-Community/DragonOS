@@ -1,8 +1,8 @@
-use alloc::vec;
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::file::File,
+    filesystem::{fsnotify::FsEvent, vfs::file::File},
     mm::VirtAddr,
     syscall::user_access::{copy_from_user_protected, copy_to_user_protected, user_accessible_len},
 };
@@ -32,9 +32,9 @@ pub(super) fn do_pread_pwrite_at(
         return match dir {
             PreadPwriteDir::Read => {
                 let mut empty: [u8; 0] = [];
-                file.pread(offset, 0, &mut empty)
+                file.pread_syscall_chunk(offset, 0, &mut empty)
             }
-            PreadPwriteDir::Write => file.pwrite(offset, 0, &[]),
+            PreadPwriteDir::Write => file.pwrite_syscall_chunk(offset, 0, &[]),
         };
     }
 
@@ -50,7 +50,7 @@ pub(super) fn do_pread_pwrite_at(
         let remain = len - total;
         let want = core::cmp::min(CHUNK, remain);
 
-        let user_addr = VirtAddr::new(user_ptr.saturating_add(total));
+        let user_addr = VirtAddr::new(user_ptr.checked_add(total).ok_or(SystemError::EFAULT)?);
         let check_write = matches!(dir, PreadPwriteDir::Read);
 
         let accessible = if from_user {
@@ -66,11 +66,22 @@ pub(super) fn do_pread_pwrite_at(
             break;
         }
 
-        let mut kbuf = vec![0u8; accessible];
+        let mut kbuf = Vec::new();
+        if kbuf.try_reserve_exact(accessible).is_err() {
+            if total == 0 {
+                return Err(SystemError::ENOMEM);
+            }
+            break;
+        }
+        kbuf.resize(accessible, 0);
 
         match dir {
             PreadPwriteDir::Read => {
-                let n = file.pread(cur_off, accessible, &mut kbuf)?;
+                let n = match file.pread_syscall_chunk(cur_off, accessible, &mut kbuf) {
+                    Ok(n) => n,
+                    Err(error) if total == 0 => return Err(error),
+                    Err(_) => break,
+                };
                 if n == 0 {
                     break;
                 }
@@ -79,7 +90,7 @@ pub(super) fn do_pread_pwrite_at(
                     match unsafe { copy_to_user_protected(user_addr, &kbuf[..n]) } {
                         Ok(_) => {
                             total = total.saturating_add(n);
-                            cur_off = cur_off.saturating_add(n);
+                            cur_off = cur_off.checked_add(n).ok_or(SystemError::EINVAL)?;
                         }
                         Err(SystemError::EFAULT) => {
                             if total == 0 {
@@ -94,7 +105,7 @@ pub(super) fn do_pread_pwrite_at(
                         unsafe { core::slice::from_raw_parts_mut(user_addr.data() as *mut u8, n) };
                     dst.copy_from_slice(&kbuf[..n]);
                     total = total.saturating_add(n);
-                    cur_off = cur_off.saturating_add(n);
+                    cur_off = cur_off.checked_add(n).ok_or(SystemError::EINVAL)?;
                 }
 
                 // Stop on short file read (EOF) or when we intentionally clipped to accessible area.
@@ -121,9 +132,13 @@ pub(super) fn do_pread_pwrite_at(
                     kbuf.copy_from_slice(src);
                 }
 
-                let n = file.pwrite(cur_off, accessible, &kbuf)?;
+                let n = match file.pwrite_syscall_chunk(cur_off, accessible, &kbuf) {
+                    Ok(n) => n,
+                    Err(error) if total == 0 => return Err(error),
+                    Err(_) => break,
+                };
                 total = total.saturating_add(n);
-                cur_off = cur_off.saturating_add(n);
+                cur_off = cur_off.checked_add(n).ok_or(SystemError::EINVAL)?;
 
                 // Stop on short write or when we intentionally clipped to accessible area.
                 if n < accessible || accessible < want {
@@ -133,5 +148,11 @@ pub(super) fn do_pread_pwrite_at(
         }
     }
 
+    if total > 0 {
+        file.notify_io_event(match dir {
+            PreadPwriteDir::Read => FsEvent::ACCESS,
+            PreadPwriteDir::Write => FsEvent::MODIFY,
+        });
+    }
     Ok(total)
 }

@@ -33,6 +33,7 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <atomic>
 #include <chrono>
@@ -139,6 +140,7 @@ size_t inotify_record_size(const std::string &name) {
 struct InotifyTestCleanup {
     std::string path;
     std::string dir;
+    int fd = -1;
     int ifd = -1;
     int parent_wd = -1;
     int self_wd = -1;
@@ -151,6 +153,7 @@ struct InotifyTestCleanup {
             if (self_wd >= 0) inotify_rm_watch(ifd, self_wd);
             close(ifd);
         }
+        if (fd >= 0) close(fd);
         if (file_created) unlink(path.c_str());
         if (directory_created) rmdir(dir.c_str());
     }
@@ -233,6 +236,54 @@ TEST(InotifyFileEvents, ReadvPublishesOneAccessPerWatch) {
     close(fd);
     ASSERT_EQ(unlink(path.c_str()), 0);
     ASSERT_EQ(rmdir(dir.c_str()), 0);
+}
+
+TEST(InotifyFileEvents, LargePositionedIoPublishesOneEventPerWatch) {
+    const std::string dir = "/tmp/dunitest_inotify_large_positioned_io";
+    const std::string name = "file";
+    const std::string path = dir + "/" + name;
+    ASSERT_EQ(mkdir(dir.c_str(), 0700), 0) << strerror(errno);
+    InotifyTestCleanup cleanup{path, dir};
+    cleanup.directory_created = true;
+
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    cleanup.fd = fd;
+    cleanup.file_created = true;
+    constexpr size_t kSize = 200 * 1024;
+    std::vector<char> input(kSize, 'x');
+    std::vector<char> output(kSize);
+    ASSERT_EQ(write(fd, input.data(), input.size()), static_cast<ssize_t>(input.size()))
+        << strerror(errno);
+    ASSERT_EQ(lseek(fd, 17, SEEK_SET), 17);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    cleanup.ifd = ifd;
+    int self_wd = inotify_add_watch(ifd, path.c_str(), IN_ACCESS | IN_MODIFY);
+    int parent_wd = inotify_add_watch(ifd, dir.c_str(), IN_ACCESS | IN_MODIFY);
+    ASSERT_GE(self_wd, 0) << strerror(errno);
+    cleanup.self_wd = self_wd;
+    ASSERT_GE(parent_wd, 0) << strerror(errno);
+    cleanup.parent_wd = parent_wd;
+
+    ASSERT_EQ(pread(fd, output.data(), output.size(), 0),
+              static_cast<ssize_t>(output.size()))
+        << strerror(errno);
+    EXPECT_EQ(output, input);
+    EXPECT_EQ(lseek(fd, 0, SEEK_CUR), 17);
+    auto events = drain_events(ifd);
+    EXPECT_EQ(event_count(events, self_wd, IN_ACCESS, ""), 1);
+    EXPECT_EQ(event_count(events, parent_wd, IN_ACCESS, name), 1);
+
+    std::fill(input.begin(), input.end(), 'y');
+    ASSERT_EQ(pwrite(fd, input.data(), input.size(), 0),
+              static_cast<ssize_t>(input.size()))
+        << strerror(errno);
+    EXPECT_EQ(lseek(fd, 0, SEEK_CUR), 17);
+    events = drain_events(ifd);
+    EXPECT_EQ(event_count(events, self_wd, IN_MODIFY, ""), 1);
+    EXPECT_EQ(event_count(events, parent_wd, IN_MODIFY, name), 1);
 }
 
 // ---------------------------------------------------------------------------

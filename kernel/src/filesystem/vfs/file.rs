@@ -1561,6 +1561,17 @@ impl File {
         self.do_read_with_fsnotify(offset, len, buf, false, emit_fsnotify)
     }
 
+    /// Read one internal `pread(2)` chunk while deferring ACCESS until the
+    /// syscall has determined its final, user-visible result.
+    pub(crate) fn pread_syscall_chunk(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.pread_with_fsnotify(offset, len, buf, false)
+    }
+
     /// Read for splice while deferring ACCESS until the transfer commits.
     /// This preserves the normal permission, readahead and atime behavior but
     /// lets do_splice publish MODIFY(out) before ACCESS(in), as Linux does.
@@ -1610,6 +1621,17 @@ impl File {
         buf: &[u8],
         requested_sync: WriteSyncIntent,
     ) -> Result<DelegatedWriteResult, SystemError> {
+        self.pwrite_with_sync_intent_and_fsnotify(offset, len, buf, requested_sync, true)
+    }
+
+    fn pwrite_with_sync_intent_and_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        requested_sync: WriteSyncIntent,
+        emit_data_fsnotify: bool,
+    ) -> Result<DelegatedWriteResult, SystemError> {
         // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
         let mode = *self.mode.read();
         if mode.contains(FileMode::FMODE_PATH) {
@@ -1639,9 +1661,29 @@ impl File {
             false,
             WriteCompletionPolicy {
                 sync_intent: requested_sync,
-                emit_data_fsnotify: true,
+                emit_data_fsnotify,
             },
         )
+    }
+
+    /// Write one internal `pwrite(2)` chunk while deferring its data-content
+    /// MODIFY notification until the syscall completion point. Metadata
+    /// changes such as setid removal remain visible at their commit point.
+    pub(crate) fn pwrite_syscall_chunk(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        let result = self.pwrite_with_sync_intent_and_fsnotify(
+            offset,
+            len,
+            buf,
+            WriteSyncIntent::None,
+            false,
+        )?;
+        result.sync_result?;
+        Ok(result.written_len)
     }
 
     /// 强制追加写（Linux `RWF_APPEND`/`IOCB_APPEND` 语义）：

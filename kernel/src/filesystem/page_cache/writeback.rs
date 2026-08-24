@@ -3770,6 +3770,31 @@ impl PageCacheManager {
     where
         F: FnOnce() -> Result<T, SystemError>,
     {
+        self.start_writeback_range_with_freeze_and_chunk_release(
+            start_index,
+            end_index,
+            freeze,
+            || {
+                crate::sched::sched_yield();
+            },
+        )
+    }
+
+    /// Internal form with an explicit action at each released chunk boundary.
+    /// Production uses it to yield; the selftest uses it to verify that the
+    /// invalidate writer is actually absent without relying on scheduler
+    /// timing.
+    pub(super) fn start_writeback_range_with_freeze_and_chunk_release<T, F, C>(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        freeze: F,
+        mut chunk_released: C,
+    ) -> Result<(T, PageCacheWritebackRange), SystemError>
+    where
+        F: FnOnce() -> Result<T, SystemError>,
+        C: FnMut(),
+    {
         let cache = self.upgrade()?;
         // Keep one freeze scanner's epoch from being split by a later
         // scanner while `invalidate_write` is released between chunks.
@@ -3884,7 +3909,7 @@ impl PageCacheManager {
             // Match Linux tag_pages_for_writeback(): release the mapping
             // exclusion as well as the page-cache index lock between bounded
             // chunks, then allow queued faults and invalidators to run.
-            crate::sched::sched_yield();
+            chunk_released();
             invalidate = cache.invalidate_write();
         };
         let operation = PageCacheWritebackRange {

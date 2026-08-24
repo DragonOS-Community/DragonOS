@@ -780,6 +780,9 @@ pub struct VfsDentry {
     automount_gate: Mutex<()>,
     /// True for a magic-link target that has identity but no directory edge.
     anonymous: bool,
+    /// Validated epoch at which neither this object nor its current parent had
+    /// a watch. Zero means unvalidated; MAX disables caching after saturation.
+    negative_fsnotify_interest_epoch: AtomicUsize,
     state: Mutex<VfsDentryState>,
 }
 
@@ -801,6 +804,11 @@ impl VfsDentry {
 
     fn is_disconnected(&self) -> bool {
         self.state.lock().disconnected
+    }
+
+    fn invalidate_fsnotify_interest_cache(&self) {
+        self.negative_fsnotify_interest_epoch
+            .store(0, Ordering::Release);
     }
 
     fn is_local_mountpoint(&self) -> bool {
@@ -846,6 +854,7 @@ impl VfsDentry {
             mount_edges: AtomicUsize::new(0),
             automount_gate: Mutex::new(()),
             anonymous: true,
+            negative_fsnotify_interest_epoch: AtomicUsize::new(0),
             state: Mutex::new(VfsDentryState {
                 name: Some(dname),
                 parent: None,
@@ -1305,6 +1314,7 @@ impl SuperBlockState {
             mount_edges: AtomicUsize::new(0),
             automount_gate: Mutex::new(()),
             anonymous: false,
+            negative_fsnotify_interest_epoch: AtomicUsize::new(0),
             state: Mutex::new(VfsDentryState {
                 name,
                 parent: parent.cloned(),
@@ -1355,7 +1365,9 @@ impl SuperBlockState {
 
     fn disconnect_dentry(&self, dentry: &Arc<VfsDentry>) {
         self.remove_dentry_key(dentry);
-        dentry.state.lock().disconnected = true;
+        let mut state = dentry.state.lock();
+        dentry.invalidate_fsnotify_interest_cache();
+        state.disconnected = true;
     }
 
     /// Update the alias registry after a successful rename while the caller
@@ -1414,6 +1426,7 @@ impl SuperBlockState {
         if let (Some(dentry), Some(child)) = (moved, moved_child) {
             {
                 let mut state = dentry.state.lock();
+                dentry.invalidate_fsnotify_interest_cache();
                 state.parent = Some(target_parent.clone());
                 state.name = Some(new_name.clone());
                 state.disconnected = false;
@@ -1433,6 +1446,7 @@ impl SuperBlockState {
             if exchange {
                 {
                     let mut state = dentry.state.lock();
+                    dentry.invalidate_fsnotify_interest_cache();
                     state.parent = Some(source_parent.clone());
                     state.name = Some(old_name.clone());
                     state.disconnected = false;
@@ -1447,7 +1461,9 @@ impl SuperBlockState {
                     Arc::downgrade(&dentry),
                 );
             } else {
-                dentry.state.lock().disconnected = true;
+                let mut state = dentry.state.lock();
+                dentry.invalidate_fsnotify_interest_cache();
+                state.disconnected = true;
             }
         }
     }
@@ -4734,19 +4750,21 @@ impl MountFSInode {
     pub(crate) fn fsnotify_snapshot(
         &self,
     ) -> Option<(FsNotifyTarget, Option<(FsNotifyTarget, DName)>)> {
-        if !self
-            .mount_fs
-            .super_block_state
-            .fsnotify_presence
-            .has_watches()
+        let presence = &self.mount_fs.super_block_state.fsnotify_presence;
+        if !presence.has_watches() {
+            return None;
+        }
+        let interest_epoch = presence.interest_epoch();
+        if interest_epoch != usize::MAX
+            && self
+                .dentry
+                .negative_fsnotify_interest_epoch
+                .load(Ordering::Acquire)
+                == interest_epoch
         {
             return None;
         }
-        let want_parent = self
-            .mount_fs
-            .super_block_state
-            .fsnotify_presence
-            .has_directory_watches();
+        let want_parent = presence.has_directory_watches();
         let (parent_entry, disconnected) = {
             let state = self.dentry.state.lock();
             let parent = want_parent
@@ -4772,8 +4790,8 @@ impl MountFSInode {
             watched,
             object_state: child_object,
         };
-        let parent = parent_entry.and_then(|(parent, name)| {
-            if Arc::ptr_eq(&parent, &self.dentry) {
+        let parent = parent_entry.as_ref().and_then(|(parent, name)| {
+            if Arc::ptr_eq(parent, &self.dentry) {
                 return None;
             }
             let parent_object = self
@@ -4795,9 +4813,35 @@ impl MountFSInode {
                     watched: parent_watched,
                     object_state: parent_object,
                 },
-                name,
+                name.clone(),
             ))
         });
+        if !child.watched && !parent.as_ref().is_some_and(|(parent, _)| parent.watched) {
+            // Resolve object state without holding dentry.state, then publish
+            // the topology validation and negative cache under that same
+            // state lock. A concurrent rename/unlink either happens before
+            // this validation or invalidates the cache after it.
+            let state = self.dentry.state.lock();
+            let current_parent = state.parent.as_ref().zip(state.name.as_ref());
+            let same_parent = !want_parent
+                || match (parent_entry.as_ref(), current_parent) {
+                    (Some((expected_parent, expected_name)), Some((parent, name))) => {
+                        Arc::ptr_eq(expected_parent, parent) && expected_name == name
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+            if same_parent
+                && state.disconnected == disconnected
+                && interest_epoch != usize::MAX
+                && presence.interest_epoch() == interest_epoch
+            {
+                self.dentry
+                    .negative_fsnotify_interest_epoch
+                    .store(interest_epoch, Ordering::Release);
+            }
+            return None;
+        }
         Some((child, parent))
     }
 

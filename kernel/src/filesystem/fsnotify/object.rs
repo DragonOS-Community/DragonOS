@@ -42,10 +42,22 @@ pub(crate) struct FsNotifyObjectState {
 unsafe impl Send for FsNotifyObjectState {}
 unsafe impl Sync for FsNotifyObjectState {}
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct MountedFsNotifyPresence {
     watches: AtomicUsize,
     directory_watches: AtomicUsize,
+    interest_epoch: AtomicUsize,
+}
+
+impl Default for MountedFsNotifyPresence {
+    fn default() -> Self {
+        Self {
+            watches: AtomicUsize::new(0),
+            directory_watches: AtomicUsize::new(0),
+            // Dentry negative-interest caches use zero as "not validated".
+            interest_epoch: AtomicUsize::new(1),
+        }
+    }
 }
 
 impl MountedFsNotifyPresence {
@@ -55,6 +67,21 @@ impl MountedFsNotifyPresence {
 
     pub(crate) fn has_directory_watches(&self) -> bool {
         self.directory_watches.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn interest_epoch(&self) -> usize {
+        self.interest_epoch.load(Ordering::Acquire)
+    }
+
+    fn advance_interest_epoch(&self) {
+        // Saturation permanently disables negative caching at MAX. This is a
+        // safe slow-path fallback and avoids accepting an ancient cache entry
+        // after a theoretical counter wrap.
+        let _ = self
+            .interest_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            });
     }
 }
 
@@ -79,22 +106,30 @@ impl FsNotifyObjectState {
     }
 
     pub(crate) fn watch_added(&self) {
-        self.watches.fetch_add(1, Ordering::Release);
+        let previous = self.watches.fetch_add(1, Ordering::Release);
         self.presence.watches.fetch_add(1, Ordering::Release);
         if self.is_dir {
             self.presence
                 .directory_watches
                 .fetch_add(1, Ordering::Release);
         }
+        if previous == 0 {
+            // Publish the object and superblock counts before invalidating
+            // dentry negative-interest caches. Active is published later.
+            self.presence.advance_interest_epoch();
+        }
     }
 
     pub(crate) fn watch_removed(&self) {
-        let result = self
-            .watches
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_sub(1)
-            });
-        debug_assert!(result.is_ok(), "fsnotify object watch count underflow");
+        let object_result =
+            self.watches
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                });
+        debug_assert!(
+            object_result.is_ok(),
+            "fsnotify object watch count underflow"
+        );
         let result =
             self.presence
                 .watches
@@ -112,6 +147,12 @@ impl FsNotifyObjectState {
                 result.is_ok(),
                 "mounted fsnotify directory watch count underflow"
             );
+        }
+        if object_result.is_ok_and(|previous| previous == 1) {
+            // Retirement has already made the mark inactive and removed it
+            // from the dispatch index. Invalidate negative caches only after
+            // all presence counts describe the new state.
+            self.presence.advance_interest_epoch();
         }
     }
 

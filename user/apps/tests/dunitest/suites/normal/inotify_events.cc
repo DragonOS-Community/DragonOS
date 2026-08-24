@@ -140,6 +140,9 @@ size_t inotify_record_size(const std::string &name) {
 struct InotifyTestCleanup {
     std::string path;
     std::string dir;
+    std::vector<std::string> extra_paths;
+    std::vector<std::string> extra_dirs;
+    std::vector<int> extra_wds;
     int fd = -1;
     int ifd = -1;
     int parent_wd = -1;
@@ -149,12 +152,16 @@ struct InotifyTestCleanup {
 
     ~InotifyTestCleanup() {
         if (ifd >= 0) {
+            for (int wd : extra_wds) inotify_rm_watch(ifd, wd);
             if (parent_wd >= 0) inotify_rm_watch(ifd, parent_wd);
             if (self_wd >= 0) inotify_rm_watch(ifd, self_wd);
             close(ifd);
         }
         if (fd >= 0) close(fd);
+        for (const auto &extra_path : extra_paths) unlink(extra_path.c_str());
         if (file_created) unlink(path.c_str());
+        for (auto it = extra_dirs.rbegin(); it != extra_dirs.rend(); ++it)
+            rmdir(it->c_str());
         if (directory_created) rmdir(dir.c_str());
     }
 };
@@ -276,6 +283,73 @@ TEST(InotifyFileEvents, LargePositionedIoPublishesOneEventPerWatch) {
     EXPECT_EQ(event_count(events, self_wd, IN_ACCESS, ""), 1);
     EXPECT_EQ(event_count(events, parent_wd, IN_ACCESS, name), 1);
 
+    auto expect_one_access_per_watch = [&]() {
+        auto access_events = drain_events(ifd);
+        EXPECT_EQ(event_count(access_events, self_wd, IN_ACCESS, ""), 1);
+        EXPECT_EQ(event_count(access_events, parent_wd, IN_ACCESS, name), 1);
+    };
+
+    struct iovec zero_iov = {output.data(), 0};
+    ASSERT_EQ(preadv(fd, &zero_iov, 1, 0), 0) << strerror(errno);
+    expect_one_access_per_watch();
+
+    // Linux accepts iovcnt==0 without touching the iovec pointer and still
+    // publishes the successful vector-read ACCESS event.
+    ASSERT_EQ(preadv(fd, reinterpret_cast<const struct iovec *>(1), 0, 0), 0)
+        << strerror(errno);
+    expect_one_access_per_watch();
+
+    // preadv validates its signed offset before accessing a nonempty invalid
+    // iovec, matching Linux's EINVAL-before-EFAULT error priority.
+    errno = 0;
+    ASSERT_EQ(syscall(SYS_preadv, fd,
+                      reinterpret_cast<const struct iovec *>(1), 1, -1L),
+              -1);
+    EXPECT_EQ(errno, EINVAL);
+    events = drain_events(ifd);
+    EXPECT_EQ(event_count(events, self_wd, IN_ACCESS, ""), 0);
+    EXPECT_EQ(event_count(events, parent_wd, IN_ACCESS, name), 0);
+
+    // preadv2 applies the same priority to offsets below its -1 sentinel,
+    // before both iovec import and unsupported-flag validation.
+    errno = 0;
+    ASSERT_EQ(syscall(SYS_preadv2, fd,
+                      reinterpret_cast<const struct iovec *>(1), 1, -2L, -1L,
+                      0L),
+              -1);
+    EXPECT_EQ(errno, EINVAL);
+    errno = 0;
+    ASSERT_EQ(syscall(SYS_preadv2, fd, &zero_iov, 1, -2L, -1L,
+                      0x80000000L),
+              -1);
+    EXPECT_EQ(errno, EINVAL);
+    events = drain_events(ifd);
+    EXPECT_EQ(event_count(events, self_wd, IN_ACCESS, ""), 0);
+    EXPECT_EQ(event_count(events, parent_wd, IN_ACCESS, name), 0);
+
+    struct iovec eof_iov = {output.data(), 1};
+    ASSERT_EQ(preadv(fd, &eof_iov, 1, static_cast<off_t>(kSize)), 0)
+        << strerror(errno);
+    expect_one_access_per_watch();
+
+    // preadv2(offset=-1) uses and preserves the current file position at EOF,
+    // but follows the same successful-zero vector notification contract.
+    ASSERT_EQ(lseek(fd, static_cast<off_t>(kSize), SEEK_SET),
+              static_cast<off_t>(kSize));
+    ASSERT_EQ(syscall(SYS_preadv2, fd, &eof_iov, 1, -1L, -1L, 0L), 0)
+        << strerror(errno);
+    EXPECT_EQ(lseek(fd, 0, SEEK_CUR), static_cast<off_t>(kSize));
+    expect_one_access_per_watch();
+
+    // Scalar pread differs: a successful EOF result does not publish ACCESS.
+    ASSERT_EQ(pread(fd, output.data(), 1, static_cast<off_t>(kSize)), 0)
+        << strerror(errno);
+    events = drain_events(ifd);
+    EXPECT_EQ(event_count(events, self_wd, IN_ACCESS, ""), 0);
+    EXPECT_EQ(event_count(events, parent_wd, IN_ACCESS, name), 0);
+
+    ASSERT_EQ(lseek(fd, 17, SEEK_SET), 17);
+
     std::fill(input.begin(), input.end(), 'y');
     ASSERT_EQ(pwrite(fd, input.data(), input.size(), 0),
               static_cast<ssize_t>(input.size()))
@@ -284,6 +358,67 @@ TEST(InotifyFileEvents, LargePositionedIoPublishesOneEventPerWatch) {
     events = drain_events(ifd);
     EXPECT_EQ(event_count(events, self_wd, IN_MODIFY, ""), 1);
     EXPECT_EQ(event_count(events, parent_wd, IN_MODIFY, name), 1);
+}
+
+TEST(InotifyFileEvents, NegativeInterestCacheTracksWatchAndRename) {
+    const std::string root = "/tmp/dunitest_inotify_interest_cache";
+    const std::string cold = root + "/cold";
+    const std::string watched = root + "/watched";
+    const std::string name = "file";
+    const std::string old_path = cold + "/" + name;
+    const std::string new_path = watched + "/" + name;
+
+    ASSERT_EQ(mkdir(root.c_str(), 0700), 0) << strerror(errno);
+    InotifyTestCleanup cleanup{"", root};
+    cleanup.directory_created = true;
+    ASSERT_EQ(mkdir(cold.c_str(), 0700), 0) << strerror(errno);
+    cleanup.extra_dirs.push_back(cold);
+    ASSERT_EQ(mkdir(watched.c_str(), 0700), 0) << strerror(errno);
+    cleanup.extra_dirs.push_back(watched);
+    cleanup.extra_paths = {old_path, new_path};
+
+    int fd = open(old_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    cleanup.fd = fd;
+    ASSERT_EQ(write(fd, "a", 1), 1) << strerror(errno);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    cleanup.ifd = ifd;
+    cleanup.parent_wd = inotify_add_watch(ifd, root.c_str(), IN_MODIFY);
+    ASSERT_GE(cleanup.parent_wd, 0) << strerror(errno);
+
+    // The root watch enables this superblock's fsnotify path, but neither the
+    // file nor its direct parent is watched. This I/O establishes a negative
+    // interest cache for the file.
+    char byte = 0;
+    ASSERT_EQ(pread(fd, &byte, 1, 0), 1) << strerror(errno);
+    EXPECT_TRUE(drain_events(ifd).empty());
+
+    cleanup.self_wd = inotify_add_watch(ifd, old_path.c_str(), IN_MODIFY);
+    ASSERT_GE(cleanup.self_wd, 0) << strerror(errno);
+    ASSERT_EQ(pwrite(fd, "b", 1, 0), 1) << strerror(errno);
+    auto events = drain_events(ifd);
+    EXPECT_EQ(event_count(events, cleanup.self_wd, IN_MODIFY, ""), 1);
+
+    ASSERT_EQ(inotify_rm_watch(ifd, cleanup.self_wd), 0) << strerror(errno);
+    cleanup.self_wd = -1;
+    drain_events(ifd);
+
+    int watched_wd = inotify_add_watch(ifd, watched.c_str(), IN_MODIFY | IN_MOVED_TO);
+    ASSERT_GE(watched_wd, 0) << strerror(errno);
+    cleanup.extra_wds.push_back(watched_wd);
+
+    // Cache the old, unwatched direct parent, then move the same dentry under
+    // an already-watched parent. The topology commit must invalidate it.
+    ASSERT_EQ(pwrite(fd, "c", 1, 0), 1) << strerror(errno);
+    EXPECT_TRUE(drain_events(ifd).empty());
+    ASSERT_EQ(rename(old_path.c_str(), new_path.c_str()), 0) << strerror(errno);
+    drain_events(ifd);
+
+    ASSERT_EQ(pwrite(fd, "d", 1, 0), 1) << strerror(errno);
+    events = drain_events(ifd);
+    EXPECT_EQ(event_count(events, watched_wd, IN_MODIFY, name), 1);
 }
 
 // ---------------------------------------------------------------------------

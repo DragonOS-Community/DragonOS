@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/sendfile.h>
@@ -127,6 +128,33 @@ int event_count(const std::vector<Ev> &evs, int wd, uint32_t bit,
     }
     return count;
 }
+
+size_t inotify_record_size(const std::string &name) {
+    if (name.empty()) return sizeof(struct inotify_event);
+    const size_t alignment = sizeof(struct inotify_event);
+    const size_t name_size = (name.size() + 1 + alignment - 1) & ~(alignment - 1);
+    return sizeof(struct inotify_event) + name_size;
+}
+
+struct InotifyTestCleanup {
+    std::string path;
+    std::string dir;
+    int ifd = -1;
+    int parent_wd = -1;
+    int self_wd = -1;
+    bool directory_created = false;
+    bool file_created = false;
+
+    ~InotifyTestCleanup() {
+        if (ifd >= 0) {
+            if (parent_wd >= 0) inotify_rm_watch(ifd, parent_wd);
+            if (self_wd >= 0) inotify_rm_watch(ifd, self_wd);
+            close(ifd);
+        }
+        if (file_created) unlink(path.c_str());
+        if (directory_created) rmdir(dir.c_str());
+    }
+};
 
 }  // namespace
 
@@ -1948,6 +1976,54 @@ TEST(InotifyMultiInstance, TwoInstancesBothReceiveEvents) {
     close(ifd2);
     unlink(cpath.c_str());
     rmdir(dir.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// FIONREAD reports the exact serialized size of all currently queued events.
+// ---------------------------------------------------------------------------
+TEST(InotifyIoctl, FionreadReportsQueuedBytesWithoutConsumingEvents) {
+    const std::string dir =
+        "/tmp/dunitest_inotify_fionread_" + std::to_string(getpid());
+    const std::string name = "file";
+    const std::string path = dir + "/" + name;
+    InotifyTestCleanup cleanup{path, dir};
+    ASSERT_EQ(0, mkdir(dir.c_str(), 0700)) << strerror(errno);
+    cleanup.directory_created = true;
+
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    cleanup.file_created = true;
+    close(fd);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    cleanup.ifd = ifd;
+    int parent_wd = inotify_add_watch(ifd, dir.c_str(), IN_ATTRIB);
+    int self_wd = inotify_add_watch(ifd, path.c_str(), IN_ATTRIB);
+    ASSERT_GE(parent_wd, 0) << strerror(errno);
+    cleanup.parent_wd = parent_wd;
+    ASSERT_GE(self_wd, 0) << strerror(errno);
+    cleanup.self_wd = self_wd;
+
+    ASSERT_EQ(0, chmod(path.c_str(), 0600)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(ifd, FIONREAD,
+                       reinterpret_cast<int *>(static_cast<uintptr_t>(-1))));
+    EXPECT_EQ(EFAULT, errno);
+
+    int available = -1;
+    ASSERT_EQ(0, ioctl(ifd, FIONREAD, &available)) << strerror(errno);
+    const size_t expected = inotify_record_size(name) + inotify_record_size("");
+    ASSERT_EQ(static_cast<int>(expected), available);
+
+    std::vector<char> records(static_cast<size_t>(available));
+    ASSERT_EQ(static_cast<ssize_t>(records.size()),
+              read(ifd, records.data(), records.size()))
+        << strerror(errno);
+    ASSERT_EQ(0, ioctl(ifd, FIONREAD, &available)) << strerror(errno);
+    EXPECT_EQ(0, available);
+
 }
 
 // ---------------------------------------------------------------------------

@@ -44,8 +44,11 @@ use crate::mm::MemoryManagementArch;
 use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::vfs_check_and_clone_cstr;
+use crate::syscall::user_access::{vfs_check_and_clone_cstr, UserBufferWriter};
 use crate::syscall::user_buffer::UserBuffer;
+
+/// Linux `FIONREAD`: report the number of bytes readable without blocking.
+const FIONREAD: u32 = 0x541B;
 
 // ============================================================================
 // 用户态 mask 位（与 Linux `include/uapi/linux/inotify.h` 完全一致）
@@ -569,6 +572,21 @@ impl InotifyInode {
         }
     }
 
+    /// Return the serialized size of the current logical queue.
+    ///
+    /// The overflow notification is tracked separately from `list`, but it is
+    /// still one readable, header-only `inotify_event` and must be included.
+    fn queued_bytes(&self) -> usize {
+        const HEADER: usize = 16;
+        let queue = self.state.events.lock();
+        queue
+            .list
+            .iter()
+            .map(|event| Self::record_len(event.name.as_deref()))
+            .sum::<usize>()
+            + usize::from(queue.overflow_pending) * HEADER
+    }
+
     /// 序列化单个事件到 `out`（长度已由 `record_len` 保证足够）。返回写入字节数。
     fn serialize(ev: &InotifyEventInfo, out: &mut [u8]) -> usize {
         let name = ev.name.as_deref();
@@ -931,6 +949,27 @@ impl IndexNode for InotifyInode {
         // 回退实例/全局 watch 计数，唤醒任何阻塞的 reader。
         self.shutdown();
         Ok(())
+    }
+
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if cmd != FIONREAD {
+            return Err(SystemError::ENOIOCTLCMD);
+        }
+
+        // Snapshot under the queue lock, then release it before touching user
+        // memory: a page fault must not block event producers or consumers.
+        let queued_bytes = self.queued_bytes();
+        debug_assert!(queued_bytes <= i32::MAX as usize);
+        let queued_bytes = queued_bytes as i32;
+        let mut writer =
+            UserBufferWriter::new(data as *mut i32, core::mem::size_of::<i32>(), true)?;
+        writer.buffer_protected(0)?.write_one(0, &queued_bytes)?;
+        Ok(0)
     }
 
     /// read 语义见设计文档 §4.3。

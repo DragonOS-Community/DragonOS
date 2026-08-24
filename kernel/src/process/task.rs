@@ -81,13 +81,10 @@ pub struct ProcessControlBlock {
     pub(super) rcu_read_depth: AtomicUsize,
 
     pub(super) flags: LockFreeFlags<ProcessFlags>,
-    /// uprobe XOL 单步窗口的每线程活跃状态（仅 x86_64）。
-    ///
-    /// #BP 重定向 rip 到 XOL slot 前保存（精确 slot_end、原始 TF、状态、site/slot
-    /// 强引用和命中 consumer 快照），#DB 完成或 abort 时取回。评审 R2/R3/R5：
-    /// 保存于执行线程而非 mm，使并发注销/信号投递不破坏恢复语义。
+    /// Per-task uprobe XOL state. Kept in the process subsystem so exception
+    /// routing does not become process state ownership.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) uprobe_ss: SpinLock<Option<crate::exception::uprobe::ActiveXol>>,
+    pub(crate) uprobe: super::uprobe::TaskXolState,
     /// Whether the current task has been counted in the global visible thread
     /// count.
     pub(super) visible_thread_accounted: AtomicBool,
@@ -396,7 +393,7 @@ impl ProcessControlBlock {
                 cmdline: RwLock::new(Vec::new()),
                 rlimits: RwLock::new(Self::default_rlimits()),
                 #[cfg(target_arch = "x86_64")]
-                uprobe_ss: SpinLock::new(None),
+                uprobe: super::uprobe::TaskXolState::new(),
             };
 
             pcb.sig_info.write().set_tty(tty);

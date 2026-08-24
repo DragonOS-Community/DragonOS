@@ -27,6 +27,9 @@ impl VmaCloseNotifications {
 pub(super) struct MremapOutcome {
     pub(super) addr: VirtAddr,
     pub(super) notifications: VmaCloseNotifications,
+    /// Explicit executable-publication plan for ranges whose uprobe sites must
+    /// be installed before their original execute permission is restored.
+    pub(super) exec_publication: super::mremap::MremapExecPublication,
     /// Locked pages in this committed range must be populated only after the
     /// caller has released `AddressSpace::write()`.  A file fault can return
     /// `VM_FAULT_RETRY` and wait on PageCache invalidation.
@@ -59,6 +62,9 @@ pub(crate) struct LockedPopulationRequest {
 pub(super) struct MremapFailure {
     pub(super) err: SystemError,
     pub(super) notifications: VmaCloseNotifications,
+    /// A source barrier can survive phase-A rollback. The outer owner must
+    /// reapply source sites and publish this plan before dropping mm.write().
+    pub(super) exec_publication: super::mremap::MremapExecPublication,
 }
 
 impl From<SystemError> for MremapFailure {
@@ -66,6 +72,7 @@ impl From<SystemError> for MremapFailure {
         Self {
             err,
             notifications: VmaCloseNotifications::default(),
+            exec_publication: super::mremap::MremapExecPublication::default(),
         }
     }
 }

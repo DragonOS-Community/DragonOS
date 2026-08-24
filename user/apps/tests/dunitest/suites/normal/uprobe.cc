@@ -412,6 +412,7 @@ TEST(UprobeTest, InitiallyDisabledCanBeEnabled) {
     ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
               static_cast<ssize_t>(sizeof(count)));
     EXPECT_EQ(count, 1U);
+    ASSERT_EQ(ioctl(fd.get(), PERF_EVENT_IOC_DISABLE, 0), 0);
 }
 
 TEST(UprobeTest, InvalidPidCpuCombinationsAreRejected) {
@@ -560,16 +561,20 @@ TEST(UprobeTest, CounterReadUsesRawSingletonFormat) {
     ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
               static_cast<ssize_t>(sizeof(count)));
     EXPECT_EQ(count, 1U);
+    ASSERT_EQ(ioctl(fd.get(), PERF_EVENT_IOC_DISABLE, 0), 0);
 }
 
 TEST(UprobeTest, TargetThreadExitDetachesTaskScopedSites) {
-    std::string path;
-    unsigned long offset = 0;
-    ASSERT_TRUE(resolve_file_offset(
-        reinterpret_cast<const void*>(&uprobe_target), path, offset));
-    const auto* target_byte =
-        reinterpret_cast<const unsigned char*>(&uprobe_target);
+    char path[] = "/tmp/uprobe_task_exit_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* executable = mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE,
+                            file.get(), 0);
+    ASSERT_NE(executable, MAP_FAILED);
+    auto target_fn = reinterpret_cast<int (*)(int)>(executable);
+    const auto* target_byte = static_cast<const unsigned char*>(executable);
     const unsigned char original_byte = *target_byte;
+    ASSERT_NE(original_byte, 0xcc);
 
     std::atomic<pid_t> target_tid{0};
     std::atomic<bool> run{false};
@@ -580,7 +585,7 @@ TEST(UprobeTest, TargetThreadExitDetachesTaskScopedSites) {
         while (!run.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        target_result.store(uprobe_target(21), std::memory_order_release);
+        target_result.store(target_fn(21), std::memory_order_release);
     });
     while (target_tid.load(std::memory_order_acquire) == 0) {
         std::this_thread::yield();
@@ -588,7 +593,7 @@ TEST(UprobeTest, TargetThreadExitDetachesTaskScopedSites) {
 
     UprobePerfEventOptions options;
     options.pid = target_tid.load(std::memory_order_acquire);
-    FdGuard event(open_uprobe_perf_event(path, offset, options));
+    FdGuard event(open_uprobe_perf_event(path, 0, options));
     ASSERT_GE(event.get(), 0) << "errno=" << errno;
     EXPECT_EQ(*target_byte, 0xcc);
     run.store(true, std::memory_order_release);
@@ -604,6 +609,9 @@ TEST(UprobeTest, TargetThreadExitDetachesTaskScopedSites) {
     ASSERT_EQ(ioctl(event.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
     EXPECT_EQ(*target_byte, original_byte)
         << "an exited task event must not be reactivated";
+    event.close_now();
+    munmap(executable, 4096);
+    unlink(path);
 }
 
 TEST(UprobeTest, UnsupportedReadFormatIsRejected) {
@@ -731,6 +739,313 @@ TEST(UprobeTest, ReadOnlyAliasIsSkippedAndLaterExecutableMapIsProbed) {
 
     munmap(executable, 4096);
     munmap(read_only, 4096);
+    unlink(path);
+}
+
+TEST(UprobeTest, DontNeedReconcilesPersistentProbe) {
+    char path[] = "/tmp/uprobe_dontneed_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* executable =
+        mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file.get(), 0);
+    ASSERT_NE(executable, MAP_FAILED);
+    auto target = reinterpret_cast<int (*)(int)>(executable);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    EXPECT_EQ(target(5), 11);
+    ASSERT_EQ(madvise(executable, 4096, MADV_DONTNEED), 0);
+    EXPECT_EQ(target(7), 15)
+        << "DONTNEED refault must reinstall the persistent probe";
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 2U);
+    event.close_now();
+    EXPECT_EQ(target(9), 19) << "close must restore the refaulted instruction";
+
+    munmap(executable, 4096);
+    unlink(path);
+}
+
+TEST(UprobeTest, MremapMoveReconcilesSourceAndDestination) {
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size_raw, 0);
+    const size_t page_size = static_cast<size_t>(page_size_raw);
+    char path[] = "/tmp/uprobe_mremap_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+
+    void* reservation = mmap(nullptr, page_size * 2, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(reservation, MAP_FAILED);
+    void* source = mmap(reservation, page_size, PROT_READ | PROT_EXEC,
+                        MAP_PRIVATE | MAP_FIXED, file.get(), 0);
+    ASSERT_EQ(source, reservation);
+    auto source_target = reinterpret_cast<int (*)(int)>(source);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    EXPECT_EQ(source_target(3), 7);
+
+    void* destination = static_cast<char*>(reservation) + page_size;
+    void* moved = mremap(source, page_size, page_size,
+                         MREMAP_MAYMOVE | MREMAP_FIXED, destination);
+    ASSERT_EQ(moved, destination) << "errno=" << errno;
+    auto moved_target = reinterpret_cast<int (*)(int)>(moved);
+    EXPECT_EQ(moved_target(4), 9);
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 2U);
+    event.close_now();
+    EXPECT_EQ(moved_target(6), 13)
+        << "close after mremap must not leave an ownerless INT3";
+
+    munmap(moved, page_size);
+    unlink(path);
+}
+
+TEST(UprobeTest, MremapInPlaceGrowthPublishesProbeBeforeReturn) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    char path[] = "/tmp/uprobe_mremap_grow_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    ASSERT_EQ(ftruncate(file.get(), static_cast<off_t>(page_size * 2)), 0);
+    ASSERT_EQ(pwrite(file.get(), RAW_TARGET_CODE, sizeof(RAW_TARGET_CODE),
+                     static_cast<off_t>(page_size)),
+              static_cast<ssize_t>(sizeof(RAW_TARGET_CODE)));
+
+    void* reservation = mmap(nullptr, page_size * 2, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(reservation, MAP_FAILED);
+    void* source = mmap(reservation, page_size, PROT_READ | PROT_EXEC,
+                        MAP_PRIVATE | MAP_FIXED, file.get(), 0);
+    ASSERT_EQ(source, reservation);
+    ASSERT_EQ(munmap(static_cast<char*>(reservation) + page_size, page_size),
+              0);
+
+    FdGuard event(open_uprobe_perf_event(path, page_size));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    void* grown = mremap(source, page_size, page_size * 2, 0);
+    ASSERT_EQ(grown, source) << "errno=" << errno;
+    auto grown_target = reinterpret_cast<int (*)(int)>(
+        static_cast<char*>(grown) + page_size);
+    EXPECT_EQ(grown_target(8), 17);
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U)
+        << "the new executable offset must be probed before mremap returns";
+
+    munmap(grown, page_size * 2);
+    unlink(path);
+}
+
+TEST(UprobeTest, MremapDontUnmapReconcilesRetainedSourceAndDestination) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    char path[] = "/tmp/uprobe_mremap_dontunmap_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+
+    void* source = mmap(nullptr, page_size, PROT_READ | PROT_EXEC, MAP_PRIVATE,
+                        file.get(), 0);
+    ASSERT_NE(source, MAP_FAILED);
+    // MREMAP_DONTUNMAP clears VM_LOCKED on the retained source. This forces
+    // the kernel through the set_flags() path which used to overwrite the
+    // temporary NX publication barrier before the source probe was rearmed.
+    ASSERT_EQ(mlock(source, page_size), 0) << "errno=" << errno;
+    auto source_target = reinterpret_cast<int (*)(int)>(source);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    EXPECT_EQ(source_target(2), 5);
+
+    std::atomic<pid_t> source_tid{0};
+    std::atomic<bool> run{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> bad_results{0};
+    std::atomic<__u64> source_calls{0};
+    std::thread source_runner([&] {
+        source_tid.store(static_cast<pid_t>(syscall(SYS_gettid)),
+                         std::memory_order_release);
+        while (!run.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        while (!stop.load(std::memory_order_acquire)) {
+            if (source_target(3) != 7) {
+                bad_results.fetch_add(1, std::memory_order_relaxed);
+            }
+            source_calls.fetch_add(1, std::memory_order_release);
+        }
+    });
+    while (source_tid.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+    UprobePerfEventOptions runner_options;
+    runner_options.pid = source_tid.load(std::memory_order_acquire);
+    FdGuard runner_event(
+        open_uprobe_perf_event(path, 0, runner_options));
+    if (runner_event.get() < 0) {
+        const int open_errno = errno;
+        stop.store(true, std::memory_order_release);
+        run.store(true, std::memory_order_release);
+        source_runner.join();
+        FAIL() << "runner task uprobe failed, errno=" << open_errno;
+        return;
+    }
+    run.store(true, std::memory_order_release);
+    while (source_calls.load(std::memory_order_acquire) < 256) {
+        std::this_thread::yield();
+    }
+
+    void* moved = mremap(source, page_size, page_size,
+                         MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    const __u64 calls_after_mremap =
+        source_calls.load(std::memory_order_acquire);
+    while (source_calls.load(std::memory_order_acquire) <
+           calls_after_mremap + 256) {
+        std::this_thread::yield();
+    }
+    stop.store(true, std::memory_order_release);
+    source_runner.join();
+    EXPECT_EQ(bad_results.load(std::memory_order_relaxed), 0);
+    ASSERT_NE(moved, MAP_FAILED) << "errno=" << errno;
+    ASSERT_NE(moved, source);
+    auto moved_target = reinterpret_cast<int (*)(int)>(moved);
+
+    EXPECT_EQ(source_target(3), 7)
+        << "the retained source must be reprobed before mremap returns";
+    EXPECT_EQ(moved_target(4), 9)
+        << "the moved destination must be probed before it becomes executable";
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 3U);
+    ASSERT_EQ(read(runner_event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, source_calls.load(std::memory_order_relaxed))
+        << "every concurrent retained-source execution must remain probed";
+    event.close_now();
+    EXPECT_EQ(source_target(5), 11);
+    EXPECT_EQ(moved_target(6), 13);
+
+    munmap(source, page_size);
+    munmap(moved, page_size);
+    unlink(path);
+}
+
+TEST(UprobeTest, RejectedMprotectDoesNotWithdrawProbe) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    char path[] = "/tmp/uprobe_mprotect_reject_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* reservation = mmap(nullptr, page_size * 2, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(reservation, MAP_FAILED);
+    void* executable = mmap(reservation, page_size, PROT_READ | PROT_EXEC,
+                            MAP_PRIVATE | MAP_FIXED, file.get(), 0);
+    ASSERT_EQ(executable, reservation);
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    // Keep the adjacent page reserved until after the event creates its XOL
+    // mapping; otherwise the XOL page can legitimately occupy the intended
+    // hole and make the mprotect request valid.
+    ASSERT_EQ(munmap(static_cast<char*>(reservation) + page_size, page_size),
+              0);
+    auto target = reinterpret_cast<int (*)(int)>(executable);
+    std::atomic<bool> start{false};
+    std::atomic<bool> done{false};
+    std::atomic<int> syscall_failures{0};
+    std::atomic<__u64> calls{0};
+    std::thread mutator([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        // Keep issuing rejected mutations until the executing thread has
+        // completed a substantial number of calls. This prevents the test
+        // from passing with an empty overlap window on a fast scheduler.
+        while (calls.load(std::memory_order_acquire) < 256) {
+            errno = 0;
+            if (mprotect(executable, page_size * 2,
+                         PROT_READ | PROT_EXEC) == -1 && errno == ENOMEM) {
+                syscall_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            std::this_thread::yield();
+        }
+        done.store(true, std::memory_order_release);
+    });
+    start.store(true, std::memory_order_release);
+    do {
+        EXPECT_EQ(target(1), 3);
+        calls.fetch_add(1, std::memory_order_relaxed);
+    } while (!done.load(std::memory_order_acquire));
+    mutator.join();
+    EXPECT_GT(syscall_failures.load(std::memory_order_relaxed), 0);
+    EXPECT_GE(calls.load(std::memory_order_relaxed), 256U);
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, calls.load(std::memory_order_relaxed))
+        << "rejected mprotect must not create an unarmed execution window";
+    munmap(executable, page_size);
+    unlink(path);
+}
+
+TEST(UprobeTest, RejectedMremapDoesNotWithdrawSourceProbe) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    char path[] = "/tmp/uprobe_mremap_reject_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* reservation = mmap(nullptr, page_size * 2, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(reservation, MAP_FAILED);
+    void* executable = mmap(reservation, page_size, PROT_READ | PROT_EXEC,
+                            MAP_PRIVATE | MAP_FIXED, file.get(), 0);
+    ASSERT_EQ(executable, reservation);
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    ASSERT_EQ(munmap(static_cast<char*>(reservation) + page_size, page_size),
+              0);
+    auto target = reinterpret_cast<int (*)(int)>(executable);
+    std::atomic<bool> start{false};
+    std::atomic<bool> done{false};
+    std::atomic<int> syscall_failures{0};
+    std::atomic<__u64> calls{0};
+    std::thread mutator([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        while (calls.load(std::memory_order_acquire) < 256) {
+            errno = 0;
+            if (mremap(executable, page_size * 2, page_size * 3,
+                       MREMAP_MAYMOVE) == MAP_FAILED && errno == EFAULT) {
+                syscall_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            std::this_thread::yield();
+        }
+        done.store(true, std::memory_order_release);
+    });
+    start.store(true, std::memory_order_release);
+    do {
+        EXPECT_EQ(target(2), 5);
+        calls.fetch_add(1, std::memory_order_relaxed);
+    } while (!done.load(std::memory_order_acquire));
+    mutator.join();
+    EXPECT_GT(syscall_failures.load(std::memory_order_relaxed), 0);
+    EXPECT_GE(calls.load(std::memory_order_relaxed), 256U);
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, calls.load(std::memory_order_relaxed))
+        << "rejected mremap must not create an unarmed source window";
+    munmap(executable, page_size);
     unlink(path);
 }
 

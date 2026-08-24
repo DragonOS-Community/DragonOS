@@ -25,9 +25,8 @@ use crate::filesystem::vfs::{
 use crate::include::bindings::linux_bpf::{bpf_prog_type, perf_event_attr};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::{Mutex, MutexGuard};
-use crate::libs::wait_queue::WaitQueue;
 use crate::mm::ucontext::{
-    noop_handler, uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_remove_consumer,
+    uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_remove_consumer,
     uprobe_registry_set_enabled, UprobeConsumerReg, UprobeConsumerScope, UprobeDefinition,
     UprobeTaskScope,
 };
@@ -43,7 +42,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rbpf::EbpfVmRaw;
 use system_error::SystemError;
 use uprobe::{CallBackFunc, ProbeArgs};
@@ -54,8 +53,7 @@ pub struct UprobePerfEvent {
     // The mount owner must be released from perf-fd process context, never
     // when an IRQ-side ActiveXol releases its last site reference.
     _resolved_path: ResolvedPath,
-    /// 消费者 id（评审 R9）：全局注册表与迟到句柄的归属键。
-    consumer_id: u64,
+    consumer: Arc<crate::mm::ucontext::UprobeConsumer>,
     callback: Arc<UprobePerfCallBack>,
     lifecycle: Mutex<()>,
     released: AtomicBool,
@@ -86,9 +84,8 @@ impl UprobePerfEvent {
         if self.released.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.callback.set_enabled(false);
-        uprobe_registry_remove_consumer(self.consumer_id);
-        self.callback.wait_idle();
+        uprobe_registry_remove_consumer(&self.consumer);
+        self.callback.retire_bpf();
     }
 
     /// JIT 编译 BPF 程序并注入到每个 per-mm 实例的 `event_callback`。
@@ -159,21 +156,13 @@ impl UprobePerfEvent {
 pub struct UprobePerfCallBack {
     cpu: i32,
     hit_count: AtomicU64,
-    enabled: AtomicBool,
-    inflight: AtomicUsize,
-    inflight_wait: WaitQueue,
-    bpf_attached: AtomicBool,
+    /// Process-context owner of the BPF/JIT allocation. The published RCU slot
+    /// below contains only a clone, so a hit-side pin can never become the last
+    /// reference and run the JIT destructor from exception context.
+    bpf_owner: crate::libs::spinlock::SpinLock<Option<Arc<BasicPerfEbpfCallBack>>>,
+    /// Lockless hit-path publication. Writers are serialized by `bpf_owner`;
+    /// release closes and drains the consumer epoch before withdrawing it.
     bpf_callback: RcuOptionArcSlot<BasicPerfEbpfCallBack>,
-}
-
-struct UprobePerfHitGuard<'a>(&'a UprobePerfCallBack);
-
-impl Drop for UprobePerfHitGuard<'_> {
-    fn drop(&mut self) {
-        if self.0.inflight.fetch_sub(1, Ordering::Release) == 1 {
-            self.0.inflight_wait.wakeup_all(None);
-        }
-    }
 }
 
 impl UprobePerfCallBack {
@@ -181,20 +170,40 @@ impl UprobePerfCallBack {
         Self {
             cpu,
             hit_count: AtomicU64::new(0),
-            enabled: AtomicBool::new(false),
-            inflight: AtomicUsize::new(0),
-            inflight_wait: WaitQueue::default(),
-            bpf_attached: AtomicBool::new(false),
+            bpf_owner: crate::libs::spinlock::SpinLock::new(None),
             bpf_callback: RcuOptionArcSlot::new_none(),
         }
     }
 
     fn attach_bpf(&self, callback: Arc<BasicPerfEbpfCallBack>) -> Result<()> {
-        self.bpf_attached
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| SystemError::EEXIST)?;
-        self.bpf_callback.store_deferred(Some(callback));
+        let mut owner = self.bpf_owner.lock_irqsave();
+        if owner.is_some() {
+            return Err(SystemError::EEXIST);
+        }
+        self.bpf_callback.store_deferred(Some(callback.clone()));
+        *owner = Some(callback);
         Ok(())
+    }
+
+    fn retire_bpf(&self) {
+        let mut owner = self.bpf_owner.lock_irqsave();
+        // `release_consumer()` has already closed and drained the consumer
+        // delivery epoch. Therefore no callback can be inside `load()` here,
+        // and none can enter afterwards. It is safe to take the slot-owned Arc
+        // directly instead of deferring its drop to the RCU worker.
+        let published = unsafe { self.bpf_callback.swap(None) };
+        let authoritative = owner.take();
+        debug_assert!(published
+            .as_ref()
+            .zip(authoritative.as_ref())
+            .is_none_or(|(published, authoritative)| Arc::ptr_eq(published, authoritative)));
+        drop(owner);
+
+        // Drop the publication clone first. The authoritative reference is
+        // deliberately last, so BPF/JIT teardown runs in perf release process
+        // context rather than in an exception handler or RCU callback.
+        drop(published);
+        drop(authoritative);
     }
 
     fn count(&self) -> u64 {
@@ -204,29 +213,6 @@ impl UprobePerfCallBack {
     fn reset_count(&self) {
         self.hit_count.store(0, Ordering::Relaxed);
     }
-
-    fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Release);
-    }
-
-    fn begin_hit(&self) -> Option<UprobePerfHitGuard<'_>> {
-        if !self.enabled.load(Ordering::Acquire) {
-            return None;
-        }
-        self.inflight.fetch_add(1, Ordering::AcqRel);
-        if !self.enabled.load(Ordering::Acquire) {
-            if self.inflight.fetch_sub(1, Ordering::Release) == 1 {
-                self.inflight_wait.wakeup_all(None);
-            }
-            return None;
-        }
-        Some(UprobePerfHitGuard(self))
-    }
-
-    fn wait_idle(&self) {
-        self.inflight_wait
-            .wait_until(|| (self.inflight.load(Ordering::Acquire) == 0).then_some(()));
-    }
 }
 
 impl CallBackFunc for UprobePerfCallBack {
@@ -234,14 +220,10 @@ impl CallBackFunc for UprobePerfCallBack {
         if self.cpu >= 0 && smp_get_processor_id().data() != self.cpu as u32 {
             return;
         }
-        let Some(_hit_guard) = self.begin_hit() else {
-            return;
-        };
-        let bpf_callback = self.bpf_callback.load();
-        if bpf_callback.is_none() {
+        let Some(bpf_callback) = self.bpf_callback.load() else {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
             return;
-        }
+        };
         // F5：BPF 看到的 rip 是原探针址（break_address），不是 XOL slot、也不是 rip+1。
         let probe_addr = trap_frame.break_address();
         let trap_frame = match trap_frame.as_any().downcast_ref::<TrapFrame>() {
@@ -257,8 +239,7 @@ impl CallBackFunc for UprobePerfCallBack {
             )
         };
         if bpf_callback
-            .as_ref()
-            .and_then(|callback| callback.call_with_result(probe_context))
+            .call_with_result(probe_context)
             .is_some_and(|result| result != 0)
         {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
@@ -310,26 +291,20 @@ impl IndexNode for UprobePerfEvent {
 
 impl PerfEventOps for UprobePerfEvent {
     fn set_bpf_prog(&self, bpf_prog: Arc<File>) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        if self.released.load(Ordering::Acquire) {
+            return Err(SystemError::ENOENT);
+        }
         self.do_set_bpf_prog(bpf_prog)
     }
     fn enable(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock();
-        self.callback.set_enabled(true);
-        if let Err(err) = uprobe_registry_set_enabled(self.consumer_id, true) {
-            self.callback.set_enabled(false);
-            self.callback.wait_idle();
-            return Err(err);
-        }
+        uprobe_registry_set_enabled(&self.consumer, true)?;
         Ok(())
     }
     fn disable(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock();
-        self.callback.set_enabled(false);
-        if let Err(err) = uprobe_registry_set_enabled(self.consumer_id, false) {
-            self.callback.set_enabled(true);
-            return Err(err);
-        }
-        self.callback.wait_idle();
+        uprobe_registry_set_enabled(&self.consumer, false)?;
         Ok(())
     }
 
@@ -452,15 +427,13 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     let consumer_id = uprobe_new_consumer_id();
     let inode_id = definition.inode_id();
     let callback = Arc::new(UprobePerfCallBack::new(args.cpu));
-    uprobe_registry_add(
+    let consumer = uprobe_registry_add(
         inode_id,
         offset,
         consumer_id,
         Arc::new(UprobeConsumerReg {
             definition,
             scope,
-            pre_handler: noop_handler,
-            post_handler: noop_handler,
             event_callback: Some(callback.clone()),
             // Initial activation uses the same scope-aware path as ioctl
             // ENABLE, so task events never need a global file-rmap scan.
@@ -472,18 +445,15 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     // is valid; future mmap/dlopen/exec hooks will install the persistent
     // consumer. A real initial installation failure rolls registration back.
     if !args.disabled {
-        callback.set_enabled(true);
-        if let Err(e) = uprobe_registry_set_enabled(consumer_id, true) {
-            callback.set_enabled(false);
-            callback.wait_idle();
-            uprobe_registry_remove_consumer(consumer_id);
+        if let Err(e) = uprobe_registry_set_enabled(&consumer, true) {
+            uprobe_registry_remove_consumer(&consumer);
             return Err(e);
         }
     }
 
     Ok(UprobePerfEvent {
         _resolved_path: resolved,
-        consumer_id,
+        consumer,
         callback,
         lifecycle: Mutex::new(()),
         released: AtomicBool::new(false),

@@ -816,6 +816,12 @@ impl VMA {
         self.flags = MMArch::vm_get_page_prot(self.vm_flags);
     }
 
+    /// Override only the execute bit used when publishing PTEs for this VMA.
+    /// The logical `VM_EXEC` permission is intentionally unchanged.
+    pub(super) fn set_entry_execute(&mut self, executable: bool) {
+        self.flags = self.flags.set_execute(executable);
+    }
+
     #[inline(always)]
     pub fn set_sysv_shm(&mut self, sysv_shm: Option<Arc<SysVShmAttach>>) {
         self.sysv_shm = sysv_shm;

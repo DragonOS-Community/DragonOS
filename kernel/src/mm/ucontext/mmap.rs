@@ -32,6 +32,7 @@ impl InnerAddressSpace {
             map_flags,
             round_to_min,
             allocate_at_once,
+            |_, _| Ok(()),
         ) {
             Ok(outcome) => outcome,
             Err(failure) => {
@@ -57,7 +58,7 @@ impl InnerAddressSpace {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn map_anonymous_collect(
+    pub(super) fn map_anonymous_collect<F>(
         &mut self,
         start_vaddr: VirtAddr,
         len: usize,
@@ -65,7 +66,11 @@ impl InnerAddressSpace {
         map_flags: MapFlags,
         round_to_min: bool,
         allocate_at_once: bool,
-    ) -> Result<(VirtPageFrame, VmaCloseNotifications), MmapFailure> {
+        before_replace: F,
+    ) -> Result<(VirtPageFrame, VmaCloseNotifications), MmapFailure>
+    where
+        F: FnMut(&mut Self, &[VirtRegion]) -> Result<(), SystemError>,
+    {
         let allocate_at_once = if MMArch::PAGE_FAULT_ENABLED {
             allocate_at_once
         } else {
@@ -113,6 +118,7 @@ impl InnerAddressSpace {
                     Ok(vma)
                 }
             },
+            before_replace,
         )?;
 
         return Ok((start_page, notifications));
@@ -207,6 +213,7 @@ impl InnerAddressSpace {
                     )?)
                 }
             },
+            |_, _| Ok(()),
         )?;
         Ok((start_page, notifications))
     }
@@ -237,6 +244,7 @@ impl InnerAddressSpace {
             &mut PageMapper,
             &mut dyn Flusher<MMArch>,
         ) -> Result<Arc<LockedVMA>, SystemError>,
+        B: FnMut(&mut Self, &[VirtRegion]) -> Result<(), SystemError>,
     >(
         &mut self,
         addr: Option<VirtAddr>,
@@ -244,6 +252,7 @@ impl InnerAddressSpace {
         prot_flags: ProtFlags,
         map_flags: MapFlags,
         map_func: F,
+        mut before_replace: B,
     ) -> Result<(VirtPageFrame, VmaCloseNotifications), MmapFailure> {
         if page_count == PageFrameCount::new(0) {
             return Err(SystemError::EINVAL.into());
@@ -305,24 +314,7 @@ impl InnerAddressSpace {
 
         self.check_rlimit_as_for_region(region, page_count.bytes(), map_flags)?;
 
-        if map_flags.contains(MapFlags::MAP_FIXED) && self.mappings.has_conflict(region) {
-            let close_notifications = match self.munmap_collect(
-                VirtPageFrame::new(region.start()),
-                PageFrameCount::from_bytes(region.size()).unwrap(),
-            ) {
-                Ok(close_notifications) => close_notifications,
-                Err(failure) => {
-                    notifications.extend(failure.notifications);
-                    mmap_fail!(failure.err);
-                }
-            };
-            notifications.extend(close_notifications);
-        }
-
-        let page = VirtPageFrame::new(region.start());
-        // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
-
-        let new_locked_vm = if vm_flags.contains(VmFlags::VM_LOCKED) {
+        let mut new_locked_vm = if vm_flags.contains(VmFlags::VM_LOCKED) {
             Some(
                 self.locked_vm
                     .checked_add(page_count.data())
@@ -331,6 +323,35 @@ impl InnerAddressSpace {
         } else {
             None
         };
+
+        if map_flags.contains(MapFlags::MAP_FIXED) && self.mappings.has_conflict(region) {
+            let prepared = match self.prepare_munmap(
+                VirtPageFrame::new(region.start()),
+                PageFrameCount::from_bytes(region.size()).unwrap(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    notifications.extend(failure.notifications);
+                    mmap_fail!(failure.err);
+                }
+            };
+            if vm_flags.contains(VmFlags::VM_LOCKED) {
+                new_locked_vm = Some(
+                    prepared
+                        .locked_vm_after_commit()
+                        .checked_add(page_count.data())
+                        .ok_or(SystemError::ENOMEM)?,
+                );
+            }
+            if let Err(err) = before_replace(self, &prepared.affected_ranges()) {
+                notifications.extend(prepared.rollback());
+                mmap_fail!(err);
+            }
+            notifications.extend(self.commit_munmap(prepared));
+        }
+
+        let page = VirtPageFrame::new(region.start());
+        // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
 
         compiler_fence(Ordering::SeqCst);
         // New mapping: the new region had no prior PTE, no TLB invalidation needed.

@@ -235,6 +235,31 @@ TEST(Mlock, PopulatesAnonymousPages) {
     EXPECT_EQ(0, munmap(addr, len));
 }
 
+TEST(Mlock, LockedMapFixedReplacementUsesNetLockedPages) {
+    const size_t ps = PageSize();
+    ScopedMemlockLimit lim;
+    ASSERT_TRUE(lim.valid());
+    ASSERT_TRUE(lim.set_bytes(ps * 2));
+
+    void* first = mmap(nullptr, ps, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
+    ASSERT_NE(MAP_FAILED, first) << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    void* replaced = mmap(first, ps, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_LOCKED, -1, 0);
+    ASSERT_EQ(first, replaced) << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    // A same-size locked replacement still consumes one page, so the second
+    // page must remain available under a two-page limit. The old accounting
+    // bug charged both the removed and replacement VMA and rejected this map.
+    void* second = mmap(nullptr, ps, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
+    ASSERT_NE(MAP_FAILED, second) << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    EXPECT_EQ(0, munmap(second, ps));
+    EXPECT_EQ(0, munmap(replaced, ps));
+}
+
 TEST(Mlock, PopulatesFileMappingBeforeFault) {
     const size_t ps = PageSize();
     ScopedMemlockLimit lim;

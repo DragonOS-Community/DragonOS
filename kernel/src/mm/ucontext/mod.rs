@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -35,7 +35,6 @@ use crate::{
         align::page_align_up,
         cpumask::CpuMask,
         mutex::{Mutex, MutexGuard},
-        rwlock::RwLock,
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
         wait_queue::WaitQueue,
@@ -119,7 +118,12 @@ pub(crate) mod uprobe;
 mod vma;
 mod vma_ops;
 #[cfg(target_arch = "x86_64")]
-use self::{mappings::UserMappings, notifications::*, uprobe::UprobePageState, vma::VmaSplitSides};
+use self::{
+    mappings::UserMappings,
+    notifications::*,
+    uprobe::{UprobePageState, UprobeSiteTable},
+    vma::VmaSplitSides,
+};
 #[cfg(not(target_arch = "x86_64"))]
 use self::{mappings::UserMappings, notifications::*, vma::VmaSplitSides};
 
@@ -130,11 +134,11 @@ pub use stack::UserStack;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use uprobe::{
-    fork_inherit_uprobes, noop_handler, uprobe_apply_to_new_vma, uprobe_new_consumer_id,
-    uprobe_registry_add, uprobe_registry_remove_consumer, uprobe_registry_set_enabled,
-    UprobeConsumer, UprobeConsumerReg, UprobeConsumerRuntime, UprobeConsumerRuntimeSnapshot,
-    UprobeConsumerScope, UprobeDefinition, UprobeHandle, UprobeInstance, UprobeSite,
-    UprobeSiteState, UprobeTaskScope, XolArea, XolSlotLease,
+    fork_inherit_uprobes, uprobe_apply_to_new_vma, uprobe_new_consumer_id, uprobe_registry_add,
+    uprobe_registry_remove_consumer, uprobe_registry_set_enabled, UprobeConsumer,
+    UprobeConsumerReg, UprobeConsumerRuntime, UprobeConsumerRuntimeSnapshot, UprobeConsumerScope,
+    UprobeDefinition, UprobeHandle, UprobeSite, UprobeSiteState, UprobeTaskScope, XolArea,
+    XolSlotLease,
 };
 #[allow(unused_imports)]
 pub use vma::{

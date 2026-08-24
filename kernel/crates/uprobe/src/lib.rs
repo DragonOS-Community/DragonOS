@@ -7,13 +7,13 @@
 //! - 只保存原指令副本与 XOL slot 偏移，**不**提供任何内核态“单步地址”；
 //! - 指令分析直接复用 yaxpeax-x86（kprobe 已依赖）。
 //!
-//! 本 crate 是 uprobe 整体实现的第一批（计划步骤 1+2），仅含 crate 内部数据结构、
-//! trait 与 x86 指令分析；mm 集成 / 异常分发 / perf 接入由后续步骤完成。
+//! 本 crate 仅保留纯指令分析/重定位与命中回调的架构无关接口；MM、异常和 perf
+//! 生命周期由内核对应模块拥有。
 
-extern crate alloc;
+/// 用户态指令副本的最大字节数。x86-64 指令最长 15 字节，16 字节同时作为 XOL
+/// slot 宽度，便于固定大小复制与对齐。
+pub const UPROBE_INSN_COPY_SIZE: usize = 16;
 
 pub mod arch;
-pub mod core;
 
-pub use crate::core::*;
 pub use arch::*;

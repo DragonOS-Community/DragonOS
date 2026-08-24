@@ -11,32 +11,23 @@
 //! - XOL slot 内容通过物理页的内核 direct-map 写入（`phys_2_virt`），无需
 //!   `PageMapper`/`RwSem`——这是 batch2 `XolArea::page_paddr` 的设计意图。
 //!
-//! # F4：NEED_UPROBE 是 #DB 分发判别位
-//!
-//! #BP handler 在重定向 rip 到 XOL slot 前置 `NEED_UPROBE`；用户态 #DB handler
-//! 检查并清之以识别「XOL 单步完成的 #DB」，区别于 ptrace/硬件断点 #DB。
-//!
 //! # F5：BPF 透明性
 //!
-//! `call_pre_handler`/`call_event_callback`/`call_post_handler` 入口 rip 必须是
+//! event callback 入口 rip 必须是
 //! 原探针语境（`probe_vaddr` 或 `probe_vaddr + insn_len`），XOL slot 用户地址
 //! **绝不**暴露给 BPF。
-
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::Signal;
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::ipc::signal::force_sig_fault_to_current;
-use crate::mm::ucontext::{UprobeConsumerRuntimeSnapshot, XolSlotLease};
 use crate::mm::VirtAddr;
+use crate::process::uprobe::{ActiveXol, TaskXolPhase};
 use crate::process::{ProcessControlBlock, ProcessFlags, ProcessManager};
 use kprobe::ProbeArgs;
 use log::{debug, warn};
 use system_error::SystemError;
-use uprobe::UprobeOps;
 
 /// `SIGTRAP` 的 `si_code`：breakpoint trap（镜像 Linux `TRAP_BRKPT`，用于未消费的
 /// 用户态 #BP）。
@@ -57,50 +48,6 @@ pub const DR6_SINGLE_STEP: u64 = 1 << 14;
 
 /// RFLAGS 的 TF（Trap Flag）位——置位后每条指令执行完触发 #DB，用于 XOL 单步。
 const RFLAGS_TF: u64 = 1 << 8;
-
-/// XOL 单步的生命周期状态，镜像 Linux 的 `UTASK_SSTEP` 与
-/// `UTASK_SSTEP_TRAPPED`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActiveXolState {
-    Running,
-    Trapped,
-}
-
-/// Per-thread 活跃 XOL 单步状态（评审 R2/R3/R5/R12）。
-/// 在 #BP 重定向 rip 到 XOL slot **之前**保存到执行线程的 PCB；
-/// #DB 到达时取回——不依赖 uprobe_list/slot 反查，使「另一线程在 XOL
-/// 窗口内注销探针并释放 slot」的竞态不影响本线程的恢复语义。
-pub struct ActiveXol {
-    /// 被探测的原地址（abort 路径重新执行处）。
-    pub probe_vaddr: usize,
-    /// 原指令执行完毕后的返回地址（= probe_vaddr + insn_len）。
-    pub return_addr: usize,
-    /// 进入 XOL 前 RFLAGS.TF 的原始值（程序自身/调试器可能已置单步）。
-    pub orig_tf: bool,
-    /// 原指令在 XOL slot 中执行完毕后的精确 RIP。
-    pub slot_end: usize,
-    /// Strongly hold the slot lease so concurrent close can only withdraw
-    /// future hits and cannot reuse this in-flight instruction slot.
-    pub xol_lease: Arc<XolSlotLease>,
-    /// #BP 时 enabled consumer 的稳定快照。post handler 必须遍历它，不能从
-    /// 可能已被 close 删除的 per-mm 命中表重新查找。
-    pub participants: Arc<Vec<UprobeConsumerRuntimeSnapshot>>,
-    pub state: ActiveXolState,
-}
-
-impl core::fmt::Debug for ActiveXol {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ActiveXol")
-            .field("probe_vaddr", &self.probe_vaddr)
-            .field("return_addr", &self.return_addr)
-            .field("orig_tf", &self.orig_tf)
-            .field("slot_end", &self.slot_end)
-            .field("xol_slot_offset", &self.xol_lease.offset())
-            .field("participant_count", &self.participants.len())
-            .field("state", &self.state)
-            .finish_non_exhaustive()
-    }
-}
 
 /// 用户态 #BP（int3）分发：uprobe 命中则 XOL 单步原指令，否则投递
 /// `SIGTRAP(TRAP_BRKPT)`。
@@ -123,34 +70,27 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
         }
     };
 
-    // ── Phase 1：uprobe_list 锁内——仅做查表与 Arc 收集（评审 R12）──
-    // 短临界区：收集实例 Arc + 首实例的 slot/返回址，回调在锁外执行，
-    // 避免持 per-mm 锁跑 BPF 造成长关中断。
-    let (xol_lease, slot_vaddr, slot_end, return_addr, participants) = {
-        let list = mm.uprobe_list.lock_irqsave();
-        let Some(entries) = list.get(&break_addr) else {
-            drop(list);
-            // 无匹配 uprobe → 未消费用户态 #BP → SIGTRAP(TRAP_BRKPT)
-            return send_sigtrap_brkpt(frame, break_addr);
-        };
-        if entries.is_empty() {
-            drop(list);
-            return send_sigtrap_brkpt(frame, break_addr);
-        }
-        let first = entries[0].read();
-        let pp = first.point.clone();
-        let site = first.site.clone();
-        let xol_lease = first.xol_lease.clone();
-        let slot_vaddr = xol_lease.slot_vaddr().data();
-        let slot_end = slot_vaddr
-            .checked_add(pp.insn_len())
-            .ok_or(SystemError::EINVAL)?;
-        let return_addr = pp.return_address();
-        drop(first);
+    // ── Phase 1：RCU 命中快照内复制 IRQ-safe 运行值 ──
+    let captured = mm
+        .uprobe_list
+        .with_hit(break_addr, |site| -> Result<_, SystemError> {
+            let xol_lease = site.xol_lease.clone();
+            let slot_vaddr = xol_lease.slot_vaddr().data();
+            let slot_end = slot_vaddr
+                .checked_add(site.insn_analysis.insn_len)
+                .ok_or(SystemError::EINVAL)?;
+            let return_addr = site
+                .probe_vaddr
+                .checked_add(site.insn_analysis.insn_len)
+                .ok_or(SystemError::EINVAL)?;
 
-        let participants = site.participants.read().clone();
-        (xol_lease, slot_vaddr, slot_end, return_addr, participants)
-    }; // uprobe_list 释放
+            let participants = site.participants.load();
+            Ok((xol_lease, slot_vaddr, slot_end, return_addr, participants))
+        });
+    let Some(captured) = captured else {
+        return send_sigtrap_brkpt(frame, break_addr);
+    };
+    let (xol_lease, slot_vaddr, slot_end, return_addr, participants) = captured?;
 
     // #BP uses a DPL=3 interrupt gate so teardown cannot observe this CPU's
     // shootdown acknowledgement before the hit-table lookup and slot lease
@@ -158,41 +98,36 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
     // from this point with normal user-exception interrupt semantics.
     unsafe { CurrentIrqArch::interrupt_enable() };
 
-    // ── Phase 1.5：锁外跑 pre_handler + event_callback（评审 R12）──
+    // ── Phase 1.5：锁外跑 event callback（评审 R12）──
     // rip 保持 raw（probe_vaddr+1）：BPF 回调经 break_address()=rip-1 取得原探针址。
     for participant in participants.iter() {
-        if !participant.permits_task(&pcb) {
-            continue;
-        }
-        (participant.pre_handler)(frame);
-        if let Some(callback) = participant.event_callback.as_ref() {
-            callback.call(frame);
-        }
+        participant.deliver(&pcb, frame);
     }
 
     // ── Phase 2：保存 per-thread 活跃状态（评审 R2/R5）→ 重定向 rip → 置 TF ──
     let orig_tf = frame.rflags & RFLAGS_TF != 0;
-    {
-        let mut ss = pcb.uprobe_ss.lock_irqsave();
-        *ss = Some(ActiveXol {
-            probe_vaddr: break_addr,
-            return_addr,
-            orig_tf,
-            slot_end,
-            xol_lease,
-            participants,
-            state: ActiveXolState::Running,
-        });
+    let active = ActiveXol {
+        probe_vaddr: break_addr,
+        return_addr,
+        orig_tf,
+        slot_end,
+        xol_lease,
+    };
+    if let Err(active) = pcb.uprobe.publish_running(active) {
+        warn!(
+            "nested uprobe XOL state at probe {:#x}; preserving existing lease",
+            active.probe_vaddr
+        );
+        return send_sigtrap_brkpt(frame, break_addr);
     }
     frame.set_rip(slot_vaddr);
     frame.rflags |= RFLAGS_TF;
-    pcb.flags().insert(ProcessFlags::NEED_UPROBE);
 
     Ok(())
 }
 
-/// 用户态 #DB 分发：`NEED_UPROBE` 置位 → XOL 单步完成（消费）；否则本异常
-/// **不属于 uprobe**，返回 `false` 交由调用方路由到正常 debug 路径
+/// 用户态 #DB 分发：task XOL state 为 active → XOL 单步完成（消费）；否则本
+/// 异常**不属于 uprobe**，返回 `false` 交由调用方路由到正常 debug 路径
 /// （ptrace 单步 / 硬件断点 / SIGTRAP，评审 R4）。
 ///
 /// 调用方（`do_debug`）已保证 `is_from_user()` 为真。
@@ -202,21 +137,18 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
 pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, SystemError> {
     let pcb = ProcessManager::current_pcb();
 
-    // ── F4：NEED_UPROBE 是 #DB 判别位 ──
-    if !pcb.flags().contains(ProcessFlags::NEED_UPROBE) {
+    if pcb.uprobe.phase() == TaskXolPhase::Idle {
         // 非 uprobe 单步 #DB：不吞掉（评审 R4），交还 do_debug 走正常
         // DebugException 路径（ptrace / 硬件断点 / SIGTRAP）。
         return Ok(false);
     }
 
-    // 清 NEED_UPROBE + 取回 per-thread 活跃状态（评审 R2/R12：O(1)，
-    // 不经 uprobe_list/slot 反查——注销竞态下本线程仍能正确恢复）。
-    pcb.flags().remove(ProcessFlags::NEED_UPROBE);
-    let state = { pcb.uprobe_ss.lock_irqsave().take() };
-    let Some(state) = state else {
-        // NEED_UPROBE 置位但无活跃状态（不应发生）：防御性按未消费处理。
+    // Atomically return the task state to Idle and preserve the old phase for
+    // exact Running/Trapped classification.
+    let state = pcb.uprobe.take();
+    let Some((phase, state)) = state else {
         warn!(
-            "uprobe #DB: NEED_UPROBE set but no active state @ rip {:#x}",
+            "uprobe #DB: active phase without payload @ rip {:#x}",
             frame.rip
         );
         return Ok(false);
@@ -225,11 +157,10 @@ pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, Sys
     // 只有原指令在本租约的 slot 内恰好执行完毕，才是本次 XOL 的完成 #DB。
     // 页范围判断会把硬件断点或异常改道后的 #DB 错认成完成。
     let rip = frame.rip as usize;
-    if state.state != ActiveXolState::Running || rip != state.slot_end || dr6 & DR6_SINGLE_STEP == 0
-    {
+    if phase != TaskXolPhase::Running || rip != state.slot_end || dr6 & DR6_SINGLE_STEP == 0 {
         warn!(
             "uprobe #DB abort: rip {:#x}, expected {:#x}, dr6 {:#x}, state {:?}, re-execute probe {:#x}",
-            rip, state.slot_end, dr6, state.state, state.probe_vaddr
+            rip, state.slot_end, dr6, phase, state.probe_vaddr
         );
         restore_after_abort(frame, &state);
         pcb.recalc_sigpending();
@@ -246,15 +177,6 @@ pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, Sys
         frame.rflags |= RFLAGS_TF;
     } else {
         frame.rflags &= !RFLAGS_TF;
-    }
-
-    // post 使用 #BP 时的 participant 快照。并发 close 可从 mm 表移除实例，
-    // 但不能让已经执行过 pre 的 consumer 丢失配对的 post。
-    for participant in state.participants.iter() {
-        if !participant.permits_task(&pcb) {
-            continue;
-        }
-        (participant.post_handler)(frame);
     }
 
     debug!(
@@ -320,18 +242,14 @@ pub fn mark_current_xol_trapped() -> bool {
 /// without exposing the private XOL slot address to userspace.
 pub fn mark_current_xol_trapped_and_get_probe_addr() -> Option<usize> {
     let pcb = ProcessManager::current_pcb();
-    let mut active = pcb.uprobe_ss.lock_irqsave();
-    let active = active.as_mut()?;
-    active.state = ActiveXolState::Trapped;
-    Some(active.probe_vaddr)
+    pcb.uprobe.mark_trapped()
 }
 
 /// 幂等中止当前 XOL，并把 trapframe 恢复为可重试原指令的状态。
 pub fn abort_current_xol(frame: &mut TrapFrame) -> bool {
     let pcb = ProcessManager::current_pcb();
-    pcb.flags().remove(ProcessFlags::NEED_UPROBE);
-    let state = pcb.uprobe_ss.lock_irqsave().take();
-    let Some(state) = state else {
+    let state = pcb.uprobe.take();
+    let Some((_phase, state)) = state else {
         return false;
     };
     restore_after_abort(frame, &state);
@@ -343,9 +261,7 @@ pub fn abort_current_xol(frame: &mut TrapFrame) -> bool {
 /// exec/exit 等不再返回旧用户上下文的路径可调用此函数释放 ActiveXol 的
 /// site/slot/consumer 强引用。无需也不应修改一个即将废弃的 trapframe。
 pub fn cleanup_task_active_xol(pcb: &ProcessControlBlock) {
-    pcb.flags().remove(ProcessFlags::NEED_UPROBE);
-    let state = pcb.uprobe_ss.lock_irqsave().take();
-    drop(state);
+    pcb.uprobe.discard();
     pcb.recalc_sigpending();
 }
 
@@ -353,19 +269,15 @@ pub fn cleanup_task_active_xol(pcb: &ProcessControlBlock) {
 /// fatal 或已标记 Trapped 的路径会先 abort，再允许信号构造用户 frame。
 pub fn signal_gate(frame: &mut TrapFrame) -> bool {
     let pcb = ProcessManager::current_pcb();
-    let state = pcb
-        .uprobe_ss
-        .lock_irqsave()
-        .as_ref()
-        .map(|active| active.state);
-    let Some(state) = state else {
+    let state = pcb.uprobe.phase();
+    if state == TaskXolPhase::Idle {
         return true;
-    };
+    }
 
     // group-exit 与线程/共享 SIGKILL 都必须立刻终止 XOL。该 helper 虽因 OOM
     // 命名，但语义正是这里需要的完整 fatal-pending 查询。
     let fatal = Signal::oom_fatal_signal_pending(&pcb);
-    if state == ActiveXolState::Running && !fatal {
+    if state == TaskXolPhase::Running && !fatal {
         // pending 队列保持不变；只暂时清 fast flag，避免 exit-to-user loop
         // 原地重入。XOL 的紧邻 #DB 完成/abort 会 recalc 并重新置位。
         pcb.flags().remove(ProcessFlags::HAS_PENDING_SIGNAL);

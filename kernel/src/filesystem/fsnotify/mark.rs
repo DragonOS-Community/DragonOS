@@ -10,6 +10,22 @@ use super::{
 };
 use crate::libs::mutex::Mutex;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetireReason {
+    Explicit,
+    OneShot,
+    ObjectDelete,
+    Unmount,
+    Shutdown,
+}
+
+/// Unique ownership of a mark's cleanup obligations.
+pub(crate) struct RetireToken {
+    mark: Arc<FsNotifyMark>,
+    group: Arc<FsNotifyGroup>,
+    reason: RetireReason,
+}
+
 /// 一个 watch：连接 group 与 inode。
 ///
 /// 生命周期：由 `group.marks` 持有强引用（pin 住被监听 inode），全局索引持 `Weak`。
@@ -67,45 +83,80 @@ impl FsNotifyMark {
             debug_assert!(result.is_ok(), "fsnotify inode watch count underflow");
         }
     }
+
+    pub(crate) fn begin_retire(mark: &Arc<Self>, reason: RetireReason) -> Option<RetireToken> {
+        let _dispatch = mark.dispatch_lock.lock();
+        Self::begin_retire_locked(mark, reason)
+    }
+
+    /// Caller must hold `dispatch_lock`. Event delivery and one-shot/death
+    /// retirement therefore form one indivisible dispatch transition.
+    pub(crate) fn begin_retire_locked(
+        mark: &Arc<Self>,
+        reason: RetireReason,
+    ) -> Option<RetireToken> {
+        if !mark.active.load(Ordering::Acquire) {
+            return None;
+        }
+
+        // An active mark is fully published and therefore must still belong to
+        // a live group. Pin that group before transferring the unique cleanup
+        // obligation to the token; shutdown may drop the last other strong
+        // reference immediately after this dispatch critical section.
+        let group = mark
+            .group
+            .upgrade()
+            .expect("active fsnotify mark lost its group");
+        if !mark.active.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        Some(RetireToken {
+            mark: mark.clone(),
+            group,
+            reason,
+        })
+    }
 }
 
 /// 撤销一个 mark：从 group.marks、全局索引移除，并维护全局计数。
 ///
 /// 在 `rm_watch`、`DELETE_SELF`/`UNMOUNT` dispatch、group 销毁时调用。
 /// 注意：不取 events 锁，故与 read 路径互不阻塞（锁族分离）。
-pub fn destroy_mark(mark: &Arc<FsNotifyMark>) {
-    let Some(group) = mark.group.upgrade() else {
-        // group 已销毁，mark 仅可能残留在 snapshot 中；直接清索引即可。
-        index_remove(mark);
-        return;
-    };
-
-    // Stop dispatch before removing any lookup path. A snapshot that already
-    // owns the Arc will observe inactive after acquiring this lock.
-    let dispatch = mark.dispatch_lock.lock();
-    mark.active.store(false, Ordering::Release);
-    drop(dispatch);
+pub(crate) fn finish_retire(token: RetireToken) {
+    let RetireToken {
+        mark,
+        group,
+        reason,
+    } = token;
 
     // 从 group.marks 移除（按指针相等）。
     let mut marks = group.marks.lock();
     let removed = marks
         .get(&mark.object_id)
-        .is_some_and(|candidate| Arc::ptr_eq(candidate, mark));
+        .is_some_and(|candidate| Arc::ptr_eq(candidate, &mark));
     if removed {
         marks.remove(&mark.object_id);
     }
     drop(marks);
 
-    if removed {
-        // 投递 IN_IGNORED：watch 被撤销（rm_watch/oneshot/DELETE_SELF/UNMOUNT 均经此路径）。
-        // shutdown(fd close) 不调用 destroy_mark，故不误发。
-        group.backend.notify_ignored(&group, mark);
-        // 通知后端从其内部结构（wd 表）移除。
-        group.backend.free_mark(mark);
-        // 从全局索引移除。
-        index_remove(mark);
-        mark.watch_removed();
-        // 维护全局 watch 计数（唯一计数器，覆盖上限检查 + 快速路径）。
-        adjust_total_watches(-1);
+    // The token, not group-map membership, owns every cleanup charge. This
+    // remains correct when shutdown detached the map or a new mark replaced
+    // the same object id.
+    if reason != RetireReason::Shutdown {
+        group.backend.notify_ignored(&group, &mark);
+    }
+    group.backend.free_mark(&mark);
+    index_remove(&mark);
+    mark.watch_removed();
+    adjust_total_watches(-1);
+}
+
+/// Explicit rm_watch compatibility wrapper.
+pub fn destroy_mark(mark: &Arc<FsNotifyMark>) -> bool {
+    if let Some(token) = FsNotifyMark::begin_retire(mark, RetireReason::Explicit) {
+        finish_retire(token);
+        true
+    } else {
+        false
     }
 }

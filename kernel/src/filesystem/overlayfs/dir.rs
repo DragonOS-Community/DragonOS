@@ -25,7 +25,7 @@ pub(super) fn mkdir(
 }
 
 pub(super) fn rmdir(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
-    remove(inode, name, true, None)
+    remove(inode, name, true, None).map(|_| ())
 }
 
 pub(super) fn rmdir_with_context(
@@ -33,10 +33,10 @@ pub(super) fn rmdir_with_context(
     name: &str,
     context: &DentryMutationContext<'_>,
 ) -> Result<(), SystemError> {
-    remove(inode, name, true, Some(context))
+    remove(inode, name, true, Some(context)).map(|_| ())
 }
 
-pub(super) fn unlink(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
+pub(super) fn unlink(inode: &OvlInode, name: &str) -> Result<vfs::LinkRemovalOutcome, SystemError> {
     remove(inode, name, false, None)
 }
 
@@ -44,7 +44,7 @@ pub(super) fn unlink_with_context(
     inode: &OvlInode,
     name: &str,
     context: &DentryMutationContext<'_>,
-) -> Result<(), SystemError> {
+) -> Result<vfs::LinkRemovalOutcome, SystemError> {
     remove(inode, name, false, Some(context))
 }
 
@@ -53,7 +53,7 @@ fn remove(
     name: &str,
     is_dir: bool,
     context: Option<&DentryMutationContext<'_>>,
-) -> Result<(), SystemError> {
+) -> Result<vfs::LinkRemovalOutcome, SystemError> {
     let fs = inode.overlay_fs()?;
     // rmdir keeps the mount-wide commit lock because it nests a child directory
     // emptiness check. Unlink only needs the stable parent namespace lock.
@@ -67,6 +67,18 @@ fn remove(
     }
     if !is_dir && child.is_dir() {
         return Err(SystemError::EISDIR);
+    }
+    let child_link_state = if is_dir {
+        None
+    } else {
+        child.logical_link_state()?
+    };
+    let child_link_mutation = child_link_state
+        .as_ref()
+        .map(|state| child.begin_link_mutation(state))
+        .transpose()?;
+    if child_link_mutation.as_deref() == Some(&0) {
+        return Err(SystemError::EIO);
     }
 
     // Serialize the emptiness check and namespace commit with mutations made
@@ -84,35 +96,51 @@ fn remove(
     }
 
     let upper_dir = inode.upper_inode.lock().clone();
-    let result = if let Some(upper_dir) = upper_dir {
+    let backing_outcome = if let Some(upper_dir) = upper_dir {
         match upper_dir.find(name) {
             Ok(_) if lower_positive => {
-                inode.replace_upper_with_whiteout_locked(name, is_dir, context)
+                inode.replace_upper_with_whiteout_locked(name, is_dir, context)?
             }
-            Ok(_) if is_dir => rmdir_backing(&upper_dir, name, context),
-            Ok(_) => unlink_backing(&upper_dir, name, context),
+            Ok(_) if is_dir => {
+                rmdir_backing(&upper_dir, name, context)?;
+                None
+            }
+            Ok(_) => Some(unlink_backing(&upper_dir, name, context)?),
             Err(SystemError::ENOENT) if lower_positive => {
-                inode.create_whiteout_locked(name, context)
+                inode.create_whiteout_locked(name, context)?;
+                None
             }
-            Err(SystemError::ENOENT) => Err(SystemError::ENOENT),
-            Err(err) => Err(err),
+            Err(SystemError::ENOENT) => return Err(SystemError::ENOENT),
+            Err(err) => return Err(err),
         }
     } else if lower_positive {
-        inode.create_whiteout_locked(name, context)
+        inode.create_whiteout_locked(name, context)?;
+        None
     } else {
-        Err(SystemError::ENOENT)
+        return Err(SystemError::ENOENT);
     };
-    if result.is_ok() {
-        state.modified(&[name]);
+    state.modified(&[name]);
+    if is_dir {
+        Ok(vfs::LinkRemovalOutcome::LastLink)
+    } else if let Some(mut mutation) = child_link_mutation {
+        *mutation -= 1;
+        let outcome = if *mutation == 0 {
+            vfs::LinkRemovalOutcome::LastLink
+        } else {
+            vfs::LinkRemovalOutcome::StillLinked
+        };
+        mutation.commit();
+        Ok(outcome)
+    } else {
+        backing_outcome.ok_or(SystemError::EIO)
     }
-    result
 }
 
 fn unlink_backing(
     inode: &Arc<dyn IndexNode>,
     name: &str,
     context: Option<&DentryMutationContext<'_>>,
-) -> Result<(), SystemError> {
+) -> Result<vfs::LinkRemovalOutcome, SystemError> {
     match context {
         Some(context) => inode.unlink_with_context(name, context),
         None => inode.unlink(name),
@@ -150,9 +178,26 @@ pub(super) fn link(
     if !Arc::ptr_eq(&fs, &source_fs) {
         return Err(SystemError::EXDEV);
     }
+    let source_link_state = source.logical_link_state()?;
+    if source.has_lower_link_origin() && source_link_state.is_none() {
+        return Err(SystemError::EIO);
+    }
+    let source_link_mutation = source_link_state
+        .as_ref()
+        .map(|state| source.begin_link_mutation(state))
+        .transpose()?;
+    if source_link_mutation
+        .as_deref()
+        .is_some_and(|nlinks| *nlinks == usize::MAX)
+    {
+        return Err(SystemError::EMLINK);
+    }
 
     source.copy_up_locked()?;
     let source_upper = source.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    if let Some(state) = source_link_state.as_ref() {
+        source.publish_upper_link_alias(state)?;
+    }
 
     let result = create_over_whiteout(
         inode,
@@ -165,6 +210,10 @@ pub(super) fn link(
     )
     .map(|_| ());
     if result.is_ok() {
+        if let Some(mut mutation) = source_link_mutation {
+            *mutation += 1;
+            mutation.commit();
+        }
         state.modified(&[name]);
     }
     result

@@ -2,13 +2,15 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READ;
-use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::FileType;
+use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::{copy_to_user_protected, user_accessible_len, UserBufferWriter};
+use crate::syscall::user_access::{UserBufferWriter, copy_to_user_protected, user_accessible_len};
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -147,6 +149,22 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
         return read_socket_into_user_buffer(file.as_ref(), user_ptr, accessible);
     }
 
+    // Some record streams must own the whole userspace read boundary. In
+    // particular, inotify decides whether to wait again and consumes a record
+    // even when copying that record faults, matching Linux inotify_read().
+    // Use the original count here so a partially mapped range faults at the
+    // exact record copy instead of being silently shortened to `accessible`.
+    if file.supports_read_user() {
+        let mut direct_buffer = UserBuffer::new_protected(user_ptr, len, true)?;
+        if let Some(read_len) = file.read_user(len, &mut direct_buffer)? {
+            return Ok(read_len);
+        }
+        debug_assert!(
+            false,
+            "supports_read_user without read_user_at implementation"
+        );
+    }
+
     // Keep the kernel-side buffer modest to avoid huge allocations/long critical sections.
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
@@ -194,5 +212,9 @@ fn read_socket_into_user_buffer(
 
     let mut writer = UserBufferWriter::new(user_ptr, accessible, true)?;
     let mut user_buffer = writer.buffer_protected(0)?;
-    socket.read_to_user_buffer(&mut user_buffer)
+    let read_len = socket.read_to_user_buffer(&mut user_buffer)?;
+    if read_len != 0 {
+        file.notify_io_event(FsEvent::ACCESS);
+    }
+    Ok(read_len)
 }

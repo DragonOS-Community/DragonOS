@@ -18,7 +18,10 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         page_cache::PageCache,
-        vfs::{FileType, InodeFlags, InodeId, InodeMode, Metadata},
+        vfs::{
+            FileType, InodeFlags, InodeId, InodeMode, LinkMutationCoordinator, LinkRemovalOutcome,
+            Metadata,
+        },
     },
     libs::{
         mutex::Mutex,
@@ -298,6 +301,7 @@ pub struct FuseNode {
     /// FUSE daemons may process requests concurrently, so without this lock an
     /// older reply can overwrite a newer inode metadata snapshot in the cache.
     setattr_lock: Mutex<()>,
+    link_mutation_coordinator: LinkMutationCoordinator,
     /// Version chain produced while short READ replies from one metadata
     /// snapshot monotonically converge on the lowest observed EOF.
     short_read_source_attr_version: AtomicU64,
@@ -381,6 +385,7 @@ impl FuseNode {
             cached_metadata_deadline_ticks: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             attr_version: AtomicU64::new(initial_attr_epoch),
             setattr_lock: Mutex::new(()),
+            link_mutation_coordinator: LinkMutationCoordinator::new(),
             short_read_source_attr_version: AtomicU64::new(0),
             short_read_chain_attr_version: AtomicU64::new(0),
             pending_short_read_eof: AtomicU64::new(u64::MAX),
@@ -1300,20 +1305,26 @@ impl FuseNode {
     /// Publish a successful namespace link-count mutation locally. FUSE
     /// unlink/rmdir replies carry no attributes, so waiting for GETATTR would
     /// leave stale nlink state and race an older reply over the mutation.
-    pub(crate) fn note_link_removed(&self, directory: bool) -> Option<usize> {
+    pub(crate) fn note_link_removed(
+        &self,
+        directory: bool,
+    ) -> Result<LinkRemovalOutcome, SystemError> {
         let mut metadata = self.cached_metadata.lock();
-        let nlinks = metadata.as_mut().map(|md| {
-            md.nlinks = if directory {
-                0
-            } else {
-                md.nlinks.saturating_sub(1)
-            };
-            md.nlinks
-        });
+        let md = metadata.as_mut().ok_or(SystemError::EIO)?;
+        md.nlinks = if directory {
+            0
+        } else {
+            md.nlinks.checked_sub(1).ok_or(SystemError::EIO)?
+        };
+        let outcome = if md.nlinks == 0 {
+            LinkRemovalOutcome::LastLink
+        } else {
+            LinkRemovalOutcome::StillLinked
+        };
         self.bump_attr_version();
         self.cached_metadata_deadline_ticks
             .store(0, Ordering::Release);
-        nlinks
+        Ok(outcome)
     }
 
     /// 累计该 inode 在 userspace daemon 侧持有的 LOOKUP 引用。

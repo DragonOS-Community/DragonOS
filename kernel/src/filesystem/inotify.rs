@@ -28,7 +28,7 @@ use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::fsnotify::{
     self, mark, EnqueueResult, FsEvent, FsNotifyBackend, FsNotifyGroup, FsNotifyMark,
-    FsNotifyObjectState,
+    FsNotifyObjectId, FsNotifyObjectState,
 };
 use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::file::{File, FileFlags, FileMode, FilePrivateData};
@@ -45,6 +45,7 @@ use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
+use crate::syscall::user_buffer::UserBuffer;
 
 // ============================================================================
 // 用户态 mask 位（与 Linux `include/uapi/linux/inotify.h` 完全一致）
@@ -234,7 +235,6 @@ pub struct InotifyState {
     events: Mutex<InotifyQueue>,
     /// One read must consume a contiguous queue prefix even though events are
     /// serialized outside `events`.
-    read_consumer: Mutex<()>,
     max_queued_events: usize,
     /// wd 锁：add_watch/rm_watch 竞争。
     wd: Mutex<WdTable>,
@@ -249,7 +249,6 @@ impl InotifyState {
                 overflow_pending: false,
                 pre_overflow_remaining: 0,
             }),
-            read_consumer: Mutex::new(()),
             max_queued_events: MAX_QUEUED_EVENTS,
             wd: Mutex::new(WdTable {
                 counter: 0,
@@ -592,6 +591,95 @@ impl InotifyInode {
         16 + name_field
     }
 
+    /// Consume one read syscall's contiguous queue prefix.
+    ///
+    /// `write_record` runs without the queue lock. Concurrent readers claim
+    /// records one at a time under `events`, matching Linux's notification-lock
+    /// boundary. An error consumes the dequeued record and is returned even
+    /// after earlier progress, matching Linux's inotify EFAULT rule.
+    fn read_events_with(
+        &self,
+        len: usize,
+        mut write_record: impl FnMut(usize, &InotifyEventInfo) -> Result<(), SystemError>,
+    ) -> Result<usize, SystemError> {
+        if len < 16 {
+            return Err(SystemError::EINVAL);
+        }
+
+        loop {
+            let mut written = 0usize;
+            let mut blocked_by_size = false;
+
+            loop {
+                let next = {
+                    let mut q = self.state.events.lock();
+                    if q.overflow_pending && q.pre_overflow_remaining == 0 {
+                        if written + 16 > len {
+                            blocked_by_size = true;
+                            None
+                        } else {
+                            q.overflow_pending = false;
+                            q.pre_overflow_remaining = 0;
+                            Some(InotifyEventInfo {
+                                wd: -1,
+                                mask: user_mask::IN_Q_OVERFLOW,
+                                cookie: 0,
+                                name: None,
+                            })
+                        }
+                    } else if let Some(front) = q.list.front() {
+                        let record_len = Self::record_len(front.name.as_deref());
+                        if written + record_len > len {
+                            blocked_by_size = true;
+                            None
+                        } else {
+                            let ev = q.list.pop_front().expect("front existed under events lock");
+                            if q.overflow_pending && q.pre_overflow_remaining > 0 {
+                                q.pre_overflow_remaining -= 1;
+                            }
+                            Some(ev)
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let Some(ev) = next else {
+                    break;
+                };
+                write_record(written, &ev)?;
+                written += Self::record_len(ev.name.as_deref());
+            }
+
+            if written != 0 {
+                return Ok(written);
+            }
+            if blocked_by_size {
+                return Err(SystemError::EINVAL);
+            }
+
+            let empty = {
+                let q = self.state.events.lock();
+                q.list.is_empty() && !q.overflow_pending
+            };
+            if !empty {
+                continue;
+            }
+
+            if self.nonblock.load(Ordering::Relaxed) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            if ProcessManager::current_pcb().has_pending_signal_fast() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+            wq_wait_event_interruptible!(
+                self.group.wait_queue,
+                self.group.backend.queue_nonempty(),
+                {}
+            )?;
+        }
+    }
+
     /// `inotify_add_watch`：在 `inode` 上建立（或更新）一个 watch。
     pub fn add_watch(&self, inode: Arc<dyn IndexNode>, mask: u32) -> Result<i32, SystemError> {
         if let Some(mounted) = inode
@@ -599,20 +687,21 @@ impl InotifyInode {
             .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
         {
             return mounted.with_fsnotify_admission(|| {
+                let (target_identity, event_mask) = self.preflight_watch(&inode, mask)?;
                 mounted.with_fsnotify_watch_lifecycle(|lifecycle| {
-                    self.add_watch_inner(inode, mask, Some(lifecycle))
+                    self.add_watch_inner(inode, mask, event_mask, target_identity, Some(lifecycle))
                 })
             });
         }
-        self.add_watch_inner(inode, mask, None)
+        let (target_identity, event_mask) = self.preflight_watch(&inode, mask)?;
+        self.add_watch_inner(inode, mask, event_mask, target_identity, None)
     }
 
-    fn add_watch_inner(
+    fn preflight_watch(
         &self,
-        inode: Arc<dyn IndexNode>,
+        inode: &Arc<dyn IndexNode>,
         mask: u32,
-        object_state: Option<Arc<FsNotifyObjectState>>,
-    ) -> Result<i32, SystemError> {
+    ) -> Result<(FsNotifyObjectId, u32), SystemError> {
         // mask 校验：仅允许已知位。
         Self::validate_watch_mask(mask)?;
         // IN_MASK_ADD 与 IN_MASK_CREATE 互斥。
@@ -635,7 +724,17 @@ impl InotifyInode {
         // ONESHOT/EXCL_UNLINK are mark flags, while ISDIR/Q_OVERFLOW/IGNORED
         // are output-only bits even though the syscall accepts them.
         let event_mask = (mask & 0x0000_0fff) | user_mask::IN_UNMOUNT;
+        Ok((target_identity, event_mask))
+    }
 
+    fn add_watch_inner(
+        &self,
+        inode: Arc<dyn IndexNode>,
+        mask: u32,
+        event_mask: u32,
+        target_identity: FsNotifyObjectId,
+        object_state: Option<Arc<FsNotifyObjectState>>,
+    ) -> Result<i32, SystemError> {
         // 查找同 inode 上已有 mark（同 group）；若无，则在**同一把 marks 锁**内完成
         // 新建与插入，避免并发 add_watch 同一 inode 产生重复 mark（TOCTOU：查重与插入
         // 不在同一锁内时，两个线程可各自通过「无 existing」检查并各建一个 mark，导致
@@ -651,9 +750,20 @@ impl InotifyInode {
             if !existing.active.load(Ordering::Acquire) {
                 let stale = existing.clone();
                 drop(_dispatch);
+                if marks
+                    .get(&target_identity)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &stale))
+                {
+                    marks.remove(&target_identity);
+                }
                 drop(marks);
-                mark::destroy_mark(&stale);
-                return self.add_watch_inner(inode, mask, object_state);
+                return self.add_watch_inner(
+                    inode,
+                    mask,
+                    event_mask,
+                    target_identity,
+                    object_state,
+                );
             }
             if (mask & user_mask::IN_MASK_ADD) != 0 {
                 existing.mask.fetch_or(event_mask, Ordering::Relaxed);
@@ -697,7 +807,7 @@ impl InotifyInode {
             object_state,
             object_id: target_identity,
             dispatch_lock: Mutex::new(()),
-            active: AtomicBool::new(true),
+            active: AtomicBool::new(false),
             mask: AtomicU32::new(event_mask),
             oneshot: AtomicBool::new((mask & user_mask::IN_ONESHOT) != 0),
             excl_unlink: AtomicBool::new((mask & user_mask::IN_EXCL_UNLINK) != 0),
@@ -728,6 +838,10 @@ impl InotifyInode {
             release_quota(&self.state.quota_keys, 0, 1);
             return Err(error);
         }
+        // The final Release publication is the watch's linearization point.
+        // Every lookup path, presence hint and accounting charge is visible
+        // before dispatch may observe Active.
+        mark.active.store(true, Ordering::Release);
         drop(marks);
         // 注：watch 计数已由 try_reserve_watch 原子 +1（含上限检查），此处不可再次 +1，
         // 否则每次 add 会 +2 而 destroy 仅 -1，导致 TOTAL_WATCHES 永不归零（fast-path 短路
@@ -746,8 +860,9 @@ impl InotifyInode {
             }
         }?;
         // destroy_mark 完成 group.marks / 全局索引 / free_mark / 计数 收尾。
-        mark::destroy_mark(&mark);
-        Ok(())
+        mark::destroy_mark(&mark)
+            .then_some(())
+            .ok_or(SystemError::EINVAL)
     }
 
     /// fd 关闭收尾：撤销该实例所有 watch，回退计数。
@@ -756,18 +871,10 @@ impl InotifyInode {
             let mut g = self.group.marks.lock();
             core::mem::take(&mut *g)
         };
-        let n = marks.len();
         for m in marks.values() {
-            let dispatch = m.dispatch_lock.lock();
-            m.active.store(false, Ordering::Release);
-            drop(dispatch);
-            fsnotify::index_remove(m);
-            m.watch_removed();
-            self.state.wd.lock().map.remove(&m.wd);
-        }
-        if n > 0 {
-            fsnotify::adjust_total_watches(-(n as i32));
-            release_quota(&self.state.quota_keys, 0, n);
+            if let Some(token) = FsNotifyMark::begin_retire(m, mark::RetireReason::Shutdown) {
+                mark::finish_retire(token);
+            }
         }
         release_quota(&self.state.quota_keys, 1, 0);
         // 唤醒任何阻塞在 read 的线程（队列不再增长）。
@@ -835,92 +942,34 @@ impl IndexNode for InotifyInode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         drop(data);
-        // 1. buffer 小于事件头 → EINVAL。
-        if len < 16 {
-            return Err(SystemError::EINVAL);
-        }
+        self.read_events_with(len, |written, ev| {
+            let record_len = Self::record_len(ev.name.as_deref());
+            Self::serialize(ev, &mut buf[written..written + record_len]);
+            Ok(())
+        })
+    }
 
-        loop {
-            // Serialize one queue extraction, but never keep this mutex while
-            // sleeping. Other readers must still be able to observe a later
-            // O_NONBLOCK update or their own pending signal.
-            let consumer = self.state.read_consumer.lock();
-            let mut written = 0;
-            let mut blocked_by_size = false;
-            loop {
-                let next = {
-                    let mut q = self.state.events.lock();
-                    if q.overflow_pending && q.pre_overflow_remaining == 0 {
-                        if written + 16 > len {
-                            blocked_by_size = true;
-                            None
-                        } else {
-                            q.overflow_pending = false;
-                            q.pre_overflow_remaining = 0;
-                            Some(InotifyEventInfo {
-                                wd: -1,
-                                mask: user_mask::IN_Q_OVERFLOW,
-                                cookie: 0,
-                                name: None,
-                            })
-                        }
-                    } else if let Some(front) = q.list.front() {
-                        let record_len = Self::record_len(front.name.as_deref());
-                        if written + record_len > len {
-                            blocked_by_size = true;
-                            None
-                        } else {
-                            let ev = q.list.pop_front().expect("front existed under events lock");
-                            if q.overflow_pending && q.pre_overflow_remaining > 0 {
-                                q.pre_overflow_remaining -= 1;
-                            }
-                            Some(ev)
-                        }
-                    } else {
-                        None
-                    }
-                };
+    fn supports_read_user(&self) -> bool {
+        true
+    }
 
-                let Some(ev) = next else {
-                    break;
-                };
-                let rl = Self::record_len(ev.name.as_deref());
-                written += Self::serialize(&ev, &mut buf[written..written + rl]);
-            }
-
-            if written == 0 {
-                if blocked_by_size {
-                    // The first queued record cannot fit in the caller's
-                    // buffer. This is the only zero-byte EINVAL case.
-                    return Err(SystemError::EINVAL);
-                }
-                let empty = {
-                    let q = self.state.events.lock();
-                    q.list.is_empty() && !q.overflow_pending
-                };
-                if empty {
-                    drop(consumer);
-                    // 空队列
-                    if self.nonblock.load(Ordering::Relaxed) {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-                    if ProcessManager::current_pcb().has_pending_signal_fast() {
-                        return Err(SystemError::ERESTARTSYS);
-                    }
-                    wq_wait_event_interruptible!(
-                        self.group.wait_queue,
-                        self.group.backend.queue_nonempty(),
-                        {}
-                    )?;
-                    continue;
-                }
-                // An event arrived after the extraction observed an empty
-                // queue. Restart instead of misreporting a size error.
-                drop(consumer);
-                continue;
-            }
-            return Ok(written);
-        }
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        const MAX_RECORD_LEN: usize = 16 + ((NAME_MAX + 1 + 15) & !15);
+        self.read_events_with(len, |written, ev| {
+            let record_len = Self::record_len(ev.name.as_deref());
+            let mut record = [0u8; MAX_RECORD_LEN];
+            Self::serialize(ev, &mut record[..record_len]);
+            writer.write_to_user(written, &record[..record_len])?;
+            Ok(())
+        })
+        .map(Some)
     }
 
     fn write_at(

@@ -46,7 +46,7 @@ impl OvlInode {
         name: &str,
         is_dir: bool,
         context: Option<&DentryMutationContext<'_>>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<Option<vfs::LinkRemovalOutcome>, SystemError> {
         let upper_dir = match context {
             Some(context) => self.writable_upper_inode_locked_with_context(context)?,
             None => self.writable_upper_inode_locked()?,
@@ -74,15 +74,27 @@ impl OvlInode {
             }
             None => workdir.move_to(&temp_name, &upper_dir, name, flags),
         };
-        if let Err(err) = move_result {
-            let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-            return Err(err);
-        }
+        let outcome = match move_result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                return Err(err);
+            }
+        };
 
         if let Some(entries) = internal_whiteouts {
             Self::cleanup_detached_whiteout_dir(&workdir, &temp_name, &entries, context);
         }
-        Ok(())
+        match (is_dir, outcome) {
+            (true, vfs::RenameOutcome::Exchange) => Ok(None),
+            (
+                false,
+                vfs::RenameOutcome::Moved {
+                    replaced: Some(removed),
+                },
+            ) => Ok(Some(removed)),
+            _ => Err(SystemError::EIO),
+        }
     }
 
     fn validated_whiteout_entries(dir: &Arc<dyn IndexNode>) -> Result<Vec<String>, SystemError> {

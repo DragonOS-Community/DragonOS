@@ -1,12 +1,12 @@
 use crate::filesystem::fsnotify::{self, FsEvent};
+use crate::filesystem::vfs::SystemError;
+use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::filesystem::vfs::mount::MountFSInode;
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::is_ancestor;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
-use crate::filesystem::vfs::SystemError;
-use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::filesystem::vfs::{MAX_PATHLEN, NAME_MAX};
 use crate::libs::casting::DowncastArc;
 use crate::process::ProcessManager;
@@ -268,13 +268,13 @@ impl RenameNotification<'_> {
                 Some(self.moved),
                 cookie,
             );
-            fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(self.moved), 0);
             // Replacing a target is part of the rename pair, not a parent DELETE.
             // Linux reports ATTRIB on the displaced inode; DELETE_SELF is tied to
             // the later dentry/inode detach lifecycle.
             if let Some(displaced) = self.displaced {
                 fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(displaced), 0);
             }
+            fsnotify::fsnotify(FsEvent::MOVE_SELF, None, Some(self.moved), 0);
         }
     }
 }

@@ -35,8 +35,9 @@ use system_error::SystemError;
 
 use super::vfs::{
     file::FilePrivateData, mount::MountFlags, utils::DName, FileSystem, FsInfo,
-    FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode, Metadata, OpenFileBehavior,
-    PostWriteSyncPolicy, SetMetadataMask, SpecialNodeData,
+    FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode, LinkMutationCoordinator,
+    LinkRemovalOutcome, Metadata, OpenFileBehavior, PostWriteSyncPolicy, RenameOutcome,
+    SetMetadataMask, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -122,7 +123,7 @@ fn tmpfs_move_entry_between_dirs(
     old_key: &DName,
     new_key: &DName,
     flags: RenameFlags,
-) -> Result<(), SystemError> {
+) -> Result<RenameOutcome, SystemError> {
     tmpfs_require_live_dir(src_dir)?;
     tmpfs_require_live_dir(dst_dir)?;
 
@@ -143,7 +144,7 @@ fn tmpfs_move_entry_between_dirs(
             .cloned()
             .ok_or(SystemError::ENOENT)?;
         if Arc::ptr_eq(&inode_to_move, &existing) {
-            return Ok(());
+            return Ok(RenameOutcome::NoOp);
         }
         let now = PosixTimeSpec::now();
         let existing_type = existing.0.lock().metadata.file_type;
@@ -175,9 +176,10 @@ fn tmpfs_move_entry_between_dirs(
         }
         tmpfs_touch_dir(src_dir, now);
         tmpfs_touch_dir(dst_dir, now);
-        return Ok(());
+        return Ok(RenameOutcome::Exchange);
     }
 
+    let mut replaced = None;
     if let Some(existing) = dst_dir.children.get(new_key).cloned() {
         if flags.contains(RenameFlags::NOREPLACE) {
             return Err(SystemError::EEXIST);
@@ -203,13 +205,7 @@ fn tmpfs_move_entry_between_dirs(
 
         let to_move_id = inode_to_move.0.lock().metadata.inode_id;
         if existing_id == to_move_id {
-            // Destination already points to the same inode. For files this is
-            // effectively removing the old entry.
-            src_dir.children.remove(old_key);
-            let now = PosixTimeSpec::now();
-            tmpfs_touch_dir(src_dir, now);
-            inode_to_move.0.lock().metadata.ctime = now;
-            return Ok(());
+            return Ok(RenameOutcome::NoOp);
         }
 
         if old_type == FileType::Dir && existing_type != FileType::Dir {
@@ -228,8 +224,14 @@ fn tmpfs_move_entry_between_dirs(
         if existing_type == FileType::Dir {
             dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_sub(1);
             existing_guard.metadata.nlinks = 0;
+            replaced = Some(LinkRemovalOutcome::LastLink);
         } else {
             existing_guard.metadata.nlinks = existing_guard.metadata.nlinks.saturating_sub(1);
+            replaced = Some(if existing_guard.metadata.nlinks == 0 {
+                LinkRemovalOutcome::LastLink
+            } else {
+                LinkRemovalOutcome::StillLinked
+            });
         }
         existing_guard.metadata.ctime = PosixTimeSpec::now();
     }
@@ -256,7 +258,7 @@ fn tmpfs_move_entry_between_dirs(
     tmpfs_touch_dir(src_dir, now);
     tmpfs_touch_dir(dst_dir, now);
 
-    Ok(())
+    Ok(RenameOutcome::Moved { replaced })
 }
 
 fn tmpfs_touch_dir(dir: &mut TmpfsInode, now: PosixTimeSpec) {
@@ -314,11 +316,15 @@ fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), Syste
 }
 
 #[derive(Debug)]
-pub struct LockedTmpfsInode(pub Mutex<TmpfsInode>, RwSem<()>);
+pub struct LockedTmpfsInode(pub Mutex<TmpfsInode>, RwSem<()>, LinkMutationCoordinator);
 
 impl LockedTmpfsInode {
     fn new(inode: TmpfsInode) -> Self {
-        Self(Mutex::new(inode), RwSem::new(()))
+        Self(
+            Mutex::new(inode),
+            RwSem::new(()),
+            LinkMutationCoordinator::new(),
+        )
     }
 }
 
@@ -813,6 +819,10 @@ impl MountableFileSystem for Tmpfs {
 register_mountable_fs!(Tmpfs, TMPFSMAKER, "tmpfs");
 
 impl IndexNode for LockedTmpfsInode {
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        Some(&self.2)
+    }
+
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
     }
@@ -1134,8 +1144,9 @@ impl IndexNode for LockedTmpfsInode {
         offset: usize,
         len: usize,
         lock_owner: u64,
+        attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<(), SystemError> {
         drop(data);
         if mode != 0 {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -1150,12 +1161,12 @@ impl IndexNode for LockedTmpfsInode {
         crate::filesystem::vfs::vcore::check_file_size_limit(end)?;
 
         let _size_guard = self.1.write();
+        let cred = ProcessManager::current_pcb().cred();
         let (page_cache, fs) = {
             let inode = self.0.lock();
-            (
-                inode.page_cache.clone().ok_or(SystemError::EIO)?,
-                inode.fs.upgrade().ok_or(SystemError::EIO)?,
-            )
+            let page_cache = inode.page_cache.clone().ok_or(SystemError::EIO)?;
+            let fs = inode.fs.upgrade().ok_or(SystemError::EIO)?;
+            (page_cache, fs)
         };
         let first = offset >> MMArch::PAGE_SHIFT;
         let last = (end - 1) >> MMArch::PAGE_SHIFT;
@@ -1205,24 +1216,27 @@ impl IndexNode for LockedTmpfsInode {
             }
         }
 
-        // Match Linux shmem_fallocate(): only after every page has been
-        // allocated successfully, apply the same write-side metadata effects
-        // as a regular file modification.  Build the update from the latest
-        // metadata while holding the inode lock so concurrent chmod/chown
-        // changes cannot be overwritten by a stale pre-allocation snapshot.
-        let cred = ProcessManager::current_pcb().cred();
-        let mut inode = self.0.lock();
-        let new_size = core::cmp::max(inode.metadata.size.max(0) as usize, end);
-        let (metadata, mask) =
-            crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
-                inode.metadata.clone(),
-                new_size,
-                &cred,
-            );
-        inode.metadata.size = metadata.size;
-        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
+        // Linux shmem commits file_modified() only after allocation succeeds.
+        // Compute from the current metadata while holding the inode lock so a
+        // concurrent chmod cannot be overwritten by a pre-allocation snapshot.
+        let mode_changed = {
+            let mut inode = self.0.lock();
+            let effective_size = core::cmp::max(inode.metadata.size.max(0) as usize, end);
+            let (metadata, mask) =
+                crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                    inode.metadata.clone(),
+                    effective_size,
+                    &cred,
+                );
+            crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
+            inode.metadata.size = metadata.size;
+            mask.contains(SetMetadataMask::MODE)
+        };
+        if mode_changed {
+            attrib.commit();
+        }
         let _ = lock_owner;
-        Ok(mask)
+        Ok(())
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -1420,7 +1434,7 @@ impl IndexNode for LockedTmpfsInode {
         Ok(())
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
         let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
         tmpfs_require_live_dir(&inode)?;
         if name == "." || name == ".." {
@@ -1442,6 +1456,11 @@ impl IndexNode for LockedTmpfsInode {
             .nlinks
             .checked_sub(1)
             .expect("tempfs nlinks underflow: filesystem corruption detected");
+        let outcome = if deleted_guard.metadata.nlinks == 0 {
+            LinkRemovalOutcome::LastLink
+        } else {
+            LinkRemovalOutcome::StillLinked
+        };
 
         let now = PosixTimeSpec::now();
         deleted_guard.metadata.ctime = now;
@@ -1450,7 +1469,7 @@ impl IndexNode for LockedTmpfsInode {
         inode.children.remove(&name);
         tmpfs_touch_dir(&mut inode, now);
 
-        Ok(())
+        Ok(outcome)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
@@ -1495,7 +1514,7 @@ impl IndexNode for LockedTmpfsInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         // tmpfs rename should move a directory entry (dentry move), not create
         // a hardlink+unlink pair. The latter breaks directory moves (unlink()
         // rejects directories) and can also lead to incorrect link/size accounting.
@@ -1533,7 +1552,7 @@ impl IndexNode for LockedTmpfsInode {
                 let to_move_id = inode_to_move.0.lock().metadata.inode_id;
                 let existing_id = existing.0.lock().metadata.inode_id;
                 if existing_id == to_move_id {
-                    return Ok(());
+                    return Ok(RenameOutcome::NoOp);
                 }
 
                 let now = PosixTimeSpec::now();
@@ -1546,9 +1565,10 @@ impl IndexNode for LockedTmpfsInode {
                 moved.name = new_key;
                 moved.metadata.ctime = now;
                 tmpfs_touch_dir(&mut dir, now);
-                return Ok(());
+                return Ok(RenameOutcome::Exchange);
             }
 
+            let mut replaced = None;
             if let Some(existing) = dir.children.get(&new_key).cloned() {
                 if flags.contains(RenameFlags::NOREPLACE) {
                     return Err(SystemError::EEXIST);
@@ -1558,7 +1578,7 @@ impl IndexNode for LockedTmpfsInode {
                 let existing_id = existing.0.lock().metadata.inode_id;
                 let to_move_id = inode_to_move.0.lock().metadata.inode_id;
                 if existing_id == to_move_id {
-                    return Ok(());
+                    return Ok(RenameOutcome::NoOp);
                 }
 
                 let existing_type = existing.0.lock().metadata.file_type;
@@ -1579,9 +1599,15 @@ impl IndexNode for LockedTmpfsInode {
                 if existing_type == FileType::Dir {
                     dir.metadata.nlinks = dir.metadata.nlinks.saturating_sub(1);
                     existing_guard.metadata.nlinks = 0;
+                    replaced = Some(LinkRemovalOutcome::LastLink);
                 } else {
                     existing_guard.metadata.nlinks =
                         existing_guard.metadata.nlinks.saturating_sub(1);
+                    replaced = Some(if existing_guard.metadata.nlinks == 0 {
+                        LinkRemovalOutcome::LastLink
+                    } else {
+                        LinkRemovalOutcome::StillLinked
+                    });
                 }
                 existing_guard.metadata.ctime = PosixTimeSpec::now();
             }
@@ -1597,7 +1623,7 @@ impl IndexNode for LockedTmpfsInode {
             moved.name = new_key;
             moved.metadata.ctime = now;
             tmpfs_touch_dir(&mut dir, now);
-            return Ok(());
+            return Ok(RenameOutcome::Moved { replaced });
         }
 
         // Cross-directory move.

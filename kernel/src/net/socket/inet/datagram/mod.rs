@@ -84,6 +84,7 @@ pub struct UdpSocket {
     wait_queue: WaitQueue,
     inode_id: InodeId,
     open_files: AtomicUsize,
+    fsnotify_watches: AtomicUsize,
     self_ref: Weak<UdpSocket>,
     netns: Arc<NetNamespace>,
     epoll_items: EPollItems,
@@ -180,6 +181,7 @@ impl UdpSocket {
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            fsnotify_watches: AtomicUsize::new(0),
             self_ref: me.clone(),
             netns,
             epoll_items: EPollItems::default(),
@@ -1308,6 +1310,10 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize {
+        &self.fsnotify_watches
+    }
+
     fn open_file_counter(&self) -> &AtomicUsize {
         &self.open_files
     }

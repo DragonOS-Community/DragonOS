@@ -13,8 +13,9 @@ use crate::{
             permission::PermissionMask,
             syscall::RenameFlags,
             utils::DName,
-            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata,
-            OpenFileBehavior, SetMetadataMask, XattrFlags,
+            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode,
+            LinkMutationCoordinator, LinkRemovalOutcome, Metadata, OpenFileBehavior, RenameOutcome,
+            SetMetadataMask, XattrFlags,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -30,8 +31,8 @@ use super::super::{
         FuseReadIn, FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseSetxattrInCompat, FuseWriteIn,
         FuseWriteOut, FATTR_ATIME, FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE,
         FATTR_UID, FOPEN_DIRECT_IO, FOPEN_NONSEEKABLE, FOPEN_STREAM, FUSE_ACCESS, FUSE_CREATE,
-        FUSE_FALLOCATE, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_LINK, FUSE_LISTXATTR,
-        FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READDIR,
+        FUSE_FALLOCATE, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_LINK,
+        FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READDIR,
         FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_REMOVEXATTR,
         FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_SETATTR, FUSE_SETXATTR, FUSE_SYMLINK,
         FUSE_UNLINK, FUSE_WRITE, FUSE_WRITEBACK_CACHE, FUSE_WRITE_LOCKOWNER,
@@ -40,6 +41,10 @@ use super::super::{
 use super::FuseNode;
 
 impl IndexNode for FuseNode {
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        Some(&self.link_mutation_coordinator)
+    }
+
     fn inode_generation(&self) -> u64 {
         self.node_incarnation()
     }
@@ -249,11 +254,21 @@ impl IndexNode for FuseNode {
         }
     }
 
-    fn requires_separate_open_truncate(&self, flags: &FileFlags) -> bool {
-        flags.contains(FileFlags::O_TRUNC)
-            && !self
-                .conn
-                .has_init_flag(super::super::protocol::FUSE_ATOMIC_O_TRUNC)
+    fn resize_open_truncate(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        context: &crate::filesystem::vfs::OpenTruncateContext,
+    ) -> Result<(), SystemError> {
+        if self
+            .conn
+            .has_init_flag(super::super::protocol::FUSE_ATOMIC_O_TRUNC)
+        {
+            drop(data);
+            return Ok(());
+        }
+        self.resize_file_with_metadata(len, lock_owner, data, &context.requested, context.mask)
     }
 
     fn open(
@@ -804,8 +819,9 @@ impl IndexNode for FuseNode {
         offset: usize,
         len: usize,
         _lock_owner: u64,
+        attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<(), SystemError> {
         const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
         const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
         const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
@@ -828,13 +844,27 @@ impl IndexNode for FuseNode {
         };
         drop(data);
 
-        let md = self.metadata()?;
-        let old_size = md.size.max(0) as usize;
         let keep_size = mode_bits & FALLOC_FL_KEEP_SIZE != 0;
         let changes_contents = mode_bits & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0;
+        // Linux serializes the dirty-range drain, file_modified(), and the
+        // FALLOCATE request with the inode lock. In particular, a failed
+        // writeback must not clear setid bits or publish ATTRIB.
+        let _setattr_guard = self.setattr_lock.lock();
+        // Fetch attributes before entering the writeback/DAX exclusion range:
+        // an expired FUSE cache performs a synchronous GETATTR and the daemon
+        // may need the same mapping machinery while serving it.
+        let md = self.metadata()?;
+        let old_size = md.size.max(0) as usize;
         if !keep_size && new_size > old_size {
             crate::filesystem::vfs::vcore::check_file_size_limit(new_size)?;
         }
+        let effective_size = if keep_size {
+            old_size
+        } else {
+            old_size.max(new_size)
+        };
+        let (write_metadata, write_mask) =
+            crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata(md, effective_size);
         if changes_contents {
             self.sync_dirty_cached_pages()?;
         }
@@ -847,6 +877,58 @@ impl IndexNode for FuseNode {
         if changes_contents {
             // Close dirty admission between the first drain and exclusivity.
             self.sync_dirty_cached_pages_admitted(&_barrier)?;
+        }
+
+        let daemon_handles_killpriv = self.conn().has_init_flag(FUSE_HANDLE_KILLPRIV);
+        let mode_changed = write_mask.contains(SetMetadataMask::MODE);
+        if mode_changed && !daemon_handles_killpriv {
+            let inarg = FuseSetattrIn {
+                valid: FATTR_MODE,
+                padding: 0,
+                fh: 0,
+                size: 0,
+                lock_owner: 0,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                atimensec: 0,
+                mtimensec: 0,
+                ctimensec: 0,
+                mode: write_metadata.mode.bits(),
+                unused4: 0,
+                uid: 0,
+                gid: 0,
+                unused5: 0,
+            };
+            let payload =
+                self.conn()
+                    .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
+            let out: FuseAttrOut = fuse_read_struct(&payload)?;
+            self.set_cached_metadata_with_valid(
+                Self::attr_to_metadata(&out.attr),
+                out.attr_valid,
+                out.attr_valid_nsec,
+                out.attr.flags,
+            );
+        }
+        if mode_changed {
+            // notify_change() publishes ATTRIB in file_modified() before the
+            // filesystem operation, including when the daemon owns killpriv
+            // and the later FALLOCATE request fails.
+            attrib.commit();
+        }
+
+        // file_modified() updates cmtime before the FALLOCATE RPC and does not
+        // roll it back when that RPC fails. Preserve the same local-cache
+        // ordering. A daemon-owned killpriv transition is applied only after a
+        // successful operation because the daemon owns that mode change.
+        {
+            let mut metadata = self.cached_metadata.lock();
+            if let Some(md) = metadata.as_mut() {
+                md.mtime = write_metadata.mtime;
+                md.ctime = write_metadata.ctime;
+                self.bump_attr_version();
+            }
         }
 
         let in_arg = FuseFallocateIn {
@@ -869,15 +951,15 @@ impl IndexNode for FuseNode {
                     if !keep_size && new_size > md.size.max(0) as usize {
                         md.size = new_size as i64;
                     }
-                    let now = crate::time::PosixTimeSpec::now();
-                    md.mtime = now;
-                    md.ctime = now;
+                    if mode_changed && daemon_handles_killpriv {
+                        md.mode = write_metadata.mode;
+                    }
                     self.bump_attr_version();
                 }
-                drop(metadata);
                 self.cached_metadata_deadline_ticks
-                    .store(0, Ordering::Relaxed);
-                Ok(SetMetadataMask::empty())
+                    .store(0, Ordering::Release);
+                drop(metadata);
+                Ok(())
             }
             Err(SystemError::ENOSYS) => {
                 self.conn().mark_no_fallocate();
@@ -1406,19 +1488,35 @@ impl IndexNode for FuseNode {
         result
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
+        let target = match self.lookup_cached_child(name) {
+            Some(target) => target,
+            None => self
+                .find(name)?
+                .downcast_arc::<FuseNode>()
+                .ok_or(SystemError::EIO)?,
+        };
         let _ = self.request_name(FUSE_UNLINK, self.nodeid, name)?;
         self.invalidate_child_name(name);
-        Ok(())
+        target.note_link_removed(false)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
+        let target = match self.lookup_cached_child(name) {
+            Some(target) => target,
+            None => self
+                .find(name)?
+                .downcast_arc::<FuseNode>()
+                .ok_or(SystemError::EIO)?,
+        };
         let _ = self.request_name(FUSE_RMDIR, self.nodeid, name)?;
         self.invalidate_child_name(name);
+        let outcome = target.note_link_removed(true)?;
+        debug_assert_eq!(outcome, LinkRemovalOutcome::LastLink);
         Ok(())
     }
 
@@ -1428,7 +1526,7 @@ impl IndexNode for FuseNode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flag: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         self.check_not_stale()?;
         self.ensure_dir()?;
         let target_any = target
@@ -1456,17 +1554,29 @@ impl IndexNode for FuseNode {
         payload_in.push(0);
         payload_in.extend_from_slice(new_name.as_bytes());
         payload_in.push(0);
-        let cached_old = self.lookup_cached_child(old_name).or_else(|| {
-            self.find(old_name)
-                .ok()
-                .and_then(|inode| inode.downcast_arc::<FuseNode>())
-        });
-        let cached_new = target_any.lookup_cached_child(new_name).or_else(|| {
-            target_any
-                .find(new_name)
-                .ok()
-                .and_then(|inode| inode.downcast_arc::<FuseNode>())
-        });
+        let cached_old = match self.lookup_cached_child(old_name) {
+            Some(node) => Some(node),
+            None => Some(
+                self.find(old_name)?
+                    .downcast_arc::<FuseNode>()
+                    .ok_or(SystemError::EIO)?,
+            ),
+        };
+        let cached_new = match target_any.lookup_cached_child(new_name) {
+            Some(node) => Some(node),
+            None => match target_any.find(new_name) {
+                Ok(inode) => Some(inode.downcast_arc::<FuseNode>().ok_or(SystemError::EIO)?),
+                Err(SystemError::ENOENT) => None,
+                Err(error) => return Err(error),
+            },
+        };
+        if cached_old
+            .as_ref()
+            .zip(cached_new.as_ref())
+            .is_some_and(|(old, new)| old.nodeid == new.nodeid)
+        {
+            return Ok(RenameOutcome::NoOp);
+        }
         let r = self.conn().request(opcode, self.nodeid, &payload_in);
         if opcode == FUSE_RENAME2 && matches!(r, Err(SystemError::ENOSYS)) {
             return Err(SystemError::EINVAL);
@@ -1481,16 +1591,23 @@ impl IndexNode for FuseNode {
             ));
             node.set_dname(new_name);
         }
+        let mut replaced = None;
         if let Some(node) = cached_new {
             if flag.contains(RenameFlags::EXCHANGE) {
                 node.set_parent_nodeid(self.nodeid);
                 node.set_parent(Some(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?));
                 node.set_dname(old_name);
             } else {
+                let directory = node.cached_file_type() == Some(FileType::Dir);
+                replaced = Some(node.note_link_removed(directory)?);
                 node.clear_dname_if(new_name);
             }
         }
-        Ok(())
+        Ok(if flag.contains(RenameFlags::EXCHANGE) {
+            RenameOutcome::Exchange
+        } else {
+            RenameOutcome::Moved { replaced }
+        })
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {

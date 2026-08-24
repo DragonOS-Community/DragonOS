@@ -19,8 +19,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -82,6 +84,18 @@ bool saw_self(const std::vector<Ev> &evs, uint32_t bit) {
         if ((e.mask & bit) && e.name.empty()) return true;
     }
     return false;
+}
+
+void queue_exact_64k_self_events(int ifd, int fd) {
+    ASSERT_GE(inotify_add_watch(ifd, ("/proc/self/fd/" + std::to_string(fd)).c_str(),
+                                IN_ATTRIB | IN_MODIFY),
+              0);
+    constexpr int kPairs = 2048;
+    const char byte = 'x';
+    for (int i = 0; i < kPairs; ++i) {
+        ASSERT_EQ(fchmod(fd, (i & 1) ? 0644 : 0600), 0) << strerror(errno);
+        ASSERT_EQ(pwrite(fd, &byte, 1, 0), 1) << strerror(errno);
+    }
 }
 
 int first_event_index(const std::vector<Ev> &evs, uint32_t bit) {
@@ -778,6 +792,41 @@ TEST(InotifySelfEvents, HardLinkCreatedBeforeWatchKeepsWatchAlive) {
     close(ifd);
 }
 
+TEST(InotifySelfEvents, RelinkFromAnotherDisconnectedAliasCancelsDelete) {
+    const std::string first = "/tmp/dunitest_inotify_relink_a";
+    const std::string second = "/tmp/dunitest_inotify_relink_b";
+    const std::string restored = "/tmp/dunitest_inotify_relink_c";
+    int first_fd = open(first.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(first_fd, 0);
+    ASSERT_EQ(link(first.c_str(), second.c_str()), 0) << strerror(errno);
+    int second_fd = open(second.c_str(), O_RDWR);
+    ASSERT_GE(second_fd, 0);
+
+    ASSERT_EQ(unlink(first.c_str()), 0) << strerror(errno);
+    ASSERT_EQ(unlink(second.c_str()), 0) << strerror(errno);
+    constexpr int kAtEmptyPath = 0x1000;
+    ASSERT_EQ(linkat(first_fd, "", AT_FDCWD, restored.c_str(), kAtEmptyPath), 0)
+        << strerror(errno);
+
+    char procfd[64];
+    snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", second_fd);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, procfd, IN_DELETE_SELF), 0) << strerror(errno);
+
+    ASSERT_EQ(close(second_fd), 0);
+    auto after_old_alias_close = drain_events(ifd);
+    EXPECT_FALSE(saw_self(after_old_alias_close, IN_DELETE_SELF));
+    EXPECT_FALSE(saw_self(after_old_alias_close, IN_IGNORED));
+
+    ASSERT_EQ(close(first_fd), 0);
+    ASSERT_EQ(unlink(restored.c_str()), 0) << strerror(errno);
+    auto after_final_unlink = drain_events(ifd);
+    EXPECT_TRUE(saw_self(after_final_unlink, IN_DELETE_SELF));
+    EXPECT_TRUE(saw_self(after_final_unlink, IN_IGNORED));
+    close(ifd);
+}
+
 TEST(InotifySelfEvents, ProcFdReopenIsRejectedWithoutClosingOriginalInstance) {
     const std::string path = "/tmp/dunitest_inotify_procfd_reopen";
     int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
@@ -969,6 +1018,35 @@ TEST(InotifySelfEvents, RenameOverEmptyDirectoryDeletesTargetWatch) {
     rmdir(root.c_str());
 }
 
+TEST(InotifyRenameEvents, OverwriteNotifiesTargetBeforeSourceMoveSelf) {
+    const std::string source = "/tmp/dunitest_inotify_rename_order_source";
+    const std::string target = "/tmp/dunitest_inotify_rename_order_target";
+    int fd = open(source.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+    fd = open(target.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    close(fd);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    int source_wd = inotify_add_watch(ifd, source.c_str(), IN_MOVE_SELF);
+    int target_wd = inotify_add_watch(ifd, target.c_str(), IN_ATTRIB);
+    ASSERT_GE(source_wd, 0);
+    ASSERT_GE(target_wd, 0);
+
+    ASSERT_EQ(rename(source.c_str(), target.c_str()), 0) << strerror(errno);
+    auto evs = drain_events(ifd);
+    int target_attrib = first_event_index(evs, target_wd, IN_ATTRIB);
+    int source_move = first_event_index(evs, source_wd, IN_MOVE_SELF);
+    ASSERT_GE(target_attrib, 0);
+    ASSERT_GE(source_move, 0);
+    EXPECT_LT(target_attrib, source_move);
+
+    close(ifd);
+    unlink(target.c_str());
+}
+
 TEST(InotifyAnonymousObjects, PipeProcFdWatchEnablesEvents) {
     int pipefd[2];
     ASSERT_EQ(pipe(pipefd), 0);
@@ -990,6 +1068,30 @@ TEST(InotifyAnonymousObjects, PipeProcFdWatchEnablesEvents) {
     close(ifd);
     close(pipefd[0]);
     close(pipefd[1]);
+}
+
+TEST(InotifyAnonymousObjects, SocketProcFdWatchEnablesEvents) {
+    int sockets[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0) << strerror(errno);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(add_fd_watch(ifd, sockets[0], IN_ACCESS | IN_MODIFY), 0)
+        << strerror(errno);
+
+    ASSERT_EQ(write(sockets[1], "x", 1), 1);
+    char byte = 0;
+    ASSERT_EQ(read(sockets[0], &byte, 1), 1);
+    ASSERT_EQ(write(sockets[0], "y", 1), 1);
+    ASSERT_EQ(read(sockets[1], &byte, 1), 1);
+
+    auto evs = drain_events(ifd);
+    EXPECT_TRUE(saw_self(evs, IN_ACCESS));
+    EXPECT_TRUE(saw_self(evs, IN_MODIFY));
+
+    close(ifd);
+    close(sockets[0]);
+    close(sockets[1]);
 }
 
 TEST(InotifyAnonymousObjects, SpliceAndTeeNotifyBothPipeEndpoints) {
@@ -1295,6 +1397,18 @@ TEST(InotifyMetadataEvents, FallocateKillPrivPrecedesModify) {
     ASSERT_EQ(stat(path.c_str(), &st), 0);
     EXPECT_EQ(st.st_mode & S_ISUID, 0);
 
+    ASSERT_EQ(chmod(path.c_str(), 04755), 0);
+    (void)drain_events(ifd);
+    run_unprivileged_fallocate(0, 4096, 20);
+    auto within_eof = drain_events(ifd);
+    ASSERT_GE(first_event_index(within_eof, IN_ATTRIB), 0);
+    ASSERT_GE(first_event_index(within_eof, IN_MODIFY), 0);
+    EXPECT_LT(first_event_index(within_eof, IN_ATTRIB),
+              first_event_index(within_eof, IN_MODIFY));
+    ASSERT_EQ(stat(path.c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & S_ISUID, 0);
+    EXPECT_EQ(st.st_size, 8192);
+
     (void)drain_events(ifd);
     fd = open(path.c_str(), O_RDWR);
     ASSERT_GE(fd, 0);
@@ -1575,6 +1689,56 @@ TEST(InotifyOpenEvents, OTruncDeliversOpenBeforeModify) {
     unlink(path.c_str());
 }
 
+TEST(InotifyOpenEvents, OTruncKillPrivUsesOneCombinedMetadataEvent) {
+    const std::string path = "/tmp/dunitest_inotify_otrunc_killpriv";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0755);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(write(fd, "payload", 7), 7);
+    close(fd);
+    ASSERT_EQ(chown(path.c_str(), 65534, 65534), 0);
+    ASSERT_EQ(chmod(path.c_str(), 04755), 0);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(inotify_add_watch(ifd, path.c_str(), IN_OPEN | IN_ATTRIB | IN_MODIFY), 0);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (setgid(65534) != 0 || setuid(65534) != 0) _exit(10);
+        int child_fd = open(path.c_str(), O_WRONLY | O_TRUNC);
+        if (child_fd < 0) _exit(11);
+        close(child_fd);
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    auto evs = drain_events(ifd);
+    int open_index = first_event_index(evs, IN_OPEN);
+    int combined_index = -1;
+    int combined_count = 0;
+    for (size_t i = 0; i < evs.size(); ++i) {
+        if ((evs[i].mask & (IN_ATTRIB | IN_MODIFY)) == (IN_ATTRIB | IN_MODIFY)) {
+            combined_index = static_cast<int>(i);
+            combined_count++;
+        }
+    }
+    ASSERT_GE(open_index, 0);
+    ASSERT_GE(combined_index, 0);
+    EXPECT_LT(open_index, combined_index);
+    EXPECT_EQ(combined_count, 1);
+    struct stat st = {};
+    ASSERT_EQ(stat(path.c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & S_ISUID, 0);
+    EXPECT_EQ(st.st_size, 0);
+
+    close(ifd);
+    unlink(path.c_str());
+}
+
 TEST(InotifyOpenEvents, NewlyCreatedOTruncFileHasNoModifyEvent) {
     const std::string dir = "/tmp/dunitest_inotify_otrunc_create";
     const std::string path = dir + "/file";
@@ -1787,6 +1951,83 @@ TEST(InotifyConcurrentReaders, BlockingReaderDoesNotHideNonblockingState) {
     EXPECT_TRUE(second.error == EAGAIN || second.error == EWOULDBLOCK);
 
     close(ifd);
+    unlink(path.c_str());
+}
+
+TEST(InotifyReadBoundary, NonblockingExact64kReturnsConsumedPrefix) {
+    const std::string path = "/tmp/dunitest_inotify_read_64k_nonblock";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    queue_exact_64k_self_events(ifd, fd);
+
+    std::vector<char> buf(128 * 1024);
+    errno = 0;
+    ssize_t n = read(ifd, buf.data(), buf.size());
+    EXPECT_EQ(n, 64 * 1024)
+        << "a second empty read must not replace consumed progress: " << strerror(errno);
+
+    close(ifd);
+    close(fd);
+    unlink(path.c_str());
+}
+
+TEST(InotifyReadBoundary, PartialUserFaultConsumesFailingRecordAndReturnsEfault) {
+    const std::string path = "/tmp/dunitest_inotify_read_partial_fault";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    ASSERT_GE(add_fd_watch(ifd, fd, IN_ATTRIB | IN_MODIFY), 0);
+    ASSERT_EQ(fchmod(fd, 0600), 0);
+    const char byte = 'x';
+    ASSERT_EQ(pwrite(fd, &byte, 1, 0), 1);
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    char *mapping = static_cast<char *>(
+        mmap(nullptr, page_size * 2, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(mapping, MAP_FAILED);
+    ASSERT_EQ(munmap(mapping + page_size, page_size), 0);
+
+    errno = 0;
+    EXPECT_EQ(read(ifd, mapping + page_size - 16, 32), -1);
+    EXPECT_EQ(errno, EFAULT);
+
+    char event[16] __attribute__((aligned(8)));
+    errno = 0;
+    EXPECT_EQ(read(ifd, event, sizeof(event)), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK)
+        << "the record whose copy faulted must still be consumed";
+
+    ASSERT_EQ(munmap(mapping, page_size), 0);
+    close(ifd);
+    close(fd);
+    unlink(path.c_str());
+}
+
+TEST(InotifyReadBoundary, BlockingExact64kDoesNotWaitForAnotherEvent) {
+    const std::string path = "/tmp/dunitest_inotify_read_64k_blocking";
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    int ifd = inotify_init1(IN_CLOEXEC);
+    ASSERT_GE(ifd, 0);
+    queue_exact_64k_self_events(ifd, fd);
+
+    std::thread delayed_producer([fd] {
+        usleep(500000);
+        EXPECT_EQ(fchmod(fd, 0600), 0) << strerror(errno);
+    });
+    std::vector<char> buf(128 * 1024);
+    ssize_t n = read(ifd, buf.data(), buf.size());
+    EXPECT_EQ(n, 64 * 1024)
+        << "a successful record-stream read must not enter a second wait cycle";
+    delayed_producer.join();
+
+    close(ifd);
+    close(fd);
     unlink(path.c_str());
 }
 

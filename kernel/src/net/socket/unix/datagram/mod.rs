@@ -272,6 +272,7 @@ pub struct UnixDatagramSocket {
     wait_queue: Arc<WaitQueue>,
     inode_id: InodeId,
     open_files: AtomicUsize,
+    fsnotify_watches: AtomicUsize,
     netns: Arc<NetNamespace>,
     is_nonblocking: AtomicBool,
     sndbuf: AtomicUsize,
@@ -307,6 +308,7 @@ impl UnixDatagramSocket {
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            fsnotify_watches: AtomicUsize::new(0),
             netns: netns.clone(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             sndbuf: AtomicUsize::new(Self::DEFAULT_BUF_SIZE),
@@ -636,6 +638,10 @@ impl UnixDatagramSocket {
 }
 
 impl Socket for UnixDatagramSocket {
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize {
+        &self.fsnotify_watches
+    }
+
     fn open_file_counter(&self) -> &AtomicUsize {
         &self.open_files
     }

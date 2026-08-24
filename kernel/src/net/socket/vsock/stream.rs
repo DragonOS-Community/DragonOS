@@ -154,6 +154,7 @@ pub struct VsockStreamSocket {
     inode_id: InodeId,
     /// 打开该 socket 的文件引用计数
     open_files: AtomicUsize,
+    fsnotify_watches: AtomicUsize,
     /// 非阻塞模式标志
     nonblock: AtomicBool,
     /// 自身弱引用，供内部注册和回调使用
@@ -184,6 +185,7 @@ impl VsockStreamSocket {
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            fsnotify_watches: AtomicUsize::new(0),
             nonblock: AtomicBool::new(nonblock),
             self_ref: me.clone(),
             epoll_items: EPollItems::default(),
@@ -834,6 +836,10 @@ impl VsockStreamSocket {
 }
 
 impl Socket for VsockStreamSocket {
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize {
+        &self.fsnotify_watches
+    }
+
     fn open_file_counter(&self) -> &AtomicUsize {
         &self.open_files
     }

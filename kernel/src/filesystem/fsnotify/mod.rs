@@ -1,15 +1,17 @@
 //! 文件系统事件通知统一层（fsnotify）。
 //!
 //! 本模块是 VFS 写路径 hook 与具体后端（当前仅 inotify）之间的解耦层。
-//! VFS hook 只调用 [`fsnotify`]，由它查全局 mark 索引并把事件分发给匹配的 watch。
+//! VFS hook 只调用 [`fsnotify`]。挂载文件系统的 watch 使用对象局部快照，
+//! 非挂载对象才使用全局后备索引，事件在取得不可变快照后分发。
 //!
 //! 设计原则（见 `docs/kernel/filesystem/inotify.md` §0/§3）：
 //! - `fsnotify()` 尽力而为，绝不影响 syscall 返回值；
 //! - `fsnotify()` 内部只取本层自旋锁与 group 队列锁，绝不回调 `IndexNode` 写方法；
-//! - 锁序：`MountFSInode/File 锁` → `FSNOTIFY 全局锁` → `group 队列锁`，永不反向。
+//! - 锁序：对象快照锁只用于 clone/publish，释放后才进入 mark 与 group 队列，永不反向。
 
 pub mod group;
 pub mod mark;
+mod object;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -17,13 +19,19 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 
-use crate::filesystem::vfs::{mount::MountFSInode, FileType, IndexNode, InodeId};
+use crate::filesystem::vfs::{mount::MountFSInode, FileType, IndexNode};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::Mutex;
 use system_error::SystemError;
 
 pub use group::FsNotifyGroup;
 pub use mark::FsNotifyMark;
+use mark::{finish_retire, RetireReason};
+pub use object::FsNotifyObjectId;
+pub(crate) use object::{
+    note_link_added, note_link_removed, notify_dentry_detach, FsNotifyObjectState,
+    MountedFsNotifyPresence,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnqueueResult {
@@ -34,72 +42,13 @@ pub enum EnqueueResult {
     Filtered,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct FsNotifyObjectId {
-    pub superblock: usize,
-    pub inode: InodeId,
-    pub generation: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FsNotifyTarget {
     pub id: FsNotifyObjectId,
     pub is_dir: bool,
     pub disconnected: bool,
     pub watched: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct FsNotifyDeleteState {
-    pending: bool,
-    committed: bool,
-    nlinks: usize,
-}
-
-#[derive(Debug)]
-pub(crate) struct FsNotifyObjectState {
-    pub(crate) delete: Mutex<FsNotifyDeleteState>,
-    watches: AtomicUsize,
-}
-
-impl FsNotifyObjectState {
-    pub(crate) fn new(nlinks: usize) -> Self {
-        Self {
-            delete: Mutex::new(FsNotifyDeleteState::new(nlinks)),
-            watches: AtomicUsize::new(0),
-        }
-    }
-
-    pub(crate) fn has_watches(&self) -> bool {
-        self.watches.load(Ordering::Acquire) != 0
-    }
-
-    pub(crate) fn watch_added(&self) {
-        self.watches.fetch_add(1, Ordering::Release);
-    }
-
-    pub(crate) fn watch_removed(&self) {
-        let result = self
-            .watches
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_sub(1)
-            });
-        debug_assert!(result.is_ok(), "fsnotify object watch count underflow");
-    }
-}
-
-impl FsNotifyDeleteState {
-    pub(crate) fn new(nlinks: usize) -> Self {
-        Self {
-            pending: false,
-            committed: false,
-            nlinks,
-        }
-    }
-
-    pub(crate) fn committed(&self) -> bool {
-        self.committed
-    }
+    pub(crate) object_state: Option<Arc<FsNotifyObjectState>>,
 }
 
 pub fn target_for_inode(inode: &Arc<dyn IndexNode>) -> Result<FsNotifyTarget, SystemError> {
@@ -115,6 +64,7 @@ pub fn target_for_inode(inode: &Arc<dyn IndexNode>) -> Result<FsNotifyTarget, Sy
             is_dir: file_type == FileType::Dir,
             disconnected,
             watched,
+            object_state: mounted.fsnotify_object_state(),
         });
     }
     let md = inode.metadata()?;
@@ -133,7 +83,23 @@ pub fn target_for_inode(inode: &Arc<dyn IndexNode>) -> Result<FsNotifyTarget, Sy
             .fsnotify_watch_count()
             .map(|count| count.load(Ordering::Acquire) != 0)
             .unwrap_or(true),
+        object_state: None,
     })
+}
+
+/// Resolve an event target after consulting an inode-local watch hint.
+///
+/// Identity lookups used to add a watch must always resolve the inode. Event
+/// delivery may skip that work when an anonymous inode authoritatively reports
+/// that it has no marks; implementations without a hint remain conservative.
+fn target_for_event(inode: &Arc<dyn IndexNode>) -> Result<Option<FsNotifyTarget>, SystemError> {
+    if inode
+        .fsnotify_watch_count()
+        .is_some_and(|count| count.load(Ordering::Acquire) == 0)
+    {
+        return Ok(None);
+    }
+    target_for_inode(inode).map(Some)
 }
 
 pub fn canonical_inode(inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
@@ -152,7 +118,9 @@ pub fn fsnotify_inode(mask: FsEvent, inode: &Arc<dyn IndexNode>) {
         return;
     }
     if let Some(mounted) = inode.clone().downcast_arc::<MountFSInode>() {
-        let (child, parent) = mounted.fsnotify_snapshot();
+        let Some((child, parent)) = mounted.fsnotify_snapshot() else {
+            return;
+        };
         if let Some((parent, name)) = parent.as_ref() {
             return fsnotify_targets(
                 mask,
@@ -244,43 +212,11 @@ lazy_static::lazy_static! {
     static ref FSNOTIFY_MARKS: Mutex<MarkIndex> = Mutex::new(HashMap::new());
 }
 
-pub(crate) fn mark_delete_pending(state: &mut FsNotifyDeleteState) {
-    state.pending = true;
-    state.nlinks = 0;
-}
-
-pub(crate) fn note_link_added(state: &mut FsNotifyDeleteState) {
-    state.nlinks = state.nlinks.saturating_add(1);
-    state.pending = false;
-    state.committed = false;
-}
-
-pub(crate) fn note_link_removed(state: &mut FsNotifyDeleteState) -> bool {
-    state.nlinks = state.nlinks.saturating_sub(1);
-    state.pending = state.nlinks == 0;
-    state.pending
-}
-
-/// Called at the irreversible dentry/inode detach boundary. The first alias
-/// that observes a pending zero-link object commits DELETE_SELF exactly once.
-pub(crate) fn notify_dentry_detach(
-    id: FsNotifyObjectId,
-    object: &FsNotifyObjectState,
-    state: &mut FsNotifyDeleteState,
-) {
-    if !state.pending {
-        return;
-    }
-    state.pending = false;
-    state.committed = true;
-    notify_object_delete(id, object);
-}
-
-pub(crate) fn notify_object_delete(id: FsNotifyObjectId, object: &FsNotifyObjectState) {
+pub(crate) fn notify_object_delete(_id: FsNotifyObjectId, object: &FsNotifyObjectState) {
     if !object.has_watches() {
         return;
     }
-    let marks = FSNOTIFY_MARKS.lock().get(&id).cloned();
+    let marks = object.mark_snapshot();
     for mark in marks
         .iter()
         .flat_map(|entries| entries.iter())
@@ -295,73 +231,11 @@ pub(crate) fn notify_object_delete(id: FsNotifyObjectId, object: &FsNotifyObject
                 .backend
                 .handle_event(&group, &mark, FsEvent::DELETE_SELF, None, 0);
         }
-        mark.active.store(false, Ordering::Release);
+        let token = FsNotifyMark::begin_retire_locked(&mark, RetireReason::ObjectDelete);
         drop(guard);
-        mark::destroy_mark(&mark);
-    }
-}
-
-pub(crate) fn notify_unmount(superblock: usize) {
-    // Detach all keys for this superblock in one index pass.  Processing the
-    // marks outside the global lock keeps queueing and group teardown out of
-    // the index critical section, while avoiding a full-index scan per mark.
-    let snapshot = {
-        let mut idx = FSNOTIFY_MARKS.lock();
-        let key_count = idx.keys().filter(|id| id.superblock == superblock).count();
-        let mut entries = Vec::new();
-        if entries.try_reserve_exact(key_count).is_err() {
-            None
-        } else {
-            entries.extend(
-                idx.iter()
-                    .filter(|(id, _)| id.superblock == superblock)
-                    .map(|(id, marks)| (*id, marks.clone())),
-            );
-            for (id, _) in &entries {
-                idx.remove(id);
-            }
-            Some(entries)
+        if let Some(token) = token {
+            finish_retire(token);
         }
-    };
-
-    if let Some(entries) = snapshot {
-        for mark in entries
-            .iter()
-            .flat_map(|(_, marks)| marks.iter())
-            .filter_map(|entry| entry.upgrade())
-        {
-            notify_unmount_mark(&mark);
-        }
-        return;
-    }
-
-    // Final unmount cannot fail with ENOMEM.  Keep an allocation-free fallback
-    // for memory pressure; normal operation uses the linear snapshot above.
-    loop {
-        let mark = {
-            let mut idx = FSNOTIFY_MARKS.lock();
-            let next = idx.iter().find_map(|(id, entries)| {
-                (id.superblock == superblock).then(|| {
-                    (
-                        *id,
-                        entries
-                            .iter()
-                            .filter_map(|entry| entry.upgrade())
-                            .find(|mark| mark.active.load(Ordering::Acquire)),
-                    )
-                })
-            });
-            match next {
-                Some((_id, Some(mark))) => Some(mark),
-                Some((id, None)) => {
-                    idx.remove(&id);
-                    continue;
-                }
-                None => None,
-            }
-        };
-        let Some(mark) = mark else { break };
-        notify_unmount_mark(&mark);
     }
 }
 
@@ -375,9 +249,22 @@ fn notify_unmount_mark(mark: &Arc<FsNotifyMark>) {
             .backend
             .handle_event(&group, mark, FsEvent::UNMOUNT, None, 0);
     }
-    mark.active.store(false, Ordering::Release);
+    let token = FsNotifyMark::begin_retire_locked(mark, RetireReason::Unmount);
     drop(guard);
-    mark::destroy_mark(mark);
+    if let Some(token) = token {
+        finish_retire(token);
+    }
+}
+
+pub(crate) fn notify_unmount_object(object: &FsNotifyObjectState) {
+    let marks = object.mark_snapshot();
+    for mark in marks
+        .iter()
+        .flat_map(|entries| entries.iter())
+        .filter_map(|entry| entry.upgrade())
+    {
+        notify_unmount_mark(&mark);
+    }
 }
 
 /// 记录一次 watch 计数变更（add +1，撤销 -1）。
@@ -396,6 +283,9 @@ pub fn has_any_watch() -> bool {
 }
 
 pub(crate) fn index_add(mark: &Arc<FsNotifyMark>) -> Result<(), SystemError> {
+    if let Some(object) = mark.object_state.as_ref() {
+        return object_index_add(object, mark);
+    }
     let key = mark.identity();
     loop {
         let old = FSNOTIFY_MARKS.lock().get(&key).cloned();
@@ -432,6 +322,10 @@ pub(crate) fn index_add(mark: &Arc<FsNotifyMark>) -> Result<(), SystemError> {
 }
 /// 把 mark 从全局索引移除（按指针相等匹配，rm_watch / 撤销时调用）。
 pub(crate) fn index_remove(mark: &FsNotifyMark) {
+    if let Some(object) = mark.object_state.as_ref() {
+        object_index_remove(object, mark);
+        return;
+    }
     let key = mark.identity();
     let self_ptr = mark as *const FsNotifyMark;
     loop {
@@ -497,6 +391,94 @@ pub(crate) fn index_remove(mark: &FsNotifyMark) {
     }
 }
 
+fn object_index_add(
+    object: &FsNotifyObjectState,
+    mark: &Arc<FsNotifyMark>,
+) -> Result<(), SystemError> {
+    loop {
+        let old = object.mark_snapshot();
+        let live = old
+            .iter()
+            .flat_map(|entries| entries.iter())
+            .filter(|entry| entry.strong_count() != 0)
+            .count();
+        let mut next = Vec::new();
+        next.try_reserve_exact(live.saturating_add(1))
+            .map_err(|_| SystemError::ENOMEM)?;
+        next.extend(
+            old.iter()
+                .flat_map(|entries| entries.iter())
+                .filter(|entry| entry.strong_count() != 0)
+                .cloned(),
+        );
+        next.push(Arc::downgrade(mark));
+        let next = Arc::try_new(next).map_err(|_| SystemError::ENOMEM)?;
+
+        let mut current = object.marks.lock();
+        let unchanged = match (current.as_ref(), old.as_ref()) {
+            (Some(current), Some(old)) => Arc::ptr_eq(current, old),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            *current = Some(next);
+            return Ok(());
+        }
+    }
+}
+
+fn object_index_remove(object: &FsNotifyObjectState, mark: &FsNotifyMark) {
+    let self_ptr = mark as *const FsNotifyMark;
+    loop {
+        let Some(old) = object.mark_snapshot() else {
+            return;
+        };
+        let has_survivor = old.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|arc| !core::ptr::eq(Arc::as_ptr(&arc), self_ptr))
+        });
+        if !has_survivor {
+            let mut current = object.marks.lock();
+            if !current
+                .as_ref()
+                .is_some_and(|entries| Arc::ptr_eq(entries, &old))
+            {
+                continue;
+            }
+            *current = None;
+            return;
+        }
+
+        let mut compact = Vec::new();
+        if compact.try_reserve_exact(old.len()).is_err() {
+            return;
+        }
+        compact.extend(old.iter().filter_map(|entry| {
+            entry.upgrade().and_then(|arc| {
+                (!core::ptr::eq(Arc::as_ptr(&arc), self_ptr)).then(|| Arc::downgrade(&arc))
+            })
+        }));
+        let replacement = if compact.is_empty() {
+            None
+        } else {
+            match Arc::try_new(compact) {
+                Ok(entries) => Some(entries),
+                Err(_) => return,
+            }
+        };
+        let mut current = object.marks.lock();
+        if !current
+            .as_ref()
+            .is_some_and(|entries| Arc::ptr_eq(entries, &old))
+        {
+            continue;
+        }
+        *current = replacement;
+        return;
+    }
+}
+
 /// 统一事件投递入口。在 VFS 操作**成功之后**调用，尽力而为，不影响调用方返回值。
 ///
 /// - `parent`：对子项事件（CREATE/DELETE/MOVED_*），传 `(父目录 inode, 子项名)`；
@@ -532,8 +514,8 @@ fn fsnotify_with_data(
     // 目录决定，对 parent/child 两类 watch 一视同仁。若无 child（仅父目录自身事件
     // 的退化情况），ISDIR 不置位。
     // 用 (inode_id, dev_id) 复合键：FUSE 多挂载复用相同 inode 号，必须加 dev_id 区分。
-    let child_target = child.and_then(|inode| target_for_inode(inode).ok());
-    let parent_target = parent.and_then(|(inode, _)| target_for_inode(inode).ok());
+    let child_target = child.and_then(|inode| target_for_event(inode).ok().flatten());
+    let parent_target = parent.and_then(|(inode, _)| target_for_event(inode).ok().flatten());
     fsnotify_targets(
         mask,
         parent_target.as_ref().zip(parent.map(|(_, name)| name)),
@@ -572,13 +554,26 @@ pub(crate) fn fsnotify_targets(
 
     // ③ 收集候选 mark 快照：临界区仅做哈希查表（秒放），不做后端工作。
     // (mark 强引用, name, is_parent)
-    let (parent_marks, child_marks) = {
-        let idx = FSNOTIFY_MARKS.lock();
-        (
-            parent_key.and_then(|key| idx.get(&key).cloned()),
-            child_key.and_then(|key| idx.get(&key).cloned()),
-        )
-    };
+    let local_parent = parent.and_then(|(target, _)| target.object_state.as_ref());
+    let local_child = child.and_then(|target| target.object_state.as_ref());
+    let parent_marks = local_parent
+        .and_then(|object| object.mark_snapshot())
+        .or_else(|| {
+            parent_key.and_then(|key| {
+                (local_parent.is_none())
+                    .then(|| FSNOTIFY_MARKS.lock().get(&key).cloned())
+                    .flatten()
+            })
+        });
+    let child_marks = local_child
+        .and_then(|object| object.mark_snapshot())
+        .or_else(|| {
+            child_key.and_then(|key| {
+                (local_child.is_none())
+                    .then(|| FSNOTIFY_MARKS.lock().get(&key).cloned())
+                    .flatten()
+            })
+        });
     // 注：死 Weak 在 lock 内 upgrade 失败时被跳过；惰性清理留给 index_remove。
 
     // 事件路由（Linux 模型）：
@@ -668,13 +663,18 @@ pub(crate) fn fsnotify_targets(
             enqueue_result,
             EnqueueResult::Queued | EnqueueResult::Merged | EnqueueResult::DroppedQueueFull
         );
-        let destroy = inode_death || (mark.oneshot.load(Ordering::Relaxed) && consumes_oneshot);
-        if destroy {
-            mark.active.store(false, Ordering::Release);
-        }
+        let retire_reason = if inode_death {
+            Some(RetireReason::ObjectDelete)
+        } else if mark.oneshot.load(Ordering::Relaxed) && consumes_oneshot {
+            Some(RetireReason::OneShot)
+        } else {
+            None
+        };
+        let token =
+            retire_reason.and_then(|reason| FsNotifyMark::begin_retire_locked(&mark, reason));
         drop(dispatch_guard);
-        if destroy {
-            mark::destroy_mark(&mark);
+        if let Some(token) = token {
+            finish_retire(token);
         }
     }
 }

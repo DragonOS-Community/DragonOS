@@ -19,7 +19,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     fmt::{Debug, Display, Write},
-    sync::atomic::AtomicUsize,
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 use derive_builder::Builder;
 use intertrait::CastFromSync;
@@ -144,6 +144,141 @@ bitflags! {
         const S_IWUGO = Self::S_IWUSR.bits | Self::S_IWGRP.bits | Self::S_IWOTH.bits;
         /// 0o111
         const S_IXUGO = Self::S_IXUSR.bits | Self::S_IXGRP.bits | Self::S_IXOTH.bits;
+    }
+}
+
+/// Metadata prepared for the post-open truncate stage of an existing file.
+///
+/// The snapshot is taken before filesystem open so atomic FUSE O_TRUNC cannot
+/// erase the information needed to report its killpriv side effect.
+#[derive(Debug, Clone)]
+pub struct OpenTruncateContext {
+    pub(crate) requested: Metadata,
+    pub(crate) mask: SetMetadataMask,
+}
+
+/// One-shot publication hook for a write-side ATTRIB stage that may commit
+/// before the subsequent data operation succeeds.
+pub struct AttribStageObserver<'a> {
+    publish: &'a mut dyn FnMut(),
+    committed: bool,
+}
+
+/// Authoritative result of removing one namespace link. Filesystems produce
+/// this while holding the lock that commits their link-count mutation; VFS
+/// consumers must not reconstruct it with a later metadata read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkRemovalOutcome {
+    StillLinked,
+    LastLink,
+}
+
+/// Canonical-inode coordinator for namespace operations which change link
+/// state. It is deliberately independent from fsnotify mark admission: a
+/// filesystem may wait for a userspace daemon while holding this lock, while
+/// adding a watch must remain able to proceed.
+#[derive(Debug)]
+pub struct LinkMutationCoordinator {
+    lock: Mutex<()>,
+    known_state: AtomicU8,
+    revision: AtomicUsize,
+}
+
+impl LinkMutationCoordinator {
+    const UNKNOWN: u8 = 0;
+    const LINKED: u8 = 1;
+    const ZERO_LINKS: u8 = 2;
+
+    pub const fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            known_state: AtomicU8::new(Self::UNKNOWN),
+            revision: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock()
+    }
+
+    pub fn revision(&self) -> usize {
+        self.snapshot().0
+    }
+
+    pub fn known_zero_links(&self) -> Option<bool> {
+        self.snapshot().1
+    }
+
+    /// Read one stable fact/revision pair. Odd revisions are the short
+    /// publication window between the fact store and its commit sequence.
+    pub fn snapshot(&self) -> (usize, Option<bool>) {
+        loop {
+            let before = self.revision.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let fact = match self.known_state.load(Ordering::Acquire) {
+                Self::LINKED => Some(false),
+                Self::ZERO_LINKS => Some(true),
+                _ => None,
+            };
+            let after = self.revision.load(Ordering::Acquire);
+            if before == after {
+                return (after, fact);
+            }
+        }
+    }
+
+    pub fn commit_removed(&self, outcome: LinkRemovalOutcome) -> usize {
+        let publishing = self.revision.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        debug_assert_ne!(publishing & 1, 0);
+        self.known_state.store(
+            match outcome {
+                LinkRemovalOutcome::StillLinked => Self::LINKED,
+                LinkRemovalOutcome::LastLink => Self::ZERO_LINKS,
+            },
+            Ordering::Release,
+        );
+        self.revision
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1)
+    }
+
+    pub fn commit_added(&self) -> usize {
+        let publishing = self.revision.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        debug_assert_ne!(publishing & 1, 0);
+        self.known_state.store(Self::LINKED, Ordering::Release);
+        self.revision
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1)
+    }
+}
+
+/// Namespace-visible effect of a successful rename.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameOutcome {
+    NoOp,
+    Exchange,
+    Moved {
+        replaced: Option<LinkRemovalOutcome>,
+    },
+}
+
+impl<'a> AttribStageObserver<'a> {
+    pub fn new(publish: &'a mut dyn FnMut()) -> Self {
+        Self {
+            publish,
+            committed: false,
+        }
+    }
+
+    pub fn commit(&mut self) {
+        debug_assert!(!self.committed, "ATTRIB stage committed more than once");
+        if !self.committed {
+            self.committed = true;
+            (self.publish)();
+        }
     }
 }
 
@@ -554,11 +689,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         !self.is_stream()
     }
 
-    /// Whether VFS must issue a separate truncate after a successful open.
-    /// `false` means the filesystem's open operation completed O_TRUNC
-    /// atomically and VFS must only publish the resulting metadata event.
-    fn requires_separate_open_truncate(&self, flags: &FileFlags) -> bool {
-        flags.contains(FileFlags::O_TRUNC)
+    /// Complete the truncate stage following a successful open of an existing
+    /// regular file. Filesystems may consume an atomic-open result, but VFS
+    /// remains the owner of the common OPEN -> truncate ordering.
+    fn resize_open_truncate(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        context: &OpenTruncateContext,
+    ) -> Result<(), SystemError> {
+        self.resize_file_with_metadata(len, lock_owner, data, &context.requested, context.mask)
     }
 
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
@@ -664,6 +805,31 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
+    /// Whether this inode implements [`IndexNode::read_user_at`].
+    ///
+    /// This explicit capability keeps the ordinary read hot path from taking
+    /// private-data locks merely to discover the default `None` result.
+    fn supports_read_user(&self) -> bool {
+        false
+    }
+
+    /// Read directly into a protected userspace buffer.
+    ///
+    /// The default returns `None`, so ordinary inodes keep using the bounded
+    /// kernel-buffer path. Record-oriented streams such as inotify override
+    /// this when they must own the whole syscall boundary (including
+    /// per-record copy faults and the decision whether to wait again).
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        Ok(None)
+    }
+
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
     ///
     /// @param offset 起始位置在Inode中的偏移量
@@ -707,9 +873,22 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _offset: usize,
         _len: usize,
         _lock_owner: u64,
+        _attrib: &mut AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<(), SystemError> {
         drop(data);
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+
+    /// Atomically commit the write-side metadata and non-shrinking size stage
+    /// used by mode-0 fallocate. Implementations that opt into the generic
+    /// resize-backed helper must serialize this with chmod and other content
+    /// mutations in their native inode lock domain.
+    fn fallocate_resize_atomic(
+        &self,
+        _requested_end: usize,
+        _lock_owner: u64,
+    ) -> Result<SetMetadataMask, SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
@@ -790,6 +969,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// without such reuse may keep zero.
     fn inode_generation(&self) -> u64 {
         0
+    }
+
+    /// Stable coordinator shared by every alias of this canonical inode.
+    ///
+    /// Any filesystem which can create hard links, relink a zero-link inode,
+    /// or report `StillLinked` from unlink/rename must override this method.
+    /// Single-edge pseudo filesystems may keep the default.
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        None
     }
 
     /// @brief 设置inode的元数据
@@ -971,7 +1159,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn unlink(&self, _name: &str) -> Result<(), SystemError> {
+    fn unlink(&self, _name: &str) -> Result<LinkRemovalOutcome, SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
@@ -983,7 +1171,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         name: &str,
         context: &mount::DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<LinkRemovalOutcome, SystemError> {
         context.ensure_locked();
         self.unlink(name)
     }
@@ -1017,7 +1205,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
         _flag: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
@@ -1029,7 +1217,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         new_name: &str,
         flag: RenameFlags,
         context: &mount::DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         context.ensure_locked();
         self.move_to(old_name, target, new_name, flag)
     }

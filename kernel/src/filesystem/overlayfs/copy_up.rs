@@ -27,19 +27,6 @@ enum CopyUpOutcome {
     Existing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OpenCopyUpOutcome {
-    NoTruncateRequested,
-    TruncateCompletedBeforePublish,
-    NeedsPostOpenTruncate,
-}
-
-impl OpenCopyUpOutcome {
-    pub(super) fn needs_post_open_truncate(self) -> bool {
-        self == Self::NeedsPostOpenTruncate
-    }
-}
-
 impl OvlInode {
     pub(super) fn writable_upper_inode_locked(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.writable_upper_inode_locked_impl(None)
@@ -64,10 +51,7 @@ impl OvlInode {
         self.upper_inode.lock().clone().ok_or(SystemError::EROFS)
     }
 
-    pub(super) fn copy_up_for_open(
-        &self,
-        flags: &FileFlags,
-    ) -> Result<OpenCopyUpOutcome, SystemError> {
+    pub(super) fn copy_up_for_open(&self, flags: &FileFlags) -> Result<(), SystemError> {
         let copy_size = if flags.contains(FileFlags::O_TRUNC) {
             Some(0)
         } else {
@@ -76,14 +60,8 @@ impl OvlInode {
 
         let fs = self.overlay_fs()?;
         let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
-        let outcome = self.copy_up_locked_with_size(copy_size, None)?;
-        if copy_size.is_none() {
-            Ok(OpenCopyUpOutcome::NoTruncateRequested)
-        } else if outcome == CopyUpOutcome::PublishedAfterTruncate {
-            Ok(OpenCopyUpOutcome::TruncateCompletedBeforePublish)
-        } else {
-            Ok(OpenCopyUpOutcome::NeedsPostOpenTruncate)
-        }
+        self.copy_up_locked_with_size(copy_size, None)?;
+        Ok(())
     }
 
     pub(super) fn copy_up_locked(&self) -> Result<(), SystemError> {
@@ -224,6 +202,18 @@ impl OvlInode {
             CopyUpOutcome::Published
         };
 
+        // The temp inode keeps its identity across the final rename. Publish
+        // the lightweight lower-origin connector before that namespace
+        // commit; allocation failure can still remove the temp and return
+        // ENOMEM without exposing an upper inode that has lost its origin.
+        let link_seed_publication = match self.prepare_copy_up_link_seed(&temp_inode) {
+            Ok(publication) => publication,
+            Err(err) => {
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                return Err(err);
+            }
+        };
+
         let parent_metadata = match parent_inode.metadata() {
             Ok(metadata) => metadata,
             Err(err) => {
@@ -240,6 +230,9 @@ impl OvlInode {
             context,
         ) {
             Ok(()) => {
+                if let Some(publication) = link_seed_publication {
+                    publication.commit();
+                }
                 Self::restore_parent_timestamps(&parent_inode, &parent_metadata);
                 self.set_origin(origin);
                 let inode = Self::validate_existing_upper(temp_inode, &metadata)?;
@@ -606,6 +599,7 @@ impl OvlInode {
             }
             None => source.move_to(old_name, target, new_name, flags),
         }
+        .map(|_| ())
     }
 
     fn read_symlink_target(lower_inode: Arc<dyn IndexNode>) -> Result<String, SystemError> {

@@ -228,7 +228,10 @@ impl IndexNode for KernFSInode {
         return Err(SystemError::EROFS);
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), SystemError> {
+    fn unlink(
+        &self,
+        _name: &str,
+    ) -> Result<crate::filesystem::vfs::LinkRemovalOutcome, SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
         return Err(SystemError::ENOSYS);
     }
@@ -244,7 +247,7 @@ impl IndexNode for KernFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         _flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<crate::filesystem::vfs::RenameOutcome, SystemError> {
         // 处理重命名到自身的特殊情况
         // 如果源目录和目标目录是同一个 inode，且文件名相同，则直接返回成功
         // 这符合 Linux 的 rename 语义：重命名到自身是一个空操作
@@ -258,7 +261,7 @@ impl IndexNode for KernFSInode {
                 .ok_or(SystemError::ENOENT)?;
 
             if Arc::ptr_eq(&self_arc, &target_arc) && old_name == new_name {
-                return Ok(());
+                return Ok(crate::filesystem::vfs::RenameOutcome::NoOp);
             }
         }
 

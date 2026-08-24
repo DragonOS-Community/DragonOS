@@ -59,7 +59,7 @@ use crate::{
         resource::RLimitID,
         ProcessControlBlock, ProcessManager, RawPid,
     },
-    syscall::user_access::UserBufferReader,
+    syscall::{user_access::UserBufferReader, user_buffer::UserBuffer},
 };
 
 use crate::filesystem::vfs::InodeMode;
@@ -1086,8 +1086,8 @@ impl File {
 
         // fsnotify：写成功后投递 IN_MODIFY（FMODE_NONOTIFY 短路，防 inotify fd 递归）。
         if written_len > 0
-            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
             && fsnotify::has_any_watch()
+            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
         {
             // Linux publishes the ATTR_MODE change from file_remove_privs
             // before the successful write's MODIFY event.
@@ -1321,7 +1321,9 @@ impl File {
     pub(crate) fn notify_fs_event(&self, mask: FsEvent) {
         let event_inode = self.fsnotify_path_inode.as_ref().unwrap_or(&self.inode);
         if let Some(mounted) = event_inode.clone().downcast_arc::<MountFSInode>() {
-            let (child, parent) = mounted.fsnotify_snapshot();
+            let Some((child, parent)) = mounted.fsnotify_snapshot() else {
+                return;
+            };
             // Linux deliberately withholds ACCESS/MODIFY child events from a
             // special file's parent directory to avoid a side channel.  The
             // special inode itself still receives the event through f_path.
@@ -1351,15 +1353,22 @@ impl File {
         }
     }
 
+    /// Publish a dentry-data event such as ATTRIB/truncate. Unlike PATH I/O
+    /// events, this is not suppressed by IN_EXCL_UNLINK.
+    pub(crate) fn notify_dentry_event(&self, mask: FsEvent) {
+        let event_inode = self.fsnotify_path_inode.as_ref().unwrap_or(&self.inode);
+        fsnotify::fsnotify_inode(mask, event_inode);
+    }
+
     /// Publish an I/O event when this open file description participates in
     /// userspace-visible I/O.  Internal FMODE_NONOTIFY users must not recurse
     /// into fsnotify, and O_PATH descriptors never perform such I/O.
     pub(crate) fn notify_io_event(&self, mask: FsEvent) {
-        if !self
-            .mode
-            .read()
-            .intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
-            && fsnotify::has_any_watch()
+        if fsnotify::has_any_watch()
+            && !self
+                .mode
+                .read()
+                .intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
         {
             self.notify_fs_event(mask);
         }
@@ -1368,10 +1377,11 @@ impl File {
     /// Notify a successful userspace-visible open. Callers decide which File
     /// constructions represent VFS open/exec rather than internal kernel I/O.
     pub(crate) fn notify_open_event(&self) {
+        if !fsnotify::has_any_watch() {
+            return;
+        }
         let mode = *self.mode.read();
-        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
-            && fsnotify::has_any_watch()
-        {
+        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH) {
             self.notify_fs_event(FsEvent::OPEN);
         }
     }
@@ -1402,6 +1412,50 @@ impl File {
         };
 
         self.do_read(offset, len, buf, !stream)
+    }
+
+    /// Let an inode consume a protected userspace buffer as one read syscall.
+    ///
+    /// `None` means the inode does not need this capability and the syscall
+    /// layer should use the normal bounded kernel-buffer fallback.
+    pub fn read_user(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+    ) -> Result<Option<usize>, SystemError> {
+        let mode = *self.mode.read();
+        let stream = mode.contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.readable()?;
+        if len == 0 {
+            return Ok(Some(0));
+        }
+        if writer.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+        if self.flags().contains(FileFlags::O_DIRECT) {
+            return Ok(None);
+        }
+
+        let Some(read_len) =
+            self.inode
+                .read_user_at(offset, len, writer, self.private_data.lock())?
+        else {
+            return Ok(None);
+        };
+
+        self.finalize_read(offset, read_len, !stream, true);
+        Ok(Some(read_len))
+    }
+
+    #[inline]
+    pub fn supports_read_user(&self) -> bool {
+        self.inode.supports_read_user()
     }
 
     /// Read from the current file position without advancing it.
@@ -1693,6 +1747,11 @@ impl File {
                 .read_at(offset, len, buf, self.private_data.lock())
         }?;
 
+        self.finalize_read(offset, len, update_offset, emit_fsnotify);
+        Ok(len)
+    }
+
+    fn finalize_read(&self, offset: usize, len: usize, update_offset: bool, emit_fsnotify: bool) {
         if len > 0 {
             let last_page_readed = (offset + len - 1) >> MMArch::PAGE_SHIFT;
             self.ra_state.lock().prev_index = last_page_readed as i64;
@@ -1711,12 +1770,11 @@ impl File {
         // EOF 读（len==0）不投递——与 atime 语义独立。
         if emit_fsnotify
             && len > 0
-            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
             && fsnotify::has_any_watch()
+            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
         {
             self.notify_fs_event(FsEvent::ACCESS);
         }
-        Ok(len)
     }
 
     /// Best-effort equivalent of Linux file_accessed()/touch_atime().
@@ -2666,16 +2724,16 @@ impl Drop for File {
         }
         // fsnotify：最后一次 close → IN_CLOSE_WRITE / IN_CLOSE_NOWRITE（FMODE_NONOTIFY 短路）。
         // 此时 self.inode 仍存活（Drop 在 inode.close() 之前），可安全取 inode_id。
-        let mode = *self.mode.read();
-        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
-            && fsnotify::has_any_watch()
-        {
-            let m = if mode.contains(FileMode::FMODE_WRITE) {
-                FsEvent::CLOSE_WRITE
-            } else {
-                FsEvent::CLOSE_NOWRITE
-            };
-            self.notify_fs_event(m);
+        if fsnotify::has_any_watch() {
+            let mode = *self.mode.read();
+            if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH) {
+                let m = if mode.contains(FileMode::FMODE_WRITE) {
+                    FsEvent::CLOSE_WRITE
+                } else {
+                    FsEvent::CLOSE_NOWRITE
+                };
+                self.notify_fs_event(m);
+            }
         }
 
         if self.flags().contains(FileFlags::FASYNC) {

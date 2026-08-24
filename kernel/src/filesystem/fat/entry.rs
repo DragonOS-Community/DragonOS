@@ -12,11 +12,11 @@ use alloc::{
     vec::Vec,
 };
 use core::{cmp::min, intrinsics::unlikely};
-use log::{debug, warn};
+use log::debug;
 use system_error::SystemError;
 
 use super::{
-    fs::{Cluster, FATFileSystem, MAX_FILE_SIZE, ZERO_BUF_SIZE},
+    fs::{AttachReservedError, Cluster, FATFileSystem, MAX_FILE_SIZE, ZERO_BUF_SIZE},
     utils::decode_u8_ascii,
 };
 
@@ -58,6 +58,10 @@ pub struct FATFile {
     pub short_dir_entry: ShortDirEntry,
     /// 文件目录项的起始、终止簇。格式：(簇，簇内偏移量)
     pub loc: ((Cluster, u64), (Cluster, u64)),
+    /// Cached allocation extent for sequential growth. `None` means that the
+    /// on-disk chain has not been measured since this entry was loaded or
+    /// truncated. The inode mutex serializes every update to this file.
+    chain_extent: Option<(u64, Cluster)>,
 }
 
 impl FATFile {
@@ -233,92 +237,143 @@ impl FATFile {
         offset: u64,
         len: u64,
     ) -> Result<(), SystemError> {
-        // 文件内本身就还有空余的空间
-        if offset + len <= self.size() {
+        let requested_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+        if requested_size <= self.size() {
+            return Ok(());
+        }
+        self.extend_zeroed(
+            fs,
+            requested_size.min(MAX_FILE_SIZE),
+            offset.min(MAX_FILE_SIZE),
+        )
+    }
+
+    /// Extend using an isolated, fully initialized tail chain. The new chain
+    /// is attached only after all allocation and gap-zeroing work succeeds,
+    /// and the in-memory size changes only after the short entry is written.
+    pub(super) fn extend_zeroed(
+        &mut self,
+        fs: &Arc<FATFileSystem>,
+        new_size: u64,
+        zero_until: u64,
+    ) -> Result<(), SystemError> {
+        let old_size = self.size();
+        if new_size <= old_size {
             return Ok(());
         }
 
-        // 计算文件的最后一个簇中有多少空闲空间
-        let in_cluster_offset = self.size() % fs.bytes_per_cluster();
-        let mut bytes_remain_in_cluster = if in_cluster_offset == 0 {
-            0
-        } else {
-            fs.bytes_per_cluster() - in_cluster_offset
-        };
-
-        // 计算还需要申请多少空间
-        let extra_bytes = min((offset + len) - self.size(), MAX_FILE_SIZE - self.size());
-
-        // 如果文件大小为0,证明它还没有分配簇，因此分配一个簇给它
-        if self.size() == 0 {
-            // first_cluster应当为0,否则将产生空间泄露的错误
-            assert_eq!(self.first_cluster, Cluster::default());
-            self.first_cluster = fs.allocate_cluster(None)?;
-            self.short_dir_entry.set_first_cluster(self.first_cluster);
-            bytes_remain_in_cluster = fs.bytes_per_cluster();
-        }
-
-        // 如果还需要更多的簇
-        if bytes_remain_in_cluster < extra_bytes {
-            let clusters_to_allocate =
-                (extra_bytes - bytes_remain_in_cluster).div_ceil(fs.bytes_per_cluster());
-            let last_cluster = if let Some(c) = fs.get_last_cluster(self.first_cluster) {
-                c
-            } else {
-                warn!("FAT: last cluster not found, File = {self:?}");
-                return Err(SystemError::EINVAL);
+        let cluster_size = fs.bytes_per_cluster();
+        let old_chain_exists = self.first_cluster != Cluster::default();
+        let (allocated_clusters, old_tail) = if old_chain_exists {
+            let extent = match self.chain_extent {
+                Some(extent) => extent,
+                None => {
+                    let extent = fs
+                        .chain_len_and_tail(self.first_cluster)
+                        .ok_or(SystemError::EIO)?;
+                    self.chain_extent = Some(extent);
+                    extent
+                }
             };
-            // 申请簇
-            let mut current_cluster: Cluster = last_cluster;
-            for _ in 0..clusters_to_allocate {
-                current_cluster = fs.allocate_cluster(Some(current_cluster))?;
+            (extent.0, Some(extent.1))
+        } else {
+            (0, None)
+        };
+        let required_clusters = new_size.div_ceil(cluster_size);
+        let clusters_to_allocate = required_clusters.saturating_sub(allocated_clusters);
+
+        let mut cluster_zeroes = Vec::new();
+        if clusters_to_allocate != 0 {
+            cluster_zeroes
+                .try_reserve_exact(cluster_size as usize)
+                .map_err(|_| SystemError::ENOMEM)?;
+            cluster_zeroes.resize(cluster_size as usize, 0);
+        }
+        let mut reserved_first = None;
+        let mut reserved_last = None;
+        for _ in 0..clusters_to_allocate {
+            match fs.allocate_cluster_with_buffer(reserved_last, &cluster_zeroes) {
+                Ok(cluster) => {
+                    reserved_first.get_or_insert(cluster);
+                    reserved_last = Some(cluster);
+                }
+                Err(error) => {
+                    if let Some(first) = reserved_first {
+                        fs.release_reserved_chain(first);
+                    }
+                    return Err(error);
+                }
             }
         }
 
-        // 如果文件被扩展，则清空刚刚被扩展的部分的数据
-        if offset > self.size() {
-            // 文件内的簇偏移
-            let start_cluster: u64 = self.size() / fs.bytes_per_cluster();
-            let start_cluster: Cluster = fs
-                .get_cluster_by_relative(self.first_cluster, start_cluster as usize)
-                .unwrap();
-            // 计算当前文件末尾在分区上的字节偏移量
-            let start_offset: u64 =
-                fs.cluster_bytes_offset(start_cluster) + self.size() % fs.bytes_per_cluster();
-            // 扩展之前，最后一个簇内还剩下多少字节的空间
-            let bytes_remain: u64 = fs.bytes_per_cluster() - (self.size() % fs.bytes_per_cluster());
-            // 计算在扩展之后的最后一个簇内，文件的终止字节
-            let cluster_offset_start = offset / fs.bytes_per_cluster();
-            // 扩展后，文件的最后
-            let end_cluster: Cluster = fs
-                .get_cluster_by_relative(self.first_cluster, cluster_offset_start as usize)
-                .unwrap();
-
-            if start_cluster != end_cluster {
-                self.zero_range(fs, start_offset, start_offset + bytes_remain)?;
-            } else {
-                self.zero_range(fs, start_offset, start_offset + offset - self.size())?;
+        // Only the old partial tail can contain stale bytes. Every reserved
+        // cluster is already zeroed, including preallocation retained after a
+        // previous directory-entry I/O error.
+        if old_size != 0 && zero_until > old_size && old_size % cluster_size != 0 {
+            let tail_index = old_size / cluster_size;
+            let tail = match fs.get_cluster_by_relative(self.first_cluster, tail_index as usize) {
+                Some(cluster) => cluster,
+                None => {
+                    if let Some(first) = reserved_first {
+                        fs.release_reserved_chain(first);
+                    }
+                    return Err(SystemError::EIO);
+                }
+            };
+            let start = fs.cluster_bytes_offset(tail) + old_size % cluster_size;
+            let end = start + (zero_until - old_size).min(cluster_size - old_size % cluster_size);
+            if let Err(error) = self.zero_range(fs, start, end) {
+                if let Some(first) = reserved_first {
+                    fs.release_reserved_chain(first);
+                }
+                return Err(error);
             }
         }
-        // 计算文件的新大小
-        let new_size = self.size() + extra_bytes;
-        self.set_size(new_size as u32);
-        // 计算短目录项所在的位置，更新短目录项
+
+        if old_chain_exists {
+            if let Some(first) = reserved_first {
+                let old_tail = old_tail.expect("non-empty FAT chain must have a cached tail");
+                // An ambiguous mirrored-FAT failure retains the reservation;
+                // freeing a possibly referenced cluster would corrupt data.
+                match fs.attach_reserved_chain(old_tail, first) {
+                    Ok(()) => {}
+                    Err(AttachReservedError::Isolated(error)) => {
+                        fs.release_reserved_chain(first);
+                        return Err(error);
+                    }
+                    Err(AttachReservedError::Ambiguous(error)) => {
+                        self.chain_extent = None;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        let resulting_first = if old_chain_exists {
+            self.first_cluster
+        } else {
+            reserved_first.ok_or(SystemError::EIO)?
+        };
+        if let Some(tail) = reserved_last {
+            self.chain_extent = Some((allocated_clusters + clusters_to_allocate, tail));
+        }
+        let mut proposed = self.short_dir_entry;
+        proposed.set_first_cluster(resulting_first);
+        proposed.file_size = new_size as u32;
         let short_entry_offset = fs.cluster_bytes_offset(self.loc.1 .0) + self.loc.1 .1;
-        // todo: 更新时间信息
-        //
-        // 这里只提交文件可达性所需的首簇和长度元数据，不提前发出设备
-        // barrier。调用者随后还要写入实际文件数据；若这里使用 flush()，
-        // O_SYNC 扩展写会在数据写入前后各做一次昂贵且顺序错误的 barrier。
-        //
-        // 当前 FAT 不延迟 FAT chain 或 short direntry 元数据：
-        // FATFile::write()/ensure_len() 返回前，这些写已经提交给底层设备。
-        // file-level fsync 会在数据页写回完成后执行最终 gendisk.sync()。
-        // 若未来引入延迟 metadata，必须同时扩展 FAT 的 sync_file_range()
-        // 以显式提交并等待这些 metadata。
-        self.short_dir_entry
-            .commit_without_barrier(fs, short_entry_offset)?;
-        return Ok(());
+        if let Err(error) = proposed.commit_without_barrier(fs, short_entry_offset) {
+            // The chain may already be reachable on disk. Keep it as
+            // preallocation at the old visible size so a retry reuses it.
+            if !old_chain_exists {
+                self.first_cluster = resulting_first;
+                self.short_dir_entry.set_first_cluster(resulting_first);
+            }
+            return Err(error);
+        }
+
+        self.first_cluster = resulting_first;
+        self.short_dir_entry = proposed;
+        Ok(())
     }
 
     /// @brief 把分区上[range_start, range_end)范围的数据清零
@@ -336,7 +391,11 @@ impl FATFile {
         }
 
         // 限制每次写入的缓冲区大小，避免大文件扩展时分配过大内存
-        let zeroes: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
+        let mut zeroes = Vec::new();
+        zeroes
+            .try_reserve_exact(ZERO_BUF_SIZE)
+            .map_err(|_| SystemError::ENOMEM)?;
+        zeroes.resize(ZERO_BUF_SIZE, 0);
         let mut offset = range_start;
         let mut remain = (range_end - range_start) as usize;
 
@@ -378,6 +437,11 @@ impl FATFile {
             self.short_dir_entry.set_first_cluster(Cluster::new(0));
             self.first_cluster = Cluster::new(0);
         }
+
+        // Truncation changes the tail and can partially preallocate on some
+        // error paths. Re-measure once on the next growth instead of keeping a
+        // second, independently updated truncation state machine.
+        self.chain_extent = None;
 
         self.set_size(new_size as u32);
         // 计算短目录项在分区内的字节偏移量
@@ -1176,7 +1240,11 @@ impl LongDirEntry {
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
         let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
-        let mut v: Vec<u8> = vec![0; fs.lba_per_sector() * LBA_SIZE];
+        let buffer_len = fs.lba_per_sector() * LBA_SIZE;
+        let mut v = Vec::new();
+        v.try_reserve_exact(buffer_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        v.resize(buffer_len, 0);
         fs.gendisk.read_at(&mut v, lba)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);
@@ -1311,6 +1379,7 @@ impl ShortDirEntry {
                 first_cluster,
                 short_dir_entry: *self,
                 loc: (loc, loc),
+                chain_extent: None,
             };
 
             // 根据当前短目录项的类型的不同，返回对应的枚举类型。
@@ -1354,6 +1423,7 @@ impl ShortDirEntry {
                 file_name: name,
                 loc,
                 short_dir_entry: *self,
+                chain_extent: None,
             };
 
             if self.is_file() {
@@ -1404,7 +1474,11 @@ impl ShortDirEntry {
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
         let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
-        let mut v: Vec<u8> = vec![0; fs.lba_per_sector() * LBA_SIZE];
+        let buffer_len = fs.lba_per_sector() * LBA_SIZE;
+        let mut v = Vec::new();
+        v.try_reserve_exact(buffer_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        v.resize(buffer_len, 0);
         fs.gendisk.read_at(&mut v, lba)?;
 
         let mut cursor: VecCursor = VecCursor::new(v);

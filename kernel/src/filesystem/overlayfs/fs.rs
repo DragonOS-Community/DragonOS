@@ -1,11 +1,11 @@
 use super::config::OverlayMountData;
 use super::entry::OvlLayer;
-use super::inode::{DirState, OvlInode};
+use super::inode::{DirState, OvlInode, OvlLinkState};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
 use crate::filesystem::vfs::{
     self, vcore::generate_inode_id, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode,
-    InodeId, MountableFileSystem, SuperBlock,
+    InodeId, LinkMutationCoordinator, MountableFileSystem, SuperBlock,
 };
 use crate::libs::{casting::DowncastArc, mutex::Mutex};
 use crate::process::Cred;
@@ -14,21 +14,23 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+use hashbrown::HashMap;
 use system_error::SystemError;
 
 const MAX_MOUNT_ANCESTOR_DEPTH: usize = vfs::MAX_PATHLEN;
 const INODE_CACHE_PRUNE_INTERVAL: usize = 256;
 type LowerRoot = (String, Arc<dyn IndexNode>);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct RealInodeIdentity {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct RealInodeIdentity {
     filesystem: usize,
     dev_id: usize,
     inode_id: InodeId,
 }
 
 impl RealInodeIdentity {
-    fn from_inode(inode: &Arc<dyn IndexNode>) -> Result<Self, SystemError> {
+    pub(super) fn from_inode(inode: &Arc<dyn IndexNode>) -> Result<Self, SystemError> {
         let fs = OverlayFS::canonical_backing_fs(inode);
         let metadata = inode.metadata()?;
         Ok(Self {
@@ -46,6 +48,39 @@ enum OvlInodeOrigin {
         upper: Option<RealInodeIdentity>,
     },
     Upper(RealInodeIdentity),
+}
+
+/// Stable identity of one overlay-visible non-directory inode.
+///
+/// Once an inode has a lower origin, copy-up must not change this identity.
+/// Pure-upper inodes use the backing upper identity directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum OvlLinkIdentity {
+    Lower(RealInodeIdentity),
+    Upper(RealInodeIdentity),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OvlLinkSeed {
+    identity: OvlLinkIdentity,
+    initial_nlinks: usize,
+}
+
+impl OvlLinkSeed {
+    pub(super) fn new(identity: OvlLinkIdentity, initial_nlinks: usize) -> Self {
+        Self {
+            identity,
+            initial_nlinks,
+        }
+    }
+
+    pub(super) fn identity(self) -> OvlLinkIdentity {
+        self.identity
+    }
+
+    pub(super) fn initial_nlinks(self) -> usize {
+        self.initial_nlinks
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,6 +126,179 @@ struct OvlInodeCache {
     /// number is only meaningful for the OvlInode cache lifetime.
     recent_fallback_dirs: VecDeque<Arc<OvlInode>>,
     insertions_since_prune: usize,
+}
+
+#[derive(Debug, Default)]
+struct OvlLinkStateCache {
+    entries: HashMap<OvlLinkIdentity, Weak<OvlLinkState>>,
+    coordinators: HashMap<OvlLinkIdentity, Weak<LinkMutationCoordinator>>,
+    /// Copy-up publishes this small identity connector before the new upper
+    /// name becomes visible. It preserves a lower-origin seed without eagerly
+    /// allocating the shared mutation state on lookup or open.
+    connectors: HashMap<RealInodeIdentity, OvlLinkSeed>,
+    /// Lower-origin states are created only for a logical link-count mutation.
+    /// A mutation guard pins here before the backing commit so retaining the
+    /// authoritative union count can never allocate after namespace change.
+    divergent: HashMap<OvlLinkIdentity, Arc<OvlLinkState>>,
+    insertions_since_prune: usize,
+    coordinator_insertions_since_prune: usize,
+}
+
+impl OvlLinkStateCache {
+    fn intern_coordinator(
+        &mut self,
+        identity: OvlLinkIdentity,
+    ) -> Result<Arc<LinkMutationCoordinator>, SystemError> {
+        if let Some(coordinator) = self.coordinators.get(&identity).and_then(Weak::upgrade) {
+            return Ok(coordinator);
+        }
+        if self.coordinator_insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.coordinators
+                .retain(|_, coordinator| coordinator.strong_count() != 0);
+            self.coordinator_insertions_since_prune = 0;
+        }
+        self.coordinators
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let coordinator =
+            Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?;
+        self.coordinators
+            .insert(identity, Arc::downgrade(&coordinator));
+        self.coordinator_insertions_since_prune += 1;
+        Ok(coordinator)
+    }
+
+    fn resolve(&self, identity: OvlLinkIdentity) -> Option<Arc<OvlLinkState>> {
+        self.entries.get(&identity).and_then(Weak::upgrade)
+    }
+
+    fn intern(
+        &mut self,
+        identity: OvlLinkIdentity,
+        upper_alias: Option<OvlLinkIdentity>,
+        nlinks: usize,
+    ) -> Result<Arc<OvlLinkState>, SystemError> {
+        if let Some(state) = self
+            .resolve(identity)
+            .or_else(|| upper_alias.and_then(|upper_identity| self.resolve(upper_identity)))
+        {
+            self.entries
+                .try_reserve(1 + usize::from(upper_alias.is_some()))
+                .map_err(|_| SystemError::ENOMEM)?;
+            self.entries.insert(identity, Arc::downgrade(&state));
+            if let Some(upper_identity) = upper_alias {
+                self.entries.insert(upper_identity, Arc::downgrade(&state));
+            }
+            return Ok(state);
+        }
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, state| state.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+        self.entries
+            .try_reserve(1 + usize::from(upper_alias.is_some()))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let state =
+            Arc::try_new(OvlLinkState::new(identity, nlinks)).map_err(|_| SystemError::ENOMEM)?;
+        self.entries.insert(identity, Arc::downgrade(&state));
+        if let Some(upper_identity) = upper_alias {
+            self.entries.insert(upper_identity, Arc::downgrade(&state));
+        }
+        self.insertions_since_prune += 1;
+        Ok(state)
+    }
+
+    fn begin_mutation(&mut self, state: &Arc<OvlLinkState>) -> Result<bool, SystemError> {
+        let identity = state.identity();
+        if self.divergent.contains_key(&identity) {
+            return Ok(false);
+        }
+        self.divergent
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.divergent.insert(identity, state.clone());
+        Ok(true)
+    }
+
+    fn abort_mutation(&mut self, state: &Arc<OvlLinkState>, newly_pinned: bool) {
+        if newly_pinned
+            && self
+                .divergent
+                .get(&state.identity())
+                .is_some_and(|current| Arc::ptr_eq(current, state))
+        {
+            self.divergent.remove(&state.identity());
+        }
+    }
+
+    fn alias(
+        &mut self,
+        alias: OvlLinkIdentity,
+        state: &Arc<OvlLinkState>,
+    ) -> Result<(), SystemError> {
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.entries.insert(alias, Arc::downgrade(state));
+        Ok(())
+    }
+
+    fn commit_mutation(&mut self, state: &Arc<OvlLinkState>, nlinks: usize) {
+        let identity = state.identity();
+        if nlinks == 0 {
+            if self
+                .divergent
+                .get(&identity)
+                .is_some_and(|current| Arc::ptr_eq(current, state))
+            {
+                self.divergent.remove(&identity);
+            }
+            self.connectors
+                .retain(|_, seed| seed.identity() != identity);
+            self.entries.retain(|_, cached| {
+                cached
+                    .upgrade()
+                    .is_some_and(|current| !Arc::ptr_eq(&current, state))
+            });
+        } else {
+            debug_assert!(self.divergent.contains_key(&identity));
+        }
+    }
+
+    fn connector(&self, upper: RealInodeIdentity) -> Option<OvlLinkSeed> {
+        self.connectors.get(&upper).copied()
+    }
+}
+
+pub(super) struct OvlLinkSeedPublication {
+    fs: Arc<OverlayFS>,
+    upper: RealInodeIdentity,
+    seed: OvlLinkSeed,
+    inserted: bool,
+    committed: bool,
+}
+
+impl OvlLinkSeedPublication {
+    pub(super) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for OvlLinkSeedPublication {
+    fn drop(&mut self) {
+        if self.committed || !self.inserted {
+            return;
+        }
+        let mut cache = self.fs.link_state_cache.lock();
+        if cache.connectors.get(&self.upper) == Some(&self.seed) {
+            cache.connectors.remove(&self.upper);
+        }
+        if cache.connectors.is_empty() {
+            self.fs
+                .link_seed_connectors_present
+                .store(false, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -175,6 +383,8 @@ pub(super) struct OverlayFS {
     pub(super) backing_cred: Arc<Cred>,
     pub(super) samefs: bool,
     inode_cache: Mutex<OvlInodeCache>,
+    link_state_cache: Mutex<OvlLinkStateCache>,
+    link_seed_connectors_present: AtomicBool,
     dir_state_cache: Mutex<DirStateCache>,
     ancestor_publications: Mutex<AncestorPublicationCache>,
     copy_up_locks: Vec<Mutex<()>>,
@@ -225,28 +435,46 @@ impl OverlayFS {
         upper_inode: Option<Arc<dyn IndexNode>>,
         lower_inodes: Vec<Arc<dyn IndexNode>>,
         replace_stale: bool,
+        initial_nlinks: usize,
     ) -> Result<Option<Arc<OvlInode>>, SystemError> {
-        let origin = if lower_inodes.is_empty() {
-            OvlInodeOrigin::Upper(RealInodeIdentity::from_inode(
-                upper_inode.as_ref().ok_or(SystemError::ENOENT)?,
-            )?)
+        let upper_identity = upper_inode
+            .as_ref()
+            .map(RealInodeIdentity::from_inode)
+            .transpose()?;
+        let recovered_seed = if lower_inodes.is_empty() && file_type != FileType::Dir {
+            upper_identity.and_then(|upper| self.resolve_link_seed(upper))
+        } else {
+            None
+        };
+        let origin = if let Some(seed) = recovered_seed {
+            let OvlLinkIdentity::Lower(lower) = seed.identity() else {
+                return Err(SystemError::EIO);
+            };
+            OvlInodeOrigin::Lower {
+                lower: alloc::vec![lower],
+                upper: upper_identity,
+            }
+        } else if lower_inodes.is_empty() {
+            OvlInodeOrigin::Upper(upper_identity.ok_or(SystemError::ENOENT)?)
         } else {
             OvlInodeOrigin::Lower {
                 lower: lower_inodes
                     .iter()
                     .map(RealInodeIdentity::from_inode)
                     .collect::<Result<Vec<_>, _>>()?,
-                upper: upper_inode
-                    .as_ref()
-                    .map(RealInodeIdentity::from_inode)
-                    .transpose()?,
+                upper: upper_identity,
             }
+        };
+        let link_identity = match &origin {
+            OvlInodeOrigin::Lower { lower, .. } => {
+                lower.first().copied().map(OvlLinkIdentity::Lower)
+            }
+            OvlInodeOrigin::Upper(identity) => Some(OvlLinkIdentity::Upper(*identity)),
         };
         let key = OvlInodeCacheKey {
             redirect: redirect.clone(),
             origin,
         };
-
         let retain_fallback_dir = !self.samefs && file_type == FileType::Dir;
         let expected_has_upper = upper_inode.is_some();
         let inode = loop {
@@ -272,12 +500,24 @@ impl OverlayFS {
 
             let replacement = {
                 let fallback_id = retain_fallback_dir.then(generate_inode_id);
+                // A cache hit already owns the canonical coordinator. Only
+                // intern one when this lookup really needs a new inode; the
+                // cache comparison below decides which racing replacement is
+                // published, and the loser drops its temporary references.
+                let link_coordinator = match link_identity {
+                    Some(identity) if file_type != FileType::Dir => {
+                        self.link_state_cache.lock().intern_coordinator(identity)?
+                    }
+                    _ => Arc::try_new(LinkMutationCoordinator::new())
+                        .map_err(|_| SystemError::ENOMEM)?,
+                };
                 let inode = Arc::new(OvlInode::new(
                     redirect.clone(),
                     file_type,
                     upper_inode.clone(),
                     lower_inodes.clone(),
                     fallback_id,
+                    link_coordinator,
                 ));
                 inode.set_fs(Arc::downgrade(self));
                 inode
@@ -289,7 +529,100 @@ impl OverlayFS {
             }
         };
         inode.load_origin_once()?;
+        if let Some(identity) = link_identity {
+            inode.install_link_seed(
+                identity,
+                recovered_seed
+                    .map(OvlLinkSeed::initial_nlinks)
+                    .unwrap_or(initial_nlinks),
+            );
+        }
         Ok(Some(inode))
+    }
+
+    pub(super) fn resolve_link_state(
+        &self,
+        identity: OvlLinkIdentity,
+    ) -> Option<Arc<OvlLinkState>> {
+        self.link_state_cache.lock().resolve(identity)
+    }
+
+    pub(super) fn intern_link_state(
+        &self,
+        identity: OvlLinkIdentity,
+        upper_alias: Option<OvlLinkIdentity>,
+        initial_nlinks: usize,
+    ) -> Result<Arc<OvlLinkState>, SystemError> {
+        self.link_state_cache
+            .lock()
+            .intern(identity, upper_alias, initial_nlinks)
+    }
+
+    pub(super) fn begin_link_mutation(
+        &self,
+        state: &Arc<OvlLinkState>,
+    ) -> Result<bool, SystemError> {
+        self.link_state_cache.lock().begin_mutation(state)
+    }
+
+    pub(super) fn abort_link_mutation(&self, state: &Arc<OvlLinkState>, newly_pinned: bool) {
+        self.link_state_cache
+            .lock()
+            .abort_mutation(state, newly_pinned);
+    }
+
+    pub(super) fn alias_link_state(
+        &self,
+        alias: OvlLinkIdentity,
+        state: &Arc<OvlLinkState>,
+    ) -> Result<(), SystemError> {
+        self.link_state_cache.lock().alias(alias, state)
+    }
+
+    pub(super) fn commit_link_mutation(&self, state: &Arc<OvlLinkState>, nlinks: usize) {
+        let mut cache = self.link_state_cache.lock();
+        cache.commit_mutation(state, nlinks);
+        if cache.connectors.is_empty() {
+            self.link_seed_connectors_present
+                .store(false, Ordering::Release);
+        }
+    }
+
+    fn resolve_link_seed(&self, upper: RealInodeIdentity) -> Option<OvlLinkSeed> {
+        if !self.link_seed_connectors_present.load(Ordering::Acquire) {
+            return None;
+        }
+        self.link_state_cache.lock().connector(upper)
+    }
+
+    pub(super) fn prepare_link_seed_publication(
+        self: &Arc<Self>,
+        upper: RealInodeIdentity,
+        seed: OvlLinkSeed,
+    ) -> Result<OvlLinkSeedPublication, SystemError> {
+        let mut cache = self.link_state_cache.lock();
+        let inserted = match cache.connectors.get(&upper) {
+            Some(current) if *current == seed => false,
+            Some(_) => return Err(SystemError::EIO),
+            None => {
+                cache
+                    .connectors
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                cache.connectors.insert(upper, seed);
+                true
+            }
+        };
+        self.link_seed_connectors_present
+            .store(true, Ordering::Release);
+        drop(cache);
+        Ok(OvlLinkSeedPublication {
+            fs: self.clone(),
+            upper,
+            seed,
+            inserted,
+            committed: false,
+        })
     }
 
     pub(super) fn cached_lower_dirs(
@@ -554,6 +887,7 @@ impl MountableFileSystem for OverlayFS {
                 Some(upper_inode.clone()),
                 Vec::new(),
                 None,
+                Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?,
             )),
             index: 0,
             fsid: 0,
@@ -588,6 +922,8 @@ impl MountableFileSystem for OverlayFS {
                         None,
                         vec![lower_inode.clone()],
                         None,
+                        Arc::try_new(LinkMutationCoordinator::new())
+                            .map_err(|_| SystemError::ENOMEM)?,
                     )),
                     index: (i + 1) as u32,
                     fsid: (i + 1) as u32,
@@ -643,6 +979,7 @@ impl MountableFileSystem for OverlayFS {
                 .map(|(_, lower_inode)| lower_inode.clone())
                 .collect(),
             (!samefs).then(generate_inode_id),
+            Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?,
         ));
 
         let super_block = SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255);
@@ -665,6 +1002,8 @@ impl MountableFileSystem for OverlayFS {
                 backing_cred,
                 samefs,
                 inode_cache: Mutex::new(OvlInodeCache::default()),
+                link_state_cache: Mutex::new(OvlLinkStateCache::default()),
+                link_seed_connectors_present: AtomicBool::new(false),
                 dir_state_cache: Mutex::new(DirStateCache::default()),
                 ancestor_publications: Mutex::new(AncestorPublicationCache::default()),
                 copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),

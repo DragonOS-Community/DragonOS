@@ -116,6 +116,7 @@ pub struct PacketSocket {
     memberships: Mutex<mreq::PacketMembershipState>,
     inode_id: InodeId,
     open_files: AtomicUsize,
+    fsnotify_watches: AtomicUsize,
     pub(super) self_ref: Weak<Self>,
     pub(super) netns: Arc<NetNamespace>,
     /// cBPF filter program; an empty slot is the single source of truth for “not installed”.
@@ -172,6 +173,7 @@ impl PacketSocket {
             memberships: Mutex::new(mreq::PacketMembershipState::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            fsnotify_watches: AtomicUsize::new(0),
             self_ref: me.clone(),
             netns,
             fanout_membership: AtomicU64::new(0),
@@ -284,6 +286,10 @@ pub fn deliver_ip_to_packet_sockets(iface: &Arc<dyn Iface>, packet: &[u8], pkt_t
 }
 
 impl Socket for PacketSocket {
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize {
+        &self.fsnotify_watches
+    }
+
     fn open_file_counter(&self) -> &AtomicUsize {
         &self.open_files
     }

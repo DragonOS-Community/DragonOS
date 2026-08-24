@@ -57,6 +57,7 @@ impl OvlInode {
                 Some(context) => workdir.unlink_with_context(name, context),
                 None => workdir.unlink(name),
             }
+            .map(|_| ())
         }
     }
 }

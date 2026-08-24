@@ -13,6 +13,10 @@ use super::{InetSocket, RawSocket};
 type EP = crate::filesystem::epoll::EPollEventType;
 
 impl crate::net::socket::Socket for RawSocket {
+    fn fsnotify_watch_counter(&self) -> &core::sync::atomic::AtomicUsize {
+        &self.fsnotify_watches
+    }
+
     fn open_file_counter(&self) -> &core::sync::atomic::AtomicUsize {
         &self.open_files
     }

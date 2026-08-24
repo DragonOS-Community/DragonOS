@@ -23,7 +23,6 @@ use crate::filesystem::vfs::mount::filesystem_is_synchronous;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{Magic, SpecialNodeData, SuperBlock};
 use crate::ipc::pipe::LockedPipeInode;
-use crate::libs::casting::DowncastArc;
 use crate::libs::rwsem::RwSem;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::VmFaultReason;
@@ -32,7 +31,8 @@ use crate::{
     filesystem::vfs::{
         file::{FileFlags, FilePrivateData},
         vcore::generate_inode_id,
-        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata, SetMetadataMask,
+        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, LinkMutationCoordinator,
+        LinkRemovalOutcome, Metadata, RenameOutcome, SetMetadataMask,
     },
     libs::{
         mutex::{Mutex, MutexGuard},
@@ -137,10 +137,15 @@ pub struct FATFileSystem {
 
 /// FAT文件系统的Inode
 #[derive(Debug)]
-pub struct LockedFATInode(Mutex<FATInode>, RwSem<()>);
+pub struct LockedFATInode(Mutex<FATInode>, RwSem<()>, LinkMutationCoordinator);
 
 #[derive(Debug)]
 pub struct LockedFATFsInfo(Mutex<FATFsInfo>);
+
+pub(super) enum AttachReservedError {
+    Isolated(SystemError),
+    Ambiguous(SystemError),
+}
 
 impl LockedFATFsInfo {
     #[inline]
@@ -332,6 +337,7 @@ impl LockedFATInode {
                 page_cache: None,
             }),
             RwSem::new(()),
+            LinkMutationCoordinator::new(),
         ));
 
         if !inode.0.lock().inode_type.is_dir() {
@@ -359,7 +365,7 @@ impl LockedFATInode {
         old_name: &str,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         if flags.contains(RenameFlags::WHITEOUT) {
             return Err(SystemError::EINVAL);
         }
@@ -367,7 +373,7 @@ impl LockedFATInode {
             if flags.contains(RenameFlags::NOREPLACE) {
                 return Err(SystemError::EEXIST);
             }
-            return Ok(());
+            return Ok(RenameOutcome::NoOp);
         }
         let old_key = to_search_name(old_name);
         let new_key = to_search_name(new_name);
@@ -377,10 +383,15 @@ impl LockedFATInode {
             if flags.contains(RenameFlags::NOREPLACE) {
                 return Err(SystemError::EEXIST);
             }
-            return Ok(());
+            return Ok(RenameOutcome::NoOp);
         }
         let old_inode = guard.find(old_name)?;
-        let new_inode = guard.find(new_name).ok();
+        let new_inode = match guard.find(new_name) {
+            Ok(inode) => Some(inode),
+            Err(SystemError::ENOENT) => None,
+            Err(error) => return Err(error),
+        };
+        let had_new = new_inode.is_some();
         if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_some() {
             return Err(SystemError::EEXIST);
         }
@@ -414,7 +425,9 @@ impl LockedFATInode {
         guard.mark_child_negative(old_key);
         guard.children.insert(new_key, old_inode);
 
-        Ok(())
+        Ok(RenameOutcome::Moved {
+            replaced: had_new.then_some(LinkRemovalOutcome::LastLink),
+        })
     }
 
     #[inline(never)]
@@ -424,7 +437,7 @@ impl LockedFATInode {
         new_name: &str,
         target: &Arc<dyn IndexNode>,
         flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         if flags.contains(RenameFlags::WHITEOUT) {
             return Err(SystemError::EINVAL);
         }
@@ -435,14 +448,18 @@ impl LockedFATInode {
 
         let mut new_guard = other.0.lock();
         let old_inode: Arc<LockedFATInode> = old_guard.find(old_name)?;
-        let new_inode = new_guard.find(new_name);
+        let new_inode = match new_guard.find(new_name) {
+            Ok(inode) => Some(inode),
+            Err(SystemError::ENOENT) => None,
+            Err(error) => return Err(error),
+        };
 
-        if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_ok() {
+        if flags.contains(RenameFlags::NOREPLACE) && new_inode.is_some() {
             return Err(SystemError::EEXIST);
         }
 
         if flags.contains(RenameFlags::EXCHANGE) {
-            if new_inode.is_err() {
+            if new_inode.is_none() {
                 return Err(SystemError::ENOENT);
             }
             // TODO: Implement EXCHANGE logic
@@ -474,8 +491,13 @@ impl LockedFATInode {
             }
         };
 
-        old_inode_guard.inode_type =
-            old_dir.rename_across(fs, new_dir, old_name, new_name, new_inode)?;
+        old_inode_guard.inode_type = old_dir.rename_across(
+            fs,
+            new_dir,
+            old_name,
+            new_name,
+            new_inode.clone().ok_or(SystemError::ENOENT),
+        )?;
         // 将源节点从父目录中删除
         let old_key = to_search_name(old_name);
         let new_key = to_search_name(new_name);
@@ -484,7 +506,9 @@ impl LockedFATInode {
         old_guard.mark_child_negative(old_key);
         new_guard.invalidate_negative_children();
         new_guard.children.insert(new_key, old_inode);
-        Ok(())
+        Ok(RenameOutcome::Moved {
+            replaced: new_inode.map(|_| LinkRemovalOutcome::LastLink),
+        })
     }
 }
 
@@ -612,7 +636,15 @@ impl FATFileSystem {
             }
         }
 
-        // FSInfo 不可用：扫描 FAT 表（一次性），并回填缓存（FAT32 则后续可 flush 到盘）。
+        // FSInfo 不可用：在分配器使用的同一 FAT 锁下复查、扫描并回填。
+        // 否则并发分配可能发生在扫描与绝对值回填之间，导致高估空闲簇。
+        let _fat_guard = self.fat_lock.lock();
+        {
+            let guard = self.fs_info.0.lock();
+            if let Some(n) = guard.count_free_cluster(max_cluster) {
+                return Ok(n);
+            }
+        }
         let free_clusters = self.scan_free_clusters(max_cluster)?;
 
         if free_clusters <= u32::MAX as u64 {
@@ -777,6 +809,7 @@ impl FATFileSystem {
                 page_cache: None,
             }),
             RwSem::new(()),
+            LinkMutationCoordinator::new(),
         ));
 
         let result: Arc<FATFileSystem> = Arc::new(FATFileSystem {
@@ -1063,6 +1096,25 @@ impl FATFileSystem {
     /// @return Ok(Cluster) 新获取的空闲簇
     /// @return Err(SystemError) 错误码
     pub fn allocate_cluster(&self, prev_cluster: Option<Cluster>) -> Result<Cluster, SystemError> {
+        // Prepare the full-cluster zero buffer before reserving any FAT entry.
+        // OOM must not leave an unreachable allocated cluster behind.
+        let cluster_len = self.bytes_per_cluster() as usize;
+        let mut zeros = Vec::new();
+        zeros
+            .try_reserve_exact(cluster_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        zeros.resize(cluster_len, 0);
+
+        self.allocate_cluster_with_buffer(prev_cluster, &zeros)
+    }
+
+    pub(super) fn allocate_cluster_with_buffer(
+        &self,
+        prev_cluster: Option<Cluster>,
+        zeros: &[u8],
+    ) -> Result<Cluster, SystemError> {
+        debug_assert_eq!(zeros.len(), self.bytes_per_cluster() as usize);
+
         let _fat_guard = self.fat_lock.lock();
         let end_cluster: Cluster = self.max_cluster_number();
         let start_cluster: Cluster = match self.bpb.fat_type {
@@ -1086,7 +1138,14 @@ impl FATFileSystem {
             Err(e) => return Err(e),
         };
 
-        self.set_entry(free_cluster, FATEntry::EndOfChain)?;
+        if let Err(error) = self.set_entry(free_cluster, FATEntry::EndOfChain) {
+            if self.set_entry(free_cluster, FATEntry::Unused).is_err() {
+                // A mirrored FAT write may have reached only some copies. Do
+                // not keep advertising an exact free count in that state.
+                self.fs_info.0.lock().update_free_count_abs(u32::MAX);
+            }
+            return Err(error);
+        }
         // 减少空闲簇计数
         self.fs_info.0.lock().update_free_count_delta(-1);
         // 更新搜索空闲簇的参考量
@@ -1095,19 +1154,116 @@ impl FATFileSystem {
             .lock()
             .update_next_free((free_cluster.cluster_num + 1) as u32);
 
-        // 如果这个空闲簇不是簇链的第一个簇，那么把当前簇跟前一个簇连上。
-        if let Some(prev_cluster) = prev_cluster {
-            // debug!("set entry, prev ={prev_cluster:?}, next = {free_cluster:?}");
-            self.set_entry(prev_cluster, FATEntry::Next(free_cluster))?;
-        }
-        // The cluster is now reserved and linked, so another allocator cannot
-        // select it.  Do not serialize data-area zeroing behind the FAT
-        // metadata lock; callers already hold the owning inode lock until this
-        // initialization completes.
+        // The cluster is reserved but deliberately not linked yet. Zero it
+        // outside the global FAT lock, then publish the predecessor edge. A
+        // failure can therefore restore this isolated entry without exposing
+        // an uninitialized cluster through the file chain.
         drop(_fat_guard);
-        // 清空新获取的这个簇
-        self.zero_cluster(free_cluster)?;
+        if let Err(error) = self.zero_cluster_with_buffer(free_cluster, &zeros) {
+            let _fat_guard = self.fat_lock.lock();
+            self.rollback_reserved_cluster_locked(free_cluster);
+            return Err(error);
+        }
+        if let Some(prev_cluster) = prev_cluster {
+            let _fat_guard = self.fat_lock.lock();
+            let predecessor = match self.get_fat_entry(prev_cluster) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.rollback_reserved_cluster_locked(free_cluster);
+                    return Err(error);
+                }
+            };
+            if !matches!(predecessor, FATEntry::EndOfChain) {
+                self.rollback_reserved_cluster_locked(free_cluster);
+                return Err(SystemError::EIO);
+            }
+            if let Err(error) = self.set_entry(prev_cluster, FATEntry::Next(free_cluster)) {
+                // set_entry may have updated only part of a mirrored FAT. It
+                // is safe to free the new cluster only after the predecessor
+                // is definitely restored to EOC. Otherwise retain the
+                // reservation: a conservative leak is preferable to a live
+                // chain pointing at a cluster that can be reallocated.
+                if self.set_entry(prev_cluster, FATEntry::EndOfChain).is_ok() {
+                    self.rollback_reserved_cluster_locked(free_cluster);
+                } else {
+                    error!(
+                        "FAT: failed to restore predecessor {:?} after linking {:?}",
+                        prev_cluster, free_cluster
+                    );
+                }
+                return Err(error);
+            }
+        }
         return Ok(free_cluster);
+    }
+
+    /// Attach an already allocated, zeroed cluster chain to an EOC tail.
+    ///
+    /// The caller owns `first_cluster` as an isolated reservation. On a
+    /// partial mirrored-FAT failure this method restores the predecessor when
+    /// possible, but deliberately leaves the reservation allocated; the
+    /// caller decides whether it is safe to release the isolated chain.
+    pub(super) fn attach_reserved_chain(
+        &self,
+        prev_cluster: Cluster,
+        first_cluster: Cluster,
+    ) -> Result<(), AttachReservedError> {
+        let _fat_guard = self.fat_lock.lock();
+        let predecessor = self
+            .get_fat_entry(prev_cluster)
+            .map_err(AttachReservedError::Isolated)?;
+        if !matches!(predecessor, FATEntry::EndOfChain) {
+            return Err(AttachReservedError::Isolated(SystemError::EIO));
+        }
+        if let Err(error) = self.set_entry(prev_cluster, FATEntry::Next(first_cluster)) {
+            if self.set_entry(prev_cluster, FATEntry::EndOfChain).is_err() {
+                error!(
+                    "FAT: failed to restore predecessor {:?} after attaching {:?}",
+                    prev_cluster, first_cluster
+                );
+                self.fs_info.0.lock().update_free_count_abs(u32::MAX);
+                return Err(AttachReservedError::Ambiguous(error));
+            }
+            return Err(AttachReservedError::Isolated(error));
+        }
+        Ok(())
+    }
+
+    /// Release a chain which has not been made reachable from a directory
+    /// entry or an existing file chain. No allocation is performed here.
+    pub(super) fn release_reserved_chain(&self, first_cluster: Cluster) {
+        let _fat_guard = self.fat_lock.lock();
+        let mut current = first_cluster;
+        for _ in 0..self.max_cluster_number().cluster_num {
+            let next = match self.get_fat_entry(current) {
+                Ok(FATEntry::Next(next)) => Some(next),
+                Ok(FATEntry::EndOfChain) => None,
+                Ok(_) | Err(_) => {
+                    error!("FAT: invalid reserved chain at {:?}", current);
+                    return;
+                }
+            };
+            if !self.rollback_reserved_cluster_locked(current) {
+                return;
+            }
+            match next {
+                Some(next) => current = next,
+                None => return,
+            }
+        }
+        error!("FAT: cycle detected while releasing reserved chain");
+    }
+
+    fn rollback_reserved_cluster_locked(&self, cluster: Cluster) -> bool {
+        if self.set_entry(cluster, FATEntry::Unused).is_err() {
+            self.fs_info.0.lock().update_free_count_abs(u32::MAX);
+            error!("FAT: failed to release reserved cluster {:?}", cluster);
+            return false;
+        }
+        let mut info = self.fs_info.0.lock();
+        info.update_free_count_delta(1);
+        info.update_next_free(cluster.cluster_num as u32);
+        true
     }
 
     /// @brief 释放簇链上的所有簇
@@ -1253,6 +1409,17 @@ impl FATFileSystem {
             .cluster_iter(start_cluster)
             .fold(0, |size, _cluster| size + 1);
     }
+
+    /// Return the number of clusters and the tail in one FAT traversal.
+    pub fn chain_len_and_tail(&self, start_cluster: Cluster) -> Option<(u64, Cluster)> {
+        let mut count = 0;
+        let mut tail = None;
+        for cluster in self.cluster_iter(start_cluster) {
+            count += 1;
+            tail = Some(cluster);
+        }
+        tail.map(|tail| (count, tail))
+    }
     /// @brief 获取一个簇迭代器对象
     ///
     /// @param start_cluster 整个FAT链的起始簇号
@@ -1267,12 +1434,6 @@ impl FATFileSystem {
     #[inline]
     pub fn get_cluster_by_relative(&self, start_cluster: Cluster, n: usize) -> Option<Cluster> {
         return self.cluster_iter(start_cluster).nth(n);
-    }
-
-    /// @brief 获取整个簇链的最后一个簇
-    #[inline]
-    pub fn get_last_cluster(&self, start_cluster: Cluster) -> Option<Cluster> {
-        return self.cluster_iter(start_cluster).last();
     }
 
     /// @brief 判断FAT文件系统的shut bit是否正常。
@@ -1562,7 +1723,10 @@ impl FATFileSystem {
 
                 let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
-                let mut v: Vec<u8> = vec![0; LBA_SIZE];
+                let mut v = Vec::new();
+                v.try_reserve_exact(LBA_SIZE)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                v.resize(LBA_SIZE, 0);
                 self.gendisk.read_at(&mut v, lba)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
@@ -1595,7 +1759,10 @@ impl FATFileSystem {
 
                 let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(fat_part_bytes_offset));
 
-                let mut v: Vec<u8> = vec![0; LBA_SIZE];
+                let mut v = Vec::new();
+                v.try_reserve_exact(LBA_SIZE)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                v.resize(LBA_SIZE, 0);
                 self.gendisk.read_at(&mut v, lba)?;
 
                 let mut cursor: VecCursor = VecCursor::new(v);
@@ -1622,7 +1789,10 @@ impl FATFileSystem {
                     let lba = self.gendisk_lba_from_offset(self.bytes_to_sector(f_offset));
 
                     // debug!("set entry, lba={lba}, in_block_offset={in_block_offset}");
-                    let mut v: Vec<u8> = vec![0; LBA_SIZE];
+                    let mut v = Vec::new();
+                    v.try_reserve_exact(LBA_SIZE)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    v.resize(LBA_SIZE, 0);
                     self.gendisk.read_at(&mut v, lba)?;
 
                     let mut cursor: VecCursor = VecCursor::new(v);
@@ -1673,10 +1843,20 @@ impl FATFileSystem {
     /// - cluster 要被清空的簇
     pub fn zero_cluster(&self, cluster: Cluster) -> Result<(), SystemError> {
         // 准备数据，用于写入
-        let zeros: Vec<u8> = vec![0u8; self.bytes_per_cluster() as usize];
+        let len = self.bytes_per_cluster() as usize;
+        let mut zeros = Vec::new();
+        zeros
+            .try_reserve_exact(len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        zeros.resize(len, 0);
+        self.zero_cluster_with_buffer(cluster, &zeros)
+    }
+
+    fn zero_cluster_with_buffer(&self, cluster: Cluster, zeros: &[u8]) -> Result<(), SystemError> {
+        debug_assert_eq!(zeros.len(), self.bytes_per_cluster() as usize);
         let offset = self.cluster_bytes_offset(cluster) as usize;
-        self.gendisk.write_at_bytes(&zeros, offset)?;
-        return Ok(());
+        self.gendisk.write_at_bytes(zeros, offset)?;
+        Ok(())
     }
 }
 
@@ -1883,6 +2063,10 @@ impl LockedFATInode {
 }
 
 impl IndexNode for LockedFATInode {
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        Some(&self.2)
+    }
+
     fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
         Some(self.fs())
     }
@@ -2082,38 +2266,8 @@ impl IndexNode for LockedFATInode {
     }
 
     // fat32 does not support hard link
-    // TODO: remove this function
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        let ty = other.metadata()?.file_type;
-        let mode = other.metadata()?.mode;
-        let other = other
-            .downcast_ref::<LockedFATInode>()
-            .ok_or(SystemError::EINVAL)?;
-
-        let new_inode = self
-            .create(name, ty, mode)?
-            .downcast_arc::<LockedFATInode>()
-            .ok_or(SystemError::EINVAL)?;
-
-        let mut offset = 0;
-        let mut buf = [0u8; 512];
-        loop {
-            let read_len = other.try_read_pagecache(offset, &mut buf)?;
-            if read_len == 0 {
-                break;
-            }
-            log::error!("Fake FATFS(link): read_len={read_len}, offset={offset}");
-            let write_len = new_inode.try_write_pagecache(offset, &buf[0..read_len])?;
-            if write_len < read_len {
-                log::error!(
-                    "Fake FATFS(link): write link file failed, read_len={read_len}, write_len={write_len}"
-                );
-                return Err(SystemError::EIO);
-            }
-            offset += write_len;
-        }
-        log::error!("Fake FATFS(link): link file {name} success, size={offset}");
-        Ok(())
+    fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -2135,6 +2289,15 @@ impl IndexNode for LockedFATInode {
         inode.metadata.mode = metadata.mode;
         inode.metadata.uid = metadata.uid;
         inode.metadata.gid = metadata.gid;
+        Ok(())
+    }
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        let inode = &mut self.0.lock();
+        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, metadata, mask);
         Ok(())
     }
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
@@ -2218,16 +2381,69 @@ impl IndexNode for LockedFATInode {
         }
     }
 
+    fn fallocate_resize_atomic(
+        &self,
+        requested_end: usize,
+        _lock_owner: u64,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _size_guard = self.1.write();
+        if requested_end as u64 > MAX_FILE_SIZE {
+            return Err(SystemError::EFBIG);
+        }
+        let mut guard = self.0.lock();
+        let old_size = guard.metadata.size.max(0) as usize;
+        if requested_end <= old_size {
+            // Linux FAT treats mode-0 fallocate inside i_size as a successful
+            // no-op. The VFS still emits MODIFY, but FAT does not run
+            // file_modified or update cmtime here.
+            return Ok(SetMetadataMask::empty());
+        }
+        crate::filesystem::vfs::vcore::check_file_size_limit(requested_end)?;
+        let fs = guard.fs.upgrade().ok_or(SystemError::EIO)?;
+        match &mut guard.inode_type {
+            FATDirEntry::File(file) | FATDirEntry::VolId(file) => {
+                // Allocate and zero the complete gap before publishing the
+                // new length. Unlike chunked `write()`, ensure_len performs a
+                // single size commit, so a later chunk error cannot expose a
+                // partially advanced i_size for a failed fallocate.
+                file.extend_zeroed(&fs, requested_end as u64, requested_end as u64)?;
+            }
+            FATDirEntry::Dir(_) => return Err(SystemError::ENOSYS),
+            FATDirEntry::UnInit => return Err(SystemError::EROFS),
+        }
+        let (metadata, mut mask) =
+            crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata(
+                guard.metadata.clone(),
+                requested_end,
+            );
+        // Linux FAT's mode-0 fallocate does not call file_modified(), so it
+        // neither performs killpriv nor publishes ATTRIB for a mode change.
+        mask.remove(SetMetadataMask::MODE);
+        crate::filesystem::vfs::merge_metadata_masked(&mut guard.metadata, &metadata, mask);
+        guard.metadata.size = requested_end as i64;
+        guard.synchronize_metadata();
+        let inode_sync = guard.metadata.flags.contains(InodeFlags::S_SYNC);
+        drop(guard);
+        let mounted_fs: Arc<dyn FileSystem> = fs.clone();
+        if inode_sync || filesystem_is_synchronous(&mounted_fs) {
+            fs.gendisk.sync()?;
+        }
+        Ok(mask)
+    }
+
     fn fallocate_file(
         &self,
         mode: i32,
         offset: usize,
         len: usize,
         lock_owner: u64,
+        attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<SetMetadataMask, SystemError> {
+    ) -> Result<(), SystemError> {
         drop(data);
-        crate::filesystem::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
+        crate::filesystem::vfs::vcore::resize_based_fallocate(
+            self, mode, offset, len, lock_owner, attrib,
+        )
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -2303,7 +2519,7 @@ impl IndexNode for LockedFATInode {
         return Ok(());
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
         let mut guard: MutexGuard<FATInode> = self.0.lock();
         let target: Arc<LockedFATInode> = guard.find(name)?;
         // 对目标inode上锁，以防更改
@@ -2317,7 +2533,7 @@ impl IndexNode for LockedFATInode {
             if file_type == FileType::Pipe {
                 guard.invalidate_negative_children();
                 guard.mark_child_negative(to_search_name(name));
-                return Ok(());
+                return Ok(LinkRemovalOutcome::LastLink);
             }
         }
 
@@ -2340,7 +2556,7 @@ impl IndexNode for LockedFATInode {
         if r.is_ok() {
             guard.mark_child_absent(name);
         }
-        return r;
+        r.map(|_| LinkRemovalOutcome::LastLink)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
@@ -2393,17 +2609,15 @@ impl IndexNode for LockedFATInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         let old_id = self.metadata().unwrap().inode_id;
         let new_id = target.metadata().unwrap().inode_id;
         // 若在同一父目录下
         if old_id == new_id {
-            self.rename_file_in_current_dir(old_name, new_name, flags)?;
+            self.rename_file_in_current_dir(old_name, new_name, flags)
         } else {
-            self.move_to_another_dir(old_name, new_name, target, flags)?;
+            self.move_to_another_dir(old_name, new_name, target, flags)
         }
-
-        return Ok(());
     }
 
     fn get_entry_name(&self, ino: InodeId) -> Result<String, SystemError> {

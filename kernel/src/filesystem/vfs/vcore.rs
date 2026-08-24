@@ -20,7 +20,7 @@ use crate::{
             mount::{MountFSInode, MountFlags, MOUNT_LIFECYCLE_LOCK},
             permission::PermissionMask,
             AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, Metadata, MountFS,
-            SetMetadataMask,
+            OpenTruncateContext, SetMetadataMask,
         },
     },
     init::cmdline::kenrel_cmdline_param_manager,
@@ -786,6 +786,25 @@ where
 {
     let md = inode.metadata()?;
 
+    validate_truncate(&inode, &md, len)?;
+    let (md, mask) = prepare_write_side_effect_metadata(md, len);
+    let r = do_resize(&inode, &md, mask);
+    if r.is_ok() {
+        let mut event = FsEvent::MODIFY;
+        if mask.contains(SetMetadataMask::MODE) {
+            // notify_change emits one combined event for ATTR_SIZE|ATTR_MODE.
+            event |= FsEvent::ATTRIB;
+        }
+        fsnotify::fsnotify_inode(event, &inode);
+    }
+    r
+}
+
+fn validate_truncate(
+    inode: &Arc<dyn IndexNode>,
+    md: &Metadata,
+    len: usize,
+) -> Result<(), SystemError> {
     // 防御性检查：统一拒绝超出 isize::MAX 的长度，避免后续类型转换溢出
     if len > isize::MAX as usize {
         return Err(SystemError::EINVAL);
@@ -822,17 +841,7 @@ where
         }
     }
 
-    let (md, mask) = prepare_write_side_effect_metadata(md, len);
-    let r = do_resize(&inode, &md, mask);
-    if r.is_ok() {
-        let mut event = FsEvent::MODIFY;
-        if mask.contains(SetMetadataMask::MODE) {
-            // notify_change emits one combined event for ATTR_SIZE|ATTR_MODE.
-            event |= FsEvent::ATTRIB;
-        }
-        fsnotify::fsnotify_inode(event, &inode);
-    }
-    r
+    Ok(())
 }
 
 pub(crate) fn prepare_write_side_effect_metadata(
@@ -841,6 +850,32 @@ pub(crate) fn prepare_write_side_effect_metadata(
 ) -> (Metadata, SetMetadataMask) {
     let cred = ProcessManager::current_pcb().cred();
     prepare_write_side_effect_metadata_with_cred(md, new_size, &cred)
+}
+
+pub(crate) fn prepare_open_truncate(metadata_before_open: Metadata) -> OpenTruncateContext {
+    let (requested, mask) = prepare_write_side_effect_metadata(metadata_before_open, 0);
+    OpenTruncateContext { requested, mask }
+}
+
+/// Complete Linux's post-open truncate stage for an existing regular file.
+pub(crate) fn vfs_open_truncate(
+    file: &File,
+    context: &OpenTruncateContext,
+) -> Result<(), SystemError> {
+    let inode = file.inode();
+    validate_truncate(&inode, &context.requested, 0)?;
+    inode.resize_open_truncate(
+        0,
+        current_file_lock_owner_id(),
+        file.private_data.lock(),
+        context,
+    )?;
+    let mut event = FsEvent::MODIFY;
+    if context.mask.contains(SetMetadataMask::MODE) {
+        event |= FsEvent::ATTRIB;
+    }
+    file.notify_dentry_event(event);
+    Ok(())
 }
 
 pub(crate) fn prepare_write_side_effect_metadata_with_cred(
@@ -920,7 +955,8 @@ pub fn resize_based_fallocate(
     offset: usize,
     len: usize,
     lock_owner: u64,
-) -> Result<SetMetadataMask, SystemError> {
+    attrib: &mut super::AttribStageObserver<'_>,
+) -> Result<(), SystemError> {
     if mode != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -935,16 +971,14 @@ pub fn resize_based_fallocate(
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    let current_size = md.size.max(0) as usize;
-    if new_size <= current_size {
-        return Ok(SetMetadataMask::empty());
+    // The filesystem re-reads size and metadata inside its native mutation
+    // lock. A VFS snapshot cannot safely decide whether a concurrent grow has
+    // already satisfied the request or which privilege bits remain to clear.
+    let mask = inode.fallocate_resize_atomic(new_size, lock_owner)?;
+    if mask.contains(SetMetadataMask::MODE) {
+        attrib.commit();
     }
-
-    check_file_size_limit(new_size)?;
-
-    let (metadata, mask) = prepare_write_side_effect_metadata(md, new_size);
-    inode.resize_with_metadata(new_size, lock_owner, &metadata, mask)?;
-    Ok(mask)
+    Ok(())
 }
 
 /// 基于已打开文件执行 VFS fallocate 公共检查，再分派给具体文件系统。
@@ -1039,20 +1073,18 @@ pub fn vfs_fallocate_file(
         _ => return Err(SystemError::ENODEV),
     }
 
+    let mut publish_attrib = || file.notify_dentry_event(FsEvent::ATTRIB);
+    let mut attrib = super::AttribStageObserver::new(&mut publish_attrib);
     let r = inode.fallocate_file(
         mode,
         offset,
         len,
         current_file_lock_owner_id(),
+        &mut attrib,
         file.private_data.lock(),
     );
-    // Linux file_modified() reports a committed privilege-bit removal before
-    // vfs_fallocate() reports the successful data modification.
-    if let Ok(mask) = r.as_ref() {
-        if mask.contains(SetMetadataMask::MODE) {
-            file.notify_fs_event(FsEvent::ATTRIB);
-        }
+    if r.is_ok() {
         file.notify_fs_event(FsEvent::MODIFY);
     }
-    r.map(|_| ())
+    r
 }

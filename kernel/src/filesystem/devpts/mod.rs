@@ -385,15 +385,21 @@ impl IndexNode for LockedDevPtsFSInode {
         }
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<crate::filesystem::vfs::LinkRemovalOutcome, SystemError> {
         let mut guard = self.inner.lock();
-        if guard.children_unchecked_mut().remove(name).is_some()
-            && name.as_bytes().iter().all(u8::is_ascii_digit)
-        {
+        let removed = guard
+            .children_unchecked_mut()
+            .remove(name)
+            .ok_or(SystemError::ENOENT)?;
+        if name.as_bytes().iter().all(u8::is_ascii_digit) {
             let fs = guard.fs.upgrade().unwrap();
             fs.pts_count.fetch_sub(1, Ordering::SeqCst);
         }
-        Ok(())
+        drop(removed);
+        Ok(crate::filesystem::vfs::LinkRemovalOutcome::LastLink)
     }
 }
 

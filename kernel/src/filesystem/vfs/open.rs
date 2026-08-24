@@ -3,27 +3,27 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::{
+    FileType, FsPermissionPolicy, IndexNode, InodeMode, MAX_PATHLEN, SetMetadataMask,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
     fcntl::AtFlags,
     file::{File, FileFlags, PreopenedFile},
     mount::{MountFSInode, MountFlags},
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{
-        should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, OwnedLookupOutcome,
-        ResolvedPath,
+        OwnedLookupOutcome, ResolvedPath, should_remove_sgid_on_chown, user_path_at,
+        user_resolved_path_at,
     },
-    vcore::{check_parent_dir_permission_inode, vfs_truncate},
-    FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
-    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    vcore::{check_parent_dir_permission_inode, prepare_open_truncate, vfs_open_truncate},
 };
 use crate::libs::casting::DowncastArc;
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
+use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
 use crate::{
     process::cred::CAPFlags,
     process::cred::GroupInfo,
-    time::{syscall::PosixTimeval, PosixTimeSpec},
+    time::{PosixTimeSpec, syscall::PosixTimeval},
 };
-use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
 use alloc::string::String;
 
 /// 计算创建文件/目录时使用的最终 mode（应用 umask，并丢弃非法位）。
@@ -499,7 +499,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         // Linux clears O_TRUNC for this phase.
         let do_truncate =
             !created && file_type == FileType::File && how.o_flags.contains(FileFlags::O_TRUNC);
-        let truncate_in_vfs = do_truncate && inode.requires_separate_open_truncate(&how.o_flags);
+        let truncate_metadata = do_truncate.then(|| metadata.clone());
         let (inode, mount_guard, operation_guard) = resolved.into_parts();
         let file: File = match preopened {
             Some(opened) => File::new_preopened_with_mount_guard(
@@ -512,20 +512,10 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         };
 
         // Linux emits OPEN from do_dentry_open() before handle_truncate().
-        // Filesystems with atomic O_TRUNC have already completed the resize by
-        // this point, but the externally visible events retain that ordering.
         file.notify_open_event();
-        if do_truncate {
-            if truncate_in_vfs {
-                // handle_truncate() follows open but remains a pathname
-                // setattr operation. In particular, FUSE must not receive an
-                // ftruncate-style FATTR_FH/FATTR_LOCKOWNER request here.
-                vfs_truncate(file.inode(), 0)?;
-            } else {
-                // open(O_TRUNC) metadata notification is a dentry-data event,
-                // unlike read/write path-data events subject to EXCL_UNLINK.
-                fsnotify::fsnotify_inode(FsEvent::MODIFY, &file.inode());
-            }
+        if let Some(metadata_before_open) = truncate_metadata {
+            let context = prepare_open_truncate(metadata_before_open);
+            vfs_open_truncate(&file, &context)?;
         }
         Ok(file)
     })();

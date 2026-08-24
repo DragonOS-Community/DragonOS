@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -83,6 +84,66 @@ class TempFile {
   private:
     std::string path_;
     int fd_ = -1;
+};
+
+class RamfsTempFile {
+  public:
+    RamfsTempFile() {
+        if (mkdtemp(mountpoint_) == nullptr) {
+            error_ = errno;
+            return;
+        }
+        directory_created_ = true;
+        if (mount("", mountpoint_, "ramfs", 0, nullptr) != 0) {
+            error_ = errno;
+            return;
+        }
+        mounted_ = true;
+        path_ = std::string(mountpoint_) + "/file";
+        fd_ = open(path_.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd_ < 0) {
+            error_ = errno;
+        }
+    }
+
+    ~RamfsTempFile() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+        if (!path_.empty()) {
+            unlink(path_.c_str());
+        }
+        if (mounted_) {
+            umount(mountpoint_);
+        }
+        if (directory_created_) {
+            rmdir(mountpoint_);
+        }
+    }
+
+    RamfsTempFile(const RamfsTempFile&) = delete;
+    RamfsTempFile& operator=(const RamfsTempFile&) = delete;
+
+    bool valid() const {
+        return fd_ >= 0;
+    }
+
+    int fd() const {
+        return fd_;
+    }
+
+    int error() const {
+        return error_;
+    }
+
+  private:
+    char mountpoint_[sizeof("/tmp/dunitest_fallocate_ramfs_XXXXXX")] =
+        "/tmp/dunitest_fallocate_ramfs_XXXXXX";
+    std::string path_;
+    int fd_ = -1;
+    int error_ = 0;
+    bool directory_created_ = false;
+    bool mounted_ = false;
 };
 
 off_t FileSize(int fd) {
@@ -168,6 +229,28 @@ TEST(FallocateSemantics, Mode0DoesNotShrink) {
     EXPECT_EQ(0, RawFallocate(file.fd(), 0, 0, 128)) << "smaller fallocate failed: errno=" << errno
                                                      << " (" << strerror(errno) << ")";
     EXPECT_EQ(4096, FileSize(file.fd()));
+}
+
+TEST(FallocateSemantics, RamfsMode0PreservesWrittenData) {
+    RamfsTempFile file;
+    ASSERT_TRUE(file.valid()) << strerror(file.error());
+
+    char contents[4096];
+    for (size_t i = 0; i < sizeof(contents); ++i) {
+        contents[i] = static_cast<char>(i & 0x7f);
+    }
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(contents)),
+              write(file.fd(), contents, sizeof(contents)))
+        << strerror(errno);
+
+    ASSERT_EQ(0, RawFallocate(file.fd(), 0, 0, 512)) << strerror(errno);
+    EXPECT_EQ(static_cast<off_t>(sizeof(contents)), FileSize(file.fd()));
+
+    char tail[128] = {};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(tail)),
+              pread(file.fd(), tail, sizeof(tail), sizeof(contents) - sizeof(tail)))
+        << strerror(errno);
+    EXPECT_EQ(0, memcmp(tail, contents + sizeof(contents) - sizeof(tail), sizeof(tail)));
 }
 
 TEST(FallocateSemantics, SuccessfulMode0UpdatesWriteSideMetadata) {

@@ -568,7 +568,11 @@ impl IndexNode for LockedRamFSInode {
         if inode.metadata.file_type != FileType::File {
             return Err(SystemError::EINVAL);
         }
-        let current_size = inode.metadata.size.max(0) as usize;
+        // RamFS stores file contents in `data`; metadata.size is only a cached
+        // field and may lag behind write_at()/resize().  Use the authoritative
+        // length while holding the inode lock so mode-0 fallocate can never
+        // shrink data written through another path.
+        let current_size = inode.data.len();
         if requested_end > current_size {
             super::vfs::vcore::check_file_size_limit(requested_end)?;
             inode

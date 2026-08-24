@@ -467,6 +467,32 @@ pub fn uprobe_apply_to_new_vma(
     );
 }
 
+/// Attempt one best-effort site installation without waiting for a contended
+/// source page. Mapping hooks and fork replay must never turn an observer into
+/// an unbounded wait; explicit consumer activation uses `uprobe_register()`
+/// below and retains its strict wait/revalidate contract.
+fn uprobe_register_best_effort_once(
+    mm: &Arc<AddressSpace>,
+    probe_vaddr: usize,
+    consumer: &Arc<UprobeConsumer>,
+    expected_mapping: &ExpectedProbeMapping,
+) -> Result<(), SystemError> {
+    let mut inner = mm.write();
+    match uprobe_register_locked(mm, &mut inner, probe_vaddr, consumer, expected_mapping) {
+        Ok(Some(handle)) => {
+            if consumer.scope.permits(mm) {
+                handle.persist();
+            } else {
+                handle.rollback_locked(mm, &mut inner);
+            }
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(LockedRegisterError::PageContended(_)) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+        Err(LockedRegisterError::System(error)) => Err(error),
+    }
+}
+
 pub(super) fn uprobe_apply_to_new_vma_inner(
     mm: &Arc<AddressSpace>,
     file: &Arc<crate::filesystem::vfs::file::File>,
@@ -566,11 +592,17 @@ pub(super) fn uprobe_apply_to_new_vma_inner(
                 }
                 continue;
             }
-            match uprobe_register(mm, probe_vaddr, &consumer, &expected_mapping) {
-                Ok(Some(handle)) => {
-                    handle.persist();
-                }
-                Ok(None) => continue,
+            let register_result = if strict {
+                uprobe_register(mm, probe_vaddr, &consumer, &expected_mapping).map(|handle| {
+                    if let Some(handle) = handle {
+                        handle.persist();
+                    }
+                })
+            } else {
+                uprobe_register_best_effort_once(mm, probe_vaddr, &consumer, &expected_mapping)
+            };
+            match register_result {
+                Ok(()) => {}
                 Err(e) => {
                     log::debug!(
                         "uprobe late-apply {:x}+{:#x} in new vma failed: {:?}",
@@ -646,14 +678,6 @@ pub(crate) fn uprobe_apply_to_all_vmas(mm: &Arc<AddressSpace>) {
         mm,
         VirtRegion::new(VirtAddr::new(0), MMArch::USER_END_VADDR.data()),
     );
-}
-
-fn uprobe_apply_to_all_vmas_strict(mm: &Arc<AddressSpace>) -> Result<(), SystemError> {
-    let all = VirtRegion::new(VirtAddr::new(0), MMArch::USER_END_VADDR.data());
-    for (file, start, size, offset) in collect_file_vma_snapshot(mm, all) {
-        uprobe_apply_to_new_vma_inner(mm, &file, start, size, offset, true, None)?;
-    }
-    Ok(())
 }
 
 /// Restore breakpoint bytes inherited through fork COW before the child mm is
@@ -739,9 +763,12 @@ pub(crate) fn fork_restore_inherited_uprobes_locked(
     Ok(())
 }
 
-/// Replay all currently enabled consumers after fork has published a clean
-/// child address space. Concurrent register scans are idempotent because both
-/// paths serialize installation with the child mm write lock.
-pub fn fork_inherit_uprobes(child_mm: &Arc<AddressSpace>) -> Result<(), SystemError> {
-    uprobe_apply_to_all_vmas_strict(child_mm)
+/// Best-effort replay of currently enabled consumers after fork has published
+/// a clean child address space.  The inherited breakpoint sanitization above
+/// remains part of the fallible fork transaction, but a consumer whose
+/// definition no longer matches a private child page must not change fork's
+/// result. Concurrent registry scans are idempotent because both paths
+/// serialize installation with the child mm write lock.
+pub fn fork_inherit_uprobes(child_mm: &Arc<AddressSpace>) {
+    uprobe_apply_to_all_vmas(child_mm);
 }

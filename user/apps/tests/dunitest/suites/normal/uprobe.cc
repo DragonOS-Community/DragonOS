@@ -1956,6 +1956,45 @@ TEST(UprobeTest, LargeBpfJitProgramAttachesSafely) {
         << "large SET_BPF failed, errno=" << errno;
 }
 
+// A system-wide observer must not turn a valid fork into an error when one
+// private executable mapping no longer matches the backing-file definition.
+// Ordinary VMA reconciliation already treats that alias as best-effort; fork
+// must preserve the same Linux-visible behavior after sanitizing inherited
+// breakpoint pages.
+TEST(UprobeTest, PrivateInstructionMismatchDoesNotFailFork) {
+    char path[] = "/tmp/uprobe_fork_private_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+
+    UprobePerfEventOptions options;
+    options.pid = -1;
+    options.cpu = 0;
+    FdGuard event(open_uprobe_perf_event(path, 0, options));
+    ASSERT_GE(event.get(), 0) << "system-wide uprobe failed, errno=" << errno;
+
+    void* mapping = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+                         file.get(), 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+    static_cast<unsigned char*>(mapping)[3] = 2;  // lea eax,[rdi+rdi+2]
+    ASSERT_EQ(mprotect(mapping, 4096, PROT_READ | PROT_EXEC), 0);
+    auto target = reinterpret_cast<int (*)(int)>(mapping);
+    ASSERT_EQ(target(5), 12);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "a best-effort uprobe replay must not fail fork, errno="
+                        << errno;
+    if (child == 0) {
+        _exit(target(7) == 16 ? 0 : 1);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    munmap(mapping, 4096);
+    unlink(path);
+}
+
 // A forked child initially shares the parent's private breakpoint page.  A
 // concurrent system-wide registration must never observe the child's VMA
 // before the inherited INT3 has been reconciled with its empty hit table.

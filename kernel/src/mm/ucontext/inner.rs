@@ -275,7 +275,7 @@ impl InnerAddressSpace {
         // releasing the child lock; concurrent registry scans are idempotent
         // under the same mm.write() serialization domain.
         #[cfg(target_arch = "x86_64")]
-        super::uprobe::fork_inherit_uprobes(&new_addr_space)?;
+        super::uprobe::fork_inherit_uprobes(&new_addr_space);
 
         return Ok(new_addr_space);
     }

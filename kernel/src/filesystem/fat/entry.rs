@@ -309,7 +309,7 @@ impl FATFile {
         // Only the old partial tail can contain stale bytes. Every reserved
         // cluster is already zeroed, including preallocation retained after a
         // previous directory-entry I/O error.
-        if old_size != 0 && zero_until > old_size && old_size % cluster_size != 0 {
+        if old_size != 0 && zero_until > old_size && !old_size.is_multiple_of(cluster_size) {
             let tail_index = old_size / cluster_size;
             let tail = match fs.get_cluster_by_relative(self.first_cluster, tail_index as usize) {
                 Some(cluster) => cluster,

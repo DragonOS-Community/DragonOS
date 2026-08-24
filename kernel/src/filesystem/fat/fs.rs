@@ -1159,7 +1159,7 @@ impl FATFileSystem {
         // failure can therefore restore this isolated entry without exposing
         // an uninitialized cluster through the file chain.
         drop(_fat_guard);
-        if let Err(error) = self.zero_cluster_with_buffer(free_cluster, &zeros) {
+        if let Err(error) = self.zero_cluster_with_buffer(free_cluster, zeros) {
             let _fat_guard = self.fat_lock.lock();
             self.rollback_reserved_cluster_locked(free_cluster);
             return Err(error);

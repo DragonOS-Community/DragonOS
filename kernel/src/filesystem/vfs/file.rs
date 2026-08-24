@@ -1414,6 +1414,26 @@ impl File {
         self.do_read(offset, len, buf, !stream)
     }
 
+    /// Read one bounded kernel-buffer chunk for a single read(2) operation.
+    ///
+    /// The syscall layer may need several chunks to cover the userspace
+    /// buffer, but Linux publishes ACCESS once for the whole successful
+    /// syscall rather than once per implementation chunk.
+    pub(crate) fn read_syscall_chunk(
+        &self,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_read_with_fsnotify(offset, len, buf, !stream, false)
+    }
+
     /// Let an inode consume a protected userspace buffer as one read syscall.
     ///
     /// `None` means the inode does not need this capability and the syscall

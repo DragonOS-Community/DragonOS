@@ -268,7 +268,11 @@ impl IndexNode for FuseNode {
             drop(data);
             return Ok(());
         }
-        self.resize_file_with_metadata(len, lock_owner, data, &context.requested, context.mask)
+        // Linux clears the file handle for the ATTR_OPEN truncate stage before
+        // translating it to FUSE_SETATTR.  Only ftruncate carries FATTR_FH;
+        // open(O_TRUNC) still carries the lock owner but is path based here.
+        drop(data);
+        self.resize_with_metadata(len, lock_owner, &context.requested, context.mask)
     }
 
     fn open(

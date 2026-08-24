@@ -118,7 +118,50 @@ int first_event_index(const std::vector<Ev> &evs, int wd, uint32_t bit) {
     return -1;
 }
 
+int event_count(const std::vector<Ev> &evs, int wd, uint32_t bit,
+                const std::string &name) {
+    int count = 0;
+    for (const auto &event : evs) {
+        if (event.wd == wd && (event.mask & bit) && event.name == name) ++count;
+    }
+    return count;
+}
+
 }  // namespace
+
+TEST(InotifyFileEvents, LargeReadPublishesOneAccessPerWatch) {
+    const std::string dir = "/tmp/dunitest_inotify_large_read";
+    const std::string name = "input";
+    const std::string path = dir + "/" + name;
+    ASSERT_EQ(mkdir(dir.c_str(), 0700), 0) << strerror(errno);
+
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    constexpr size_t kSize = 200 * 1024;
+    std::vector<char> data(kSize, 'x');
+    ASSERT_EQ(write(fd, data.data(), data.size()), static_cast<ssize_t>(data.size()))
+        << strerror(errno);
+    ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    int self_wd = inotify_add_watch(ifd, path.c_str(), IN_ACCESS);
+    int parent_wd = inotify_add_watch(ifd, dir.c_str(), IN_ACCESS);
+    ASSERT_GE(self_wd, 0) << strerror(errno);
+    ASSERT_GE(parent_wd, 0) << strerror(errno);
+
+    std::vector<char> output(kSize);
+    ASSERT_EQ(read(fd, output.data(), output.size()), static_cast<ssize_t>(output.size()))
+        << strerror(errno);
+    auto events = drain_events(ifd);
+    EXPECT_EQ(event_count(events, self_wd, IN_ACCESS, ""), 1);
+    EXPECT_EQ(event_count(events, parent_wd, IN_ACCESS, name), 1);
+
+    close(ifd);
+    close(fd);
+    ASSERT_EQ(unlink(path.c_str()), 0);
+    ASSERT_EQ(rmdir(dir.c_str()), 0);
+}
 
 // ---------------------------------------------------------------------------
 // Namespace events on a directory watch: create, delete, move (rename).

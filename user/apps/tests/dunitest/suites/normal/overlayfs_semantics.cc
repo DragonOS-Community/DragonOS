@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -1635,6 +1636,39 @@ TEST(OverlayFsSemantics, CopyUpLowerFilePublishesCompleteUpperFile) {
     EXPECT_EQ("lower-copy-up-data", read_text(upper_file));
     EXPECT_EQ("lower-copy-up-data", read_text(merged_file));
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpDataTransferDoesNotPublishAccessOrModify) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_fsnotify");
+    const auto& env = scoped.env;
+    std::string lower_file = join_path(env.lower, "file");
+    std::string upper_file = join_path(env.upper, "file");
+    std::string merged_file = join_path(env.merged, "file");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_TRUE(write_pattern_file(lower_file, 200 * 1024));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    ASSERT_GE(ifd, 0) << strerror(errno);
+    ASSERT_GE(inotify_add_watch(ifd, lower_file.c_str(), IN_ACCESS), 0)
+        << strerror(errno);
+    ASSERT_GE(inotify_add_watch(ifd, env.upper.c_str(), IN_MODIFY), 0)
+        << strerror(errno);
+
+    ASSERT_EQ(chmod(merged_file.c_str(), 0600), 0) << strerror(errno);
+    ASSERT_TRUE(path_exists(upper_file));
+
+    char events[4096];
+    errno = 0;
+    EXPECT_EQ(read(ifd, events, sizeof(events)), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+    close(ifd);
 }
 
 TEST(OverlayFsSemantics, CopyUpNestedLowerFileUsesWorkdirTempAndKeepsLeafAtomic) {

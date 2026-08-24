@@ -562,17 +562,19 @@ impl OvlInode {
 
         while offset < size {
             let chunk_len = (size - offset).min(buffer.len());
-            let read_len = lower_file.pread(offset, chunk_len, &mut buffer[..chunk_len])?;
+            let read_len =
+                lower_file.read_for_transfer(Some(offset), chunk_len, &mut buffer[..chunk_len])?;
             if read_len == 0 {
                 return Err(SystemError::EIO);
             }
 
             let mut written = 0usize;
             while written < read_len {
-                let n = upper_file.pwrite(
+                let n = upper_file.write_for_transfer(
                     offset + written,
                     read_len - written,
                     &buffer[written..read_len],
+                    false,
                 )?;
                 if n == 0 {
                     return Err(SystemError::EIO);

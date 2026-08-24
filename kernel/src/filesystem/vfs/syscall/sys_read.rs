@@ -3,13 +3,13 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READ;
 use crate::filesystem::fsnotify::FsEvent;
-use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::FileType;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::{UserBufferWriter, copy_to_user_protected, user_accessible_len};
+use crate::syscall::user_access::{copy_to_user_protected, user_accessible_len, UserBufferWriter};
 use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -174,7 +174,11 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
         let chunk_len = core::cmp::min(CHUNK, remain);
 
         let mut kbuf = alloc::vec![0u8; chunk_len];
-        let n = do_read_file(file.as_ref(), &mut kbuf[..])?;
+        let n = match file.read_syscall_chunk(chunk_len, &mut kbuf[..]) {
+            Ok(n) => n,
+            Err(_) if total != 0 => break,
+            Err(err) => return Err(err),
+        };
         if n == 0 {
             break;
         }
@@ -197,6 +201,10 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
         if n < chunk_len {
             break;
         }
+    }
+
+    if total != 0 {
+        file.notify_io_event(FsEvent::ACCESS);
     }
 
     Ok(total)

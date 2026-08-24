@@ -710,7 +710,7 @@ impl InotifyInode {
         }
 
         let md = inode.metadata()?;
-        let target_identity = fsnotify::target_for_inode(&inode)?.id;
+        let target_identity = fsnotify::target_for_inode(inode)?.id;
 
         // IN_ONLYDIR：目标必须是目录。
         if (mask & user_mask::IN_ONLYDIR) != 0 && md.file_type != FileType::Dir {
@@ -718,7 +718,7 @@ impl InotifyInode {
         }
 
         // 读权限检查（防止通过监听泄露文件名/元数据）。
-        check_inode_permission(&inode, &md, PermissionMask::MAY_READ)?;
+        check_inode_permission(inode, &md, PermissionMask::MAY_READ)?;
 
         // Linux stores only user event bits and adds UNMOUNT implicitly;
         // ONESHOT/EXCL_UNLINK are mark flags, while ISDIR/Q_OVERFLOW/IGNORED

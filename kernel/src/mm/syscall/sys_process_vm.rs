@@ -228,10 +228,13 @@ fn do_process_vm_readv(
     let target_pcb = find_target_process(pid)?;
 
     // Check permission to access target process's memory
-    check_process_vm_access(&target_pcb)?;
-
-    // Get target process's address space
-    let target_vm = target_pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
+    let _target_mm_guard = {
+        let _exec_guard = target_pcb.exec_update_read();
+        let guard = target_pcb.active_vm().ok_or(SystemError::ESRCH)?;
+        check_process_vm_access(&target_pcb)?;
+        guard
+    };
+    let target_vm = _target_mm_guard.vm().clone();
 
     // Read local and remote iovec arrays
     let local_iovecs = read_iovecs(local_iov, liovcnt)?;
@@ -356,11 +359,15 @@ fn do_process_vm_writev(
     // This ensures we return ESRCH for non-existent processes
     let target_pcb = find_target_process(pid)?;
 
-    // Check permission to access target process's memory
-    check_process_vm_access(&target_pcb)?;
-
-    // Get target process's address space
-    let target_vm = target_pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
+    // 与读取方向相同：临界区内完成权限检查与活跃使用者引用获取，
+    // 整个传输期间保持地址空间不拆。
+    let _target_mm_guard = {
+        let _exec_guard = target_pcb.exec_update_read();
+        let guard = target_pcb.active_vm().ok_or(SystemError::ESRCH)?;
+        check_process_vm_access(&target_pcb)?;
+        guard
+    };
+    let target_vm = _target_mm_guard.vm().clone();
 
     // Read local and remote iovec arrays
     let local_iovecs = read_iovecs(local_iov, liovcnt)?;

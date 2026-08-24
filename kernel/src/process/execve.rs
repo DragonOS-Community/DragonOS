@@ -332,6 +332,9 @@ fn finish_exec_error(
     let post_point_of_no_return = param.point_of_no_return();
     if let Some(old_vm) = old_vm {
         do_execve_switch_user_vm(old_vm.clone());
+        // Drop the failed prospective mm only after switching back to the old
+        // address space, then restore any uprobe state lost to a concurrent scan.
+        ProcessManager::release_old_user_vm_if_last(Some(param.vm()));
         // DragonOS publishes the prospective mm before ELF validation. If a
         // concurrent ENABLE scanned that temporary mm, a recoverable exec
         // failure must provide the complementary replay after restoring the

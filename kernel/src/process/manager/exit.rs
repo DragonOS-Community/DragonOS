@@ -740,13 +740,6 @@ impl ProcessManager {
         let Some(old_vm) = old_vm else {
             return;
         };
-        if old_vm.user_count_dec_and_test() {
-            unsafe {
-                // Unmap under the write lock, then set torn_down. This bounds the reader critical section.
-                old_vm.write().unmap_all();
-            }
-            old_vm.mark_torn_down();
-            crate::mm::oom::note_oom_victim_mm_released(old_vm.id());
-        }
+        old_vm.mmput();
     }
 }

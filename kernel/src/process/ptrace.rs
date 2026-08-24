@@ -1764,7 +1764,8 @@ impl ProcessControlBlock {
         if last >= MMArch::USER_END_VADDR.data() {
             return Err(SystemError::EIO);
         }
-        let target_vm = self.basic().user_vm().clone().ok_or(SystemError::ESRCH)?;
+        let _mm_guard = self.active_vm().ok_or(SystemError::ESRCH)?;
+        let target_vm = _mm_guard.vm().clone();
         let mut bytes = [0u8; size_of::<usize>()];
         // 整 word 在单次 AddressSpace 读锁内拷（force=true：ptrace 越权语义）
         let n = target_vm.access_remote_vm(addr, RemoteAccess::Read(&mut bytes), true)?;
@@ -1782,7 +1783,8 @@ impl ProcessControlBlock {
         if last >= MMArch::USER_END_VADDR.data() {
             return Err(SystemError::EIO);
         }
-        let target_vm = self.basic().user_vm().clone().ok_or(SystemError::ESRCH)?;
+        let _mm_guard = self.active_vm().ok_or(SystemError::ESRCH)?;
+        let target_vm = _mm_guard.vm().clone();
         let bytes = value.to_ne_bytes();
         let n = target_vm.access_remote_vm(addr, RemoteAccess::Write(&bytes), true)?;
         if n != size_of::<usize>() {

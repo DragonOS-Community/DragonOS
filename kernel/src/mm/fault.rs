@@ -474,7 +474,13 @@ impl PageFaultHandler {
         let current_pcb = ProcessManager::current_pcb();
         current_pcb.sched_info().restore_runnable_if_blocked();
 
-        let reason = if !MMArch::vma_access_permitted(
+        let reason = if (flags.contains(FaultFlags::FAULT_FLAG_WRITE) && {
+            let guard = vma.lock();
+            let vm_flags = *guard.vm_flags();
+            !(vm_flags.contains(VmFlags::VM_WRITE)
+                || (!vm_flags.contains(VmFlags::VM_SHARED)
+                    && vm_flags.contains(VmFlags::VM_MAYWRITE)))
+        }) || !MMArch::vma_access_permitted(
             vma.clone(),
             flags.contains(FaultFlags::FAULT_FLAG_WRITE),
             flags.contains(FaultFlags::FAULT_FLAG_INSTRUCTION),

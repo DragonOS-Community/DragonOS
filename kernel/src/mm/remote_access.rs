@@ -120,9 +120,7 @@ impl AddressSpace {
                         // Read-only page: write must COW-fault first
                         break;
                     }
-                    if !entry_flags.has_user() && (write || !force) {
-                        // PROT_NONE is encoded as present-without-user PTEs:
-                        // only forced reads may follow; other accesses and forced writes stop.
+                    if !entry_flags.has_user() && !force {
                         break;
                     }
                     // File page write: pin the page-cache page first (Arc held across the copy), publish dirty afterwards

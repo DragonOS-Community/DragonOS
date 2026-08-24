@@ -80,9 +80,9 @@ impl FileOps for MemFileOps {
         let Some(pinned_vm) = Self::pinned_vm_from_data(&data) else {
             return Ok(0);
         };
-        if pinned_vm.is_torn_down() {
+        let Some(_mm_guard) = pinned_vm.try_acquire() else {
             return Ok(0);
-        }
+        };
         let actual_len = len.min(buf.len());
         // Batched cross-process read
         let n =
@@ -112,9 +112,9 @@ impl FileOps for MemFileOps {
             return Ok(0);
         };
         // After tear-down, writes are also treated as EOF (0)
-        if pinned_vm.is_torn_down() {
+        let Some(_mm_guard) = pinned_vm.try_acquire() else {
             return Ok(0);
-        }
+        };
         let actual_len = len.min(buf.len());
         let n =
             pinned_vm.access_remote_vm(offset, RemoteAccess::Write(&buf[..actual_len]), true)?;

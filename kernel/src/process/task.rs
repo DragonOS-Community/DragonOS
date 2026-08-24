@@ -35,6 +35,7 @@ use crate::{
         futex::futex::RobustListHead,
         mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwsem::RwSem,
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -269,6 +270,16 @@ impl ProcessControlBlock {
     /// `true` if the process is a kernel thread, `false` otherwise.
     pub fn is_kthread(&self) -> bool {
         self.flags().contains(ProcessFlags::KTHREAD)
+    }
+
+    /// 获取本任务当前安装的、活跃的用户地址空间引用。
+    pub fn active_vm(&self) -> Option<crate::mm::ucontext::MmUserRef> {
+        if self.is_kthread() {
+            return None;
+        }
+        let basic = self.basic();
+        let vm = basic.user_vm()?;
+        vm.try_acquire()
     }
 
     #[inline(never)]

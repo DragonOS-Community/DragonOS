@@ -412,10 +412,44 @@ impl AddressSpace {
         self.user_count.fetch_add(1, Ordering::Release);
     }
 
+    #[inline]
+    pub fn try_acquire(self: &Arc<Self>) -> Option<MmUserRef> {
+        if self.mmget_not_zero() {
+            Some(MmUserRef { vm: self.clone() })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn mmget_not_zero(&self) -> bool {
+        self.user_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                if c == 0 {
+                    None
+                } else {
+                    Some(c + 1)
+                }
+            })
+            .is_ok()
+    }
+
+    #[inline]
+    pub(crate) fn mmput(&self) {
+        if self.user_count_dec_and_test() {
+            unsafe {
+                // 先持写锁拆除映射，再置 torn_down。与读者形成临界区边界。
+                self.write().unmap_all();
+            }
+            self.mark_torn_down();
+            crate::mm::oom::note_oom_victim_mm_released(self.id());
+        }
+    }
+
     /// Decrement when a task releases it (exit or exec swap);
     /// returns true if the caller is the last user and must tear down the mappings.
     #[inline]
-    pub fn user_count_dec_and_test(&self) -> bool {
+    pub(crate) fn user_count_dec_and_test(&self) -> bool {
         let prev = self.user_count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(prev > 0, "AddressSpace user_count 下溢");
         prev == 1
@@ -1830,5 +1864,33 @@ impl Drop for MmapReservationGuard {
             drop(guard);
             self.mm.wake_reservation_waiters();
         }
+    }
+}
+
+/// 地址空间使用者引用守卫：获取时已对使用者计数 +1，析构时归还；
+/// 归还使计数归零时（任务均已退出或换走、守卫是最后持有者）由守卫
+/// 完成映射拆除。持有期间目标进程的退出与 exec 换地址空间都不会
+/// 使映射中途消失。
+pub struct MmUserRef {
+    vm: Arc<AddressSpace>,
+}
+
+impl MmUserRef {
+    /// 借出被引用的地址空间。
+    #[inline]
+    pub fn vm(&self) -> &Arc<AddressSpace> {
+        &self.vm
+    }
+
+    /// 判断两个引用是否指向同一地址空间。
+    #[inline]
+    pub fn is_same(&self, other: &MmUserRef) -> bool {
+        Arc::ptr_eq(&self.vm, &other.vm)
+    }
+}
+
+impl Drop for MmUserRef {
+    fn drop(&mut self) {
+        self.vm.mmput();
     }
 }

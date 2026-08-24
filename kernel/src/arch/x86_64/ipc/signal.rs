@@ -1035,28 +1035,6 @@ impl SignalArch for X86_64SignalArch {
         // restart_syscall should only get EINTR and must not continue consuming the old restart context.
         let _ = ProcessManager::current_pcb().restart_block().take();
 
-        // 走异常表保护读取用户信号栈帧，坏指针返回 badframe 路径（SIGSEGV）。
-        let frame_ptr_vaddr = VirtAddr::new(frame_ptr as usize);
-        let mut frame: SigFrame = unsafe { core::mem::zeroed() };
-        if unsafe {
-            crate::syscall::user_access::copy_from_user_protected(
-                core::slice::from_raw_parts_mut(
-                    &mut frame as *mut SigFrame as *mut u8,
-                    size_of::<SigFrame>(),
-                ),
-                frame_ptr_vaddr,
-            )
-        }
-        .is_err()
-        {
-            error!(
-                "sys_rt_sigreturn: bad sigframe at {:#x}",
-                frame_ptr_vaddr.data()
-            );
-            let _ = crate::ipc::signal::force_kernel_default_signal_to_current(Signal::SIGSEGV);
-            return 0;
-        }
-
         // 1. 恢复信号掩码（从 1024-bit 用户态格式转换到 64-bit 内核格式）
         let mut sigmask = ucontext.uc_sigmask.to_kernel_sigset();
         set_current_blocked(&mut sigmask);

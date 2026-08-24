@@ -32,6 +32,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -281,6 +282,17 @@ TEST(UprobeTest, InvalidPathIsRejected) {
     if (fd >= 0) close(fd);
 }
 
+TEST(UprobeTest, PathWithoutNullWithinPathMaxIsE2big) {
+    // Linux perf_uprobe_init() uses strndup_user(PATH_MAX): the terminator
+    // must occur before byte PATH_MAX, otherwise perf_event_open returns
+    // E2BIG instead of scanning an unbounded user mapping.
+    std::string overlong(4096, 'a');
+    errno = 0;
+    FdGuard event(open_uprobe_perf_event(overlong, 0));
+    EXPECT_LT(event.get(), 0);
+    EXPECT_EQ(errno, E2BIG);
+}
+
 // 越界偏移应被拒绝。
 TEST(UprobeTest, InvalidOffsetIsRejected) {
     std::string path;
@@ -342,6 +354,43 @@ TEST(UprobeTest, UnregisterRestoresNormalExecution) {
         volatile int result = uprobe_target(i + 100);
         EXPECT_EQ(result, (i + 100) * 2 + 1) << "注销后第 " << i << " 次结果错误";
     }
+}
+
+TEST(UprobeTest, ProcessVmWritevCannotBypassExecutableMappingPermissions) {
+    char path[] = "/tmp/uprobe_process_vm_write_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* executable = mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE,
+                            file.get(), 0);
+    ASSERT_NE(executable, MAP_FAILED);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+
+    unsigned char replacement = 0x90;
+    iovec local = {};
+    local.iov_base = &replacement;
+    local.iov_len = 1;
+    iovec remote = {};
+    remote.iov_base = executable;
+    remote.iov_len = 1;
+    errno = 0;
+    EXPECT_EQ(syscall(SYS_process_vm_writev, getpid(), &local, 1, &remote, 1,
+                      0),
+              -1);
+    EXPECT_EQ(errno, EFAULT)
+        << "process_vm_writev must use FOLL_WRITE-like VMA permission checks";
+
+    auto target = reinterpret_cast<int (*)(int)>(executable);
+    EXPECT_EQ(target(21), 43);
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U);
+
+    event.close_now();
+    munmap(executable, 4096);
+    unlink(path);
 }
 
 // disabled 会撤销该 consumer；若它是最后一个，应恢复原指令，且命中计数冻结。

@@ -468,6 +468,14 @@ pub fn perf_event_open(
     group_fd: i32,
     flags: usize,
 ) -> Result<usize> {
+    // Linux validates perfmon capability before dereferencing dynamic probe
+    // names. Besides matching errno precedence, this prevents an unauthorized
+    // caller from forcing an arbitrary user-memory scan through config1.
+    if (attr.type_ == PERF_TYPE_KPROBE || attr.type_ == PERF_TYPE_UPROBE)
+        && !crate::process::cred::perfmon_capable()
+    {
+        return Err(SystemError::EACCES);
+    }
     let args = PerfProbeArgs::try_from(attr, pid, cpu, group_fd, flags)?;
     #[cfg(target_arch = "x86_64")]
     if args.type_ == PERF_TYPE_UPROBE {

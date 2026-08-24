@@ -352,11 +352,6 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     {
         return Err(SystemError::EINVAL);
     }
-    // Linux 6.6 perf_uprobe_event_init() applies perfmon_capable() before
-    // parsing or installing the probe.
-    if !crate::process::cred::perfmon_capable() {
-        return Err(SystemError::EACCES);
-    }
     if args.inherit || args.enable_on_exec || args.remove_on_exec {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

@@ -1,7 +1,8 @@
+use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_header, perf_event_sample_format, perf_sw_ids, perf_type_id,
 };
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::string::String;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -62,6 +63,22 @@ pub struct PerfProbeArgs {
 pub const PERF_TYPE_KPROBE: u32 = perf_type_id::PERF_TYPE_MAX as u32;
 pub const PERF_TYPE_UPROBE: u32 = PERF_TYPE_KPROBE + 1;
 
+/// Linux 6.6 bounds perf kprobe symbol names with `KSYM_NAME_LEN`.
+const KSYM_NAME_LEN: usize = 512;
+
+fn copy_probe_name(user: *const u8, max_len: usize) -> Result<String, SystemError> {
+    let name = vfs_check_and_clone_cstr(user, Some(max_len)).map_err(|error| {
+        if error == SystemError::ENAMETOOLONG {
+            // perf_{k,u}probe_init() exposes strndup_user() exhaustion as
+            // E2BIG, rather than the pathname-oriented ENAMETOOLONG.
+            SystemError::E2BIG
+        } else {
+            error
+        }
+    })?;
+    name.into_string().map_err(|_| SystemError::EINVAL)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerfProbeConfig {
     PerfSwIds(perf_sw_ids),
@@ -95,12 +112,11 @@ impl PerfProbeArgs {
             }
             _ => PerfProbeConfig::Raw(attr.config),
         };
-        let name = if ty == PERF_TYPE_KPROBE || ty == PERF_TYPE_UPROBE {
-            let name_ptr = unsafe { attr.__bindgen_anon_3.config1 } as *const u8;
-            let name = check_and_clone_cstr(name_ptr, None)?;
-            name.into_string().map_err(|_| SystemError::EINVAL)?
-        } else {
-            String::new()
+        let name_ptr = unsafe { attr.__bindgen_anon_3.config1 } as *const u8;
+        let name = match ty {
+            PERF_TYPE_KPROBE => copy_probe_name(name_ptr, KSYM_NAME_LEN)?,
+            PERF_TYPE_UPROBE => copy_probe_name(name_ptr, MAX_PATHLEN)?,
+            _ => String::new(),
         };
         let sample_ty = perf_event_sample_format::from_u32(attr.sample_type as u32);
         let raw_flags = u32::try_from(flags).map_err(|_| SystemError::EINVAL)?;

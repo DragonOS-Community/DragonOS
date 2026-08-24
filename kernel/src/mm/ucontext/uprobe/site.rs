@@ -868,9 +868,10 @@ pub(super) fn site_mapping_still_matches(inner: &InnerAddressSpace, site: &Uprob
 /// 在**当前映射页**上恢复断点原字节（评审 R8）。
 ///
 /// 经 `translate` 取当前 paddr（可能是断点安装时的 COW 副本，也可能是程序
-/// 写缺页二次 COW 后的页），直接写回原首字节。不交换页映射——页上其他字节
-/// 的任何程序写入都保留。无 PTE 变更 → 无需 TLB flush（TLB 缓存翻译而非
-/// 内容；跨修改代码的串行化由 #BP 中断返回后的取指重取保证）。
+/// 写缺页二次 COW 后的页）。与 Linux `verify_opcode()` 一样，只有当前字节仍
+/// 是本设施安装的 INT3 才恢复；调试器等外部写入的新指令绝不能被 close 覆盖。
+/// 不交换页映射——页上其他字节的任何程序写入都保留。无 PTE 变更 → 无需 TLB
+/// flush（TLB 缓存翻译而非内容；跨修改代码的串行化由同步 rendezvous 保证）。
 pub(super) fn restore_breakpoint_byte(
     mm: &Arc<AddressSpace>,
     inner: &mut InnerAddressSpace,
@@ -883,7 +884,11 @@ pub(super) fn restore_breakpoint_byte(
     if let Some((paddr, _)) = mapper.translate(VirtAddr::new(page_base_addr)) {
         if let Some(kva) = unsafe { MMArch::phys_2_virt(paddr) } {
             unsafe {
-                core::ptr::write_volatile((kva.data() + page_offset) as *mut u8, orig_first_byte);
+                let opcode = (kva.data() + page_offset) as *mut u8;
+                if core::ptr::read_volatile(opcode) != 0xcc {
+                    return false;
+                }
+                core::ptr::write_volatile(opcode, orig_first_byte);
             }
             return true;
         }

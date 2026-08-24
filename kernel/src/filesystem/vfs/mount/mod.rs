@@ -206,6 +206,29 @@ pub struct DentryMutationContext<'a> {
     guard: RefCell<Option<RwSemWriteGuard<'a, ()>>>,
 }
 
+type RenamePreCommit<'a> =
+    dyn FnMut(&Arc<dyn IndexNode>, Option<&Arc<dyn IndexNode>>) -> Result<(), SystemError> + 'a;
+type RenamePostCommit<'a> = dyn FnMut(&FsNotifyTarget, Option<&FsNotifyTarget>) + 'a;
+
+#[derive(Default)]
+struct RenameCommitHooks<'a> {
+    pre_commit: Option<&'a mut RenamePreCommit<'a>>,
+    post_commit: Option<&'a mut RenamePostCommit<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct RenameNotifyTargetSeed {
+    id: FsNotifyObjectId,
+    is_dir: bool,
+}
+
+struct RegisteredDentryLookup {
+    dentry: Option<Arc<VfsDentry>>,
+    inode: InodeId,
+    generation: u64,
+    file_type: FileType,
+}
+
 impl DentryMutationContext<'static> {
     fn new() -> Self {
         Self {
@@ -1135,6 +1158,38 @@ impl SuperBlockState {
         self.resolve_dentry_fsnotify_state(dentry)
     }
 
+    /// Capture the metadata already resolved by the locked rename lookup.
+    /// Notification bookkeeping must not issue another metadata request or
+    /// turn a successful filesystem mutation into an error.
+    fn rename_notify_target_seed(
+        &self,
+        inode: InodeId,
+        generation: u64,
+        file_type: FileType,
+    ) -> RenameNotifyTargetSeed {
+        RenameNotifyTargetSeed {
+            id: FsNotifyObjectId {
+                superblock: self.fsnotify_id,
+                inode,
+                generation,
+            },
+            is_dir: file_type == FileType::Dir,
+        }
+    }
+
+    fn resolve_rename_notify_target(&self, seed: RenameNotifyTargetSeed) -> FsNotifyTarget {
+        let object_state = self.fsnotify_object_state(seed.id.inode, seed.id.generation);
+        FsNotifyTarget {
+            id: seed.id,
+            is_dir: seed.is_dir,
+            disconnected: false,
+            watched: object_state
+                .as_ref()
+                .is_some_and(|object| object.has_watches()),
+            object_state,
+        }
+    }
+
     fn activate_mount(&self, construction_reserved: bool) -> Result<(), SystemError> {
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.state != SuperBlockLifecycleState::Active {
@@ -1279,8 +1334,9 @@ impl SuperBlockState {
         parent: &Arc<VfsDentry>,
         name: &DName,
         inode: &Arc<dyn IndexNode>,
-    ) -> Result<(Option<Arc<VfsDentry>>, InodeId, u64), SystemError> {
-        let child = inode.metadata()?.inode_id;
+    ) -> Result<RegisteredDentryLookup, SystemError> {
+        let metadata = inode.metadata()?;
+        let child = metadata.inode_id;
         let generation = inode.inode_generation();
         let key = DentryRegistryKey {
             parent: Some(parent.id),
@@ -1289,11 +1345,12 @@ impl SuperBlockState {
             name: Some(name.clone()),
         };
         let registry = self.dentry_registry.lock();
-        Ok((
-            registry.get(&key).and_then(Weak::upgrade),
-            child,
+        Ok(RegisteredDentryLookup {
+            dentry: registry.get(&key).and_then(Weak::upgrade),
+            inode: child,
             generation,
-        ))
+            file_type: metadata.file_type,
+        })
     }
 
     fn disconnect_dentry(&self, dentry: &Arc<VfsDentry>) {
@@ -3315,14 +3372,25 @@ impl MountFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-        post_commit: impl FnOnce(),
+        pre_commit: impl FnOnce(
+            &Arc<dyn IndexNode>,
+            Option<&Arc<dyn IndexNode>>,
+        ) -> Result<(), SystemError>,
+        post_commit: impl FnOnce(&FsNotifyTarget, Option<&FsNotifyTarget>),
     ) -> Result<(), SystemError> {
         let context = DentryMutationContext::new();
+        let mut pre_commit = Some(pre_commit);
+        let mut run_pre_commit =
+            |source: &Arc<dyn IndexNode>, target: Option<&Arc<dyn IndexNode>>| {
+                pre_commit
+                    .take()
+                    .expect("rename pre-commit callback runs once")(source, target)
+            };
         let mut post_commit = Some(post_commit);
-        let mut run_post_commit = || {
+        let mut run_post_commit = |source: &FsNotifyTarget, target: Option<&FsNotifyTarget>| {
             post_commit
                 .take()
-                .expect("rename post-commit callback runs once")();
+                .expect("rename post-commit callback runs once")(source, target);
         };
         self.move_to_with_context_impl(
             old_name,
@@ -3330,7 +3398,10 @@ impl MountFSInode {
             new_name,
             flags,
             &context,
-            Some(&mut run_post_commit),
+            RenameCommitHooks {
+                pre_commit: Some(&mut run_pre_commit),
+                post_commit: Some(&mut run_post_commit),
+            },
         )
         .map(|_| ())
     }
@@ -3503,10 +3574,13 @@ impl MountFSInode {
             .write();
         let inner = self.dentry.inode.find(name)?;
         let dname = DName::from(name);
-        let (child, child_inode, child_generation) = self
-            .mount_fs
-            .super_block_state
-            .get_registered_dentry(&self.dentry, &dname, &inner)?;
+        let lookup =
+            self.mount_fs
+                .super_block_state
+                .get_registered_dentry(&self.dentry, &dname, &inner)?;
+        let child = lookup.dentry;
+        let child_inode = lookup.inode;
+        let child_generation = lookup.generation;
         let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
         drop(namespace_guard);
 
@@ -3613,10 +3687,13 @@ impl MountFSInode {
             .write();
         let inner = self.dentry.inode.find(name)?;
         let dname = DName::from(name);
-        let (child, child_inode, child_generation) = self
-            .mount_fs
-            .super_block_state
-            .get_registered_dentry(&self.dentry, &dname, &inner)?;
+        let lookup =
+            self.mount_fs
+                .super_block_state
+                .get_registered_dentry(&self.dentry, &dname, &inner)?;
+        let child = lookup.dentry;
+        let child_inode = lookup.inode;
+        let child_generation = lookup.generation;
         let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
         drop(namespace_guard);
 
@@ -3772,8 +3849,12 @@ impl MountFSInode {
         new_name: &str,
         flags: RenameFlags,
         context: &DentryMutationContext<'_>,
-        post_commit: Option<&mut dyn FnMut()>,
+        hooks: RenameCommitHooks<'_>,
     ) -> Result<RenameOutcome, SystemError> {
+        let RenameCommitHooks {
+            pre_commit,
+            post_commit,
+        } = hooks;
         self.ensure_mount_writable()?;
         // Filesystem implementations generally expect `target` to be an inode
         // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
@@ -3794,32 +3875,41 @@ impl MountFSInode {
                 .super_block_state
                 .dentry_namespace_lock
                 .write();
-            let (source_dentry, target_lookup, target_child_inode) = if let Some(target_mount) =
-                target_mount.as_ref()
-            {
-                let sb = &self.mount_fs.super_block_state;
-                let source_inner = self.dentry.inode.find(old_name)?;
-                let (source_dentry, _, _) =
-                    sb.get_registered_dentry(&self.dentry, &DName::from(old_name), &source_inner)?;
-                let (target_lookup, target_child_inode) = match target_inner.find(new_name) {
-                    Ok(target_child) => {
-                        let lookup = sb.get_registered_dentry(
-                            &target_mount.dentry,
-                            &DName::from(new_name),
-                            &target_child,
-                        )?;
-                        (Some(lookup), Some(target_child))
-                    }
-                    Err(SystemError::ENOENT) => (None, None),
-                    Err(error) => return Err(error),
+            let (source_inode, source_lookup, source_dentry, target_lookup, target_child_inode) =
+                if let Some(target_mount) = target_mount.as_ref() {
+                    let sb = &self.mount_fs.super_block_state;
+                    let source_inner = self.dentry.inode.find(old_name)?;
+                    let source_lookup = sb.get_registered_dentry(
+                        &self.dentry,
+                        &DName::from(old_name),
+                        &source_inner,
+                    )?;
+                    let source_dentry = source_lookup.dentry.clone();
+                    let (target_lookup, target_child_inode) = match target_inner.find(new_name) {
+                        Ok(target_child) => {
+                            let lookup = sb.get_registered_dentry(
+                                &target_mount.dentry,
+                                &DName::from(new_name),
+                                &target_child,
+                            )?;
+                            (Some(lookup), Some(target_child))
+                        }
+                        Err(SystemError::ENOENT) => (None, None),
+                        Err(error) => return Err(error),
+                    };
+                    (
+                        Some(source_inner),
+                        Some(source_lookup),
+                        source_dentry,
+                        target_lookup,
+                        target_child_inode,
+                    )
+                } else {
+                    (None, None, None, None, None)
                 };
-                (source_dentry, target_lookup, target_child_inode)
-            } else {
-                (None, None, None)
-            };
             let target_dentry = target_lookup
                 .as_ref()
-                .and_then(|(dentry, _, _)| dentry.clone());
+                .and_then(|lookup| lookup.dentry.clone());
             with_dentry_mount_gates(source_dentry.as_ref(), target_dentry.as_ref(), || {
                 // The parent directory gates keep both positive and negative
                 // names stable while the per-superblock registry lock is
@@ -3834,15 +3924,58 @@ impl MountFSInode {
                 {
                     return Err(SystemError::EBUSY);
                 }
+                if flags.contains(RenameFlags::NOREPLACE) && target_child_inode.is_some() {
+                    return Err(SystemError::EEXIST);
+                }
+                if let (Some(source_lookup), Some(target_lookup)) =
+                    (source_lookup.as_ref(), target_lookup.as_ref())
+                {
+                    if (source_lookup.inode, source_lookup.generation)
+                        == (target_lookup.inode, target_lookup.generation)
+                    {
+                        return Ok(RenameOutcome::NoOp);
+                    }
+                }
+                if let Some(pre_commit) = pre_commit {
+                    pre_commit(
+                        source_inode
+                            .as_ref()
+                            .expect("mounted rename resolves its source under the parent gates"),
+                        target_child_inode.as_ref(),
+                    )?;
+                }
+                let notify_targets = if post_commit.is_some() {
+                    let source = source_lookup
+                        .as_ref()
+                        .expect("mounted rename resolves its source under the parent gates");
+                    let source = self.mount_fs.super_block_state.rename_notify_target_seed(
+                        source.inode,
+                        source.generation,
+                        source.file_type,
+                    );
+                    let target = target_lookup.as_ref().map(|target| {
+                        self.mount_fs.super_block_state.rename_notify_target_seed(
+                            target.inode,
+                            target.generation,
+                            target.file_type,
+                        )
+                    });
+                    Some((source, target))
+                } else {
+                    None
+                };
                 let mut object_state = match target_lookup.as_ref() {
-                    Some((Some(target), _, _)) => self
+                    Some(RegisteredDentryLookup {
+                        dentry: Some(target),
+                        ..
+                    }) => self
                         .mount_fs
                         .super_block_state
                         .existing_dentry_fsnotify_state(target),
-                    Some((None, inode, generation)) => self
+                    Some(lookup) => self
                         .mount_fs
                         .super_block_state
-                        .fsnotify_object_state(*inode, *generation),
+                        .fsnotify_object_state(lookup.inode, lookup.generation),
                     None => None,
                 };
                 let coordinator = target_child_inode
@@ -3856,6 +3989,14 @@ impl MountFSInode {
                     flags,
                     context,
                 )?;
+                // The destination may have become a hard-link alias of the
+                // source after the syscall's optimistic lookup but before the
+                // parent gates were acquired. The filesystem's locked result
+                // is authoritative: a no-op has no dentry or notification
+                // commit to publish.
+                if outcome == RenameOutcome::NoOp {
+                    return Ok(outcome);
+                }
                 debug_assert!(
                     !matches!(
                         outcome,
@@ -3870,22 +4011,22 @@ impl MountFSInode {
                         RenameOutcome::Moved {
                             replaced: Some(replaced),
                         },
-                        Some((_, inode, generation)),
+                        Some(lookup),
                     ) => Some(coordinator.map_or_else(
                         || {
                             self.mount_fs
                                 .super_block_state
-                                .note_fsnotify_link_mutation(*inode, *generation)
+                                .note_fsnotify_link_mutation(lookup.inode, lookup.generation)
                         },
                         |coordinator| coordinator.commit_removed(replaced),
                     )),
                     _ => None,
                 };
                 if object_state.is_none() {
-                    object_state = target_lookup.as_ref().and_then(|(_, inode, generation)| {
+                    object_state = target_lookup.as_ref().and_then(|lookup| {
                         self.mount_fs
                             .super_block_state
-                            .fsnotify_object_state(*inode, *generation)
+                            .fsnotify_object_state(lookup.inode, lookup.generation)
                     });
                 }
                 let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
@@ -3924,7 +4065,12 @@ impl MountFSInode {
                         RenameOutcome::Moved {
                             replaced: Some(LinkRemovalOutcome::LastLink),
                         },
-                        Some((None, inode, generation)),
+                        Some(RegisteredDentryLookup {
+                            dentry: None,
+                            inode,
+                            generation,
+                            ..
+                        }),
                     ) => Some((*inode, *generation)),
                     _ => None,
                 };
@@ -3934,7 +4080,21 @@ impl MountFSInode {
                     // while the two parent gates still serialize conflicting
                     // renames and therefore their notification order.
                     context.release_locked();
-                    post_commit();
+                    if fsnotify::has_any_watch() {
+                        let (source, target) = notify_targets
+                            .as_ref()
+                            .expect("rename post-commit target seeds were prepared");
+                        let source = self
+                            .mount_fs
+                            .super_block_state
+                            .resolve_rename_notify_target(*source);
+                        let target = target.map(|target| {
+                            self.mount_fs
+                                .super_block_state
+                                .resolve_rename_notify_target(target)
+                        });
+                        post_commit(&source, target.as_ref());
+                    }
                     if let (Some((inode, generation)), Some(object), Some(state)) = (
                         untracked_delete,
                         object_state.as_ref(),
@@ -5233,7 +5393,14 @@ impl IndexNode for MountFSInode {
         flags: RenameFlags,
     ) -> Result<RenameOutcome, SystemError> {
         let context = DentryMutationContext::new();
-        self.move_to_with_context_impl(old_name, target, new_name, flags, &context, None)
+        self.move_to_with_context_impl(
+            old_name,
+            target,
+            new_name,
+            flags,
+            &context,
+            RenameCommitHooks::default(),
+        )
     }
 
     fn move_to_with_context(
@@ -5244,7 +5411,14 @@ impl IndexNode for MountFSInode {
         flags: RenameFlags,
         context: &DentryMutationContext<'_>,
     ) -> Result<RenameOutcome, SystemError> {
-        self.move_to_with_context_impl(old_name, target, new_name, flags, context, None)
+        self.move_to_with_context_impl(
+            old_name,
+            target,
+            new_name,
+            flags,
+            context,
+            RenameCommitHooks::default(),
+        )
     }
 
     fn check_access(

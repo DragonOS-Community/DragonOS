@@ -110,7 +110,7 @@ pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
     do_read_file(file.as_ref(), buf)
 }
 
-fn get_read_file(fd: i32) -> Result<Arc<File>, SystemError> {
+pub(super) fn get_read_file(fd: i32) -> Result<Arc<File>, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 

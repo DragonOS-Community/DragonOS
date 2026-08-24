@@ -4797,7 +4797,7 @@ impl MountFSInode {
             let parent_object = self
                 .mount_fs
                 .super_block_state
-                .resolve_dentry_fsnotify_state(&parent);
+                .resolve_dentry_fsnotify_state(parent);
             let parent_watched = parent_object
                 .as_ref()
                 .is_some_and(|object| object.has_watches());

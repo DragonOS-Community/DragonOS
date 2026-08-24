@@ -74,9 +74,9 @@ pub struct AddressSpace {
     /// Per-mm uprobe 表：唯一写控制表 + 面向 #BP 的不可变 RCU 快照。
     #[cfg(target_arch = "x86_64")]
     pub uprobe_list: UprobeSiteTable,
-    /// Per-mm XOL 区（懒初始化，首次注册 uprobe 时创建）。
+    /// Per-mm XOL page pool (grown lazily by uprobe registration).
     #[cfg(target_arch = "x86_64")]
-    pub xol_area: SpinLock<Option<Arc<XolArea>>>,
+    pub xol_pool: XolPool,
     /// Per-page 断点状态（追踪 COW 副本 + refcount，供注销恢复原页）。
     #[cfg(target_arch = "x86_64")]
     pub(crate) uprobe_page_state: SpinLock<BTreeMap<usize, UprobePageState>>,
@@ -301,7 +301,7 @@ impl AddressSpace {
             #[cfg(target_arch = "x86_64")]
             uprobe_list: UprobeSiteTable::new(),
             #[cfg(target_arch = "x86_64")]
-            xol_area: SpinLock::new(None),
+            xol_pool: XolPool::new(),
             #[cfg(target_arch = "x86_64")]
             uprobe_page_state: SpinLock::new(BTreeMap::new()),
         });

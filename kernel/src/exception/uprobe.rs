@@ -9,7 +9,7 @@
 //! - 仅 `lock_irqsave` + 查表 + 改 trapframe + 跑 BPF（callback）；
 //! - 绝不改页表、绝不睡眠、绝不取 `AddressSpace` 的 `RwSem`（会睡眠）；
 //! - XOL slot 内容通过物理页的内核 direct-map 写入（`phys_2_virt`），无需
-//!   `PageMapper`/`RwSem`——这是 batch2 `XolArea::page_paddr` 的设计意图。
+//!   `PageMapper`/`RwSem`——这是 `XolPage::page_paddr` 的设计意图。
 //!
 //! # F5：BPF 透明性
 //!
@@ -207,7 +207,7 @@ fn send_sigtrap_brkpt(frame: &mut TrapFrame, break_addr: usize) -> Result<(), Sy
     // 若这个 #BP 来自 XOL 指令本身，它是确定会投递信号的同步异常。
     mark_current_xol_trapped();
     // #Safety: `interrupt_enable` 仅置位 RFLAGS.IF；此处已脱离 uprobe 命中路径的
-    // irqsave 临界区（uprobe_list/xol_area 均已释放），与 do_undefined_opcode 一致。
+    // irqsave 临界区（uprobe_list/XOL slot lock 均已释放），与 do_undefined_opcode 一致。
     unsafe { CurrentIrqArch::interrupt_enable() };
     if let Err(err) =
         force_sig_fault_to_current(Signal::SIGTRAP, TRAP_BRKPT, VirtAddr::new(break_addr))

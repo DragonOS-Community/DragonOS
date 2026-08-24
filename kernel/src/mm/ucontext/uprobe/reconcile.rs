@@ -17,14 +17,7 @@ struct DisarmTarget {
 /// User VMA operations which overlap it are rejected before any probe byte or
 /// mapping is changed.
 fn validate_uprobe_change_range(mm: &AddressSpace, region: VirtRegion) -> Result<(), SystemError> {
-    let overlaps_xol = {
-        let area = mm.xol_area.lock_irqsave();
-        area.as_ref().is_some_and(|area| {
-            let xol = VirtRegion::new(area.page_base(), MMArch::PAGE_SIZE);
-            xol.collide(&region)
-        })
-    };
-    if overlaps_xol {
+    if mm.xol_pool.overlaps(region) {
         Err(SystemError::EBUSY)
     } else {
         Ok(())

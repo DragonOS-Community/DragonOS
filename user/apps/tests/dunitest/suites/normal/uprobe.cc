@@ -1397,6 +1397,56 @@ TEST(UprobeTest, DifferentAddressesOnSamePageRemainIndependent) {
     unlink(path);
 }
 
+TEST(UprobeTest, MoreThanOneXolPageOfDistinctSitesCanBeRegistered) {
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size_raw, 0);
+    const size_t page_size = static_cast<size_t>(page_size_raw);
+    constexpr size_t kProbeCount = 257;
+    ASSERT_LT(kProbeCount, page_size);
+
+    // Each NOP is a distinct valid instruction start. The old implementation
+    // retained one XOL slot per site but provided only one 256-slot page, so
+    // the final perf_event_open deterministically failed with ENOMEM.
+    std::vector<unsigned char> code(page_size, 0x90);
+    code[kProbeCount] = 0xc3;  // ret after the first slot on the second XOL page
+    char path[] = "/tmp/uprobe_xol_growth_XXXXXX";
+    FdGuard file(create_raw_code(path, code.data(), code.size()));
+    ASSERT_GE(file.get(), 0);
+    void* executable = mmap(nullptr, page_size, PROT_READ | PROT_EXEC,
+                            MAP_PRIVATE, file.get(), 0);
+    ASSERT_NE(executable, MAP_FAILED);
+
+    std::vector<int> events;
+    events.reserve(kProbeCount);
+    int registration_errno = 0;
+    for (size_t offset = 0; offset < kProbeCount; ++offset) {
+        const int fd = open_uprobe_perf_event(path, offset);
+        if (fd < 0) {
+            registration_errno = errno;
+            break;
+        }
+        events.push_back(fd);
+    }
+
+    EXPECT_EQ(events.size(), kProbeCount)
+        << "registered=" << events.size() << ", errno=" << registration_errno;
+    if (events.size() == kProbeCount) {
+        auto second_page_target = reinterpret_cast<void (*)()>(
+            static_cast<unsigned char*>(executable) + kProbeCount - 1);
+        second_page_target();
+
+        __u64 count = 0;
+        const ssize_t count_bytes = read(events.back(), &count, sizeof(count));
+        EXPECT_EQ(count_bytes, static_cast<ssize_t>(sizeof(count)));
+        if (count_bytes == static_cast<ssize_t>(sizeof(count))) {
+            EXPECT_EQ(count, 1U);
+        }
+    }
+    for (int fd : events) close(fd);
+    munmap(executable, page_size);
+    unlink(path);
+}
+
 TEST(UprobeTest, RepeatedStringInstructionIsRejected) {
     constexpr unsigned char rep_movsb[] = {
         0xf3, 0xa4,  // rep movsb

@@ -118,9 +118,9 @@ impl core::fmt::Debug for UprobeSite {
     }
 }
 
-impl core::fmt::Debug for XolArea {
+impl core::fmt::Debug for XolPage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("XolArea")
+        f.debug_struct("XolPage")
             .field("page_base", &self.page_base())
             .finish_non_exhaustive()
     }
@@ -314,7 +314,7 @@ fn revalidate_probe_mapping(
 /// - `probe_vaddr`：被探测的用户虚拟地址（必须在已映射的可执行 VMA 内且页已 present）。
 /// ## 返回
 /// `Ok(UprobeHandle)` 或错误码（`EINVAL`=地址非法/指令不支持，`EFAULT`=页未映射，
-/// `ENOMEM`=内存不足/XOL 区满，`EACCES`=VMA 不可执行）。
+/// `ENOMEM`=内存不足，`EACCES`=VMA 不可执行）。
 ///
 pub(super) fn uprobe_register(
     mm: &Arc<AddressSpace>,
@@ -540,21 +540,21 @@ fn read_user_instruction(
     Ok(())
 }
 
-/// 确保 mm 有 XOL 区，并分配一个 slot，返回 slot 在页内偏移。
+/// Allocate an XOL slot, growing the per-mm pool by one page when necessary.
 fn ensure_xol_and_alloc_slot(
     mm: &Arc<AddressSpace>,
     inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
 ) -> Result<Arc<XolSlotLease>, SystemError> {
-    // 快速路径：XOL 已存在 → 直接分配
-    {
-        let guard = mm.xol_area.lock_irqsave();
-        if let Some(area) = guard.as_ref() {
-            return area.alloc_slot().map(Arc::new).ok_or(SystemError::ENOMEM);
-        }
+    if let Some(lease) = mm.xol_pool.alloc_slot() {
+        return Ok(lease);
     }
 
-    // 慢速路径：创建 XOL 页（匿名映射，R-X）
-    // map_anonymous 可能分配物理页（睡眠安全：此时未持有任何 SpinLock）
+    // Reserve the collection entry before committing a new VMA. All callers
+    // own mm.write, so no competing registration can consume this capacity.
+    mm.xol_pool.reserve_page()?;
+
+    // Slow path: create another anonymous read/execute page. map_anonymous may
+    // allocate and sleep; no XOL pool or slot lock is held here.
     let prot = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
     let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
     let page = inner.map_anonymous(
@@ -569,7 +569,7 @@ fn ensure_xol_and_alloc_slot(
     // XOL is kernel-owned execution state, not an ordinary anonymous mapping.
     // It must never be copied into a child mm or expanded/remapped as user data.
     // VM_IO also makes MADV_DOFORK reject attempts to clear VM_DONTCOPY, matching
-    // the invariant that every mm owns exactly one independently managed XOL area.
+    // the invariant that every mm owns independently managed XOL pages.
     let xol_vma = inner
         .mappings
         .contains(page.virt_address())
@@ -594,22 +594,12 @@ fn ensure_xol_and_alloc_slot(
         let mut pm = page_manager_lock();
         pm.get(&page_paddr).ok_or(SystemError::EFAULT)?
     };
-    let area = XolArea::new(page.virt_address(), page_paddr, owned_page);
-    let lease = area.alloc_slot().map(Arc::new).ok_or(SystemError::ENOMEM)?;
-
-    let mut guard = mm.xol_area.lock_irqsave();
-    if guard.is_none() {
-        *guard = Some(area);
-    } else {
-        // 因调用方持有 inner.write()，同 mm 的注册是串行的，此分支理论上不可达。
-        // TODO: [stage2] unmap 冗余的 XOL 页避免泄漏
-        return guard
-            .as_ref()
-            .unwrap()
-            .alloc_slot()
-            .map(Arc::new)
-            .ok_or(SystemError::ENOMEM);
-    }
+    let xol_page = XolPage::new(page.virt_address(), page_paddr, owned_page);
+    let lease = xol_page
+        .alloc_slot()
+        .map(Arc::new)
+        .ok_or(SystemError::ENOMEM)?;
+    mm.xol_pool.add_page(xol_page);
     Ok(lease)
 }
 

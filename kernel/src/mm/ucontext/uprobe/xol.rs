@@ -11,13 +11,12 @@ const XOL_SLOTS_PER_PAGE: usize = MMArch::PAGE_SIZE / XOL_SLOT_SIZE;
 /// slot 位图需要的 u64 字数（256 bits → 4 words）。
 const XOL_BITMAP_WORDS: usize = XOL_SLOTS_PER_PAGE.div_ceil(64);
 
-/// Per-mm XOL（eXecute Out of Line）区。
+/// One page in a per-mm XOL (eXecute Out of Line) pool.
 ///
-/// 在用户地址空间映射一个可读可执行页，分成 16 字节对齐的 slot。每个 uprobe 分配一个 slot，
-/// 命中时 batch3 在 slot 中写入原指令副本（RIP-relative 重定位后），rip 指向 slot 执行。
-///
-/// XOL 页在**注册时**（进程上下文、开中断）创建，**不能**在命中路径（关中断）创建。
-pub struct XolArea {
+/// The page is mapped read/execute in userspace and divided into 16-byte
+/// slots. Pages are added to [`XolPool`] only from the registration path;
+/// the exception path never grows the pool or allocates memory.
+pub struct XolPage {
     /// XOL 页在用户空间的基地址。
     page_base: VirtAddr,
     /// XOL 页的物理地址（供 batch3 在关中断路径下通过 `phys_2_virt` 直接写 slot 内容，
@@ -31,7 +30,7 @@ pub struct XolArea {
     slot_bitmap: SpinLock<[u64; XOL_BITMAP_WORDS]>,
 }
 
-impl XolArea {
+impl XolPage {
     pub(super) fn new(page_base: VirtAddr, page_paddr: PhysAddr, page: Arc<Page>) -> Arc<Self> {
         Arc::new(Self {
             page_base,
@@ -53,7 +52,7 @@ impl XolArea {
                 }
                 *word |= 1u64 << bit;
                 return Some(XolSlotLease {
-                    area: self.clone(),
+                    page: self.clone(),
                     offset: slot * XOL_SLOT_SIZE,
                     generation: self.generation,
                 });
@@ -91,7 +90,7 @@ impl XolArea {
 /// 一个 XOL slot 的唯一所有权租约。命中路径应把 `Arc<XolSlotLease>` 放入
 /// `ActiveXol`，从而让注销只撤销后续命中，不能复用仍在执行的 slot。
 pub struct XolSlotLease {
-    area: Arc<XolArea>,
+    page: Arc<XolPage>,
     offset: usize,
     generation: u64,
 }
@@ -102,21 +101,21 @@ impl XolSlotLease {
     }
 
     pub fn slot_vaddr(&self) -> VirtAddr {
-        self.area.slot_vaddr(self.offset)
+        self.page.slot_vaddr(self.offset)
     }
 
     pub fn page_paddr(&self) -> PhysAddr {
-        self.area.page_paddr()
+        self.page.page_paddr()
     }
 
-    pub fn area(&self) -> &Arc<XolArea> {
-        &self.area
+    pub fn page(&self) -> &Arc<XolPage> {
+        &self.page
     }
 }
 
 impl Drop for XolSlotLease {
     fn drop(&mut self) {
-        self.area.free_slot(self.offset, self.generation);
+        self.page.free_slot(self.offset, self.generation);
     }
 }
 
@@ -126,6 +125,73 @@ impl core::fmt::Debug for XolSlotLease {
             .field("offset", &self.offset)
             .field("generation", &self.generation)
             .finish_non_exhaustive()
+    }
+}
+
+/// Growable collection of immutable XOL pages owned by one address space.
+///
+/// DragonOS deliberately assigns one pre-relocated slot to each installed
+/// site so the #BP path remains allocation-free. Consequently a fixed
+/// one-page area would incorrectly cap an mm at 256 registered addresses.
+/// The pool grows one page at a time on the registration cold path instead.
+pub struct XolPool {
+    pages: Mutex<Vec<Arc<XolPage>>>,
+}
+
+impl core::fmt::Debug for XolPool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // AddressSpace formatting may happen on diagnostic paths. Do not take
+        // the sleeping pool mutex merely to report an advisory page count.
+        f.debug_struct("XolPool").finish_non_exhaustive()
+    }
+}
+
+impl XolPool {
+    pub fn new() -> Self {
+        Self {
+            pages: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(super) fn alloc_slot(&self) -> Option<Arc<XolSlotLease>> {
+        let pages = self.pages.lock();
+        pages
+            .iter()
+            // The newest page is normally the only partially filled one, so
+            // monotonic registration remains O(1) instead of rescanning every
+            // older full page for each new site. A full reverse scan still
+            // reuses holes released from any earlier page before growing.
+            .rev()
+            .find_map(|page| page.alloc_slot().map(Arc::new))
+    }
+
+    /// Reserve the collection entry before mapping a new page. Registration
+    /// is serialized by mm.write, so this capacity cannot be consumed by a
+    /// competing grow operation before [`Self::add_page`] is called.
+    pub(super) fn reserve_page(&self) -> Result<(), SystemError> {
+        self.pages
+            .lock()
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)
+    }
+
+    pub(super) fn add_page(&self, page: Arc<XolPage>) {
+        let mut pages = self.pages.lock();
+        debug_assert!(pages.len() < pages.capacity());
+        pages.push(page);
+    }
+
+    pub(super) fn overlaps(&self, region: VirtRegion) -> bool {
+        self.pages
+            .lock()
+            .iter()
+            .any(|page| VirtRegion::new(page.page_base(), MMArch::PAGE_SIZE).collide(&region))
+    }
+}
+
+impl Default for XolPool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

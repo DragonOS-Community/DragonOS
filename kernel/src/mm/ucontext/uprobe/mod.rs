@@ -4,7 +4,7 @@
 //!
 //! # 关键设计（评审 findings）
 //!
-//! - **F8**：`uprobe_list` / `xol_area` / `uprobe_page_state` 挂在 `AddressSpace` 上，由
+//! - **F8**：`uprobe_list` / `xol_pool` / `uprobe_page_state` 挂在 `AddressSpace` 上，由
 //!   **独立 irqsave `SpinLock`** 保护（**不**走 `inner: RwSem`），命中路径（#BP/#DB 关中断）
 //!   仅 `lock_irqsave` + 查表，绝不睡眠。
 //! - **F1/F2**：断点页安装复刻 `do_wp_page` 私有文件 COW——`copy_page_as_normal` + patch

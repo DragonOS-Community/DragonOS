@@ -137,7 +137,7 @@ pub use uprobe::{
     fork_inherit_uprobes, uprobe_apply_to_new_vma, uprobe_new_consumer_id, uprobe_registry_add,
     uprobe_registry_remove_consumer, uprobe_registry_set_enabled, UprobeConsumer,
     UprobeConsumerReg, UprobeConsumerRuntime, UprobeConsumerRuntimeSnapshot, UprobeConsumerScope,
-    UprobeDefinition, UprobeHandle, UprobeSite, UprobeSiteState, UprobeTaskScope, XolArea,
+    UprobeDefinition, UprobeHandle, UprobeSite, UprobeSiteState, UprobeTaskScope, XolPool,
     XolSlotLease,
 };
 #[allow(unused_imports)]

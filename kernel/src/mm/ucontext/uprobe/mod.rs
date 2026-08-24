@@ -7,9 +7,9 @@
 //! - **F8**：`uprobe_list` / `xol_pool` / `uprobe_page_state` 挂在 `AddressSpace` 上，由
 //!   **独立 irqsave `SpinLock`** 保护（**不**走 `inner: RwSem`），命中路径（#BP/#DB 关中断）
 //!   仅 `lock_irqsave` + 查表，绝不睡眠。
-//! - **F1/F2**：断点页安装复刻 `do_wp_page` 私有文件 COW——`copy_page_as_normal` + patch
-//!   0xcc + **单次** `set_entry` 原子帧替换（**绝不** unmap+map_phys 制造瞬时空 PTE）+
-//!   `insert_vma`/`remove_vma` rmap 账簿 + `flush_tlb_range`。
+//! - **F1/F2**：断点页安装复刻 `do_wp_page` 私有文件 COW——在 try-only source Page
+//!   guards 下验证并复制到未发布 Normal 页，patch 0xcc 后用**单次** `set_entry`
+//!   原子替换（**绝不** unmap+map_phys 制造瞬时空 PTE）+ rmap 账簿 + TLB rendezvous。
 //! - **F7**：每目标 mm 私有 COW 副本（type `Normal`），**绝不**修改共享 page-cache 页
 //!   （否则 writeback 回写 0xcc 损坏 .so）。
 //! - **F6 装弹顺序不变量**：注册时严格按 XOL slot 分配 → uprobe 表项插入 → 0xcc 页发布；
@@ -32,7 +32,7 @@ use crate::{
     },
     libs::mutex::Mutex,
     mm::{
-        page::{page_manager_lock, Page, PageEntry},
+        page::{page_manager_lock, page_reclaimer_lock, Page, PageEntry, PageFlags, PageType},
         syscall::{MapFlags, ProtFlags},
         MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion, VmFlags,
     },

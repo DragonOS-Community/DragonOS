@@ -421,8 +421,16 @@ pub(crate) fn uprobe_apply_vma_range_locked(
                         handle.rollback_locked(mm, inner);
                     }
                 }
-                Ok(None) | Err(SystemError::ENOENT) => {}
-                Err(error) => {
+                Ok(None) | Err(LockedRegisterError::System(SystemError::ENOENT)) => {}
+                Err(LockedRegisterError::PageContended(page)) => {
+                    needs_fallback = true;
+                    log::debug!(
+                        "uprobe locked mmap apply deferred at {:#x}: Page {:#x} is busy",
+                        probe_vaddr,
+                        page.phys_address().data()
+                    );
+                }
+                Err(LockedRegisterError::System(error)) => {
                     needs_fallback = true;
                     log::debug!(
                         "uprobe locked mmap apply failed at {:#x}: {:?}",

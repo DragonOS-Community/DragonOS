@@ -1687,6 +1687,69 @@ TEST(UprobeTest, RepeatedStringInstructionIsRejected) {
     unlink(path);
 }
 
+TEST(UprobeTest, FastSystemCallInstructionsAreRejected) {
+    constexpr unsigned char fast_system_calls[] = {
+        0x0f, 0x34,  // sysenter
+        0x0f, 0x35,  // sysexit
+    };
+    constexpr unsigned long offsets[] = {0, 2};
+    char path[] = "/tmp/uprobe_fast_syscall_XXXXXX";
+    FdGuard file(
+        create_raw_code(path, fast_system_calls, sizeof(fast_system_calls)));
+    ASSERT_GE(file.get(), 0);
+
+    for (unsigned long offset : offsets) {
+        errno = 0;
+        FdGuard event(open_uprobe_perf_event(path, offset));
+        EXPECT_LT(event.get(), 0)
+            << "XOL must reject SYSENTER/SYSEXIT at offset " << offset;
+        EXPECT_EQ(errno, EINVAL) << "unexpected errno at offset " << offset;
+    }
+    unlink(path);
+}
+
+TEST(UprobeTest, RipRelativeAliasesUseReachableXolPages) {
+    constexpr unsigned char code[] = {
+        0x8b, 0x05, 0x02, 0x00, 0x00, 0x00,  // mov eax,[rip+2]
+        0xc3,                                // ret
+        0x90,                                // padding
+        0x2a, 0x00, 0x00, 0x00,              // value 42
+    };
+    constexpr uintptr_t kFirstAddress = 0x2000000000ULL;
+    constexpr uintptr_t kSecondAddress = 0x4000000000ULL;
+    char path[] = "/tmp/uprobe_reachable_xol_XXXXXX";
+    FdGuard file(create_raw_code(path, code, sizeof(code)));
+    ASSERT_GE(file.get(), 0);
+
+    void* first = mmap(reinterpret_cast<void*>(kFirstAddress), 4096,
+                       PROT_READ | PROT_EXEC,
+                       MAP_PRIVATE | MAP_FIXED_NOREPLACE, file.get(), 0);
+    ASSERT_EQ(first, reinterpret_cast<void*>(kFirstAddress)) << "errno=" << errno;
+    void* second = mmap(reinterpret_cast<void*>(kSecondAddress), 4096,
+                        PROT_READ | PROT_EXEC,
+                        MAP_PRIVATE | MAP_FIXED_NOREPLACE, file.get(), 0);
+    if (second != reinterpret_cast<void*>(kSecondAddress)) {
+        const int mapping_errno = errno;
+        munmap(first, 4096);
+        FAIL() << "second fixed alias failed, errno=" << mapping_errno;
+    }
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0)
+        << "each distant alias needs a disp32-reachable XOL slot, errno="
+        << errno;
+    EXPECT_EQ(reinterpret_cast<int (*)()>(first)(), 42);
+    EXPECT_EQ(reinterpret_cast<int (*)()>(second)(), 42);
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 2U);
+
+    munmap(second, 4096);
+    munmap(first, 4096);
+    unlink(path);
+}
+
 TEST(UprobeTest, PrefixedRipRelativeImm32RelocatesWithoutCorruption) {
     // cs; imul rax, qword ptr [rip+4], 5; ret; padding; qword 7
     // The decoder exposes the sign-extended immediate as 64-bit even though

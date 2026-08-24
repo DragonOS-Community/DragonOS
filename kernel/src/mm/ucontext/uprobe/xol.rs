@@ -11,6 +11,32 @@ const XOL_SLOTS_PER_PAGE: usize = MMArch::PAGE_SIZE / XOL_SLOT_SIZE;
 /// slot 位图需要的 u64 字数（256 bits → 4 words）。
 const XOL_BITMAP_WORDS: usize = XOL_SLOTS_PER_PAGE.div_ceil(64);
 
+fn take_reachable_slot(
+    bitmap: &mut [u64; XOL_BITMAP_WORDS],
+    page_base: usize,
+    reachable: &core::ops::RangeInclusive<usize>,
+) -> Option<usize> {
+    for (word_idx, word) in bitmap.iter_mut().enumerate() {
+        let mut free = !*word;
+        while free != 0 {
+            let bit = free.trailing_zeros() as usize;
+            let slot = word_idx * 64 + bit;
+            if slot >= XOL_SLOTS_PER_PAGE {
+                break;
+            }
+            let offset = slot * XOL_SLOT_SIZE;
+            let slot_vaddr = page_base.checked_add(offset)?;
+            if !reachable.contains(&slot_vaddr) {
+                free &= free - 1;
+                continue;
+            }
+            *word |= 1u64 << bit;
+            return Some(offset);
+        }
+    }
+    None
+}
+
 /// One page in a per-mm XOL (eXecute Out of Line) pool.
 ///
 /// The page is mapped read/execute in userspace and divided into 16-byte
@@ -41,24 +67,17 @@ impl XolPage {
         })
     }
 
-    pub(super) fn alloc_slot(self: &Arc<Self>) -> Option<XolSlotLease> {
+    pub(super) fn alloc_slot_in(
+        self: &Arc<Self>,
+        reachable: &core::ops::RangeInclusive<usize>,
+    ) -> Option<XolSlotLease> {
         let mut bitmap = self.slot_bitmap.lock_irqsave();
-        for (word_idx, word) in bitmap.iter_mut().enumerate() {
-            if *word != u64::MAX {
-                let bit = (!*word).trailing_zeros() as usize;
-                let slot = word_idx * 64 + bit;
-                if slot >= XOL_SLOTS_PER_PAGE {
-                    break;
-                }
-                *word |= 1u64 << bit;
-                return Some(XolSlotLease {
-                    page: self.clone(),
-                    offset: slot * XOL_SLOT_SIZE,
-                    generation: self.generation,
-                });
-            }
-        }
-        None
+        let offset = take_reachable_slot(&mut bitmap, self.page_base.data(), reachable)?;
+        Some(XolSlotLease {
+            page: self.clone(),
+            offset,
+            generation: self.generation,
+        })
     }
 
     fn free_slot(&self, offset: usize, generation: u64) {
@@ -153,16 +172,23 @@ impl XolPool {
         }
     }
 
-    pub(super) fn alloc_slot(&self) -> Option<Arc<XolSlotLease>> {
+    pub(super) fn alloc_slot_in(
+        &self,
+        reachable: &core::ops::RangeInclusive<usize>,
+    ) -> Option<Arc<XolSlotLease>> {
         let pages = self.pages.lock();
-        pages
+        let first = pages.partition_point(|page| {
+            page.page_base.data() + MMArch::PAGE_SIZE - XOL_SLOT_SIZE < *reachable.start()
+        });
+        let end = pages.partition_point(|page| page.page_base.data() <= *reachable.end());
+        pages[first..end]
             .iter()
             // The newest page is normally the only partially filled one, so
             // monotonic registration remains O(1) instead of rescanning every
-            // older full page for each new site. A full reverse scan still
-            // reuses holes released from any earlier page before growing.
+            // older compatible page for each new site. Pages outside the exact
+            // disp32 interval are excluded by the two binary searches above.
             .rev()
-            .find_map(|page| page.alloc_slot().map(Arc::new))
+            .find_map(|page| page.alloc_slot_in(reachable).map(Arc::new))
     }
 
     /// Reserve the collection entry before mapping a new page. Registration
@@ -178,14 +204,20 @@ impl XolPool {
     pub(super) fn add_page(&self, page: Arc<XolPage>) {
         let mut pages = self.pages.lock();
         debug_assert!(pages.len() < pages.capacity());
-        pages.push(page);
+        let index = pages
+            .binary_search_by_key(&page.page_base.data(), |entry| entry.page_base.data())
+            .expect_err("duplicate XOL page base");
+        pages.insert(index, page);
     }
 
     pub(super) fn overlaps(&self, region: VirtRegion) -> bool {
-        self.pages
-            .lock()
-            .iter()
-            .any(|page| VirtRegion::new(page.page_base(), MMArch::PAGE_SIZE).collide(&region))
+        let pages = self.pages.lock();
+        let first = pages.partition_point(|page| {
+            page.page_base.data() + MMArch::PAGE_SIZE <= region.start().data()
+        });
+        pages.get(first).is_some_and(|page| {
+            VirtRegion::new(page.page_base(), MMArch::PAGE_SIZE).collide(&region)
+        })
     }
 }
 
@@ -196,3 +228,31 @@ impl Default for XolPool {
 }
 
 static NEXT_XOL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_slots_are_not_consumed() {
+        let mut bitmap = [0u64; XOL_BITMAP_WORDS];
+        let original = bitmap;
+        assert_eq!(
+            take_reachable_slot(&mut bitmap, 0x1000, &(0x8000..=0x8fff)),
+            None
+        );
+        assert_eq!(bitmap, original);
+    }
+
+    #[test]
+    fn only_a_reachable_free_slot_is_consumed() {
+        let mut bitmap = [0u64; XOL_BITMAP_WORDS];
+        let page_base = 0x4000;
+        let wanted = page_base + 7 * XOL_SLOT_SIZE;
+        assert_eq!(
+            take_reachable_slot(&mut bitmap, page_base, &(wanted..=wanted)),
+            Some(7 * XOL_SLOT_SIZE)
+        );
+        assert_eq!(bitmap[0], 1 << 7);
+    }
+}

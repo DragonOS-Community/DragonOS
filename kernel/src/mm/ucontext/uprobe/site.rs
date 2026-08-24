@@ -1,5 +1,6 @@
 use super::hit_index::UprobeHitIndex;
 use super::*;
+use crate::mm::ucontext::MmuGather;
 
 #[derive(Debug, Default)]
 struct UprobeSiteControl {
@@ -350,11 +351,23 @@ pub(super) fn uprobe_register(
     consumer: &Arc<UprobeConsumer>,
     expected_mapping: &ExpectedProbeMapping,
 ) -> Result<Option<UprobeHandle>, SystemError> {
-    let result = {
-        let mut inner = mm.write();
-        uprobe_register_locked(mm, &mut inner, probe_vaddr, consumer, expected_mapping)
+    let result = loop {
+        let result = {
+            let mut inner = mm.write();
+            uprobe_register_locked(mm, &mut inner, probe_vaddr, consumer, expected_mapping)
+        };
+        match result {
+            Err(LockedRegisterError::PageContended(page)) => {
+                // Wait for the exact conflicting Page only after releasing
+                // mm.write, then retry with full mapping/epoch revalidation.
+                // Taking a write guard handles both reader and writer
+                // contention without speculative map/unmap retry storms.
+                drop(page.write());
+            }
+            other => break other,
+        }
     };
-    let handle = match result {
+    let handle = match result.map_err(LockedRegisterError::into_system_error) {
         Ok(Some(handle)) => handle,
         other => return other,
     };
@@ -369,6 +382,26 @@ pub(super) fn uprobe_register(
     Ok(Some(handle))
 }
 
+pub(super) enum LockedRegisterError {
+    System(SystemError),
+    PageContended(Arc<Page>),
+}
+
+impl LockedRegisterError {
+    fn into_system_error(self) -> SystemError {
+        match self {
+            Self::System(error) => error,
+            Self::PageContended(_) => SystemError::EAGAIN_OR_EWOULDBLOCK,
+        }
+    }
+}
+
+impl From<SystemError> for LockedRegisterError {
+    fn from(error: SystemError) -> Self {
+        Self::System(error)
+    }
+}
+
 /// Install one site while the caller already owns this address space's write
 /// guard. New-VMA reconciliation uses this entry point before it publishes the
 /// mapping outside the write-locked commit boundary.
@@ -378,7 +411,7 @@ pub(super) fn uprobe_register_locked(
     probe_vaddr: usize,
     consumer: &Arc<UprobeConsumer>,
     expected_mapping: &ExpectedProbeMapping,
-) -> Result<Option<UprobeHandle>, SystemError> {
+) -> Result<Option<UprobeHandle>, LockedRegisterError> {
     let install = consumer.begin_install(mm).ok_or(SystemError::ENOENT)?;
     let consumer_id = consumer.id;
 
@@ -410,32 +443,19 @@ pub(super) fn uprobe_register_locked(
 
     let (old_instruction, analysis) = if let Some(site) = existing_site.as_ref() {
         if !Arc::ptr_eq(&site.definition, &consumer.definition) {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
         (site.old_instruction, site.insn_analysis)
     } else {
-        // XOL must execute the bytes that native instruction fetch would have
-        // observed. Linux verifies the software-breakpoint-sized opcode; we
-        // additionally compare the complete decoded instruction so a private
-        // alias or unrelated adjacent VMA cannot change execution semantics.
-        let (old_instruction, analysis) = consumer.definition.instruction();
-        let mut mapped_instruction = [0u8; UPROBE_INSN_COPY_SIZE];
-        read_user_instruction(
-            &inner.user_mapper.utable,
-            probe_vaddr,
-            &mut mapped_instruction[..analysis.insn_len],
-        )?;
-        if mapped_instruction[..analysis.insn_len] != old_instruction[..analysis.insn_len] {
-            return Err(SystemError::EINVAL);
-        }
-        (old_instruction, analysis)
+        consumer.definition.instruction()
     };
 
     // ── Step 2: 确保 XOL 区存在 + 分配 slot ──
-    let xol_lease = if let Some(site) = existing_site.as_ref() {
-        site.xol_lease.clone()
+    let (xol_lease, fresh_xol_page) = if let Some(site) = existing_site.as_ref() {
+        (site.xol_lease.clone(), None)
     } else {
-        ensure_xol_and_alloc_slot(mm, inner)?
+        let reachable = ::uprobe::xol_slot_vaddr_range(&analysis, probe_vaddr);
+        ensure_xol_and_alloc_slot(mm, inner, &reachable)?
     };
     let xol_slot_offset = xol_lease.offset();
 
@@ -446,28 +466,39 @@ pub(super) fn uprobe_register_locked(
     if existing_site.is_none() {
         let (slot_vaddr, page_paddr) = { (xol_lease.slot_vaddr(), xol_lease.page_paddr()) };
 
-        let mut slot_buf = [0u8; UPROBE_INSN_COPY_SIZE];
-        if let Err(e) = build_xol_slot(
-            &analysis,
-            probe_vaddr,
-            slot_vaddr.data(),
-            &old_instruction,
-            &mut slot_buf,
-        ) {
-            log::warn!(
-                "uprobe_register: build_xol_slot failed at {:#x} (slot {:#x}): {:?}",
+        let fill_result = (|| {
+            let mut slot_buf = [0u8; UPROBE_INSN_COPY_SIZE];
+            build_xol_slot(
+                &analysis,
                 probe_vaddr,
                 slot_vaddr.data(),
-                e
-            );
-            return Err(SystemError::EINVAL);
-        }
+                &old_instruction,
+                &mut slot_buf,
+            )
+            .map_err(|e| {
+                log::warn!(
+                    "uprobe_register: build_xol_slot failed at {:#x} (slot {:#x}): {:?}",
+                    probe_vaddr,
+                    slot_vaddr.data(),
+                    e
+                );
+                SystemError::EINVAL
+            })?;
 
-        // 写入 XOL slot 物理页（复刻 batch3 fill_xol_slot / patch_byte_in_phys 写法）。
-        let kva = unsafe { MMArch::phys_2_virt(page_paddr) }.ok_or(SystemError::EFAULT)?;
-        unsafe {
-            let dst = (kva.data() + xol_slot_offset) as *mut u8;
-            core::ptr::copy_nonoverlapping(slot_buf.as_ptr(), dst, UPROBE_INSN_COPY_SIZE);
+            // 写入 XOL slot 物理页（复刻 batch3 fill_xol_slot / patch_byte_in_phys 写法）。
+            let kva = unsafe { MMArch::phys_2_virt(page_paddr) }.ok_or(SystemError::EFAULT)?;
+            unsafe {
+                let dst = (kva.data() + xol_slot_offset) as *mut u8;
+                core::ptr::copy_nonoverlapping(slot_buf.as_ptr(), dst, UPROBE_INSN_COPY_SIZE);
+            }
+            Ok::<(), SystemError>(())
+        })();
+        if let Err(error) = fill_result {
+            if let Some(page) = fresh_xol_page.as_ref() {
+                drop(xol_lease);
+                discard_unpublished_xol_page(mm, inner, page);
+            }
+            return Err(error.into());
         }
     }
 
@@ -495,25 +526,35 @@ pub(super) fn uprobe_register_locked(
         },
     );
 
-    // ── Step 4: 插入 uprobe_list（表项在 0xcc 发布前就绪 — F6）──
-    if first_site {
-        let previous = mm.uprobe_list.insert(probe_vaddr, site.clone());
-        debug_assert!(previous.is_none());
-    }
-    // Publish the weak reverse index before building the runtime snapshot so
-    // a concurrent enable/disable/SET_BPF cannot miss this in-flight site.
-    consumer.remember_site(mm, probe_vaddr, &site);
-    rebuild_site_participants(&site);
-
-    // ── Step 5: 安装 0xcc 断点页 ──
-    if first_site {
-        // hit table 已发布后才允许暴露 0xcc；Armed 在 PTE 提交之前发布。
-        site.state
-            .store(UprobeSiteState::Armed as u8, Ordering::Release);
-    }
     let install_result = if first_site {
-        install_breakpoint_page(mm, inner, &vma, page_base_addr, page_offset)
+        // Prepare and validate the exact COW bytes before publishing any hit
+        // metadata. The callback is invoked only after every fallible step and
+        // immediately before the infallible INT3/PTE commit, preserving F6
+        // without exposing an XOL lease from a failed installation.
+        let publish_site = || {
+            let previous = mm.uprobe_list.insert(probe_vaddr, site.clone());
+            debug_assert!(previous.is_none());
+            consumer.remember_site(mm, probe_vaddr, &site);
+            rebuild_site_participants(&site);
+            site.state
+                .store(UprobeSiteState::Armed as u8, Ordering::Release);
+        };
+        install_breakpoint_page(
+            mm,
+            inner,
+            &vma,
+            probe_vaddr,
+            page_base_addr,
+            page_offset,
+            &old_instruction,
+            analysis.insn_len,
+            publish_site,
+        )
     } else {
+        // The breakpoint and hit-table entry already exist. Publish only the
+        // new consumer membership and its reverse index.
+        consumer.remember_site(mm, probe_vaddr, &site);
+        rebuild_site_participants(&site);
         Ok(())
     };
     if let Err(e) = install_result {
@@ -525,7 +566,20 @@ pub(super) fn uprobe_register_locked(
         consumer.forget_site(mm.id(), probe_vaddr, &site);
         site.state
             .store(UprobeSiteState::Dead as u8, Ordering::Release);
+        if let Some(page) = fresh_xol_page {
+            // No breakpoint was published, so this newly grown XOL page has
+            // no external user. Drop every slot owner before removing the
+            // exact kernel-owned VMA; failed registrations must not grow the
+            // per-mm pool high-water mark.
+            drop(site);
+            drop(xol_lease);
+            discard_unpublished_xol_page(mm, inner, &page);
+        }
         return Err(e);
+    }
+
+    if let Some(page) = fresh_xol_page {
+        mm.xol_pool.add_page(page);
     }
 
     Ok(Some(UprobeHandle {
@@ -538,11 +592,8 @@ pub(super) fn uprobe_register_locked(
 
 // ──────────────────────── 内部实现 ────────────────────────
 
-/// 从目标 mm 的页表读取 probe_vaddr 处的指令字节（最多 16 字节）。
-///
-/// `PageMapper::translate` 直接 walk 物理页表，不需要目标 mm 的 CR3 上下文，
-/// 因此可跨进程读取。若页未 present 返回 `EFAULT`。
-fn read_user_instruction(
+/// Copy instruction bytes after the caller has locked every backing Page.
+fn copy_locked_instruction(
     mapper: &PageMapper,
     probe_vaddr: usize,
     output: &mut [u8],
@@ -572,21 +623,50 @@ fn read_user_instruction(
 fn ensure_xol_and_alloc_slot(
     mm: &Arc<AddressSpace>,
     inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
-) -> Result<Arc<XolSlotLease>, SystemError> {
-    if let Some(lease) = mm.xol_pool.alloc_slot() {
-        return Ok(lease);
+    reachable: &core::ops::RangeInclusive<usize>,
+) -> Result<(Arc<XolSlotLease>, Option<Arc<XolPage>>), SystemError> {
+    if let Some(lease) = mm.xol_pool.alloc_slot_in(reachable) {
+        return Ok((lease, None));
     }
 
     // Reserve the collection entry before committing a new VMA. All callers
     // own mm.write, so no competing registration can consume this capacity.
     mm.xol_pool.reserve_page()?;
 
+    // Select a whole-page hole whose base is itself reachable. Slot zero of
+    // the fresh page is then guaranteed to satisfy the exact disp32 interval,
+    // and MAP_FIXED_NOREPLACE below cannot silently fall back elsewhere.
+    let page_mask = MMArch::PAGE_SIZE - 1;
+    let first = (*reachable.start())
+        .max(inner.mmap_min.data())
+        .checked_add(page_mask)
+        .map(|addr| addr & !page_mask)
+        .ok_or(SystemError::ENOMEM)?;
+    let last = (*reachable.end()).min(
+        MMArch::USER_END_VADDR
+            .data()
+            .checked_sub(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::ENOMEM)?,
+    ) & !page_mask;
+    if first > last {
+        return Err(SystemError::ENOMEM);
+    }
+    let bounded_size = last
+        .checked_sub(first)
+        .and_then(|size| size.checked_add(MMArch::PAGE_SIZE))
+        .ok_or(SystemError::ENOMEM)?;
+    let bounds = VirtRegion::new(VirtAddr::new(first), bounded_size);
+    let region = inner
+        .mappings
+        .find_free_bounded(bounds, MMArch::PAGE_SIZE)
+        .ok_or(SystemError::ENOMEM)?;
+
     // Slow path: create another anonymous read/execute page. map_anonymous may
     // allocate and sleep; no XOL pool or slot lock is held here.
     let prot = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
-    let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+    let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE;
     let page = inner.map_anonymous(
-        VirtAddr::new(0), // 让内核选择地址
+        region.start(),
         MMArch::PAGE_SIZE,
         prot,
         map_flags,
@@ -601,7 +681,7 @@ fn ensure_xol_and_alloc_slot(
     let xol_vma = inner
         .mappings
         .contains(page.virt_address())
-        .ok_or(SystemError::EFAULT)?;
+        .expect("fresh XOL mapping disappeared under mm.write");
     {
         let mut guard = xol_vma.lock();
         let special =
@@ -616,32 +696,58 @@ fn ensure_xol_and_alloc_slot(
         .utable
         .translate(page.virt_address())
         .map(|(pa, _)| pa)
-        .ok_or(SystemError::EFAULT)?;
+        .expect("allocate_at_once XOL mapping has no PTE");
 
     let owned_page = {
         let mut pm = page_manager_lock();
-        pm.get(&page_paddr).ok_or(SystemError::EFAULT)?
+        pm.get(&page_paddr)
+            .expect("fresh XOL page is absent from the page manager")
     };
     let xol_page = XolPage::new(page.virt_address(), page_paddr, owned_page);
     let lease = xol_page
-        .alloc_slot()
+        .alloc_slot_in(reachable)
         .map(Arc::new)
-        .ok_or(SystemError::ENOMEM)?;
-    mm.xol_pool.add_page(xol_page);
-    Ok(lease)
+        .expect("fresh reachable XOL page has no reachable slot");
+    Ok((lease, Some(xol_page)))
+}
+
+/// Remove an XOL VMA which was created for an installation that never
+/// published a breakpoint. The VMA is exact, anonymous, and has no consumer,
+/// so the generic fallible munmap transaction would only add rollback states.
+fn discard_unpublished_xol_page(
+    mm: &Arc<AddressSpace>,
+    inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+    page: &Arc<XolPage>,
+) {
+    let region = VirtRegion::new(page.page_base(), MMArch::PAGE_SIZE);
+    let vma = inner
+        .mappings
+        .remove_vma(&region)
+        .expect("unpublished XOL VMA disappeared under mm.write");
+    let mut tlb = MmuGather::gather(mm);
+    vma.unmap(&mut inner.user_mapper.utable, &mut tlb);
+    tlb.finish();
 }
 
 /// 安装 0xcc 断点页（复刻 do_wp_page 私有文件 COW）。
 ///
 /// 若页已有断点（同一物理页上的另一个 uprobe），仅 patch 额外 0xcc 字节 + refcount++；
 /// 否则 COW → patch → 单次 set_entry → rmap → flush_tlb_range。
-fn install_breakpoint_page(
+#[allow(clippy::too_many_arguments)]
+fn install_breakpoint_page<F>(
     mm: &Arc<AddressSpace>,
     inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
     vma: &Arc<LockedVMA>,
+    probe_vaddr: usize,
     page_base_addr: usize,
     page_offset: usize,
-) -> Result<(), SystemError> {
+    old_instruction: &[u8; UPROBE_INSN_COPY_SIZE],
+    insn_len: usize,
+    publish_site: F,
+) -> Result<(), LockedRegisterError>
+where
+    F: FnOnce(),
+{
     let address = VirtAddr::new(page_base_addr);
     let end = VirtAddr::new(page_base_addr + MMArch::PAGE_SIZE);
 
@@ -652,33 +758,84 @@ fn install_breakpoint_page(
     };
 
     if already_cowed {
-        // 页已私有化：在**当前映射页** patch 额外 0xcc 字节（translate 取实时
-        // paddr——写缺页二次 COW 后仍是正确页），refcount++。
+        // Validate and patch the current private page under one try-only Page
+        // lock. Blocking here under mm.write would invert writeback's Page ->
+        // mm ordering.
         {
-            let _pt_edit = mm.page_table_edit();
             let mapper = &mut inner.user_mapper.utable;
             let (paddr, _) = mapper.translate(address).ok_or(SystemError::EFAULT)?;
-            let kva = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
-            let mut pb = mm.uprobe_page_state.lock_irqsave();
-            let state = pb.get_mut(&page_base_addr).ok_or(SystemError::EFAULT)?;
+            let page = page_manager_lock().get(&paddr).ok_or(SystemError::EFAULT)?;
+            let instruction_end = probe_vaddr
+                .checked_add(insn_len)
+                .ok_or(SystemError::EFAULT)?;
+            let second_page = if instruction_end > page_base_addr + MMArch::PAGE_SIZE {
+                let second_addr = VirtAddr::new(page_base_addr + MMArch::PAGE_SIZE);
+                let (second_paddr, _) = mapper.translate(second_addr).ok_or(SystemError::EFAULT)?;
+                Some((
+                    second_paddr,
+                    page_manager_lock()
+                        .get(&second_paddr)
+                        .ok_or(SystemError::EFAULT)?,
+                ))
+            } else {
+                None
+            };
+            let (_first_guard, _second_guard) = match second_page.as_ref() {
+                Some((second_paddr, second)) if *second_paddr != paddr => {
+                    if paddr.data() <= second_paddr.data() {
+                        let first = page
+                            .try_write()
+                            .ok_or_else(|| LockedRegisterError::PageContended(page.clone()))?;
+                        let second = second
+                            .try_write()
+                            .ok_or_else(|| LockedRegisterError::PageContended(second.clone()))?;
+                        (first, Some(second))
+                    } else {
+                        let second_guard = second
+                            .try_write()
+                            .ok_or_else(|| LockedRegisterError::PageContended(second.clone()))?;
+                        let first = page
+                            .try_write()
+                            .ok_or_else(|| LockedRegisterError::PageContended(page.clone()))?;
+                        (first, Some(second_guard))
+                    }
+                }
+                _ => (
+                    page.try_write()
+                        .ok_or_else(|| LockedRegisterError::PageContended(page.clone()))?,
+                    None,
+                ),
+            };
+            let mut mapped = [0u8; UPROBE_INSN_COPY_SIZE];
+            copy_locked_instruction(mapper, probe_vaddr, &mut mapped[..insn_len])?;
+            if mapped[..insn_len] != old_instruction[..insn_len] {
+                return Err(SystemError::EINVAL.into());
+            }
+            let kva =
+                unsafe { MMArch::phys_2_virt(page.phys_address()) }.ok_or(SystemError::EFAULT)?;
+
+            publish_site();
+            // All fallible preparation is complete. Publish page-state before
+            // the byte so teardown can account for every visible INT3.
+            mm.uprobe_page_state
+                .lock_irqsave()
+                .get_mut(&page_base_addr)
+                .expect("existing uprobe COW page lost its state")
+                .refcount += 1;
+            let pt_edit = mm.page_table_edit();
             unsafe {
                 core::ptr::write_volatile((kva.data() + page_offset) as *mut u8, 0xcc);
             }
-            state.refcount += 1;
+            drop(pt_edit);
+            // Keep both source-page guards until stale executable translations
+            // have passed the new INT3 publication point.
+            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
         }
-
-        // This branch edits an already mapped physical page, so there is no
-        // PTE replacement to serialize instruction fetch on remote CPUs.  A
-        // synchronous mm shootdown is the publication point for the new INT3.
-        // Do not wait for the IPI while holding page_table_edit or page-state.
-        mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
         return Ok(());
     }
 
     // ── 新 COW 断点页 ──
 
-    // page_table_edit 锁（debug_assert IRQ 启用——注册在进程上下文）
-    let _pt_edit = mm.page_table_edit();
     let mapper = &mut inner.user_mapper.utable;
 
     // translate 取旧 paddr + flags
@@ -690,39 +847,146 @@ fn install_breakpoint_page(
         pm.get(&old_paddr).ok_or(SystemError::EFAULT)?
     };
 
-    // COW：copy_page_as_normal → 私有 Normal 副本（type=Normal，不回写 page-cache — F7）
+    // Allocate an unpublished destination before taking source Page locks, so
+    // PageManager -> Page remains the only blocking lock order.
     let new_page = {
         let mut pm = page_manager_lock();
-        pm.copy_page_as_normal(&old_paddr, mapper.allocator_mut())
-            .map_err(|_| SystemError::ENOMEM)?
+        pm.create_one_page(PageType::Normal, PageFlags::empty(), mapper.allocator_mut())?
     };
+    let install_result = (|| -> Result<(), LockedRegisterError> {
+        let instruction_end = probe_vaddr
+            .checked_add(insn_len)
+            .ok_or(SystemError::EFAULT)?;
+        let second_page = if instruction_end > page_base_addr + MMArch::PAGE_SIZE {
+            let second_addr = VirtAddr::new(page_base_addr + MMArch::PAGE_SIZE);
+            let (second_paddr, _) = mapper.translate(second_addr).ok_or(SystemError::EFAULT)?;
+            Some((
+                second_paddr,
+                page_manager_lock()
+                    .get(&second_paddr)
+                    .ok_or(SystemError::EFAULT)?,
+            ))
+        } else {
+            None
+        };
 
-    // patch 0xcc
-    patch_byte_in_phys(&new_page, page_offset, 0xcc)?;
+        let mut new_guard = new_page.write();
+        // x86 instructions span at most two pages. Try-lock both in physical
+        // order; a concurrent writer makes registration retry instead of
+        // creating an mm -> Page wait edge.
+        let (mut first_guard, mut second_guard) = match second_page.as_ref() {
+            Some((second_paddr, second)) if *second_paddr != old_paddr => {
+                if old_paddr.data() <= second_paddr.data() {
+                    let first = old_page
+                        .try_write()
+                        .ok_or_else(|| LockedRegisterError::PageContended(old_page.clone()))?;
+                    let second = second
+                        .try_write()
+                        .ok_or_else(|| LockedRegisterError::PageContended(second.clone()))?;
+                    (Some(first), Some(second))
+                } else {
+                    let second = second
+                        .try_write()
+                        .ok_or_else(|| LockedRegisterError::PageContended(second.clone()))?;
+                    let first = old_page
+                        .try_write()
+                        .ok_or_else(|| LockedRegisterError::PageContended(old_page.clone()))?;
+                    (Some(first), Some(second))
+                }
+            }
+            _ => (
+                Some(
+                    old_page
+                        .try_write()
+                        .ok_or_else(|| LockedRegisterError::PageContended(old_page.clone()))?,
+                ),
+                None,
+            ),
+        };
 
-    // 单次原子 set_entry（绝不制造瞬时空 PTE — F1/F2）
-    let table = mapper.get_table(address, 0).ok_or(SystemError::EFAULT)?;
-    let i = table.index_of(address).ok_or(SystemError::EFAULT)?;
-    unsafe {
-        table.set_entry(i, PageEntry::new(new_page.phys_address(), entry_flags));
-    }
+        let old_guard = first_guard.as_mut().expect("first source page guard");
+        unsafe { new_guard.copy_from_slice(old_guard.as_slice()) };
+        new_guard.set_flags(*old_guard.flags());
+        new_guard.clear_mapping_unevictable_source_for_cow();
 
-    // mm-aware TLB shootdown
-    mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+        let mut mapped = [0u8; UPROBE_INSN_COPY_SIZE];
+        // Validate the bytes that will actually become executable. A writable
+        // MAP_SHARED alias can modify the source through hardware without
+        // taking the Page lock, so re-reading only the source after the copy
+        // could accept a mixed-version destination. The first-page bytes come
+        // from the unpublished COW candidate; only a cross-page tail remains
+        // backed by (and is read from) the locked source mapping.
+        let first_len = insn_len.min(MMArch::PAGE_SIZE - page_offset);
+        unsafe {
+            mapped[..first_len]
+                .copy_from_slice(&new_guard.as_slice()[page_offset..page_offset + first_len]);
+        }
+        if first_len < insn_len {
+            copy_locked_instruction(
+                mapper,
+                probe_vaddr + first_len,
+                &mut mapped[first_len..insn_len],
+            )?;
+        }
+        if mapped[..insn_len] != old_instruction[..insn_len] {
+            return Err(SystemError::EINVAL.into());
+        }
+        patch_byte_in_phys(&new_page, page_offset, 0xcc)?;
 
-    // rmap 账簿：attach 新副本，detach 旧页
-    let vm_locked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
-    new_page.write().insert_vma(vma.clone(), vm_locked);
-    {
-        let mut old_guard = old_page.write();
+        // Complete all bookkeeping which may allocate before publishing the
+        // hit metadata. mm.write keeps the original PTE stable throughout.
+        let vm_locked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
+        new_guard.insert_vma(vma.clone(), vm_locked);
+        mm.uprobe_page_state
+            .lock_irqsave()
+            .insert(page_base_addr, UprobePageState { refcount: 1 });
+
+        publish_site();
+        // No fallible operation follows site publication. Revalidate the PTE
+        // as an invariant under mm.write, then atomically expose the patched
+        // private page.
+        let pt_edit = mm.page_table_edit();
+        let (current_paddr, _) = mapper
+            .translate(address)
+            .expect("prepared uprobe source PTE disappeared under mm.write");
+        assert_eq!(current_paddr, old_paddr);
+        let table = mapper
+            .get_table(address, 0)
+            .expect("prepared uprobe page table disappeared under mm.write");
+        let i = table
+            .index_of(address)
+            .expect("prepared uprobe address left its page table");
+        unsafe {
+            table.set_entry(i, PageEntry::new(new_page.phys_address(), entry_flags));
+        }
+        drop(pt_edit);
+
+        // The old source Page remains locked until every CPU has discarded a
+        // possibly stale executable translation. Only then may writeback
+        // mutate it or stop accounting this VMA in its reverse map.
+        mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
         old_guard.remove_vma(vma.as_ref());
+        let should_reclaim_old = old_guard.flags().contains(PageFlags::PG_UNEVICTABLE)
+            && !old_guard.has_unevictable_source();
+        if should_reclaim_old {
+            old_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
+        }
+        let old_was_lru = old_guard.flags().contains(PageFlags::PG_LRU);
+        drop(second_guard.take());
+        drop(first_guard.take());
+        drop(new_guard);
+        if should_reclaim_old && old_was_lru {
+            page_reclaimer_lock().insert_page(old_paddr, &old_page);
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = install_result {
+        // No PTE points at the destination on failure; remove PageManager's
+        // owning reference after all page guards have unwound.
+        page_manager_lock().remove_page_if_same(&new_page);
+        return Err(error);
     }
-    InnerAddressSpace::remove_page_unevictable_if_unneeded(&old_page);
-
-    // 记录页状态（页已私有化的标记）
-    let mut pb = mm.uprobe_page_state.lock_irqsave();
-    pb.insert(page_base_addr, UprobePageState { refcount: 1 });
-
     Ok(())
 }
 

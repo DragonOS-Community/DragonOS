@@ -352,6 +352,16 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     {
         return Err(SystemError::EINVAL);
     }
+    // Linux checks CPU online state only for a per-CPU event (task == NULL),
+    // not for a task event constrained to one CPU. Keep the possible-CPU
+    // validation above so an out-of-range CPU remains EINVAL, while a real
+    // but offline per-CPU target reports ENODEV.
+    if args.pid == -1
+        && args.cpu >= 0
+        && !smp_cpu_manager().is_online_cpu(ProcessorId::new(args.cpu as u32))
+    {
+        return Err(SystemError::ENODEV);
+    }
     if args.inherit || args.enable_on_exec || args.remove_on_exec {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }

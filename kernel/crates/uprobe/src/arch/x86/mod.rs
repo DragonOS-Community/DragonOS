@@ -59,6 +59,31 @@ pub struct InsnAnalysis {
     pub rip_relative: Option<RipReloc>,
 }
 
+/// Return the exact inclusive range of XOL slot addresses from which this
+/// instruction can be relocated without overflowing its encoded `disp32`.
+///
+/// For a RIP-relative instruction, [`build_xol_slot`] computes
+/// `new_disp = old_disp + probe_vaddr - slot_vaddr`. Solving that expression
+/// for every value representable by `i32` gives this interval. Non-RIP-relative
+/// instructions have no placement constraint.
+pub fn xol_slot_vaddr_range(
+    analysis: &InsnAnalysis,
+    probe_vaddr: usize,
+) -> core::ops::RangeInclusive<usize> {
+    let Some(reloc) = analysis.rip_relative else {
+        return 0..=usize::MAX;
+    };
+
+    // i128 keeps both signed disp32 endpoints and the full usize address
+    // domain representable without wrapping at either user-address boundary.
+    let center = probe_vaddr as i128 + reloc.disp as i128;
+    let first = center - i32::MAX as i128;
+    let last = center - i32::MIN as i128;
+    let first = first.clamp(0, usize::MAX as i128) as usize;
+    let last = last.clamp(0, usize::MAX as i128) as usize;
+    first..=last
+}
+
 /// 解码并静态分析一条 x86_64 指令。
 ///
 /// `bytes` 至少应包含完整指令（多余字节被忽略）。返回指令长度与（若存在的）
@@ -129,7 +154,8 @@ fn is_repeated_string(inst: &Instruction) -> bool {
 /// 判断指令是否为控制流指令（不可从 XOL slot 安全执行）。
 ///
 /// 覆盖：直接跳转/调用/返回、条件跳转（Jcc）、循环（LOOP*）、
-/// 事务分支（XBEGIN）、中断（INT/INT3/IRET*）、系统调用/返回（SYSCALL/SYSRET）。
+/// 事务分支（XBEGIN）、中断（INT/INT3/IRET*）、系统调用/返回
+/// （SYSCALL/SYSRET/SYSENTER/SYSEXIT）。
 /// 这些指令改变 RIP 的方式使 XOL 单步后的 #DB 无法在 slot 内捕获，
 /// 或会向用户栈写入 XOL 地址损坏控制流。
 fn is_control_flow(inst: &Instruction) -> bool {
@@ -153,6 +179,8 @@ fn is_control_flow(inst: &Instruction) -> bool {
             | Opcode::IRETQ
             | Opcode::SYSCALL
             | Opcode::SYSRET
+            | Opcode::SYSENTER
+            | Opcode::SYSEXIT
     ) || inst.opcode().is_jcc()
 }
 
@@ -326,6 +354,56 @@ mod tests {
         let a = analyze_insn(&[0x48, 0x89, 0xe5]).unwrap();
         assert_eq!(a.insn_len, 3);
         assert!(a.rip_relative.is_none());
+        assert_eq!(xol_slot_vaddr_range(&a, usize::MAX), 0..=usize::MAX);
+    }
+
+    #[test]
+    fn xol_slot_range_matches_disp32_endpoints() {
+        let analysis = InsnAnalysis {
+            insn_len: 7,
+            rip_relative: Some(RipReloc {
+                disp_offset: 3,
+                disp: 0,
+            }),
+        };
+        let probe = 0x1_0000_0000usize;
+        let range = xol_slot_vaddr_range(&analysis, probe);
+        assert_eq!(*range.start(), probe - i32::MAX as usize);
+        assert_eq!(*range.end(), probe + (i32::MAX as usize + 1));
+
+        let insn = [0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        let mut slot = [0u8; crate::UPROBE_INSN_COPY_SIZE];
+        assert!(build_xol_slot(&analysis, probe, *range.start(), &insn, &mut slot).is_ok());
+        assert!(build_xol_slot(&analysis, probe, *range.end(), &insn, &mut slot).is_ok());
+        assert_eq!(
+            build_xol_slot(&analysis, probe, range.start() - 1, &insn, &mut slot,),
+            Err(UprobeInsnError::DisplacementOverflow)
+        );
+        assert_eq!(
+            build_xol_slot(&analysis, probe, range.end() + 1, &insn, &mut slot),
+            Err(UprobeInsnError::DisplacementOverflow)
+        );
+    }
+
+    #[test]
+    fn xol_slot_range_clips_without_wrapping() {
+        let low = InsnAnalysis {
+            insn_len: 7,
+            rip_relative: Some(RipReloc {
+                disp_offset: 3,
+                disp: i32::MIN,
+            }),
+        };
+        assert_eq!(*xol_slot_vaddr_range(&low, 0).start(), 0);
+
+        let high = InsnAnalysis {
+            insn_len: 7,
+            rip_relative: Some(RipReloc {
+                disp_offset: 3,
+                disp: i32::MAX,
+            }),
+        };
+        assert_eq!(*xol_slot_vaddr_range(&high, usize::MAX).end(), usize::MAX);
     }
 
     #[test]
@@ -440,7 +518,7 @@ mod tests {
     fn control_flow_rejected() {
         // call rel32 (e8), jmp rel8 (eb), ret (c3), je rel8 (74),
         // loopnz/loopz/loop/jrcxz (e0..e3), xbegin rel32 (c7 f8),
-        // syscall (0f 05)
+        // syscall/sysret (0f 05/07), sysenter/sysexit (0f 34/35)
         for bytes in [
             &[0xe8, 0x00, 0x00, 0x00, 0x00][..],
             &[0xeb, 0xfe][..],
@@ -456,6 +534,9 @@ mod tests {
             &[0x67, 0xe3, 0x00][..],
             &[0xc7, 0xf8, 0x00, 0x00, 0x00, 0x00][..],
             &[0x0f, 0x05][..],
+            &[0x0f, 0x07][..],
+            &[0x0f, 0x34][..],
+            &[0x0f, 0x35][..],
         ] {
             assert_eq!(
                 analyze_insn(bytes).unwrap_err(),

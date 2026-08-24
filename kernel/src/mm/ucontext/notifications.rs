@@ -127,6 +127,10 @@ pub(super) struct MunmapVmaPlan {
 pub(super) struct MprotectVmaPlan {
     pub(super) original_region: VirtRegion,
     pub(super) intersection: VirtRegion,
+    #[cfg(target_arch = "x86_64")]
+    pub(super) old_vm_flags: VmFlags,
+    #[cfg(target_arch = "x86_64")]
+    pub(super) defer_uprobe_execute: bool,
     pub(super) new_vm_flags: VmFlags,
     pub(super) split_lifecycle: VmaSplitLifecycle,
 }

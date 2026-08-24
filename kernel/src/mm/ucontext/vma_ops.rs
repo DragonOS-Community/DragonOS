@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(target_arch = "x86_64")]
+use crate::mm::page::PageEntry;
+#[cfg(target_arch = "x86_64")]
+use ::uprobe::UPROBE_INSN_COPY_SIZE;
 
 pub(super) struct PreparedMunmap {
     plans: Vec<MunmapVmaPlan>,
@@ -28,8 +32,28 @@ pub(super) struct PreparedMprotect {
 }
 
 impl PreparedMprotect {
-    pub(super) fn affected_ranges(&self) -> Vec<VirtRegion> {
+    /// Every planned VMA mutation must be checked against the kernel-owned XOL
+    /// mapping, independently of whether uprobe eligibility changes.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn validation_ranges(&self) -> Vec<VirtRegion> {
         self.plans.iter().map(|plan| plan.intersection).collect()
+    }
+
+    /// Only protection changes which cross the uprobe eligibility boundary
+    /// require site withdrawal/reapplication. Read-only permission changes on
+    /// an already executable private file mapping keep the same mapping and
+    /// breakpoint page, so withdrawing them would create a needless execution
+    /// gap while another CPU continues to use its present PTE.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn uprobe_affected_ranges(&self) -> Vec<VirtRegion> {
+        self.plans
+            .iter()
+            .filter(|plan| {
+                super::uprobe::valid_probe_vma_flags(plan.old_vm_flags)
+                    != super::uprobe::valid_probe_vma_flags(plan.new_vm_flags)
+            })
+            .map(|plan| plan.intersection)
+            .collect()
     }
 
     pub(super) fn rollback(self) -> VmaCloseNotifications {
@@ -46,9 +70,136 @@ pub(super) struct PreparedMadviseDontNeed {
     terminal_error: Option<SystemError>,
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(super) struct MadviseUprobePublication {
+    vmas: Vec<MadviseUprobeVmaPublication>,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct MadviseUprobeVmaPublication {
+    vma: Arc<LockedVMA>,
+    advised_region: VirtRegion,
+    original_execute: bool,
+    pte_publication: Option<(VirtRegion, bool)>,
+}
+
 impl PreparedMadviseDontNeed {
     pub(super) fn affected_ranges(&self) -> Vec<VirtRegion> {
         self.actions.iter().map(|(_, region)| *region).collect()
+    }
+
+    /// Keep refaulted DONTNEED pages non-executable until the replacement
+    /// breakpoint page is ready. Existing present pages remain executable and
+    /// armed until the zap itself commits; the temporary default applies only
+    /// to pages faulted by the locked reconciliation which follows that zap.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn defer_uprobe_execute(&self) -> MadviseUprobePublication {
+        if !super::uprobe::has_active_consumers() {
+            return MadviseUprobePublication { vmas: Vec::new() };
+        }
+        let mut vmas: Vec<MadviseUprobeVmaPublication> = Vec::new();
+        for (vma, region) in &self.actions {
+            if vmas.iter().any(|current| Arc::ptr_eq(&current.vma, vma)) {
+                continue;
+            }
+            let mut guard = vma.lock();
+            let vm_flags = *guard.vm_flags();
+            if !vm_flags.contains(VmFlags::VM_EXEC) {
+                continue;
+            }
+            let Some(file) = guard.vm_file() else {
+                continue;
+            };
+            let Some(file_start) = guard.backing_page_offset().and_then(|pgoff| {
+                pgoff.checked_mul(MMArch::PAGE_SIZE).and_then(|start| {
+                    start.checked_add(region.start().data() - guard.region().start().data())
+                })
+            }) else {
+                continue;
+            };
+            if !super::uprobe::requires_exec_publication_barrier(
+                &file,
+                vm_flags,
+                file_start,
+                region.size(),
+            ) {
+                continue;
+            }
+            let original_execute = guard.flags().has_execute();
+            guard.set_entry_execute(false);
+            vmas.push(MadviseUprobeVmaPublication {
+                vma: vma.clone(),
+                advised_region: *region,
+                original_execute,
+                pte_publication: None,
+            });
+        }
+        MadviseUprobePublication { vmas }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl MadviseUprobePublication {
+    pub(super) fn publish(self, inner: &mut InnerAddressSpace, mm: &Arc<AddressSpace>) {
+        if self.vmas.is_empty() {
+            return;
+        }
+        let mut tlb = MmuGather::gather(mm);
+        let mapper = &mut inner.user_mapper.utable;
+        let mut vmas = self.vmas;
+        for publication in &mut vmas {
+            let mut guard = publication.vma.lock();
+            let restore =
+                publication.original_execute && guard.vm_flags().contains(VmFlags::VM_EXEC);
+            let vma_region = *guard.region();
+            guard.set_entry_execute(restore);
+            let prefix = publication
+                .advised_region
+                .start()
+                .data()
+                .saturating_sub(UPROBE_INSN_COPY_SIZE - 1)
+                & !(MMArch::PAGE_SIZE - 1);
+            let suffix = publication
+                .advised_region
+                .end()
+                .data()
+                .checked_add(UPROBE_INSN_COPY_SIZE - 1)
+                .map(page_align_up)
+                .unwrap_or(publication.advised_region.end().data());
+            let start = VirtAddr::new(core::cmp::max(prefix, vma_region.start().data()));
+            let end = VirtAddr::new(core::cmp::min(suffix, vma_region.end().data()));
+            publication.pte_publication = Some((VirtRegion::new(start, end - start), restore));
+        }
+        {
+            let _pt_edit = mm.page_table_edit();
+            for publication in vmas {
+                let Some((region, restore)) = publication.pte_publication else {
+                    continue;
+                };
+                let mut address = region.start();
+                while address < region.end() {
+                    if let Some((paddr, flags)) = mapper.translate(address) {
+                        if flags.has_execute() != restore {
+                            let table = mapper
+                                .get_table(address, 0)
+                                .expect("present madvise publication must have a leaf table");
+                            let index = table
+                                .index_of(address)
+                                .expect("present madvise publication must have a leaf index");
+                            unsafe {
+                                table.set_entry(
+                                    index,
+                                    PageEntry::new(paddr, flags.set_execute(restore)),
+                                );
+                            }
+                            tlb.accumulate_range(address);
+                        }
+                    }
+                    address += MMArch::PAGE_SIZE;
+                }
+            }
+        }
+        tlb.finish();
     }
 }
 
@@ -422,7 +573,16 @@ impl InnerAddressSpace {
         prot_flags: ProtFlags,
     ) -> Result<(), VmaOpFailure> {
         let prepared = self.prepare_mprotect(start_page, page_count, prot_flags)?;
-        self.commit_mprotect(prepared);
+        let deferred_execute = self.commit_mprotect(prepared);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mm = self
+                .outer_addr_space()
+                .expect("live mprotect transaction lost its AddressSpace");
+            self.publish_mprotect_permissions(&mm, deferred_execute);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = deferred_execute;
         Ok(())
     }
 
@@ -432,6 +592,10 @@ impl InnerAddressSpace {
         page_count: PageFrameCount,
         prot_flags: ProtFlags,
     ) -> Result<PreparedMprotect, VmaOpFailure> {
+        #[cfg(target_arch = "x86_64")]
+        let mm = self
+            .outer_addr_space()
+            .expect("live mprotect transaction lost its AddressSpace");
         // debug!(
         //     "mprotect: start_page: {:?}, page_count: {:?}, prot_flags:{prot_flags:?}",
         //     start_page,
@@ -450,7 +614,7 @@ impl InnerAddressSpace {
         let mut rollback_notifications = VmaCloseNotifications::default();
         for r in &regions {
             // debug!("mprotect: r: {:?}", r);
-            let (original_region, new_vm_flags) = {
+            let (original_region, old_vm_flags, new_vm_flags, defer_uprobe_execute) = {
                 let guard = r.lock();
                 if !guard.can_have_flags(prot_flags) {
                     for plan in plans {
@@ -481,8 +645,53 @@ impl InnerAddressSpace {
                         });
                     }
                 }
-                (*guard.region(), new_vm_flags)
+                #[cfg(target_arch = "x86_64")]
+                let defer_uprobe_execute = {
+                    let old_eligible = super::uprobe::valid_probe_vma_flags(old_vm_flags);
+                    let new_eligible = super::uprobe::valid_probe_vma_flags(new_vm_flags);
+                    if old_eligible == new_eligible {
+                        false
+                    } else if let (Some(file), Some(pgoff)) =
+                        (guard.vm_file(), guard.backing_page_offset())
+                    {
+                        let intersection = guard.region().intersect(&region).unwrap();
+                        let file_start = pgoff.checked_mul(MMArch::PAGE_SIZE).and_then(|start| {
+                            start.checked_add(
+                                intersection.start().data() - guard.region().start().data(),
+                            )
+                        });
+                        if old_eligible && !new_eligible {
+                            // A closing consumer leaves the registry before it
+                            // detaches each installed site. Query the mm-owned
+                            // table when withdrawing eligibility so that this
+                            // close window still keeps write/execute closed
+                            // until the old breakpoint byte is restored.
+                            mm.uprobe_list.intersects(intersection)
+                        } else {
+                            file_start.is_some_and(|file_start| {
+                                super::uprobe::requires_exec_publication_barrier(
+                                    &file,
+                                    new_vm_flags,
+                                    file_start,
+                                    intersection.size(),
+                                )
+                            })
+                        }
+                    } else {
+                        false
+                    }
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let defer_uprobe_execute = false;
+                (
+                    *guard.region(),
+                    old_vm_flags,
+                    new_vm_flags,
+                    defer_uprobe_execute,
+                )
             };
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = old_vm_flags;
             let intersection = original_region.intersect(&region).unwrap();
             let split_lifecycle = match r.prepare_split_lifecycle(intersection) {
                 Ok(lifecycle) => lifecycle,
@@ -501,6 +710,10 @@ impl InnerAddressSpace {
             plans.push(MprotectVmaPlan {
                 original_region,
                 intersection,
+                #[cfg(target_arch = "x86_64")]
+                old_vm_flags,
+                #[cfg(target_arch = "x86_64")]
+                defer_uprobe_execute,
                 new_vm_flags,
                 split_lifecycle,
             });
@@ -509,13 +722,14 @@ impl InnerAddressSpace {
         Ok(PreparedMprotect { plans })
     }
 
-    pub(super) fn commit_mprotect(&mut self, prepared: PreparedMprotect) {
+    pub(super) fn commit_mprotect(&mut self, prepared: PreparedMprotect) -> Vec<Arc<LockedVMA>> {
         let mm = self
             .outer_addr_space()
             .expect("live mprotect transaction lost its AddressSpace");
         let mut tlb = MmuGather::gather(&mm);
         let mapper = &mut self.user_mapper.utable;
 
+        let mut deferred_execute = Vec::new();
         for plan in prepared.plans {
             let r = self
                 .mappings
@@ -530,9 +744,18 @@ impl InnerAddressSpace {
 
                 let mut r_guard = r.lock();
                 r_guard.set_vm_flags(plan.new_vm_flags);
-
-                let new_flags: EntryFlags<MMArch> = MMArch::vm_get_page_prot(plan.new_vm_flags);
-
+                r_guard.set_flags();
+                #[cfg(target_arch = "x86_64")]
+                if plan.defer_uprobe_execute {
+                    // Do not expose either instruction fetch or newly granted
+                    // writes until the old breakpoint byte has been withdrawn.
+                    // Otherwise RX -> RWX can let a sibling overwrite the site
+                    // before withdrawal restores old_instruction[0].
+                    r_guard.set_entry_execute(false);
+                    r_guard.set_entry_write(false);
+                    deferred_execute.push(r.clone());
+                }
+                let new_flags = r_guard.flags();
                 r_guard.remap(new_flags, mapper, &mut tlb);
                 (split_result.prev, split_result.after)
             };
@@ -548,6 +771,30 @@ impl InnerAddressSpace {
         }
 
         // Unified shootdown. mprotect does not free physical pages; tlb.finish() mainly flushes the TLB.
+        tlb.finish();
+        deferred_execute
+    }
+
+    /// Publish final PTE permissions only after every matching uprobe has been
+    /// withdrawn or installed in the temporarily non-executable/non-writable
+    /// mprotect result.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn publish_mprotect_permissions(
+        &mut self,
+        mm: &Arc<AddressSpace>,
+        vmas: Vec<Arc<LockedVMA>>,
+    ) {
+        if vmas.is_empty() {
+            return;
+        }
+        let mut tlb = MmuGather::gather(mm);
+        let mapper = &mut self.user_mapper.utable;
+        for vma in vmas {
+            let mut guard = vma.lock();
+            guard.set_flags();
+            let flags = guard.flags();
+            guard.remap(flags, mapper, &mut tlb);
+        }
         tlb.finish();
     }
 

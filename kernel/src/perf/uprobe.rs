@@ -352,9 +352,9 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     {
         return Err(SystemError::EINVAL);
     }
-    // Linux 6.6 perf_uprobe_event_init() applies this PMU-wide gate before
+    // Linux 6.6 perf_uprobe_event_init() applies perfmon_capable() before
     // parsing or installing the probe.
-    if !crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_ADMIN) {
+    if !crate::process::cred::perfmon_capable() {
         return Err(SystemError::EACCES);
     }
     if args.inherit || args.enable_on_exec || args.remove_on_exec {
@@ -409,14 +409,14 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
             ProcessManager::find_task_by_vpid(RawPid::from(args.pid as usize))
                 .ok_or(SystemError::ESRCH)?
         };
-        // The PMU-wide CAP_SYS_ADMIN gate mirrors Linux's privileged uprobe
+        // The PMU-wide perfmon capability gate mirrors Linux's privileged uprobe
         // event_init path; do not layer the unrelated process_vm permission
         // helper on top of it.
         pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
         UprobeConsumerScope::Task(UprobeTaskScope::new(&pcb))
     } else if args.pid == -1 {
         // 系统级模式：向**所有**映射该文件的进程（含其他用户的）安装断点，
-        // PMU-wide CAP_SYS_ADMIN check above also covers system-wide events.
+        // The PMU-wide perfmon capability check also covers system-wide events.
         UprobeConsumerScope::SystemWideAuthorized
     } else {
         // pid < -1：Linux perf 语义不存在（-1 之外无系统级变体），EINVAL。

@@ -1,4 +1,11 @@
+use super::hit_index::UprobeHitIndex;
 use super::*;
+
+#[derive(Debug, Default)]
+struct UprobeSiteControl {
+    sites: BTreeMap<usize, Arc<UprobeSite>>,
+    hit_index: UprobeHitIndex,
+}
 
 /// Per-address-space uprobe lookup table.
 ///
@@ -8,15 +15,15 @@ use super::*;
 /// and withdraw it only after opcode restoration plus the TLB rendezvous.
 #[derive(Debug)]
 pub struct UprobeSiteTable {
-    control: Mutex<BTreeMap<usize, Arc<UprobeSite>>>,
-    hit_snapshot: crate::rcu::RcuArcSlot<BTreeMap<usize, Arc<UprobeSite>>>,
+    control: Mutex<UprobeSiteControl>,
+    hit_snapshot: crate::rcu::RcuArcSlot<UprobeHitIndex>,
 }
 
 impl UprobeSiteTable {
     pub fn new() -> Self {
         Self {
-            control: Mutex::new(BTreeMap::new()),
-            hit_snapshot: crate::rcu::RcuArcSlot::new(Arc::new(BTreeMap::new())),
+            control: Mutex::new(UprobeSiteControl::default()),
+            hit_snapshot: crate::rcu::RcuArcSlot::new(Arc::new(UprobeHitIndex::default())),
         }
     }
 
@@ -24,49 +31,68 @@ impl UprobeSiteTable {
     /// The callback copies only the IRQ-safe values needed after it returns.
     pub fn with_hit<R>(&self, vaddr: usize, f: impl FnOnce(&UprobeSite) -> R) -> Option<R> {
         self.hit_snapshot
-            .with_read(|sites| sites.get(&vaddr).map(|site| f(site)))
+            .with_read(|sites| sites.get(vaddr).map(|site| f(site)))
     }
 
     pub(super) fn get(&self, vaddr: usize) -> Option<Arc<UprobeSite>> {
-        self.control.lock().get(&vaddr).cloned()
+        self.control.lock().sites.get(&vaddr).cloned()
     }
 
     pub(super) fn range(&self, range: core::ops::Range<usize>) -> Vec<(usize, Arc<UprobeSite>)> {
         self.control
             .lock()
+            .sites
             .range(range)
             .map(|(vaddr, site)| (*vaddr, site.clone()))
             .collect()
     }
 
+    pub(crate) fn intersects(&self, region: VirtRegion) -> bool {
+        let candidate_start = region
+            .start()
+            .data()
+            .saturating_sub(UPROBE_INSN_COPY_SIZE - 1);
+        self.control
+            .lock()
+            .sites
+            .range(candidate_start..region.end().data())
+            .any(|(vaddr, site)| {
+                vaddr
+                    .checked_add(site.insn_analysis.insn_len)
+                    .is_some_and(|instruction_end| instruction_end > region.start().data())
+            })
+    }
+
     pub(super) fn insert(&self, vaddr: usize, site: Arc<UprobeSite>) -> Option<Arc<UprobeSite>> {
-        let (previous, snapshot) = {
-            let mut control = self.control.lock();
-            let previous = control.insert(vaddr, site);
-            (previous, Arc::new(control.clone()))
-        };
-        self.hit_snapshot.store_deferred(snapshot);
+        let mut control = self.control.lock();
+        let previous = control.sites.insert(vaddr, site.clone());
+        control.hit_index.insert(vaddr, site);
+        // Publish while the writer lock still orders this mutation. Publishing
+        // after unlocking would let two writers store B then stale A, rolling
+        // the #BP view back even though the control map already contains B.
+        self.hit_snapshot
+            .store_deferred(Arc::new(control.hit_index.clone()));
         previous
     }
 
     pub(super) fn remove_if(&self, vaddr: usize, expected: &Arc<UprobeSite>) -> bool {
-        let snapshot = {
-            let mut control = self.control.lock();
-            if !control
-                .get(&vaddr)
-                .is_some_and(|site| Arc::ptr_eq(site, expected))
-            {
-                return false;
-            }
-            control.remove(&vaddr);
-            Arc::new(control.clone())
-        };
-        self.hit_snapshot.store_deferred(snapshot);
+        let mut control = self.control.lock();
+        if !control
+            .sites
+            .get(&vaddr)
+            .is_some_and(|site| Arc::ptr_eq(site, expected))
+        {
+            return false;
+        }
+        control.sites.remove(&vaddr);
+        control.hit_index.remove(vaddr);
+        self.hit_snapshot
+            .store_deferred(Arc::new(control.hit_index.clone()));
         true
     }
 
     pub(super) fn take_all(&self) -> BTreeMap<usize, Arc<UprobeSite>> {
-        core::mem::take(&mut *self.control.lock())
+        core::mem::take(&mut self.control.lock().sites)
     }
 }
 
@@ -206,11 +232,13 @@ pub(super) struct ExpectedProbeMapping {
     pub(super) parts: Vec<ExpectedProbeVma>,
 }
 
-pub(super) fn valid_probe_vma_flags(flags: VmFlags) -> bool {
+pub(in crate::mm::ucontext) fn valid_probe_vma_flags(flags: VmFlags) -> bool {
     let invalid = VmFlags::VM_HUGETLB | VmFlags::VM_MAYSHARE | VmFlags::VM_WRITE;
-    flags.contains(VmFlags::VM_EXEC)
-        && flags.contains(VmFlags::VM_MAYEXEC)
-        && !flags.intersects(invalid)
+    // Linux valid_vma(vma, true) deliberately keys registration on MAYEXEC,
+    // not the current EXEC bit. Installing into an eligible NX mapping means
+    // a later mprotect(PROT_EXEC) publishes an already-patched page instead of
+    // racing a post-permission late install.
+    flags.contains(VmFlags::VM_MAYEXEC) && !flags.intersects(invalid)
 }
 
 fn probe_mapping_parts(

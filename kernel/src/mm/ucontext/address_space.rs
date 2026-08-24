@@ -118,6 +118,35 @@ impl AddressSpace {
         locked_vmas_only: bool,
         expected_vma: Option<Weak<LockedVMA>>,
     ) -> Result<(), SystemError> {
+        self.populate_range_post_commit_inner(
+            start,
+            len,
+            force_fault_in_missing,
+            locked_vmas_only,
+            expected_vma,
+            false,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn populate_uprobe_range_post_commit(
+        self: &Arc<Self>,
+        start: VirtAddr,
+        len: usize,
+        expected_vma: Option<Weak<LockedVMA>>,
+    ) -> Result<(), SystemError> {
+        self.populate_range_post_commit_inner(start, len, true, false, expected_vma, true)
+    }
+
+    fn populate_range_post_commit_inner(
+        self: &Arc<Self>,
+        start: VirtAddr,
+        len: usize,
+        force_fault_in_missing: bool,
+        locked_vmas_only: bool,
+        expected_vma: Option<Weak<LockedVMA>>,
+        force_remote_access: bool,
+    ) -> Result<(), SystemError> {
         if len == 0 {
             return Ok(());
         }
@@ -176,9 +205,13 @@ impl AddressSpace {
                 }
 
                 let mut fault_flags = InnerAddressSpace::mlock_fault_flags(vm_flags)
+                    .or_else(|| force_remote_access.then_some(FaultFlags::FAULT_FLAG_REMOTE))
                     .ok_or(SystemError::ENOMEM)?
                     | FaultFlags::FAULT_FLAG_ALLOW_RETRY
                     | FaultFlags::FAULT_FLAG_KILLABLE;
+                if force_remote_access {
+                    fault_flags |= FaultFlags::FAULT_FLAG_REMOTE;
+                }
                 if retried {
                     fault_flags |= FaultFlags::FAULT_FLAG_TRIED;
                 }
@@ -1272,23 +1305,36 @@ impl AddressSpace {
                 }
             };
             #[cfg(target_arch = "x86_64")]
-            let uprobe_change = match super::uprobe::PreparedUprobeChange::prepare(
+            let validation_ranges = prepared.validation_ranges();
+            #[cfg(target_arch = "x86_64")]
+            let uprobe_ranges = prepared.uprobe_affected_ranges();
+            #[cfg(target_arch = "x86_64")]
+            if let Err(err) =
+                super::uprobe::PreparedUprobeChange::validate(self, &validation_ranges)
+            {
+                let notifications = prepared.rollback();
+                drop(guard);
+                InnerAddressSpace::notify_close_notifications(notifications);
+                return Err(err);
+            }
+            let deferred_execute = guard.commit_mprotect(prepared);
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = deferred_execute;
+            #[cfg(target_arch = "x86_64")]
+            let uprobe_change = super::uprobe::PreparedUprobeChange::prepare_after_pte_commit(
                 self,
                 &mut guard,
-                &prepared.affected_ranges(),
-            ) {
-                Ok(change) => change,
-                Err(err) => {
-                    let notifications = prepared.rollback();
-                    drop(guard);
-                    InnerAddressSpace::notify_close_notifications(notifications);
-                    return Err(err);
-                }
-            };
-            guard.commit_mprotect(prepared);
+                &uprobe_ranges,
+            );
+            #[cfg(target_arch = "x86_64")]
+            let uprobe_change = uprobe_change.finish_locked(self, &mut guard);
+            #[cfg(target_arch = "x86_64")]
+            guard.publish_mprotect_permissions(self, deferred_execute);
             drop(guard);
             #[cfg(target_arch = "x86_64")]
-            uprobe_change.finish(self);
+            if let Some(uprobe_change) = uprobe_change {
+                uprobe_change.finish(self);
+            }
             return Ok(());
         }
     }
@@ -1310,15 +1356,27 @@ impl AddressSpace {
             if behavior == MadvFlags::MADV_DONTNEED || behavior == MadvFlags::MADV_DONTNEED_LOCKED {
                 let prepared = guard.prepare_madvise_dontneed(start_page, page_count, behavior);
                 #[cfg(target_arch = "x86_64")]
-                let uprobe_change = super::uprobe::PreparedUprobeChange::prepare(
+                let uprobe_ranges = prepared.affected_ranges();
+                #[cfg(target_arch = "x86_64")]
+                super::uprobe::PreparedUprobeChange::validate(self, &uprobe_ranges)?;
+                #[cfg(target_arch = "x86_64")]
+                let uprobe_publication = prepared.defer_uprobe_execute();
+                let result = guard.commit_madvise_dontneed(prepared);
+                #[cfg(target_arch = "x86_64")]
+                let uprobe_change = super::uprobe::PreparedUprobeChange::prepare_after_pte_commit(
                     self,
                     &mut guard,
-                    &prepared.affected_ranges(),
-                )?;
-                let result = guard.commit_madvise_dontneed(prepared);
+                    &uprobe_ranges,
+                );
+                #[cfg(target_arch = "x86_64")]
+                let uprobe_change = uprobe_change.finish_locked(self, &mut guard);
+                #[cfg(target_arch = "x86_64")]
+                uprobe_publication.publish(&mut guard, self);
                 drop(guard);
                 #[cfg(target_arch = "x86_64")]
-                uprobe_change.finish(self);
+                if let Some(uprobe_change) = uprobe_change {
+                    uprobe_change.finish(self);
+                }
                 return result.map_err(|failure| failure.err);
             }
             match guard.madvise_collect(start_page, page_count, behavior) {
@@ -1326,10 +1384,10 @@ impl AddressSpace {
                     drop(guard);
                     return Ok(());
                 }
-                Err(failure) => {
+                Err(err) => {
                     drop(guard);
-                    InnerAddressSpace::notify_close_notifications(failure.notifications);
-                    return Err(failure.err);
+                    InnerAddressSpace::notify_close_notifications(err.notifications);
+                    return Err(err.err);
                 }
             }
         }

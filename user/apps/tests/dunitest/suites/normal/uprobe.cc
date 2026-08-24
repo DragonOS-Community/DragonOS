@@ -37,6 +37,11 @@
 
 #include <linux/perf_event.h>
 #include <linux/bpf.h>
+#include <linux/capability.h>
+
+#ifndef CAP_PERFMON
+#define CAP_PERFMON 38
+#endif
 
 #ifndef SYS_perf_event_open
 #include <asm/unistd.h>
@@ -720,7 +725,44 @@ TEST(UprobeTest, DormantSamplingPayloadIsIgnored) {
     ASSERT_GE(fd.get(), 0) << "errno=" << errno;
 }
 
-TEST(UprobeTest, ReadOnlyAliasIsSkippedAndLaterExecutableMapIsProbed) {
+TEST(UprobeTest, PerfmonCapabilityAuthorizesOpen) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        __user_cap_header_struct header = {
+            .version = _LINUX_CAPABILITY_VERSION_3,
+            .pid = 0,
+        };
+        __user_cap_data_struct caps[_LINUX_CAPABILITY_U32S_3] = {};
+        constexpr unsigned int kPerfmonWord = CAP_PERFMON / 32;
+        constexpr __u32 kPerfmonBit = 1U << (CAP_PERFMON % 32);
+        caps[kPerfmonWord].effective = kPerfmonBit;
+        caps[kPerfmonWord].permitted = kPerfmonBit;
+        if (syscall(SYS_capset, &header, caps) != 0) {
+            _exit(1);
+        }
+        const int fd = open_uprobe_perf_event(path, offset);
+        if (fd < 0) {
+            _exit(errno == EACCES ? 2 : 3);
+        }
+        close(fd);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0)
+        << "CAP_PERFMON-only perf_event_open child exit="
+        << WEXITSTATUS(status);
+}
+
+TEST(UprobeTest, ReadOnlyAliasAndLaterExecutableMapAreProbed) {
     char path[] = "/tmp/uprobe_vma_XXXXXX";
     FdGuard file(create_raw_target(path));
     ASSERT_GE(file.get(), 0);
@@ -729,7 +771,8 @@ TEST(UprobeTest, ReadOnlyAliasIsSkippedAndLaterExecutableMapIsProbed) {
 
     FdGuard event(open_uprobe_perf_event(path, 0));
     ASSERT_GE(event.get(), 0)
-        << "非可执行 alias 应被跳过而不是拒绝 consumer，errno=" << errno;
+        << "VM_MAYEXEC alias should retain the persistent consumer, errno="
+        << errno;
 
     void* executable =
         mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file.get(), 0);
@@ -739,6 +782,56 @@ TEST(UprobeTest, ReadOnlyAliasIsSkippedAndLaterExecutableMapIsProbed) {
 
     munmap(executable, 4096);
     munmap(read_only, 4096);
+    unlink(path);
+}
+
+TEST(UprobeTest, NonExecutableMappingIsPatchedBeforeMprotectExec) {
+    char path[] = "/tmp/uprobe_mprotect_exec_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* mapping =
+        mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE, file.get(), 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    ASSERT_EQ(mprotect(mapping, 4096, PROT_READ | PROT_EXEC), 0);
+    auto target = reinterpret_cast<int (*)(int)>(mapping);
+    EXPECT_EQ(target(12), 25);
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U)
+        << "mprotect must expose an already-patched executable page";
+
+    munmap(mapping, 4096);
+    unlink(path);
+}
+
+TEST(UprobeTest, WritableMprotectWithdrawsProbeBeforePublishingWrite) {
+    char path[] = "/tmp/uprobe_mprotect_write_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* mapping =
+        mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file.get(), 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+    auto target = reinterpret_cast<int (*)(int)>(mapping);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    EXPECT_EQ(target(12), 25);
+
+    ASSERT_EQ(mprotect(mapping, 4096, PROT_READ | PROT_WRITE), 0);
+    EXPECT_EQ(*static_cast<unsigned char*>(mapping), RAW_TARGET_CODE[0])
+        << "the breakpoint byte must be restored before write is published";
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U)
+        << "a writable mapping is no longer eligible for the uprobe";
+
+    munmap(mapping, 4096);
     unlink(path);
 }
 
@@ -766,6 +859,87 @@ TEST(UprobeTest, DontNeedReconcilesPersistentProbe) {
     EXPECT_EQ(target(9), 19) << "close must restore the refaulted instruction";
 
     munmap(executable, 4096);
+    unlink(path);
+}
+
+TEST(UprobeTest, ExecutableVmaMutationHasNoUnarmedWindow) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    char path[] = "/tmp/uprobe_vma_publish_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* executable =
+        mmap(nullptr, page_size, PROT_READ | PROT_EXEC, MAP_PRIVATE,
+             file.get(), 0);
+    ASSERT_NE(executable, MAP_FAILED);
+    auto target = reinterpret_cast<int (*)(int)>(executable);
+
+    std::atomic<pid_t> runner_tid{0};
+    std::atomic<bool> run{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> bad_results{0};
+    std::atomic<__u64> calls{0};
+    std::thread runner([&] {
+        runner_tid.store(static_cast<pid_t>(syscall(SYS_gettid)),
+                         std::memory_order_release);
+        while (!run.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        while (!stop.load(std::memory_order_acquire)) {
+            if (target(3) != 7) {
+                bad_results.fetch_add(1, std::memory_order_relaxed);
+            }
+            calls.fetch_add(1, std::memory_order_release);
+        }
+    });
+    while (runner_tid.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+
+    UprobePerfEventOptions options;
+    options.pid = runner_tid.load(std::memory_order_acquire);
+    FdGuard event(open_uprobe_perf_event(path, 0, options));
+    if (event.get() < 0) {
+        const int open_errno = errno;
+        stop.store(true, std::memory_order_release);
+        run.store(true, std::memory_order_release);
+        runner.join();
+        FAIL() << "runner uprobe open failed, errno=" << open_errno;
+        munmap(executable, page_size);
+        unlink(path);
+        return;
+    }
+
+    run.store(true, std::memory_order_release);
+    while (calls.load(std::memory_order_acquire) < 256) {
+        std::this_thread::yield();
+    }
+
+    int mutation_errno = 0;
+    for (int i = 0; i < 32 && mutation_errno == 0; ++i) {
+        if (mprotect(executable, page_size, PROT_EXEC) != 0 ||
+            mprotect(executable, page_size, PROT_READ | PROT_EXEC) != 0 ||
+            madvise(executable, page_size, MADV_DONTNEED) != 0) {
+            mutation_errno = errno;
+        }
+    }
+    const __u64 calls_after_mutation = calls.load(std::memory_order_acquire);
+    while (calls.load(std::memory_order_acquire) <
+           calls_after_mutation + 256) {
+        std::this_thread::yield();
+    }
+    stop.store(true, std::memory_order_release);
+    runner.join();
+
+    EXPECT_EQ(mutation_errno, 0);
+    EXPECT_EQ(bad_results.load(std::memory_order_relaxed), 0);
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, calls.load(std::memory_order_relaxed))
+        << "mprotect/MADV_DONTNEED exposed executable original bytes before "
+           "the probe was reinstalled";
+
+    munmap(executable, page_size);
     unlink(path);
 }
 

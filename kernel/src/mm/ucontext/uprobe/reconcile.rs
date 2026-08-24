@@ -151,6 +151,13 @@ pub(crate) struct PreparedUprobeChange {
 }
 
 impl PreparedUprobeChange {
+    pub(crate) fn validate(mm: &AddressSpace, ranges: &[VirtRegion]) -> Result<(), SystemError> {
+        for region in ranges {
+            validate_uprobe_change_range(mm, *region)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare(
         mm: &Arc<AddressSpace>,
         inner: &mut InnerAddressSpace,
@@ -158,9 +165,7 @@ impl PreparedUprobeChange {
     ) -> Result<Self, SystemError> {
         // Validate every range before withdrawing any site, so a later XOL
         // overlap cannot leave an earlier range requiring hidden rollback.
-        for region in ranges {
-            validate_uprobe_change_range(mm, *region)?;
-        }
+        Self::validate(mm, ranges)?;
         for region in ranges {
             disarm_uprobe_change_range_locked(mm, inner, *region);
         }
@@ -168,6 +173,56 @@ impl PreparedUprobeChange {
             prepared_ranges: ranges.to_vec(),
             finished: false,
         })
+    }
+
+    /// Withdraw sites after a PTE mutation has already made the affected
+    /// instruction unreachable (for example mprotect-to-NX or DONTNEED zap).
+    /// The caller must validate the ranges before committing the mutation.
+    pub(crate) fn prepare_after_pte_commit(
+        mm: &Arc<AddressSpace>,
+        inner: &mut InnerAddressSpace,
+        ranges: &[VirtRegion],
+    ) -> Self {
+        debug_assert!(Self::validate(mm, ranges).is_ok());
+        for region in ranges {
+            disarm_uprobe_change_range_locked(mm, inner, *region);
+        }
+        Self {
+            prepared_ranges: ranges.to_vec(),
+            finished: false,
+        }
+    }
+
+    /// Reconcile every surviving file VMA before the caller releases this
+    /// address space's write lock.
+    ///
+    /// Normal faults and registrations therefore complete before sibling
+    /// threads can observe the post-mutation executable mapping. Ranges which
+    /// encounter a retry or resource error remain in the returned transaction
+    /// for Linux-style best-effort processing after the lock is released.
+    pub(crate) fn finish_locked(
+        mut self,
+        mm: &Arc<AddressSpace>,
+        inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+    ) -> Option<Self> {
+        let mut fallback = Vec::new();
+        for region in core::mem::take(&mut self.prepared_ranges) {
+            let vmas = inner.mappings.conflicts(region);
+            let mut needs_fallback = false;
+            for vma in &vmas {
+                needs_fallback |= uprobe_apply_vma_range_locked(mm, inner, vma, region);
+            }
+            if needs_fallback {
+                fallback.push(region);
+            }
+        }
+        self.prepared_ranges = fallback;
+        if self.prepared_ranges.is_empty() {
+            self.finished = true;
+            None
+        } else {
+            Some(self)
+        }
     }
 
     pub(crate) fn finish(mut self, mm: &Arc<AddressSpace>) {
@@ -209,9 +264,9 @@ fn fault_in_probe_mapping_locked(
             return Err(VmFaultReason::VM_FAULT_SIGBUS);
         };
         let vm_flags = *vma.lock().vm_flags();
-        let Some(fault_flags) = InnerAddressSpace::mlock_fault_flags(vm_flags) else {
-            return Err(VmFaultReason::VM_FAULT_SIGSEGV);
-        };
+        let fault_flags = InnerAddressSpace::mlock_fault_flags(vm_flags)
+            .unwrap_or(FaultFlags::FAULT_FLAG_REMOTE)
+            | FaultFlags::FAULT_FLAG_REMOTE;
         let outcome = unsafe {
             let message = PageFaultMessage::new(
                 vma,
@@ -482,11 +537,9 @@ pub(super) fn uprobe_apply_to_new_vma_inner(
                     population_error = Some(SystemError::EINVAL);
                     break;
                 };
-                if let Err(e) = mm.populate_range_post_commit(
+                if let Err(e) = mm.populate_uprobe_range_post_commit(
                     VirtAddr::new(page_start),
                     page_end - page_start,
-                    true,
-                    false,
                     Some(part.vma.clone()),
                 ) {
                     population_error = Some(e);

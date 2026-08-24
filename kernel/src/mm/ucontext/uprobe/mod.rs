@@ -46,6 +46,7 @@ use uprobe::{analyze_insn, build_xol_slot, InsnAnalysis, UPROBE_INSN_COPY_SIZE};
 
 mod consumer;
 mod definition;
+mod hit_index;
 mod reconcile;
 mod site;
 mod xol;
@@ -80,4 +81,8 @@ pub(super) fn requires_exec_publication_barrier(
         query_start,
         file_end,
     )
+}
+
+pub(super) fn has_active_consumers() -> bool {
+    !consumer::uprobe_registry_is_empty()
 }

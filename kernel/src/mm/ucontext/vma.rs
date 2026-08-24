@@ -822,6 +822,12 @@ impl VMA {
         self.flags = self.flags.set_execute(executable);
     }
 
+    /// Override only the write bit used when publishing PTEs for this VMA.
+    /// The logical `VM_WRITE` permission is intentionally unchanged.
+    pub(super) fn set_entry_write(&mut self, writable: bool) {
+        self.flags = self.flags.set_write(writable);
+    }
+
     #[inline(always)]
     pub fn set_sysv_shm(&mut self, sysv_shm: Option<Arc<SysVShmAttach>>) {
         self.sysv_shm = sysv_shm;

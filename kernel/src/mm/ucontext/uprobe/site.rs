@@ -48,22 +48,6 @@ impl UprobeSiteTable {
             .collect()
     }
 
-    pub(crate) fn intersects(&self, region: VirtRegion) -> bool {
-        let candidate_start = region
-            .start()
-            .data()
-            .saturating_sub(UPROBE_INSN_COPY_SIZE - 1);
-        self.control
-            .lock()
-            .sites
-            .range(candidate_start..region.end().data())
-            .any(|(vaddr, site)| {
-                vaddr
-                    .checked_add(site.insn_analysis.insn_len)
-                    .is_some_and(|instruction_end| instruction_end > region.start().data())
-            })
-    }
-
     pub(super) fn insert(&self, vaddr: usize, site: Arc<UprobeSite>) -> Option<Arc<UprobeSite>> {
         let mut control = self.control.lock();
         let previous = control.sites.insert(vaddr, site.clone());

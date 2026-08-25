@@ -994,7 +994,7 @@ TEST(UprobeTest, NonExecutableMappingIsPatchedBeforeMprotectExec) {
     unlink(path);
 }
 
-TEST(UprobeTest, WritableMprotectWithdrawsProbeBeforePublishingWrite) {
+TEST(UprobeTest, WritableMprotectRetainsInstalledProbe) {
     char path[] = "/tmp/uprobe_mprotect_write_XXXXXX";
     FdGuard file(create_raw_target(path));
     ASSERT_GE(file.get(), 0);
@@ -1007,14 +1007,45 @@ TEST(UprobeTest, WritableMprotectWithdrawsProbeBeforePublishingWrite) {
     ASSERT_GE(event.get(), 0) << "errno=" << errno;
     EXPECT_EQ(target(12), 25);
 
-    ASSERT_EQ(mprotect(mapping, 4096, PROT_READ | PROT_WRITE), 0);
-    EXPECT_EQ(*static_cast<unsigned char*>(mapping), RAW_TARGET_CODE[0])
-        << "the breakpoint byte must be restored before write is published";
+    ASSERT_EQ(
+        mprotect(mapping, 4096, PROT_READ | PROT_WRITE | PROT_EXEC), 0);
+    EXPECT_EQ(target(13), 27);
     __u64 count = 0;
     ASSERT_EQ(read(event.get(), &count, sizeof(count)),
               static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 2U)
+        << "mprotect adding WRITE must retain an already installed uprobe";
+
+    munmap(mapping, 4096);
+    unlink(path);
+}
+
+TEST(UprobeTest, WritablePrivateMappingIsProbedAfterWriteIsRemoved) {
+    char path[] = "/tmp/uprobe_writable_private_XXXXXX";
+    FdGuard file(create_raw_target(path));
+    ASSERT_GE(file.get(), 0);
+    void* mapping =
+        mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE,
+             file.get(), 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+    auto target = reinterpret_cast<int (*)(int)>(mapping);
+
+    FdGuard event(open_uprobe_perf_event(path, 0));
+    ASSERT_GE(event.get(), 0) << "errno=" << errno;
+    EXPECT_EQ(target(14), 29);
+
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 0U)
+        << "Linux registration does not install into a currently writable VMA";
+
+    ASSERT_EQ(mprotect(mapping, 4096, PROT_READ | PROT_EXEC), 0);
+    EXPECT_EQ(target(15), 31);
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
     EXPECT_EQ(count, 1U)
-        << "a writable mapping is no longer eligible for the uprobe";
+        << "removing WRITE must reconcile the persistent consumer";
 
     munmap(mapping, 4096);
     unlink(path);

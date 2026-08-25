@@ -39,18 +39,19 @@ impl PreparedMprotect {
         self.plans.iter().map(|plan| plan.intersection).collect()
     }
 
-    /// Only protection changes which cross the uprobe eligibility boundary
-    /// require site withdrawal/reapplication. Read-only permission changes on
-    /// an already executable private file mapping keep the same mapping and
-    /// breakpoint page, so withdrawing them would create a needless execution
-    /// gap while another CPU continues to use its present PTE.
+    /// Only protection changes which enter the uprobe installation domain
+    /// require reconciliation. Linux rejects a currently writable VMA for a
+    /// new installation, but deliberately keeps an already installed site
+    /// discoverable after mprotect adds WRITE. Since mprotect preserves the
+    /// mapping and breakpoint page, withdrawing that site would incorrectly
+    /// disable an existing probe.
     #[cfg(target_arch = "x86_64")]
     pub(super) fn uprobe_affected_ranges(&self) -> Vec<VirtRegion> {
         self.plans
             .iter()
             .filter(|plan| {
-                super::uprobe::valid_probe_vma_flags(plan.old_vm_flags)
-                    != super::uprobe::valid_probe_vma_flags(plan.new_vm_flags)
+                !super::uprobe::valid_probe_vma_flags(plan.old_vm_flags)
+                    && super::uprobe::valid_probe_vma_flags(plan.new_vm_flags)
             })
             .map(|plan| plan.intersection)
             .collect()
@@ -650,25 +651,17 @@ impl InnerAddressSpace {
                 let defer_uprobe_execute = {
                     let old_eligible = super::uprobe::valid_probe_vma_flags(old_vm_flags);
                     let new_eligible = super::uprobe::valid_probe_vma_flags(new_vm_flags);
-                    if old_eligible == new_eligible {
-                        false
-                    } else if let (Some(file), Some(pgoff)) =
-                        (guard.vm_file(), guard.backing_page_offset())
-                    {
-                        let intersection = guard.region().intersect(&region).unwrap();
-                        let file_start = pgoff.checked_mul(MMArch::PAGE_SIZE).and_then(|start| {
-                            start.checked_add(
-                                intersection.start().data() - guard.region().start().data(),
-                            )
-                        });
-                        if old_eligible && !new_eligible {
-                            // A closing consumer leaves the registry before it
-                            // detaches each installed site. Query the mm-owned
-                            // table when withdrawing eligibility so that this
-                            // close window still keeps write/execute closed
-                            // until the old breakpoint byte is restored.
-                            mm.uprobe_list.intersects(intersection)
-                        } else {
+                    if !old_eligible && new_eligible {
+                        if let (Some(file), Some(pgoff)) =
+                            (guard.vm_file(), guard.backing_page_offset())
+                        {
+                            let intersection = guard.region().intersect(&region).unwrap();
+                            let file_start =
+                                pgoff.checked_mul(MMArch::PAGE_SIZE).and_then(|start| {
+                                    start.checked_add(
+                                        intersection.start().data() - guard.region().start().data(),
+                                    )
+                                });
                             file_start.is_some_and(|file_start| {
                                 super::uprobe::requires_exec_publication_barrier(
                                     &mm,
@@ -678,6 +671,8 @@ impl InnerAddressSpace {
                                     intersection.size(),
                                 )
                             })
+                        } else {
+                            false
                         }
                     } else {
                         false

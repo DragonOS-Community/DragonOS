@@ -360,7 +360,7 @@ pub(crate) fn uprobe_apply_vma_range_locked(
         };
         offsets
             .range(query_start..apply_file_end)
-            .map(|(offset, consumers)| (*offset, consumers.clone()))
+            .map(|(offset, consumers)| (*offset, consumers.values().cloned().collect::<Vec<_>>()))
             .collect()
     };
 
@@ -520,14 +520,10 @@ pub(super) fn uprobe_apply_to_new_vma_inner(
         offsets
             .range(file_start_byte..region_file_end)
             .filter_map(|(off, consumers)| {
-                let consumers = if let Some(id) = only_consumer_id {
-                    consumers
-                        .iter()
-                        .filter(|consumer| consumer.id == id)
-                        .cloned()
-                        .collect()
+                let consumers: ConsumerList = if let Some(id) = only_consumer_id {
+                    consumers.get(&id).cloned().into_iter().collect()
                 } else {
-                    consumers.clone()
+                    consumers.values().cloned().collect()
                 };
                 (!consumers.is_empty()).then_some((*off, consumers))
             })

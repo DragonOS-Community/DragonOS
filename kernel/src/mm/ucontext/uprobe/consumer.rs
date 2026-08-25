@@ -177,7 +177,7 @@ impl UprobeAdmissionGate {
     }
 
     fn try_enter(&self) -> Option<UprobeAdmissionGuard<'_>> {
-        self.try_acquire().then_some(UprobeAdmissionGuard(self))
+        self.try_acquire().then(|| UprobeAdmissionGuard(self))
     }
 
     fn leave(&self) {
@@ -405,10 +405,12 @@ pub struct UprobeConsumerReg {
 }
 
 /// 全局注册表：inode id → 文件偏移 → （消费者 id，回调）。
-/// 注册表值类型：某（inode, offset）上的消费者列表。
+/// 锁外 reconcile 使用的连续消费者快照。
 pub(super) type ConsumerList = Vec<Arc<UprobeConsumer>>;
+/// 注册表值类型：某（inode, offset）上的消费者，按稳定 id 精确索引。
+pub(super) type ConsumerMap = BTreeMap<u64, Arc<UprobeConsumer>>;
 /// 注册表类型：inode id → （文件偏移 → 消费者列表）。
-type RegistryMap = BTreeMap<usize, BTreeMap<usize, ConsumerList>>;
+type RegistryMap = BTreeMap<usize, BTreeMap<usize, ConsumerMap>>;
 
 pub(super) static UPROBE_REGISTRY: SpinLock<RegistryMap> = SpinLock::new(BTreeMap::new());
 
@@ -504,7 +506,7 @@ pub(super) fn uprobe_registry_has_active_range_for_mm(
     registry.get(&inode_key).is_some_and(|offsets| {
         offsets.range(start..end).any(|(_, consumers)| {
             consumers
-                .iter()
+                .values()
                 .any(|consumer| consumer.has_published_epoch() && consumer.scope.permits(mm))
         })
     })
@@ -550,11 +552,13 @@ pub fn uprobe_registry_add_consumer(consumer: Arc<UprobeConsumer>) {
         active_consumer_enter(&consumer);
     }
     let mut r = UPROBE_REGISTRY.lock_irqsave();
-    r.entry(consumer.definition.inode_key)
+    let replaced = r
+        .entry(consumer.definition.inode_key)
         .or_default()
         .entry(consumer.definition.offset())
         .or_default()
-        .push(consumer);
+        .insert(consumer.id, consumer);
+    debug_assert!(replaced.is_none(), "duplicate uprobe consumer id");
 }
 
 fn register_task_consumer(consumer: &Arc<UprobeConsumer>) {
@@ -646,6 +650,17 @@ pub fn uprobe_registry_set_enabled(
         detach_consumer_sites(consumer);
     }
     Ok(())
+}
+
+/// Close callback and install admission from final-file context without
+/// waiting or taking a sleepable lock. The release worker performs the drain
+/// and resource teardown. Final inode close runs only after outstanding file
+/// operations have dropped their references, so the published epoch is stable.
+pub fn uprobe_registry_quiesce_consumer(consumer: &Arc<UprobeConsumer>) {
+    if let Some(epoch) = consumer.published_epoch.load() {
+        epoch.install_gate.close();
+        epoch.delivery.gate.close();
+    }
 }
 
 fn detach_consumer_sites(consumer: &UprobeConsumer) {
@@ -811,6 +826,7 @@ fn apply_consumer_to_mm(
 }
 /// 消费者关闭：移除注册表项 + drop 迟到句柄（逐 mm 注销）。
 pub fn uprobe_registry_remove_consumer(consumer: &Arc<UprobeConsumer>) {
+    uprobe_registry_quiesce_consumer(consumer);
     let mut control = consumer.control.lock();
     if control.phase == UprobeConsumerPhase::Closing {
         return;
@@ -834,12 +850,7 @@ pub fn uprobe_registry_remove_consumer(consumer: &Arc<UprobeConsumer>) {
         let removed = r
             .get_mut(&inode_key)
             .and_then(|offsets| offsets.get_mut(&offset))
-            .and_then(|consumers| {
-                consumers
-                    .iter()
-                    .position(|candidate| Arc::ptr_eq(candidate, consumer))
-                    .map(|index| consumers.remove(index))
-            });
+            .and_then(|consumers| consumers.remove(&consumer.id));
         if let Some(offsets) = r.get_mut(&inode_key) {
             if offsets
                 .get(&offset)

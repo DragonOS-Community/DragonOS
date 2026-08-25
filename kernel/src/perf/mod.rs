@@ -49,6 +49,13 @@ use system_error::SystemError;
 type Result<T> = core::result::Result<T, SystemError>;
 
 pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNode {
+    /// Non-blocking final-close notification.
+    ///
+    /// `IndexNode::close()` can run in a context where sleeping teardown is
+    /// unsafe. Events that can still admit callbacks must close that admission
+    /// here. Implementations must be idempotent and allocation-free; resource
+    /// destruction remains in the sleepable `release()` hook.
+    fn begin_release(&self) {}
     /// Set the bpf program for the perf event
     fn set_bpf_prog(&self, _bpf_prog: Arc<File>) -> Result<()> {
         Err(SystemError::ENOSYS)
@@ -286,7 +293,9 @@ impl IndexNode for PerfEventInode {
         Ok(())
     }
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
-        if let Some(node) = self.release_node.lock_irqsave().take() {
+        let node = { self.release_node.lock_irqsave().take() };
+        if let Some(node) = node {
+            self.core.event.begin_release();
             release::enqueue(node);
         }
         Ok(())

@@ -26,9 +26,9 @@ use crate::include::bindings::linux_bpf::{bpf_prog_type, perf_event_attr};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::mm::ucontext::{
-    uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_remove_consumer,
-    uprobe_registry_set_enabled, UprobeConsumerReg, UprobeConsumerScope, UprobeDefinition,
-    UprobeTaskScope,
+    uprobe_new_consumer_id, uprobe_registry_add, uprobe_registry_quiesce_consumer,
+    uprobe_registry_remove_consumer, uprobe_registry_set_enabled, UprobeConsumerReg,
+    UprobeConsumerScope, UprobeDefinition, UprobeTaskScope,
 };
 use crate::perf::util::{PerfProbeArgs, PerfProbeConfig};
 use crate::perf::{BasicPerfEbpfCallBack, PerfEventOps};
@@ -56,7 +56,8 @@ pub struct UprobePerfEvent {
     consumer: Arc<crate::mm::ucontext::UprobeConsumer>,
     callback: Arc<UprobePerfCallBack>,
     lifecycle: Mutex<()>,
-    released: AtomicBool,
+    release_started: AtomicBool,
+    release_claimed: AtomicBool,
 }
 
 impl Drop for UprobePerfEvent {
@@ -74,14 +75,22 @@ impl core::fmt::Debug for UprobePerfEvent {
 }
 
 impl UprobePerfEvent {
+    fn request_release(&self) {
+        if self.release_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        uprobe_registry_quiesce_consumer(&self.consumer);
+    }
+
     fn release_consumer(&self) {
+        self.request_release();
         // Once the worker has completed release, the eventual destructor may
         // run in any context and must not acquire a sleepable lock.
-        if self.released.load(Ordering::Acquire) {
+        if self.release_claimed.load(Ordering::Acquire) {
             return;
         }
         let _lifecycle = self.lifecycle.lock();
-        if self.released.swap(true, Ordering::AcqRel) {
+        if self.release_claimed.swap(true, Ordering::AcqRel) {
             return;
         }
         uprobe_registry_remove_consumer(&self.consumer);
@@ -292,26 +301,39 @@ impl IndexNode for UprobePerfEvent {
 impl PerfEventOps for UprobePerfEvent {
     fn set_bpf_prog(&self, bpf_prog: Arc<File>) -> Result<()> {
         let _lifecycle = self.lifecycle.lock();
-        if self.released.load(Ordering::Acquire) {
+        if self.release_started.load(Ordering::Acquire) {
             return Err(SystemError::ENOENT);
         }
         self.do_set_bpf_prog(bpf_prog)
     }
     fn enable(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock();
+        if self.release_started.load(Ordering::Acquire) {
+            return Err(SystemError::ENOENT);
+        }
         uprobe_registry_set_enabled(&self.consumer, true)?;
         Ok(())
     }
     fn disable(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock();
+        if self.release_started.load(Ordering::Acquire) {
+            return Err(SystemError::ENOENT);
+        }
         uprobe_registry_set_enabled(&self.consumer, false)?;
         Ok(())
     }
 
     fn reset(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.lock();
+        if self.release_started.load(Ordering::Acquire) {
+            return Err(SystemError::ENOENT);
+        }
         self.callback.reset_count();
         Ok(())
+    }
+
+    fn begin_release(&self) {
+        self.request_release();
     }
 
     fn release(&self) -> Result<()> {
@@ -461,7 +483,8 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         consumer,
         callback,
         lifecycle: Mutex::new(()),
-        released: AtomicBool::new(false),
+        release_started: AtomicBool::new(false),
+        release_claimed: AtomicBool::new(false),
     })
 }
 

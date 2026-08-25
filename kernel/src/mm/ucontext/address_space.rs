@@ -1418,30 +1418,46 @@ impl AddressSpace {
         new_len: usize,
         mremap_flags: MremapFlags,
         new_vaddr: VirtAddr,
-        vm_flags: VmFlags,
     ) -> Result<VirtAddr, SystemError> {
         loop {
             let mut guard = self.write();
             let mut wait_region = None;
-            if old_len != 0 && old_vaddr.data().checked_add(old_len).is_some() {
-                let old_region = VirtRegion::new(old_vaddr, old_len);
+            // A reservation cannot overlap a published source VMA. If the
+            // source is still being installed, wait only on its first page;
+            // the locked mremap transaction will validate the eventual span.
+            if guard.mappings.contains(old_vaddr).is_none() {
+                let source_probe = VirtRegion::new(old_vaddr, MMArch::PAGE_SIZE);
                 if guard
                     .mappings
-                    .first_reservation_conflict(old_region)
+                    .first_reservation_conflict(source_probe)
                     .is_some()
                 {
-                    wait_region = Some(old_region);
-                } else if new_len > old_len {
-                    if let Some(grow_start) = old_vaddr.data().checked_add(old_len) {
-                        let grow_region =
-                            VirtRegion::new(VirtAddr::new(grow_start), new_len - old_len);
-                        if guard
-                            .mappings
-                            .first_reservation_conflict(grow_region)
-                            .is_some()
-                        {
-                            wait_region = Some(grow_region);
-                        }
+                    wait_region = Some(source_probe);
+                }
+            }
+            // Plain shrink mutates only the discarded tail. Equal-size no-op
+            // has no reservation dependency at all.
+            if wait_region.is_none() && old_len > new_len {
+                let tail_region = VirtRegion::new(old_vaddr + new_len, old_len - new_len);
+                if guard
+                    .mappings
+                    .first_reservation_conflict(tail_region)
+                    .is_some()
+                {
+                    wait_region = Some(tail_region);
+                }
+            } else if wait_region.is_none()
+                && new_len > old_len
+                && !mremap_flags.contains(MremapFlags::MREMAP_FIXED)
+            {
+                if let Some(grow_start) = old_vaddr.data().checked_add(old_len) {
+                    let grow_region = VirtRegion::new(VirtAddr::new(grow_start), new_len - old_len);
+                    if guard
+                        .mappings
+                        .first_reservation_conflict(grow_region)
+                        .is_some()
+                    {
+                        wait_region = Some(grow_region);
                     }
                 }
             }
@@ -1490,7 +1506,6 @@ impl AddressSpace {
                     new_len,
                     flags: mremap_flags,
                     new_vaddr,
-                    vm_flags,
                 },
                 |inner, ranges| {
                     #[cfg(target_arch = "x86_64")]

@@ -210,7 +210,7 @@ impl XolPool {
         pages.insert(index, page);
     }
 
-    pub(super) fn overlaps(&self, region: VirtRegion) -> bool {
+    pub(in crate::mm::ucontext) fn overlaps(&self, region: VirtRegion) -> bool {
         let pages = self.pages.lock();
         let first = pages.partition_point(|page| {
             page.page_base.data() + MMArch::PAGE_SIZE <= region.start().data()

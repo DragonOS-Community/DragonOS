@@ -232,7 +232,6 @@ pub(super) struct MremapRequest {
     pub new_len: usize,
     pub flags: MremapFlags,
     pub new_vaddr: VirtAddr,
-    pub vm_flags: VmFlags,
 }
 
 impl InnerAddressSpace {
@@ -245,8 +244,6 @@ impl InnerAddressSpace {
     /// - `new_len`: length of the remapped region
     /// - `mremap_flags`: remap flags
     /// - `new_vaddr`: starting address of the remapped region
-    /// - `vm_flags`: old memory region flags
-    ///
     /// # Returns
     ///
     /// Returns the starting virtual page frame address of the remapped region
@@ -268,31 +265,7 @@ impl InnerAddressSpace {
             new_len,
             flags: mremap_flags,
             new_vaddr,
-            vm_flags,
         } = request;
-        let fixed_new_region = if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
-            if !new_vaddr.check_aligned(MMArch::PAGE_SIZE) {
-                return Err(SystemError::EINVAL.into());
-            }
-            let new_region = Self::checked_user_region(new_vaddr, new_len)?;
-            let old_end = old_vaddr.data().wrapping_add(old_len);
-            let new_end = new_vaddr
-                .data()
-                .checked_add(new_len)
-                .ok_or(SystemError::EINVAL)?;
-            if old_end > new_vaddr.data() && new_end > old_vaddr.data() {
-                return Err(SystemError::EINVAL.into());
-            }
-            if old_len != 0 {
-                let old_region = Self::checked_user_region(old_vaddr, old_len)?;
-                debug_assert!(!old_region.collide(&new_region));
-            }
-            Some(new_region)
-        } else {
-            None
-        };
-        // Initialise memory region protection flags
-        let prot_flags: ProtFlags = vm_flags.into();
         let mut notifications = VmaCloseNotifications::default();
         let mut exec_publication = MremapExecPublication::default();
         macro_rules! mremap_fail {
@@ -313,10 +286,107 @@ impl InnerAddressSpace {
             };
         }
 
-        if mremap_flags.contains(MremapFlags::MREMAP_FIXED)
-            && self.mappings.contains(old_vaddr).is_none()
-        {
+        // Linux holds mmap_write_lock from the initial lookup through every
+        // validation and mutation. Keep the source identity and flags in this
+        // same transaction instead of accepting a syscall-layer snapshot.
+        let Some(initial_vma) = self.mappings.contains(old_vaddr) else {
             mremap_fail!(SystemError::EFAULT);
+        };
+        let (initial_region, initial_vm_flags) = {
+            let guard = initial_vma.lock();
+            (*guard.region(), *guard.vm_flags())
+        };
+
+        // Huge-page remapping is not implemented yet. Like Linux, reject it
+        // before MREMAP_FIXED can destroy the destination.
+        if initial_vm_flags.contains(VmFlags::VM_HUGETLB) {
+            log::error!("mremap: huge-page mappings are not supported");
+            mremap_fail!(SystemError::ENOSYS);
+        }
+
+        // Linux performs the source lookup before validating an explicit
+        // target, then validates that target before any destination unmap.
+        if mremap_flags.intersects(MremapFlags::MREMAP_FIXED | MremapFlags::MREMAP_DONTUNMAP) {
+            if !new_vaddr.check_aligned(MMArch::PAGE_SIZE) {
+                mremap_fail!(SystemError::EINVAL);
+            }
+            let Some(new_end) = new_vaddr.data().checked_add(new_len) else {
+                mremap_fail!(SystemError::EINVAL);
+            };
+            if new_end > MMArch::USER_END_VADDR.data() {
+                mremap_fail!(SystemError::EINVAL);
+            }
+            let old_end = old_vaddr.data().wrapping_add(old_len);
+            if old_end > new_vaddr.data() && new_end > old_vaddr.data() {
+                mremap_fail!(SystemError::EINVAL);
+            }
+        }
+        let fixed_new_region = if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            let new_region = mremap_try!(Self::checked_user_region(new_vaddr, new_len));
+            Some(new_region)
+        } else {
+            None
+        };
+
+        // A plain equal-size remap is a no-op, and a plain shrink only unmaps
+        // the tail. Both precede vma_to_resize() and therefore remain valid for
+        // VM_DONTEXPAND/VM_PFNMAP mappings on Linux.
+        if !mremap_flags.intersects(MremapFlags::MREMAP_FIXED | MremapFlags::MREMAP_DONTUNMAP)
+            && old_len == new_len
+        {
+            return Ok(MremapOutcome {
+                addr: old_vaddr,
+                notifications,
+                exec_publication,
+                post_commit_population: None,
+            });
+        }
+
+        // XOL mappings are kernel-owned and their pool records a fixed virtual
+        // slot address. Unlike a generic VM_DONTEXPAND mapping, relocating or
+        // duplicating one would corrupt that ownership metadata, so reject it
+        // before any fixed-target side effect.
+        #[cfg(target_arch = "x86_64")]
+        if self.outer_addr_space().is_some_and(|mm| {
+            let plain_shrink = old_len > new_len
+                && !mremap_flags
+                    .intersects(MremapFlags::MREMAP_FIXED | MremapFlags::MREMAP_DONTUNMAP);
+            (!plain_shrink && mm.xol_pool.overlaps(initial_region))
+                || fixed_new_region.is_some_and(|target| mm.xol_pool.overlaps(target))
+                || (old_len > new_len
+                    && mm
+                        .xol_pool
+                        .overlaps(VirtRegion::new(old_vaddr + new_len, old_len - new_len)))
+        }) {
+            mremap_fail!(if mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) {
+                SystemError::EINVAL
+            } else {
+                SystemError::EFAULT
+            });
+        }
+
+        if old_len > new_len && !mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            let prepared = match self.prepare_munmap(
+                VirtPageFrame::new(old_vaddr + new_len),
+                PageFrameCount::from_bytes(old_len - new_len).unwrap(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    notifications.extend(failure.notifications);
+                    mremap_fail!(failure.err);
+                }
+            };
+            if let Err(err) = before_mutation(self, &prepared.affected_ranges()) {
+                notifications.extend(prepared.rollback());
+                mremap_fail!(err);
+            }
+            notifications.extend(self.commit_munmap(prepared));
+            return Ok(MremapOutcome {
+                addr: old_vaddr,
+                notifications,
+                exec_publication,
+                post_commit_population: None,
+            });
         }
 
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
@@ -359,7 +429,7 @@ impl InnerAddressSpace {
         let Some(old_vma) = self.mappings.contains(old_vaddr) else {
             mremap_fail!(SystemError::EFAULT);
         };
-        let (old_region, vm_file, shared_anon, base_pgoff, sysv_shm) = {
+        let (old_region, vm_flags, vm_file, shared_anon, base_pgoff, sysv_shm) = {
             let g = old_vma.lock();
             let region = *g.region();
             let vma_start = region.start();
@@ -371,12 +441,14 @@ impl InnerAddressSpace {
                 .saturating_add(off_pages);
             (
                 region,
+                *g.vm_flags(),
                 g.vm_file(),
                 g.shared_anon.clone(),
                 base,
                 g.sysv_shm(),
             )
         };
+        let prot_flags: ProtFlags = vm_flags.into();
 
         // Construct target mapping flags: mremap must preserve shared/private semantics and distinguish anon/file.
         let mut map_flags: MapFlags = vm_flags.into();
@@ -396,26 +468,32 @@ impl InnerAddressSpace {
         let locked_source = vm_flags.contains(VmFlags::VM_LOCKED);
         let sysv_mremap = sysv_shm.is_some();
         let source_len = old_len;
+        let can_move = mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
+            || mremap_flags.contains(MremapFlags::MREMAP_FIXED);
+
+        // Linux checks the old_len==0 legacy duplicate rule before the
+        // special-mapping and source-span checks in vma_to_resize().
+        if old_len == 0 && !vm_flags.intersects(VmFlags::VM_SHARED | VmFlags::VM_MAYSHARE) {
+            mremap_fail!(SystemError::EINVAL);
+        }
+        if dontunmap_flag && vm_flags.intersects(VmFlags::VM_DONTEXPAND | VmFlags::VM_PFNMAP) {
+            mremap_fail!(SystemError::EINVAL);
+        }
         let Some(max_old_len) = old_region.end().data().checked_sub(old_vaddr.data()) else {
             mremap_fail!(SystemError::EINVAL);
         };
         if source_len > max_old_len {
             mremap_fail!(SystemError::EFAULT);
         }
+        if new_len != old_len && vm_flags.intersects(VmFlags::VM_DONTEXPAND | VmFlags::VM_PFNMAP) {
+            mremap_fail!(SystemError::EFAULT);
+        }
         let source_region = VirtRegion::new(old_vaddr, source_len);
         if dontunmap_flag {
-            if vm_flags.intersects(VmFlags::VM_DONTEXPAND | VmFlags::VM_PFNMAP) {
-                mremap_fail!(SystemError::EINVAL);
-            }
-            let Some(old_end) = old_vaddr.data().checked_add(old_len) else {
-                mremap_fail!(SystemError::EINVAL);
-            };
-            let Some(new_end) = new_vaddr.data().checked_add(new_len) else {
-                mremap_fail!(SystemError::EINVAL);
-            };
-            if old_end > new_vaddr.data() && new_end > old_vaddr.data() {
-                mremap_fail!(SystemError::EINVAL);
-            }
+            debug_assert!(
+                old_vaddr.data().wrapping_add(old_len) <= new_vaddr.data()
+                    || new_vaddr.data() + new_len <= old_vaddr.data()
+            );
         }
         if locked_source {
             let additional_locked_pages = if old_len == 0 {
@@ -443,22 +521,13 @@ impl InnerAddressSpace {
             mremap_try!(self.check_rlimit_as_for_bytes(as_delta));
         }
 
-        // Whether moving is allowed (Linux: only MAYMOVE / FIXED can move)
-        let can_move = mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
-            || mremap_flags.contains(MremapFlags::MREMAP_FIXED);
+        if old_len == 0 && !can_move {
+            mremap_fail!(SystemError::ENOMEM);
+        }
 
         // Linux: old_len==0 means “copy/duplicate-map” a shared region (DOS-emu legacy).
         // - Only allowed for shared mappings
         // - Return ENOMEM without MAYMOVE/FIXED
-        if old_len == 0 {
-            if !vm_flags.intersects(VmFlags::VM_SHARED | VmFlags::VM_MAYSHARE) {
-                mremap_fail!(SystemError::EINVAL);
-            }
-            if !can_move {
-                mremap_fail!(SystemError::ENOMEM);
-            }
-        }
-
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
             if let Err(err) = check_mmap_min_addr(new_vaddr, self.mmap_min) {
                 mremap_fail!(err);

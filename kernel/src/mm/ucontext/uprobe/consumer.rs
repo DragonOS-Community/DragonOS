@@ -431,6 +431,38 @@ pub(super) fn uprobe_registry_has_active_system_wide_consumers() -> bool {
     ACTIVE_SYSTEM_WIDE_UPROBE_CONSUMERS.load(Ordering::Acquire) != 0
 }
 
+/// Return whether an exec replay can install any active consumer in the
+/// target's currently published address space.
+///
+/// The system-wide counter is paired with epoch publication by
+/// `active_consumer_enter()`. Task events use the existing per-PCB bucket so an
+/// unrelated exec does not scan the registry or allocate a full VMA snapshot.
+/// Keep the scope check before the epoch check. Besides rejecting terminal
+/// targets before their epoch is withdrawn, taking the target's basic lock
+/// synchronizes with exec's old/new-mm publication. If a concurrent ENABLE
+/// scanned the previous mm, the subsequent epoch load must make this replay
+/// cover the final mm.
+///
+/// Lock order: task-consumer bucket -> task-scope registry -> target PCB basic.
+/// Callers must not hold an mm or VMA lock.
+pub(super) fn uprobe_registry_has_active_for_exec_mm(
+    target: &Arc<ProcessControlBlock>,
+    mm: &Arc<AddressSpace>,
+) -> bool {
+    if uprobe_registry_has_active_system_wide_consumers() {
+        return true;
+    }
+
+    let target_ptr = Arc::as_ptr(target) as usize;
+    let task_consumers = UPROBE_TASK_CONSUMERS.lock_irqsave();
+    task_consumers
+        .get(&target_ptr)
+        .into_iter()
+        .flatten()
+        .filter_map(Weak::upgrade)
+        .any(|consumer| consumer.scope.permits(mm) && consumer.has_published_epoch())
+}
+
 fn active_consumer_enter(consumer: &UprobeConsumer) {
     ACTIVE_UPROBE_CONSUMERS.fetch_add(1, Ordering::AcqRel);
     if matches!(&consumer.scope, UprobeConsumerScope::SystemWideAuthorized) {

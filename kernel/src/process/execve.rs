@@ -227,6 +227,8 @@ fn do_execve_internal(
                 return finish_exec_error(&param, old_vm.as_ref(), err);
             }
             #[cfg(target_arch = "x86_64")]
+            crate::mm::ucontext::uprobe::uprobe_apply_to_exec_mm(&pcb, &address_space);
+            #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_registry_task_exec(&pcb, old_vm.as_ref());
             if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
                 completion.complete_all();
@@ -270,13 +272,24 @@ fn finish_exec_error(
     old_vm: Option<&Arc<AddressSpace>>,
     error: SystemError,
 ) -> Result<(), ExecFailure> {
+    let post_point_of_no_return = param.point_of_no_return();
     if let Some(old_vm) = old_vm {
         do_execve_switch_user_vm(old_vm.clone());
+        // DragonOS publishes the prospective mm before ELF validation. If a
+        // concurrent ENABLE scanned that temporary mm, a recoverable exec
+        // failure must provide the complementary replay after restoring the
+        // old mm. Post-PONR failures terminate instead of resuming userspace,
+        // so replaying immediately before task-exit teardown would be wasted.
+        #[cfg(target_arch = "x86_64")]
+        if !post_point_of_no_return {
+            let current = ProcessManager::current_pcb();
+            crate::mm::ucontext::uprobe::uprobe_apply_to_exec_mm(&current, old_vm);
+        }
     }
 
     Err(ExecFailure {
         error,
-        post_point_of_no_return: param.point_of_no_return(),
+        post_point_of_no_return,
     })
 }
 

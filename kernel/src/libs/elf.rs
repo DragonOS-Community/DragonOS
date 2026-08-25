@@ -1269,12 +1269,6 @@ impl BinaryLoader for ElfLoader {
 
         let result = BinaryLoaderResult::new(interp_load_addr.unwrap_or(program_entrypoint));
         drop(user_vm);
-        // ELF segments are installed through locked InnerAddressSpace helpers,
-        // bypassing the ordinary mmap post-commit hook.  Reconcile definitions
-        // only after the final write guard is released so fault-in cannot
-        // recurse on the address-space lock.
-        #[cfg(target_arch = "x86_64")]
-        crate::mm::ucontext::uprobe::uprobe_apply_to_all_vmas(&binding);
         // kdebug!("elf load OK!!!");
         return Ok(result);
     }

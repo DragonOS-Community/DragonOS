@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -54,6 +55,8 @@ namespace {
 
 constexpr const char* UPROBE_TYPE_PATH =
     "/sys/bus/event_source/devices/uprobe/type";
+constexpr const char* TASK_SCOPED_EXEC_MODE =
+    "--uprobe-task-scoped-exec-phase";
 
 struct UprobePerfEventOptions {
     pid_t pid = 0;
@@ -115,6 +118,20 @@ bool read_uprobe_perf_type(__u32& type) {
 __attribute__((noinline)) int uprobe_target(int x) {
     asm volatile("" : "+r"(x) : : "memory");  // 防止内联/优化掉
     return x * 2 + 1;
+}
+
+// This mode runs before GoogleTest initialization after the exec half of
+// TaskScopedEventSurvivesExec. The inherited perf fd is the only state carried
+// across exec; a count of two proves that the same task's event was replayed
+// into the replacement address space.
+int run_task_scoped_exec_phase(int event_fd) {
+    if (uprobe_target(42) != 85) return 1;
+
+    __u64 count = 0;
+    if (read(event_fd, &count, sizeof(count)) !=
+        static_cast<ssize_t>(sizeof(count)))
+        return 2;
+    return count == 2 ? 0 : 3;
 }
 
 #if defined(__x86_64__)
@@ -2188,6 +2205,49 @@ TEST(UprobeTest, RseqPreemptionUsesOriginalProbeIp) {
 #endif
 
 #if defined(__x86_64__)
+// A task-scoped perf event remains attached to the same task across exec. The
+// replacement mm is populated outside the ordinary mmap post-commit hook, so
+// exec must replay that task's active consumer after loading the new image.
+TEST(UprobeTest, TaskScopedEventSurvivesExec) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed, errno=" << errno;
+    if (child == 0) {
+        FdGuard event(open_uprobe_perf_event(path, offset));
+        if (event.get() < 0 || uprobe_target(41) != 83) _exit(10);
+
+        __u64 count = 0;
+        if (read(event.get(), &count, sizeof(count)) !=
+                static_cast<ssize_t>(sizeof(count)) ||
+            count != 1)
+            _exit(11);
+
+        const int fd_flags = fcntl(event.get(), F_GETFD);
+        if (fd_flags < 0 ||
+            fcntl(event.get(), F_SETFD, fd_flags & ~FD_CLOEXEC) < 0)
+            _exit(12);
+
+        char event_fd[32];
+        if (std::snprintf(event_fd, sizeof(event_fd), "%d", event.get()) <= 0)
+            _exit(13);
+        execl("/proc/self/exe", "/proc/self/exe", TASK_SCOPED_EXEC_MODE,
+              event_fd, static_cast<char*>(nullptr));
+        _exit(14);
+    }
+
+    int status = 0;
+    const pid_t waited = reap_child(child, &status);
+    ASSERT_EQ(waited, child) << "failed to reap exec worker, errno=" << errno;
+    ASSERT_TRUE(WIFEXITED(status))
+        << "exec worker terminated by signal " << WTERMSIG(status);
+    EXPECT_EQ(WEXITSTATUS(status), 0)
+        << "exec worker phase failed with status " << WEXITSTATUS(status);
+}
+
 // A task-scoped event belongs to the original task and is not inherited by a
 // fork child when perf inherit is disabled. The child nevertheless initially
 // receives the parent's private breakpoint page through COW, so fork must
@@ -2421,6 +2481,15 @@ TEST(UprobeTest, ConcurrentTeardownDoesNotExposeRetiredBreakpoint) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], TASK_SCOPED_EXEC_MODE) == 0) {
+        char* end = nullptr;
+        errno = 0;
+        const long parsed = std::strtol(argv[2], &end, 10);
+        if (errno != 0 || end == argv[2] || *end != '\0' || parsed < 0 ||
+            parsed > std::numeric_limits<int>::max())
+            return 64;
+        return run_task_scoped_exec_phase(static_cast<int>(parsed));
+    }
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -680,6 +680,20 @@ pub(crate) fn uprobe_apply_to_all_vmas(mm: &Arc<AddressSpace>) {
     );
 }
 
+/// Replay consumers after exec has published its final target mm.
+///
+/// Consumer activation and this gate form a two-sided publication handshake:
+/// an epoch visible here is replayed below, while an epoch published after the
+/// gate makes activation observe and scan the already-stable target mm. The
+/// gate is allocation-free, so unrelated task-scoped events do not turn every
+/// exec into a full address-space walk.
+pub(crate) fn uprobe_apply_to_exec_mm(target: &Arc<ProcessControlBlock>, mm: &Arc<AddressSpace>) {
+    if !uprobe_registry_has_active_for_exec_mm(target, mm) {
+        return;
+    }
+    uprobe_apply_to_all_vmas(mm);
+}
+
 /// Restore breakpoint bytes inherited through fork COW before the child mm is
 /// exposed without its write lock.
 ///

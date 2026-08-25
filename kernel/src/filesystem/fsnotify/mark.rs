@@ -1,4 +1,4 @@
-//! [`FsNotifyMark`]：一个 watch（group + inode + mask + wd）及其生命周期管理。
+//! [`FsNotifyMark`]: a watch (group + inode + mask + wd) and its lifecycle management.
 
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -26,17 +26,20 @@ pub(crate) struct RetireToken {
     reason: RetireReason,
 }
 
-/// 一个 watch：连接 group 与 inode。
+/// A watch: links a group to an inode.
 ///
-/// 生命周期：由 `group.marks` 持有强引用（pin 住被监听 inode），全局索引持 `Weak`。
-/// 撤销时机：`rm_watch`、`IN_DELETE_SELF`/`IN_UNMOUNT` 触发、group 销毁。
+/// Lifecycle: `group.marks` holds a strong reference (pinning the watched
+/// inode), while the global index holds a `Weak`.
+/// Revoked on: `rm_watch`, `IN_DELETE_SELF`/`IN_UNMOUNT` being triggered, or
+/// group destruction.
 #[derive(Debug)]
 pub struct FsNotifyMark {
-    /// watch descriptor，group 内唯一。
+    /// Watch descriptor, unique within a group.
     pub wd: i32,
-    /// 所属 group（弱引用，避免环引用）。
+    /// Owning group (weak reference, to avoid a reference cycle).
     pub group: Weak<FsNotifyGroup>,
-    /// 强引用：watch 期间 pin 住 inode（防 evict，保证 InodeId 不复用）。
+    /// Strong reference: pins the inode for the duration of the watch
+    /// (preventing eviction, so the InodeId is not reused).
     pub _inode: Arc<dyn IndexNode>,
     /// Keeps the shared per-object notification state alive without retaining
     /// a dentry.
@@ -47,20 +50,24 @@ pub struct FsNotifyMark {
     /// rm_watch race without a packed atomic state machine.
     pub dispatch_lock: Mutex<()>,
     pub active: AtomicBool,
-    /// 订阅 mask（`IN_MASK_ADD` 并发改，必须原子读）。
+    /// Subscribed mask (`IN_MASK_ADD` updates it concurrently; must be read
+    /// atomically).
     pub mask: AtomicU32,
-    /// `IN_ONESHOT`：触发一次后自动撤销。
+    /// `IN_ONESHOT`: revoke automatically after a single trigger.
     pub oneshot: AtomicBool,
-    /// `IN_EXCL_UNLINK`：已 unlink 子项不再产生事件。
+    /// `IN_EXCL_UNLINK`: no longer emit events for an unlinked child.
     pub excl_unlink: AtomicBool,
 }
 
 impl FsNotifyMark {
-    /// 取被监听 inode 的标识：(inode_id, dev_id) 复合键。
+    /// Get the identity of the watched inode: a (inode_id, dev_id) composite
+    /// key.
     ///
-    /// FUSE 等多挂载场景可能复用相同 inode 号（如 FUSE_ROOT_ID=1），
-    /// 必须用 (inode_id, dev_id) 组合区分不同挂载上的 inode，否则会跨挂载
-    /// 误匹配 mark，导致事件泄露或误判已有 watch。
+    /// In multi-mount scenarios such as FUSE, the same inode number may be
+    /// reused (e.g. FUSE_ROOT_ID=1). The (inode_id, dev_id) pair must be used
+    /// to distinguish inodes on different mounts; otherwise a mark can be
+    /// mismatched across mounts, causing event leaks or misjudging an existing
+    /// watch.
     pub fn identity(&self) -> FsNotifyObjectId {
         self.object_id
     }
@@ -118,10 +125,13 @@ impl FsNotifyMark {
     }
 }
 
-/// 撤销一个 mark：从 group.marks、全局索引移除，并维护全局计数。
+/// Revoke a mark: remove it from `group.marks` and the global index, and
+/// maintain the global counter.
 ///
-/// 在 `rm_watch`、`DELETE_SELF`/`UNMOUNT` dispatch、group 销毁时调用。
-/// 注意：不取 events 锁，故与 read 路径互不阻塞（锁族分离）。
+/// Called on `rm_watch`, `DELETE_SELF`/`UNMOUNT` dispatch, and group
+/// destruction.
+/// Note: the events lock is not taken, so this never blocks the read path
+/// (separate lock families).
 pub(crate) fn finish_retire(token: RetireToken) {
     let RetireToken {
         mark,
@@ -129,7 +139,7 @@ pub(crate) fn finish_retire(token: RetireToken) {
         reason,
     } = token;
 
-    // 从 group.marks 移除（按指针相等）。
+    // Remove from group.marks (by pointer equality).
     let mut marks = group.marks.lock();
     let removed = marks
         .get(&mark.object_id)

@@ -1,4 +1,4 @@
-//! [`FsNotifyGroup`]：一个通知消费者（一个 inotify fd 对应一个 group）。
+//! [`FsNotifyGroup`]: a notification consumer (one group per inotify fd).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -11,11 +11,13 @@ use crate::libs::wait_queue::WaitQueue;
 use super::mark::FsNotifyMark;
 use super::{FsNotifyBackend, FsNotifyObjectId};
 
-/// 一个通知消费者。一个 inotify fd 对应一个 group。
+/// A notification consumer. One group per inotify fd.
 ///
-/// - `backend`：具体后端（自带内部锁），fsnotify 层只依赖 [`FsNotifyBackend`] trait；
-/// - `marks`：group 拥有的所有 mark（强引用，pin 住被监听 inode）；
-/// - `wait_queue` / `epitems`：read 阻塞唤醒与 epoll 集成。
+/// - `backend`: the concrete backend (with its own internal lock); the fsnotify
+///   layer only depends on the [`FsNotifyBackend`] trait;
+/// - `marks`: all marks owned by the group (strong references, pinning the
+///   watched inodes);
+/// - `wait_queue` / `epitems`: read blocking wakeup and epoll integration.
 #[derive(Debug)]
 pub struct FsNotifyGroup {
     pub backend: Box<dyn FsNotifyBackend>,

@@ -1,13 +1,13 @@
-//! 文件系统事件通知统一层（fsnotify）。
+//! Unified layer for filesystem event notification (fsnotify).
 //!
-//! 本模块是 VFS 写路径 hook 与具体后端（当前仅 inotify）之间的解耦层。
-//! VFS hook 只调用 [`fsnotify`]。挂载文件系统的 watch 使用对象局部快照，
-//! 非挂载对象才使用全局后备索引，事件在取得不可变快照后分发。
+//! This module is the decoupling layer between the VFS write-path hooks and the concrete backends (currently only inotify).
+//! The VFS hooks only call [`fsnotify`]. Watches on mounted filesystems use object-local snapshots,
+//! while unmounted objects use the global fallback index; events are dispatched after an immutable snapshot is acquired.
 //!
-//! 设计原则（见 `docs/kernel/filesystem/inotify.md` §0/§3）：
-//! - `fsnotify()` 尽力而为，绝不影响 syscall 返回值；
-//! - `fsnotify()` 内部只取本层自旋锁与 group 队列锁，绝不回调 `IndexNode` 写方法；
-//! - 锁序：对象快照锁只用于 clone/publish，释放后才进入 mark 与 group 队列，永不反向。
+//! Design principles (see `docs/kernel/filesystem/inotify.md` §0/§3):
+//! - `fsnotify()` is best-effort and never affects the syscall return value;
+//! - `fsnotify()` internally takes only this layer's spinlocks and the group queue lock, and never calls back into `IndexNode` write methods;
+//! - Lock order: the object snapshot lock is only used for clone/publish; after it is released we enter the mark and group queues, never in reverse.
 
 pub mod group;
 pub mod mark;
@@ -135,10 +135,10 @@ pub fn fsnotify_inode(mask: FsEvent, inode: &Arc<dyn IndexNode>) {
     fsnotify_with_data(mask, None, Some(inode), 0, false);
 }
 
-// 事件 mask：对应 Linux 内核 `FS_*` 事件，其比特位与用户态 `IN_*` 完全一致，
-// 故可直接作为用户态 mask 使用（仅 `ISDIR` 由 dispatch 按需设置）。
+// Event mask: corresponds to the Linux kernel `FS_*` events; its bits match the user-space `IN_*` bits exactly,
+// so it can be used directly as a user-space mask (only `ISDIR` is set on demand by dispatch).
 //
-// 参考：Linux `include/uapi/linux/inotify.h`、`include/linux/fsnotify_backend.h`。
+// Reference: Linux `include/uapi/linux/inotify.h`, `include/linux/fsnotify_backend.h`.
 bitflags::bitflags! {
     pub struct FsEvent: u32 {
         const ACCESS       = 0x00000001; // IN_ACCESS
@@ -153,18 +153,18 @@ bitflags::bitflags! {
         const DELETE       = 0x00000200; // IN_DELETE
         const DELETE_SELF  = 0x00000400; // IN_DELETE_SELF
         const MOVE_SELF    = 0x00000800; // IN_MOVE_SELF
-        const UNMOUNT      = 0x00002000; // IN_UNMOUNT（文件系统卸载）
-        const Q_OVERFLOW   = 0x00004000; // IN_Q_OVERFLOW（队列溢出）
-        const IN_IGNORED   = 0x00008000; // watch 被撤销（inode 删除/卸载）
-        const ISDIR        = 0x40000000; // 事件对象是目录（由 dispatch 设置）
+        const UNMOUNT      = 0x00002000; // IN_UNMOUNT (filesystem unmount)
+        const Q_OVERFLOW   = 0x00004000; // IN_Q_OVERFLOW (queue overflow)
+        const IN_IGNORED   = 0x00008000; // watch was revoked (inode deleted/unmounted)
+        const ISDIR        = 0x40000000; // event target is a directory (set by dispatch)
     }
 }
 
-/// 后端接口（最小抽象）。
+/// Backend interface (minimal abstraction).
 ///
-/// fsnotify 层通过此 trait 调用具体后端，保持 VFS → fsnotify → inotify 单向依赖。
+/// The fsnotify layer calls the concrete backend through this trait, keeping the VFS → fsnotify → inotify dependency one-directional.
 pub trait FsNotifyBackend: Send + Sync + core::fmt::Debug {
-    /// 处理一个事件：格式化、（可选）合并、入队，并唤醒等待者。
+    /// Handle an event: format, (optionally) merge, enqueue, and wake waiters.
     fn handle_event(
         &self,
         group: &FsNotifyGroup,
@@ -173,24 +173,24 @@ pub trait FsNotifyBackend: Send + Sync + core::fmt::Debug {
         name: Option<&str>,
         cookie: u32,
     ) -> EnqueueResult;
-    /// mark 销毁时从后端内部结构（如 wd 表）移除。
+    /// Remove the mark from the backend's internal structures (e.g. the wd table) when it is destroyed.
     fn free_mark(&self, mark: &FsNotifyMark);
-    /// mark 被撤销时向消费者投递一个 IN_IGNORED 事件（rm_watch/oneshot/DELETE_SELF/UNMOUNT）。
-    /// fd close(shutdown) 路径不调用此方法。
+    /// Deliver an IN_IGNORED event to the consumer when the mark is revoked (rm_watch/oneshot/DELETE_SELF/UNMOUNT).
+    /// This method is not called on the fd close (shutdown) path.
     fn notify_ignored(&self, group: &FsNotifyGroup, mark: &FsNotifyMark);
-    /// poll 用：队列是否非空。
+    /// For poll: whether the queue is non-empty.
     fn queue_nonempty(&self) -> bool;
 }
 
-/// 全局 watch 计数：绝大多数时刻为 0。`fsnotify` 的第一道闸门——
-/// 无 watch 时零锁开销（对齐 Linux `i_fsnotify_mask` 快速跳过）。
+/// Global watch count: zero the vast majority of the time. The first gate of `fsnotify` —
+/// zero lock overhead when there are no watches (mirrors Linux's `i_fsnotify_mask` fast skip).
 static TOTAL_WATCHES: AtomicUsize = AtomicUsize::new(0);
 
-/// move 事件 cookie 分配器：每次 rename 取一个，FROM/TO 共享。
-/// 0 表示「无 move」，故从 1 开始，回绕时跳过 0。
+/// move event cookie allocator: one per rename, shared by FROM/TO.
+/// 0 means "no move", so it starts at 1 and skips 0 on wrap-around.
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(1);
 
-/// 取一个新的非零 move cookie。
+/// Take a new non-zero move cookie.
 pub fn next_cookie() -> u32 {
     loop {
         let c = NEXT_COOKIE.fetch_add(1, Ordering::Relaxed);
@@ -199,12 +199,12 @@ pub fn next_cookie() -> u32 {
         }
     }
 }
-// 全局 mark 索引：用 `(InodeId, dev_id)` 复合键反查「挂在该 inode 上的所有 mark」。
+// Global mark index: uses a composite `(InodeId, dev_id)` key to reverse-lookup "all marks attached to that inode".
 //
-// 必须用复合键：FUSE 多挂载会复用相同 inode 号（如 FUSE_ROOT_ID=1），纯 InodeId 键
-// 会跨挂载误匹配，导致事件泄露 / 误判已有 watch。
-// 存 `Weak<FsNotifyMark>`：group 拥有 mark（强引用），索引只做查找，不阻止回收。
-// dispatch 时 `Weak::upgrade()` 失败的死引用会被惰性剔除。
+// The composite key is required: multiple FUSE mounts reuse the same inode number (e.g. FUSE_ROOT_ID=1), and a bare InodeId key
+// would mismatch across mounts, causing event leaks / misjudging existing watches.
+// Stores `Weak<FsNotifyMark>`: the group owns the mark (strong reference), and the index only performs lookups without preventing reclamation.
+// Dead references whose `Weak::upgrade()` fails during dispatch are lazily pruned.
 type MarkList = Arc<Vec<alloc::sync::Weak<FsNotifyMark>>>;
 type MarkIndex = HashMap<FsNotifyObjectId, MarkList>;
 
@@ -267,7 +267,7 @@ pub(crate) fn notify_unmount_object(object: &FsNotifyObjectState) {
     }
 }
 
-/// 记录一次 watch 计数变更（add +1，撤销 -1）。
+/// Record a watch-count change (add +1, revoke -1).
 pub(crate) fn adjust_total_watches(delta: i32) {
     if delta >= 0 {
         TOTAL_WATCHES.fetch_add(delta as usize, Ordering::Release);
@@ -276,8 +276,8 @@ pub(crate) fn adjust_total_watches(delta: i32) {
     }
 }
 
-/// 系统中是否存在任意 inotify watch。供 VFS 热路径（open/read/write/close）做廉价短路：
-/// 无 watch 时完全跳过 parent 解析与 fsnotify 调用（零开销）。
+/// Whether any inotify watch exists in the system. Lets the VFS hot paths (open/read/write/close) short-circuit cheaply:
+/// with no watches, parent resolution and the fsnotify call are skipped entirely (zero overhead).
 pub fn has_any_watch() -> bool {
     TOTAL_WATCHES.load(Ordering::Acquire) != 0
 }
@@ -320,7 +320,7 @@ pub(crate) fn index_add(mark: &Arc<FsNotifyMark>) -> Result<(), SystemError> {
         return Ok(());
     }
 }
-/// 把 mark 从全局索引移除（按指针相等匹配，rm_watch / 撤销时调用）。
+/// Remove a mark from the global index (matched by pointer equality, called on rm_watch / revoke).
 pub(crate) fn index_remove(mark: &FsNotifyMark) {
     if let Some(object) = mark.object_state.as_ref() {
         object_index_remove(object, mark);
@@ -479,15 +479,15 @@ fn object_index_remove(object: &FsNotifyObjectState, mark: &FsNotifyMark) {
     }
 }
 
-/// 统一事件投递入口。在 VFS 操作**成功之后**调用，尽力而为，不影响调用方返回值。
+/// Unified event delivery entry point. Called **after a VFS operation succeeds**, best-effort, and never affects the caller's return value.
 ///
-/// - `parent`：对子项事件（CREATE/DELETE/MOVED_*），传 `(父目录 inode, 子项名)`；
-/// - `child`：对自身事件（DELETE_SELF/MOVE_SELF/MODIFY/CLOSE/OPEN/ATTRIB），传目标 inode；
-/// - 二者可同时非空（如 unlink：父目录得 `IN_DELETE`，子项得 `IN_DELETE_SELF`）。
+/// - `parent`: for child events (CREATE/DELETE/MOVED_*), pass `(parent directory inode, child name)`;
+/// - `child`: for self events (DELETE_SELF/MOVE_SELF/MODIFY/CLOSE/OPEN/ATTRIB), pass the target inode;
+/// - Both may be non-null simultaneously (e.g. unlink: the parent directory gets `IN_DELETE`, the child gets `IN_DELETE_SELF`).
 ///
-/// # 安全性
-/// 内部只读 `inode.metadata()`（inode 活着、metadata 只读不锁），不调用任何写方法，
-/// 避免在调用方持有的 VFS/File 锁下重入。
+/// # Safety guarantees
+/// Internally it only reads `inode.metadata()` (inode is alive, metadata is read-only without locking), and calls no write methods,
+/// avoiding re-entry under the VFS/File locks held by the caller.
 pub fn fsnotify(
     mask: FsEvent,
     parent: Option<(&Arc<dyn IndexNode>, &str)>,
@@ -504,16 +504,16 @@ fn fsnotify_with_data(
     cookie: u32,
     path_event: bool,
 ) {
-    // ① 快速路径：系统无任何 watch → 直接返回（read/write/close 热路径零成本）。
+    // ① Fast path: no watches in the system → return immediately (zero cost on the read/write/close hot path).
     if TOTAL_WATCHES.load(Ordering::Relaxed) == 0 {
         return;
     }
 
-    // ② 预取 inode 元数据（inode 活着、metadata 只读不锁，安全）。
-    // 事件的「主体」是 child（被创建/删除/移动/修改的对象）；IN_ISDIR 由主体是否为
-    // 目录决定，对 parent/child 两类 watch 一视同仁。若无 child（仅父目录自身事件
-    // 的退化情况），ISDIR 不置位。
-    // 用 (inode_id, dev_id) 复合键：FUSE 多挂载复用相同 inode 号，必须加 dev_id 区分。
+    // ② Prefetch inode metadata (inode is alive, metadata is read-only without locking, safe).
+    // The "subject" of the event is the child (the object created/deleted/moved/modified); IN_ISDIR is determined by whether the subject
+    // is a directory, applying uniformly to parent and child watches. If there is no child (the degenerate case of only a parent-directory self event),
+    // ISDIR is not set.
+    // Use the (inode_id, dev_id) composite key: multiple FUSE mounts reuse the same inode number, so dev_id must be added to disambiguate.
     let child_target = child.and_then(|inode| target_for_event(inode).ok().flatten());
     let parent_target = parent.and_then(|(inode, _)| target_for_event(inode).ok().flatten());
     fsnotify_targets(
@@ -552,8 +552,8 @@ pub(crate) fn fsnotify_targets(
         return;
     }
 
-    // ③ 收集候选 mark 快照：临界区仅做哈希查表（秒放），不做后端工作。
-    // (mark 强引用, name, is_parent)
+    // ③ Collect candidate mark snapshots: the critical section only does a hash lookup (held only briefly), no backend work.
+    // (mark strong reference, name, is_parent)
     let local_parent = parent.and_then(|(target, _)| target.object_state.as_ref());
     let local_child = child.and_then(|target| target.object_state.as_ref());
     let parent_marks = local_parent
@@ -574,24 +574,24 @@ pub(crate) fn fsnotify_targets(
                     .flatten()
             })
         });
-    // 注：死 Weak 在 lock 内 upgrade 失败时被跳过；惰性清理留给 index_remove。
+    // Note: dead Weak refs that fail to upgrade within the lock are skipped; lazy cleanup is left to index_remove.
 
-    // 事件路由（Linux 模型）：
-    // - 命名空间事件 CREATE/DELETE/MOVED_FROM/MOVED_TO：仅父目录 watch 收（带 name）；
-    // - 自身事件 DELETE_SELF/MOVE_SELF：仅子项自身 watch 收；
-    // - 内容类事件 ACCESS/MODIFY/ATTRIB/CLOSE_*/OPEN：父目录 watch（带 name）与子项自身 watch
-    //   均收——使「监听目录」能收到子文件被读/写/开关/改属性的事件（inotify 头号用例）。
-    // 一次 fsnotify 调用可同时通知父目录与子项（如 unlink：父得 IN_DELETE，子得 IN_DELETE_SELF）。
+    // Event routing (Linux model):
+    // - Namespace events CREATE/DELETE/MOVED_FROM/MOVED_TO: only the parent directory watch receives them (with name);
+    // - Self events DELETE_SELF/MOVE_SELF: only the child's own watch receives them;
+    // - Content events ACCESS/MODIFY/ATTRIB/CLOSE_*/OPEN: both the parent directory watch (with name) and the child's own watch
+    //   receive them — so a "watched directory" receives events for child files being read/written/opened/closed/attribute-changed (inotify's #1 use case).
+    // A single fsnotify call can notify both the parent directory and the child (e.g. unlink: parent gets IN_DELETE, child gets IN_DELETE_SELF).
     let self_only = FsEvent::DELETE_SELF | FsEvent::MOVE_SELF;
     let parent_only = FsEvent::CREATE | FsEvent::DELETE | FsEvent::MOVED_FROM | FsEvent::MOVED_TO;
-    // 内容类事件（IN_EXCL_UNLINK 抑制对象）。
+    // Content events (suppressed by IN_EXCL_UNLINK).
     let content_type = FsEvent::MODIFY
         | FsEvent::ACCESS
         | FsEvent::CLOSE_WRITE
         | FsEvent::CLOSE_NOWRITE
         | FsEvent::OPEN;
 
-    // ④ 锁外投递。
+    // ④ Deliver outside the lock.
     let parent_name = parent.map(|(_, name)| name);
     let candidates = parent_marks
         .iter()
@@ -608,7 +608,7 @@ pub(crate) fn fsnotify_targets(
         if !mark.active.load(Ordering::Acquire) {
             continue;
         }
-        // 父 mark 收除 self_only 外的全部；自身 mark 收除 parent_only 外的全部。
+        // The parent mark receives everything except self_only; the self mark receives everything except parent_only.
         let routed = if is_parent {
             mask & !self_only
         } else {
@@ -618,15 +618,15 @@ pub(crate) fn fsnotify_targets(
             continue;
         }
 
-        // inode 死亡事件（DELETE_SELF/UNMOUNT）：无论 watch 是否订阅都必须撤销 mark
-        // 并投递 IN_IGNORED（由 destroy_mark 无条件入队），否则 watch 泄漏强引用。
+        // Inode death events (DELETE_SELF/UNMOUNT): the mark must be revoked regardless of whether the watch is subscribed,
+        // and IN_IGNORED must be delivered (enqueued unconditionally by destroy_mark); otherwise the watch leaks a strong reference.
         let inode_death =
             routed.contains(FsEvent::DELETE_SELF) || routed.contains(FsEvent::UNMOUNT);
 
         let subscribed = mark.mask.load(Ordering::Relaxed);
         let mask_matches = (subscribed & routed.bits()) != 0;
 
-        // 非 inode-death 事件：未订阅或被 EXCL_UNLINK 抑制时跳过。
+        // Non-inode-death events: skip when not subscribed or suppressed by EXCL_UNLINK.
         if !inode_death {
             if !mask_matches {
                 continue;
@@ -643,7 +643,7 @@ pub(crate) fn fsnotify_targets(
             }
         }
 
-        // dispatch 设置 ISDIR（主体是目录时）。
+        // dispatch sets ISDIR (when the subject is a directory).
         let mut delivered = routed;
         if event_is_dir && !routed.intersects(self_only) {
             delivered |= FsEvent::ISDIR;
@@ -658,7 +658,7 @@ pub(crate) fn fsnotify_targets(
             EnqueueResult::Filtered
         };
 
-        // 撤销：inode 死亡（无条件）或 oneshot（订阅匹配后触发一次即撤销）。
+        // Revoke: on inode death (unconditional) or oneshot (revoke after a single trigger when the subscription matched).
         let consumes_oneshot = matches!(
             enqueue_result,
             EnqueueResult::Queued | EnqueueResult::Merged | EnqueueResult::DroppedQueueFull

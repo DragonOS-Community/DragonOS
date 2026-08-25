@@ -135,7 +135,7 @@ pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, Sy
     metadata.mode = chmod_preserve_type(metadata.mode, mode);
     metadata.ctime = PosixTimeSpec::now();
     inode.set_metadata_masked(&metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME)?;
-    // fsnotify：属性变更 → IN_ATTRIB。
+    // fsnotify: attribute change → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(0)
 }
@@ -179,7 +179,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         group_info = info.clone();
     }
 
-    // Linux 语义：uid/gid 传入 (uid_t)-1/(gid_t)-1 表示“不更改”。
+    // Linux semantics: uid/gid passed in as (uid_t)-1/(gid_t)-1 mean "do not change".
     let is_no_change = |id: usize| id == u32::MAX as usize;
     let change_uid = !is_no_change(uid);
     let change_gid = !is_no_change(gid);
@@ -290,12 +290,12 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
         let follow_symlink = !(how.o_flags.contains(FileFlags::O_NOFOLLOW)
             || how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_EXCL));
-        // 检查空字符串路径
+        // Check for an empty path
         if path.is_empty() {
             return Err(SystemError::ENOENT);
         }
 
-        // 检查路径末尾斜杠 - 如果以斜杠结尾，目标必须是目录
+        // Check for a trailing slash on the path: if it ends with a slash, the target must be a directory
         let path_ends_with_slash = path.ends_with('/');
 
         let (start_path, path) =
@@ -316,7 +316,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 name: filename,
                 must_be_dir,
             }) => {
-                // 文件不存在，且需要创建
+                // The file does not exist and must be created
                 if how.o_flags.contains(FileFlags::O_CREAT)
                     && !how.o_flags.contains(FileFlags::O_DIRECTORY)
                 {
@@ -326,20 +326,20 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                         return Err(SystemError::EISDIR);
                     }
 
-                    // 检查文件名长度
+                    // Check the filename length
                     if filename.len() > crate::filesystem::vfs::NAME_MAX {
                         return Err(SystemError::ENAMETOOLONG);
                     }
                     let parent_inode = parent_resolved.inode();
                     let parent_md = parent_inode.metadata()?;
-                    // 父节点必须是目录
+                    // The parent must be a directory
                     if parent_md.file_type != FileType::Dir {
                         return Err(SystemError::ENOTDIR);
                     }
-                    // Linux 语义：创建文件需要对父目录拥有 W+X（写+搜索）权限
+                    // Linux semantics: creating a file requires write+search (W+X) permission on the parent directory
                     check_parent_dir_permission_inode(&parent_inode, &parent_md)?;
 
-                    // 计算创建 mode：应用 umask，遵循 open/creat 语义
+                    // Compute the creation mode: apply umask, following open/creat semantics
                     let pcb = ProcessManager::current_pcb();
                     let umask = pcb.fs_struct().umask();
                     let create_mode = apply_umask_for_create(how.mode, umask);
@@ -415,11 +415,11 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
             return Err(SystemError::EACCES);
         }
 
-        // 如果路径以斜杠结尾，而目标不是目录，返回 ENOTDIR
+        // If the path ends with a slash but the target is not a directory, return ENOTDIR
         if path_ends_with_slash && file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
-        // 已存在的文件且指定了 O_CREAT|O_EXCL
+        // The file already exists and O_CREAT|O_EXCL was specified
         if how.o_flags.contains(FileFlags::O_CREAT)
             && how.o_flags.contains(FileFlags::O_EXCL)
             && !created
@@ -432,25 +432,25 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         {
             return Err(SystemError::ELOOP);
         }
-        // 对已存在的目录使用 O_CREAT 视为错误
+        // Using O_CREAT on an existing directory is treated as an error
         if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
-        // 目录相关检查
+        // Directory checks
         if file_type == FileType::Dir {
-            // 目录上不支持 O_TRUNC
+            // O_TRUNC is not supported on directories
             if how.o_flags.contains(FileFlags::O_TRUNC) {
                 return Err(SystemError::EISDIR);
             }
-            // 目录上不允许写访问
+            // Write access is not allowed on directories
             let acc_mode = how.o_flags.access_flags();
             if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
                 return Err(SystemError::EISDIR);
             }
         }
-        // 非 O_PATH 需要检查访问权限（read/write/truncate）
-        // Linux 语义：若本次 open() 触发了创建，则不应因“新 inode 的 mode”而拒绝
-        // 当前这次 open() 的访问模式；权限在“后续 reopen()”时生效。
+        // Non-O_PATH opens must check access permission (read/write/truncate)
+        // Linux semantics: if this open() triggered creation, it must not reject this
+        // open()'s access mode because of the "new inode's mode"; it takes effect on a subsequent reopen().
         if !how.o_flags.contains(FileFlags::O_PATH) && !created {
             let acc_mode = how.o_flags.access_flags();
             let mut need = PermissionMask::empty();
@@ -470,7 +470,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
             }
         }
 
-        // 如果要打开的是文件夹，而目标不是文件夹
+        // If a directory was to be opened but the target is not a directory
         if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -714,7 +714,7 @@ pub fn do_utimensat(
                 | SetMetadataMask::TIMES_BY_WRITE,
         )?;
     }
-    // fsnotify：时间戳变更 → IN_ATTRIB。
+    // fsnotify: timestamp change → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
 }
@@ -751,7 +751,7 @@ pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, 
                 | SetMetadataMask::TIMES_BY_WRITE,
         )?;
     }
-    // fsnotify：成功的 utimes(2) 时间戳更新 → IN_ATTRIB。
+    // fsnotify: a successful utimes(2) timestamp update → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
 }

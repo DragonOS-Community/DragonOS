@@ -636,8 +636,9 @@ impl FATFileSystem {
             }
         }
 
-        // FSInfo 不可用：在分配器使用的同一 FAT 锁下复查、扫描并回填。
-        // 否则并发分配可能发生在扫描与绝对值回填之间，导致高估空闲簇。
+        // FSInfo is unavailable: re-check, scan, and backfill under the same FAT lock the allocator uses.
+        // Otherwise a concurrent allocation could occur between the scan and the absolute-value
+        // backfill, causing free clusters to be overestimated.
         let _fat_guard = self.fat_lock.lock();
         {
             let guard = self.fs_info.0.lock();

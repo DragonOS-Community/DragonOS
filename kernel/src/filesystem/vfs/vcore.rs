@@ -1005,8 +1005,8 @@ pub fn vfs_fallocate_file(
     if len == 0 || offset > isize::MAX as usize || len > isize::MAX as usize {
         return Err(SystemError::EINVAL);
     }
-    // VFS 层 s_maxbytes 上限守卫（对齐 Linux do_fallocate）：offset+len 不得溢出或超过 isize::MAX。
-    // 具体文件系统实现各自再校验，但 VFS 层不应留缺口。
+    // VFS-layer s_maxbytes upper-bound guard (aligned with Linux do_fallocate): offset+len must not overflow or exceed isize::MAX.
+    // Each filesystem implementation re-validates on its own, but the VFS layer should not leave a gap.
     let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
     if new_size > isize::MAX as usize {
         return Err(SystemError::EFBIG);

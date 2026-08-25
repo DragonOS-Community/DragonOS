@@ -1084,7 +1084,7 @@ impl File {
             }
         }
 
-        // fsnotify：写成功后投递 IN_MODIFY（FMODE_NONOTIFY 短路，防 inotify fd 递归）。
+        // fsnotify: deliver IN_MODIFY after a successful write (FMODE_NONOTIFY short-circuits, preventing inotify fd recursion).
         if written_len > 0
             && fsnotify::has_any_watch()
             && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
@@ -1828,8 +1828,8 @@ impl File {
         if len > 0 || self.file_type == FileType::File {
             self.touch_atime_after_access();
         }
-        // fsnotify：仅在实际读到数据（len > 0）时投递 IN_ACCESS（FMODE_NONOTIFY 短路）。
-        // EOF 读（len==0）不投递——与 atime 语义独立。
+        // fsnotify: deliver IN_ACCESS only when data was actually read (len > 0) (FMODE_NONOTIFY short-circuits).
+        // An EOF read (len==0) does not deliver—independent of atime semantics.
         if emit_fsnotify
             && len > 0
             && fsnotify::has_any_watch()
@@ -2589,8 +2589,8 @@ impl File {
         // 更新文件的打开模式
         *self.flags.write() = new_flags;
 
-        // 将 O_NONBLOCK 变更同步到 inotify fd（其 read_at 查内部 AtomicBool 而非 FileFlags，
-        // 与 socket 的 set_nonblocking 同理）。
+        // Sync the O_NONBLOCK change to the inotify fd (its read_at checks an internal AtomicBool rather than FileFlags,
+        // same as socket's set_nonblocking).
         if new_flags.contains(FileFlags::O_NONBLOCK) != old_flags.contains(FileFlags::O_NONBLOCK) {
             if let Some(ino) = self
                 .inode
@@ -2784,8 +2784,8 @@ impl Drop for File {
             EventPoll::release_file_epitem(&epitem);
             let _ = self.remove_epitem(&epitem);
         }
-        // fsnotify：最后一次 close → IN_CLOSE_WRITE / IN_CLOSE_NOWRITE（FMODE_NONOTIFY 短路）。
-        // 此时 self.inode 仍存活（Drop 在 inode.close() 之前），可安全取 inode_id。
+        // fsnotify: the final close → IN_CLOSE_WRITE / IN_CLOSE_NOWRITE (FMODE_NONOTIFY short-circuits).
+        // At this point self.inode is still alive (Drop runs before inode.close()), so it is safe to take the inode_id.
         if fsnotify::has_any_watch() {
             let mode = *self.mode.read();
             if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH) {

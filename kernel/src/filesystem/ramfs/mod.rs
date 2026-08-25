@@ -647,7 +647,7 @@ impl IndexNode for LockedRamFSInode {
                     file_type,
                     mode: init.mode,
                     flags: InodeFlags::empty(),
-                    // 目录需要包含 "." 自引用，因此初始为2
+                    // A directory needs to contain the "." self-reference, hence the initial count of 2
                     nlinks: if file_type == FileType::Dir { 2 } else { 1 },
                     uid: init.uid,
                     gid: init.gid,

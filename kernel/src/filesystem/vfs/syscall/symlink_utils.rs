@@ -69,7 +69,7 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     check_inode_permission(&new_parent, &parent_metadata, PermissionMask::MAY_WRITE)?;
 
     let notify = || {
-        // fsnotify：父目录得 IN_CREATE（符号链接非目录，IN_ISDIR 不置位）。
+        // fsnotify: the parent directory receives IN_CREATE (a symlink is not a directory, so IN_ISDIR is not set).
         fsnotify::fsnotify(FsEvent::CREATE, Some((&new_parent, new_name)), None, 0);
     };
     if let Some(mounted) = new_parent.clone().downcast_arc::<MountFSInode>() {

@@ -138,7 +138,7 @@ pub fn do_linkat(
         // Linux reports the source inode's changed link count before the
         // destination directory entry becomes visible to fsnotify consumers.
         fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&old_inode), 0);
-        // fsnotify：父目录得 IN_CREATE（硬链接目标非目录，IN_ISDIR 不置位）。
+        // fsnotify: the parent directory receives IN_CREATE (the hard-link target is not a directory, so IN_ISDIR is not set).
         fsnotify::fsnotify(
             FsEvent::CREATE,
             Some((&new_parent, new_name)),

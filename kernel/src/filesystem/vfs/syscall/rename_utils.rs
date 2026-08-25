@@ -109,16 +109,16 @@ pub fn do_renameat2(
 
     let old_inode = old_parent_inode.lookup(old_filename)?;
 
-    // RENAME_EXCHANGE 目标必须存在；预先 lookup 供事件投递复用（move_to 后原位置查不到）。
+    // The RENAME_EXCHANGE target must exist; look up in advance for reuse during event delivery (after move_to the original location can no longer be found).
     let exchange_new_inode = if flags.contains(RenameFlags::EXCHANGE) {
         Some(new_parent_inode.lookup(new_filename)?)
     } else {
         None
     };
 
-    // 非 EXCHANGE：预先取出可能被覆盖的目标 inode（move_to 会静默销毁它），
-    // 否则其上的 watch 会沦为持续产生事件的「幽灵 watch」。只有 ENOENT
-    // 表示目标不存在；I/O、权限等 lookup 错误必须原样返回。
+    // Non-EXCHANGE: fetch in advance the target inode that may be overwritten (move_to will silently destroy it),
+    // otherwise its watch becomes a ghost watch that keeps producing events. Only ENOENT
+    // indicates the target does not exist; lookup errors such as I/O or permission errors must be returned unchanged.
     let displaced = if !flags.contains(RenameFlags::EXCHANGE) {
         match new_parent_inode.find(new_filename) {
             Ok(inode) => Some(inode),
@@ -291,7 +291,7 @@ impl RenameNotification<'_> {
 
     fn send(&self) {
         if self.flags.contains(RenameFlags::EXCHANGE) {
-            // EXCHANGE：两个 inode 互换位置 → 两组配对事件、两个 cookie、双方各 IN_MOVE_SELF。
+            // EXCHANGE: the two inodes swap positions, yielding two pairs of events, two cookies, and IN_MOVE_SELF for each side.
             // - old_inode: old_dir/old_name → new_dir/new_name（cookie1）
             // - new_inode: new_dir/new_name → old_dir/old_name（cookie2）
             let new_inode = self
@@ -331,7 +331,7 @@ impl RenameNotification<'_> {
             );
             fsnotify::fsnotify_targets(FsEvent::MOVE_SELF, None, Some(new_inode), 0, false);
         } else {
-            // 普通 rename（可能覆盖目标）：单 cookie 配对 MOVED_FROM/MOVED_TO + MOVE_SELF。
+            // Normal rename (possibly overwriting the target): a single paired cookie for MOVED_FROM/MOVED_TO + MOVE_SELF.
             let cookie = fsnotify::next_cookie();
             fsnotify::fsnotify_targets(
                 FsEvent::MOVED_FROM,

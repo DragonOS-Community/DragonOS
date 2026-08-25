@@ -3,7 +3,11 @@ mod kprobe;
 pub(crate) mod release;
 mod sys_perf_event_open;
 mod tracepoint;
+#[cfg(target_arch = "x86_64")]
+mod uprobe;
 mod util;
+
+pub(crate) use util::{PERF_TYPE_KPROBE, PERF_TYPE_UPROBE};
 
 use crate::arch::MMArch;
 use crate::bpf::prog::BpfProg;
@@ -45,6 +49,13 @@ use system_error::SystemError;
 type Result<T> = core::result::Result<T, SystemError>;
 
 pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNode {
+    /// Non-blocking final-close notification.
+    ///
+    /// `IndexNode::close()` can run in a context where sleeping teardown is
+    /// unsafe. Events that can still admit callbacks must close that admission
+    /// here. Implementations must be idempotent and allocation-free; resource
+    /// destruction remains in the sleepable `release()` hook.
+    fn begin_release(&self) {}
     /// Set the bpf program for the perf event
     fn set_bpf_prog(&self, _bpf_prog: Arc<File>) -> Result<()> {
         Err(SystemError::ENOSYS)
@@ -56,6 +67,14 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
     /// Disable the perf event
     fn disable(&self) -> Result<()> {
         Err(SystemError::ENOSYS)
+    }
+    /// Reset the event's accumulated count without changing enable state.
+    fn reset(&self) -> Result<()> {
+        Err(SystemError::ENOSYS)
+    }
+    /// Read the event-specific perf counter payload.
+    fn read_event(&self, _len: usize, _buf: &mut [u8]) -> Result<usize> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
     /// Sleepable final release. It is always run by the perf release worker,
     /// never by `File::drop` or an event destructor.
@@ -79,16 +98,52 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
 
 pub struct JITMem {
     virt_addr: VirtAddr,
+    page_count: PageFrameCount,
 }
 
 impl JITMem {
     pub fn new() -> Self {
-        let vaddr = unsafe {
-            let (paddr, _count) =
-                allocate_page_frames(PageFrameCount::new(1)).expect("JITMem alloc failed");
-            MMArch::phys_2_virt(paddr).unwrap()
+        let (paddr, page_count) =
+            unsafe { allocate_page_frames(PageFrameCount::new(1)) }.expect("JITMem alloc failed");
+        Self {
+            virt_addr: unsafe { MMArch::phys_2_virt(paddr) }.unwrap(),
+            page_count,
+        }
+    }
+
+    /// Allocate enough executable memory for rbpf's current x86_64 emitter.
+    ///
+    /// Each eBPF instruction expands to less than 128 bytes in that emitter;
+    /// the one-page minimum also covers its fixed prologue and epilogue. Keep
+    /// this bound here, next to the allocation, so a larger program cannot
+    /// reach rbpf's fixed-buffer assertion.
+    pub fn try_for_bpf_program(program_len: usize) -> Result<Self> {
+        const BPF_INSN_SIZE: usize = 8;
+        const MAX_JIT_BYTES_PER_INSN: usize = 128;
+
+        if program_len == 0 || !program_len.is_multiple_of(BPF_INSN_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+        let instruction_count = program_len / BPF_INSN_SIZE;
+        let required = instruction_count
+            .checked_mul(MAX_JIT_BYTES_PER_INSN)
+            .ok_or(SystemError::E2BIG)?
+            .max(MMArch::PAGE_SIZE);
+        let allocation_size = required
+            .checked_add(MMArch::PAGE_SIZE - 1)
+            .ok_or(SystemError::E2BIG)?
+            & !(MMArch::PAGE_SIZE - 1);
+        let requested = PageFrameCount::new(allocation_size / MMArch::PAGE_SIZE);
+        let (paddr, page_count) =
+            unsafe { allocate_page_frames(requested) }.ok_or(SystemError::ENOMEM)?;
+        let Some(virt_addr) = (unsafe { MMArch::phys_2_virt(paddr) }) else {
+            unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), page_count) };
+            return Err(SystemError::ENOMEM);
         };
-        Self { virt_addr: vaddr }
+        Ok(Self {
+            virt_addr,
+            page_count,
+        })
     }
 }
 
@@ -98,7 +153,7 @@ impl Deref for JITMem {
     fn deref(&self) -> &Self::Target {
         unsafe {
             let ptr = self.virt_addr.as_ptr();
-            core::slice::from_raw_parts(ptr, 4096)
+            core::slice::from_raw_parts(ptr, self.page_count.bytes())
         }
     }
 }
@@ -107,7 +162,7 @@ impl DerefMut for JITMem {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
             let ptr = self.virt_addr.as_ptr();
-            core::slice::from_raw_parts_mut(ptr, 4096)
+            core::slice::from_raw_parts_mut(ptr, self.page_count.bytes())
         }
     }
 }
@@ -116,8 +171,7 @@ impl Drop for JITMem {
     fn drop(&mut self) {
         unsafe {
             let paddr = MMArch::virt_2_phys(self.virt_addr).expect("JITMem drop failed");
-            let count = PageFrameCount::new(1);
-            deallocate_page_frames(PhysPageFrame::new(paddr), count);
+            deallocate_page_frames(PhysPageFrame::new(paddr), self.page_count);
         }
     }
 }
@@ -149,15 +203,23 @@ impl BasicPerfEbpfCallBack {
         }
     }
 
-    pub fn call(&self, entry: &mut [u8]) {
+    pub fn call_with_result(&self, entry: &mut [u8]) -> Option<u64> {
         let res = if cfg!(target_arch = "x86_64") {
             unsafe { self.vm.execute_program_jit(entry) }
         } else {
             self.vm.execute_program(entry)
         };
-        if res.is_err() {
-            log::error!("kprobe callback error: {:?}", res);
+        match res {
+            Ok(value) => Some(value),
+            Err(err) => {
+                log::error!("perf BPF callback error: {:?}", err);
+                None
+            }
         }
+    }
+
+    pub fn call(&self, entry: &mut [u8]) {
+        let _ = self.call_with_result(entry);
     }
 }
 
@@ -231,7 +293,9 @@ impl IndexNode for PerfEventInode {
         Ok(())
     }
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
-        if let Some(node) = self.release_node.lock_irqsave().take() {
+        let node = { self.release_node.lock_irqsave().take() };
+        if let Some(node) = node {
+            self.core.event.begin_release();
             release::enqueue(node);
         }
         Ok(())
@@ -239,11 +303,11 @@ impl IndexNode for PerfEventInode {
     fn read_at(
         &self,
         _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
+        len: usize,
+        buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
-        panic!("read_at not implemented for PerfEvent");
+        self.core.event.read_event(len, buf)
     }
 
     fn write_at(
@@ -253,7 +317,7 @@ impl IndexNode for PerfEventInode {
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
-        panic!("write_at not implemented for PerfEvent");
+        Err(SystemError::EINVAL)
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -284,6 +348,10 @@ impl IndexNode for PerfEventInode {
             }
             PerfEventIoc::Disable => {
                 self.core.event.disable()?;
+                Ok(0)
+            }
+            PerfEventIoc::Reset => {
+                self.core.event.reset()?;
                 Ok(0)
             }
             PerfEventIoc::SetBpf => {
@@ -407,9 +475,29 @@ pub fn perf_event_open(
     pid: i32,
     cpu: i32,
     group_fd: i32,
-    flags: u32,
+    flags: usize,
 ) -> Result<usize> {
+    // Linux validates perfmon capability before dereferencing dynamic probe
+    // names. Besides matching errno precedence, this prevents an unauthorized
+    // caller from forcing an arbitrary user-memory scan through config1.
+    if (attr.type_ == PERF_TYPE_KPROBE || attr.type_ == PERF_TYPE_UPROBE)
+        && !crate::process::cred::perfmon_capable()
+    {
+        return Err(SystemError::EACCES);
+    }
     let args = PerfProbeArgs::try_from(attr, pid, cpu, group_fd, flags)?;
+    #[cfg(target_arch = "x86_64")]
+    if args.type_ == PERF_TYPE_UPROBE {
+        uprobe::validate_perf_event_attr(attr)?;
+    }
+    if args.type_ == PERF_TYPE_KPROBE || args.type_ == PERF_TYPE_UPROBE {
+        let unsupported = PerfEventOpenFlags::PERF_FLAG_FD_NO_GROUP
+            | PerfEventOpenFlags::PERF_FLAG_FD_OUTPUT
+            | PerfEventOpenFlags::PERF_FLAG_PID_CGROUP;
+        if args.group_fd != -1 || args.flags.intersects(unsupported) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+    }
     log::info!("perf_event_process: {:#?}", args);
     let file_mode = if args
         .flags
@@ -422,13 +510,24 @@ pub fn perf_event_open(
     let cloexec = file_mode.contains(FileFlags::O_CLOEXEC);
 
     let event: Box<dyn PerfEventOps> = match args.type_ {
-        // Kprobe
-        // See /sys/bus/event_source/devices/kprobe/type
-        perf_type_id::PERF_TYPE_MAX => {
+        // Dynamic software PMUs are routed solely by their sysfs-advertised
+        // type. Probe names and paths are data, never dispatch metadata.
+        PERF_TYPE_KPROBE => {
             let kprobe_event = kprobe::perf_event_open_kprobe(args);
             Box::new(kprobe_event)
         }
-        perf_type_id::PERF_TYPE_SOFTWARE => {
+        PERF_TYPE_UPROBE => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let uprobe_event = uprobe::perf_event_open_uprobe(args)?;
+                Box::new(uprobe_event)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                return Err(SystemError::ENOSYS);
+            }
+        }
+        ty if ty == perf_type_id::PERF_TYPE_SOFTWARE as u32 => {
             // For bpf prog output
             assert_eq!(
                 args.config,
@@ -441,13 +540,11 @@ pub fn perf_event_open(
             let bpf_event = bpf::perf_event_open_bpf(args);
             Box::new(bpf_event)
         }
-        perf_type_id::PERF_TYPE_TRACEPOINT => {
+        ty if ty == perf_type_id::PERF_TYPE_TRACEPOINT as u32 => {
             let tracepoint_event = tracepoint::perf_event_open_tracepoint(args)?;
             Box::new(tracepoint_event)
         }
-        _ => {
-            unimplemented!("perf_event_process: unknown type: {:?}", args);
-        }
+        _ => return Err(SystemError::ENOENT),
     };
 
     let page_cache = event.page_cache();

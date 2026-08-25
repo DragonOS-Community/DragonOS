@@ -31,6 +31,38 @@ pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
 
 impl X86_64MMArch {
+    /// A protection fault can block behind the address-space write lock while
+    /// mprotect/mremap publishes a new leaf PTE. The hardware error code then
+    /// describes the old PTE, so revalidate write/instruction permission from
+    /// the stable page table before converting that stale fault into SIGSEGV.
+    fn stale_protection_fault_resolved(
+        mapper: &PageMapper,
+        address: VirtAddr,
+        error_code: X86PfErrorCode,
+        fault_from_user: bool,
+    ) -> bool {
+        const EXPECTED_FLAGS: u32 = X86PfErrorCode::X86_PF_PROT.bits()
+            | X86PfErrorCode::X86_PF_WRITE.bits()
+            | X86PfErrorCode::X86_PF_USER.bits()
+            | X86PfErrorCode::X86_PF_INSTR.bits();
+
+        if !fault_from_user
+            || !error_code.contains(X86PfErrorCode::X86_PF_PROT | X86PfErrorCode::X86_PF_USER)
+            || error_code.bits() & !EXPECTED_FLAGS != 0
+            || !error_code.intersects(X86PfErrorCode::X86_PF_WRITE | X86PfErrorCode::X86_PF_INSTR)
+        {
+            return false;
+        }
+
+        let Some(entry) = mapper.get_entry(address, 0) else {
+            return false;
+        };
+        entry.present()
+            && entry.flags().has_user()
+            && (!error_code.contains(X86PfErrorCode::X86_PF_WRITE) || entry.write())
+            && (!error_code.contains(X86PfErrorCode::X86_PF_INSTR) || entry.flags().has_execute())
+    }
+
     pub fn vma_access_error(vma: Arc<LockedVMA>, error_code: X86PfErrorCode) -> bool {
         let vm_flags = *vma.lock().vm_flags();
         let foreign = false;
@@ -278,7 +310,13 @@ impl X86_64MMArch {
             flags |= FaultFlags::FAULT_FLAG_INSTRUCTION;
         }
 
+        let fault_from_user = regs.is_from_user();
         let send_fault_signal = |sig: Signal, code: i32, addr: VirtAddr| {
+            // 只有走到最终 fault->signal 分支才标记 Trapped；可恢复的缺页、
+            // retry 和 exception-table fixup 均保持 Running，继续完成同一 XOL。
+            if fault_from_user {
+                crate::exception::uprobe::mark_current_xol_trapped();
+            }
             if let Err(e) = force_sig_fault_to_current(sig, code, addr) {
                 error!(
                     "failed to force {:?} fault to current process: pid={:?}, code={}, addr={:#x}, err={:?}",
@@ -486,6 +524,15 @@ impl X86_64MMArch {
                         send_segv_maperr();
                         return;
                     }
+                }
+
+                if Self::stale_protection_fault_resolved(
+                    &space_guard.user_mapper.utable,
+                    address,
+                    error_code,
+                    fault_from_user,
+                ) {
+                    return;
                 }
 
                 if unlikely(Self::vma_access_error(vma.clone(), error_code)) {

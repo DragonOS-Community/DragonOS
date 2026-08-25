@@ -23,4 +23,5 @@ Kernel Tracing Mechanism
    tracepoint
    text_patching
    kprobe
+   uprobe
    eBPF

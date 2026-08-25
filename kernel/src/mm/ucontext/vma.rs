@@ -19,6 +19,8 @@ pub enum PresentPfn {
 pub struct LockedVMA {
     /// Used for hash computation, avoiding the need to acquire the VMA lock for hashing.
     id: usize,
+    /// Stable identity of the logical mapping across VMA splits.
+    lineage_id: u64,
     state_seq: AtomicU64,
     vma: Mutex<VMA>,
 }
@@ -55,17 +57,28 @@ impl LockedVMA {
     }
 
     pub fn new(vma: VMA) -> Arc<Self> {
+        let lineage_id = LOCKEDVMA_LINEAGE_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(lineage_id, 0, "LockedVMA lineage ID overflow");
+        Self::new_with_lineage(vma, lineage_id)
+    }
+
+    fn new_with_lineage(vma: VMA, lineage_id: u64) -> Arc<Self> {
         let r = Arc::new(Self {
             id: LOCKEDVMA_ID_ALLOCATOR.lock().alloc().unwrap(),
+            lineage_id,
             state_seq: AtomicU64::new(0),
             vma: Mutex::new(vma),
         });
         r.vma.lock().self_ref = Arc::downgrade(&r);
-        return r;
+        r
     }
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub(crate) fn lineage_id(&self) -> u64 {
+        self.lineage_id
     }
 
     pub fn state_seq(&self) -> u64 {
@@ -449,7 +462,7 @@ impl LockedVMA {
             vma.region = virt_region;
             vma.mapped = false;
             // backing_pgoff stays unchanged; before VMA uses the original offset
-            let vma: Arc<LockedVMA> = LockedVMA::new(vma);
+            let vma: Arc<LockedVMA> = LockedVMA::new_with_lineage(vma, self.lineage_id);
             vma
         });
 
@@ -464,7 +477,7 @@ impl LockedVMA {
                     (virt_region.start() - guard.region.start()) >> MMArch::PAGE_SHIFT;
                 vma.backing_pgoff = Some(original_pgoff + offset_pages);
             }
-            let vma: Arc<LockedVMA> = LockedVMA::new(vma);
+            let vma: Arc<LockedVMA> = LockedVMA::new_with_lineage(vma, self.lineage_id);
             vma
         });
 
@@ -801,6 +814,18 @@ impl VMA {
 
     pub fn set_flags(&mut self) {
         self.flags = MMArch::vm_get_page_prot(self.vm_flags);
+    }
+
+    /// Override only the execute bit used when publishing PTEs for this VMA.
+    /// The logical `VM_EXEC` permission is intentionally unchanged.
+    pub(super) fn set_entry_execute(&mut self, executable: bool) {
+        self.flags = self.flags.set_execute(executable);
+    }
+
+    /// Override only the write bit used when publishing PTEs for this VMA.
+    /// The logical `VM_WRITE` permission is intentionally unchanged.
+    pub(super) fn set_entry_write(&mut self, writable: bool) {
+        self.flags = self.flags.set_write(writable);
     }
 
     #[inline(always)]

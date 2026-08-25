@@ -372,7 +372,7 @@ impl PageManager {
         self.phys2page.remove(paddr)
     }
 
-    fn remove_page_if_same(&mut self, expected: &Arc<Page>) -> Option<Arc<Page>> {
+    pub(crate) fn remove_page_if_same(&mut self, expected: &Arc<Page>) -> Option<Arc<Page>> {
         let paddr = expected.phys_address();
         let current = self.phys2page.get(&paddr)?;
         if !Arc::ptr_eq(current, expected) {

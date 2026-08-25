@@ -299,6 +299,15 @@ pub fn capable(cap: CAPFlags) -> bool {
     ns_capable(&INIT_USER_NAMESPACE, cap)
 }
 
+/// Whether the current task may use perf's privileged monitoring features.
+///
+/// This matches Linux 6.6 `perfmon_capable()`: `CAP_PERFMON` is the least
+/// privileged authorization, while `CAP_SYS_ADMIN` remains a compatibility
+/// fallback for existing administrative callers.
+pub fn perfmon_capable() -> bool {
+    capable(CAPFlags::CAP_PERFMON) || capable(CAPFlags::CAP_SYS_ADMIN)
+}
+
 /// 检查当前进程在指定 ns 中是否有某 capability（setid 上下文）
 pub fn ns_capable_setid(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
     ns_capable(ns, cap)

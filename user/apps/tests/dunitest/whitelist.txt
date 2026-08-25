@@ -73,6 +73,8 @@ normal/ioperm_semantics
 normal/seccomp
 normal/signal_sigqueueinfo
 normal/process_signal_fork
+normal/process_vm_writev_semantics
+normal/uprobe
 normal/wait_rusage
 normal/sysfs_cgroup2_mount
 normal/devfs_ptmx_unlink

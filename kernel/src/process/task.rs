@@ -81,6 +81,10 @@ pub struct ProcessControlBlock {
     pub(super) rcu_read_depth: AtomicUsize,
 
     pub(super) flags: LockFreeFlags<ProcessFlags>,
+    /// Per-task uprobe XOL state. Kept in the process subsystem so exception
+    /// routing does not become process state ownership.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) uprobe: super::uprobe::TaskXolState,
     /// Whether the current task has been counted in the global visible thread
     /// count.
     pub(super) visible_thread_accounted: AtomicBool,
@@ -388,6 +392,8 @@ impl ProcessControlBlock {
                 executable_path: RwLock::new(name),
                 cmdline: RwLock::new(Vec::new()),
                 rlimits: RwLock::new(Self::default_rlimits()),
+                #[cfg(target_arch = "x86_64")]
+                uprobe: super::uprobe::TaskXolState::new(),
             };
 
             pcb.sig_info.write().set_tty(tty);

@@ -1,3 +1,5 @@
+//! Shared sysfs device for DragonOS software probe PMUs.
+
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::driver::Driver;
@@ -18,38 +20,44 @@ use system_error::SystemError;
 
 #[derive(Debug)]
 #[cast_to([sync] Device)]
-pub struct KprobeDevice {
-    inner: SpinLock<InnerKprobeDevice>,
+pub struct ProbePmuDevice {
+    inner: SpinLock<InnerProbePmuDevice>,
     kobj_state: LockedKObjectState,
     name: String,
+    pmu_type: u32,
 }
 
 #[derive(Debug)]
-struct InnerKprobeDevice {
+struct InnerProbePmuDevice {
     kobject_common: KObjectCommonData,
     device_common: DeviceCommonData,
 }
 
-impl KprobeDevice {
-    pub fn new(parent: Option<Weak<dyn KObject>>) -> Arc<Self> {
+impl ProbePmuDevice {
+    pub fn new(name: &str, pmu_type: u32, parent: Option<Weak<dyn KObject>>) -> Arc<Self> {
         let bus_device = Self {
-            inner: SpinLock::new(InnerKprobeDevice {
+            inner: SpinLock::new(InnerProbePmuDevice {
                 kobject_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
             }),
             kobj_state: LockedKObjectState::new(None),
-            name: "kprobe".to_string(),
+            name: name.to_string(),
+            pmu_type,
         };
         bus_device.set_parent(parent);
         return Arc::new(bus_device);
     }
 
-    fn inner(&self) -> SpinLockGuard<'_, InnerKprobeDevice> {
+    fn inner(&self) -> SpinLockGuard<'_, InnerProbePmuDevice> {
         self.inner.lock()
+    }
+
+    fn pmu_type(&self) -> u32 {
+        self.pmu_type
     }
 }
 
-impl KObject for KprobeDevice {
+impl KObject for ProbePmuDevice {
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
@@ -105,7 +113,7 @@ impl KObject for KprobeDevice {
     }
 }
 
-impl Device for KprobeDevice {
+impl Device for ProbePmuDevice {
     #[inline]
     #[allow(dead_code)]
     fn dev_type(&self) -> DeviceType {
@@ -114,7 +122,7 @@ impl Device for KprobeDevice {
 
     #[inline]
     fn id_table(&self) -> IdTable {
-        IdTable::new("kprobe".to_string(), None)
+        IdTable::new(self.name.clone(), None)
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
@@ -164,9 +172,9 @@ impl Device for KprobeDevice {
 }
 
 #[derive(Debug)]
-pub struct KprobeAttr;
+pub struct ProbeTypeAttr;
 
-impl Attribute for KprobeAttr {
+impl Attribute for ProbeTypeAttr {
     fn name(&self) -> &str {
         "type"
     }
@@ -178,12 +186,18 @@ impl Attribute for KprobeAttr {
     fn support(&self) -> SysFSOpsSupport {
         SysFSOpsSupport::ATTR_SHOW
     }
-    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        if buf.is_empty() {
+    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let device = kobj
+            .as_any_ref()
+            .downcast_ref::<ProbePmuDevice>()
+            .ok_or(SystemError::EINVAL)?;
+        let value = alloc::format!("{}\n", device.pmu_type());
+        if buf.len() < value.len() {
             return Err(SystemError::EINVAL);
         }
-        // perf_type_id::PERF_TYPE_MAX
-        buf[0] = b'6';
-        Ok(1)
+        buf[..value.len()].copy_from_slice(value.as_bytes());
+        Ok(value.len())
     }
 }
+
+pub static PROBE_TYPE_ATTR: ProbeTypeAttr = ProbeTypeAttr;

@@ -1,5 +1,19 @@
 use super::*;
 
+#[cfg(target_arch = "x86_64")]
+struct MremapExecFallbacks {
+    regions: [Option<VirtRegion>; 2],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl MremapExecFallbacks {
+    fn finish(self, mm: &Arc<AddressSpace>) {
+        for region in self.regions.into_iter().flatten() {
+            super::uprobe::uprobe_apply_to_range(mm, region);
+        }
+    }
+}
+
 pub struct FileMappingWithFileArgs {
     pub file: Arc<File>,
     pub start_vaddr: VirtAddr,
@@ -52,9 +66,42 @@ pub struct AddressSpace {
     inner: RwSem<InnerAddressSpace>,
     /// Wait for pending mmap reservations to be committed or cancelled.
     reservation_wait: WaitQueue,
+    // ── uprobe 子系统字段（计划步骤 3）──
+    //
+    // 这些字段位于 `inner` **之外**，由独立 irqsave `SpinLock` 保护（评审 F8）。
+    // 命中路径（#BP/#DB 关中断）仅 `lock_irqsave` + 查表，绝不取 `inner` 的 RwSem（会睡眠）。
+    //
+    /// Per-mm uprobe 表：唯一写控制表 + 面向 #BP 的不可变 RCU 快照。
+    #[cfg(target_arch = "x86_64")]
+    pub uprobe_list: UprobeSiteTable,
+    /// Per-mm XOL page pool (grown lazily by uprobe registration).
+    #[cfg(target_arch = "x86_64")]
+    pub xol_pool: XolPool,
+    /// Per-page 断点状态（追踪 COW 副本 + refcount，供注销恢复原页）。
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) uprobe_page_state: SpinLock<BTreeMap<usize, UprobePageState>>,
 }
 
 impl AddressSpace {
+    /// Apply every deferred mremap range and publish execute permission while
+    /// the original mm write guard is still held. The fixed fallback slots
+    /// preserve Linux's best-effort behavior without allocating after commit.
+    #[cfg(target_arch = "x86_64")]
+    fn finalize_mremap_exec_publication_locked(
+        self: &Arc<Self>,
+        guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+        publication: super::mremap::MremapExecPublication,
+    ) -> MremapExecFallbacks {
+        let mut fallbacks = MremapExecFallbacks { regions: [None; 2] };
+        for (index, (vma, region)) in publication.ranges().enumerate() {
+            if super::uprobe::uprobe_apply_vma_range_locked(self, guard, vma, region) {
+                fallbacks.regions[index] = Some(region);
+            }
+        }
+        publication.publish(guard, self);
+        fallbacks
+    }
+
     /// Populate pages after a VMA operation has committed.
     ///
     /// A file fault may return `VM_FAULT_RETRY` with a wait token.  The token
@@ -63,13 +110,42 @@ impl AddressSpace {
     /// retry.  Do not move this loop back into `InnerAddressSpace`: doing so
     /// would turn a normal PageCache invalidation conflict into a false
     /// population failure or recreate the mmap/writeback lock cycle.
-    fn populate_range_post_commit(
+    pub(crate) fn populate_range_post_commit(
         self: &Arc<Self>,
         start: VirtAddr,
         len: usize,
         force_fault_in_missing: bool,
         locked_vmas_only: bool,
         expected_vma: Option<Weak<LockedVMA>>,
+    ) -> Result<(), SystemError> {
+        self.populate_range_post_commit_inner(
+            start,
+            len,
+            force_fault_in_missing,
+            locked_vmas_only,
+            expected_vma,
+            false,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn populate_uprobe_range_post_commit(
+        self: &Arc<Self>,
+        start: VirtAddr,
+        len: usize,
+        expected_vma: Option<Weak<LockedVMA>>,
+    ) -> Result<(), SystemError> {
+        self.populate_range_post_commit_inner(start, len, true, false, expected_vma, true)
+    }
+
+    fn populate_range_post_commit_inner(
+        self: &Arc<Self>,
+        start: VirtAddr,
+        len: usize,
+        force_fault_in_missing: bool,
+        locked_vmas_only: bool,
+        expected_vma: Option<Weak<LockedVMA>>,
+        force_remote_access: bool,
     ) -> Result<(), SystemError> {
         if len == 0 {
             return Ok(());
@@ -129,9 +205,13 @@ impl AddressSpace {
                 }
 
                 let mut fault_flags = InnerAddressSpace::mlock_fault_flags(vm_flags)
+                    .or_else(|| force_remote_access.then_some(FaultFlags::FAULT_FLAG_REMOTE))
                     .ok_or(SystemError::ENOMEM)?
                     | FaultFlags::FAULT_FLAG_ALLOW_RETRY
                     | FaultFlags::FAULT_FLAG_KILLABLE;
+                if force_remote_access {
+                    fault_flags |= FaultFlags::FAULT_FLAG_REMOTE;
+                }
                 if retried {
                     fault_flags |= FaultFlags::FAULT_FLAG_TRIED;
                 }
@@ -251,6 +331,12 @@ impl AddressSpace {
             oom_reclaim_generation: AtomicU64::new(0),
             inner: RwSem::new(inner),
             reservation_wait: WaitQueue::default(),
+            #[cfg(target_arch = "x86_64")]
+            uprobe_list: UprobeSiteTable::new(),
+            #[cfg(target_arch = "x86_64")]
+            xol_pool: XolPool::new(),
+            #[cfg(target_arch = "x86_64")]
+            uprobe_page_state: SpinLock::new(BTreeMap::new()),
         });
         // Back-fill the Weak<AddressSpace> so that InnerAddressSpace methods can obtain
         // the outer Arc to construct MmuGather / initiate TLB shootdown.
@@ -570,6 +656,9 @@ impl AddressSpace {
                 }
             }
 
+            #[cfg(target_arch = "x86_64")]
+            let mut uprobe_changes = Vec::new();
+
             let (page, notifications) = match guard.map_anonymous_collect(
                 start_vaddr,
                 len,
@@ -577,10 +666,23 @@ impl AddressSpace {
                 map_flags,
                 round_to_min,
                 allocate_at_once,
+                |inner, ranges| {
+                    #[cfg(target_arch = "x86_64")]
+                    uprobe_changes.push(super::uprobe::PreparedUprobeChange::prepare(
+                        self, inner, ranges,
+                    )?);
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let _ = (inner, ranges);
+                    Ok(())
+                },
             ) {
                 Ok(outcome) => outcome,
                 Err(failure) => {
                     drop(guard);
+                    #[cfg(target_arch = "x86_64")]
+                    for change in uprobe_changes {
+                        change.finish(self);
+                    }
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
                     return Err(failure.err);
                 }
@@ -600,6 +702,16 @@ impl AddressSpace {
                     needs_population.then(|| Arc::downgrade(&vma))
                 });
             drop(guard);
+            #[cfg(target_arch = "x86_64")]
+            {
+                for change in uprobe_changes {
+                    change.finish(self);
+                }
+                super::uprobe::uprobe_apply_to_range(
+                    self,
+                    VirtRegion::new(page.virt_address(), len),
+                );
+            }
             InnerAddressSpace::notify_close_notifications(notifications);
             // Page faults may need to drop and reacquire the address-space
             // write guard.  Keep post-map population at this outer boundary;
@@ -766,9 +878,15 @@ impl AddressSpace {
             let fixed_hint =
                 map_flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
             let mut close_notifications = VmaCloseNotifications::default();
+            #[cfg(target_arch = "x86_64")]
+            let mut uprobe_change: Option<super::uprobe::PreparedUprobeChange> = None;
             macro_rules! map_fail {
                 ($err:expr) => {{
                     drop(guard);
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(uprobe_change) = uprobe_change.take() {
+                        uprobe_change.finish(self);
+                    }
                     InnerAddressSpace::notify_close_notifications(close_notifications);
                     return Err($err);
                 }};
@@ -869,17 +987,54 @@ impl AddressSpace {
                 map_fail!(err);
             }
 
+            let mut locked_vm_after_commit = None;
+
             if map_flags.contains(MapFlags::MAP_FIXED) && guard.mappings.has_conflict(region) {
-                match guard.munmap_collect(
+                let prepared = match guard.prepare_munmap(
                     VirtPageFrame::new(region.start()),
                     PageFrameCount::from_bytes(region.size()).unwrap(),
                 ) {
-                    Ok(notifications) => close_notifications.extend(notifications),
+                    Ok(prepared) => prepared,
                     Err(failure) => {
                         close_notifications.extend(failure.notifications);
                         map_fail!(failure.err);
                     }
+                };
+                if vm_flags.contains(VmFlags::VM_LOCKED) {
+                    locked_vm_after_commit = match prepared
+                        .locked_vm_after_commit()
+                        .checked_add(page_count.data())
+                    {
+                        Some(value) => Some(value),
+                        None => {
+                            close_notifications.extend(prepared.rollback());
+                            map_fail!(SystemError::ENOMEM)
+                        }
+                    };
                 }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    uprobe_change = Some(
+                        match super::uprobe::PreparedUprobeChange::prepare(
+                            self,
+                            &mut guard,
+                            &prepared.affected_ranges(),
+                        ) {
+                            Ok(change) => change,
+                            Err(err) => {
+                                close_notifications.extend(prepared.rollback());
+                                map_fail!(err)
+                            }
+                        },
+                    );
+                }
+                close_notifications.extend(guard.commit_munmap(prepared));
+            }
+            if vm_flags.contains(VmFlags::VM_LOCKED) && locked_vm_after_commit.is_none() {
+                locked_vm_after_commit = match guard.locked_vm.checked_add(page_count.data()) {
+                    Some(value) => Some(value),
+                    None => map_fail!(SystemError::ENOMEM),
+                };
             }
 
             let reservation_id = match guard.mappings.reserve_region(region) {
@@ -887,21 +1042,9 @@ impl AddressSpace {
                 Err(err) => map_fail!(err),
             };
             let entry_flags = EntryFlags::from_prot_flags(prot_flags, true);
-            let locked_pages_reserved = if vm_flags.contains(VmFlags::VM_LOCKED) {
-                let new_locked_vm = match guard.locked_vm.checked_add(page_count.data()) {
-                    Some(new_locked_vm) => new_locked_vm,
-                    None => {
-                        if guard.mappings.cancel_reservation(reservation_id).is_some() {
-                            drop(guard);
-                            self.wake_reservation_waiters();
-                        } else {
-                            drop(guard);
-                        }
-                        InnerAddressSpace::notify_close_notifications(close_notifications);
-                        return Err(SystemError::ENOMEM);
-                    }
-                };
-                guard.locked_vm = new_locked_vm;
+            let locked_pages_reserved = if let Some(locked_vm_after_commit) = locked_vm_after_commit
+            {
+                guard.locked_vm = locked_vm_after_commit;
                 true
             } else {
                 false
@@ -926,6 +1069,10 @@ impl AddressSpace {
                 None
             };
             drop(guard);
+            #[cfg(target_arch = "x86_64")]
+            if let Some(uprobe_change) = uprobe_change.take() {
+                uprobe_change.finish(self);
+            }
             InnerAddressSpace::notify_close_notifications(close_notifications);
 
             let mut reservation = MmapReservationGuard::new(self.clone(), reservation_id);
@@ -1038,7 +1185,10 @@ impl AddressSpace {
                 || vm_flags.contains(VmFlags::VM_LOCKED))
             .then(|| Arc::downgrade(&new_vma));
 
-            if let Err(err) = guard.mappings.commit_reserved_vma(reservation_id, new_vma) {
+            if let Err(err) = guard
+                .mappings
+                .commit_reserved_vma(reservation_id, new_vma.clone())
+            {
                 let sysv_to_close = if sysv_opened { sysv_shm.clone() } else { None };
                 release_locked_pages_if_reserved!();
                 drop(guard);
@@ -1049,10 +1199,23 @@ impl AddressSpace {
                 return Err(err);
             }
 
+            // Match Linux's uprobe_mmap ordering: publish probes for the new
+            // executable file VMA while the address-space write lock still
+            // excludes competing VMA mutations, and before MAP_POPULATE can
+            // expose the mapping to userspace execution. Installation remains
+            // best-effort and must not change a successful mmap result.
+            #[cfg(target_arch = "x86_64")]
+            let uprobe_needs_fallback =
+                super::uprobe::uprobe_apply_new_vma_locked(self, &mut guard, &new_vma);
+
             self.account_present_pages_add(new_present_pages);
             reservation.disarm();
             drop(guard);
             self.wake_reservation_waiters();
+            #[cfg(target_arch = "x86_64")]
+            if uprobe_needs_fallback {
+                super::uprobe::uprobe_apply_to_range(self, region);
+            }
             if let Some(expected_vma) = post_commit_population {
                 let _ = self.populate_range_post_commit(
                     region.start(),
@@ -1079,18 +1242,34 @@ impl AddressSpace {
                 self.wait_for_no_reservation_conflict(region);
                 continue;
             }
-            match guard.munmap_collect(start_page, page_count) {
-                Ok(notifications) => {
-                    drop(guard);
-                    InnerAddressSpace::notify_close_notifications(notifications);
-                    return Ok(());
-                }
+            let prepared = match guard.prepare_munmap(start_page, page_count) {
+                Ok(prepared) => prepared,
                 Err(failure) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
                     return Err(failure.err);
                 }
-            }
+            };
+            #[cfg(target_arch = "x86_64")]
+            let uprobe_change = match super::uprobe::PreparedUprobeChange::prepare(
+                self,
+                &mut guard,
+                &prepared.affected_ranges(),
+            ) {
+                Ok(change) => change,
+                Err(err) => {
+                    let notifications = prepared.rollback();
+                    drop(guard);
+                    InnerAddressSpace::notify_close_notifications(notifications);
+                    return Err(err);
+                }
+            };
+            let notifications = guard.commit_munmap(prepared);
+            drop(guard);
+            #[cfg(target_arch = "x86_64")]
+            uprobe_change.finish(self);
+            InnerAddressSpace::notify_close_notifications(notifications);
+            return Ok(());
         }
     }
 
@@ -1117,14 +1296,46 @@ impl AddressSpace {
                 self.wait_for_no_reservation_conflict(region);
                 continue;
             }
-            match guard.mprotect_collect(start_page, page_count, prot_flags) {
-                Ok(()) => return Ok(()),
+            let prepared = match guard.prepare_mprotect(start_page, page_count, prot_flags) {
+                Ok(prepared) => prepared,
                 Err(failure) => {
                     drop(guard);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
                     return Err(failure.err);
                 }
+            };
+            #[cfg(target_arch = "x86_64")]
+            let validation_ranges = prepared.validation_ranges();
+            #[cfg(target_arch = "x86_64")]
+            let uprobe_ranges = prepared.uprobe_affected_ranges();
+            #[cfg(target_arch = "x86_64")]
+            if let Err(err) =
+                super::uprobe::PreparedUprobeChange::validate(self, &validation_ranges)
+            {
+                let notifications = prepared.rollback();
+                drop(guard);
+                InnerAddressSpace::notify_close_notifications(notifications);
+                return Err(err);
             }
+            let deferred_execute = guard.commit_mprotect(prepared);
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = deferred_execute;
+            #[cfg(target_arch = "x86_64")]
+            let uprobe_change = super::uprobe::PreparedUprobeChange::prepare_after_pte_commit(
+                self,
+                &mut guard,
+                &uprobe_ranges,
+            );
+            #[cfg(target_arch = "x86_64")]
+            let uprobe_change = uprobe_change.finish_locked(self, &mut guard);
+            #[cfg(target_arch = "x86_64")]
+            guard.publish_mprotect_permissions(self, deferred_execute);
+            drop(guard);
+            #[cfg(target_arch = "x86_64")]
+            if let Some(uprobe_change) = uprobe_change {
+                uprobe_change.finish(self);
+            }
+            return Ok(());
         }
     }
 
@@ -1142,12 +1353,41 @@ impl AddressSpace {
                 self.wait_for_no_reservation_conflict(region);
                 continue;
             }
+            if behavior == MadvFlags::MADV_DONTNEED || behavior == MadvFlags::MADV_DONTNEED_LOCKED {
+                let prepared = guard.prepare_madvise_dontneed(start_page, page_count, behavior);
+                #[cfg(target_arch = "x86_64")]
+                let uprobe_ranges = prepared.affected_ranges();
+                #[cfg(target_arch = "x86_64")]
+                super::uprobe::PreparedUprobeChange::validate(self, &uprobe_ranges)?;
+                #[cfg(target_arch = "x86_64")]
+                let uprobe_publication = prepared.defer_uprobe_execute(self);
+                let result = guard.commit_madvise_dontneed(prepared);
+                #[cfg(target_arch = "x86_64")]
+                let uprobe_change = super::uprobe::PreparedUprobeChange::prepare_after_pte_commit(
+                    self,
+                    &mut guard,
+                    &uprobe_ranges,
+                );
+                #[cfg(target_arch = "x86_64")]
+                let uprobe_change = uprobe_change.finish_locked(self, &mut guard);
+                #[cfg(target_arch = "x86_64")]
+                uprobe_publication.publish(&mut guard, self);
+                drop(guard);
+                #[cfg(target_arch = "x86_64")]
+                if let Some(uprobe_change) = uprobe_change {
+                    uprobe_change.finish(self);
+                }
+                return result.map_err(|failure| failure.err);
+            }
             match guard.madvise_collect(start_page, page_count, behavior) {
-                Ok(()) => return Ok(()),
-                Err(failure) => {
+                Ok(()) => {
                     drop(guard);
-                    InnerAddressSpace::notify_close_notifications(failure.notifications);
-                    return Err(failure.err);
+                    return Ok(());
+                }
+                Err(err) => {
+                    drop(guard);
+                    InnerAddressSpace::notify_close_notifications(err.notifications);
+                    return Err(err.err);
                 }
             }
         }
@@ -1178,30 +1418,46 @@ impl AddressSpace {
         new_len: usize,
         mremap_flags: MremapFlags,
         new_vaddr: VirtAddr,
-        vm_flags: VmFlags,
     ) -> Result<VirtAddr, SystemError> {
         loop {
             let mut guard = self.write();
             let mut wait_region = None;
-            if old_len != 0 && old_vaddr.data().checked_add(old_len).is_some() {
-                let old_region = VirtRegion::new(old_vaddr, old_len);
+            // A reservation cannot overlap a published source VMA. If the
+            // source is still being installed, wait only on its first page;
+            // the locked mremap transaction will validate the eventual span.
+            if guard.mappings.contains(old_vaddr).is_none() {
+                let source_probe = VirtRegion::new(old_vaddr, MMArch::PAGE_SIZE);
                 if guard
                     .mappings
-                    .first_reservation_conflict(old_region)
+                    .first_reservation_conflict(source_probe)
                     .is_some()
                 {
-                    wait_region = Some(old_region);
-                } else if new_len > old_len {
-                    if let Some(grow_start) = old_vaddr.data().checked_add(old_len) {
-                        let grow_region =
-                            VirtRegion::new(VirtAddr::new(grow_start), new_len - old_len);
-                        if guard
-                            .mappings
-                            .first_reservation_conflict(grow_region)
-                            .is_some()
-                        {
-                            wait_region = Some(grow_region);
-                        }
+                    wait_region = Some(source_probe);
+                }
+            }
+            // Plain shrink mutates only the discarded tail. Equal-size no-op
+            // has no reservation dependency at all.
+            if wait_region.is_none() && old_len > new_len {
+                let tail_region = VirtRegion::new(old_vaddr + new_len, old_len - new_len);
+                if guard
+                    .mappings
+                    .first_reservation_conflict(tail_region)
+                    .is_some()
+                {
+                    wait_region = Some(tail_region);
+                }
+            } else if wait_region.is_none()
+                && new_len > old_len
+                && !mremap_flags.contains(MremapFlags::MREMAP_FIXED)
+            {
+                if let Some(grow_start) = old_vaddr.data().checked_add(old_len) {
+                    let grow_region = VirtRegion::new(VirtAddr::new(grow_start), new_len - old_len);
+                    if guard
+                        .mappings
+                        .first_reservation_conflict(grow_region)
+                        .is_some()
+                    {
+                        wait_region = Some(grow_region);
                     }
                 }
             }
@@ -1240,17 +1496,42 @@ impl AddressSpace {
                 continue;
             }
 
+            #[cfg(target_arch = "x86_64")]
+            let mut uprobe_changes = Vec::new();
+
             match guard.mremap(
-                old_vaddr,
-                old_len,
-                new_len,
-                mremap_flags,
-                new_vaddr,
-                vm_flags,
+                super::mremap::MremapRequest {
+                    old_vaddr,
+                    old_len,
+                    new_len,
+                    flags: mremap_flags,
+                    new_vaddr,
+                },
+                |inner, ranges| {
+                    #[cfg(target_arch = "x86_64")]
+                    uprobe_changes.push(super::uprobe::PreparedUprobeChange::prepare(
+                        self, inner, ranges,
+                    )?);
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let _ = (inner, ranges);
+                    Ok(())
+                },
             ) {
                 Ok(outcome) => {
                     let post_commit_population = outcome.post_commit_population;
+                    #[cfg(target_arch = "x86_64")]
+                    let exec_fallbacks = self.finalize_mremap_exec_publication_locked(
+                        &mut guard,
+                        outcome.exec_publication,
+                    );
                     drop(guard);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        for change in uprobe_changes {
+                            change.finish(self);
+                        }
+                        exec_fallbacks.finish(self);
+                    }
                     InnerAddressSpace::notify_close_notifications(outcome.notifications);
                     if let Some((region, expected_vma)) = post_commit_population {
                         let _ = self.populate_range_post_commit(
@@ -1264,6 +1545,11 @@ impl AddressSpace {
                     return Ok(outcome.addr);
                 }
                 Err(failure) if failure.err == SystemError::EAGAIN_OR_EWOULDBLOCK => {
+                    #[cfg(target_arch = "x86_64")]
+                    let exec_fallbacks = self.finalize_mremap_exec_publication_locked(
+                        &mut guard,
+                        failure.exec_publication,
+                    );
                     let retry_region = if mremap_flags.contains(MremapFlags::MREMAP_FIXED)
                         || (mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP)
                             && new_vaddr != VirtAddr::new(0))
@@ -1284,16 +1570,39 @@ impl AddressSpace {
                         .is_some()
                     {
                         drop(guard);
+                        #[cfg(target_arch = "x86_64")]
+                        for change in uprobe_changes {
+                            change.finish(self);
+                        }
+                        #[cfg(target_arch = "x86_64")]
+                        exec_fallbacks.finish(self);
                         InnerAddressSpace::notify_close_notifications(failure.notifications);
                         self.wait_for_no_reservation_conflict(retry_region);
                         continue;
                     }
                     drop(guard);
+                    #[cfg(target_arch = "x86_64")]
+                    for change in uprobe_changes {
+                        change.finish(self);
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    exec_fallbacks.finish(self);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 Err(failure) => {
+                    #[cfg(target_arch = "x86_64")]
+                    let exec_fallbacks = self.finalize_mremap_exec_publication_locked(
+                        &mut guard,
+                        failure.exec_publication,
+                    );
                     drop(guard);
+                    #[cfg(target_arch = "x86_64")]
+                    for change in uprobe_changes {
+                        change.finish(self);
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    exec_fallbacks.finish(self);
                     InnerAddressSpace::notify_close_notifications(failure.notifications);
                     return Err(failure.err);
                 }
@@ -1414,6 +1723,9 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        super::uprobe::uprobe_forget_address_space(self);
+
         // Assert that no CPUs still reference this mm when it is dropped in debug builds.
         // In release builds, degrade gracefully to avoid false positives (a leak is better than a panic).
         #[cfg(debug_assertions)]

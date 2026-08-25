@@ -16,6 +16,7 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
+    process::ProcessManager,
 };
 
 use super::{
@@ -242,14 +243,35 @@ impl ProbeArgs for TrapFrame {
     }
 }
 
+// uprobe 的 ProbeArgs 与 kprobe 同签名（独立 trait，低耦合）；TrapFrame 两套都实现，
+// 以便用户态 #BP/#DB 分发把同一个 trapframe 传给 uprobe 的 pre/post/event callback。
+impl uprobe::ProbeArgs for TrapFrame {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn break_address(&self) -> usize {
+        (self.rip - 1) as usize
+    }
+
+    fn debug_address(&self) -> usize {
+        self.rip as usize
+    }
+}
+
 impl crate::process::rseq::RseqTrapFrame for TrapFrame {
     #[inline]
-    fn rseq_ip(&self) -> usize {
-        self.rip as usize
+    fn rseq_effective_ip(&self) -> usize {
+        ProcessManager::current_pcb()
+            .uprobe
+            .active_probe_vaddr()
+            .unwrap_or(self.rip as usize)
     }
 
     #[inline]
-    fn set_rseq_ip(&mut self, ip: usize) {
+    fn redirect_rseq_ip(&mut self, ip: usize) {
+        // rseq owns the final redirect. Consume an active XOL first so its
+        // later #DB completion cannot restore return_addr over abort_ip.
+        crate::exception::uprobe::abort_current_xol(self);
         self.rip = ip as u64;
     }
 }

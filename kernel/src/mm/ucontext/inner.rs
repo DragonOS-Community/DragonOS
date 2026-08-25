@@ -117,6 +117,7 @@ impl InnerAddressSpace {
 
         let mut parent_cow_remaps: Vec<(VirtAddr, EntryFlags<MMArch>)> = Vec::new();
         let mut child_present_pages = 0usize;
+
         let clone_result: Result<(), SystemError> = (|| {
             // Iterate over each VMA of the parent process and perform appropriate copying based on VMA attributes
             // Reference Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
@@ -229,6 +230,19 @@ impl InnerAddressSpace {
                     }
                 }
             }
+
+            // File-backed child VMAs are already present in file-rmap, so a
+            // system-wide uprobe registration can discover them as soon as
+            // this write guard is released. Reconcile inherited INT3 bytes
+            // while the child mm is still exclusively locked; otherwise a
+            // registration scan can observe an empty hit table with a stale
+            // breakpoint and reject a valid consumer.
+            #[cfg(target_arch = "x86_64")]
+            super::uprobe::fork_restore_inherited_uprobes_locked(
+                &parent_mm,
+                &new_addr_space,
+                &mut new_guard,
+            )?;
             Ok(())
         })();
 
@@ -255,6 +269,14 @@ impl InnerAddressSpace {
         // Complete the parent mm's mm-aware shootdown: INV-3 requires TLB completion before continuing with subsequent logic;
         // since no pages enter pending_pages here, this actually only triggers flush_tlb_mm_range.
         parent_tlb.finish();
+
+        // The inherited breakpoint bytes were restored before publishing the
+        // child mm above. Replay currently enabled, permitted consumers after
+        // releasing the child lock; concurrent registry scans are idempotent
+        // under the same mm.write() serialization domain.
+        #[cfg(target_arch = "x86_64")]
+        super::uprobe::fork_inherit_uprobes(&new_addr_space);
+
         return Ok(new_addr_space);
     }
 

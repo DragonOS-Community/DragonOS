@@ -378,6 +378,11 @@ impl ProcessManager {
             }
         }
 
+        // 退出不再返回旧用户态上下文；先释放 ActiveXol 对 site/slot/consumer
+        // 的强引用，再进入 mm teardown。该清理不需要也不应改 trapframe。
+        #[cfg(target_arch = "x86_64")]
+        crate::exception::uprobe::cleanup_task_active_xol(&current_pcb);
+
         let pid: Arc<Pid>;
         let raw_pid = current_pcb.raw_pid();
         // log::debug!("[exit: {}]", raw_pid.data());
@@ -398,6 +403,11 @@ impl ProcessManager {
                 assert_ne!(previous, 0, "thread-group live count underflow");
                 (group_leader, previous == 1)
             };
+            // Match Linux perf_event_exit_task(): terminal task events must be
+            // detached while the old mm and its original instruction bytes
+            // are still available. The perf fd retains its final count.
+            #[cfg(target_arch = "x86_64")]
+            crate::mm::ucontext::uprobe::uprobe_registry_task_exit(&pcb);
             pid = pcb.pid();
             if pid.is_child_reaper() {
                 pid.ns_of_pid().disable_pid_allocation();

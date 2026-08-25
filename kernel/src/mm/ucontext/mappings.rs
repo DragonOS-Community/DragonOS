@@ -263,6 +263,26 @@ impl UserMappings {
         return Some(region);
     }
 
+    /// Find the first free region wholly contained in `bounds`.
+    ///
+    /// Unlike an mmap hint, this query never falls back outside the requested
+    /// interval. Callers which have an architectural placement constraint can
+    /// therefore select a hole here and commit it with `MAP_FIXED_NOREPLACE`
+    /// without accidentally replacing an unrelated VMA.
+    pub fn find_free_bounded(&self, bounds: VirtRegion, req_size: usize) -> Option<VirtRegion> {
+        if req_size == 0 || req_size > bounds.size() {
+            return None;
+        }
+
+        self.vm_holes.iter().find_map(|(hole_start, hole_size)| {
+            let hole_end = hole_start.data().checked_add(*hole_size)?;
+            let start = cmp::max(*hole_start, bounds.start());
+            let end = cmp::min(VirtAddr::new(hole_end), bounds.end());
+            let requested_end = start.data().checked_add(req_size)?;
+            (requested_end <= end.data()).then_some(VirtRegion::new(start, req_size))
+        })
+    }
+
     /// Reserve a region of the specified size in the current process's address space,
     /// removing it from the hole list.
     /// This function modifies the hole information in vm_holes.
@@ -372,5 +392,43 @@ impl UserMappings {
 impl Default for UserMappings {
     fn default() -> Self {
         return Self::new();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_hole_search_never_falls_outside_bounds() {
+        let mut mappings = UserMappings::new();
+        let occupied = VirtRegion::new(VirtAddr::new(0x2000), MMArch::PAGE_SIZE);
+        mappings.reserve_hole(&occupied);
+
+        assert_eq!(
+            mappings.find_free_bounded(occupied, MMArch::PAGE_SIZE),
+            None
+        );
+        assert_eq!(
+            mappings.find_free_bounded(
+                VirtRegion::new(VirtAddr::new(0x1000), 3 * MMArch::PAGE_SIZE),
+                MMArch::PAGE_SIZE,
+            ),
+            Some(VirtRegion::new(VirtAddr::new(0x1000), MMArch::PAGE_SIZE,))
+        );
+    }
+
+    #[test]
+    fn bounded_hole_search_clips_a_larger_hole() {
+        let mappings = UserMappings::new();
+        let bounds = VirtRegion::new(VirtAddr::new(0x345000), 2 * MMArch::PAGE_SIZE);
+        assert_eq!(
+            mappings.find_free_bounded(bounds, MMArch::PAGE_SIZE),
+            Some(VirtRegion::new(VirtAddr::new(0x345000), MMArch::PAGE_SIZE,))
+        );
+        assert_eq!(
+            mappings.find_free_bounded(bounds, 3 * MMArch::PAGE_SIZE),
+            None
+        );
     }
 }

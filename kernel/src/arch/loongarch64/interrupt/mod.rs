@@ -132,12 +132,12 @@ impl ProbeArgs for TrapFrame {
 
 impl crate::process::rseq::RseqTrapFrame for TrapFrame {
     #[inline]
-    fn rseq_ip(&self) -> usize {
+    fn rseq_effective_ip(&self) -> usize {
         self.csr_era
     }
 
     #[inline]
-    fn set_rseq_ip(&mut self, ip: usize) {
+    fn redirect_rseq_ip(&mut self, ip: usize) {
         self.csr_era = ip;
     }
 }

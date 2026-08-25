@@ -21,7 +21,7 @@ mod sys_msync;
 mod sys_munlock;
 mod sys_munlockall;
 mod sys_munmap;
-mod sys_process_vm;
+pub mod sys_process_vm;
 pub mod sys_sbrk;
 
 bitflags! {

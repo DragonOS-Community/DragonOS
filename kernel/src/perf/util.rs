@@ -1,7 +1,8 @@
+use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_header, perf_event_sample_format, perf_sw_ids, perf_type_id,
 };
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::string::String;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -25,6 +26,8 @@ pub enum PerfEventIoc {
     Enable = 9216,
     /// Equivalent to [crate::include::bindings::linux_bpf::AYA_PERF_EVENT_IOC_DISABLE].
     Disable = 9217,
+    /// Equivalent to Linux `PERF_EVENT_IOC_RESET` (`_IO('$', 3)`).
+    Reset = 9219,
     /// Equivalent to [crate::include::bindings::linux_bpf::AYA_PERF_EVENT_IOC_SET_BPF].
     SetBpf = 1074013192,
 }
@@ -37,12 +40,43 @@ pub struct PerfProbeArgs {
     pub name: String,
     pub offset: u64,
     pub size: u32,
-    pub type_: perf_type_id,
+    /// Raw `perf_event_attr.type` value. Dynamic PMU types intentionally live
+    /// outside `perf_type_id`, whose `PERF_TYPE_MAX` member is not ABI.
+    pub type_: u32,
     pub pid: i32,
     pub cpu: i32,
     pub group_fd: i32,
     pub flags: PerfEventOpenFlags,
     pub sample_type: Option<perf_event_sample_format>,
+    /// Requested layout for read(2) on the perf event fd.
+    pub read_format: u64,
+    /// `perf_event_attr.disabled`：事件初始是否禁用（评审 R11a）。
+    pub disabled: bool,
+    pub inherit: bool,
+    pub enable_on_exec: bool,
+    pub remove_on_exec: bool,
+}
+
+/// DragonOS currently has no general PMU type allocator. Keep the two
+/// software probe PMUs in the dynamic range and expose these exact values via
+/// event_source sysfs.
+pub const PERF_TYPE_KPROBE: u32 = perf_type_id::PERF_TYPE_MAX as u32;
+pub const PERF_TYPE_UPROBE: u32 = PERF_TYPE_KPROBE + 1;
+
+/// Linux 6.6 bounds perf kprobe symbol names with `KSYM_NAME_LEN`.
+const KSYM_NAME_LEN: usize = 512;
+
+fn copy_probe_name(user: *const u8, max_len: usize) -> Result<String, SystemError> {
+    let name = vfs_check_and_clone_cstr(user, Some(max_len)).map_err(|error| {
+        if error == SystemError::ENAMETOOLONG {
+            // perf_{k,u}probe_init() exposes strndup_user() exhaustion as
+            // E2BIG, rather than the pathname-oriented ENAMETOOLONG.
+            SystemError::E2BIG
+        } else {
+            error
+        }
+    })?;
+    name.into_string().map_err(|_| SystemError::EINVAL)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,24 +91,35 @@ impl PerfProbeArgs {
         pid: i32,
         cpu: i32,
         group_fd: i32,
-        flags: u32,
+        flags: usize,
     ) -> Result<Self, SystemError> {
-        let ty = perf_type_id::from_u32(attr.type_).ok_or(SystemError::EINVAL)?;
-        let config = match ty {
-            perf_type_id::PERF_TYPE_TRACEPOINT => PerfProbeConfig::Raw(attr.config),
-            _ => {
+        if attr.__reserved_1() != 0 || attr.__reserved_2 != 0 || attr.__reserved_3 != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        const KNOWN_READ_FORMAT_BITS: u64 = (1 << 5) - 1;
+        if attr.read_format & !KNOWN_READ_FORMAT_BITS != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        const KNOWN_SAMPLE_TYPE_BITS: u64 = perf_event_sample_format::PERF_SAMPLE_MAX as u64 - 1;
+        if attr.sample_type & !KNOWN_SAMPLE_TYPE_BITS != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let ty = attr.type_;
+        let config = match perf_type_id::from_u32(ty) {
+            Some(perf_type_id::PERF_TYPE_SOFTWARE) => {
                 let sw_id = perf_sw_ids::from_u32(attr.config as u32).ok_or(SystemError::EINVAL)?;
                 PerfProbeConfig::PerfSwIds(sw_id)
             }
+            _ => PerfProbeConfig::Raw(attr.config),
         };
-        let name = if ty == perf_type_id::PERF_TYPE_MAX {
-            let name_ptr = unsafe { attr.__bindgen_anon_3.config1 } as *const u8;
-            let name = check_and_clone_cstr(name_ptr, None)?;
-            name.into_string().map_err(|_| SystemError::EINVAL)?
-        } else {
-            String::new()
+        let name_ptr = unsafe { attr.__bindgen_anon_3.config1 } as *const u8;
+        let name = match ty {
+            PERF_TYPE_KPROBE => copy_probe_name(name_ptr, KSYM_NAME_LEN)?,
+            PERF_TYPE_UPROBE => copy_probe_name(name_ptr, MAX_PATHLEN)?,
+            _ => String::new(),
         };
         let sample_ty = perf_event_sample_format::from_u32(attr.sample_type as u32);
+        let raw_flags = u32::try_from(flags).map_err(|_| SystemError::EINVAL)?;
         let args = PerfProbeArgs {
             config,
             name,
@@ -84,8 +129,13 @@ impl PerfProbeArgs {
             pid,
             cpu,
             group_fd,
-            flags: PerfEventOpenFlags::from_bits_truncate(flags),
+            flags: PerfEventOpenFlags::from_bits(raw_flags).ok_or(SystemError::EINVAL)?,
             sample_type: sample_ty,
+            read_format: attr.read_format,
+            disabled: attr.disabled() != 0,
+            inherit: attr.inherit() != 0,
+            enable_on_exec: attr.enable_on_exec() != 0,
+            remove_on_exec: attr.remove_on_exec() != 0,
         };
         Ok(args)
     }

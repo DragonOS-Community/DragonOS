@@ -518,7 +518,8 @@ mod tests {
     fn control_flow_rejected() {
         // call rel32 (e8), jmp rel8 (eb), ret (c3), je rel8 (74),
         // loopnz/loopz/loop/jrcxz (e0..e3), xbegin rel32 (c7 f8),
-        // syscall/sysret (0f 05/07), sysenter/sysexit (0f 34/35)
+        // ICEBP/INT1 (f1), syscall/sysret (0f 05/07),
+        // sysenter/sysexit (0f 34/35)
         for bytes in [
             &[0xe8, 0x00, 0x00, 0x00, 0x00][..],
             &[0xeb, 0xfe][..],
@@ -533,6 +534,7 @@ mod tests {
             &[0x67, 0xe2, 0x00][..],
             &[0x67, 0xe3, 0x00][..],
             &[0xc7, 0xf8, 0x00, 0x00, 0x00, 0x00][..],
+            &[0xf1][..],
             &[0x0f, 0x05][..],
             &[0x0f, 0x07][..],
             &[0x0f, 0x34][..],

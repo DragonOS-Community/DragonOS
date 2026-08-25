@@ -154,10 +154,12 @@ pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, Sys
         return Ok(false);
     };
 
-    // 只有原指令在本租约的 slot 内恰好执行完毕，才是本次 XOL 的完成 #DB。
-    // 页范围判断会把硬件断点或异常改道后的 #DB 错认成完成。
+    // 只有 Running 原指令在本租约的 slot 内恰好执行完毕，才是本次 XOL
+    // 的完成 #DB。部分虚拟化环境不会为该精确完成事件报告 DR6.BS；归属
+    // 由任务的 XOL phase 和精确 slot endpoint 决定，DR6.B0-B3 仍在完成后
+    // 转交普通硬件断点语义。页范围判断会把异常改道后的 #DB 错认成完成。
     let rip = frame.rip as usize;
-    if phase != TaskXolPhase::Running || rip != state.slot_end || dr6 & DR6_SINGLE_STEP == 0 {
+    if phase != TaskXolPhase::Running || rip != state.slot_end {
         warn!(
             "uprobe #DB abort: rip {:#x}, expected {:#x}, dr6 {:#x}, state {:?}, re-execute probe {:#x}",
             rip, state.slot_end, dr6, phase, state.probe_vaddr

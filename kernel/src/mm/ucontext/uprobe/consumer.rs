@@ -420,7 +420,7 @@ static UPROBE_TASK_SCOPES: SpinLock<BTreeMap<u64, Weak<ProcessControlBlock>>> =
     SpinLock::new(BTreeMap::new());
 /// Target PCB pointer -> task-scoped consumers. The target scope's Weak keeps
 /// the PCB allocation from being reused until the consumer is removed.
-static UPROBE_TASK_CONSUMERS: SpinLock<BTreeMap<usize, Vec<Weak<UprobeConsumer>>>> =
+static UPROBE_TASK_CONSUMERS: SpinLock<BTreeMap<usize, BTreeMap<u64, Weak<UprobeConsumer>>>> =
     SpinLock::new(BTreeMap::new());
 
 pub(super) fn uprobe_registry_is_empty() -> bool {
@@ -458,7 +458,7 @@ pub(super) fn uprobe_registry_has_active_for_exec_mm(
     task_consumers
         .get(&target_ptr)
         .into_iter()
-        .flatten()
+        .flat_map(|consumers| consumers.values())
         .filter_map(Weak::upgrade)
         .any(|consumer| consumer.scope.permits(mm) && consumer.has_published_epoch())
 }
@@ -580,7 +580,7 @@ fn register_task_consumer(consumer: &Arc<UprobeConsumer>) {
     task_consumers
         .entry(scope.target_ptr())
         .or_default()
-        .push(Arc::downgrade(consumer));
+        .insert(consumer.id, Arc::downgrade(consumer));
 }
 
 fn unregister_task_consumer(consumer: &UprobeConsumer) {
@@ -589,11 +589,7 @@ fn unregister_task_consumer(consumer: &UprobeConsumer) {
     };
     let mut task_consumers = UPROBE_TASK_CONSUMERS.lock_irqsave();
     let remove_key = if let Some(consumers) = task_consumers.get_mut(&scope.target_ptr()) {
-        consumers.retain(|indexed| {
-            indexed
-                .upgrade()
-                .is_some_and(|indexed| indexed.id != consumer.id)
-        });
+        consumers.remove(&consumer.id);
         consumers.is_empty()
     } else {
         false
@@ -690,7 +686,7 @@ pub fn uprobe_registry_task_exit(target: &Arc<ProcessControlBlock>) {
         task_consumers
             .remove(&target_ptr)
             .unwrap_or_default()
-            .into_iter()
+            .into_values()
             .filter_map(|consumer| {
                 let consumer = consumer.upgrade()?;
                 if let UprobeConsumerScope::Task(scope) = &consumer.scope {
@@ -737,7 +733,7 @@ pub fn uprobe_registry_task_exec(
         task_consumers
             .get(&target_ptr)
             .into_iter()
-            .flatten()
+            .flat_map(|consumers| consumers.values())
             .filter_map(|consumer| consumer.upgrade())
             .collect::<Vec<_>>()
     };
@@ -845,7 +841,12 @@ pub fn uprobe_registry_remove_consumer(consumer: &Arc<UprobeConsumer>) {
                     .map(|index| consumers.remove(index))
             });
         if let Some(offsets) = r.get_mut(&inode_key) {
-            offsets.retain(|_, consumers| !consumers.is_empty());
+            if offsets
+                .get(&offset)
+                .is_some_and(|consumers| consumers.is_empty())
+            {
+                offsets.remove(&offset);
+            }
             if offsets.is_empty() {
                 r.remove(&inode_key);
             }

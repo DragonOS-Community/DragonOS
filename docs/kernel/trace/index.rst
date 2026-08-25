@@ -10,4 +10,5 @@
    tracepoint
    text_patching
    kprobe
+   uprobe
    eBPF

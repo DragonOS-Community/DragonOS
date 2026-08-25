@@ -1360,7 +1360,7 @@ impl AddressSpace {
                 #[cfg(target_arch = "x86_64")]
                 super::uprobe::PreparedUprobeChange::validate(self, &uprobe_ranges)?;
                 #[cfg(target_arch = "x86_64")]
-                let uprobe_publication = prepared.defer_uprobe_execute();
+                let uprobe_publication = prepared.defer_uprobe_execute(self);
                 let result = guard.commit_madvise_dontneed(prepared);
                 #[cfg(target_arch = "x86_64")]
                 let uprobe_change = super::uprobe::PreparedUprobeChange::prepare_after_pte_commit(

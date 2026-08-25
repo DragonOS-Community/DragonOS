@@ -93,7 +93,7 @@ impl PreparedMadviseDontNeed {
     /// armed until the zap itself commits; the temporary default applies only
     /// to pages faulted by the locked reconciliation which follows that zap.
     #[cfg(target_arch = "x86_64")]
-    pub(super) fn defer_uprobe_execute(&self) -> MadviseUprobePublication {
+    pub(super) fn defer_uprobe_execute(&self, mm: &Arc<AddressSpace>) -> MadviseUprobePublication {
         if !super::uprobe::has_active_consumers() {
             return MadviseUprobePublication { vmas: Vec::new() };
         }
@@ -118,6 +118,7 @@ impl PreparedMadviseDontNeed {
                 continue;
             };
             if !super::uprobe::requires_exec_publication_barrier(
+                mm,
                 &file,
                 vm_flags,
                 file_start,
@@ -670,6 +671,7 @@ impl InnerAddressSpace {
                         } else {
                             file_start.is_some_and(|file_start| {
                                 super::uprobe::requires_exec_publication_barrier(
+                                    &mm,
                                     &file,
                                     new_vm_flags,
                                     file_start,

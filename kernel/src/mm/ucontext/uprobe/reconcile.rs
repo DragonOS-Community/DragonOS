@@ -119,7 +119,7 @@ fn disarm_uprobe_change_range_locked(
         // newer site installed at the same virtual address.
         mm.uprobe_list.remove_if(probe_vaddr, &site);
         site.members.lock().clear();
-        site.participants.store_deferred(Arc::new(Vec::new()));
+        site.withdraw_participants();
         for consumer in consumers {
             consumer.forget_site(mm.id(), probe_vaddr, &site);
         }
@@ -770,5 +770,15 @@ pub(crate) fn fork_restore_inherited_uprobes_locked(
 /// result. Concurrent registry scans are idempotent because both paths
 /// serialize installation with the child mm write lock.
 pub fn fork_inherit_uprobes(child_mm: &Arc<AddressSpace>) {
+    // Task-scoped perf events have inherit=0 and can never permit this fresh
+    // child mm. The exact system-wide active count participates in the same
+    // publication handshake as registry activation: if fork observes zero,
+    // a later activation's file-rmap scan will discover the already-linked
+    // child VMA; if it observes non-zero, this replay sees the published epoch.
+    // Inherited INT3 sanitization is deliberately not guarded by this fast
+    // path and remains in fork_restore_inherited_uprobes_locked().
+    if !uprobe_registry_has_active_system_wide_consumers() {
+        return;
+    }
     uprobe_apply_to_all_vmas(child_mm);
 }

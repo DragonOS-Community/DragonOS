@@ -114,15 +114,66 @@ pub struct UprobeSite {
     pub(crate) insn_analysis: InsnAnalysis,
     pub xol_lease: Arc<XolSlotLease>,
     pub(super) members: Mutex<BTreeMap<u64, UprobeSiteMember>>,
-    /// Immutable hit-path snapshot. Writers rebuild it in process context;
-    /// #BP only clones the Arc and never allocates.
-    pub participants: crate::rcu::RcuArcSlot<Vec<UprobeConsumerRuntimeSnapshot>>,
+    participant_control: Mutex<UprobeParticipantControl>,
+    /// Structurally shared hit-path snapshot. A writer prepends one node when
+    /// a member is added and only rebuilds after stale removals become
+    /// proportional to the live set. #BP pins one root and then only follows
+    /// immutable links.
+    participants: crate::rcu::RcuOptionArcSlot<UprobeParticipantNode>,
     pub(super) state: AtomicU8,
 }
 
 pub(super) struct UprobeSiteMember {
     pub(super) consumer: Arc<UprobeConsumer>,
+    participant: Arc<UprobeSiteParticipant>,
+}
+
+#[derive(Default)]
+struct UprobeParticipantControl {
+    head: Option<Arc<UprobeParticipantNode>>,
+    active: usize,
+    stale: usize,
+}
+
+struct UprobeSiteParticipant {
     target: UprobeConsumerRuntimeSnapshot,
+    active: AtomicBool,
+}
+
+pub(crate) struct UprobeParticipantNode {
+    participant: Arc<UprobeSiteParticipant>,
+    next: Option<Arc<UprobeParticipantNode>>,
+}
+
+impl UprobeParticipantNode {
+    /// Visit the live participants in one pinned snapshot. Entries are never
+    /// reactivated, so observing `false` cannot hide a later membership.
+    pub(crate) fn for_each_active(&self, mut visit: impl FnMut(&UprobeConsumerRuntimeSnapshot)) {
+        let mut node = Some(self);
+        while let Some(current) = node {
+            if current.participant.active.load(Ordering::Acquire) {
+                visit(&current.participant.target);
+            }
+            node = current.next.as_deref();
+        }
+    }
+}
+
+impl Drop for UprobeParticipantNode {
+    fn drop(&mut self) {
+        // A directly nested Arc chain would otherwise recursively destroy one
+        // stack frame per colocated consumer. `into_inner` elects at most one
+        // owner to continue releasing a shared suffix, so even concurrent RCU
+        // root retirement eventually destroys every uniquely owned suffix
+        // iteratively.
+        let mut next = self.next.take();
+        while let Some(current) = next {
+            let Some(mut current) = Arc::into_inner(current) else {
+                break;
+            };
+            next = current.next.take();
+        }
+    }
 }
 
 impl UprobeSite {
@@ -133,6 +184,92 @@ impl UprobeSite {
             2 => UprobeSiteState::Disarming,
             _ => UprobeSiteState::Dead,
         }
+    }
+
+    pub(crate) fn participant_snapshot(&self) -> Option<Arc<UprobeParticipantNode>> {
+        self.participants.load()
+    }
+
+    fn add_member(
+        &self,
+        consumer_id: u64,
+        consumer: Arc<UprobeConsumer>,
+        target: UprobeConsumerRuntimeSnapshot,
+    ) -> bool {
+        let participant = Arc::new(UprobeSiteParticipant {
+            target,
+            active: AtomicBool::new(true),
+        });
+        let mut members = self.members.lock();
+        if members.contains_key(&consumer_id) {
+            return false;
+        }
+        let mut control = self.participant_control.lock();
+        let head = Arc::new(UprobeParticipantNode {
+            participant: participant.clone(),
+            next: control.head.clone(),
+        });
+        members.insert(
+            consumer_id,
+            UprobeSiteMember {
+                consumer,
+                participant,
+            },
+        );
+        control.head = Some(head);
+        control.active += 1;
+        true
+    }
+
+    /// Publish a root after its reverse index is ready. For the first site the
+    /// root is completely prepared before the INT3 commit callback, so this
+    /// operation only clones an Arc and swaps the RCU slot and F6 remains free
+    /// of fallible preparation.
+    fn publish_current_participants(&self) {
+        let control = self.participant_control.lock();
+        debug_assert!(control.head.is_some());
+        self.participants.store_deferred(control.head.clone());
+    }
+
+    fn remove_member(&self, consumer_id: u64) -> Option<(bool, Arc<UprobeConsumer>)> {
+        let mut members = self.members.lock();
+        let removed = members.remove(&consumer_id)?;
+        let last = members.is_empty();
+        let mut control = self.participant_control.lock();
+        let was_active = removed.participant.active.swap(false, Ordering::AcqRel);
+        debug_assert!(was_active, "removed uprobe membership was already inactive");
+        control.active = control
+            .active
+            .checked_sub(1)
+            .expect("uprobe participant count underflow");
+        control.stale += 1;
+
+        if !last && control.stale >= control.active {
+            let mut head = None;
+            // Nodes are prepended, so the exact BTree iteration order is not
+            // exposed as an ABI. Linux likewise prepends colocated consumers.
+            for member in members.values() {
+                head = Some(Arc::new(UprobeParticipantNode {
+                    participant: member.participant.clone(),
+                    next: head,
+                }));
+            }
+            control.head = head;
+            control.stale = 0;
+            self.participants.store_deferred(control.head.clone());
+        }
+        Some((last, removed.consumer))
+    }
+
+    /// Withdraw the published root after the caller has made the breakpoint
+    /// unreachable and completed the required TLB rendezvous. Already pinned
+    /// roots remain valid through RCU and preserve the old-hit semantics.
+    pub(super) fn withdraw_participants(&self) {
+        let mut control = self.participant_control.lock();
+        control.head = None;
+        control.active = 0;
+        control.stale = 0;
+        self.participants.store_deferred(None);
     }
 }
 
@@ -513,18 +650,14 @@ pub(super) fn uprobe_register_locked(
             insn_analysis: analysis,
             xol_lease: xol_lease.clone(),
             members: Mutex::new(BTreeMap::new()),
-            participants: crate::rcu::RcuArcSlot::new(Arc::new(Vec::new())),
+            participant_control: Mutex::new(UprobeParticipantControl::default()),
+            participants: crate::rcu::RcuOptionArcSlot::new_none(),
             state: AtomicU8::new(UprobeSiteState::Prepared as u8),
         })
     });
 
-    site.members.lock().insert(
-        consumer_id,
-        UprobeSiteMember {
-            consumer: consumer.clone(),
-            target: install.hit_target(),
-        },
-    );
+    let inserted = site.add_member(consumer_id, consumer.clone(), install.hit_target());
+    debug_assert!(inserted, "duplicate uprobe membership passed precheck");
 
     let install_result = if first_site {
         // Prepare and validate the exact COW bytes before publishing any hit
@@ -535,7 +668,7 @@ pub(super) fn uprobe_register_locked(
             let previous = mm.uprobe_list.insert(probe_vaddr, site.clone());
             debug_assert!(previous.is_none());
             consumer.remember_site(mm, probe_vaddr, &site);
-            rebuild_site_participants(&site);
+            site.publish_current_participants();
             site.state
                 .store(UprobeSiteState::Armed as u8, Ordering::Release);
         };
@@ -554,12 +687,12 @@ pub(super) fn uprobe_register_locked(
         // The breakpoint and hit-table entry already exist. Publish only the
         // new consumer membership and its reverse index.
         consumer.remember_site(mm, probe_vaddr, &site);
-        rebuild_site_participants(&site);
+        site.publish_current_participants();
         Ok(())
     };
     if let Err(e) = install_result {
-        site.members.lock().remove(&consumer_id);
-        rebuild_site_participants(&site);
+        let removed = site.remove_member(consumer_id);
+        debug_assert!(removed.is_some());
         if first_site {
             mm.uprobe_list.remove_if(probe_vaddr, &site);
         }
@@ -1027,17 +1160,12 @@ fn uprobe_unregister_consumer_from_site_locked(
         return;
     }
 
-    let (last_consumer, removed_consumer) = {
-        let mut members = installed.members.lock();
-        let Some(removed) = members.remove(&consumer_id) else {
-            return;
-        };
-        (members.is_empty(), removed.consumer)
+    let Some((last_consumer, removed_consumer)) = installed.remove_member(consumer_id) else {
+        return;
     };
     removed_consumer.forget_site(mm.id(), probe_vaddr, site);
 
     if !last_consumer {
-        rebuild_site_participants(site);
         return;
     }
 
@@ -1074,7 +1202,7 @@ fn uprobe_unregister_consumer_from_site_locked(
         );
     }
     mm.uprobe_list.remove_if(probe_vaddr, site);
-    site.participants.store_deferred(Arc::new(Vec::new()));
+    site.withdraw_participants();
     site.state
         .store(UprobeSiteState::Dead as u8, Ordering::Release);
     let mut pages = mm.uprobe_page_state.lock_irqsave();
@@ -1088,16 +1216,6 @@ fn uprobe_unregister_consumer_from_site_locked(
     } else {
         debug_assert!(false, "armed uprobe site without page state");
     }
-}
-
-fn rebuild_site_participants(site: &Arc<UprobeSite>) {
-    let participants = site
-        .members
-        .lock()
-        .values()
-        .map(|member| member.target.clone())
-        .collect();
-    site.participants.store_deferred(Arc::new(participants));
 }
 
 /// 注销前按 Linux `register_for_each_vma()` 的方式在 mm 写锁下重验映射身份，
@@ -1177,7 +1295,7 @@ pub(crate) fn uprobe_forget_address_space(mm: &AddressSpace) {
         for member in members.into_values() {
             member.consumer.forget_site(mm.id(), vaddr, &site);
         }
-        site.participants.store_deferred(Arc::new(Vec::new()));
+        site.withdraw_participants();
         site.state
             .store(UprobeSiteState::Dead as u8, Ordering::Release);
     }

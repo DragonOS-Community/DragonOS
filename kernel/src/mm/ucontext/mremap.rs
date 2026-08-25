@@ -521,6 +521,7 @@ impl InnerAddressSpace {
                     .and_then(|start| start.checked_add(old_len))
                     .is_some_and(|file_start_byte| {
                         super::uprobe::requires_exec_publication_barrier(
+                            &mm,
                             file,
                             vm_flags,
                             file_start_byte,
@@ -587,6 +588,7 @@ impl InnerAddressSpace {
                 .checked_mul(MMArch::PAGE_SIZE)
                 .is_some_and(|file_start_byte| {
                     super::uprobe::requires_exec_publication_barrier(
+                        &mm,
                         file,
                         vm_flags,
                         file_start_byte,
@@ -603,6 +605,7 @@ impl InnerAddressSpace {
                     .checked_mul(MMArch::PAGE_SIZE)
                     .is_some_and(|file_start_byte| {
                         super::uprobe::requires_exec_publication_barrier(
+                            &mm,
                             file,
                             vm_flags,
                             file_start_byte,

@@ -61,6 +61,7 @@ pub use reconcile::*;
 /// Whether an enabled consumer can require executable mapping publication to
 /// synchronize with uprobe installation.
 pub(super) fn requires_exec_publication_barrier(
+    mm: &Arc<AddressSpace>,
     file: &Arc<File>,
     flags: VmFlags,
     file_start_byte: usize,
@@ -76,7 +77,8 @@ pub(super) fn requires_exec_publication_barrier(
         return false;
     };
     let query_start = file_start_byte.saturating_sub(UPROBE_INSN_COPY_SIZE - 1);
-    consumer::uprobe_registry_has_active_range(
+    consumer::uprobe_registry_has_active_range_for_mm(
+        mm,
         Arc::as_ptr(&page_cache) as usize,
         query_start,
         file_end,

@@ -184,9 +184,9 @@ int rseq_uprobe_child(void* opaque) {
 }
 
 // Return child on a normal reap, zero when another waiter already reaped it,
-// and -1 only when the child could not be proven gone. The caller must not
-// unmap a CLONE_VM stack in the last case.
-pid_t reap_rseq_clone_child(pid_t child, int* status) {
+// and -1 only when the child could not be proven gone. A caller must retain
+// resources which could still be in use by the child in the last case.
+pid_t reap_child(pid_t child, int* status) {
     auto wait_nointr = [&] {
         pid_t waited;
         do {
@@ -2156,7 +2156,7 @@ TEST(UprobeTest, RseqPreemptionUsesOriginalProbeIp) {
         sched_yield();
     if (child_args.registration.load(std::memory_order_acquire) < 0) {
         int status = 0;
-        const pid_t waited = reap_rseq_clone_child(child, &status);
+        const pid_t waited = reap_child(child, &status);
         if (waited >= 0) munmap(child_stack, child_stack_size);
         stop.store(true, std::memory_order_relaxed);
         competitor.join();
@@ -2166,7 +2166,7 @@ TEST(UprobeTest, RseqPreemptionUsesOriginalProbeIp) {
 
     child_args.start.store(true, std::memory_order_release);
     int status = 0;
-    const pid_t waited = reap_rseq_clone_child(child, &status);
+    const pid_t waited = reap_child(child, &status);
     stop.store(true, std::memory_order_relaxed);
     competitor.join();
     if (waited >= 0) munmap(child_stack, child_stack_size);
@@ -2184,6 +2184,54 @@ TEST(UprobeTest, RseqPreemptionUsesOriginalProbeIp) {
     // hits + aborts exceeds attempts iff the rseq/XOL race was exercised.
     EXPECT_GT(hits + aborts, static_cast<__u64>(child_args.attempts))
         << "preemption between #BP and XOL must restart the rseq section";
+}
+#endif
+
+#if defined(__x86_64__)
+// A task-scoped event belongs to the original task and is not inherited by a
+// fork child when perf inherit is disabled. The child nevertheless initially
+// receives the parent's private breakpoint page through COW, so fork must
+// sanitize that INT3 before allowing the child to execute without a hit-table
+// entry. The parent's site must remain armed throughout the transaction.
+TEST(UprobeTest, TaskScopedForkDoesNotInheritButSanitizes) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+        reinterpret_cast<const void*>(&uprobe_target), path, offset));
+
+    FdGuard event(open_uprobe_perf_event(path, offset));
+    ASSERT_GE(event.get(), 0) << "task uprobe failed, errno=" << errno;
+
+    EXPECT_EQ(uprobe_target(40), 81);
+    __u64 count = 0;
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    ASSERT_EQ(count, 1U);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed, errno=" << errno;
+    if (child == 0) {
+        for (int i = 0; i < 256; ++i) {
+            if (uprobe_target(i) != i * 2 + 1) _exit(1);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    const pid_t waited = reap_child(child, &status);
+    ASSERT_EQ(waited, child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0)
+        << "fork child encountered an inherited task-scoped breakpoint";
+
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 1U) << "task-scoped event counted fork-child hits";
+
+    EXPECT_EQ(uprobe_target(41), 83);
+    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 2U) << "fork sanitization disarmed the parent's site";
 }
 #endif
 

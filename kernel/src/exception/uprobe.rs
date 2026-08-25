@@ -84,7 +84,7 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
                 .checked_add(site.insn_analysis.insn_len)
                 .ok_or(SystemError::EINVAL)?;
 
-            let participants = site.participants.load();
+            let participants = site.participant_snapshot();
             Ok((xol_lease, slot_vaddr, slot_end, return_addr, participants))
         });
     let Some(captured) = captured else {
@@ -100,8 +100,8 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
 
     // ── Phase 1.5：锁外跑 event callback（评审 R12）──
     // rip 保持 raw（probe_vaddr+1）：BPF 回调经 break_address()=rip-1 取得原探针址。
-    for participant in participants.iter() {
-        participant.deliver(&pcb, frame);
+    if let Some(participants) = participants {
+        participants.for_each_active(|participant| participant.deliver(&pcb, frame));
     }
 
     // ── Phase 2：保存 per-thread 活跃状态（评审 R2/R5）→ 重定向 rip → 置 TF ──

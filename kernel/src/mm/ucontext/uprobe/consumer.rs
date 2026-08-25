@@ -414,6 +414,7 @@ pub(super) static UPROBE_REGISTRY: SpinLock<RegistryMap> = SpinLock::new(BTreeMa
 
 static NEXT_CONSUMER_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_UPROBE_CONSUMERS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_SYSTEM_WIDE_UPROBE_CONSUMERS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_TASK_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 static UPROBE_TASK_SCOPES: SpinLock<BTreeMap<u64, Weak<ProcessControlBlock>>> =
     SpinLock::new(BTreeMap::new());
@@ -426,7 +427,44 @@ pub(super) fn uprobe_registry_is_empty() -> bool {
     ACTIVE_UPROBE_CONSUMERS.load(Ordering::Acquire) == 0
 }
 
-pub(super) fn uprobe_registry_has_active_range(inode_key: usize, start: usize, end: usize) -> bool {
+pub(super) fn uprobe_registry_has_active_system_wide_consumers() -> bool {
+    ACTIVE_SYSTEM_WIDE_UPROBE_CONSUMERS.load(Ordering::Acquire) != 0
+}
+
+fn active_consumer_enter(consumer: &UprobeConsumer) {
+    ACTIVE_UPROBE_CONSUMERS.fetch_add(1, Ordering::AcqRel);
+    if matches!(&consumer.scope, UprobeConsumerScope::SystemWideAuthorized) {
+        ACTIVE_SYSTEM_WIDE_UPROBE_CONSUMERS.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn active_consumer_leave(consumer: &UprobeConsumer) {
+    let previous = ACTIVE_UPROBE_CONSUMERS.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous != 0, "active uprobe consumer count underflow");
+    if matches!(&consumer.scope, UprobeConsumerScope::SystemWideAuthorized) {
+        let previous = ACTIVE_SYSTEM_WIDE_UPROBE_CONSUMERS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous != 0,
+            "active system-wide uprobe consumer count underflow"
+        );
+    }
+}
+
+/// Return whether this exact file window has an enabled consumer which may be
+/// installed in `mm`.
+///
+/// Callers already own `mm.write()` and may own one of its VMA locks. The
+/// nested order here is therefore mm -> VMA -> registry -> task-scope ->
+/// target PCB basic. Registry add/remove never acquire an mm/VMA lock while
+/// holding the registry, and exec/exit drop PCB basic before detaching sites.
+/// Keep this predicate allocation-free because mremap can call it after its
+/// VMA transaction has committed.
+pub(super) fn uprobe_registry_has_active_range_for_mm(
+    mm: &Arc<AddressSpace>,
+    inode_key: usize,
+    start: usize,
+    end: usize,
+) -> bool {
     if start >= end || uprobe_registry_is_empty() {
         return false;
     }
@@ -435,7 +473,7 @@ pub(super) fn uprobe_registry_has_active_range(inode_key: usize, start: usize, e
         offsets.range(start..end).any(|(_, consumers)| {
             consumers
                 .iter()
-                .any(|consumer| consumer.has_published_epoch())
+                .any(|consumer| consumer.has_published_epoch() && consumer.scope.permits(mm))
         })
     })
 }
@@ -477,7 +515,7 @@ pub fn uprobe_registry_add_consumer(consumer: Arc<UprobeConsumer>) {
         UprobeConsumerPhase::Enabling | UprobeConsumerPhase::Enabled
     ) && !consumer.scope.is_terminal()
     {
-        ACTIVE_UPROBE_CONSUMERS.fetch_add(1, Ordering::AcqRel);
+        active_consumer_enter(&consumer);
     }
     let mut r = UPROBE_REGISTRY.lock_irqsave();
     r.entry(consumer.definition.inode_key)
@@ -552,12 +590,12 @@ pub fn uprobe_registry_set_enabled(
         control.phase = UprobeConsumerPhase::Enabling;
         control.epoch = Some(epoch.clone());
         consumer.published_epoch.store_deferred(Some(epoch.clone()));
-        ACTIVE_UPROBE_CONSUMERS.fetch_add(1, Ordering::AcqRel);
+        active_consumer_enter(consumer);
         if let Err(e) = apply_consumer_to_existing_mappings(consumer) {
             control.epoch.take();
             control.phase = UprobeConsumerPhase::Disabled;
             consumer.published_epoch.store_deferred(None);
-            ACTIVE_UPROBE_CONSUMERS.fetch_sub(1, Ordering::AcqRel);
+            active_consumer_leave(consumer);
             epoch.close_and_drain();
             detach_consumer_sites(consumer);
             return Err(e);
@@ -575,7 +613,7 @@ pub fn uprobe_registry_set_enabled(
         let epoch = control.epoch.take().expect("enabled uprobe without epoch");
         control.phase = UprobeConsumerPhase::Disabled;
         consumer.published_epoch.store_deferred(None);
-        ACTIVE_UPROBE_CONSUMERS.fetch_sub(1, Ordering::AcqRel);
+        active_consumer_leave(consumer);
         epoch.close_and_drain();
         detach_consumer_sites(consumer);
     }
@@ -644,7 +682,7 @@ pub fn uprobe_registry_task_exit(target: &Arc<ProcessControlBlock>) {
         control.phase = UprobeConsumerPhase::Terminal;
         consumer.published_epoch.store_deferred(None);
         if was_active {
-            ACTIVE_UPROBE_CONSUMERS.fetch_sub(1, Ordering::AcqRel);
+            active_consumer_leave(&consumer);
         }
         if let Some(epoch) = epoch {
             epoch.close_and_drain();
@@ -757,7 +795,7 @@ pub fn uprobe_registry_remove_consumer(consumer: &Arc<UprobeConsumer>) {
     control.phase = UprobeConsumerPhase::Closing;
     consumer.published_epoch.store_deferred(None);
     if was_active {
-        ACTIVE_UPROBE_CONSUMERS.fetch_sub(1, Ordering::AcqRel);
+        active_consumer_leave(consumer);
     }
     drop(control);
 

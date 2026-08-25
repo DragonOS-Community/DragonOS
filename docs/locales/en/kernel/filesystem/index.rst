@@ -23,6 +23,7 @@ todo: Due to the file system module reconstruction, the documentation is tempora
    :caption: Contents
 
    overview
+   inotify
    fuse
    virtiofs_benchmark_runbook
    vfs/index

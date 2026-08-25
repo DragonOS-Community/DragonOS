@@ -3,8 +3,10 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READV;
 use crate::arch::MMArch;
+use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::iov::IoVec;
 use crate::filesystem::vfs::iov::IoVecs;
+use crate::filesystem::vfs::FileType;
 use crate::mm::MemoryManagementArch;
 use crate::mm::VirtAddr;
 use crate::syscall::table::FormattedSyscallParam;
@@ -13,7 +15,7 @@ use crate::syscall::user_access::{copy_to_user_protected, user_accessible_len};
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use super::sys_read::do_read;
+use super::sys_read::get_read_file;
 
 /// System call handler for `readv` operation
 ///
@@ -31,21 +33,29 @@ impl Syscall for SysReadVHandle {
         let iov = Self::iov(args);
         let count = Self::count(args);
 
+        let file = get_read_file(fd)?;
+        file.readable()?;
+
+        // Linux accepts a zero-segment readv, returns zero and publishes the
+        // syscall-level ACCESS event after validating the descriptor.
+        if count == 0 {
+            return finish_readv(file.as_ref(), 0);
+        }
+
         // IoVecs 会进行用户态检验(包含 len==0 的 iov_base 校验)。
         let iovecs = unsafe { IoVecs::from_user(iov, count, true) }?;
 
-        // TODO: Here work around, not suppose to read entire buf once
-        use crate::process::ProcessManager;
-        if let Ok(_socket_inode) = ProcessManager::current_pcb().get_socket_inode(fd) {
-            // Socket: read entire message then scatter to iovecs
-            let mut buf = iovecs.new_buf(true)?;
-            let nread = do_read(fd, &mut buf)?;
-            iovecs.scatter(&buf[..nread])?;
-            return Ok(nread);
-        }
-
         // Linux: limit per readv() to MAX_RW_COUNT = INT_MAX & ~(PAGE_SIZE-1)
         let max_rw_count = (i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1);
+
+        if file.file_type() == FileType::Socket {
+            // Socket readv is one underlying read, but ACCESS still belongs to
+            // the readv completion boundary (including a zero-byte result).
+            let mut buf = iovecs.new_buf(true)?;
+            let nread = file.read_syscall_chunk(buf.len(), &mut buf)?;
+            iovecs.scatter(&buf[..nread])?;
+            return finish_readv(file.as_ref(), nread);
+        }
 
         let mut total_read: usize = 0;
 
@@ -82,16 +92,20 @@ impl Syscall for SysReadVHandle {
                         return Err(SystemError::EFAULT);
                     }
                     // Hit unmapped region, return what we've read so far
-                    return Ok(total_read);
+                    return finish_readv(file.as_ref(), total_read);
                 }
 
                 // Read into kernel buffer
                 let to_read = core::cmp::min(accessible, chunk_len);
                 let mut kbuf = alloc::vec![0u8; to_read];
-                let n = do_read(fd, &mut kbuf[..])?;
+                let n = match file.read_syscall_chunk(to_read, &mut kbuf[..]) {
+                    Ok(n) => n,
+                    Err(_) if total_read != 0 => return finish_readv(file.as_ref(), total_read),
+                    Err(error) => return Err(error),
+                };
                 if n == 0 {
                     // EOF
-                    return Ok(total_read);
+                    return finish_readv(file.as_ref(), total_read);
                 }
 
                 // Copy to user space
@@ -104,7 +118,7 @@ impl Syscall for SysReadVHandle {
 
                         // Check MAX_RW_COUNT limit after each chunk
                         if total_read >= max_rw_count {
-                            return Ok(total_read);
+                            return finish_readv(file.as_ref(), total_read);
                         }
                     }
                     Err(SystemError::EFAULT) => {
@@ -112,19 +126,19 @@ impl Syscall for SysReadVHandle {
                         if total_read == 0 {
                             return Err(SystemError::EFAULT);
                         }
-                        return Ok(total_read);
+                        return finish_readv(file.as_ref(), total_read);
                     }
                     Err(e) => return Err(e),
                 }
 
                 // Stop on short read (EOF or error in underlying file)
                 if n < to_read {
-                    return Ok(total_read);
+                    return finish_readv(file.as_ref(), total_read);
                 }
             }
         }
 
-        Ok(total_read)
+        finish_readv(file.as_ref(), total_read)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -134,6 +148,16 @@ impl Syscall for SysReadVHandle {
             FormattedSyscallParam::new("count", Self::count(args).to_string()),
         ]
     }
+}
+
+fn finish_readv(
+    file: &crate::filesystem::vfs::file::File,
+    total_read: usize,
+) -> Result<usize, SystemError> {
+    // Linux do_iter_read() publishes one ACCESS event at the readv syscall
+    // boundary, not once per iovec or bounded implementation chunk.
+    file.notify_io_event(FsEvent::ACCESS);
+    Ok(total_read)
 }
 
 impl SysReadVHandle {

@@ -849,7 +849,10 @@ impl IndexNode for LockedDevFSInode {
         }
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<crate::filesystem::vfs::LinkRemovalOutcome, SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -869,7 +872,7 @@ impl IndexNode for LockedDevFSInode {
             .cloned()
             .ok_or(SystemError::ENOENT)?;
 
-        if let Some(child) = child.as_any_ref().downcast_ref::<LockedDevFSInode>() {
+        let outcome = if let Some(child) = child.as_any_ref().downcast_ref::<LockedDevFSInode>() {
             let mut child_inode = child.0.lock();
             if child_inode.metadata.file_type == FileType::Dir {
                 return Err(SystemError::EISDIR);
@@ -881,16 +884,24 @@ impl IndexNode for LockedDevFSInode {
                 .checked_sub(1)
                 .ok_or(SystemError::EINVAL)?;
             child_inode.metadata.ctime = PosixTimeSpec::now();
+            if child_inode.metadata.nlinks == 0 {
+                crate::filesystem::vfs::LinkRemovalOutcome::LastLink
+            } else {
+                crate::filesystem::vfs::LinkRemovalOutcome::StillLinked
+            }
         } else if child.metadata()?.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
-        }
+        } else {
+            // Externally registered device nodes have a single devfs edge.
+            crate::filesystem::vfs::LinkRemovalOutcome::LastLink
+        };
 
         inode.children.remove(&dname);
         let now = PosixTimeSpec::now();
         inode.metadata.mtime = now;
         inode.metadata.ctime = now;
 
-        Ok(())
+        Ok(outcome)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

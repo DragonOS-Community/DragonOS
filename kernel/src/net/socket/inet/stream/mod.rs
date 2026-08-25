@@ -33,6 +33,10 @@ mod stream_core;
 pub use stream_core::TcpSocket;
 
 impl Socket for TcpSocket {
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize {
+        &self.fsnotify_watches
+    }
+
     fn set_nonblocking(&self, nonblocking: bool) {
         self.nonblock
             .store(nonblocking, core::sync::atomic::Ordering::Relaxed);

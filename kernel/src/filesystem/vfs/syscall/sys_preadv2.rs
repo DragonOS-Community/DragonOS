@@ -8,7 +8,7 @@ use crate::filesystem::vfs::iov::{IoVec, IoVecs};
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 
-use super::sys_preadv::do_preadv;
+use super::sys_preadv::{do_preadv, read_iovecs};
 
 // Linux 兼容的 RWF 标志位（preadv2 专用）
 const RWF_HIPRI: usize = 0x0000_0001;
@@ -42,6 +42,9 @@ impl Syscall for SysPreadV2Handle {
         let iov_count = Self::iov_count(args);
         let offset = Self::offset(args);
         let flags = Self::flags(args);
+        if offset < -1 {
+            return Err(SystemError::EINVAL);
+        }
 
         // 先校验标志位，遵循 Linux 语义：未知标志返回 EOPNOTSUPP。
         if flags & !RWF_VALID_MASK != 0 {
@@ -131,14 +134,11 @@ pub fn do_preadv2(
         // 读路径会负责 O_PATH / 读权限检查
         drop(fd_table_guard);
 
-        let mut data = vec![0; iovecs.total_len()];
-        let read_len = file.read(data.len(), &mut data)?;
-        let copied = iovecs.scatter(&data[..read_len])?;
-        return Ok(copied);
+        return read_iovecs(file.as_ref(), iovecs, None);
     }
 
     // offset 为非负时，直接复用现有的 preadv 实现，保持语义一致
-    do_preadv(fd, iovecs, offset as usize)
+    do_preadv(fd, iovecs, offset)
 }
 
 syscall_table_macros::declare_syscall!(SYS_PREADV2, SysPreadV2Handle);

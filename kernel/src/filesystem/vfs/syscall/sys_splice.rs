@@ -1,4 +1,5 @@
 use crate::arch::syscall::nr::SYS_SPLICE;
+use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::FileFlags;
 use crate::filesystem::vfs::{file::File, syscall::SpliceFlags, FileType};
@@ -197,12 +198,30 @@ fn do_splice(
     in_is_pipe: bool,
     out_is_pipe: bool,
 ) -> Result<usize, SystemError> {
-    match (in_is_pipe, out_is_pipe) {
+    let transferred = match (in_is_pipe, out_is_pipe) {
         (true, true) => splice_pipe_to_pipe(file_in, file_out, len, flags),
         (false, true) => splice_file_to_pipe(file_in, off_in, file_out, len, flags),
         (true, false) => splice_pipe_to_file(file_in, file_out, off_out, len, flags),
         (false, false) => unreachable!(),
+    }?;
+
+    if transferred > 0 {
+        match (in_is_pipe, out_is_pipe) {
+            (_, true) => {
+                // The regular-file input path deliberately deferred ACCESS so
+                // both pipe-output cases retain Linux's event order.
+                file_out.notify_io_event(FsEvent::MODIFY);
+                file_in.notify_io_event(FsEvent::ACCESS);
+            }
+            (true, false) => {
+                // File::write already published MODIFY for the regular output.
+                file_in.notify_io_event(FsEvent::ACCESS);
+            }
+            (false, false) => unreachable!(),
+        }
     }
+
+    Ok(transferred)
 }
 
 fn get_pipe_inode(file: &File) -> Result<Arc<LockedPipeInode>, SystemError> {
@@ -281,14 +300,8 @@ fn splice_file_to_pipe(
     // 从文件读取
     // 为了满足 Linux 语义：若后续写入 pipe 被信号中断且未写入任何字节，
     // 则不应推进输入文件的 file position。
-    let read_result = if let Some(off) = offset {
-        file.pread(off, buf_size, &mut buffer)
-            .map(|read_len| (read_len, false))
-    } else {
-        file.read_noadv(buf_size, &mut buffer)
-            .map(|read_len| (read_len, true))
-    };
-    let (read_len, advance_file_pos) = read_result?;
+    let advance_file_pos = offset.is_none();
+    let read_len = file.read_for_transfer(offset, buf_size, &mut buffer)?;
 
     if read_len == 0 {
         return Ok(0);

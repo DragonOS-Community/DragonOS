@@ -4,7 +4,9 @@
 #include <signal.h>
 #include <sched.h>
 #include <setjmp.h>
+#include <linux/falloc.h>
 #include <sys/ioctl.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -1099,7 +1101,7 @@ static int ext_test_p2_ops() {
     usleep(100 * 1000);
 
     if (access_count < 2 || flush_count == 0 || fsync_count == 0 || fsyncdir_count == 0 ||
-        create_count == 0 || rename2_count < 2) {
+        create_count == 0 || rename2_count != 1) {
         printf("[FAIL] counters access=%u flush=%u fsync=%u fsyncdir=%u create=%u rename2=%u\n",
                access_count, flush_count, fsync_count, fsyncdir_count, create_count,
                rename2_count);
@@ -1437,7 +1439,7 @@ static int ext_test_positive_lookup_cache_respects_entry_ttl() {
     const char *mp = "/tmp/test_fuse_lookup_cache";
     char hello[256];
     char missing[256];
-    struct stat st;
+    struct stat st = {};
     char buf[32];
 
     if (ensure_dir(mp) != 0) {
@@ -4090,6 +4092,14 @@ static int ext_test_atomic_otrunc_uses_open_without_setattr() {
     const char *mp = "/tmp/test_fuse_atomic_otrunc";
     int requested = O_RDWR | O_TRUNC;
     int f = -1;
+    int ifd = -1;
+    struct stat st = {};
+    unsigned char event_buf[512];
+    ssize_t event_len = -1;
+    int open_index = -1;
+    int modify_index = -1;
+    int event_index = 0;
+    uint32_t getattr_before = 0;
     if (ensure_dir(mp) != 0) {
         printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         return -1;
@@ -4107,6 +4117,7 @@ static int ext_test_atomic_otrunc_uses_open_without_setattr() {
     volatile uint32_t last_open_flags = 0;
     volatile uint32_t open_count = 0;
     volatile uint32_t setattr_count = 0;
+    volatile uint32_t getattr_count = 0;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -4117,8 +4128,10 @@ static int ext_test_atomic_otrunc_uses_open_without_setattr() {
     args.stop_on_destroy = 1;
     args.open_count = &open_count;
     args.setattr_count = &setattr_count;
+    args.getattr_count = &getattr_count;
     args.last_open_in_flags = &last_open_flags;
     args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_ATOMIC_O_TRUNC;
+    args.attr_valid_sec = 60;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -4145,13 +4158,45 @@ static int ext_test_atomic_otrunc_uses_open_without_setattr() {
 
     char path[256];
     snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (ifd < 0 || inotify_add_watch(ifd, path, IN_OPEN | IN_MODIFY) < 0) {
+        printf("[FAIL] inotify watch for atomic O_TRUNC: %s (errno=%d)\n", strerror(errno),
+               errno);
+        goto fail;
+    }
     f = open(path, requested);
     if (f < 0) {
         printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
         goto fail;
     }
+    getattr_before = getattr_count;
+    if (fstat(f, &st) != 0 || st.st_size != 0 || getattr_count <= getattr_before) {
+        printf("[FAIL] atomic O_TRUNC cached size=%lld errno=%d\n", (long long)st.st_size,
+               errno);
+        goto fail;
+    }
     close(f);
     f = -1;
+
+    if (fuseg_wait_readable(ifd, 1000) != 0) {
+        printf("[FAIL] no inotify events for atomic O_TRUNC\n");
+        goto fail;
+    }
+    event_len = read(ifd, event_buf, sizeof(event_buf));
+    for (size_t off = 0; event_len > 0 && off + sizeof(struct inotify_event) <= (size_t)event_len;
+         event_index++) {
+        const struct inotify_event *event = (const struct inotify_event *)(event_buf + off);
+        if ((event->mask & IN_OPEN) && open_index < 0)
+            open_index = event_index;
+        if ((event->mask & IN_MODIFY) && modify_index < 0)
+            modify_index = event_index;
+        off += sizeof(*event) + event->len;
+    }
+    if (open_index < 0 || modify_index <= open_index) {
+        printf("[FAIL] atomic O_TRUNC event order open=%d modify=%d\n", open_index,
+               modify_index);
+        goto fail;
+    }
 
     usleep(100 * 1000);
     if (open_count != 1 || (last_open_flags & O_TRUNC) == 0) {
@@ -4162,6 +4207,9 @@ static int ext_test_atomic_otrunc_uses_open_without_setattr() {
         printf("[FAIL] atomic O_TRUNC unexpectedly sent SETATTR count=%u\n", setattr_count);
         goto fail;
     }
+
+    close(ifd);
+    ifd = -1;
 
     if (umount(mp) != 0) {
         printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
@@ -4176,6 +4224,9 @@ static int ext_test_atomic_otrunc_uses_open_without_setattr() {
 fail:
     if (f >= 0) {
         close(f);
+    }
+    if (ifd >= 0) {
+        close(ifd);
     }
     umount(mp);
 fail_no_umount:

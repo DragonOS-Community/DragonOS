@@ -64,6 +64,7 @@ pub struct RawSocket {
     inode_id: InodeId,
     /// 打开文件计数
     open_files: AtomicUsize,
+    fsnotify_watches: AtomicUsize,
     /// 自引用
     self_ref: Weak<Self>,
     /// 网络命名空间

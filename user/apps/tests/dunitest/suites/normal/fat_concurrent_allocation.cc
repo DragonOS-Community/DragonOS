@@ -162,6 +162,39 @@ TEST(FatConcurrentAllocation, ParallelGrowthKeepsClusterChainsIndependent) {
   }
 }
 
+TEST(FatConcurrentAllocation, FallocateAcrossExactClusterBoundaries) {
+  struct statfs fs_type {};
+  ASSERT_EQ(0, statfs("/", &fs_type)) << strerror(errno);
+  if (fs_type.f_type != kMsdosSuperMagic) {
+    GTEST_SKIP() << "root filesystem is not FAT";
+  }
+
+  const std::string path = TestPath(999);
+  unlink(path.c_str());
+  const int fd = open(path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600);
+  ASSERT_GE(fd, 0) << path << ": " << strerror(errno);
+
+  // FAT cluster sizes are powers of two. Exercising each possible boundary
+  // catches the exclusive-EOF bug without depending on a non-portable ioctl
+  // for the mounted volume's cluster size.
+  for (off_t size = 512; size <= 64 * 1024; size *= 2) {
+    ASSERT_EQ(0, ftruncate(fd, 0)) << "size=" << size << ": " << strerror(errno);
+    ASSERT_EQ(0, fallocate(fd, 0, 0, size))
+        << "size=" << size << ": " << strerror(errno);
+
+    struct stat st {};
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    ASSERT_EQ(size, st.st_size);
+
+    uint8_t last = 0xff;
+    ASSERT_EQ(1, pread(fd, &last, sizeof(last), size - 1)) << strerror(errno);
+    EXPECT_EQ(0, last) << "size=" << size;
+  }
+
+  ASSERT_EQ(0, close(fd)) << strerror(errno);
+  ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

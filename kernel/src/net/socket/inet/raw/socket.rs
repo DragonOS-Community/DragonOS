@@ -76,6 +76,7 @@ impl RawSocket {
             wait_queue: crate::libs::wait_queue::WaitQueue::default(),
             inode_id: generate_inode_id(),
             open_files: core::sync::atomic::AtomicUsize::new(0),
+            fsnotify_watches: core::sync::atomic::AtomicUsize::new(0),
             self_ref: me.clone(),
             netns,
             epoll_items: crate::net::socket::common::EPollItems::default(),

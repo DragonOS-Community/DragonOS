@@ -27,7 +27,8 @@ use system_error::SystemError;
 
 use super::vfs::{
     file::FilePrivateData, utils::DName, FileSystem, FsInfo, FsReconfigureRequest, IndexNode,
-    InodeFlags, InodeId, InodeMode, Metadata, SpecialNodeData,
+    InodeFlags, InodeId, InodeMode, LinkMutationCoordinator, LinkRemovalOutcome, Metadata,
+    RenameOutcome, SetMetadataMask, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -45,7 +46,7 @@ fn ramfs_move_entry_between_dirs(
     old_key: &DName,
     new_key: &DName,
     flags: RenameFlags,
-) -> Result<(), SystemError> {
+) -> Result<RenameOutcome, SystemError> {
     if src_dir.metadata.file_type != FileType::Dir || dst_dir.metadata.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
@@ -66,7 +67,7 @@ fn ramfs_move_entry_between_dirs(
             .cloned()
             .ok_or(SystemError::ENOENT)?;
         if Arc::ptr_eq(&inode_to_move, &existing) {
-            return Ok(());
+            return Ok(RenameOutcome::NoOp);
         }
         let existing_type = existing.0.lock().metadata.file_type;
 
@@ -93,9 +94,10 @@ fn ramfs_move_entry_between_dirs(
             replaced.parent = Arc::downgrade(&src_self);
             replaced.name = old_key.clone();
         }
-        return Ok(());
+        return Ok(RenameOutcome::Exchange);
     }
 
+    let mut replaced = None;
     if let Some(existing) = dst_dir.children.get(new_key).cloned() {
         if flags.contains(RenameFlags::NOREPLACE) {
             return Err(SystemError::EEXIST);
@@ -109,8 +111,7 @@ fn ramfs_move_entry_between_dirs(
         };
         let to_move_id = inode_to_move.0.lock().metadata.inode_id;
         if existing_id == to_move_id {
-            src_dir.children.remove(old_key);
-            return Ok(());
+            return Ok(RenameOutcome::NoOp);
         }
 
         if old_type == FileType::Dir && existing_type != FileType::Dir {
@@ -128,8 +129,14 @@ fn ramfs_move_entry_between_dirs(
         if existing_type == FileType::Dir {
             dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_sub(1);
             existing_guard.metadata.nlinks = 0;
+            replaced = Some(LinkRemovalOutcome::LastLink);
         } else {
             existing_guard.metadata.nlinks = existing_guard.metadata.nlinks.saturating_sub(1);
+            replaced = Some(if existing_guard.metadata.nlinks == 0 {
+                LinkRemovalOutcome::LastLink
+            } else {
+                LinkRemovalOutcome::StillLinked
+            });
         }
     }
 
@@ -148,7 +155,7 @@ fn ramfs_move_entry_between_dirs(
     let mut moved = inode_to_move.0.lock();
     moved.parent = Arc::downgrade(&dst_self);
     moved.name = new_key.clone();
-    Ok(())
+    Ok(RenameOutcome::Moved { replaced })
 }
 
 fn ramfs_insert_whiteout(dir: &mut RamFSInode, name: &DName) -> Result<(), SystemError> {
@@ -156,33 +163,36 @@ fn ramfs_insert_whiteout(dir: &mut RamFSInode, name: &DName) -> Result<(), Syste
         return Err(SystemError::EEXIST);
     }
 
-    let whiteout = Arc::new(LockedRamFSInode(Mutex::new(RamFSInode {
-        parent: dir.self_ref.clone(),
-        self_ref: Weak::default(),
-        children: BTreeMap::new(),
-        data: Vec::new(),
-        metadata: Metadata {
-            dev_id: 0,
-            inode_id: generate_inode_id(),
-            size: 0,
-            blk_size: 0,
-            blocks: 0,
-            atime: PosixTimeSpec::default(),
-            mtime: PosixTimeSpec::default(),
-            ctime: PosixTimeSpec::default(),
-            btime: PosixTimeSpec::default(),
-            file_type: FileType::CharDevice,
-            mode: InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            raw_dev: WHITEOUT_DEV,
-            flags: InodeFlags::empty(),
-        },
-        fs: dir.fs.clone(),
-        special_node: None,
-        name: name.clone(),
-    })));
+    let whiteout = Arc::new(LockedRamFSInode(
+        Mutex::new(RamFSInode {
+            parent: dir.self_ref.clone(),
+            self_ref: Weak::default(),
+            children: BTreeMap::new(),
+            data: Vec::new(),
+            metadata: Metadata {
+                dev_id: 0,
+                inode_id: generate_inode_id(),
+                size: 0,
+                blk_size: 0,
+                blocks: 0,
+                atime: PosixTimeSpec::default(),
+                mtime: PosixTimeSpec::default(),
+                ctime: PosixTimeSpec::default(),
+                btime: PosixTimeSpec::default(),
+                file_type: FileType::CharDevice,
+                mode: InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                raw_dev: WHITEOUT_DEV,
+                flags: InodeFlags::empty(),
+            },
+            fs: dir.fs.clone(),
+            special_node: None,
+            name: name.clone(),
+        }),
+        LinkMutationCoordinator::new(),
+    ));
     whiteout.0.lock().self_ref = Arc::downgrade(&whiteout);
     dir.children.insert(name.clone(), whiteout);
     Ok(())
@@ -190,7 +200,7 @@ fn ramfs_insert_whiteout(dir: &mut RamFSInode, name: &DName) -> Result<(), Syste
 
 /// @brief 内存文件系统的Inode结构体
 #[derive(Debug)]
-pub struct LockedRamFSInode(pub Mutex<RamFSInode>);
+pub struct LockedRamFSInode(pub Mutex<RamFSInode>, LinkMutationCoordinator);
 
 /// @brief 内存文件系统结构体
 #[derive(Debug)]
@@ -312,7 +322,10 @@ impl RamFS {
             RAMFS_MAX_NAMELEN as u64,
         );
         // 初始化root inode
-        let root: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(Mutex::new(RamFSInode::new())));
+        let root: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(
+            Mutex::new(RamFSInode::new()),
+            LinkMutationCoordinator::new(),
+        ));
 
         let result: Arc<RamFS> = Arc::new(RamFS {
             root_inode: root,
@@ -350,6 +363,10 @@ impl MountableFileSystem for RamFS {
 register_mountable_fs!(RamFS, RAMFSMAKER, "ramfs");
 
 impl IndexNode for LockedRamFSInode {
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        Some(&self.1)
+    }
+
     fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
         Some(self.fs())
     }
@@ -516,6 +533,16 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        super::vfs::merge_metadata_masked(&mut inode.metadata, metadata, mask);
+        Ok(())
+    }
+
     fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
         let mut inode = self.0.lock();
         crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
@@ -532,16 +559,51 @@ impl IndexNode for LockedRamFSInode {
         }
     }
 
+    fn fallocate_resize_atomic(
+        &self,
+        requested_end: usize,
+        _lock_owner: u64,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let mut inode = self.0.lock();
+        if inode.metadata.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+        // RamFS stores file contents in `data`; metadata.size is only a cached
+        // field and may lag behind write_at()/resize().  Use the authoritative
+        // length while holding the inode lock so mode-0 fallocate can never
+        // shrink data written through another path.
+        let current_size = inode.data.len();
+        if requested_end > current_size {
+            super::vfs::vcore::check_file_size_limit(requested_end)?;
+            inode
+                .data
+                .try_reserve(requested_end - current_size)
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
+        let effective_size = current_size.max(requested_end);
+        let (metadata, mask) = super::vfs::vcore::prepare_write_side_effect_metadata(
+            inode.metadata.clone(),
+            effective_size,
+        );
+        crate::filesystem::vfs::merge_metadata_masked(&mut inode.metadata, &metadata, mask);
+        if requested_end > current_size {
+            inode.data.resize(requested_end, 0);
+            inode.metadata.size = requested_end as i64;
+        }
+        Ok(mask)
+    }
+
     fn fallocate_file(
         &self,
         mode: i32,
         offset: usize,
         len: usize,
         lock_owner: u64,
+        attrib: &mut super::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         drop(data);
-        super::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
+        super::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner, attrib)
     }
 
     fn create_with_data(
@@ -566,34 +628,37 @@ impl IndexNode for LockedRamFSInode {
             crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
 
         // 创建inode
-        let result: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(Mutex::new(RamFSInode {
-            parent: inode.self_ref.clone(),
-            self_ref: Weak::default(),
-            children: BTreeMap::new(),
-            data: Vec::new(),
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id: generate_inode_id(),
-                size: 0,
-                blk_size: 0,
-                blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
-                btime: PosixTimeSpec::default(),
-                file_type,
-                mode: init.mode,
-                flags: InodeFlags::empty(),
-                // 目录需要包含 "." 自引用，因此初始为2
-                nlinks: if file_type == FileType::Dir { 2 } else { 1 },
-                uid: init.uid,
-                gid: init.gid,
-                raw_dev: DeviceNumber::from(data as u32),
-            },
-            fs: inode.fs.clone(),
-            special_node: None,
-            name: name.clone(),
-        })));
+        let result: Arc<LockedRamFSInode> = Arc::new(LockedRamFSInode(
+            Mutex::new(RamFSInode {
+                parent: inode.self_ref.clone(),
+                self_ref: Weak::default(),
+                children: BTreeMap::new(),
+                data: Vec::new(),
+                metadata: Metadata {
+                    dev_id: 0,
+                    inode_id: generate_inode_id(),
+                    size: 0,
+                    blk_size: 0,
+                    blocks: 0,
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
+                    btime: PosixTimeSpec::default(),
+                    file_type,
+                    mode: init.mode,
+                    flags: InodeFlags::empty(),
+                    // A directory needs to contain the "." self-reference, hence the initial count of 2
+                    nlinks: if file_type == FileType::Dir { 2 } else { 1 },
+                    uid: init.uid,
+                    gid: init.gid,
+                    raw_dev: DeviceNumber::from(data as u32),
+                },
+                fs: inode.fs.clone(),
+                special_node: None,
+                name: name.clone(),
+            }),
+            LinkMutationCoordinator::new(),
+        ));
 
         // 初始化inode的自引用的weak指针
         result.0.lock().self_ref = Arc::downgrade(&result);
@@ -640,7 +705,7 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
         let mut inode: MutexGuard<RamFSInode> = self.0.lock();
         // 如果当前inode不是目录，那么也没有子目录/文件的概念了，因此要求当前inode的类型是目录
         if inode.metadata.file_type != FileType::Dir {
@@ -658,10 +723,21 @@ impl IndexNode for LockedRamFSInode {
             return Err(SystemError::EPERM);
         }
         // 减少硬链接计数
-        to_delete.0.lock().metadata.nlinks -= 1;
+        let mut deleted = to_delete.0.lock();
+        deleted.metadata.nlinks = deleted
+            .metadata
+            .nlinks
+            .checked_sub(1)
+            .expect("ramfs nlinks underflow: filesystem corruption detected");
+        let outcome = if deleted.metadata.nlinks == 0 {
+            LinkRemovalOutcome::LastLink
+        } else {
+            LinkRemovalOutcome::StillLinked
+        };
+        drop(deleted);
         // 在当前目录中删除这个子目录项
         inode.children.remove(&name);
-        return Ok(());
+        return Ok(outcome);
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
@@ -691,7 +767,7 @@ impl IndexNode for LockedRamFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         let old_key = DName::from(old_name);
         let new_name = DName::from(new_name);
         let target_locked = target
@@ -720,16 +796,17 @@ impl IndexNode for LockedRamFSInode {
                 let to_move_id = inode_to_move.0.lock().metadata.inode_id;
                 let existing_id = existing.0.lock().metadata.inode_id;
                 if existing_id == to_move_id {
-                    return Ok(());
+                    return Ok(RenameOutcome::NoOp);
                 }
 
                 dir.children.insert(old_key.clone(), existing.clone());
                 dir.children.insert(new_name.clone(), inode_to_move.clone());
                 existing.0.lock().name = old_key;
                 inode_to_move.0.lock().name = new_name;
-                return Ok(());
+                return Ok(RenameOutcome::Exchange);
             }
 
+            let mut replaced = None;
             if let Some(existing) = dir.children.get(&new_name).cloned() {
                 if flags.contains(RenameFlags::NOREPLACE) {
                     return Err(SystemError::EEXIST);
@@ -738,7 +815,7 @@ impl IndexNode for LockedRamFSInode {
                 let existing_id = existing.0.lock().metadata.inode_id;
                 let to_move_id = inode_to_move.0.lock().metadata.inode_id;
                 if existing_id == to_move_id {
-                    return Ok(());
+                    return Ok(RenameOutcome::NoOp);
                 }
 
                 let existing_type = existing.0.lock().metadata.file_type;
@@ -757,9 +834,15 @@ impl IndexNode for LockedRamFSInode {
                 if existing_type == FileType::Dir {
                     dir.metadata.nlinks = dir.metadata.nlinks.saturating_sub(1);
                     existing_guard.metadata.nlinks = 0;
+                    replaced = Some(LinkRemovalOutcome::LastLink);
                 } else {
                     existing_guard.metadata.nlinks =
                         existing_guard.metadata.nlinks.saturating_sub(1);
+                    replaced = Some(if existing_guard.metadata.nlinks == 0 {
+                        LinkRemovalOutcome::LastLink
+                    } else {
+                        LinkRemovalOutcome::StillLinked
+                    });
                 }
             }
 
@@ -769,7 +852,7 @@ impl IndexNode for LockedRamFSInode {
             }
             dir.children.insert(new_name.clone(), inode_to_move.clone());
             inode_to_move.0.lock().name = new_name;
-            return Ok(());
+            return Ok(RenameOutcome::Moved { replaced });
         }
 
         if self_id < target_id {
@@ -909,33 +992,36 @@ impl IndexNode for LockedRamFSInode {
         let init =
             crate::filesystem::vfs::permission::child_inode_init(&inode.metadata, file_type, mode);
 
-        let nod = Arc::new(LockedRamFSInode(Mutex::new(RamFSInode {
-            parent: inode.self_ref.clone(),
-            self_ref: Weak::default(),
-            children: BTreeMap::new(),
-            data: Vec::new(),
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id: generate_inode_id(),
-                size: 0,
-                blk_size: 0,
-                blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
-                btime: PosixTimeSpec::default(),
-                file_type,
-                mode: init.mode,
-                nlinks: 1,
-                uid: init.uid,
-                gid: init.gid,
-                raw_dev: dev_t,
-                flags: InodeFlags::empty(),
-            },
-            fs: inode.fs.clone(),
-            special_node: None,
-            name: filename.clone(),
-        })));
+        let nod = Arc::new(LockedRamFSInode(
+            Mutex::new(RamFSInode {
+                parent: inode.self_ref.clone(),
+                self_ref: Weak::default(),
+                children: BTreeMap::new(),
+                data: Vec::new(),
+                metadata: Metadata {
+                    dev_id: 0,
+                    inode_id: generate_inode_id(),
+                    size: 0,
+                    blk_size: 0,
+                    blocks: 0,
+                    atime: PosixTimeSpec::default(),
+                    mtime: PosixTimeSpec::default(),
+                    ctime: PosixTimeSpec::default(),
+                    btime: PosixTimeSpec::default(),
+                    file_type,
+                    mode: init.mode,
+                    nlinks: 1,
+                    uid: init.uid,
+                    gid: init.gid,
+                    raw_dev: dev_t,
+                    flags: InodeFlags::empty(),
+                },
+                fs: inode.fs.clone(),
+                special_node: None,
+                name: filename.clone(),
+            }),
+            LinkMutationCoordinator::new(),
+        ));
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);
 

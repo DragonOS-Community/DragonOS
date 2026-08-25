@@ -54,13 +54,17 @@ fn find_locked_revalidated(
 
     let mut upper_inode = None;
     let mut upper_file_type = None;
+    let mut lower_visible_file_type = None;
+    let mut visible_nlinks = None;
     if let Some(ref upper) = *inode.upper_inode.lock() {
         match upper.find(name) {
             Ok(found) => {
                 if OvlInode::is_whiteout_inode(&found) {
                     return Err(SystemError::ENOENT);
                 }
-                upper_file_type = Some(found.metadata()?.file_type);
+                let metadata = found.metadata()?;
+                upper_file_type = Some(metadata.file_type);
+                visible_nlinks = Some(metadata.nlinks);
                 upper_inode = Some(found);
             }
             Err(SystemError::ENOENT) => {}
@@ -84,7 +88,12 @@ fn find_locked_revalidated(
                         }
                         break;
                     }
-                    let lower_file_type = found.metadata()?.file_type;
+                    let metadata = found.metadata()?;
+                    let lower_file_type = metadata.file_type;
+                    if upper_inode.is_none() && visible_nlinks.is_none() {
+                        lower_visible_file_type = Some(lower_file_type);
+                        visible_nlinks = Some(metadata.nlinks);
+                    }
                     if merge_dirs {
                         if lower_file_type == FileType::Dir {
                             lower_inodes.push(found);
@@ -110,11 +119,9 @@ fn find_locked_revalidated(
         return Err(SystemError::ENOENT);
     }
 
-    let file_type = if let Some(file_type) = upper_file_type {
-        file_type
-    } else {
-        lower_inodes[0].metadata()?.file_type
-    };
+    let file_type = upper_file_type
+        .or(lower_visible_file_type)
+        .ok_or(SystemError::EIO)?;
 
     if let Some(cached) = cached {
         if cached.redirect == child_redirect
@@ -126,12 +133,14 @@ fn find_locked_revalidated(
     }
 
     let fs = inode.overlay_fs()?;
+    let initial_nlinks = visible_nlinks.ok_or(SystemError::EIO)?;
     let child = fs.intern_inode(
         child_redirect.clone(),
         file_type,
         upper_inode,
         lower_inodes,
         replace_stale,
+        initial_nlinks,
     )?;
     let Some(child) = child else {
         // Serialize the refreshed backing lookup with both direct copy-up and

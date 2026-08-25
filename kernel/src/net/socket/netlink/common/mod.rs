@@ -71,6 +71,7 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     fasync_items: Arc<FAsyncItems>,
     inode_id: InodeId,
     open_files: AtomicUsize,
+    fsnotify_watches: AtomicUsize,
 }
 
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P>
@@ -96,6 +97,7 @@ where
             fasync_items,
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            fsnotify_watches: AtomicUsize::new(0),
         })
     }
 
@@ -379,6 +381,10 @@ impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
 where
     BoundNetlink<P::Message>: Bound<Endpoint = NetlinkSocketAddr>,
 {
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize {
+        &self.fsnotify_watches
+    }
+
     fn open_file_counter(&self) -> &AtomicUsize {
         &self.open_files
     }

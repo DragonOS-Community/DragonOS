@@ -1,7 +1,7 @@
 use super::cred::CredOverrideGuard;
 use super::inode::OvlInode;
 use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
-use crate::filesystem::vfs::{self, vcore, FileType, Metadata, SetMetadataMask};
+use crate::filesystem::vfs::{self, FileType, Metadata, SetMetadataMask};
 use crate::libs::mutex::Mutex;
 use crate::mm::VmFlags;
 use crate::process::Cred;
@@ -248,8 +248,9 @@ fn open_backing_file(
     inode: &OvlInode,
     flags: FileFlags,
 ) -> Result<OverlayFilePrivateData, SystemError> {
-    let needs_post_open_truncate = open_flags_need_copy_up(inode.file_type, &flags)
-        && inode.copy_up_for_open(&flags)?.needs_post_open_truncate();
+    if open_flags_need_copy_up(inode.file_type, &flags) {
+        inode.copy_up_for_open(&flags)?;
+    }
 
     let (backing_inode, backing_is_upper) = inode.current_realdata_inode()?;
     let backing_cred = inode.overlay_fs()?.backing_cred.clone();
@@ -258,16 +259,6 @@ fn open_backing_file(
         backing_open_flags(flags),
         backing_cred.clone(),
     )?;
-    if inode.file_type == FileType::File && backing_is_upper && needs_post_open_truncate {
-        let fs = inode.overlay_fs()?;
-        let _content_guard = fs.content_lock(&backing_file.inode())?.lock();
-        vcore::vfs_truncate_file(
-            backing_file.inode(),
-            0,
-            vcore::current_file_lock_owner_id(),
-            || backing_file.private_data.lock(),
-        )?;
-    }
     Ok(OverlayFilePrivateData::new(
         backing_inode,
         backing_file,

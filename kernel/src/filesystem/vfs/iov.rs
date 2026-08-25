@@ -66,9 +66,13 @@ impl IoVecs {
         iovcnt: usize,
         _readv: bool,
     ) -> Result<Self, SystemError> {
-        // Linux: iovcnt must be > 0 and not unreasonably large.
-        if iovcnt == 0 || iovcnt > IOV_MAX {
+        if iovcnt > IOV_MAX {
             return Err(SystemError::EINVAL);
+        }
+        // Linux accepts an empty vector without inspecting the pointer. The
+        // descriptor/mode checks still happen in the syscall's I/O path.
+        if iovcnt == 0 {
+            return Ok(Self(Vec::new()));
         }
 
         let elem_size = core::mem::size_of::<IoVec>();

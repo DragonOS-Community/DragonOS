@@ -1,6 +1,6 @@
 use super::dir;
-use super::inode::{DirState, OvlInode};
-use crate::filesystem::vfs::{mount::DentryMutationContext, syscall::RenameFlags, IndexNode};
+use super::inode::{DirState, OvlInode, OvlLinkMutation};
+use crate::filesystem::vfs::{self, mount::DentryMutationContext, syscall::RenameFlags, IndexNode};
 use crate::libs::casting::DowncastArc;
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -11,7 +11,7 @@ pub(super) fn move_to(
     target: &Arc<dyn IndexNode>,
     new_name: &str,
     flags: RenameFlags,
-) -> Result<(), SystemError> {
+) -> Result<vfs::RenameOutcome, SystemError> {
     move_to_impl(inode, old_name, target, new_name, flags, None)
 }
 
@@ -22,7 +22,7 @@ pub(super) fn move_to_with_context(
     new_name: &str,
     flags: RenameFlags,
     context: &DentryMutationContext<'_>,
-) -> Result<(), SystemError> {
+) -> Result<vfs::RenameOutcome, SystemError> {
     move_to_impl(inode, old_name, target, new_name, flags, Some(context))
 }
 
@@ -33,7 +33,7 @@ fn move_to_impl(
     new_name: &str,
     flags: RenameFlags,
     context: Option<&DentryMutationContext<'_>>,
-) -> Result<(), SystemError> {
+) -> Result<vfs::RenameOutcome, SystemError> {
     if flags.contains(RenameFlags::WHITEOUT) {
         return Err(SystemError::EINVAL);
     }
@@ -100,7 +100,7 @@ fn move_to_locked(
     flags: RenameFlags,
     dir_states: (&DirState, &DirState),
     context: Option<&DentryMutationContext<'_>>,
-) -> Result<(), SystemError> {
+) -> Result<vfs::RenameOutcome, SystemError> {
     let (source_state, target_state) = dir_states;
     let source = inode.lookup_overlay_child_locked(old_name, source_state)?;
     let target_had_whiteout = target_ovl.has_whiteout(new_name);
@@ -115,7 +115,7 @@ fn move_to_locked(
     }
 
     if inode.redirect == target_ovl.redirect && old_name == new_name {
-        return Ok(());
+        return Ok(vfs::RenameOutcome::NoOp);
     }
 
     if flags.contains(RenameFlags::EXCHANGE) {
@@ -128,16 +128,48 @@ fn move_to_locked(
 
         copy_up_backing(&source, context)?;
         copy_up_backing(&target_child, context)?;
+        source.publish_existing_upper_link_alias()?;
+        target_child.publish_existing_upper_link_alias()?;
         let old_upper_dir = writable_upper_backing(inode, context)?;
         let new_upper_dir = writable_upper_backing(target_ovl, context)?;
-        return move_backing(
+        let backing = move_backing(
             &old_upper_dir,
             old_name,
             &new_upper_dir,
             new_name,
             flags,
             context,
-        );
+        )?;
+        return match backing {
+            vfs::RenameOutcome::NoOp => Ok(vfs::RenameOutcome::NoOp),
+            vfs::RenameOutcome::Exchange => Ok(vfs::RenameOutcome::Exchange),
+            _ => Err(SystemError::EIO),
+        };
+    }
+
+    // Serialize the logical victim link fact across the backing transaction.
+    // Different hardlink aliases may live under different parent DirState
+    // locks, while all of them share this object lock.
+    let target_link_state = target_child
+        .as_ref()
+        .filter(|child| !child.is_dir())
+        .map(|child| child.logical_link_state())
+        .transpose()?
+        .flatten();
+    if target_child
+        .as_ref()
+        .is_some_and(|child| !child.is_dir() && child.has_lower_link_origin())
+        && target_link_state.is_none()
+    {
+        return Err(SystemError::EIO);
+    }
+    let mut target_link_mutation = target_child
+        .as_ref()
+        .zip(target_link_state.as_ref())
+        .map(|(child, state)| child.begin_link_mutation(state))
+        .transpose()?;
+    if target_link_mutation.as_deref() == Some(&0) {
+        return Err(SystemError::EIO);
     }
 
     let source_needs_whiteout = inode.lower_positive(old_name);
@@ -174,6 +206,7 @@ fn move_to_locked(
 
     if !source.is_pure_upper() {
         copy_up_backing(&source, context)?;
+        source.publish_existing_upper_link_alias()?;
     }
 
     let old_upper_dir = writable_upper_backing(inode, context)?;
@@ -182,17 +215,7 @@ fn move_to_locked(
     if target_had_whiteout {
         upper_flags.remove(RenameFlags::NOREPLACE);
         if source_needs_whiteout {
-            return move_backing(
-                &old_upper_dir,
-                old_name,
-                &new_upper_dir,
-                new_name,
-                RenameFlags::EXCHANGE,
-                context,
-            );
-        }
-        if source.is_dir() {
-            move_backing(
+            let backing = move_backing(
                 &old_upper_dir,
                 old_name,
                 &new_upper_dir,
@@ -200,21 +223,86 @@ fn move_to_locked(
                 RenameFlags::EXCHANGE,
                 context,
             )?;
+            if backing == vfs::RenameOutcome::NoOp {
+                return Ok(vfs::RenameOutcome::NoOp);
+            }
+            if backing != vfs::RenameOutcome::Exchange {
+                return Err(SystemError::EIO);
+            }
+            return Ok(vfs::RenameOutcome::Moved { replaced: None });
+        }
+        if source.is_dir() {
+            let backing = move_backing(
+                &old_upper_dir,
+                old_name,
+                &new_upper_dir,
+                new_name,
+                RenameFlags::EXCHANGE,
+                context,
+            )?;
+            if backing == vfs::RenameOutcome::NoOp {
+                return Ok(vfs::RenameOutcome::NoOp);
+            }
+            if backing != vfs::RenameOutcome::Exchange {
+                return Err(SystemError::EIO);
+            }
             let _ = OvlInode::cleanup_workdir_temp_with_context(&old_upper_dir, old_name, context);
-            return Ok(());
+            let replaced =
+                commit_logical_remove(target_child.as_ref(), &mut target_link_mutation, backing)?;
+            return Ok(vfs::RenameOutcome::Moved { replaced });
         }
     }
     if source_needs_whiteout {
         upper_flags.insert(RenameFlags::WHITEOUT);
     }
-    move_backing(
+    let backing = move_backing(
         &old_upper_dir,
         old_name,
         &new_upper_dir,
         new_name,
         upper_flags,
         context,
-    )
+    )?;
+    if backing == vfs::RenameOutcome::NoOp {
+        return Ok(vfs::RenameOutcome::NoOp);
+    }
+    if !matches!(backing, vfs::RenameOutcome::Moved { .. }) {
+        return Err(SystemError::EIO);
+    }
+    let replaced =
+        commit_logical_remove(target_child.as_ref(), &mut target_link_mutation, backing)?;
+    Ok(vfs::RenameOutcome::Moved { replaced })
+}
+
+fn commit_logical_remove(
+    inode: Option<&Arc<OvlInode>>,
+    mutation: &mut Option<OvlLinkMutation<'_>>,
+    backing: vfs::RenameOutcome,
+) -> Result<Option<vfs::LinkRemovalOutcome>, SystemError> {
+    let Some(inode) = inode else {
+        return match backing {
+            vfs::RenameOutcome::Moved { replaced } => Ok(replaced),
+            _ => Err(SystemError::EIO),
+        };
+    };
+    if inode.is_dir() {
+        return Ok(Some(vfs::LinkRemovalOutcome::LastLink));
+    }
+    if let Some(mut mutation) = mutation.take() {
+        *mutation -= 1;
+        let outcome = if *mutation == 0 {
+            vfs::LinkRemovalOutcome::LastLink
+        } else {
+            vfs::LinkRemovalOutcome::StillLinked
+        };
+        mutation.commit();
+        Ok(Some(outcome))
+    } else {
+        match backing {
+            vfs::RenameOutcome::Moved { replaced } => Ok(replaced),
+            _ => Err(SystemError::EIO),
+        }
+    }
 }
 
 fn move_backing(
@@ -224,7 +312,7 @@ fn move_backing(
     new_name: &str,
     flags: RenameFlags,
     context: Option<&DentryMutationContext<'_>>,
-) -> Result<(), SystemError> {
+) -> Result<vfs::RenameOutcome, SystemError> {
     match context {
         Some(context) => source.move_to_with_context(old_name, target, new_name, flags, context),
         None => source.move_to(old_name, target, new_name, flags),

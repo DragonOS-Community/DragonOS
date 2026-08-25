@@ -283,6 +283,10 @@ fn handle_siocgifconf(data: usize) -> Result<usize, SystemError> {
 }
 
 impl<T: Socket + 'static> IndexNode for T {
+    fn fsnotify_watch_count(&self) -> Option<&core::sync::atomic::AtomicUsize> {
+        Some(Socket::fsnotify_watch_counter(self))
+    }
+
     fn open(
         &self,
         data: MutexGuard<FilePrivateData>,

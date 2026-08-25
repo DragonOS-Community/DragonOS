@@ -1,20 +1,22 @@
+use crate::filesystem::fsnotify::{self, FsEvent};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
     file::{File, FileFlags, PreopenedFile},
-    mount::MountFlags,
+    mount::{MountFSInode, MountFlags},
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{
         should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, OwnedLookupOutcome,
         ResolvedPath,
     },
-    vcore::{check_parent_dir_permission_inode, vfs_truncate},
+    vcore::{check_parent_dir_permission_inode, prepare_open_truncate, vfs_open_truncate},
     FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+use crate::libs::casting::DowncastArc;
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
     process::cred::CAPFlags,
@@ -133,6 +135,8 @@ pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, Sy
     metadata.mode = chmod_preserve_type(metadata.mode, mode);
     metadata.ctime = PosixTimeSpec::now();
     inode.set_metadata_masked(&metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME)?;
+    // fsnotify: attribute change → IN_ATTRIB.
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(0)
 }
 
@@ -144,34 +148,28 @@ pub fn do_fchownat(
     flag: AtFlags,
 ) -> Result<usize, SystemError> {
     // 检查flag是否合法
-    if flag.contains(!(AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH)) {
+    let allowed_flags = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+    if flag.intersects(!allowed_flags) {
         return Err(SystemError::EINVAL);
     }
 
-    let follow_symlink = flag.contains(!AtFlags::AT_SYMLINK_NOFOLLOW);
+    let follow_symlink = !flag.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-    // 如果找不到文件，则返回错误码ENOENT
     let inode = if follow_symlink {
-        inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+        inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
     } else {
-        inode.lookup(path.as_str())
-    };
-
-    if inode.is_err() {
-        let errno = inode.clone().unwrap_err();
-        // 文件不存在
-        if errno == SystemError::ENOENT {
-            return Err(SystemError::ENOENT);
-        }
-    }
-
-    let inode = inode.unwrap();
+        inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+    }?;
 
     return chown_common(inode, uid, gid);
 }
 
 fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
+    // The syscall ABI declares these arguments as 32-bit uid_t/gid_t. Truncate
+    // register-width inputs before interpreting (uid_t)-1 as "no change".
+    let uid = uid as u32 as usize;
+    let gid = gid as u32 as usize;
     let mut meta = inode.metadata()?;
     let cred = ProcessManager::current_pcb().cred();
     let current_uid = cred.uid.data();
@@ -181,11 +179,10 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
         group_info = info.clone();
     }
 
-    // Linux 语义：uid/gid 传入 -1 表示“不更改”。在 syscall 入口处参数被提升为 usize，
-    // 因此这里以 usize::MAX 代表 (uid_t/gid_t)-1。
-    let change_uid = uid != usize::MAX;
-    let change_gid = gid != usize::MAX;
-    let old_uid = meta.uid;
+    // Linux semantics: uid/gid passed in as (uid_t)-1/(gid_t)-1 mean "do not change".
+    let is_no_change = |id: usize| id == u32::MAX as usize;
+    let change_uid = !is_no_change(uid);
+    let change_gid = !is_no_change(gid);
     let old_gid = meta.gid;
     let old_mode = meta.mode;
 
@@ -218,8 +215,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     // - chown 普通文件：总是清除 suid；sgid 按 Linux setattr_should_drop_sgid 规则清理
     //   - 若 S_IXGRP 置位：无条件清除 sgid
     //   - 否则（mandatory locking 语义）：仅当调用者不在文件所属组且无 CAP_FSETID 时清除
-    let ownership_changed = meta.uid != old_uid || meta.gid != old_gid;
-    if ownership_changed && meta.file_type != FileType::Dir {
+    if meta.file_type != FileType::Dir {
         // suid always must be killed on chown for non-directories
         meta.mode.remove(InodeMode::S_ISUID);
 
@@ -237,11 +233,14 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     if meta.mode != old_mode {
         mask.insert(SetMetadataMask::MODE);
     }
-    if !mask.is_empty() {
-        meta.ctime = PosixTimeSpec::now();
-        mask.insert(SetMetadataMask::CTIME);
-    }
+    // Linux chown always updates ctime, even for chown(-1, -1). A ctime-only
+    // update is not, however, exposed as IN_ATTRIB.
+    meta.ctime = PosixTimeSpec::now();
+    mask.insert(SetMetadataMask::CTIME);
     inode.set_metadata_masked(&meta, mask)?;
+    if mask.intersects(SetMetadataMask::UID | SetMetadataMask::GID | SetMetadataMask::MODE) {
+        fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
+    }
 
     return Ok(0);
 }
@@ -281,204 +280,258 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     if how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_DIRECTORY) {
         return Err(SystemError::EINVAL);
     }
-    let path = path.trim();
-    // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
-    let follow_symlink = !(how.o_flags.contains(FileFlags::O_NOFOLLOW)
-        || how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_EXCL));
-    // 检查空字符串路径
-    if path.is_empty() {
-        return Err(SystemError::ENOENT);
-    }
+    // Match Linux's get_unused_fd_flags() ordering: reserve the descriptor
+    // before pathname lookup and before create/truncate/open side effects.
+    let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
+    let fd_table = ProcessManager::current_pcb().fd_table();
+    let reservation = fd_table.write().reserve_fd(cloexec)?;
+    let open_result = (|| -> Result<File, SystemError> {
+        let path = path.trim();
+        // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
+        let follow_symlink = !(how.o_flags.contains(FileFlags::O_NOFOLLOW)
+            || how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_EXCL));
+        // Check for an empty path
+        if path.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
 
-    // 检查路径末尾斜杠 - 如果以斜杠结尾，目标必须是目录
-    let path_ends_with_slash = path.ends_with('/');
+        // Check for a trailing slash on the path: if it ends with a slash, the target must be a directory
+        let path_ends_with_slash = path.ends_with('/');
 
-    let (start_path, path) = user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
-    let inode_begin = start_path.inode();
-    let resolved = inode_begin.lookup_follow_symlink_or_missing_owned(
-        &start_path,
-        &path,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        follow_symlink,
-    );
-    let mut created = false;
-    let mut preopened: Option<PreopenedFile> = None;
-    let resolved = match resolved {
-        Ok(OwnedLookupOutcome::Found(resolved)) => resolved,
-        Ok(OwnedLookupOutcome::MissingFinal {
-            parent: parent_resolved,
-            name: filename,
-            must_be_dir,
-        }) => {
-            // 文件不存在，且需要创建
-            if how.o_flags.contains(FileFlags::O_CREAT)
-                && !how.o_flags.contains(FileFlags::O_DIRECTORY)
-            {
-                // A trailing slash may come from the expanded symlink target,
-                // not only from the original userspace pathname.
-                if must_be_dir {
-                    return Err(SystemError::EISDIR);
-                }
+        let (start_path, path) =
+            user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+        let inode_begin = start_path.inode();
+        let resolved = inode_begin.lookup_follow_symlink_or_missing_owned(
+            &start_path,
+            &path,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            follow_symlink,
+        );
+        let mut created = false;
+        let mut preopened: Option<PreopenedFile> = None;
+        let resolved = match resolved {
+            Ok(OwnedLookupOutcome::Found(resolved)) => resolved,
+            Ok(OwnedLookupOutcome::MissingFinal {
+                parent: parent_resolved,
+                name: filename,
+                must_be_dir,
+            }) => {
+                // The file does not exist and must be created
+                if how.o_flags.contains(FileFlags::O_CREAT)
+                    && !how.o_flags.contains(FileFlags::O_DIRECTORY)
+                {
+                    // A trailing slash may come from the expanded symlink target,
+                    // not only from the original userspace pathname.
+                    if must_be_dir {
+                        return Err(SystemError::EISDIR);
+                    }
 
-                // 检查文件名长度
-                if filename.len() > crate::filesystem::vfs::NAME_MAX {
-                    return Err(SystemError::ENAMETOOLONG);
-                }
-                let parent_inode = parent_resolved.inode();
-                let parent_md = parent_inode.metadata()?;
-                // 父节点必须是目录
-                if parent_md.file_type != FileType::Dir {
-                    return Err(SystemError::ENOTDIR);
-                }
-                // Linux 语义：创建文件需要对父目录拥有 W+X（写+搜索）权限
-                check_parent_dir_permission_inode(&parent_inode, &parent_md)?;
+                    // Check the filename length
+                    if filename.len() > crate::filesystem::vfs::NAME_MAX {
+                        return Err(SystemError::ENAMETOOLONG);
+                    }
+                    let parent_inode = parent_resolved.inode();
+                    let parent_md = parent_inode.metadata()?;
+                    // The parent must be a directory
+                    if parent_md.file_type != FileType::Dir {
+                        return Err(SystemError::ENOTDIR);
+                    }
+                    // Linux semantics: creating a file requires write+search (W+X) permission on the parent directory
+                    check_parent_dir_permission_inode(&parent_inode, &parent_md)?;
 
-                // 计算创建 mode：应用 umask，遵循 open/creat 语义
-                let pcb = ProcessManager::current_pcb();
-                let umask = pcb.fs_struct().umask();
-                let create_mode = apply_umask_for_create(how.mode, umask);
-                // Let filesystems with an atomic create/open operation carry
-                // the returned handle directly into the new File.  ENOSYS
-                // preserves the generic create-then-open fallback.
-                let mut create_flags = how.o_flags;
-                if create_flags.contains(FileFlags::O_EXCL) {
-                    create_flags.remove(FileFlags::O_TRUNC);
-                }
-                let inode: Arc<dyn IndexNode> =
-                    match parent_inode.create_and_open(&filename, create_mode, &create_flags) {
-                        Ok(opened) => {
-                            let inode = opened.inode();
-                            preopened = Some(opened);
-                            inode
-                        }
-                        Err(SystemError::ENOSYS) => {
-                            parent_inode.create(&filename, FileType::File, create_mode)?
-                        }
-                        Err(err) => return Err(err),
+                    // Compute the creation mode: apply umask, following open/creat semantics
+                    let pcb = ProcessManager::current_pcb();
+                    let umask = pcb.fs_struct().umask();
+                    let create_mode = apply_umask_for_create(how.mode, umask);
+                    // Let filesystems with an atomic create/open operation carry
+                    // the returned handle directly into the new File.  ENOSYS
+                    // preserves the generic create-then-open fallback.
+                    let mut create_flags = how.o_flags;
+                    if create_flags.contains(FileFlags::O_EXCL) {
+                        create_flags.remove(FileFlags::O_TRUNC);
+                    }
+                    let notify = || {
+                        fsnotify::fsnotify(
+                            FsEvent::CREATE,
+                            Some((&parent_inode, &filename)),
+                            None,
+                            0,
+                        );
                     };
-                created = true;
-                let created_path = ResolvedPath::new(inode)?;
-                drop(parent_resolved);
-                created_path
-            } else {
-                return Err(SystemError::ENOENT);
+                    let inode: Arc<dyn IndexNode> = if let Some(mounted) =
+                        parent_inode.clone().downcast_arc::<MountFSInode>()
+                    {
+                        let (inode, opened) = mounted.create_file_with_post_commit(
+                            &filename,
+                            create_mode,
+                            &create_flags,
+                            notify,
+                        )?;
+                        preopened = opened;
+                        inode
+                    } else {
+                        let inode = match parent_inode.create_and_open(
+                            &filename,
+                            create_mode,
+                            &create_flags,
+                        ) {
+                            Ok(opened) => {
+                                let inode = opened.inode();
+                                preopened = Some(opened);
+                                inode
+                            }
+                            Err(SystemError::ENOSYS) => {
+                                parent_inode.create(&filename, FileType::File, create_mode)?
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        fsnotify::fsnotify(
+                            FsEvent::CREATE,
+                            Some((&parent_inode, &filename)),
+                            Some(&inode),
+                            0,
+                        );
+                        inode
+                    };
+                    created = true;
+                    let created_path = ResolvedPath::new(inode)?;
+                    drop(parent_resolved);
+                    created_path
+                } else {
+                    return Err(SystemError::ENOENT);
+                }
+            }
+            Err(errno) => return Err(errno),
+        };
+        drop(start_path);
+        let inode = resolved.inode();
+        let metadata = inode.metadata()?;
+        let file_type: FileType = metadata.file_type;
+
+        if !how.o_flags.contains(FileFlags::O_PATH)
+            && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)
+            && inode.mount_flags().contains(MountFlags::NODEV)
+        {
+            return Err(SystemError::EACCES);
+        }
+
+        // If the path ends with a slash but the target is not a directory, return ENOTDIR
+        if path_ends_with_slash && file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        // The file already exists and O_CREAT|O_EXCL was specified
+        if how.o_flags.contains(FileFlags::O_CREAT)
+            && how.o_flags.contains(FileFlags::O_EXCL)
+            && !created
+        {
+            return Err(SystemError::EEXIST);
+        }
+        if how.o_flags.contains(FileFlags::O_NOFOLLOW)
+            && !how.o_flags.contains(FileFlags::O_PATH)
+            && file_type == FileType::SymLink
+        {
+            return Err(SystemError::ELOOP);
+        }
+        // Using O_CREAT on an existing directory is treated as an error
+        if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+        // Directory checks
+        if file_type == FileType::Dir {
+            // O_TRUNC is not supported on directories
+            if how.o_flags.contains(FileFlags::O_TRUNC) {
+                return Err(SystemError::EISDIR);
+            }
+            // Write access is not allowed on directories
+            let acc_mode = how.o_flags.access_flags();
+            if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
+                return Err(SystemError::EISDIR);
             }
         }
-        Err(errno) => return Err(errno),
+        // Non-O_PATH opens must check access permission (read/write/truncate)
+        // Linux semantics: if this open() triggered creation, it must not reject this
+        // open()'s access mode because of the "new inode's mode"; it takes effect on a subsequent reopen().
+        if !how.o_flags.contains(FileFlags::O_PATH) && !created {
+            let acc_mode = how.o_flags.access_flags();
+            let mut need = PermissionMask::empty();
+            match acc_mode {
+                FileFlags::O_RDONLY => need.insert(PermissionMask::MAY_READ),
+                FileFlags::O_WRONLY => need.insert(PermissionMask::MAY_WRITE),
+                FileFlags::O_RDWR => {
+                    need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE)
+                }
+                _ => {}
+            }
+            if how.o_flags.contains(FileFlags::O_TRUNC) {
+                need.insert(PermissionMask::MAY_WRITE);
+            }
+            if !need.is_empty() {
+                super::permission::check_inode_permission(&inode, &metadata, need)?;
+            }
+        }
+
+        // If a directory was to be opened but the target is not a directory
+        if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // Linux resolves path/file-type and ordinary DAC errors before applying
+        // O_NOATIME's owner/CAP_FOWNER restriction. In particular, O_NOFOLLOW on
+        // a final symlink must report ELOOP rather than an ownership-based EPERM.
+        if how.o_flags.contains(FileFlags::O_NOATIME) {
+            super::permission::check_noatime_permission(&metadata)?;
+        }
+
+        // Linux rejects unsupported direct I/O from do_dentry_open(), after
+        // may_open() has enforced O_NOATIME ownership.
+        if file_type == FileType::Dir && how.o_flags.contains(FileFlags::O_DIRECT) {
+            return Err(SystemError::EINVAL);
+        }
+
+        // Linux reaches the socket file operation only after DAC and O_NOATIME
+        // checks; sock_no_open() then rejects pathname-based opens with ENXIO.
+        if file_type == FileType::Socket {
+            return Err(SystemError::ENXIO);
+        }
+
+        // Existing regular files opened with O_TRUNC are modified after the
+        // filesystem open succeeds. Newly created files are already empty and
+        // Linux clears O_TRUNC for this phase.
+        let do_truncate =
+            !created && file_type == FileType::File && how.o_flags.contains(FileFlags::O_TRUNC);
+        let truncate_metadata = do_truncate.then(|| metadata.clone());
+        let (inode, mount_guard, operation_guard) = resolved.into_parts();
+        let file: File = match preopened {
+            Some(opened) => File::new_preopened_with_mount_guard(
+                opened,
+                how.o_flags,
+                mount_guard,
+                operation_guard,
+            )?,
+            None => File::new_with_mount_guard(inode, how.o_flags, mount_guard, operation_guard)?,
+        };
+
+        // Linux emits OPEN from do_dentry_open() before handle_truncate().
+        file.notify_open_event();
+        if let Some(metadata_before_open) = truncate_metadata {
+            let context = prepare_open_truncate(metadata_before_open);
+            vfs_open_truncate(&file, &context)?;
+        }
+        Ok(file)
+    })();
+
+    let file = match open_result {
+        Ok(file) => file,
+        Err(error) => {
+            fd_table.write().release_reserved_fd(reservation);
+            return Err(error);
+        }
     };
-    drop(start_path);
-    let inode = resolved.inode();
-    let metadata = inode.metadata()?;
-    let file_type: FileType = metadata.file_type;
-
-    if !how.o_flags.contains(FileFlags::O_PATH)
-        && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)
-        && inode.mount_flags().contains(MountFlags::NODEV)
-    {
-        return Err(SystemError::EACCES);
-    }
-
-    // 如果路径以斜杠结尾，而目标不是目录，返回 ENOTDIR
-    if path_ends_with_slash && file_type != FileType::Dir {
-        return Err(SystemError::ENOTDIR);
-    }
-    // 已存在的文件且指定了 O_CREAT|O_EXCL
-    if how.o_flags.contains(FileFlags::O_CREAT)
-        && how.o_flags.contains(FileFlags::O_EXCL)
-        && !created
-    {
-        return Err(SystemError::EEXIST);
-    }
-    if how.o_flags.contains(FileFlags::O_NOFOLLOW)
-        && !how.o_flags.contains(FileFlags::O_PATH)
-        && file_type == FileType::SymLink
-    {
-        return Err(SystemError::ELOOP);
-    }
-    // 对已存在的目录使用 O_CREAT 视为错误
-    if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
-        return Err(SystemError::EISDIR);
-    }
-    // 目录相关检查
-    if file_type == FileType::Dir {
-        // 目录上不支持 O_TRUNC
-        if how.o_flags.contains(FileFlags::O_TRUNC) {
-            return Err(SystemError::EISDIR);
-        }
-        // 目录上不允许写访问
-        let acc_mode = how.o_flags.access_flags();
-        if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
-            return Err(SystemError::EISDIR);
-        }
-    }
-    // 非 O_PATH 需要检查访问权限（read/write/truncate）
-    // Linux 语义：若本次 open() 触发了创建，则不应因“新 inode 的 mode”而拒绝
-    // 当前这次 open() 的访问模式；权限在“后续 reopen()”时生效。
-    if !how.o_flags.contains(FileFlags::O_PATH) && !created {
-        let acc_mode = how.o_flags.access_flags();
-        let mut need = PermissionMask::empty();
-        match acc_mode {
-            FileFlags::O_RDONLY => need.insert(PermissionMask::MAY_READ),
-            FileFlags::O_WRONLY => need.insert(PermissionMask::MAY_WRITE),
-            FileFlags::O_RDWR => need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE),
-            _ => {}
-        }
-        if how.o_flags.contains(FileFlags::O_TRUNC) {
-            need.insert(PermissionMask::MAY_WRITE);
-        }
-        if !need.is_empty() {
-            super::permission::check_inode_permission(&inode, &metadata, need)?;
-        }
-    }
-
-    // 如果要打开的是文件夹，而目标不是文件夹
-    if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
-        return Err(SystemError::ENOTDIR);
-    }
-
-    // Linux resolves path/file-type and ordinary DAC errors before applying
-    // O_NOATIME's owner/CAP_FOWNER restriction. In particular, O_NOFOLLOW on
-    // a final symlink must report ELOOP rather than an ownership-based EPERM.
-    if how.o_flags.contains(FileFlags::O_NOATIME) {
-        super::permission::check_noatime_permission(&metadata)?;
-    }
-
-    // Linux rejects unsupported direct I/O from do_dentry_open(), after
-    // may_open() has enforced O_NOATIME ownership.
-    if file_type == FileType::Dir && how.o_flags.contains(FileFlags::O_DIRECT) {
-        return Err(SystemError::EINVAL);
-    }
-
-    // Linux reaches the socket file operation only after DAC and O_NOATIME
-    // checks; sock_no_open() then rejects pathname-based opens with ENXIO.
-    if file_type == FileType::Socket {
-        return Err(SystemError::ENXIO);
-    }
-
-    // 如果O_TRUNC，并且是普通文件，清空文件
-    // 注意：必须在创建 File 对象之前截断
-    // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
-    // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
-    if file_type == FileType::File && inode.truncate_before_open(&how.o_flags) {
-        vfs_truncate(inode.clone(), 0)?;
-    }
-    let (inode, mount_guard, operation_guard) = resolved.into_parts();
-    let file: File = match preopened {
-        Some(opened) => {
-            File::new_preopened_with_mount_guard(opened, how.o_flags, mount_guard, operation_guard)?
-        }
-        None => File::new_with_mount_guard(inode, how.o_flags, mount_guard, operation_guard)?,
-    };
-    let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
-
-    // 把文件对象存入pcb
-    let r = ProcessManager::current_pcb()
-        .fd_table()
+    let result = fd_table
         .write()
-        .alloc_fd(file, None, cloexec)
+        .install_reserved_fd(reservation, file)
         .map(|fd| fd as usize);
-
-    return r;
+    result
 }
 
 /// 为exec打开可执行文件
@@ -545,10 +598,10 @@ pub fn do_open_execat_with_flags(
     }
 
     super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_EXEC)?;
-    super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_READ)?;
 
     // 创建File对象，使用O_RDONLY | O_CLOEXEC
     let file = File::new(inode, FileFlags::O_RDONLY | FileFlags::O_CLOEXEC)?;
+    file.notify_open_event();
 
     Ok(Arc::new(file))
 }
@@ -661,6 +714,8 @@ pub fn do_utimensat(
                 | SetMetadataMask::TIMES_BY_WRITE,
         )?;
     }
+    // fsnotify: timestamp change → IN_ATTRIB.
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
 }
 
@@ -696,6 +751,8 @@ pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, 
                 | SetMetadataMask::TIMES_BY_WRITE,
         )?;
     }
+    // fsnotify: a successful utimes(2) timestamp update → IN_ATTRIB.
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
 }
 

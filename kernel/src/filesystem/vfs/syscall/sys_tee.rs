@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_TEE;
+use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::{file::File, syscall::SpliceFlags, FileType};
 use crate::ipc::pipe::LockedPipeInode;
@@ -86,6 +87,10 @@ impl Syscall for SysTeeHandle {
             .ok_or(SystemError::EBADF)?;
 
         let copied = in_pipe.tee_to(&out_pipe, len, splice_flags)?;
+        if copied > 0 {
+            file_in.notify_io_event(FsEvent::ACCESS);
+            file_out.notify_io_event(FsEvent::MODIFY);
+        }
         Ok(copied)
     }
 

@@ -38,6 +38,9 @@ pub struct SocketMmapLayout {
 /// ## Reference
 /// - [Posix standard](https://pubs.opengion.org/onlinepubs/9699919799/)
 pub trait Socket: PollableInode + IndexNode {
+    /// Number of fsnotify marks attached to this anonymous socket inode.
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize;
+
     /// Open-file refcount for this socket.
     ///
     /// Each `File` that references this socket (including those received via SCM_RIGHTS)

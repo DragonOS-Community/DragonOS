@@ -2,13 +2,16 @@ use super::{
     file::{File, FileFlags, PreopenedFile},
     utils::DName,
     DelegatedWriteResult, DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode,
-    InodeId, InodeMode, InodeRetentionKind, PollableInode, SetMetadataMask, SuperBlock,
-    VmaOpenRollback, WriteSyncIntent, XattrFlags,
+    InodeId, InodeMode, InodeRetentionKind, LinkRemovalOutcome, PollableInode, RenameOutcome,
+    SetMetadataMask, SuperBlock, VmaOpenRollback, WriteSyncIntent, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
     exception::workqueue::{schedule_work, Work},
     filesystem::{
+        fsnotify::{
+            self, FsNotifyObjectId, FsNotifyObjectState, FsNotifyTarget, MountedFsNotifyPresence,
+        },
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
@@ -62,6 +65,7 @@ use system_error::SystemError;
 /// mount's propagation state -> propagation group allocator.
 /// A lower layer must never acquire the lifecycle/topology layers in reverse.
 pub(crate) static MOUNT_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_SUPERBLOCK_FSNOTIFY_ID: AtomicUsize = AtomicUsize::new(1);
 
 lazy_static! {
     /// Serializes pathname rendering against alias rename/disconnect. Mount
@@ -202,6 +206,29 @@ pub struct DentryMutationContext<'a> {
     guard: RefCell<Option<RwSemWriteGuard<'a, ()>>>,
 }
 
+type RenamePreCommit<'a> =
+    dyn FnMut(&Arc<dyn IndexNode>, Option<&Arc<dyn IndexNode>>) -> Result<(), SystemError> + 'a;
+type RenamePostCommit<'a> = dyn FnMut(&FsNotifyTarget, Option<&FsNotifyTarget>) + 'a;
+
+#[derive(Default)]
+struct RenameCommitHooks<'a> {
+    pre_commit: Option<&'a mut RenamePreCommit<'a>>,
+    post_commit: Option<&'a mut RenamePostCommit<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct RenameNotifyTargetSeed {
+    id: FsNotifyObjectId,
+    is_dir: bool,
+}
+
+struct RegisteredDentryLookup {
+    dentry: Option<Arc<VfsDentry>>,
+    inode: InodeId,
+    generation: u64,
+    file_type: FileType,
+}
+
 impl DentryMutationContext<'static> {
     fn new() -> Self {
         Self {
@@ -218,6 +245,10 @@ impl DentryMutationContext<'_> {
         if guard.is_none() {
             *guard = Some(DENTRY_TOPOLOGY_LOCK.write());
         }
+    }
+
+    fn release_locked(&self) {
+        self.guard.borrow_mut().take();
     }
 }
 
@@ -663,6 +694,16 @@ unsafe impl Sync for MountExternalGuard {}
 
 #[derive(Debug)]
 pub struct SuperBlockState {
+    /// Monotonic identity used by fsnotify; unlike an Arc address it cannot be
+    /// confused after allocator address reuse.
+    fsnotify_id: usize,
+    fsnotify_object_locks: Mutex<FsNotifyObjectLocks>,
+    fsnotify_object_epoch: AtomicUsize,
+    fsnotify_presence: Arc<MountedFsNotifyPresence>,
+    /// Fixed, allocation-free mutation epochs. They are used only by the cold
+    /// first-watch path to validate a metadata snapshot without holding an
+    /// fsnotify lock across filesystem/FUSE I/O.
+    fsnotify_link_epochs: [AtomicUsize; 64],
     /// User namespace that owns this superblock, matching Linux `s_user_ns`.
     /// Bind mounts and mount-namespace copies retain the same owner.
     owner_user_ns: Arc<UserNamespace>,
@@ -678,6 +719,8 @@ pub struct SuperBlockState {
     lifecycle: Mutex<SuperBlockLifecycle>,
     shutdown_wait: WaitQueue,
 }
+
+type FsNotifyObjectLocks = HashMap<(InodeId, u64), Weak<FsNotifyObjectState>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuperBlockLifecycleState {
@@ -723,6 +766,8 @@ pub struct VfsDentry {
     /// follow later FUSE invalidations, otherwise the original key could no
     /// longer be removed deterministically.
     registry_generation: u64,
+    fsnotify_superblock: usize,
+    file_type: FileType,
     /// Serializes exact-edge attach/detach against rename/unlink/rmdir of this
     /// alias without holding a global mount lock across filesystem I/O.
     mount_gate: Mutex<()>,
@@ -735,6 +780,9 @@ pub struct VfsDentry {
     automount_gate: Mutex<()>,
     /// True for a magic-link target that has identity but no directory edge.
     anonymous: bool,
+    /// Validated epoch at which neither this object nor its current parent had
+    /// a watch. Zero means unvalidated; MAX disables caching after saturation.
+    negative_fsnotify_interest_epoch: AtomicUsize,
     state: Mutex<VfsDentryState>,
 }
 
@@ -743,6 +791,10 @@ struct VfsDentryState {
     name: Option<DName>,
     parent: Option<Arc<VfsDentry>>,
     disconnected: bool,
+    fsnotify_object_state: Option<Arc<FsNotifyObjectState>>,
+    /// Last object-registry publication epoch checked by the event fast path.
+    /// A matching epoch makes an empty slot a valid negative cache entry.
+    fsnotify_checked_epoch: usize,
 }
 
 impl VfsDentry {
@@ -752,6 +804,11 @@ impl VfsDentry {
 
     fn is_disconnected(&self) -> bool {
         self.state.lock().disconnected
+    }
+
+    fn invalidate_fsnotify_interest_cache(&self) {
+        self.negative_fsnotify_interest_epoch
+            .store(0, Ordering::Release);
     }
 
     fn is_local_mountpoint(&self) -> bool {
@@ -777,7 +834,12 @@ impl VfsDentry {
     /// Magic-link targets use this to retain a mount projection for open and
     /// bind mount. Anonymous dentries deliberately never enter the ordinary
     /// dentry registry and therefore cannot participate in lookup or rename.
-    fn new_anonymous(inode: Arc<dyn IndexNode>, dname: DName) -> Result<Arc<Self>, SystemError> {
+    fn new_anonymous(
+        inode: Arc<dyn IndexNode>,
+        dname: DName,
+        fsnotify_superblock: usize,
+        fsnotify_object_state: Option<Arc<FsNotifyObjectState>>,
+    ) -> Result<Arc<Self>, SystemError> {
         let metadata = inode.metadata()?;
         let generation = inode.inode_generation();
         Ok(Arc::new(Self {
@@ -785,17 +847,47 @@ impl VfsDentry {
             inode,
             registry_child: metadata.inode_id,
             registry_generation: generation,
+            fsnotify_superblock,
+            file_type: metadata.file_type,
             mount_gate: Mutex::new(()),
             children_gate: Mutex::new(()),
             mount_edges: AtomicUsize::new(0),
             automount_gate: Mutex::new(()),
             anonymous: true,
+            negative_fsnotify_interest_epoch: AtomicUsize::new(0),
             state: Mutex::new(VfsDentryState {
                 name: Some(dname),
                 parent: None,
                 disconnected: false,
+                fsnotify_object_state,
+                fsnotify_checked_epoch: 0,
             }),
         }))
+    }
+}
+
+impl Drop for VfsDentry {
+    fn drop(&mut self) {
+        let object_state = {
+            let state = self.state.lock();
+            if !state.disconnected {
+                return;
+            }
+            state.fsnotify_object_state.clone()
+        };
+        let Some(object_state) = object_state else {
+            return;
+        };
+        let mut lifecycle = object_state.delete.lock();
+        fsnotify::notify_dentry_detach(
+            FsNotifyObjectId {
+                superblock: self.fsnotify_superblock,
+                inode: self.registry_child,
+                generation: self.registry_generation,
+            },
+            &object_state,
+            &mut lifecycle,
+        );
     }
 }
 
@@ -872,6 +964,11 @@ impl SuperBlockState {
     pub fn new(flags: MountFlags) -> Self {
         let flags = flags & MountFlags::SB_SETTABLE_MASK;
         Self {
+            fsnotify_id: NEXT_SUPERBLOCK_FSNOTIFY_ID.fetch_add(1, Ordering::Relaxed),
+            fsnotify_object_locks: Mutex::new(HashMap::new()),
+            fsnotify_object_epoch: AtomicUsize::new(0),
+            fsnotify_presence: Arc::new(MountedFsNotifyPresence::default()),
+            fsnotify_link_epochs: core::array::from_fn(|_| AtomicUsize::new(0)),
             owner_user_ns: ProcessManager::current_user_ns(),
             flags: RwSem::new(flags),
             synchronous: AtomicBool::new(flags.contains(MountFlags::SYNCHRONOUS)),
@@ -892,6 +989,214 @@ impl SuperBlockState {
 
     pub fn owner_user_ns(&self) -> &Arc<UserNamespace> {
         &self.owner_user_ns
+    }
+
+    #[inline]
+    fn fsnotify_link_epoch(&self, inode: InodeId, generation: u64) -> &AtomicUsize {
+        let mixed = inode.data() ^ (generation as usize).rotate_left(17);
+        &self.fsnotify_link_epochs[mixed % self.fsnotify_link_epochs.len()]
+    }
+
+    #[inline]
+    fn note_fsnotify_link_mutation(&self, inode: InodeId, generation: u64) -> usize {
+        self.fsnotify_link_epoch(inode, generation)
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn ensure_dentry_fsnotify_state(
+        &self,
+        dentry: &Arc<VfsDentry>,
+    ) -> Result<Arc<FsNotifyObjectState>, SystemError> {
+        {
+            let state = dentry.state.lock();
+            if let Some(object) = state.fsnotify_object_state.as_ref() {
+                return Ok(object.clone());
+            }
+        }
+        // A disconnected alias may predate the final removal of a different
+        // hard-link name. Prefer the canonical inode's mutation fact. Before
+        // the first mutation, validate the cold metadata sample against its
+        // revision without taking the coordinator across filesystem/FUSE I/O.
+        let coordinator = dentry.inode.link_mutation_coordinator();
+        let fallback_epoch =
+            self.fsnotify_link_epoch(dentry.registry_child, dentry.registry_generation);
+        let object = loop {
+            if let Some(existing) =
+                self.fsnotify_object_state(dentry.registry_child, dentry.registry_generation)
+            {
+                break existing;
+            }
+            let (sampled_epoch, known_zero_links) = coordinator
+                .map(|coordinator| coordinator.snapshot())
+                .unwrap_or_else(|| (fallback_epoch.load(Ordering::Acquire), None));
+            let disconnected = {
+                let state = dentry.state.lock();
+                state.disconnected
+            };
+            let delete_pending = if !disconnected {
+                false
+            } else if let Some(zero_links) = known_zero_links {
+                zero_links
+            } else {
+                dentry.inode.metadata()?.nlinks == 0
+            };
+            let current_epoch = coordinator
+                .map(|coordinator| coordinator.snapshot().0)
+                .unwrap_or_else(|| fallback_epoch.load(Ordering::Acquire));
+            if current_epoch != sampled_epoch {
+                continue;
+            }
+            // Allocate outside the shared registry lock. Publication happens
+            // only after the typed-mutation epoch is revalidated under that
+            // short lock; an in-flight mutation that commits later will find
+            // and update the newly published object in its post-commit pass.
+            let candidate = Arc::try_new(FsNotifyObjectState::new(
+                delete_pending,
+                sampled_epoch,
+                self.fsnotify_presence.clone(),
+                dentry.file_type == FileType::Dir,
+            ))
+            .map_err(|_| SystemError::ENOMEM)?;
+            let mut locks = self.fsnotify_object_locks.lock();
+            if let Some(existing) = locks
+                .get(&(dentry.registry_child, dentry.registry_generation))
+                .and_then(Weak::upgrade)
+            {
+                break existing;
+            }
+            let current_epoch = coordinator
+                .map(|coordinator| coordinator.snapshot().0)
+                .unwrap_or_else(|| fallback_epoch.load(Ordering::Acquire));
+            if current_epoch != sampled_epoch {
+                drop(locks);
+                continue;
+            }
+            locks.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            locks.insert(
+                (dentry.registry_child, dentry.registry_generation),
+                Arc::downgrade(&candidate),
+            );
+            if locks.len().is_multiple_of(256) {
+                locks.retain(|_, lock| lock.strong_count() != 0);
+            }
+            break candidate;
+        };
+        let mut state = dentry.state.lock();
+        if let Some(current) = state.fsnotify_object_state.as_ref() {
+            debug_assert!(Arc::ptr_eq(current, &object));
+            return Ok(current.clone());
+        }
+        state.fsnotify_object_state = Some(object.clone());
+        Ok(object)
+    }
+
+    fn fsnotify_object_state(
+        &self,
+        inode: InodeId,
+        generation: u64,
+    ) -> Option<Arc<FsNotifyObjectState>> {
+        self.fsnotify_object_locks
+            .lock()
+            .get(&(inode, generation))
+            .and_then(Weak::upgrade)
+    }
+
+    /// Final-unmount drain for mounted object-local mark snapshots. The
+    /// superblock is already under umount_write, so no new watch can publish.
+    /// Taking ownership keeps this path allocation-free and ensures no
+    /// registry lock is held while dispatch retires marks.
+    fn drain_fsnotify_objects_for_unmount(&self) {
+        let objects = {
+            let mut registry = self.fsnotify_object_locks.lock();
+            core::mem::take(&mut *registry)
+        };
+        for object in objects.into_values() {
+            if let Some(object) = object.upgrade() {
+                fsnotify::notify_unmount_object(&object);
+            }
+        }
+    }
+
+    /// Resolve an already-published fsnotify object state for an alias.
+    ///
+    /// Ordinary lookup deliberately does not create fsnotify state. An alias
+    /// that predates the first watch can therefore have an empty local slot
+    /// even though another hard-link alias has published the shared object
+    /// state. Event production uses this allocation-free slow path once to
+    /// inherit that state; subsequent events use the cached slot.
+    fn resolve_dentry_fsnotify_state(
+        &self,
+        dentry: &Arc<VfsDentry>,
+    ) -> Option<Arc<FsNotifyObjectState>> {
+        let published_epoch = self.fsnotify_object_epoch.load(Ordering::Acquire);
+        {
+            let state = dentry.state.lock();
+            if let Some(object) = state.fsnotify_object_state.as_ref() {
+                return Some(object.clone());
+            }
+            if state.fsnotify_checked_epoch == published_epoch {
+                return None;
+            }
+        }
+
+        let object = self.fsnotify_object_state(dentry.registry_child, dentry.registry_generation);
+        let mut state = dentry.state.lock();
+        if let Some(current) = state.fsnotify_object_state.as_ref() {
+            if let Some(object) = object.as_ref() {
+                debug_assert!(Arc::ptr_eq(current, object));
+            }
+            return Some(current.clone());
+        }
+        state.fsnotify_checked_epoch = published_epoch;
+        if let Some(object) = object {
+            state.fsnotify_object_state = Some(object.clone());
+            Some(object)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve lifecycle state for a namespace mutation without creating it.
+    /// Mutations use typed outcomes and must never fail merely because
+    /// fsnotify bookkeeping cannot allocate.
+    fn existing_dentry_fsnotify_state(
+        &self,
+        dentry: &Arc<VfsDentry>,
+    ) -> Option<Arc<FsNotifyObjectState>> {
+        self.resolve_dentry_fsnotify_state(dentry)
+    }
+
+    /// Capture the metadata already resolved by the locked rename lookup.
+    /// Notification bookkeeping must not issue another metadata request or
+    /// turn a successful filesystem mutation into an error.
+    fn rename_notify_target_seed(
+        &self,
+        inode: InodeId,
+        generation: u64,
+        file_type: FileType,
+    ) -> RenameNotifyTargetSeed {
+        RenameNotifyTargetSeed {
+            id: FsNotifyObjectId {
+                superblock: self.fsnotify_id,
+                inode,
+                generation,
+            },
+            is_dir: file_type == FileType::Dir,
+        }
+    }
+
+    fn resolve_rename_notify_target(&self, seed: RenameNotifyTargetSeed) -> FsNotifyTarget {
+        let object_state = self.fsnotify_object_state(seed.id.inode, seed.id.generation);
+        FsNotifyTarget {
+            id: seed.id,
+            is_dir: seed.is_dir,
+            disconnected: false,
+            watched: object_state
+                .as_ref()
+                .is_some_and(|object| object.has_watches()),
+            object_state,
+        }
     }
 
     fn activate_mount(&self, construction_reserved: bool) -> Result<(), SystemError> {
@@ -965,7 +1270,8 @@ impl SuperBlockState {
         inode: Arc<dyn IndexNode>,
         name: Option<DName>,
     ) -> Result<Arc<VfsDentry>, SystemError> {
-        let child = inode.metadata()?.inode_id;
+        let metadata = inode.metadata()?;
+        let child = metadata.inode_id;
         let child_generation = inode.inode_generation();
         let key = DentryRegistryKey {
             parent: parent.map(|dentry| dentry.id),
@@ -973,6 +1279,20 @@ impl SuperBlockState {
             child_generation,
             name: name.clone(),
         };
+        {
+            let registry = self.dentry_registry.lock();
+            if let Some(dentry) = registry.get(&key).and_then(Weak::upgrade) {
+                if !dentry.is_disconnected() {
+                    return Ok(dentry);
+                }
+            }
+        }
+
+        // Ordinary lookup never allocates fsnotify state. If this object has
+        // already participated in a link-count mutation or has a watch, the
+        // new alias inherits that shared lifecycle fact.
+        let checked_epoch = self.fsnotify_object_epoch.load(Ordering::Acquire);
+        let object_state = self.fsnotify_object_state(child, child_generation);
         let mut registry = self.dentry_registry.lock();
         if let Some(dentry) = registry.get(&key).and_then(Weak::upgrade) {
             if !dentry.is_disconnected() {
@@ -987,15 +1307,20 @@ impl SuperBlockState {
             inode,
             registry_child: child,
             registry_generation: child_generation,
+            fsnotify_superblock: self.fsnotify_id,
+            file_type: metadata.file_type,
             mount_gate: Mutex::new(()),
             children_gate: Mutex::new(()),
             mount_edges: AtomicUsize::new(0),
             automount_gate: Mutex::new(()),
             anonymous: false,
+            negative_fsnotify_interest_epoch: AtomicUsize::new(0),
             state: Mutex::new(VfsDentryState {
                 name,
                 parent: parent.cloned(),
                 disconnected: false,
+                fsnotify_object_state: object_state,
+                fsnotify_checked_epoch: checked_epoch,
             }),
         });
         registry.insert(key, Arc::downgrade(&dentry));
@@ -1019,21 +1344,30 @@ impl SuperBlockState {
         parent: &Arc<VfsDentry>,
         name: &DName,
         inode: &Arc<dyn IndexNode>,
-    ) -> Result<Option<Arc<VfsDentry>>, SystemError> {
-        let child = inode.metadata()?.inode_id;
+    ) -> Result<RegisteredDentryLookup, SystemError> {
+        let metadata = inode.metadata()?;
+        let child = metadata.inode_id;
+        let generation = inode.inode_generation();
         let key = DentryRegistryKey {
             parent: Some(parent.id),
             child,
-            child_generation: inode.inode_generation(),
+            child_generation: generation,
             name: Some(name.clone()),
         };
         let registry = self.dentry_registry.lock();
-        Ok(registry.get(&key).and_then(Weak::upgrade))
+        Ok(RegisteredDentryLookup {
+            dentry: registry.get(&key).and_then(Weak::upgrade),
+            inode: child,
+            generation,
+            file_type: metadata.file_type,
+        })
     }
 
     fn disconnect_dentry(&self, dentry: &Arc<VfsDentry>) {
         self.remove_dentry_key(dentry);
-        dentry.state.lock().disconnected = true;
+        let mut state = dentry.state.lock();
+        dentry.invalidate_fsnotify_interest_cache();
+        state.disconnected = true;
     }
 
     /// Update the alias registry after a successful rename while the caller
@@ -1092,6 +1426,7 @@ impl SuperBlockState {
         if let (Some(dentry), Some(child)) = (moved, moved_child) {
             {
                 let mut state = dentry.state.lock();
+                dentry.invalidate_fsnotify_interest_cache();
                 state.parent = Some(target_parent.clone());
                 state.name = Some(new_name.clone());
                 state.disconnected = false;
@@ -1111,6 +1446,7 @@ impl SuperBlockState {
             if exchange {
                 {
                     let mut state = dentry.state.lock();
+                    dentry.invalidate_fsnotify_interest_cache();
                     state.parent = Some(source_parent.clone());
                     state.name = Some(old_name.clone());
                     state.disconnected = false;
@@ -1125,7 +1461,9 @@ impl SuperBlockState {
                     Arc::downgrade(&dentry),
                 );
             } else {
-                dentry.state.lock().disconnected = true;
+                let mut state = dentry.state.lock();
+                dentry.invalidate_fsnotify_interest_cache();
+                state.disconnected = true;
             }
         }
     }
@@ -2637,6 +2975,7 @@ impl MountFS {
             log::warn!("final superblock eviction drain failed: {:?}", err);
             sb_state.record_wb_error(err);
         }
+        sb_state.drain_fsnotify_objects_for_unmount();
         self.inner_filesystem.on_umount();
         sb_state.finish_shutdown();
     }
@@ -3036,8 +3375,779 @@ impl Drop for MountSnapshotGuard {
 }
 
 impl MountFSInode {
+    pub(crate) fn same_mount_ref(&self, other: &MountFSInode) -> bool {
+        Arc::ptr_eq(&self.mount_fs, &other.mount_fs)
+    }
+
+    /// Run a rename notification after every alias is committed and the
+    /// global topology writer is released, while the conflicting parent gates
+    /// still preserve the order in which successful renames become visible.
+    pub(crate) fn move_to_with_post_commit(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        pre_commit: impl FnOnce(
+            &Arc<dyn IndexNode>,
+            Option<&Arc<dyn IndexNode>>,
+        ) -> Result<(), SystemError>,
+        post_commit: impl FnOnce(&FsNotifyTarget, Option<&FsNotifyTarget>),
+    ) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        let mut pre_commit = Some(pre_commit);
+        let mut run_pre_commit =
+            |source: &Arc<dyn IndexNode>, target: Option<&Arc<dyn IndexNode>>| {
+                pre_commit
+                    .take()
+                    .expect("rename pre-commit callback runs once")(source, target)
+            };
+        let mut post_commit = Some(post_commit);
+        let mut run_post_commit = |source: &FsNotifyTarget, target: Option<&FsNotifyTarget>| {
+            post_commit
+                .take()
+                .expect("rename post-commit callback runs once")(source, target);
+        };
+        self.move_to_with_context_impl(
+            old_name,
+            target,
+            new_name,
+            flags,
+            &context,
+            RenameCommitHooks {
+                pre_commit: Some(&mut run_pre_commit),
+                post_commit: Some(&mut run_post_commit),
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// Publish a successful mknod while the parent gate still orders it
+    /// against unlink and another create of the same name.
+    pub(crate) fn mknod_with_post_commit(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        self.dentry.inode.mknod(filename, mode, dev_t)?;
+        post_commit();
+        Ok(())
+    }
+
+    /// Create a regular file and publish its namespace event before another
+    /// mutation of the same parent can overtake it.  Atomic create/open and
+    /// the generic create fallback share this commit boundary.
+    pub(crate) fn create_file_with_post_commit(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        flags: &FileFlags,
+        post_commit: impl FnOnce(),
+    ) -> Result<(Arc<dyn IndexNode>, Option<PreopenedFile>), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let (inner_inode, mut preopened) =
+            match self.dentry.inode.create_and_open(name, mode, flags) {
+                Ok(opened) => (opened.inode(), Some(opened)),
+                Err(SystemError::ENOSYS) => {
+                    (self.dentry.inode.create(name, FileType::File, mode)?, None)
+                }
+                Err(err) => return Err(err),
+            };
+        // The backing namespace mutation is now committed.  Publish CREATE
+        // before Mount wrapper construction, which may still fail just as a
+        // later file-open step may fail on Linux after successful creation.
+        post_commit();
+        let wrapped = {
+            let _namespace_guard = self
+                .mount_fs
+                .super_block_state
+                .dentry_namespace_lock
+                .write();
+            let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            MountFSInode::new_child(
+                inner_inode,
+                self.mount_fs.clone(),
+                &parent,
+                DName::from(name),
+            )?
+        };
+        if let Some(opened) = preopened.as_mut() {
+            opened.replace_inode(wrapped.clone());
+        }
+        let inode: Arc<dyn IndexNode> = wrapped;
+        Ok((inode, preopened))
+    }
+
+    /// Create a directory and publish its namespace event while the parent
+    /// gate still orders it against rmdir and same-name mutations.
+    pub(crate) fn mkdir_with_post_commit(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        post_commit: impl FnOnce(),
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        match self.dentry.inode.find(name) {
+            Ok(_) => return Err(SystemError::EEXIST),
+            Err(SystemError::ENOENT) => {}
+            Err(error) => return Err(error),
+        }
+        let inner_inode = self.dentry.inode.mkdir(name, mode)?;
+        post_commit();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        Ok(MountFSInode::new_child(
+            inner_inode,
+            self.mount_fs.clone(),
+            &parent,
+            DName::from(name),
+        )?)
+    }
+
+    /// Create a symbolic link and publish its namespace event while the
+    /// parent gate still serializes same-name mutations.
+    pub(crate) fn symlink_with_post_commit(
+        &self,
+        name: &str,
+        target: &str,
+        post_commit: impl FnOnce(),
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let inner_inode = self.dentry.inode.symlink(name, target)?;
+        post_commit();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        Ok(MountFSInode::new_child(
+            inner_inode,
+            self.mount_fs.clone(),
+            &parent,
+            DName::from(name),
+        )?)
+    }
+
+    /// Publish unlink notifications after the namespace and delete lifecycle
+    /// are committed, before another mutation of this parent can overtake it.
+    pub(crate) fn unlink_with_post_commit(
+        &self,
+        name: &str,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        let mut post_commit = Some(post_commit);
+        let mut run_post_commit = || {
+            post_commit
+                .take()
+                .expect("unlink post-commit callback runs once")();
+        };
+        self.unlink_with_context_impl(name, &context, Some(&mut run_post_commit))
+            .map(|_| ())
+    }
+
+    /// Publish rmdir notifications at the same parent-directory commit
+    /// boundary used for unlink.
+    pub(crate) fn rmdir_with_post_commit(
+        &self,
+        name: &str,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        let mut post_commit = Some(post_commit);
+        let mut run_post_commit = || {
+            post_commit
+                .take()
+                .expect("rmdir post-commit callback runs once")();
+        };
+        self.rmdir_with_context_impl(name, &context, Some(&mut run_post_commit))
+    }
+
+    fn unlink_with_context_impl(
+        &self,
+        name: &str,
+        context: &DentryMutationContext<'_>,
+        post_commit: Option<&mut dyn FnMut()>,
+    ) -> Result<LinkRemovalOutcome, SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        let inner = self.dentry.inode.find(name)?;
+        let dname = DName::from(name);
+        let lookup =
+            self.mount_fs
+                .super_block_state
+                .get_registered_dentry(&self.dentry, &dname, &inner)?;
+        let child = lookup.dentry;
+        let child_inode = lookup.inode;
+        let child_generation = lookup.generation;
+        let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
+        drop(namespace_guard);
+
+        if child
+            .as_ref()
+            .is_some_and(|dentry| dentry.is_local_mountpoint())
+        {
+            return Err(SystemError::EBUSY);
+        }
+        let mut object_state = match child.as_ref() {
+            Some(child) => self
+                .mount_fs
+                .super_block_state
+                .existing_dentry_fsnotify_state(child),
+            None => self
+                .mount_fs
+                .super_block_state
+                .fsnotify_object_state(child_inode, child_generation),
+        };
+        let coordinator = inner.link_mutation_coordinator();
+        let _link_mutation = coordinator.map(|coordinator| coordinator.lock());
+        let outcome = self.dentry.inode.unlink_with_context(name, context)?;
+        debug_assert!(
+            coordinator.is_some() || outcome == LinkRemovalOutcome::LastLink,
+            "multi-link filesystem must expose a canonical link coordinator"
+        );
+        let link_epoch = coordinator.map_or_else(
+            || {
+                self.mount_fs
+                    .super_block_state
+                    .note_fsnotify_link_mutation(child_inode, child_generation)
+            },
+            |coordinator| coordinator.commit_removed(outcome),
+        );
+        if object_state.is_none() {
+            object_state = self
+                .mount_fs
+                .super_block_state
+                .fsnotify_object_state(child_inode, child_generation);
+        }
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
+        if let Some(state) = delete_lifecycle.as_mut() {
+            fsnotify::note_link_removed(state, outcome, link_epoch);
+        }
+        context.ensure_locked();
+        let namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        if let Some(child) = child.as_ref() {
+            self.mount_fs.super_block_state.disconnect_dentry(child);
+        }
+        drop(namespace_guard);
+
+        let commit_untracked_delete = child.is_none() && outcome == LinkRemovalOutcome::LastLink;
+        if let Some(post_commit) = post_commit {
+            context.release_locked();
+            post_commit();
+            if commit_untracked_delete {
+                if let (Some(object), Some(state)) =
+                    (object_state.as_ref(), delete_lifecycle.as_mut())
+                {
+                    fsnotify::notify_dentry_detach(
+                        FsNotifyObjectId {
+                            superblock: self.dentry.fsnotify_superblock,
+                            inode: child_inode,
+                            generation: child_generation,
+                        },
+                        object,
+                        state,
+                    );
+                }
+            }
+        } else if commit_untracked_delete {
+            if let (Some(object), Some(state)) = (object_state.as_ref(), delete_lifecycle.as_mut())
+            {
+                fsnotify::notify_dentry_detach(
+                    FsNotifyObjectId {
+                        superblock: self.dentry.fsnotify_superblock,
+                        inode: child_inode,
+                        generation: child_generation,
+                    },
+                    object,
+                    state,
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn rmdir_with_context_impl(
+        &self,
+        name: &str,
+        context: &DentryMutationContext<'_>,
+        post_commit: Option<&mut dyn FnMut()>,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        let inner = self.dentry.inode.find(name)?;
+        let dname = DName::from(name);
+        let lookup =
+            self.mount_fs
+                .super_block_state
+                .get_registered_dentry(&self.dentry, &dname, &inner)?;
+        let child = lookup.dentry;
+        let child_inode = lookup.inode;
+        let child_generation = lookup.generation;
+        let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
+        drop(namespace_guard);
+
+        if child
+            .as_ref()
+            .is_some_and(|dentry| dentry.is_local_mountpoint())
+        {
+            return Err(SystemError::EBUSY);
+        }
+        let mut object_state = match child.as_ref() {
+            Some(child) => self
+                .mount_fs
+                .super_block_state
+                .existing_dentry_fsnotify_state(child),
+            None => self
+                .mount_fs
+                .super_block_state
+                .fsnotify_object_state(child_inode, child_generation),
+        };
+        let coordinator = inner.link_mutation_coordinator();
+        let _link_mutation = coordinator.map(|coordinator| coordinator.lock());
+        self.dentry.inode.rmdir_with_context(name, context)?;
+        let link_epoch = coordinator.map_or_else(
+            || {
+                self.mount_fs
+                    .super_block_state
+                    .note_fsnotify_link_mutation(child_inode, child_generation)
+            },
+            |coordinator| coordinator.commit_removed(LinkRemovalOutcome::LastLink),
+        );
+        if object_state.is_none() {
+            object_state = self
+                .mount_fs
+                .super_block_state
+                .fsnotify_object_state(child_inode, child_generation);
+        }
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
+        if let Some(state) = delete_lifecycle.as_mut() {
+            fsnotify::note_link_removed(state, LinkRemovalOutcome::LastLink, link_epoch);
+        }
+        context.ensure_locked();
+        let namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
+        if let Some(child) = child.as_ref() {
+            self.mount_fs.super_block_state.disconnect_dentry(child);
+        }
+        drop(namespace_guard);
+        let commit_untracked_delete = child.is_none();
+        if let Some(post_commit) = post_commit {
+            context.release_locked();
+            post_commit();
+            if commit_untracked_delete {
+                if let (Some(object), Some(state)) =
+                    (object_state.as_ref(), delete_lifecycle.as_mut())
+                {
+                    fsnotify::notify_dentry_detach(
+                        FsNotifyObjectId {
+                            superblock: self.dentry.fsnotify_superblock,
+                            inode: child_inode,
+                            generation: child_generation,
+                        },
+                        object,
+                        state,
+                    );
+                }
+            }
+        } else if commit_untracked_delete {
+            if let (Some(object), Some(state)) = (object_state.as_ref(), delete_lifecycle.as_mut())
+            {
+                fsnotify::notify_dentry_detach(
+                    FsNotifyObjectId {
+                        superblock: self.dentry.fsnotify_superblock,
+                        inode: child_inode,
+                        generation: child_generation,
+                    },
+                    object,
+                    state,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish a successful hard link after its link-count state is updated,
+    /// while the destination parent gate still orders it against unlink and
+    /// other namespace mutations in that directory.
+    pub(crate) fn link_with_post_commit(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+        post_commit: impl FnOnce(),
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        // Backing filesystems expect their own inode type rather than the
+        // mount projection used by syscall paths.
+        let other_mount = other.clone().downcast_arc::<MountFSInode>();
+        let other_inner: Arc<dyn IndexNode> = other_mount
+            .as_ref()
+            .map(|mnt| mnt.dentry.inode.clone())
+            .unwrap_or_else(|| other.clone());
+
+        let mut object_state = other_mount.as_ref().and_then(|inode| {
+            inode
+                .mount_fs
+                .super_block_state
+                .existing_dentry_fsnotify_state(&inode.dentry)
+        });
+        let coordinator = other_inner.link_mutation_coordinator();
+        let _link_mutation = coordinator.map(|coordinator| coordinator.lock());
+        self.dentry.inode.link(name, &other_inner)?;
+        debug_assert!(
+            other_mount.is_none() || coordinator.is_some(),
+            "link-capable mounted filesystem must expose a canonical link coordinator"
+        );
+        let link_epoch = other_mount.as_ref().map(|inode| {
+            coordinator.map_or_else(
+                || {
+                    inode
+                        .mount_fs
+                        .super_block_state
+                        .note_fsnotify_link_mutation(
+                            inode.dentry.registry_child,
+                            inode.dentry.registry_generation,
+                        )
+                },
+                |coordinator| coordinator.commit_added(),
+            )
+        });
+        if object_state.is_none() {
+            object_state = other_mount.as_ref().and_then(|inode| {
+                inode.mount_fs.super_block_state.fsnotify_object_state(
+                    inode.dentry.registry_child,
+                    inode.dentry.registry_generation,
+                )
+            });
+        }
+        let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
+        if let (Some(state), Some(link_epoch)) = (delete_lifecycle.as_mut(), link_epoch) {
+            fsnotify::note_link_added(state, link_epoch);
+        }
+        post_commit();
+        Ok(())
+    }
+
+    fn move_to_with_context_impl(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: &DentryMutationContext<'_>,
+        hooks: RenameCommitHooks<'_>,
+    ) -> Result<RenameOutcome, SystemError> {
+        let RenameCommitHooks {
+            pre_commit,
+            post_commit,
+        } = hooks;
+        self.ensure_mount_writable()?;
+        // Filesystem implementations generally expect `target` to be an inode
+        // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
+        // mount wrapping is enabled, unwrap it before delegating.
+        let target_mount = target.clone().downcast_arc::<MountFSInode>();
+        let target_inner: Arc<dyn IndexNode> = target_mount
+            .as_ref()
+            .map(|mnt| mnt.dentry.inode.clone())
+            .unwrap_or_else(|| target.clone());
+        let target_parent = target_mount
+            .as_ref()
+            .map(|mount| mount.dentry.clone())
+            .unwrap_or_else(|| self.dentry.clone());
+
+        with_dentry_children_gates(&self.dentry, &target_parent, || {
+            let namespace_guard = self
+                .mount_fs
+                .super_block_state
+                .dentry_namespace_lock
+                .write();
+            let (source_inode, source_lookup, source_dentry, target_lookup, target_child_inode) =
+                if let Some(target_mount) = target_mount.as_ref() {
+                    let sb = &self.mount_fs.super_block_state;
+                    let source_inner = self.dentry.inode.find(old_name)?;
+                    let source_lookup = sb.get_registered_dentry(
+                        &self.dentry,
+                        &DName::from(old_name),
+                        &source_inner,
+                    )?;
+                    let source_dentry = source_lookup.dentry.clone();
+                    let (target_lookup, target_child_inode) = match target_inner.find(new_name) {
+                        Ok(target_child) => {
+                            let lookup = sb.get_registered_dentry(
+                                &target_mount.dentry,
+                                &DName::from(new_name),
+                                &target_child,
+                            )?;
+                            (Some(lookup), Some(target_child))
+                        }
+                        Err(SystemError::ENOENT) => (None, None),
+                        Err(error) => return Err(error),
+                    };
+                    (
+                        Some(source_inner),
+                        Some(source_lookup),
+                        source_dentry,
+                        target_lookup,
+                        target_child_inode,
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
+            let target_dentry = target_lookup
+                .as_ref()
+                .and_then(|lookup| lookup.dentry.clone());
+            with_dentry_mount_gates(source_dentry.as_ref(), target_dentry.as_ref(), || {
+                // The parent directory gates keep both positive and negative
+                // names stable while the per-superblock registry lock is
+                // released for potentially long layered copy-up I/O.
+                drop(namespace_guard);
+                if source_dentry
+                    .as_ref()
+                    .is_some_and(|dentry| dentry.is_local_mountpoint())
+                    || target_dentry
+                        .as_ref()
+                        .is_some_and(|dentry| dentry.is_local_mountpoint())
+                {
+                    return Err(SystemError::EBUSY);
+                }
+                if flags.contains(RenameFlags::NOREPLACE) && target_child_inode.is_some() {
+                    return Err(SystemError::EEXIST);
+                }
+                if let (Some(source_lookup), Some(target_lookup)) =
+                    (source_lookup.as_ref(), target_lookup.as_ref())
+                {
+                    if (source_lookup.inode, source_lookup.generation)
+                        == (target_lookup.inode, target_lookup.generation)
+                    {
+                        return Ok(RenameOutcome::NoOp);
+                    }
+                }
+                if let Some(pre_commit) = pre_commit {
+                    pre_commit(
+                        source_inode
+                            .as_ref()
+                            .expect("mounted rename resolves its source under the parent gates"),
+                        target_child_inode.as_ref(),
+                    )?;
+                }
+                let notify_targets = if post_commit.is_some() {
+                    let source = source_lookup
+                        .as_ref()
+                        .expect("mounted rename resolves its source under the parent gates");
+                    let source = self.mount_fs.super_block_state.rename_notify_target_seed(
+                        source.inode,
+                        source.generation,
+                        source.file_type,
+                    );
+                    let target = target_lookup.as_ref().map(|target| {
+                        self.mount_fs.super_block_state.rename_notify_target_seed(
+                            target.inode,
+                            target.generation,
+                            target.file_type,
+                        )
+                    });
+                    Some((source, target))
+                } else {
+                    None
+                };
+                let mut object_state = match target_lookup.as_ref() {
+                    Some(RegisteredDentryLookup {
+                        dentry: Some(target),
+                        ..
+                    }) => self
+                        .mount_fs
+                        .super_block_state
+                        .existing_dentry_fsnotify_state(target),
+                    Some(lookup) => self
+                        .mount_fs
+                        .super_block_state
+                        .fsnotify_object_state(lookup.inode, lookup.generation),
+                    None => None,
+                };
+                let coordinator = target_child_inode
+                    .as_ref()
+                    .and_then(|inode| inode.link_mutation_coordinator());
+                let _link_mutation = coordinator.map(|coordinator| coordinator.lock());
+                let outcome = self.dentry.inode.move_to_with_context(
+                    old_name,
+                    &target_inner,
+                    new_name,
+                    flags,
+                    context,
+                )?;
+                // The destination may have become a hard-link alias of the
+                // source after the syscall's optimistic lookup but before the
+                // parent gates were acquired. The filesystem's locked result
+                // is authoritative: a no-op has no dentry or notification
+                // commit to publish.
+                if outcome == RenameOutcome::NoOp {
+                    return Ok(outcome);
+                }
+                debug_assert!(
+                    !matches!(
+                        outcome,
+                        RenameOutcome::Moved {
+                            replaced: Some(LinkRemovalOutcome::StillLinked)
+                        }
+                    ) || coordinator.is_some(),
+                    "multi-link rename victim must expose a canonical link coordinator"
+                );
+                let link_epoch = match (outcome, target_lookup.as_ref()) {
+                    (
+                        RenameOutcome::Moved {
+                            replaced: Some(replaced),
+                        },
+                        Some(lookup),
+                    ) => Some(coordinator.map_or_else(
+                        || {
+                            self.mount_fs
+                                .super_block_state
+                                .note_fsnotify_link_mutation(lookup.inode, lookup.generation)
+                        },
+                        |coordinator| coordinator.commit_removed(replaced),
+                    )),
+                    _ => None,
+                };
+                if object_state.is_none() {
+                    object_state = target_lookup.as_ref().and_then(|lookup| {
+                        self.mount_fs
+                            .super_block_state
+                            .fsnotify_object_state(lookup.inode, lookup.generation)
+                    });
+                }
+                let mut delete_lifecycle = object_state.as_ref().map(|state| state.delete.lock());
+                if let (
+                    RenameOutcome::Moved {
+                        replaced: Some(replaced),
+                    },
+                    Some(state),
+                    Some(link_epoch),
+                ) = (outcome, delete_lifecycle.as_mut(), link_epoch)
+                {
+                    fsnotify::note_link_removed(state, replaced, link_epoch);
+                }
+                context.ensure_locked();
+                let namespace_guard = self
+                    .mount_fs
+                    .super_block_state
+                    .dentry_namespace_lock
+                    .write();
+                if let (Some(source), Some(target)) =
+                    (self.self_ref.upgrade(), target_mount.clone())
+                {
+                    Self::update_move_dentries(
+                        &source,
+                        DName::from(old_name),
+                        &target,
+                        DName::from(new_name),
+                        flags.contains(RenameFlags::EXCHANGE),
+                        source_dentry.clone(),
+                        target_dentry.clone(),
+                    );
+                }
+                drop(namespace_guard);
+                let untracked_delete = match (outcome, target_lookup.as_ref()) {
+                    (
+                        RenameOutcome::Moved {
+                            replaced: Some(LinkRemovalOutcome::LastLink),
+                        },
+                        Some(RegisteredDentryLookup {
+                            dentry: None,
+                            inode,
+                            generation,
+                            ..
+                        }),
+                    ) => Some((*inode, *generation)),
+                    _ => None,
+                };
+                if let Some(post_commit) = post_commit {
+                    // Alias publication is complete. Release the system-wide
+                    // topology writer before work proportional to watch count,
+                    // while the two parent gates still serialize conflicting
+                    // renames and therefore their notification order.
+                    context.release_locked();
+                    if fsnotify::has_any_watch() {
+                        let (source, target) = notify_targets
+                            .as_ref()
+                            .expect("rename post-commit target seeds were prepared");
+                        let source = self
+                            .mount_fs
+                            .super_block_state
+                            .resolve_rename_notify_target(*source);
+                        let target = target.map(|target| {
+                            self.mount_fs
+                                .super_block_state
+                                .resolve_rename_notify_target(target)
+                        });
+                        post_commit(&source, target.as_ref());
+                    }
+                    if let (Some((inode, generation)), Some(object), Some(state)) = (
+                        untracked_delete,
+                        object_state.as_ref(),
+                        delete_lifecycle.as_mut(),
+                    ) {
+                        fsnotify::notify_dentry_detach(
+                            FsNotifyObjectId {
+                                superblock: self.dentry.fsnotify_superblock,
+                                inode,
+                                generation,
+                            },
+                            object,
+                            state,
+                        );
+                    }
+                } else if let (Some((inode, generation)), Some(object), Some(state)) = (
+                    untracked_delete,
+                    object_state.as_ref(),
+                    delete_lifecycle.as_mut(),
+                ) {
+                    fsnotify::notify_dentry_detach(
+                        FsNotifyObjectId {
+                            superblock: self.dentry.fsnotify_superblock,
+                            inode,
+                            generation,
+                        },
+                        object,
+                        state,
+                    );
+                }
+                Ok(outcome)
+            })
+        })
+    }
+
     pub(crate) fn same_path_ref(&self, other: &MountFSInode) -> bool {
-        Arc::ptr_eq(&self.mount_fs, &other.mount_fs) && self.dentry.id == other.dentry.id
+        self.same_mount_ref(other) && self.dentry.id == other.dentry.id
     }
 
     pub(crate) fn is_disconnected(&self) -> bool {
@@ -3117,7 +4227,16 @@ impl MountFSInode {
         dname: DName,
         mount_fs: Arc<MountFS>,
     ) -> Result<Arc<Self>, SystemError> {
-        let dentry = VfsDentry::new_anonymous(inner_inode, dname)?;
+        let metadata = inner_inode.metadata()?;
+        let object_state = mount_fs
+            .super_block_state
+            .fsnotify_object_state(metadata.inode_id, inner_inode.inode_generation());
+        let dentry = VfsDentry::new_anonymous(
+            inner_inode,
+            dname,
+            mount_fs.super_block_state.fsnotify_id,
+            object_state,
+        )?;
         // Anonymous magic-link targets have no directory edge and therefore
         // cannot be rediscovered by dentry ID. Caching their wrappers would
         // retain one stale Weak key for every namespace-link traversal.
@@ -3373,6 +4492,86 @@ impl MountFSInode {
         self.dentry.inode.clone()
     }
 
+    /// Stable, metadata-I/O-free identity for fsnotify.
+    pub(crate) fn fsnotify_target(&self) -> (usize, InodeId, u64, FileType, bool, bool) {
+        let disconnected = self.dentry.state.lock().disconnected;
+        let watched = self
+            .fsnotify_object_state()
+            .is_some_and(|object| object.has_watches());
+        (
+            self.mount_fs.super_block_state.fsnotify_id,
+            self.dentry.registry_child,
+            self.dentry.registry_generation,
+            self.dentry.file_type,
+            disconnected,
+            watched,
+        )
+    }
+
+    pub(crate) fn fsnotify_object_state(&self) -> Option<Arc<FsNotifyObjectState>> {
+        self.mount_fs
+            .super_block_state
+            .resolve_dentry_fsnotify_state(&self.dentry)
+    }
+
+    pub(crate) fn with_fsnotify_watch_lifecycle<T>(
+        &self,
+        operation: impl FnOnce(Arc<FsNotifyObjectState>) -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        let object_state = self
+            .mount_fs
+            .super_block_state
+            .ensure_dentry_fsnotify_state(&self.dentry)?;
+        let object_id = FsNotifyObjectId {
+            superblock: self.dentry.fsnotify_superblock,
+            inode: self.dentry.registry_child,
+            generation: self.dentry.registry_generation,
+        };
+        let mut state = object_state.delete.lock();
+        // A link mutation may have committed its canonical fact while waiting
+        // for this delete lock. Reconcile that fact before publishing a new
+        // mark so an old committed epoch cannot immediately retire a watch on
+        // an inode which has already been relinked.
+        if let Some(coordinator) = self.dentry.inode.link_mutation_coordinator() {
+            let (revision, zero_links) = coordinator.snapshot();
+            match zero_links {
+                Some(true) => {
+                    fsnotify::note_link_removed(&mut state, LinkRemovalOutcome::LastLink, revision)
+                }
+                Some(false) => fsnotify::note_link_added(&mut state, revision),
+                None => {}
+            }
+        }
+        // Invalidate aliases' negative caches before the mark's Active-last
+        // publication. A false-positive retry is harmless if add fails.
+        if !object_state.has_watches() {
+            self.mount_fs
+                .super_block_state
+                .fsnotify_object_epoch
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        let result = operation(object_state.clone());
+        if state.committed() && result.is_ok() {
+            // Keep the committed check and deletion notification in the same
+            // object lifecycle epoch. A concurrent linkat(AT_EMPTY_PATH)
+            // cannot relink the inode and publish a new watch between them.
+            fsnotify::notify_object_delete(object_id, &object_state);
+        }
+        result
+    }
+
+    pub(crate) fn with_fsnotify_admission<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        let state = &self.mount_fs.super_block_state;
+        let _admission = state.umount_read();
+        if state.lifecycle.lock().state != SuperBlockLifecycleState::Active {
+            return Err(SystemError::ESTALE);
+        }
+        operation()
+    }
+
     /// @brief Wrap a MountFSInode object in an Arc pointer.
     /// The main purpose of this function is to initialize the self-referencing Weak pointer within the MountFSInode object.
     /// This function should only be called in constructors.
@@ -3544,6 +4743,106 @@ impl MountFSInode {
                 None => Ok(current),
             };
         }
+    }
+
+    /// Capture child identity and its current parent/name from dentry state.
+    /// This avoids path walking and String allocation on read/write/close.
+    pub(crate) fn fsnotify_snapshot(
+        &self,
+    ) -> Option<(FsNotifyTarget, Option<(FsNotifyTarget, DName)>)> {
+        let presence = &self.mount_fs.super_block_state.fsnotify_presence;
+        if !presence.has_watches() {
+            return None;
+        }
+        let interest_epoch = presence.interest_epoch();
+        if interest_epoch != usize::MAX
+            && self
+                .dentry
+                .negative_fsnotify_interest_epoch
+                .load(Ordering::Acquire)
+                == interest_epoch
+        {
+            return None;
+        }
+        let want_parent = presence.has_directory_watches();
+        let (parent_entry, disconnected) = {
+            let state = self.dentry.state.lock();
+            let parent = want_parent
+                .then(|| state.parent.clone().zip(state.name.clone()))
+                .flatten();
+            (parent, state.disconnected)
+        };
+        let child_object = self
+            .mount_fs
+            .super_block_state
+            .resolve_dentry_fsnotify_state(&self.dentry);
+        let watched = child_object
+            .as_ref()
+            .is_some_and(|object| object.has_watches());
+        let child = FsNotifyTarget {
+            id: FsNotifyObjectId {
+                superblock: self.dentry.fsnotify_superblock,
+                inode: self.dentry.registry_child,
+                generation: self.dentry.registry_generation,
+            },
+            is_dir: self.dentry.file_type == FileType::Dir,
+            disconnected,
+            watched,
+            object_state: child_object,
+        };
+        let parent = parent_entry.as_ref().and_then(|(parent, name)| {
+            if Arc::ptr_eq(parent, &self.dentry) {
+                return None;
+            }
+            let parent_object = self
+                .mount_fs
+                .super_block_state
+                .resolve_dentry_fsnotify_state(parent);
+            let parent_watched = parent_object
+                .as_ref()
+                .is_some_and(|object| object.has_watches());
+            Some((
+                FsNotifyTarget {
+                    id: FsNotifyObjectId {
+                        superblock: parent.fsnotify_superblock,
+                        inode: parent.registry_child,
+                        generation: parent.registry_generation,
+                    },
+                    is_dir: parent.file_type == FileType::Dir,
+                    disconnected: false,
+                    watched: parent_watched,
+                    object_state: parent_object,
+                },
+                name.clone(),
+            ))
+        });
+        if !child.watched && !parent.as_ref().is_some_and(|(parent, _)| parent.watched) {
+            // Resolve object state without holding dentry.state, then publish
+            // the topology validation and negative cache under that same
+            // state lock. A concurrent rename/unlink either happens before
+            // this validation or invalidates the cache after it.
+            let state = self.dentry.state.lock();
+            let current_parent = state.parent.as_ref().zip(state.name.as_ref());
+            let same_parent = !want_parent
+                || match (parent_entry.as_ref(), current_parent) {
+                    (Some((expected_parent, expected_name)), Some((parent, name))) => {
+                        Arc::ptr_eq(expected_parent, parent) && expected_name == name
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+            if same_parent
+                && state.disconnected == disconnected
+                && interest_epoch != usize::MAX
+                && presence.interest_epoch() == interest_epoch
+            {
+                self.dentry
+                    .negative_fsnotify_interest_epoch
+                    .store(interest_epoch, Ordering::Release);
+            }
+            return None;
+        }
+        Some((child, parent))
     }
 
     fn do_absolute_path(&self) -> Result<String, SystemError> {
@@ -3754,8 +5053,17 @@ impl IndexNode for MountFSInode {
             .mmap_file(file, start, len, offset, vm_flags)
     }
 
-    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
-        self.dentry.inode.truncate_before_open(flags)
+    fn resize_open_truncate(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        context: &super::OpenTruncateContext,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        self.dentry
+            .inode
+            .resize_open_truncate(len, lock_owner, data, context)
     }
 
     fn sync(&self) -> Result<(), SystemError> {
@@ -4017,13 +5325,14 @@ impl IndexNode for MountFSInode {
         offset: usize,
         len: usize,
         lock_owner: u64,
+        attrib: &mut super::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
         return self
             .dentry
             .inode
-            .fallocate_file(mode, offset, len, lock_owner, data);
+            .fallocate_file(mode, offset, len, lock_owner, attrib, data);
     }
 
     #[inline]
@@ -4083,94 +5392,32 @@ impl IndexNode for MountFSInode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        let _children_guard = self.dentry.children_gate.lock();
-        // Filesystem implementations expect `other` to be an inode of the same concrete filesystem (e.g. LockedExt4Inode).
-        // When VFS mount wrapping is enabled, `other` is typically a `MountFSInode`, which causes
-        // filesystem-level downcasts to fail and incorrectly return EINVAL.
-        //
-        // Therefore, before linking, we need to unwrap the mount wrapper (same as move_to).
-        let other_inner: Arc<dyn IndexNode> = other
-            .clone()
-            .downcast_arc::<MountFSInode>()
-            .map(|mnt| mnt.dentry.inode.clone())
-            .unwrap_or_else(|| other.clone());
-
-        return self.dentry.inode.link(name, &other_inner);
+        self.link_with_post_commit(name, other, || {})
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_mount_writable()?;
-        let _children_guard = self.dentry.children_gate.lock();
-        let inner_inode = self.dentry.inode.symlink(name, target)?;
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        Ok(MountFSInode::new_child(
-            inner_inode,
-            self.mount_fs.clone(),
-            &parent,
-            DName::from(name),
-        )?)
+        self.symlink_with_post_commit(name, target, || {})
     }
 
     /// @brief Delete a file/directory in the mounted filesystem
     #[inline]
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(&self, name: &str) -> Result<LinkRemovalOutcome, SystemError> {
         let context = DentryMutationContext::new();
-        self.unlink_with_context(name, &context)
+        self.unlink_with_context_impl(name, &context, None)
     }
 
     fn unlink_with_context(
         &self,
         name: &str,
         context: &DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        let _children_guard = self.dentry.children_gate.lock();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        let inner = self.dentry.inode.find(name)?;
-        let dname = DName::from(name);
-        let child =
-            self.mount_fs
-                .super_block_state
-                .get_registered_dentry(&self.dentry, &dname, &inner)?;
-        let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
-        drop(_namespace_guard);
-
-        // First check if this inode is a mount point; if so, it cannot be deleted
-        if child
-            .as_ref()
-            .is_some_and(|dentry| dentry.is_local_mountpoint())
-        {
-            return Err(SystemError::EBUSY);
-        }
-        // Delegate to the inner inode's unlink method to delete this inode
-        self.dentry.inode.unlink_with_context(name, context)?;
-        context.ensure_locked();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        drop(inner);
-        if let Some(child) = child.as_ref() {
-            self.mount_fs.super_block_state.disconnect_dentry(child);
-        }
-        return Ok(());
+    ) -> Result<LinkRemovalOutcome, SystemError> {
+        self.unlink_with_context_impl(name, context, None)
     }
 
     #[inline]
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let context = DentryMutationContext::new();
-        self.rmdir_with_context(name, &context)
+        self.rmdir_with_context_impl(name, &context, None)
     }
 
     fn rmdir_with_context(
@@ -4178,42 +5425,7 @@ impl IndexNode for MountFSInode {
         name: &str,
         context: &DentryMutationContext<'_>,
     ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        let _children_guard = self.dentry.children_gate.lock();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        let inner = self.dentry.inode.find(name)?;
-        let dname = DName::from(name);
-        let child =
-            self.mount_fs
-                .super_block_state
-                .get_registered_dentry(&self.dentry, &dname, &inner)?;
-        let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
-        drop(_namespace_guard);
-
-        // First check if this inode is a mount point; if so, it cannot be deleted
-        if child
-            .as_ref()
-            .is_some_and(|dentry| dentry.is_local_mountpoint())
-        {
-            return Err(SystemError::EBUSY);
-        }
-        // Delegate to the inner inode's rmdir method to delete this inode
-        self.dentry.inode.rmdir_with_context(name, context)?;
-        context.ensure_locked();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
-        drop(inner);
-        if let Some(child) = child.as_ref() {
-            self.mount_fs.super_block_state.disconnect_dentry(child);
-        }
-        return Ok(());
+        self.rmdir_with_context_impl(name, context, None)
     }
 
     #[inline]
@@ -4223,9 +5435,16 @@ impl IndexNode for MountFSInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, SystemError> {
         let context = DentryMutationContext::new();
-        self.move_to_with_context(old_name, target, new_name, flags, &context)
+        self.move_to_with_context_impl(
+            old_name,
+            target,
+            new_name,
+            flags,
+            &context,
+            RenameCommitHooks::default(),
+        )
     }
 
     fn move_to_with_context(
@@ -4235,91 +5454,15 @@ impl IndexNode for MountFSInode {
         new_name: &str,
         flags: RenameFlags,
         context: &DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
-        self.ensure_mount_writable()?;
-        // Filesystem implementations generally expect `target` to be an inode
-        // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
-        // mount wrapping is enabled, `target` is often a `MountFSInode`, which
-        // would make FS-level downcasts fail and incorrectly return EINVAL.
-        //
-        // So we unwrap the mount wrapper before delegating.
-        let target_mount = target.clone().downcast_arc::<MountFSInode>();
-        let target_inner: Arc<dyn IndexNode> = target_mount
-            .as_ref()
-            .map(|mnt| mnt.dentry.inode.clone())
-            .unwrap_or_else(|| target.clone());
-        let target_parent = target_mount
-            .as_ref()
-            .map(|mount| mount.dentry.clone())
-            .unwrap_or_else(|| self.dentry.clone());
-
-        with_dentry_children_gates(&self.dentry, &target_parent, || {
-            let namespace_guard = self
-                .mount_fs
-                .super_block_state
-                .dentry_namespace_lock
-                .write();
-            let (source_dentry, target_dentry) = if let Some(target_mount) = target_mount.as_ref() {
-                let sb = &self.mount_fs.super_block_state;
-                let source_inner = self.dentry.inode.find(old_name)?;
-                let source_dentry =
-                    sb.get_registered_dentry(&self.dentry, &DName::from(old_name), &source_inner)?;
-                let target_dentry = match target_inner.find(new_name) {
-                    Ok(target_child) => sb.get_registered_dentry(
-                        &target_mount.dentry,
-                        &DName::from(new_name),
-                        &target_child,
-                    )?,
-                    Err(SystemError::ENOENT) => None,
-                    Err(error) => return Err(error),
-                };
-                (source_dentry, target_dentry)
-            } else {
-                (None, None)
-            };
-            with_dentry_mount_gates(source_dentry.as_ref(), target_dentry.as_ref(), || {
-                // The parent directory gates keep both positive and negative
-                // names stable while the per-superblock registry lock is
-                // released for potentially long layered copy-up I/O.
-                drop(namespace_guard);
-                if source_dentry
-                    .as_ref()
-                    .is_some_and(|dentry| dentry.is_local_mountpoint())
-                    || target_dentry
-                        .as_ref()
-                        .is_some_and(|dentry| dentry.is_local_mountpoint())
-                {
-                    return Err(SystemError::EBUSY);
-                }
-                self.dentry.inode.move_to_with_context(
-                    old_name,
-                    &target_inner,
-                    new_name,
-                    flags,
-                    context,
-                )?;
-                context.ensure_locked();
-                let _namespace_guard = self
-                    .mount_fs
-                    .super_block_state
-                    .dentry_namespace_lock
-                    .write();
-                if let (Some(source), Some(target)) =
-                    (self.self_ref.upgrade(), target_mount.clone())
-                {
-                    Self::update_move_dentries(
-                        &source,
-                        DName::from(old_name),
-                        &target,
-                        DName::from(new_name),
-                        flags.contains(RenameFlags::EXCHANGE),
-                        source_dentry.clone(),
-                        target_dentry.clone(),
-                    );
-                }
-                Ok(())
-            })
-        })
+    ) -> Result<RenameOutcome, SystemError> {
+        self.move_to_with_context_impl(
+            old_name,
+            target,
+            new_name,
+            flags,
+            context,
+            RenameCommitHooks::default(),
+        )
     }
 
     fn check_access(

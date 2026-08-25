@@ -4,6 +4,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::filesystem::fsnotify::{self, FsEvent};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
@@ -58,7 +59,7 @@ use crate::{
         resource::RLimitID,
         ProcessControlBlock, ProcessManager, RawPid,
     },
-    syscall::user_access::UserBufferReader,
+    syscall::{user_access::UserBufferReader, user_buffer::UserBuffer},
 };
 
 use crate::filesystem::vfs::InodeMode;
@@ -208,6 +209,14 @@ struct WriteConfig {
     offset_update: OffsetUpdate,
     /// Only consumed by a delegated write operation.
     sync_intent: WriteSyncIntent,
+    /// Whether this operation owns the data-content MODIFY notification.
+    emit_data_fsnotify: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WriteCompletionPolicy {
+    sync_intent: WriteSyncIntent,
+    emit_data_fsnotify: bool,
 }
 
 /// Determines which write operation owns Linux post-write synchronous-I/O
@@ -632,6 +641,11 @@ pub struct File {
     /// 唯一 open file description id，用于 flock owner 标识。
     open_file_id: usize,
     inode: Arc<dyn IndexNode>,
+    /// Original pathname inode when open substitutes a runtime special inode
+    /// (for example, a named FIFO's LockedPipeInode).  Linux keeps this
+    /// identity in file->f_path for fsnotify even though I/O uses the special
+    /// inode.  Anonymous objects and ordinary files need no extra reference.
+    fsnotify_path_inode: Option<Arc<dyn IndexNode>>,
     /// Filesystem selected when this open file description was created.
     ///
     /// Mount wrappers retain the mount selected by path lookup. Cache that
@@ -850,23 +864,24 @@ impl File {
         inode.flush_file(self.private_data.lock(), lock_owner)
     }
 
-    fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
+    fn maybe_kill_suid_sgid_after_write(&self) -> Result<bool, SystemError> {
         // 仅对普通文件生效。
         if self.file_type != FileType::File {
-            return Ok(());
+            return Ok(false);
         }
 
         // Linux 语义：若调用者具备 CAP_FSETID，则写/截断不会清除 suid/sgid。
         let cred = ProcessManager::current_pcb().cred();
         if cred.has_capability(CAPFlags::CAP_FSETID) {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut md = self.inode.metadata()?;
         if !md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID) {
-            return Ok(());
+            return Ok(false);
         }
 
+        let original_mode = md.mode;
         // suid always must be killed on write/truncate when no CAP_FSETID.
         md.mode.remove(InodeMode::S_ISUID);
 
@@ -876,12 +891,15 @@ impl File {
         if should_remove_sgid(md.mode, md.gid, &cred) {
             md.mode.remove(InodeMode::S_ISGID);
         }
+        if md.mode == original_mode {
+            return Ok(false);
+        }
 
         self.inode.set_metadata_masked(
             &md,
             SetMetadataMask::MODE | SetMetadataMask::WRITE_SIDE_EFFECT,
         )?;
-        Ok(())
+        Ok(true)
     }
 
     #[inline(never)]
@@ -1049,9 +1067,7 @@ impl File {
         written_len: usize,
         config: WriteConfig,
     ) -> Result<usize, SystemError> {
-        if written_len > 0 {
-            self.maybe_kill_suid_sgid_after_write()?;
-        }
+        let mode_changed = written_len > 0 && self.maybe_kill_suid_sgid_after_write()?;
 
         if config.update_offset {
             match config.offset_update {
@@ -1068,6 +1084,20 @@ impl File {
             }
         }
 
+        // fsnotify: deliver IN_MODIFY after a successful write (FMODE_NONOTIFY short-circuits, preventing inotify fd recursion).
+        if written_len > 0
+            && fsnotify::has_any_watch()
+            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
+        {
+            // Linux publishes the ATTR_MODE change from file_remove_privs
+            // before the successful write's MODIFY event.
+            if mode_changed {
+                self.notify_fs_event(FsEvent::ATTRIB);
+            }
+            if config.emit_data_fsnotify {
+                self.notify_fs_event(FsEvent::MODIFY);
+            }
+        }
         Ok(written_len)
     }
     /// @brief 创建一个新的文件对象
@@ -1147,6 +1177,7 @@ impl File {
         mut preopened: Option<PreopenedFile>,
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
+        let path_inode = inode.clone();
         let mut file_type = inode.metadata()?.file_type;
         let is_path = flags.contains(FileFlags::O_PATH);
 
@@ -1259,6 +1290,7 @@ impl File {
 
         let f = File {
             open_file_id: alloc_open_file_id(),
+            fsnotify_path_inode: (!Arc::ptr_eq(&inode, &path_inode)).then_some(path_inode),
             inode,
             io_fs,
             offset: AtomicUsize::new(0),
@@ -1282,6 +1314,76 @@ impl File {
         };
 
         return Ok(f);
+    }
+
+    /// Dispatch using one coherent dentry snapshot. This keeps the read/write
+    /// hot path free of namespace walks and temporary String allocations.
+    pub(crate) fn notify_fs_event(&self, mask: FsEvent) {
+        let event_inode = self.fsnotify_path_inode.as_ref().unwrap_or(&self.inode);
+        if let Some(mounted) = event_inode.clone().downcast_arc::<MountFSInode>() {
+            let Some((child, parent)) = mounted.fsnotify_snapshot() else {
+                return;
+            };
+            // Linux deliberately withholds ACCESS/MODIFY child events from a
+            // special file's parent directory to avoid a side channel.  The
+            // special inode itself still receives the event through f_path.
+            let special_content_event = mask.intersects(FsEvent::ACCESS | FsEvent::MODIFY)
+                && matches!(
+                    self.file_type,
+                    FileType::BlockDevice
+                        | FileType::CharDevice
+                        | FileType::FramebufferDevice
+                        | FileType::KvmDevice
+                        | FileType::Pipe
+                        | FileType::Socket
+                );
+            if let Some((parent, name)) = parent.as_ref().filter(|_| !special_content_event) {
+                fsnotify::fsnotify_targets(
+                    mask,
+                    Some((parent, name.0.as_str())),
+                    Some(&child),
+                    0,
+                    true,
+                );
+            } else {
+                fsnotify::fsnotify_targets(mask, None, Some(&child), 0, true);
+            }
+        } else {
+            fsnotify::fsnotify(mask, None, Some(event_inode), 0);
+        }
+    }
+
+    /// Publish a dentry-data event such as ATTRIB/truncate. Unlike PATH I/O
+    /// events, this is not suppressed by IN_EXCL_UNLINK.
+    pub(crate) fn notify_dentry_event(&self, mask: FsEvent) {
+        let event_inode = self.fsnotify_path_inode.as_ref().unwrap_or(&self.inode);
+        fsnotify::fsnotify_inode(mask, event_inode);
+    }
+
+    /// Publish an I/O event when this open file description participates in
+    /// userspace-visible I/O.  Internal FMODE_NONOTIFY users must not recurse
+    /// into fsnotify, and O_PATH descriptors never perform such I/O.
+    pub(crate) fn notify_io_event(&self, mask: FsEvent) {
+        if fsnotify::has_any_watch()
+            && !self
+                .mode
+                .read()
+                .intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
+        {
+            self.notify_fs_event(mask);
+        }
+    }
+
+    /// Notify a successful userspace-visible open. Callers decide which File
+    /// constructions represent VFS open/exec rather than internal kernel I/O.
+    pub(crate) fn notify_open_event(&self) {
+        if !fsnotify::has_any_watch() {
+            return;
+        }
+        let mode = *self.mode.read();
+        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH) {
+            self.notify_fs_event(FsEvent::OPEN);
+        }
     }
 
     /// Create a file object for sockets created by socket syscalls.
@@ -1310,6 +1412,70 @@ impl File {
         };
 
         self.do_read(offset, len, buf, !stream)
+    }
+
+    /// Read one bounded kernel-buffer chunk for a single read(2) operation.
+    ///
+    /// The syscall layer may need several chunks to cover the userspace
+    /// buffer, but Linux publishes ACCESS once for the whole successful
+    /// syscall rather than once per implementation chunk.
+    pub(crate) fn read_syscall_chunk(
+        &self,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_read_with_fsnotify(offset, len, buf, !stream, false)
+    }
+
+    /// Let an inode consume a protected userspace buffer as one read syscall.
+    ///
+    /// `None` means the inode does not need this capability and the syscall
+    /// layer should use the normal bounded kernel-buffer fallback.
+    pub fn read_user(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+    ) -> Result<Option<usize>, SystemError> {
+        let mode = *self.mode.read();
+        let stream = mode.contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.readable()?;
+        if len == 0 {
+            return Ok(Some(0));
+        }
+        if writer.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+        if self.flags().contains(FileFlags::O_DIRECT) {
+            return Ok(None);
+        }
+
+        let Some(read_len) =
+            self.inode
+                .read_user_at(offset, len, writer, self.private_data.lock())?
+        else {
+            return Ok(None);
+        };
+
+        self.finalize_read(offset, read_len, !stream, true);
+        Ok(Some(read_len))
+    }
+
+    #[inline]
+    pub fn supports_read_user(&self) -> bool {
+        self.inode.supports_read_user()
     }
 
     /// Read from the current file position without advancing it.
@@ -1354,6 +1520,16 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
     pub fn pread(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.pread_with_fsnotify(offset, len, buf, true)
+    }
+
+    fn pread_with_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        emit_fsnotify: bool,
+    ) -> Result<usize, SystemError> {
         // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
         let mode = *self.mode.read();
         if mode.contains(FileMode::FMODE_PATH) {
@@ -1382,7 +1558,40 @@ impl File {
             return Err(SystemError::EINVAL);
         }
 
-        self.do_read(offset, len, buf, false)
+        self.do_read_with_fsnotify(offset, len, buf, false, emit_fsnotify)
+    }
+
+    /// Read one internal `pread(2)` chunk while deferring ACCESS until the
+    /// syscall has determined its final, user-visible result.
+    pub(crate) fn pread_syscall_chunk(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.pread_with_fsnotify(offset, len, buf, false)
+    }
+
+    /// Read for splice while deferring ACCESS until the transfer commits.
+    /// This preserves the normal permission, readahead and atime behavior but
+    /// lets do_splice publish MODIFY(out) before ACCESS(in), as Linux does.
+    pub(crate) fn read_for_transfer(
+        &self,
+        offset: Option<usize>,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        match offset {
+            Some(offset) => self.pread_with_fsnotify(offset, len, buf, false),
+            None => {
+                let offset = if self.mode.read().contains(FileMode::FMODE_STREAM) {
+                    0
+                } else {
+                    self.offset.load(Ordering::SeqCst)
+                };
+                self.do_read_with_fsnotify(offset, len, buf, false, false)
+            }
+        }
     }
 
     /// ## 从buf向文件中指定的偏移处写入指定的字节数的数据
@@ -1412,6 +1621,17 @@ impl File {
         buf: &[u8],
         requested_sync: WriteSyncIntent,
     ) -> Result<DelegatedWriteResult, SystemError> {
+        self.pwrite_with_sync_intent_and_fsnotify(offset, len, buf, requested_sync, true)
+    }
+
+    fn pwrite_with_sync_intent_and_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        requested_sync: WriteSyncIntent,
+        emit_data_fsnotify: bool,
+    ) -> Result<DelegatedWriteResult, SystemError> {
         // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
         let mode = *self.mode.read();
         if mode.contains(FileMode::FMODE_PATH) {
@@ -1433,7 +1653,37 @@ impl File {
             return Err(SystemError::EBADF);
         }
 
-        self.do_write_split(offset, len, buf, false, false, requested_sync)
+        self.do_write_split(
+            offset,
+            len,
+            buf,
+            false,
+            false,
+            WriteCompletionPolicy {
+                sync_intent: requested_sync,
+                emit_data_fsnotify,
+            },
+        )
+    }
+
+    /// Write one internal `pwrite(2)` chunk while deferring its data-content
+    /// MODIFY notification until the syscall completion point. Metadata
+    /// changes such as setid removal remain visible at their commit point.
+    pub(crate) fn pwrite_syscall_chunk(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        let result = self.pwrite_with_sync_intent_and_fsnotify(
+            offset,
+            len,
+            buf,
+            WriteSyncIntent::None,
+            false,
+        )?;
+        result.sync_result?;
+        Ok(result.written_len)
     }
 
     /// 强制追加写（Linux `RWF_APPEND`/`IOCB_APPEND` 语义）：
@@ -1527,6 +1777,17 @@ impl File {
         buf: &mut [u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
+        self.do_read_with_fsnotify(offset, len, buf, update_offset, true)
+    }
+
+    fn do_read_with_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        update_offset: bool,
+        emit_fsnotify: bool,
+    ) -> Result<usize, SystemError> {
         self.readable()?;
         // Linux/POSIX: count==0 must not touch the buffer and must not block.
         if len == 0 {
@@ -1548,6 +1809,11 @@ impl File {
                 .read_at(offset, len, buf, self.private_data.lock())
         }?;
 
+        self.finalize_read(offset, len, update_offset, emit_fsnotify);
+        Ok(len)
+    }
+
+    fn finalize_read(&self, offset: usize, len: usize, update_offset: bool, emit_fsnotify: bool) {
         if len > 0 {
             let last_page_readed = (offset + len - 1) >> MMArch::PAGE_SHIFT;
             self.ra_state.lock().prev_index = last_page_readed as i64;
@@ -1562,7 +1828,15 @@ impl File {
         if len > 0 || self.file_type == FileType::File {
             self.touch_atime_after_access();
         }
-        Ok(len)
+        // fsnotify: deliver IN_ACCESS only when data was actually read (len > 0) (FMODE_NONOTIFY short-circuits).
+        // An EOF read (len==0) does not deliver—independent of atime semantics.
+        if emit_fsnotify
+            && len > 0
+            && fsnotify::has_any_watch()
+            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
+        {
+            self.notify_fs_event(FsEvent::ACCESS);
+        }
     }
 
     /// Best-effort equivalent of Linux file_accessed()/touch_atime().
@@ -1611,7 +1885,35 @@ impl File {
             buf,
             update_offset,
             force_append,
-            WriteSyncIntent::None,
+            WriteCompletionPolicy {
+                sync_intent: WriteSyncIntent::None,
+                emit_data_fsnotify: true,
+            },
+        )?;
+        result.sync_result?;
+        Ok(result.written_len)
+    }
+
+    /// Write one internal transfer chunk while deferring its data-content
+    /// notification to the syscall that owns the complete transfer. Metadata
+    /// side effects such as setid removal are still reported immediately.
+    pub(crate) fn write_for_transfer(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        update_offset: bool,
+    ) -> Result<usize, SystemError> {
+        let result = self.do_write_split(
+            offset,
+            len,
+            buf,
+            update_offset,
+            false,
+            WriteCompletionPolicy {
+                sync_intent: WriteSyncIntent::None,
+                emit_data_fsnotify: false,
+            },
         )?;
         result.sync_result?;
         Ok(result.written_len)
@@ -1624,7 +1926,7 @@ impl File {
         buf: &[u8],
         update_offset: bool,
         force_append: bool,
-        requested_sync: WriteSyncIntent,
+        completion: WriteCompletionPolicy,
     ) -> Result<DelegatedWriteResult, SystemError> {
         self.writeable()?;
 
@@ -1647,7 +1949,7 @@ impl File {
         let sync_intent = match self.post_write_sync {
             PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::Delegated => self
                 .post_write_sync_intent(flags, inode_flags)
-                .combine(requested_sync),
+                .combine(completion.sync_intent),
             PostWriteSyncPolicy::NotApplicable => WriteSyncIntent::None,
         };
 
@@ -1671,6 +1973,7 @@ impl File {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
                         sync_intent,
+                        emit_data_fsnotify: completion.emit_data_fsnotify,
                     },
                 )
                 .map(|result| (actual_offset, result))
@@ -1685,7 +1988,7 @@ impl File {
                 // inode flags already fetched before I/O.
                 let current_sync_intent = self
                     .post_write_sync_intent(flags, inode_flags)
-                    .combine(requested_sync);
+                    .combine(completion.sync_intent);
                 result.sync_result = self.generic_sync_after_write(
                     actual_offset,
                     result.written_len,
@@ -1706,12 +2009,13 @@ impl File {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
                 sync_intent,
+                emit_data_fsnotify: completion.emit_data_fsnotify,
             },
         )?;
         if result.sync_result.is_ok() {
             let current_sync_intent = self
                 .post_write_sync_intent(flags, inode_flags)
-                .combine(requested_sync);
+                .combine(completion.sync_intent);
             result.sync_result = self.generic_sync_after_write(
                 actual_offset,
                 result.written_len,
@@ -1765,6 +2069,7 @@ impl File {
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
                         sync_intent,
+                        emit_data_fsnotify: true,
                     },
                 )
                 .map(|written_len| (actual_offset, written_len))
@@ -1789,6 +2094,7 @@ impl File {
                 update_offset,
                 offset_update: OffsetUpdate::Add,
                 sync_intent,
+                emit_data_fsnotify: true,
             },
         )?;
         let current_sync_intent = self.post_write_sync_intent(flags, inode_flags);
@@ -1977,6 +2283,14 @@ impl File {
         // read_dir_impl has released readdir_state before this metadata update,
         // avoiding a cross-filesystem lock-order dependency.
         self.touch_atime_after_access();
+        if fsnotify::has_any_watch()
+            && !self
+                .mode
+                .read()
+                .intersects(FileMode::FMODE_PATH | FileMode::FMODE_NONOTIFY)
+        {
+            self.notify_fs_event(FsEvent::ACCESS);
+        }
         result
     }
 
@@ -2081,6 +2395,16 @@ impl File {
         return self.inode.clone();
     }
 
+    /// Inode selected by the pathname that opened this file. Special-file I/O
+    /// may use a substituted runtime inode, but procfs fd links and fsnotify
+    /// must retain Linux file->f_path identity.
+    #[inline]
+    pub(crate) fn path_inode(&self) -> Arc<dyn IndexNode> {
+        self.fsnotify_path_inode
+            .clone()
+            .unwrap_or_else(|| self.inode.clone())
+    }
+
     /// Invoke an operation on the filesystem selected for this open file.
     ///
     /// Pathname-backed files retain their selected mount and therefore avoid
@@ -2146,6 +2470,7 @@ impl File {
         let res = Self {
             open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
+            fsnotify_path_inode: self.fsnotify_path_inode.clone(),
             io_fs: self.io_fs.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
             flags: RwSem::new(flags),
@@ -2263,6 +2588,18 @@ impl File {
         self.private_data.lock().update_flags(new_flags)?;
         // 更新文件的打开模式
         *self.flags.write() = new_flags;
+
+        // Sync the O_NONBLOCK change to the inotify fd (its read_at checks an internal AtomicBool rather than FileFlags,
+        // same as socket's set_nonblocking).
+        if new_flags.contains(FileFlags::O_NONBLOCK) != old_flags.contains(FileFlags::O_NONBLOCK) {
+            if let Some(ino) = self
+                .inode
+                .as_any_ref()
+                .downcast_ref::<crate::filesystem::inotify::InotifyInode>()
+            {
+                ino.set_nonblocking(new_flags.contains(FileFlags::O_NONBLOCK));
+            }
+        }
         return Ok(());
     }
 
@@ -2446,6 +2783,19 @@ impl Drop for File {
         for epitem in epitems {
             EventPoll::release_file_epitem(&epitem);
             let _ = self.remove_epitem(&epitem);
+        }
+        // fsnotify: the final close → IN_CLOSE_WRITE / IN_CLOSE_NOWRITE (FMODE_NONOTIFY short-circuits).
+        // At this point self.inode is still alive (Drop runs before inode.close()), so it is safe to take the inode_id.
+        if fsnotify::has_any_watch() {
+            let mode = *self.mode.read();
+            if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH) {
+                let m = if mode.contains(FileMode::FMODE_WRITE) {
+                    FsEvent::CLOSE_WRITE
+                } else {
+                    FsEvent::CLOSE_NOWRITE
+                };
+                self.notify_fs_event(m);
+            }
         }
 
         if self.flags().contains(FileFlags::FASYNC) {

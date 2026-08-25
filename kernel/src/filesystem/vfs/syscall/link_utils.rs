@@ -1,4 +1,5 @@
-use crate::filesystem::vfs::mount::MountFS;
+use crate::filesystem::fsnotify::{self, FsEvent};
+use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
 use crate::filesystem::vfs::permission::check_inode_permission;
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::AtFlags;
@@ -133,7 +134,25 @@ pub fn do_linkat(
         return Err(SystemError::EPERM);
     }
 
-    return new_parent.link(new_name, &old_inode).map(|_| 0);
+    let notify = || {
+        // Linux reports the source inode's changed link count before the
+        // destination directory entry becomes visible to fsnotify consumers.
+        fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&old_inode), 0);
+        // fsnotify: the parent directory receives IN_CREATE (the hard-link target is not a directory, so IN_ISDIR is not set).
+        fsnotify::fsnotify(
+            FsEvent::CREATE,
+            Some((&new_parent, new_name)),
+            Some(&old_inode),
+            0,
+        );
+    };
+    if let Some(mounted) = new_parent.clone().downcast_arc::<MountFSInode>() {
+        mounted.link_with_post_commit(new_name, &old_inode, notify)?;
+    } else {
+        new_parent.link(new_name, &old_inode)?;
+        notify();
+    }
+    Ok(0)
 }
 
 /// 检查是否允许创建硬链接（对应Linux的may_linkat）

@@ -1,5 +1,6 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
+use crate::filesystem::fsnotify::{self, FsEvent};
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use log::{error, info, warn};
 use system_error::SystemError;
@@ -16,10 +17,10 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{
             file::{File, FileMode, FilePrivateData},
-            mount::{MountFlags, MOUNT_LIFECYCLE_LOCK},
+            mount::{MountFSInode, MountFlags, MOUNT_LIFECYCLE_LOCK},
             permission::PermissionMask,
             AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, Metadata, MountFS,
-            SetMetadataMask,
+            OpenTruncateContext, SetMetadataMask,
         },
     },
     init::cmdline::kenrel_cmdline_param_manager,
@@ -592,9 +593,21 @@ pub fn do_mkdir_at(
     }
     let umask = pcb.fs_struct().umask();
     let final_mode = InodeMode::from_bits_truncate(final_mode_bits) & !umask;
-
-    // 执行创建
-    return current_inode.mkdir(name, final_mode);
+    let notify = || {
+        fsnotify::fsnotify(
+            FsEvent::CREATE | FsEvent::ISDIR,
+            Some((&current_inode, name)),
+            None,
+            0,
+        );
+    };
+    if let Some(mounted) = current_inode.clone().downcast_arc::<MountFSInode>() {
+        mounted.mkdir_with_post_commit(name, final_mode, notify)
+    } else {
+        let inode = current_inode.mkdir(name, final_mode)?;
+        notify();
+        Ok(inode)
+    }
 }
 
 /// 解析父目录inode
@@ -670,8 +683,22 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::ENOTDIR);
     }
 
-    // 删除文件夹
-    parent_inode.rmdir(filename)?;
+    let notify = || {
+        // DELETE_SELF is emitted later when the disconnected dentry finally
+        // detaches from the inode.
+        fsnotify::fsnotify(
+            FsEvent::DELETE,
+            Some((&parent_inode, filename)),
+            Some(&target_inode),
+            0,
+        );
+    };
+    if let Some(mounted) = parent_inode.clone().downcast_arc::<MountFSInode>() {
+        mounted.rmdir_with_post_commit(filename, notify)?;
+    } else {
+        parent_inode.rmdir(filename)?;
+        notify();
+    }
 
     return Ok(0);
 }
@@ -711,9 +738,23 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EISDIR);
     }
 
-    // 在父目录上执行 unlink 操作
-    parent_inode.unlink(filename)?;
-
+    let notify = || {
+        // Linux publishes the link-count ATTRIB before the parent DELETE
+        // record. DELETE_SELF remains deferred to final dentry detach.
+        fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&target_inode), 0);
+        fsnotify::fsnotify(
+            FsEvent::DELETE,
+            Some((&parent_inode, filename)),
+            Some(&target_inode),
+            0,
+        );
+    };
+    if let Some(mounted) = parent_inode.clone().downcast_arc::<MountFSInode>() {
+        mounted.unlink_with_post_commit(filename, notify)?;
+    } else {
+        parent_inode.unlink(filename)?;
+        notify();
+    }
     return Ok(0);
 }
 
@@ -745,6 +786,25 @@ where
 {
     let md = inode.metadata()?;
 
+    validate_truncate(&inode, &md, len)?;
+    let (md, mask) = prepare_write_side_effect_metadata(md, len);
+    let r = do_resize(&inode, &md, mask);
+    if r.is_ok() {
+        let mut event = FsEvent::MODIFY;
+        if mask.contains(SetMetadataMask::MODE) {
+            // notify_change emits one combined event for ATTR_SIZE|ATTR_MODE.
+            event |= FsEvent::ATTRIB;
+        }
+        fsnotify::fsnotify_inode(event, &inode);
+    }
+    r
+}
+
+fn validate_truncate(
+    inode: &Arc<dyn IndexNode>,
+    md: &Metadata,
+    len: usize,
+) -> Result<(), SystemError> {
     // 防御性检查：统一拒绝超出 isize::MAX 的长度，避免后续类型转换溢出
     if len > isize::MAX as usize {
         return Err(SystemError::EINVAL);
@@ -781,8 +841,7 @@ where
         }
     }
 
-    let (md, mask) = prepare_write_side_effect_metadata(md, len);
-    do_resize(&inode, &md, mask)
+    Ok(())
 }
 
 pub(crate) fn prepare_write_side_effect_metadata(
@@ -791,6 +850,32 @@ pub(crate) fn prepare_write_side_effect_metadata(
 ) -> (Metadata, SetMetadataMask) {
     let cred = ProcessManager::current_pcb().cred();
     prepare_write_side_effect_metadata_with_cred(md, new_size, &cred)
+}
+
+pub(crate) fn prepare_open_truncate(metadata_before_open: Metadata) -> OpenTruncateContext {
+    let (requested, mask) = prepare_write_side_effect_metadata(metadata_before_open, 0);
+    OpenTruncateContext { requested, mask }
+}
+
+/// Complete Linux's post-open truncate stage for an existing regular file.
+pub(crate) fn vfs_open_truncate(
+    file: &File,
+    context: &OpenTruncateContext,
+) -> Result<(), SystemError> {
+    let inode = file.inode();
+    validate_truncate(&inode, &context.requested, 0)?;
+    inode.resize_open_truncate(
+        0,
+        current_file_lock_owner_id(),
+        file.private_data.lock(),
+        context,
+    )?;
+    let mut event = FsEvent::MODIFY;
+    if context.mask.contains(SetMetadataMask::MODE) {
+        event |= FsEvent::ATTRIB;
+    }
+    file.notify_dentry_event(event);
+    Ok(())
 }
 
 pub(crate) fn prepare_write_side_effect_metadata_with_cred(
@@ -870,6 +955,7 @@ pub fn resize_based_fallocate(
     offset: usize,
     len: usize,
     lock_owner: u64,
+    attrib: &mut super::AttribStageObserver<'_>,
 ) -> Result<(), SystemError> {
     if mode != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -885,15 +971,14 @@ pub fn resize_based_fallocate(
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
-    let current_size = md.size.max(0) as usize;
-    if new_size <= current_size {
-        return Ok(());
+    // The filesystem re-reads size and metadata inside its native mutation
+    // lock. A VFS snapshot cannot safely decide whether a concurrent grow has
+    // already satisfied the request or which privilege bits remain to clear.
+    let mask = inode.fallocate_resize_atomic(new_size, lock_owner)?;
+    if mask.contains(SetMetadataMask::MODE) {
+        attrib.commit();
     }
-
-    check_file_size_limit(new_size)?;
-
-    let (metadata, mask) = prepare_write_side_effect_metadata(md, new_size);
-    inode.resize_with_metadata(new_size, lock_owner, &metadata, mask)
+    Ok(())
 }
 
 /// 基于已打开文件执行 VFS fallocate 公共检查，再分派给具体文件系统。
@@ -919,6 +1004,12 @@ pub fn vfs_fallocate_file(
 
     if len == 0 || offset > isize::MAX as usize || len > isize::MAX as usize {
         return Err(SystemError::EINVAL);
+    }
+    // VFS-layer s_maxbytes upper-bound guard (aligned with Linux do_fallocate): offset+len must not overflow or exceed isize::MAX.
+    // Each filesystem implementation re-validates on its own, but the VFS layer should not leave a gap.
+    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+    if new_size > isize::MAX as usize {
+        return Err(SystemError::EFBIG);
     }
 
     let mode_bits = mode as u32;
@@ -982,16 +1073,18 @@ pub fn vfs_fallocate_file(
         _ => return Err(SystemError::ENODEV),
     }
 
-    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
-    if new_size > isize::MAX as usize {
-        return Err(SystemError::EFBIG);
-    }
-
-    inode.fallocate_file(
+    let mut publish_attrib = || file.notify_dentry_event(FsEvent::ATTRIB);
+    let mut attrib = super::AttribStageObserver::new(&mut publish_attrib);
+    let r = inode.fallocate_file(
         mode,
         offset,
         len,
         current_file_lock_owner_id(),
+        &mut attrib,
         file.private_data.lock(),
-    )
+    );
+    if r.is_ok() {
+        file.notify_fs_event(FsEvent::MODIFY);
+    }
+    r
 }

@@ -2,7 +2,7 @@
 //!
 //! 提供对用户空间缓冲区的安全访问接口，所有操作都通过异常表保护
 
-use crate::mm::VirtAddr;
+use crate::mm::{access_ok, VirtAddr};
 use num::traits::FromBytes;
 use system_error::SystemError;
 
@@ -20,6 +20,31 @@ pub struct UserBuffer<'a> {
 }
 
 impl<'a> UserBuffer<'a> {
+    /// Build an address-only protected userspace buffer.
+    ///
+    /// Unlike `UserBufferWriter`, this does not construct a Rust slice over
+    /// the user range. Individual accesses remain exception-table protected,
+    /// so a range containing a later unmapped page can safely report EFAULT
+    /// at the exact copy operation.
+    pub fn new_protected<U>(
+        addr: *mut U,
+        len: usize,
+        from_user: bool,
+    ) -> Result<Self, SystemError> {
+        if len != 0 && addr.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+        let user_addr = VirtAddr::new(addr as usize);
+        if from_user {
+            access_ok(user_addr, len).map_err(|_| SystemError::EFAULT)?;
+        }
+        Ok(Self {
+            user_addr,
+            len,
+            _phantom: core::marker::PhantomData,
+        })
+    }
+
     /// 创建一个新的用户缓冲区包装
     ///
     /// # 参数

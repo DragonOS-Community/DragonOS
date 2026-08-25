@@ -1,5 +1,7 @@
 use super::entry::OvlEntry;
-use super::fs::OverlayFS;
+use super::fs::{
+    OverlayFS, OvlLinkIdentity, OvlLinkSeed, OvlLinkSeedPublication, RealInodeIdentity,
+};
 use super::metadata::OvlOrigin;
 use super::{dir, file, lookup, readdir, rename};
 use crate::driver::base::device::device_number::DeviceNumber;
@@ -9,11 +11,11 @@ use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{
     self, inode_lifecycle::InodeRetentionGuard, DirectoryEntry, FileSystem, FileType, IndexNode,
-    InodeId, InodeRetentionKind, Metadata, OpenFileBehavior, PostWriteSyncPolicy, SetMetadataMask,
-    XattrFlags,
+    InodeId, InodeRetentionKind, LinkMutationCoordinator, Metadata, OpenFileBehavior,
+    PostWriteSyncPolicy, SetMetadataMask, XattrFlags,
 };
 use crate::libs::casting::DowncastArc;
-use crate::libs::mutex::Mutex;
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::mm::VmFlags;
 use crate::time::PosixTimeSpec;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -21,6 +23,45 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use system_error::SystemError;
+
+pub(super) struct OvlLinkMutation<'a> {
+    fs: Arc<OverlayFS>,
+    state: &'a Arc<OvlLinkState>,
+    nlinks: MutexGuard<'a, usize>,
+    newly_pinned: bool,
+    committed: bool,
+}
+
+impl core::ops::Deref for OvlLinkMutation<'_> {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.nlinks
+    }
+}
+
+impl core::ops::DerefMut for OvlLinkMutation<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.nlinks
+    }
+}
+
+impl OvlLinkMutation<'_> {
+    /// Commit is allocation-free: capacity and the temporary strong pin were
+    /// installed before backing I/O while this object's nlink lock was held.
+    pub(super) fn commit(mut self) {
+        self.fs.commit_link_mutation(self.state, *self.nlinks);
+        self.committed = true;
+    }
+}
+
+impl Drop for OvlLinkMutation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.fs.abort_link_mutation(self.state, self.newly_pinned);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct OvlInode {
@@ -34,10 +75,48 @@ pub struct OvlInode {
     pub(super) overlay_inode_id: Option<InodeId>,
     origin: Mutex<OriginState>,
     pub(super) content_privilege_lock: Mutex<()>,
+    link_mutation_coordinator: Arc<LinkMutationCoordinator>,
+    /// Lazy overlay-visible link fact. Lookup records only the already-known
+    /// identity/count seed; the shared heap object is created on the first
+    /// lower-origin link-count mutation.
+    link_state: Mutex<OvlLinkStateSlot>,
     dir_state: Mutex<Option<Arc<DirState>>>,
     #[allow(dead_code)]
     pub(super) oe: Arc<OvlEntry>,
     pub(super) fs: Mutex<Weak<OverlayFS>>,
+}
+
+#[derive(Debug)]
+pub(super) struct OvlLinkState {
+    identity: OvlLinkIdentity,
+    nlinks: Mutex<usize>,
+}
+
+impl OvlLinkState {
+    pub(super) fn new(identity: OvlLinkIdentity, nlinks: usize) -> Self {
+        Self {
+            identity,
+            nlinks: Mutex::new(nlinks),
+        }
+    }
+
+    pub(super) fn identity(&self) -> OvlLinkIdentity {
+        self.identity
+    }
+
+    pub(super) fn lock(&self) -> MutexGuard<'_, usize> {
+        self.nlinks.lock()
+    }
+}
+
+#[derive(Debug)]
+enum OvlLinkStateSlot {
+    Unseeded,
+    Seeded {
+        identity: OvlLinkIdentity,
+        initial_nlinks: usize,
+        state: Option<Arc<OvlLinkState>>,
+    },
 }
 
 const LOOKUP_CACHE_CAPACITY: usize = 256;
@@ -172,6 +251,7 @@ impl OvlInode {
         upper: Option<Arc<dyn IndexNode>>,
         lower_inodes: Vec<Arc<dyn IndexNode>>,
         overlay_inode_id: Option<InodeId>,
+        link_mutation_coordinator: Arc<LinkMutationCoordinator>,
     ) -> Self {
         let backing_retentions = upper
             .iter()
@@ -189,10 +269,158 @@ impl OvlInode {
             overlay_inode_id,
             origin: Mutex::new(OriginState::Unchecked),
             content_privilege_lock: Mutex::new(()),
+            link_mutation_coordinator,
+            link_state: Mutex::new(OvlLinkStateSlot::Unseeded),
             dir_state: Mutex::new(None),
             oe: Arc::new(OvlEntry::new()),
             fs: Mutex::new(Weak::default()),
         }
+    }
+
+    pub(super) fn install_link_seed(&self, identity: OvlLinkIdentity, initial_nlinks: usize) {
+        let mut slot = self.link_state.lock();
+        match &*slot {
+            OvlLinkStateSlot::Unseeded => {
+                *slot = OvlLinkStateSlot::Seeded {
+                    identity,
+                    initial_nlinks,
+                    state: None,
+                };
+            }
+            OvlLinkStateSlot::Seeded {
+                identity: current, ..
+            } => debug_assert_eq!(*current, identity),
+        }
+    }
+
+    fn link_seed(&self) -> Option<OvlLinkSeed> {
+        match &*self.link_state.lock() {
+            OvlLinkStateSlot::Seeded {
+                identity: identity @ OvlLinkIdentity::Lower(_),
+                initial_nlinks,
+                ..
+            } => Some(OvlLinkSeed::new(*identity, *initial_nlinks)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn prepare_copy_up_link_seed(
+        &self,
+        upper: &Arc<dyn IndexNode>,
+    ) -> Result<Option<OvlLinkSeedPublication>, SystemError> {
+        if self.file_type == FileType::Dir {
+            return Ok(None);
+        }
+        let Some(seed) = self.link_seed() else {
+            return Ok(None);
+        };
+        let upper = RealInodeIdentity::from_inode(upper)?;
+        Ok(Some(
+            self.overlay_fs()?
+                .prepare_link_seed_publication(upper, seed)?,
+        ))
+    }
+
+    /// Resolve the logical link state for a namespace mutation.
+    ///
+    /// Lower-origin objects create the state lazily. Pure-upper objects only
+    /// adopt an existing state when they are an upper hardlink alias of a
+    /// copied-up lower object; otherwise their backing outcome is authoritative.
+    pub(super) fn logical_link_state(&self) -> Result<Option<Arc<OvlLinkState>>, SystemError> {
+        let (identity, initial_nlinks, current) = match &*self.link_state.lock() {
+            OvlLinkStateSlot::Unseeded => return Ok(None),
+            OvlLinkStateSlot::Seeded {
+                identity,
+                initial_nlinks,
+                state,
+            } => (*identity, *initial_nlinks, state.clone()),
+        };
+        if current.is_some() {
+            return Ok(current);
+        }
+
+        let fs = self.overlay_fs()?;
+        let state = match identity {
+            OvlLinkIdentity::Lower(_) => {
+                let upper_alias = self
+                    .upper_inode
+                    .lock()
+                    .as_ref()
+                    .map(RealInodeIdentity::from_inode)
+                    .transpose()?
+                    .map(OvlLinkIdentity::Upper);
+                Some(fs.intern_link_state(identity, upper_alias, initial_nlinks)?)
+            }
+            OvlLinkIdentity::Upper(_) => fs.resolve_link_state(identity),
+        };
+        let Some(state) = state else {
+            return Ok(None);
+        };
+
+        let mut slot = self.link_state.lock();
+        if let OvlLinkStateSlot::Seeded {
+            state: installed, ..
+        } = &mut *slot
+        {
+            if let Some(current) = installed.as_ref() {
+                debug_assert!(Arc::ptr_eq(current, &state));
+                return Ok(Some(current.clone()));
+            }
+            *installed = Some(state.clone());
+        }
+        Ok(Some(state))
+    }
+
+    pub(super) fn begin_link_mutation<'a>(
+        &self,
+        state: &'a Arc<OvlLinkState>,
+    ) -> Result<OvlLinkMutation<'a>, SystemError> {
+        let fs = self.overlay_fs()?;
+        let nlinks = state.lock();
+        let newly_pinned = fs.begin_link_mutation(state)?;
+        Ok(OvlLinkMutation {
+            fs,
+            state,
+            nlinks,
+            newly_pinned,
+            committed: false,
+        })
+    }
+
+    /// A copy-up can create pure-upper hardlink aliases of a lower-origin
+    /// object. Publish the upper identity as an alias of the stable lower fact
+    /// before the new namespace link becomes visible.
+    pub(super) fn publish_upper_link_alias(
+        &self,
+        state: &Arc<OvlLinkState>,
+    ) -> Result<(), SystemError> {
+        let Some(upper) = self.upper_inode.lock().clone() else {
+            return Err(SystemError::EIO);
+        };
+        let alias = OvlLinkIdentity::Upper(RealInodeIdentity::from_inode(&upper)?);
+        self.overlay_fs()?.alias_link_state(alias, state)?;
+        Ok(())
+    }
+
+    /// Bridge a copy-up identity only when a logical state already exists.
+    /// Rename/open copy-up must not allocate link state for an otherwise
+    /// untouched inode, but an earlier whiteout/link mutation may require the
+    /// copied-up upper identity to keep resolving that retained fact.
+    pub(super) fn publish_existing_upper_link_alias(&self) -> Result<(), SystemError> {
+        let (identity, installed) = match &*self.link_state.lock() {
+            OvlLinkStateSlot::Unseeded => return Ok(()),
+            OvlLinkStateSlot::Seeded {
+                identity, state, ..
+            } => (*identity, state.clone()),
+        };
+        let state = match installed {
+            Some(state) => Some(state),
+            None => self.overlay_fs()?.resolve_link_state(identity),
+        };
+        if let Some(state) = state {
+            self.publish_upper_link_alias(&state)?;
+        }
+        Ok(())
     }
 
     pub(super) fn set_fs(&self, fs: Weak<OverlayFS>) {
@@ -266,6 +494,16 @@ impl OvlInode {
         !self.lower_inodes.is_empty()
     }
 
+    pub(super) fn has_lower_link_origin(&self) -> bool {
+        matches!(
+            &*self.link_state.lock(),
+            OvlLinkStateSlot::Seeded {
+                identity: OvlLinkIdentity::Lower(_),
+                ..
+            }
+        )
+    }
+
     pub(super) fn is_pure_upper(&self) -> bool {
         self.has_upper() && !self.has_lower()
     }
@@ -307,6 +545,10 @@ impl OvlInode {
 }
 
 impl IndexNode for OvlInode {
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        Some(self.link_mutation_coordinator.as_ref())
+    }
+
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         if self.file_type == FileType::File {
             behavior.post_write_sync = PostWriteSyncPolicy::Delegated;
@@ -323,10 +565,6 @@ impl IndexNode for OvlInode {
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
         file::open(self, data, flags)
-    }
-
-    fn truncate_before_open(&self, _flags: &FileFlags) -> bool {
-        false
     }
 
     fn read_at(
@@ -501,6 +739,26 @@ impl IndexNode for OvlInode {
         super::metadata::resize_file_with_metadata(self, len, lock_owner, data, metadata, mask)
     }
 
+    fn resize_open_truncate(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        context: &vfs::OpenTruncateContext,
+    ) -> Result<(), SystemError> {
+        // Linux overlayfs clears ATTR_FILE/ATTR_OPEN before forwarding setattr
+        // to the upper inode. The outer open file therefore must not leak its
+        // backing file handle into an upper FUSE SETATTR request.
+        drop(data);
+        super::metadata::resize_with_metadata(
+            self,
+            len,
+            lock_owner,
+            &context.requested,
+            context.mask,
+        )
+    }
+
     fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
         super::metadata::getxattr(self, name, buf)
     }
@@ -573,7 +831,7 @@ impl IndexNode for OvlInode {
         dir::rmdir_with_context(self, name, context)
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(&self, name: &str) -> Result<vfs::LinkRemovalOutcome, SystemError> {
         dir::unlink(self, name)
     }
 
@@ -581,7 +839,7 @@ impl IndexNode for OvlInode {
         &self,
         name: &str,
         context: &vfs::mount::DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<vfs::LinkRemovalOutcome, SystemError> {
         dir::unlink_with_context(self, name, context)
     }
 
@@ -608,7 +866,7 @@ impl IndexNode for OvlInode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<vfs::RenameOutcome, SystemError> {
         rename::move_to(self, old_name, target, new_name, flags)
     }
 
@@ -619,7 +877,7 @@ impl IndexNode for OvlInode {
         new_name: &str,
         flags: RenameFlags,
         context: &vfs::mount::DentryMutationContext<'_>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<vfs::RenameOutcome, SystemError> {
         rename::move_to_with_context(self, old_name, target, new_name, flags, context)
     }
 

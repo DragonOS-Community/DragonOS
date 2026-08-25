@@ -14,8 +14,8 @@ use crate::{
         },
         vfs::{
             self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
-            IndexNode, InodeFlags, InodeId, InodeMode, InodeRetentionState, SetMetadataMask,
-            SpecialNodeData, XattrFlags,
+            IndexNode, InodeFlags, InodeId, InodeMode, InodeRetentionState,
+            LinkMutationCoordinator, SetMetadataMask, SpecialNodeData, XattrFlags,
         },
     },
     ipc::pipe::LockedPipeInode,
@@ -697,6 +697,7 @@ pub struct LockedExt4Inode {
     pub(super) metadata_commit_lock: Mutex<()>,
     pub(super) size_lock: RwSem<()>,
     pub(super) namespace_lock: Mutex<()>,
+    pub(super) link_mutation_coordinator: LinkMutationCoordinator,
     pub(super) lifecycle: Arc<Ext4InodeLifecycle>,
     pub(super) retention: InodeRetentionState,
     pub(super) pending_reclaim: SpinLock<Option<another_ext4::InodeReclaimHandle>>,
@@ -1419,6 +1420,10 @@ impl PageCacheBackend for Ext4PageCacheBackend {
 }
 
 impl IndexNode for LockedExt4Inode {
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        Some(&self.link_mutation_coordinator)
+    }
+
     fn append_lock_fs(&self) -> Option<Arc<dyn vfs::FileSystem>> {
         Some(self.fs())
     }
@@ -1933,7 +1938,7 @@ impl IndexNode for LockedExt4Inode {
         Ok(())
     }
 
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+    fn unlink(&self, name: &str) -> Result<vfs::LinkRemovalOutcome, SystemError> {
         let _operation = self.begin_operation()?;
         let _namespace = self.namespace_lock.lock();
         let mut guard = self.inner.lock();
@@ -1963,10 +1968,15 @@ impl IndexNode for LockedExt4Inode {
             Err(error) => return Err(error.into()),
         }
         let reclaim = fs.retry_metadata_contention(|| ext4.unlink(inode_num, name))?;
+        let outcome = if reclaim.is_some() {
+            vfs::LinkRemovalOutcome::LastLink
+        } else {
+            vfs::LinkRemovalOutcome::StillLinked
+        };
         target.handoff_namespace_reclaim(reclaim)?;
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
-        Ok(())
+        Ok(outcome)
     }
 
     fn metadata(&self) -> Result<vfs::Metadata, SystemError> {
@@ -2400,16 +2410,112 @@ impl IndexNode for LockedExt4Inode {
         apply_resize()
     }
 
+    fn fallocate_resize_atomic(
+        &self,
+        requested_end: usize,
+        _lock_owner: u64,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let _operation = self.begin_operation()?;
+        let _delalloc_admission = self.close_production_delalloc_admission()?;
+        self.drain_delalloc_before_eager()?;
+        let _size_guard = self.size_lock.write();
+        let _io_guard = self.io_lock.lock();
+        let _metadata_commit = self.metadata_commit_lock.lock();
+        let to_ext4_time =
+            |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
+        let (fs, inode_num, before_mtime_version, before_ctime_version) = {
+            let guard = self.inner.lock();
+            (
+                guard.concret_fs(),
+                guard.inner_inode_num,
+                guard.cached_mtime_version,
+                guard.cached_ctime_version,
+            )
+        };
+        // Re-read after taking ext4's mutation locks. A VFS snapshot can be
+        // stale after a concurrent grow or chmod and must never shrink data or
+        // restore privilege bits.
+        let current_metadata = self.metadata()?;
+        let current_size = current_metadata.size.max(0) as usize;
+        if requested_end > current_size {
+            vfs::vcore::check_file_size_limit(requested_end)?;
+        }
+        let effective_size = current_size.max(requested_end);
+        let (metadata, mask) =
+            vfs::vcore::prepare_write_side_effect_metadata(current_metadata, effective_size);
+        let mtime = mask
+            .contains(SetMetadataMask::MTIME)
+            .then(|| to_ext4_time(&metadata.mtime));
+        let ctime = mask
+            .contains(SetMetadataMask::CTIME)
+            .then(|| to_ext4_time(&metadata.ctime));
+        let next_mtime_version = mtime
+            .map(|_| {
+                before_mtime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)
+            })
+            .transpose()?;
+        let next_ctime_version = ctime
+            .map(|_| {
+                before_ctime_version
+                    .checked_add(1)
+                    .ok_or(SystemError::EOVERFLOW)
+            })
+            .transpose()?;
+        let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
+        fs.retry_metadata_contention(|| {
+            fs.fs.setattr(
+                inode_num,
+                another_ext4::SetAttr {
+                    mode: mask
+                        .contains(SetMetadataMask::MODE)
+                        .then(|| another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16)),
+                    size: (requested_end > current_size).then_some(requested_end as u64),
+                    mtime,
+                    ctime,
+                    ..Default::default()
+                },
+            )
+        })?;
+        {
+            let mut guard = self.inner.lock();
+            if requested_end > current_size {
+                guard.cached_file_size = Some(requested_end as u64);
+                guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+            }
+            if let (Some(mtime), Some(version)) = (mtime, next_mtime_version) {
+                if guard.cached_mtime_version == before_mtime_version {
+                    guard.cached_times.mtime = mtime;
+                    guard.cached_mtime_version = version;
+                    guard.durable_mtime_version = version;
+                    guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                }
+            }
+            if let (Some(ctime), Some(version)) = (ctime, next_ctime_version) {
+                if guard.cached_ctime_version == before_ctime_version {
+                    guard.cached_times.ctime = ctime;
+                    guard.cached_ctime_version = version;
+                    guard.durable_ctime_version = version;
+                    guard.dirty_state.remove(InodeDirtyState::CTIME_DIRTY);
+                }
+            }
+        }
+        self.release_clean_metadata_queue_owner(&fs);
+        Ok(mask)
+    }
+
     fn fallocate_file(
         &self,
         mode: i32,
         offset: usize,
         len: usize,
         lock_owner: u64,
+        attrib: &mut crate::filesystem::vfs::AttribStageObserver<'_>,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         drop(data);
-        vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
+        vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner, attrib)
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
@@ -2666,7 +2772,7 @@ impl IndexNode for LockedExt4Inode {
         target: &Arc<dyn IndexNode>,
         new_name: &str,
         flags: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<vfs::RenameOutcome, SystemError> {
         let _operation = self.begin_operation()?;
         let _source_io = self.io_lock.lock();
         let whiteout_init = if flags.contains(RenameFlags::WHITEOUT) {
@@ -2719,7 +2825,7 @@ impl IndexNode for LockedExt4Inode {
 
         // Same directory, same name -> no-op
         if src_inode_num == target_inode_num && old_dname == new_dname {
-            return Ok(());
+            return Ok(vfs::RenameOutcome::NoOp);
         }
 
         // RENAME_EXCHANGE: 原子交换两个文件/目录
@@ -2737,14 +2843,18 @@ impl IndexNode for LockedExt4Inode {
                 &old_dname,
                 &new_dname,
             );
-            return Ok(());
+            return Ok(vfs::RenameOutcome::Exchange);
         }
 
         // Capture the replacement target while both parent namespace locks are held.
-        let dst_inode_num = ext4.lookup(target_inode_num, new_name).ok();
+        let dst_inode_num = match ext4.lookup(target_inode_num, new_name) {
+            Ok(inode) => Some(inode),
+            Err(error) if error.code() == another_ext4::ErrCode::ENOENT => None,
+            Err(error) => return Err(error.into()),
+        };
         let src_child_num = ext4.lookup(src_inode_num, old_name)?;
         if dst_inode_num == Some(src_child_num) {
-            return Ok(());
+            return Ok(vfs::RenameOutcome::NoOp);
         }
         let had_dst = dst_inode_num.is_some();
         let dst_inode = if let Some(dst_inode_num) = dst_inode_num {
@@ -2783,6 +2893,7 @@ impl IndexNode for LockedExt4Inode {
         }
 
         let mut resulting_whiteout = None;
+        let mut replaced = None;
         if flags.contains(RenameFlags::WHITEOUT) {
             let whiteout_init = whiteout_init.as_ref().ok_or(SystemError::EIO)?;
             let mut temp_name = String::new();
@@ -2882,6 +2993,11 @@ impl IndexNode for LockedExt4Inode {
                 }
             };
             if let Some(dst_inode) = &dst_inode {
+                replaced = Some(if rename_handle.is_some() {
+                    vfs::LinkRemovalOutcome::LastLink
+                } else {
+                    vfs::LinkRemovalOutcome::StillLinked
+                });
                 dst_inode.handoff_namespace_reclaim(rename_handle)?;
             } else if let Some(handle) = rename_handle {
                 // The destination was absent while both namespace locks were
@@ -2898,6 +3014,11 @@ impl IndexNode for LockedExt4Inode {
                 let reclaim = ext4_fs.retry_metadata_contention(|| {
                     ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
                 })?;
+                replaced = Some(if reclaim.is_some() {
+                    vfs::LinkRemovalOutcome::LastLink
+                } else {
+                    vfs::LinkRemovalOutcome::StillLinked
+                });
                 dst_inode.handoff_namespace_reclaim(reclaim)?;
             } else {
                 // ext4 library now correctly handles atomic replace
@@ -2922,7 +3043,7 @@ impl IndexNode for LockedExt4Inode {
         if let Some(whiteout) = resulting_whiteout {
             self.inner.lock().children.insert(old_dname, whiteout);
         }
-        Ok(())
+        Ok(vfs::RenameOutcome::Moved { replaced })
     }
 }
 
@@ -3963,10 +4084,10 @@ impl LockedExt4Inode {
         true
     }
 
-    fn quarantine_unexpected_rename_reclaim(
+    fn quarantine_unexpected_rename_reclaim<T>(
         fs: &Arc<Ext4FileSystem>,
         handle: another_ext4::InodeReclaimHandle,
-    ) -> Result<(), SystemError> {
+    ) -> Result<T, SystemError> {
         fs.fail_stop_lifecycle();
         // Never risk a second pending capability on a guessed canonical inode.
         // The fail-stopped mount owns this handle until durable orphan recovery
@@ -4201,6 +4322,7 @@ impl LockedExt4Inode {
             metadata_commit_lock: Mutex::new(()),
             size_lock: RwSem::new(()),
             namespace_lock: Mutex::new(()),
+            link_mutation_coordinator: LinkMutationCoordinator::new(),
             lifecycle,
             retention: InodeRetentionState::new(),
             pending_reclaim: SpinLock::new(None),

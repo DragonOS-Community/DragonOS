@@ -1336,6 +1336,7 @@ impl Ext4FileSystem {
                 metadata_commit_lock: Mutex::new(()),
                 size_lock: RwSem::new(()),
                 namespace_lock: Mutex::new(()),
+                link_mutation_coordinator: vfs::LinkMutationCoordinator::new(),
                 lifecycle: Ext4InodeLifecycle::new(),
                 retention: vfs::InodeRetentionState::new(),
                 pending_reclaim: SpinLock::new(None),

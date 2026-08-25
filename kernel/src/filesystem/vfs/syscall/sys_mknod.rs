@@ -79,7 +79,7 @@ impl Syscall for SysMknodHandle {
         let parent_inode: Arc<dyn IndexNode> = resolve_parent_inode(inode_begin, parent_path)?;
 
         // 创建节点
-        parent_inode.mknod(filename, mode, dev)?;
+        super::mknod_utils::mknod_and_notify(&parent_inode, filename, mode, dev)?;
 
         Ok(0)
     }

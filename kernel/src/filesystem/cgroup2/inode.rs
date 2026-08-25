@@ -702,7 +702,10 @@ impl IndexNode for Cgroup2Inode {
         }
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), SystemError> {
+    fn unlink(
+        &self,
+        _name: &str,
+    ) -> Result<crate::filesystem::vfs::LinkRemovalOutcome, SystemError> {
         // cgroup core files are always present and managed by kernel.
         Err(SystemError::EPERM)
     }

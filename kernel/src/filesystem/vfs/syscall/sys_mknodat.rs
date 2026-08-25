@@ -74,7 +74,7 @@ impl Syscall for SysMknodatHandle {
         }
 
         // 在解析出的父目录上进行 mknod
-        current_inode.mknod(name, mode, dev)?;
+        super::mknod_utils::mknod_and_notify(&current_inode, name, mode, dev)?;
 
         Ok(0)
     }

@@ -29,6 +29,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -115,6 +116,124 @@ __attribute__((noinline)) int uprobe_target(int x) {
     asm volatile("" : "+r"(x) : : "memory");  // 防止内联/优化掉
     return x * 2 + 1;
 }
+
+#if defined(__x86_64__)
+constexpr uint32_t TEST_RSEQ_SIG = 0x53053053;
+
+struct alignas(32) TestRseqAbi {
+    uint32_t cpu_id_start;
+    uint32_t cpu_id;
+    uint64_t rseq_cs;
+    uint32_t flags;
+    uint32_t node_id;
+    uint32_t mm_cid;
+    uint32_t padding;
+};
+
+struct alignas(32) TestRseqCs {
+    uint32_t version;
+    uint32_t flags;
+    uint64_t start_ip;
+    uint64_t post_commit_offset;
+    uint64_t abort_ip;
+};
+
+extern "C" int rseq_uprobe_critical(TestRseqAbi*, const TestRseqCs*);
+extern "C" unsigned char rseq_uprobe_start[];
+extern "C" unsigned char rseq_uprobe_probe[];
+extern "C" unsigned char rseq_uprobe_post_commit[];
+extern "C" unsigned char rseq_uprobe_abort[];
+
+struct RseqUprobeChildArgs {
+    TestRseqAbi rseq = {};
+    TestRseqCs critical_section = {};
+    std::atomic<int> registration{0};
+    std::atomic<bool> start{false};
+    std::atomic<int> aborts{0};
+    int attempts = 0;
+};
+
+int rseq_uprobe_child(void* opaque) {
+    auto* args = static_cast<RseqUprobeChildArgs*>(opaque);
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    CPU_SET(0, &affinity);
+    if (sched_setaffinity(0, sizeof(affinity), &affinity) != 0) {
+        args->registration.store(-1, std::memory_order_release);
+        return 2;
+    }
+
+    const int registered =
+        syscall(SYS_rseq, &args->rseq, sizeof(args->rseq), 0, TEST_RSEQ_SIG) ==
+                0
+            ? 1
+            : -1;
+    args->registration.store(registered, std::memory_order_release);
+    if (registered < 0) return 2;
+
+    while (!args->start.load(std::memory_order_acquire)) asm volatile("pause");
+    int aborts = 0;
+    for (int i = 0; i < args->attempts; ++i) {
+        aborts += rseq_uprobe_critical(&args->rseq,
+                                       &args->critical_section) == 0;
+    }
+    args->aborts.store(aborts, std::memory_order_release);
+    (void)syscall(SYS_rseq, &args->rseq, sizeof(args->rseq), 1,
+                  TEST_RSEQ_SIG);
+    return 0;
+}
+
+// Return child on a normal reap, zero when another waiter already reaped it,
+// and -1 only when the child could not be proven gone. The caller must not
+// unmap a CLONE_VM stack in the last case.
+pid_t reap_rseq_clone_child(pid_t child, int* status) {
+    auto wait_nointr = [&] {
+        pid_t waited;
+        do {
+            waited = waitpid(child, status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited;
+    };
+
+    pid_t waited = wait_nointr();
+    if (waited == child) return child;
+    if (waited < 0 && errno == ECHILD) return 0;
+
+    const int wait_errno = errno;
+    if (kill(child, SIGKILL) == 0 || errno == ESRCH) {
+        waited = wait_nointr();
+        if (waited == child) return child;
+        if (waited < 0 && errno == ECHILD) return 0;
+    }
+    errno = wait_errno;
+    return -1;
+}
+
+asm(
+    ".pushsection .text\n"
+    ".global rseq_uprobe_critical\n"
+    ".type rseq_uprobe_critical,@function\n"
+    "rseq_uprobe_critical:\n"
+    "  movq %rsi, 8(%rdi)\n"
+    ".global rseq_uprobe_start\n"
+    "rseq_uprobe_start:\n"
+    ".global rseq_uprobe_probe\n"
+    "rseq_uprobe_probe:\n"
+    "  nop\n"
+    ".global rseq_uprobe_post_commit\n"
+    "rseq_uprobe_post_commit:\n"
+    "  movq $0, 8(%rdi)\n"
+    "  movl $1, %eax\n"
+    "  ret\n"
+    "  .long 0x53053053\n"
+    ".global rseq_uprobe_abort\n"
+    "rseq_uprobe_abort:\n"
+    "  movq $0, 8(%rdi)\n"
+    "  xorl %eax, %eax\n"
+    "  ret\n"
+    ".size rseq_uprobe_critical, .-rseq_uprobe_critical\n"
+    ".popsection\n");
+#endif
 
 // 从 /proc/self/maps 解析 func 在所属可执行文件中的偏移。
 // 返回 false 表示解析失败（如 procfs 不支持该格式）。
@@ -1955,6 +2074,118 @@ TEST(UprobeTest, LargeBpfJitProgramAttachesSafely) {
     EXPECT_EQ(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0)
         << "large SET_BPF failed, errno=" << errno;
 }
+
+#if defined(__x86_64__)
+TEST(UprobeTest, RseqPreemptionUsesOriginalProbeIp) {
+    static_assert(sizeof(TestRseqAbi) == 32);
+    static_assert(sizeof(TestRseqCs) == 32);
+
+    RseqUprobeChildArgs child_args;
+    child_args.critical_section.start_ip =
+        reinterpret_cast<uintptr_t>(rseq_uprobe_start);
+    child_args.critical_section.post_commit_offset =
+        reinterpret_cast<uintptr_t>(rseq_uprobe_post_commit) -
+        child_args.critical_section.start_ip;
+    child_args.critical_section.abort_ip =
+        reinterpret_cast<uintptr_t>(rseq_uprobe_abort);
+    child_args.attempts = 200000;
+
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(rseq_uprobe_probe, path, offset));
+    UprobePerfEventOptions options;
+    options.pid = -1;
+    options.cpu = 0;
+    FdGuard event(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(event.get(), 0) << "rseq uprobe open failed, errno=" << errno;
+
+    // Keep interrupts enabled in the #BP callback long enough for a scheduler
+    // tick to request a context switch before the handler publishes XOL state.
+    // The old implementation then exposed the XOL RIP to rseq and missed the
+    // mandatory abort. Repetition avoids depending on one exact timer phase.
+    std::vector<bpf_insn> instructions(600, bpf_mov64_imm(1));
+    instructions.push_back(bpf_exit());
+    FdGuard program(load_kprobe_bpf_program(instructions));
+    ASSERT_GE(program.get(), 0) << "BPF_PROG_LOAD failed, errno=" << errno;
+    ASSERT_EQ(ioctl(event.get(), PERF_EVENT_IOC_SET_BPF, program.get()), 0);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> competitor_ready{0};
+    std::thread competitor([&] {
+        cpu_set_t competitor_affinity;
+        CPU_ZERO(&competitor_affinity);
+        CPU_SET(0, &competitor_affinity);
+        competitor_ready.store(
+            sched_setaffinity(0, sizeof(competitor_affinity),
+                              &competitor_affinity) == 0
+                ? 1
+                : -1,
+            std::memory_order_release);
+        while (!stop.load(std::memory_order_relaxed)) sched_yield();
+    });
+    while (competitor_ready.load(std::memory_order_acquire) == 0)
+        sched_yield();
+    if (competitor_ready.load(std::memory_order_acquire) < 0) {
+        stop.store(true, std::memory_order_relaxed);
+        competitor.join();
+        GTEST_SKIP() << "CPU 0 is unavailable to the competitor";
+    }
+
+    constexpr size_t child_stack_size = 1 << 20;
+    void* child_stack =
+        mmap(nullptr, child_stack_size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (child_stack == MAP_FAILED) {
+        const int mmap_errno = errno;
+        stop.store(true, std::memory_order_relaxed);
+        competitor.join();
+        FAIL() << "child stack mmap failed, errno=" << mmap_errno;
+    }
+    const pid_t child =
+        clone(rseq_uprobe_child,
+              static_cast<unsigned char*>(child_stack) + child_stack_size,
+              CLONE_VM | SIGCHLD, &child_args);
+    if (child <= 0) {
+        const int clone_errno = errno;
+        munmap(child_stack, child_stack_size);
+        stop.store(true, std::memory_order_relaxed);
+        competitor.join();
+        FAIL() << "CLONE_VM failed, errno=" << clone_errno;
+    }
+    while (child_args.registration.load(std::memory_order_acquire) == 0)
+        sched_yield();
+    if (child_args.registration.load(std::memory_order_acquire) < 0) {
+        int status = 0;
+        const pid_t waited = reap_rseq_clone_child(child, &status);
+        if (waited >= 0) munmap(child_stack, child_stack_size);
+        stop.store(true, std::memory_order_relaxed);
+        competitor.join();
+        ASSERT_GE(waited, 0) << "failed to reap rseq child, errno=" << errno;
+        GTEST_SKIP() << "raw CLONE_VM child could not register rseq";
+    }
+
+    child_args.start.store(true, std::memory_order_release);
+    int status = 0;
+    const pid_t waited = reap_rseq_clone_child(child, &status);
+    stop.store(true, std::memory_order_relaxed);
+    competitor.join();
+    if (waited >= 0) munmap(child_stack, child_stack_size);
+    ASSERT_EQ(waited, child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    const __u64 aborts =
+        child_args.aborts.load(std::memory_order_acquire);
+    __u64 hits = 0;
+    ASSERT_EQ(read(event.get(), &hits, sizeof(hits)),
+              static_cast<ssize_t>(sizeof(hits)));
+    // An attempt can finish normally (one hit), abort before reaching the
+    // probe (no hit), or abort after #BP while XOL is active (one hit). Thus
+    // hits + aborts exceeds attempts iff the rseq/XOL race was exercised.
+    EXPECT_GT(hits + aborts, static_cast<__u64>(child_args.attempts))
+        << "preemption between #BP and XOL must restart the rseq section";
+}
+#endif
 
 // A system-wide observer must not turn a valid fork into an error when one
 // private executable mapping no longer matches the backing-file definition.

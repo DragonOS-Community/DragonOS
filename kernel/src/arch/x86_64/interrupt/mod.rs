@@ -16,6 +16,7 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
+    process::ProcessManager,
 };
 
 use super::{
@@ -259,12 +260,18 @@ impl uprobe::ProbeArgs for TrapFrame {
 
 impl crate::process::rseq::RseqTrapFrame for TrapFrame {
     #[inline]
-    fn rseq_ip(&self) -> usize {
-        self.rip as usize
+    fn rseq_effective_ip(&self) -> usize {
+        ProcessManager::current_pcb()
+            .uprobe
+            .active_probe_vaddr()
+            .unwrap_or(self.rip as usize)
     }
 
     #[inline]
-    fn set_rseq_ip(&mut self, ip: usize) {
+    fn redirect_rseq_ip(&mut self, ip: usize) {
+        // rseq owns the final redirect. Consume an active XOL first so its
+        // later #DB completion cannot restore return_addr over abort_ip.
+        crate::exception::uprobe::abort_current_xol(self);
         self.rip = ip as u64;
     }
 }

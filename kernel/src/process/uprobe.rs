@@ -82,6 +82,23 @@ impl TaskXolState {
         TaskXolPhase::from_raw(self.phase.load(Ordering::Acquire))
     }
 
+    /// Return the original userspace instruction address represented by an
+    /// active XOL operation.
+    ///
+    /// Architecture code uses this logical address when a subsystem such as
+    /// rseq must reason about the interrupted userspace instruction rather
+    /// than the private XOL slot currently stored in the trap frame.
+    pub fn active_probe_vaddr(&self) -> Option<usize> {
+        if self.phase() == TaskXolPhase::Idle {
+            return None;
+        }
+
+        self.payload
+            .lock_irqsave()
+            .as_ref()
+            .map(|active| active.probe_vaddr)
+    }
+
     /// Publish a newly active XOL operation. Refuses to overwrite an existing
     /// lease, which would otherwise make the earlier instruction unrecoverable.
     pub fn publish_running(&self, active: ActiveXol) -> Result<(), ActiveXol> {

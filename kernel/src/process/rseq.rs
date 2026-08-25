@@ -405,11 +405,19 @@ impl RseqState {
 
 /// TrapFrame 需要实现的 rseq 相关操作
 pub trait RseqTrapFrame {
-    /// 获取用户态返回地址（instruction pointer）
-    fn rseq_ip(&self) -> usize;
+    /// Return the logical userspace instruction pointer.
+    ///
+    /// An architecture may be executing an instruction through a private
+    /// emulation/XOL address. In that case rseq must observe the original
+    /// instruction address so that preemption and migration still restart a
+    /// critical section correctly.
+    fn rseq_effective_ip(&self) -> usize;
 
-    /// 设置用户态返回地址
-    fn set_rseq_ip(&mut self, ip: usize);
+    /// Redirect userspace execution to an rseq abort handler.
+    ///
+    /// Implementations must first cancel any in-progress emulation/XOL state
+    /// whose later completion could overwrite this redirect.
+    fn redirect_rseq_ip(&mut self, ip: usize);
 }
 
 // ============================================================================
@@ -608,7 +616,7 @@ impl Rseq {
         user_end: usize,
         pcb: &ProcessControlBlock,
     ) -> Result<(), RseqError> {
-        let current_ip = frame.rseq_ip() as u64;
+        let current_ip = frame.rseq_effective_ip() as u64;
 
         // 获取 rseq_cs 描述符
         let rseq_cs = match unsafe { access.read_rseq_cs(sig, user_end) }? {
@@ -632,7 +640,7 @@ impl Rseq {
 
         // 需要重启：清除 rseq_cs，修改 IP 为 abort_ip
         unsafe { access.clear_rseq_cs() }?;
-        frame.set_rseq_ip(rseq_cs.abort_ip as usize);
+        frame.redirect_rseq_ip(rseq_cs.abort_ip as usize);
 
         Ok(())
     }

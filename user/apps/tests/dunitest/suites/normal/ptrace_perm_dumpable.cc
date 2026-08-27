@@ -11,6 +11,7 @@
 // root 负责清理。
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
@@ -63,7 +64,54 @@ bool read_byte(int fd, char* out) {
     return read(fd, out, 1) == 1;
 }
 
+struct DumpableThreadSync {
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    int phase = 0;
+    int observed = -1;
+};
+
+void* dumpable_thread(void* opaque) {
+    auto* sync = static_cast<DumpableThreadSync*>(opaque);
+    pthread_mutex_lock(&sync->lock);
+    while (sync->phase == 0) {
+        pthread_cond_wait(&sync->cond, &sync->lock);
+    }
+    pthread_mutex_unlock(&sync->lock);
+
+    sync->observed = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+    if (sync->observed == 0) {
+        prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+    }
+
+    pthread_mutex_lock(&sync->lock);
+    sync->phase = 2;
+    pthread_cond_signal(&sync->cond);
+    pthread_mutex_unlock(&sync->lock);
+    return nullptr;
+}
+
 }  // namespace
+
+TEST(PtracePermDumpable, DumpabilityIsSharedByThreadsInOneMm) {
+    ASSERT_EQ(0, prctl(PR_SET_DUMPABLE, 0, 0, 0, 0));
+
+    DumpableThreadSync sync;
+    pthread_t thread;
+    ASSERT_EQ(0, pthread_create(&thread, nullptr, dumpable_thread, &sync));
+
+    pthread_mutex_lock(&sync.lock);
+    sync.phase = 1;
+    pthread_cond_signal(&sync.cond);
+    while (sync.phase != 2) {
+        pthread_cond_wait(&sync.cond, &sync.lock);
+    }
+    pthread_mutex_unlock(&sync.lock);
+
+    ASSERT_EQ(0, pthread_join(thread, nullptr));
+    EXPECT_EQ(0, sync.observed);
+    EXPECT_EQ(1, prctl(PR_GET_DUMPABLE, 0, 0, 0, 0));
+}
 
 TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
     // ---- 场景 C：dumpable=0 不影响 TRACEME ----

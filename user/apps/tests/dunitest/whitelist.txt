@@ -74,6 +74,11 @@ normal/seccomp
 normal/signal_sigqueueinfo
 normal/process_signal_fork
 normal/process_vm_writev_semantics
+normal/exec_dumpable_semantics
+normal/ptrace_stop_state
+normal/ptrace_syscall_info
+normal/ptrace_relation_lifecycle
+normal/remote_icache_sync
 normal/uprobe
 normal/wait_rusage
 normal/sysfs_cgroup2_mount
@@ -105,3 +110,4 @@ normal/inotify_events
 normal/sched_tracepoint
 normal/proc_mem_shared
 normal/ptrace_perm_dumpable
+normal/ptrace_x86_debug

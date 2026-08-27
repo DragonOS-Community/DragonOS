@@ -70,6 +70,7 @@ setns_test
 eventfd_test
 poll_test
 rseq_test
+process_vm_read_write_test
 
 
 # 内存管理测试

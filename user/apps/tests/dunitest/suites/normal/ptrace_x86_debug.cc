@@ -1,6 +1,7 @@
 // x86_64 ptrace register/debug-register/#DB ABI regression tests.
 
 #include <errno.h>
+#include <elf.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
@@ -12,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/user.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -229,6 +231,86 @@ TEST(PtraceX86Debug, GeneralRegistersRejectKernelCodeSelector) {
     ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
                              reinterpret_cast<unsigned long>(&regs)));
     continue_and_reap(child);
+}
+
+TEST(PtraceX86Debug, SetregsetRequiresWordAlignedPrefixLength) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (ptrace_call(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(10);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    ChildGuard child_guard(child);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid_deadline(child, &status));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGSTOP, WSTOPSIG(status));
+
+    user_regs_struct baseline = {};
+    ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&baseline)));
+    user_regs_struct candidate = baseline;
+    candidate.r15 ^= 0x13579bdfUL;
+    candidate.r14 ^= 0x2468ace0UL;
+
+    const size_t valid_lengths[] = {
+        0,
+        sizeof(unsigned long),
+        2 * sizeof(unsigned long),
+        sizeof(user_regs_struct),
+        sizeof(user_regs_struct) + 64,
+    };
+    for (size_t requested : valid_lengths) {
+        ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&baseline)));
+        iovec iov = {
+            .iov_base = &candidate,
+            .iov_len = requested,
+        };
+        ASSERT_EQ(0, ptrace_call(PTRACE_SETREGSET, child, NT_PRSTATUS,
+                                 reinterpret_cast<unsigned long>(&iov)))
+            << "requested=" << requested << " errno=" << errno;
+        const size_t copied =
+            requested < sizeof(candidate) ? requested : sizeof(candidate);
+        EXPECT_EQ(copied, iov.iov_len);
+
+        user_regs_struct actual = {};
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&actual)));
+        user_regs_struct expected = baseline;
+        memcpy(&expected, &candidate, copied);
+        EXPECT_EQ(0, memcmp(&expected, &actual, sizeof(actual)))
+            << "requested=" << requested;
+    }
+
+    for (size_t requested : {size_t{1}, size_t{7}, size_t{9}}) {
+        ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&baseline)));
+        iovec iov = {
+            .iov_base = &candidate,
+            .iov_len = requested,
+        };
+        errno = 0;
+        EXPECT_EQ(-1, ptrace_call(PTRACE_SETREGSET, child, NT_PRSTATUS,
+                                  reinterpret_cast<unsigned long>(&iov)))
+            << "requested=" << requested;
+        EXPECT_EQ(EINVAL, errno) << "requested=" << requested;
+        EXPECT_EQ(requested, iov.iov_len);
+
+        user_regs_struct actual = {};
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&actual)));
+        EXPECT_EQ(0, memcmp(&baseline, &actual, sizeof(actual)))
+            << "failed SETREGSET modified registers for requested=" << requested;
+    }
+
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+    ASSERT_EQ(child, waitpid_deadline(child, &status));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    child_guard.release();
 }
 
 TEST(PtraceX86Debug, Dr7LengthValidationUsesArchitecturalEncoding) {

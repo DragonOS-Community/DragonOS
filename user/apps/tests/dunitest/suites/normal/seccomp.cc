@@ -6,15 +6,19 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/ucontext.h>
+#include <sys/user.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -34,11 +38,80 @@
 #define SYS_SECCOMP 1
 #endif
 
+#ifndef PTRACE_EVENT_SECCOMP
+#define PTRACE_EVENT_SECCOMP 7
+#endif
+
 namespace {
 
 constexpr int kOk = 42;
 constexpr long kTrapReturn = 424242;
 constexpr int kTrapData = 0xdead;
+constexpr int kDeadlineMs = 3000;
+char g_trace_payload = 'Q';
+
+long PtraceCall(long request, pid_t pid, unsigned long addr,
+                unsigned long data) {
+  return syscall(SYS_ptrace, request, pid, addr, data);
+}
+
+int64_t MonotonicMillis() {
+  timespec now = {};
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+  return static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+}
+
+pid_t WaitPidDeadline(pid_t pid, int* status, int options = 0,
+                      int timeout_ms = kDeadlineMs) {
+  const int64_t start = MonotonicMillis();
+  if (start < 0) return -1;
+  const int64_t deadline = start + timeout_ms;
+  for (;;) {
+    const pid_t result = waitpid(pid, status, options | WNOHANG);
+    if (result != 0) return result;
+    if (MonotonicMillis() >= deadline) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    sched_yield();
+  }
+}
+
+bool ReadByteDeadline(int fd, char* byte, int timeout_ms = kDeadlineMs) {
+  const int64_t start = MonotonicMillis();
+  if (start < 0) return false;
+  const int64_t deadline = start + timeout_ms;
+  pollfd event = {.fd = fd, .events = POLLIN, .revents = 0};
+  for (;;) {
+    const int64_t now = MonotonicMillis();
+    if (now < 0 || now >= deadline) {
+      errno = ETIMEDOUT;
+      return false;
+    }
+    const int ready = poll(&event, 1, static_cast<int>(deadline - now));
+    if (ready > 0) return read(fd, byte, 1) == 1;
+    if (ready == 0) {
+      errno = ETIMEDOUT;
+      return false;
+    }
+    if (errno != EINTR) return false;
+  }
+}
+
+class ScopedChild {
+ public:
+  explicit ScopedChild(pid_t child) : child_(child) {}
+  ~ScopedChild() {
+    if (child_ <= 0) return;
+    kill(child_, SIGKILL);
+    int status = 0;
+    (void)WaitPidDeadline(child_, &status, 0, 1000);
+  }
+  void Release() { child_ = -1; }
+
+ private:
+  pid_t child_;
+};
 
 int InstallFilterWithFlags(const struct sock_filter* filter, unsigned short len,
                            unsigned int flags) {
@@ -262,6 +335,99 @@ TEST(SeccompTest, TraceWithoutPtracerReturnsEnosys) {
 
   ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
   EXPECT_EQ(WEXITSTATUS(status), kOk);
+}
+
+TEST(SeccompTest,
+     TraceRereadsTracerModifiedSyscallAfterNonzeroResumeSignal) {
+#if !defined(__x86_64__)
+  GTEST_SKIP() << "register rewrite is x86_64-specific";
+#else
+  int ready[2] = {};
+  int release[2] = {};
+  int payload[2] = {};
+  ASSERT_EQ(0, pipe(ready));
+  ASSERT_EQ(0, pipe(release));
+  ASSERT_EQ(0, pipe(payload));
+
+  const pid_t child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    close(ready[0]);
+    close(release[1]);
+    close(payload[0]);
+    if (signal(SIGUSR1, SIG_IGN) == SIG_ERR) _exit(69);
+    if (PtraceCall(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(70);
+    raise(SIGSTOP);
+
+    RequireNoNewPrivs();
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getpid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE | 0x1234),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    if (InstallFilter(filter, sizeof(filter) / sizeof(filter[0])) != 0) {
+      _exit(71);
+    }
+    const char marker = 'R';
+    if (write(ready[1], &marker, 1) != 1) _exit(72);
+    char token = 0;
+    if (read(release[0], &token, 1) != 1) _exit(73);
+
+    errno = 0;
+    const long result = syscall(__NR_getpid);
+    _exit(result == 1 && errno == 0 ? 0 : 74);
+  }
+  ScopedChild child_guard(child);
+  close(ready[1]);
+  close(release[0]);
+  close(payload[1]);
+
+  int status = 0;
+  ASSERT_EQ(child, WaitPidDeadline(child, &status));
+  ASSERT_TRUE(WIFSTOPPED(status));
+  ASSERT_EQ(SIGSTOP, WSTOPSIG(status));
+  ASSERT_EQ(0, PtraceCall(PTRACE_SETOPTIONS, child, 0,
+                          PTRACE_O_TRACESECCOMP));
+  ASSERT_EQ(0, PtraceCall(PTRACE_CONT, child, 0, 0));
+
+  char marker = 0;
+  ASSERT_TRUE(ReadByteDeadline(ready[0], &marker));
+  ASSERT_EQ('R', marker);
+  const char go = 'G';
+  ASSERT_EQ(1, write(release[1], &go, 1));
+
+  ASSERT_EQ(child, WaitPidDeadline(child, &status));
+  ASSERT_TRUE(WIFSTOPPED(status));
+  ASSERT_EQ(SIGTRAP | (PTRACE_EVENT_SECCOMP << 8), status >> 8);
+
+  user_regs_struct regs = {};
+  ASSERT_EQ(0, PtraceCall(PTRACE_GETREGS, child, 0,
+                          reinterpret_cast<unsigned long>(&regs)));
+  ASSERT_EQ(static_cast<unsigned long>(__NR_getpid), regs.orig_rax);
+  regs.orig_rax = __NR_write;
+  regs.rdi = payload[1];
+  regs.rsi = reinterpret_cast<unsigned long>(&g_trace_payload);
+  regs.rdx = 1;
+  ASSERT_EQ(0, PtraceCall(PTRACE_SETREGS, child, 0,
+                          reinterpret_cast<unsigned long>(&regs)));
+  // A nonzero resume signal is independent of whether this already-published
+  // SECCOMP event belonged to the live tracing session. SIGUSR1 is ignored so
+  // Linux and DragonOS can differ in whether the signal is actually delivered
+  // without changing the oracle for the rewritten syscall.
+  ASSERT_EQ(0, PtraceCall(PTRACE_CONT, child, 0, SIGUSR1));
+
+  char observed = 0;
+  ASSERT_TRUE(ReadByteDeadline(payload[0], &observed));
+  EXPECT_EQ(g_trace_payload, observed);
+  ASSERT_EQ(child, WaitPidDeadline(child, &status));
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+  child_guard.Release();
+  close(ready[0]);
+  close(release[1]);
+  close(payload[0]);
+#endif
 }
 
 TEST(SeccompTest, TsyncAppliesFilterToSiblingThread) {

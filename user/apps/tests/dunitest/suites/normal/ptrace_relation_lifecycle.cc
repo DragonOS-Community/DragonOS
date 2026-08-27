@@ -339,9 +339,24 @@ TEST(PtraceRelationLifecycle, TracerExitHonorsExitKillAndStartsCleanSession) {
     ASSERT_GE(fresh_tracer, 0);
     if (fresh_tracer == 0) {
         OpResult fresh = {getpid(), 0, 0, 0};
-        if (ptrace_call(PTRACE_SEIZE, survivor, 0, 0) != 0 ||
-            ptrace_call(PTRACE_INTERRUPT, survivor, 0, 0) != 0 ||
-            !WaitPidUntil(survivor, &fresh.status, __WALL)) {
+        if (ptrace_call(PTRACE_SEIZE, survivor, 0, 0) != 0) {
+            fresh.result = -1;
+            fresh.error = errno;
+        }
+        // The old session stopped this task with TRACESYSGOOD enabled. A new
+        // zero-option session must not inherit a report or event notification
+        // before it explicitly requests its own stop.
+        if (fresh.result == 0) {
+            const pid_t premature = waitpid(survivor, &fresh.status,
+                                            __WALL | WNOHANG);
+            if (premature != 0) {
+                fresh.result = -1;
+                fresh.error = premature < 0 ? errno : EPROTO;
+            }
+        }
+        if (fresh.result == 0 &&
+            (ptrace_call(PTRACE_INTERRUPT, survivor, 0, 0) != 0 ||
+             !WaitPidUntil(survivor, &fresh.status, __WALL))) {
             fresh.result = -1;
             fresh.error = errno;
         }
@@ -369,6 +384,7 @@ TEST(PtraceRelationLifecycle, TracerExitHonorsExitKillAndStartsCleanSession) {
     ASSERT_EQ(0, fresh.result) << fresh.error;
     ASSERT_TRUE(WIFSTOPPED(fresh.status));
     EXPECT_EQ(SIGTRAP, WSTOPSIG(fresh.status));
+    EXPECT_EQ(0u, static_cast<unsigned>(fresh.status) >> 16);
     ASSERT_TRUE(WaitPidUntil(fresh_tracer, &status));
     ASSERT_TRUE(WIFEXITED(status));
     ASSERT_EQ(0, WEXITSTATUS(status));

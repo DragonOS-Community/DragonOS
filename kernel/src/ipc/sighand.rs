@@ -95,6 +95,14 @@ pub struct InnerSigHand {
     pub group_exit_code: usize,
     /// 最近一次 job-control stop 的信号号，用于 wait(WSTOPPED) 填充 WSTOPSIG。
     pub stop_signal: Signal,
+    /// Identity of the current thread-group stop transaction. Zero is reserved
+    /// for the initial state; begin/cancel transitions advance it so delayed
+    /// ptrace participants cannot complete a later stop.
+    group_stop_generation: u64,
+    /// Ptrace participants which still have to publish their group-stop. The
+    /// existing asynchronous `stop_task()` commits untraced siblings
+    /// immediately, so only ptraced siblings need a completion count.
+    group_stop_pending_ptraced: usize,
     /// 线程组 exec（de-thread）当前执行者
     pub group_exec_task: Option<Weak<ProcessControlBlock>>,
     /// 线程组 exec（de-thread）等待计数（仿照 Linux 的 signal_struct::notify_count）
@@ -140,6 +148,13 @@ impl SigHand {
 
     fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerSigHand> {
         self.inner.write_irqsave()
+    }
+
+    /// Run a narrow group-stop transaction while the shared signal state is
+    /// write-locked. Ptrace callers acquire `PTRACE_RELATION_LOCK` first.
+    pub(crate) fn with_group_stop_state<R>(&self, f: impl FnOnce(&mut InnerSigHand) -> R) -> R {
+        let mut guard = self.inner_mut();
+        f(&mut guard)
     }
 
     pub fn inner_read(&self) -> RwLockReadGuard<'_, InnerSigHand> {
@@ -438,21 +453,6 @@ impl SigHand {
         true
     }
 
-    pub fn ptrace_participate_group_stop(&self, sig: Signal) -> bool {
-        let mut g = self.inner_mut();
-        if g.flags.contains(SignalFlags::GROUP_EXIT) {
-            return false;
-        }
-        if g.flags.contains(SignalFlags::STOP_STOPPED) {
-            return false;
-        }
-        g.stop_signal = sig;
-        g.flags.remove(SignalFlags::STOP_MASK);
-        g.flags
-            .insert(SignalFlags::STOP_STOPPED | SignalFlags::CLD_STOPPED);
-        true
-    }
-
     /// Continue a job-control-stopped group as one transition. The callback is
     /// run whenever group exit has not started because SIGCONT resumes stopped
     /// tasks even when no parent notification is pending. A continued event is
@@ -467,6 +467,11 @@ impl SigHand {
             return false;
         }
         let was_stopped = g.flags.contains(SignalFlags::STOP_STOPPED);
+
+        if was_stopped || g.group_stop_pending_ptraced != 0 {
+            g.advance_group_stop_generation();
+            g.group_stop_pending_ptraced = 0;
+        }
 
         continue_group();
         if was_stopped {
@@ -937,6 +942,7 @@ impl SigHand {
         } else {
             // Linux do_group_exit() replaces signal->flags with
             // SIGNAL_GROUP_EXIT, discarding all job-control wait state.
+            g.cancel_group_stop();
             g.flags.remove(SignalFlags::STOP_MASK);
             g.flags.insert(SignalFlags::GROUP_EXIT);
             g.group_exit_code = exit_code;
@@ -960,6 +966,7 @@ impl SigHand {
         if g.flags.contains(SignalFlags::GROUP_EXIT) {
             false
         } else {
+            g.cancel_group_stop();
             g.flags.remove(SignalFlags::STOP_MASK);
             g.flags.insert(SignalFlags::GROUP_EXIT);
             g.group_exit_code = exit_code;
@@ -994,6 +1001,89 @@ impl Default for InnerSigHand {
 }
 
 impl InnerSigHand {
+    fn advance_group_stop_generation(&mut self) -> u64 {
+        self.group_stop_generation = self.group_stop_generation.wrapping_add(1);
+        if self.group_stop_generation == 0 {
+            self.group_stop_generation = 1;
+        }
+        self.group_stop_generation
+    }
+
+    /// Begin a fresh group-stop with the current ptraced task as its first
+    /// asynchronous participant. Repeated stop signals do not restart a
+    /// completed or already in-flight transaction.
+    pub(crate) fn begin_ptrace_group_stop(&mut self, signal: Signal) -> Option<u64> {
+        if self.flags.contains(SignalFlags::GROUP_EXIT)
+            || self.flags.contains(SignalFlags::STOP_STOPPED)
+            || self.group_stop_pending_ptraced != 0
+        {
+            return None;
+        }
+        let generation = self.advance_group_stop_generation();
+        self.stop_signal = signal;
+        self.flags.remove(SignalFlags::STOP_MASK);
+        self.group_stop_pending_ptraced = 1;
+        Some(generation)
+    }
+
+    pub(crate) fn add_ptrace_group_stop_participant(&mut self, generation: u64) -> bool {
+        if self.group_stop_generation != generation || self.group_stop_pending_ptraced == 0 {
+            return false;
+        }
+        self.group_stop_pending_ptraced += 1;
+        true
+    }
+
+    pub(crate) fn ptrace_group_stop_in_progress(&self, generation: u64) -> bool {
+        self.group_stop_generation == generation && self.group_stop_pending_ptraced != 0
+    }
+
+    pub(crate) fn ptrace_group_stop_is_current(&self, generation: u64) -> bool {
+        self.group_stop_generation == generation
+            && (self.group_stop_pending_ptraced != 0
+                || self.flags.contains(SignalFlags::STOP_STOPPED))
+    }
+
+    /// Complete exactly one generation-bound ptrace participant. The last
+    /// participant publishes the existing wait-visible STOP flags.
+    pub(crate) fn complete_ptrace_group_stop(&mut self, generation: u64) -> bool {
+        if !self.ptrace_group_stop_in_progress(generation) {
+            return false;
+        }
+        self.group_stop_pending_ptraced -= 1;
+        if self.group_stop_pending_ptraced == 0 {
+            self.flags
+                .insert(SignalFlags::STOP_STOPPED | SignalFlags::CLD_STOPPED);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn current_incomplete_group_stop(&self) -> Option<u64> {
+        (self.group_stop_pending_ptraced != 0).then_some(self.group_stop_generation)
+    }
+
+    /// Generation whose pending per-task group tickets must not be displaced
+    /// by PTRACE_INTERRUPT. SIGCONT advances the generation before publishing
+    /// its notification, so cancelled tickets remain replaceable.
+    pub(crate) fn current_valid_group_stop(&self) -> Option<u64> {
+        (self.group_stop_pending_ptraced != 0 || self.flags.contains(SignalFlags::STOP_STOPPED))
+            .then_some(self.group_stop_generation)
+    }
+
+    pub(crate) fn current_completed_group_stop(&self) -> Option<(u64, Signal)> {
+        self.flags
+            .contains(SignalFlags::STOP_STOPPED)
+            .then_some((self.group_stop_generation, self.stop_signal))
+    }
+
+    pub(crate) fn cancel_group_stop(&mut self) {
+        if self.group_stop_pending_ptraced != 0 || self.flags.intersects(SignalFlags::STOP_MASK) {
+            self.advance_group_stop_generation();
+            self.group_stop_pending_ptraced = 0;
+        }
+    }
+
     fn try_default() -> Result<Self, SystemError> {
         Ok(Self {
             handlers: try_default_sighandlers()?,
@@ -1001,6 +1091,8 @@ impl InnerSigHand {
             shared_pending: SigPending::default(),
             group_exit_code: 0,
             stop_signal: Signal::SIGSTOP,
+            group_stop_generation: 0,
+            group_stop_pending_ptraced: 0,
             curr_target: None,
             flags: SignalFlags::empty(),
             group_exec_task: None,

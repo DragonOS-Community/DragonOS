@@ -13,7 +13,7 @@ use crate::{
     mm::VirtAddr,
     process::{
         pid::PidType,
-        ptrace::{self, PtraceRequest},
+        ptrace::{self, PtraceRequest, PtraceRequestGuard},
         ProcessManager, RawPid,
     },
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -85,22 +85,28 @@ impl Syscall for SysPtrace {
             _ => {}
         }
 
-        // Other requests: the tracee must be traced by current and in an operable state.
-        tracee.ptrace_check_attach(request)?;
-
-        // Request-level freeze
-        if !matches!(request, PtraceRequest::Kill | PtraceRequest::Interrupt) {
-            tracee.ptrace_freeze()?;
-        }
-        defer::defer!({
-            tracee.ptrace_unfreeze();
-        });
+        // Linux permits KILL/INTERRUPT without TASK_TRACED/freeze. Every other
+        // request owns a generation-bound freeze until the guard is dropped or
+        // consumed by a resume/detach/listen transition.
+        let mut request_guard = if request == PtraceRequest::Kill {
+            tracee.ptrace_check_non_frozen(&current)?;
+            None
+        } else if request == PtraceRequest::Interrupt {
+            // Ownership is checked together with the pending-stop publication
+            // in ptrace_interrupt(), under the relation lock.
+            None
+        } else {
+            Some(PtraceRequestGuard::begin(tracee.clone(), current.clone())?)
+        };
 
         let result: isize = match request {
             // DETACH: detach the tracee. data is the signal to inject (0 = none).
             PtraceRequest::Detach => {
                 let signal = decode_injected_signal(data);
-                tracee.ptrace_detach(signal)?
+                request_guard
+                    .take()
+                    .ok_or(SystemError::ESRCH)?
+                    .detach(signal)?
             }
             // KILL: send SIGKILL directly.
             PtraceRequest::Kill => {
@@ -122,64 +128,83 @@ impl Syscall for SysPtrace {
             }
             // INTERRUPT: force a running SEIZED tracee into ptrace-stop.
             PtraceRequest::Interrupt => {
-                tracee.ptrace_interrupt()?;
+                tracee.ptrace_interrupt(&current)?;
                 0
             }
             // LISTEN: take a tracee at PTRACE_EVENT_STOP out of ptrace-stop while keeping it stopped.
-            PtraceRequest::Listen => {
-                tracee.ptrace_listen()?;
-                0
-            }
+            PtraceRequest::Listen => request_guard.take().ok_or(SystemError::ESRCH)?.listen()?,
             // CONT / SYSCALL / SINGLESTEP / SYSEMU / SYSEMU_SINGLESTEP: resume the tracee.
             PtraceRequest::Cont
             | PtraceRequest::Syscall
             | PtraceRequest::Singlestep
             | PtraceRequest::Sysemu
-            | PtraceRequest::SysemuSinglestep => {
-                tracee.ptrace_resume(request, decode_injected_signal(data))?
-            }
+            | PtraceRequest::SysemuSinglestep => request_guard
+                .take()
+                .ok_or(SystemError::ESRCH)?
+                .resume(request, decode_injected_signal(data))?,
             // SETOPTIONS: set ptrace options (strace sets TRACESYSGOOD, etc.).
             PtraceRequest::Setoptions => {
                 let opts = ptrace::PtraceOptions::from_bits(data).ok_or(SystemError::EINVAL)?;
-                tracee.set_ptrace_options(opts)?;
+                request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .set_options(opts)?;
                 0
             }
             // GETEVENTMSG: read the most recent event message.
             PtraceRequest::Geteventmsg => {
                 // Write event_message to the unsigned long in user space pointed to by data.
-                let msg = tracee.ptrace_get_event_message();
+                let msg = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .event_message();
                 ptrace_store_word_to_user(data, &msg)?;
                 0
             }
             // GETREGS / SETREGS: read/write the x86_64 user registers.
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Getregs => {
-                let regs = tracee.tracee_user_regs()?;
+                let regs = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .get_regs()?;
                 copy_to_user(data, &regs)?;
                 0
             }
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Setregs => {
                 let regs: ptrace::UserRegsStruct = copy_from_user(data)?;
-                tracee.write_tracee_user_regs(&regs)?;
+                request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .set_regs(&regs)?;
                 0
             }
             // PEEKUSER / POKEUSER: read/write user_regs_struct by offset.
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Peekuser => {
                 // PEEKUSER uses data as the user address where the result is stored (PEEK* semantics).
-                let val = tracee.ptrace_peek_user(addr)?;
+                let val = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .peek_user(addr)?;
                 ptrace_store_word_to_user(data, &val)?;
                 0
             }
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Pokeuser => {
-                tracee.ptrace_poke_user(addr, data)?;
+                request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .poke_user(addr, data)?;
                 0
             }
             // GETSIGINFO: read last_siginfo and convert it to siginfo_t for the user.
             PtraceRequest::Getsiginfo => {
-                let info = tracee.ptrace_get_siginfo()?;
+                let info = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .get_siginfo()?;
                 let posix = info.convert_to_posix_siginfo();
                 copy_to_user(data, &posix)?;
                 0
@@ -194,7 +219,10 @@ impl Syscall for SysPtrace {
                     )?
                 };
                 let info = SigInfo::from_posix(&posix);
-                tracee.ptrace_set_siginfo(info)?;
+                request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .set_siginfo(info)?;
                 0
             }
             // GETSIGMASK: addr must equal sizeof(sigset).
@@ -202,7 +230,10 @@ impl Syscall for SysPtrace {
                 if addr != core::mem::size_of::<u64>() {
                     return Err(SystemError::EINVAL);
                 }
-                let mask = tracee.ptrace_get_sigmask();
+                let mask = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .get_sigmask();
                 let bits: usize = mask.bits() as usize;
                 ptrace_store_word_to_user(data, &bits)?;
                 0
@@ -213,7 +244,10 @@ impl Syscall for SysPtrace {
                 }
                 let bits = copy_from_user::<u64>(data)?;
                 let mask = SigSet::from_bits_truncate(bits);
-                tracee.ptrace_set_sigmask(mask);
+                request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .set_sigmask(mask);
                 0
             }
             // GETREGSET / SETREGSET:
@@ -225,7 +259,10 @@ impl Syscall for SysPtrace {
                     return Err(SystemError::EINVAL);
                 }
                 let (iov_base, iov_len) = read_iovec(data)?;
-                let regs = tracee.tracee_user_regs()?;
+                let regs = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .get_regs()?;
                 let len = iov_len.min(core::mem::size_of::<ptrace::UserRegsStruct>());
                 // Uses exception-table protection; a bad iov_base returns EFAULT rather than panicking.
                 let regs_bytes: &[u8] = unsafe {
@@ -255,7 +292,10 @@ impl Syscall for SysPtrace {
                 }
                 let len = iov_len.min(core::mem::size_of::<ptrace::UserRegsStruct>());
                 // Read the current registers, overwriting only the first len bytes from the iov; untouched fields (e.g. cs/ss) are preserved as-is.
-                let mut regs = tracee.tracee_user_regs()?;
+                let mut regs = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .get_regs()?;
                 let regs_bytes: &mut [u8] = unsafe {
                     core::slice::from_raw_parts_mut(
                         &mut regs as *mut ptrace::UserRegsStruct as *mut u8,
@@ -268,7 +308,10 @@ impl Syscall for SysPtrace {
                         VirtAddr::new(iov_base),
                     )?;
                 }
-                tracee.write_tracee_user_regs(&regs)?;
+                request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .set_regs(&regs)?;
                 write_iovec_len(data, len)?;
                 0
             }
@@ -277,7 +320,10 @@ impl Syscall for SysPtrace {
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Getsyscallinfo => {
                 let user_size = addr;
-                let info = tracee.ptrace_get_syscall_info()?;
+                let info = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .syscall_info()?;
                 let actual: usize = match info.op {
                     ptrace::PtraceSyscallInfoOp::None => {
                         core::mem::offset_of!(ptrace::PtraceSyscallInfo, data)
@@ -304,12 +350,18 @@ impl Syscall for SysPtrace {
             }
             // PEEKDATA/PEEKTEXT/POKEDATA/POKETEXT: read/write the tracee's user memory.
             PtraceRequest::Peektext | PtraceRequest::Peekdata => {
-                let val = tracee.ptrace_peek_data(addr)?;
+                let val = request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .peek_data(addr)?;
                 ptrace_store_word_to_user(data, &val)?;
                 0
             }
             PtraceRequest::Poketext | PtraceRequest::Pokedata => {
-                tracee.ptrace_poke_data(addr, data)?;
+                request_guard
+                    .as_ref()
+                    .ok_or(SystemError::ESRCH)?
+                    .poke_data(addr, data)?;
                 0
             }
             _ => {

@@ -664,10 +664,9 @@ fn report_wait_event(
     // LISTENING is suppressed inside consume_stop_report (aligned with exit.c:1232 JOBCTL_LISTENING).
     if relation == WaitRelation::Ptraced && state.is_stopped() {
         let consume = !kwo.options.contains(WaitOption::WNOWAIT);
-        if let Some(exit_code) = child_pcb
-            .ptrace_state
-            .lock_irqsave()
-            .consume_stop_report(consume)
+        let waiter = ProcessManager::current_pcb();
+        if let Some(exit_code) =
+            ptrace::consume_wait_ptrace_stop_report(child_pcb, &waiter, kwo.options, consume)
         {
             let cause = SigChildCode::Trapped.into();
             kwo.no_task_error = None;
@@ -681,12 +680,12 @@ fn report_wait_event(
     // group-stop branch (Natural relation): use the transactional sighand
     // group_stop_event (replacing stop_consume_test — the sighand has no
     // stop_exit_code field; the stop signal number lives in stop_signal).
-    // in_ptrace_stop gating: avoids the same stop being consumed twice — by the
+    // traced-stop gating: avoids the same stop being consumed twice — by the
     // tracer (ptrace-stop branch) and by the real_parent (this branch) after
     // attaching to a group-stopped tracee.
     let stop_requested =
         relation == WaitRelation::Ptraced || kwo.options.contains(WaitOption::WSTOPPED);
-    let in_ptrace_stop = child_pcb.ptrace_state.lock_irqsave().in_ptrace_stop;
+    let in_ptrace_stop = child_pcb.is_in_ptrace_stop();
     if state.is_stopped() && stop_requested && relation != WaitRelation::Ptraced && !in_ptrace_stop
     {
         let consume = !kwo.options.contains(WaitOption::WNOWAIT);

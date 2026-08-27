@@ -52,9 +52,4 @@ impl ProcessControlBlock {
     pub fn task_session(&self) -> Option<Arc<Pid>> {
         self.sighand().pid(PidType::SID)
     }
-
-    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=task_join_group_stop#393
-    pub(super) fn task_join_group_stop(&self) {
-        // todo: 实现  https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=task_join_group_stop#393
-    }
 }

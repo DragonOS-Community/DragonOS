@@ -406,6 +406,7 @@ impl ProcessManager {
                 assert_ne!(previous, 0, "thread-group live count underflow");
                 (group_leader, previous == 1)
             };
+            ptrace::settle_exiting_group_stop(&pcb);
             // Match Linux perf_event_exit_task(): terminal task events must be
             // detached while the old mm and its original instruction bytes
             // are still available. The perf fd retains its final count.

@@ -63,7 +63,6 @@ pub fn do_clone(
     clone_args.verify()?;
     let flags = clone_args.flags;
     let parent_tid = clone_args.parent_tid;
-    let exit_signal = clone_args.exit_signal;
 
     let vfork = Arc::new(Completion::new());
 
@@ -79,11 +78,11 @@ pub fn do_clone(
 
     let pcb = ProcessControlBlock::new(name, new_kstack);
     // 克隆pcb
-    ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
+    let ptrace_fork_session = ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
     let child_vpid = pcb
         .task_pid_nr_ns(PidType::PID, Some(current_pcb.active_pid_ns()))
-        .ok_or(SystemError::EINVAL)?
+        .expect("published fork child must be visible in the caller's PID namespace")
         .data();
 
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
@@ -107,7 +106,7 @@ pub fn do_clone(
         )
     });
     // Report the ptrace event only after wake_up_new_task.
-    ProcessManager::ptrace_report_fork_event(&current_pcb, &pcb, flags, exit_signal);
+    ProcessManager::ptrace_report_fork_event(&current_pcb, &pcb, ptrace_fork_session.as_ref());
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
         // Wait for the child to exit or exec

@@ -165,25 +165,9 @@ pub struct ProcessControlBlock {
 
     /// Linked list of children processes.
     pub(super) children: RwLock<Vec<RawPid>>,
-    /// Tasks currently traced by this process.
-    ///
-    /// `PTRACE_RELATION_LOCK` serializes this index with every tracee's
-    /// `ptrace_slot`.  Strong references make relation traversal independent
-    /// of PID identity exchange and let tracer exit remove one entry at a time
-    /// without allocating a temporary snapshot.
-    pub(super) ptraced: RwLock<Vec<Arc<ProcessControlBlock>>>,
-    /// Slot occupied by this task in its tracer's `ptraced` vector.
-    /// `usize::MAX` means that no ptrace relation is installed.  The value is
-    /// only read or written while `PTRACE_RELATION_LOCK` is held.
-    pub(super) ptrace_slot: AtomicUsize,
-    /// Current tracer if this process is ptraced.
-    pub(super) ptracer_pcb: RwLock<Weak<ProcessControlBlock>>,
-    /// Monotonic identity of the active ptrace ownership session. Only the
-    /// relation facade advances it while holding `PTRACE_RELATION_LOCK`.
-    ptrace_session_generation: AtomicU64,
-    /// Per-tracee ptrace stop/event state machine (Linux task_struct ptrace/jobctl
-    /// analog). SpinLock because it is touched in irqsave critical sections.
-    pub(crate) ptrace_state: SpinLock<ptrace::PtraceState>,
+    /// Ptrace relation ownership and the per-tracee stop/event state machine.
+    /// The header preserves the existing inner locks and field order.
+    pub(super) ptrace: ptrace::PtraceTask,
 
     /// Wait queue.
     pub(super) wait_queue: WaitQueue,
@@ -386,11 +370,7 @@ impl ProcessControlBlock {
                 wait_parent_pcb: RwLock::new(ppcb.clone()),
                 fork_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
-                ptraced: RwLock::new(Vec::new()),
-                ptrace_slot: AtomicUsize::new(usize::MAX),
-                ptracer_pcb: RwLock::new(Weak::new()),
-                ptrace_session_generation: AtomicU64::new(0),
-                ptrace_state: SpinLock::new(ptrace::PtraceState::new()),
+                ptrace: ptrace::PtraceTask::new(),
                 wait_queue: WaitQueue::default(),
                 cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
@@ -971,25 +951,6 @@ impl ProcessControlBlock {
         ptrace::ptracer_of(&self.self_ref.upgrade()?)
     }
 
-    pub(crate) fn ptrace_session_generation(&self) -> u64 {
-        self.ptrace_session_generation.load(Ordering::Acquire)
-    }
-
-    /// Advance ownership while the caller holds `PTRACE_RELATION_LOCK`.
-    pub(super) fn advance_ptrace_session_generation(&self) -> u64 {
-        let mut next = self
-            .ptrace_session_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        if next == 0 {
-            // Wrap is practically unreachable; reserve zero as the initial
-            // unowned generation and publish one for deterministic matching.
-            self.ptrace_session_generation.store(1, Ordering::Release);
-            next = 1;
-        }
-        next
-    }
-
     pub fn is_ptraced(&self) -> bool {
         ptrace::is_ptraced(self)
     }
@@ -1516,6 +1477,61 @@ impl ProcessControlBlock {
 
     pub fn threads_write_irqsave(&self) -> RwLockWriteGuard<'_, ThreadInfo> {
         self.thread.write_irqsave()
+    }
+
+    /// Reserve one leader-owned thread-list slot without allocating while the
+    /// IRQ-safe membership lock is held. Timer signal delivery can inspect the
+    /// list from hardirq context, so using a non-irqsave writer would deadlock
+    /// if that interrupt arrived while the process-context writer was active.
+    /// Publication must still recheck capacity under pid-membership ordering.
+    pub(crate) fn try_reserve_thread_group_slot(&self) -> Result<(), SystemError> {
+        loop {
+            let required_capacity = {
+                let threads = self.thread.read_irqsave();
+                if threads.group_tasks.len() < threads.group_tasks.capacity() {
+                    return Ok(());
+                }
+                let required = threads
+                    .group_tasks
+                    .len()
+                    .checked_add(1)
+                    .ok_or(SystemError::ENOMEM)?;
+                threads
+                    .group_tasks
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+            };
+
+            // All allocator work happens before taking the IRQ-safe writer.
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(required_capacity)
+                .map_err(|_| SystemError::ENOMEM)?;
+
+            let installed = {
+                let mut threads = self.thread.write_irqsave();
+                if threads.group_tasks.len() < threads.group_tasks.capacity() {
+                    false
+                } else if replacement.capacity() < threads.group_tasks.len().saturating_add(1) {
+                    // A concurrent publisher consumed more capacity than the
+                    // lock-free preparation anticipated. Retry with its size.
+                    false
+                } else {
+                    // Capacity is already sufficient, so append only moves
+                    // Weak values; swap leaves the old empty buffer to be
+                    // dropped after IRQs are restored.
+                    replacement.append(&mut threads.group_tasks);
+                    core::mem::swap(&mut replacement, &mut threads.group_tasks);
+                    true
+                }
+            };
+            drop(replacement);
+
+            if installed {
+                return Ok(());
+            }
+        }
     }
 
     pub fn restart_block(&self) -> SpinLockGuard<'_, Option<RestartBlock>> {

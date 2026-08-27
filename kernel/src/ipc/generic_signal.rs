@@ -466,9 +466,11 @@ fn sig_stop(sig: Signal) {
     }
     // A normal non-ptraced process: go through transition_group_stop (atomically set
     // STOP_STOPPED | CLD_STOPPED + stop_signal under the sighand lock) and report to real_parent.
-    let fresh_stop = pcb
-        .sighand()
-        .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok());
+    let fresh_stop =
+        crate::process::ptrace::stop_mixed_ptrace_group(&pcb, sig).unwrap_or_else(|| {
+            pcb.sighand()
+                .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok())
+        });
     drop(guard);
     // attach may convert this task to ptraced during the schedule inside mark_stop()
     // and queue a trap. The STOPPED→TRACED transition must complete immediately before

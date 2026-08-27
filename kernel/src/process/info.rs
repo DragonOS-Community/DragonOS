@@ -89,6 +89,12 @@ impl ThreadInfo {
         self.group_tasks.clone()
     }
 
+    /// Borrow the leader-owned thread list without allocating. Callers must
+    /// keep the surrounding ThreadInfo read guard alive while iterating.
+    pub(crate) fn group_tasks(&self) -> &[Weak<ProcessControlBlock>] {
+        &self.group_tasks
+    }
+
     /// Whether the group has only the leader thread (an empty group list means a single-threaded group).
     pub fn group_tasks_is_empty(&self) -> bool {
         self.group_tasks.is_empty()

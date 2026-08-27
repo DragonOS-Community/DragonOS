@@ -736,7 +736,9 @@ impl Signal {
             // sender; instead they are enqueued so the delivery-side ptrace_signal turns them
             // into a signal-delivery-stop; otherwise the tracee enters group-stop (not ptrace-stop)
             // and PTRACE_CONT fails with ESRCH. PTRACED is per-thread, so check the target pcb, not the leader.
-            if pcb.flags().contains(ProcessFlags::PTRACED) {
+            if pcb.flags().contains(ProcessFlags::PTRACED)
+                || crate::process::ptrace::thread_group_has_ptraced(&thread_group_leader)
+            {
                 return !self.sig_ignored(&pcb, false);
             }
             // Not traced: transactional group-stop (atomically set STOP_STOPPED | CLD_STOPPED +
@@ -795,19 +797,11 @@ impl Signal {
                 true
             });
 
-            // SIGCONT always wakes stopped threads. Only a completed persistent
-            // group stop produces a continued event.
-            let was_stopped = thread_group_leader.sighand().transition_group_continue(|| {
-                ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
-                    // Non-seized threads are woken directly; waking seized threads is handled by ptrace_trap_notify.
-                    if !t.flags().contains(ProcessFlags::PT_SEIZED)
-                        && !t.ptrace_state.lock_irqsave().in_ptrace_stop
-                    {
-                        let _ = ProcessManager::wakeup_stop(&t);
-                    }
-                    true
-                });
-            });
+            // Cancellation and seized re-trap publication are one relation
+            // transaction. Otherwise a tracer exit followed by a re-seize in
+            // this window could redirect this SIGCONT to the new session.
+            let (was_stopped, continue_committed) =
+                crate::process::ptrace::continue_group_with_ptrace(&thread_group_leader);
 
             if was_stopped {
                 if let Some(parent) = pcb.parent_pcb() {
@@ -822,13 +816,14 @@ impl Signal {
                 });
             }
 
-            // A seized tracee receiving SIGCONT must leave group-stop/LISTEN and re-trap with PTRACE_EVENT_STOP
-            ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
-                if t.flags().contains(ProcessFlags::PT_SEIZED) {
-                    t.ptrace_trap_notify();
-                }
-                true
-            });
+            // Only the kick/wake side effect remains outside the relation
+            // transaction. It cannot manufacture or redirect a stop.
+            if continue_committed {
+                ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
+                    t.ptrace_activate_after_group_continue();
+                    true
+                });
+            }
             // 如果未处于 stopped，则不生成 CLD_CONTINUED/不通知父进程。
             // SIGCONT 需要完成“继续运行”的语义，但若其在当前 handler 语义下会被忽略（默认忽略且未被阻塞），
             // 则不应继续入队为 pending，否则可能错误地打断可重启系统调用。
@@ -849,43 +844,18 @@ impl Signal {
 /// - `fatal` 表明这个信号是不是致命的(会导致进程退出)
 #[inline]
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
-    let state = pcb.sched_info().state();
-
     if fatal {
         // A fatal signal must interrupt both stops and interruptible sleeps. First leave
         // ptrace-stop: the ptrace_state lock serializes this with the tracer's request
         // validation / frame writes, so the tracer cannot write into a stale frame that has
         // already been woken. Note: clear the flags and release the lock before waking --
         // holding the lock across the wakeup reverse-nests with the scheduler lock inside it.
-        {
-            let mut ps = pcb.ptrace_state.lock_irqsave();
-            if ps.frozen {
-                ps.deferred_fatal_wake = true;
-                return;
-            }
-            ps.in_ptrace_stop = false;
-        }
-        let r = if state.is_stopped() {
-            ProcessManager::wakeup_stop(&pcb)
-        } else if state.is_blocked_interruptable() {
-            // Interruptible sleeps (including killable waits) are woken directly to take the exit path.
-            ProcessManager::wakeup(&pcb)
-        } else {
-            // Running or in an uninterruptible sleep: waking does nothing useful, so only kick
-            // to make it re-enter the kernel promptly to handle the fatal signal. Uninterruptible
-            // sleeps are not force-woken, consistent with the "uninterruptible" semantics.
-            ProcessManager::kick(&pcb);
-            return;
-        };
-        // Kick only as a fallback when the wakeup fails; on success the wakeup path has already
-        // rescheduled the target, so kicking again would be a redundant IPI.
-        if r.is_err() {
-            ProcessManager::kick(&pcb);
-        }
+        replay_deferred_fatal_wake(pcb);
         return;
     }
 
     // Non-fatal: only wake interruptible sleeps; resuming Stopped tasks is handled by the dedicated SIGCONT path, which is left untouched here.
+    let state = pcb.sched_info().state();
     if state.is_blocked_interruptable() {
         if ProcessManager::wakeup(&pcb).is_err() {
             ProcessManager::kick(&pcb);
@@ -894,6 +864,38 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     }
     // A running target needs a kick to process pending signals (including job-control stops) promptly.
     if !state.is_stopped() {
+        ProcessManager::kick(&pcb);
+    }
+}
+
+/// Re-issue a fatal wake after a ptrace request releases its generation-bound
+/// freeze.  Callers must invoke this only after dropping ptrace/relation/signal
+/// locks.  It is also the common non-deferred fatal wake path, keeping both
+/// cases aligned with Linux's `ptrace_unfreeze_traced()` behavior.
+pub(crate) fn replay_deferred_fatal_wake(pcb: Arc<ProcessControlBlock>) {
+    // Revalidate the currently active stop at replay time.  A deferred wake
+    // may cross detach/reattach after its old freeze owner was revoked; in
+    // that case the fatal signal must abort (or transfer to the freeze owner
+    // of) the new session instead of waking its scheduler stop underneath an
+    // intact ActiveStop record.
+    if pcb.prepare_ptrace_fatal_wake() {
+        return;
+    }
+    let state = pcb.sched_info().state();
+    let r = if state.is_stopped() {
+        ProcessManager::wakeup_stop(&pcb)
+    } else if state.is_blocked_interruptable() {
+        // Interruptible sleeps (including killable waits) are woken directly
+        // to take the exit path.
+        ProcessManager::wakeup(&pcb)
+    } else {
+        // Running or in an uninterruptible sleep: waking does nothing useful,
+        // so only kick to make it re-enter the kernel promptly. Do not broaden
+        // the semantics of uninterruptible sleeps.
+        ProcessManager::kick(&pcb);
+        return;
+    };
+    if r.is_err() {
         ProcessManager::kick(&pcb);
     }
 }

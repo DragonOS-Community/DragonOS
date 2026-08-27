@@ -287,9 +287,11 @@ fn do_execve_internal(
 
             // ptrace EVENT_EXEC: must fire after arch_do_execve writes the new entry registers (rip/rsp/rflags/cs).
             // During EXEC-stop, GETREGS reads the new rip (the new program entry), and SETREGS is not overwritten by arch_do_execve.
-            if pcb.ptrace_event_enabled(ptrace::PtraceEvent::Exec) {
-                pcb.ptrace_event(ptrace::PtraceEvent::Exec, old_vpid);
-            } else if pcb.is_traced() && !pcb.flags().contains(ProcessFlags::PT_SEIZED) {
+            if pcb.ptrace_event(ptrace::PtraceEvent::Exec, old_vpid)
+                == ptrace::PtraceEventOutcome::Disabled
+                && pcb.is_traced()
+                && !pcb.flags().contains(ProcessFlags::PT_SEIZED)
+            {
                 // Traditional attach in non-SEIZE mode: deliver a bare SIGTRAP (SI_KERNEL) after a successful execve.
                 let mut info = crate::ipc::signal_types::SigInfo::new(
                     Signal::SIGTRAP,

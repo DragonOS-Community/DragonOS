@@ -128,13 +128,9 @@ unsafe fn load_task_debug_regs(task: &ProcessControlBlock) {
     let should_load = task.flags().contains(ProcessFlags::HW_DEBUG_REGS)
         && !task.flags().contains(ProcessFlags::PENDING_DEBUG);
     if should_load {
-        let dr = {
-            let ps = task.ptrace_state.lock_irqsave();
-            let mut dr = ps.debug_regs;
-            dr[6] = 0;
-            dr[7] &= !crate::process::ptrace::DR_CONTROL_RESERVED;
-            dr
-        };
+        let mut dr = task.ptrace_debug_regs_snapshot();
+        dr[6] = 0;
+        dr[7] &= !crate::process::ptrace::DR_CONTROL_RESERVED;
         cpu_dr7().store(dr[7], Ordering::Relaxed);
         compiler_fence(Ordering::SeqCst);
         unsafe {

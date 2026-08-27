@@ -197,11 +197,7 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
             dr6 & (ptrace::X86_DR_B_MASK | ptrace::X86_DR_BS)
         };
         let icebp = !uprobe.consumed && dr6 == 0;
-        let forced_step = {
-            let mut ps = current.ptrace_state.lock_irqsave();
-            ps.debug_regs[6] = report_bits;
-            ps.forced_trap_flag
-        };
+        let forced_step = current.record_ptrace_debug_status(report_bits);
         let breakpoint_bits = report_bits & ptrace::X86_DR_B_MASK;
         let owned_breakpoints =
             if active_generation.is_some() || owner_generation != current_generation {
@@ -243,7 +239,7 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
             // Match Linux exc_debug_kernel()/ptrace_triggered(): remember the
             // virtual DR6 cause, but do not synthesize a signal at syscall
             // return. A later user #DB starts a fresh virtual DR6 report.
-            current.ptrace_state.lock_irqsave().debug_regs[6] |= breakpoint_bits;
+            current.merge_ptrace_debug_status(breakpoint_bits);
         }
         // B0-B3 belong to the user ptrace watchpoint. Preserve any coexisting
         // BS reason for the kernel kprobe single-step handler.

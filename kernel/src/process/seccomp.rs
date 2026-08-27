@@ -290,6 +290,10 @@ fn action_priority(ret: u32) -> i32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeccompDecision {
     Allow,
+    /// A `SECCOMP_RET_TRACE` stop completed and the tracer may have changed
+    /// the syscall number or arguments in the TrapFrame. The dispatcher must
+    /// reload both before selecting and invoking a handler.
+    AllowAfterTrace,
     Skip(usize),
 }
 
@@ -301,6 +305,7 @@ pub enum SeccompDecision {
 ///
 /// # 返回值
 /// - `Allow`: 允许继续执行系统调用
+/// - `AllowAfterTrace`: tracer 可能已修改 TrapFrame，调用方重取系统调用号和参数后继续执行
 /// - `Skip(ret)`: 跳过系统调用并直接返回 `ret`
 ///
 /// 对于 KILL 动作，此函数不会返回，而是按 Linux seccomp 语义终止线程/线程组。
@@ -380,20 +385,27 @@ fn filter_decision(
             // Re-entry guard: when recheck_after_trace is set, allow a second
             // TRACE hit outright.
             if recheck_after_trace {
-                return Ok(SeccompDecision::Allow);
+                return Ok(SeccompDecision::AllowAfterTrace);
             }
-            // With no tracer or when TRACESECCOMP is not enabled, skip the
-            // syscall and return -ENOSYS.
-            if !pcb.ptrace_event_enabled(crate::process::ptrace::PtraceEvent::Seccomp) {
-                rollback_syscall(frame, syscall_num);
-                return Ok(SeccompDecision::Skip(
-                    SystemError::ENOSYS.to_posix_errno() as usize
-                ));
-            }
-            pcb.ptrace_event(
+            // The option decision and stop publication are session-bound. An
+            // initially disabled event returns -ENOSYS. If an enabled session
+            // disappears before the stop commits, continue through Linux's
+            // fatal-check/register-reload/recheck path without redirecting the
+            // event to a replacement tracer.
+            let event_outcome = pcb.ptrace_event(
                 crate::process::ptrace::PtraceEvent::Seccomp,
                 data_val as usize,
             );
+            match event_outcome {
+                crate::process::ptrace::PtraceEventOutcome::Committed
+                | crate::process::ptrace::PtraceEventOutcome::NotCommitted => {}
+                crate::process::ptrace::PtraceEventOutcome::Disabled => {
+                    rollback_syscall(frame, syscall_num);
+                    return Ok(SeccompDecision::Skip(
+                        SystemError::ENOSYS.to_posix_errno() as usize
+                    ));
+                }
+            }
             // If a fatal signal is pending after ptrace_event returns, force-skip
             // the syscall to avoid side effects.
             if Signal::fatal_signal_pending(&pcb) {
@@ -410,7 +422,12 @@ fn filter_decision(
             }
             // On re-entry, reload all arguments from the frame.
             let args_after = frame_syscall_args(frame);
-            filter_decision(pcb, nr_after as usize, &args_after, frame, true)
+            match filter_decision(pcb, nr_after as usize, &args_after, frame, true)? {
+                SeccompDecision::Allow | SeccompDecision::AllowAfterTrace => {
+                    Ok(SeccompDecision::AllowAfterTrace)
+                }
+                decision @ SeccompDecision::Skip(_) => Ok(decision),
+            }
         }
         SECCOMP_RET_LOG => {
             log::info!(

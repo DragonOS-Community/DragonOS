@@ -86,12 +86,26 @@ impl Syscall {
             let _ = current_pcb.ptrace_report_syscall(false, nr_raw as u64, &seccomp_args);
             return Ok(frame.get_syscall_return());
         }
-        let nr_after_ptrace = nr_raw as usize;
-        let args_after_ptrace = crate::process::seccomp::frame_syscall_args(frame);
-        seccomp_args = args_after_ptrace;
+        let mut dispatch_nr = nr_raw as usize;
+        let mut dispatch_args = crate::process::seccomp::frame_syscall_args(frame);
+        seccomp_args = dispatch_args;
         let mut seccomp_skipped = false;
-        match crate::process::seccomp::secure_computing(nr_after_ptrace, &seccomp_args, frame) {
+        match crate::process::seccomp::secure_computing(dispatch_nr, &seccomp_args, frame) {
             Ok(crate::process::seccomp::SeccompDecision::Allow) => {}
+            Ok(crate::process::seccomp::SeccompDecision::AllowAfterTrace) => {
+                // Linux reloads the syscall number after entry work because
+                // SECCOMP_RET_TRACE lets the tracer rewrite the register frame.
+                // DragonOS dispatch also carries an explicit argument array,
+                // so refresh all six arguments from that same frame snapshot.
+                let nr_after_trace = frame.get_orig_syscall_nr();
+                debug_assert!(
+                    nr_after_trace >= 0,
+                    "seccomp TRACE returned Allow with a negative syscall number"
+                );
+                dispatch_nr = nr_after_trace as usize;
+                dispatch_args = crate::process::seccomp::frame_syscall_args(frame);
+                seccomp_args = dispatch_args;
+            }
             Ok(crate::process::seccomp::SeccompDecision::Skip(ret)) => {
                 frame.set_return_value(ret);
                 seccomp_skipped = true;
@@ -114,18 +128,18 @@ impl Syscall {
         // Execute the real syscall when seccomp did not intercept it; skip execution when it did.
         if !seccomp_skipped {
             // First try to obtain the handler from the syscall_table
-            if let Some(handler) = syscall_table().get(nr_after_ptrace) {
+            if let Some(handler) = syscall_table().get(dispatch_nr) {
                 let show = false;
                 if show {
                     log::debug!(
                         "pid: {} Syscall {} called with args {}",
                         ProcessManager::current_pid().data(),
                         handler.name,
-                        handler.args_string(&args_after_ptrace)
+                        handler.args_string(&dispatch_args)
                     );
                 }
 
-                let r = handler.inner_handle.handle(&args_after_ptrace, frame);
+                let r = handler.inner_handle.handle(&dispatch_args, frame);
                 if show {
                     log::debug!(
                         "pid: {} Syscall {} returned {:?}",
@@ -143,14 +157,14 @@ impl Syscall {
                 frame.set_return_value(rax_value);
             } else {
                 // fallback: an unregistered or unknown syscall.
-                let r = match nr_after_ptrace {
+                let r = match dispatch_nr {
                     SYS_PUT_STRING => Self::put_string(
-                        args_after_ptrace[0] as *const u8,
-                        args_after_ptrace[1] as u32,
-                        args_after_ptrace[2] as u32,
+                        dispatch_args[0] as *const u8,
+                        dispatch_args[1] as u32,
+                        dispatch_args[2] as u32,
                     ),
                     SYS_SBRK => {
-                        let incr = args_after_ptrace[0] as isize;
+                        let incr = dispatch_args[0] as isize;
                         crate::mm::syscall::sys_sbrk::sys_sbrk(incr)
                     }
                     SYS_CLOCK => Self::clock(),
@@ -160,9 +174,9 @@ impl Syscall {
                         Ok(0)
                     }
                     SYS_SYSLOG => {
-                        let syslog_action_type = args_after_ptrace[0];
-                        let buf_vaddr = args_after_ptrace[1];
-                        let len = args_after_ptrace[2];
+                        let syslog_action_type = dispatch_args[0];
+                        let buf_vaddr = dispatch_args[1];
+                        let len = dispatch_args[2];
                         let from_user = frame.is_from_user();
                         if len == 0 {
                             Self::do_syslog(syslog_action_type, &mut [], 0)
@@ -183,9 +197,9 @@ impl Syscall {
                     _ => {
                         log::error!(
                             "Unsupported syscall ID: {} -> {}, args: {:?}",
-                            nr_after_ptrace,
-                            syscall_number_to_str(nr_after_ptrace),
-                            args_after_ptrace
+                            dispatch_nr,
+                            syscall_number_to_str(dispatch_nr),
+                            dispatch_args
                         );
                         Err(SystemError::ENOSYS)
                     }
@@ -200,7 +214,7 @@ impl Syscall {
 
         // Unified ptrace syscall-exit-stop: every path must go through exit-stop.
         let current_pcb = ProcessManager::current_pcb();
-        let _ = current_pcb.ptrace_report_syscall(false, nr_after_ptrace as u64, &seccomp_args);
+        let _ = current_pcb.ptrace_report_syscall(false, dispatch_nr as u64, &seccomp_args);
 
         // Return the return-value register (ptrace may have rewritten it via POKEUSER);
         return Ok(frame.get_syscall_return());

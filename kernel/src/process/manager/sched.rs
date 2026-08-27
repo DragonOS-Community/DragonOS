@@ -99,7 +99,7 @@ impl ProcessManager {
         debug_assert!(pcb.sched_info().on_cpu().is_none());
 
         let pi_guard = pcb.sched_info().pi_lock_irqsave();
-        pcb.sched_info().set_state(ProcessState::Runnable);
+        let starts_stopped = pcb.sched_info().state().is_stopped();
 
         let target_cpu = pcb.sched_info().consume_new_task_target_cpu(
             smp_get_processor_id(),
@@ -114,6 +114,16 @@ impl ProcessManager {
                 }
             },
         )?;
+
+        // A CLONE_THREAD child published into an existing group-stop consumes
+        // its one-time placement state but must not become runnable before
+        // SIGCONT. wakeup_stop() will select and enqueue it normally later.
+        if starts_stopped {
+            debug_assert!(!pcb.sched_info().is_new_task());
+            return Ok(());
+        }
+
+        pcb.sched_info().set_state(ProcessState::Runnable);
 
         enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::WF_FORK, false);
 
@@ -241,6 +251,25 @@ impl ProcessManager {
             };
         }
 
+        Self::wakeup_stop_locked(pcb)
+    }
+
+    /// Wake a stopped task while the caller keeps the ptrace relation
+    /// transaction locked.
+    ///
+    /// This narrow entry point lets ptrace teardown validate the old session,
+    /// clear its active stop and commit `Stopped -> Runnable` without an
+    /// unlock/re-attach window.  The caller's lock order is
+    /// `PTRACE_RELATION_LOCK -> sighand -> pi_lock -> rq_lock`; this function
+    /// never acquires the relation or sighand locks in the reverse direction.
+    pub(crate) fn wakeup_stop_relation_locked(
+        pcb: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        Self::wakeup_stop_locked(pcb)
+    }
+
+    fn wakeup_stop_locked(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let pi_guard = pcb.sched_info().pi_lock_irqsave();
         let state = pcb.sched_info().state();
         if !state.is_stopped() {
@@ -284,8 +313,8 @@ impl ProcessManager {
             // placement while it slept. Select again under pi_lock exactly
             // like ordinary ttwu.
             pcb.sched_info().wait_until_not_running();
-            let allowed = pi_guard.cpus_allowed.clone();
-            let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
+            let target_cpu =
+                select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &pi_guard.cpus_allowed);
             enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::empty(), false);
         }
 

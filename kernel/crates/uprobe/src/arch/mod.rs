@@ -1,7 +1,7 @@
-//! uprobe 的架构无关 trait 定义与架构分发。
+//! Architecture-independent trait definitions and dispatch for uprobe.
 //!
-//! - [`ProbeArgs`]：处理器寄存器/陷阱帧的架构无关视图（供回调使用）。
-//! - [`CallBackFunc`]：事件回调（典型为 eBPF 程序入口）。
+//! - [`ProbeArgs`]: architecture-independent view of processor registers/trap frames (for callbacks).
+//! - [`CallBackFunc`]: the event callback (typically the entry point of an eBPF program).
 
 use ::core::any::Any;
 
@@ -11,23 +11,26 @@ mod x86;
 #[cfg(target_arch = "x86_64")]
 pub use x86::*;
 
-/// 处理器寄存器/陷阱帧的架构无关视图（供回调使用）。
+/// Architecture-independent view of processor registers/trap frames (for callbacks).
 ///
-/// 与 kprobe 的 `ProbeArgs` 保持相同签名，以便复用同一套 TrapFrame 适配模式；
-/// 但 uprobe 是独立 crate，不依赖 kprobe crate（低耦合），故单独定义。
+/// Keeps the same signature as kprobe's `ProbeArgs` to reuse the same TrapFrame
+/// adaptation pattern; however, uprobe is a standalone crate that does not depend on the
+/// kprobe crate (low coupling), so it is defined separately.
 pub trait ProbeArgs: Send {
-    /// 供使用者转换为特定架构的 TrapFrame。
+    /// Allows the user to convert to a specific architecture's TrapFrame.
     fn as_any(&self) -> &dyn Any;
-    /// 触发断点异常（#BP）的指令地址（对 uprobe 即 probe_vaddr）。
+    /// The instruction address that triggered the breakpoint exception (#BP); for uprobe
+    /// this is probe_vaddr.
     fn break_address(&self) -> usize;
-    /// 触发单步异常（#DB）的指令地址（XOL slot 中原指令执行后的下一条）。
+    /// The instruction address that triggered the single-step exception (#DB); the next
+    /// instruction after the original one in the XOL slot.
     fn debug_address(&self) -> usize;
 }
 
-/// 事件回调（典型为 eBPF 程序入口）。
+/// The event callback (typically the entry point of an eBPF program).
 ///
-/// 与 kprobe 的 `CallBackFunc` 同签名。使用 `Arc` 以便在多个 per-mm 探测点间共享
-/// 同一回调实例。
+/// Same signature as kprobe's `CallBackFunc`. Uses `Arc` so the same callback instance can
+/// be shared across multiple per-mm probe sites.
 pub trait CallBackFunc: Send + Sync {
     fn call(&self, trap_frame: &dyn ProbeArgs);
 }

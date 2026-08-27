@@ -1,6 +1,6 @@
 use super::*;
 
-/// Linux `struct uprobe` 的定义域：文件对象与文件偏移唯一确定探针，指令只分析一次。
+/// The definition scope of Linux's `struct uprobe`: the file object plus file offset uniquely identify a probe, and the instruction is analyzed only once.
 pub struct UprobeDefinition {
     inode: Arc<dyn IndexNode>,
     page_cache: Arc<PageCache>,

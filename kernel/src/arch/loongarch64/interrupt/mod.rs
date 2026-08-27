@@ -116,13 +116,13 @@ impl TrapFrame {
         unsafe { x.assume_init() }
     }
 
-    /// 设置系统调用返回值寄存器（loongarch64 为 a0）。
+    /// Set the syscall return value register (a0 on loongarch64).
     #[inline]
     pub fn set_return_value(&mut self, value: usize) {
         self.a0 = value;
     }
 
-    /// 读取系统调用返回值寄存器（loongarch64 为 a0）。
+    /// Read the syscall return value register (a0 on loongarch64).
     pub fn get_syscall_return(&self) -> usize {
         self.a0
     }

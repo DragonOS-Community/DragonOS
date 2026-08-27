@@ -100,7 +100,7 @@ fn complete_ptrace_claim_after_ack(child_pcb: &Arc<ProcessControlBlock>) {
     real_parent
         .wait_queue
         .wakeup_all(Some(ProcessState::Blocked(true)));
-    // 线程组 leader 的 wait_queue 也要唤醒（__WNOTHREAD 语义对称）。
+    // The thread group leader's wait_queue must also be woken (symmetric with __WNOTHREAD semantics).
     let parent_leader = real_parent.thread.read_irqsave().group_leader();
     if let Some(leader) = parent_leader {
         if !Arc::ptr_eq(&leader, &real_parent) {
@@ -111,7 +111,7 @@ fn complete_ptrace_claim_after_ack(child_pcb: &Arc<ProcessControlBlock>) {
     }
 }
 
-/// mt-exec: de_thread 正在等待旧 leader 完成 PID/TID 交换时，禁止提前回收
+/// mt-exec: forbid early reaping while de_thread is waiting for the old leader to complete the PID/TID swap
 fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
     child_pcb.sighand().reap_blocked_by_group_exec(child_pcb)
 }
@@ -563,9 +563,11 @@ fn report_wait_event(
                 WaitRelation::Natural => child_pcb.sighand().natural_reap_blocked(child_pcb),
                 WaitRelation::Ptraced => reap_blocked_by_group_exec(child_pcb),
             });
-    // 可见性门控：ptraced zombie 在 tracer ack（Ptraced 关系）之前对 natural parent
-    // 不可见。对齐 Linux wait_task_zombie：ptraced 子进程只能由 tracer 先 reap，
-    // real_parent 在 tracer 解除关系前不可 reap（否则抢先回收，tracer 见不到退出）。
+    // Visibility gating: a ptraced zombie is invisible to the natural parent until
+    // the tracer acknowledges it (Ptraced relation). Aligned with Linux
+    // wait_task_zombie: a ptraced child may only be reaped by the tracer first; the
+    // real_parent cannot reap before the tracer detaches (otherwise it would reap
+    // first and the tracer would never see the exit).
     if is_zombie && !delayed_zombie && child_pcb.is_ptraced() && relation != WaitRelation::Ptraced {
         return CandidateDecision::Pending { can_change: true };
     }
@@ -607,12 +609,13 @@ fn report_wait_event(
             kwo.ret_info = Some(waitid_info(child_pcb, status, cause));
 
             if need_cascade {
-                // ptracer != real_parent（外部调试器）：通知 real_parent 并保留 zombie，
-                // 等 real_parent 走 Natural 分支二次 reap。
+                // ptracer != real_parent (external debugger): notify real_parent and
+                // keep the zombie so real_parent can reap it again via the Natural branch.
                 complete_ptrace_claim_after_ack(child_pcb);
             } else {
-                // ptracer == real_parent（strace fork-then-trace 场景）：立即 reap+release，
-                // 只上报一次，不保留 zombie 避免二次 Natural reap。
+                // ptracer == real_parent (strace fork-then-trace case): reap + release
+                // immediately, report only once, and do not keep the zombie to avoid a
+                // second Natural reap.
                 child_pcb.finish_trace_zombie_claim();
                 let rusage = fill_wait_rusage(child_pcb, kwo);
                 account_reaped_child_rusage(&rusage);
@@ -621,8 +624,9 @@ fn report_wait_event(
             return CandidateDecision::Ready(Ok(pid.into()));
         }
 
-        // Natural reap（含已 unlink 的原 ptraced zombie）：用事务化 try_reap_natural_child
-        //（内部处理 autoreap / group-exec 仲裁 / mark-dead）。
+        // Natural reap (including an already-unlinked former ptraced zombie): use the
+        // transactional try_reap_natural_child (which internally handles autoreap /
+        // group-exec arbitration / mark-dead).
         let transition = child_pcb
             .sighand()
             .try_reap_natural_child(child_pcb, consume);
@@ -653,10 +657,11 @@ fn report_wait_event(
         return CandidateDecision::Ready(Ok(pid.into()));
     }
 
-    // ptrace-stop 分支：纯 ptrace-trap（syscall-stop 的 SIGTRAP|0x80、EVENT_STOP 的
-    // (event<<8)|SIGTRAP、signal-delivery-stop）的 exit_code 比 sighand 的 stop_signal
-    // 丰富，须取自 per-tracee 的 PtraceState（对齐 Linux task->exit_code）。
-    // LISTENING 由 consume_stop_report 内部抑制（对齐 exit.c:1232 JOBCTL_LISTENING）。
+    // ptrace-stop branch: pure ptrace-traps (syscall-stop's SIGTRAP|0x80, EVENT_STOP's
+    // (event<<8)|SIGTRAP, signal-delivery-stop) carry a richer exit_code than the
+    // sighand's stop_signal, so it must come from the per-tracee PtraceState (aligned
+    // with Linux task->exit_code).
+    // LISTENING is suppressed inside consume_stop_report (aligned with exit.c:1232 JOBCTL_LISTENING).
     if relation == WaitRelation::Ptraced && state.is_stopped() {
         let consume = !kwo.options.contains(WaitOption::WNOWAIT);
         if let Some(exit_code) = child_pcb
@@ -673,10 +678,12 @@ fn report_wait_event(
         }
     }
 
-    // group-stop 分支（Natural 关系）：用 sighand 事务化 group_stop_event（替代
-    // stop_consume_test——sighand 无 stop_exit_code 字段，stop 信号号存于 stop_signal）。
-    // in_ptrace_stop 门控：避免 attach 到 group-stopped tracee 后同一 stop 被 tracer
-    // （ptrace-stop 分支）和 real_parent（本分支）双重消费。
+    // group-stop branch (Natural relation): use the transactional sighand
+    // group_stop_event (replacing stop_consume_test — the sighand has no
+    // stop_exit_code field; the stop signal number lives in stop_signal).
+    // in_ptrace_stop gating: avoids the same stop being consumed twice — by the
+    // tracer (ptrace-stop branch) and by the real_parent (this branch) after
+    // attaching to a group-stopped tracee.
     let stop_requested =
         relation == WaitRelation::Ptraced || kwo.options.contains(WaitOption::WSTOPPED);
     let in_ptrace_stop = child_pcb.ptrace_state.lock_irqsave().in_ptrace_stop;

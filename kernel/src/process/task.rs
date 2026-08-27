@@ -279,7 +279,7 @@ impl ProcessControlBlock {
         self.flags().contains(ProcessFlags::KTHREAD)
     }
 
-    /// 获取本任务当前安装的、活跃的用户地址空间引用。
+    /// Get a reference to this task's currently installed, active user address space.
     pub fn active_vm(&self) -> Option<crate::mm::ucontext::MmUserRef> {
         if self.is_kthread() {
             return None;
@@ -676,12 +676,12 @@ impl ProcessControlBlock {
         return self.basic.read_irqsave();
     }
 
-    /// 获取 exec_update_lock 读锁
+    /// Acquire the exec_update_lock read lock
     pub fn exec_update_read(&self) -> crate::libs::rwsem::RwSemReadGuard<'_, ()> {
         self.exec_update_lock.read()
     }
 
-    /// 获取 exec_update_lock 写锁：execve 切换 mm/cred/dumpable 的临界区持此锁。
+    /// Acquire the exec_update_lock write lock: the critical sections where execve swaps mm/cred/dumpable hold this lock.
     #[inline(always)]
     pub fn exec_update_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
         self.exec_update_lock.write()

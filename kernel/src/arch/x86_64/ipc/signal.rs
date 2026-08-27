@@ -754,17 +754,20 @@ struct SignalFrameLocation {
 unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let pcb = ProcessManager::current_pcb();
 
-    // Linux uprobe_deny_signal(): 普通异步信号不能在 XOL 单条指令中间构造
-    // signal frame；同步陷阱或 fatal signal 则必须先把 RIP 恢复到原探针址。
+    // Linux uprobe_deny_signal(): a normal asynchronous signal cannot build a
+    // signal frame in the middle of a single XOL instruction; a synchronous trap
+    // or fatal signal must first restore RIP to the original probe address.
     if !crate::exception::uprobe::signal_gate(frame) {
         return;
     }
 
-    // 先读进程级 shared_pending 位图（sighand 读锁获取后立即释放）。
-    // 必须在取 sig_info 读锁之前完成：否则 do_signal 持 sig_info 读锁时再取
-    // sighand 读锁，与 recalc_sigpending_tsk（sender 上下文）的 sighand(读)→sig_info(读)
-    // 锁序冲突。DragonOS RwLock 为 writer-preferring，在有 sighand 待写者（sigaction）
-    // 与 sig_info 待写者（sigprocmask）并发时可构成 AB-BA 死锁。
+    // Read the process-level shared_pending bitmap first (the sighand read lock
+    // is released right after).
+    // This must complete before taking the sig_info read lock: otherwise do_signal
+    // takes the sighand read lock while holding sig_info's, conflicting with the
+    // recalc_sigpending_tsk (sender context) sighand(read)→sig_info(read) lock order.
+    // DragonOS RwLock is writer-preferring; with concurrent sighand writers
+    // (sigaction) and sig_info writers (sigprocmask) this can form an AB-BA deadlock.
     let shared_pending = pcb.sighand().shared_pending_signal().bits();
 
     let siginfo = pcb.try_siginfo_irqsave(5);
@@ -1001,8 +1004,9 @@ impl SignalArch for X86_64SignalArch {
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#865
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame) {
-        // 在返回用户态前检查 JOBCTL_TRAP_STOP，发起 PTRACE_EVENT_STOP ptrace_stop。
-        // 触发源：fork 的 seized 子进程初始 stop、PTRACE_INTERRUPT、ptraced group-stop。
+        // Before returning to user space, check JOBCTL_TRAP_STOP and initiate a
+        // PTRACE_EVENT_STOP ptrace_stop.
+        // Sources: a fork'd seized child's initial stop, PTRACE_INTERRUPT, ptraced group-stop.
         let pcb = ProcessManager::current_pcb();
         let debug_restore = pcb.flags().contains(ProcessFlags::PENDING_DEBUG);
         defer! {
@@ -1031,7 +1035,8 @@ impl SignalArch for X86_64SignalArch {
                 }
             }
         }
-        // 返回用户态前检查 PENDING_PTRACE_STOP，发起 PTRACE_EVENT_STOP ptrace_stop。
+        // Before returning to user space, check PENDING_PTRACE_STOP and initiate a
+        // PTRACE_EVENT_STOP ptrace_stop.
         while pcb.ptrace_handle_pending_stop() {}
 
         let mut got_signal = false;
@@ -1208,7 +1213,8 @@ fn setup_frame(
     let frame_location = get_stack(sigaction, trap_frame, size_of::<SigFrame>());
     let frame_ptr = frame_location.frame;
 
-    // 验证地址位于用户空间（access check；整帧随后由 copy_to_user_protected 写入）。
+    // Verify the address lies in user space (access check; the whole frame is
+    // written later by copy_to_user_protected).
     UserBufferWriter::new(frame_ptr, size_of::<SigFrame>(), true).map_err(|_| {
         error!("In setup_frame: access check failed");
         let _ = crate::ipc::kill::send_signal_to_pid(
@@ -1223,9 +1229,11 @@ fn setup_frame(
         SystemError::EFAULT
     })?;
 
-    // 在内核栈上构造完整 SigFrame，最后一次性走异常表保护写入用户栈。
-    // 这样所有用户指针访问都集中在受保护的 copy_to_user_protected 调用上，
-    // 坏用户栈指针返回 EFAULT/SIGSEGV 而非 panic。
+    // Build the complete SigFrame on the kernel stack, then write it to the user
+    // stack in one protected copy.
+    // This keeps all user pointer accesses concentrated in the protected
+    // copy_to_user_protected call, so a bad user stack pointer returns
+    // EFAULT/SIGSEGV rather than panicking.
     let mut frame: SigFrame = unsafe { core::mem::zeroed() };
 
     // 1. 读取 arch 信息并生成用户态数据（避免持锁访问用户内存）
@@ -1245,7 +1253,7 @@ fn setup_frame(
     archinfo_guard.clear_fp_state();
     drop(archinfo_guard);
 
-    // 3. 填充栈帧字段（纯内核态写入，无 user deref）
+    // 3. Fill in the frame fields (pure kernel-side writes, no user deref)
     frame.ucontext = user_ucontext;
     if let Some(fpstate) = user_fpstate {
         unsafe {
@@ -1254,7 +1262,7 @@ fn setup_frame(
                 &fpstate,
             )?;
         }
-        // FP_XSTATE_MAGIC2 尾随 fpstate 之后。
+        // FP_XSTATE_MAGIC2 follows immediately after fpstate.
         let magic2_addr =
             unsafe { (frame_location.fpstate as *mut u8).add(size_of::<UserXState>()) as usize };
         unsafe {
@@ -1265,10 +1273,11 @@ fn setup_frame(
         }
     }
 
-    // 4. 填充栈帧剩余字段（栈上写入，随后整帧受保护写入用户栈）。
+    // 4. Fill the remaining frame fields (written on the stack; the whole frame
+    // is then written to the user stack under protection).
     frame.siginfo = info.convert_to_posix_siginfo();
     frame.ret_code_ptr = ret_code_ptr;
-    // 设置 fpstate 指针指向栈帧内的 fpstate。
+    // Point the fpstate pointer at the fpstate within the frame.
     frame.setup_fpstate_pointer(frame_location.fpstate);
 
     if sig_altstack.flags.contains(SigStackFlags::SS_AUTODISARM) {
@@ -1276,7 +1285,7 @@ fn setup_frame(
         pcb.sig_altstack_mut().reset_for_autodisarm();
     }
 
-    // 6. 一次性把整帧写入用户栈（走异常表保护）
+    // 6. Write the whole frame to the user stack in one go (exception-table protection)
     let frame_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             &frame as *const SigFrame as *const u8,
@@ -1295,8 +1304,9 @@ fn setup_frame(
         })?;
     }
 
-    // 7. 设置 trap_frame，准备进入信号处理函数。
-    // rsi/rdx 指向用户栈上的 siginfo/ucontext（SigFrame 偏移已在编译期断言）。
+    // 7. Set up trap_frame to enter the signal handler.
+    // rsi/rdx point at the siginfo/ucontext on the user stack (the SigFrame offsets
+    // are asserted at compile time).
     let frame_base = frame_ptr as usize;
     let siginfo_uaddr = frame_base + core::mem::offset_of!(SigFrame, siginfo);
     let ucontext_uaddr = frame_base + core::mem::offset_of!(SigFrame, ucontext);

@@ -100,7 +100,7 @@ impl StatusFileOps {
             .to_owned(),
         );
 
-        // TracerPid（跟踪此线程组的调试器 pid，无则为 0）
+        // TracerPid (pid of the debugger tracing this thread group, 0 if none)
         let tracer_pid = crate::process::ptrace::ptracer_of(&pcb)
             .and_then(|t| t.task_pid_ptr(PidType::TGID))
             .map(|pid| pid.pid_nr_ns(view_pid_ns).data() as isize)

@@ -147,8 +147,9 @@ unsafe extern "C" fn do_divide_error(regs: &'static mut TrapFrame, error_code: u
 /// 处理调试异常 1 #DB
 #[no_mangle]
 unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
-    // DR6 可同时报告 BS(single-step) 与 B0-B3(hardware breakpoint)。必须在
-    // 任何 handler 前保存并复位，避免旧 cause 污染下一次 #DB。
+    // DR6 can report BS (single-step) and B0-B3 (hardware breakpoint) together.
+    // It must be saved and reset before any handler runs, so a stale cause cannot
+    // pollute the next #DB.
     let dr6 = read_and_reset_dr6() & !ptrace::DR6_RESERVED;
     let from_user = regs.is_from_user();
     let dr7: u64;
@@ -174,9 +175,11 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
         ProcessManager::current_pid()
     );
     if from_user {
-        // 用户态 #DB：uprobe XOL 单步完成优先（handler 返回是否消费，评审 R4）；
-        // 未消费的用户态单步通过统一信号路径进入 SIGTRAP/ptrace。DebugException 只查
-        // 内核 kprobe 表，不能处理用户态 #DB，否则会静默吞掉调试异常。
+        // User-mode #DB: a completed uprobe XOL single-step takes priority (whether
+        // the handler consumes it is reviewed in R4); an unconsumed user single-step
+        // goes to SIGTRAP/ptrace via the unified signal path. DebugException only
+        // consults the kernel kprobe table and cannot handle user-mode #DB, otherwise
+        // it would silently swallow the debug exception.
         let current = ProcessManager::current_pcb();
         let uprobe = crate::exception::uprobe::uprobe_debug_handler(regs, dr6).unwrap();
         let (active_generation, current_generation) =
@@ -261,7 +264,7 @@ unsafe fn read_and_reset_dr6() -> u64 {
         out(reg) dr6,
         options(nomem, nostack, preserves_flags)
     );
-    // Intel/Linux 要求保留 DR6 的固定 1 位并清除可写状态位。
+    // Intel/Linux requires preserving DR6's fixed 1 bits and clearing the writable status bits.
     const DR6_RESET: u64 = 0xffff_0ff0;
     core::arch::asm!(
         "mov dr6, {}",
@@ -297,7 +300,7 @@ unsafe extern "C" fn do_int3(regs: &'static mut TrapFrame, error_code: u64) {
         ProcessManager::current_pid()
     );
     if regs.is_from_user() {
-        // 用户态 #BP：uprobe 命中或未消费 #BP（→ SIGTRAP）。
+        // User-mode #BP: an uprobe hit or an unconsumed #BP (→ SIGTRAP).
         crate::exception::uprobe::uprobe_breakpoint_handler(regs).unwrap();
     } else {
         // Vector 3 is now an interrupt gate for the user-uprobe entry race.
@@ -307,7 +310,7 @@ unsafe extern "C" fn do_int3(regs: &'static mut TrapFrame, error_code: u64) {
         if regs.rflags & (1 << 9) != 0 {
             CurrentIrqArch::interrupt_enable();
         }
-        // 内核态 #BP：kprobe 命中。
+        // Kernel-mode #BP: a kprobe hit.
         EBreak::handle(regs).unwrap();
     }
 }
@@ -344,8 +347,9 @@ unsafe extern "C" fn do_bounds(regs: &'static TrapFrame, error_code: u64) {
 #[no_mangle]
 unsafe extern "C" fn do_undefined_opcode(regs: &'static mut TrapFrame, error_code: u64) {
     if regs.is_from_user() {
-        // #UD 不可恢复且下面确定投递 SIGILL；若发生在 XOL，signal frame 必须
-        // 看到原探针址，而不是 slot 地址。
+        // #UD is unrecoverable and SIGILL is definitely delivered below; if it
+        // happens in XOL, the signal frame must see the original probe address
+        // rather than the slot address.
         crate::exception::uprobe::mark_current_xol_trapped();
         CurrentIrqArch::interrupt_enable();
         if let Err(err) = force_kernel_signal_to_current(Signal::SIGILL) {
@@ -481,8 +485,9 @@ unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code
 #[no_mangle]
 unsafe extern "C" fn do_general_protection(regs: &'static mut TrapFrame, error_code: u64) {
     if regs.is_from_user() {
-        // 用户 #GP 在这里确定转换为 SIGSEGV；不要在异常入口无条件 abort，
-        // 只标记实际信号递送路径。
+        // A user #GP is definitively converted to SIGSEGV here; do not abort
+        // unconditionally at the exception entry, only mark the actual signal
+        // delivery path.
         crate::exception::uprobe::mark_current_xol_trapped();
         CurrentIrqArch::interrupt_enable();
         if let Err(err) = force_kernel_signal_to_current(Signal::SIGSEGV) {

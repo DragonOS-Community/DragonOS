@@ -334,7 +334,7 @@ pub fn secure_computing(
     }
 }
 
-/// 执行 Filter 模式的过滤决策
+/// Execute the filter-mode filtering decision
 fn filter_decision(
     pcb: Arc<ProcessControlBlock>,
     syscall_num: usize,
@@ -377,11 +377,13 @@ fn filter_decision(
             Ok(SeccompDecision::Skip((-(errno as i32)) as usize))
         }
         SECCOMP_RET_TRACE => {
-            // 重入保护：recheck_after_trace 时再次命中 TRACE 直接放行
+            // Re-entry guard: when recheck_after_trace is set, allow a second
+            // TRACE hit outright.
             if recheck_after_trace {
                 return Ok(SeccompDecision::Allow);
             }
-            // 无 tracer 或 TRACESECCOMP 未开启时，跳过系统调用并返回 -ENOSYS
+            // With no tracer or when TRACESECCOMP is not enabled, skip the
+            // syscall and return -ENOSYS.
             if !pcb.ptrace_event_enabled(crate::process::ptrace::PtraceEvent::Seccomp) {
                 rollback_syscall(frame, syscall_num);
                 return Ok(SeccompDecision::Skip(
@@ -392,18 +394,21 @@ fn filter_decision(
                 crate::process::ptrace::PtraceEvent::Seccomp,
                 data_val as usize,
             );
-            // ptrace_event 返回后若有致命信号挂起，强制跳过 syscall 以免产生副作用。
+            // If a fatal signal is pending after ptrace_event returns, force-skip
+            // the syscall to avoid side effects.
             if Signal::fatal_signal_pending(&pcb) {
                 rollback_syscall(frame, syscall_num);
                 return Ok(SeccompDecision::Skip(frame_syscall_return(frame)));
             }
-            // ptrace_event 返回后，tracer 可能已通过 POKEUSER/SETREGS 修改 TrapFrame。
+            // After ptrace_event returns, the tracer may have modified the
+            // TrapFrame via POKEUSER/SETREGS.
             let nr_after = frame.get_orig_syscall_nr();
             if nr_after < 0 {
-                // 负 syscall 号 = tracer 请求跳过。返回值取 tracer 写入返回寄存器的值
+                // A negative syscall number means the tracer requested a skip.
+                // The return value is whatever the tracer wrote to the return register.
                 return Ok(SeccompDecision::Skip(frame_syscall_return(frame)));
             }
-            // 重入时从 frame 重新装载全部参数
+            // On re-entry, reload all arguments from the frame.
             let args_after = frame_syscall_args(frame);
             filter_decision(pcb, nr_after as usize, &args_after, frame, true)
         }
@@ -418,7 +423,7 @@ fn filter_decision(
         SECCOMP_RET_ALLOW => Ok(SeccompDecision::Allow),
 
         _ => {
-            // 未知动作，默认 KILL
+            // Unknown action, default to KILL
             kill_current(SECCOMP_RET_KILL_PROCESS);
         }
     }
@@ -583,7 +588,7 @@ fn frame_syscall_return(frame: &TrapFrame) -> usize {
     frame.a0
 }
 
-/// 从 trap frame 读取 6 个系统调用参数。
+/// Read the 6 syscall arguments from the trap frame.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) fn frame_syscall_args(frame: &TrapFrame) -> [usize; 6] {

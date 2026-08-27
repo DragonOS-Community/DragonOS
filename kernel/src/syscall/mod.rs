@@ -78,10 +78,11 @@ impl Syscall {
             // SYSEMU: skip the real syscall, return the current return register.
             return Ok(frame.get_syscall_return());
         }
-        // ptrace syscall-enter-stop 可能改写 syscall 号/参数，从 frame 重取。
+        // The ptrace syscall-enter-stop may have rewritten the syscall number/args; re-fetch them from the frame.
         let nr_raw = frame.get_orig_syscall_nr();
         if nr_raw == -1 {
-            // 补一次 exit-stop 以与前面已发生的 entry-stop 配对，再跳过执行。
+            // Emit a matching exit-stop to pair with the entry-stop that already
+            // happened, then skip execution.
             let _ = current_pcb.ptrace_report_syscall(false, nr_raw as u64, &seccomp_args);
             return Ok(frame.get_syscall_return());
         }
@@ -110,9 +111,9 @@ impl Syscall {
             }
         });
 
-        // seccomp 未拦截时执行真正的 syscall；拦截则跳过执行。
+        // Execute the real syscall when seccomp did not intercept it; skip execution when it did.
         if !seccomp_skipped {
-            // 首先尝试从 syscall_table 获取处理函数
+            // First try to obtain the handler from the syscall_table
             if let Some(handler) = syscall_table().get(nr_after_ptrace) {
                 let show = false;
                 if show {
@@ -134,14 +135,14 @@ impl Syscall {
                     );
                 }
 
-                // 把最终返回值写入返回值寄存器
+                // Write the final return value into the return-value register
                 let rax_value: usize = match r {
                     Ok(v) => v,
                     Err(e) => e.to_posix_errno() as i64 as u64 as usize,
                 };
                 frame.set_return_value(rax_value);
             } else {
-                // fallback：未注册或未知 syscall。
+                // fallback: an unregistered or unknown syscall.
                 let r = match nr_after_ptrace {
                     SYS_PUT_STRING => Self::put_string(
                         args_after_ptrace[0] as *const u8,
@@ -197,11 +198,11 @@ impl Syscall {
             }
         }
 
-        // 统一的 ptrace syscall-exit-stop：所有路径都必须经过 exit-stop。
+        // Unified ptrace syscall-exit-stop: every path must go through exit-stop.
         let current_pcb = ProcessManager::current_pcb();
         let _ = current_pcb.ptrace_report_syscall(false, nr_after_ptrace as u64, &seccomp_args);
 
-        // 返回返回值寄存器（ptrace 可能已 POKEUSER 改写）；
+        // Return the return-value register (ptrace may have rewritten it via POKEUSER);
         return Ok(frame.get_syscall_return());
     }
 

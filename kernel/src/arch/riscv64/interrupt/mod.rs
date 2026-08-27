@@ -174,7 +174,7 @@ impl TrapFrame {
         self.sp
     }
 
-    /// 读取系统调用返回值寄存器（riscv64 为 a0）。
+    /// Read the system call return value register (a0 on riscv64).
     #[inline]
     pub fn get_syscall_return(&self) -> usize {
         self.a0

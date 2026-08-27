@@ -1,14 +1,14 @@
-// ptrace 权限与 dumpability 联动回归测试。
+// Regression test for the interplay between ptrace permissions and dumpability.
 //
-// 覆盖语义：
-// 1. tracee 经 setgid+setuid 降权后 dumpable 归零，同 uid 且无能力的
-//    tracer ATTACH 必须被拒绝（EPERM）；
-// 2. tracee prctl(PR_SET_DUMPABLE, 1) 后同一 tracer ATTACH 成功，
-//    停止事件正常上报，DETACH 干净退出；
-// 3. dumpability 不影响 TRACEME（自愿跟踪只走 capability 判定）。
+// Semantics covered:
+// 1. After the tracee drops privileges via setgid+setuid, dumpable resets to zero,
+//    and ATTACH from a same-uid, unprivileged tracer must be rejected (EPERM);
+// 2. After the tracee calls prctl(PR_SET_DUMPABLE, 1), the same tracer ATTACH succeeds,
+//    stop events are reported normally, and DETACH exits cleanly;
+// 3. Dumpability does not affect TRACEME (voluntary tracing relies only on the capability check).
 //
-// dunitest 以 root 运行：降权只发生在 fork 出的子进程内，父进程保持
-// root 负责清理。
+// dunitest runs as root: privilege dropping only happens inside forked children, while the
+// parent stays root and handles cleanup.
 
 #include <errno.h>
 #include <pthread.h>
@@ -22,7 +22,7 @@
 
 #include <gtest/gtest.h>
 
-// ptrace 请求号（编译环境头文件缺失时兜底，取值与 Linux x86_64 ABI 一致）
+// ptrace request numbers (fallback when build-environment headers are missing; values match the Linux x86_64 ABI)
 #ifndef PTRACE_TRACEME
 #define PTRACE_TRACEME 0
 #endif
@@ -44,8 +44,8 @@ long ptrace_call(long request, long pid, unsigned long addr, unsigned long data)
     return syscall(SYS_ptrace, request, pid, addr, data);
 }
 
-// 降权到 kTestUid：gid 与 uid 一并降，保证与 tracee 的 gid 六元组匹配。
-// 成功返回 0，失败返回 errno。
+// Drop privileges to kTestUid: lower gid and uid together so they match the tracee's gid six-tuple.
+// Returns 0 on success, errno on failure.
 int drop_to_test_ids() {
     if (setgid(kTestUid) != 0) {
         return errno;
@@ -114,20 +114,20 @@ TEST(PtracePermDumpable, DumpabilityIsSharedByThreadsInOneMm) {
 }
 
 TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
-    // ---- 场景 C：dumpable=0 不影响 TRACEME ----
-    // 父进程是 root（持 CAP_SYS_PTRACE），降权子进程 TRACEME 必须成功。
+    // ---- Scenario C: dumpable=0 does not affect TRACEME ----
+    // The parent runs as root (holds CAP_SYS_PTRACE); TRACEME from the privilege-dropped child must succeed.
     {
         pid_t child = fork();
         ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
         if (child == 0) {
             if (geteuid() != 0) {
-                // 非 root 环境无法构造降权场景，跳过（沿用 capability.cc 先例）。
+                // Without root the privilege-drop scenario cannot be constructed; skip (following the capability.cc precedent).
                 _exit(0);
             }
             if (drop_to_test_ids() != 0) {
                 _exit(60);
             }
-            // 此时 dumpable 已经因 setuid 降权归零。
+            // At this point dumpable has already been reset to zero by the setuid privilege drop.
             if (ptrace_call(PTRACE_TRACEME, 0, 0, 0) != 0) {
                 _exit(61);
             }
@@ -136,12 +136,12 @@ TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
         int status = 0;
         ASSERT_EQ(child, waitpid(child, &status, 0));
         ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
-        EXPECT_EQ(0, WEXITSTATUS(status)) << "TRACEME 在 dumpable=0 下应成功";
+        EXPECT_EQ(0, WEXITSTATUS(status)) << "TRACEME should succeed with dumpable=0";
     }
 
-    // ---- 场景 A/B：ATTACH 先被 dumpable=0 拒绝，PR_SET_DUMPABLE(1) 后成功 ----
-    // 结构：父进程 fork tracer；tracer fork tracee（tracee 是 tracer 的子进程，
-    // tracer 才能 waitpid 其停止事件）。
+    // ---- Scenario A/B: ATTACH is first rejected with dumpable=0, then succeeds after PR_SET_DUMPABLE(1) ----
+    // Structure: the parent forks a tracer; the tracer forks the tracee (the tracee is the tracer's child,
+    // so the tracer can waitpid its stop events).
     int tracee_to_tracer[2];
     int tracer_to_tracee[2];
     ASSERT_EQ(0, pipe(tracee_to_tracer));
@@ -151,20 +151,20 @@ TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
     ASSERT_GE(tracer, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
     if (tracer == 0) {
         if (geteuid() != 0) {
-            // 非 root 环境下 setuid(1000) 不构成降权（dumpable 不会归零），
-            // 场景不可构造，跳过（沿用 capability.cc 先例）。
+            // Without root, setuid(1000) is not a privilege drop (dumpable will not reset to zero),
+            // so the scenario cannot be constructed; skip (following the capability.cc precedent).
             _exit(0);
         }
-        // 注意：先 fork 再各自关闭不用的端——若在 fork 前关闭，
+        // Note: fork first, then each side closes the ends it does not use — if closed before the fork,
         pid_t tracee = fork();
         if (tracee < 0) {
             _exit(90);
         }
         if (tracee == 0) {
-            // tracee 用 tracee_to_tracer[1] 写、tracer_to_tracee[0] 读。
+            // The tracee writes via tracee_to_tracer[1] and reads via tracer_to_tracee[0].
             close(tracee_to_tracer[0]);
             close(tracer_to_tracee[1]);
-            // tracee：降权（dumpable→0），通知后等待"置 dumpable=1"指令。
+            // The tracee: drops privileges (dumpable→0), notifies, then waits for the "set dumpable=1" command.
             if (drop_to_test_ids() != 0) {
                 _exit(40);
             }
@@ -181,18 +181,18 @@ TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
             if (!write_byte(tracee_to_tracer[1], 'd')) {
                 _exit(44);
             }
-            // 等待被 attach 停止或被清理，不主动退出。
+            // Wait to be stopped by an attach or to be cleaned up; do not exit on our own.
             for (;;) {
                 pause();
             }
         }
 
-        // tracer 用 tracee_to_tracer[0] 读、tracer_to_tracee[1] 写。
+        // The tracer reads via tracee_to_tracer[0] and writes via tracer_to_tracee[1].
         close(tracee_to_tracer[1]);
         close(tracer_to_tracee[0]);
 
 
-        // tracer：降权到与 tracee 相同身份。
+        // The tracer: drops privileges to the same identity as the tracee.
         int err = drop_to_test_ids();
         if (err != 0) {
             kill(tracee, SIGKILL);
@@ -200,7 +200,7 @@ TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
         }
 
         char c = 0;
-        // tracee 已降权且 dumpable=0。
+        // The tracee has dropped privileges and dumpable=0.
         if (!read_byte(tracee_to_tracer[0], &c)) {
             kill(tracee, SIGKILL);
             _exit(20);
@@ -209,14 +209,14 @@ TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
         errno = 0;
         if (ptrace_call(PTRACE_ATTACH, tracee, 0, 0) != -1) {
             kill(tracee, SIGKILL);
-            _exit(21);  // dumpable=0 时不应放行
+            _exit(21);  // must not be allowed when dumpable=0
         }
         if (errno != EPERM) {
             kill(tracee, SIGKILL);
-            _exit(22);  // 期望 EPERM
+            _exit(22);  // expected EPERM
         }
 
-        // 通知 tracee 置 dumpable=1，再次 attach。
+        // Tell the tracee to set dumpable=1, then attach again.
         if (!write_byte(tracer_to_tracee[1], 'g')) {
             kill(tracee, SIGKILL);
             _exit(23);
@@ -228,12 +228,12 @@ TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
 
         if (ptrace_call(PTRACE_ATTACH, tracee, 0, 0) != 0) {
             kill(tracee, SIGKILL);
-            _exit(25);  // dumpable=1 后应成功
+            _exit(25);  // should succeed after dumpable=1
         }
         int status = 0;
         if (waitpid(tracee, &status, WUNTRACED) != tracee || !WIFSTOPPED(status)) {
             kill(tracee, SIGKILL);
-            _exit(26);  // attach 后应观察到停止
+            _exit(26);  // should observe a stop after attach
         }
         if (ptrace_call(PTRACE_DETACH, tracee, 0, 0) != 0) {
             kill(tracee, SIGKILL);
@@ -258,10 +258,10 @@ TEST(PtracePermDumpable, DumpabilityGatesAttachButNotTraceme) {
     ASSERT_EQ(tracer, waitpid(tracer, &status, 0));
     ASSERT_TRUE(WIFEXITED(status)) << "tracer status=" << status;
     const int code = WEXITSTATUS(status);
-    EXPECT_EQ(0, code) << "tracer 退出码含义：20/24=管道同步失败 21=dumpable=0 时 ATTACH 未拒绝"
-                          " 22=errno 非 EPERM 25=dumpable=1 后 ATTACH 失败 26=未观察到停止"
-                          " 27=DETACH 失败 28/29=清理失败 4x=tracee 准备失败 5x=tracer 降权失败"
-                          " 60/61=TRACEME 场景失败 90=fork 失败";
+    EXPECT_EQ(0, code) << "tracer exit code meaning: 20/24=pipe sync failed 21=ATTACH not rejected with dumpable=0"
+                          " 22=errno not EPERM 25=ATTACH failed after dumpable=1 26=no stop observed"
+                          " 27=DETACH failed 28/29=cleanup failed 4x=tracee setup failed 5x=tracer privilege drop failed"
+                          " 60/61=TRACEME scenario failed 90=fork failed";
 }
 
 int main(int argc, char** argv) {

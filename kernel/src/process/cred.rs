@@ -256,7 +256,7 @@ impl Cred {
         cap_capable(self, &self.user_ns, cap)
     }
 
-    /// 检查当前进程在指定（通常是目标任务的）user namespace 中是否具有指定 capability。
+    /// Check whether the current process has the given capability in the specified (usually the target task's) user namespace.
     pub fn has_capability_in_ns(&self, targ_ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
         cap_capable(self, targ_ns, cap)
     }

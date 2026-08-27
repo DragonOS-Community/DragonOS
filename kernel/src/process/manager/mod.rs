@@ -212,7 +212,7 @@ impl ProcessManager {
             let Some(task) = weak.upgrade() else {
                 continue;
             };
-            // 组列表由组长维护且不包含组长自身
+            // The group list is maintained by the leader and does not include the leader itself
             if Arc::ptr_eq(&task, &leader) {
                 continue;
             }

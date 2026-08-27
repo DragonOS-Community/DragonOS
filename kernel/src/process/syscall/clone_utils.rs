@@ -106,15 +106,15 @@ pub fn do_clone(
             e
         )
     });
-    // wake_up_new_task 之后才上报 ptrace 事件。
+    // Report the ptrace event only after wake_up_new_task.
     ProcessManager::ptrace_report_fork_event(&current_pcb, &pcb, flags, exit_signal);
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
-        // 等待子进程结束或 exec
-        // 仅致命信号可打断
+        // Wait for the child to exit or exec
+        // Only a fatal signal can interrupt this wait
         if vfork.wait_for_completion_killable().is_err() {
-            // 清除子进程的 vfork_done：等待方已放弃，避免子进程
-            // exec/exit 时对已弃置的 completion 调用 complete。
+            // Clear the child's vfork_done: the waiter has given up, so the child
+            // must not complete() on a discarded completion during exec/exit.
             pcb.thread.write_irqsave().vfork_done = None;
             return Ok(child_vpid);
         }

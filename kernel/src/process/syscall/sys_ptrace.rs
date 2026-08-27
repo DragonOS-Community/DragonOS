@@ -1,7 +1,7 @@
-//! ptrace 系统调用分发。
+//! ptrace system call dispatch.
 //!
-//! 本文件只做请求解析、参数校验、目标进程查找和 `ptrace_check_attach` 前置检查，
-//! 真正的逻辑在 `process::ptrace` 的 PCB 方法中。
+//! This file only performs request parsing, argument validation, target process lookup,
+//! and the `ptrace_check_attach` pre-check; the real logic lives in the `process::ptrace` PCB methods.
 
 use crate::{
     arch::{
@@ -58,23 +58,23 @@ impl Syscall for SysPtrace {
 
         let current = ProcessManager::current_pcb();
 
-        // PTRACE_TRACEME：当前进程请求被其父跟踪，不走 find/check_attach 路径。
+        // PTRACE_TRACEME: the current process asks to be traced by its parent; this skips the find/check_attach path.
         if request == PtraceRequest::Traceme {
             ptrace::traceme_current()?;
             return Ok(0);
         }
 
-        // 查找目标进程。
+        // Find the target process.
         let tracee = ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?;
 
-        // ATTACH / SEIZE：建立关系，不做 check_attach。
+        // ATTACH / SEIZE: establish the relationship without check_attach.
         match request {
             PtraceRequest::Attach => {
                 tracee.ptrace_attach(&current)?;
                 return Ok(0);
             }
             PtraceRequest::Seize => {
-                // SEIZE：addr 必须为 0，data 是选项位。
+                // SEIZE: addr must be 0 and data holds the option bits.
                 if addr != 0 {
                     return Err(SystemError::EIO);
                 }
@@ -85,10 +85,10 @@ impl Syscall for SysPtrace {
             _ => {}
         }
 
-        // 其余请求：要求 tracee 由 current 跟踪且处于可操作状态。
+        // Other requests: the tracee must be traced by current and in an operable state.
         tracee.ptrace_check_attach(request)?;
 
-        // 请求级冻结
+        // Request-level freeze
         if !matches!(request, PtraceRequest::Kill | PtraceRequest::Interrupt) {
             tracee.ptrace_freeze()?;
         }
@@ -97,12 +97,12 @@ impl Syscall for SysPtrace {
         });
 
         let result: isize = match request {
-            // DETACH：解除关系。data 是要注入的信号号（0=不注入）。
+            // DETACH: detach the tracee. data is the signal to inject (0 = none).
             PtraceRequest::Detach => {
                 let signal = decode_injected_signal(data);
                 tracee.ptrace_detach(signal)?
             }
-            // KILL：直接发送 SIGKILL。
+            // KILL: send SIGKILL directly.
             PtraceRequest::Kill => {
                 let mut info = SigInfo::new(
                     Signal::SIGKILL,
@@ -120,17 +120,17 @@ impl Syscall for SysPtrace {
                 )?;
                 0
             }
-            // INTERRUPT：让运行中的 SEIZED tracee 进入 ptrace-stop。
+            // INTERRUPT: force a running SEIZED tracee into ptrace-stop.
             PtraceRequest::Interrupt => {
                 tracee.ptrace_interrupt()?;
                 0
             }
-            // LISTEN：让处于 PTRACE_EVENT_STOP 的 tracee 脱离 ptrace-stop 但保持 stopped。
+            // LISTEN: take a tracee at PTRACE_EVENT_STOP out of ptrace-stop while keeping it stopped.
             PtraceRequest::Listen => {
                 tracee.ptrace_listen()?;
                 0
             }
-            // CONT / SYSCALL / SINGLESTEP / SYSEMU / SYSEMU_SINGLESTEP：恢复 tracee。
+            // CONT / SYSCALL / SINGLESTEP / SYSEMU / SYSEMU_SINGLESTEP: resume the tracee.
             PtraceRequest::Cont
             | PtraceRequest::Syscall
             | PtraceRequest::Singlestep
@@ -138,20 +138,20 @@ impl Syscall for SysPtrace {
             | PtraceRequest::SysemuSinglestep => {
                 tracee.ptrace_resume(request, decode_injected_signal(data))?
             }
-            // SETOPTIONS：设置 ptrace 选项（strace 设置 TRACESYSGOOD 等）。
+            // SETOPTIONS: set ptrace options (strace sets TRACESYSGOOD, etc.).
             PtraceRequest::Setoptions => {
                 let opts = ptrace::PtraceOptions::from_bits(data).ok_or(SystemError::EINVAL)?;
                 tracee.set_ptrace_options(opts)?;
                 0
             }
-            // GETEVENTMSG：读最近一次 event message。
+            // GETEVENTMSG: read the most recent event message.
             PtraceRequest::Geteventmsg => {
-                // 把 event_message 写入用户态 data 指向的 unsigned long。
+                // Write event_message to the unsigned long in user space pointed to by data.
                 let msg = tracee.ptrace_get_event_message();
                 ptrace_store_word_to_user(data, &msg)?;
                 0
             }
-            // GETREGS / SETREGS：读写 x86_64 用户寄存器。
+            // GETREGS / SETREGS: read/write the x86_64 user registers.
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Getregs => {
                 let regs = tracee.tracee_user_regs()?;
@@ -164,10 +164,10 @@ impl Syscall for SysPtrace {
                 tracee.write_tracee_user_regs(&regs)?;
                 0
             }
-            // PEEKUSER / POKEUSER：按偏移读写 user_regs_struct。
+            // PEEKUSER / POKEUSER: read/write user_regs_struct by offset.
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Peekuser => {
-                // PEEKUSER 用 data 作为存放结果的用户地址（PEEK* 语义）。
+                // PEEKUSER uses data as the user address where the result is stored (PEEK* semantics).
                 let val = tracee.ptrace_peek_user(addr)?;
                 ptrace_store_word_to_user(data, &val)?;
                 0
@@ -177,14 +177,14 @@ impl Syscall for SysPtrace {
                 tracee.ptrace_poke_user(addr, data)?;
                 0
             }
-            // GETSIGINFO：读 last_siginfo，转为 siginfo_t 给用户。
+            // GETSIGINFO: read last_siginfo and convert it to siginfo_t for the user.
             PtraceRequest::Getsiginfo => {
                 let info = tracee.ptrace_get_siginfo()?;
                 let posix = info.convert_to_posix_siginfo();
                 copy_to_user(data, &posix)?;
                 0
             }
-            // SETSIGINFO：从用户 siginfo_t 整体更新 last_siginfo。
+            // SETSIGINFO: update last_siginfo wholesale from the user siginfo_t.
             PtraceRequest::Setsiginfo => {
                 let mut posix: PosixSigInfo = PosixSigInfo::default();
                 unsafe {
@@ -197,7 +197,7 @@ impl Syscall for SysPtrace {
                 tracee.ptrace_set_siginfo(info)?;
                 0
             }
-            // GETSIGMASK：addr 必须为 sizeof(sigset)。
+            // GETSIGMASK: addr must equal sizeof(sigset).
             PtraceRequest::Getsigmask => {
                 if addr != core::mem::size_of::<u64>() {
                     return Err(SystemError::EINVAL);
@@ -216,9 +216,9 @@ impl Syscall for SysPtrace {
                 tracee.ptrace_set_sigmask(mask);
                 0
             }
-            // GETREGSET / SETREGSET：
-            // addr = NT_* note type；data = 用户态 struct iovec 指针。
-            // 成功后把（min 截断后的）实际长度写回 iov.iov_len
+            // GETREGSET / SETREGSET:
+            // addr = NT_* note type; data = pointer to a user-space struct iovec.
+            // On success, write the actual (min-truncated) length back to iov.iov_len
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Getregset => {
                 if addr != ptrace::NT_PRSTATUS as usize {
@@ -227,7 +227,7 @@ impl Syscall for SysPtrace {
                 let (iov_base, iov_len) = read_iovec(data)?;
                 let regs = tracee.tracee_user_regs()?;
                 let len = iov_len.min(core::mem::size_of::<ptrace::UserRegsStruct>());
-                // 走异常表保护，坏 iov_base 返回 EFAULT 而非 panic。
+                // Uses exception-table protection; a bad iov_base returns EFAULT rather than panicking.
                 let regs_bytes: &[u8] = unsafe {
                     core::slice::from_raw_parts(
                         &regs as *const ptrace::UserRegsStruct as *const u8,
@@ -249,12 +249,12 @@ impl Syscall for SysPtrace {
                     return Err(SystemError::EINVAL);
                 }
                 let (iov_base, iov_len) = read_iovec(data)?;
-                // iov_len 必须是寄存器字（8 字节）的整数倍，否则 EINVAL
+                // iov_len must be a multiple of the register word size (8 bytes), otherwise EINVAL
                 if iov_len % core::mem::size_of::<u64>() != 0 {
                     return Err(SystemError::EINVAL);
                 }
                 let len = iov_len.min(core::mem::size_of::<ptrace::UserRegsStruct>());
-                // 读出当前寄存器，仅覆盖 iov 提供的前 len 字节，未覆盖字段（如 cs/ss）原样保留。
+                // Read the current registers, overwriting only the first len bytes from the iov; untouched fields (e.g. cs/ss) are preserved as-is.
                 let mut regs = tracee.tracee_user_regs()?;
                 let regs_bytes: &mut [u8] = unsafe {
                     core::slice::from_raw_parts_mut(
@@ -272,8 +272,8 @@ impl Syscall for SysPtrace {
                 write_iovec_len(data, len)?;
                 0
             }
-            // GET_SYSCALL_INFO：读最近 syscall-stop 的 op/nr/args。
-            // Linux ABI：addr 是用户缓冲区大小，data 是输出缓冲区指针。
+            // GET_SYSCALL_INFO: read the op/nr/args of the most recent syscall-stop.
+            // Linux ABI: addr is the user buffer size and data is the output buffer pointer.
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Getsyscallinfo => {
                 let user_size = addr;
@@ -286,7 +286,7 @@ impl Syscall for SysPtrace {
                     ptrace::PtraceSyscallInfoOp::Exit => 33,
                     ptrace::PtraceSyscallInfoOp::Seccomp => 84,
                 };
-                // 截断到用户缓冲区大小，避免溢出；返回值是“可提供的字节数”。
+                // Truncate to the user buffer size to avoid overflow; the return value is the "number of bytes available".
                 let write_size = actual.min(user_size);
                 let info_bytes: &[u8] = unsafe {
                     core::slice::from_raw_parts(
@@ -302,7 +302,7 @@ impl Syscall for SysPtrace {
                 }
                 actual as isize
             }
-            // PEEKDATA/PEEKTEXT/POKEDATA/POKETEXT：读写 tracee 用户内存。
+            // PEEKDATA/PEEKTEXT/POKEDATA/POKETEXT: read/write the tracee's user memory.
             PtraceRequest::Peektext | PtraceRequest::Peekdata => {
                 let val = tracee.ptrace_peek_data(addr)?;
                 ptrace_store_word_to_user(data, &val)?;
@@ -331,7 +331,7 @@ impl Syscall for SysPtrace {
     }
 }
 
-/// 解析 ATTACH/CONT/DETACH 等 request 的 data 参数为要注入的信号。
+/// Decode the data argument of requests such as ATTACH/CONT/DETACH into the signal to inject.
 fn decode_injected_signal(data: usize) -> Option<Signal> {
     if data == 0 {
         return None;
@@ -346,7 +346,7 @@ fn decode_injected_signal(data: usize) -> Option<Signal> {
     Some(sig)
 }
 
-/// 读用户态 iovec {base, len}（GETREGSET/SETREGSET 用）。返回 (base, len)。
+/// Read a user-space iovec {base, len} (used by GETREGSET/SETREGSET). Returns (base, len).
 fn read_iovec(addr: usize) -> Result<(usize, usize), SystemError> {
     // iovec = { void *iov_base; size_t iov_len; }
     let base = copy_from_user::<usize>(addr)?;
@@ -354,18 +354,18 @@ fn read_iovec(addr: usize) -> Result<(usize, usize), SystemError> {
     Ok((base, len))
 }
 
-/// 写回 iovec 的 iov_len（GETREGSET 返回实际长度）。走异常表保护。
+/// Write back the iovec's iov_len (GETREGSET returns the actual length). Uses exception-table protection.
 fn write_iovec_len(addr: usize, len: usize) -> Result<(), SystemError> {
     ptrace_store_word_to_user(addr + core::mem::size_of::<usize>(), &len)
 }
 
-/// put_user：把一个 Copy 值写入用户态地址（PEEKUSER/GETEVENTMSG/GETSIGMASK 等结果存放）
-/// 走异常表保护，坏指针返回 EFAULT 而非 panic。
+/// put_user: write a Copy value to a user-space address (result storage for PEEKUSER/GETEVENTMSG/GETSIGMASK, etc.)
+/// Uses exception-table protection; a bad pointer returns EFAULT rather than panicking.
 fn ptrace_store_word_to_user<T: Copy>(addr: usize, value: &T) -> Result<(), SystemError> {
     unsafe { crate::syscall::user_access::write_one_to_user_protected(VirtAddr::new(addr), value) }
 }
 
-/// 从用户态拷贝一个 Copy 结构（SETREGS/SETSIGINFO/SETSIGMASK/read_iovec 等）。
+/// Copy a Copy structure from user space (SETREGS/SETSIGINFO/SETSIGMASK/read_iovec, etc.).
 fn copy_from_user<T: Copy + Default>(addr: usize) -> Result<T, SystemError> {
     let mut dst: T = T::default();
     unsafe {
@@ -374,7 +374,7 @@ fn copy_from_user<T: Copy + Default>(addr: usize) -> Result<T, SystemError> {
     Ok(dst)
 }
 
-/// 拷贝一个 Copy 结构到用户态（GETREGS/GETSIGINFO 等）。走异常表保护。
+/// Copy a Copy structure to user space (GETREGS/GETSIGINFO, etc.). Uses exception-table protection.
 fn copy_to_user<T: Copy>(addr: usize, value: &T) -> Result<(), SystemError> {
     unsafe { crate::syscall::user_access::write_one_to_user_protected(VirtAddr::new(addr), value) }
 }

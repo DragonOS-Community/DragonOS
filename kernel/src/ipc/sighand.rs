@@ -340,8 +340,8 @@ impl SigHand {
         g.shared_pending.signal_mut().insert(sig.into());
     }
 
-    /// 去重并入队进程级信号
-    /// 返回 true 表示已入队；false 表示队列中已存在该非实时信号。
+    /// Deduplicate and enqueue a process-level signal.
+    /// Returns true if enqueued; false if that non-real-time signal is already in the queue.
     pub fn shared_pending_push_dedup(&self, sig: Signal, info: SigInfo) -> bool {
         let mut g = self.inner_mut();
         if !sig.is_rt_signal() && g.shared_pending.queue().find(sig).0.is_some() {
@@ -352,8 +352,8 @@ impl SigHand {
         true
     }
 
-    /// POSIX timer 的进程级信号入队
-    /// 返回 true 表示已入队。
+    /// Enqueue the process-level signal for a POSIX timer.
+    /// Returns true if enqueued.
     pub fn shared_pending_push_posix_timer(&self, sig: Signal, info: SigInfo) -> bool {
         let mut g = self.inner_mut();
         if g.shared_pending.queue().find(sig).0.is_some() {

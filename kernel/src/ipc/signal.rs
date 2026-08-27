@@ -333,7 +333,7 @@ impl Signal {
         // 根据 Linux 语义：PidType::PID 表示线程级信号，其他类型（TGID/PGID/SID）表示进程级信号
         let is_thread_target = matches!(pt, PidType::PID);
 
-        // SIGKILL 与内核线程走快路径：不入队 siginfo，直接完成位图置位与唤醒
+        // SIGKILL and kernel threads take the fast path: skip enqueueing siginfo and directly set the pending bitmap and wake up
         if matches!(self, Signal::SIGKILL) || pcb.flags().contains(ProcessFlags::KTHREAD) {
             self.complete_signal(pcb.clone(), pt, false);
             return Ok(0);
@@ -341,11 +341,11 @@ impl Signal {
 
         let new_sig_info = match info {
             Some(siginfo) => {
-                // 已经显式指定了siginfo，则直接使用它。
+                // An explicit siginfo was provided, so use it directly.
                 *siginfo
             }
             None => {
-                // 不需要显示指定siginfo，因此设置为默认值
+                // No explicit siginfo was provided, so fill in the default values
                 let current_pcb = ProcessManager::current_pcb();
                 let sender_pid = current_pcb.raw_pid();
                 let sender_uid = current_pcb.cred().uid.data() as u32;
@@ -362,20 +362,20 @@ impl Signal {
         };
 
         if is_thread_target {
-            // 线程级信号：添加到线程的 sig_pending
+            // Thread-level signal: add to the thread's sig_pending
             let mut pcb_info = pcb.sig_info_mut();
             if !self.is_rt_signal() && pcb_info.sig_pending().queue().find(*self).0.is_some() {
                 return Ok(0);
             }
             pcb_info.sig_pending_mut().queue_mut().q.push(new_sig_info);
         } else {
-            // 进程级信号：添加到 shared_pending
+            // Process-level signal: add to shared_pending
             if !pcb.sighand().shared_pending_push_dedup(*self, new_sig_info) {
                 return Ok(0);
             }
         }
 
-        // 正常路径的共享位图已随入队置位。
+        // On the normal path the shared bitmap has already been set when the signal was enqueued.
         self.complete_signal(pcb.clone(), pt, true);
         Ok(0)
     }
@@ -418,9 +418,9 @@ impl Signal {
         self.complete_signal(pcb, pt, true);
     }
 
-    /// @brief 完成信号投递：设置 pending 位图、选择投递目标并按需唤醒。
-    /// @param shared_bitmap_set 进程级信号的共享位图是否已随入队置位
-    /// （正常入队路径为 true；SIGKILL/KTHREAD 快路径为 false，由本函数补置）
+    /// @brief Complete signal delivery: set the pending bitmap, choose the delivery target, and wake up as needed.
+    /// @param shared_bitmap_set Whether the shared bitmap for process-level signals was already set at enqueue time
+    /// (true on the normal enqueue path; false on the SIGKILL/KTHREAD fast path, where this function sets it)
     #[allow(clippy::if_same_then_else)]
     pub(crate) fn complete_signal(
         &self,
@@ -451,14 +451,14 @@ impl Signal {
         }
 
         if is_thread_target {
-            // 线程级信号：设置线程 pending 位图
+            // Thread-level signal: set the thread pending bitmap
             pcb.sig_info_mut()
                 .sig_pending_mut()
                 .signal_mut()
                 .insert((*self).into());
         } else if !shared_bitmap_set {
-            // 进程级信号：正常路径的入队函数已在 sighand 写临界区内同时完成位图置位；
-            // 只有 SIGKILL / KTHREAD 等不入队的快路径需要在这里补置共享位图。
+            // Process-level signal: on the normal path the enqueue function has already set the
+            // bitmap inside the sighand write critical section; only non-enqueueing fast paths such as SIGKILL / KTHREAD set it here.
             pcb.sighand().shared_pending_signal_insert(*self);
         }
 
@@ -564,7 +564,7 @@ impl Signal {
         }
 
         let leader = ProcessManager::thread_group_leader_of(&suggested);
-        // 零分配探测：组长组列表为空意味着只有组长一个线程，无需建立快照即可返回。
+        // Zero-allocation probe: an empty group-task list means the leader is the only thread, so return without building a snapshot.
         if leader.threads_read_irqsave().group_tasks_is_empty() {
             return None;
         }
@@ -685,7 +685,7 @@ impl Signal {
         }
         drop(sig_info);
 
-        // 对被 ptrace 跟踪的任务，任何非 SIGKILL 信号都不视为 ignored —— tracer 必须能观察到所有信号
+        // For a ptrace-attached task, no non-SIGKILL signal is treated as ignored -- the tracer must be able to observe every signal
         if pcb.flags().contains(ProcessFlags::PTRACED) && *self != Signal::SIGKILL {
             return false;
         }
@@ -732,16 +732,16 @@ impl Signal {
                 t.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
                 true
             });
-            // 被 ptrace 跟踪的 tracee，stop 信号不在发送侧急切 group-stop，
-            // 而是入队让投递侧的 ptrace_signal 转为 signal-delivery-stop
-            // 否则 tracee 进入 group-stop（非 ptrace-stop），PTRACE_CONT 会 ESRCH。
-            // PTRACED 是每线程位，须检查信号目标 pcb 而非线程组长。
+            // For a ptrace-attached tracee, stop signals are not eagerly group-stopped at the
+            // sender; instead they are enqueued so the delivery-side ptrace_signal turns them
+            // into a signal-delivery-stop; otherwise the tracee enters group-stop (not ptrace-stop)
+            // and PTRACE_CONT fails with ESRCH. PTRACED is per-thread, so check the target pcb, not the leader.
             if pcb.flags().contains(ProcessFlags::PTRACED) {
                 return !self.sig_ignored(&pcb, false);
             }
-            // 非 traced：事务化 group-stop（持 sighand 锁原子设置
-            // STOP_STOPPED | CLD_STOPPED + stop_signal），对齐 Linux 的
-            // sighand -> pi_lock -> rq_lock 序，防止并发 SIGCONT 撕裂。
+            // Not traced: transactional group-stop (atomically set STOP_STOPPED | CLD_STOPPED +
+            // stop_signal while holding the sighand lock), matching Linux's sighand -> pi_lock
+            // -> rq_lock ordering to prevent a concurrent SIGCONT from tearing the transition.
             let fresh_stop = thread_group_leader
                 .sighand()
                 .transition_group_stop(*self, || {
@@ -799,7 +799,7 @@ impl Signal {
             // group stop produces a continued event.
             let was_stopped = thread_group_leader.sighand().transition_group_continue(|| {
                 ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
-                    // 非 seized 线程直接唤醒；seized 线程的唤醒交给 ptrace_trap_notify。
+                    // Non-seized threads are woken directly; waking seized threads is handled by ptrace_trap_notify.
                     if !t.flags().contains(ProcessFlags::PT_SEIZED)
                         && !t.ptrace_state.lock_irqsave().in_ptrace_stop
                     {
@@ -822,7 +822,7 @@ impl Signal {
                 });
             }
 
-            // seized tracee 收到 SIGCONT 时，须离开 group-stop/LISTEN 并重陷 PTRACE_EVENT_STOP
+            // A seized tracee receiving SIGCONT must leave group-stop/LISTEN and re-trap with PTRACE_EVENT_STOP
             ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
                 if t.flags().contains(ProcessFlags::PT_SEIZED) {
                     t.ptrace_trap_notify();
@@ -852,11 +852,11 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     let state = pcb.sched_info().state();
 
     if fatal {
-        // 致命信号需要打断停止与可中断阻塞。先退出 ptrace-stop：
-        // 与 tracer 侧的请求校验/写帧通过 ptrace_state 锁串行化，
-        // 保证 tracer 不会写入一个已被唤醒的废弃帧。
-        // 注意：清完标志必须先释放锁再唤醒——持锁跨越唤醒会与
-        // 唤醒路径内部的调度器锁形成反向嵌套。
+        // A fatal signal must interrupt both stops and interruptible sleeps. First leave
+        // ptrace-stop: the ptrace_state lock serializes this with the tracer's request
+        // validation / frame writes, so the tracer cannot write into a stale frame that has
+        // already been woken. Note: clear the flags and release the lock before waking --
+        // holding the lock across the wakeup reverse-nests with the scheduler lock inside it.
         {
             let mut ps = pcb.ptrace_state.lock_irqsave();
             if ps.frozen {
@@ -868,31 +868,31 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
         let r = if state.is_stopped() {
             ProcessManager::wakeup_stop(&pcb)
         } else if state.is_blocked_interruptable() {
-            // 可中断睡眠（含 killable 等待）直接唤醒去走退出路径。
+            // Interruptible sleeps (including killable waits) are woken directly to take the exit path.
             ProcessManager::wakeup(&pcb)
         } else {
-            // 运行中或不可中断睡眠：唤醒无事可做，仅 kick 使其
-            // 尽快陷入内核处理致命信号。不可中断睡眠不被致命信号
-            // 强制唤醒，这与“不可中断”语义一致。
+            // Running or in an uninterruptible sleep: waking does nothing useful, so only kick
+            // to make it re-enter the kernel promptly to handle the fatal signal. Uninterruptible
+            // sleeps are not force-woken, consistent with the "uninterruptible" semantics.
             ProcessManager::kick(&pcb);
             return;
         };
-        // 唤醒失败才 kick 兜底；成功时唤醒路径已让目标重新调度，
-        // 再 kick 属于冗余 IPI。
+        // Kick only as a fallback when the wakeup fails; on success the wakeup path has already
+        // rescheduled the target, so kicking again would be a redundant IPI.
         if r.is_err() {
             ProcessManager::kick(&pcb);
         }
         return;
     }
 
-    // 非 fatal：仅唤醒可中断阻塞；Stopped 任务的恢复由 SIGCONT 的专门路径处理，这里不动它。
+    // Non-fatal: only wake interruptible sleeps; resuming Stopped tasks is handled by the dedicated SIGCONT path, which is left untouched here.
     if state.is_blocked_interruptable() {
         if ProcessManager::wakeup(&pcb).is_err() {
             ProcessManager::kick(&pcb);
         }
         return;
     }
-    // 运行中的目标需要 kick 以尽快处理 pending 的信号（含作业控制停止）。
+    // A running target needs a kick to process pending signals (including job-control stops) promptly.
     if !state.is_stopped() {
         ProcessManager::kick(&pcb);
     }

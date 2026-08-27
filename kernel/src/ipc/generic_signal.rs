@@ -450,29 +450,29 @@ fn sig_stop(sig: Signal) {
         drop(guard);
         return;
     }
-    // 被 ptrace 跟踪的 tracee：stop 信号不上报 real_parent 的 group-stop，而是上报 tracer
+    // A ptraced tracee: stop signals report the group-stop to the tracer, not the real_parent
     if pcb.flags().contains(ProcessFlags::PTRACED) {
         if pcb.flags().contains(ProcessFlags::PT_SEIZED) {
             drop(guard);
             let _ = pcb.ptrace_event_stop(sig);
             return;
         }
-        // 非 SEIZED ptraced：经 ptrace_stop 上报 group-stop 给 tracer（CLD_STOPPED）
-        // Linux do_jobctl_trap() 忽略 group-stop 的 ptrace_stop 返回值；
-        // resume data 不得被重新排队为新的 signal-delivery-stop。
+        // Non-SEIZED ptraced: report the group-stop to the tracer via ptrace_stop (CLD_STOPPED)
+        // Linux do_jobctl_trap() ignores the ptrace_stop return value for group-stops;
+        // resume data must not be re-queued as a new signal-delivery-stop.
         let _ = pcb.ptrace_group_stop(sig);
         drop(guard);
         return;
     }
-    // 非 ptraced 的普通进程：走 transition_group_stop（持 sighand 锁原子设置
-    // STOP_STOPPED | CLD_STOPPED + stop_signal），上报 real_parent。
+    // A normal non-ptraced process: go through transition_group_stop (atomically set
+    // STOP_STOPPED | CLD_STOPPED + stop_signal under the sighand lock) and report to real_parent.
     let fresh_stop = pcb
         .sighand()
         .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok());
     drop(guard);
-    // attach 可能在 mark_stop() 的 schedule 期间将本任务转为 ptraced
-    // 并排队 trap。必须在返回用户态前立即完成 STOPPED→TRACED，
-    // 不能等待下一次内核入口。
+    // attach may convert this task to ptraced during the schedule inside mark_stop()
+    // and queue a trap. The STOPPED→TRACED transition must complete immediately before
+    // returning to user mode; it cannot wait for the next kernel entry.
     while pcb.ptrace_handle_pending_stop() {}
     log::debug!(
         "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",

@@ -23,7 +23,7 @@ impl Syscall for SysPauseHandle {
 
         // 检查是否已经有待处理的信号
         if current_pcb.has_pending_signal_fast() {
-            // 由 arch 层 do_signal_or_restart 的 try_restart_syscall 决定 restart/转 EINTR。
+            // The arch-layer do_signal_or_restart's try_restart_syscall decides between restart and EINTR.
             return Err(SystemError::ERESTARTNOHAND);
         }
 
@@ -39,7 +39,7 @@ impl Syscall for SysPauseHandle {
         // 调度出去，等待信号唤醒
         crate::sched::schedule(crate::sched::SchedMode::SM_NONE);
 
-        // POKEUSER 改 rax 后 try_restart_syscall 据此决定 restart。
+        // After POKEUSER changes rax, try_restart_syscall uses it to decide whether to restart.
         Err(SystemError::ERESTARTNOHAND)
     }
 

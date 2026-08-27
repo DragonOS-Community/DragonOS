@@ -15,14 +15,14 @@ use crate::{
 const COMPLETE_ALL: u32 = u32::MAX;
 const MAX_TIMEOUT: i64 = i64::MAX;
 
-/// completion 等待的信号响应模式。
+/// Signal response mode used while waiting on a completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitMode {
-    /// 不可中断睡眠：不看任何信号。
+    /// Uninterruptible sleep: ignores all signals.
     Uninterruptible,
-    /// 可被任意 pending 信号打断。
+    /// Interruptible by any pending signal.
     Interruptible,
-    /// 仅可被致命信号打断。
+    /// Interruptible only by fatal signals.
     Killable,
 }
 
@@ -41,7 +41,7 @@ impl Completion {
     /// @brief 基本函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
     ///
     /// @param timeout jiffies
-    /// @param mode 睡眠的信号响应模式
+    /// @param mode the signal response mode of the sleep
     /// @return 返回剩余时间或者SystemError
     fn do_wait_for_common(&self, timeout: i64, mode: WaitMode) -> Result<i64, SystemError> {
         let pcb = ProcessManager::current_pcb();
@@ -69,7 +69,7 @@ impl Completion {
                 }
             }
 
-            // 可中断模式看任意 pending；killable 模式仅致命信号可打断；不可中断模式不看信号。
+            // Interruptible mode checks any pending signal; killable only fatal ones; uninterruptible ignores signals.
             let has_pending = match mode {
                 WaitMode::Uninterruptible => false,
                 WaitMode::Interruptible => pcb.sig_info_irqsave().sig_pending().has_pending(),
@@ -156,17 +156,17 @@ impl Completion {
         self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Uninterruptible)
     }
 
-    /// @brief 等待completion的完成，但是可以被任意信号中断
+    /// @brief Wait for the completion to be done, but can be interrupted by any signal
     pub fn wait_for_completion_interruptible(&self) -> Result<i64, SystemError> {
         self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Interruptible)
     }
 
-    /// @brief 等待completion的完成，仅可被致命信号中断。
+    /// @brief Wait for the completion to be done, interruptible only by fatal signals.
     pub fn wait_for_completion_killable(&self) -> Result<i64, SystemError> {
         self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Killable)
     }
 
-    /// @brief 等待completion的完成，可以被任意信号中断，带超时
+    /// @brief Wait for the completion to be done, interruptible by any signal, with a timeout
     pub fn wait_for_completion_interruptible_timeout(
         &mut self,
         timeout: i64,

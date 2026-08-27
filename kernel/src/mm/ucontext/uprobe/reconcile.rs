@@ -444,11 +444,13 @@ pub(crate) fn uprobe_apply_vma_range_locked(
     needs_fallback
 }
 
-/// 对新映射的文件 VMA 迟到应用注册表中的探针（评审 R9：dlopen / 后续 mmap）。
+/// Late-apply probes from the registry to a newly mapped file VMA (review R9: dlopen /
+/// subsequent mmap).
 ///
-/// 在 mmap 提交且地址空间写锁释放后调用（本函数内部自取 `mm.write()`）。
-/// `region_start/size` 为 VMA 的用户地址区间；`file_start_byte` 为 VMA 起始
-/// 地址对应的文件偏移（= `backing_pgoff << PAGE_SHIFT`）。
+/// Called after mmap commits and the address-space write lock is released (this function
+/// takes `mm.write()` itself). `region_start/size` is the user address range of the VMA;
+/// `file_start_byte` is the file offset corresponding to the VMA start address
+/// (= `backing_pgoff << PAGE_SHIFT`).
 pub fn uprobe_apply_to_new_vma(
     mm: &Arc<AddressSpace>,
     file: &Arc<crate::filesystem::vfs::file::File>,
@@ -511,7 +513,7 @@ pub(super) fn uprobe_apply_to_new_vma_inner(
     let region_file_end = file_start_byte
         .checked_add(region_size)
         .ok_or(SystemError::EINVAL)?;
-    // 锁内快照：落在新 VMA 文件区间内的消费者列表
+    // Snapshot inside the lock: the consumer list that falls within the new VMA's file range
     let matches: Vec<(usize, ConsumerList)> = {
         let r = UPROBE_REGISTRY.lock_irqsave();
         let Some(offsets) = r.get(&inode_key) else {

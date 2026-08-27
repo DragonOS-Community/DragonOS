@@ -309,7 +309,7 @@ impl ProcessManager {
                 e
             )
         });
-        // wake_up_new_task 之后才上报 ptrace 事件，
+        // Report the ptrace event only after wake_up_new_task,
         Self::ptrace_report_fork_event(&current_pcb, &pcb, clone_flags, exit_signal);
 
         if ProcessManager::current_pid().data() == 0 {
@@ -501,7 +501,7 @@ impl ProcessManager {
     ///
     /// - no_new_privs：线程级语义，clone/fork 继承，execve 保持（execve 不走这里）。
     /// - keepcaps：clone/fork 继承。
-    /// - dumpable：由共享或克隆的 AddressSpace 自然继承。
+    /// - dumpable: inherited naturally via the shared or cloned AddressSpace.
     fn copy_prctl_state(
         _clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
@@ -975,7 +975,7 @@ impl ProcessManager {
                         .unwrap_or(RawPid::new(0));
                     pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
                 }
-                // 子进程继承父进程的执行域标志（personality）
+                // The child inherits the parent's execution domain flags (personality)
                 pcb.basic
                     .write_irqsave()
                     .set_personality(current_pcb.basic().personality());
@@ -1104,12 +1104,14 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
-        // ptrace 子侧 attach 仅建关系 + 继承标志/选项 + 注初始 stop。
-        // 父侧的 ptrace_event 上报必须在 wake_up_new_task 之后由调用方执行，
-        // 否则父进程在 copy_process 内就 ptrace_stop 阻塞，子进程未被唤醒，tracer wait(子) 永久阻塞。
+        // The child-side ptrace attach only builds the relation, inherits flags/options,
+        // and notes the initial stop. The parent-side ptrace_event report must be issued by
+        // the caller after wake_up_new_task, otherwise the parent blocks in ptrace_stop inside
+        // copy_process before the child is woken, and tracer wait(child) blocks forever.
         if !clone_flags.contains(CloneFlags::CLONE_UNTRACED) {
-            // 事件分类用 exit_signal!=SIGCHLD 区分 CLONE/FORK（对齐 fork.c:2898-2903），
-            // 而非 CLONE_THREAD：非线程但 exit_signal!=SIGCHLD 也应报 CLONE。
+            // Event classification uses exit_signal!=SIGCHLD to distinguish CLONE/FORK
+            // (matching fork.c:2898-2903), not CLONE_THREAD: a non-thread with
+            // exit_signal!=SIGCHLD must also report CLONE.
             let event = if clone_flags.contains(CloneFlags::CLONE_VFORK) {
                 PtraceEvent::VFork
             } else if clone_args.exit_signal != Signal::SIGCHLD as i32 {
@@ -1117,16 +1119,17 @@ impl ProcessManager {
             } else {
                 PtraceEvent::Fork
             };
-            // attach 条件：对应 TRACE 选项开启，或显式 CLONE_PTRACE（对齐 ptrace_init_task）。
+            // Attach condition: the corresponding TRACE option is enabled, or CLONE_PTRACE is
+            // explicit (matching ptrace_init_task).
             if clone_flags.contains(CloneFlags::CLONE_PTRACE)
                 || current_pcb.ptrace_event_enabled(event)
             {
-                // 先 attach + 继承标志/选项 + 注 stop，最后才 notify。
+                // Attach + inherit flags/options + note the stop first, then notify last.
                 if let Some(tracer) = ptracer_of(current_pcb) {
-                    // 用 inherit 变体：不重新检查权限
+                    // Use the inherit variant: do not re-check permissions
                     pcb.ptrace_link_inherit(&tracer)?;
                     if !pcb.flags().contains(ProcessFlags::PTRACED) {
-                        // tracer 已退出、链接被跳过：子进程保持普通未跟踪进程。
+                        // The tracer exited and the link was skipped: the child stays a normal untraced process.
                     } else {
                         let is_seized = current_pcb.flags().contains(ProcessFlags::PT_SEIZED);
                         if is_seized {
@@ -1135,7 +1138,7 @@ impl ProcessManager {
                         let opts = current_pcb.ptrace_state.lock_irqsave().options;
                         pcb.ptrace_state.lock_irqsave().options = opts;
                         if is_seized {
-                            // seized 子进程的初始 PTRACE_EVENT_STOP 报告 SIGTRAP
+                            // A seized child's initial PTRACE_EVENT_STOP reports SIGTRAP
                             pcb.ptrace_state.lock_irqsave().pending_event_stop =
                                 Some(Signal::SIGTRAP);
                             pcb.flags().insert(ProcessFlags::PENDING_PTRACE_STOP);
@@ -1143,7 +1146,7 @@ impl ProcessManager {
                             Signal::SIGSTOP
                                 .send_signal_info_to_pcb(None, pcb.clone(), PidType::PID)
                                 .inspect_err(|_e| {
-                                    // link 已成功，send 失败须回滚关系。
+                                    // The link succeeded, so a send failure must roll back the relation.
                                     let _ = pcb.ptrace_unlink();
                                 })?;
                         }
@@ -1163,10 +1166,11 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// 上报 ptrace FORK/CLONE/VFORK 事件（父侧 ptrace-stop）。
+    /// Report the ptrace FORK/CLONE/VFORK event (parent-side ptrace-stop).
     ///
-    /// 调用——父进程在此处进入 ptrace_stop 阻塞并通知 tracer。
-    /// 若在 wake_up_new_task 之前调用，子进程未被唤醒，tracer wait(子) 会永久阻塞。
+    /// On call, the parent enters ptrace_stop here, blocks, and notifies the tracer.
+    /// If called before wake_up_new_task, the child is not woken and tracer wait(child)
+    /// blocks forever.
     pub fn ptrace_report_fork_event(
         current_pcb: &Arc<ProcessControlBlock>,
         pcb: &Arc<ProcessControlBlock>,
@@ -1176,8 +1180,9 @@ impl ProcessManager {
         if clone_flags.contains(CloneFlags::CLONE_UNTRACED) {
             return;
         }
-        // 事件分类用 exit_signal!=SIGCHLD 区分 CLONE/FORK（与子侧 copy_process 一致，
-        // 对齐 fork.c:2897-2903），而非 CLONE_THREAD。
+        // Event classification uses exit_signal!=SIGCHLD to distinguish CLONE/FORK
+        // (consistent with the child-side copy_process, aligning with fork.c:2897-2903),
+        // not CLONE_THREAD.
         let event = if clone_flags.contains(CloneFlags::CLONE_VFORK) {
             PtraceEvent::VFork
         } else if exit_signal != Signal::SIGCHLD as i32 {
@@ -1188,7 +1193,7 @@ impl ProcessManager {
         if !current_pcb.ptrace_event_enabled(event) {
             return;
         }
-        // event_message(子 pid) 按 ptracer 所在 pid namespace 翻译。
+        // The event_message (child pid) is translated into the ptracer's pid namespace.
         let child_vpid = ptracer_of(current_pcb)
             .and_then(|tracer| pcb.task_pid_nr_ns(PidType::PID, Some(tracer.active_pid_ns())))
             .map(|p| p.data())

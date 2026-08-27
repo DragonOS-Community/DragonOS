@@ -348,8 +348,8 @@ pub struct PosixSigInfo {
     pub _sifields: PosixSiginfoFields,
 }
 
-/// `PosixSigInfo` 全零是有效表示（si_signo=0, si_code=0 等）。
-/// 用于 `copy_from_user` 等需要 Default 的场景。
+/// An all-zero `PosixSigInfo` is a valid representation (si_signo=0, si_code=0, etc.).
+/// Used for scenarios that require `Default`, such as `copy_from_user`.
 impl Default for PosixSigInfo {
     fn default() -> Self {
         unsafe { core::mem::zeroed() }
@@ -486,29 +486,29 @@ impl SigInfo {
         self.sig_code
     }
 
-    /// 从用户态 PosixSigInfo 完整转换为 SigInfo。
+    /// Fully convert a user-mode PosixSigInfo into a SigInfo.
     pub fn from_posix(posix: &PosixSigInfo) -> Self {
         let sig_code = SigCode::try_from_i32(posix.si_code).unwrap_or(SigCode::Raw(posix.si_code));
         let sig_type = unsafe {
             match posix.si_code {
-                // SI_USER(0)/SI_TKILL(-6)：Kill{pid,uid}
+                // SI_USER(0)/SI_TKILL(-6): Kill{pid,uid}
                 0 | -6 => SigType::Kill {
                     pid: RawPid::new(posix._sifields._kill.si_pid as usize),
                     uid: posix._sifields._kill.si_uid,
                 },
-                // SI_QUEUE(-1)/SI_MESGQ(-3)：Rt{pid,uid,sigval}
+                // SI_QUEUE(-1)/SI_MESGQ(-3): Rt{pid,uid,sigval}
                 -1 | -3 => SigType::Rt {
                     pid: RawPid::new(posix._sifields._rt.si_pid as usize),
                     uid: posix._sifields._rt.si_uid,
                     sigval: posix._sifields._rt.si_sigval,
                 },
-                // SI_TIMER(-2)：PosixTimer{timerid,overrun,sigval}
+                // SI_TIMER(-2): PosixTimer{timerid,overrun,sigval}
                 -2 => SigType::PosixTimer {
                     timerid: posix._sifields._timer.si_tid,
                     overrun: posix._sifields._timer.si_overrun,
                     sigval: posix._sifields._timer.si_sigval,
                 },
-                // SIGCHLD：SigChild{pid,uid,status,utime,stime}
+                // SIGCHLD: SigChild{pid,uid,status,utime,stime}
                 _ if posix.si_signo == Signal::SIGCHLD as i32 => SigType::SigChild {
                     pid: RawPid::new(posix._sifields._sigchld.si_pid as usize),
                     uid: posix._sifields._sigchld.si_uid,
@@ -516,8 +516,8 @@ impl SigInfo {
                     utime: posix._sifields._sigchld.si_utime,
                     stime: posix._sifields._sigchld.si_stime,
                 },
-                // 同步故障信号（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGTRAP，si_code>0）：
-                // Fault{addr,addr_lsb}
+                // Synchronous fault signals (SIGSEGV/SIGBUS/SIGFPE/SIGILL/
+                // SIGTRAP, si_code>0): Fault{addr,addr_lsb}
                 _ if posix.si_code > 0
                     && matches!(
                         posix.si_signo,
@@ -545,13 +545,13 @@ impl SigInfo {
                         addr_lsb: posix._sifields._sigfault.si_addr_lsb,
                     }
                 }
-                // SIGSYS（seccomp）：SigSys{call_addr,syscall,arch}
+                // SIGSYS (seccomp): SigSys{call_addr,syscall,arch}
                 _ if posix.si_signo == Signal::SIGSYS as i32 => SigType::SigSys {
                     call_addr: posix._sifields._sigsys._call_addr,
                     syscall: posix._sifields._sigsys._syscall,
                     arch: posix._sifields._sigsys._arch,
                 },
-                // 其余情况：退化为 Kill 类型（保留 si_pid/si_uid）。
+                // All other cases: fall back to the Kill type (keeping si_pid/si_uid).
                 _ => SigType::Kill {
                     pid: RawPid::new(posix._sifields._kill.si_pid as usize),
                     uid: posix._sifields._kill.si_uid,
@@ -763,7 +763,8 @@ impl SigInfo {
     #[inline(never)]
     pub fn copy_posix_siginfo_to_user(&self, to: *mut PosixSigInfo) -> Result<i32, SystemError> {
         let posix_siginfo = self.convert_to_posix_siginfo();
-        // 走异常表保护写入用户 siginfo，坏指针返回 EFAULT 而非 panic。
+        // Write the user siginfo under exception-table protection; a bad
+        // pointer returns EFAULT instead of panicking.
         unsafe {
             crate::syscall::user_access::write_one_to_user_protected(
                 VirtAddr::new(to as usize),

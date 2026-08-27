@@ -91,18 +91,19 @@ pub struct AddressSpace {
     inner: RwSem<InnerAddressSpace>,
     /// Wait for pending mmap reservations to be committed or cancelled.
     reservation_wait: WaitQueue,
-    // ── uprobe 子系统字段（计划步骤 3）──
+    // ── uprobe subsystem fields (planned step 3) ──
     //
-    // 这些字段位于 `inner` **之外**，由独立 irqsave `SpinLock` 保护（评审 F8）。
-    // 命中路径（#BP/#DB 关中断）仅 `lock_irqsave` + 查表，绝不取 `inner` 的 RwSem（会睡眠）。
+    // These fields live **outside** `inner` and are protected by their own irqsave
+    // `SpinLock`s (review F8). The hit path (#BP/#DB with interrupts off) only takes
+    // `lock_irqsave` + a table lookup, never the `inner` RwSem (which could sleep).
     //
-    /// Per-mm uprobe 表：唯一写控制表 + 面向 #BP 的不可变 RCU 快照。
+    /// Per-mm uprobe table: the single write-control table + an immutable RCU snapshot for #BP.
     #[cfg(target_arch = "x86_64")]
     pub uprobe_list: UprobeSiteTable,
     /// Per-mm XOL page pool (grown lazily by uprobe registration).
     #[cfg(target_arch = "x86_64")]
     pub xol_pool: XolPool,
-    /// Per-page 断点状态（追踪 COW 副本 + refcount，供注销恢复原页）。
+    /// Per-page breakpoint state (tracks the COW copy + refcount, used by unregister to restore the original page).
     #[cfg(target_arch = "x86_64")]
     pub(crate) uprobe_page_state: SpinLock<BTreeMap<usize, UprobePageState>>,
 }
@@ -502,7 +503,7 @@ impl AddressSpace {
     pub(crate) fn mmput(&self) {
         if self.user_count_dec_and_test() {
             unsafe {
-                // 先持写锁拆除映射，再置 torn_down。与读者形成临界区边界。
+                // Take the write lock to unmap first, then set torn_down, forming a critical-section boundary with readers.
                 self.write().unmap_all();
             }
             self.mark_torn_down();
@@ -515,7 +516,7 @@ impl AddressSpace {
     #[inline]
     pub(crate) fn user_count_dec_and_test(&self) -> bool {
         let prev = self.user_count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(prev > 0, "AddressSpace user_count 下溢");
+        debug_assert!(prev > 0, "AddressSpace user_count underflow");
         prev == 1
     }
 
@@ -2025,22 +2026,23 @@ impl Drop for MmapReservationGuard {
     }
 }
 
-/// 地址空间使用者引用守卫：获取时已对使用者计数 +1，析构时归还；
-/// 归还使计数归零时（任务均已退出或换走、守卫是最后持有者）由守卫
-/// 完成映射拆除。持有期间目标进程的退出与 exec 换地址空间都不会
-/// 使映射中途消失。
+/// Reference guard for address-space users: acquiring it increments the user count by 1,
+/// and dropping it releases that count. When the release makes the count zero (all tasks
+/// have exited or switched away and this guard is the last holder), the guard completes
+/// the mapping teardown. While held, neither the target process's exit nor its exec
+/// switching address spaces can make the mappings disappear midway.
 pub struct MmUserRef {
     vm: Arc<AddressSpace>,
 }
 
 impl MmUserRef {
-    /// 借出被引用的地址空间。
+    /// Lend out the referenced address space.
     #[inline]
     pub fn vm(&self) -> &Arc<AddressSpace> {
         &self.vm
     }
 
-    /// 判断两个引用是否指向同一地址空间。
+    /// Determine whether two references point to the same address space.
     #[inline]
     pub fn is_same(&self, other: &MmUserRef) -> bool {
         Arc::ptr_eq(&self.vm, &other.vm)

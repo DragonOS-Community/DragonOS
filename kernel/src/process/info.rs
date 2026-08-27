@@ -89,7 +89,7 @@ impl ThreadInfo {
         self.group_tasks.clone()
     }
 
-    /// 组内是否只有组长一个线程（组列表为空即单线程组）。
+    /// Whether the group has only the leader thread (an empty group list means a single-threaded group).
     pub fn group_tasks_is_empty(&self) -> bool {
         self.group_tasks.is_empty()
     }
@@ -140,7 +140,7 @@ pub struct ProcessBasicInfo {
     /// File descriptor table.
     fd_table: Option<FdTableAttachment>,
 
-    /// 进程执行域标志（personality），GDB 经 SYS_personality 设置 ADDR_NO_RANDOMIZE 等位。
+    /// Process execution domain flags (personality); GDB sets bits such as ADDR_NO_RANDOMIZE via SYS_personality.
     personality: u32,
 }
 

@@ -414,17 +414,17 @@ impl ProcessManager {
         return Ok(());
     }
 
-    /// 撤销刚完成的 Self::mark_sleep：处理“prepare_sleep 与 mark_sleep 之间到达的唤醒”。
+    /// Undo a just-completed Self::mark_sleep: handles a wakeup arriving between prepare_sleep and mark_sleep.
     pub fn undo_mark_sleep() {
         let pcb = ProcessManager::current_pcb();
         let _pi_guard = pcb.sched_info().pi_lock_irqsave();
         let state = pcb.sched_info().state();
         if state.is_stopped() {
-            // 保留 Stopped 与停机写入的 NEED_SCHEDULE。
+            // Preserve Stopped and the NEED_SCHEDULE written by the stop.
             return;
         }
         if state.is_blocked() {
-            // 仅从本次 mark_sleep 写入的 Blocked 提升回 Runnable。
+            // Only promote the Blocked written by this mark_sleep back to Runnable.
             pcb.sched_info().set_state(ProcessState::Runnable);
             fence(Ordering::SeqCst);
         }

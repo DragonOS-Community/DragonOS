@@ -1,13 +1,13 @@
-// uprobe 断点探针端到端测试（issue #2150 阶段一）。
+// End-to-end tests for the uprobe breakpoint probe (issue #2150, phase one).
 //
-// 验证用户态经 perf_event_open 挂载 uprobe、触发被探测函数后进程存活
-// （#BP → XOL 单步 → #DB → 恢复 的命中路径不崩溃），并覆盖错误入参路径。
+// Verifies that a user-space uprobe attached via perf_event_open keeps the process alive when
+// the probed function is hit (#BP -> XOL single-step -> #DB -> resume), and covers invalid input paths.
 //
-// 内核侧接口（kernel/src/perf/uprobe.rs）：
-//   - perf_event_attr.type 由 /sys/bus/event_source/devices/uprobe/type 提供
-//   - perf_event_attr.config1 = 目标二进制路径
-//   - perf_event_attr.config2 = 文件偏移
-//   - syscall 参数 pid/cpu 决定 task 或 per-CPU scope
+// Kernel-side interface (kernel/src/perf/uprobe.rs):
+//   - perf_event_attr.type comes from /sys/bus/event_source/devices/uprobe/type
+//   - perf_event_attr.config1 = path of the target binary
+//   - perf_event_attr.config2 = file offset
+//   - the pid/cpu syscall arguments select task or per-CPU scope
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -96,7 +96,7 @@ class FdGuard {
     int fd_;
 };
 
-// 动态 PMU type 是用户态 ABI，测试不得依赖内核当前的分配顺序。
+// The dynamic PMU type is a user-space ABI; the test must not depend on the kernel's current allocation order.
 bool read_uprobe_perf_type(__u32& type) {
     std::ifstream type_file(UPROBE_TYPE_PATH);
     unsigned long long parsed = 0;
@@ -113,10 +113,10 @@ bool read_uprobe_perf_type(__u32& type) {
     return true;
 }
 
-// 一个简单的 noinline 目标函数，作为 uprobe 的挂载点。保持纯计算，避免
-// RIP-relative 操作数，降低 XOL 重定位的不确定性。
+// A simple noinline target function that serves as the uprobe mount point. Keep it pure to avoid
+// RIP-relative operands, reducing XOL relocation uncertainty.
 __attribute__((noinline)) int uprobe_target(int x) {
-    asm volatile("" : "+r"(x) : : "memory");  // 防止内联/优化掉
+    asm volatile("" : "+r"(x) : : "memory");  // prevent inlining/optimizing away
     return x * 2 + 1;
 }
 
@@ -252,8 +252,8 @@ asm(
     ".popsection\n");
 #endif
 
-// 从 /proc/self/maps 解析 func 在所属可执行文件中的偏移。
-// 返回 false 表示解析失败（如 procfs 不支持该格式）。
+// Resolve the offset of func within its containing executable from /proc/self/maps.
+// Returns false if resolution fails (e.g. procfs does not support this format).
 bool resolve_file_offset(const void* func, std::string& path,
                          unsigned long& offset) {
     char exe_buf[4096];
@@ -270,11 +270,11 @@ bool resolve_file_offset(const void* func, std::string& path,
     while (std::getline(maps, line)) {
         unsigned long start = 0, end = 0, mapoff = 0;
         char perms[8] = {};
-        // 格式：start-end perms offset dev inode pathname
+        // Format: start-end perms offset dev inode pathname
         if (std::sscanf(line.c_str(), "%lx-%lx %7s %lx", &start, &end, perms,
                         &mapoff) != 4)
             continue;
-        // 可执行段且 func 落在其中
+        // Executable segment and func falls within it
         if (perms[0] == 'r' && perms[2] == 'x' && func_addr >= start &&
             func_addr < end) {
             offset = mapoff + (func_addr - start);
@@ -381,24 +381,24 @@ void capture_divide_fault(int, siginfo_t* info, void*) {
 
 }  // namespace
 
-// 挂载 uprobe 到当前进程的目标函数，触发它，验证进程不崩溃且函数返回正确。
-// 这条用例是 uprobe 端到端的核心验证：#BP → XOL 单步 → #DB → 恢复。
+// Attach a uprobe to the current process's target function, trigger it, and verify the process
+// does not crash and the function returns correctly: the core end-to-end #BP -> XOL single-step -> #DB -> resume check.
 TEST(UprobeTest, RegisterAndTriggerSurvivesHit) {
     std::string path;
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法从 /proc/self/maps 解析目标函数偏移";
+        << "failed to resolve target function offset from /proc/self/maps";
 
     int fd = open_uprobe_perf_event(path, offset);
-    ASSERT_GE(fd, 0) << "perf_event_open(uprobe) 失败，errno=" << errno
-                     << "（内核可能未启用 uprobe）";
+    ASSERT_GE(fd, 0) << "perf_event_open(uprobe) failed, errno=" << errno
+                     << " (the kernel may not have uprobe enabled)";
 
     ASSERT_GE(ioctl(fd, PERF_EVENT_IOC_ENABLE, 0), 0)
-        << "PERF_EVENT_IOC_ENABLE 失败，errno=" << errno;
+        << "PERF_EVENT_IOC_ENABLE failed, errno=" << errno;
 
-    // 执行被探测函数：应命中 uprobe，经 XOL 单步原指令后正确返回。
-    // 若 uprobe 命中路径有 bug，这里可能崩溃 / hang / SIGTRAP。
+    // Execute the probed function: it should hit the uprobe, single-step the original instruction
+    // via XOL, and return correctly. If the uprobe hit path has a bug, this may crash / hang / SIGTRAP.
     volatile int result = uprobe_target(21);
     EXPECT_EQ(result, 43);
 
@@ -411,10 +411,10 @@ TEST(UprobeTest, RegisterAndTriggerSurvivesHit) {
     close(fd);
 }
 
-// 非法路径应被拒绝（返回负 errno）。
+// Invalid paths must be rejected (returning a negative errno).
 TEST(UprobeTest, InvalidPathIsRejected) {
     int fd = open_uprobe_perf_event("/nonexistent/path/to/binary", 0);
-    EXPECT_LT(fd, 0) << "非法路径不应成功挂载 uprobe";
+    EXPECT_LT(fd, 0) << "invalid path must not successfully attach a uprobe";
     if (fd >= 0) close(fd);
 }
 
@@ -429,66 +429,66 @@ TEST(UprobeTest, PathWithoutNullWithinPathMaxIsE2big) {
     EXPECT_EQ(errno, E2BIG);
 }
 
-// 越界偏移应被拒绝。
+// Out-of-range offsets must be rejected.
 TEST(UprobeTest, InvalidOffsetIsRejected) {
     std::string path;
     unsigned long offset = 0;
     if (!resolve_file_offset(reinterpret_cast<const void*>(&uprobe_target), path,
                              offset)) {
-        GTEST_SKIP() << "无法解析目标函数偏移，跳过";
+        GTEST_SKIP() << "failed to resolve target function offset, skipping";
     }
     int fd = open_uprobe_perf_event(path, 0xFFFFFFFFFFFFULL);
-    EXPECT_LT(fd, 0) << "越界偏移不应成功挂载";
+    EXPECT_LT(fd, 0) << "out-of-range offset must not attach successfully";
     if (fd >= 0) close(fd);
 }
 
-// 同一 uprobe 挂载后多次触发，验证 XOL 单步可重复且每次都正确返回。
-// 潜在 bug：XOL slot 内容被破坏、TF 未清导致单步循环、NEED_UPROBE 未清。
+// Trigger the same attached uprobe many times to verify XOL single-step is repeatable and always returns correctly.
+// Potential bugs: corrupted XOL slot contents, TF not cleared causing a single-step loop, NEED_UPROBE not cleared.
 TEST(UprobeTest, MultipleTriggersAllReturnCorrect) {
     std::string path;
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法从 /proc/self/maps 解析目标函数偏移";
+        << "failed to resolve target function offset from /proc/self/maps";
 
     int fd = open_uprobe_perf_event(path, offset);
-    ASSERT_GE(fd, 0) << "perf_event_open(uprobe) 失败，errno=" << errno;
-    ASSERT_GE(ioctl(fd, PERF_EVENT_IOC_ENABLE, 0), 0) << "ENABLE 失败";
+    ASSERT_GE(fd, 0) << "perf_event_open(uprobe) failed, errno=" << errno;
+    ASSERT_GE(ioctl(fd, PERF_EVENT_IOC_ENABLE, 0), 0) << "ENABLE failed";
 
-    // 连续触发 200 次：每次都必须经 #BP → XOL → #DB → 恢复并正确返回。
+    // Trigger 200 times in a row: each must go through #BP -> XOL -> #DB -> resume and return correctly.
     for (int i = 0; i < 200; ++i) {
         volatile int result = uprobe_target(i);
-        EXPECT_EQ(result, i * 2 + 1) << "第 " << i << " 次触发结果错误";
+        EXPECT_EQ(result, i * 2 + 1) << "wrong result on trigger " << i;
     }
 
     ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
     close(fd);
 }
 
-// close(fd) 触发注销（恢复原页）。注销后再调用函数应完全正常（无 0xcc 残留）。
-// 验证注销路径：移除表项 → 恢复断点页 → 回收 XOL slot。
+// close(fd) triggers unregistration (restores the original page). Calls after that must be entirely
+// normal, with no 0xcc residue. Unregister path: remove entry -> restore breakpoint page -> reclaim XOL slot.
 TEST(UprobeTest, UnregisterRestoresNormalExecution) {
     std::string path;
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法解析目标函数偏移";
+        << "failed to resolve target function offset";
 
     {
         int fd = open_uprobe_perf_event(path, offset);
-        ASSERT_GE(fd, 0) << "perf_event_open(uprobe) 失败，errno=" << errno;
+        ASSERT_GE(fd, 0) << "perf_event_open(uprobe) failed, errno=" << errno;
         ASSERT_GE(ioctl(fd, PERF_EVENT_IOC_ENABLE, 0), 0);
-        // 触发一次确认探针生效
+        // Trigger once to confirm the probe is active
         volatile int r = uprobe_target(5);
         ASSERT_EQ(r, 11);
-        // close 触发 Drop → uprobe_unregister → 恢复原页
+        // close triggers Drop -> uprobe_unregister -> restores the original page
         close(fd);
     }
 
-    // 注销后：函数应直接执行，无断点介入，结果仍正确。
+    // After unregistration: the function runs directly, no breakpoint involved, results still correct.
     for (int i = 0; i < 50; ++i) {
         volatile int result = uprobe_target(i + 100);
-        EXPECT_EQ(result, (i + 100) * 2 + 1) << "注销后第 " << i << " 次结果错误";
+        EXPECT_EQ(result, (i + 100) * 2 + 1) << "wrong result on post-unregister call " << i;
     }
 }
 
@@ -529,23 +529,23 @@ TEST(UprobeTest, ProcessVmWritevCannotBypassExecutableMappingPermissions) {
     unlink(path);
 }
 
-// disabled 会撤销该 consumer；若它是最后一个，应恢复原指令，且命中计数冻结。
+// Disabling revokes that consumer; if it was the last one, the original instruction is restored and the hit count freezes.
 TEST(UprobeTest, DisabledStillReturnsCorrectly) {
     std::string path;
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法解析目标函数偏移";
+        << "failed to resolve target function offset";
 
     int fd = open_uprobe_perf_event(path, offset);
-    ASSERT_GE(fd, 0) << "perf_event_open(uprobe) 失败，errno=" << errno;
-    // 注册即 enable（perf 默认），先 disable 再测试
+    ASSERT_GE(fd, 0) << "perf_event_open(uprobe) failed, errno=" << errno;
+    // Registration enables the event (perf default); disable it first before testing
     ASSERT_GE(ioctl(fd, PERF_EVENT_IOC_DISABLE, 0), 0);
 
-    // disabled 期间应直接执行原指令。
+    // While disabled, the original instruction should execute directly.
     for (int i = 0; i < 20; ++i) {
         volatile int result = uprobe_target(i + 200);
-        EXPECT_EQ(result, (i + 200) * 2 + 1) << "disabled 第 " << i << " 次结果错误";
+        EXPECT_EQ(result, (i + 200) * 2 + 1) << "wrong result while disabled, call " << i;
     }
 
     __u64 count = ~0ULL;
@@ -553,7 +553,7 @@ TEST(UprobeTest, DisabledStillReturnsCorrectly) {
               static_cast<ssize_t>(sizeof(count)));
     EXPECT_EQ(count, 0U);
 
-    // 重新 enable：回调恢复（此处 noop_handler），函数结果仍须正确。
+    // Re-enable: the callback is restored (noop_handler here), and the function result must still be correct.
     ASSERT_GE(ioctl(fd, PERF_EVENT_IOC_ENABLE, 0), 0);
     volatile int r = uprobe_target(7);
     EXPECT_EQ(r, 15);
@@ -567,23 +567,23 @@ TEST(UprobeTest, DisabledStillReturnsCorrectly) {
 TEST(UprobeTest, EventSourceTypeIsPublished) {
     __u32 type = 0;
     ASSERT_TRUE(read_uprobe_perf_type(type))
-        << "无法读取 " << UPROBE_TYPE_PATH << "，errno=" << errno;
+        << "failed to read " << UPROBE_TYPE_PATH << ", errno=" << errno;
     EXPECT_GT(type, 0U);
 }
 
-// 事件以 disabled=1 创建后不计数，并可显式启用。
+// An event created with disabled=1 does not count until explicitly enabled.
 TEST(UprobeTest, InitiallyDisabledCanBeEnabled) {
     std::string path;
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法解析目标函数偏移";
+        << "failed to resolve target function offset";
 
     UprobePerfEventOptions options;
     options.disabled = true;
     FdGuard fd(open_uprobe_perf_event(path, offset, options));
     ASSERT_GE(fd.get(), 0)
-        << "disabled=1 的 perf_event_open 失败，errno=" << errno;
+        << "perf_event_open with disabled=1 failed, errno=" << errno;
 
     for (int i = 0; i < 20; ++i) {
         volatile int result = uprobe_target(i + 300);
@@ -596,7 +596,7 @@ TEST(UprobeTest, InitiallyDisabledCanBeEnabled) {
     EXPECT_EQ(count, 0U);
 
     ASSERT_GE(ioctl(fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0)
-        << "初始 disabled 事件 ENABLE 失败，errno=" << errno;
+        << "failed to ENABLE the initially-disabled event, errno=" << errno;
     volatile int result = uprobe_target(17);
     EXPECT_EQ(result, 35);
     ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
@@ -610,7 +610,7 @@ TEST(UprobeTest, InvalidPidCpuCombinationsAreRejected) {
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法解析目标函数偏移";
+        << "failed to resolve target function offset";
 
     auto expect_einval = [&](pid_t pid, int cpu) {
         UprobePerfEventOptions options;
@@ -621,7 +621,7 @@ TEST(UprobeTest, InvalidPidCpuCombinationsAreRejected) {
         int saved_errno = errno;
         if (fd >= 0) {
             close(fd);
-            ADD_FAILURE() << "非法 pid/cpu 组合意外成功：pid=" << pid
+            ADD_FAILURE() << "invalid pid/cpu combination unexpectedly succeeded: pid=" << pid
                           << ", cpu=" << cpu;
             return;
         }
@@ -640,7 +640,7 @@ TEST(UprobeTest, UnsupportedInheritanceAndExecFlagsAreRejected) {
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法解析目标函数偏移";
+        << "failed to resolve target function offset";
 
     auto expect_eopnotsupp = [&](const char* flag_name,
                                  const UprobePerfEventOptions& options) {
@@ -649,7 +649,7 @@ TEST(UprobeTest, UnsupportedInheritanceAndExecFlagsAreRejected) {
         int saved_errno = errno;
         if (fd >= 0) {
             close(fd);
-            ADD_FAILURE() << flag_name << " 在 phase-1 不应被静默接受";
+            ADD_FAILURE() << flag_name << " must not be silently accepted in phase-1";
             return;
         }
         EXPECT_EQ(saved_errno, EOPNOTSUPP) << flag_name;
@@ -678,7 +678,7 @@ TEST(UprobeTest, UnsupportedConfigAndPerfCoreOptionsAreRejected) {
                                  const UprobePerfEventOptions& options) {
         errno = 0;
         FdGuard fd(open_uprobe_perf_event(path, offset, options));
-        EXPECT_LT(fd.get(), 0) << name << " 不应被静默接受";
+        EXPECT_LT(fd.get(), 0) << name << " must not be silently accepted";
         EXPECT_EQ(errno, EOPNOTSUPP) << name;
     };
 
@@ -712,7 +712,7 @@ TEST(UprobeTest, RelativePathUsesCurrentWorkingDirectory) {
     ASSERT_EQ(chdir(path.substr(0, slash).c_str()), 0);
     FdGuard event(open_uprobe_perf_event(path.substr(slash + 1), offset));
     const int saved_errno = errno;
-    EXPECT_GE(event.get(), 0) << "相对路径应从 cwd 解析，errno=" << saved_errno;
+    EXPECT_GE(event.get(), 0) << "relative path should resolve from cwd, errno=" << saved_errno;
     ASSERT_EQ(fchdir(old_cwd.get()), 0);
 }
 
@@ -739,7 +739,7 @@ TEST(UprobeTest, CounterReadUsesRawSingletonFormat) {
     count = 0;
     ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
               static_cast<ssize_t>(sizeof(count)));
-    EXPECT_EQ(count, 3U) << "读取计数不应清零";
+    EXPECT_EQ(count, 3U) << "reading the count must not reset it";
 
     ASSERT_EQ(ioctl(fd.get(), PERF_EVENT_IOC_DISABLE, 0), 0);
     ASSERT_EQ(ioctl(fd.get(), PERF_EVENT_IOC_RESET, 0), 0);
@@ -1450,7 +1450,7 @@ TEST(UprobeTest, HardlinkAliasUsesCanonicalFileIdentity) {
         mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, file.get(), 0);
     ASSERT_NE(executable, MAP_FAILED);
     FdGuard event(open_uprobe_perf_event(alias, 0));
-    ASSERT_GE(event.get(), 0) << "hardlink alias 应命中同一 page cache，errno="
+    ASSERT_GE(event.get(), 0) << "hardlink alias should hit the same page cache, errno="
                               << errno;
     auto target = reinterpret_cast<int (*)(int)>(executable);
     EXPECT_EQ(target(9), 19);
@@ -1464,7 +1464,7 @@ TEST(UprobeTest, TmpfsExecutableUsesPageCacheInstructionBytes) {
     char path[] = "/dev/shm/uprobe_tmpfs_XXXXXX";
     FdGuard file(create_raw_target(path));
     if (file.get() < 0 && (errno == ENOENT || errno == ENOSYS)) {
-        GTEST_SKIP() << "当前 rootfs 未提供 /dev/shm tmpfs";
+        GTEST_SKIP() << "current rootfs does not provide a /dev/shm tmpfs";
     }
     ASSERT_GE(file.get(), 0);
     void* executable =
@@ -1475,12 +1475,12 @@ TEST(UprobeTest, TmpfsExecutableUsesPageCacheInstructionBytes) {
         // wait for a future eligible mapping.
         FdGuard event(open_uprobe_perf_event(path, 0));
         EXPECT_GE(event.get(), 0)
-            << "tmpfs definition 应从 page cache 读取，errno=" << errno;
+            << "tmpfs definition should be read from page cache, errno=" << errno;
         unlink(path);
         return;
     }
     FdGuard event(open_uprobe_perf_event(path, 0));
-    ASSERT_GE(event.get(), 0) << "tmpfs uprobe 应从 page cache 读取，errno=" << errno;
+    ASSERT_GE(event.get(), 0) << "tmpfs uprobe should be read from page cache, errno=" << errno;
     auto target = reinterpret_cast<int (*)(int)>(executable);
     EXPECT_EQ(target(13), 27);
 
@@ -1676,21 +1676,21 @@ TEST(UprobeTest, AdjacentContinuousFileMappingsCanBeProbed) {
     unlink(path);
 }
 
-// 同址 consumer 必须共享 site 生命周期：关闭第一个不能拆除第二个仍需要的断点；
-// 关闭最后一个后继续执行不能触发无归属的 #BP。
+// Consumers at the same address must share the site lifecycle: closing the first must not tear down a
+// breakpoint the second still needs; after closing the last one, continued execution must not trigger an unowned #BP.
 TEST(UprobeTest, SameAddressConsumersCloseIndependently) {
     std::string path;
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法解析目标函数偏移";
+        << "failed to resolve target function offset";
 
     FdGuard first_fd(open_uprobe_perf_event(path, offset));
     ASSERT_GE(first_fd.get(), 0)
-        << "第一个 consumer 创建失败，errno=" << errno;
+        << "failed to create the first consumer, errno=" << errno;
     FdGuard second_fd(open_uprobe_perf_event(path, offset));
     ASSERT_GE(second_fd.get(), 0)
-        << "同址第二个 consumer 创建失败，errno=" << errno;
+        << "failed to create the second consumer at the same address, errno=" << errno;
 
     ASSERT_GE(ioctl(first_fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
     ASSERT_GE(ioctl(second_fd.get(), PERF_EVENT_IOC_ENABLE, 0), 0);
@@ -1714,12 +1714,12 @@ TEST(UprobeTest, SameAddressConsumersCloseIndependently) {
 
     first_fd.close_now();
     EXPECT_EQ(uprobe_target(32), 65)
-        << "关闭一个 consumer 不应破坏剩余 consumer 的 XOL 路径";
+        << "closing one consumer must not break the remaining consumer's XOL path";
 
     second_fd.close_now();
     for (int i = 0; i < 50; ++i) {
         EXPECT_EQ(uprobe_target(i + 400), (i + 400) * 2 + 1)
-            << "最后一个 consumer 关闭后第 " << i << " 次执行错误";
+            << "wrong result on call " << i << " after the last consumer closed";
     }
 }
 
@@ -2459,7 +2459,7 @@ TEST(UprobeTest, ConcurrentTeardownDoesNotExposeRetiredBreakpoint) {
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
                     reinterpret_cast<const void*>(&uprobe_target), path, offset))
-        << "无法解析目标函数偏移";
+        << "failed to resolve target function offset";
 
     std::atomic<bool> stop{false};
     std::atomic<int> bad_results{0};

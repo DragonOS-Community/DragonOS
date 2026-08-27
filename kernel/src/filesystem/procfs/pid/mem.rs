@@ -1,7 +1,8 @@
-//! /proc/[pid]/mem - 目标进程虚拟地址空间访问。
+//! /proc/[pid]/mem - access to the target process's virtual address space.
 //!
-//! 文件偏移量即目标进程的用户虚拟地址，read/write 直接读写该地址空间。
-//! 复用 ptrace 的批量跨进程内存访问（页表翻译 + 缺页 fault-in）。
+//! The file offset is a user virtual address of the target process; read/write directly
+//! access that address space. Reuses ptrace's batched cross-process memory access
+//! (page-table translation + fault-in on page faults).
 
 use crate::{
     filesystem::{
@@ -19,7 +20,7 @@ use crate::{
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
-/// /proc/[pid]/mem 的 FileOps 实现。
+/// FileOps implementation for /proc/[pid]/mem.
 #[derive(Debug)]
 pub struct MemFileOps {
     target: ProcPidTarget,
@@ -33,7 +34,7 @@ impl MemFileOps {
             .unwrap()
     }
 
-    /// 权限检查（仅在 open 时调用一次）。
+    /// Permission check (called only once at open time).
     fn check_access(target: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let current = crate::process::ProcessManager::current_pcb();
         if current.has_permission_to_trace(target, PtraceAccessCreds::FsCreds) {
@@ -43,7 +44,7 @@ impl MemFileOps {
         }
     }
 
-    /// 从文件私有数据取出打开时钉住的目标地址空间。
+    /// Extract the address space pinned at open time from the file private data.
     fn pinned_vm_from_data(data: &MutexGuard<FilePrivateData>) -> Option<Arc<AddressSpace>> {
         let FilePrivateData::Procfs(ProcfsFilePrivateData { pinned_vm, .. }) = &**data else {
             return None;
@@ -91,7 +92,7 @@ impl FileOps for MemFileOps {
         if n == 0 && actual_len > 0 && pinned_vm.is_torn_down() {
             return Ok(0);
         }
-        // 首字节即不可访问（含 offset 越过 USER_END）：返回 EIO，mem_rw
+        // The first byte is inaccessible (including offset beyond USER_END): return EIO like mem_rw
         if n == 0 && actual_len > 0 {
             return Err(SystemError::EIO);
         }
@@ -121,7 +122,7 @@ impl FileOps for MemFileOps {
         if n == 0 && actual_len > 0 && pinned_vm.is_torn_down() {
             return Ok(0);
         }
-        // 首字节即不可访问：返回 EIO，mem_rw。
+        // The first byte is inaccessible: return EIO like mem_rw.
         if n == 0 && actual_len > 0 {
             return Err(SystemError::EIO);
         }

@@ -1,14 +1,14 @@
-//! perf_event_open 的 uprobe 分发实现（计划步骤 7 / batch4）。
+//! Uprobe dispatch implementation for perf_event_open (planned step 7 / batch4).
 //!
-//! 照 [`crate::perf::kprobe`] 的 `KprobePerfEvent` 结构，为用户态断点探针提供
-//! perf 接入：`perf_event_open` 按 event_source sysfs 公布的 uprobe PMU type
-//! 分发到本模块；`config1`(name) 为路径，`config2`(offset) 为文件偏移。
+//! Following the `KprobePerfEvent` structure in [`crate::perf::kprobe`], this module provides perf
+//! integration for user-mode breakpoint probes: `perf_event_open` dispatches to this module by the
+//! uprobe PMU type published in the event_source sysfs; `config1`(name) is the path, `config2`(offset) is the file offset.
 //!
-//! - BPF 程序经 `PERF_EVENT_IOC_SET_BPF` → [`UprobePerfEvent::do_set_bpf_prog`] JIT 后
-//!   注入每个 per-mm 实例的 `event_callback`（评审 F10：复用 `BPF_PROG_TYPE_KPROBE`）。
-//! - 命中时由 batch3 的 `#BP` handler 调 `call_event_callback`，本模块的
-//!   [`UprobePerfCallBack`] 保证 BPF 入口 `pt_regs.rip = break_address()`（原探针址，
-//!   评审 F5，绝不暴露 XOL slot 地址）。
+//! - A BPF program is JIT-compiled via `PERF_EVENT_IOC_SET_BPF` → [`UprobePerfEvent::do_set_bpf_prog`] and then
+//!   injected into each per-mm instance's `event_callback` (review F10: reuse `BPF_PROG_TYPE_KPROBE`).
+//! - On hit, the batch3 `#BP` handler calls `call_event_callback`; this module's
+//!   [`UprobePerfCallBack`] guarantees the BPF entry `pt_regs.rip = break_address()` (the original probe address,
+//!   review F5: never expose the XOL slot address).
 
 use super::Result;
 use crate::arch::interrupt::TrapFrame;
@@ -47,8 +47,8 @@ use rbpf::EbpfVmRaw;
 use system_error::SystemError;
 use uprobe::{CallBackFunc, ProbeArgs};
 
-/// 一次 `perf_event_open(uprobe)` 对应一个持久 consumer。per-mm site 由
-/// AddressSpace 命中表拥有，consumer 只保存弱索引用于 close 撤销。
+/// One `perf_event_open(uprobe)` maps to one persistent consumer. Each per-mm site is
+/// owned by the AddressSpace hit table; the consumer only keeps a weak index for close revocation.
 pub struct UprobePerfEvent {
     // The mount owner must be released from perf-fd process context, never
     // when an IRQ-side ActiveXol releases its last site reference.
@@ -97,10 +97,10 @@ impl UprobePerfEvent {
         self.callback.retire_bpf();
     }
 
-    /// JIT 编译 BPF 程序并注入到每个 per-mm 实例的 `event_callback`。
+    /// JIT-compiles the BPF program and injects it into each per-mm instance's `event_callback`.
     ///
-    /// 同一个 `Arc<UprobePerfCallBack>` 共享给所有句柄（多 mm / 多映射共用一份 JIT
-    /// 产物），与 kprobe 的注入路径一致。
+    /// The same `Arc<UprobePerfCallBack>` is shared by all handles (multiple mm / multiple mappings share one JIT
+    /// output), matching the kprobe injection path.
     pub fn do_set_bpf_prog(&self, prog_file: Arc<File>) -> Result<()> {
         let file = prog_file
             .inode()
@@ -157,11 +157,11 @@ impl UprobePerfEvent {
     }
 }
 
-/// uprobe 的 eBPF 事件回调（镜像 kprobe 的 `KprobePerfCallBack`）。
+/// eBPF event callback for uprobe (mirrors kprobe's `KprobePerfCallBack`).
 ///
-/// **F5 不变量**：BPF 入口 `pt_regs.rip = break_address()`（原探针址）。即便
-/// batch3 传入的 TrapFrame.rip 仍是 int3 故障点（probe_vaddr+1），此处也强制把
-/// 暴露给 BPF 的 rip 改为原探针址，XOL slot 地址绝不外泄。
+/// **F5 invariant**: the BPF entry `pt_regs.rip = break_address()` (the original probe address). Even if
+/// the TrapFrame.rip passed in by batch3 is still the int3 fault point (probe_vaddr+1), this forces the
+/// rip exposed to BPF back to the original probe address; the XOL slot address is never leaked.
 pub struct UprobePerfCallBack {
     cpu: i32,
     hit_count: AtomicU64,
@@ -233,7 +233,7 @@ impl CallBackFunc for UprobePerfCallBack {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        // F5：BPF 看到的 rip 是原探针址（break_address），不是 XOL slot、也不是 rip+1。
+        // F5: the rip seen by BPF is the original probe address (break_address), not the XOL slot, nor rip+1.
         let probe_addr = trap_frame.break_address();
         let trap_frame = match trap_frame.as_any().downcast_ref::<TrapFrame>() {
             Some(tf) => tf,
@@ -355,11 +355,11 @@ impl PerfEventOps for UprobePerfEvent {
     }
 }
 
-/// 创建 uprobe perf event（照 `perf_event_open_kprobe`）。
+/// Creates an uprobe perf event (following `perf_event_open_kprobe`).
 ///
-/// - `config1`(name) = 二进制路径；`config2`(offset) = 文件偏移。
-/// - `pid >= 0`：仅目标进程的 mm（`pid == 0` = 当前进程）；`pid == -1`：经 inode rmap
-///   遍历所有映射该文件的 mm（评审 B8）。
+/// - `config1`(name) = the binary path; `config2`(offset) = the file offset.
+/// - `pid >= 0`: only the target process's mm (`pid == 0` = the current process); `pid == -1`: walk the inode rmap
+///   to cover every mm that maps the file (review B8).
 pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     // Linux perf accepts task events with cpu=-1 or a concrete CPU, and CPU
     // events only with a concrete CPU. Values below -1 are never meaningful.
@@ -408,7 +408,7 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         args.pid
     );
 
-    // path → inode → page_cache（inode rmap 入口）
+    // path → inode → page_cache (the inode rmap entry point)
     let caller = ProcessManager::current_pcb();
     let (start, remaining) = user_resolved_path_at(&caller, AtFlags::AT_FDCWD.bits(), &path)?;
     let resolved = start
@@ -425,8 +425,8 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     })?;
     let definition = UprobeDefinition::new(inode.clone(), offset)?;
 
-    // pid 语义（评审 R1）：>=0 单 mm（需 ptrace 访问检查）；==-1 全量（需特权）；
-    // 其他负值非法（EINVAL）。
+    // pid semantics (review R1): >=0 targets a single mm (requires the ptrace access check); ==-1 is system-wide (requires privileges);
+    // other negative values are invalid (EINVAL).
     let scope = if args.pid >= 0 {
         let pcb = if args.pid == 0 {
             // Do not round-trip through a raw pid: pid 0 denotes current even
@@ -442,15 +442,15 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
         pcb.basic().user_vm().ok_or(SystemError::ESRCH)?;
         UprobeConsumerScope::Task(UprobeTaskScope::new(&pcb))
     } else if args.pid == -1 {
-        // 系统级模式：向**所有**映射该文件的进程（含其他用户的）安装断点，
+        // System-wide mode: install breakpoints in **all** processes mapping this file (including other users'),
         // The PMU-wide perfmon capability check also covers system-wide events.
         UprobeConsumerScope::SystemWideAuthorized
     } else {
-        // pid < -1：Linux perf 语义不存在（-1 之外无系统级变体），EINVAL。
+        // pid < -1: no such Linux perf semantics (there is no system-wide variant other than -1), EINVAL.
         return Err(SystemError::EINVAL);
     };
 
-    // 消费者身份 + 注册表登记（评审 R9：fork/后续 mmap 迟到安装的依据）。
+    // Consumer identity + registry registration (review R9: the basis for late installation on fork / subsequent mmap).
     let consumer_id = uprobe_new_consumer_id();
     let inode_id = definition.inode_id();
     let callback = Arc::new(UprobePerfCallBack::new(args.cpu));

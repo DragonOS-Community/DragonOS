@@ -1,17 +1,17 @@
 #![no_std]
-//! 用户态断点探针（uprobe）支持——架构无关核心与 x86_64 指令分析。
+//! Userspace breakpoint probe (uprobe) support -- architecture-independent core and x86_64
+//! instruction analysis.
 //!
-//! 与 kprobe 的关键差异：被探测指令位于**用户地址空间**，单步执行原指令必须借助
-//! XOL（eXecute Out of Line，在用户态 slot 页执行副本），不能像 kprobe 那样把 rip
-//! 指向内核缓冲区（CPL=3 时内核页 supervisor-only + NX 不可执行）。因此本 crate：
-//! - 只保存原指令副本与 XOL slot 偏移，**不**提供任何内核态“单步地址”；
-//! - 指令分析直接复用 yaxpeax-x86（kprobe 已依赖）。
-//!
-//! 本 crate 仅保留纯指令分析/重定位与命中回调的架构无关接口；MM、异常和 perf
-//! 生命周期由内核对应模块拥有。
+//! Key difference from kprobe: the probed instruction lives in **user address space**, so
+//! single-stepping must use XOL (eXecute Out of Line, a copy executed in a user-mode slot page);
+//! rip cannot point at a kernel buffer (supervisor-only + NX at CPL=3). Hence this crate:
+//! - only stores the original instruction copy and the XOL slot offset (**no** kernel-mode
+//!   "single-step address"); instruction analysis reuses yaxpeax-x86 (a kprobe dependency);
+//! - keeps the architecture-independent hit-callback interfaces; MM/exception/perf lifecycles
+//!   are owned by the corresponding kernel modules.
 
-/// 用户态指令副本的最大字节数。x86-64 指令最长 15 字节，16 字节同时作为 XOL
-/// slot 宽度，便于固定大小复制与对齐。
+/// Maximum size in bytes of a user-mode instruction copy. x86-64 instructions are at most 15
+/// bytes; 16 bytes also serves as the XOL slot width for fixed-size copying and alignment.
 pub const UPROBE_INSN_COPY_SIZE: usize = 16;
 
 pub mod arch;

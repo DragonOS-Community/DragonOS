@@ -1,14 +1,14 @@
 use super::*;
 
-// ──────────────────────────── XOL 区 ────────────────────────────
+// ──────────────────────────── XOL area ────────────────────────────
 
-/// 每个 slot 的宽度（= `UPROBE_INSN_COPY_SIZE` = 16 字节）。
+/// Width of each slot (= `UPROBE_INSN_COPY_SIZE` = 16 bytes).
 const XOL_SLOT_SIZE: usize = UPROBE_INSN_COPY_SIZE;
 
-/// 每页 slot 数量（4096 / 16 = 256）。
+/// Number of slots per page (4096 / 16 = 256).
 const XOL_SLOTS_PER_PAGE: usize = MMArch::PAGE_SIZE / XOL_SLOT_SIZE;
 
-/// slot 位图需要的 u64 字数（256 bits → 4 words）。
+/// Number of u64 words needed for the slot bitmap (256 bits -> 4 words).
 const XOL_BITMAP_WORDS: usize = XOL_SLOTS_PER_PAGE.div_ceil(64);
 
 fn take_reachable_slot(
@@ -43,16 +43,16 @@ fn take_reachable_slot(
 /// slots. Pages are added to [`XolPool`] only from the registration path;
 /// the exception path never grows the pool or allocates memory.
 pub struct XolPage {
-    /// XOL 页在用户空间的基地址。
+    /// Base address of the XOL page in user space.
     page_base: VirtAddr,
-    /// XOL 页的物理地址（供 batch3 在关中断路径下通过 `phys_2_virt` 直接写 slot 内容，
-    /// 无需 mapper / RwSem）。
+    /// Physical address of the XOL page (for batch3 to write slot contents directly via
+    /// `phys_2_virt` on the interrupts-disabled path, without mapper / RwSem).
     page_paddr: PhysAddr,
-    /// 保证 XOL 物理页覆盖整个租约生命周期；不能只保存裸物理地址。
+    /// Keeps the XOL physical page alive for the whole lease lifetime; never keep only a raw paddr.
     _page: Arc<Page>,
-    /// 区域代次，用于阻止旧租约释放新区域的同号 slot。
+    /// Area generation: prevents an old lease from freeing the same-numbered slot in a new area.
     generation: u64,
-    /// slot 分配位图（bit=1 表示已占用）。
+    /// Slot allocation bitmap (bit=1 means occupied).
     slot_bitmap: SpinLock<[u64; XOL_BITMAP_WORDS]>,
 }
 
@@ -90,24 +90,24 @@ impl XolPage {
         }
     }
 
-    /// 计算 slot 对应的用户虚拟地址（供 batch3 使用）。
+    /// Compute the user virtual address for a slot (used by batch3).
     pub fn slot_vaddr(&self, offset: usize) -> VirtAddr {
         VirtAddr::new(self.page_base.data() + offset)
     }
 
-    /// XOL 页基地址（供 batch3 计算 slot 地址）。
+    /// Base address of the XOL page (used by batch3 to compute slot addresses).
     pub fn page_base(&self) -> VirtAddr {
         self.page_base
     }
 
-    /// XOL 页物理地址（供 batch3 在关中断路径下通过 `phys_2_virt` 写 slot 内容）。
+    /// XOL page physical address (batch3 writes slot contents via `phys_2_virt` when interrupts are off).
     pub fn page_paddr(&self) -> PhysAddr {
         self.page_paddr
     }
 }
 
-/// 一个 XOL slot 的唯一所有权租约。命中路径应把 `Arc<XolSlotLease>` 放入
-/// `ActiveXol`，从而让注销只撤销后续命中，不能复用仍在执行的 slot。
+/// Exclusive ownership lease for one XOL slot. The hit path should store the `Arc<XolSlotLease>`
+/// in `ActiveXol`, so deregistration revokes only future hits, never reusing a still-running slot.
 pub struct XolSlotLease {
     page: Arc<XolPage>,
     offset: usize,

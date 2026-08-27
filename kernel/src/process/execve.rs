@@ -189,7 +189,7 @@ fn do_execve_internal(
             .unwrap_or(0)
     };
 
-    // 尝试加载二进制文件（内部 begin_new_exec → de_thread 会交换 PID）
+    // Try to load the binary (internally begin_new_exec → de_thread may swap the PID)
     let load_result = load_binary_file_with_context(&mut param, &ctx);
 
     match load_result {
@@ -268,13 +268,13 @@ fn do_execve_internal(
             crate::mm::ucontext::uprobe::uprobe_apply_to_exec_mm(&pcb, &address_space);
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_registry_task_exec(&pcb, old_vm.as_ref());
-            // uprobe 必须先从旧 mm 脱离，再释放该 mm 的最后一个用户引用。
+            // The uprobe must first detach from the old mm before releasing the last user reference to that mm.
             ProcessManager::release_old_user_vm_if_last(old_vm.as_ref());
             if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
                 completion.complete_all();
             }
-            // exec_update 锁覆盖整个提交阶段；对外发布 trace/ptrace 事件前释放，
-            // 避免 tracer 回调与 exec 状态更新互相等待。
+            // The exec_update lock covers the whole commit phase; drop it before publishing
+            // trace/ptrace events so tracer callbacks and exec state updates never wait on each other.
             drop(exec_guard);
             // Linux keeps bprm->filename as the original exec-visible name
             // across shebang/interpreter rewrites. Complete vfork first so
@@ -285,12 +285,12 @@ fn do_execve_internal(
                 old_pid,
             );
 
-            // ptrace EVENT_EXEC：必须在 arch_do_execve 写入新入口寄存器（rip/rsp/rflags/cs）之后触发。
-            // EXEC-stop 期间 GETREGS 读到新 rip（新程序入口），SETREGS 不会被 arch_do_execve 覆盖。
+            // ptrace EVENT_EXEC: must fire after arch_do_execve writes the new entry registers (rip/rsp/rflags/cs).
+            // During EXEC-stop, GETREGS reads the new rip (the new program entry), and SETREGS is not overwritten by arch_do_execve.
             if pcb.ptrace_event_enabled(ptrace::PtraceEvent::Exec) {
                 pcb.ptrace_event(ptrace::PtraceEvent::Exec, old_vpid);
             } else if pcb.is_traced() && !pcb.flags().contains(ProcessFlags::PT_SEIZED) {
-                // 非 SEIZE 模式传统 attach：execve 成功后发裸 SIGTRAP（SI_KERNEL）。
+                // Traditional attach in non-SEIZE mode: deliver a bare SIGTRAP (SI_KERNEL) after a successful execve.
                 let mut info = crate::ipc::signal_types::SigInfo::new(
                     Signal::SIGTRAP,
                     0,

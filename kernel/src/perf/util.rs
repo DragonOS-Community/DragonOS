@@ -50,7 +50,7 @@ pub struct PerfProbeArgs {
     pub sample_type: Option<perf_event_sample_format>,
     /// Requested layout for read(2) on the perf event fd.
     pub read_format: u64,
-    /// `perf_event_attr.disabled`：事件初始是否禁用（评审 R11a）。
+    /// `perf_event_attr.disabled`: whether the event starts disabled (review R11a).
     pub disabled: bool,
     pub inherit: bool,
     pub enable_on_exec: bool,

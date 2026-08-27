@@ -404,12 +404,12 @@ pub struct UprobeConsumerReg {
     pub enabled: bool,
 }
 
-/// 全局注册表：inode id → 文件偏移 → （消费者 id，回调）。
-/// 锁外 reconcile 使用的连续消费者快照。
+/// Global registry: inode id -> file offset -> (consumer id, callback).
+/// Contiguous consumer snapshot used by reconcile outside the lock.
 pub(super) type ConsumerList = Vec<Arc<UprobeConsumer>>;
-/// 注册表值类型：某（inode, offset）上的消费者，按稳定 id 精确索引。
+/// Registry value type: consumers on a given (inode, offset), indexed precisely by stable id.
 pub(super) type ConsumerMap = BTreeMap<u64, Arc<UprobeConsumer>>;
-/// 注册表类型：inode id → （文件偏移 → 消费者列表）。
+/// Registry type: inode id -> (file offset -> consumer list).
 type RegistryMap = BTreeMap<usize, BTreeMap<usize, ConsumerMap>>;
 
 pub(super) static UPROBE_REGISTRY: SpinLock<RegistryMap> = SpinLock::new(BTreeMap::new());
@@ -512,12 +512,12 @@ pub(super) fn uprobe_registry_has_active_range_for_mm(
     })
 }
 
-/// 分配新的消费者 id（每次 perf_event_open(uprobe) 一次）。
+/// Allocate a new consumer id (once per perf_event_open(uprobe)).
 pub fn uprobe_new_consumer_id() -> u64 {
     NEXT_CONSUMER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// 注册一个消费者探测点（inode + offset）。
+/// Register a consumer probe point (inode + offset).
 pub fn uprobe_registry_add(
     inode_id: usize,
     offset: usize,
@@ -824,7 +824,7 @@ fn apply_consumer_to_mm(
     }
     Ok(())
 }
-/// 消费者关闭：移除注册表项 + drop 迟到句柄（逐 mm 注销）。
+/// Consumer close: remove the registry entry + drop the late handles (unregister per mm).
 pub fn uprobe_registry_remove_consumer(consumer: &Arc<UprobeConsumer>) {
     uprobe_registry_quiesce_consumer(consumer);
     let mut control = consumer.control.lock();

@@ -6,8 +6,9 @@ use crate::{
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-/// `SYS_personality` —— 读取或设置进程执行域。
-/// 当参数为 `0xffffffff` 时只读当前值；否则设新值并返回旧值。
+/// `SYS_personality` — read or set the process execution domain.
+/// When the argument is `0xffffffff`, only the current value is read;
+/// otherwise set the new value and return the old one.
 pub struct SysPersonality;
 
 impl Syscall for SysPersonality {

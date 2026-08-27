@@ -371,12 +371,13 @@ impl TimerFunction for PosixTimerHelper {
                     PidType::TGID
                 };
 
-                // 根据信号类型选择操作的 pending 队列：
-                // - 线程级信号（SIGEV_THREAD_ID）：操作 target 的 sig_pending
-                // - 进程级信号：操作 shared_pending
+                // Select the pending queue to operate on based on the signal type:
+                // - Thread-directed signals (SIGEV_THREAD_ID): operate on the target's sig_pending
+                // - Process-directed signals: operate on shared_pending
                 let is_thread_target = matches!(pt, PidType::PID);
 
-                // 避免持 sig_info 锁再去获取 sighand 锁造成锁序倒置。
+                // Avoid holding the sig_info lock while acquiring the sighand lock, which would
+                // invert the lock order.
                 let ignored_and_unblocked = {
                     let siginfo = target.sig_info_irqsave();
                     let mut blocked = *siginfo.sig_blocked();
@@ -397,8 +398,8 @@ impl TimerFunction for PosixTimerHelper {
                 };
 
                 if is_thread_target {
-                    // 线程级：存在性检查、overrun 累加与入队都在同一
-                    // sig_info 写临界区内完成。
+                    // Thread-directed: existence check, overrun accumulation, and enqueue all
+                    // happen in the same sig_info write critical section.
                     let mut siginfo_guard = target.sig_info_mut();
                     if siginfo_guard
                         .sig_pending_mut()
@@ -414,11 +415,11 @@ impl TimerFunction for PosixTimerHelper {
                     } else if siginfo_guard.sig_pending().queue().find(signo).0.is_some()
                         || ignored_and_unblocked
                     {
-                        // signo 已有其他来源的 pending，或未阻塞且被忽略：
-                        // 本次无法入队，记为 overrun。
+                        // signo already has pending signals from another source, or it is
+                        // unblocked and ignored: it cannot be enqueued this time; count it as an overrun.
                         t.pending_overrun_acc = t.pending_overrun_acc.saturating_add(1);
                     } else {
-                        // 可以入队：构造 SI_TIMER siginfo（确保只入队一次）
+                        // It can be enqueued: build an SI_TIMER siginfo (ensure it is enqueued exactly once)
                         let overrun = t.pending_overrun_acc;
                         t.pending_overrun_acc = 0;
                         t.last_overrun = overrun;
@@ -435,8 +436,8 @@ impl TimerFunction for PosixTimerHelper {
                         signo.enqueue_signal_locked(info, target.clone(), pt, siginfo_guard);
                     }
                 } else {
-                    // 进程级：全部操作在 sighand 侧完成，避免与 sig_info
-                    // 产生任何嵌套。
+                    // Process-directed: all operations complete on the sighand side, avoiding
+                    // any nesting with sig_info.
                     let bump = 1i32.saturating_add(t.pending_overrun_acc);
                     if target.sighand().shared_pending_posix_timer_bump_overrun(
                         signo,
@@ -446,12 +447,13 @@ impl TimerFunction for PosixTimerHelper {
                         // Reset only after the bump succeeds; keep the value on failure.
                         t.pending_overrun_acc = 0;
                     } else if ignored_and_unblocked {
-                        // 未阻塞且 handler=SIG_IGN：Linux 语义下丢弃，
-                        // 计入 overrun。
+                        // Unblocked with handler=SIG_IGN: dropped per Linux semantics,
+                        // counted as an overrun.
                         t.pending_overrun_acc = t.pending_overrun_acc.saturating_add(1);
                     } else {
-                        // 先读取累计值构造 siginfo；只有入队成功才消费它，
-                        // 失败时原值保留并追加本次到期，避免丢失累计。
+                        // Read the accumulated value first to build the siginfo; consume it
+                        // only if enqueue succeeds, otherwise the original value is kept and this
+                        // expiry is added, so no accumulation is lost.
                         let overrun = t.pending_overrun_acc;
                         let info = SigInfo::new(
                             signo,
@@ -463,9 +465,10 @@ impl TimerFunction for PosixTimerHelper {
                                 sigval,
                             },
                         );
-                        // 存在性检查与入队在同一写临界区内原子完成：
-                        // 若 signo 已有其他来源的 pending（如并发 kill），
-                        // 返回 false，本次记为 overrun，避免重复入队。
+                        // The existence check and enqueue complete atomically in the same write
+                        // critical section: if signo already has pending signals from another
+                        // source (e.g. a concurrent kill), false is returned and this is counted
+                        // as an overrun, avoiding duplicate enqueue.
                         if target
                             .sighand()
                             .shared_pending_push_posix_timer(signo, info)

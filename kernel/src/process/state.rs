@@ -261,7 +261,7 @@ impl ProcessFlags {
     }
 }
 
-/// 进程标志位的原子存储。
+/// Atomic storage for process flags.
 #[derive(Debug, Default)]
 pub struct AtomicProcessFlags {
     bits: AtomicUsize,

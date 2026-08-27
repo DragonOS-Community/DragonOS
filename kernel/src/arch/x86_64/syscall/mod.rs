@@ -68,8 +68,8 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     // 系统调用进入时，把系统调用号存入errcode字段，以便在syscall_handler退出后，仍能获取到系统调用号
     frame.errcode = frame.rax;
     let syscall_num = frame.rax as usize;
-    // syscall 入口无条件把 pt_regs->ax 置 -ENOSYS（errcode 字段已保存 syscall 号）。
-    // 先于任何 ptrace/seccomp 检查。SYSEMU skip 或正常 dispatch 都不依赖 frame.rax 作为输入。
+    // The syscall entry unconditionally sets pt_regs->ax to -ENOSYS (the errcode field has already saved the syscall number).
+    // This happens before any ptrace/seccomp checks. Neither the SYSEMU skip nor normal dispatch relies on frame.rax as input.
     frame.rax = SystemError::ENOSYS.to_posix_errno() as i64 as u64;
     // 防止sys_sched由于超时无法退出导致的死锁
     if syscall_num == SYS_SCHED {
@@ -103,14 +103,14 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         debug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
     }
 
-    // syscall 执行（catch_handle 内部已把返回值写入 frame.rax）
+    // Execute the syscall (catch_handle writes the return value into frame.rax internally)
     let mut syscall_handle = || -> u64 {
         Syscall::catch_handle(syscall_num, &args, frame)
             .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
     };
     let _ = syscall_handle();
 
-    // 返回用户态前处理信号/ptrace-stop
+    // Handle signals/ptrace-stop before returning to user mode
     unsafe {
         <X86_64SignalArch as SignalArch>::do_signal_or_restart(frame);
     }

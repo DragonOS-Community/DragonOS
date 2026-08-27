@@ -324,7 +324,7 @@ where
             loop {
                 match self.try_recv(buffer, flags) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        let _ = wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {});
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
                     }
                     result => break result,
                 }

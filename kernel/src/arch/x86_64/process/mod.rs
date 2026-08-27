@@ -89,11 +89,65 @@ pub mod debugreg {
 /// Per-CPU shadow of the current hardware DR7
 static CPU_DR7: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
     [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
+static CPU_DEBUG_OWNER_GENERATION: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
 
 /// Per-CPU DR7 shadow slot; accessed only with IRQs off on the local CPU.
 #[inline]
 pub(crate) fn cpu_dr7() -> &'static AtomicU64 {
     &CPU_DR7[crate::smp::core::smp_get_processor_id().data() as usize]
+}
+
+#[inline]
+pub(crate) fn cpu_debug_owner_generation() -> &'static AtomicU64 {
+    &CPU_DEBUG_OWNER_GENERATION[crate::smp::core::smp_get_processor_id().data() as usize]
+}
+
+/// Restore the current task's latest debug-register state immediately before
+/// returning to userspace. The pending flag keeps context switch from arming
+/// DR7 while signal/ptrace work may schedule.
+pub(crate) fn restore_current_debug_regs() {
+    let _irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    let current = ProcessManager::current_pcb();
+    current.flags().remove(ProcessFlags::PENDING_DEBUG);
+    unsafe { load_task_debug_regs(&current) };
+}
+
+/// Clear local hardware state while exec replaces the current task image.
+/// The saved task state and pending record have already been cleared.
+pub(crate) fn clear_current_debug_regs(task: &ProcessControlBlock) {
+    let _irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    unsafe { debugreg::write_dr7(0) };
+    cpu_dr7().store(0, Ordering::Relaxed);
+    cpu_debug_owner_generation().store(task.ptrace_session_generation(), Ordering::Relaxed);
+}
+
+unsafe fn load_task_debug_regs(task: &ProcessControlBlock) {
+    let generation = task.ptrace_session_generation();
+    cpu_debug_owner_generation().store(generation, Ordering::Relaxed);
+    let should_load = task.flags().contains(ProcessFlags::HW_DEBUG_REGS)
+        && !task.flags().contains(ProcessFlags::PENDING_DEBUG);
+    if should_load {
+        let dr = {
+            let ps = task.ptrace_state.lock_irqsave();
+            let mut dr = ps.debug_regs;
+            dr[6] = 0;
+            dr[7] &= !crate::process::ptrace::DR_CONTROL_RESERVED;
+            dr
+        };
+        cpu_dr7().store(dr[7], Ordering::Relaxed);
+        compiler_fence(Ordering::SeqCst);
+        unsafe {
+            debugreg::write_dr(0, dr[0]);
+            debugreg::write_dr(1, dr[1]);
+            debugreg::write_dr(2, dr[2]);
+            debugreg::write_dr(3, dr[3]);
+            debugreg::write_dr(7, dr[7]);
+        }
+    } else {
+        unsafe { debugreg::write_dr7(0) };
+        cpu_dr7().store(0, Ordering::Relaxed);
+    }
 }
 
 /// PCB中与架构相关的信息
@@ -506,34 +560,7 @@ impl ProcessManager {
 
         // Switch hardware debug registers (ptrace POKEUSER breakpoints):
         // a task with HW_DEBUG_REGS loads its DR0-3/DR7 on switch-in.
-        {
-            let next_has_dr = next.flags().contains(ProcessFlags::HW_DEBUG_REGS);
-            if next_has_dr {
-                let dr = {
-                    let ps = next.ptrace_state.lock_irqsave();
-                    let mut dr = ps.debug_regs;
-                    // DR6 is sticky state kept by the #DB path; not loaded.
-                    // DR7 is loaded with reserved bits (incl. GD) masked off.
-                    dr[6] = 0;
-                    dr[7] &= !crate::process::ptrace::DR_CONTROL_RESERVED;
-                    dr
-                };
-
-                cpu_dr7().store(dr[7], Ordering::Relaxed);
-                compiler_fence(Ordering::SeqCst);
-                unsafe {
-                    debugreg::write_dr(0, dr[0]);
-                    debugreg::write_dr(1, dr[1]);
-                    debugreg::write_dr(2, dr[2]);
-                    debugreg::write_dr(3, dr[3]);
-                    debugreg::write_dr(7, dr[7]);
-                }
-            } else if cpu_dr7().load(Ordering::Relaxed) != 0 {
-                // Clear order: hardware first, then shadow
-                unsafe { debugreg::write_dr7(0) };
-                cpu_dr7().store(0, Ordering::Relaxed);
-            }
-        }
+        unsafe { load_task_debug_regs(&next) };
 
         // 切换地址空间（无锁快速路径）
         let next_addr_space = next.basic().user_vm();

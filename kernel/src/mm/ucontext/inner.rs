@@ -82,7 +82,11 @@ impl InnerAddressSpace {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let new_addr_space = AddressSpace::new(false)?;
+        let parent_mm = self
+            .outer
+            .upgrade()
+            .expect("InnerAddressSpace::try_clone called before AddressSpace::new finished");
+        let new_addr_space = AddressSpace::new(false, parent_mm.user_ns(), parent_mm.dumpable())?;
         let mut new_guard = new_addr_space.write();
 
         // The parent mm may be shared by multiple threads (CLONE_VM / CLONE_THREAD), meaning threads running on other CPUs
@@ -90,10 +94,6 @@ impl InnerAddressSpace {
         // an mm-aware TLB shootdown is required: a local invlpg alone would still allow remote CPUs to write through stale writable TLB entries,
         // breaking COW semantics (residual risk 4). Here we use MmuGather to accumulate the full rewritten range;
         // after the loop, tlb.finish() triggers flush_tlb_mm_range to synchronously shoot down all active CPUs of the parent mm.
-        let parent_mm = self
-            .outer
-            .upgrade()
-            .expect("InnerAddressSpace::try_clone called before AddressSpace::new finished");
         let mut parent_tlb = MmuGather::gather(&parent_mm);
 
         // Only copy the user stack's structural info (metadata); actual user stack page content is handled in the VMA loop below

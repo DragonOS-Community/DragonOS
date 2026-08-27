@@ -40,7 +40,7 @@ use crate::{
         wait_queue::WaitQueue,
     },
     process::{
-        cred::{cred_cap_issubset, Cred, INIT_CRED, SUID_DUMPABLE},
+        cred::{cred_cap_issubset, Cred, INIT_CRED, SUID_DUMPABLE, SUID_DUMP_DISABLE},
         kthread::WorkerPrivate,
         namespace::nsproxy::NsProxy,
         pid::{Pid, PidLink, PidType},
@@ -140,11 +140,6 @@ pub struct ProcessControlBlock {
     /// When true, the process retains capabilities after changing UID/GID.
     pub(super) keepcaps: AtomicBool,
 
-    /// prctl(PR_SET/GET_DUMPABLE) state.
-    /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER; 2 (SUID_DUMP_ROOT) is not
-    /// allowed via PR_SET_DUMPABLE.
-    pub(super) dumpable: AtomicU8,
-
     pub(super) seccomp_mode: AtomicU8,
     pub(super) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
 
@@ -170,10 +165,22 @@ pub struct ProcessControlBlock {
 
     /// Linked list of children processes.
     pub(super) children: RwLock<Vec<RawPid>>,
-    /// Tasks currently traced by this process. Entries are global raw pids.
-    pub(super) ptraced: RwLock<Vec<RawPid>>,
+    /// Tasks currently traced by this process.
+    ///
+    /// `PTRACE_RELATION_LOCK` serializes this index with every tracee's
+    /// `ptrace_slot`.  Strong references make relation traversal independent
+    /// of PID identity exchange and let tracer exit remove one entry at a time
+    /// without allocating a temporary snapshot.
+    pub(super) ptraced: RwLock<Vec<Arc<ProcessControlBlock>>>,
+    /// Slot occupied by this task in its tracer's `ptraced` vector.
+    /// `usize::MAX` means that no ptrace relation is installed.  The value is
+    /// only read or written while `PTRACE_RELATION_LOCK` is held.
+    pub(super) ptrace_slot: AtomicUsize,
     /// Current tracer if this process is ptraced.
     pub(super) ptracer_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// Monotonic identity of the active ptrace ownership session. Only the
+    /// relation facade advances it while holding `PTRACE_RELATION_LOCK`.
+    ptrace_session_generation: AtomicU64,
     /// Per-tracee ptrace stop/event state machine (Linux task_struct ptrace/jobctl
     /// analog). SpinLock because it is touched in irqsave critical sections.
     pub(crate) ptrace_state: SpinLock<ptrace::PtraceState>,
@@ -372,9 +379,6 @@ impl ProcessControlBlock {
 
                 no_new_privs: AtomicBool::new(false),
                 keepcaps: AtomicBool::new(false),
-                // Default to SUID_DUMP_USER(=1) to satisfy gVisor's
-                // SetGetDumpability expectation.
-                dumpable: AtomicU8::new(1),
                 seccomp_mode: AtomicU8::new(seccomp::SeccompMode::Disabled as u8),
                 seccomp_filter: SpinLock::new(None),
                 parent_pcb: RwLock::new(ppcb.clone()),
@@ -383,7 +387,9 @@ impl ProcessControlBlock {
                 fork_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
                 ptraced: RwLock::new(Vec::new()),
+                ptrace_slot: AtomicUsize::new(usize::MAX),
                 ptracer_pcb: RwLock::new(Weak::new()),
+                ptrace_session_generation: AtomicU64::new(0),
                 ptrace_state: SpinLock::new(ptrace::PtraceState::new()),
                 wait_queue: WaitQueue::default(),
                 cputime_wait_queue: WaitQueue::default(),
@@ -725,12 +731,17 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn dumpable(&self) -> u8 {
-        self.dumpable.load(Ordering::SeqCst)
+        self.basic()
+            .user_vm()
+            .map(|mm| mm.dumpable())
+            .unwrap_or(SUID_DUMP_DISABLE as u8)
     }
 
     #[inline(always)]
     pub fn set_dumpable(&self, value: u8) {
-        self.dumpable.store(value, Ordering::SeqCst)
+        if let Some(mm) = self.basic().user_vm() {
+            mm.set_dumpable(value);
+        }
     }
 
     #[inline(always)]
@@ -893,6 +904,11 @@ impl ProcessControlBlock {
 
     /// Commit new creds, updating dumpability accordingly
     pub fn commit_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        // Stabilize the active mm across the credential publication. Linux
+        // publishes a dumpability downgrade before readers can observe the new
+        // credentials; exec uses the write side of this same lock.
+        let _exec_guard = self.exec_update_read();
+        let active_mm = self.basic().user_vm();
         let _task_guard = self.task_lock.lock_irqsave();
         let old = self.cred();
         // Trigger: any of euid/egid/fsuid/fsgid changes, or new permitted is not a subset of old (privilege raise)
@@ -903,10 +919,12 @@ impl ProcessControlBlock {
             || !cred_cap_issubset(&old, &new)
         {
             // Publish dumpability before creds; with the read-side fence, checks never see new creds with old dumpable
-            self.set_dumpable(SUID_DUMPABLE.load(Ordering::SeqCst) as u8);
+            if let Some(mm) = active_mm.as_ref() {
+                mm.set_dumpable(SUID_DUMPABLE.load(Ordering::SeqCst) as u8);
+            }
             // Also clear the parent-death signal on identity change
             self.set_pdeath_signal(Signal::INVALID);
-            fence(Ordering::SeqCst);
+            fence(Ordering::Release);
         }
         self.cred.store_deferred(new);
         Ok(())
@@ -951,6 +969,25 @@ impl ProcessControlBlock {
 
     pub fn ptracer_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         ptrace::ptracer_of(&self.self_ref.upgrade()?)
+    }
+
+    pub(crate) fn ptrace_session_generation(&self) -> u64 {
+        self.ptrace_session_generation.load(Ordering::Acquire)
+    }
+
+    /// Advance ownership while the caller holds `PTRACE_RELATION_LOCK`.
+    pub(super) fn advance_ptrace_session_generation(&self) -> u64 {
+        let mut next = self
+            .ptrace_session_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        if next == 0 {
+            // Wrap is practically unreachable; reserve zero as the initial
+            // unowned generation and publish one for deterministic matching.
+            self.ptrace_session_generation.store(1, Ordering::Release);
+            next = 1;
+        }
+        next
     }
 
     pub fn is_ptraced(&self) -> bool {
@@ -1538,6 +1575,40 @@ impl ProcessControlBlock {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Acquire the unique consuming ownership used by ptrace zombie wait.
+    pub(crate) fn try_claim_trace_zombie(&self) -> bool {
+        self.exit_state
+            .compare_exchange(
+                ExitState::Zombie as u8,
+                ExitState::TraceClaimed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn release_trace_zombie_claim(&self) {
+        self.exit_state
+            .compare_exchange(
+                ExitState::TraceClaimed as u8,
+                ExitState::Zombie as u8,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .expect("only the ptrace zombie owner may release its claim");
+    }
+
+    pub(crate) fn finish_trace_zombie_claim(&self) {
+        self.exit_state
+            .compare_exchange(
+                ExitState::TraceClaimed as u8,
+                ExitState::Dead as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("only the ptrace zombie owner may finish its claim");
     }
 
     /// Publish completion of `exit_notify()` after all producer-side effects.

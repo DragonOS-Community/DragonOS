@@ -44,6 +44,25 @@ pub(self) static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = Spi
 pub struct RiscV64MMArch;
 
 impl RiscV64MMArch {
+    /// Synchronize this hart's instruction stream with prior data writes.
+    #[inline]
+    pub fn local_flush_icache_all() {
+        unsafe { asm!("fence.i", options(nostack)) };
+    }
+
+    /// Execute a synchronous `fence.i` on one remote hart through SBI RFENCE.
+    /// A successful return is the acknowledgement required before a remote
+    /// memory writer may report completion to userspace.
+    pub fn remote_flush_icache(cpu: ProcessorId) -> Result<(), SbiRet> {
+        let mask = <ProcessorId as Into<HartMask>>::into(cpu);
+        let result = sbi_rt::remote_fence_i(mask);
+        if result.is_ok() {
+            Ok(())
+        } else {
+            Err(result)
+        }
+    }
+
     /// 使远程cpu的TLB中，指定地址范围的页失效
     #[allow(dead_code)]
     pub fn remote_invalidate_page(

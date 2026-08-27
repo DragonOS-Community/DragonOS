@@ -323,7 +323,6 @@ mod fd_table_attachment_tests {
         drop(observer);
         drop(owner);
     }
-
 }
 
 #[derive(Debug)]

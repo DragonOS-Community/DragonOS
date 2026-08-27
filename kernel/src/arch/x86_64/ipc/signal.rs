@@ -14,13 +14,13 @@ use crate::{
     exception::InterruptArch,
     ipc::{
         kill::send_signal_to_pid,
-        signal::{restore_saved_sigmask, set_current_blocked},
+        signal::{force_sig_fault_to_current, restore_saved_sigmask, set_current_blocked},
         signal_types::{
             PosixSigInfo, SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags,
         },
     },
     mm::{MemoryManagementArch, VirtAddr},
-    process::{ptrace, rseq::Rseq, ProcessFlags, ProcessManager},
+    process::{ptrace, rseq::Rseq, ProcessControlBlock, ProcessFlags, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 use core::{
@@ -927,11 +927,23 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     }
     set_current_blocked(&mut blocked);
 
+    // Linux disables TIF_SINGLESTEP/forced TF before copying sigcontext and,
+    // after a successful frame setup, reports an immediate ptrace SIGTRAP.
+    // Re-arming TF on the handler would execute its first instruction before
+    // the tracer regains control and would recurse for SIGTRAP handlers.
+    let stepping = ProcessManager::current_pcb().prepare_single_step_signal_delivery(frame);
+
     // 注意！由于handle_signal里面可能会退出进程，
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
     let res: Result<i32, SystemError> =
         handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
     compiler_fence(Ordering::SeqCst);
+    if res.is_ok() && stepping {
+        // Linux signal_delivered() intentionally ignores ptrace_notify()'s
+        // resume signal for this synthetic post-frame single-step stop.
+        let _ =
+            ProcessControlBlock::ptrace_notify(Signal::SIGTRAP as usize, Signal::SIGTRAP as i32);
+    }
     if let Err(e) = res {
         let _ = if sig_number == Signal::SIGSEGV {
             crate::ipc::signal::force_kernel_default_signal_to_current(Signal::SIGSEGV)
@@ -992,18 +1004,35 @@ impl SignalArch for X86_64SignalArch {
         // 在返回用户态前检查 JOBCTL_TRAP_STOP，发起 PTRACE_EVENT_STOP ptrace_stop。
         // 触发源：fork 的 seized 子进程初始 stop、PTRACE_INTERRUPT、ptraced group-stop。
         let pcb = ProcessManager::current_pcb();
-        // 返回用户态前检查 PENDING_PTRACE_STOP，发起 PTRACE_EVENT_STOP ptrace_stop。
-        while pcb.flags().contains(ProcessFlags::PT_SEIZED)
-            && pcb.flags().contains(ProcessFlags::PENDING_PTRACE_STOP)
-        {
-            pcb.flags().remove(ProcessFlags::PENDING_PTRACE_STOP);
-            let pending_sig = {
-                let mut ps = pcb.ptrace_state.lock_irqsave();
-                ps.pending_event_stop.take().unwrap_or(Signal::SIGTRAP)
-            };
-            // ptrace_event_stop 内部计算 exit_code = (EVENT_STOP<<8)|pending_sig，
-            let _ = pcb.ptrace_event_stop(pending_sig);
+        let debug_restore = pcb.flags().contains(ProcessFlags::PENDING_DEBUG);
+        defer! {
+            if debug_restore {
+                crate::arch::process::restore_current_debug_regs();
+            }
         }
+        if debug_restore {
+            if let Some(pending) = pcb.take_pending_debug_signal() {
+                let code = if pending.bits & ptrace::X86_DR_BS != 0 {
+                    ptrace::TRAP_TRACE
+                } else if pending.bits & ptrace::X86_DR_B_MASK != 0 {
+                    ptrace::TRAP_HWBKPT
+                } else if pending.icebp {
+                    ptrace::TRAP_BRKPT
+                } else {
+                    unreachable!("pending debug signal without a #DB cause")
+                };
+                // We are now at the task-context return boundary, where signal
+                // queueing and ptrace stops are permitted.
+                CurrentIrqArch::interrupt_enable();
+                if let Err(err) =
+                    force_sig_fault_to_current(Signal::SIGTRAP, code, VirtAddr::new(pending.addr))
+                {
+                    error!("failed to defer #DB SIGTRAP: {:?}", err);
+                }
+            }
+        }
+        // 返回用户态前检查 PENDING_PTRACE_STOP，发起 PTRACE_EVENT_STOP ptrace_stop。
+        while pcb.ptrace_handle_pending_stop() {}
 
         let mut got_signal = false;
         do_signal(frame, &mut got_signal);
@@ -1280,13 +1309,6 @@ fn setup_frame(
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
     trap_frame.ds = 0;
     trap_frame.rflags &= !(X86_EFLAGS_DF | X86_EFLAGS_RF | X86_EFLAGS_TF);
-    // 若当前处于 ptrace 单步，sigframe 建好后须重新置 TF，使信号 handler 第一条指令即触发单步陷阱。
-    let current_pcb = ProcessManager::current_pcb();
-    let stepping = current_pcb.ptrace_state.lock_irqsave().forced_trap_flag;
-    if stepping {
-        trap_frame.rflags |= X86_EFLAGS_TF;
-    }
-
     Ok(0)
 }
 

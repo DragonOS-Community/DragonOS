@@ -33,19 +33,6 @@ use system_error::SystemError;
 /// 用户态 #BP）。
 const TRAP_BRKPT: i32 = 1;
 
-/// `SIGTRAP` 的 `si_code`：single-step trap。
-///
-/// Linux 在用户态 TF 单步完成后使用该 code。DragonOS 已在 #DB 入口区分
-/// DR6.BS 与 B0-B3，但尚未实现完整 ptrace virtual_dr6。
-const TRAP_TRACE: i32 = 2;
-
-/// `SIGTRAP` 的 `si_code`：硬件断点/观察点。
-const TRAP_HWBKPT: i32 = 4;
-
-/// x86 DR6 cause bits。
-pub const DR6_TRAP_BITS: u64 = 0xf;
-pub const DR6_SINGLE_STEP: u64 = 1 << 14;
-
 /// RFLAGS 的 TF（Trap Flag）位——置位后每条指令执行完触发 #DB，用于 XOL 单步。
 const RFLAGS_TF: u64 = 1 << 8;
 
@@ -132,15 +119,31 @@ pub fn uprobe_breakpoint_handler(frame: &mut TrapFrame) -> Result<(), SystemErro
 ///
 /// 调用方（`do_debug`）已保证 `is_from_user()` 为真。
 ///
-/// 返回值：`true` = 精确完成本次 XOL；`false` = 非 uprobe #DB，或异常 #DB
-/// 已 abort 但仍需走正常用户 SIGTRAP 路径。
-pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, SystemError> {
+/// The #DB entry owns signal conversion. This result only states which part
+/// of the hardware cause the XOL machinery consumed.
+#[derive(Debug, Clone, Copy)]
+pub struct UprobeDebugOutcome {
+    pub consumed: bool,
+    pub report_single_step: bool,
+}
+
+impl UprobeDebugOutcome {
+    const NOT_CONSUMED: Self = Self {
+        consumed: false,
+        report_single_step: false,
+    };
+}
+
+pub fn uprobe_debug_handler(
+    frame: &mut TrapFrame,
+    dr6: u64,
+) -> Result<UprobeDebugOutcome, SystemError> {
     let pcb = ProcessManager::current_pcb();
 
     if pcb.uprobe.phase() == TaskXolPhase::Idle {
         // 非 uprobe 单步 #DB：不吞掉（评审 R4），交还 do_debug 走正常
         // DebugException 路径（ptrace / 硬件断点 / SIGTRAP）。
-        return Ok(false);
+        return Ok(UprobeDebugOutcome::NOT_CONSUMED);
     }
 
     // Atomically return the task state to Idle and preserve the old phase for
@@ -151,7 +154,7 @@ pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, Sys
             "uprobe #DB: active phase without payload @ rip {:#x}",
             frame.rip
         );
-        return Ok(false);
+        return Ok(UprobeDebugOutcome::NOT_CONSUMED);
     };
 
     // 只有 Running 原指令在本租约的 slot 内恰好执行完毕，才是本次 XOL
@@ -167,7 +170,7 @@ pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, Sys
         restore_after_abort(frame, &state);
         pcb.recalc_sigpending();
         // 当前 #DB 不是 XOL 完成事件，交给用户 debug/SIGTRAP 路径。
-        return Ok(false);
+        return Ok(UprobeDebugOutcome::NOT_CONSUMED);
     }
 
     // ── XOL 完成：恢复 rip 到返回址 + 恢复原始 TF（评审 R5）──
@@ -189,16 +192,12 @@ pub fn uprobe_debug_handler(frame: &mut TrapFrame, dr6: u64) -> Result<bool, Sys
     // 重新发布 XOL 窗口内暂时延迟的普通 pending 信号。
     pcb.recalc_sigpending();
 
-    // 回调与所有 irqsave 临界区结束后再开中断并排队调试信号。
-    if state.orig_tf {
-        send_sigtrap_trace(state.return_addr)?;
-    } else if dr6 & DR6_TRAP_BITS != 0 {
-        // uprobe 只消费自己置 TF 产生的 BS；同一 #DB 中并发出现的硬件断点
-        // cause 仍必须对用户可见，不能随 XOL 完成一起吞掉。
-        send_sigtrap_hwbkpt(state.return_addr)?;
-    }
-
-    Ok(true)
+    Ok(UprobeDebugOutcome {
+        consumed: true,
+        // If TF predated XOL, the completed instruction is still a real user
+        // single-step and must be reported by the unified deferred #DB path.
+        report_single_step: state.orig_tf,
+    })
 }
 
 /// 向当前进程投递 `SIGTRAP(TRAP_BRKPT)`（未消费的用户态 #BP）。
@@ -299,51 +298,4 @@ pub fn signal_gate(frame: &mut TrapFrame) -> bool {
     }
     abort_current_xol(frame);
     true
-}
-
-/// 投递用户态单步产生的 `SIGTRAP(TRAP_TRACE)`。
-///
-/// 该入口只负责用户调试异常，不得路由到仅处理内核 kprobe 的
-/// `DebugException`。
-pub fn send_sigtrap_trace(addr: usize) -> Result<(), SystemError> {
-    unsafe { CurrentIrqArch::interrupt_enable() };
-    if let Err(err) = force_sig_fault_to_current(Signal::SIGTRAP, TRAP_TRACE, VirtAddr::new(addr)) {
-        warn!(
-            "failed to send SIGTRAP(TRAP_TRACE), pid: {:?}, addr: {:#x}, err: {:?}",
-            ProcessManager::current_pid(),
-            addr,
-            err
-        );
-    }
-    Ok(())
-}
-
-fn send_sigtrap_hwbkpt(addr: usize) -> Result<(), SystemError> {
-    send_sigtrap_fault(TRAP_HWBKPT, addr, "TRAP_HWBKPT")
-}
-
-/// 投递未被 uprobe 消费的用户 #DB。DragonOS 尚无完整 ptrace virtual_dr6，
-/// 但至少按 Linux get_si_code() 的优先级保留 single-step 与 hardware cause。
-pub fn send_user_debug_sigtrap(addr: usize, dr6: u64) -> Result<(), SystemError> {
-    if dr6 & DR6_SINGLE_STEP != 0 {
-        send_sigtrap_trace(addr)
-    } else if dr6 & DR6_TRAP_BITS != 0 {
-        send_sigtrap_hwbkpt(addr)
-    } else {
-        send_sigtrap_fault(TRAP_BRKPT, addr, "TRAP_BRKPT")
-    }
-}
-
-fn send_sigtrap_fault(code: i32, addr: usize, name: &str) -> Result<(), SystemError> {
-    unsafe { CurrentIrqArch::interrupt_enable() };
-    if let Err(err) = force_sig_fault_to_current(Signal::SIGTRAP, code, VirtAddr::new(addr)) {
-        warn!(
-            "failed to send SIGTRAP({}), pid: {:?}, addr: {:#x}, err: {:?}",
-            name,
-            ProcessManager::current_pid(),
-            addr,
-            err
-        );
-    }
-    Ok(())
 }

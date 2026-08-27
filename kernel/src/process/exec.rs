@@ -10,6 +10,7 @@ use crate::{
         fcntl::AtFlags,
         file::{File, FileDescriptorTable},
         open::do_open_execat,
+        permission::{check_inode_permission, PermissionMask},
     },
     ipc::sighand::{GroupExecCancelResult, SigHand},
     libs::elf::ELF_LOADER,
@@ -20,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    namespace::nsproxy::exec_task_namespaces,
+    namespace::{nsproxy::exec_task_namespaces, user_namespace::map_id_up},
     pid::PidType,
     shebang::{ShebangLoader, SHEBANG_LOADER, SHEBANG_MAX_RECURSION_DEPTH},
     ProcessControlBlock, ProcessFlags, ProcessManager, PTRACE_RELATION_LOCK,
@@ -303,6 +304,35 @@ impl ExecParam {
 
     pub fn interp_flags(&self) -> ExecInterpFlags {
         self.interp_flags
+    }
+
+    /// Apply Linux `would_dump()` semantics to this executable or interpreter.
+    /// All recursive ELF ExecParams share the same prospective AddressSpace,
+    /// so the namespace promotion naturally converges without a second builder.
+    pub(crate) fn would_dump_current_file(&self) -> Result<(), SystemError> {
+        let inode = self.file.inode();
+        let metadata = self.file.metadata()?;
+        if check_inode_permission(&inode, &metadata, PermissionMask::MAY_READ).is_ok() {
+            return Ok(());
+        }
+
+        let mut user_ns = self.vm.user_ns();
+        loop {
+            let maps_ids = {
+                let inner = user_ns.inner.lock();
+                map_id_up(&inner.uid_map, metadata.uid as u32).is_some()
+                    && map_id_up(&inner.gid_map, metadata.gid as u32).is_some()
+            };
+            if maps_ids {
+                break;
+            }
+            let Some(parent) = user_ns.parent_ns() else {
+                break;
+            };
+            user_ns = parent;
+        }
+        self.vm.enforce_exec_nondump_in(user_ns);
+        Ok(())
     }
 
     /// Consume the `ExecParam` and take ownership of the `File` (used for adding
@@ -665,6 +695,8 @@ pub fn load_binary_file_with_context(
 ) -> Result<LoadBinaryResult, SystemError> {
     // Check the recursion depth.
     ctx.check_recursion_limit()?;
+
+    param.would_dump_current_file()?;
 
     // Read the file header to determine the file type.
     let mut head_buf = [0u8; 512];

@@ -9,7 +9,7 @@ use crate::{
     libs::{futex::futex::RobustListHead, rand::rand_bytes},
     mm::ucontext::AddressSpace,
     process::{
-        cred::{SUID_DUMPABLE, SUID_DUMP_USER},
+        cred::{SUID_DUMPABLE, SUID_DUMP_DISABLE, SUID_DUMP_USER},
         exec::{
             load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
             ExecStartInfo, LoadBinaryResult,
@@ -150,7 +150,12 @@ fn do_execve_internal(
 ) -> Result<(), ExecFailure> {
     let exec_pcb = ProcessManager::current_pcb();
     let exec_guard = exec_pcb.exec_update_write();
-    let address_space = AddressSpace::new(true).expect("Failed to create new address space");
+    let address_space = AddressSpace::new(
+        true,
+        exec_pcb.cred().user_ns.clone(),
+        SUID_DUMP_DISABLE as u8,
+    )
+    .expect("Failed to create new address space");
 
     let mut param = ExecParam::new(
         start.file(),
@@ -250,12 +255,15 @@ fn do_execve_internal(
             exec_pcb.flush_ptrace_hw_debug_regs();
             // After commit, reset dumpability according to the new credentials.
             let cred = exec_pcb.cred();
-            let dump = if cred.euid != cred.uid || cred.egid != cred.gid {
+            let dump = if address_space.exec_enforces_nondump()
+                || cred.euid != cred.uid
+                || cred.egid != cred.gid
+            {
                 SUID_DUMPABLE.load(Ordering::SeqCst) as u8
             } else {
                 SUID_DUMP_USER as u8
             };
-            exec_pcb.set_dumpable(dump);
+            address_space.set_dumpable(dump);
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_apply_to_exec_mm(&pcb, &address_space);
             #[cfg(target_arch = "x86_64")]

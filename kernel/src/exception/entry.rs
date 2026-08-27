@@ -58,6 +58,7 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
         // 检查信号或 ptrace trap
         if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL)
             || process_flags_work.contains(ProcessFlags::PENDING_PTRACE_STOP)
+            || process_flags_work.contains(ProcessFlags::PENDING_DEBUG)
         {
             unsafe { CurrentSignalArch::do_signal_or_restart(frame) };
         }

@@ -45,8 +45,12 @@ pub(crate) fn wstatus_to_waitid_exit_info(raw_wstatus: i32) -> (i32, i32) {
     }
 }
 
-fn notify_real_parent_after_ptrace_ack(child_pcb: &Arc<ProcessControlBlock>) {
+/// Complete a ptrace zombie claim and notify its natural parent.  The caller
+/// owns `TraceClaimed`; the autoreap/report decision is committed before the
+/// state becomes visible to competing natural waiters.
+fn complete_ptrace_claim_after_ack(child_pcb: &Arc<ProcessControlBlock>) {
     let Some(real_parent) = child_pcb.real_parent_pcb() else {
+        child_pcb.release_trace_zombie_claim();
         return;
     };
     let exit_signal = child_pcb.exit_signal.load(Ordering::SeqCst);
@@ -71,17 +75,21 @@ fn notify_real_parent_after_ptrace_ack(child_pcb: &Arc<ProcessControlBlock>) {
         (false, false)
     };
 
-    // autoreap 必须在唤醒 real_parent wait_queue 之前完成 release，
-    // 否则 real_parent 被唤醒后 wait 命中已 Dead 子进程。CAS 保证仅释放一次。
-    if autoreap && child_pcb.try_mark_dead_from_zombie() {
+    // Keep TraceClaimed until the disposition decision is final. Publishing
+    // Zombie before this point would allow a natural waiter to reap between
+    // the decision and the owner's autoreap transition.
+    if autoreap {
+        child_pcb.finish_trace_zombie_claim();
         unsafe { ProcessManager::release(child_pcb.raw_pid()) };
+    } else {
+        child_pcb.release_trace_zombie_claim();
     }
     if send_sigchld {
         if let Err(e) =
             crate::ipc::kill::send_signal_to_pcb(real_parent.clone(), Signal::from(exit_signal))
         {
             log::warn!(
-                "notify_real_parent_after_ptrace_ack: deliver {:?} to {:?} failed: {:?}",
+                "complete_ptrace_claim_after_ack: deliver {:?} to {:?} failed: {:?}",
                 Signal::from(exit_signal),
                 real_parent.raw_pid(),
                 e
@@ -101,17 +109,6 @@ fn notify_real_parent_after_ptrace_ack(child_pcb: &Arc<ProcessControlBlock>) {
                 .wakeup_all(Some(ProcessState::Blocked(true)));
         }
     }
-}
-
-/// 判断 tracee 的 ptracer 与 real_parent 是否不在同一线程组。
-fn ptrace_reparented(child_pcb: &Arc<ProcessControlBlock>) -> bool {
-    let Some(ptracer) = child_pcb.ptracer_pcb() else {
-        return false;
-    };
-    let Some(real_parent) = child_pcb.real_parent_pcb() else {
-        return false;
-    };
-    ptracer.raw_tgid() != real_parent.raw_tgid()
 }
 
 /// mt-exec: de_thread 正在等待旧 leader 完成 PID/TID 交换时，禁止提前回收
@@ -589,11 +586,18 @@ fn report_wait_event(
             && relation == WaitRelation::Ptraced
             && !kwo.options.contains(WaitOption::WNOWAIT)
         {
-            // 先判定是否需要级联通知 real_parent（必须在 ptrace_unlink 之前，
-            // 因为 ptrace_unlink 会清空 ptracer_pcb，导致 ptracer_pcb() 返回 None）。
-            let need_cascade = ptrace_reparented(child_pcb);
-            // 解除 ptrace 关系（zombie 状态不变，仍 Zombie）。
-            let _ = child_pcb.ptrace_unlink();
+            // Linux wait_task_zombie() first cmpxchg's EXIT_ZOMBIE to
+            // EXIT_TRACE.  Claim before unlink so neither a natural waiter nor
+            // another tracer thread can consume the same zombie.
+            let waiter = ProcessManager::current_pcb();
+            let need_cascade =
+                match ptrace::claim_and_unlink_wait_zombie(child_pcb, &waiter, kwo.options) {
+                    ptrace::PtraceZombieClaim::Claimed { need_cascade } => need_cascade,
+                    ptrace::PtraceZombieClaim::Blocked => {
+                        return CandidateDecision::Pending { can_change: true };
+                    }
+                    ptrace::PtraceZombieClaim::Lost => return CandidateDecision::Ineligible,
+                };
 
             let pid = wait_visible_pid(child_pcb);
             let (status, cause) = wstatus_to_waitid_exit_info(raw_wstatus);
@@ -605,14 +609,11 @@ fn report_wait_event(
             if need_cascade {
                 // ptracer != real_parent（外部调试器）：通知 real_parent 并保留 zombie，
                 // 等 real_parent 走 Natural 分支二次 reap。
-                notify_real_parent_after_ptrace_ack(child_pcb);
+                complete_ptrace_claim_after_ack(child_pcb);
             } else {
                 // ptracer == real_parent（strace fork-then-trace 场景）：立即 reap+release，
                 // 只上报一次，不保留 zombie 避免二次 Natural reap。
-                let transition = child_pcb.sighand().try_reap_natural_child(child_pcb, true);
-                if transition != ReapTransition::Reaped {
-                    return CandidateDecision::Pending { can_change: true };
-                }
+                child_pcb.finish_trace_zombie_claim();
                 let rusage = fill_wait_rusage(child_pcb, kwo);
                 account_reaped_child_rusage(&rusage);
                 unsafe { ProcessManager::release(child_pcb.raw_pid()) };

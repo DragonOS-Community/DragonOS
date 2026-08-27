@@ -55,6 +55,7 @@ pub enum ReapTransition {
     Blocked,
     NotZombie,
     Reportable,
+    TraceClaimed,
     Reaped,
 }
 
@@ -842,6 +843,24 @@ impl SigHand {
         }
         if candidate.try_mark_dead_from_zombie() {
             ReapTransition::Reaped
+        } else {
+            ReapTransition::NotZombie
+        }
+    }
+
+    /// Claim a ptraced zombie for a consuming wait without publishing Dead
+    /// yet.  This mirrors Linux's EXIT_ZOMBIE -> EXIT_TRACE cmpxchg: the owner
+    /// may safely detach before deciding whether the natural parent needs a
+    /// second zombie report.
+    pub fn try_claim_ptraced_child(&self, candidate: &Arc<ProcessControlBlock>) -> ReapTransition {
+        let g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXEC)
+            && Self::weak_matches(&g.group_exec_old_leader, candidate)
+        {
+            return ReapTransition::Blocked;
+        }
+        if candidate.try_claim_trace_zombie() {
+            ReapTransition::TraceClaimed
         } else {
             ReapTransition::NotZombie
         }

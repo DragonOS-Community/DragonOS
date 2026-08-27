@@ -5,15 +5,11 @@ use super::{
     TrapFrame,
 };
 use crate::{
-    arch::{
-        ipc::signal::Signal,
-        x86_64::process::debugreg,
-        CurrentIrqArch, MMArch,
-    },
+    arch::{ipc::signal::Signal, x86_64::process::debugreg, CurrentIrqArch, MMArch},
     exception::{debug::DebugException, ebreak::EBreak, InterruptArch},
     ipc::signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
     mm::VirtAddr,
-    process::{ptrace, ProcessFlags, ProcessManager},
+    process::{ptrace, ProcessManager},
     smp::core::smp_get_processor_id,
 };
 use log::{error, trace, warn};
@@ -153,24 +149,21 @@ unsafe extern "C" fn do_divide_error(regs: &'static mut TrapFrame, error_code: u
 unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
     // DR6 可同时报告 BS(single-step) 与 B0-B3(hardware breakpoint)。必须在
     // 任何 handler 前保存并复位，避免旧 cause 污染下一次 #DB。
-    let dr6 = read_and_reset_dr6();
+    let dr6 = read_and_reset_dr6() & !ptrace::DR6_RESERVED;
     let from_user = regs.is_from_user();
-    let dr7 = if from_user {
-        let dr7: u64;
-        core::arch::asm!(
-            "mov {}, dr7",
-            out(reg) dr7,
-            options(nomem, nostack, preserves_flags)
-        );
-        // Keep user debug registers disabled while handling #DB to avoid
-        // recursively hitting them in the kernel signal path. Clear hardware
-        // first, then the CPU shadow, matching the context-switch protocol.
-        debugreg::write_dr7(0);
-        crate::arch::process::cpu_dr7().store(0, core::sync::atomic::Ordering::Relaxed);
-        dr7
-    } else {
-        0
-    };
+    let dr7: u64;
+    core::arch::asm!(
+        "mov {}, dr7",
+        out(reg) dr7,
+        options(nomem, nostack, preserves_flags)
+    );
+    let owner_generation = crate::arch::process::cpu_debug_owner_generation()
+        .load(core::sync::atomic::Ordering::Relaxed);
+    // Disable hardware breakpoints before touching any kernel state. They stay
+    // disabled across signal/ptrace work and are restored from the current
+    // task state only at the final return-to-user boundary.
+    debugreg::write_dr7(0);
+    crate::arch::process::cpu_dr7().store(0, core::sync::atomic::Ordering::Relaxed);
     trace!(
         "do_debug(1), \tError code: {:#x},\tdr6: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -184,49 +177,79 @@ unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
         // 用户态 #DB：uprobe XOL 单步完成优先（handler 返回是否消费，评审 R4）；
         // 未消费的用户态单步通过统一信号路径进入 SIGTRAP/ptrace。DebugException 只查
         // 内核 kprobe 表，不能处理用户态 #DB，否则会静默吞掉调试异常。
-        if crate::exception::uprobe::uprobe_debug_handler(regs, dr6).unwrap() {
-            // 已被 uprobe 消费（精确 XOL 完成）。
+        let current = ProcessManager::current_pcb();
+        let uprobe = crate::exception::uprobe::uprobe_debug_handler(regs, dr6).unwrap();
+        let (active_generation, current_generation) =
+            ptrace::ptrace_debug_session_snapshot(&current);
+        // Uprobe consumes only its XOL single-step reason. A simultaneous
+        // hardware B0-B3 hit is independent and must still be reported.
+        let report_bits = if uprobe.consumed {
+            (dr6 & ptrace::X86_DR_B_MASK)
+                | if uprobe.report_single_step {
+                    ptrace::X86_DR_BS
+                } else {
+                    0
+                }
         } else {
-            let current = ProcessManager::current_pcb();
-            // PEEKUSER(DR6) uses positive-polarity virtual DR6; hardware
-            // reserved bits are not part of the reported cause.
-            current.ptrace_state.lock_irqsave().debug_regs[6] = dr6 & !ptrace::DR6_RESERVED;
-            // An execution breakpoint needs RF, otherwise resuming the same
-            // instruction immediately triggers the breakpoint again.
-            if dr6 & ptrace::X86_DR_BS == 0 {
-                for i in 0..4u32 {
-                    if (dr6 & (1u64 << i)) != 0 && ((dr7 >> (16 + i * 4)) & 0b11) == 0 {
-                        regs.rflags |= ptrace::X86_EFLAGS_RF;
-                        break;
-                    }
+            dr6 & (ptrace::X86_DR_B_MASK | ptrace::X86_DR_BS)
+        };
+        let icebp = !uprobe.consumed && dr6 == 0;
+        let forced_step = {
+            let mut ps = current.ptrace_state.lock_irqsave();
+            ps.debug_regs[6] = report_bits;
+            ps.forced_trap_flag
+        };
+        let breakpoint_bits = report_bits & ptrace::X86_DR_B_MASK;
+        let owned_breakpoints =
+            if active_generation.is_some() || owner_generation != current_generation {
+                breakpoint_bits
+            } else {
+                0
+            };
+        let owned_step = if active_generation.is_some() && forced_step {
+            report_bits & ptrace::X86_DR_BS
+        } else {
+            0
+        };
+        let owned_bits = owned_breakpoints | owned_step;
+        let unowned_bits = report_bits & !owned_bits;
+
+        // Execution breakpoints require RF or the same instruction would
+        // immediately retrigger when DR7 is restored.
+        if report_bits & ptrace::X86_DR_BS == 0 {
+            for i in 0..4u32 {
+                if (breakpoint_bits & (1u64 << i)) != 0 && ((dr7 >> (16 + i * 4)) & 0b11) == 0 {
+                    regs.rflags |= ptrace::X86_EFLAGS_RF;
+                    break;
                 }
             }
-            crate::exception::uprobe::send_user_debug_sigtrap(regs.rip as usize, dr6).unwrap();
         }
-
-        let current = ProcessManager::current_pcb();
-        let was_armed = (dr7 & !ptrace::DR_CONTROL_RESERVED) != 0;
-        if was_armed || current.flags().contains(ProcessFlags::HW_DEBUG_REGS) {
-            let dr = {
-                let ps = current.ptrace_state.lock_irqsave();
-                let mut dr = ps.debug_regs;
-                dr[6] = 0;
-                dr[7] &= !ptrace::DR_CONTROL_RESERVED;
-                dr
-            };
-            // Arm the CPU shadow before hardware so a context switch cannot
-            // observe a partially committed state.
-            crate::arch::process::cpu_dr7().store(dr[7], core::sync::atomic::Ordering::Relaxed);
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            debugreg::write_dr(0, dr[0]);
-            debugreg::write_dr(1, dr[1]);
-            debugreg::write_dr(2, dr[2]);
-            debugreg::write_dr(3, dr[3]);
-            debugreg::write_dr(7, dr[7]);
-        }
+        // Record even a fully consumed uprobe #DB so DR7 restoration remains
+        // deferred until all return-to-user work has completed.
+        current.record_pending_debug(
+            owned_bits,
+            unowned_bits,
+            icebp,
+            regs.rip as usize,
+            active_generation.unwrap_or(owner_generation),
+        );
     } else {
-        // 内核态 #DB：kprobe 单步完成。
-        DebugException::handle(regs).unwrap();
+        let current = ProcessManager::current_pcb();
+        let breakpoint_bits = dr6 & ptrace::X86_DR_B_MASK;
+        if breakpoint_bits != 0 {
+            // Match Linux exc_debug_kernel()/ptrace_triggered(): remember the
+            // virtual DR6 cause, but do not synthesize a signal at syscall
+            // return. A later user #DB starts a fresh virtual DR6 report.
+            current.ptrace_state.lock_irqsave().debug_regs[6] |= breakpoint_bits;
+        }
+        // B0-B3 belong to the user ptrace watchpoint. Preserve any coexisting
+        // BS reason for the kernel kprobe single-step handler.
+        if dr6 & !ptrace::X86_DR_B_MASK != 0 {
+            DebugException::handle(regs).unwrap();
+        }
+        // local_db_restore() semantics: kernel #DB handling must leave the
+        // current task's breakpoint state armed, including after a B0-B3 hit.
+        crate::arch::process::restore_current_debug_regs();
     }
 }
 

@@ -46,6 +46,7 @@ use crate::{
     },
     process::{
         cred::{capable, CAPFlags},
+        namespace::user_namespace::UserNamespace,
         resource::RLimitID,
         ProcessManager,
     },

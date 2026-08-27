@@ -12,7 +12,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::{SYS_PROCESS_VM_READV, SYS_PROCESS_VM_WRITEV};
 use crate::arch::MMArch;
 use crate::filesystem::vfs::iov::IoVec;
-use crate::mm::{remote_access::RemoteAccess, MemoryManagementArch};
+use crate::mm::{access_ok, remote_access::RemoteAccess, MemoryManagementArch, VirtAddr};
 use crate::process::{ptrace::PtraceAccessCreds, ProcessControlBlock, ProcessManager, RawPid};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
@@ -50,7 +50,15 @@ impl Syscall for SysProcessVmReadvHandle {
         let riovcnt = args[4];
         let flags = args[5];
 
-        do_process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+        process_vm_rw(
+            ProcessVmDirection::Read,
+            pid,
+            local_iov,
+            liovcnt,
+            remote_iov,
+            riovcnt,
+            flags,
+        )
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -92,7 +100,15 @@ impl Syscall for SysProcessVmWritevHandle {
         let riovcnt = args[4];
         let flags = args[5];
 
-        do_process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+        process_vm_rw(
+            ProcessVmDirection::Write,
+            pid,
+            local_iov,
+            liovcnt,
+            remote_iov,
+            riovcnt,
+            flags,
+        )
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -105,21 +121,6 @@ impl Syscall for SysProcessVmWritevHandle {
             FormattedSyscallParam::new("flags", format!("{}", args[5])),
         ]
     }
-}
-
-/// Validate iovec count and flags
-fn validate_args(liovcnt: usize, riovcnt: usize, flags: usize) -> Result<(), SystemError> {
-    // Flags must be 0
-    if flags != 0 {
-        return Err(SystemError::EINVAL);
-    }
-
-    // Check iovec count limits
-    if liovcnt > UIO_MAXIOV || riovcnt > UIO_MAXIOV {
-        return Err(SystemError::EINVAL);
-    }
-
-    Ok(())
 }
 
 /// Find target process by PID
@@ -148,28 +149,50 @@ fn check_process_vm_access(target_pcb: &Arc<ProcessControlBlock>) -> Result<(), 
     Ok(())
 }
 
-/// Read iovec array from user space
-fn read_iovecs(iov_ptr: *const IoVec, iovcnt: usize) -> Result<Vec<IoVec>, SystemError> {
+/// Copy an iovec array from userspace without touching the buffers it describes.
+fn import_iovecs(iov_ptr: *const IoVec, iovcnt: usize) -> Result<Vec<IoVec>, SystemError> {
+    if iovcnt > UIO_MAXIOV {
+        return Err(SystemError::EINVAL);
+    }
     if iovcnt == 0 {
         return Ok(Vec::new());
     }
-
-    if iov_ptr.is_null() {
-        return Err(SystemError::EFAULT);
-    }
-
-    let iov_size = iovcnt * core::mem::size_of::<IoVec>();
+    let iov_size = iovcnt
+        .checked_mul(core::mem::size_of::<IoVec>())
+        .ok_or(SystemError::EINVAL)?;
     let reader = UserBufferReader::new(iov_ptr, iov_size, true)?;
-    let iovecs = reader.read_from_user::<IoVec>(0)?;
-
-    Ok(iovecs.to_vec())
+    let user_iovecs = reader.buffer_protected(0)?;
+    let mut iovecs = Vec::new();
+    iovecs
+        .try_reserve_exact(iovcnt)
+        .map_err(|_| SystemError::ENOMEM)?;
+    for index in 0..iovcnt {
+        let iovec: IoVec = user_iovecs.read_one(index * core::mem::size_of::<IoVec>())?;
+        // Linux copy_iovec_from_user() imports iov_len through ssize_t and
+        // rejects any size_t value whose sign bit is set before range checks.
+        if iovec.iov_len > isize::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+        iovecs.push(iovec);
+    }
+    Ok(iovecs)
 }
 
-/// Calculate total length of iovec array with overflow checking
-fn total_iov_len(iovecs: &[IoVec]) -> Result<usize, SystemError> {
+/// Match import_iovec(): validate local ranges and cap the iterator at MAX_RW_COUNT.
+fn prepare_local_iovecs(iovecs: &mut [IoVec]) -> Result<usize, SystemError> {
+    let max_rw_count = (i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1);
     let mut total = 0usize;
-    for iov in iovecs {
-        total = total.checked_add(iov.iov_len).ok_or(SystemError::EINVAL)?;
+    let single_segment = iovecs.len() == 1;
+    for iov in iovecs.iter_mut() {
+        // Linux import_iovec() validates every original range, including
+        // segments which will later be truncated away by MAX_RW_COUNT.  Its
+        // one-segment import_ubuf() fast path instead checks the capped size.
+        let len = min(iov.iov_len, max_rw_count - total);
+        let checked_len = if single_segment { len } else { iov.iov_len };
+        access_ok(VirtAddr::new(iov.iov_base as usize), checked_len)
+            .map_err(|_| SystemError::EFAULT)?;
+        iov.iov_len = len;
+        total += len;
     }
     Ok(total)
 }
@@ -183,286 +206,160 @@ fn partial_or_fault(bytes_copied: usize) -> Result<usize, SystemError> {
     }
 }
 
-/// Advance the local/remote cursors by the number of bytes just copied.
-fn advance_cursors(
-    local_iovecs: &[IoVec],
-    remote_iovecs: &[IoVec],
-    local_idx: &mut usize,
-    local_offset: &mut usize,
-    remote_idx: &mut usize,
-    remote_offset: &mut usize,
-    copied: usize,
-) {
-    *local_offset += copied;
-    *remote_offset += copied;
-    if *local_offset >= local_iovecs[*local_idx].iov_len {
-        *local_idx += 1;
-        *local_offset = 0;
-    }
-    if *remote_offset >= remote_iovecs[*remote_idx].iov_len {
-        *remote_idx += 1;
-        *remote_offset = 0;
-    }
+#[derive(Clone, Copy)]
+enum ProcessVmDirection {
+    Read,
+    Write,
 }
 
-/// process_vm_readv implementation
-///
-/// Copies data from remote process to local process
-fn do_process_vm_readv(
-    pid: usize,
-    local_iov: *const IoVec,
-    liovcnt: usize,
-    remote_iov: *const IoVec,
-    riovcnt: usize,
-    flags: usize,
-) -> Result<usize, SystemError> {
-    validate_args(liovcnt, riovcnt, flags)?;
-
-    // Handle zero-length cases early
-    if liovcnt == 0 || riovcnt == 0 {
-        return Ok(0);
-    }
-
-    // Find target process first (before reading iovecs)
-    // This ensures we return ESRCH for non-existent processes
-    let target_pcb = find_target_process(pid)?;
-
-    // Check permission to access target process's memory
-    let _target_mm_guard = {
-        let _exec_guard = target_pcb.exec_update_read();
-        let guard = target_pcb.active_vm().ok_or(SystemError::ESRCH)?;
-        check_process_vm_access(&target_pcb)?;
-        guard
-    };
-    let target_vm = _target_mm_guard.vm().clone();
-
-    // Read local and remote iovec arrays
-    let local_iovecs = read_iovecs(local_iov, liovcnt)?;
-    let remote_iovecs = read_iovecs(remote_iov, riovcnt)?;
-
-    // Calculate total lengths (with overflow checking)
-    let local_len = total_iov_len(&local_iovecs)?;
-    let remote_len = total_iov_len(&remote_iovecs)?;
-
-    if local_len == 0 || remote_len == 0 {
-        return Ok(0);
-    }
-
-    // Determine how much data to transfer
-    let transfer_len = min(local_len, remote_len);
-
-    // Page-granular bounce buffer: read the remote side, then write the local user buffer with exception protection.
-    let mut bounce: alloc::boxed::Box<[u8]> = vec![0u8; MMArch::PAGE_SIZE].into_boxed_slice();
-
-    let mut bytes_copied = 0usize;
-    let mut local_idx = 0usize;
-    let mut local_offset = 0usize;
-    let mut remote_idx = 0usize;
-    let mut remote_offset = 0usize;
-
-    while bytes_copied < transfer_len
-        && local_idx < local_iovecs.len()
-        && remote_idx < remote_iovecs.len()
-    {
-        let local_iov = &local_iovecs[local_idx];
-        let remote_iov = &remote_iovecs[remote_idx];
-
-        let local_remaining = local_iov.iov_len - local_offset;
-        let remote_remaining = remote_iov.iov_len - remote_offset;
-
-        if local_remaining == 0 {
-            local_idx += 1;
-            local_offset = 0;
-            continue;
-        }
-
-        if remote_remaining == 0 {
-            remote_idx += 1;
-            remote_offset = 0;
-            continue;
-        }
-
-        let chunk_len = min(
-            min(local_remaining, remote_remaining),
-            transfer_len - bytes_copied,
-        );
-        let chunk_len = min(chunk_len, bounce.len());
-
-        if chunk_len == 0 {
-            break;
-        }
-
-        let local_addr = local_iov.iov_base as usize + local_offset;
-        let remote_addr = remote_iov.iov_base as usize + remote_offset;
-
-        // Remote side
-        let n = match target_vm.access_remote_vm(
-            remote_addr,
-            RemoteAccess::Read(&mut bounce[..chunk_len]),
-            false,
-        ) {
-            Ok(n) => n,
-            Err(_) => return partial_or_fault(bytes_copied),
-        };
-        if n == 0 {
-            return partial_or_fault(bytes_copied);
-        }
-
-        // Local side: exception-protected write (read-only/COW pages fault normally).
-        let mut writer = match UserBufferWriter::new(local_addr as *mut u8, n, true) {
-            Ok(writer) => writer,
-            Err(_) => return partial_or_fault(bytes_copied),
-        };
-        if writer.copy_to_user_protected(&bounce[..n], 0).is_err() {
-            return partial_or_fault(bytes_copied);
-        }
-
-        bytes_copied += n;
-        advance_cursors(
-            &local_iovecs,
-            &remote_iovecs,
-            &mut local_idx,
-            &mut local_offset,
-            &mut remote_idx,
-            &mut remote_offset,
-            n,
-        );
-
-        // Remote short copy: accessible range exhausted, stop (no hole skipping).
-        if n < chunk_len {
-            break;
-        }
-    }
-
-    Ok(bytes_copied)
+#[derive(Default)]
+struct TransferCursor {
+    local_index: usize,
+    local_offset: usize,
+    remote_index: usize,
+    remote_offset: usize,
 }
 
-/// process_vm_writev implementation
-///
-/// Copies data from local process to remote process
-fn do_process_vm_writev(
-    pid: usize,
-    local_iov: *const IoVec,
-    liovcnt: usize,
-    remote_iov: *const IoVec,
-    riovcnt: usize,
-    flags: usize,
-) -> Result<usize, SystemError> {
-    validate_args(liovcnt, riovcnt, flags)?;
-
-    // Handle zero-length cases early
-    if liovcnt == 0 || riovcnt == 0 {
-        return Ok(0);
-    }
-
-    // Find target process first (before reading iovecs)
-    // This ensures we return ESRCH for non-existent processes
-    let target_pcb = find_target_process(pid)?;
-
-    // 与读取方向相同：临界区内完成权限检查与活跃使用者引用获取，
-    // 整个传输期间保持地址空间不拆。
-    let _target_mm_guard = {
-        let _exec_guard = target_pcb.exec_update_read();
-        let guard = target_pcb.active_vm().ok_or(SystemError::ESRCH)?;
-        check_process_vm_access(&target_pcb)?;
-        guard
-    };
-    let target_vm = _target_mm_guard.vm().clone();
-
-    // Read local and remote iovec arrays
-    let local_iovecs = read_iovecs(local_iov, liovcnt)?;
-    let remote_iovecs = read_iovecs(remote_iov, riovcnt)?;
-
-    // Calculate total lengths (with overflow checking)
-    let local_len = total_iov_len(&local_iovecs)?;
-    let remote_len = total_iov_len(&remote_iovecs)?;
-
-    if local_len == 0 || remote_len == 0 {
-        return Ok(0);
-    }
-
-    // Determine how much data to transfer
-    let transfer_len = min(local_len, remote_len);
-
-    // Page-granular bounce buffer: read local user data with exception protection, then write remotely.
-    let mut bounce: alloc::boxed::Box<[u8]> = vec![0u8; MMArch::PAGE_SIZE].into_boxed_slice();
-
-    let mut bytes_copied = 0usize;
-    let mut local_idx = 0usize;
-    let mut local_offset = 0usize;
-    let mut remote_idx = 0usize;
-    let mut remote_offset = 0usize;
-
-    while bytes_copied < transfer_len
-        && local_idx < local_iovecs.len()
-        && remote_idx < remote_iovecs.len()
-    {
-        let local_iov = &local_iovecs[local_idx];
-        let remote_iov = &remote_iovecs[remote_idx];
-
-        let local_remaining = local_iov.iov_len - local_offset;
-        let remote_remaining = remote_iov.iov_len - remote_offset;
-
-        if local_remaining == 0 {
-            local_idx += 1;
-            local_offset = 0;
-            continue;
-        }
-
-        if remote_remaining == 0 {
-            remote_idx += 1;
-            remote_offset = 0;
-            continue;
-        }
-
-        let chunk_len = min(
-            min(local_remaining, remote_remaining),
-            transfer_len - bytes_copied,
-        );
-        let chunk_len = min(chunk_len, bounce.len());
-
-        if chunk_len == 0 {
-            break;
-        }
-
-        let local_addr = local_iov.iov_base as usize + local_offset;
-        let remote_addr = remote_iov.iov_base as usize + remote_offset;
-
-        // Local side: exception-protected read (unmapped or non-COW-able sources yield EFAULT).
-        let reader = match UserBufferReader::new(local_addr as *const u8, chunk_len, true) {
-            Ok(reader) => reader,
-            Err(_) => return partial_or_fault(bytes_copied),
-        };
-        if reader
-            .copy_from_user_protected(&mut bounce[..chunk_len], 0)
-            .is_err()
+impl TransferCursor {
+    fn skip_empty(&mut self, local_iovecs: &[IoVec], remote_iovecs: &[IoVec]) {
+        while self.local_index < local_iovecs.len()
+            && self.local_offset == local_iovecs[self.local_index].iov_len
         {
-            return partial_or_fault(bytes_copied);
+            self.local_index += 1;
+            self.local_offset = 0;
+        }
+        while self.remote_index < remote_iovecs.len()
+            && self.remote_offset == remote_iovecs[self.remote_index].iov_len
+        {
+            self.remote_index += 1;
+            self.remote_offset = 0;
+        }
+    }
+
+    fn advance(&mut self, copied: usize) {
+        self.local_offset += copied;
+        self.remote_offset += copied;
+    }
+}
+
+fn process_vm_rw(
+    direction: ProcessVmDirection,
+    pid: usize,
+    local_iov: *const IoVec,
+    liovcnt: usize,
+    remote_iov: *const IoVec,
+    riovcnt: usize,
+    flags: usize,
+) -> Result<usize, SystemError> {
+    if flags != 0 {
+        return Err(SystemError::EINVAL);
+    }
+
+    // Linux imports local iovecs first and returns before even inspecting the
+    // remote array or pid when the resulting local iterator is empty.
+    let mut local_iovecs = import_iovecs(local_iov, liovcnt)?;
+    let local_len = prepare_local_iovecs(&mut local_iovecs)?;
+    if local_len == 0 {
+        return Ok(0);
+    }
+
+    let remote_iovecs = import_iovecs(remote_iov, riovcnt)?;
+    if !remote_iovecs.iter().any(|iov| iov.iov_len != 0) {
+        return Ok(0);
+    }
+
+    // Linux admits its process-page scratch before pid lookup/mm_access. Keep
+    // the same error priority for DragonOS's page-sized transfer scratch.
+    let mut bounce = Vec::new();
+    bounce
+        .try_reserve_exact(MMArch::PAGE_SIZE)
+        .map_err(|_| SystemError::ENOMEM)?;
+    bounce.resize(MMArch::PAGE_SIZE, 0);
+
+    let target_pcb = find_target_process(pid)?;
+    let target_mm_guard = {
+        let _exec_guard = target_pcb.exec_update_read();
+        let guard = target_pcb.active_vm().ok_or(SystemError::ESRCH)?;
+        check_process_vm_access(&target_pcb)?;
+        guard
+    };
+    let target_vm = target_mm_guard.vm().clone();
+
+    let mut bytes_copied = 0usize;
+    let mut cursor = TransferCursor::default();
+    while bytes_copied < local_len {
+        cursor.skip_empty(&local_iovecs, &remote_iovecs);
+        if cursor.local_index == local_iovecs.len() || cursor.remote_index == remote_iovecs.len() {
+            break;
         }
 
-        // Remote side: force=false — writing a mapping without VM_WRITE fails (no COW).
-        let n = match target_vm.access_remote_vm(
-            remote_addr,
-            RemoteAccess::Write(&bounce[..chunk_len]),
-            false,
-        ) {
-            Ok(n) => n,
-            Err(_) => return partial_or_fault(bytes_copied),
+        let local = &local_iovecs[cursor.local_index];
+        let remote = &remote_iovecs[cursor.remote_index];
+        let chunk_len = min(
+            min(
+                local.iov_len - cursor.local_offset,
+                remote.iov_len - cursor.remote_offset,
+            ),
+            bounce.len(),
+        );
+        let Some(local_addr) = (local.iov_base as usize).checked_add(cursor.local_offset) else {
+            return partial_or_fault(bytes_copied);
+        };
+        let Some(remote_addr) = (remote.iov_base as usize).checked_add(cursor.remote_offset) else {
+            return partial_or_fault(bytes_copied);
+        };
+        // Linux advances its local iov_iter by the bytes copied before a user
+        // fault.  DragonOS's protected user-copy helper is all-or-error, so
+        // never let one helper call straddle a local page boundary: a hole in
+        // the following page is then observed only after the preceding page's
+        // progress has been committed to bytes_copied.
+        let local_page_remaining = MMArch::PAGE_SIZE - (local_addr & (MMArch::PAGE_SIZE - 1));
+        let chunk_len = min(chunk_len, local_page_remaining);
+
+        let copied = match direction {
+            ProcessVmDirection::Read => {
+                let copied = match target_vm.access_remote_vm(
+                    remote_addr,
+                    RemoteAccess::Read(&mut bounce[..chunk_len]),
+                    false,
+                ) {
+                    Ok(copied) if copied != 0 => copied,
+                    Ok(_) | Err(_) => return partial_or_fault(bytes_copied),
+                };
+                let mut writer = match UserBufferWriter::new(local_addr as *mut u8, copied, true) {
+                    Ok(writer) => writer,
+                    Err(_) => return partial_or_fault(bytes_copied),
+                };
+                if writer.copy_to_user_protected(&bounce[..copied], 0).is_err() {
+                    return partial_or_fault(bytes_copied);
+                }
+                copied
+            }
+            ProcessVmDirection::Write => {
+                let reader = match UserBufferReader::new(local_addr as *const u8, chunk_len, true) {
+                    Ok(reader) => reader,
+                    Err(_) => return partial_or_fault(bytes_copied),
+                };
+                if reader
+                    .copy_from_user_protected(&mut bounce[..chunk_len], 0)
+                    .is_err()
+                {
+                    return partial_or_fault(bytes_copied);
+                }
+                match target_vm.access_remote_vm(
+                    remote_addr,
+                    RemoteAccess::Write(&bounce[..chunk_len]),
+                    false,
+                ) {
+                    Ok(copied) if copied != 0 => copied,
+                    Ok(_) | Err(_) => return partial_or_fault(bytes_copied),
+                }
+            }
         };
 
-        bytes_copied += n;
-        advance_cursors(
-            &local_iovecs,
-            &remote_iovecs,
-            &mut local_idx,
-            &mut local_offset,
-            &mut remote_idx,
-            &mut remote_offset,
-            n,
-        );
-
-        // Remote short copy: writable range exhausted, stop (no hole skipping).
-        if n < chunk_len {
+        bytes_copied += copied;
+        cursor.advance(copied);
+        if copied < chunk_len {
             break;
         }
     }

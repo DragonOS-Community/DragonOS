@@ -192,6 +192,16 @@ impl Signal {
             return false;
         }
 
+        // Linux ptrace_signal_wake_up() publishes TIF_SIGPENDING even though
+        // PTRACE_INTERRUPT does not enqueue a signal. Treat DragonOS's
+        // equivalent return-to-user work bit the same way for interruptible
+        // sleeps, so a tracee cannot race the wakeup and block after the
+        // tracer has requested an EVENT_STOP. Killable/uninterruptible waits
+        // remain wakeable only by a fatal signal.
+        if interruptible && pcb.flags().contains(ProcessFlags::PENDING_PTRACE_STOP) {
+            return true;
+        }
+
         if !pcb.has_pending_signal_fast() {
             return false;
         }

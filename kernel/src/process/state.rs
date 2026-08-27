@@ -57,6 +57,9 @@ pub enum ExitState {
     Running = 0,
     Zombie = 1,
     Dead = 2,
+    /// A consuming ptrace waiter owns the zombie while it detaches and decides
+    /// whether to cascade it to the natural parent or reap it finally.
+    TraceClaimed = 3,
 }
 
 impl ExitState {
@@ -64,6 +67,7 @@ impl ExitState {
         match v {
             1 => ExitState::Zombie,
             2 => ExitState::Dead,
+            3 => ExitState::TraceClaimed,
             _ => ExitState::Running,
         }
     }
@@ -218,6 +222,9 @@ bitflags! {
         /// Task has hardware debug registers (DR0-3/DR7) configured via
         /// PTRACE_POKEUSER; context switch loads/clears them accordingly.
         const HW_DEBUG_REGS = 1 << 24;
+        /// x86 #DB work is recorded and must be committed/restored at the
+        /// return-to-user boundary, never in exception context.
+        const PENDING_DEBUG = 1 << 25;
     }
 }
 
@@ -235,6 +242,7 @@ impl ProcessFlags {
             | Self::HAS_PENDING_SIGNAL.bits
             | Self::NEED_RSEQ.bits
             | Self::PENDING_PTRACE_STOP.bits
+            | Self::PENDING_DEBUG.bits
     }
 
     /// Test and clear flags.

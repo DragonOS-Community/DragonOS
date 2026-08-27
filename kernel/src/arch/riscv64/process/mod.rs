@@ -201,6 +201,10 @@ impl ProcessManager {
 
             next_mm.make_current();
             compiler_fence(Ordering::SeqCst);
+            // Pairs with remote-user writers: active membership is published
+            // before this stale check, and no user instruction can execute
+            // until the eventual exception return.
+            next_mm.flush_stale_user_icache_on_switch(cpu);
 
             if !same_mm {
                 if let Some(prev_mm) = prev_active_mm.as_ref() {

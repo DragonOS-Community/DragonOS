@@ -1,11 +1,11 @@
 use crate::{
     arch::{
-        ipc::signal::{SigChildCode, SigSet, Signal, MAX_SIG_NUM},
+        ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
         CurrentIrqArch,
     },
     exception::InterruptArch,
     ipc::signal_types::SignalFlags,
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager},
+    process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
 };
 use alloc::sync::Arc;
@@ -458,9 +458,10 @@ fn sig_stop(sig: Signal) {
             return;
         }
         // 非 SEIZED ptraced：经 ptrace_stop 上报 group-stop 给 tracer（CLD_STOPPED）
-        let signr = pcb.ptrace_stop(sig as usize, SigChildCode::Stopped, None);
+        // Linux do_jobctl_trap() 忽略 group-stop 的 ptrace_stop 返回值；
+        // resume data 不得被重新排队为新的 signal-delivery-stop。
+        let _ = pcb.ptrace_group_stop(sig);
         drop(guard);
-        ProcessControlBlock::reinject_ptrace_signal(signr);
         return;
     }
     // 非 ptraced 的普通进程：走 transition_group_stop（持 sighand 锁原子设置
@@ -469,6 +470,10 @@ fn sig_stop(sig: Signal) {
         .sighand()
         .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok());
     drop(guard);
+    // attach 可能在 mark_stop() 的 schedule 期间将本任务转为 ptraced
+    // 并排队 trap。必须在返回用户态前立即完成 STOPPED→TRACED，
+    // 不能等待下一次内核入口。
+    while pcb.ptrace_handle_pending_stop() {}
     log::debug!(
         "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",
         pcb.raw_pid()

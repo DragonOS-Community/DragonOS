@@ -1498,6 +1498,51 @@ fn run_dirty_incarnation_entrypoint_selftest() -> Result<bool, SystemError> {
         && rejected_removed)
 }
 
+/// Exercise the exact-entry token used by remote writes.  The token must pin
+/// membership before publication, publish Dirty while the protected bytes are
+/// still unchanged, and release both the reservation and pin after the copy.
+fn run_remote_dirty_publish_selftest() -> Result<bool, SystemError> {
+    let cache = PageCache::new_shmem(None, None);
+    let page = cache.get_or_create_page_zero(0)?;
+    let mut prepared = cache
+        .prepare_remote_page_dirty(0, &page)?
+        .ok_or(SystemError::EIO)?;
+
+    let removal_blocked_before_publish = cache.manager.remove_page(0)?.is_none();
+    let published_before_copy = {
+        let mut page_locked = page.write();
+        prepared.publish_before_copy(&page_locked);
+        let published = {
+            let inner = cache.inner.lock();
+            let entry = inner.get_entry(0).ok_or(SystemError::EIO)?;
+            inner.dirty_pages.contains(&0)
+                && entry.state() == PageState::Dirty
+                && unsafe { page_locked.as_slice()[17] == 0 }
+        };
+        unsafe { page_locked.as_slice_mut()[17] = 0x5a };
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        published
+    };
+    drop(prepared);
+
+    let copied_and_published = {
+        let page_locked = page.read();
+        let inner = cache.inner.lock();
+        inner.dirty_pages.contains(&0)
+            && page_locked.flags().contains(PageFlags::PG_DIRTY)
+            && unsafe { page_locked.as_slice()[17] == 0x5a }
+    };
+    let removal_after_token_release = cache.manager.remove_page(0)?.is_some();
+    let paddr = page.phys_address();
+    page_manager_lock().remove_page(&paddr);
+    let _ = page_reclaimer_lock().remove_page(&paddr);
+
+    Ok(removal_blocked_before_publish
+        && published_before_copy
+        && copied_and_published
+        && removal_after_token_release)
+}
+
 /// Exercise the descriptor half of the front-dirty certificate independently
 /// from the future ext4 consumer.  In particular, g1 must remain frozen in
 /// its already-bound descriptor while a writer creates g2 during g1's
@@ -1658,6 +1703,18 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     };
     if !dirty_incarnation {
         return Ok("status=fail stage=dirty_incarnation\n".into());
+    }
+
+    let remote_dirty_publish = match run_remote_dirty_publish_selftest() {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=remote_dirty_publish error={error:?}\n"
+            ));
+        }
+    };
+    if !remote_dirty_publish {
+        return Ok("status=fail stage=remote_dirty_publish\n".into());
     }
 
     let single_page_token_certificate = match run_single_page_token_certificate_selftest() {
@@ -3477,6 +3534,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

@@ -19,6 +19,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+// The pinned gVisor tests are executed directly rather than through gVisor's
+// Bazel runner, so publish the DragonOS capability that the Int3 test queries.
+// Keep this list conservative: an omitted capability does not claim support.
+const DRAGONOS_GVISOR_PLATFORM_SUPPORT: &str = "INT3:TRUE";
+
 macro_rules! safe_println {
     ($($arg:tt)*) => {{
         // Rust's println!/eprintln! panic when DragonOS returns a transient
@@ -454,6 +459,7 @@ impl TestRunner {
 
         cmd.current_dir(&self.config.tests_dir)
             .env("TEST_TMPDIR", &self.config.temp_dir)
+            .env("GVISOR_PLATFORM_SUPPORT", DRAGONOS_GVISOR_PLATFORM_SUPPORT)
             .stdout(stdout)
             .stderr(stderr);
         let status = wait_with_timeout(&mut cmd, Duration::from_secs(self.config.timeout));

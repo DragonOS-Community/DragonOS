@@ -1,10 +1,14 @@
 // Ptrace relation ownership and teardown lifecycle regression tests.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -143,6 +147,201 @@ public:
 private:
     pid_t child_;
 };
+
+bool ReadTracerPid(pid_t tracee, pid_t* tracer_pid) {
+    char path[64];
+    const int path_len = snprintf(path, sizeof(path), "/proc/%d/status", tracee);
+    if (path_len <= 0 || static_cast<size_t>(path_len) >= sizeof(path)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    char buffer[8192];
+    size_t used = 0;
+    while (used + 1 < sizeof(buffer)) {
+        const ssize_t got = read(fd, buffer + used, sizeof(buffer) - used - 1);
+        if (got > 0) {
+            used += static_cast<size_t>(got);
+            continue;
+        }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got < 0) {
+            close(fd);
+            return false;
+        }
+        break;
+    }
+    close(fd);
+    buffer[used] = '\0';
+    const char* field = strstr(buffer, "\nTracerPid:\t");
+    if (field == nullptr) {
+        errno = EPROTO;
+        return false;
+    }
+    field += strlen("\nTracerPid:\t");
+    char* end = nullptr;
+    const long parsed = strtol(field, &end, 10);
+    if (end == field || parsed <= 0) {
+        errno = EPROTO;
+        return false;
+    }
+    *tracer_pid = static_cast<pid_t>(parsed);
+    return true;
+}
+
+struct WorkerTracerArgs {
+    pid_t tracee;
+    int ready_fd;
+    int release_fd;
+    int done_fd;
+};
+
+void* TraceFromWorkerThread(void* opaque) {
+    auto* args = static_cast<WorkerTracerArgs*>(opaque);
+    OpResult result = {
+        static_cast<pid_t>(syscall(SYS_gettid)),
+        ptrace_call(PTRACE_SEIZE, args->tracee, 0, 0),
+        0,
+        0,
+    };
+    if (result.result < 0) {
+        result.error = errno;
+    }
+    WriteExact(args->ready_fd, &result, sizeof(result));
+
+    char command = 0;
+    if (!ReadExactUntil(args->release_fd, &command, sizeof(command))) {
+        result.result = -1;
+        result.error = errno;
+    }
+    if (result.result == 0 &&
+        (ptrace_call(PTRACE_INTERRUPT, args->tracee, 0, 0) != 0 ||
+         !WaitPidUntil(args->tracee, &result.status, __WALL) ||
+         ptrace_call(PTRACE_DETACH, args->tracee, 0, 0) != 0)) {
+        result.result = -1;
+        result.error = errno;
+    }
+    WriteExact(args->done_fd, &result, sizeof(result));
+    return nullptr;
+}
+
+class WorkerTracerSession {
+public:
+    explicit WorkerTracerSession(pid_t tracee)
+        : args_{tracee, -1, -1, -1} {}
+    WorkerTracerSession(const WorkerTracerSession&) = delete;
+    WorkerTracerSession& operator=(const WorkerTracerSession&) = delete;
+    ~WorkerTracerSession() {
+        if (started_) {
+            ReleaseWorker();
+            pthread_join(worker_, nullptr);
+        }
+        ClosePipes();
+    }
+
+    bool Start() {
+        if (pipe(ready_) != 0 || pipe(release_) != 0 || pipe(done_) != 0) {
+            ClosePipes();
+            return false;
+        }
+        args_.ready_fd = ready_[1];
+        args_.release_fd = release_[0];
+        args_.done_fd = done_[1];
+        const int error =
+            pthread_create(&worker_, nullptr, TraceFromWorkerThread, &args_);
+        if (error != 0) {
+            errno = error;
+            ClosePipes();
+            return false;
+        }
+        started_ = true;
+        return true;
+    }
+
+    bool ReadSetup(OpResult* result) {
+        return ReadExactUntil(ready_[0], result, sizeof(*result));
+    }
+
+    bool Finish(OpResult* result) {
+        const bool released = ReleaseWorker();
+        const bool completed =
+            released && ReadExactUntil(done_[0], result, sizeof(*result));
+        const int join_error = pthread_join(worker_, nullptr);
+        started_ = false;
+        ClosePipes();
+        if (join_error != 0) {
+            errno = join_error;
+            return false;
+        }
+        return completed;
+    }
+
+private:
+    bool ReleaseWorker() {
+        if (released_) {
+            return true;
+        }
+        const char finish = 'F';
+        released_ = WriteExact(release_[1], &finish, sizeof(finish));
+        return released_;
+    }
+
+    static void CloseFd(int* fd) {
+        if (*fd >= 0) {
+            close(*fd);
+            *fd = -1;
+        }
+    }
+
+    void ClosePipes() {
+        CloseFd(&ready_[0]);
+        CloseFd(&ready_[1]);
+        CloseFd(&release_[0]);
+        CloseFd(&release_[1]);
+        CloseFd(&done_[0]);
+        CloseFd(&done_[1]);
+    }
+
+    WorkerTracerArgs args_;
+    pthread_t worker_ = {};
+    int ready_[2] = {-1, -1};
+    int release_[2] = {-1, -1};
+    int done_[2] = {-1, -1};
+    bool started_ = false;
+    bool released_ = false;
+};
+
+TEST(PtraceRelationLifecycle, ProcStatusReportsActualTracerTid) {
+    pid_t tracee = fork();
+    ASSERT_GE(tracee, 0);
+    if (tracee == 0) {
+        for (;;) {
+            pause();
+        }
+    }
+    ProcessGuard tracee_guard(tracee);
+
+    WorkerTracerSession tracer(tracee);
+    ASSERT_TRUE(tracer.Start()) << errno;
+
+    OpResult setup = {};
+    ASSERT_TRUE(tracer.ReadSetup(&setup));
+    ASSERT_EQ(0, setup.result) << setup.error;
+    ASSERT_NE(getpid(), setup.reporter);
+
+    pid_t reported = 0;
+    ASSERT_TRUE(ReadTracerPid(tracee, &reported)) << errno;
+    EXPECT_EQ(setup.reporter, reported);
+
+    OpResult completed = {};
+    ASSERT_TRUE(tracer.Finish(&completed));
+    EXPECT_EQ(0, completed.result) << completed.error;
+}
 
 [[noreturn]] void RunSeizeContender(pid_t tracee, int ready_fd, int start_fd,
                                     int result_fd, int command_fd) {

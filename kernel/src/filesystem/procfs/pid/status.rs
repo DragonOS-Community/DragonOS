@@ -100,9 +100,9 @@ impl StatusFileOps {
             .to_owned(),
         );
 
-        // TracerPid (pid of the debugger tracing this thread group, 0 if none)
+        // TracerPid (TID of the exact tracer task in the reader's PID namespace)
         let tracer_pid = crate::process::ptrace::ptracer_of(&pcb)
-            .and_then(|t| t.task_pid_ptr(PidType::TGID))
+            .and_then(|t| t.task_pid_ptr(PidType::PID))
             .map(|pid| pid.pid_nr_ns(view_pid_ns).data() as isize)
             .unwrap_or(0);
         pdata.append(

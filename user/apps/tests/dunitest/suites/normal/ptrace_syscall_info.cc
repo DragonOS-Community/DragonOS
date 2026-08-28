@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <sys/syscall.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -17,6 +18,12 @@
 #endif
 #ifndef PTRACE_CONT
 #define PTRACE_CONT 7
+#endif
+#ifndef PTRACE_GETREGS
+#define PTRACE_GETREGS 12
+#endif
+#ifndef PTRACE_SETREGS
+#define PTRACE_SETREGS 13
 #endif
 #ifndef PTRACE_SYSCALL
 #define PTRACE_SYSCALL 24
@@ -163,6 +170,131 @@ TEST(PtraceSyscallInfo, TracesysgoodReportsMatchingEntryAndExit) {
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
     guard.Release();
+#endif
+}
+
+enum class RewriteExpectation {
+    kPreserveTracerResult,
+    kReturnEnosys,
+    kExecuteGetpid,
+};
+
+void VerifySyscallRewrite(unsigned long rewritten_nr,
+                          RewriteExpectation expectation) {
+    constexpr unsigned long kSimulatedResult = 0x12345678UL;
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (ptrace_call(PTRACE_TRACEME, 0, 0, 0) != 0) {
+            _exit(72);
+        }
+        raise(SIGSTOP);
+        errno = 0;
+        const long result = syscall(SYS_getpid);
+        bool expected = false;
+        switch (expectation) {
+            case RewriteExpectation::kPreserveTracerResult:
+                expected = result == static_cast<long>(kSimulatedResult);
+                break;
+            case RewriteExpectation::kReturnEnosys:
+                expected = result == -1 && errno == ENOSYS;
+                break;
+            case RewriteExpectation::kExecuteGetpid:
+                expected = result == getpid();
+                break;
+        }
+        _exit(expected ? 0 : 73);
+    }
+    ChildGuard guard(child);
+
+    int status = 0;
+    ASSERT_TRUE(WaitPidUntil(child, &status));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGSTOP, WSTOPSIG(status));
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETOPTIONS, child, 0,
+                             PTRACE_O_TRACESYSGOOD));
+
+    bool found_getpid_entry = false;
+    for (int stop_count = 0; stop_count < 16 && !found_getpid_entry;
+         ++stop_count) {
+        ASSERT_EQ(0, ptrace_call(PTRACE_SYSCALL, child, 0, 0));
+        ASSERT_TRUE(WaitPidUntil(child, &status));
+        ASSERT_TRUE(WIFSTOPPED(status));
+        ASSERT_EQ(SIGTRAP | 0x80, WSTOPSIG(status));
+
+        PtraceSyscallInfo info = {};
+        ASSERT_GE(ptrace_call(PTRACE_GET_SYSCALL_INFO, child, sizeof(info),
+                              reinterpret_cast<unsigned long>(&info)),
+                  0);
+        if (info.op != kSyscallInfoEntry ||
+            info.data.entry.nr != SYS_getpid) {
+            continue;
+        }
+
+        user_regs_struct regs = {};
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&regs)));
+        regs.orig_rax = rewritten_nr;
+        regs.rax = kSimulatedResult;
+        ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&regs)));
+        found_getpid_entry = true;
+    }
+    ASSERT_TRUE(found_getpid_entry);
+
+    ASSERT_EQ(0, ptrace_call(PTRACE_SYSCALL, child, 0, 0));
+    ASSERT_TRUE(WaitPidUntil(child, &status));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGTRAP | 0x80, WSTOPSIG(status));
+
+    PtraceSyscallInfo info = {};
+    ASSERT_EQ(33, ptrace_call(PTRACE_GET_SYSCALL_INFO, child, sizeof(info),
+                              reinterpret_cast<unsigned long>(&info)));
+    ASSERT_EQ(kSyscallInfoExit, info.op);
+    int64_t expected_result = -ENOSYS;
+    if (expectation == RewriteExpectation::kPreserveTracerResult) {
+        expected_result = static_cast<int64_t>(kSimulatedResult);
+    } else if (expectation == RewriteExpectation::kExecuteGetpid) {
+        expected_result = child;
+    }
+    EXPECT_EQ(expected_result, info.data.exit.rval);
+    EXPECT_EQ(expectation == RewriteExpectation::kReturnEnosys ? 1 : 0,
+              info.data.exit.is_error);
+
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+    ASSERT_TRUE(WaitPidUntil(child, &status));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    guard.Release();
+}
+
+TEST(PtraceSyscallInfo, MinusOneSentinelPreservesTracerResult) {
+#if !defined(__x86_64__)
+    GTEST_SKIP() << "register rewrite is x86_64-specific";
+#else
+    VerifySyscallRewrite(static_cast<unsigned long>(-1),
+                         RewriteExpectation::kPreserveTracerResult);
+#endif
+}
+
+TEST(PtraceSyscallInfo, OtherNegativeSyscallNumberReturnsEnosys) {
+#if !defined(__x86_64__)
+    GTEST_SKIP() << "register rewrite is x86_64-specific";
+#else
+    VerifySyscallRewrite(static_cast<unsigned long>(-2),
+                         RewriteExpectation::kReturnEnosys);
+#endif
+}
+
+TEST(PtraceSyscallInfo, SyscallNumberUsesSignedLowWord) {
+#if !defined(__x86_64__)
+    GTEST_SKIP() << "register rewrite is x86_64-specific";
+#else
+    VerifySyscallRewrite(0x00000000ffffffffUL,
+                         RewriteExpectation::kPreserveTracerResult);
+    VerifySyscallRewrite(0x1234567800000000UL |
+                             static_cast<unsigned long>(SYS_getpid),
+                         RewriteExpectation::kExecuteGetpid);
 #endif
 }
 

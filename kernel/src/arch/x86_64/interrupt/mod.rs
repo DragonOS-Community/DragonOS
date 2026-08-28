@@ -238,7 +238,9 @@ impl TrapFrame {
     /// On x86_64, rax is both the syscall-number input and the return value
     #[inline]
     pub fn get_orig_syscall_nr(&self) -> i64 {
-        self.errcode as i64
+        // Linux's syscall_get_nr() returns int: only the low 32 bits of
+        // orig_rax are meaningful, and comparisons use their sign extension.
+        (self.errcode as u32 as i32) as i64
     }
 }
 

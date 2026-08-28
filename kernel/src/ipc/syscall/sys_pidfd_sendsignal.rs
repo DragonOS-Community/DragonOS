@@ -1,18 +1,16 @@
 use crate::arch::ipc::signal::Signal;
-use crate::ipc::signal_types::{PosixSigInfo, SigCode};
-use crate::ipc::signal_types::{SigInfo, SigType};
+use crate::ipc::signal_types::{
+    copy_siginfo_from_user, sig_type_from_user_siginfo, PosixSigInfo, SigCode, SigInfo, SigType,
+};
 use crate::ipc::syscall::sys_kill::check_signal_permission_pcb_with_sig;
-use crate::ipc::syscall::sys_rt_sigqueueinfo::sig_type_from_user_siginfo;
 use crate::process::pid::{Pid, PidType};
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::ffi::c_int;
-use core::mem::size_of;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::UserBufferReader;
-use crate::{arch::syscall::nr::SYS_PIDFD_SEND_SIGNAL, process::ProcessManager};
+use crate::{arch::syscall::nr::SYS_PIDFD_SEND_SIGNAL, mm::VirtAddr, process::ProcessManager};
 use system_error::SystemError;
 
 pub struct SysPidfdSendSignalHandle;
@@ -71,19 +69,41 @@ impl Syscall for SysPidfdSendSignalHandle {
             return Err(SystemError::EINVAL);
         }
 
-        if sig_c_int == 0 {
-            check_signal_permission_pcb_with_sig(&target, None)?;
-            // log::warn!("Pidfd_Send_Signal: Send empty sig(0)");
-            // 这里的信号是 0, 是空信号值, 其他的信号处理是怎样的不清楚, 但是这里应该直接返回成功, 因为 0 是空信号
-            return Ok(0);
-        }
-
         let sig = Signal::from(sig_c_int);
-        if sig == Signal::INVALID {
+        if sig_c_int != 0 && sig == Signal::INVALID {
             return Err(SystemError::EINVAL);
         }
 
-        let mut info = if sig_info.is_null() {
+        let user_info = if sig_info.is_null() {
+            None
+        } else {
+            let user_info =
+                unsafe { copy_siginfo_from_user(VirtAddr::new(sig_info as usize), None)? };
+            if user_info.si_signo != sig_c_int {
+                return Err(SystemError::EINVAL);
+            }
+
+            let current_pid = ProcessManager::current_pcb().pid();
+            let si_code = user_info.si_code;
+            if (si_code >= 0 || si_code == SigCode::Tkill.as_i32())
+                && !Arc::ptr_eq(&current_pid, &target_pid.pid())
+            {
+                return Err(SystemError::EPERM);
+            }
+            Some(user_info)
+        };
+
+        if sig_c_int == 0 {
+            check_signal_permission_pcb_with_sig(&target, None)?;
+            return Ok(0);
+        }
+
+        let mut info = if let Some(user_info) = user_info {
+            let si_code = user_info.si_code;
+            let code_enum = SigCode::try_from_i32(si_code).unwrap_or(SigCode::Raw(si_code));
+            let sig_type = sig_type_from_user_siginfo(sig, code_enum, &user_info);
+            SigInfo::new(sig, user_info.si_errno, code_enum, sig_type)
+        } else {
             let current_pcb = ProcessManager::current_pcb();
             let sender_pid = current_pcb.raw_pid();
             let sender_uid = current_pcb.cred().uid.data() as u32;
@@ -96,25 +116,6 @@ impl Syscall for SysPidfdSendSignalHandle {
                     uid: sender_uid,
                 },
             )
-        } else {
-            let reader = UserBufferReader::new(sig_info, size_of::<PosixSigInfo>(), true)?;
-            let buffer = reader.buffer_protected(0)?;
-            let user_info = buffer.read_one::<PosixSigInfo>(0)?;
-            if user_info.si_signo != sig_c_int {
-                return Err(SystemError::EINVAL);
-            }
-
-            let current_pid = ProcessManager::current_pcb().pid();
-            let si_code = user_info.si_code;
-            if (si_code >= 0 || si_code == SigCode::Tkill.as_i32())
-                && !Arc::ptr_eq(&current_pid, &target_pid.pid())
-            {
-                return Err(SystemError::EPERM);
-            }
-
-            let code_enum = SigCode::try_from_i32(si_code).unwrap_or(SigCode::Raw(si_code));
-            let sig_type = sig_type_from_user_siginfo(sig, code_enum, &user_info);
-            SigInfo::new(sig, user_info.si_errno, code_enum, sig_type)
         };
 
         check_signal_permission_pcb_with_sig(&target, Some(sig))?;

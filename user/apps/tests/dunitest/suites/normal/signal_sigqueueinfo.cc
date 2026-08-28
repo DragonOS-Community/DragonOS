@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -154,6 +155,89 @@ TEST(SignalSigqueueinfo, SiQueuePreservesRtFields) {
     EXPECT_EQ(static_cast<uid_t>(kUid), received.si_uid);
     EXPECT_EQ(kValue, received.si_value.sival_int);
 }
+
+TEST(SignalSigqueueinfo, KnownLayoutOnlyRequiresKernelSiginfoBytesReadable) {
+    ScopedSignalBlock block(SIGUSR2);
+    ASSERT_TRUE(block.active());
+    DrainPendingSignal(SIGUSR2);
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    void* mapping = mmap(nullptr, static_cast<size_t>(page_size) * 2,
+                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+                         0);
+    ASSERT_NE(MAP_FAILED, mapping);
+    auto* info = reinterpret_cast<siginfo_t*>(
+        static_cast<unsigned char*>(mapping) + page_size - 48);
+    siginfo_t source {};
+    source.si_signo = SIGUSR2;
+    source.si_code = SI_QUEUE;
+    source.si_pid = getpid();
+    source.si_uid = getuid();
+    source.si_value.sival_int = 0x2468;
+    memcpy(info, &source, 48);
+    ASSERT_EQ(0, mprotect(static_cast<unsigned char*>(mapping) + page_size,
+                          page_size, PROT_NONE));
+
+    errno = 0;
+    ASSERT_EQ(0, syscall(__NR_rt_sigqueueinfo, getpid(), SIGUSR2, info))
+        << strerror(errno);
+    siginfo_t received = WaitForSignalInfo(SIGUSR2);
+    EXPECT_EQ(0x2468, received.si_value.sival_int);
+    EXPECT_EQ(0, munmap(mapping, static_cast<size_t>(page_size) * 2));
+}
+
+TEST(SignalSigqueueinfo, ValidationUsesSyscallSignalAndStillRunsForSignalZero) {
+    ScopedSignalBlock block(SIGUSR1);
+    ASSERT_TRUE(block.active());
+    DrainPendingSignal(SIGUSR1);
+
+    siginfo_t info {};
+    info.si_signo = SIGSYS;
+    info.si_code = 3;
+    info.si_band = 0x3141;
+    info.si_fd = 27;
+    reinterpret_cast<unsigned char*>(&info)[48] = 1;
+    ASSERT_EQ(0, syscall(__NR_rt_sigqueueinfo, getpid(), SIGUSR1, &info));
+    siginfo_t received = WaitForSignalInfo(SIGUSR1);
+    EXPECT_EQ(SIGUSR1, received.si_signo);
+    EXPECT_EQ(3, received.si_code);
+    EXPECT_EQ(0x3141, received.si_band);
+    EXPECT_EQ(27, received.si_fd);
+
+    memset(&info, 0, sizeof(info));
+    info.si_code = 7;
+    reinterpret_cast<unsigned char*>(&info)[48] = 1;
+    errno = 0;
+    EXPECT_EQ(-1, syscall(__NR_rt_sigqueueinfo, getpid(), 0, &info));
+    EXPECT_EQ(E2BIG, errno);
+}
+
+#if defined(__NR_pidfd_open) && defined(__NR_pidfd_send_signal)
+TEST(SignalSigqueueinfo, PidfdSignalZeroStillValidatesSiginfo) {
+    const int pidfd = static_cast<int>(syscall(__NR_pidfd_open, getpid(), 0));
+    ASSERT_GE(pidfd, 0) << strerror(errno);
+
+    siginfo_t info {};
+    info.si_signo = SIGUSR1;
+    errno = 0;
+    EXPECT_EQ(-1, syscall(__NR_pidfd_send_signal, pidfd, 0, &info, 0));
+    EXPECT_EQ(EINVAL, errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, syscall(__NR_pidfd_send_signal, pidfd, 0,
+                          reinterpret_cast<void*>(1), 0));
+    EXPECT_EQ(EFAULT, errno);
+
+    memset(&info, 0, sizeof(info));
+    info.si_code = 7;
+    reinterpret_cast<unsigned char*>(&info)[48] = 1;
+    errno = 0;
+    EXPECT_EQ(-1, syscall(__NR_pidfd_send_signal, pidfd, 0, &info, 0));
+    EXPECT_EQ(E2BIG, errno);
+    close(pidfd);
+}
+#endif
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);

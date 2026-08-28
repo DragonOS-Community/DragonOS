@@ -9,7 +9,7 @@ use crate::{
         ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
         syscall::nr::SYS_PTRACE,
     },
-    ipc::signal_types::{PosixSigInfo, SigCode, SigInfo, SigType},
+    ipc::signal_types::{SigCode, SigInfo, SigType},
     mm::VirtAddr,
     process::{
         pid::PidType,
@@ -211,12 +211,8 @@ impl Syscall for SysPtrace {
             }
             // SETSIGINFO: update last_siginfo wholesale from the user siginfo_t.
             PtraceRequest::Setsiginfo => {
-                let mut posix: PosixSigInfo = PosixSigInfo::default();
-                unsafe {
-                    crate::syscall::user_access::read_one_from_user_protected(
-                        VirtAddr::new(data),
-                        &mut posix,
-                    )?
+                let posix = unsafe {
+                    crate::ipc::signal_types::copy_siginfo_from_user(VirtAddr::new(data), None)?
                 };
                 let info = SigInfo::from_posix(&posix);
                 request_guard
@@ -259,6 +255,9 @@ impl Syscall for SysPtrace {
                     return Err(SystemError::EINVAL);
                 }
                 let (iov_base, iov_len) = read_iovec(data)?;
+                if iov_len % core::mem::size_of::<u64>() != 0 {
+                    return Err(SystemError::EINVAL);
+                }
                 let regs = request_guard
                     .as_ref()
                     .ok_or(SystemError::ESRCH)?

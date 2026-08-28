@@ -138,7 +138,7 @@ pub fn force_sig_fault_to_current(
         SigCode::Raw(code),
         SigType::Fault {
             addr: addr.data() as u64,
-            addr_lsb: 0,
+            reason: crate::ipc::signal_types::SigFaultReason::AddrLsb(0),
         },
     );
 

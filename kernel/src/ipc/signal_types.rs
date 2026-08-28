@@ -55,6 +55,15 @@ pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
 pub const BUS_ADRERR: i32 = 2;
 
+const NSIGPOLL: i32 = 6;
+const NSIGILL: i32 = 11;
+const NSIGFPE: i32 = 15;
+const NSIGSEGV: i32 = 10;
+const NSIGBUS: i32 = 5;
+const NSIGTRAP: i32 = 6;
+const NSIGCHLD: i32 = 6;
+const NSIGSYS: i32 = 2;
+
 impl SigCode {
     pub fn as_i32(self) -> i32 {
         match self {
@@ -345,6 +354,7 @@ pub struct PosixSigInfo {
     pub si_signo: i32,
     pub si_errno: i32,
     pub si_code: i32,
+    pub(crate) _padding: u32,
     pub _sifields: PosixSiginfoFields,
 }
 
@@ -411,17 +421,16 @@ pub struct PosixSiginfoSigchld {
     pub si_pid: i32,
     pub si_uid: u32,
     pub si_status: i32,
+    pub(crate) _padding: u32,
     pub si_utime: i64,
     pub si_stime: i64,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 pub struct PosixSiginfoSigfault {
     pub si_addr: u64,
-    pub si_addr_lsb: u16,
-    pub si_band: i32,
-    pub si_fd: i32,
+    pub reason: [u8; 24],
 }
 
 #[repr(C)]
@@ -429,6 +438,7 @@ pub struct PosixSiginfoSigfault {
 pub struct PosixSiginfoSigpoll {
     pub si_band: i64,
     pub si_fd: i32,
+    pub(crate) _padding: u32,
 }
 
 #[repr(C)]
@@ -481,6 +491,239 @@ impl core::fmt::Debug for PosixSigval {
 // 编译期校验：sigval_t 在 64-bit 架构下应为 8 字节
 const _: [(); 8] = [(); core::mem::size_of::<PosixSigval>()];
 
+fn is_positive_sig_specific_code(si_code: i32) -> bool {
+    si_code > SigCode::User.as_i32() && si_code < SigCode::Kernel.as_i32()
+}
+
+fn is_fault_layout_signal(signal: Signal) -> bool {
+    matches!(
+        signal,
+        Signal::SIGILL | Signal::SIGFPE | Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGTRAP
+    )
+}
+
+fn signal_specific_code_limit(signal: Signal) -> Option<i32> {
+    match signal {
+        Signal::SIGILL => Some(NSIGILL),
+        Signal::SIGFPE => Some(NSIGFPE),
+        Signal::SIGSEGV => Some(NSIGSEGV),
+        Signal::SIGBUS => Some(NSIGBUS),
+        Signal::SIGTRAP => Some(NSIGTRAP),
+        Signal::SIGCHLD => Some(NSIGCHLD),
+        Signal::SIGSYS => Some(NSIGSYS),
+        Signal::SIGIO_OR_POLL => Some(NSIGPOLL),
+        _ => None,
+    }
+}
+
+const BUS_MCEERR_AR: i32 = 4;
+const BUS_MCEERR_AO: i32 = 5;
+const SEGV_BNDERR: i32 = 3;
+const SEGV_PKUERR: i32 = 4;
+const TRAP_PERF: i32 = 6;
+const SI_DETHREAD: i32 = -7;
+const SI_ASYNCNL: i32 = -60;
+const KERNEL_SIGINFO_SIZE: usize = 48;
+
+fn known_siginfo_layout(signal: Signal, code: i32) -> bool {
+    if code == SigCode::Kernel.as_i32() {
+        true
+    } else if code > SigCode::User.as_i32() {
+        signal_specific_code_limit(signal).map_or(code <= NSIGPOLL, |limit| code <= limit)
+    } else {
+        code >= SI_DETHREAD || code == SI_ASYNCNL
+    }
+}
+
+/// Linux rejects unknown siginfo layouts when their userspace-only expansion
+/// contains data that the kernel cannot preserve on a GETSIGINFO round trip.
+pub(crate) fn validate_user_siginfo(user_info: &PosixSigInfo) -> Result<(), SystemError> {
+    let signal = Signal::from(user_info.si_signo as usize);
+    if known_siginfo_layout(signal, user_info.si_code) {
+        return Ok(());
+    }
+
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            user_info as *const PosixSigInfo as *const u8,
+            core::mem::size_of::<PosixSigInfo>(),
+        )
+    };
+    if bytes[KERNEL_SIGINFO_SIZE..].iter().any(|byte| *byte != 0) {
+        Err(SystemError::E2BIG)
+    } else {
+        Ok(())
+    }
+}
+
+/// Copy Linux siginfo_t without requiring its userspace-only expansion to be
+/// readable for a known 48-byte kernel layout.
+pub(crate) unsafe fn copy_siginfo_from_user(
+    address: VirtAddr,
+    forced_signo: Option<i32>,
+) -> Result<PosixSigInfo, SystemError> {
+    let mut result = PosixSigInfo::default();
+    {
+        let prefix = core::slice::from_raw_parts_mut(
+            (&mut result as *mut PosixSigInfo).cast::<u8>(),
+            KERNEL_SIGINFO_SIZE,
+        );
+        crate::syscall::user_access::copy_from_user_protected(prefix, address)?;
+    }
+    if let Some(signo) = forced_signo {
+        result.si_signo = signo;
+    }
+    if !known_siginfo_layout(Signal::from(result.si_signo as usize), result.si_code) {
+        {
+            let expansion = core::slice::from_raw_parts_mut(
+                (&mut result as *mut PosixSigInfo)
+                    .cast::<u8>()
+                    .add(KERNEL_SIGINFO_SIZE),
+                core::mem::size_of::<PosixSigInfo>() - KERNEL_SIGINFO_SIZE,
+            );
+            crate::syscall::user_access::copy_from_user_protected(
+                expansion,
+                address + KERNEL_SIGINFO_SIZE,
+            )?;
+        }
+        validate_user_siginfo(&result)?;
+    }
+    Ok(result)
+}
+
+fn read_reason_u16(reason: &[u8; 24], offset: usize) -> u16 {
+    u16::from_ne_bytes(reason[offset..offset + 2].try_into().unwrap())
+}
+
+fn read_reason_u32(reason: &[u8; 24], offset: usize) -> u32 {
+    u32::from_ne_bytes(reason[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_reason_u64(reason: &[u8; 24], offset: usize) -> u64 {
+    u64::from_ne_bytes(reason[offset..offset + 8].try_into().unwrap())
+}
+
+/// Classify a user-provided siginfo union using the signal-specific layout
+/// rules from Linux 6.6 `siginfo_layout()`.
+pub(crate) fn sig_type_from_user_siginfo(
+    signal: Signal,
+    code_enum: SigCode,
+    user_info: &PosixSigInfo,
+) -> SigType {
+    match code_enum {
+        SigCode::Timer => {
+            let timer = unsafe { user_info._sifields._timer };
+            SigType::PosixTimer {
+                timerid: timer.si_tid,
+                overrun: timer.si_overrun,
+                sigval: timer.si_sigval,
+            }
+        }
+        SigCode::SigIO => {
+            let sigpoll = unsafe { user_info._sifields._sigpoll };
+            SigType::SigPoll {
+                fd: sigpoll.si_fd,
+                band: sigpoll.si_band,
+            }
+        }
+        SigCode::Raw(code) if is_positive_sig_specific_code(code) => {
+            let specific_limit = signal_specific_code_limit(signal);
+            if is_fault_layout_signal(signal) && specific_limit.is_some_and(|limit| code <= limit) {
+                let fault = unsafe { user_info._sifields._sigfault };
+                let reason = if signal == Signal::SIGBUS
+                    && (BUS_MCEERR_AR..=BUS_MCEERR_AO).contains(&code)
+                {
+                    SigFaultReason::AddrLsb(read_reason_u16(&fault.reason, 0))
+                } else if signal == Signal::SIGSEGV && code == SEGV_BNDERR {
+                    SigFaultReason::Bounds {
+                        lower: read_reason_u64(&fault.reason, 8),
+                        upper: read_reason_u64(&fault.reason, 16),
+                    }
+                } else if signal == Signal::SIGSEGV && code == SEGV_PKUERR {
+                    SigFaultReason::Pkey(read_reason_u32(&fault.reason, 8))
+                } else if signal == Signal::SIGTRAP && code == TRAP_PERF {
+                    SigFaultReason::Perf {
+                        data: read_reason_u64(&fault.reason, 0),
+                        kind: read_reason_u32(&fault.reason, 8),
+                        flags: read_reason_u32(&fault.reason, 12),
+                    }
+                } else {
+                    SigFaultReason::AddrLsb(read_reason_u16(&fault.reason, 0))
+                };
+                SigType::Fault {
+                    addr: fault.si_addr,
+                    reason,
+                }
+            } else if signal == Signal::SIGCHLD && specific_limit.is_some_and(|limit| code <= limit)
+            {
+                let child = unsafe { user_info._sifields._sigchld };
+                SigType::SigChild {
+                    pid: RawPid::new(child.si_pid as usize),
+                    uid: child.si_uid,
+                    status: child.si_status,
+                    utime: child.si_utime,
+                    stime: child.si_stime,
+                }
+            } else if signal == Signal::SIGSYS && specific_limit.is_some_and(|limit| code <= limit)
+            {
+                let sigsys = unsafe { user_info._sifields._sigsys };
+                SigType::SigSys {
+                    call_addr: sigsys._call_addr,
+                    syscall: sigsys._syscall,
+                    arch: sigsys._arch,
+                }
+            } else if code <= NSIGPOLL {
+                let sigpoll = unsafe { user_info._sifields._sigpoll };
+                SigType::SigPoll {
+                    fd: sigpoll.si_fd,
+                    band: sigpoll.si_band,
+                }
+            } else {
+                let kill = unsafe { user_info._sifields._kill };
+                SigType::Kill {
+                    pid: RawPid::new(kill.si_pid as usize),
+                    uid: kill.si_uid,
+                }
+            }
+        }
+        SigCode::Raw(code) if code < 0 => {
+            let rt = unsafe { user_info._sifields._rt };
+            SigType::Rt {
+                pid: RawPid::new(rt.si_pid as usize),
+                uid: rt.si_uid,
+                sigval: rt.si_sigval,
+            }
+        }
+        SigCode::Queue | SigCode::Mesgq | SigCode::AsyncIO | SigCode::Tkill => {
+            let rt = unsafe { user_info._sifields._rt };
+            SigType::Rt {
+                pid: RawPid::new(rt.si_pid as usize),
+                uid: rt.si_uid,
+                sigval: rt.si_sigval,
+            }
+        }
+        SigCode::PollIn
+        | SigCode::PollOut
+        | SigCode::PollMsg
+        | SigCode::PollErr
+        | SigCode::PollPri
+        | SigCode::PollHup => {
+            let sigpoll = unsafe { user_info._sifields._sigpoll };
+            SigType::SigPoll {
+                fd: sigpoll.si_fd,
+                band: sigpoll.si_band,
+            }
+        }
+        _ => {
+            let kill = unsafe { user_info._sifields._kill };
+            SigType::Kill {
+                pid: RawPid::new(kill.si_pid as usize),
+                uid: kill.si_uid,
+            }
+        }
+    }
+}
+
 impl SigInfo {
     pub fn sig_code(&self) -> SigCode {
         self.sig_code
@@ -489,75 +732,8 @@ impl SigInfo {
     /// Fully convert a user-mode PosixSigInfo into a SigInfo.
     pub fn from_posix(posix: &PosixSigInfo) -> Self {
         let sig_code = SigCode::try_from_i32(posix.si_code).unwrap_or(SigCode::Raw(posix.si_code));
-        let sig_type = unsafe {
-            match posix.si_code {
-                // SI_USER(0)/SI_TKILL(-6): Kill{pid,uid}
-                0 | -6 => SigType::Kill {
-                    pid: RawPid::new(posix._sifields._kill.si_pid as usize),
-                    uid: posix._sifields._kill.si_uid,
-                },
-                // SI_QUEUE(-1)/SI_MESGQ(-3): Rt{pid,uid,sigval}
-                -1 | -3 => SigType::Rt {
-                    pid: RawPid::new(posix._sifields._rt.si_pid as usize),
-                    uid: posix._sifields._rt.si_uid,
-                    sigval: posix._sifields._rt.si_sigval,
-                },
-                // SI_TIMER(-2): PosixTimer{timerid,overrun,sigval}
-                -2 => SigType::PosixTimer {
-                    timerid: posix._sifields._timer.si_tid,
-                    overrun: posix._sifields._timer.si_overrun,
-                    sigval: posix._sifields._timer.si_sigval,
-                },
-                // SIGCHLD: SigChild{pid,uid,status,utime,stime}
-                _ if posix.si_signo == Signal::SIGCHLD as i32 => SigType::SigChild {
-                    pid: RawPid::new(posix._sifields._sigchld.si_pid as usize),
-                    uid: posix._sifields._sigchld.si_uid,
-                    status: posix._sifields._sigchld.si_status,
-                    utime: posix._sifields._sigchld.si_utime,
-                    stime: posix._sifields._sigchld.si_stime,
-                },
-                // Synchronous fault signals (SIGSEGV/SIGBUS/SIGFPE/SIGILL/
-                // SIGTRAP, si_code>0): Fault{addr,addr_lsb}
-                _ if posix.si_code > 0
-                    && matches!(
-                        posix.si_signo,
-                        4 | 5
-                            | 7
-                            | 8
-                            | 9
-                            | 10
-                            | 11
-                            | 12
-                            | 13
-                            | 14
-                            | 16
-                            | 17
-                            | 18
-                            | 23
-                            | 24
-                            | 26
-                            | 27
-                            | 31
-                    ) =>
-                {
-                    SigType::Fault {
-                        addr: posix._sifields._sigfault.si_addr,
-                        addr_lsb: posix._sifields._sigfault.si_addr_lsb,
-                    }
-                }
-                // SIGSYS (seccomp): SigSys{call_addr,syscall,arch}
-                _ if posix.si_signo == Signal::SIGSYS as i32 => SigType::SigSys {
-                    call_addr: posix._sifields._sigsys._call_addr,
-                    syscall: posix._sifields._sigsys._syscall,
-                    arch: posix._sifields._sigsys._arch,
-                },
-                // All other cases: fall back to the Kill type (keeping si_pid/si_uid).
-                _ => SigType::Kill {
-                    pid: RawPid::new(posix._sifields._kill.si_pid as usize),
-                    uid: posix._sifields._kill.si_uid,
-                },
-            }
-        };
+        let signal = Signal::from(posix.si_signo as usize);
+        let sig_type = sig_type_from_user_siginfo(signal, sig_code, posix);
         Self {
             sig_no: posix.si_signo,
             errno: posix.si_errno,
@@ -635,119 +811,107 @@ impl SigInfo {
     /// 将内核SigInfo转换为标准PosixSigInfo
     #[inline(never)]
     pub fn convert_to_posix_siginfo(&self) -> PosixSigInfo {
+        // Linux copies a 48-byte kernel siginfo and explicitly clears the
+        // remaining userspace expansion. Start from zero so short union
+        // members cannot expose padding or make a later SETSIGINFO fail E2BIG.
+        let mut result = PosixSigInfo {
+            si_signo: self.sig_no,
+            si_errno: self.errno,
+            si_code: self.sig_code.as_i32(),
+            ..PosixSigInfo::default()
+        };
         match self.sig_type {
-            SigType::Kill { pid, uid } => PosixSigInfo {
-                si_signo: self.sig_no,
-                si_errno: self.errno,
-                si_code: self.sig_code.as_i32(),
-                _sifields: PosixSiginfoFields {
-                    _kill: PosixSiginfoKill {
-                        si_pid: pid.data() as i32,
-                        si_uid: uid,
-                    },
-                },
-            },
-            SigType::Rt { pid, uid, sigval } => PosixSigInfo {
-                si_signo: self.sig_no,
-                si_errno: self.errno,
-                si_code: self.sig_code.as_i32(),
-                _sifields: PosixSiginfoFields {
-                    _rt: PosixSiginfoRt {
-                        si_pid: pid.data() as i32,
-                        si_uid: uid,
-                        si_sigval: sigval,
-                    },
-                },
-            },
+            SigType::Kill { pid, uid } => {
+                result._sifields._kill = PosixSiginfoKill {
+                    si_pid: pid.data() as i32,
+                    si_uid: uid,
+                };
+            }
+            SigType::Rt { pid, uid, sigval } => {
+                result._sifields._rt = PosixSiginfoRt {
+                    si_pid: pid.data() as i32,
+                    si_uid: uid,
+                    si_sigval: sigval,
+                };
+            }
             SigType::SigChild {
                 pid,
                 uid,
                 status,
                 utime,
                 stime,
-            } => PosixSigInfo {
-                si_signo: self.sig_no,
-                si_errno: self.errno,
-                si_code: self.sig_code.as_i32(),
-                _sifields: PosixSiginfoFields {
-                    _sigchld: PosixSiginfoSigchld {
-                        si_pid: pid.data() as i32,
-                        si_uid: uid,
-                        si_status: status,
-                        si_utime: utime,
-                        si_stime: stime,
-                    },
-                },
-            },
-            SigType::Alarm(pid) => PosixSigInfo {
-                si_signo: self.sig_no,
-                si_errno: self.errno,
-                si_code: self.sig_code.as_i32(),
-                _sifields: PosixSiginfoFields {
-                    _timer: PosixSiginfoTimer {
-                        si_tid: pid.data() as i32,
-                        si_overrun: 0,
-                        si_sigval: PosixSigval::zero(),
-                    },
-                },
-            },
+            } => {
+                result._sifields._sigchld = PosixSiginfoSigchld {
+                    si_pid: pid.data() as i32,
+                    si_uid: uid,
+                    si_status: status,
+                    _padding: 0,
+                    si_utime: utime,
+                    si_stime: stime,
+                };
+            }
+            SigType::Alarm(pid) => {
+                result._sifields._timer = PosixSiginfoTimer {
+                    si_tid: pid.data() as i32,
+                    si_overrun: 0,
+                    si_sigval: PosixSigval::zero(),
+                };
+            }
             SigType::PosixTimer {
                 timerid,
                 overrun,
                 sigval,
-            } => PosixSigInfo {
-                si_signo: self.sig_no,
-                si_errno: self.errno,
-                si_code: self.sig_code.as_i32(),
-                _sifields: PosixSiginfoFields {
-                    _timer: PosixSiginfoTimer {
-                        si_tid: timerid,
-                        si_overrun: overrun,
-                        si_sigval: sigval,
-                    },
-                },
-            },
-            SigType::SigPoll { fd, band } => PosixSigInfo {
-                si_signo: self.sig_no,
-                si_errno: self.errno,
-                si_code: self.sig_code.as_i32(),
-                _sifields: PosixSiginfoFields {
-                    _sigpoll: PosixSiginfoSigpoll {
-                        si_band: band,
-                        si_fd: fd,
-                    },
-                },
-            },
+            } => {
+                result._sifields._timer = PosixSiginfoTimer {
+                    si_tid: timerid,
+                    si_overrun: overrun,
+                    si_sigval: sigval,
+                };
+            }
+            SigType::SigPoll { fd, band } => {
+                result._sifields._sigpoll = PosixSiginfoSigpoll {
+                    si_band: band,
+                    si_fd: fd,
+                    _padding: 0,
+                };
+            }
             SigType::SigSys {
                 call_addr,
                 syscall,
                 arch,
-            } => PosixSigInfo {
-                si_signo: self.sig_no,
-                si_errno: self.errno,
-                si_code: self.sig_code.as_i32(),
-                _sifields: PosixSiginfoFields {
-                    _sigsys: PosixSiginfoSigsys {
-                        _call_addr: call_addr,
-                        _syscall: syscall,
-                        _arch: arch,
-                    },
-                },
-            },
-            SigType::Fault { addr, addr_lsb } => PosixSigInfo {
-                si_signo: self.sig_no,
-                si_errno: self.errno,
-                si_code: self.sig_code.as_i32(),
-                _sifields: PosixSiginfoFields {
-                    _sigfault: PosixSiginfoSigfault {
-                        si_addr: addr,
-                        si_addr_lsb: addr_lsb,
-                        si_band: 0,
-                        si_fd: 0,
-                    },
-                },
-            },
+            } => {
+                result._sifields._sigsys = PosixSiginfoSigsys {
+                    _call_addr: call_addr,
+                    _syscall: syscall,
+                    _arch: arch,
+                };
+            }
+            SigType::Fault { addr, reason } => {
+                let mut raw_reason = [0u8; 24];
+                match reason {
+                    SigFaultReason::AddrLsb(value) => {
+                        raw_reason[..2].copy_from_slice(&value.to_ne_bytes());
+                    }
+                    SigFaultReason::Bounds { lower, upper } => {
+                        raw_reason[8..16].copy_from_slice(&lower.to_ne_bytes());
+                        raw_reason[16..24].copy_from_slice(&upper.to_ne_bytes());
+                    }
+                    SigFaultReason::Pkey(value) => {
+                        raw_reason[8..12].copy_from_slice(&value.to_ne_bytes());
+                    }
+                    SigFaultReason::Perf { data, kind, flags } => {
+                        raw_reason[..8].copy_from_slice(&data.to_ne_bytes());
+                        raw_reason[8..12].copy_from_slice(&kind.to_ne_bytes());
+                        raw_reason[12..16].copy_from_slice(&flags.to_ne_bytes());
+                    }
+                }
+                result._sifields._sigfault = PosixSiginfoSigfault {
+                    si_addr: addr,
+                    reason: raw_reason,
+                };
+            }
         }
+        result
     }
 
     /// @brief 将PosixSigInfo结构体拷贝到用户栈
@@ -820,13 +984,21 @@ pub enum SigType {
     /// synchronous fault signal carrying siginfo_t::si_addr.
     Fault {
         addr: u64,
-        addr_lsb: u16,
+        reason: SigFaultReason,
     },
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
     // SigFault,
     // SigSys,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum SigFaultReason {
+    AddrLsb(u16),
+    Bounds { lower: u64, upper: u64 },
+    Pkey(u32),
+    Perf { data: u64, kind: u32, flags: u32 },
 }
 
 impl SigInfo {

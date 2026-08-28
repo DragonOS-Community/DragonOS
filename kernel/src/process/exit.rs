@@ -361,6 +361,7 @@ pub fn kernel_waitid(
                     si_pid: info.pid.data() as i32,
                     si_uid: info.uid,
                     si_status: info.status,
+                    _padding: 0,
                     si_utime: 0,
                     si_stime: 0,
                 },

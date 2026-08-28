@@ -233,7 +233,7 @@ TEST(PtraceX86Debug, GeneralRegistersRejectKernelCodeSelector) {
     continue_and_reap(child);
 }
 
-TEST(PtraceX86Debug, SetregsetRequiresWordAlignedPrefixLength) {
+TEST(PtraceX86Debug, RegsetRequiresWordAlignedPrefixLength) {
     pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
@@ -285,7 +285,26 @@ TEST(PtraceX86Debug, SetregsetRequiresWordAlignedPrefixLength) {
             << "requested=" << requested;
     }
 
-    for (size_t requested : {size_t{1}, size_t{7}, size_t{9}}) {
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&baseline)));
+    for (size_t requested : valid_lengths) {
+        user_regs_struct output = {};
+        iovec iov = {
+            .iov_base = &output,
+            .iov_len = requested,
+        };
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETREGSET, child, NT_PRSTATUS,
+                                 reinterpret_cast<unsigned long>(&iov)))
+            << "requested=" << requested << " errno=" << errno;
+        const size_t copied =
+            requested < sizeof(output) ? requested : sizeof(output);
+        EXPECT_EQ(copied, iov.iov_len);
+        EXPECT_EQ(0, memcmp(&baseline, &output, copied))
+            << "requested=" << requested;
+    }
+
+    for (size_t requested :
+         {size_t{1}, size_t{4}, size_t{7}, size_t{9}, size_t{12}}) {
         ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
                                  reinterpret_cast<unsigned long>(&baseline)));
         iovec iov = {
@@ -304,6 +323,22 @@ TEST(PtraceX86Debug, SetregsetRequiresWordAlignedPrefixLength) {
                                  reinterpret_cast<unsigned long>(&actual)));
         EXPECT_EQ(0, memcmp(&baseline, &actual, sizeof(actual)))
             << "failed SETREGSET modified registers for requested=" << requested;
+
+        user_regs_struct output = {};
+        memset(&output, 0xa5, sizeof(output));
+        const user_regs_struct unchanged = output;
+        iov = {
+            .iov_base = &output,
+            .iov_len = requested,
+        };
+        errno = 0;
+        EXPECT_EQ(-1, ptrace_call(PTRACE_GETREGSET, child, NT_PRSTATUS,
+                                  reinterpret_cast<unsigned long>(&iov)))
+            << "requested=" << requested;
+        EXPECT_EQ(EINVAL, errno) << "requested=" << requested;
+        EXPECT_EQ(requested, iov.iov_len);
+        EXPECT_EQ(0, memcmp(&unchanged, &output, sizeof(output)))
+            << "failed GETREGSET modified output for requested=" << requested;
     }
 
     ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));

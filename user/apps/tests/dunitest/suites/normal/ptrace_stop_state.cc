@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -56,6 +57,12 @@
 #endif
 #ifndef PTRACE_EVENT_CLONE
 #define PTRACE_EVENT_CLONE 3
+#endif
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
+#ifndef AUDIT_ARCH_X86_64
+#define AUDIT_ARCH_X86_64 0xc000003eU
 #endif
 
 namespace {
@@ -918,6 +925,232 @@ TEST(PtraceStopState, WnowaitPreservesMutableSignalInjection) {
     ASSERT_TRUE(WaitPidUntil(child, &status, 0));
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
+    guard.Release();
+}
+
+TEST(PtraceStopState, SetsiginfoPreservesSigsysPayload) {
+#if !defined(__x86_64__)
+    GTEST_SKIP() << "seccomp audit architecture is x86_64-specific";
+#else
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (ptrace_call(0 /* PTRACE_TRACEME */, 0, 0, 0) != 0) {
+            _exit(64);
+        }
+        raise(SIGSTOP);
+        raise(SIGSYS);
+        _exit(0);
+    }
+    ChildGuard guard(child);
+
+    int status = 0;
+    ASSERT_TRUE(WaitPidUntil(child, &status, 0));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGSTOP, WSTOPSIG(status));
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+
+    ASSERT_TRUE(WaitPidUntil(child, &status, 0));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGSYS, WSTOPSIG(status));
+
+    siginfo_t replacement = {};
+    replacement.si_signo = SIGSYS;
+    replacement.si_errno = 0x1234;
+    replacement.si_code = SYS_SECCOMP;
+    replacement.si_call_addr = reinterpret_cast<void*>(0x12345678UL);
+    replacement.si_syscall = SYS_getpid;
+    replacement.si_arch = AUDIT_ARCH_X86_64;
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETSIGINFO, child, 0,
+                             reinterpret_cast<unsigned long>(&replacement)));
+
+    siginfo_t observed = {};
+    ASSERT_EQ(0, ptrace_call(PTRACE_GETSIGINFO, child, 0,
+                             reinterpret_cast<unsigned long>(&observed)));
+    EXPECT_EQ(SIGSYS, observed.si_signo);
+    EXPECT_EQ(0x1234, observed.si_errno);
+    EXPECT_EQ(SYS_SECCOMP, observed.si_code);
+    EXPECT_EQ(replacement.si_call_addr, observed.si_call_addr);
+    EXPECT_EQ(SYS_getpid, observed.si_syscall);
+    EXPECT_EQ(AUDIT_ARCH_X86_64, observed.si_arch);
+
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+    ASSERT_TRUE(WaitPidUntil(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    guard.Release();
+#endif
+}
+
+TEST(PtraceStopState, SetsiginfoPreservesAllLinuxFaultUnionLayouts) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (ptrace_call(0 /* PTRACE_TRACEME */, 0, 0, 0) != 0) _exit(72);
+        raise(SIGUSR1);
+        _exit(73);
+    }
+    ChildGuard guard(child);
+    int status = 0;
+    ASSERT_TRUE(WaitPidUntil(child, &status, 0));
+    ASSERT_TRUE(WIFSTOPPED(status));
+
+    auto set_u64 = [](siginfo_t* info, size_t offset, uint64_t value) {
+        memcpy(reinterpret_cast<unsigned char*>(info) + offset, &value,
+               sizeof(value));
+    };
+    auto set_u32 = [](siginfo_t* info, size_t offset, uint32_t value) {
+        memcpy(reinterpret_cast<unsigned char*>(info) + offset, &value,
+               sizeof(value));
+    };
+    auto get_u64 = [](const siginfo_t* info, size_t offset) {
+        uint64_t value = 0;
+        memcpy(&value, reinterpret_cast<const unsigned char*>(info) + offset,
+               sizeof(value));
+        return value;
+    };
+    auto get_u32 = [](const siginfo_t* info, size_t offset) {
+        uint32_t value = 0;
+        memcpy(&value, reinterpret_cast<const unsigned char*>(info) + offset,
+               sizeof(value));
+        return value;
+    };
+    auto check_roundtrip = [&](siginfo_t input, siginfo_t* output) {
+        ASSERT_EQ(0, ptrace_call(PTRACE_SETSIGINFO, child, 0,
+                                 reinterpret_cast<unsigned long>(&input)));
+        memset(output, 0, sizeof(*output));
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETSIGINFO, child, 0,
+                                 reinterpret_cast<unsigned long>(output)));
+        EXPECT_EQ(input.si_signo, output->si_signo);
+        EXPECT_EQ(input.si_code, output->si_code);
+    };
+
+    // x86_64 siginfo_t: preamble 16 bytes, si_addr at 16, reason union at 24.
+    siginfo_t mce = {};
+    mce.si_signo = SIGBUS;
+    mce.si_code = 4;  // BUS_MCEERR_AR
+    set_u64(&mce, 16, 0x1111222233334444ULL);
+    set_u32(&mce, 24, 13);
+    siginfo_t output = {};
+    check_roundtrip(mce, &output);
+    EXPECT_EQ(0x1111222233334444ULL, get_u64(&output, 16));
+    EXPECT_EQ(13U, get_u32(&output, 24));
+
+    siginfo_t bounds = {};
+    bounds.si_signo = SIGSEGV;
+    bounds.si_code = 3;  // SEGV_BNDERR
+    set_u64(&bounds, 16, 0x2222333344445555ULL);
+    set_u64(&bounds, 32, 0x1000);
+    set_u64(&bounds, 40, 0x2000);
+    check_roundtrip(bounds, &output);
+    EXPECT_EQ(0x2222333344445555ULL, get_u64(&output, 16));
+    EXPECT_EQ(0x1000U, get_u64(&output, 32));
+    EXPECT_EQ(0x2000U, get_u64(&output, 40));
+
+    siginfo_t pkey = {};
+    pkey.si_signo = SIGSEGV;
+    pkey.si_code = 4;  // SEGV_PKUERR
+    set_u64(&pkey, 16, 0x3333444455556666ULL);
+    set_u32(&pkey, 32, 7);
+    check_roundtrip(pkey, &output);
+    EXPECT_EQ(0x3333444455556666ULL, get_u64(&output, 16));
+    EXPECT_EQ(7U, get_u32(&output, 32));
+
+    siginfo_t perf = {};
+    perf.si_signo = SIGTRAP;
+    perf.si_code = 6;  // TRAP_PERF
+    set_u64(&perf, 16, 0x4444555566667777ULL);
+    set_u64(&perf, 24, 0xabcddcba11223344ULL);
+    set_u32(&perf, 32, 9);
+    set_u32(&perf, 36, 3);
+    check_roundtrip(perf, &output);
+    EXPECT_EQ(0x4444555566667777ULL, get_u64(&output, 16));
+    EXPECT_EQ(0xabcddcba11223344ULL, get_u64(&output, 24));
+    EXPECT_EQ(9U, get_u32(&output, 32));
+    EXPECT_EQ(3U, get_u32(&output, 36));
+
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+    ASSERT_TRUE(WaitPidUntil(child, &status, 0));
+    EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(73, WEXITSTATUS(status));
+    guard.Release();
+}
+
+TEST(PtraceStopState, SetsiginfoUsesPollFallbackAndRejectsUnknownExpansion) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (ptrace_call(0 /* PTRACE_TRACEME */, 0, 0, 0) != 0) _exit(74);
+        raise(SIGUSR1);
+        _exit(75);
+    }
+    ChildGuard guard(child);
+    int status = 0;
+    ASSERT_TRUE(WaitPidUntil(child, &status, 0));
+    ASSERT_TRUE(WIFSTOPPED(status));
+
+    siginfo_t poll_info = {};
+    poll_info.si_signo = SIGSYS;
+    poll_info.si_code = 3;  // outside NSIGSYS, inside NSIGPOLL
+    poll_info.si_band = 0x12345678;
+    poll_info.si_fd = 42;
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETSIGINFO, child, 0,
+                             reinterpret_cast<unsigned long>(&poll_info)));
+    siginfo_t output = {};
+    ASSERT_EQ(0, ptrace_call(PTRACE_GETSIGINFO, child, 0,
+                             reinterpret_cast<unsigned long>(&output)));
+    EXPECT_EQ(SIGSYS, output.si_signo);
+    EXPECT_EQ(3, output.si_code);
+    EXPECT_EQ(0x12345678, output.si_band);
+    EXPECT_EQ(42, output.si_fd);
+
+    // Linux accepts the siginfo payload wholesale; signo zero must not be fed
+    // into a signal-mask shift while selecting the positive-code layout.
+    poll_info.si_signo = 0;
+    poll_info.si_code = 1;
+    poll_info.si_band = 0x55667788;
+    poll_info.si_fd = 24;
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETSIGINFO, child, 0,
+                             reinterpret_cast<unsigned long>(&poll_info)));
+    memset(&output, 0, sizeof(output));
+    ASSERT_EQ(0, ptrace_call(PTRACE_GETSIGINFO, child, 0,
+                             reinterpret_cast<unsigned long>(&output)));
+    EXPECT_EQ(0, output.si_signo);
+    EXPECT_EQ(1, output.si_code);
+    EXPECT_EQ(0x55667788, output.si_band);
+    EXPECT_EQ(24, output.si_fd);
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    void* mapping = mmap(nullptr, static_cast<size_t>(page_size) * 2,
+                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+                         0);
+    ASSERT_NE(MAP_FAILED, mapping);
+    auto* boundary_info = reinterpret_cast<siginfo_t*>(
+        static_cast<unsigned char*>(mapping) + page_size - 48);
+    memcpy(boundary_info, &poll_info, 48);
+    ASSERT_EQ(0, mprotect(static_cast<unsigned char*>(mapping) + page_size,
+                          page_size, PROT_NONE));
+    EXPECT_EQ(0, ptrace_call(PTRACE_SETSIGINFO, child, 0,
+                             reinterpret_cast<unsigned long>(boundary_info)));
+    EXPECT_EQ(0, munmap(mapping, static_cast<size_t>(page_size) * 2));
+
+    siginfo_t unknown = {};
+    unknown.si_signo = SIGSYS;
+    unknown.si_code = 7;
+    reinterpret_cast<unsigned char*>(&unknown)[48] = 1;
+    errno = 0;
+    EXPECT_EQ(-1, ptrace_call(PTRACE_SETSIGINFO, child, 0,
+                              reinterpret_cast<unsigned long>(&unknown)));
+    EXPECT_EQ(E2BIG, errno);
+    reinterpret_cast<unsigned char*>(&unknown)[48] = 0;
+    EXPECT_EQ(0, ptrace_call(PTRACE_SETSIGINFO, child, 0,
+                             reinterpret_cast<unsigned long>(&unknown)));
+
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+    ASSERT_TRUE(WaitPidUntil(child, &status, 0));
+    EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(75, WEXITSTATUS(status));
     guard.Release();
 }
 

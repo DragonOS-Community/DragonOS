@@ -14,6 +14,7 @@
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -280,7 +281,7 @@ void WriteAll(int fd, const char* data, size_t len) {
 // uses no gtest assertion because the parent executes it in a child process
 // with a deadline; return zero on success, otherwise an errno-style failure.
 int RunMmapBufferedWriteAndFsyncStress(char* mapping, size_t page_size, int buffered_fd,
-                                       int sync_fd) {
+                                       int sync_fd, bool process_vm_write) {
     constexpr int kIterations = 32;
     constexpr size_t kMappingHalf = 2048;
     constexpr size_t kBufferedHalf = 2048;
@@ -328,7 +329,18 @@ int RunMmapBufferedWriteAndFsyncStress(char* mapping, size_t page_size, int buff
             // Mapping and buffered writes intentionally use disjoint halves
             // of one page. This keeps the invalidate domain identical without
             // introducing unrelated, non-atomic byte races.
-            mapping[(iteration * 37) % kMappingHalf] = static_cast<char>(iteration + 1);
+            const size_t offset = (iteration * 37) % kMappingHalf;
+            const char value = static_cast<char>(iteration + 1);
+            if (process_vm_write) {
+                iovec local = {const_cast<char*>(&value), 1};
+                iovec remote = {mapping + offset, 1};
+                if (syscall(SYS_process_vm_writev, getpid(), &local, 1, &remote, 1, 0) != 1) {
+                    record_error(errno);
+                    return;
+                }
+            } else {
+                mapping[offset] = value;
+            }
             std::this_thread::yield();
         }
     });
@@ -392,8 +404,9 @@ int RunMmapBufferedWriteAndFsyncStress(char* mapping, size_t page_size, int buff
 // MAP_PRIVATE covers COW. The exact A/B/C lock order is proved by PageCache's
 // deterministic debug selftest; this is a bounded integration stress test of
 // the real ext4 paths.
-void RunMmapBufferedWriteAndFsyncProgress(int mapping_mode) {
+void RunMmapBufferedWriteAndFsyncProgress(int mapping_mode, bool process_vm_write = false) {
     constexpr size_t kPageSize = 4096;
+    constexpr size_t kMappingHalf = 2048;
     constexpr char kInitialByte = 'I';
     constexpr char kPrivateByte = 'P';
     const bool private_mapping = mapping_mode == MAP_PRIVATE;
@@ -403,7 +416,8 @@ void RunMmapBufferedWriteAndFsyncProgress(int mapping_mode) {
     ASSERT_NO_FATAL_FAILURE(fs.Mount());
 
     const std::string path = fs.mount_point()
-        + (private_mapping ? "/private_mmap_cow_fsync_race" : "/shared_mmap_fsync_race");
+        + (private_mapping ? "/private_mmap_cow_fsync_race" : "/shared_mmap_fsync_race")
+        + (process_vm_write ? "_process_vm" : "_store");
     int writer_fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
     ASSERT_GE(writer_fd, 0) << strerror(errno);
     int sync_fd = dup(writer_fd);
@@ -435,7 +449,9 @@ void RunMmapBufferedWriteAndFsyncProgress(int mapping_mode) {
         FAIL() << "fork mmap/writeback stress child: " << strerror(saved_errno);
     }
     if (child == 0) {
-        _exit(RunMmapBufferedWriteAndFsyncStress(mapping, kPageSize, buffered_fd, sync_fd) == 0
+        _exit(RunMmapBufferedWriteAndFsyncStress(
+                  mapping, kPageSize, buffered_fd, sync_fd, process_vm_write)
+                      == 0
                   ? 0
                   : 1);
     }
@@ -495,6 +511,24 @@ void RunMmapBufferedWriteAndFsyncProgress(int mapping_mode) {
 
     if (!private_mapping) {
         EXPECT_EQ(0, msync(mapping, kPageSize, MS_SYNC)) << strerror(errno);
+    }
+
+    // Mapping writes and buffered writes use disjoint halves. Verify the first
+    // half through the file descriptor: shared writes must be durable, while a
+    // private COW mapping must leave the backing bytes untouched.
+    char mapping_half[kMappingHalf] = {};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(mapping_half)),
+              pread(writer_fd, mapping_half, sizeof(mapping_half), 0))
+        << strerror(errno);
+    if (private_mapping) {
+        EXPECT_EQ(kInitialByte, mapping_half[0]);
+        EXPECT_TRUE(std::all_of(mapping_half + 1, mapping_half + sizeof(mapping_half),
+                                [](char byte) { return byte == 0; }));
+    } else {
+        for (int iteration = 0; iteration < 32; ++iteration) {
+            EXPECT_EQ(static_cast<char>(iteration + 1),
+                      mapping_half[(iteration * 37) % kMappingHalf]);
+        }
     }
 
     // Concurrent writers have no defined last-byte ordering. Re-establish a
@@ -1213,6 +1247,14 @@ TEST(Ext4InodeIdentity, SharedMmapBufferedWriteAndFsyncMakeProgress) {
 
 TEST(Ext4InodeIdentity, PrivateMmapCowBufferedWriteAndFsyncMakeProgress) {
     ASSERT_NO_FATAL_FAILURE(RunMmapBufferedWriteAndFsyncProgress(MAP_PRIVATE));
+}
+
+TEST(Ext4InodeIdentity, ProcessVmSharedMmapBufferedWriteAndFsyncMakeProgress) {
+    ASSERT_NO_FATAL_FAILURE(RunMmapBufferedWriteAndFsyncProgress(MAP_SHARED, true));
+}
+
+TEST(Ext4InodeIdentity, ProcessVmPrivateCowBufferedWriteAndFsyncMakeProgress) {
+    ASSERT_NO_FATAL_FAILURE(RunMmapBufferedWriteAndFsyncProgress(MAP_PRIVATE, true));
 }
 
 TEST(Ext4InodeIdentity, BufferedPartialTailWritebackSerializesWithTruncate) {

@@ -1,25 +1,25 @@
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use core::sync::atomic::Ordering;
-use system_error::SystemError;
-
-use crate::{
-    arch::ipc::signal::{SigChildCode, Signal},
-    driver::tty::tty_core::TtyCore,
-    ipc::sighand::ReapTransition,
-    ipc::signal_types::SignalFlags,
-    process::{namespace::user_namespace::map_id_up, pid::PidType, ptrace, wait::WaitSelector},
-    syscall::user_access::UserBufferWriter,
-};
-
 use super::{
     abi::WaitOption,
     dec_visible_thread_count,
     resource::{RUsage, RUsageWho},
     ProcessControlBlock, ProcessFlags, ProcessManager, RawPid, PTRACE_RELATION_LOCK,
 };
+use crate::{
+    arch::ipc::signal::{SigChildCode, SigFlags, Signal},
+    driver::tty::tty_core::TtyCore,
+    ipc::{sighand::ReapTransition, signal_types::SignalFlags},
+    process::{
+        namespace::user_namespace::map_id_up, pid::PidType, ptrace, wait::WaitSelector,
+        ProcessState,
+    },
+    syscall::user_access::UserBufferWriter,
+};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::sync::atomic::Ordering;
+use system_error::SystemError;
 
 const DEFAULT_OVERFLOW_UID: u32 = 65534;
 
@@ -45,7 +45,73 @@ pub(crate) fn wstatus_to_waitid_exit_info(raw_wstatus: i32) -> (i32, i32) {
     }
 }
 
-/// mt-exec: de_thread 正在接管旧线程组时，禁止 wait 路径提前回收其他线程。
+/// Complete a ptrace zombie claim and notify its natural parent.  The caller
+/// owns `TraceClaimed`; the autoreap/report decision is committed before the
+/// state becomes visible to competing natural waiters.
+fn complete_ptrace_claim_after_ack(child_pcb: &Arc<ProcessControlBlock>) {
+    let Some(real_parent) = child_pcb.real_parent_pcb() else {
+        child_pcb.release_trace_zombie_claim();
+        return;
+    };
+    let exit_signal = child_pcb.exit_signal.load(Ordering::SeqCst);
+
+    let (autoreap, send_sigchld) = if exit_signal == Signal::SIGCHLD as i32 {
+        let disp = real_parent.sighand().handler(Signal::SIGCHLD);
+        let ignored = disp.as_ref().map(|sa| sa.is_ignore()).unwrap_or(false);
+        let no_cldwait = disp
+            .as_ref()
+            .map(|sa| sa.flags().contains(SigFlags::SA_NOCLDWAIT))
+            .unwrap_or(false);
+        if ignored {
+            (true, false)
+        } else if no_cldwait {
+            (true, true)
+        } else {
+            (false, true)
+        }
+    } else if exit_signal > 0 {
+        (false, true)
+    } else {
+        (false, false)
+    };
+
+    // Keep TraceClaimed until the disposition decision is final. Publishing
+    // Zombie before this point would allow a natural waiter to reap between
+    // the decision and the owner's autoreap transition.
+    if autoreap {
+        child_pcb.finish_trace_zombie_claim();
+        unsafe { ProcessManager::release(child_pcb.raw_pid()) };
+    } else {
+        child_pcb.release_trace_zombie_claim();
+    }
+    if send_sigchld {
+        if let Err(e) =
+            crate::ipc::kill::send_signal_to_pcb(real_parent.clone(), Signal::from(exit_signal))
+        {
+            log::warn!(
+                "complete_ptrace_claim_after_ack: deliver {:?} to {:?} failed: {:?}",
+                Signal::from(exit_signal),
+                real_parent.raw_pid(),
+                e
+            );
+        }
+    }
+
+    real_parent
+        .wait_queue
+        .wakeup_all(Some(ProcessState::Blocked(true)));
+    // The thread group leader's wait_queue must also be woken (symmetric with __WNOTHREAD semantics).
+    let parent_leader = real_parent.thread.read_irqsave().group_leader();
+    if let Some(leader) = parent_leader {
+        if !Arc::ptr_eq(&leader, &real_parent) {
+            leader
+                .wait_queue
+                .wakeup_all(Some(ProcessState::Blocked(true)));
+        }
+    }
+}
+
+/// mt-exec: forbid early reaping while de_thread is waiting for the old leader to complete the PID/TID swap
 fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
     child_pcb.sighand().reap_blocked_by_group_exec(child_pcb)
 }
@@ -295,6 +361,7 @@ pub fn kernel_waitid(
                     si_pid: info.pid.data() as i32,
                     si_uid: info.uid,
                     si_status: info.status,
+                    _padding: 0,
                     si_utime: 0,
                     si_stime: 0,
                 },
@@ -497,6 +564,14 @@ fn report_wait_event(
                 WaitRelation::Natural => child_pcb.sighand().natural_reap_blocked(child_pcb),
                 WaitRelation::Ptraced => reap_blocked_by_group_exec(child_pcb),
             });
+    // Visibility gating: a ptraced zombie is invisible to the natural parent until
+    // the tracer acknowledges it (Ptraced relation). Aligned with Linux
+    // wait_task_zombie: a ptraced child may only be reaped by the tracer first; the
+    // real_parent cannot reap before the tracer detaches (otherwise it would reap
+    // first and the tracer would never see the exit).
+    if is_zombie && !delayed_zombie && child_pcb.is_ptraced() && relation != WaitRelation::Ptraced {
+        return CandidateDecision::Pending { can_change: true };
+    }
     if is_zombie && !delayed_zombie && kwo.options.contains(WaitOption::WEXITED) {
         let Some(task_wstatus) = state.raw_wstatus().map(|status| status as i32) else {
             return CandidateDecision::Pending { can_change: false };
@@ -509,39 +584,63 @@ fn report_wait_event(
             .map(|status| status as i32)
             .unwrap_or(task_wstatus);
         let consume = !kwo.options.contains(WaitOption::WNOWAIT);
-        match relation {
-            WaitRelation::Natural => {
-                let transition = child_pcb
-                    .sighand()
-                    .try_reap_natural_child(child_pcb, consume);
-                let expected = if consume {
-                    ReapTransition::Reaped
-                } else {
-                    ReapTransition::Reportable
+
+        if child_pcb.is_ptraced()
+            && relation == WaitRelation::Ptraced
+            && !kwo.options.contains(WaitOption::WNOWAIT)
+        {
+            // Linux wait_task_zombie() first cmpxchg's EXIT_ZOMBIE to
+            // EXIT_TRACE.  Claim before unlink so neither a natural waiter nor
+            // another tracer thread can consume the same zombie.
+            let waiter = ProcessManager::current_pcb();
+            let need_cascade =
+                match ptrace::claim_and_unlink_wait_zombie(child_pcb, &waiter, kwo.options) {
+                    ptrace::PtraceZombieClaim::Claimed { need_cascade } => need_cascade,
+                    ptrace::PtraceZombieClaim::Blocked => {
+                        return CandidateDecision::Pending { can_change: true };
+                    }
+                    ptrace::PtraceZombieClaim::Lost => return CandidateDecision::Ineligible,
                 };
-                if transition == ReapTransition::Blocked {
-                    return CandidateDecision::Pending { can_change: true };
-                }
-                if transition != expected {
-                    return CandidateDecision::Ineligible;
-                }
+
+            let pid = wait_visible_pid(child_pcb);
+            let (status, cause) = wstatus_to_waitid_exit_info(raw_wstatus);
+            fill_wait_rusage(child_pcb, kwo);
+            kwo.no_task_error = None;
+            kwo.ret_status = raw_wstatus;
+            kwo.ret_info = Some(waitid_info(child_pcb, status, cause));
+
+            if need_cascade {
+                // ptracer != real_parent (external debugger): notify real_parent and
+                // keep the zombie so real_parent can reap it again via the Natural branch.
+                complete_ptrace_claim_after_ack(child_pcb);
+            } else {
+                // ptracer == real_parent (strace fork-then-trace case): reap + release
+                // immediately, report only once, and do not keep the zombie to avoid a
+                // second Natural reap.
+                child_pcb.finish_trace_zombie_claim();
+                let rusage = fill_wait_rusage(child_pcb, kwo);
+                account_reaped_child_rusage(&rusage);
+                unsafe { ProcessManager::release(child_pcb.raw_pid()) };
             }
-            WaitRelation::Ptraced => {
-                let transition = child_pcb
-                    .sighand()
-                    .try_reap_ptraced_child(child_pcb, consume);
-                let expected = if consume {
-                    ReapTransition::Reaped
-                } else {
-                    ReapTransition::Reportable
-                };
-                if transition == ReapTransition::Blocked {
-                    return CandidateDecision::Pending { can_change: true };
-                }
-                if transition != expected {
-                    return CandidateDecision::Ineligible;
-                }
-            }
+            return CandidateDecision::Ready(Ok(pid.into()));
+        }
+
+        // Natural reap (including an already-unlinked former ptraced zombie): use the
+        // transactional try_reap_natural_child (which internally handles autoreap /
+        // group-exec arbitration / mark-dead).
+        let transition = child_pcb
+            .sighand()
+            .try_reap_natural_child(child_pcb, consume);
+        let expected = if consume {
+            ReapTransition::Reaped
+        } else {
+            ReapTransition::Reportable
+        };
+        if transition == ReapTransition::Blocked {
+            return CandidateDecision::Pending { can_change: true };
+        }
+        if transition != expected {
+            return CandidateDecision::Ineligible;
         }
 
         let pid = wait_visible_pid(child_pcb);
@@ -559,28 +658,47 @@ fn report_wait_event(
         return CandidateDecision::Ready(Ok(pid.into()));
     }
 
-    let consume = !kwo.options.contains(WaitOption::WNOWAIT);
-    let stop_signal = match relation {
-        WaitRelation::Natural if kwo.options.contains(WaitOption::WSTOPPED) => {
-            child_pcb.sighand().group_stop_event(consume)
+    // ptrace-stop branch: pure ptrace-traps (syscall-stop's SIGTRAP|0x80, EVENT_STOP's
+    // (event<<8)|SIGTRAP, signal-delivery-stop) carry a richer exit_code than the
+    // sighand's stop_signal, so it must come from the per-tracee PtraceState (aligned
+    // with Linux task->exit_code).
+    // LISTENING is suppressed inside consume_stop_report (aligned with exit.c:1232 JOBCTL_LISTENING).
+    if relation == WaitRelation::Ptraced && state.is_stopped() {
+        let consume = !kwo.options.contains(WaitOption::WNOWAIT);
+        let waiter = ProcessManager::current_pcb();
+        if let Some(exit_code) =
+            ptrace::consume_wait_ptrace_stop_report(child_pcb, &waiter, kwo.options, consume)
+        {
+            let cause = SigChildCode::Trapped.into();
+            kwo.no_task_error = None;
+            kwo.ret_info = Some(waitid_info(child_pcb, exit_code, cause));
+            kwo.ret_status = (exit_code << 8) | 0x7f;
+            fill_wait_rusage(child_pcb, kwo);
+            return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
         }
-        WaitRelation::Ptraced => child_pcb
-            .sighand()
-            .ptrace_stop_event(consume, || child_pcb.sched_info().state().is_stopped()),
-        _ => None,
-    };
-    if let Some(stop_signal) = stop_signal {
-        let stopsig = stop_signal as i32;
-        let cause = if relation == WaitRelation::Ptraced {
-            SigChildCode::Trapped.into()
-        } else {
-            SigChildCode::Stopped.into()
-        };
-        kwo.no_task_error = None;
-        kwo.ret_info = Some(waitid_info(child_pcb, stopsig, cause));
-        kwo.ret_status = (stopsig << 8) | 0x7f;
-        fill_wait_rusage(child_pcb, kwo);
-        return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
+    }
+
+    // group-stop branch (Natural relation): use the transactional sighand
+    // group_stop_event (replacing stop_consume_test — the sighand has no
+    // stop_exit_code field; the stop signal number lives in stop_signal).
+    // traced-stop gating: avoids the same stop being consumed twice — by the
+    // tracer (ptrace-stop branch) and by the real_parent (this branch) after
+    // attaching to a group-stopped tracee.
+    let stop_requested =
+        relation == WaitRelation::Ptraced || kwo.options.contains(WaitOption::WSTOPPED);
+    let in_ptrace_stop = child_pcb.is_in_ptrace_stop();
+    if state.is_stopped() && stop_requested && relation != WaitRelation::Ptraced && !in_ptrace_stop
+    {
+        let consume = !kwo.options.contains(WaitOption::WNOWAIT);
+        if let Some(stop_signal) = child_pcb.sighand().group_stop_event(consume) {
+            let stopsig = stop_signal as i32;
+            let cause = SigChildCode::Stopped.into();
+            kwo.no_task_error = None;
+            kwo.ret_info = Some(waitid_info(child_pcb, stopsig, cause));
+            kwo.ret_status = (stopsig << 8) | 0x7f;
+            fill_wait_rusage(child_pcb, kwo);
+            return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
+        }
     }
 
     if kwo.options.contains(WaitOption::WCONTINUED)

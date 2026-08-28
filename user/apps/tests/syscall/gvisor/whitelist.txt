@@ -70,6 +70,7 @@ setns_test
 eventfd_test
 poll_test
 rseq_test
+process_vm_read_write_test
 
 
 # 内存管理测试
@@ -150,3 +151,4 @@ setgid_test
 uidgid_test
 partitial_bad_buffer_test
 sysinfo_test
+ptrace_test

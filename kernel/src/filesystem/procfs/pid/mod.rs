@@ -28,6 +28,7 @@ mod fdinfo;
 mod id_map;
 mod limits;
 mod maps;
+mod mem;
 mod ns;
 mod oom_score_adj;
 pub mod stat;
@@ -44,6 +45,7 @@ use fdinfo::FdInfoDirOps;
 use id_map::{IdMapFileOps, SetgroupsFileOps};
 use limits::LimitsFile;
 use maps::MapsFileOps;
+use mem::MemFileOps;
 use ns::NsDirOps;
 use oom_score_adj::{OomScoreAdjFileOps, OomScoreFileOps};
 use stat::StatFileOps;
@@ -168,6 +170,9 @@ impl PidDirOps {
         }),
         ("maps", |ops, parent| {
             MapsFileOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("mem", |ops, parent| {
+            MemFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("limits", |ops, parent| {
             LimitsFile::new_inode(ops.target.clone(), parent)

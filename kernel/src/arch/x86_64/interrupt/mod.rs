@@ -177,6 +177,12 @@ impl TrapFrame {
         self.rax = value as u64;
     }
 
+    /// Reads the syscall return-value register (rax on x86_64).
+    #[inline]
+    pub fn get_syscall_return(&self) -> usize {
+        self.rax as usize
+    }
+
     /// 判断当前中断是否来自用户模式
     pub fn is_from_user(&self) -> bool {
         return (self.cs & 0x3) != 0;
@@ -228,6 +234,14 @@ impl TrapFrame {
         let val = self.rax as i32;
         SystemError::from_posix_errno(val)
     }
+
+    /// On x86_64, rax is both the syscall-number input and the return value
+    #[inline]
+    pub fn get_orig_syscall_nr(&self) -> i64 {
+        // Linux's syscall_get_nr() returns int: only the low 32 bits of
+        // orig_rax are meaningful, and comparisons use their sign extension.
+        (self.errcode as u32 as i32) as i64
+    }
 }
 
 impl ProbeArgs for TrapFrame {
@@ -243,8 +257,8 @@ impl ProbeArgs for TrapFrame {
     }
 }
 
-// uprobe 的 ProbeArgs 与 kprobe 同签名（独立 trait，低耦合）；TrapFrame 两套都实现，
-// 以便用户态 #BP/#DB 分发把同一个 trapframe 传给 uprobe 的 pre/post/event callback。
+// uprobe's ProbeArgs has the same signature as kprobe's (a separate trait, low coupling); TrapFrame implements both,
+// so user-mode #BP/#DB dispatch can pass the same trapframe to uprobe's pre/post/event callback.
 impl uprobe::ProbeArgs for TrapFrame {
     fn as_any(&self) -> &dyn Any {
         self

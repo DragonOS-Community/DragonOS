@@ -144,9 +144,11 @@ impl TtyJobCtrlManager {
 
     fn sig_is_ignored(sig: Signal) -> bool {
         let pcb = ProcessManager::current_pcb();
-        let siginfo_guard = pcb.sig_info_irqsave();
-        siginfo_guard.sig_blocked().contains(SigSet::from(sig))
-            || pcb.sighand().handler(sig).unwrap().is_ignore()
+        let blocked = pcb
+            .sig_info_irqsave()
+            .sig_blocked()
+            .contains(SigSet::from(sig));
+        blocked || pcb.sighand().handler(sig).unwrap().is_ignore()
     }
 
     pub fn job_ctrl_ioctl(

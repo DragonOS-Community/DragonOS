@@ -26,9 +26,10 @@ pub fn current_cpu_id() -> ProcessorId {
 }
 impl Into<HartMask> for ProcessorId {
     fn into(self) -> HartMask {
-        let base = self.data() as usize / RISCV_XLEN;
-        let offset = self.data() as usize & (RISCV_XLEN - 1);
-        HartMask::from_mask_base(offset, base)
+        let hart = self.data() as usize;
+        let base = (hart / RISCV_XLEN) * RISCV_XLEN;
+        let offset = hart - base;
+        HartMask::from_mask_base(1usize << offset, base)
     }
 }
 /// 重置cpu

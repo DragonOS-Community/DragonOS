@@ -1,19 +1,18 @@
-use alloc::sync::Arc;
-use system_error::SystemError;
-
 use crate::{
     arch::{
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
         MMArch,
     },
-    mm::{access_ok, MemoryManagementArch, VirtAddr},
+    mm::{MemoryManagementArch, VirtAddr},
     process::{
         exec::{BinaryLoaderResult, ExecParam},
         ProcessControlBlock, ProcessManager,
     },
     syscall::{user_access::UserBufferWriter, Syscall},
 };
+use alloc::sync::Arc;
+use system_error::SystemError;
 
 impl Syscall {
     pub fn arch_do_execve(
@@ -41,7 +40,7 @@ impl Syscall {
         regs.rip = load_result.entry_point().data() as u64;
 
         regs.cs = USER_CS.bits() as u64;
-        regs.ds = USER_DS.bits() as u64;
+        regs.ds = 0;
         regs.ss = USER_DS.bits() as u64;
         regs.es = 0;
         regs.rflags = 0x200;
@@ -91,7 +90,10 @@ impl Syscall {
         let mut arch_info = pcb.arch_info_irqsave();
         match option {
             ARCH_GET_FS => {
-                unsafe { arch_info.save_fsbase() };
+                unsafe {
+                    arch_info.save_fs_selector();
+                    arch_info.save_fsbase();
+                };
                 let mut writer = UserBufferWriter::new(
                     arg2 as *mut usize,
                     core::mem::size_of::<usize>(),
@@ -100,7 +102,10 @@ impl Syscall {
                 writer.copy_one_to_user(&arch_info.fsbase, 0)?;
             }
             ARCH_GET_GS => {
-                unsafe { arch_info.save_gsbase() };
+                unsafe {
+                    arch_info.save_gs_selector();
+                    arch_info.save_user_gsbase();
+                };
                 let mut writer = UserBufferWriter::new(
                     arg2 as *mut usize,
                     core::mem::size_of::<usize>(),
@@ -109,22 +114,29 @@ impl Syscall {
                 writer.copy_one_to_user(&arch_info.gsbase, 0)?;
             }
             ARCH_SET_FS => {
-                // 验证FS地址是否为有效的用户空间地址
-                let fs_addr = VirtAddr::new(arg2);
-                access_ok(fs_addr, MMArch::PAGE_SIZE).map_err(|_| SystemError::EPERM)?;
+                // Only reject kernel addresses; any user address is allowed.
+                if arg2 >= MMArch::USER_END_VADDR.data() {
+                    return Err(SystemError::EPERM);
+                }
                 arch_info.fsbase = arg2;
                 // 如果是当前进程则直接写入寄存器
                 if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
-                    unsafe { arch_info.restore_fsbase() }
+                    unsafe {
+                        arch_info.load_fs_selector_zero();
+                        arch_info.restore_fsbase();
+                    }
                 }
             }
             ARCH_SET_GS => {
-                // 验证GS地址是否为有效的用户空间地址
-                let gs_addr = VirtAddr::new(arg2);
-                access_ok(gs_addr, MMArch::PAGE_SIZE).map_err(|_| SystemError::EPERM)?;
+                if arg2 >= MMArch::USER_END_VADDR.data() {
+                    return Err(SystemError::EPERM);
+                }
                 arch_info.gsbase = arg2;
                 if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
-                    unsafe { arch_info.restore_gsbase() }
+                    unsafe {
+                        arch_info.load_gs_selector_zero();
+                        arch_info.restore_user_gsbase();
+                    }
                 }
             }
             _ => {

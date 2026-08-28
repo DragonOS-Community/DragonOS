@@ -1,4 +1,11 @@
 # Focused conformance binaries that must never report a skipped gtest case.
+normal/process_vm_writev_semantics
+normal/exec_dumpable_semantics
+normal/ptrace_stop_state
+normal/ptrace_syscall_info
+normal/ptrace_relation_lifecycle
+normal/ptrace_x86_debug
+normal/remote_icache_sync
 normal/close_range_semantics
 normal/test_pivot_root
 normal/mount_propagation

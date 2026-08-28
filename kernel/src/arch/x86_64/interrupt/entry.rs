@@ -50,7 +50,7 @@ macro_rules! interrupt_handler {
                 core::arch::naked_asm!(
                     concat!(
                         "
-                        push 0x0
+                        push -1
                         ",
                         save_all_regs!(),
                         "\n",
@@ -575,7 +575,7 @@ pub unsafe fn set_system_trap_gate(irq: u32, ist: u8, vaddr: VirtAddr) {
     set_gate(idt_entry, 0xEF, ist, vaddr);
 }
 
-/// 设置中断门(DPL=3)
+/// Set an interrupt gate (DPL=3)
 #[allow(dead_code)]
 pub unsafe fn set_system_intr_gate(irq: u32, ist: u8, vaddr: VirtAddr) {
     let idt_entry = get_idt_entry(irq);

@@ -1,4 +1,5 @@
 use super::*;
+use core::sync::atomic::{AtomicBool, AtomicU8};
 
 #[cfg(target_arch = "x86_64")]
 struct MremapExecFallbacks {
@@ -41,6 +42,13 @@ pub struct AddressSpace {
     /// Maintained by context switch / exec / process exit paths; `flush_tlb_mm_range` uses this to determine shootdown targets.
     /// Cf. Linux 6.6 `struct mm_struct::cpu_bitmap` semantics.
     pub active_cpus: SpinLock<CpuMask>,
+    /// RISC-V harts which must execute `fence.i` before this mm next runs.
+    ///
+    /// Active harts are fenced synchronously by a writer; retaining their bits
+    /// is intentional, because clearing them after SBI acknowledgement could
+    /// erase a concurrent writer's newer stale mark.
+    #[cfg(target_arch = "riscv64")]
+    icache_stale_cpus: SpinLock<CpuMask>,
     /// Monotonically increasing count of page table modifications for this mm.
     ///
     /// `flush_tlb_*` must increment this after publishing page table writes and before snapshotting `active_cpus`;
@@ -62,22 +70,40 @@ pub struct AddressSpace {
     /// OOM waiters must not treat the earlier resident-page accounting decrement
     /// as reclaim progress.
     oom_reclaim_generation: AtomicU64,
+    /// Explicit tear-down flag
+    /// After the last active user exits/execs away, the mappings are already
+    /// gone even if external references (e.g. a /proc/[pid]/mem fd) remain.
+    /// Later reads/writes through pinned references return EOF.
+    torn_down: AtomicBool,
+    /// Tasks that still have this address space installed and have not released it.
+    user_count: AtomicUsize,
+    /// Dumpability is an address-space property, matching Linux `mm_struct`.
+    /// Threads sharing an mm must never observe different ptrace access state.
+    dumpable: AtomicU8,
+    /// User namespace which owns this mm for ptrace capability checks.
+    /// Exec may monotonically promote it before publishing the new image.
+    /// This is a cold permission-check path, so a narrow lock is simpler and
+    /// avoids RCU callback allocation during an exec security transition.
+    user_ns: SpinLock<Arc<UserNamespace>>,
+    /// Linux BINPRM_FLAGS_ENFORCE_NONDUMP equivalent for the prospective exec mm.
+    exec_enforce_nondump: AtomicBool,
     /// Uses RwSem instead of RwLock because address space operations may require I/O (e.g., file reads on page faults)
     inner: RwSem<InnerAddressSpace>,
     /// Wait for pending mmap reservations to be committed or cancelled.
     reservation_wait: WaitQueue,
-    // ── uprobe 子系统字段（计划步骤 3）──
+    // ── uprobe subsystem fields (planned step 3) ──
     //
-    // 这些字段位于 `inner` **之外**，由独立 irqsave `SpinLock` 保护（评审 F8）。
-    // 命中路径（#BP/#DB 关中断）仅 `lock_irqsave` + 查表，绝不取 `inner` 的 RwSem（会睡眠）。
+    // These fields live **outside** `inner` and are protected by their own irqsave
+    // `SpinLock`s (review F8). The hit path (#BP/#DB with interrupts off) only takes
+    // `lock_irqsave` + a table lookup, never the `inner` RwSem (which could sleep).
     //
-    /// Per-mm uprobe 表：唯一写控制表 + 面向 #BP 的不可变 RCU 快照。
+    /// Per-mm uprobe table: the single write-control table + an immutable RCU snapshot for #BP.
     #[cfg(target_arch = "x86_64")]
     pub uprobe_list: UprobeSiteTable,
     /// Per-mm XOL page pool (grown lazily by uprobe registration).
     #[cfg(target_arch = "x86_64")]
     pub xol_pool: XolPool,
-    /// Per-page 断点状态（追踪 COW 副本 + refcount，供注销恢复原页）。
+    /// Per-page breakpoint state (tracks the COW copy + refcount, used by unregister to restore the original page).
     #[cfg(target_arch = "x86_64")]
     pub(crate) uprobe_page_state: SpinLock<BTreeMap<usize, UprobePageState>>,
 }
@@ -317,7 +343,11 @@ impl AddressSpace {
         }
     }
 
-    pub fn new(create_stack: bool) -> Result<Arc<Self>, SystemError> {
+    pub fn new(
+        create_stack: bool,
+        user_ns: Arc<UserNamespace>,
+        dumpable: u8,
+    ) -> Result<Arc<Self>, SystemError> {
         let inner = InnerAddressSpace::new(false)?;
         let table_paddr = inner.user_mapper.utable.table().phys();
         let id = ADDRESS_SPACE_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
@@ -325,10 +355,19 @@ impl AddressSpace {
             id,
             table_paddr,
             active_cpus: SpinLock::new(CpuMask::new()),
+            #[cfg(target_arch = "riscv64")]
+            icache_stale_cpus: SpinLock::new(CpuMask::new()),
             tlb_gen: AtomicU64::new(0),
             page_table_edit_lock: Mutex::new(()),
             resident_user_pages: AtomicUsize::new(0),
             oom_reclaim_generation: AtomicU64::new(0),
+            torn_down: AtomicBool::new(false),
+            // Baseline 1 stands for the first task installing this space (exec'd table or deep-copied child).
+            // The IDLE space's baseline 1 has no task; it is a deliberate floor preventing tear-down.
+            user_count: AtomicUsize::new(1),
+            dumpable: AtomicU8::new(dumpable),
+            user_ns: SpinLock::new(user_ns),
+            exec_enforce_nondump: AtomicBool::new(false),
             inner: RwSem::new(inner),
             reservation_wait: WaitQueue::default(),
             #[cfg(target_arch = "x86_64")]
@@ -352,6 +391,44 @@ impl AddressSpace {
         return Ok(result);
     }
 
+    #[inline]
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_dumpable(&self, value: u8) {
+        self.dumpable.store(value, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn user_ns(&self) -> Arc<UserNamespace> {
+        self.user_ns.lock_irqsave().clone()
+    }
+
+    /// Mark an unreadable executable/interpreter and monotonically promote
+    /// the prospective exec mm's owning user namespace.
+    ///
+    /// The caller holds the task's exec-update write lock. Keeping this API on
+    /// AddressSpace makes all recursive ELF interpreter ExecParams converge on
+    /// the same security state without a second transaction object.
+    pub(crate) fn enforce_exec_nondump_in(&self, user_ns: Arc<UserNamespace>) {
+        self.exec_enforce_nondump.store(true, Ordering::Release);
+        let current = self.user_ns();
+        if user_ns.level() < current.level() {
+            let old = {
+                let mut slot = self.user_ns.lock_irqsave();
+                core::mem::replace(&mut *slot, user_ns)
+            };
+            drop(old);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn exec_enforces_nondump(&self) -> bool {
+        self.exec_enforce_nondump.load(Ordering::Acquire)
+    }
+
     /// Get the globally unique ID of this address space
     #[inline(always)]
     pub fn id(&self) -> u64 {
@@ -373,6 +450,74 @@ impl AddressSpace {
             .expect("Current process has no address space");
 
         return Ok(vm);
+    }
+
+    /// Mark this address space as explicitly torn down
+    /// Readers either finish before tear-down or observe torn_down
+    #[inline]
+    pub fn mark_torn_down(&self) {
+        self.torn_down.store(true, Ordering::Release);
+    }
+
+    /// Whether this address space has been explicitly torn down.
+    #[inline]
+    pub fn is_torn_down(&self) -> bool {
+        self.torn_down.load(Ordering::Acquire)
+    }
+
+    /// Number of tasks still holding this space unreleased (see field docs).
+    #[inline]
+    pub fn user_count(&self) -> usize {
+        self.user_count.load(Ordering::Acquire)
+    }
+
+    /// Increment the user count when a task installs this address space
+    #[inline]
+    pub fn user_count_inc(&self) {
+        self.user_count.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn try_acquire(self: &Arc<Self>) -> Option<MmUserRef> {
+        if self.mmget_not_zero() {
+            Some(MmUserRef { vm: self.clone() })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn mmget_not_zero(&self) -> bool {
+        self.user_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                if c == 0 {
+                    None
+                } else {
+                    Some(c + 1)
+                }
+            })
+            .is_ok()
+    }
+
+    #[inline]
+    pub(crate) fn mmput(&self) {
+        if self.user_count_dec_and_test() {
+            unsafe {
+                // Take the write lock to unmap first, then set torn_down, forming a critical-section boundary with readers.
+                self.write().unmap_all();
+            }
+            self.mark_torn_down();
+            crate::mm::oom::note_oom_victim_mm_released(self.id());
+        }
+    }
+
+    /// Decrement when a task releases it (exit or exec swap);
+    /// returns true if the caller is the last user and must tear down the mappings.
+    #[inline]
+    pub(crate) fn user_count_dec_and_test(&self) -> bool {
+        let prev = self.user_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev > 0, "AddressSpace user_count underflow");
+        prev == 1
     }
 
     /// Check whether this address space belongs to the current process
@@ -411,6 +556,100 @@ impl AddressSpace {
     pub fn active_cpus_clear(&self, cpu: crate::smp::cpu::ProcessorId) {
         let mut g = self.active_cpus.lock();
         g.set(cpu, false);
+    }
+
+    /// Synchronize instruction fetch after a remote user-memory write.
+    ///
+    /// x86 has coherent instruction/data caches. LoongArch's Linux
+    /// `flush_icache_user_page` is also a no-op because hardware maintains
+    /// I/D coherence; `ibar` is reserved for local kernel instruction-patch
+    /// hazards. RISC-V requires the explicit protocol below.
+    #[inline]
+    pub(crate) fn sync_remote_user_icache(&self) {
+        #[cfg(target_arch = "riscv64")]
+        self.sync_remote_user_icache_riscv();
+    }
+
+    /// Validate architecture support before a remote write changes any byte.
+    #[inline]
+    pub(crate) fn prepare_remote_user_write(&self) -> Result<(), SystemError> {
+        #[cfg(target_arch = "riscv64")]
+        {
+            use crate::arch::driver::sbi::{SBIExtensions, SbiDriver};
+
+            if !SbiDriver::extensions().contains(SBIExtensions::RFENCE) {
+                return Err(SystemError::EIO);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn sync_remote_user_icache_riscv(&self) {
+        use crate::{
+            arch::mm::RiscV64MMArch,
+            mm::percpu::PerCpu,
+            smp::{core::smp_get_processor_id, cpu::smp_cpu_manager},
+        };
+
+        // Prevent migration between clearing the local stale bit, local
+        // fence.i and the active-cpu snapshot.
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let current = smp_get_processor_id();
+        {
+            let mut stale = self.icache_stale_cpus.lock();
+            for id in 0..PerCpu::MAX_CPU_NUM {
+                stale.set(crate::smp::cpu::ProcessorId::new(id), true);
+            }
+            stale.set(current, false);
+        }
+
+        // Publish copied instructions before either local or SBI fence.i.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        RiscV64MMArch::local_flush_icache_all();
+
+        // Writer order is stale -> active. Switch order is active -> stale:
+        // whichever publication happens first is therefore observed by the
+        // other side, closing the switch-in race without a generation token.
+        let remote = {
+            let active = self.active_cpus.lock();
+            let mut remote = active.clone();
+            remote.set(current, false);
+            remote
+        };
+        core::sync::atomic::fence(Ordering::SeqCst);
+        for cpu in remote.iter_cpu() {
+            if smp_cpu_manager().is_online_cpu(cpu) {
+                RiscV64MMArch::remote_flush_icache(cpu)
+                    // RFENCE was checked before any byte was copied. Failure
+                    // after firmware advertised the extension violates the
+                    // SBI platform contract; returning would let an active
+                    // hart execute stale instructions.
+                    .expect("SBI remote_fence_i failed for an active user mm");
+            }
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        drop(irq_guard);
+    }
+
+    /// Complete a deferred RISC-V instruction-cache synchronization after
+    /// publishing this CPU in `active_cpus`, but before it can return to user.
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn flush_stale_user_icache_on_switch(&self, cpu: crate::smp::cpu::ProcessorId) {
+        let stale = {
+            let mut mask = self.icache_stale_cpus.lock();
+            let stale = mask.get(cpu).unwrap_or(false);
+            if stale {
+                mask.set(cpu, false);
+            }
+            stale
+        };
+        if stale {
+            // Pairs with the writer's stale publication barrier and makes its
+            // instruction bytes visible before the local fence.i.
+            core::sync::atomic::fence(Ordering::SeqCst);
+            crate::arch::mm::RiscV64MMArch::local_flush_icache_all();
+        }
     }
 
     /// Issue a range-based TLB flush for this mm (including remote shootdown + local).
@@ -1784,5 +2023,34 @@ impl Drop for MmapReservationGuard {
             drop(guard);
             self.mm.wake_reservation_waiters();
         }
+    }
+}
+
+/// Reference guard for address-space users: acquiring it increments the user count by 1,
+/// and dropping it releases that count. When the release makes the count zero (all tasks
+/// have exited or switched away and this guard is the last holder), the guard completes
+/// the mapping teardown. While held, neither the target process's exit nor its exec
+/// switching address spaces can make the mappings disappear midway.
+pub struct MmUserRef {
+    vm: Arc<AddressSpace>,
+}
+
+impl MmUserRef {
+    /// Lend out the referenced address space.
+    #[inline]
+    pub fn vm(&self) -> &Arc<AddressSpace> {
+        &self.vm
+    }
+
+    /// Determine whether two references point to the same address space.
+    #[inline]
+    pub fn is_same(&self, other: &MmUserRef) -> bool {
+        Arc::ptr_eq(&self.vm, &other.vm)
+    }
+}
+
+impl Drop for MmUserRef {
+    fn drop(&mut self) {
+        self.vm.mmput();
     }
 }

@@ -33,22 +33,22 @@ use crate::{
     },
     libs::{
         futex::futex::RobustListHead,
-        lock_free_flags::LockFreeFlags,
         mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwsem::RwSem,
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
     process::{
-        cred::{Cred, INIT_CRED},
+        cred::{cred_cap_issubset, Cred, INIT_CRED, SUID_DUMPABLE, SUID_DUMP_DISABLE},
         kthread::WorkerPrivate,
         namespace::nsproxy::NsProxy,
         pid::{Pid, PidLink, PidType},
         resource::{RLimit64, RLimitID, RUsage},
         timer::AlarmTimer,
-        AtomicRawPid, ExitState, KernelStack, ProcessBasicInfo, ProcessCpuTime, ProcessFlags,
-        ProcessItimers, ProcessManager, ProcessSchedulerInfo, ProcessSignalInfo, ProcessState,
-        RawPid, ThreadInfo, PTRACE_RELATION_LOCK,
+        AtomicProcessFlags, AtomicRawPid, ExitState, KernelStack, ProcessBasicInfo, ProcessCpuTime,
+        ProcessFlags, ProcessItimers, ProcessManager, ProcessSchedulerInfo, ProcessSignalInfo,
+        ProcessState, RawPid, ThreadInfo, PTRACE_RELATION_LOCK,
     },
     rcu::RcuArcSlot,
 };
@@ -73,14 +73,14 @@ pub struct ProcessControlBlock {
     pub(super) task_cgroup: RwLock<TaskCgroupRef>,
 
     pub(super) basic: RwLock<ProcessBasicInfo>,
-    /// Spinlock hold count of the current process.
+    pub(super) exec_update_lock: RwSem<()>,
     pub(super) preempt_count: AtomicUsize,
     /// Nesting count for no-fault user access sections.
     pub(super) pagefault_disabled: AtomicUsize,
     /// RCU read-side nesting depth of the current process.
     pub(super) rcu_read_depth: AtomicUsize,
 
-    pub(super) flags: LockFreeFlags<ProcessFlags>,
+    pub(super) flags: AtomicProcessFlags,
     /// Per-task uprobe XOL state. Kept in the process subsystem so exception
     /// routing does not become process state ownership.
     #[cfg(target_arch = "x86_64")]
@@ -140,11 +140,6 @@ pub struct ProcessControlBlock {
     /// When true, the process retains capabilities after changing UID/GID.
     pub(super) keepcaps: AtomicBool,
 
-    /// prctl(PR_SET/GET_DUMPABLE) state.
-    /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER; 2 (SUID_DUMP_ROOT) is not
-    /// allowed via PR_SET_DUMPABLE.
-    pub(super) dumpable: AtomicU8,
-
     pub(super) seccomp_mode: AtomicU8,
     pub(super) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
 
@@ -170,10 +165,9 @@ pub struct ProcessControlBlock {
 
     /// Linked list of children processes.
     pub(super) children: RwLock<Vec<RawPid>>,
-    /// Tasks currently traced by this process. Entries are global raw pids.
-    pub(super) ptraced: RwLock<Vec<RawPid>>,
-    /// Current tracer if this process is ptraced.
-    pub(super) ptracer_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// Ptrace relation ownership and the per-tracee stop/event state machine.
+    /// The header preserves the existing inner locks and field order.
+    pub(super) ptrace: ptrace::PtraceTask,
 
     /// Wait queue.
     pub(super) wait_queue: WaitQueue,
@@ -269,6 +263,16 @@ impl ProcessControlBlock {
         self.flags().contains(ProcessFlags::KTHREAD)
     }
 
+    /// Get a reference to this task's currently installed, active user address space.
+    pub fn active_vm(&self) -> Option<crate::mm::ucontext::MmUserRef> {
+        if self.is_kthread() {
+            return None;
+        }
+        let basic = self.basic();
+        let vm = basic.user_vm()?;
+        vm.try_acquire()
+    }
+
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
         // Initialize the namespace proxy.
@@ -312,7 +316,7 @@ impl ProcessControlBlock {
         let preempt_count = AtomicUsize::new(0);
         let pagefault_disabled = AtomicUsize::new(0);
         let rcu_read_depth = AtomicUsize::new(0);
-        let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
+        let flags = AtomicProcessFlags::new();
         let initial_sighand = SigHand::new();
         initial_sighand.attach_task_ref();
 
@@ -330,10 +334,11 @@ impl ProcessControlBlock {
                 pid: AtomicRawPid::new(raw_pid),
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
+                basic: basic_info,
+                exec_update_lock: RwSem::new(()),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RcuArcSlot::new(nsproxy),
                 task_cgroup: RwLock::new(task_cgroup),
-                basic: basic_info,
                 preempt_count,
                 pagefault_disabled,
                 rcu_read_depth,
@@ -358,9 +363,6 @@ impl ProcessControlBlock {
 
                 no_new_privs: AtomicBool::new(false),
                 keepcaps: AtomicBool::new(false),
-                // Default to SUID_DUMP_USER(=1) to satisfy gVisor's
-                // SetGetDumpability expectation.
-                dumpable: AtomicU8::new(1),
                 seccomp_mode: AtomicU8::new(seccomp::SeccompMode::Disabled as u8),
                 seccomp_filter: SpinLock::new(None),
                 parent_pcb: RwLock::new(ppcb.clone()),
@@ -368,8 +370,7 @@ impl ProcessControlBlock {
                 wait_parent_pcb: RwLock::new(ppcb.clone()),
                 fork_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
-                ptraced: RwLock::new(Vec::new()),
-                ptracer_pcb: RwLock::new(Weak::new()),
+                ptrace: ptrace::PtraceTask::new(),
                 wait_queue: WaitQueue::default(),
                 cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
@@ -634,8 +635,8 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> &mut ProcessFlags {
-        return self.flags.get_mut();
+    pub fn flags(&self) -> &AtomicProcessFlags {
+        &self.flags
     }
 
     #[inline(always)]
@@ -653,6 +654,17 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn basic(&self) -> RwLockReadGuard<'_, ProcessBasicInfo> {
         return self.basic.read_irqsave();
+    }
+
+    /// Acquire the exec_update_lock read lock
+    pub fn exec_update_read(&self) -> crate::libs::rwsem::RwSemReadGuard<'_, ()> {
+        self.exec_update_lock.read()
+    }
+
+    /// Acquire the exec_update_lock write lock: the critical sections where execve swaps mm/cred/dumpable hold this lock.
+    #[inline(always)]
+    pub fn exec_update_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
+        self.exec_update_lock.write()
     }
 
     #[inline(always)]
@@ -699,12 +711,17 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn dumpable(&self) -> u8 {
-        self.dumpable.load(Ordering::SeqCst)
+        self.basic()
+            .user_vm()
+            .map(|mm| mm.dumpable())
+            .unwrap_or(SUID_DUMP_DISABLE as u8)
     }
 
     #[inline(always)]
     pub fn set_dumpable(&self, value: u8) {
-        self.dumpable.store(value, Ordering::SeqCst)
+        if let Some(mm) = self.basic().user_vm() {
+            mm.set_dumpable(value);
+        }
     }
 
     #[inline(always)]
@@ -861,6 +878,34 @@ impl ProcessControlBlock {
     /// - Returns `Result` so that callers can extend error handling as needed.
     pub fn set_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
         let _task_guard = self.task_lock.lock_irqsave();
+        self.cred.store_deferred(new);
+        Ok(())
+    }
+
+    /// Commit new creds, updating dumpability accordingly
+    pub fn commit_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        // Stabilize the active mm across the credential publication. Linux
+        // publishes a dumpability downgrade before readers can observe the new
+        // credentials; exec uses the write side of this same lock.
+        let _exec_guard = self.exec_update_read();
+        let active_mm = self.basic().user_vm();
+        let _task_guard = self.task_lock.lock_irqsave();
+        let old = self.cred();
+        // Trigger: any of euid/egid/fsuid/fsgid changes, or new permitted is not a subset of old (privilege raise)
+        if old.euid != new.euid
+            || old.egid != new.egid
+            || old.fsuid != new.fsuid
+            || old.fsgid != new.fsgid
+            || !cred_cap_issubset(&old, &new)
+        {
+            // Publish dumpability before creds; with the read-side fence, checks never see new creds with old dumpable
+            if let Some(mm) = active_mm.as_ref() {
+                mm.set_dumpable(SUID_DUMPABLE.load(Ordering::SeqCst) as u8);
+            }
+            // Also clear the parent-death signal on identity change
+            self.set_pdeath_signal(Signal::INVALID);
+            fence(Ordering::Release);
+        }
         self.cred.store_deferred(new);
         Ok(())
     }
@@ -1319,7 +1364,7 @@ impl ProcessControlBlock {
 
     /// Fast check using PCB flags: whether the current process has any pending signals.
     pub fn has_pending_signal_fast(&self) -> bool {
-        self.flags.get().contains(ProcessFlags::HAS_PENDING_SIGNAL)
+        self.flags.contains(ProcessFlags::HAS_PENDING_SIGNAL)
     }
 
     /// Checks whether the current process has pending signals that are not
@@ -1434,6 +1479,61 @@ impl ProcessControlBlock {
         self.thread.write_irqsave()
     }
 
+    /// Reserve one leader-owned thread-list slot without allocating while the
+    /// IRQ-safe membership lock is held. Timer signal delivery can inspect the
+    /// list from hardirq context, so using a non-irqsave writer would deadlock
+    /// if that interrupt arrived while the process-context writer was active.
+    /// Publication must still recheck capacity under pid-membership ordering.
+    pub(crate) fn try_reserve_thread_group_slot(&self) -> Result<(), SystemError> {
+        loop {
+            let required_capacity = {
+                let threads = self.thread.read_irqsave();
+                if threads.group_tasks.len() < threads.group_tasks.capacity() {
+                    return Ok(());
+                }
+                let required = threads
+                    .group_tasks
+                    .len()
+                    .checked_add(1)
+                    .ok_or(SystemError::ENOMEM)?;
+                threads
+                    .group_tasks
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+            };
+
+            // All allocator work happens before taking the IRQ-safe writer.
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(required_capacity)
+                .map_err(|_| SystemError::ENOMEM)?;
+
+            let installed = {
+                let mut threads = self.thread.write_irqsave();
+                if threads.group_tasks.len() < threads.group_tasks.capacity() {
+                    false
+                } else if replacement.capacity() < threads.group_tasks.len().saturating_add(1) {
+                    // A concurrent publisher consumed more capacity than the
+                    // lock-free preparation anticipated. Retry with its size.
+                    false
+                } else {
+                    // Capacity is already sufficient, so append only moves
+                    // Weak values; swap leaves the old empty buffer to be
+                    // dropped after IRQs are restored.
+                    replacement.append(&mut threads.group_tasks);
+                    core::mem::swap(&mut replacement, &mut threads.group_tasks);
+                    true
+                }
+            };
+            drop(replacement);
+
+            if installed {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn restart_block(&self) -> SpinLockGuard<'_, Option<RestartBlock>> {
         self.restart_block.lock()
     }
@@ -1491,6 +1591,40 @@ impl ProcessControlBlock {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Acquire the unique consuming ownership used by ptrace zombie wait.
+    pub(crate) fn try_claim_trace_zombie(&self) -> bool {
+        self.exit_state
+            .compare_exchange(
+                ExitState::Zombie as u8,
+                ExitState::TraceClaimed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn release_trace_zombie_claim(&self) {
+        self.exit_state
+            .compare_exchange(
+                ExitState::TraceClaimed as u8,
+                ExitState::Zombie as u8,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .expect("only the ptrace zombie owner may release its claim");
+    }
+
+    pub(crate) fn finish_trace_zombie_claim(&self) {
+        self.exit_state
+            .compare_exchange(
+                ExitState::TraceClaimed as u8,
+                ExitState::Dead as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("only the ptrace zombie owner may finish its claim");
     }
 
     /// Publish completion of `exit_notify()` after all producer-side effects.

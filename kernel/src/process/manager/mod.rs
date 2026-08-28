@@ -19,7 +19,10 @@ use crate::{
         set_IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
     },
-    process::{ProcessControlBlock, RawPid},
+    process::{
+        cred::SUID_DUMP_USER, namespace::user_namespace::INIT_USER_NAMESPACE, ProcessControlBlock,
+        RawPid,
+    },
     sched::{cpu_rq, enqueue_task_on_cpu, select_task_rq, OnRq, WakeupFlags},
     smp::{core::smp_get_processor_id, cpu::ProcessorId, kick_cpu},
     syscall::user_access::write_one_to_user_protected,
@@ -157,17 +160,6 @@ impl ProcessManager {
         OOM_SCORE_ADJ_LOCK.lock()
     }
 
-    fn mm_has_user_tasks(mm: &Arc<AddressSpace>) -> bool {
-        ProcessManager::get_all_processes()
-            .into_iter()
-            .filter_map(ProcessManager::find)
-            .any(|task| {
-                task.basic()
-                    .user_vm()
-                    .is_some_and(|task_mm| task_mm.id() == mm.id() || Arc::ptr_eq(&task_mm, mm))
-            })
-    }
-
     pub fn is_current(pcb: &Arc<ProcessControlBlock>) -> bool {
         Arc::ptr_eq(pcb, &Self::current_pcb())
     }
@@ -220,7 +212,8 @@ impl ProcessManager {
             let Some(task) = weak.upgrade() else {
                 continue;
             };
-            if tasks.iter().any(|existing| Arc::ptr_eq(existing, &task)) {
+            // The group list is maintained by the leader and does not include the leader itself
+            if Arc::ptr_eq(&task, &leader) {
                 continue;
             }
             tasks.push(task);
@@ -244,7 +237,8 @@ impl ProcessManager {
             debug!("To create address space for INIT process.");
             // test_buddy();
             set_IDLE_PROCESS_ADDRESS_SPACE(
-                AddressSpace::new(true).expect("Failed to create address space for INIT process."),
+                AddressSpace::new(true, INIT_USER_NAMESPACE.clone(), SUID_DUMP_USER as u8)
+                    .expect("Failed to create address space for INIT process."),
             );
             debug!("INIT process address space created.");
             compiler_fence(Ordering::SeqCst);
@@ -335,12 +329,6 @@ impl ProcessManager {
         let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
         let left_old_pid = left.raw_pid();
         let right_old_pid = right.raw_pid();
-        let ptrace_plan = crate::process::ptrace::prepare_tracee_pid_exchange_locked(
-            left,
-            right,
-            left_old_pid,
-            right_old_pid,
-        );
         let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
         let mut all_proc = all_process().lock_irqsave();
         let map = all_proc
@@ -370,7 +358,6 @@ impl ProcessManager {
 
         left.exchange_tid_with(right, || {
             exchange_raw_pids_locked(map, left, right);
-            crate::process::ptrace::commit_tracee_pid_exchange_locked(ptrace_plan);
         });
 
         // cgroup.procs only shows tasks that are still alive; when exec

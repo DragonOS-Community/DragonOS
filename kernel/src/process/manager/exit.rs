@@ -22,7 +22,7 @@ use crate::{
         constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
         futex::{Futex, RobustListHead},
     },
-    mm::IDLE_PROCESS_ADDRESS_SPACE,
+    mm::{ucontext::AddressSpace, IDLE_PROCESS_ADDRESS_SPACE},
     process::{
         exit::wstatus_to_waitid_exit_info,
         kthread::KernelThreadMechanism,
@@ -378,8 +378,11 @@ impl ProcessManager {
             }
         }
 
-        // 退出不再返回旧用户态上下文；先释放 ActiveXol 对 site/slot/consumer
-        // 的强引用，再进入 mm teardown。该清理不需要也不应改 trapframe。
+        current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
+
+        // Exit will not return to the old user context; release ActiveXol's strong
+        // references to site/slot/consumer before entering mm teardown. This cleanup does
+        // not need to — and should not — modify the trapframe.
         #[cfg(target_arch = "x86_64")]
         crate::exception::uprobe::cleanup_task_active_xol(&current_pcb);
 
@@ -403,6 +406,7 @@ impl ProcessManager {
                 assert_ne!(previous, 0, "thread-group live count underflow");
                 (group_leader, previous == 1)
             };
+            ptrace::settle_exiting_group_stop(&pcb);
             // Match Linux perf_event_exit_task(): terminal task events must be
             // detached while the old mm and its original instruction bytes
             // are still available. The perf fd retains its final count.
@@ -436,7 +440,12 @@ impl ProcessManager {
                 // If *clear_child_tid cannot be cleared, avoid futex_wake as well
                 // (avoid further invalid userspace accesses).
                 if cleared_ok
-                    && Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1
+                    && pcb
+                        .basic()
+                        .user_vm()
+                        .expect("User VM Not found")
+                        .user_count()
+                        > 1
                 {
                     // Linux uses the FUTEX_SHARED flag to wake clear_child_tid.
                     // This allows cross-process/thread synchronization (e.g.
@@ -476,15 +485,7 @@ impl ProcessManager {
                 drop(irq_guard);
                 old_vm
             });
-            if let Some(old_vm) = old_user_vm.as_ref() {
-                let last_user = !Self::mm_has_user_tasks(old_vm);
-                if last_user {
-                    unsafe {
-                        old_vm.write().unmap_all();
-                    }
-                    crate::mm::oom::note_oom_victim_mm_released(old_vm.id());
-                }
-            }
+            Self::release_old_user_vm_if_last(old_user_vm.as_ref());
             drop(old_user_vm);
 
             pcb.exit_files();
@@ -734,5 +735,13 @@ impl ProcessManager {
                     .wakeup_all(Some(ProcessState::Blocked(true)));
             }
         }
+    }
+
+    /// Release the old user address space: if no task still uses it, tear down all mappings
+    pub(crate) fn release_old_user_vm_if_last(old_vm: Option<&Arc<AddressSpace>>) {
+        let Some(old_vm) = old_vm else {
+            return;
+        };
+        old_vm.mmput();
     }
 }

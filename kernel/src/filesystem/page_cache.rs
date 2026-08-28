@@ -740,6 +740,42 @@ impl Drop for PageDirtyReservation {
     }
 }
 
+/// A fallibly admitted remote write against one exact attached cache entry.
+///
+/// The entry pin prevents truncate/invalidate from replacing this incarnation.
+/// Dirty membership is published while the caller holds the page write lock,
+/// immediately before the infallible byte copy. Writeback also serializes its
+/// page snapshot with that lock and rechecks successor membership under
+/// `inner`, so it cannot observe a partially copied page or lose a redirty.
+pub(crate) struct PreparedRemotePageDirty {
+    cache: Arc<PageCache>,
+    entry: Arc<PageEntry>,
+    _pin: PageEntryPin,
+    page_index: usize,
+    reservation: PageDirtyReservation,
+}
+
+impl PreparedRemotePageDirty {
+    pub(crate) fn publish_before_copy(&mut self, page_locked: &InnerPage) {
+        let mut inner = self.cache.inner.lock();
+        let current = inner
+            .get_entry(self.page_index)
+            .expect("prepared remote dirty entry detached while pinned");
+        assert!(
+            Arc::ptr_eq(&current, &self.entry),
+            "prepared remote dirty entry was replaced while pinned"
+        );
+        PageCache::validate_page_locked_entry(&current, page_locked)
+            .expect("prepared remote dirty page identity changed");
+        let _ = PageCache::publish_prepared_front_dirty_locked(
+            &mut inner,
+            self.page_index,
+            &current,
+            &mut self.reservation,
+        );
+    }
+}
+
 #[derive(Debug)]
 pub struct InnerPageCache {
     #[allow(unused)]
@@ -2955,6 +2991,43 @@ impl PageCache {
             cache: self.manager.owner.clone(),
             active: true,
         })
+    }
+
+    /// Complete every fallible PageCache precondition for a remote write and
+    /// pin the exact entry until the caller finishes copying.
+    ///
+    /// `Ok(None)` means the managed page is no longer this mapping's cache
+    /// entry (for example, a private COW page), so only the Page itself should
+    /// be dirtied.
+    pub(crate) fn prepare_remote_page_dirty(
+        self: &Arc<Self>,
+        page_index: usize,
+        expected_page: &Arc<Page>,
+    ) -> Result<Option<PreparedRemotePageDirty>, SystemError> {
+        let mut inner = self.inner.lock();
+        let Some(entry) = inner.get_entry(page_index) else {
+            return Ok(None);
+        };
+        if !Arc::ptr_eq(&entry.page, expected_page) || !entry.state().is_ready() {
+            return Ok(None);
+        }
+        let next_preparations = inner
+            .dirty_preparations
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        self.ensure_dirty_retention_locked(&mut inner)?;
+        inner.dirty_preparations = next_preparations;
+        let pin = entry.pin();
+        Ok(Some(PreparedRemotePageDirty {
+            cache: self.clone(),
+            entry,
+            _pin: pin,
+            page_index,
+            reservation: PageDirtyReservation {
+                cache: self.manager.owner.clone(),
+                active: true,
+            },
+        }))
     }
 
     fn cancel_page_dirty_reservation(&self) {

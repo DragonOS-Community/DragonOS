@@ -154,8 +154,8 @@ impl Syscall for SysCapset {
         new_cred.cap_ambient &= CAPFlags::from_bits_truncate(p_p_new);
         new_cred.cap_ambient &= CAPFlags::from_bits_truncate(p_i_new);
 
-        // 原子替换 cred（需要 PCB 暴露 set_cred）
-        pcb.set_cred(Cred::new_arc(new_cred))?;
+        // Commit the new cred; a permitted-cap change that raises privileges also resets dumpability
+        pcb.commit_cred(Cred::new_arc(new_cred))?;
 
         Ok(0)
     }

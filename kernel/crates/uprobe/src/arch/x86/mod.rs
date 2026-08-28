@@ -1,39 +1,45 @@
-//! x86_64 指令分析与 XOL slot 副本生成。
+//! x86_64 instruction analysis and XOL slot copy generation.
 //!
-//! 直接复用 yaxpeax-x86（kprobe 已依赖）解码器：
-//! - 用 `InstDecoder::default().decode_slice(bytes)` 解码，取 `.len().to_const()` 得
-//!   指令长度（与 kprobe `arch/x86/mod.rs` 用法一致）；
-//! - 遍历操作数检测 RIP-relative（`[rip+disp]` 与 `[rip]` 两种呈现均处理）；
-//! - XOL slot 副本生成分两步：静态分析产出 [`InsnAnalysis`]，运行时用真实 slot 地址
-//!   调用 [`build_xol_slot`] 做 RIP-relative 重定位（由 mm 层在命中时调用）。
+//! Reuses the yaxpeax-x86 decoder that kprobe already depends on:
+//! - decode with `InstDecoder::default().decode_slice(bytes)` and take
+//!   `.len().to_const()` for the instruction length (consistent with kprobe's
+//!   `arch/x86/mod.rs` usage);
+//! - iterate over the operands to detect RIP-relative addressing (both
+//!   `[rip+disp]` and `[rip]` forms are handled);
+//! - XOL slot copy generation happens in two steps: static analysis produces
+//!   [`InsnAnalysis`], and at runtime the mm layer calls [`build_xol_slot`]
+//!   with the real slot address to perform the RIP-relative relocation.
 
 use ::core::convert::TryFrom;
 
 use yaxpeax_arch::{DecodeError, LengthedInstruction};
 use yaxpeax_x86::amd64::{Instruction, Operand, RegSpec};
 
-/// x86_64 单条指令最大长度（含前缀）。
+/// Maximum length of a single x86_64 instruction, including prefixes.
 const MAX_INSN_SIZE: usize = 15;
 
-/// uprobe 指令分析错误。
+/// uprobe instruction analysis error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UprobeInsnError {
-    /// 输入字节数不足以解码一条完整指令。
+    /// The input bytes are not enough to decode a complete instruction.
     Truncated,
-    /// yaxpeax 解码失败（非法操作码 / 操作数 / 前缀等）。
+    /// yaxpeax decoding failed (invalid opcode / operand / prefix, etc.).
     DecodeFailed,
-    /// 解码长度超过 x86_64 上限（15 字节）。
+    /// Decoded length exceeds the x86_64 limit (15 bytes).
     TooLong,
-    /// RIP-relative 重定位后的位移超出 i32 范围（disp32 装不下）。
+    /// The displacement after RIP-relative relocation overflows the i32 range
+    /// (does not fit in a disp32).
     DisplacementOverflow,
     /// Address-size override selected EIP-relative addressing. Phase one does
     /// not implement the required 32-bit wrapping relocation semantics.
     UnsupportedEipRelative,
-    /// 控制流指令（call/jmp/ret/jcc/loop/int 等）——XOL 执行会跳出 slot，
-    /// 后续 #DB 无法反推探针址，且可能损坏栈/控制流。注册时拒绝。
+    /// Control-flow instructions (call/jmp/ret/jcc/loop/int, etc.) — execution
+    /// leaves the XOL slot, so a subsequent #DB cannot infer the probe address,
+    /// and the stack/control flow may be corrupted. Rejected at registration.
     UnsupportedControlFlow,
-    /// 指令抑制 #DB（MOV SS/POP SS）、观察临时 TF（PUSHF*）或整体改写
-    /// RFLAGS（POPF*）——XOL 单步会改变用户可见状态或丢失 #DB。注册时拒绝。
+    /// Instructions that suppress #DB (MOV SS/POP SS), observe the transient TF
+    /// (PUSHF*), or rewrite RFLAGS wholesale (POPF*) — XOL single-stepping
+    /// would alter user-visible state or lose the #DB. Rejected at registration.
     UnsafeForXol,
     /// REP/REPE/REPNE string instructions may report an intermediate #DB
     /// with RIP still at the copied instruction. The phase-1 exact-end XOL
@@ -41,21 +47,23 @@ pub enum UprobeInsnError {
     UnsupportedRepeatedString,
 }
 
-/// RIP-relative 重定位信息（静态分析得出，运行时用真实 slot 地址套用）。
+/// RIP-relative relocation information (derived statically; applied at runtime
+/// with the real slot address).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RipReloc {
-    /// 4 字节有符号位移在指令内的字节偏移。
+    /// Byte offset of the 4-byte signed displacement within the instruction.
     pub disp_offset: usize,
-    /// 解码得到的原始有符号位移。
+    /// The original signed displacement obtained by decoding.
     pub disp: i32,
 }
 
-/// 指令静态分析结果。
+/// Static analysis result of an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InsnAnalysis {
-    /// 解码长度（1..=15）。
+    /// Decoded length (1..=15).
     pub insn_len: usize,
-    /// 若为 RIP-relative 指令，给出重定位所需信息；否则为 `None`。
+    /// If this is a RIP-relative instruction, the relocation information;
+    /// otherwise `None`.
     pub rip_relative: Option<RipReloc>,
 }
 
@@ -84,13 +92,15 @@ pub fn xol_slot_vaddr_range(
     first..=last
 }
 
-/// 解码并静态分析一条 x86_64 指令。
+/// Decode and statically analyze a single x86_64 instruction.
 ///
-/// `bytes` 至少应包含完整指令（多余字节被忽略）。返回指令长度与（若存在的）
-/// RIP-relative 重定位信息。
+/// `bytes` must contain at least the full instruction (extra bytes are
+/// ignored). Returns the instruction length and, if present, the
+/// RIP-relative relocation information.
 ///
 /// # Fail-fast
-/// 字节不足 / 解码失败 / 长度超限 → 返回对应错误，调用方据此放弃该探测点。
+/// Truncated bytes / decode failure / length overflow → the corresponding
+/// error is returned, and the caller abandons that probe point.
 pub fn analyze_insn(bytes: &[u8]) -> Result<InsnAnalysis, UprobeInsnError> {
     if bytes.is_empty() {
         return Err(UprobeInsnError::Truncated);
@@ -110,14 +120,19 @@ pub fn analyze_insn(bytes: &[u8]) -> Result<InsnAnalysis, UprobeInsnError> {
     if bytes.len() < insn_len {
         return Err(UprobeInsnError::Truncated);
     }
-    // 控制流/不安全指令从 XOL slot 执行会破坏单步窗口，注册时拒绝：
-    // - 控制流（跳转/调用/返回/循环/中断/系统调用）：跳出 slot，#DB 无法
-    //   在 slot 内捕获，call/ret 还会损坏用户栈（与 Linux uprobe 阶段一致：
-    //   boost/add_on_return 不在本范围）。
-    // - MOV SS / POP SS：Intel SDM 规定其后的指令边界抑制 #DB——XOL 单步
-    //   完成的 #DB 会丢失（评审 R10）。
-    // - PUSHF：会把 uprobe 临时设置的 TF 压入用户栈，改变用户可见结果。
-    // - POPF：整体覆写 RFLAGS，清掉 uprobe 置的 TF，单步窗口断裂（评审 R10）。
+    // Control-flow / unsafe instructions would break the single-step window
+    // when executed from the XOL slot, so they are rejected at registration:
+    // - Control flow (jump/call/return/loop/interrupt/syscall): execution
+    //   leaves the slot, so the #DB cannot be captured inside it, and call/ret
+    //   would also corrupt the user stack (consistent with the Linux uprobe
+    //   phases: boost/add_on_return are not in scope).
+    // - MOV SS / POP SS: the Intel SDM specifies that #DB is suppressed up to
+    //   the following instruction boundary — the #DB completing the XOL
+    //   single-step would be lost (review R10).
+    // - PUSHF: pushes the TF temporarily set by uprobe onto the user stack,
+    //   changing user-visible results.
+    // - POPF: rewrites RFLAGS wholesale, clearing the TF set by uprobe and
+    //   breaking the single-step window (review R10).
     if is_control_flow(&inst) {
         return Err(UprobeInsnError::UnsupportedControlFlow);
     }
@@ -151,13 +166,15 @@ fn is_repeated_string(inst: &Instruction) -> bool {
         )
 }
 
-/// 判断指令是否为控制流指令（不可从 XOL slot 安全执行）。
+/// Determine whether an instruction is a control-flow instruction (not safely
+/// executable from an XOL slot).
 ///
-/// 覆盖：直接跳转/调用/返回、条件跳转（Jcc）、循环（LOOP*）、
-/// 事务分支（XBEGIN）、中断（INT/INT3/IRET*）、系统调用/返回
-/// （SYSCALL/SYSRET/SYSENTER/SYSEXIT）。
-/// 这些指令改变 RIP 的方式使 XOL 单步后的 #DB 无法在 slot 内捕获，
-/// 或会向用户栈写入 XOL 地址损坏控制流。
+/// Covers: direct jumps/calls/returns, conditional jumps (Jcc), loops (LOOP*),
+/// transactional branches (XBEGIN), interrupts (INT/INT3/IRET*), and
+/// syscall/sysret (SYSCALL/SYSRET/SYSENTER/SYSEXIT).
+/// These instructions change RIP in a way that prevents the #DB after XOL
+/// single-stepping from being captured inside the slot, or they write the XOL
+/// address to the user stack and corrupt control flow.
 fn is_control_flow(inst: &Instruction) -> bool {
     use yaxpeax_x86::amd64::Opcode;
     matches!(
@@ -189,9 +206,11 @@ fn suppresses_debug_or_rewrites_flags(inst: &Instruction) -> bool {
     if matches!(inst.opcode(), Opcode::PUSHF | Opcode::POPF) {
         return true;
     }
-    // `MOV SS, r/m16`（8e /r）：装载 SS 后到下一条指令边界之间 #DB 被抑制。
-    // yaxpeax 将其解码为 `Opcode::MOV` + 目标操作数为 ss 段寄存器。
-    // （`POP SS` 0x17 在 64 位模式为非法编码，解码器直接报错，无需处理。）
+    // `MOV SS, r/m16` (8e /r): after loading SS, #DB is suppressed up to the
+    // next instruction boundary. yaxpeax decodes it as `Opcode::MOV` with the
+    // destination operand being the ss segment register.
+    // (`POP SS`, 0x17, is an invalid encoding in 64-bit mode; the decoder
+    // errors out directly, so no handling is needed.)
     if inst.opcode() == Opcode::MOV {
         if let Operand::Register { reg } = inst.operand(0) {
             return reg == RegSpec::ss();
@@ -200,23 +219,28 @@ fn suppresses_debug_or_rewrites_flags(inst: &Instruction) -> bool {
     false
 }
 
-/// 在已解码指令中查找 RIP-relative 内存操作数，返回重定位信息。
+/// Find a RIP-relative memory operand in a decoded instruction and return the
+/// relocation information.
 ///
-/// 必须覆盖**所有** base 为 RIP 的操作数呈现：yaxpeax 对 `[rip+disp]` 给出
-/// `Disp { base: RIP, disp }`，对 `[rip]`（disp 为 0）给出 `MemDeref { base: RIP }`。
-/// 漏判任一形式都会导致 XOL slot 用原始 disp 执行、指向错误地址（静默损坏），故对
-/// 无法安全重定位的 RIP 形式（掩码 / 带 index）一律 fail-fast。
+/// Must cover **every** operand form whose base is RIP: yaxpeax yields
+/// `Disp { base: RIP, disp }` for `[rip+disp]` and `MemDeref { base: RIP }`
+/// for `[rip]` (disp == 0). Missing either form would make the XOL slot
+/// execute with the original disp, pointing at the wrong address (silent
+/// corruption), so any RIP form that cannot be relocated safely (masked /
+/// with index) fails fast.
 fn find_rip_relative(
     inst: &Instruction,
     insn_len: usize,
 ) -> Result<Option<RipReloc>, UprobeInsnError> {
     for i in 0..inst.operand_count() {
         if let Some(disp) = operand_rip_disp(&inst.operand(i))? {
-            // [rip+disp32] 编码：位移恒为 4 字节，且位于任何尾随立即数之前。
-            // 故 disp_offset = insn_len - 4 - imm_size。
+            // [rip+disp32] encoding: the displacement is always 4 bytes and
+            // precedes any trailing immediate. Hence
+            // disp_offset = insn_len - 4 - imm_size.
             let imm_size = trailing_immediate_size(inst);
             if imm_size + 4 > insn_len {
-                // 结构异常（理论不应发生），保守失败。
+                // Structurally abnormal (should not happen in theory); fail
+                // conservatively.
                 return Err(UprobeInsnError::DecodeFailed);
             }
             let disp_offset = insn_len - 4 - imm_size;
@@ -226,10 +250,11 @@ fn find_rip_relative(
     Ok(None)
 }
 
-/// 判定单个操作数是否为 RIP-relative：
-/// - `Ok(Some(disp))`：是，给出有符号位移（`[rip]` 视为 disp=0）；
-/// - `Ok(None)`：否；
-/// - `Err`：是 RIP-relative 但属掩码 / 带 index 的非常规形式，无法安全重定位。
+/// Determine whether a single operand is RIP-relative:
+/// - `Ok(Some(disp))`: yes, with the signed displacement (`[rip]` counts as disp=0);
+/// - `Ok(None)`: no;
+/// - `Err`: RIP-relative but an unusual masked / indexed form that cannot be
+///   relocated safely.
 fn operand_rip_disp(op: &Operand) -> Result<Option<i32>, UprobeInsnError> {
     match op {
         Operand::MemDeref { base } if *base == RegSpec::RIP => Ok(Some(0)),
@@ -237,7 +262,8 @@ fn operand_rip_disp(op: &Operand) -> Result<Option<i32>, UprobeInsnError> {
         Operand::MemDeref { base } | Operand::Disp { base, .. } if *base == RegSpec::eip() => {
             Err(UprobeInsnError::UnsupportedEipRelative)
         }
-        // 标准 RIP-relative 不带 SIB index、不带掩码；命中这些形式即 fail-fast。
+        // Standard RIP-relative addressing has no SIB index and no mask;
+        // matching these forms fails fast.
         Operand::DispMasked { base, .. }
         | Operand::MemDerefMasked { base, .. }
         | Operand::MemBaseIndexScale { base, .. }
@@ -262,10 +288,12 @@ fn operand_rip_disp(op: &Operand) -> Result<Option<i32>, UprobeInsnError> {
     }
 }
 
-/// 计算指令尾随立即数的字节数（用于定位 [rip+disp32] 的位移偏移）。
+/// Compute the byte size of the instruction's trailing immediate (used to
+/// locate the displacement offset of a [rip+disp32]).
 ///
-/// x86 编码顺序固定为：前缀 / 操作码 / ModRM / [SIB] / [disp] / [imm]，
-/// 故 disp 紧邻 imm 之前。对含 [rip+disp32] 内存操作数的指令，至多一个立即数。
+/// The fixed x86 encoding order is: prefixes / opcode / ModRM / [SIB] /
+/// [disp] / [imm], so disp immediately precedes imm. An instruction with a
+/// [rip+disp32] memory operand has at most one immediate.
 fn trailing_immediate_size(inst: &Instruction) -> usize {
     for i in 0..inst.operand_count() {
         match inst.operand(i) {
@@ -284,21 +312,26 @@ fn trailing_immediate_size(inst: &Instruction) -> usize {
     0
 }
 
-/// 生成 XOL slot 副本（复制原指令并对 RIP-relative 做重定位）。
+/// Generate the XOL slot copy (copy the original instruction and perform the
+/// RIP-relative relocation).
 ///
-/// # 参数
-/// - `analysis`：[`analyze_insn`] 的结果。
-/// - `probe_vaddr`：原探测点用户虚拟地址。
-/// - `slot_vaddr`：XOL slot 的真实用户虚拟地址（per-mm，运行时由 mm 层给出）。
-/// - `old_instruction`：原指令字节（前 `analysis.insn_len` 字节有效）。
-/// - `slot`：输出缓冲，长度须 >= `analysis.insn_len`。
+/// # Parameters
+/// - `analysis`: the result of [`analyze_insn`].
+/// - `probe_vaddr`: the user virtual address of the original probe point.
+/// - `slot_vaddr`: the real user virtual address of the XOL slot (per-mm,
+///   supplied by the mm layer at runtime).
+/// - `old_instruction`: the original instruction bytes (the first
+///   `analysis.insn_len` bytes are valid).
+/// - `slot`: the output buffer; its length must be >= `analysis.insn_len`.
 ///
-/// # RIP-relative 重定位
-/// 原指令在 `probe_vaddr` 执行时，`[rip+disp]` 的有效地址为
-/// `probe_vaddr + insn_len + disp`（rip 指向下一条指令）。副本在 `slot_vaddr`
-/// 执行时，欲保持同一有效地址，需满足
-/// `slot_vaddr + insn_len + new_disp = probe_vaddr + insn_len + disp`，即
-/// `new_disp = disp + (probe_vaddr - slot_vaddr)`。若 `new_disp` 超出 i32 范围则失败。
+/// # RIP-relative relocation
+/// When the original instruction executes at `probe_vaddr`, the effective
+/// address of `[rip+disp]` is `probe_vaddr + insn_len + disp` (rip points at
+/// the next instruction). For the copy executing at `slot_vaddr` to keep the
+/// same effective address, we need
+/// `slot_vaddr + insn_len + new_disp = probe_vaddr + insn_len + disp`, i.e.
+/// `new_disp = disp + (probe_vaddr - slot_vaddr)`. If `new_disp` overflows
+/// the i32 range, the relocation fails.
 pub fn build_xol_slot(
     analysis: &InsnAnalysis,
     probe_vaddr: usize,
@@ -310,10 +343,10 @@ pub fn build_xol_slot(
     if old_instruction.len() < len || slot.len() < len {
         return Err(UprobeInsnError::Truncated);
     }
-    // 复制原指令。
+    // Copy the original instruction.
     slot[..len].copy_from_slice(&old_instruction[..len]);
 
-    // RIP-relative 重定位。
+    // RIP-relative relocation.
     if let Some(reloc) = analysis.rip_relative {
         let delta = probe_vaddr as i64 - slot_vaddr as i64;
         let new_disp = reloc.disp as i64 + delta;
@@ -322,13 +355,17 @@ pub fn build_xol_slot(
         slot[reloc.disp_offset..reloc.disp_offset + 4].copy_from_slice(&new_disp.to_le_bytes());
     }
 
-    // 原指令之后的尾随字节填 int3(0xcc)。
+    // Fill the trailing bytes after the original instruction with int3 (0xcc).
     //
-    // 正常路径：TF 在原指令执行后立即触发 #DB，不会执行到尾随字节。
-    // 竞态路径：若 #BP 后、#DB 前该 uprobe 被注销（slot 被释放），且 slot
-    // 被重分配给另一探针，#DB handler 无法反推 probe_vaddr。此时线程从 slot
-    // 继续执行会命中尾随 int3 → 再次触发 #BP → 正常 uprobe 分发或 SIGTRAP，
-    // 而非执行零填充（可能解码为 add [rax], al 等意外指令损坏内存）。
+    // Normal path: TF fires #DB immediately after the original instruction
+    // executes, so the trailing bytes are never reached.
+    // Race path: if this uprobe is unregistered after #BP but before #DB (the
+    // slot is freed) and the slot is reassigned to another probe, the #DB
+    // handler cannot infer probe_vaddr. If the thread keeps executing from
+    // the slot, it will hit the trailing int3 → #BP fires again → normal
+    // uprobe dispatch or SIGTRAP, instead of executing zero-fill bytes (which
+    // could decode as unexpected instructions like `add [rax], al` and
+    // corrupt memory).
     for b in &mut slot[len..] {
         *b = 0xcc;
     }
@@ -550,7 +587,7 @@ mod tests {
 
     #[test]
     fn debug_suppressing_rejected() {
-        // pushfq (9c)；popfq (9d)；mov ss, rax (8e d0)
+        // pushfq (9c); popfq (9d); mov ss, rax (8e d0)
         assert_eq!(
             analyze_insn(&[0x9c]).unwrap_err(),
             UprobeInsnError::UnsafeForXol
@@ -563,12 +600,14 @@ mod tests {
             analyze_insn(&[0x8e, 0xd0]).unwrap_err(),
             UprobeInsnError::UnsafeForXol
         );
-        // 对照：mov ds, eax（8e d8，段编码 3=DS 非 SS）不抑制 #DB，可接受
+        // Control: mov ds, eax (8e d8, segment encoding 3 = DS, not SS) does
+        // not suppress #DB, so it is accepted
         assert!(analyze_insn(&[0x8e, 0xd8]).is_ok());
-        // 对照：普通 mov（非 SS 目标）可接受
+        // Control: an ordinary mov (non-SS destination) is accepted
         assert!(analyze_insn(&[0x48, 0x89, 0xe5]).is_ok());
-        // Intel 明确规定 LSS 不具有 MOV SS/POP SS 的事件抑制行为；Linux 的
-        // insn_masking_exception() 也不拒绝它，不能在这里扩大拒绝范围。
+        // Intel explicitly specifies that LSS does not have the event-suppression
+        // behavior of MOV SS/POP SS; Linux's insn_masking_exception() does not
+        // reject it either, so we must not widen the rejection here.
         assert!(analyze_insn(&[0x0f, 0xb2, 0x00]).is_ok());
     }
 
@@ -600,11 +639,13 @@ mod tests {
         let mut slot = [0u8; 16];
         build_xol_slot(&a, probe_vaddr, slot_vaddr, &insn, &mut slot).unwrap();
 
-        // new_disp = 0 + (0x1000 - 0x2000) = -0x1000；opcode/ModRM 不变，仅 disp 被改写。
+        // new_disp = 0 + (0x1000 - 0x2000) = -0x1000; opcode/ModRM unchanged,
+        // only disp is rewritten.
         assert_eq!(&slot[..3], &insn[..3]);
         assert_eq!(&slot[3..7], &(-0x1000i32).to_le_bytes());
 
-        // 从 slot 执行后仍指向原有效地址：slot+7+new_disp == probe+7+0
+        // Executing from the slot still points at the original effective
+        // address: slot+7+new_disp == probe+7+0
         let new_disp = i32::from_le_bytes([slot[3], slot[4], slot[5], slot[6]]);
         let eff = slot_vaddr as i64 + 7 + new_disp as i64;
         assert_eq!(eff, probe_vaddr as i64 + 7);
@@ -615,7 +656,7 @@ mod tests {
         let insn: [u8; 7] = [0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00];
         let a = analyze_insn(&insn).unwrap();
         let mut slot = [0u8; 16];
-        // 跨度超过 i32 范围 -> 重定位失败。
+        // The span exceeds the i32 range -> relocation fails.
         let huge = (i32::MAX as usize) + 2;
         let err = build_xol_slot(&a, huge, 0, &insn, &mut slot).unwrap_err();
         assert_eq!(err, UprobeInsnError::DisplacementOverflow);
@@ -623,14 +664,15 @@ mod tests {
 
     #[test]
     fn analyze_errors() {
-        // 空输入。
+        // Empty input.
         assert_eq!(analyze_insn(&[]).unwrap_err(), UprobeInsnError::Truncated);
-        // 不完整指令（call rel32 只有 opcode、缺 4 字节 imm）-> 解码耗尽输入。
+        // Incomplete instruction (call rel32 has only the opcode, missing the
+        // 4-byte imm) -> the decoder exhausts the input.
         assert_eq!(
             analyze_insn(&[0xe8]).unwrap_err(),
             UprobeInsnError::Truncated
         );
-        // 非法操作码（push es 在 64 位长模式下无效）。
+        // Invalid opcode (push es is invalid in 64-bit long mode).
         assert_eq!(
             analyze_insn(&[0x06]).unwrap_err(),
             UprobeInsnError::DecodeFailed

@@ -1184,8 +1184,8 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
                     DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
                 );
 
-                // nr_iowait++ 在 deactivate_task 之后
-                if prev.flags().contains(ProcessFlags::IN_IOWAIT) {
+                // nr_iowait++ happens after deactivate_task.
+                if prev_state.is_blocked() && prev.flags().contains(ProcessFlags::IN_IOWAIT) {
                     rq.nr_iowait.fetch_add(1, Ordering::Relaxed);
                 }
             }

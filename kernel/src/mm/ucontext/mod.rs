@@ -46,6 +46,7 @@ use crate::{
     },
     process::{
         cred::{capable, CAPFlags},
+        namespace::user_namespace::UserNamespace,
         resource::RLimitID,
         ProcessManager,
     },
@@ -127,7 +128,7 @@ use self::{
 #[cfg(not(target_arch = "x86_64"))]
 use self::{mappings::UserMappings, notifications::*, vma::VmaSplitSides};
 
-pub use address_space::{AddressSpace, FileMappingWithFileArgs};
+pub use address_space::{AddressSpace, FileMappingWithFileArgs, MmUserRef};
 pub use inner::InnerAddressSpace;
 pub use mapper::UserMapper;
 pub use stack::UserStack;

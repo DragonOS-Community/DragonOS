@@ -290,6 +290,10 @@ fn action_priority(ret: u32) -> i32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeccompDecision {
     Allow,
+    /// A `SECCOMP_RET_TRACE` stop completed and the tracer may have changed
+    /// the syscall number or arguments in the TrapFrame. The dispatcher must
+    /// reload both before selecting and invoking a handler.
+    AllowAfterTrace,
     Skip(usize),
 }
 
@@ -301,6 +305,7 @@ pub enum SeccompDecision {
 ///
 /// # 返回值
 /// - `Allow`: 允许继续执行系统调用
+/// - `AllowAfterTrace`: tracer 可能已修改 TrapFrame，调用方重取系统调用号和参数后继续执行
 /// - `Skip(ret)`: 跳过系统调用并直接返回 `ret`
 ///
 /// 对于 KILL 动作，此函数不会返回，而是按 Linux seccomp 语义终止线程/线程组。
@@ -330,59 +335,113 @@ pub fn secure_computing(
             }
         }
 
-        SeccompMode::Filter => {
-            let data = SeccompData {
-                nr: syscall_num as i32,
-                arch: seccomp_arch(),
-                instruction_pointer: instruction_pointer(frame),
-                args: [
-                    args[0] as u64,
-                    args[1] as u64,
-                    args[2] as u64,
-                    args[3] as u64,
-                    args[4] as u64,
-                    args[5] as u64,
-                ],
-            };
+        SeccompMode::Filter => filter_decision(pcb.clone(), syscall_num, args, frame, false),
+    }
+}
 
-            let filter_guard = pcb.seccomp_filter.lock();
-            let result = seccomp_run_filters(&data, &filter_guard);
-            drop(filter_guard);
+/// Execute the filter-mode filtering decision
+fn filter_decision(
+    pcb: Arc<ProcessControlBlock>,
+    syscall_num: usize,
+    args: &[usize; 6],
+    frame: &mut TrapFrame,
+    recheck_after_trace: bool,
+) -> Result<SeccompDecision, SystemError> {
+    let data = SeccompData {
+        nr: syscall_num as i32,
+        arch: seccomp_arch(),
+        instruction_pointer: instruction_pointer(frame),
+        args: [
+            args[0] as u64,
+            args[1] as u64,
+            args[2] as u64,
+            args[3] as u64,
+            args[4] as u64,
+            args[5] as u64,
+        ],
+    };
 
-            let action = result & SECCOMP_RET_ACTION_FULL;
-            let data_val = result & SECCOMP_RET_DATA;
+    let filter_guard = pcb.seccomp_filter.lock();
+    let result = seccomp_run_filters(&data, &filter_guard);
+    drop(filter_guard);
 
-            match action {
-                SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
-                    kill_current(action);
-                }
-                SECCOMP_RET_TRAP => {
+    let action = result & SECCOMP_RET_ACTION_FULL;
+    let data_val = result & SECCOMP_RET_DATA;
+
+    match action {
+        SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
+            kill_current(action);
+        }
+        SECCOMP_RET_TRAP => {
+            rollback_syscall(frame, syscall_num);
+            send_seccomp_sigsys(&data, data_val);
+            Ok(SeccompDecision::Skip(frame_syscall_return(frame)))
+        }
+        SECCOMP_RET_ERRNO => {
+            let errno = data_val.min(MAX_ERRNO);
+            Ok(SeccompDecision::Skip((-(errno as i32)) as usize))
+        }
+        SECCOMP_RET_TRACE => {
+            // Re-entry guard: when recheck_after_trace is set, allow a second
+            // TRACE hit outright.
+            if recheck_after_trace {
+                return Ok(SeccompDecision::AllowAfterTrace);
+            }
+            // The option decision and stop publication are session-bound. An
+            // initially disabled event returns -ENOSYS. If an enabled session
+            // disappears before the stop commits, continue through Linux's
+            // fatal-check/register-reload/recheck path without redirecting the
+            // event to a replacement tracer.
+            let event_outcome = pcb.ptrace_event(
+                crate::process::ptrace::PtraceEvent::Seccomp,
+                data_val as usize,
+            );
+            match event_outcome {
+                crate::process::ptrace::PtraceEventOutcome::Committed
+                | crate::process::ptrace::PtraceEventOutcome::NotCommitted => {}
+                crate::process::ptrace::PtraceEventOutcome::Disabled => {
                     rollback_syscall(frame, syscall_num);
-                    send_seccomp_sigsys(&data, data_val);
-                    Ok(SeccompDecision::Skip(frame_syscall_return(frame)))
-                }
-                SECCOMP_RET_ERRNO => {
-                    let errno = data_val.min(MAX_ERRNO);
-                    Ok(SeccompDecision::Skip((-(errno as i32)) as usize))
-                }
-                SECCOMP_RET_TRACE => Ok(SeccompDecision::Skip(
-                    SystemError::ENOSYS.to_posix_errno() as usize,
-                )),
-                SECCOMP_RET_LOG => {
-                    log::info!(
-                        "seccomp: pid={:?} syscall={} action=LOG",
-                        pcb.raw_pid(),
-                        syscall_num
-                    );
-                    Ok(SeccompDecision::Allow)
-                }
-                SECCOMP_RET_ALLOW => Ok(SeccompDecision::Allow),
-
-                _ => {
-                    // 未知动作，默认 KILL
-                    kill_current(SECCOMP_RET_KILL_PROCESS);
+                    return Ok(SeccompDecision::Skip(
+                        SystemError::ENOSYS.to_posix_errno() as usize
+                    ));
                 }
             }
+            // If a fatal signal is pending after ptrace_event returns, force-skip
+            // the syscall to avoid side effects.
+            if Signal::fatal_signal_pending(&pcb) {
+                rollback_syscall(frame, syscall_num);
+                return Ok(SeccompDecision::Skip(frame_syscall_return(frame)));
+            }
+            // After ptrace_event returns, the tracer may have modified the
+            // TrapFrame via POKEUSER/SETREGS.
+            let nr_after = frame.get_orig_syscall_nr();
+            if nr_after < 0 {
+                // A negative syscall number means the tracer requested a skip.
+                // The return value is whatever the tracer wrote to the return register.
+                return Ok(SeccompDecision::Skip(frame_syscall_return(frame)));
+            }
+            // On re-entry, reload all arguments from the frame.
+            let args_after = frame_syscall_args(frame);
+            match filter_decision(pcb, nr_after as usize, &args_after, frame, true)? {
+                SeccompDecision::Allow | SeccompDecision::AllowAfterTrace => {
+                    Ok(SeccompDecision::AllowAfterTrace)
+                }
+                decision @ SeccompDecision::Skip(_) => Ok(decision),
+            }
+        }
+        SECCOMP_RET_LOG => {
+            log::info!(
+                "seccomp: pid={:?} syscall={} action=LOG",
+                pcb.raw_pid(),
+                syscall_num
+            );
+            Ok(SeccompDecision::Allow)
+        }
+        SECCOMP_RET_ALLOW => Ok(SeccompDecision::Allow),
+
+        _ => {
+            // Unknown action, default to KILL
+            kill_current(SECCOMP_RET_KILL_PROCESS);
         }
     }
 }
@@ -546,6 +605,29 @@ fn frame_syscall_return(frame: &TrapFrame) -> usize {
     frame.a0
 }
 
+/// Read the 6 syscall arguments from the trap frame.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn frame_syscall_args(frame: &TrapFrame) -> [usize; 6] {
+    [
+        frame.rdi as usize,
+        frame.rsi as usize,
+        frame.rdx as usize,
+        frame.r10 as usize,
+        frame.r8 as usize,
+        frame.r9 as usize,
+    ]
+}
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub(crate) fn frame_syscall_args(frame: &TrapFrame) -> [usize; 6] {
+    [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5]
+}
+#[cfg(target_arch = "loongarch64")]
+#[inline(always)]
+pub(crate) fn frame_syscall_args(frame: &TrapFrame) -> [usize; 6] {
+    [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5]
+}
 // ============ Seccomp 模式操作 ============
 
 /// 设置 strict 模式

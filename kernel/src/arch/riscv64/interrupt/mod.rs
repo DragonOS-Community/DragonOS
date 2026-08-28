@@ -173,6 +173,17 @@ impl TrapFrame {
     pub fn stack_pointer(&self) -> usize {
         self.sp
     }
+
+    /// Read the system call return value register (a0 on riscv64).
+    #[inline]
+    pub fn get_syscall_return(&self) -> usize {
+        self.a0
+    }
+
+    #[inline]
+    pub fn get_orig_syscall_nr(&self) -> i64 {
+        self.a7 as i64
+    }
 }
 
 impl ProbeArgs for TrapFrame {

@@ -78,11 +78,11 @@ pub fn do_clone(
 
     let pcb = ProcessControlBlock::new(name, new_kstack);
     // 克隆pcb
-    ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
+    let ptrace_fork_session = ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
     let child_vpid = pcb
         .task_pid_nr_ns(PidType::PID, Some(current_pcb.active_pid_ns()))
-        .ok_or(SystemError::EINVAL)?
+        .expect("published fork child must be visible in the caller's PID namespace")
         .data();
 
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
@@ -105,10 +105,23 @@ pub fn do_clone(
             e
         )
     });
+    // Report the ptrace event only after wake_up_new_task.
+    ProcessManager::ptrace_report_fork_event(&current_pcb, &pcb, ptrace_fork_session.as_ref());
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
-        // 等待子进程结束或者exec;
-        vfork.wait_for_completion_interruptible()?;
+        // Wait for the child to exit or exec
+        // Only a fatal signal can interrupt this wait
+        if vfork.wait_for_completion_killable().is_err() {
+            // Clear the child's vfork_done: the waiter has given up, so the child
+            // must not complete() on a discarded completion during exec/exit.
+            pcb.thread.write_irqsave().vfork_done = None;
+            return Ok(child_vpid);
+        }
+        let done_vpid = crate::process::ptrace::ptracer_of(&current_pcb)
+            .and_then(|tracer| pcb.task_pid_nr_ns(PidType::PID, Some(tracer.active_pid_ns())))
+            .map(|p| p.data())
+            .unwrap_or(child_vpid);
+        current_pcb.ptrace_event(crate::process::ptrace::PtraceEvent::VForkDone, done_vpid);
     }
 
     return Ok(child_vpid);

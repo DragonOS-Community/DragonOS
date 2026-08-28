@@ -19,7 +19,7 @@ use crate::{
         ucontext::{AddressSpace, InnerAddressSpace, LockedVMA},
         PhysAddr, VirtAddr, VmFaultReason, VmFlags,
     },
-    process::{ProcessManager, ProcessState},
+    process::ProcessManager,
 };
 
 use crate::mm::MemoryManagementArch;
@@ -472,11 +472,15 @@ impl PageFaultHandler {
         let flags = pfm.flags();
         let vma = pfm.vma();
         let current_pcb = ProcessManager::current_pcb();
-        {
-            current_pcb.sched_info().set_state(ProcessState::Runnable);
-        }
+        current_pcb.sched_info().restore_runnable_if_blocked();
 
-        let reason = if !MMArch::vma_access_permitted(
+        let reason = if (flags.contains(FaultFlags::FAULT_FLAG_WRITE) && {
+            let guard = vma.lock();
+            let vm_flags = *guard.vm_flags();
+            !(vm_flags.contains(VmFlags::VM_WRITE)
+                || (!vm_flags.contains(VmFlags::VM_SHARED)
+                    && vm_flags.contains(VmFlags::VM_MAYWRITE)))
+        }) || !MMArch::vma_access_permitted(
             vma.clone(),
             flags.contains(FaultFlags::FAULT_FLAG_WRITE),
             flags.contains(FaultFlags::FAULT_FLAG_INSTRUCTION),
@@ -1038,7 +1042,8 @@ impl PageFaultHandler {
         if entry.address() != Ok(old_paddr) {
             return VmFaultReason::VM_FAULT_NOPAGE;
         }
-        let new_flags = entry.flags().set_write(true).set_dirty(true);
+        let vma_writable = vma.lock().vm_flags().contains(VmFlags::VM_WRITE);
+        let new_flags = entry.flags().set_write(vma_writable).set_dirty(true);
 
         // 统一为 do_wp_page 所有分支做 mm-aware shootdown：
         // 这里的 `mm` 可能被多个线程/CPU 共享（CLONE_VM / CLONE_THREAD），

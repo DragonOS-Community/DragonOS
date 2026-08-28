@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -285,11 +285,28 @@ impl ProcessSchedulerInfo {
         self.state_atomic.store(state.to_u32(), Ordering::Release);
     }
 
-    /// Acquire pi_lock (SpinLock), disabling interrupts and preemption.
-    /// Lock ordering: pi_lock may nest rq_lock (pi_lock → rq_lock); the reverse
-    /// is prohibited.
+    /// Acquire pi_lock (a spin lock), disabling interrupts and preemption.
+    /// Lock ordering: pi_lock may nest rq_lock (pi_lock -> rq_lock); the reverse is forbidden.
+    /// Acquiring the sighand lock while holding pi_lock is likewise forbidden; the global order is sighand -> pi_lock
     pub fn pi_lock_irqsave(&self) -> SpinLockGuard<'_, PiProtected> {
         self.pi_lock.lock_irqsave()
+    }
+
+    /// Conditionally restore the runnable state: only when the state is actually `Blocked`
+    /// (interruptible/uninterruptible sleep) promote it to `Runnable` inside the pi_lock critical section;
+    #[inline]
+    pub(crate) fn restore_runnable_if_blocked(&self) {
+        // Fast path: most callers are already in the Runnable state (e.g. page-fault entry); one Acquire atomic read returns, zero lock overhead.
+        if !self.state().is_blocked() {
+            return;
+        }
+
+        // Slow path: possibly Blocked; take pi_lock and re-check before deciding.
+        let _pi_guard = self.pi_lock_irqsave();
+        if self.state().is_blocked() {
+            self.set_state(ProcessState::Runnable);
+            fence(Ordering::SeqCst);
+        }
     }
 
     // pub fn virtual_runtime(&self) -> isize {

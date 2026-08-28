@@ -1,5 +1,5 @@
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicI32, AtomicUsize};
 
 use alloc::vec::Vec;
 
@@ -14,6 +14,17 @@ lazy_static::lazy_static! {
 
 int_like!(Kuid, AtomicKuid, usize, AtomicUsize);
 int_like!(Kgid, AtomicKgid, usize, AtomicUsize);
+
+/// suid_dumpable value: core dumps fully disabled
+pub const SUID_DUMP_DISABLE: i32 = 0;
+/// suid_dumpable value: dump by the normal user-process rules
+pub const SUID_DUMP_USER: i32 = 1;
+/// suid_dumpable value: root suid binaries may also dump.
+#[allow(dead_code)]
+pub const SUID_DUMP_ROOT: i32 = 2;
+
+/// Global suid_dumpable switch (/proc/sys/fs/suid_dumpable).
+pub static SUID_DUMPABLE: AtomicI32 = AtomicI32::new(SUID_DUMP_DISABLE);
 
 bitflags! {
     pub struct CAPFlags:u64{
@@ -245,6 +256,11 @@ impl Cred {
         cap_capable(self, &self.user_ns, cap)
     }
 
+    /// Check whether the current process has the given capability in the specified (usually the target task's) user namespace.
+    pub fn has_capability_in_ns(&self, targ_ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
+        cap_capable(self, targ_ns, cap)
+    }
+
     /// 检查当前进程是否具有CAP_SYS_ADMIN权限
     pub fn has_cap_sys_admin(&self) -> bool {
         self.has_capability(CAPFlags::CAP_SYS_ADMIN)
@@ -306,6 +322,30 @@ pub fn capable(cap: CAPFlags) -> bool {
 /// fallback for existing administrative callers.
 pub fn perfmon_capable() -> bool {
     capable(CAPFlags::CAP_PERFMON) || capable(CAPFlags::CAP_SYS_ADMIN)
+}
+
+/// Whether new's permitted caps are a subset of old's (no privilege raise).
+pub fn cred_cap_issubset(old: &Cred, new: &Cred) -> bool {
+    let mut ns = new.user_ns.clone();
+    // Same namespace: compare the cap sets directly
+    if Arc::ptr_eq(&old.user_ns, &ns) {
+        return (new.cap_permitted.bits() & !old.cap_permitted.bits()) == 0;
+    }
+    // Across namespaces: walk the parent chain checking each owner against old's euid
+    while !Arc::ptr_eq(&ns, &INIT_USER_NAMESPACE) {
+        let ns_owner = ns.inner.lock().owner;
+        let Some(parent_weak) = ns.parent.as_ref() else {
+            return false;
+        };
+        let Some(parent_ns) = parent_weak.upgrade() else {
+            return false;
+        };
+        if Arc::ptr_eq(&old.user_ns, &parent_ns) && ns_owner == old.euid.data() {
+            return true;
+        }
+        ns = parent_ns;
+    }
+    false
 }
 
 /// 检查当前进程在指定 ns 中是否有某 capability（setid 上下文）

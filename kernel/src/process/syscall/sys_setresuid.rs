@@ -94,7 +94,7 @@ impl Syscall for SysSetResUid {
             new_cred.setfsuid(new_euid);
         }
 
-        pcb.set_cred(Cred::new_arc(new_cred))?;
+        pcb.commit_cred(Cred::new_arc(new_cred))?;
 
         Ok(0)
     }

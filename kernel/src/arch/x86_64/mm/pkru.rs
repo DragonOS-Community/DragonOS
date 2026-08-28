@@ -41,12 +41,14 @@ pub fn pkru_allows_pkey(pkey: u16, write: bool) -> bool {
 
 pub fn pkru_allows_read(pkru: u32, pkey: u16) -> bool {
     let pkru_pkey_bits: u32 = pkey as u32 * PKRU_BITS_PER_PKEY;
-    pkru & ((PKRU_AD_BIT as u32) << pkru_pkey_bits) > 0
+    // Reading is allowed only when the access-disable bit (AD) is clear.
+    pkru & ((PKRU_AD_BIT as u32) << pkru_pkey_bits) == 0
 }
 
 pub fn pkru_allows_write(pkru: u32, pkey: u16) -> bool {
     let pkru_pkey_bits: u32 = pkey as u32 * PKRU_BITS_PER_PKEY;
-    pkru & (((PKRU_AD_BIT | PKRU_WD_BIT) as u32) << pkru_pkey_bits) > 0
+    // Writing is allowed only when both the access-disable (AD) and write-disable (WD) bits are clear.
+    pkru & (((PKRU_AD_BIT | PKRU_WD_BIT) as u32) << pkru_pkey_bits) == 0
 }
 
 pub fn read_pkru() -> u32 {

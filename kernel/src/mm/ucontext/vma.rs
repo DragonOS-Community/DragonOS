@@ -535,7 +535,7 @@ impl LockedVMA {
         let guard = self.lock();
         if let Some(space) = guard.user_address_space.clone() {
             if let Some(space) = space.upgrade() {
-                return AddressSpace::is_current(&space);
+                return !AddressSpace::is_current(&space);
             } else {
                 return true;
             }

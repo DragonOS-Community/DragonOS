@@ -1,20 +1,26 @@
 use super::trace::trace_sched_process_exec;
-use crate::arch::ipc::signal::Signal;
-use crate::arch::CurrentIrqArch;
-use crate::exception::InterruptArch;
-use crate::filesystem::vfs::fcntl::AtFlags;
-use crate::filesystem::vfs::open::{do_open_execat, do_open_execat_with_flags};
-use crate::libs::futex::futex::RobustListHead;
-use crate::process::exec::{
-    load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
-    ExecStartInfo, LoadBinaryResult,
+use crate::{
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, CurrentIrqArch},
+    exception::InterruptArch,
+    filesystem::vfs::{
+        fcntl::AtFlags,
+        open::{do_open_execat, do_open_execat_with_flags},
+    },
+    libs::{futex::futex::RobustListHead, rand::rand_bytes},
+    mm::ucontext::AddressSpace,
+    process::{
+        cred::{SUID_DUMPABLE, SUID_DUMP_DISABLE, SUID_DUMP_USER},
+        exec::{
+            load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
+            ExecStartInfo, LoadBinaryResult,
+        },
+        pid::PidType,
+        ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
+    },
+    syscall::Syscall,
 };
-use crate::process::{ProcessControlBlock, ProcessManager};
-use crate::syscall::Syscall;
-use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
-
-use crate::arch::interrupt::TrapFrame;
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 struct ExecFailure {
@@ -142,7 +148,14 @@ fn do_execve_internal(
     regs: &mut TrapFrame,
     ctx: ExecContext,
 ) -> Result<(), ExecFailure> {
-    let address_space = AddressSpace::new(true).expect("Failed to create new address space");
+    let exec_pcb = ProcessManager::current_pcb();
+    let exec_guard = exec_pcb.exec_update_write();
+    let address_space = AddressSpace::new(
+        true,
+        exec_pcb.cred().user_ns.clone(),
+        SUID_DUMP_DISABLE as u8,
+    )
+    .expect("Failed to create new address space");
 
     let mut param = ExecParam::new(
         start.file(),
@@ -159,12 +172,24 @@ fn do_execve_internal(
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
-    // 捕获 sched_process_exec 的 old_pid：必须在 load_binary_file_with_context 之前，
-    // 因为该函数内的 begin_new_exec → de_thread 会在「非 leader 线程 execve」时
-    // 交换 current 与旧 thread-group leader 的 raw_pid（对齐 Linux fs/exec.c:1770）。
+    // Capture sched_process_exec's old_pid before load_binary_file_with_context:
+    // begin_new_exec -> de_thread may swap current's raw_pid with the old
+    // thread-group leader when a non-leader thread calls execve.
     let old_pid = ProcessManager::current_pcb().raw_pid().data() as i32;
 
-    // 尝试加载二进制文件
+    let pre_exec_pcb = ProcessManager::current_pcb();
+    let old_vpid = if !pre_exec_pcb.is_traced() {
+        0
+    } else {
+        ptrace::ptracer_of(&pre_exec_pcb)
+            .and_then(|tracer| {
+                pre_exec_pcb.task_pid_nr_ns(PidType::PID, Some(tracer.active_pid_ns()))
+            })
+            .map(|p| p.data())
+            .unwrap_or(0)
+    };
+
+    // Try to load the binary (internally begin_new_exec → de_thread may swap the PID)
     let load_result = load_binary_file_with_context(&mut param, &ctx);
 
     match load_result {
@@ -226,13 +251,31 @@ fn do_execve_internal(
             if let Err(err) = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr) {
                 return finish_exec_error(&param, old_vm.as_ref(), err);
             }
+            // A successful exec does not inherit ptrace hardware debug state.
+            exec_pcb.flush_ptrace_hw_debug_regs();
+            // After commit, reset dumpability according to the new credentials.
+            let cred = exec_pcb.cred();
+            let dump = if address_space.exec_enforces_nondump()
+                || cred.euid != cred.uid
+                || cred.egid != cred.gid
+            {
+                SUID_DUMPABLE.load(Ordering::SeqCst) as u8
+            } else {
+                SUID_DUMP_USER as u8
+            };
+            address_space.set_dumpable(dump);
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_apply_to_exec_mm(&pcb, &address_space);
             #[cfg(target_arch = "x86_64")]
             crate::mm::ucontext::uprobe::uprobe_registry_task_exec(&pcb, old_vm.as_ref());
+            // The uprobe must first detach from the old mm before releasing the last user reference to that mm.
+            ProcessManager::release_old_user_vm_if_last(old_vm.as_ref());
             if let Some(completion) = pcb.thread.write_irqsave().vfork_done.take() {
                 completion.complete_all();
             }
+            // The exec_update lock covers the whole commit phase; drop it before publishing
+            // trace/ptrace events so tracer callbacks and exec state updates never wait on each other.
+            drop(exec_guard);
             // Linux keeps bprm->filename as the original exec-visible name
             // across shebang/interpreter rewrites. Complete vfork first so
             // trace callbacks cannot delay the parent after exec committed.
@@ -241,6 +284,30 @@ fn do_execve_internal(
                 pcb.raw_pid().data() as i32,
                 old_pid,
             );
+
+            // ptrace EVENT_EXEC: must fire after arch_do_execve writes the new entry registers (rip/rsp/rflags/cs).
+            // During EXEC-stop, GETREGS reads the new rip (the new program entry), and SETREGS is not overwritten by arch_do_execve.
+            if pcb.ptrace_event(ptrace::PtraceEvent::Exec, old_vpid)
+                == ptrace::PtraceEventOutcome::Disabled
+                && pcb.is_traced()
+                && !pcb.flags().contains(ProcessFlags::PT_SEIZED)
+            {
+                // Traditional attach in non-SEIZE mode: deliver a bare SIGTRAP (SI_KERNEL) after a successful execve.
+                let mut info = crate::ipc::signal_types::SigInfo::new(
+                    Signal::SIGTRAP,
+                    0,
+                    crate::ipc::signal_types::SigCode::Kernel,
+                    crate::ipc::signal_types::SigType::Kill {
+                        pid: RawPid(0),
+                        uid: 0,
+                    },
+                );
+                let _ = Signal::SIGTRAP.send_signal_info_to_pcb(
+                    Some(&mut info),
+                    pcb.clone(),
+                    PidType::PID,
+                );
+            }
             Ok(())
         }
 
@@ -250,7 +317,7 @@ fn do_execve_internal(
             if let Some(old_vm) = old_vm {
                 do_execve_switch_user_vm(old_vm);
             }
-
+            drop(exec_guard);
             // 增加递归深度并递归调用
             let new_ctx = ctx.increment_depth();
 
@@ -275,6 +342,9 @@ fn finish_exec_error(
     let post_point_of_no_return = param.point_of_no_return();
     if let Some(old_vm) = old_vm {
         do_execve_switch_user_vm(old_vm.clone());
+        // Drop the failed prospective mm only after switching back to the old
+        // address space, then restore any uprobe state lost to a concurrent scan.
+        ProcessManager::release_old_user_vm_if_last(Some(param.vm()));
         // DragonOS publishes the prospective mm before ELF validation. If a
         // concurrent ENABLE scanned that temporary mm, a recoverable exec
         // failure must provide the complementary replay after restoring the

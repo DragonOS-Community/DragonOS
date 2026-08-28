@@ -230,7 +230,7 @@ impl Syscall for SysPrctl {
                 new_cred.cap_bset.remove(cap_flag);
                 let new_cred = Cred::new_arc(new_cred);
 
-                current.set_cred(new_cred)?;
+                current.commit_cred(new_cred)?;
                 Ok(0)
             }
 

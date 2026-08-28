@@ -484,6 +484,9 @@ impl ElfLoader {
         interp_elf_ex: &mut ExecParam,
         load_bias: usize,
     ) -> Result<(BinaryLoaderResult, VirtAddr), ExecError> {
+        interp_elf_ex
+            .would_dump_current_file()
+            .map_err(ExecError::SystemError)?;
         // log::debug!("loading elf interp");
         // defer!({
         //     log::debug!("load_elf_interp done");

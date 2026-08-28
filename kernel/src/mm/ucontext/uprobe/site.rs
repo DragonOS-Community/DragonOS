@@ -274,13 +274,15 @@ impl core::fmt::Debug for XolPage {
     }
 }
 
-/// 某个页上已安装断点的状态标记。
+/// Per-page state marker for installed breakpoints.
 ///
-/// 以页基地址（`probe_vaddr & !(PAGE_SIZE-1)`）为键。多个 uprobe 命中同一页时共享
-/// 一个 COW 副本，`refcount` 记录活跃断点数。注销在**当前映射页**上恢复字节、
-/// 不换页（评审 R8），故此处仅保留计数标记（供安装路径判定「页已私有化」）。
+/// Keyed by the page base address (`probe_vaddr & !(PAGE_SIZE-1)`). Multiple uprobes
+/// hitting the same page share one COW copy; `refcount` records the active breakpoint
+/// count. Unregister restores bytes on the **currently mapped page** without swapping
+/// pages (review R8), so only this counting marker is kept here (for the install path
+/// to decide whether the page is already privatized).
 pub(crate) struct UprobePageState {
-    /// 活跃断点数。
+    /// Number of active breakpoints.
     pub(super) refcount: usize,
 }
 
@@ -291,11 +293,12 @@ impl core::fmt::Debug for UprobePageState {
             .finish_non_exhaustive()
     }
 }
-// ──────────────────────── 注册句柄 ────────────────────────
+// ──────────────────────── Registration handles ────────────────────────
 
-/// 已注册 uprobe 的句柄。
+/// Handle for a registered uprobe.
 ///
-/// Drop 时自动撤销尚未转交给 mm 命中表的安装。
+/// On drop, automatically rolls back any installation not yet handed off to
+/// the mm hit table.
 pub struct UprobeHandle {
     mm: Weak<AddressSpace>,
     probe_vaddr: usize,
@@ -304,7 +307,7 @@ pub struct UprobeHandle {
 }
 
 impl UprobeHandle {
-    /// 把所有权转交给 consumer 的弱 site 索引；用于 mmap/fork 的持久安装。
+    /// Transfer ownership to the consumer's weak site index; used for persistent mmap/fork installs.
     pub(super) fn persist(mut self) {
         self.site.take();
     }
@@ -446,25 +449,29 @@ fn revalidate_probe_mapping(
     current.first().map(|(vma, _, _)| vma.clone())
 }
 
-// ──────────────────────── 公开 API ────────────────────────
+// ──────────────────────── Public API ────────────────────────
 
-/// # 注册一个 uprobe
+/// # Register an uprobe
 ///
-/// 在目标 mm 的 `probe_vaddr` 处安装 0xcc 断点。注册流程（装弹顺序 F6）：
-/// 1. 查 `uprobe_list` 是否已有同址条目：有则复用其 old_instruction + insn_analysis
-///    （避免读到 COW 副本里的 0xcc）；无则读原指令 + `analyze_insn` 校验；
-/// 2. 分配 XOL slot（填 `xol_slot_offset`）；
-/// 3. 用真实 slot_vaddr 调 `build_xol_slot` 预填 slot + 校验 RIP-relative 位移
-///    （溢出→EINVAL fail-fast，绝不留下命中时 panic 的探针）；
-/// 4. 插入 `uprobe_list` 表项；
-/// 5. 安装 0xcc（私有 COW，复刻 `do_wp_page`）。
+/// Installs a 0xcc breakpoint at `probe_vaddr` in the target mm. Registration flow
+/// (load order F6):
+/// 1. Check whether `uprobe_list` already has an entry at the same address: if so,
+///    reuse its old_instruction + insn_analysis (avoiding reading the 0xcc inside the
+///    COW copy); otherwise read the original instruction and validate with `analyze_insn`;
+/// 2. Allocate an XOL slot (filling `xol_slot_offset`);
+/// 3. Call `build_xol_slot` with the real slot_vaddr to prefill the slot and validate
+///    the RIP-relative displacement (overflow -> EINVAL fail-fast, never leaving a probe
+///    that would panic on hit);
+/// 4. Insert the `uprobe_list` entry;
+/// 5. Install 0xcc (private COW, mirroring `do_wp_page`).
 ///
-/// ## 参数
-/// - `mm`：目标地址空间。
-/// - `probe_vaddr`：被探测的用户虚拟地址（必须在已映射的可执行 VMA 内且页已 present）。
-/// ## 返回
-/// `Ok(UprobeHandle)` 或错误码（`EINVAL`=地址非法/指令不支持，`EFAULT`=页未映射，
-/// `ENOMEM`=内存不足，`EACCES`=VMA 不可执行）。
+/// ## Parameters
+/// - `mm`: the target address space.
+/// - `probe_vaddr`: the user virtual address being probed (must lie in a mapped
+///   executable VMA with the page present).
+/// ## Returns
+/// `Ok(UprobeHandle)` or an error code (`EINVAL`=invalid address/unsupported instruction,
+/// `EFAULT`=page not mapped, `ENOMEM`=out of memory, `EACCES`=VMA not executable).
 ///
 pub(super) fn uprobe_register(
     mm: &Arc<AddressSpace>,
@@ -536,7 +543,7 @@ pub(super) fn uprobe_register_locked(
     let install = consumer.begin_install(mm).ok_or(SystemError::ENOENT)?;
     let consumer_id = consumer.id;
 
-    // ── Step 1: 定位 VMA + 读原指令 + 分析 ──
+    // ── Step 1: locate VMA + read original instruction + analyze ──
     let page_base_addr = probe_vaddr & !(MMArch::PAGE_SIZE - 1);
     let page_offset = probe_vaddr & (MMArch::PAGE_SIZE - 1);
 
@@ -549,10 +556,11 @@ pub(super) fn uprobe_register_locked(
         return Ok(None);
     };
 
-    // ── P1：重复注册同一 probe_vaddr 时复用已有指令信息（避免读到 0xcc）──
-    // 第二个 consumer 注册同一地址时 PTE 已指向含 0xcc 的 COW 副本，
-    // read_user_insn_bytes 会把 0xcc 当原指令。故先查 uprobe_list：若有同址条目，
-    // 复用其 old_instruction + insn_analysis（二者对所有同址实例一致），跳过读取。
+    // ── P1: when re-registering the same probe_vaddr, reuse existing instruction info (avoid reading 0xcc) ──
+    // A second consumer registering the same address finds the PTE already pointing at a COW
+    // copy containing 0xcc, which read_user_insn_bytes would mistake for the original instruction.
+    // Consult uprobe_list first: if an entry exists at the same address, reuse its
+    // old_instruction + insn_analysis (identical for all same-address instances), skipping the read.
     let existing_site = mm.uprobe_list.get(probe_vaddr);
 
     if existing_site
@@ -571,7 +579,7 @@ pub(super) fn uprobe_register_locked(
         consumer.definition.instruction()
     };
 
-    // ── Step 2: 确保 XOL 区存在 + 分配 slot ──
+    // ── Step 2: ensure the XOL area exists + allocate a slot ──
     let (xol_lease, fresh_xol_page) = if let Some(site) = existing_site.as_ref() {
         (site.xol_lease.clone(), None)
     } else {
@@ -580,10 +588,10 @@ pub(super) fn uprobe_register_locked(
     };
     let xol_slot_offset = xol_lease.offset();
 
-    // ── P2：注册时预填 XOL slot + 验证 RIP-relative 位移（fail-fast）──
-    // slot_vaddr = xol_page_base + slot_offset 此时已知，立即用真实地址调
-    // build_xol_slot：位移溢出→EINVAL（注册失败，不引入会在命中时 panic 的探针）；
-    // 成功→slot 内容写入物理页，命中时（#BP handler）slot 已就绪、直接 rip→slot。
+    // ── P2: prefill the XOL slot at registration + validate the RIP-relative displacement (fail-fast) ──
+    // slot_vaddr = xol_page_base + slot_offset is now known; call build_xol_slot with the real address
+    // immediately: displacement overflow -> EINVAL (registration fails, no hit-time-panicking probe is
+    // introduced); on success the slot content is written to the physical page, ready for rip on #BP hit.
     if existing_site.is_none() {
         let (slot_vaddr, page_paddr) = { (xol_lease.slot_vaddr(), xol_lease.page_paddr()) };
 
@@ -606,7 +614,7 @@ pub(super) fn uprobe_register_locked(
                 SystemError::EINVAL
             })?;
 
-            // 写入 XOL slot 物理页（复刻 batch3 fill_xol_slot / patch_byte_in_phys 写法）。
+            // Write the XOL slot into the physical page (mirroring batch3's fill_xol_slot / patch_byte_in_phys).
             let kva = unsafe { MMArch::phys_2_virt(page_paddr) }.ok_or(SystemError::EFAULT)?;
             unsafe {
                 let dst = (kva.data() + xol_slot_offset) as *mut u8;
@@ -623,7 +631,7 @@ pub(super) fn uprobe_register_locked(
         }
     }
 
-    // ── Step 3: 创建 uprobe 实体 ──
+    // ── Step 3: create the uprobe entity ──
     let first_site = existing_site.is_none();
     let site = existing_site.unwrap_or_else(|| {
         Arc::new(UprobeSite {
@@ -707,7 +715,7 @@ pub(super) fn uprobe_register_locked(
     }))
 }
 
-// ──────────────────────── 内部实现 ────────────────────────
+// ──────────────────────── Internal implementation ────────────────────────
 
 /// Copy instruction bytes after the caller has locked every backing Page.
 fn copy_locked_instruction(
@@ -788,7 +796,7 @@ fn ensure_xol_and_alloc_slot(
         prot,
         map_flags,
         true, // round_to_min
-        true, // allocate_at_once（立即分配零页）
+        true, // allocate_at_once (allocate zero pages immediately)
     )?;
 
     // XOL is kernel-owned execution state, not an ordinary anonymous mapping.
@@ -807,7 +815,7 @@ fn ensure_xol_and_alloc_slot(
         guard.set_vm_flags(flags);
     }
 
-    // 获取 XOL 页物理地址（供 batch3 关中断路径写 slot 内容）
+    // Get the XOL page physical address (for batch3's irq-off path to write slot contents)
     let page_paddr = inner
         .user_mapper
         .utable
@@ -846,10 +854,11 @@ fn discard_unpublished_xol_page(
     tlb.finish();
 }
 
-/// 安装 0xcc 断点页（复刻 do_wp_page 私有文件 COW）。
+/// Install the 0xcc breakpoint page (mirroring do_wp_page private-file COW).
 ///
-/// 若页已有断点（同一物理页上的另一个 uprobe），仅 patch 额外 0xcc 字节 + refcount++；
-/// 否则 COW → patch → 单次 set_entry → rmap → flush_tlb_range。
+/// If the page already has a breakpoint (another uprobe on the same physical page),
+/// only patch the extra 0xcc bytes + refcount++; otherwise COW → patch → single
+/// set_entry → rmap → flush_tlb_range.
 #[allow(clippy::too_many_arguments)]
 fn install_breakpoint_page<F>(
     mm: &Arc<AddressSpace>,
@@ -868,7 +877,7 @@ where
     let address = VirtAddr::new(page_base_addr);
     let end = VirtAddr::new(page_base_addr + MMArch::PAGE_SIZE);
 
-    // ── 检查页是否已有断点（同页多 uprobe）──
+    // ── check whether the page already has a breakpoint (multiple uprobes on one page) ──
     let already_cowed = {
         let pb = mm.uprobe_page_state.lock_irqsave();
         pb.contains_key(&page_base_addr)
@@ -951,14 +960,14 @@ where
         return Ok(());
     }
 
-    // ── 新 COW 断点页 ──
+    // ── New COW breakpoint page ──
 
     let mapper = &mut inner.user_mapper.utable;
 
-    // translate 取旧 paddr + flags
+    // translate to get the old paddr + flags
     let (old_paddr, entry_flags) = mapper.translate(address).ok_or(SystemError::EFAULT)?;
 
-    // 取旧 page（必须被 page_manager 追踪——File 页或 Normal 页）
+    // Fetch the old page (must be tracked by page_manager -- a File or Normal page)
     let old_page = {
         let mut pm = page_manager_lock();
         pm.get(&old_paddr).ok_or(SystemError::EFAULT)?
@@ -1107,7 +1116,7 @@ where
     Ok(())
 }
 
-/// 在物理页的指定偏移写入一个字节（通过内核 direct-map）。
+/// Write one byte at the given offset of a physical page (via the kernel direct map).
 pub(super) fn patch_byte_in_phys(
     page: &Arc<Page>,
     offset: usize,
@@ -1202,9 +1211,11 @@ fn uprobe_unregister_consumer_from_site_locked(
     }
 }
 
-/// 注销前按 Linux `register_for_each_vma()` 的方式在 mm 写锁下重验映射身份，
-/// 防止 munmap 后同一虚址被无关文件复用时写坏新映射。VMA split 会创建新的
-/// `LockedVMA` 对象，但保留相同的映射 lineage，因此不会丢失 retained segment。
+/// Before unregistering, revalidate the mapping identity under the mm write lock the way
+/// Linux `register_for_each_vma()` does, to avoid corrupting a new mapping when the same
+/// virtual address is reused by an unrelated file after munmap. VMA split creates new
+/// `LockedVMA` objects but preserves the same mapping lineage, so the retained segment
+/// is not lost.
 pub(super) fn site_mapping_still_matches(inner: &InnerAddressSpace, site: &UprobeSite) -> bool {
     let Some(vma) = inner.mappings.contains(VirtAddr::new(site.probe_vaddr)) else {
         return false;
@@ -1231,13 +1242,15 @@ pub(super) fn site_mapping_still_matches(inner: &InnerAddressSpace, site: &Uprob
     site.definition.matches_inode(&file.inode()) && offset == site.definition.offset()
 }
 
-/// 在**当前映射页**上恢复断点原字节（评审 R8）。
+/// Restore the original breakpoint byte on the **currently mapped page** (review R8).
 ///
-/// 经 `translate` 取当前 paddr（可能是断点安装时的 COW 副本，也可能是程序
-/// 写缺页二次 COW 后的页）。与 Linux `verify_opcode()` 一样，只有当前字节仍
-/// 是本设施安装的 INT3 才恢复；调试器等外部写入的新指令绝不能被 close 覆盖。
-/// 不交换页映射——页上其他字节的任何程序写入都保留。无 PTE 变更 → 无需 TLB
-/// flush（TLB 缓存翻译而非内容；跨修改代码的串行化由同步 rendezvous 保证）。
+/// Use `translate` to get the current paddr (the COW copy from breakpoint installation,
+/// or a page from a second COW after a program write fault). As with Linux
+/// `verify_opcode()`, restore only while the current byte is still the INT3 this
+/// facility installed; a new instruction written externally (e.g. by a debugger) must
+/// never be overwritten by close. The page mapping is not swapped, so program writes to
+/// other bytes remain. No PTE change → no TLB flush (TLB caches translations, not
+/// contents; cross-modifying-code serialization is provided by the synchronous rendezvous).
 pub(super) fn restore_breakpoint_byte(
     mm: &Arc<AddressSpace>,
     inner: &mut InnerAddressSpace,
@@ -1259,7 +1272,7 @@ pub(super) fn restore_breakpoint_byte(
             return true;
         }
     }
-    // 页已被 munmap（translate 失败）：无需恢复。
+    // The page was munmapped (translate failed): nothing to restore.
     false
 }
 

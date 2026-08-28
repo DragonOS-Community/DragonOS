@@ -115,6 +115,22 @@ impl TrapFrame {
         let x = core::mem::MaybeUninit::<Self>::zeroed();
         unsafe { x.assume_init() }
     }
+
+    /// Set the syscall return value register (a0 on loongarch64).
+    #[inline]
+    pub fn set_return_value(&mut self, value: usize) {
+        self.a0 = value;
+    }
+
+    /// Read the syscall return value register (a0 on loongarch64).
+    pub fn get_syscall_return(&self) -> usize {
+        self.a0
+    }
+
+    #[inline]
+    pub fn get_orig_syscall_nr(&self) -> i64 {
+        self.a7 as i64
+    }
 }
 
 impl ProbeArgs for TrapFrame {

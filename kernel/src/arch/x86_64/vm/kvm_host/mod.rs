@@ -212,6 +212,8 @@ pub trait KvmFunc: Send + Sync + Debug {
 
     fn prepare_switch_to_guest(&self, vcpu: &mut VirtCpu);
 
+    fn prepare_switch_to_host(&self, vcpu: &mut VirtCpu);
+
     fn flush_tlb_all(&self, vcpu: &mut VirtCpu);
 
     fn vcpu_run(&self, vcpu: &mut VirtCpu) -> ExitFastpathCompletion;

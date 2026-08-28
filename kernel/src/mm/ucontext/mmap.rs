@@ -124,23 +124,24 @@ impl InnerAddressSpace {
         return Ok((start_page, notifications));
     }
 
-    /// 创建**文件关联的立即映射**（file-backed eager mapping）。
+    /// Creates a **file-backed eager mapping**.
     ///
-    /// 与 [`Self::map_anonymous`] 的区别：创建的 VMA 绑定 `vm_file` +
-    /// `backing_pgoff`，使 `attach_vma` 将其注册到 inode 的 file-rmap
-    /// （`page_cache::register_file_vma`）。物理页仍由内核立即分配并零填充
-    /// （eager），调用方随后用字节拷贝（如 ELF loader 的 `do_load_file`）
-    /// 覆盖为真实文件内容。
+    /// Difference from [`Self::map_anonymous`]: the created VMA is bound to `vm_file` +
+    /// `backing_pgoff`, so `attach_vma` registers it in the inode's file-rmap
+    /// (`page_cache::register_file_vma`). The physical pages are still immediately allocated and zero-filled
+    /// by the kernel (eager); the caller then overwrites them with the real file contents via
+    /// byte copies (e.g. the ELF loader's `do_load_file`).
     ///
-    /// 这样设计的原因：ELF loader 在持有 `InnerAddressSpace` 写锁的进程上下文中
-    /// 加载段，不能触发缺页（缺页需取地址空间锁）。立即映射 + 拷贝既满足
-    /// 「页已驻留」（uprobe 注册等需要 translate 目标页）又满足「VMA 在 inode
-    /// rmap 中可被发现」（uprobe 经 `collect_file_vmas` 定位）。
+    /// Rationale: the ELF loader loads segments in process context while holding the
+    /// `InnerAddressSpace` write lock, so it cannot trigger page faults (a fault would need to
+    /// take the address-space lock). An eager mapping + copy both satisfies "pages are resident"
+    /// (uprobe registration etc. needs to translate the target pages) and "the VMA is discoverable
+    /// in the inode rmap" (uprobe locates it via `collect_file_vmas`).
     ///
-    /// ## 参数
-    /// - `file`：关联的文件（VMA 的 `vm_file`）。
-    /// - `file_offset`：段在文件中的**页对齐**偏移（字节），用于计算
-    ///   `backing_pgoff = file_offset >> PAGE_SHIFT`。
+    /// ## Parameters
+    /// - `file`: the associated file (the VMA's `vm_file`).
+    /// - `file_offset`: the **page-aligned** byte offset of the segment within the file, used to compute
+    ///   `backing_pgoff = file_offset >> PAGE_SHIFT`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_file_backed(
         &mut self,
@@ -199,15 +200,15 @@ impl InnerAddressSpace {
                 let vma_file = Some(file.clone());
                 let vma_pgoff = Some(pgoff);
                 if !MMArch::PAGE_FAULT_ENABLED {
-                    // 无按需分页：立即映射物理页（零填充），内容由调用方覆盖。
+                    // No demand paging: map the physical pages immediately (zero-filled); the caller overwrites the contents.
                     Ok(VMA::zeroed(
                         page, count, vm_flags, flags, mapper, flusher, vma_file, vma_pgoff,
                     )?)
                 } else {
-                    // 按需分页可用：创建 lazy 文件映射 VMA。
-                    // 注意：ELF loader 当前对只读段仍需 eager（uprobe 要求页驻留），
-                    // 走 eager 路径时 PAGE_FAULT_ENABLED 为真但调用方仍期望立即映射。
-                    // 这里与 map_anonymous 一致：无 allocate_at_once 参数时一律 eager。
+                    // Demand paging is available: create a lazy file-backed VMA.
+                    // Note: the ELF loader still needs eager mappings for read-only segments (uprobe requires resident pages),
+                    // so on the eager path PAGE_FAULT_ENABLED is true but the caller still expects an immediate mapping.
+                    // This matches map_anonymous: without an allocate_at_once argument it is always eager.
                     Ok(VMA::zeroed(
                         page, count, vm_flags, flags, mapper, flusher, vma_file, vma_pgoff,
                     )?)

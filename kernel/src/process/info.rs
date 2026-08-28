@@ -89,6 +89,17 @@ impl ThreadInfo {
         self.group_tasks.clone()
     }
 
+    /// Borrow the leader-owned thread list without allocating. Callers must
+    /// keep the surrounding ThreadInfo read guard alive while iterating.
+    pub(crate) fn group_tasks(&self) -> &[Weak<ProcessControlBlock>] {
+        &self.group_tasks
+    }
+
+    /// Whether the group has only the leader thread (an empty group list means a single-threaded group).
+    pub fn group_tasks_is_empty(&self) -> bool {
+        self.group_tasks.is_empty()
+    }
+
     pub fn thread_group_empty(&self) -> bool {
         let group_leader = self.group_leader();
         if let Some(leader) = group_leader {
@@ -134,6 +145,9 @@ pub struct ProcessBasicInfo {
 
     /// File descriptor table.
     fd_table: Option<FdTableAttachment>,
+
+    /// Process execution domain flags (personality); GDB sets bits such as ADDR_NO_RANDOMIZE via SYS_personality.
+    personality: u32,
 }
 
 /// A PCB slot's ownership of a files table.
@@ -205,6 +219,7 @@ impl ProcessBasicInfo {
             cwd,
             user_vm,
             fd_table: Some(FdTableAttachment::new(fd_table)),
+            personality: 0,
         });
     }
 
@@ -277,6 +292,16 @@ impl ProcessBasicInfo {
         let old = self.fd_table.take();
         self.fd_table = fd_table;
         old.map(FdTableAttachment::retire)
+    }
+
+    pub fn personality(&self) -> u32 {
+        self.personality
+    }
+
+    pub fn set_personality(&mut self, new: u32) -> u32 {
+        let old = self.personality;
+        self.personality = new;
+        old
     }
 }
 

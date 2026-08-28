@@ -2,6 +2,7 @@
 //!
 //! 实现 Linux 兼容的 /proc 文件系统
 
+use crate::mm::ucontext::AddressSpace;
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -51,6 +52,7 @@ pub(super) use template::Builder;
 pub struct ProcfsFilePrivateData {
     pub data: Vec<u8>,
     pub open_cred: Arc<Cred>,
+    pub pinned_vm: Option<Arc<AddressSpace>>,
 }
 
 impl ProcfsFilePrivateData {
@@ -58,6 +60,7 @@ impl ProcfsFilePrivateData {
         ProcfsFilePrivateData {
             data: Vec::new(),
             open_cred: ProcessManager::current_pcb().cred(),
+            pinned_vm: None,
         }
     }
 }

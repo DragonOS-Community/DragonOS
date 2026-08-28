@@ -3,6 +3,7 @@
 use system_error::SystemError;
 
 use crate::{
+    arch::ipc::signal::Signal,
     libs::{
         spinlock::SpinLock,
         wait_queue::{TimeoutWaker, WaitQueue, Waiter},
@@ -13,6 +14,17 @@ use crate::{
 
 const COMPLETE_ALL: u32 = u32::MAX;
 const MAX_TIMEOUT: i64 = i64::MAX;
+
+/// Signal response mode used while waiting on a completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitMode {
+    /// Uninterruptible sleep: ignores all signals.
+    Uninterruptible,
+    /// Interruptible by any pending signal.
+    Interruptible,
+    /// Interruptible only by fatal signals.
+    Killable,
+}
 
 #[derive(Debug)]
 pub struct Completion {
@@ -29,9 +41,9 @@ impl Completion {
     /// @brief 基本函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
     ///
     /// @param timeout jiffies
-    /// @param interuptible 设置进程是否能被打断
+    /// @param mode the signal response mode of the sleep
     /// @return 返回剩余时间或者SystemError
-    fn do_wait_for_common(&self, timeout: i64, interuptible: bool) -> Result<i64, SystemError> {
+    fn do_wait_for_common(&self, timeout: i64, mode: WaitMode) -> Result<i64, SystemError> {
         let pcb = ProcessManager::current_pcb();
 
         // None 代表无限等待；Some(jiffies) 代表还剩多少 jiffies
@@ -57,14 +69,16 @@ impl Completion {
                 }
             }
 
-            // 信号快速检查
-            if interuptible && pcb.sig_info_irqsave().sig_pending().has_pending() {
+            // Interruptible mode checks any pending signal; killable only fatal ones; uninterruptible ignores signals.
+            let has_pending = match mode {
+                WaitMode::Uninterruptible => false,
+                WaitMode::Interruptible => pcb.sig_info_irqsave().sig_pending().has_pending(),
+                WaitMode::Killable => Signal::signal_pending_state(false, true, &pcb),
+            };
+            if has_pending {
                 return Err(SystemError::ERESTARTSYS);
             }
 
-            if remaining.is_some_and(|r| r <= 0) {
-                return Ok(0);
-            }
             if remaining.is_some_and(|r| r <= 0) {
                 return Ok(0);
             }
@@ -98,7 +112,11 @@ impl Completion {
             }
 
             // 阻塞等待
-            let wait_res = waiter.wait(interuptible);
+            let wait_res = match mode {
+                WaitMode::Uninterruptible => waiter.wait(false),
+                WaitMode::Interruptible => waiter.wait(true),
+                WaitMode::Killable => waiter.wait_killable(),
+            };
 
             // 取消定时器（如果还没超时）
             if let Some(t) = &timer {
@@ -130,25 +148,31 @@ impl Completion {
     /// @brief 等待指定时间，超时后就返回, 同时设置pcb state为uninteruptible.
     /// @param timeout 非负整数，等待指定时间，超时后就返回/或者提前done
     pub fn wait_for_completion_timeout(&self, timeout: i64) -> Result<i64, SystemError> {
-        self.do_wait_for_common(timeout, false)
+        self.do_wait_for_common(timeout, WaitMode::Uninterruptible)
     }
 
     /// @brief 等待completion命令唤醒进程, 同时设置pcb state 为uninteruptible.
     pub fn wait_for_completion(&self) -> Result<i64, SystemError> {
-        self.do_wait_for_common(MAX_TIMEOUT, false)
+        self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Uninterruptible)
     }
 
-    /// @brief @brief 等待completion的完成，但是可以被中断
+    /// @brief Wait for the completion to be done, but can be interrupted by any signal
     pub fn wait_for_completion_interruptible(&self) -> Result<i64, SystemError> {
-        self.do_wait_for_common(MAX_TIMEOUT, true)
+        self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Interruptible)
     }
 
+    /// @brief Wait for the completion to be done, interruptible only by fatal signals.
+    pub fn wait_for_completion_killable(&self) -> Result<i64, SystemError> {
+        self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Killable)
+    }
+
+    /// @brief Wait for the completion to be done, interruptible by any signal, with a timeout
     pub fn wait_for_completion_interruptible_timeout(
         &mut self,
         timeout: i64,
     ) -> Result<i64, SystemError> {
         assert!(timeout >= 0);
-        self.do_wait_for_common(timeout, true)
+        self.do_wait_for_common(timeout, WaitMode::Interruptible)
     }
 
     /// @brief 唤醒一个wait_queue中的节点

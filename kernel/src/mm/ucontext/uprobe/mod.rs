@@ -1,19 +1,22 @@
-//! Per-mm uprobe 管理 + XOL 区 + 断点页安装（计划步骤 3+4）。
+//! Per-mm uprobe management + XOL area + breakpoint page installation (planned steps 3+4).
 //!
-//! 本模块提供 uprobe 注册/注销的基础设施，供 batch3（异常分发）与 batch4（perf 接入）调用。
+//! This module provides uprobe registration/unregistration infrastructure, used by batch3
+//! (exception dispatch) and batch4 (perf integration).
 //!
-//! # 关键设计（评审 findings）
+//! # Key design (review findings)
 //!
-//! - **F8**：`uprobe_list` / `xol_pool` / `uprobe_page_state` 挂在 `AddressSpace` 上，由
-//!   **独立 irqsave `SpinLock`** 保护（**不**走 `inner: RwSem`），命中路径（#BP/#DB 关中断）
-//!   仅 `lock_irqsave` + 查表，绝不睡眠。
-//! - **F1/F2**：断点页安装复刻 `do_wp_page` 私有文件 COW——在 try-only source Page
-//!   guards 下验证并复制到未发布 Normal 页，patch 0xcc 后用**单次** `set_entry`
-//!   原子替换（**绝不** unmap+map_phys 制造瞬时空 PTE）+ rmap 账簿 + TLB rendezvous。
-//! - **F7**：每目标 mm 私有 COW 副本（type `Normal`），**绝不**修改共享 page-cache 页
-//!   （否则 writeback 回写 0xcc 损坏 .so）。
-//! - **F6 装弹顺序不变量**：注册时严格按 XOL slot 分配 → uprobe 表项插入 → 0xcc 页发布；
-//!   0xcc 发布前任何路径查该 vaddr 必须能找到就绪 uprobe 表项。
+//! - **F8**: `uprobe_list` / `xol_pool` / `uprobe_page_state` are attached to `AddressSpace`, protected by
+//!   a dedicated irqsave `SpinLock` (**not** via `inner: RwSem`); the hit path (#BP/#DB with interrupts
+//!   disabled) only does `lock_irqsave` + a table lookup and never sleeps.
+//! - **F1/F2**: breakpoint page installation mirrors `do_wp_page` private-file COW — under try-only source
+//!   Page guards, validate and copy into an unpublished Normal page, then patch in 0xcc and use a
+//!   single `set_entry` atomic swap (**never** unmap+map_phys, which would create a transient empty PTE)
+//!   + rmap bookkeeping + TLB rendezvous.
+//! - **F7**: a private COW copy per target mm (type `Normal`), **never** modifying the shared page-cache page
+//!   (otherwise writeback would flush 0xcc and corrupt the .so).
+//! - **F6 arming-order invariant**: registration strictly follows XOL slot allocation -> uprobe table
+//!   entry insert -> 0xcc page publish; before 0xcc is published, any path querying that vaddr must
+//!   find a ready uprobe table entry.
 use crate::libs::{spinlock::SpinLock, wait_queue::WaitQueue};
 use alloc::{
     collections::BTreeMap,

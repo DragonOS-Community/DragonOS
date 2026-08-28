@@ -1,29 +1,3 @@
-use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
-
-use crate::arch::MMArch;
-use crate::cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src};
-use crate::filesystem::cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node};
-use crate::filesystem::vfs::file::{File, FileDescriptorTable, FileFlags, ReservedFd};
-use crate::filesystem::vfs::FileType;
-use crate::mm::access_ok;
-use crate::mm::MemoryManagementArch;
-use crate::process::pidfd::PidFd;
-use alloc::{string::ToString, sync::Arc};
-use log::{error, warn};
-use system_error::SystemError;
-
-use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal},
-    ipc::signal_types::SignalFlags,
-    libs::cpumask::CpuMask,
-    mm::VirtAddr,
-    process::ProcessFlags,
-    sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
-    smp::cpu::{smp_cpu_manager_initialized, ProcessorId},
-    syscall::user_access::UserBufferWriter,
-};
-
 use super::{
     account_successful_fork, alloc_pid, inc_visible_thread_count,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
@@ -32,6 +6,36 @@ use super::{
     FsRefsReadGuard, KernelStack, ProcessControlBlock, ProcessManager, RawPid,
     PTRACE_RELATION_LOCK,
 };
+use crate::{
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, MMArch},
+    cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src},
+    filesystem::{
+        cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node},
+        vfs::{
+            file::{File, FileDescriptorTable, FileFlags, ReservedFd},
+            FileType,
+        },
+    },
+    ipc::signal_types::SignalFlags,
+    libs::cpumask::CpuMask,
+    mm::{access_ok, MemoryManagementArch, VirtAddr},
+    process::{
+        pidfd::PidFd,
+        ptrace::{
+            join_new_thread_group_stop_locked, ptrace_fork_session_snapshot_locked, PtraceEvent,
+            PtraceForkSession,
+        },
+        ProcessFlags,
+    },
+    sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
+    smp::cpu::{smp_cpu_manager_initialized, ProcessorId},
+    syscall::user_access::UserBufferWriter,
+};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
+use log::{error, warn};
+use system_error::SystemError;
+
 pub const MAX_PID_NS_LEVEL: usize = 32;
 
 bitflags! {
@@ -280,7 +284,8 @@ impl ProcessManager {
 
         args.verify()?;
         let pcb = ProcessControlBlock::new(name, new_kstack);
-        Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
+        let ptrace_fork_session = Self::copy_process(&current_pcb, &pcb, args, current_trapframe)
+            .map_err(|e| {
             error!(
                 "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(),
@@ -289,6 +294,12 @@ impl ProcessManager {
             );
             e
         })?;
+        let child_vpid = if current_pcb.raw_pid().data() == 0 {
+            pcb.raw_pid()
+        } else {
+            pcb.task_pid_nr_ns(PidType::PID, caller_pid_ns)
+                .expect("published fork child must be visible in the caller's PID namespace")
+        };
         // if pcb.raw_pid().data() > 1 {
         //     log::debug!(
         //         "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
@@ -306,14 +317,10 @@ impl ProcessManager {
                 e
             )
         });
+        // Report the ptrace event only after wake_up_new_task,
+        Self::ptrace_report_fork_event(&current_pcb, &pcb, ptrace_fork_session.as_ref());
 
-        if ProcessManager::current_pid().data() == 0 {
-            return Ok(pcb.raw_pid());
-        }
-
-        return pcb
-            .task_pid_nr_ns(PidType::PID, caller_pid_ns)
-            .ok_or(SystemError::EINVAL);
+        Ok(child_vpid)
     }
 
     fn copy_flags(
@@ -321,7 +328,7 @@ impl ProcessManager {
         kthread: bool,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        let parent_flags = *ProcessManager::current_pcb().flags();
+        let parent_flags = ProcessManager::current_pcb().flags().load();
         let mut child_flags = parent_flags.fork_inherited();
 
         // KTHREAD 不通过继承传递，而是由创建参数显式赋予。
@@ -334,7 +341,7 @@ impl ProcessManager {
         }
         child_flags.insert(ProcessFlags::FORKNOEXEC);
 
-        *new_pcb.flags.get_mut() = child_flags;
+        new_pcb.flags.store(child_flags);
 
         return Ok(());
     }
@@ -496,7 +503,7 @@ impl ProcessManager {
     ///
     /// - no_new_privs：线程级语义，clone/fork 继承，execve 保持（execve 不走这里）。
     /// - keepcaps：clone/fork 继承。
-    /// - dumpable：fork 继承。
+    /// - dumpable: inherited naturally via the shared or cloned AddressSpace.
     fn copy_prctl_state(
         _clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
@@ -510,8 +517,6 @@ impl ProcessManager {
         // KEEPCAPS
         new_pcb.set_keepcaps(current_pcb.keepcaps());
 
-        // DUMPABLE
-        new_pcb.set_dumpable(current_pcb.dumpable());
         Ok(())
     }
 
@@ -569,7 +574,7 @@ impl ProcessManager {
     /// - pcb 目标pcb
     ///
     /// ## return
-    /// - 成功时返回Ok(())
+    /// - 成功时返回绑定到本次 child link 的 ptrace fork session（若有）
     /// - 发生错误时返回Err(SystemError)
     #[inline(never)]
     pub fn copy_process(
@@ -577,7 +582,7 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         mut clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
-    ) -> Result<(), SystemError> {
+    ) -> Result<Option<PtraceForkSession>, SystemError> {
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
@@ -907,12 +912,74 @@ impl ProcessManager {
         // 处理 rseq 状态。按 Linux copy_process() 顺序，应在任务对外可见前完成。
         crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));
 
-        let publish_result: Result<(), SystemError> = {
+        // Event classification uses exit_signal!=SIGCHLD to distinguish
+        // CLONE/FORK (Linux fork.c), not CLONE_THREAD. The actual tracing
+        // snapshot is taken under the existing publication relation lock, so
+        // an untraced fork adds only one flag test to that transaction.
+        let ptrace_event = if clone_flags.contains(CloneFlags::CLONE_UNTRACED) {
+            None
+        } else if clone_flags.contains(CloneFlags::CLONE_VFORK) {
+            Some(PtraceEvent::VFork)
+        } else if clone_args.exit_signal != Signal::SIGCHLD as i32 {
+            Some(PtraceEvent::Clone)
+        } else {
+            Some(PtraceEvent::Fork)
+        };
+
+        let mut inherited_ptrace_session = None;
+        let publish_result: Result<(), SystemError> = loop {
             // Keep PGID/SID publication ordered before the relation lock, the
             // same order used by de_thread's membership transaction.
-            let _membership_guard = crate::process::pid::pid_membership_lock();
-            let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
-            if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+            let membership_guard = crate::process::pid::pid_membership_lock();
+            let relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+
+            let fork_session = ptrace_event.and_then(|event| {
+                current_pcb
+                    .flags()
+                    .contains(ProcessFlags::PTRACED)
+                    .then(|| {
+                        ptrace_fork_session_snapshot_locked(
+                            current_pcb,
+                            event,
+                            clone_flags.contains(CloneFlags::CLONE_PTRACE),
+                        )
+                    })
+                    .flatten()
+            });
+            if let Some((session, false)) = fork_session.as_ref() {
+                drop(relation_guard);
+                drop(membership_guard);
+                if let Err(err) = ProcessControlBlock::ptrace_reserve_fork_relation_slot(session) {
+                    break Err(err);
+                }
+                continue;
+            }
+            let fork_session = fork_session.map(|(session, _slot_available)| session);
+
+            let thread_group_leader = clone_flags.contains(CloneFlags::CLONE_THREAD).then(|| {
+                pcb.threads_read_irqsave()
+                    .group_leader()
+                    .expect("CLONE_THREAD child must have a thread-group leader")
+            });
+            if let Some(group_leader) = thread_group_leader.as_ref() {
+                let slot_available = {
+                    let threads = group_leader.threads_read_irqsave();
+                    threads.group_tasks.len() < threads.group_tasks.capacity()
+                };
+                if !slot_available {
+                    drop(relation_guard);
+                    drop(membership_guard);
+                    if let Err(err) = group_leader.try_reserve_thread_group_slot() {
+                        break Err(err);
+                    }
+                    // Another fork can consume the reserved slot before this
+                    // transaction is reacquired, so capacity is rechecked on
+                    // every iteration.
+                    continue;
+                }
+            }
+
+            let result = if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                 let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
                 let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
                 *pcb.parent_pcb.write_irqsave() = inherited_parent;
@@ -921,7 +988,9 @@ impl ProcessManager {
                 *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
                 pcb.exit_signal.store(-1, Ordering::SeqCst);
 
-                let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
+                let group_leader = thread_group_leader
+                    .as_ref()
+                    .expect("CLONE_THREAD publication requires a group leader");
                 // PCB construction happens before the membership transaction.
                 // Refresh the per-thread tty here so session_clear_tty() and
                 // thread publication have a single linearization order.
@@ -934,7 +1003,6 @@ impl ProcessManager {
                         .fetch_add(1, Ordering::Relaxed);
                     assert_ne!(live, 0, "cannot publish a thread into a dead group");
                     pcb.attach_pid(PidType::PID);
-                    pcb.task_join_group_stop();
                     group_leader
                         .threads_write_irqsave()
                         .group_tasks
@@ -972,6 +1040,10 @@ impl ProcessManager {
                         .unwrap_or(RawPid::new(0));
                     pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
                 }
+                // The child inherits the parent's execution domain flags (personality)
+                pcb.basic
+                    .write_irqsave()
+                    .set_personality(current_pcb.basic().personality());
 
                 let pid = pcb.pid();
                 if pcb.raw_pid() == RawPid(1) {
@@ -1045,7 +1117,19 @@ impl ProcessManager {
                 }
 
                 Ok(())
+            };
+
+            if result.is_ok() {
+                if let Some(session) = fork_session {
+                    if pcb.ptrace_link_inherit_from_locked(current_pcb, &session) {
+                        inherited_ptrace_session = Some(session);
+                    }
+                }
+                if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                    join_new_thread_group_stop_locked(pcb);
+                }
             }
+            break result;
         };
         if let Err(err) = publish_result {
             if let Some(reservation) = reserved_pidfd.take() {
@@ -1056,13 +1140,6 @@ impl ProcessManager {
             }
             Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
             return Err(err);
-        }
-
-        if let (Some(reservation), Some(file)) = (reserved_pidfd.take(), pidfd_file.take()) {
-            current_pcb
-                .fd_table()
-                .write()
-                .install_reserved_fd(reservation, file)?;
         }
 
         let published_cgroup = if pcb.raw_pid() > RawPid(0) {
@@ -1097,7 +1174,57 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
-        Ok(())
+        // All fallible steps passed: bump the shared space's user count now.
+        // The child is woken after this point, so the count is set before it runs.
+        if clone_flags.contains(CloneFlags::CLONE_VM) {
+            if let Some(shared_vm) = pcb.basic().user_vm() {
+                shared_vm.user_count_inc();
+            }
+        }
+
+        // Linux installs pidfd only after copy_process() has fully initialized
+        // and published the child. The reserved slot cannot be consumed by
+        // another fd-table operation, so failure here would mean an internal
+        // reservation invariant was violated, not a recoverable fork error.
+        match (reserved_pidfd.take(), pidfd_file.take()) {
+            (Some(reservation), Some(file)) => {
+                let installed = current_pcb
+                    .fd_table()
+                    .write()
+                    .install_reserved_fd(reservation, file)
+                    .expect("reserved pidfd slot changed before fork publication");
+                assert_eq!(installed, reservation.fd());
+            }
+            (None, None) => {}
+            _ => unreachable!("pidfd reservation and file must be prepared together"),
+        }
+
+        Ok(inherited_ptrace_session)
+    }
+
+    /// Report the ptrace FORK/CLONE/VFORK event (parent-side ptrace-stop).
+    ///
+    /// On call, the parent enters ptrace_stop here, blocks, and notifies the tracer.
+    /// If called before wake_up_new_task, the child is not woken and tracer wait(child)
+    /// blocks forever.
+    pub fn ptrace_report_fork_event(
+        current_pcb: &Arc<ProcessControlBlock>,
+        pcb: &Arc<ProcessControlBlock>,
+        session: Option<&PtraceForkSession>,
+    ) {
+        let Some(session) = session.filter(|session| session.report_event()) else {
+            return;
+        };
+        // The event_message (child pid) is translated into the ptracer's pid namespace.
+        let child_vpid = pcb
+            .task_pid_nr_ns(PidType::PID, Some(session.tracer().active_pid_ns()))
+            .map(|p| p.data())
+            .unwrap_or(0);
+        current_pcb.ptrace_fork_event_bound(
+            session.event(),
+            child_vpid,
+            session.source_generation(),
+        );
     }
 
     fn rollback_failed_fork(

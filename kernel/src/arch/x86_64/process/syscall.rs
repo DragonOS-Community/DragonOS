@@ -90,7 +90,10 @@ impl Syscall {
         let mut arch_info = pcb.arch_info_irqsave();
         match option {
             ARCH_GET_FS => {
-                unsafe { arch_info.save_fsbase() };
+                unsafe {
+                    arch_info.save_fs_selector();
+                    arch_info.save_fsbase();
+                };
                 let mut writer = UserBufferWriter::new(
                     arg2 as *mut usize,
                     core::mem::size_of::<usize>(),
@@ -99,7 +102,10 @@ impl Syscall {
                 writer.copy_one_to_user(&arch_info.fsbase, 0)?;
             }
             ARCH_GET_GS => {
-                unsafe { arch_info.save_user_gsbase() };
+                unsafe {
+                    arch_info.save_gs_selector();
+                    arch_info.save_user_gsbase();
+                };
                 let mut writer = UserBufferWriter::new(
                     arg2 as *mut usize,
                     core::mem::size_of::<usize>(),

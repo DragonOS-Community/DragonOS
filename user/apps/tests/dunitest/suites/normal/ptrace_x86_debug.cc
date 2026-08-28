@@ -12,6 +12,7 @@
 #include <sys/ptrace.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/user.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -102,6 +103,11 @@ pid_t waitpid_deadline(pid_t pid, int* status, int options = 0,
         }
         poll(nullptr, 0, 1);
     }
+}
+
+bool running_on_dragonos() {
+    utsname name = {};
+    return uname(&name) == 0 && strstr(name.release, "dragonos") != nullptr;
 }
 
 bool read_byte_deadline(int fd, char* byte, int timeout_ms = kDeadlineMs) {
@@ -208,7 +214,88 @@ void continue_and_reap(pid_t child) {
     EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
-TEST(PtraceX86Debug, GeneralRegistersRejectKernelCodeSelector) {
+[[noreturn]] __attribute__((noinline)) void run_fs_gs_selector_tracee() {
+    asm volatile("mov %[probe], %%rdx\n\t"
+                 "mov $0x2b, %%ax\n\t"
+                 "mov %%ax, %%fs\n\t"
+                 "mov %%ax, %%gs\n\t"
+                 "int3\n\t"
+                 "xor %%edi, %%edi\n\t"
+                 "mov %%fs, %%ax\n\t"
+                 "cmp $0x2b, %%ax\n\t"
+                 "setne %%dil\n\t"
+                 "mov %%gs, %%ax\n\t"
+                 "cmp $0x2b, %%ax\n\t"
+                 "setne %%al\n\t"
+                 "movzbl %%al, %%eax\n\t"
+                 "or %%eax, %%edi\n\t"
+                 "mov (%%rdx), %%rcx\n\t"
+                 "mov %%fs:(%%rdx), %%rax\n\t"
+                 "cmp %%rcx, %%rax\n\t"
+                 "setne %%al\n\t"
+                 "movzbl %%al, %%eax\n\t"
+                 "or %%eax, %%edi\n\t"
+                 "mov %%gs:(%%rdx), %%rax\n\t"
+                 "cmp %%rcx, %%rax\n\t"
+                 "setne %%al\n\t"
+                 "movzbl %%al, %%eax\n\t"
+                 "or %%eax, %%edi\n\t"
+                 "mov $60, %%eax\n\t"
+                 "syscall\n\t"
+                 "ud2"
+                 :
+                 : [probe] "r"(&watched_word)
+                 : "rax", "rdx", "rdi", "rcx", "r11", "memory");
+    __builtin_unreachable();
+}
+
+[[noreturn]] __attribute__((noinline)) void run_zero_data_selectors_tracee(
+    bool check_bases) {
+    asm volatile("int3\n\t"
+                 "xor %%edi, %%edi\n\t"
+                 "mov %%ds, %%ax\n\t"
+                 "test %%ax, %%ax\n\t"
+                 "setne %%dil\n\t"
+                 "mov %%es, %%ax\n\t"
+                 "test %%ax, %%ax\n\t"
+                 "setne %%al\n\t"
+                 "movzbl %%al, %%eax\n\t"
+                 "or %%eax, %%edi\n\t"
+                 "mov %%fs, %%ax\n\t"
+                 "test %%ax, %%ax\n\t"
+                 "setne %%al\n\t"
+                 "movzbl %%al, %%eax\n\t"
+                 "or %%eax, %%edi\n\t"
+                 "mov %%gs, %%ax\n\t"
+                 "test %%ax, %%ax\n\t"
+                 "setne %%al\n\t"
+                 "movzbl %%al, %%eax\n\t"
+                 "or %%eax, %%edi\n\t"
+                 "test %[check_bases], %[check_bases]\n\t"
+                 "jz 1f\n\t"
+                 "mov %[probe], %%rdx\n\t"
+                 "mov (%%rdx), %%rcx\n\t"
+                 "mov %%fs:(%%rdx), %%rax\n\t"
+                 "cmp %%rcx, %%rax\n\t"
+                 "setne %%al\n\t"
+                 "movzbl %%al, %%eax\n\t"
+                 "or %%eax, %%edi\n\t"
+                 "mov %%gs:(%%rdx), %%rax\n\t"
+                 "cmp %%rcx, %%rax\n\t"
+                 "setne %%al\n\t"
+                 "movzbl %%al, %%eax\n\t"
+                 "or %%eax, %%edi\n\t"
+                 "1:\n\t"
+                 "mov $60, %%eax\n\t"
+                 "syscall\n\t"
+                 "ud2"
+                 :
+                 : [probe] "r"(&watched_word), [check_bases] "r"(check_bases)
+                 : "rax", "rdx", "rdi", "rcx", "r11", "memory");
+    __builtin_unreachable();
+}
+
+TEST(PtraceX86Debug, GeneralRegisterWritesStopAtInvalidSegmentSelector) {
     pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
@@ -221,16 +308,206 @@ TEST(PtraceX86Debug, GeneralRegistersRejectKernelCodeSelector) {
     user_regs_struct regs = {};
     ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
                              reinterpret_cast<unsigned long>(&regs)));
-    const unsigned long valid_cs = regs.cs;
+    const user_regs_struct baseline = regs;
+    for (int selector = 0; selector < 4; ++selector) {
+        regs = baseline;
+        regs.r15 ^= 0x12345678UL + selector;
+        switch (selector) {
+            case 0: regs.ds = 0x10; break;
+            case 1: regs.es = 0x10; break;
+            case 2: regs.fs = 0x10; break;
+            case 3: regs.gs = 0x10; break;
+        }
+        errno = 0;
+        EXPECT_EQ(-1, ptrace_call(PTRACE_SETREGS, child, 0,
+                                  reinterpret_cast<unsigned long>(&regs)));
+        EXPECT_EQ(EIO, errno);
+
+        user_regs_struct actual = {};
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&actual)));
+        // Linux genregs_set() commits preceding words before putreg() rejects
+        // the invalid selector; it does not make SETREGS atomic.
+        EXPECT_EQ(regs.r15, actual.r15);
+        EXPECT_EQ(selector == 0 ? baseline.ds : regs.ds, actual.ds);
+        EXPECT_EQ(selector == 1 ? baseline.es : regs.es, actual.es);
+        EXPECT_EQ(selector == 2 ? baseline.fs : regs.fs, actual.fs);
+        EXPECT_EQ(selector == 3 ? baseline.gs : regs.gs, actual.gs);
+        ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&baseline)));
+    }
+
+    regs = baseline;
     regs.cs = 0;
     errno = 0;
     EXPECT_EQ(-1, ptrace_call(PTRACE_SETREGS, child, 0,
                               reinterpret_cast<unsigned long>(&regs)));
     EXPECT_EQ(EIO, errno);
-    regs.cs = valid_cs;
+
+    regs = baseline;
+    regs.ds = 0xffffffffffff002bUL;
+    regs.es = 0x123400000000002bUL;
     ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
                              reinterpret_cast<unsigned long>(&regs)));
+    user_regs_struct truncated = {};
+    ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&truncated)));
+    EXPECT_EQ(0x2bUL, truncated.ds);
+    EXPECT_EQ(0x2bUL, truncated.es);
+
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&baseline)));
     continue_and_reap(child);
+}
+
+TEST(PtraceX86Debug, FsGsSelectorsRoundTripAcrossStopAndResume) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (ptrace_call(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(10);
+        raise(SIGSTOP);
+        run_fs_gs_selector_tracee();
+    }
+    ChildGuard child_guard(child);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid_deadline(child, &status));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGSTOP, WSTOPSIG(status));
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+
+    ASSERT_EQ(child, waitpid_deadline(child, &status));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGTRAP, WSTOPSIG(status));
+    user_regs_struct regs = {};
+    ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&regs)));
+    EXPECT_EQ(0x2bUL, regs.fs);
+    EXPECT_EQ(0x2bUL, regs.gs);
+
+    // On a legacy CPU, a real selector supplies the descriptor base and the
+    // saved MSR base must be ignored. On FSGSBASE CPUs the explicit base is
+    // authoritative, so reset it after observing that mode before resuming.
+    constexpr unsigned long kProbeBase = 0x100000;
+    regs.fs_base = kProbeBase;
+    regs.gs_base = kProbeBase;
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&regs)));
+    user_regs_struct observed = {};
+    ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&observed)));
+    EXPECT_EQ(observed.fs_base, observed.gs_base);
+    if (observed.fs_base != 0) {
+        EXPECT_EQ(kProbeBase, observed.fs_base);
+        regs.fs_base = 0;
+        regs.gs_base = 0;
+        ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&regs)));
+    }
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+    ASSERT_EQ(child, waitpid_deadline(child, &status));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    child_guard.release();
+}
+
+TEST(PtraceX86Debug, MissingUserDataSegmentDescriptorsAreClearedAtResume) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const bool dragonos = running_on_dragonos();
+        if (ptrace_call(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(10);
+        run_zero_data_selectors_tracee(dragonos);
+    }
+    ChildGuard child_guard(child);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid_deadline(child, &status));
+    ASSERT_TRUE(WIFSTOPPED(status));
+    ASSERT_EQ(SIGTRAP, WSTOPSIG(status));
+    user_regs_struct regs = {};
+    ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&regs)));
+    // DragonOS GDT slot 9 is not present. RPL 3 passes Linux's ptrace input
+    // validation, while the restore-time #NP fixup must clear each selector.
+    regs.ds = 0x4b;
+    regs.es = 0x4b;
+    regs.fs = 0x4b;
+    regs.gs = 0x4b;
+    if (running_on_dragonos()) {
+        // DragonOS currently runs with CR4.FSGSBASE clear. A failed legacy
+        // selector load must not turn this ignored base into an active one.
+        regs.fs_base = 0x100000;
+        regs.gs_base = 0x100000;
+    }
+    ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                             reinterpret_cast<unsigned long>(&regs)));
+    ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+    ASSERT_EQ(child, waitpid_deadline(child, &status));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    child_guard.release();
+}
+
+TEST(PtraceX86Debug, MissingCodeAndStackDescriptorsFaultTheTracee) {
+    for (bool invalid_cs : {false, true}) {
+        pid_t child = fork();
+        ASSERT_GE(child, 0);
+        if (child == 0) {
+            if (ptrace_call(PTRACE_TRACEME, 0, 0, 0) != 0) _exit(10);
+            raise(SIGSTOP);
+            _exit(0);
+        }
+        ChildGuard child_guard(child);
+
+        int status = 0;
+        ASSERT_EQ(child, waitpid_deadline(child, &status));
+        ASSERT_TRUE(WIFSTOPPED(status));
+        user_regs_struct regs = {};
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&regs)));
+        if (invalid_cs) {
+            regs.cs = 0x4b;
+        } else {
+            regs.ss = 0x4b;
+        }
+        ASSERT_EQ(0, ptrace_call(PTRACE_SETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&regs)));
+        ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+
+        ASSERT_EQ(child, waitpid_deadline(child, &status));
+        ASSERT_TRUE(WIFSTOPPED(status)) << "status=0x" << std::hex << status;
+        // DragonOS GDT slot 9 is an all-zero reserved descriptor. Its invalid
+        // type is rejected as #GP before the present-bit check, so DragonOS
+        // must report SIGSEGV. A host Linux GDT layout may instead make 0x4b a
+        // valid-but-not-present descriptor and report SIGBUS.
+        const int fault_signal = WSTOPSIG(status);
+        if (running_on_dragonos()) {
+            EXPECT_EQ(SIGSEGV, fault_signal);
+        } else {
+            EXPECT_TRUE(fault_signal == SIGSEGV || fault_signal == SIGBUS);
+        }
+        user_regs_struct fault_regs = {};
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&fault_regs)));
+        EXPECT_EQ(0x4bUL, invalid_cs ? fault_regs.cs : fault_regs.ss);
+
+        // Suppressing the delivery must not silently repair the bad iret
+        // target. Returning retries iretq and reports the same fault/frame.
+        ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, 0));
+        ASSERT_EQ(child, waitpid_deadline(child, &status));
+        ASSERT_TRUE(WIFSTOPPED(status)) << "status=0x" << std::hex << status;
+        EXPECT_EQ(fault_signal, WSTOPSIG(status));
+        ASSERT_EQ(0, ptrace_call(PTRACE_GETREGS, child, 0,
+                                 reinterpret_cast<unsigned long>(&fault_regs)));
+        EXPECT_EQ(0x4bUL, invalid_cs ? fault_regs.cs : fault_regs.ss);
+
+        ASSERT_EQ(0, ptrace_call(PTRACE_CONT, child, 0, fault_signal));
+        ASSERT_EQ(child, waitpid_deadline(child, &status));
+        ASSERT_TRUE(WIFSIGNALED(status));
+        EXPECT_EQ(fault_signal, WTERMSIG(status));
+        child_guard.release();
+    }
 }
 
 TEST(PtraceX86Debug, RegsetRequiresWordAlignedPrefixLength) {

@@ -28,6 +28,25 @@ RFLAGS	=	0xa8
 OLD_RSP	=	0xb0
 OLDSS	=	0xb8
 
+// DS/ES are user-controlled through ptrace. Linux accepts selectors with RPL3
+// even when the descriptor does not exist, so restore them with the same
+// exception-table clearing semantics used by the FS/GS context switch.
+.macro RESTORE_DATA_SEGMENT segment
+    popq %rax
+.Lload_\segment\()_\@:
+    movq %rax, %\segment
+    jmp .Lload_\segment\()_done_\@
+.Lload_\segment\()_fixup_\@:
+    movq $0, %rax
+    movq %rax, %\segment
+.Lload_\segment\()_done_\@:
+    .pushsection __ex_table, "a"
+    .balign 8
+    .quad .Lload_\segment\()_\@ - .
+    .quad .Lload_\segment\()_fixup_\@ - . + 8
+    .popsection
+.endm
+
 Restore_all:
     // === 恢复调用现场 ===
     popq %r15
@@ -45,15 +64,13 @@ Restore_all:
     popq %rdi
     popq %rbp
 
-    popq %rax   //  不允许直接pop到ds
-    movq %rax, %ds
-
-    popq %rax
-    movq %rax, %es
+    RESTORE_DATA_SEGMENT ds
+    RESTORE_DATA_SEGMENT es
 
     popq %rax
     addq $0x10, %rsp // 弹出变量FUNC和errcode
     
+.Lnative_user_iret:
     iretq
 
 ret_from_exception:
@@ -124,14 +141,51 @@ Err_Code:
 
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
-__entry_err_code_before_gs_check_1:
-    pushq %rcx
-    movq CS(%rdi), %rcx
-    and $0x3, %rcx
-    cmp $0x3, %rcx
+    // Ordinary user exceptions are the hot path. Like Linux error_entry,
+    // inspect the fault frame's privilege first and only compare return-site
+    // labels for a kernel-mode exception that may have been raised by iretq.
+    movq CS(%rdi), %rax
+    andq $3, %rax
+    cmpq $3, %rax
+    je .Lerror_entry_from_user
 
-    jne __entry_err_code_after_gs_check_1
+    // An iretq fault arrives while CPL is still 0, immediately below the
+    // original five-word user return frame, and after swapgs selected user GS.
+    // Rebuild this TrapFrame as a user exception, as Linux fixup_bad_iret does,
+    // so #GP/#NP/#SS are delivered to the tracee with the original selectors.
+    leaq .Lnative_user_iret(%rip), %rax
+    cmpq %rax, RIP(%rdi)
+    je .Lfixup_bad_user_iret
+    leaq .Lsyscall_user_iret(%rip), %rax
+    cmpq %rax, RIP(%rdi)
+    jne .Lerror_entry_from_kernel
+
+.Lfixup_bad_user_iret:
+    // OLD_RSP is the fault frame's saved kernel stack pointer. It points at
+    // the original five-word IRET target, matching Linux fixup_bad_iret().
+    movq OLD_RSP(%rdi), %rax
+    movq 0x8(%rax), %rcx
+    andq $3, %rcx
+    cmpq $3, %rcx
+    jne .Lerror_entry_from_kernel
     swapgs
+    movq 0x0(%rax), %rcx
+    movq %rcx, RIP(%rdi)
+    movq 0x8(%rax), %rcx
+    movq %rcx, CS(%rdi)
+    movq 0x10(%rax), %rcx
+    movq %rcx, RFLAGS(%rdi)
+    movq 0x18(%rax), %rcx
+    movq %rcx, OLD_RSP(%rdi)
+    movq 0x20(%rax), %rcx
+    movq %rcx, OLDSS(%rdi)
+    pushq %rcx
+    jmp __entry_err_code_after_gs_check_1
+
+.Lerror_entry_from_user:
+    swapgs
+.Lerror_entry_from_kernel:
+    pushq %rcx
 
 __entry_err_code_after_gs_check_1:
     popq %rcx
@@ -399,11 +453,8 @@ ENTRY(syscall_64)
     popq %rdi
     popq %rbp
 
-    popq %rax           // 不允许直接pop到ds
-    movq %rax, %ds
-
-    popq %rax
-    movq %rax, %es
+    RESTORE_DATA_SEGMENT ds
+    RESTORE_DATA_SEGMENT es
 
     popq %rax
     addq $0x10, %rsp    // 弹出变量FUNC和errcode
@@ -411,6 +462,10 @@ ENTRY(syscall_64)
     cmpq (%rsp), %rcx
     jne .L_syscall_must_use_iret
     cmpq 0x10(%rsp), %r11
+    jne .L_syscall_must_use_iret
+    cmpq $51, 0x8(%rsp)     // USER_CS
+    jne .L_syscall_must_use_iret
+    cmpq $43, 0x20(%rsp)    // USER_DS / user SS
     jne .L_syscall_must_use_iret
 
     popq %rcx           // pop rip到rcx
@@ -426,4 +481,5 @@ ENTRY(syscall_64)
 // 此时栈结构完美符合 iretq 要求: [RIP, CS, RFLAGS, RSP, SS]
 .L_syscall_must_use_iret: 
     swapgs
+.Lsyscall_user_iret:
     iretq

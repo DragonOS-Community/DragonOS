@@ -6,7 +6,9 @@ use super::{
 };
 use crate::{
     arch::{ipc::signal::Signal, x86_64::process::debugreg, CurrentIrqArch, MMArch},
-    exception::{debug::DebugException, ebreak::EBreak, InterruptArch},
+    exception::{
+        debug::DebugException, ebreak::EBreak, extable::ExceptionTableManager, InterruptArch,
+    },
     ipc::signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
     mm::VirtAddr,
     process::{ptrace, ProcessManager},
@@ -451,7 +453,26 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
 
 /// 处理段不存在 11 #NP
 #[no_mangle]
-unsafe extern "C" fn do_segment_not_exists(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_segment_not_exists(regs: &'static mut TrapFrame, error_code: u64) {
+    if try_fixup_kernel_exception(regs) {
+        return;
+    }
+
+    if regs.is_from_user() {
+        crate::exception::uprobe::mark_current_xol_trapped();
+        CurrentIrqArch::interrupt_enable();
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGBUS) {
+            error!(
+                "failed to send SIGBUS for user segment-not-present fault, pid: {:?}, rip: {:#x}, error_code: {:#x}, err: {:?}",
+                ProcessManager::current_pid(),
+                regs.rip,
+                error_code,
+                err
+            );
+        }
+        return;
+    }
+
     error!(
         "do_segment_not_exists(11), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -465,7 +486,22 @@ unsafe extern "C" fn do_segment_not_exists(regs: &'static TrapFrame, error_code:
 
 /// 处理栈段错误 12 #SS
 #[no_mangle]
-unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_stack_segment_fault(regs: &'static mut TrapFrame, error_code: u64) {
+    if regs.is_from_user() {
+        crate::exception::uprobe::mark_current_xol_trapped();
+        CurrentIrqArch::interrupt_enable();
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGBUS) {
+            error!(
+                "failed to send SIGBUS for user stack-segment fault, pid: {:?}, rip: {:#x}, error_code: {:#x}, err: {:?}",
+                ProcessManager::current_pid(),
+                regs.rip,
+                error_code,
+                err
+            );
+        }
+        return;
+    }
+
     error!(
         "do_stack_segment_fault(12), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -480,6 +516,10 @@ unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code
 /// 处理一般保护异常 13 #GP
 #[no_mangle]
 unsafe extern "C" fn do_general_protection(regs: &'static mut TrapFrame, error_code: u64) {
+    if try_fixup_kernel_exception(regs) {
+        return;
+    }
+
     if regs.is_from_user() {
         // A user #GP is definitively converted to SIGSEGV here; do not abort
         // unconditionally at the exception entry, only mark the actual signal
@@ -540,6 +580,18 @@ Segment Selector Index: {:#x}\n
         error_code & 0xfff8
     );
     panic!("General Protection");
+}
+
+#[inline]
+fn try_fixup_kernel_exception(regs: &mut TrapFrame) -> bool {
+    if regs.is_from_user() {
+        return false;
+    }
+    let Some(fixup_addr) = ExceptionTableManager::search_exception_table(regs.rip as usize) else {
+        return false;
+    };
+    regs.rip = fixup_addr as u64;
+    true
 }
 
 /// 处理页错误 14 #PF

@@ -72,6 +72,27 @@ pub(super) fn validate_dr_slot(nibble: u64, addr: u64) -> Result<(), SystemError
 
 #[cfg(target_arch = "x86_64")]
 impl UserRegsStruct {
+    #[inline]
+    fn checked_selector(value: u64, required: bool) -> Result<u16, SystemError> {
+        // Linux's set_segment_reg() receives a u16, so ptrace first truncates
+        // the word and then validates the architectural selector value.
+        let selector = value as u16;
+        if (selector != 0 && selector & 0x3 != 0x3) || (required && selector == 0) {
+            return Err(SystemError::EIO);
+        }
+        Ok(selector)
+    }
+
+    fn validate_segment_selectors(&self) -> Result<(), SystemError> {
+        Self::checked_selector(self.cs, true)?;
+        Self::checked_selector(self.ss, true)?;
+        Self::checked_selector(self.ds, false)?;
+        Self::checked_selector(self.es, false)?;
+        Self::checked_selector(self.fs, false)?;
+        Self::checked_selector(self.gs, false)?;
+        Ok(())
+    }
+
     /// Construct from a TrapFrame (GETREGS path).
     /// Note that orig_ax takes TrapFrame.errcode (the syscall number during a syscall).
     pub fn from_trap_frame(frame: &TrapFrame) -> Self {
@@ -93,14 +114,14 @@ impl UserRegsStruct {
             di: frame.rdi,
             orig_ax: frame.errcode,
             ip: frame.rip,
-            cs: frame.cs,
+            cs: frame.cs as u16 as u64,
             flags: frame.rflags,
             sp: frame.rsp,
-            ss: frame.ss,
+            ss: frame.ss as u16 as u64,
             fs_base: 0,
             gs_base: 0,
-            ds: frame.ds,
-            es: frame.es,
+            ds: frame.ds as u16 as u64,
+            es: frame.es as u16 as u64,
             fs: 0,
             gs: 0,
         }
@@ -111,14 +132,11 @@ impl UserRegsStruct {
     /// - cs/ss must be RPL=3 and non-zero (prevents ring-0 injection)
     /// - rflags only allows the FLAG_MASK bits through, preserving the frame's non-masked bits (prevents clearing IF and hanging user mode)
     pub fn write_to_trap_frame(&self, frame: &mut TrapFrame) -> Result<(), SystemError> {
-        // Segment selector validation
-        // cs/ss: RPL=3, non-zero (SEGMENT_RPL_MASK=0x3, USER_RPL=3).
-        if (self.cs & 0x3) != 3 || self.cs == 0 {
-            return Err(SystemError::EIO);
-        }
-        if (self.ss & 0x3) != 3 || self.ss == 0 {
-            return Err(SystemError::EIO);
-        }
+        self.validate_segment_selectors()?;
+        let cs = Self::checked_selector(self.cs, true)? as u64;
+        let ss = Self::checked_selector(self.ss, true)? as u64;
+        let ds = Self::checked_selector(self.ds, false)? as u64;
+        let es = Self::checked_selector(self.es, false)? as u64;
         // rflags: preserve the frame's non-masked bits, only allow the FLAG_MASK bits through.
         // FLAG_MASK = FLAG_MASK_32 | NT = CF|PF|AF|ZF|SF|TF|DF|RF|AC|NT = 0x00054DD5.
         const FLAG_MASK: u64 = 0x0005_4DD5;
@@ -141,12 +159,12 @@ impl UserRegsStruct {
         frame.rdi = self.di;
         frame.errcode = self.orig_ax;
         frame.rip = self.ip;
-        frame.cs = self.cs;
+        frame.cs = cs;
         frame.rflags = new_rflags;
         frame.rsp = self.sp;
-        frame.ss = self.ss;
-        frame.ds = self.ds;
-        frame.es = self.es;
+        frame.ss = ss;
+        frame.ds = ds;
+        frame.es = es;
         Ok(())
     }
 }
@@ -261,11 +279,6 @@ impl PtraceRequestGuard {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn get_regs(&self) -> Result<UserRegsStruct, SystemError> {
         self.tracee.tracee_user_regs()
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn set_regs(&self, regs: &UserRegsStruct) -> Result<(), SystemError> {
-        self.tracee.write_tracee_user_regs(regs)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -401,6 +414,23 @@ impl ProcessControlBlock {
     /// Read the tracee's user registers (PTRACE_GETREGS).
     #[cfg(target_arch = "x86_64")]
     fn tracee_user_regs(&self) -> Result<UserRegsStruct, SystemError> {
+        self.tracee_user_regs_inner(true)
+    }
+
+    /// Build the register image used by a one-word POKE/SET update. Unlike
+    /// GETREGS, untouched FS/GS base words must come from authoritative task
+    /// storage: feeding the legacy descriptor-derived public value back into
+    /// storage would corrupt a later selector update in the same SETREGS.
+    #[cfg(target_arch = "x86_64")]
+    fn tracee_stored_user_regs(&self) -> Result<UserRegsStruct, SystemError> {
+        self.tracee_user_regs_inner(false)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn tracee_user_regs_inner(
+        &self,
+        expose_legacy_descriptor_base: bool,
+    ) -> Result<UserRegsStruct, SystemError> {
         loop {
             self.wait_tracee_descheduled();
             let ps = self.ptrace.state.lock_irqsave();
@@ -417,8 +447,18 @@ impl ProcessControlBlock {
             // fs/gs base are not in the TrapFrame: read them from the ArchPCBInfo authoritative storage (the latest values were read back at switch-out).
             {
                 let arch = self.arch_info_irqsave();
-                regs.fs_base = arch.fsbase() as u64;
-                regs.gs_base = arch.gsbase() as u64;
+                regs.fs_base = if expose_legacy_descriptor_base {
+                    arch.ptrace_fsbase()
+                } else {
+                    arch.fsbase()
+                } as u64;
+                regs.gs_base = if expose_legacy_descriptor_base {
+                    arch.ptrace_gsbase()
+                } else {
+                    arch.gsbase()
+                } as u64;
+                regs.fs = arch.fs_selector() as u64;
+                regs.gs = arch.gs_selector() as u64;
             }
             if ps.forced_trap_flag {
                 regs.flags &= !X86_EFLAGS_TF;
@@ -443,6 +483,9 @@ impl ProcessControlBlock {
             if regs.fs_base >= user_end || regs.gs_base >= user_end {
                 return Err(SystemError::EIO);
             }
+            // Validate every selector before touching either storage object so
+            // a rejected SETREGS cannot partially update the TrapFrame.
+            regs.validate_segment_selectors()?;
             // SAFETY: The tracee is still in a ptrace-stop and the TrapFrame is stable.
             let frame = unsafe { &mut *self.trap_frame_ptr_for(ps.stop_frame_on_syscall_stack) };
             regs.write_to_trap_frame(frame)?;
@@ -451,6 +494,8 @@ impl ProcessControlBlock {
                 let mut arch = self.arch_info_irqsave();
                 arch.set_fsbase(regs.fs_base as usize);
                 arch.set_gsbase(regs.gs_base as usize);
+                arch.set_fs_selector(regs.fs as u16);
+                arch.set_gs_selector(regs.gs as u16);
             }
             if frame.rflags & X86_EFLAGS_TF != 0 {
                 ps.forced_trap_flag = false;
@@ -521,7 +566,7 @@ impl ProcessControlBlock {
         let val = value as u64;
         // General-purpose register area: write back to the trap frame after putreg validation.
         if offset < GP_REGS_SIZE {
-            let mut regs = self.tracee_user_regs()?;
+            let mut regs = self.tracee_stored_user_regs()?;
             let bytes = unsafe {
                 core::slice::from_raw_parts_mut(
                     &mut regs as *mut UserRegsStruct as *mut u8,

@@ -11,7 +11,6 @@ use x86_64::registers::control::Cr3Flags;
 use x86_64::structures::paging::PhysFrame;
 
 use crate::arch::interrupt::ipi::{send_ipi, IPI_NUM_LOADED_VMCS_CLEAR};
-use crate::arch::process::table::USER_DS;
 use crate::arch::vm::mmu::kvm_mmu::KvmMmu;
 use crate::arch::vm::uapi::kvm_exit;
 use crate::arch::vm::uapi::{
@@ -24,7 +23,6 @@ use crate::exception::{
 };
 use crate::libs::spinlock::SpinLockGuard;
 use crate::mm::VirtAddr;
-use crate::process::ProcessManager;
 use crate::virt::vm::kvm_host::vcpu::GuestDebug;
 use crate::{
     arch::{
@@ -59,8 +57,6 @@ use system_error::SystemError;
 use x86::controlregs::{cr2, cr2_write};
 use x86::dtables::ldtr;
 use x86::msr::wrmsr;
-use x86::segmentation::load_ds;
-use x86::segmentation::load_es;
 use x86::segmentation::{ds, es, fs, gs};
 use x86::vmx::vmcs::ro;
 use x86::{
@@ -1202,11 +1198,6 @@ impl KvmFunc for VmxKvmFunc {
 
         Vmx::vmx_vcpu_enter_exit(vcpu, vcpu.vmx().vmx_vcpu_run_flags());
 
-        unsafe {
-            load_ds(USER_DS);
-            load_es(USER_DS);
-        };
-
         // TODO: pt_guest_exit
 
         // TODO: kvm_load_host_xsave_state
@@ -1262,22 +1253,16 @@ impl KvmFunc for VmxKvmFunc {
             return;
         }
 
-        // fixme: 这里读的是当前cpu的gsbase，正确安全做法应该为将gsbase设置为percpu变量
-        let gs_base = unsafe { rdmsr(msr::IA32_KERNEL_GSBASE) };
-
-        let current = ProcessManager::current_pcb();
-        let mut pcb_arch = current.arch_info_irqsave();
-
         let fs_sel = fs().bits();
         let gs_sel = gs().bits();
-
-        unsafe {
-            pcb_arch.save_fsbase();
-            pcb_arch.save_gsbase();
-        }
-
-        let fs_base = pcb_arch.fsbase();
-        vmx.msr_host_kernel_gs_base = pcb_arch.gsbase() as u64;
+        // VMCS host state describes the currently active kernel context, not
+        // the current task's saved user FS/GS state. Read the hardware MSRs
+        // directly so selector-dependent legacy task bookkeeping cannot alter
+        // the host base pair. After swapgs, IA32_KERNEL_GS_BASE holds the
+        // inactive user GS base that must be restored after guest execution.
+        let fs_base = unsafe { rdmsr(msr::IA32_FS_BASE) } as usize;
+        let gs_base = unsafe { rdmsr(msr::IA32_GS_BASE) } as usize;
+        vmx.msr_host_kernel_gs_base = unsafe { rdmsr(msr::IA32_KERNEL_GSBASE) };
 
         unsafe { wrmsr(msr::IA32_KERNEL_GSBASE, vmx.msr_guest_kernel_gs_base) };
 
@@ -1288,10 +1273,49 @@ impl KvmFunc for VmxKvmFunc {
         host_state.ds_sel = ds().bits();
         host_state.es_sel = es().bits();
 
-        host_state.set_host_fsgs(fs_sel, gs_sel, fs_base, gs_base as usize);
+        host_state.set_host_fsgs(fs_sel, gs_sel, fs_base, gs_base);
         drop(loaded_vmcs);
 
         vmx.guest_state_loaded = true;
+    }
+
+    fn prepare_switch_to_host(&self, vcpu: &mut VirtCpu) {
+        let vmx = vcpu.vmx_mut();
+        if !vmx.guest_state_loaded {
+            return;
+        }
+
+        vmx.msr_guest_kernel_gs_base = unsafe { rdmsr(msr::IA32_KERNEL_GSBASE) };
+
+        let (ds_sel, es_sel, fs_sel, gs_sel) = {
+            let host_state = &vmx.loaded_vmcs().host_state;
+            (
+                host_state.ds_sel,
+                host_state.es_sel,
+                host_state.fs_sel,
+                host_state.gs_sel,
+            )
+        };
+        if gs_sel & 7 != 0 {
+            unsafe {
+                crate::arch::process::ArchPCBInfo::load_user_gs_selector_with_fixup(gs_sel);
+            }
+        }
+        if fs_sel & 7 != 0 {
+            unsafe {
+                crate::arch::process::ArchPCBInfo::load_fs_selector_with_fixup(fs_sel);
+            }
+        }
+        if ds_sel | es_sel != 0 {
+            unsafe {
+                crate::arch::process::ArchPCBInfo::load_ds_selector_with_fixup(ds_sel);
+                crate::arch::process::ArchPCBInfo::load_es_selector_with_fixup(es_sel);
+            }
+        }
+
+        unsafe { wrmsr(msr::IA32_KERNEL_GSBASE, vmx.msr_host_kernel_gs_base) };
+        vmx.guest_state_loaded = false;
+        vmx.guest_uret_msrs_loaded = false;
     }
 
     fn flush_tlb_all(&self, vcpu: &mut VirtCpu) {

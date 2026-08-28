@@ -870,6 +870,7 @@ impl VirtCpu {
             // TODO: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/x86.c#10730
             if self.mode == VcpuMode::ExitingGuestMode || !self.request.is_empty() {
                 self.mode = VcpuMode::OutsideGuestMode;
+                x86_kvm_ops().prepare_switch_to_host(self);
                 drop(preempt_guard);
                 return Err(SystemError::EINVAL);
             }
@@ -906,6 +907,7 @@ impl VirtCpu {
             x86_kvm_ops().handle_exit_irqoff(self);
             x86_kvm_ops().cache_exit_info(self);
 
+            x86_kvm_ops().prepare_switch_to_host(self);
             drop(preempt_guard);
 
             // todo: xfd

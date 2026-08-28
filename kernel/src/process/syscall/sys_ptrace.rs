@@ -10,7 +10,7 @@ use crate::{
         syscall::nr::SYS_PTRACE,
     },
     ipc::signal_types::{SigCode, SigInfo, SigType},
-    mm::VirtAddr,
+    mm::{access_ok, VirtAddr},
     process::{
         pid::PidType,
         ptrace::{self, PtraceRequest, PtraceRequestGuard},
@@ -173,11 +173,17 @@ impl Syscall for SysPtrace {
             }
             #[cfg(target_arch = "x86_64")]
             PtraceRequest::Setregs => {
-                let regs: ptrace::UserRegsStruct = copy_from_user(data)?;
-                request_guard
-                    .as_ref()
-                    .ok_or(SystemError::ESRCH)?
-                    .set_regs(&regs)?;
+                let guard = request_guard.as_ref().ok_or(SystemError::ESRCH)?;
+                let regs_len = core::mem::size_of::<ptrace::UserRegsStruct>();
+                access_ok(VirtAddr::new(data), regs_len).map_err(|_| SystemError::EFAULT)?;
+                // Linux's genregs_set() fetches and commits one machine word
+                // at a time. Preserve that observable partial-update behavior
+                // when a later user read or selector validation fails.
+                for offset in (0..regs_len).step_by(core::mem::size_of::<u64>()) {
+                    let word_addr = data.checked_add(offset).ok_or(SystemError::EFAULT)?;
+                    let word = copy_from_user::<u64>(word_addr)?;
+                    guard.poke_user(offset, word as usize)?;
+                }
                 0
             }
             // PEEKUSER / POKEUSER: read/write user_regs_struct by offset.
@@ -290,27 +296,15 @@ impl Syscall for SysPtrace {
                     return Err(SystemError::EINVAL);
                 }
                 let len = iov_len.min(core::mem::size_of::<ptrace::UserRegsStruct>());
-                // Read the current registers, overwriting only the first len bytes from the iov; untouched fields (e.g. cs/ss) are preserved as-is.
-                let mut regs = request_guard
-                    .as_ref()
-                    .ok_or(SystemError::ESRCH)?
-                    .get_regs()?;
-                let regs_bytes: &mut [u8] = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        &mut regs as *mut ptrace::UserRegsStruct as *mut u8,
-                        core::mem::size_of::<ptrace::UserRegsStruct>(),
-                    )
-                };
-                unsafe {
-                    crate::syscall::user_access::copy_from_user_protected(
-                        &mut regs_bytes[..len],
-                        VirtAddr::new(iov_base),
-                    )?;
+                let guard = request_guard.as_ref().ok_or(SystemError::ESRCH)?;
+                access_ok(VirtAddr::new(iov_base), len).map_err(|_| SystemError::EFAULT)?;
+                // copy_regset_from_user() reaches x86 genregs_set(), which
+                // fetches and applies each word before moving to the next.
+                for offset in (0..len).step_by(core::mem::size_of::<u64>()) {
+                    let word_addr = iov_base.checked_add(offset).ok_or(SystemError::EFAULT)?;
+                    let word = copy_from_user::<u64>(word_addr)?;
+                    guard.poke_user(offset, word as usize)?;
                 }
-                request_guard
-                    .as_ref()
-                    .ok_or(SystemError::ESRCH)?
-                    .set_regs(&regs)?;
                 write_iovec_len(data, len)?;
                 0
             }

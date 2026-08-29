@@ -4,7 +4,7 @@
 //! or callback invocation. Callers serialize it with `RcuState::inner` and are
 //! responsible for the full memory barriers documented in `rcu/mod.rs`.
 
-use crate::{libs::cpumask::CpuMask, smp::cpu::ProcessorId};
+use crate::{libs::cpumask::CpuMask, mm::percpu::PerCpu, smp::cpu::ProcessorId};
 
 const SEQUENCE_HALF_RANGE: u64 = 1_u64 << 63;
 
@@ -41,6 +41,7 @@ impl RcuSequence {
 struct ActiveGracePeriod {
     seq: RcuSequence,
     waiting_cpus: CpuMask,
+    context_generations: [u64; PerCpu::MAX_CPU_NUM as usize],
 }
 
 /// The minimal ordinary-RCU grace-period state machine.
@@ -87,7 +88,11 @@ impl GracePeriodState {
     }
 
     /// Starts the requested GP with a freshly collected CPU snapshot.
-    pub(super) fn start_requested(&mut self, waiting_cpus: CpuMask) -> RcuSequence {
+    pub(super) fn start_requested(
+        &mut self,
+        waiting_cpus: CpuMask,
+        context_generations: [u64; PerCpu::MAX_CPU_NUM as usize],
+    ) -> RcuSequence {
         self.assert_invariants();
         debug_assert!(
             self.active.is_none(),
@@ -97,7 +102,11 @@ impl GracePeriodState {
 
         let seq = self.completed.next();
         self.next_requested = false;
-        self.active = Some(ActiveGracePeriod { seq, waiting_cpus });
+        self.active = Some(ActiveGracePeriod {
+            seq,
+            waiting_cpus,
+            context_generations,
+        });
         self.assert_invariants();
         seq
     }
@@ -117,6 +126,31 @@ impl GracePeriodState {
             return false;
         };
         if !active.waiting_cpus.get(cpu).unwrap_or(false) {
+            return false;
+        }
+
+        active.waiting_cpus.set(cpu, false);
+        true
+    }
+
+    /// Credits a CPU whose context snapshot proves that it is currently in
+    /// an extended quiescent state or has passed through one since GP start.
+    pub(super) fn report_context_progress(
+        &mut self,
+        cpu: ProcessorId,
+        current_generation: u64,
+        in_eqs: bool,
+    ) -> bool {
+        self.assert_invariants();
+        let Some(active) = self.active.as_mut() else {
+            return false;
+        };
+        if !active.waiting_cpus.get(cpu).unwrap_or(false) {
+            return false;
+        }
+
+        let start_generation = active.context_generations[cpu.data() as usize];
+        if !in_eqs && current_generation == start_generation {
             return false;
         }
 
@@ -255,6 +289,10 @@ fn one_cpu_mask(cpu: u32) -> CpuMask {
     CpuMask::from_cpu(ProcessorId::new(cpu))
 }
 
+fn zero_context_generations() -> [u64; PerCpu::MAX_CPU_NUM as usize] {
+    [0; PerCpu::MAX_CPU_NUM as usize]
+}
+
 /// Runs deterministic tests against the production state-transition methods.
 pub(super) fn run_state_machine_selftests() -> Result<(), &'static str> {
     let cpu0 = ProcessorId::new(0);
@@ -265,7 +303,9 @@ pub(super) fn run_state_machine_selftests() -> Result<(), &'static str> {
     if gp.request_future() != first {
         return Err("idle RCU GP requests did not coalesce");
     }
-    if gp.start_requested(one_cpu_mask(0)) != first || !gp.is_waiting_for(cpu0) {
+    if gp.start_requested(one_cpu_mask(0), zero_context_generations()) != first
+        || !gp.is_waiting_for(cpu0)
+    {
         return Err("RCU GP did not start with the requested waiting mask");
     }
     let second = gp.request_future();
@@ -278,16 +318,37 @@ pub(super) fn run_state_machine_selftests() -> Result<(), &'static str> {
     if gp.complete_ready() != first || gp.has_completed(second) {
         return Err("RCU GP completed a nested future request too early");
     }
-    if gp.start_requested(one_cpu_mask(1)) != second || !gp.is_waiting_for(cpu1) {
+    if gp.start_requested(one_cpu_mask(1), zero_context_generations()) != second
+        || !gp.is_waiting_for(cpu1)
+    {
         return Err("consecutive RCU GP did not use its fresh waiting mask");
     }
     if !gp.report_quiescent_state(cpu1) || gp.complete_ready() != second {
         return Err("consecutive RCU GP did not complete in sequence");
     }
 
+    let mut context_gp = GracePeriodState::new();
+    let context_target = context_gp.request_future();
+    let mut context_generations = zero_context_generations();
+    context_generations[cpu0.data() as usize] = 7;
+    context_generations[cpu1.data() as usize] = 11;
+    let mut context_waiting = one_cpu_mask(0);
+    context_waiting.set(cpu1, true);
+    context_gp.start_requested(context_waiting, context_generations);
+    if context_gp.report_context_progress(cpu0, 7, false) || !context_gp.is_waiting_for(cpu0) {
+        return Err("RCU GP credited a CPU without context progress");
+    }
+    if !context_gp.report_context_progress(cpu0, 8, false)
+        || !context_gp.report_context_progress(cpu1, 11, true)
+        || !context_gp.ready_to_complete()
+        || context_gp.complete_ready() != context_target
+    {
+        return Err("RCU GP did not credit generation change and current EQS");
+    }
+
     let mut empty_gp = GracePeriodState::new();
     let empty_target = empty_gp.request_future();
-    empty_gp.start_requested(CpuMask::new());
+    empty_gp.start_requested(CpuMask::new(), zero_context_generations());
     if !empty_gp.ready_to_complete()
         || empty_gp.complete_ready() != empty_target
         || empty_gp.is_active()
@@ -297,12 +358,12 @@ pub(super) fn run_state_machine_selftests() -> Result<(), &'static str> {
 
     let mut wrapping_gp = GracePeriodState::with_completed(RcuSequence(u64::MAX.wrapping_sub(1)));
     let max_target = wrapping_gp.request_future();
-    wrapping_gp.start_requested(CpuMask::new());
+    wrapping_gp.start_requested(CpuMask::new(), zero_context_generations());
     if max_target.raw() != u64::MAX || wrapping_gp.complete_ready() != max_target {
         return Err("RCU GP did not advance to u64::MAX");
     }
     let zero_target = wrapping_gp.request_future();
-    wrapping_gp.start_requested(CpuMask::new());
+    wrapping_gp.start_requested(CpuMask::new(), zero_context_generations());
     if zero_target.raw() != 0
         || wrapping_gp.complete_ready() != zero_target
         || !wrapping_gp.has_completed(max_target)

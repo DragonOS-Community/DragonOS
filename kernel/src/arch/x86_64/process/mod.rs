@@ -955,7 +955,6 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
 
     compiler_fence(Ordering::SeqCst);
     TSSManager::update_io_bitmap_from_current();
-    crate::rcu::note_exit_to_user_mode();
     ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());
 }
 

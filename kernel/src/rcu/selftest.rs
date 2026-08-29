@@ -6,19 +6,14 @@ use core::{
 };
 
 use crate::{
-    arch::CurrentIrqArch,
-    exception::InterruptArch,
     ipc::sighand::SigHand,
     libs::{
         notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
         spinlock::SpinLock,
     },
-    process::{
-        kthread::{KernelThreadClosure, KernelThreadMechanism},
-        preempt::PreemptGuard,
-    },
+    process::kthread::{KernelThreadClosure, KernelThreadMechanism},
     sched::completion::Completion,
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    smp::cpu::ProcessorId,
 };
 use system_error::SystemError;
 
@@ -128,153 +123,9 @@ unsafe fn rcu_selftest_callback(head: NonNull<RcuHead>) {
     probe.hits.fetch_add(1, Ordering::SeqCst);
 }
 
-struct RcuSelftestCpuStateGuard {
-    cpu: ProcessorId,
-    saved: RcuCpuState,
-}
-
-impl RcuSelftestCpuStateGuard {
-    fn new_active(cpu: ProcessorId) -> Self {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu_idx = cpu.data() as usize;
-        let saved = inner.cpu_states[cpu_idx];
-        inner.cpu_states[cpu_idx].in_idle_eqs = false;
-        inner.cpu_states[cpu_idx].irq_nesting = 0;
-        inner.cpu_states[cpu_idx].irq_from_idle_eqs = false;
-        Self { cpu, saved }
-    }
-}
-
-impl Drop for RcuSelftestCpuStateGuard {
-    fn drop(&mut self) {
-        restore_cpu_state_after_selftest(self.cpu, self.saved);
-    }
-}
-
-fn restore_cpu_state_after_selftest(cpu: ProcessorId, saved: RcuCpuState) {
-    let wake_worker = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu_idx = cpu.data() as usize;
-        inner.cpu_states[cpu_idx] = saved;
-        report_quiescent_state_locked(&mut inner, cpu);
-        RcuState::pump_grace_periods(&mut inner) || inner.has_ready_work()
-    };
-
-    RCU_STATE.wake_state_waiters();
-    if wake_worker {
-        RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
-    }
-}
-
-fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
-    let cpu = smp_get_processor_id();
-    let cpu_idx = cpu.data() as usize;
-
-    rcu_barrier();
-    let (_, _, _, pending_before, ready_before) = debug_snapshot();
-    if pending_before != 0 || ready_before != 0 {
-        return Err("rcu callback queues were not empty before idle IRQ selftest");
-    }
-
-    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let _preempt_guard = PreemptGuard::new();
-    let cpu_state_guard = RcuSelftestCpuStateGuard::new_active(cpu);
-
-    let wake_worker = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let wake_worker = enter_cpu_idle_eqs(&mut inner, cpu);
-        if !cpu_in_idle_eqs(&inner.cpu_states[cpu_idx]) {
-            return Err("internal idle EQS helper failed to mark the CPU idle");
-        }
-
-        let cpu_state = &mut inner.cpu_states[cpu_idx];
-        cpu_state.irq_from_idle_eqs = cpu_in_idle_eqs(cpu_state);
-        cpu_state.irq_nesting += 1;
-        if cpu_in_idle_eqs(cpu_state) {
-            return Err("internal idle IRQ helper failed to exit the idle EQS state");
-        }
-
-        wake_worker
-    };
-
-    RCU_STATE.wake_state_waiters();
-    if wake_worker {
-        RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
-    }
-
-    let idle_hits = Arc::new(AtomicUsize::new(0));
-    rcu_defer({
-        let idle_hits = idle_hits.clone();
-        move || {
-            idle_hits.fetch_add(1, Ordering::SeqCst);
-        }
-    });
-
-    let pre_exit_error = {
-        let inner = RCU_STATE.inner.lock_irqsave();
-        if idle_hits.load(Ordering::SeqCst) != 0 {
-            Some("idle IRQ callback ran before the interrupted CPU returned to idle")
-        } else if !inner.gp.is_active() || !inner.gp.is_waiting_for(cpu) {
-            Some("idle IRQ selftest did not put the current CPU in waiting_cpus")
-        } else if inner.pending_callbacks.len() != 1 || !inner.ready_callbacks.is_empty() {
-            Some("idle IRQ selftest corrupted callback queue state before irq_exit")
-        } else {
-            None
-        }
-    };
-    if let Some(error) = pre_exit_error {
-        return Err(error);
-    }
-
-    let idle_irq_exit_result = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu_state = &mut inner.cpu_states[cpu_idx];
-        if cpu_state.irq_nesting != 1 || !cpu_state.irq_from_idle_eqs {
-            Err("idle IRQ selftest lost the interrupted-idle state")
-        } else {
-            cpu_state.irq_nesting -= 1;
-            cpu_state.irq_from_idle_eqs = false;
-            Ok(enter_cpu_idle_eqs(&mut inner, cpu))
-        }
-    };
-    let wake_worker = match idle_irq_exit_result {
-        Ok(wake_worker) => wake_worker,
-        Err(error) => {
-            return Err(error);
-        }
-    };
-
-    RCU_STATE.wake_state_waiters();
-    if wake_worker {
-        RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
-    }
-
-    let post_exit_waiting = {
-        let inner = RCU_STATE.inner.lock_irqsave();
-        inner.gp.is_waiting_for(cpu)
-    };
-    if post_exit_waiting {
-        return Err("idle IRQ exit left the current CPU in waiting_cpus");
-    }
-
-    drop(cpu_state_guard);
-    drop(_preempt_guard);
-    drop(_irq_guard);
-
-    rcu_barrier();
-
-    if idle_hits.load(Ordering::SeqCst) != 1 {
-        return Err("callback did not execute after the idle IRQ wakeup selftest finished");
-    }
-
-    Ok(())
-}
-
 fn run_pr1_selftest() -> Result<(), &'static str> {
     gp::run_state_machine_selftests()?;
+    context::run_context_selftests()?;
     run_callback_generation_selftest()?;
 
     if ProcessManager::current_pcb().rcu_read_depth() != 0 {
@@ -349,8 +200,6 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     }
 
     rcu_barrier();
-    run_idle_irq_wakeup_selftest()?;
-
     let callback_hits = Arc::new(AtomicUsize::new(0));
     let callback_probe = Box::new(RcuSelftestCallbackProbe {
         head: RcuHead::new(),
@@ -425,12 +274,19 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     let mut inner = RcuStateInner::new();
 
     let first_gp = inner.gp.request_future();
-    if inner.gp.start_requested(CpuMask::from_cpu(cpu0)) != first_gp {
+    if inner
+        .gp
+        .start_requested(CpuMask::from_cpu(cpu0), [0; PerCpu::MAX_CPU_NUM as usize])
+        != first_gp
+    {
         return Err("callback generation selftest failed to start its first GP");
     }
 
-    enqueue_callback_locked(&mut inner, CallbackKind::Deferred(Box::new(|| {})));
-    enqueue_callback_locked(&mut inner, CallbackKind::Deferred(Box::new(|| {})));
+    // Admission and GP pumping are separate responsibilities. Keep this
+    // deterministic state-machine test independent of the live per-CPU
+    // context snapshots used by the production coordinator.
+    admit_callback_locked(&mut inner, CallbackKind::Deferred(Box::new(|| {})));
+    admit_callback_locked(&mut inner, CallbackKind::Deferred(Box::new(|| {})));
 
     let expected_second_gp = first_gp.next();
     if inner.pending_callbacks.len() != 2
@@ -445,7 +301,12 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     if !inner.gp.report_quiescent_state(cpu0) {
         return Err("callback generation selftest could not complete its first waiting mask");
     }
-    RcuState::pump_grace_periods_with(&mut inner, |_| CpuMask::from_cpu(cpu1));
+    RcuState::pump_grace_periods_with(
+        &mut inner,
+        || (CpuMask::from_cpu(cpu1), [0; PerCpu::MAX_CPU_NUM as usize]),
+        |_| {},
+        |_| {},
+    );
     if inner.gp.completed() != first_gp
         || !inner.gp.is_waiting_for(cpu1)
         || inner.pending_callbacks.len() != 2
@@ -457,7 +318,12 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     if !inner.gp.report_quiescent_state(cpu1) {
         return Err("callback generation selftest could not complete its second waiting mask");
     }
-    RcuState::pump_grace_periods_with(&mut inner, |_| CpuMask::new());
+    RcuState::pump_grace_periods_with(
+        &mut inner,
+        || (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
+        |_| {},
+        |_| {},
+    );
     if inner.gp.completed() != expected_second_gp
         || !inner.pending_callbacks.is_empty()
         || inner.ready_callbacks.len() != 2

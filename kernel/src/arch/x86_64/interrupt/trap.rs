@@ -1,7 +1,7 @@
 #![allow(function_casts_as_integer)]
 
 use super::{
-    entry::{set_intr_gate, set_system_intr_gate, set_system_trap_gate},
+    entry::{set_intr_gate, set_system_intr_gate},
     TrapFrame,
 };
 use crate::{
@@ -92,8 +92,12 @@ pub fn arch_trap_init() -> Result<(), SystemError> {
         // acknowledge that IPI before do_int3 acquires the entry. The user
         // uprobe path reenables interrupts after capturing its XOL slot lease.
         set_system_intr_gate(3, 0, VirtAddr::new(trap_int3 as usize));
-        set_system_trap_gate(4, 0, VirtAddr::new(trap_overflow as usize));
-        set_system_trap_gate(5, 0, VirtAddr::new(trap_bounds as usize));
+        // Context tracking requires every userspace entry to run with
+        // maskable interrupts disabled until user_exit() has made RCU watch
+        // the CPU. Keep DPL3, but use interrupt gates so an IRQ cannot nest in
+        // the low-level entry window with a kernel-mode frame.
+        set_system_intr_gate(4, 0, VirtAddr::new(trap_overflow as usize));
+        set_system_intr_gate(5, 0, VirtAddr::new(trap_bounds as usize));
         set_intr_gate(6, 0, VirtAddr::new(trap_undefined_opcode as usize));
         set_intr_gate(7, 0, VirtAddr::new(trap_dev_not_avaliable as usize));
         set_intr_gate(8, 0, VirtAddr::new(trap_double_fault as usize));

@@ -14,7 +14,7 @@ use crate::{
     exception::softirq::do_softirq,
     mm::VirtAddr,
     process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
-    sched::{SchedMode, SchedPolicy, __schedule},
+    sched::{SchedMode, __schedule},
 };
 
 type ExceptionHandler = fn(&mut TrapFrame) -> Result<(), SystemError>;
@@ -56,27 +56,39 @@ fn try_fixup_kernel_user_access(trap_frame: &mut TrapFrame) -> bool {
 
 #[no_mangle]
 unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
+    let from_user = trap_frame.is_from_user();
+    if from_user {
+        crate::rcu::user_exit();
+    }
+
     if trap_frame.cause.is_interrupt() {
         let hardirq_guard = crate::exception::enter_hardirq();
-        crate::rcu::irq_enter();
+        let rcu_irq = crate::rcu::irq_enter();
         riscv64_do_interrupt(trap_frame);
-        let irq_outermost = crate::rcu::irq_is_outermost();
+        let irq_outermost = rcu_irq.is_outermost();
         if irq_outermost {
             do_softirq();
         }
 
         let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE)
             || trap_frame.cause.code() as u32 == RiscVSbiTimer::TIMER_IRQ.data();
-        let resume_idle_eqs = !should_schedule
-            && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
-        let irq_exited_outermost = crate::rcu::irq_exit(resume_idle_eqs);
+        let disposition = if should_schedule && irq_outermost {
+            crate::rcu::RcuIrqDisposition::ToKernel
+        } else {
+            crate::rcu::RcuIrqDisposition::ResumeInterrupted
+        };
+        crate::rcu::irq_exit(rcu_irq, disposition);
         drop(hardirq_guard);
 
-        if should_schedule && irq_exited_outermost {
+        if should_schedule && irq_outermost {
             __schedule(SchedMode::SM_PREEMPT);
         }
     } else if trap_frame.cause.is_exception() {
         riscv64_do_exception(trap_frame);
+    }
+
+    if from_user {
+        crate::rcu::user_enter();
     }
 }
 

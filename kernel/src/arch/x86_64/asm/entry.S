@@ -131,8 +131,6 @@ Err_Code:
 
     cld
     
-    movq ERRCODE(%rsp), %rsi    // 把错误码装进rsi，作为函数的第二个参数
-    movq $-1, ERRCODE(%rsp)     // orig_rax sentinel
     movq FUNC(%rsp), %rdx
     
     movq $0x10, %rdi    // 加载内核段的地址
@@ -190,6 +188,16 @@ Err_Code:
 __entry_err_code_after_gs_check_1:
     popq %rcx
 
+    // Make RCU watch user-origin entries before high-level kernel code.
+    movq %rsp, %rdi
+    callq irqentry_enter
+    // irqentry_enter follows the SysV ABI and may clobber argument registers.
+    // Preserve the original exception code in the frame until after it
+    // returns, then establish the handler ABI and orig_rax sentinel together.
+    movq ERRCODE(%rsp), %rsi
+    movq $-1, ERRCODE(%rsp)
+    movq FUNC(%rsp), %rdx
+    movq %rsp, %rdi
     callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
 
 __entry_err_code_to_ret_from_exception:
@@ -427,15 +435,17 @@ ENTRY(syscall_64)
 
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
+    callq irqentry_enter
+    movq %rsp, %rdi
+    movq FUNC(%rsp), %rdx
     sti
     callq *%rdx //调用服务程序
 
     // 将原本要返回的栈帧的栈指针传入 irqentry_exit 的第一个参数
     movq %rsp, %rdi
 
-    callq irqentry_exit
-
     cli
+    callq irqentry_exit
     
     // === 恢复调用现场 ===
     popq %r15

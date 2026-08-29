@@ -3,8 +3,8 @@ use core::intrinsics::likely;
 use crate::{
     arch::driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
     exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
-    process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
-    sched::{SchedMode, SchedPolicy, __schedule},
+    process::{utils::current_pcb_flags, ProcessFlags},
+    sched::{SchedMode, __schedule},
 };
 
 use super::TrapFrame;
@@ -15,10 +15,11 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
 
     if trap_frame.is_from_user() {
         x86_64::registers::segmentation::GS::swap();
+        crate::rcu::user_exit();
     }
 
     let hardirq_guard = crate::exception::enter_hardirq();
-    crate::rcu::irq_enter();
+    let rcu_irq = crate::rcu::irq_enter();
 
     // 由于x86上面，虚拟中断号与物理中断号是一一对应的，所以这里直接使用vector作为中断号来查询irqdesc
 
@@ -36,7 +37,7 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
         CurrentApic.send_eoi();
     }
 
-    let irq_outermost = crate::rcu::irq_is_outermost();
+    let irq_outermost = rcu_irq.is_outermost();
     if irq_outermost {
         do_softirq();
     }
@@ -44,12 +45,15 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
     // 检测当前进程是否可被调度
     let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE)
         || vector == APIC_TIMER_IRQ_NUM.data();
-    let resume_idle_eqs = !should_schedule
-        && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
-    let irq_exited_outermost = crate::rcu::irq_exit(resume_idle_eqs);
+    let disposition = if should_schedule && irq_outermost {
+        crate::rcu::RcuIrqDisposition::ToKernel
+    } else {
+        crate::rcu::RcuIrqDisposition::ResumeInterrupted
+    };
+    crate::rcu::irq_exit(rcu_irq, disposition);
     drop(hardirq_guard);
 
-    if should_schedule && irq_exited_outermost {
+    if should_schedule && irq_outermost {
         __schedule(SchedMode::SM_PREEMPT);
     }
 }

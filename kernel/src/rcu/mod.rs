@@ -34,8 +34,13 @@ use crate::{
     },
 };
 
+mod context;
 mod gp;
 mod selftest;
+use context::{
+    BaseContext, ContextTransition, ContextTransitionError, IdleTransition, IrqDisposition,
+    IrqEntry, RcuContextTracker,
+};
 use gp::{CallbackTracker, GracePeriodState, RcuSequence};
 pub use selftest::run_debug_selftests;
 
@@ -67,6 +72,32 @@ impl RcuHead {
 pub struct RcuReadGuard {
     active: bool,
     _not_send: PhantomData<Rc<()>>,
+}
+
+#[must_use = "RCU idle entry must be paired with idle_exit(token)"]
+pub struct RcuIdleToken {
+    cpu: ProcessorId,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+#[must_use = "RCU IRQ entry must be paired with irq_exit(token, disposition)"]
+pub struct RcuIrqToken {
+    cpu: ProcessorId,
+    entry: IrqEntry,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl RcuIrqToken {
+    #[inline]
+    pub fn is_outermost(&self) -> bool {
+        self.entry.outermost()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RcuIrqDisposition {
+    ResumeInterrupted,
+    ToKernel,
 }
 
 impl Drop for RcuReadGuard {
@@ -353,17 +384,9 @@ struct CallbackItem {
     kind: CallbackKind,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct RcuCpuState {
-    in_idle_eqs: bool,
-    irq_nesting: usize,
-    irq_from_idle_eqs: bool,
-}
-
 struct RcuStateInner {
     gp: GracePeriodState,
     callbacks: CallbackTracker,
-    cpu_states: [RcuCpuState; PerCpu::MAX_CPU_NUM as usize],
     pending_callbacks: VecDeque<CallbackItem>,
     ready_callbacks: VecDeque<CallbackItem>,
 }
@@ -373,7 +396,6 @@ impl RcuStateInner {
         Self {
             gp: GracePeriodState::new(),
             callbacks: CallbackTracker::new(),
-            cpu_states: [RcuCpuState::default(); PerCpu::MAX_CPU_NUM as usize],
             pending_callbacks: VecDeque::new(),
             ready_callbacks: VecDeque::new(),
         }
@@ -392,6 +414,8 @@ struct RcuState {
     initialized: AtomicBool,
     worker_started: AtomicBool,
     worker_should_stop: AtomicBool,
+    gp_active: AtomicBool,
+    contexts: [RcuContextTracker; PerCpu::MAX_CPU_NUM as usize],
     inner: SpinLock<RcuStateInner>,
     state_wait: WaitQueue,
     worker_wait: WaitQueue,
@@ -403,6 +427,8 @@ impl RcuState {
             initialized: AtomicBool::new(false),
             worker_started: AtomicBool::new(false),
             worker_should_stop: AtomicBool::new(false),
+            gp_active: AtomicBool::new(false),
+            contexts: [const { RcuContextTracker::new() }; PerCpu::MAX_CPU_NUM as usize],
             inner: SpinLock::new(RcuStateInner::new()),
             state_wait: WaitQueue::default(),
             worker_wait: WaitQueue::default(),
@@ -414,15 +440,24 @@ impl RcuState {
     }
 
     fn pump_grace_periods(inner: &mut RcuStateInner) -> bool {
-        Self::pump_grace_periods_with(inner, online_non_idle_cpus)
+        Self::pump_grace_periods_with(
+            inner,
+            online_context_snapshot,
+            credit_context_progress_locked,
+            publish_gp_active,
+        )
     }
 
     fn pump_grace_periods_with(
         inner: &mut RcuStateInner,
-        mut waiting_snapshot: impl FnMut(&[RcuCpuState; PerCpu::MAX_CPU_NUM as usize]) -> CpuMask,
+        mut waiting_snapshot: impl FnMut() -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
+        mut credit_context: impl FnMut(&mut GracePeriodState),
+        mut publish_active: impl FnMut(bool),
     ) -> bool {
         let mut ready_changed = false;
         loop {
+            credit_context(&mut inner.gp);
+
             if inner.gp.ready_to_complete() {
                 // Pair all real quiescent-state reports with GP completion.
                 // This is a GP slow path and does not affect RCU readers.
@@ -459,10 +494,13 @@ impl RcuState {
 
             // Admission/request operations preceding this point must be
             // ordered before the fresh CPU snapshot that defines GP start.
+            publish_active(true);
             fence(Ordering::SeqCst);
-            let waiting_cpus = waiting_snapshot(&inner.cpu_states);
-            inner.gp.start_requested(waiting_cpus);
+            let (waiting_cpus, context_generations) = waiting_snapshot();
+            inner.gp.start_requested(waiting_cpus, context_generations);
         }
+
+        publish_active(inner.gp.is_active());
 
         debug_assert!(inner.gp.is_active() || !inner.gp.has_request());
         debug_assert!(
@@ -544,8 +582,26 @@ fn rcu_enabled() -> bool {
     RCU_STATE.is_initialized()
 }
 
-fn online_non_idle_cpus(cpu_states: &[RcuCpuState; PerCpu::MAX_CPU_NUM as usize]) -> CpuMask {
+fn publish_gp_active(active: bool) {
+    // Production callers hold `RCU_STATE.inner`, so GP-active publishers are
+    // serialized. Avoid a write RMW on the common inactive -> inactive path:
+    // context-transition readers would otherwise contend on this cache line.
+    let was_active = RCU_STATE.gp_active.load(Ordering::SeqCst);
+    if was_active == active {
+        return;
+    }
+
+    RCU_STATE.gp_active.store(active, Ordering::SeqCst);
+    if !active {
+        for context in &RCU_STATE.contexts {
+            context.clear_gp_report();
+        }
+    }
+}
+
+fn online_context_snapshot() -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]) {
     let mut waiting = CpuMask::new();
+    let mut generations = [0; PerCpu::MAX_CPU_NUM as usize];
 
     if smp_cpu_manager_initialized() {
         let cpu_manager = smp_cpu_manager();
@@ -554,17 +610,30 @@ fn online_non_idle_cpus(cpu_states: &[RcuCpuState; PerCpu::MAX_CPU_NUM as usize]
                 continue;
             }
 
-            if cpu_in_idle_eqs(&cpu_states[cpu.data() as usize]) {
-                continue;
+            let context = &RCU_STATE.contexts[cpu.data() as usize];
+            context.prepare_gp_report();
+            let snapshot = context.snapshot();
+            generations[cpu.data() as usize] = snapshot.generation();
+            if snapshot.is_watching() {
+                waiting.set(cpu, true);
+            } else {
+                context.clear_gp_report();
             }
-
-            waiting.set(cpu, true);
         }
     } else {
-        waiting.set(smp_get_processor_id(), true);
+        let cpu = smp_get_processor_id();
+        let context = &RCU_STATE.contexts[cpu.data() as usize];
+        context.prepare_gp_report();
+        let snapshot = context.snapshot();
+        generations[cpu.data() as usize] = snapshot.generation();
+        if snapshot.is_watching() {
+            waiting.set(cpu, true);
+        } else {
+            context.clear_gp_report();
+        }
     }
 
-    waiting
+    (waiting, generations)
 }
 
 #[inline]
@@ -573,22 +642,18 @@ fn current_task_is_idle() -> bool {
 }
 
 #[inline]
-fn cpu_in_idle_eqs(cpu_state: &RcuCpuState) -> bool {
-    cpu_state.in_idle_eqs && cpu_state.irq_nesting == 0
-}
-
-fn enter_cpu_idle_eqs(inner: &mut RcuStateInner, cpu: ProcessorId) -> bool {
-    let cpu_idx = cpu.data() as usize;
-    debug_assert_eq!(inner.cpu_states[cpu_idx].irq_nesting, 0);
-
-    inner.cpu_states[cpu_idx].in_idle_eqs = true;
-    let ready_changed =
-        report_quiescent_state_locked(inner, cpu) && RcuState::pump_grace_periods(inner);
-    ready_changed || inner.has_ready_work()
-}
-
-fn exit_cpu_idle_eqs(inner: &mut RcuStateInner, cpu: ProcessorId) {
-    inner.cpu_states[cpu.data() as usize].in_idle_eqs = false;
+fn credit_context_progress_locked(gp: &mut GracePeriodState) {
+    for cpu_idx in 0..PerCpu::MAX_CPU_NUM as usize {
+        let cpu = ProcessorId::new(cpu_idx as u32);
+        if !gp.is_waiting_for(cpu) {
+            continue;
+        }
+        let context = &RCU_STATE.contexts[cpu_idx];
+        let snapshot = context.snapshot();
+        if gp.report_context_progress(cpu, snapshot.generation(), snapshot.in_eqs()) {
+            context.clear_gp_report();
+        }
+    }
 }
 
 /// Reports a real quiescent state while `RcuState::inner` is held.
@@ -604,6 +669,9 @@ fn report_quiescent_state_locked(inner: &mut RcuStateInner, cpu: ProcessorId) ->
     fence(Ordering::SeqCst);
     let cleared = inner.gp.report_quiescent_state(cpu);
     debug_assert!(cleared, "RCU holdout disappeared before QS reporting");
+    if cleared {
+        RCU_STATE.contexts[cpu.data() as usize].clear_gp_report();
+    }
     cleared
 }
 
@@ -648,7 +716,7 @@ fn try_reserve_callback_capacity(inner: &mut RcuStateInner) -> Result<(), ()> {
     Ok(())
 }
 
-fn enqueue_callback_locked(inner: &mut RcuStateInner, kind: CallbackKind) -> bool {
+fn admit_callback_locked(inner: &mut RcuStateInner, kind: CallbackKind) {
     let target_gp = inner.gp.request_future();
     let seq = inner.callbacks.admit();
     inner.pending_callbacks.push_back(CallbackItem {
@@ -656,6 +724,10 @@ fn enqueue_callback_locked(inner: &mut RcuStateInner, kind: CallbackKind) -> boo
         seq,
         kind,
     });
+}
+
+fn enqueue_callback_locked(inner: &mut RcuStateInner, kind: CallbackKind) -> bool {
+    admit_callback_locked(inner, kind);
     let ready_changed = RcuState::pump_grace_periods(inner);
     ready_changed || inner.has_ready_work()
 }
@@ -735,12 +807,6 @@ pub fn init() {
     if already {
         return;
     }
-
-    {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu = smp_get_processor_id();
-        inner.cpu_states[cpu.data() as usize].in_idle_eqs = false;
-    }
 }
 
 pub fn start_worker() {
@@ -786,6 +852,17 @@ pub fn rcu_read_lock() -> RcuReadGuard {
     }
 
     ProcessManager::preempt_disable();
+    #[cfg(debug_assertions)]
+    {
+        let cpu = smp_get_processor_id();
+        let watching = RCU_STATE.contexts[cpu.data() as usize]
+            .snapshot()
+            .is_watching();
+        if !watching {
+            warn!("rcu_read_lock() called while RCU is not watching CPU {cpu:?}");
+            debug_assert!(watching, "ordinary RCU reader entered from an EQS");
+        }
+    }
     ProcessManager::current_pcb().rcu_read_lock();
     RcuReadGuard {
         active: true,
@@ -1040,115 +1117,126 @@ pub fn note_context_switch() {
     report_quiescent_state(smp_get_processor_id());
 }
 
-pub fn note_exit_to_user_mode() {
-    if !rcu_enabled() {
-        return;
+fn context_transition_or_panic<T>(operation: &str, result: Result<T, ContextTransitionError>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("invalid RCU context transition {operation}: {error:?}");
+            panic!("invalid RCU context transition");
+        }
     }
-
-    report_quiescent_state(smp_get_processor_id());
 }
 
-pub fn enter_idle() {
-    if !rcu_enabled() {
+/// Credits an EQS boundary without executing callbacks inline. After the
+/// transition, this path must remain free of ordinary RCU read-side use.
+fn note_context_eqs_transition(transition: ContextTransition) {
+    if !rcu_enabled() || !transition.entered_eqs() {
         return;
     }
 
-    if !current_task_is_idle() {
-        warn!("rcu::enter_idle() must only be called from the idle task");
-        debug_assert!(current_task_is_idle());
-        return;
-    }
-
+    // This SeqCst load participates in the GP-start/context-transition
+    // handshake documented in docs/kernel/libs/rcu-context-tracking.md.
     let cpu = smp_get_processor_id();
-    let wake_worker = {
+    let context = &RCU_STATE.contexts[cpu.data() as usize];
+    if !RCU_STATE.gp_active.load(Ordering::SeqCst) || !context.gp_report_needed() {
+        return;
+    }
+
+    let (wake_waiters, wake_worker) = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        enter_cpu_idle_eqs(&mut inner, cpu)
-    };
-
-    RCU_STATE.wake_state_waiters();
-    if wake_worker {
-        RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
-    }
-}
-
-pub fn exit_idle() {
-    if !rcu_enabled() {
-        return;
-    }
-
-    if !current_task_is_idle() {
-        warn!("rcu::exit_idle() must only be called from the idle task");
-        debug_assert!(current_task_is_idle());
-        return;
-    }
-
-    let cpu = smp_get_processor_id();
-    let mut inner = RCU_STATE.inner.lock_irqsave();
-    exit_cpu_idle_eqs(&mut inner, cpu);
-}
-
-pub fn irq_enter() {
-    if !rcu_enabled() {
-        return;
-    }
-
-    let cpu = smp_get_processor_id();
-    let mut inner = RCU_STATE.inner.lock_irqsave();
-    let cpu_state = &mut inner.cpu_states[cpu.data() as usize];
-    if cpu_state.irq_nesting == 0 {
-        cpu_state.irq_from_idle_eqs = cpu_in_idle_eqs(cpu_state);
-    }
-    cpu_state.irq_nesting += 1;
-}
-
-/// Returns true when this call exits the outermost IRQ nesting level.
-pub fn irq_is_outermost() -> bool {
-    if !rcu_enabled() {
-        return true;
-    }
-
-    let cpu = smp_get_processor_id();
-    let inner = RCU_STATE.inner.lock_irqsave();
-    inner.cpu_states[cpu.data() as usize].irq_nesting == 1
-}
-
-/// Returns true when this call exits the outermost IRQ nesting level.
-pub fn irq_exit(resume_idle_eqs: bool) -> bool {
-    if !rcu_enabled() {
-        return true;
-    }
-
-    let cpu = smp_get_processor_id();
-    let (outermost, wake_worker) = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu_idx = cpu.data() as usize;
-        assert!(
-            inner.cpu_states[cpu_idx].irq_nesting > 0,
-            "rcu::irq_exit without irq_enter"
-        );
-        inner.cpu_states[cpu_idx].irq_nesting -= 1;
-        if inner.cpu_states[cpu_idx].irq_nesting != 0 {
+        if !inner.gp.is_waiting_for(cpu) {
+            context.clear_gp_report();
             (false, false)
         } else {
-            let resume_idle_eqs = inner.cpu_states[cpu_idx].irq_from_idle_eqs && resume_idle_eqs;
-            inner.cpu_states[cpu_idx].irq_from_idle_eqs = false;
-            if resume_idle_eqs {
-                (true, enter_cpu_idle_eqs(&mut inner, cpu))
-            } else {
-                inner.cpu_states[cpu_idx].in_idle_eqs = false;
-                (true, false)
-            }
+            let ready_changed = RcuState::pump_grace_periods(&mut inner);
+            (true, ready_changed || inner.has_ready_work())
         }
     };
 
-    RCU_STATE.wake_state_waiters();
+    if wake_waiters {
+        RCU_STATE.wake_state_waiters();
+    }
     if wake_worker {
         RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
+    }
+}
+
+pub fn user_enter() {
+    let cpu = smp_get_processor_id();
+    let transition = context_transition_or_panic(
+        "user_enter",
+        RCU_STATE.contexts[cpu.data() as usize].user_enter(),
+    );
+    note_context_eqs_transition(transition);
+}
+
+pub fn user_exit() {
+    let cpu = smp_get_processor_id();
+    context_transition_or_panic(
+        "user_exit",
+        RCU_STATE.contexts[cpu.data() as usize].user_exit(),
+    );
+}
+
+pub fn idle_enter() -> RcuIdleToken {
+    if !current_task_is_idle() {
+        warn!("rcu::idle_enter() must only be called from the idle task");
+        debug_assert!(current_task_is_idle());
+        panic!("RCU idle entry outside the idle task");
     }
 
-    outermost
+    let cpu = smp_get_processor_id();
+    let transition: IdleTransition = context_transition_or_panic(
+        "idle_enter",
+        RCU_STATE.contexts[cpu.data() as usize].idle_enter(),
+    );
+    note_context_eqs_transition(transition.transition());
+    RcuIdleToken {
+        cpu,
+        _not_send: PhantomData,
+    }
+}
+
+pub fn idle_exit(token: RcuIdleToken) {
+    if !current_task_is_idle() {
+        warn!("rcu::idle_exit() must only be called from the idle task");
+        debug_assert!(current_task_is_idle());
+        panic!("RCU idle exit outside the idle task");
+    }
+
+    let cpu = smp_get_processor_id();
+    assert_eq!(token.cpu, cpu, "RCU idle token migrated across CPUs");
+    context_transition_or_panic(
+        "idle_exit",
+        RCU_STATE.contexts[cpu.data() as usize].idle_exit(),
+    );
+}
+
+pub fn irq_enter() -> RcuIrqToken {
+    let cpu = smp_get_processor_id();
+    let entry = context_transition_or_panic(
+        "irq_enter",
+        RCU_STATE.contexts[cpu.data() as usize].irq_enter(),
+    );
+    RcuIrqToken {
+        cpu,
+        entry,
+        _not_send: PhantomData,
+    }
+}
+
+pub fn irq_exit(token: RcuIrqToken, disposition: RcuIrqDisposition) {
+    let cpu = smp_get_processor_id();
+    assert_eq!(token.cpu, cpu, "RCU IRQ token migrated across CPUs");
+    let disposition = match disposition {
+        RcuIrqDisposition::ResumeInterrupted => IrqDisposition::ResumeInterrupted,
+        RcuIrqDisposition::ToKernel => IrqDisposition::ToKernel,
+    };
+    let transition = context_transition_or_panic(
+        "irq_exit",
+        RCU_STATE.contexts[cpu.data() as usize].irq_exit(&token.entry, disposition),
+    );
+    note_context_eqs_transition(transition);
 }
 
 pub fn cpu_offline(cpu: ProcessorId) {
@@ -1190,6 +1278,6 @@ pub fn debug_force_quiescent_state() {
 #[allow(dead_code)]
 pub fn debug_current_cpu_in_idle_eqs() -> bool {
     let cpu = smp_get_processor_id();
-    let inner = RCU_STATE.inner.lock_irqsave();
-    cpu_in_idle_eqs(&inner.cpu_states[cpu.data() as usize])
+    let snapshot = RCU_STATE.contexts[cpu.data() as usize].snapshot();
+    snapshot.base() == BaseContext::Idle && snapshot.in_eqs()
 }

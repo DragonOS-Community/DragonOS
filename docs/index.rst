@@ -38,6 +38,7 @@
    kernel/core_api/index
    kernel/interrupt/index
    kernel/locking/index
+   kernel/rcu/index
    kernel/process_management/index
    kernel/sched/index
    kernel/ipc/index

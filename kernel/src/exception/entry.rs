@@ -5,6 +5,16 @@ use crate::{
     sched::{schedule, SchedMode},
 };
 
+/// Establishes RCU's persistent kernel context before any high-level handler
+/// can use ordinary RCU. Architecture entry code calls this with interrupts
+/// disabled and a complete trap frame.
+#[no_mangle]
+unsafe extern "C" fn irqentry_enter(frame: &mut TrapFrame) {
+    if frame.is_from_user() {
+        crate::rcu::user_exit();
+    }
+}
+
 #[no_mangle]
 unsafe extern "C" fn irqentry_exit(frame: &mut TrapFrame) {
     if frame.is_from_user() {
@@ -22,7 +32,7 @@ unsafe fn irqentry_exit_to_user_mode(frame: &mut TrapFrame) {
     exit_to_user_mode_prepare(frame);
     #[cfg(target_arch = "x86_64")]
     crate::arch::process::table::TSSManager::update_io_bitmap_from_current();
-    crate::rcu::note_exit_to_user_mode();
+    crate::rcu::user_enter();
 }
 
 /// # Safety

@@ -28,10 +28,7 @@ use crate::{
     mm::percpu::PerCpu,
     process::{kthread::KernelThreadClosure, kthread::KernelThreadMechanism, ProcessManager},
     sched::{sched_yield, SchedPolicy},
-    smp::{
-        core::smp_get_processor_id,
-        cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
-    },
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 mod callback;
@@ -349,6 +346,9 @@ where
 
 struct RcuStateInner {
     gp: GracePeriodState,
+    /// CPUs that have executed the RCU starting hook and are eligible for
+    /// future GP snapshots. The active GP keeps its own immutable snapshot.
+    participating_cpus: CpuMask,
     callbacks: CallbackTracker,
     callback_queue: RcuCallbackList,
 }
@@ -357,6 +357,7 @@ impl RcuStateInner {
     fn new() -> Self {
         Self {
             gp: GracePeriodState::new(),
+            participating_cpus: CpuMask::new(),
             callbacks: CallbackTracker::new(),
             callback_queue: RcuCallbackList::new(),
         }
@@ -413,7 +414,7 @@ impl RcuState {
     fn pump_grace_periods(inner: &mut RcuStateInner) -> bool {
         Self::pump_grace_periods_with(
             inner,
-            online_context_snapshot,
+            participating_context_snapshot,
             credit_context_progress_locked,
             publish_gp_active,
         )
@@ -421,7 +422,7 @@ impl RcuState {
 
     fn pump_grace_periods_with(
         inner: &mut RcuStateInner,
-        mut waiting_snapshot: impl FnMut() -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
+        mut waiting_snapshot: impl FnMut(&CpuMask) -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
         mut credit_context: impl FnMut(&mut GracePeriodState),
         mut publish_active: impl FnMut(bool),
     ) -> bool {
@@ -450,7 +451,7 @@ impl RcuState {
             // ordered before the fresh CPU snapshot that defines GP start.
             publish_active(true);
             fence(Ordering::SeqCst);
-            let (waiting_cpus, context_generations) = waiting_snapshot();
+            let (waiting_cpus, context_generations) = waiting_snapshot(&inner.participating_cpus);
             inner.gp.start_requested(waiting_cpus, context_generations);
         }
 
@@ -550,29 +551,13 @@ fn publish_gp_active(active: bool) {
     }
 }
 
-fn online_context_snapshot() -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]) {
+fn participating_context_snapshot(
+    participating_cpus: &CpuMask,
+) -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]) {
     let mut waiting = CpuMask::new();
     let mut generations = [0; PerCpu::MAX_CPU_NUM as usize];
 
-    if smp_cpu_manager_initialized() {
-        let cpu_manager = smp_cpu_manager();
-        for cpu in cpu_manager.present_cpus().iter_cpu() {
-            if !cpu_manager.is_online_cpu(cpu) {
-                continue;
-            }
-
-            let context = &RCU_STATE.contexts[cpu.data() as usize];
-            context.prepare_gp_report();
-            let snapshot = context.snapshot();
-            generations[cpu.data() as usize] = snapshot.generation();
-            if snapshot.is_watching() {
-                waiting.set(cpu, true);
-            } else {
-                context.clear_gp_report();
-            }
-        }
-    } else {
-        let cpu = smp_get_processor_id();
+    for cpu in participating_cpus.iter_cpu() {
         let context = &RCU_STATE.contexts[cpu.data() as usize];
         context.prepare_gp_report();
         let snapshot = context.snapshot();
@@ -624,6 +609,19 @@ fn report_quiescent_state_locked(inner: &mut RcuStateInner, cpu: ProcessorId) ->
         RCU_STATE.contexts[cpu.data() as usize].clear_gp_report();
     }
     cleared
+}
+
+fn prepare_cpu_starting_locked(inner: &RcuStateInner, cpu: ProcessorId) -> bool {
+    !inner.participating_cpus.get(cpu).unwrap_or(false) && !inner.gp.is_waiting_for(cpu)
+}
+
+fn cpu_starting_locked(inner: &mut RcuStateInner, cpu: ProcessorId) {
+    inner.participating_cpus.set(cpu, true);
+}
+
+fn cpu_dying_locked(inner: &mut RcuStateInner, cpu: ProcessorId) {
+    inner.participating_cpus.set(cpu, false);
+    report_quiescent_state_locked(inner, cpu);
 }
 
 fn report_quiescent_state(cpu: ProcessorId) {
@@ -759,10 +757,20 @@ fn worker_main() -> i32 {
 }
 
 pub fn init() {
-    let already = RCU_STATE.initialized.swap(true, Ordering::AcqRel);
-    if already {
+    if RCU_STATE.initialized.load(Ordering::Acquire) {
         return;
     }
+
+    // The BSP is already executing and may have used its persistent context
+    // before the SMP manager exists. Admit it without applying the AP restart
+    // reset protocol.
+    let boot_cpu = smp_get_processor_id();
+    let mut inner = RCU_STATE.inner.lock_irqsave();
+    let previous = inner.participating_cpus.set(boot_cpu, true);
+    debug_assert_eq!(previous, Some(false));
+    drop(inner);
+
+    RCU_STATE.initialized.store(true, Ordering::Release);
 }
 
 pub fn start_worker() {
@@ -781,9 +789,15 @@ pub fn start_worker() {
         RCU_STATE.worker_starting.store(true, Ordering::Release);
     }
 
+    let worker_cpu = smp_get_processor_id();
     let closure = KernelThreadClosure::EmptyClosure((Box::new(worker_main), ()));
-    KernelThreadMechanism::create_and_run(closure, "rcu_gp".to_string())
-        .expect("failed to create required RCU callback worker");
+    if KernelThreadMechanism::create_and_run_on_cpu(closure, "rcu_gp".to_string(), worker_cpu)
+        .is_none()
+    {
+        let _inner = RCU_STATE.inner.lock_irqsave();
+        RCU_STATE.worker_starting.store(false, Ordering::Release);
+        panic!("failed to create the bound RCU callback worker");
+    }
 
     RCU_STATE.wake_worker();
 }
@@ -1218,14 +1232,54 @@ pub fn irq_exit(token: RcuIrqToken, disposition: RcuIrqDisposition) {
     note_context_eqs_transition(transition);
 }
 
-pub fn cpu_offline(cpu: ProcessorId) {
+/// Prepares an AP's context before the SMP coordinator publishes Starting.
+///
+/// Returns false if a previous lifecycle still owns RCU participation or GP
+/// responsibility. The caller must not start the AP in that case.
+pub fn prepare_cpu_starting(cpu: ProcessorId) -> bool {
+    if !rcu_enabled() {
+        return true;
+    }
+
+    let inner = RCU_STATE.inner.lock_irqsave();
+    if !prepare_cpu_starting_locked(&inner, cpu) {
+        return false;
+    }
+    RCU_STATE.contexts[cpu.data() as usize].reset_for_cpu_starting();
+    true
+}
+
+/// Admits the current AP to future GP snapshots.
+///
+/// This must run on the incoming CPU with interrupts disabled, before its
+/// startup path first uses ordinary RCU. It deliberately does not modify the
+/// immutable waiting snapshot of an already-active GP.
+pub fn cpu_starting(cpu: ProcessorId) {
+    if !rcu_enabled() {
+        return;
+    }
+
+    let mut inner = RCU_STATE.inner.lock_irqsave();
+    cpu_starting_locked(&mut inner, cpu);
+    drop(inner);
+
+    // Match Linux rcu_cpu_starting(): no ordinary RCU read-side operation on
+    // the incoming AP may become visible before its context initialization
+    // and future-GP admission are globally published.
+    fence(Ordering::SeqCst);
+}
+
+/// Removes a CPU from future GP admission and transfers its active-GP
+/// responsibility before the CPU becomes unable to report.
+pub fn cpu_dying(cpu: ProcessorId) {
     if !rcu_enabled() {
         return;
     }
 
     let wake_worker = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        report_quiescent_state_locked(&mut inner, cpu);
+        cpu_dying_locked(&mut inner, cpu);
+        RCU_STATE.contexts[cpu.data() as usize].clear_gp_report();
         let ready_changed = RcuState::pump_grace_periods(&mut inner);
         ready_changed || inner.has_ready_work()
     };

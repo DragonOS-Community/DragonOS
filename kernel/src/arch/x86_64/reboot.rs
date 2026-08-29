@@ -191,12 +191,14 @@ fn stop_other_cpus() {
         return;
     }
 
-    crate::arch::interrupt::ipi::send_ipi(IpiKind::StopCpu, IpiTarget::Other);
+    for cpu in targets.iter_cpu() {
+        crate::arch::interrupt::ipi::send_ipi(IpiKind::StopCpu, IpiTarget::Specified(cpu));
+    }
 
     for _ in 0..STOP_OTHER_CPUS_TIMEOUT_LOOPS {
         if targets
             .iter_cpu()
-            .all(|cpu| !smp_cpu_manager().is_online_cpu(cpu))
+            .all(|cpu| smp_cpu_manager().is_dead_cpu(cpu))
         {
             return;
         }
@@ -204,10 +206,11 @@ fn stop_other_cpus() {
     }
 
     for cpu in targets.iter_cpu() {
-        if smp_cpu_manager().is_online_cpu(cpu) {
+        if !smp_cpu_manager().is_dead_cpu(cpu) {
             log::warn!(
-                "stop_other_cpus: CPU {} did not stop before timeout",
-                cpu.data()
+                "stop_other_cpus: CPU {} did not reach Dead before timeout (state: {:?})",
+                cpu.data(),
+                smp_cpu_manager().cpuhp_state(cpu).state()
             );
         }
     }

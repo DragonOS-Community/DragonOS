@@ -6,7 +6,7 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_SETAFFINITY;
 use crate::libs::cpumask::CpuMask;
-use crate::process::{ProcessFlags, ProcessManager, RawPid};
+use crate::process::{kthread::KernelThreadFlags, ProcessFlags, ProcessManager, RawPid};
 use crate::sched::{
     request_task_migration, select_task_rq, syscall::util::has_sched_setaffinity_permission,
 };
@@ -40,6 +40,17 @@ impl Syscall for SysSchedSetaffinity {
         let current_pcb = ProcessManager::current_pcb();
         if !has_sched_setaffinity_permission(&current_pcb, &target_pcb) {
             return Err(SystemError::EPERM);
+        }
+
+        if target_pcb.flags().contains(ProcessFlags::KTHREAD) {
+            let worker_private = target_pcb.worker_private();
+            let is_per_cpu = worker_private
+                .as_ref()
+                .and_then(|private| private.kernel_thread())
+                .is_some_and(|private| private.flags().contains(KernelThreadFlags::IS_PER_CPU));
+            if is_per_cpu {
+                return Err(SystemError::EINVAL);
+            }
         }
 
         let reader = UserBufferReader::new(set_vaddr as *const u8, size, frame.is_from_user())?;

@@ -319,12 +319,15 @@ impl KernelThreadCreateInfo {
             return;
         }
 
-        let mut worker_private_guard = pcb.worker_private();
+        let worker_private_guard = pcb.worker_private();
         let worker_private = worker_private_guard
-            .as_mut()
-            .and_then(|x| x.kernel_thread_mut())
+            .as_ref()
+            .and_then(|x| x.kernel_thread())
             .expect("kthread create: missing worker_private");
-        worker_private.flags |= flags;
+        assert!(
+            worker_private.flags.contains(flags),
+            "kthread create: creation flags were not published before the task"
+        );
         drop(worker_private_guard);
 
         if flags.contains(KernelThreadFlags::IS_PER_CPU) {
@@ -350,6 +353,15 @@ impl KernelThreadCreateInfo {
 pub struct KernelThreadMechanism;
 
 impl KernelThreadMechanism {
+    fn submit_create_info(info: Arc<KernelThreadCreateInfo>) -> Option<Arc<ProcessControlBlock>> {
+        while !KTHREAD_DAEMON_READY.load(Ordering::Acquire) {
+            spin_loop()
+        }
+        KTHREAD_CREATE_LIST.lock().push_back(info.clone());
+        Self::notify_daemon();
+        info.poll_result()
+    }
+
     pub fn init_stage1() {
         assert!(ProcessManager::current_pcb().raw_pid() == RawPid::new(0));
         info!("Initializing kernel thread mechanism stage1...");
@@ -421,13 +433,19 @@ impl KernelThreadMechanism {
     #[allow(dead_code)]
     pub fn create(func: KernelThreadClosure, name: String) -> Option<Arc<ProcessControlBlock>> {
         let info = KernelThreadCreateInfo::new(func, name);
-        while !KTHREAD_DAEMON_READY.load(Ordering::Acquire) {
-            // 等待kthreadd启动
-            spin_loop()
-        }
-        KTHREAD_CREATE_LIST.lock().push_back(info.clone());
-        Self::notify_daemon();
-        return info.poll_result();
+        Self::submit_create_info(info)
+    }
+
+    /// Creates a stopped per-CPU kthread whose affinity is installed before
+    /// its first instruction can run.
+    pub fn create_on_cpu(
+        func: KernelThreadClosure,
+        name: String,
+        cpu: ProcessorId,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        let info = KernelThreadCreateInfo::new(func, name);
+        info.set_per_cpu(cpu).ok()?;
+        Self::submit_create_info(info)
     }
 
     /// Notify kthreadd after publishing create or zombie-reap work.
@@ -455,6 +473,19 @@ impl KernelThreadMechanism {
         ProcessManager::wakeup(&pcb)
             .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.raw_pid()));
         return Some(pcb);
+    }
+
+    /// Creates and wakes a per-CPU kthread. Its affinity cannot be changed by
+    /// userspace after creation.
+    pub fn create_and_run_on_cpu(
+        func: KernelThreadClosure,
+        name: String,
+        cpu: ProcessorId,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        let pcb = Self::create_on_cpu(func, name, cpu)?;
+        ProcessManager::wakeup(&pcb)
+            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.raw_pid()));
+        Some(pcb)
     }
 
     /// 停止一个内核线程

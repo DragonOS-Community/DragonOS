@@ -15,7 +15,7 @@ use crate::{
     },
     process::kthread::{KernelThreadClosure, KernelThreadMechanism},
     sched::completion::Completion,
-    smp::cpu::ProcessorId,
+    smp::cpu::{smp_cpu_manager, ProcessorId},
 };
 use system_error::SystemError;
 
@@ -214,6 +214,8 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     context::run_context_selftests()?;
     run_callback_generation_selftest()?;
     run_duplicate_claim_selftest()?;
+    run_cpu_hotplug_lifecycle_selftest()?;
+    run_cpu_hotplug_concurrent_selftest()?;
 
     if ProcessManager::current_pcb().rcu_read_depth() != 0 {
         return Err("initial rcu_read_depth was not zero");
@@ -434,7 +436,7 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     }
     let first_ready_changed = RcuState::pump_grace_periods_with(
         &mut inner,
-        || (CpuMask::from_cpu(cpu1), [0; PerCpu::MAX_CPU_NUM as usize]),
+        |_| (CpuMask::from_cpu(cpu1), [0; PerCpu::MAX_CPU_NUM as usize]),
         |_| {},
         |_| {},
     );
@@ -452,7 +454,7 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     }
     let second_ready_changed = RcuState::pump_grace_periods_with(
         &mut inner,
-        || (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
+        |_| (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
         |_| {},
         |_| {},
     );
@@ -475,6 +477,258 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     }
     if !inner.callback_queue.is_empty() {
         return Err("callback generation transition did not drain its FIFO");
+    }
+
+    Ok(())
+}
+
+fn run_cpu_hotplug_lifecycle_selftest() -> Result<(), &'static str> {
+    let cpu = ProcessorId::new(PerCpu::MAX_CPU_NUM - 1);
+    let incoming = ProcessorId::new(PerCpu::MAX_CPU_NUM - 2);
+    let snapshot =
+        |participants: &CpuMask| (participants.clone(), [0; PerCpu::MAX_CPU_NUM as usize]);
+    let mut inner = RcuStateInner::new();
+
+    if !prepare_cpu_starting_locked(&inner, cpu) {
+        return Err("fresh offline CPU was not eligible for RCU preparation");
+    }
+
+    // BSP publication of Starting does not admit an AP that has not executed
+    // its local RCU starting hook.
+    let before_ap_runs = inner.gp.request_future();
+    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    if !inner.gp.has_completed(before_ap_runs) || inner.gp.is_waiting_for(cpu) {
+        return Err("RCU waited for a Starting CPU before its AP-side hook");
+    }
+
+    cpu_starting_locked(&mut inner, cpu);
+    let after_ap_runs = inner.gp.request_future();
+    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    if !inner.gp.is_waiting_for(cpu) || inner.gp.has_completed(after_ap_runs) {
+        return Err("RCU did not admit a CPU after its AP-side starting hook");
+    }
+    if prepare_cpu_starting_locked(&inner, cpu) {
+        return Err("RCU allowed an active participant to be prepared again");
+    }
+
+    // An AP becoming RCU-ready during an active GP must join only the next
+    // fresh snapshot.
+    if !prepare_cpu_starting_locked(&inner, incoming) {
+        return Err("incoming CPU could not be prepared during an active GP");
+    }
+    cpu_starting_locked(&mut inner, incoming);
+    if inner.gp.is_waiting_for(incoming) {
+        return Err("incoming CPU was added to an already-active GP");
+    }
+    let next_gp = inner.gp.request_future();
+
+    // This is the original offline/new-GP race in deterministic order: the
+    // first GP observed the CPU, Dying removes both future admission and its
+    // existing responsibility under the same lock, and the next GP snapshot
+    // must not add it back.
+    cpu_dying_locked(&mut inner, cpu);
+    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    if inner.gp.is_waiting_for(cpu)
+        || !inner.gp.is_waiting_for(incoming)
+        || inner.gp.has_completed(next_gp)
+    {
+        return Err("Dying CPU was re-admitted or incoming CPU missed the next GP");
+    }
+
+    cpu_dying_locked(&mut inner, incoming);
+    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    if !inner.gp.has_completed(next_gp) {
+        return Err("CPU Dying did not complete the GP it was responsible for");
+    }
+
+    // Repeated model transitions use the same production mask operations and
+    // ensure no waiting bit leaks across generations. This is not presented as
+    // a substitute for a future platform-level CPU restart stress test.
+    for _ in 0..32 {
+        if !prepare_cpu_starting_locked(&inner, cpu) {
+            return Err("completed CPU teardown left stale RCU responsibility");
+        }
+        cpu_starting_locked(&mut inner, cpu);
+        let target = inner.gp.request_future();
+        RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+        if !inner.gp.is_waiting_for(cpu) {
+            return Err("repeated RCU lifecycle did not admit its online CPU");
+        }
+        cpu_dying_locked(&mut inner, cpu);
+        RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+        if !inner.gp.has_completed(target) || inner.gp.is_waiting_for(cpu) {
+            return Err("repeated RCU lifecycle leaked a GP holdout");
+        }
+    }
+
+    // Queue ownership and barrier tickets remain global while Dying advances
+    // the target GP. The bound worker invariant covers the later execution.
+    cpu_starting_locked(&mut inner, cpu);
+    unsafe fn noop_callback(_head: NonNull<RcuHead>) {}
+    let callback_head = RcuHead::new();
+    if !callback_head.try_claim() {
+        return Err("fresh hotplug callback head could not be claimed");
+    }
+    enqueue_callback_locked(&mut inner, NonNull::from(&callback_head), noop_callback);
+    let barrier_target = inner
+        .callbacks
+        .barrier_target()
+        .ok_or("hotplug callback did not create a barrier target")?;
+    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    cpu_dying_locked(&mut inner, cpu);
+    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    let callback = inner
+        .callback_queue
+        .pop_ready(inner.gp.completed())
+        .ok_or("Dying CPU did not advance its pending callback")?;
+    inner.callbacks.complete(callback.seq);
+    if !inner.callbacks.has_completed(barrier_target) {
+        return Err("callback barrier ticket was lost across CPU Dying");
+    }
+
+    Ok(())
+}
+
+fn run_cpu_hotplug_concurrent_selftest() -> Result<(), &'static str> {
+    const ROUNDS: usize = 32;
+
+    // Use an absent logical CPU so the test exercises the production global
+    // lifecycle hooks without racing a real CPU's context tracker. This is a
+    // concurrency test for the RCU protocol, not a claim that platform-level
+    // CPU reset/restart has been implemented.
+    let Some(synthetic_cpu) = (0..PerCpu::MAX_CPU_NUM)
+        .rev()
+        .map(ProcessorId::new)
+        .find(|&cpu| !smp_cpu_manager().present_cpus().get(cpu).unwrap_or(false))
+    else {
+        // A machine using every representable logical CPU has no context slot
+        // that a synthetic lifecycle test may safely borrow.
+        return Ok(());
+    };
+
+    let round_ready = Arc::new(Completion::new());
+    let round_release = Arc::new(Completion::new());
+    let round_withdrawn = Arc::new(Completion::new());
+    let round_advance = Arc::new(Completion::new());
+    let finished = Arc::new(Completion::new());
+    let failed = Arc::new(AtomicBool::new(false));
+    let completed_rounds = Arc::new(AtomicUsize::new(0));
+    let callback_hits = Arc::new(AtomicUsize::new(0));
+
+    let round_ready_worker = round_ready.clone();
+    let round_release_worker = round_release.clone();
+    let round_withdrawn_worker = round_withdrawn.clone();
+    let round_advance_worker = round_advance.clone();
+    let finished_worker = finished.clone();
+    let failed_worker = failed.clone();
+    let completed_rounds_worker = completed_rounds.clone();
+    let callback_hits_worker = callback_hits.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            for _ in 0..ROUNDS {
+                if !prepare_cpu_starting(synthetic_cpu) {
+                    failed_worker.store(true, Ordering::Release);
+                    round_ready_worker.complete_all();
+                    round_withdrawn_worker.complete_all();
+                    round_advance_worker.complete_all();
+                    break;
+                }
+                cpu_starting(synthetic_cpu);
+
+                // Exercise a real read-side section and global callback
+                // admission while the lifecycle participant is visible.
+                {
+                    let _guard = rcu_read_lock();
+                    core::hint::black_box(0usize);
+                }
+                rcu_defer({
+                    let callback_hits = callback_hits_worker.clone();
+                    move || {
+                        callback_hits.fetch_add(1, Ordering::AcqRel);
+                    }
+                });
+
+                // Hold the synthetic participant until the main task has
+                // admitted its concurrent reader/callback workload. Explicit
+                // handoff avoids relying on scheduler yield fairness.
+                round_ready_worker.complete();
+                if round_release_worker.wait_for_completion().is_err() {
+                    failed_worker.store(true, Ordering::Release);
+                    cpu_dying(synthetic_cpu);
+                    round_withdrawn_worker.complete_all();
+                    round_advance_worker.complete_all();
+                    break;
+                }
+                cpu_dying(synthetic_cpu);
+                completed_rounds_worker.fetch_add(1, Ordering::AcqRel);
+                round_withdrawn_worker.complete();
+                if round_advance_worker.wait_for_completion().is_err() {
+                    failed_worker.store(true, Ordering::Release);
+                    break;
+                }
+            }
+
+            // Idempotent cleanup keeps a failed round from poisoning later GPs.
+            cpu_dying(synthetic_cpu);
+            finished_worker.complete();
+            0
+        }),
+        (),
+    ));
+    let Some(worker) = KernelThreadMechanism::create_and_run(
+        closure,
+        "rcu-hotplug-concurrency-selftest".to_string(),
+    ) else {
+        return Err("RCU hotplug concurrency selftest could not create its worker");
+    };
+
+    for _ in 0..ROUNDS {
+        if round_ready.wait_for_completion().is_err() {
+            round_release.complete_all();
+            round_advance.complete_all();
+            let _ = KernelThreadMechanism::stop(&worker);
+            return Err("RCU hotplug concurrency selftest missed lifecycle admission");
+        }
+        {
+            let _guard = rcu_read_lock();
+            core::hint::black_box(1usize);
+        }
+        rcu_defer({
+            let callback_hits = callback_hits.clone();
+            move || {
+                callback_hits.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        round_release.complete();
+        synchronize_rcu();
+        rcu_barrier();
+        if round_withdrawn.wait_for_completion().is_err() {
+            round_release.complete_all();
+            round_advance.complete_all();
+            let _ = KernelThreadMechanism::stop(&worker);
+            return Err("RCU hotplug concurrency selftest missed lifecycle withdrawal");
+        }
+        // Do not let the next synthetic Starting race ahead of this round's
+        // synchronize/barrier completion and become an unintended holdout.
+        round_advance.complete();
+    }
+
+    let finished_result = finished.wait_for_completion();
+    let stop_result = KernelThreadMechanism::stop(&worker);
+    cpu_dying(synthetic_cpu);
+    rcu_barrier();
+
+    if finished_result.is_err() || stop_result.is_err() {
+        return Err("RCU hotplug concurrency selftest worker did not finish cleanly");
+    }
+    if failed.load(Ordering::Acquire) {
+        return Err("RCU hotplug concurrency selftest rejected a clean lifecycle round");
+    }
+    if completed_rounds.load(Ordering::Acquire) != ROUNDS {
+        return Err("RCU hotplug concurrency selftest lost a lifecycle transition");
+    }
+    if callback_hits.load(Ordering::Acquire) != ROUNDS * 2 {
+        return Err("RCU hotplug concurrency selftest lost or duplicated a callback");
     }
 
     Ok(())

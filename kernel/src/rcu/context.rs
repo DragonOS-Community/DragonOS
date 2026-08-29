@@ -221,6 +221,17 @@ impl RcuContextTracker {
         }
     }
 
+    /// Resets an AP's context before it becomes eligible for future GPs.
+    ///
+    /// The hotplug coordinator must exclude this CPU from both the RCU
+    /// participation mask and the active GP while this runs. There can be no
+    /// local context transition because the AP has not started executing yet.
+    pub(super) fn reset_for_cpu_starting(&self) {
+        self.gp_report_needed.store(false, Ordering::SeqCst);
+        self.state
+            .store(BaseContext::Kernel as u64, Ordering::SeqCst);
+    }
+
     /// Must be published before the coordinator snapshots this CPU.
     #[inline]
     pub(super) fn prepare_gp_report(&self) {

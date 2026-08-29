@@ -12,6 +12,7 @@ use crate::{
     libs::cpumask::CpuMask,
     mm::percpu::{PerCpu, PerCpuVar},
     process::{ProcessControlBlock, ProcessManager},
+    rcu,
     sched::completion::Completion,
 };
 
@@ -50,6 +51,12 @@ pub enum CpuHpState {
     /// 该CPU是在线的
     Online,
 
+    /// CPU 已进入不可逆停止路径，不再接受普通工作或加入新的 RCU GP。
+    Dying,
+
+    /// CPU 已完成 RCU teardown，可以永久停止。
+    Dead,
+
     /// AP 已经运行并在初始化失败后进入终止 park，不能按 Offline 重试。
     FailedParked,
 }
@@ -77,7 +84,8 @@ pub struct CpuHpCpuState {
 
 // SAFETY: `state`, `bringup_result` and `comp_done_up` provide their own
 // synchronization. `control` is private and is only accessed by the single
-// BSP hotplug coordinator; APs never read or write it.
+// BSP hotplug coordinator. AP-side lifecycle publications go through the
+// manager methods and never access `control`.
 unsafe impl Sync for CpuHpCpuState {}
 
 impl CpuHpCpuState {
@@ -106,6 +114,8 @@ impl CpuHpCpuState {
             value if value == CpuHpState::Offline as u32 => CpuHpState::Offline,
             value if value == CpuHpState::Starting as u32 => CpuHpState::Starting,
             value if value == CpuHpState::Online as u32 => CpuHpState::Online,
+            value if value == CpuHpState::Dying as u32 => CpuHpState::Dying,
+            value if value == CpuHpState::Dead as u32 => CpuHpState::Dead,
             value if value == CpuHpState::FailedParked as u32 => CpuHpState::FailedParked,
             _ => CpuHpState::FailedParked,
         }
@@ -233,19 +243,15 @@ impl SmpCpuManager {
         unsafe { self.cpuhp_state.force_get(cpu_id) }
     }
 
-    pub fn set_online_cpu(&self, cpu_id: ProcessorId, is_online: bool) {
-        let target_state = if is_online {
-            CpuHpState::Online
-        } else {
-            CpuHpState::Offline
-        };
-        self.cpuhp_state(cpu_id).publish_state(target_state);
-    }
-
     #[inline]
     #[allow(dead_code)]
     pub fn is_online_cpu(&self, cpu_id: ProcessorId) -> bool {
         self.cpuhp_state(cpu_id).state.load(Ordering::Acquire) == CpuHpState::Online as u32
+    }
+
+    #[inline]
+    pub fn is_dead_cpu(&self, cpu_id: ProcessorId) -> bool {
+        self.cpuhp_state(cpu_id).state.load(Ordering::Acquire) == CpuHpState::Dead as u32
     }
 
     /// 获取出现在系统中的CPU
@@ -286,9 +292,11 @@ impl SmpCpuManager {
         match cpu_state {
             CpuHpState::Online if target_state == CpuHpState::Online => return Ok(()),
             CpuHpState::Offline => {}
-            CpuHpState::Starting | CpuHpState::FailedParked | CpuHpState::Online => {
-                return Err(SystemError::EBUSY)
-            }
+            CpuHpState::Starting
+            | CpuHpState::Online
+            | CpuHpState::Dying
+            | CpuHpState::Dead
+            | CpuHpState::FailedParked => return Err(SystemError::EBUSY),
         }
 
         self.cpuhp_kick_ap(cpu_id, target_state)
@@ -301,21 +309,42 @@ impl SmpCpuManager {
     ) -> Result<(), SystemError> {
         let cpu_state = self.cpuhp_state(cpu_id);
         let prev_state = cpu_state.state();
+        if !rcu::prepare_cpu_starting(cpu_id) {
+            return Err(SystemError::EBUSY);
+        }
         unsafe { cpu_state.configure_bringup(target_state, true) };
         cpu_state.publish_state(CpuHpState::Starting);
 
         if let Err(e) = self.do_cpuhp_kick_ap(cpu_id) {
             let ap_parked = cpu_state.bringup_result.load(Ordering::Acquire) < 0;
-            cpu_state.publish_state(if ap_parked {
+            let failure_state = if ap_parked {
                 CpuHpState::FailedParked
             } else {
                 prev_state
-            });
+            };
+            let _ = cpu_state.state.compare_exchange(
+                CpuHpState::Starting as u32,
+                failure_state as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             unsafe { cpu_state.configure_bringup(prev_state, false) };
             return Err(e);
         }
 
-        cpu_state.publish_state(target_state);
+        if cpu_state
+            .state
+            .compare_exchange(
+                CpuHpState::Starting as u32,
+                target_state as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            unsafe { cpu_state.configure_bringup(prev_state, false) };
+            return Err(SystemError::EBUSY);
+        }
         unsafe { cpu_state.configure_bringup(target_state, false) };
 
         Ok(())
@@ -379,6 +408,62 @@ impl SmpCpuManager {
             todo!("complete_ap_thread")
         }
     }
+
+    /// Begins the irreversible local CPU shutdown lifecycle.
+    ///
+    /// The caller must be the target CPU, have interrupts disabled, and must
+    /// not execute ordinary RCU read-side code after entering this method.
+    pub fn begin_shutdown_current_cpu(&self, cpu_id: ProcessorId) {
+        assert_eq!(cpu_id, smp_get_processor_id());
+        let cpu_state = self.cpuhp_state(cpu_id);
+
+        loop {
+            let state = cpu_state.state();
+            match state {
+                CpuHpState::Dying | CpuHpState::Dead => return,
+                _ => {
+                    if cpu_state
+                        .state
+                        .compare_exchange(
+                            state as u32,
+                            CpuHpState::Dying as u32,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        rcu::cpu_dying(cpu_id);
+    }
+
+    /// Publishes terminal teardown only after architecture-local interrupt
+    /// sources can no longer deliver work to this CPU.
+    ///
+    /// The caller must be the target CPU and must have completed the matching
+    /// architecture-local interrupt shutdown after `begin_shutdown_current_cpu`.
+    pub fn complete_shutdown_current_cpu(&self, cpu_id: ProcessorId) {
+        assert_eq!(cpu_id, smp_get_processor_id());
+        let cpu_state = self.cpuhp_state(cpu_id);
+        if cpu_state.state() == CpuHpState::Dead {
+            return;
+        }
+        cpu_state
+            .state
+            .compare_exchange(
+                CpuHpState::Dying as u32,
+                CpuHpState::Dead as u32,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .unwrap_or_else(|state| {
+                panic!("invalid terminal CPU shutdown transition from state {state}")
+            });
+    }
 }
 
 pub fn smp_cpu_manager_init(boot_cpu: ProcessorId) {
@@ -388,7 +473,9 @@ pub fn smp_cpu_manager_init(boot_cpu: ProcessorId) {
 
     unsafe { smp_cpu_manager().set_possible_cpu(boot_cpu, true) };
     unsafe { smp_cpu_manager().set_present_cpu(boot_cpu, true) };
-    smp_cpu_manager().set_online_cpu(boot_cpu, true);
+    smp_cpu_manager()
+        .cpuhp_state(boot_cpu)
+        .publish_state(CpuHpState::Online);
 
     SmpCpuManager::arch_init(boot_cpu);
 }

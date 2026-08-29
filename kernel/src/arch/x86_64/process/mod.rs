@@ -1020,10 +1020,9 @@ pub(crate) fn stop_this_cpu() -> ! {
         CurrentIrqArch::interrupt_disable();
     }
 
-    crate::rcu::cpu_offline(cpu_id);
-    // 将当前cpu标记为offline
-    smp_cpu_manager().set_online_cpu(cpu_id, false);
+    smp_cpu_manager().begin_shutdown_current_cpu(cpu_id);
     CurrentApic.disable_local_apic();
+    smp_cpu_manager().complete_shutdown_current_cpu(cpu_id);
 
     loop {
         native_halt();

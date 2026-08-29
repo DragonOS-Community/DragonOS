@@ -46,6 +46,7 @@ impl KernelThreadMechanism {
         let mut clone_args = KernelCloneArgs::new();
         clone_args.flags = clone_flags | CloneFlags::CLONE_UNTRACED;
         clone_args.kthread = true;
+        clone_args.kthread_flags = info.flags();
         if info
             .flags()
             .contains(crate::process::kthread::KernelThreadFlags::IS_PER_CPU)

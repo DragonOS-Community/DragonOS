@@ -11,3 +11,4 @@ RCU.
    :maxdepth: 1
 
    architecture
+   segmented-callback-queues

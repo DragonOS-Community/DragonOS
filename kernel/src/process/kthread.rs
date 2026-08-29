@@ -319,12 +319,15 @@ impl KernelThreadCreateInfo {
             return;
         }
 
-        let mut worker_private_guard = pcb.worker_private();
+        let worker_private_guard = pcb.worker_private();
         let worker_private = worker_private_guard
-            .as_mut()
-            .and_then(|x| x.kernel_thread_mut())
+            .as_ref()
+            .and_then(|x| x.kernel_thread())
             .expect("kthread create: missing worker_private");
-        worker_private.flags |= flags;
+        assert!(
+            worker_private.flags.contains(flags),
+            "kthread create: creation flags were not published before the task"
+        );
         drop(worker_private_guard);
 
         if flags.contains(KernelThreadFlags::IS_PER_CPU) {

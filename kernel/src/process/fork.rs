@@ -1,6 +1,6 @@
 use super::{
     account_successful_fork, alloc_pid, inc_visible_thread_count,
-    kthread::{KernelThreadPcbPrivate, WorkerPrivate},
+    kthread::{KernelThreadFlags, KernelThreadPcbPrivate, WorkerPrivate},
     lock_fs_refs_copy,
     pid::{Pid, PidType},
     FsRefsReadGuard, KernelStack, ProcessControlBlock, ProcessManager, RawPid,
@@ -133,6 +133,9 @@ pub struct KernelCloneArgs {
 
     pub io_thread: bool,
     pub kthread: bool,
+    /// Creation-time kernel-thread properties that must be visible before the
+    /// child is published in the task table.
+    pub kthread_flags: KernelThreadFlags,
     pub idle: bool,
     pub func: VirtAddr,
     pub fn_arg: VirtAddr,
@@ -158,6 +161,7 @@ impl KernelCloneArgs {
             cgroup: 0,
             io_thread: false,
             kthread: false,
+            kthread_flags: KernelThreadFlags::empty(),
             idle: false,
             func: null_addr,
             fn_arg: null_addr,
@@ -668,9 +672,10 @@ impl ProcessManager {
         drop(guard);
 
         // 为内核线程设置WorkerPrivate
-        if current_pcb.flags().contains(ProcessFlags::KTHREAD) {
-            *pcb.worker_private() =
-                Some(WorkerPrivate::KernelThread(KernelThreadPcbPrivate::new()));
+        if clone_args.kthread {
+            let mut private = KernelThreadPcbPrivate::new();
+            *private.flags_mut() |= clone_args.kthread_flags;
+            *pcb.worker_private() = Some(WorkerPrivate::KernelThread(private));
         }
 
         // 设置clear_child_tid，在线程结束时将其置0以通知父进程

@@ -317,17 +317,34 @@ impl SmpCpuManager {
 
         if let Err(e) = self.do_cpuhp_kick_ap(cpu_id) {
             let ap_parked = cpu_state.bringup_result.load(Ordering::Acquire) < 0;
-            cpu_state.publish_state(if ap_parked {
+            let failure_state = if ap_parked {
                 CpuHpState::FailedParked
             } else {
                 prev_state
-            });
-            rcu::cpu_dying(cpu_id);
+            };
+            let _ = cpu_state.state.compare_exchange(
+                CpuHpState::Starting as u32,
+                failure_state as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             unsafe { cpu_state.configure_bringup(prev_state, false) };
             return Err(e);
         }
 
-        cpu_state.publish_state(target_state);
+        if cpu_state
+            .state
+            .compare_exchange(
+                CpuHpState::Starting as u32,
+                target_state as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            unsafe { cpu_state.configure_bringup(prev_state, false) };
+            return Err(SystemError::EBUSY);
+        }
         unsafe { cpu_state.configure_bringup(target_state, false) };
 
         Ok(())
@@ -392,25 +409,60 @@ impl SmpCpuManager {
         }
     }
 
-    /// Runs the irreversible local CPU shutdown lifecycle.
+    /// Begins the irreversible local CPU shutdown lifecycle.
     ///
     /// The caller must be the target CPU, have interrupts disabled, and must
     /// not execute ordinary RCU read-side code after entering this method.
-    pub fn shutdown_current_cpu(&self, cpu_id: ProcessorId) {
+    pub fn begin_shutdown_current_cpu(&self, cpu_id: ProcessorId) {
         assert_eq!(cpu_id, smp_get_processor_id());
         let cpu_state = self.cpuhp_state(cpu_id);
+
+        loop {
+            let state = cpu_state.state();
+            match state {
+                CpuHpState::Dying | CpuHpState::Dead => return,
+                _ => {
+                    if cpu_state
+                        .state
+                        .compare_exchange(
+                            state as u32,
+                            CpuHpState::Dying as u32,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        rcu::cpu_dying(cpu_id);
+    }
+
+    /// Publishes terminal teardown only after architecture-local interrupt
+    /// sources can no longer deliver work to this CPU.
+    ///
+    /// The caller must be the target CPU and must have completed the matching
+    /// architecture-local interrupt shutdown after `begin_shutdown_current_cpu`.
+    pub fn complete_shutdown_current_cpu(&self, cpu_id: ProcessorId) {
+        assert_eq!(cpu_id, smp_get_processor_id());
+        let cpu_state = self.cpuhp_state(cpu_id);
+        if cpu_state.state() == CpuHpState::Dead {
+            return;
+        }
         cpu_state
             .state
             .compare_exchange(
-                CpuHpState::Online as u32,
                 CpuHpState::Dying as u32,
-                Ordering::AcqRel,
+                CpuHpState::Dead as u32,
+                Ordering::Release,
                 Ordering::Acquire,
             )
-            .unwrap_or_else(|state| panic!("invalid CPU shutdown transition from state {state}"));
-
-        rcu::cpu_dying(cpu_id);
-        cpu_state.publish_state(CpuHpState::Dead);
+            .unwrap_or_else(|state| {
+                panic!("invalid terminal CPU shutdown transition from state {state}")
+            });
     }
 }
 

@@ -191,7 +191,9 @@ fn stop_other_cpus() {
         return;
     }
 
-    crate::arch::interrupt::ipi::send_ipi(IpiKind::StopCpu, IpiTarget::Other);
+    for cpu in targets.iter_cpu() {
+        crate::arch::interrupt::ipi::send_ipi(IpiKind::StopCpu, IpiTarget::Specified(cpu));
+    }
 
     for _ in 0..STOP_OTHER_CPUS_TIMEOUT_LOOPS {
         if targets

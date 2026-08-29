@@ -24,15 +24,11 @@ use core::{
 use log::warn;
 
 use crate::{
-    init::initial_kthread::{get_system_state, SystemState},
     libs::{cpumask::CpuMask, spinlock::SpinLock, wait_queue::WaitQueue},
     mm::percpu::PerCpu,
     process::{kthread::KernelThreadClosure, kthread::KernelThreadMechanism, ProcessManager},
     sched::{sched_yield, SchedPolicy},
-    smp::{
-        core::smp_get_processor_id,
-        cpu::{AtomicProcessorId, ProcessorId},
-    },
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 mod callback;
@@ -389,7 +385,6 @@ struct RcuState {
     worker_starting: AtomicBool,
     worker_started: AtomicBool,
     worker_should_stop: AtomicBool,
-    callback_worker_cpu: AtomicProcessorId,
     gp_active: AtomicBool,
     contexts: [RcuContextTracker; PerCpu::MAX_CPU_NUM as usize],
     inner: SpinLock<RcuStateInner>,
@@ -404,7 +399,6 @@ impl RcuState {
             worker_starting: AtomicBool::new(false),
             worker_started: AtomicBool::new(false),
             worker_should_stop: AtomicBool::new(false),
-            callback_worker_cpu: AtomicProcessorId::new(ProcessorId::INVALID),
             gp_active: AtomicBool::new(false),
             contexts: [const { RcuContextTracker::new() }; PerCpu::MAX_CPU_NUM as usize],
             inner: SpinLock::new(RcuStateInner::new()),
@@ -796,18 +790,12 @@ pub fn start_worker() {
     }
 
     let worker_cpu = smp_get_processor_id();
-    RCU_STATE
-        .callback_worker_cpu
-        .store(worker_cpu, Ordering::Release);
     let closure = KernelThreadClosure::EmptyClosure((Box::new(worker_main), ()));
     if KernelThreadMechanism::create_and_run_on_cpu(closure, "rcu_gp".to_string(), worker_cpu)
         .is_none()
     {
         let _inner = RCU_STATE.inner.lock_irqsave();
         RCU_STATE.worker_starting.store(false, Ordering::Release);
-        RCU_STATE
-            .callback_worker_cpu
-            .store(ProcessorId::INVALID, Ordering::Release);
         panic!("failed to create the bound RCU callback worker");
     }
 
@@ -1287,12 +1275,6 @@ pub fn cpu_dying(cpu: ProcessorId) {
     if !rcu_enabled() {
         return;
     }
-
-    let worker_cpu = RCU_STATE.callback_worker_cpu.load(Ordering::Acquire);
-    assert!(
-        get_system_state() != SystemState::Running || cpu != worker_cpu,
-        "cannot offline the RCU callback-worker CPU while the system is running"
-    );
 
     let wake_worker = {
         let mut inner = RCU_STATE.inner.lock_irqsave();

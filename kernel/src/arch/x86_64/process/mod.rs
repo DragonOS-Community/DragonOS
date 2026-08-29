@@ -1020,8 +1020,9 @@ pub(crate) fn stop_this_cpu() -> ! {
         CurrentIrqArch::interrupt_disable();
     }
 
-    smp_cpu_manager().shutdown_current_cpu(cpu_id);
+    smp_cpu_manager().begin_shutdown_current_cpu(cpu_id);
     CurrentApic.disable_local_apic();
+    smp_cpu_manager().complete_shutdown_current_cpu(cpu_id);
 
     loop {
         native_halt();

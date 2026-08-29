@@ -40,6 +40,9 @@ impl KernFSCallback for RcuDirCallBack {
 #[derive(Debug)]
 struct RcuSelftestCallBack;
 
+#[derive(Debug)]
+struct RcuCallbacksCallBack;
+
 impl KernFSCallback for RcuSelftestCallBack {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
         let report = crate::rcu::run_debug_selftests();
@@ -82,6 +85,48 @@ impl KernFSCallback for RcuSelftestCallBack {
     }
 }
 
+impl KernFSCallback for RcuCallbacksCallBack {
+    fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        data.file_private_data_mut()
+            .replace(KernFilePrivateData::DebugTextSnapshot(
+                crate::rcu::callback_queue_debug_report(),
+            ));
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        data: KernCallbackData,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        let report = match data.file_private_data() {
+            Some(KernFilePrivateData::DebugTextSnapshot(report)) => report,
+            _ => return Err(SystemError::EINVAL),
+        };
+        let bytes = report.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(bytes.len() - offset);
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write(
+        &self,
+        _data: KernCallbackData,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EPERM)
+    }
+
+    fn poll(&self, _data: KernCallbackData) -> Result<PollStatus, SystemError> {
+        Ok(PollStatus::READ)
+    }
+}
+
 pub fn init_debugfs_rcu() -> Result<(), SystemError> {
     let debugfs = debugfs_kobj();
     let root_dir = debugfs.inode().ok_or(SystemError::ENOENT)?;
@@ -98,6 +143,13 @@ pub fn init_debugfs_rcu() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&RcuSelftestCallBack),
+    )?;
+    rcu_root.add_file(
+        "callbacks".to_string(),
+        InodeMode::S_IRUGO,
+        Some(32 * 1024),
+        None,
+        Some(&RcuCallbacksCallBack),
     )?;
 
     Ok(())

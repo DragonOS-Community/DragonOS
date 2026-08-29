@@ -14,34 +14,47 @@
 //! the happens-before chain from callback admission to callback invocation or
 //! `synchronize_rcu()` return.
 
-use alloc::{boxed::Box, rc::Rc, string::ToString, sync::Arc};
+use alloc::{
+    boxed::Box,
+    rc::Rc,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::{
+    fmt::Write,
     marker::PhantomData,
     ptr::{self, NonNull},
-    sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
 use log::warn;
 
 use crate::{
-    libs::{cpumask::CpuMask, spinlock::SpinLock, wait_queue::WaitQueue},
+    libs::{cpumask::CpuMask, mutex::Mutex, spinlock::SpinLock, wait_queue::WaitQueue},
     mm::percpu::PerCpu,
-    process::{kthread::KernelThreadClosure, kthread::KernelThreadMechanism, ProcessManager},
-    sched::{sched_yield, SchedPolicy},
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    process::{
+        kthread::KernelThreadClosure, kthread::KernelThreadMechanism, preempt::PreemptGuard,
+        ProcessManager,
+    },
+    sched::{cond_resched, sched_yield, SchedPolicy},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
+    },
 };
 
 mod callback;
 mod context;
 mod gp;
 mod selftest;
-use callback::RcuCallbackList;
 pub use callback::RcuHead;
+use callback::{RcuCallbackQueueDepth, RcuSegmentedCallbacks};
 use context::{
     BaseContext, ContextTransition, ContextTransitionError, IdleTransition, IrqDisposition,
     IrqEntry, RcuContextTracker,
 };
-use gp::{CallbackTracker, GracePeriodState};
+use gp::{GracePeriodState, RcuSequence};
 pub use selftest::run_debug_selftests;
 
 pub(crate) type RcuRawCallback = unsafe fn(NonNull<RcuHead>);
@@ -349,8 +362,6 @@ struct RcuStateInner {
     /// CPUs that have executed the RCU starting hook and are eligible for
     /// future GP snapshots. The active GP keeps its own immutable snapshot.
     participating_cpus: CpuMask,
-    callbacks: CallbackTracker,
-    callback_queue: RcuCallbackList,
 }
 
 impl RcuStateInner {
@@ -358,27 +369,52 @@ impl RcuStateInner {
         Self {
             gp: GracePeriodState::new(),
             participating_cpus: CpuMask::new(),
-            callbacks: CallbackTracker::new(),
-            callback_queue: RcuCallbackList::new(),
+        }
+    }
+}
+
+struct RcuCpuCallbackState {
+    segments: RcuSegmentedCallbacks,
+    executing: bool,
+}
+
+impl RcuCpuCallbackState {
+    const fn new() -> Self {
+        Self {
+            segments: RcuSegmentedCallbacks::new(),
+            executing: false,
         }
     }
 
-    fn has_ready_work(&self) -> bool {
-        self.callback_queue
-            .front_target()
-            .is_some_and(|target| self.gp.has_completed(target))
-    }
-
-    fn has_drainable_work(&self) -> bool {
-        self.has_ready_work() && self.callbacks.drainer_available()
-    }
-
-    fn has_worker_work(&self) -> bool {
-        self.has_drainable_work()
-            || self.gp.ready_to_complete()
-            || (!self.gp.is_active() && self.gp.has_request())
+    fn depth(&self) -> RcuCallbackQueueDepth {
+        let mut depth = self.segments.depth();
+        depth.executing = self.executing;
+        depth
     }
 }
+
+#[repr(align(64))]
+struct RcuCpuCallbacks {
+    state: SpinLock<RcuCpuCallbackState>,
+    needs_scan: AtomicBool,
+    barrier_head: RcuHead,
+}
+
+impl RcuCpuCallbacks {
+    const fn new() -> Self {
+        Self {
+            state: SpinLock::new(RcuCpuCallbackState::new()),
+            needs_scan: AtomicBool::new(false),
+            barrier_head: RcuHead::new(),
+        }
+    }
+
+    fn publish_work(&self) -> bool {
+        !self.needs_scan.swap(true, Ordering::AcqRel)
+    }
+}
+
+const RCU_CALLBACK_BATCH_LIMIT: usize = 64;
 
 struct RcuState {
     initialized: AtomicBool,
@@ -387,13 +423,28 @@ struct RcuState {
     worker_should_stop: AtomicBool,
     gp_active: AtomicBool,
     contexts: [RcuContextTracker; PerCpu::MAX_CPU_NUM as usize],
+    cpu_callbacks: Box<[RcuCpuCallbacks]>,
     inner: SpinLock<RcuStateInner>,
+    callback_ownership: SpinLock<()>,
+    executor_claimed: AtomicBool,
+    worker_kick_pending: AtomicBool,
+    next_scan_cpu: AtomicUsize,
+    callbacks_invoked: AtomicUsize,
+    barrier_mutex: Mutex<()>,
+    barrier_remaining: AtomicUsize,
+    barrier_wait: WaitQueue,
     state_wait: WaitQueue,
     worker_wait: WaitQueue,
 }
 
 impl RcuState {
     fn new() -> Self {
+        // Construct the cache-line-aligned per-CPU records directly in heap
+        // storage. Materializing the complete array in this function's stack
+        // frame can exhaust the BSP's fixed 32-KiB boot stack.
+        let mut cpu_callbacks = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
+        cpu_callbacks.resize_with(PerCpu::MAX_CPU_NUM as usize, RcuCpuCallbacks::new);
+
         Self {
             initialized: AtomicBool::new(false),
             worker_starting: AtomicBool::new(false),
@@ -401,7 +452,16 @@ impl RcuState {
             worker_should_stop: AtomicBool::new(false),
             gp_active: AtomicBool::new(false),
             contexts: [const { RcuContextTracker::new() }; PerCpu::MAX_CPU_NUM as usize],
+            cpu_callbacks: cpu_callbacks.into_boxed_slice(),
             inner: SpinLock::new(RcuStateInner::new()),
+            callback_ownership: SpinLock::new(()),
+            executor_claimed: AtomicBool::new(false),
+            worker_kick_pending: AtomicBool::new(false),
+            next_scan_cpu: AtomicUsize::new(0),
+            callbacks_invoked: AtomicUsize::new(0),
+            barrier_mutex: Mutex::new(()),
+            barrier_remaining: AtomicUsize::new(0),
+            barrier_wait: WaitQueue::default(),
             state_wait: WaitQueue::default(),
             worker_wait: WaitQueue::default(),
         }
@@ -417,6 +477,8 @@ impl RcuState {
             participating_context_snapshot,
             credit_context_progress_locked,
             publish_gp_active,
+            |completed| RCU_STATE.complete_callback_gp(completed),
+            |starting| RCU_STATE.prepare_callback_gp_start(starting),
         )
     }
 
@@ -425,6 +487,8 @@ impl RcuState {
         mut waiting_snapshot: impl FnMut(&CpuMask) -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
         mut credit_context: impl FnMut(&mut GracePeriodState),
         mut publish_active: impl FnMut(bool),
+        mut complete_callbacks: impl FnMut(RcuSequence) -> bool,
+        mut prepare_callbacks: impl FnMut(RcuSequence),
     ) -> bool {
         let mut ready_changed = false;
         loop {
@@ -434,8 +498,8 @@ impl RcuState {
                 // Pair all real quiescent-state reports with GP completion.
                 // This is a GP slow path and does not affect RCU readers.
                 fence(Ordering::SeqCst);
-                inner.gp.complete_ready();
-                ready_changed |= inner.has_ready_work();
+                let completed = inner.gp.complete_ready();
+                ready_changed |= complete_callbacks(completed);
                 continue;
             }
 
@@ -449,23 +513,135 @@ impl RcuState {
 
             // Admission/request operations preceding this point must be
             // ordered before the fresh CPU snapshot that defines GP start.
+            let starting = inner.gp.current().next();
+            prepare_callbacks(starting);
             publish_active(true);
             fence(Ordering::SeqCst);
             let (waiting_cpus, context_generations) = waiting_snapshot(&inner.participating_cpus);
-            inner.gp.start_requested(waiting_cpus, context_generations);
+            let started = inner.gp.start_requested(waiting_cpus, context_generations);
+            debug_assert_eq!(started, starting);
         }
 
         publish_active(inner.gp.is_active());
 
         debug_assert!(inner.gp.is_active() || !inner.gp.has_request());
-        debug_assert!(
-            inner.callback_queue.is_empty()
-                || inner.has_ready_work()
-                || inner.gp.is_active()
-                || inner.gp.has_request(),
-            "RCU callbacks exist without ready, active, or requested GP work"
-        );
         ready_changed
+    }
+
+    fn complete_callback_gp(&self, completed: RcuSequence) -> bool {
+        let _ownership = self.callback_ownership.lock_irqsave();
+        let mut became_ready = false;
+        for callbacks in &self.cpu_callbacks {
+            let ready = callbacks
+                .state
+                .lock_irqsave()
+                .segments
+                .complete_gp(completed);
+            if ready {
+                callbacks.publish_work();
+                became_ready = true;
+            }
+        }
+        became_ready
+    }
+
+    fn prepare_callback_gp_start(&self, starting: RcuSequence) {
+        let _ownership = self.callback_ownership.lock_irqsave();
+        for callbacks in &self.cpu_callbacks {
+            let mut state = callbacks.state.lock_irqsave();
+            state.segments.prepare_gp_start(starting);
+            let runnable = state.segments.has_ready() || state.segments.has_unclassified();
+            callbacks.needs_scan.store(runnable, Ordering::Release);
+        }
+    }
+
+    fn classify_new_callbacks(&self, inner: &mut RcuStateInner) -> bool {
+        let _ownership = self.callback_ownership.lock_irqsave();
+        let mut classified = false;
+        for callbacks in &self.cpu_callbacks {
+            // Only `next` admissions require classification, and enqueue
+            // publishes them through this persistent per-CPU predicate.
+            // Ready-only queues may still pass the filter, but idle and
+            // GP-blocked possible CPUs avoid an irqsave lock entirely.
+            if !callbacks.needs_scan.load(Ordering::Acquire) {
+                continue;
+            }
+            let mut state = callbacks.state.lock_irqsave();
+            if state.segments.has_unclassified() {
+                let target = inner.gp.request_future();
+                let active = inner.gp.is_active();
+                classified |= state.segments.classify_next(target, active);
+            }
+            let runnable = state.segments.has_ready() || state.segments.has_unclassified();
+            callbacks.needs_scan.store(runnable, Ordering::Release);
+        }
+        classified
+    }
+
+    /// Moves all queued callback segments while the caller holds the GP lock.
+    fn migrate_callback_segments(&self, source: usize, destination: usize) {
+        if source == destination {
+            return;
+        }
+
+        let _ownership = self.callback_ownership.lock_irqsave();
+        let (low, high) = if source < destination {
+            (source, destination)
+        } else {
+            (destination, source)
+        };
+        let mut low_state = self.cpu_callbacks[low].state.lock_irqsave();
+        let mut high_state = self.cpu_callbacks[high].state.lock_irqsave();
+
+        if source < destination {
+            high_state.segments.merge_from(&mut low_state.segments);
+        } else {
+            low_state.segments.merge_from(&mut high_state.segments);
+        }
+
+        let destination_state = if destination == low {
+            &*low_state
+        } else {
+            &*high_state
+        };
+        let destination_runnable =
+            destination_state.segments.has_ready() || destination_state.segments.has_unclassified();
+        self.cpu_callbacks[destination]
+            .needs_scan
+            .store(destination_runnable, Ordering::Release);
+
+        let source_state = if source == low {
+            &*low_state
+        } else {
+            &*high_state
+        };
+        let source_runnable =
+            source_state.segments.has_ready() || source_state.segments.has_unclassified();
+        self.cpu_callbacks[source]
+            .needs_scan
+            .store(source_runnable, Ordering::Release);
+    }
+
+    fn progress_callbacks_and_gps(&self) -> bool {
+        let mut inner = self.inner.lock_irqsave();
+        let mut ready_changed = Self::pump_grace_periods(&mut inner);
+        let classified = self.classify_new_callbacks(&mut inner);
+        if classified {
+            ready_changed |= Self::pump_grace_periods(&mut inner);
+        }
+        ready_changed
+    }
+
+    fn has_worker_work(&self) -> bool {
+        if self
+            .cpu_callbacks
+            .iter()
+            .any(|callbacks| callbacks.needs_scan.load(Ordering::Acquire))
+        {
+            return true;
+        }
+        let inner = self.inner.lock_irqsave();
+        inner.gp.ready_to_complete() || (!inner.gp.is_active() && inner.gp.has_request())
     }
 
     fn wake_state_waiters(&self) {
@@ -473,55 +649,120 @@ impl RcuState {
     }
 
     fn wake_worker(&self) {
-        self.worker_wait.wake_all();
+        // A single worker only needs one outstanding kick. Coalescing here
+        // keeps simultaneous per-CPU admissions from all serializing on the
+        // waitqueue's internal lock.
+        if !self.worker_kick_pending.swap(true, Ordering::AcqRel) {
+            self.worker_wait.wake_all();
+        }
+    }
+
+    fn wake_barrier_waiter_if_pending(&self) {
+        if self.barrier_remaining.load(Ordering::Acquire) != 0 {
+            self.barrier_wait.wake_all();
+        }
     }
 
     fn progress_and_drain_inline_if_no_worker(&self) {
         if self.worker_started.load(Ordering::Acquire) {
             return;
         }
-
-        self.process_ready_callbacks();
+        self.process_callback_batch();
     }
 
-    fn process_ready_callbacks(&self) {
-        {
-            let mut inner = self.inner.lock_irqsave();
-            Self::pump_grace_periods(&mut inner);
-            if !inner.has_ready_work() || !inner.callbacks.try_claim_drainer() {
-                return;
+    fn try_claim_executor(&self) -> Option<RcuExecutorGuard<'_>> {
+        self.executor_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| RcuExecutorGuard {
+                claimed: &self.executor_claimed,
+            })
+    }
+
+    fn pop_ready_round_robin(&self) -> Option<(usize, callback::ReadyRcuCallback)> {
+        let cpu_count = PerCpu::MAX_CPU_NUM as usize;
+        let start = self.next_scan_cpu.load(Ordering::Relaxed) % cpu_count;
+        for offset in 0..cpu_count {
+            let cpu = (start + offset) % cpu_count;
+            let callbacks = &self.cpu_callbacks[cpu];
+            // Most possible CPUs have no runnable callback. Avoid taking
+            // their queue locks on every callback in a busy CPU's batch; the
+            // flag is a persistent work predicate. Every false -> true
+            // publisher stores queue state first and then wakes the worker.
+            if !callbacks.needs_scan.load(Ordering::Acquire) {
+                continue;
+            }
+            let mut state = callbacks.state.lock_irqsave();
+            if let Some(callback) = state.segments.pop_ready() {
+                debug_assert!(!state.executing);
+                state.executing = true;
+                let more = state.segments.has_ready() || state.segments.has_unclassified();
+                callbacks.needs_scan.store(more, Ordering::Release);
+                self.next_scan_cpu
+                    .store((cpu + 1) % cpu_count, Ordering::Relaxed);
+                return Some((cpu, callback));
             }
         }
+        None
+    }
 
-        loop {
-            let next = {
-                let mut inner = self.inner.lock_irqsave();
-                let completed_gp = inner.gp.completed();
-                match inner.callback_queue.pop_ready(completed_gp) {
-                    Some(callback) => Some(callback),
-                    None => {
-                        inner.callbacks.release_drainer();
-                        None
-                    }
-                }
-            };
+    fn finish_callback(&self, cpu: usize) {
+        let callbacks = &self.cpu_callbacks[cpu];
+        let mut state = callbacks.state.lock_irqsave();
+        debug_assert!(state.executing);
+        state.executing = false;
+        let more = state.segments.has_ready() || state.segments.has_unclassified();
+        callbacks.needs_scan.store(more, Ordering::Release);
+    }
 
-            let Some(callback) = next else {
+    fn process_callback_batch(&self) -> usize {
+        let Some(_executor) = self.try_claim_executor() else {
+            self.wake_worker();
+            return 0;
+        };
+
+        self.progress_callbacks_and_gps();
+        // GP completion, including a completion credited from a context
+        // snapshot, may satisfy synchronize_rcu() even when no callback is
+        // ready. One wake per batch is sufficient.
+        self.wake_state_waiters();
+        let mut count = 0;
+        while count < RCU_CALLBACK_BATCH_LIMIT {
+            let Some((cpu, callback)) = self.pop_ready_round_robin() else {
                 break;
             };
-
             // SAFETY: `pop_ready()` detached the head, copied all state needed
             // after invocation, and released duplicate ownership. The unsafe
             // admission contract keeps the head valid until this call starts.
             unsafe { (callback.func)(callback.head) };
-
-            {
-                let mut inner = self.inner.lock_irqsave();
-                inner.callbacks.complete(callback.seq);
-            }
-
-            self.wake_state_waiters();
+            self.callbacks_invoked.fetch_add(1, Ordering::Relaxed);
+            self.finish_callback(cpu);
+            count += 1;
         }
+
+        let more = self.has_worker_work();
+        drop(_executor);
+        if more {
+            self.wake_worker();
+        }
+        // In the pre-worker boot window, the barrier waiter is itself the
+        // bounded inline executor. Wake it once per batch so markers behind
+        // more than one batch cannot stall indefinitely.
+        self.wake_barrier_waiter_if_pending();
+        if count != 0 {
+            cond_resched();
+        }
+        count
+    }
+}
+
+struct RcuExecutorGuard<'a> {
+    claimed: &'a AtomicBool,
+}
+
+impl Drop for RcuExecutorGuard<'_> {
+    fn drop(&mut self) {
+        self.claimed.store(false, Ordering::Release);
     }
 }
 
@@ -633,7 +874,7 @@ fn report_quiescent_state(cpu: ProcessorId) {
         let mut inner = RCU_STATE.inner.lock_irqsave();
         report_quiescent_state_locked(&mut inner, cpu);
         let ready_changed = RcuState::pump_grace_periods(&mut inner);
-        (ready_changed || inner.has_ready_work(), true)
+        (ready_changed, true)
     };
 
     if wake_waiters {
@@ -642,24 +883,18 @@ fn report_quiescent_state(cpu: ProcessorId) {
     if wake_worker {
         RCU_STATE.wake_worker();
     }
-}
-
-fn enqueue_callback_locked(
-    inner: &mut RcuStateInner,
-    head: NonNull<RcuHead>,
-    func: RcuRawCallback,
-) {
-    let target_gp = inner.gp.request_future();
-    let seq = inner.callbacks.admit();
-    inner.callback_queue.push(head, func, target_gp, seq);
+    RCU_STATE.wake_barrier_waiter_if_pending();
 }
 
 fn queue_raw_callback(head: NonNull<RcuHead>, func: RcuRawCallback) {
-    let wake_worker = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        enqueue_callback_locked(&mut inner, head, func);
-        inner.has_worker_work()
-    };
+    // Pin before selecting the queue. `lock_irqsave()` only disables
+    // preemption after a particular lock has already been selected.
+    let pin = PreemptGuard::new();
+    let cpu = smp_get_processor_id().data() as usize;
+    let callbacks = &RCU_STATE.cpu_callbacks[cpu];
+    callbacks.state.lock_irqsave().segments.enqueue(head, func);
+    let wake_worker = callbacks.publish_work();
+    drop(pin);
 
     if wake_worker {
         RCU_STATE.wake_worker();
@@ -734,7 +969,20 @@ fn worker_main() -> i32 {
                 return Some(());
             }
 
-            if RCU_STATE.inner.lock_irqsave().has_worker_work() {
+            if RCU_STATE.has_worker_work() {
+                return Some(());
+            }
+
+            // Retire the coalesced kick only after observing no work, then
+            // recheck. A publisher racing either side of this store will
+            // therefore be observed by the predicate or issue a fresh wake.
+            RCU_STATE
+                .worker_kick_pending
+                .store(false, Ordering::Release);
+            if RCU_STATE.worker_should_stop.load(Ordering::Acquire) {
+                return Some(());
+            }
+            if RCU_STATE.has_worker_work() {
                 return Some(());
             }
 
@@ -745,7 +993,7 @@ fn worker_main() -> i32 {
             break;
         }
 
-        RCU_STATE.process_ready_callbacks();
+        RCU_STATE.process_callback_batch();
     }
 
     {
@@ -1059,39 +1307,55 @@ pub fn rcu_barrier() {
         debug_assert!(!rcu_read_lock_held());
     }
 
-    let target_cb = {
-        let inner = RCU_STATE.inner.lock_irqsave();
-        inner.callbacks.barrier_target()
-    };
+    let _barrier = RCU_STATE.barrier_mutex.lock();
+    debug_assert_eq!(RCU_STATE.barrier_remaining.load(Ordering::Acquire), 0);
+    RCU_STATE.barrier_remaining.store(1, Ordering::Release);
 
-    let Some(target_cb) = target_cb else {
-        return;
-    };
-
-    loop {
-        RCU_STATE.progress_and_drain_inline_if_no_worker();
-
-        let done = {
-            let inner = RCU_STATE.inner.lock_irqsave();
-            inner.callbacks.has_completed(target_cb)
-        };
-        if done {
-            return;
-        }
-
-        RCU_STATE.state_wait.wait_until(|| {
-            RCU_STATE.progress_and_drain_inline_if_no_worker();
-            let completed = RCU_STATE
-                .inner
-                .lock_irqsave()
-                .callbacks
-                .has_completed(target_cb);
-            if completed {
-                Some(())
-            } else {
-                None
+    {
+        // Keep ownership stable across the complete scan. Otherwise a CPU
+        // migration could move callbacks from an unscanned source into an
+        // already-scanned destination.
+        let _ownership = RCU_STATE.callback_ownership.lock_irqsave();
+        for callbacks in &RCU_STATE.cpu_callbacks {
+            let mut state = callbacks.state.lock_irqsave();
+            if state.segments.is_empty() && !state.executing {
+                continue;
             }
-        });
+
+            if !callbacks.barrier_head.try_claim() {
+                panic!("RCU barrier head was already queued");
+            }
+            RCU_STATE.barrier_remaining.fetch_add(1, Ordering::AcqRel);
+            let marker = NonNull::from(&callbacks.barrier_head);
+            if !state.segments.entrain(marker, rcu_barrier_callback) {
+                debug_assert!(state.executing);
+                state.segments.push_done(marker, rcu_barrier_callback);
+            }
+            if state.segments.has_ready() || state.segments.has_unclassified() {
+                callbacks.publish_work();
+            }
+        }
+    }
+
+    // Drop the setup sentinel only after every queue has been inspected.
+    if RCU_STATE.barrier_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+        fence(Ordering::SeqCst);
+        return;
+    }
+
+    RCU_STATE.wake_worker();
+    RCU_STATE.barrier_wait.wait_until(|| {
+        RCU_STATE.progress_and_drain_inline_if_no_worker();
+        (RCU_STATE.barrier_remaining.load(Ordering::Acquire) == 0).then_some(())
+    });
+    fence(Ordering::SeqCst);
+}
+
+unsafe fn rcu_barrier_callback(_head: NonNull<RcuHead>) {
+    let previous = RCU_STATE.barrier_remaining.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0, "RCU barrier callback count underflow");
+    if previous == 1 {
+        RCU_STATE.barrier_wait.wake_all();
     }
 }
 
@@ -1142,12 +1406,16 @@ fn note_context_eqs_transition(transition: ContextTransition) {
             (false, false)
         } else {
             let ready_changed = RcuState::pump_grace_periods(&mut inner);
-            (true, ready_changed || inner.has_ready_work())
+            (true, ready_changed)
         }
     };
 
     if wake_waiters {
         RCU_STATE.wake_state_waiters();
+        // Before the callback worker starts, rcu_barrier() is the bounded
+        // inline executor. An EQS transition may be the final GP holdout, so
+        // it must wake that executor just like report_qs() and cpu_dying().
+        RCU_STATE.wake_barrier_waiter_if_pending();
     }
     if wake_worker {
         RCU_STATE.wake_worker();
@@ -1280,26 +1548,100 @@ pub fn cpu_dying(cpu: ProcessorId) {
         let mut inner = RCU_STATE.inner.lock_irqsave();
         cpu_dying_locked(&mut inner, cpu);
         RCU_STATE.contexts[cpu.data() as usize].clear_gp_report();
-        let ready_changed = RcuState::pump_grace_periods(&mut inner);
-        ready_changed || inner.has_ready_work()
+        let mut ready_changed = RcuState::pump_grace_periods(&mut inner);
+        let classified = RCU_STATE.classify_new_callbacks(&mut inner);
+        if classified {
+            ready_changed |= RcuState::pump_grace_periods(&mut inner);
+        }
+
+        // `cpu_dying_locked()` removed the source from the authoritative RCU
+        // admission set. Select the destination from that same set while the
+        // GP lock is held, so lifecycle state and queue ownership cannot
+        // disagree. If this is the final participant, the global executor can
+        // still drain the stable source record without migrating it.
+        if let Some(destination) = inner.participating_cpus.iter_cpu().next() {
+            RCU_STATE.migrate_callback_segments(cpu.data() as usize, destination.data() as usize);
+        }
+
+        ready_changed
+            || RCU_STATE
+                .cpu_callbacks
+                .iter()
+                .any(|callbacks| callbacks.needs_scan.load(Ordering::Acquire))
     };
 
     RCU_STATE.wake_state_waiters();
     if wake_worker {
         RCU_STATE.wake_worker();
     }
+    RCU_STATE.wake_barrier_waiter_if_pending();
 }
 
 #[allow(dead_code)]
 pub fn debug_snapshot() -> (u64, u64, u64, usize, bool) {
     let inner = RCU_STATE.inner.lock_irqsave();
+    let (aggregate, _) = callback_queue_depth_snapshot();
     (
         inner.gp.current().raw(),
         inner.gp.completed().raw(),
-        inner.callbacks.completed_raw(),
-        inner.callback_queue.len(),
-        inner.has_ready_work(),
+        RCU_STATE.callbacks_invoked.load(Ordering::Relaxed) as u64,
+        aggregate.total(),
+        aggregate.done != 0,
     )
+}
+
+pub(crate) fn callback_queue_depth_snapshot() -> (
+    RcuCallbackQueueDepth,
+    [RcuCallbackQueueDepth; PerCpu::MAX_CPU_NUM as usize],
+) {
+    let mut aggregate = RcuCallbackQueueDepth::default();
+    let mut per_cpu = [RcuCallbackQueueDepth::default(); PerCpu::MAX_CPU_NUM as usize];
+    for (cpu, callbacks) in RCU_STATE.cpu_callbacks.iter().enumerate() {
+        let depth = callbacks.state.lock_irqsave().depth();
+        per_cpu[cpu] = depth;
+        aggregate.add_assign(depth);
+    }
+    (aggregate, per_cpu)
+}
+
+pub(crate) fn callback_queue_debug_report() -> String {
+    let (aggregate, per_cpu) = callback_queue_depth_snapshot();
+    let mut report = String::new();
+    writeln!(
+        report,
+        "aggregate total={} done={} wait={} next_ready={} next={} executing={}",
+        aggregate.total(),
+        aggregate.done,
+        aggregate.wait,
+        aggregate.next_ready,
+        aggregate.next,
+        usize::from(aggregate.executing),
+    )
+    .expect("writing RCU callback snapshot to String failed");
+
+    for (cpu, depth) in per_cpu.iter().copied().enumerate() {
+        let present = !smp_cpu_manager_initialized()
+            || smp_cpu_manager()
+                .present_cpus()
+                .get(ProcessorId::new(cpu as u32))
+                .unwrap_or(false);
+        if !present && depth.total() == 0 && !depth.executing {
+            continue;
+        }
+        writeln!(
+            report,
+            "cpu={} total={} done={} wait={} next_ready={} next={} executing={}",
+            cpu,
+            depth.total(),
+            depth.done,
+            depth.wait,
+            depth.next_ready,
+            depth.next,
+            usize::from(depth.executing),
+        )
+        .expect("writing RCU per-CPU callback snapshot to String failed");
+    }
+    report
 }
 
 #[allow(dead_code)]

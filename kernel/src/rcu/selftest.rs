@@ -10,10 +10,14 @@ use crate::{
     exception::InterruptArch,
     ipc::sighand::SigHand,
     libs::{
+        cpumask::CpuMask,
         notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
         spinlock::SpinLock,
     },
-    process::kthread::{KernelThreadClosure, KernelThreadMechanism},
+    process::{
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
+        ProcessManager,
+    },
     sched::completion::Completion,
     smp::cpu::{smp_cpu_manager, ProcessorId},
 };
@@ -125,6 +129,217 @@ unsafe fn rcu_selftest_callback(head: NonNull<RcuHead>) {
     probe.hits.fetch_add(1, Ordering::SeqCst);
 }
 
+fn queue_callback_probe(hits: Arc<AtomicUsize>) {
+    let probe = Box::into_raw(Box::new(RcuSelftestCallbackProbe {
+        head: RcuHead::new(),
+        hits,
+    }));
+    // SAFETY: the callback owns the stable Box and reconstructs it exactly
+    // once after admission has detached the embedded head.
+    unsafe {
+        call_rcu_raw(
+            NonNull::new_unchecked(ptr::addr_of_mut!((*probe).head)),
+            rcu_selftest_callback,
+        );
+    }
+}
+
+fn run_callback_flood_selftest() -> Result<(), &'static str> {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let callbacks = RCU_CALLBACK_BATCH_LIMIT * 2 + 1;
+    for _ in 0..callbacks {
+        queue_callback_probe(hits.clone());
+    }
+    rcu_barrier();
+    if hits.load(Ordering::SeqCst) != callbacks {
+        return Err("RCU callback flood did not drain across bounded batches");
+    }
+    Ok(())
+}
+
+fn run_smp_callback_barrier_selftest() -> Result<(), &'static str> {
+    let cpus: Vec<ProcessorId> = smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .filter(|cpu| smp_cpu_manager().is_online_cpu(*cpu))
+        .collect();
+    if cpus.is_empty() {
+        return Err("RCU SMP callback selftest found no online CPU");
+    }
+
+    const CALLBACKS_PER_CPU: usize = 9;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(Completion::new());
+    let start = Arc::new(Completion::new());
+    let first_admitted = Arc::new(Completion::new());
+    let continue_enqueue = Arc::new(Completion::new());
+    let done = Arc::new(Completion::new());
+    let mut workers = Vec::new();
+
+    for cpu in cpus.iter().copied() {
+        let thread_hits = hits.clone();
+        let thread_ready = ready.clone();
+        let thread_start = start.clone();
+        let thread_first_admitted = first_admitted.clone();
+        let thread_continue = continue_enqueue.clone();
+        let thread_done = done.clone();
+        let closure = KernelThreadClosure::EmptyClosure((
+            Box::new(move || {
+                thread_ready.complete();
+                if thread_start.wait_for_completion().is_err() {
+                    thread_done.complete();
+                    return 1;
+                }
+
+                queue_callback_probe(thread_hits.clone());
+                thread_first_admitted.complete();
+                if thread_continue.wait_for_completion().is_err() {
+                    thread_done.complete();
+                    return 1;
+                }
+                for _ in 1..CALLBACKS_PER_CPU {
+                    queue_callback_probe(thread_hits.clone());
+                }
+                thread_done.complete();
+                0
+            }),
+            (),
+        ));
+        let Some(worker) = KernelThreadMechanism::create_on_cpu(
+            closure,
+            format!("rcu-callback-cpu{}", cpu.data()),
+            cpu,
+        ) else {
+            start.complete_all();
+            continue_enqueue.complete_all();
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback selftest could not create a worker");
+        };
+        if ProcessManager::wakeup(&worker).is_err() {
+            start.complete_all();
+            continue_enqueue.complete_all();
+            let _ = KernelThreadMechanism::stop(&worker);
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback selftest could not wake a worker");
+        }
+        workers.push(worker);
+    }
+
+    for _ in &workers {
+        if ready.wait_for_completion().is_err() {
+            start.complete_all();
+            continue_enqueue.complete_all();
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback workers did not reach their start gate");
+        }
+    }
+    start.complete_all();
+    for _ in &workers {
+        if first_admitted.wait_for_completion().is_err() {
+            continue_enqueue.complete_all();
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback workers did not admit their first callback");
+        }
+    }
+
+    // Every CPU now owns a callback ahead of its barrier marker. Release the
+    // remaining admissions immediately before the barrier to exercise its
+    // ownership scan concurrently with enqueue.
+    continue_enqueue.complete_all();
+    rcu_barrier();
+    for _ in &workers {
+        if done.wait_for_completion().is_err() {
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback workers did not finish enqueue");
+        }
+    }
+    rcu_barrier();
+
+    let mut stopped = true;
+    for worker in &workers {
+        stopped &= KernelThreadMechanism::stop(worker).is_ok();
+    }
+    if !stopped {
+        return Err("RCU SMP callback selftest could not stop its workers");
+    }
+    if hits.load(Ordering::SeqCst) != workers.len() * CALLBACKS_PER_CPU {
+        return Err("RCU SMP callback/barrier selftest lost an admitted callback");
+    }
+    Ok(())
+}
+
+fn run_concurrent_barrier_selftest() -> Result<(), &'static str> {
+    let hits = Arc::new(AtomicUsize::new(0));
+    for _ in 0..(RCU_CALLBACK_BATCH_LIMIT + 1) {
+        queue_callback_probe(hits.clone());
+    }
+
+    let ready = Arc::new(Completion::new());
+    let start = Arc::new(Completion::new());
+    let done = Arc::new(Completion::new());
+    let spawn = |name: &'static str| {
+        let ready = ready.clone();
+        let start = start.clone();
+        let done = done.clone();
+        KernelThreadMechanism::create_and_run(
+            KernelThreadClosure::EmptyClosure((
+                Box::new(move || {
+                    ready.complete();
+                    if start.wait_for_completion().is_err() {
+                        done.complete();
+                        return 1;
+                    }
+                    rcu_barrier();
+                    done.complete();
+                    0
+                }),
+                (),
+            )),
+            name.into(),
+        )
+    };
+
+    let first = spawn("rcu-barrier-a")
+        .ok_or("concurrent barrier selftest could not create its first worker")?;
+    let Some(second) = spawn("rcu-barrier-b") else {
+        start.complete_all();
+        let _ = KernelThreadMechanism::stop(&first);
+        return Err("concurrent barrier selftest could not create its second worker");
+    };
+    if ready.wait_for_completion().is_err() || ready.wait_for_completion().is_err() {
+        start.complete_all();
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&second);
+        return Err("concurrent barrier workers did not reach their start gate");
+    }
+    start.complete_all();
+    if done.wait_for_completion().is_err() || done.wait_for_completion().is_err() {
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&second);
+        return Err("concurrent barrier workers did not finish");
+    }
+
+    let first_stopped = KernelThreadMechanism::stop(&first).is_ok();
+    let second_stopped = KernelThreadMechanism::stop(&second).is_ok();
+    if !first_stopped || !second_stopped {
+        return Err("concurrent barrier selftest could not stop its workers");
+    }
+    if hits.load(Ordering::SeqCst) != RCU_CALLBACK_BATCH_LIMIT + 1 {
+        return Err("concurrent barriers returned before their callback prefixes drained");
+    }
+    Ok(())
+}
+
 #[repr(C)]
 struct RcuSelftestRequeueProbe {
     head: RcuHead,
@@ -212,10 +427,14 @@ fn run_duplicate_claim_selftest() -> Result<(), &'static str> {
 fn run_pr1_selftest() -> Result<(), &'static str> {
     gp::run_state_machine_selftests()?;
     context::run_context_selftests()?;
+    callback::run_segmented_callback_selftests()?;
     run_callback_generation_selftest()?;
     run_duplicate_claim_selftest()?;
     run_cpu_hotplug_lifecycle_selftest()?;
     run_cpu_hotplug_concurrent_selftest()?;
+    run_callback_flood_selftest()?;
+    run_smp_callback_barrier_selftest()?;
+    run_concurrent_barrier_selftest()?;
 
     if ProcessManager::current_pcb().rcu_read_depth() != 0 {
         return Err("initial rcu_read_depth was not zero");
@@ -403,6 +622,7 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     let cpu0 = ProcessorId::new(0);
     let cpu1 = ProcessorId::new(1);
     let mut inner = RcuStateInner::new();
+    let mut callbacks = RcuSegmentedCallbacks::new();
     let first_head = RcuHead::new();
     let second_head = RcuHead::new();
 
@@ -418,33 +638,34 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     if !first_head.try_claim() || !second_head.try_claim() {
         return Err("fresh callback generation heads could not be claimed");
     }
-    enqueue_callback_locked(&mut inner, NonNull::from(&first_head), noop_callback);
-    enqueue_callback_locked(&mut inner, NonNull::from(&second_head), noop_callback);
-
+    callbacks.enqueue(NonNull::from(&first_head), noop_callback);
+    callbacks.enqueue(NonNull::from(&second_head), noop_callback);
     let expected_second_gp = first_gp.next();
-    if inner.callback_queue.len() != 2
-        || inner.callback_queue.front_target() != Some(expected_second_gp)
+    let requested_second_gp = inner.gp.request_future();
+    if requested_second_gp != expected_second_gp
+        || !callbacks.classify_next(requested_second_gp, true)
+        || callbacks.depth().next_ready != 2
     {
         return Err("callback admitted during an active GP targeted the wrong generation");
     }
-    if inner.has_worker_work() {
+    if callbacks.has_ready() || callbacks.has_unclassified() {
         return Err("worker would spin on a future GP blocked by the active waiting mask");
     }
 
     if !inner.gp.report_quiescent_state(cpu0) {
         return Err("callback generation selftest could not complete its first waiting mask");
     }
-    let first_ready_changed = RcuState::pump_grace_periods_with(
-        &mut inner,
-        |_| (CpuMask::from_cpu(cpu1), [0; PerCpu::MAX_CPU_NUM as usize]),
-        |_| {},
-        |_| {},
-    );
-    if first_ready_changed
-        || inner.gp.completed() != first_gp
+    if inner.gp.complete_ready() != first_gp || callbacks.complete_gp(first_gp) {
+        return Err("callbacks became ready during the GP that preceded admission");
+    }
+    callbacks.prepare_gp_start(expected_second_gp);
+    if inner
+        .gp
+        .start_requested(CpuMask::from_cpu(cpu1), [0; PerCpu::MAX_CPU_NUM as usize])
+        != expected_second_gp
         || !inner.gp.is_waiting_for(cpu1)
-        || inner.callback_queue.len() != 2
-        || inner.has_ready_work()
+        || callbacks.depth().wait != 2
+        || callbacks.has_ready()
     {
         return Err("callbacks became ready before their post-admission GP completed");
     }
@@ -452,41 +673,42 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     if !inner.gp.report_quiescent_state(cpu1) {
         return Err("callback generation selftest could not complete its second waiting mask");
     }
-    let second_ready_changed = RcuState::pump_grace_periods_with(
-        &mut inner,
-        |_| (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
-        |_| {},
-        |_| {},
-    );
-    if !second_ready_changed
-        || inner.gp.completed() != expected_second_gp
-        || inner.callback_queue.len() != 2
-        || !inner.has_ready_work()
+    if inner.gp.complete_ready() != expected_second_gp
+        || !callbacks.complete_gp(expected_second_gp)
+        || callbacks.depth().done != 2
+        || !callbacks.has_ready()
     {
         return Err("callbacks did not become ready after their target GP completed");
     }
-    if !inner.has_worker_work() {
-        return Err("worker did not recognize a ready intrusive callback");
-    }
 
-    let completed_gp = inner.gp.completed();
-    let first_callback = inner.callback_queue.pop_ready(completed_gp).unwrap();
-    let second_callback = inner.callback_queue.pop_ready(completed_gp).unwrap();
-    if second_callback.seq != first_callback.seq.next() {
+    let first_callback = callbacks.pop_ready().unwrap();
+    let second_callback = callbacks.pop_ready().unwrap();
+    if first_callback.head != NonNull::from(&first_head)
+        || second_callback.head != NonNull::from(&second_head)
+    {
         return Err("callback generation transition did not preserve admission FIFO");
     }
-    if !inner.callback_queue.is_empty() {
+    if !callbacks.is_empty() {
         return Err("callback generation transition did not drain its FIFO");
     }
 
     Ok(())
 }
 
+fn pump_cpu_lifecycle_model(inner: &mut RcuStateInner) -> bool {
+    RcuState::pump_grace_periods_with(
+        inner,
+        |participants| (participants.clone(), [0; PerCpu::MAX_CPU_NUM as usize]),
+        |_| {},
+        |_| {},
+        |_| false,
+        |_| {},
+    )
+}
+
 fn run_cpu_hotplug_lifecycle_selftest() -> Result<(), &'static str> {
     let cpu = ProcessorId::new(PerCpu::MAX_CPU_NUM - 1);
     let incoming = ProcessorId::new(PerCpu::MAX_CPU_NUM - 2);
-    let snapshot =
-        |participants: &CpuMask| (participants.clone(), [0; PerCpu::MAX_CPU_NUM as usize]);
     let mut inner = RcuStateInner::new();
 
     if !prepare_cpu_starting_locked(&inner, cpu) {
@@ -496,14 +718,14 @@ fn run_cpu_hotplug_lifecycle_selftest() -> Result<(), &'static str> {
     // BSP publication of Starting does not admit an AP that has not executed
     // its local RCU starting hook.
     let before_ap_runs = inner.gp.request_future();
-    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    pump_cpu_lifecycle_model(&mut inner);
     if !inner.gp.has_completed(before_ap_runs) || inner.gp.is_waiting_for(cpu) {
         return Err("RCU waited for a Starting CPU before its AP-side hook");
     }
 
     cpu_starting_locked(&mut inner, cpu);
     let after_ap_runs = inner.gp.request_future();
-    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    pump_cpu_lifecycle_model(&mut inner);
     if !inner.gp.is_waiting_for(cpu) || inner.gp.has_completed(after_ap_runs) {
         return Err("RCU did not admit a CPU after its AP-side starting hook");
     }
@@ -527,7 +749,7 @@ fn run_cpu_hotplug_lifecycle_selftest() -> Result<(), &'static str> {
     // existing responsibility under the same lock, and the next GP snapshot
     // must not add it back.
     cpu_dying_locked(&mut inner, cpu);
-    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    pump_cpu_lifecycle_model(&mut inner);
     if inner.gp.is_waiting_for(cpu)
         || !inner.gp.is_waiting_for(incoming)
         || inner.gp.has_completed(next_gp)
@@ -536,7 +758,7 @@ fn run_cpu_hotplug_lifecycle_selftest() -> Result<(), &'static str> {
     }
 
     cpu_dying_locked(&mut inner, incoming);
-    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+    pump_cpu_lifecycle_model(&mut inner);
     if !inner.gp.has_completed(next_gp) {
         return Err("CPU Dying did not complete the GP it was responsible for");
     }
@@ -550,40 +772,15 @@ fn run_cpu_hotplug_lifecycle_selftest() -> Result<(), &'static str> {
         }
         cpu_starting_locked(&mut inner, cpu);
         let target = inner.gp.request_future();
-        RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+        pump_cpu_lifecycle_model(&mut inner);
         if !inner.gp.is_waiting_for(cpu) {
             return Err("repeated RCU lifecycle did not admit its online CPU");
         }
         cpu_dying_locked(&mut inner, cpu);
-        RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
+        pump_cpu_lifecycle_model(&mut inner);
         if !inner.gp.has_completed(target) || inner.gp.is_waiting_for(cpu) {
             return Err("repeated RCU lifecycle leaked a GP holdout");
         }
-    }
-
-    // Queue ownership and barrier tickets remain global while Dying advances
-    // the target GP. The bound worker invariant covers the later execution.
-    cpu_starting_locked(&mut inner, cpu);
-    unsafe fn noop_callback(_head: NonNull<RcuHead>) {}
-    let callback_head = RcuHead::new();
-    if !callback_head.try_claim() {
-        return Err("fresh hotplug callback head could not be claimed");
-    }
-    enqueue_callback_locked(&mut inner, NonNull::from(&callback_head), noop_callback);
-    let barrier_target = inner
-        .callbacks
-        .barrier_target()
-        .ok_or("hotplug callback did not create a barrier target")?;
-    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
-    cpu_dying_locked(&mut inner, cpu);
-    RcuState::pump_grace_periods_with(&mut inner, snapshot, |_| {}, |_| {});
-    let callback = inner
-        .callback_queue
-        .pop_ready(inner.gp.completed())
-        .ok_or("Dying CPU did not advance its pending callback")?;
-    inner.callbacks.complete(callback.seq);
-    if !inner.callbacks.has_completed(barrier_target) {
-        return Err("callback barrier ticket was lost across CPU Dying");
     }
 
     Ok(())

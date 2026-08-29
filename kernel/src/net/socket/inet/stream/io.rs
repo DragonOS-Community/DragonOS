@@ -322,27 +322,16 @@ impl TcpSocket {
             self.notify();
         }
 
-        if let Some(iface) = self
-            .inner
-            .read()
-            .as_ref()
-            .and_then(|inner| inner.iface())
-            .cloned()
-        {
+        if let Some(iface) = self.stack_poll_iface_snapshot() {
             // After a successful TCP recv() we may have just freed a significant portion of the
             // receive window. On loopback/blocking-large-send paths, sender progress depends on
             // promptly turning that freed window into ACK/window-update processing and sender-side
             // wakeups. A single poll is not always enough to complete the roundtrip, so mirror the
             // send path and drive the stack until quiescent.
-            if !matches!(
-                self.inner.read().as_ref(),
-                Some(inner::Inner::SelfConnected(_))
-            ) {
-                if let Some(netns) = iface.common().net_namespace() {
-                    netns.wakeup_poll_thread();
-                }
-                super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+            if let Some(netns) = iface.common().net_namespace() {
+                netns.wakeup_poll_thread();
             }
+            super::poll_util::poll_iface_until_quiescent(iface.as_ref());
         }
     }
 
@@ -356,23 +345,11 @@ impl TcpSocket {
         loop {
             // SelfConnected does not rely on protocol-stack progress; avoid calling iface.poll()
             // here to prevent hangs when running the whole syscall test suite.
-            let skip_iface_poll = matches!(
-                self.inner.read().as_ref(),
-                Some(inner::Inner::SelfConnected(_))
-            );
-            if !skip_iface_poll {
-                if let Some(iface) = self
-                    .inner
-                    .read()
-                    .as_ref()
-                    .and_then(|inner| inner.iface())
-                    .cloned()
-                {
-                    if let Some(netns) = iface.common().net_namespace() {
-                        netns.wakeup_poll_thread();
-                    }
-                    super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+            if let Some(iface) = self.stack_poll_iface_snapshot() {
+                if let Some(netns) = iface.common().net_namespace() {
+                    netns.wakeup_poll_thread();
                 }
+                super::poll_util::poll_iface_until_quiescent(iface.as_ref());
             }
 
             let iter_result = match self
@@ -479,23 +456,11 @@ impl TcpSocket {
         let mut total_read = 0usize;
 
         loop {
-            let skip_iface_poll = matches!(
-                self.inner.read().as_ref(),
-                Some(inner::Inner::SelfConnected(_))
-            );
-            if !skip_iface_poll {
-                if let Some(iface) = self
-                    .inner
-                    .read()
-                    .as_ref()
-                    .and_then(|inner| inner.iface())
-                    .cloned()
-                {
-                    if let Some(netns) = iface.common().net_namespace() {
-                        netns.wakeup_poll_thread();
-                    }
-                    super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+            if let Some(iface) = self.stack_poll_iface_snapshot() {
+                if let Some(netns) = iface.common().net_namespace() {
+                    netns.wakeup_poll_thread();
                 }
+                super::poll_util::poll_iface_until_quiescent(iface.as_ref());
             }
 
             let iter_result = match self
@@ -588,8 +553,7 @@ impl TcpSocket {
         loop {
             match self.try_read_to_user_buffer(user_buffer) {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
-                    {
+                    if let Some(iface) = self.stack_poll_iface_snapshot() {
                         super::poll_util::poll_iface_until_quiescent(iface.as_ref());
                     }
                     let events = self.check_io_event();
@@ -736,14 +700,20 @@ impl TcpSocket {
 
     fn try_send_direct(&self, buf: &[u8]) -> Result<usize, SystemError> {
         // Self-connect fast path: avoid smoltcp and iface polling.
-        {
+        let self_connected_result = {
             let inner_guard = self.inner.read();
             if let Some(inner::Inner::SelfConnected(sc)) = inner_guard.as_ref() {
-                let n = sc.send_slice(buf, self.is_send_shutdown())?;
-                // Wake reader (same fd in another thread) and refresh events.
-                self.notify();
-                return Ok(n);
+                Some(sc.send_slice(buf, self.is_send_shutdown()))
+            } else {
+                None
             }
+        };
+        if let Some(result) = self_connected_result {
+            let n = result?;
+            // Wake reader (same fd in another thread) and refresh events. `inner_guard`
+            // must be gone because notify() refreshes events by reading `inner` again.
+            self.notify();
+            return Ok(n);
         }
         // TODO: add nonblock check of connecting socket
         //
@@ -752,12 +722,7 @@ impl TcpSocket {
         // - poll BEFORE sending: to drain acks/advance state and make more send capacity available
         // - poll AFTER sending: to actually transmit queued segments and process immediate loopback delivery
         // Additionally, wake the netns poll thread so timers/retransmits can progress even if callers sleep.
-        let maybe_iface = self
-            .inner
-            .read()
-            .as_ref()
-            .and_then(|inner| inner.iface())
-            .cloned();
+        let maybe_iface = self.stack_poll_iface_snapshot();
         if let Some(iface) = maybe_iface.as_ref() {
             if let Some(netns) = iface.common().net_namespace() {
                 netns.wakeup_poll_thread();

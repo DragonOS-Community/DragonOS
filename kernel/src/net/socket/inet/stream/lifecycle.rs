@@ -213,20 +213,26 @@ impl TcpSocket {
     pub fn try_accept(&self) -> Result<(Arc<TcpSocket>, smoltcp::wire::IpEndpoint), SystemError> {
         // 主动推进协议栈：避免依赖后台 poll 线程，保证 accept 在无事件通知场景下也能前进。
         // For INADDR_ANY listeners, poll all interfaces that have listen sockets.
-        {
+        let ifaces = {
             let reader = self.inner.read();
             if let Some(inner::Inner::Listening(listening)) = reader.as_ref() {
-                let mut polled_nics: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                let mut ifaces: alloc::vec::Vec<Arc<dyn crate::net::Iface>> =
+                    alloc::vec::Vec::new();
                 for b in &listening.inners {
                     let nic_id = b.iface().nic_id();
-                    if !polled_nics.contains(&nic_id) {
-                        b.iface().poll();
-                        polled_nics.push(nic_id);
+                    if !ifaces.iter().any(|iface| iface.nic_id() == nic_id) {
+                        ifaces.push(b.iface().clone());
                     }
                 }
+                ifaces
             } else if let Some(iface) = reader.as_ref().and_then(|inner| inner.iface()).cloned() {
-                iface.poll();
+                alloc::vec![iface]
+            } else {
+                alloc::vec::Vec::new()
             }
+        };
+        for iface in ifaces {
+            iface.poll();
         }
 
         match self
@@ -377,13 +383,7 @@ impl TcpSocket {
 
     pub fn check_connect(&self) -> Result<(), SystemError> {
         // 主动推进协议栈：connect 阻塞等待期间也要持续 poll，否则状态不会从 Connecting 前进。
-        if let Some(iface) = self
-            .inner
-            .read()
-            .as_ref()
-            .and_then(|inner| inner.iface())
-            .cloned()
-        {
+        if let Some(iface) = self.stack_poll_iface_snapshot() {
             iface.poll();
         }
 

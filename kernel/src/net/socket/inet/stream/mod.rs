@@ -202,8 +202,7 @@ impl Socket for TcpSocket {
                     // - Poll 1: TX sends data to loopback queue, RX processes existing packets
                     // - Poll 2: RX processes the data we just transmitted (loopback roundtrip)
                     // Without this loop, we'd wait for the poll thread to complete the roundtrip.
-                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
-                    {
+                    if let Some(iface) = self.stack_poll_iface_snapshot() {
                         poll_util::poll_iface_until_quiescent(iface.as_ref());
                     }
                     // 与 connect() 同理，不能只依赖缓存的 pollee 位。
@@ -291,8 +290,7 @@ impl Socket for TcpSocket {
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
-                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
-                    {
+                    if let Some(iface) = self.stack_poll_iface_snapshot() {
                         poll_util::poll_iface_until_quiescent(iface.as_ref());
                     }
 

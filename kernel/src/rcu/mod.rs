@@ -14,14 +14,14 @@
 //! the happens-before chain from callback admission to callback invocation or
 //! `synchronize_rcu()` return.
 
-use alloc::{boxed::Box, collections::VecDeque, rc::Rc, string::ToString, sync::Arc};
+use alloc::{boxed::Box, rc::Rc, string::ToString, sync::Arc};
 use core::{
     marker::PhantomData,
     ptr::{self, NonNull},
     sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering},
 };
 
-use log::{error, warn};
+use log::warn;
 
 use crate::{
     libs::{cpumask::CpuMask, spinlock::SpinLock, wait_queue::WaitQueue},
@@ -34,40 +34,20 @@ use crate::{
     },
 };
 
+mod callback;
 mod context;
 mod gp;
 mod selftest;
+use callback::RcuCallbackList;
+pub use callback::RcuHead;
 use context::{
     BaseContext, ContextTransition, ContextTransitionError, IdleTransition, IrqDisposition,
     IrqEntry, RcuContextTracker,
 };
-use gp::{CallbackTracker, GracePeriodState, RcuSequence};
+use gp::{CallbackTracker, GracePeriodState};
 pub use selftest::run_debug_selftests;
 
 pub(crate) type RcuRawCallback = unsafe fn(NonNull<RcuHead>);
-
-#[derive(Clone, Copy)]
-struct QueuedRcuHead(NonNull<RcuHead>);
-
-// SAFETY: the wrapped head is an opaque token that may be transferred to the
-// RCU worker thread after `call_rcu_raw()` publishes it. The caller must keep
-// the underlying allocation alive until the callback runs, and the token is not
-// dereferenced except when the worker invokes that callback after a grace
-// period.
-unsafe impl Send for QueuedRcuHead {}
-
-#[derive(Debug)]
-pub struct RcuHead {
-    queued: AtomicBool,
-}
-
-impl RcuHead {
-    pub const fn new() -> Self {
-        Self {
-            queued: AtomicBool::new(false),
-        }
-    }
-}
 
 pub struct RcuReadGuard {
     active: bool,
@@ -108,20 +88,12 @@ impl Drop for RcuReadGuard {
     }
 }
 
-trait DeferredCall: Send {
-    fn invoke(self: Box<Self>);
-}
-
-impl<F> DeferredCall for F
-where
-    F: FnOnce() + Send,
-{
-    fn invoke(self: Box<Self>) {
-        (*self)();
-    }
-}
-
 #[derive(Debug)]
+/// An RCU-published non-null `Arc` slot.
+///
+/// Deferred updates and destruction allocate callback storage, so this type
+/// must be updated and dropped only from a task context where allocation is
+/// permitted. Its read-side operations do not inherit that restriction.
 pub struct RcuArcSlot<T>
 where
     T: Send + Sync + 'static,
@@ -238,6 +210,11 @@ where
 }
 
 #[derive(Debug)]
+/// An RCU-published optional `Arc` slot.
+///
+/// Deferred updates and destruction allocate callback storage, so this type
+/// must be updated and dropped only from a task context where allocation is
+/// permitted. Its read-side operations do not inherit that restriction.
 pub struct RcuOptionArcSlot<T>
 where
     T: Send + Sync + 'static,
@@ -370,25 +347,10 @@ where
     }
 }
 
-enum CallbackKind {
-    RawHead {
-        head: QueuedRcuHead,
-        func: RcuRawCallback,
-    },
-    Deferred(Box<dyn DeferredCall>),
-}
-
-struct CallbackItem {
-    target_gp: RcuSequence,
-    seq: RcuSequence,
-    kind: CallbackKind,
-}
-
 struct RcuStateInner {
     gp: GracePeriodState,
     callbacks: CallbackTracker,
-    pending_callbacks: VecDeque<CallbackItem>,
-    ready_callbacks: VecDeque<CallbackItem>,
+    callback_queue: RcuCallbackList,
 }
 
 impl RcuStateInner {
@@ -396,22 +358,30 @@ impl RcuStateInner {
         Self {
             gp: GracePeriodState::new(),
             callbacks: CallbackTracker::new(),
-            pending_callbacks: VecDeque::new(),
-            ready_callbacks: VecDeque::new(),
+            callback_queue: RcuCallbackList::new(),
         }
     }
 
     fn has_ready_work(&self) -> bool {
-        !self.ready_callbacks.is_empty()
+        self.callback_queue
+            .front_target()
+            .is_some_and(|target| self.gp.has_completed(target))
     }
 
     fn has_drainable_work(&self) -> bool {
         self.has_ready_work() && self.callbacks.drainer_available()
     }
+
+    fn has_worker_work(&self) -> bool {
+        self.has_drainable_work()
+            || self.gp.ready_to_complete()
+            || (!self.gp.is_active() && self.gp.has_request())
+    }
 }
 
 struct RcuState {
     initialized: AtomicBool,
+    worker_starting: AtomicBool,
     worker_started: AtomicBool,
     worker_should_stop: AtomicBool,
     gp_active: AtomicBool,
@@ -425,6 +395,7 @@ impl RcuState {
     fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
+            worker_starting: AtomicBool::new(false),
             worker_started: AtomicBool::new(false),
             worker_should_stop: AtomicBool::new(false),
             gp_active: AtomicBool::new(false),
@@ -462,25 +433,8 @@ impl RcuState {
                 // Pair all real quiescent-state reports with GP completion.
                 // This is a GP slow path and does not affect RCU readers.
                 fence(Ordering::SeqCst);
-                let completed = inner.gp.complete_ready();
-
-                while inner
-                    .pending_callbacks
-                    .front()
-                    .is_some_and(|cb| cb.target_gp == completed)
-                {
-                    if let Some(cb) = inner.pending_callbacks.pop_front() {
-                        inner.ready_callbacks.push_back(cb);
-                        ready_changed = true;
-                    }
-                }
-                debug_assert!(
-                    inner
-                        .pending_callbacks
-                        .front()
-                        .is_none_or(|cb| !inner.gp.has_completed(cb.target_gp)),
-                    "pending RCU callback targets an already completed GP"
-                );
+                inner.gp.complete_ready();
+                ready_changed |= inner.has_ready_work();
                 continue;
             }
 
@@ -504,8 +458,11 @@ impl RcuState {
 
         debug_assert!(inner.gp.is_active() || !inner.gp.has_request());
         debug_assert!(
-            inner.pending_callbacks.is_empty() || inner.gp.is_active() || inner.gp.has_request(),
-            "pending RCU callbacks exist without active or requested GP work"
+            inner.callback_queue.is_empty()
+                || inner.has_ready_work()
+                || inner.gp.is_active()
+                || inner.gp.has_request(),
+            "RCU callbacks exist without ready, active, or requested GP work"
         );
         ready_changed
     }
@@ -518,7 +475,7 @@ impl RcuState {
         self.worker_wait.wake_all();
     }
 
-    fn maybe_process_ready_callbacks_inline(&self) {
+    fn progress_and_drain_inline_if_no_worker(&self) {
         if self.worker_started.load(Ordering::Acquire) {
             return;
         }
@@ -529,7 +486,8 @@ impl RcuState {
     fn process_ready_callbacks(&self) {
         {
             let mut inner = self.inner.lock_irqsave();
-            if !inner.callbacks.try_claim_drainer() {
+            Self::pump_grace_periods(&mut inner);
+            if !inner.has_ready_work() || !inner.callbacks.try_claim_drainer() {
                 return;
             }
         }
@@ -537,7 +495,8 @@ impl RcuState {
         loop {
             let next = {
                 let mut inner = self.inner.lock_irqsave();
-                match inner.ready_callbacks.pop_front() {
+                let completed_gp = inner.gp.completed();
+                match inner.callback_queue.pop_ready(completed_gp) {
                     Some(callback) => Some(callback),
                     None => {
                         inner.callbacks.release_drainer();
@@ -550,18 +509,10 @@ impl RcuState {
                 break;
             };
 
-            match callback.kind {
-                CallbackKind::RawHead { head, func } => {
-                    let head = head.0;
-                    // SAFETY: `head` is queued only once and the callback owns
-                    // the right to recycle or requeue it after execution.
-                    unsafe {
-                        head.as_ref().queued.store(false, Ordering::Release);
-                        func(head);
-                    }
-                }
-                CallbackKind::Deferred(call) => call.invoke(),
-            }
+            // SAFETY: `pop_ready()` detached the head, copied all state needed
+            // after invocation, and released duplicate ownership. The unsafe
+            // admission contract keeps the head valid until this call starts.
+            unsafe { (callback.func)(callback.head) };
 
             {
                 let mut inner = self.inner.lock_irqsave();
@@ -692,100 +643,100 @@ fn report_quiescent_state(cpu: ProcessorId) {
     }
     if wake_worker {
         RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
     }
 }
 
-fn reserve_callback_capacity(inner: &mut RcuStateInner) {
-    let ready_additional = inner
-        .pending_callbacks
-        .len()
-        .checked_add(1)
-        .expect("RCU callback count overflow");
-    inner.pending_callbacks.reserve(1);
-    inner.ready_callbacks.reserve(ready_additional);
-}
-
-fn try_reserve_callback_capacity(inner: &mut RcuStateInner) -> Result<(), ()> {
-    let ready_additional = inner.pending_callbacks.len().checked_add(1).ok_or(())?;
-    inner.pending_callbacks.try_reserve(1).map_err(|_| ())?;
-    inner
-        .ready_callbacks
-        .try_reserve(ready_additional)
-        .map_err(|_| ())?;
-    Ok(())
-}
-
-fn admit_callback_locked(inner: &mut RcuStateInner, kind: CallbackKind) {
+fn enqueue_callback_locked(
+    inner: &mut RcuStateInner,
+    head: NonNull<RcuHead>,
+    func: RcuRawCallback,
+) {
     let target_gp = inner.gp.request_future();
     let seq = inner.callbacks.admit();
-    inner.pending_callbacks.push_back(CallbackItem {
-        target_gp,
-        seq,
-        kind,
-    });
-}
-
-fn enqueue_callback_locked(inner: &mut RcuStateInner, kind: CallbackKind) -> bool {
-    admit_callback_locked(inner, kind);
-    let ready_changed = RcuState::pump_grace_periods(inner);
-    ready_changed || inner.has_ready_work()
-}
-
-fn queue_callback(kind: CallbackKind) {
-    let wake_worker = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        // Admission reserves the destination capacity as well, so grace-period
-        // completion can move every pending callback to the ready queue without
-        // allocating in IRQ or other non-fallible progress paths.
-        reserve_callback_capacity(&mut inner);
-        enqueue_callback_locked(&mut inner, kind)
-    };
-
-    RCU_STATE.wake_state_waiters();
-    if wake_worker {
-        RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
-    }
+    inner.callback_queue.push(head, func, target_gp, seq);
 }
 
 fn queue_raw_callback(head: NonNull<RcuHead>, func: RcuRawCallback) {
-    queue_callback(CallbackKind::RawHead {
-        head: QueuedRcuHead(head),
-        func,
-    });
-}
-
-fn queue_deferred_callback(call: Box<dyn DeferredCall>) {
-    queue_callback(CallbackKind::Deferred(call));
-}
-
-fn try_queue_deferred_callback(call: Box<dyn DeferredCall>) -> Result<(), Box<dyn DeferredCall>> {
-    let mut call = Some(call);
     let wake_worker = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        if try_reserve_callback_capacity(&mut inner).is_err() {
-            return Err(call.take().unwrap());
-        }
-        enqueue_callback_locked(&mut inner, CallbackKind::Deferred(call.take().unwrap()))
+        enqueue_callback_locked(&mut inner, head, func);
+        inner.has_worker_work()
     };
 
-    RCU_STATE.wake_state_waiters();
     if wake_worker {
         RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
     }
+}
+
+#[repr(C)]
+struct DeferredRcuCall<F> {
+    head: RcuHead,
+    call: Option<F>,
+}
+
+impl<F> DeferredRcuCall<F> {
+    fn new(call: F) -> Self {
+        Self {
+            head: RcuHead::new(),
+            call: Some(call),
+        }
+    }
+}
+
+unsafe fn invoke_deferred_rcu_call<F>(head: NonNull<RcuHead>)
+where
+    F: FnOnce() + Send + 'static,
+{
+    // SAFETY: `DeferredRcuCall` is repr(C) with `head` as its first field, and
+    // `submit_deferred_rcu_call()` transferred this Box to the callback.
+    let mut deferred = unsafe { Box::from_raw(head.as_ptr().cast::<DeferredRcuCall<F>>()) };
+    let call = deferred
+        .call
+        .take()
+        .expect("deferred RCU callback invoked more than once");
+    call();
+}
+
+fn submit_deferred_rcu_call<F>(deferred: Box<DeferredRcuCall<F>>)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let deferred = Box::into_raw(deferred);
+    // SAFETY: the Box has been transferred to `invoke_deferred_rcu_call`, so
+    // it remains at this address until callback invocation starts.
+    unsafe {
+        call_rcu_raw(
+            NonNull::new_unchecked(core::ptr::addr_of_mut!((*deferred).head)),
+            invoke_deferred_rcu_call::<F>,
+        );
+    }
+}
+
+fn try_queue_deferred_callback_with<F, A>(call: F, allocate: A) -> Result<(), ()>
+where
+    F: FnOnce() + Send + 'static,
+    A: FnOnce(DeferredRcuCall<F>) -> Result<Box<DeferredRcuCall<F>>, ()>,
+{
+    let deferred = allocate(DeferredRcuCall::new(call))?;
+    submit_deferred_rcu_call(deferred);
     Ok(())
 }
 
 fn worker_main() -> i32 {
+    {
+        let _inner = RCU_STATE.inner.lock_irqsave();
+        RCU_STATE.worker_started.store(true, Ordering::Release);
+        RCU_STATE.worker_starting.store(false, Ordering::Release);
+    }
+    RCU_STATE.wake_state_waiters();
+
     loop {
         RCU_STATE.worker_wait.wait_until(|| {
             if RCU_STATE.worker_should_stop.load(Ordering::Acquire) {
                 return Some(());
             }
 
-            if RCU_STATE.inner.lock_irqsave().has_drainable_work() {
+            if RCU_STATE.inner.lock_irqsave().has_worker_work() {
                 return Some(());
             }
 
@@ -799,6 +750,11 @@ fn worker_main() -> i32 {
         RCU_STATE.process_ready_callbacks();
     }
 
+    {
+        let _inner = RCU_STATE.inner.lock_irqsave();
+        RCU_STATE.worker_started.store(false, Ordering::Release);
+    }
+    RCU_STATE.wake_state_waiters();
     0
 }
 
@@ -814,28 +770,43 @@ pub fn start_worker() {
         return;
     }
 
-    let already = RCU_STATE.worker_started.swap(true, Ordering::AcqRel);
-    if already {
-        return;
+    {
+        let _inner = RCU_STATE.inner.lock_irqsave();
+        if RCU_STATE.worker_should_stop.load(Ordering::Acquire)
+            || RCU_STATE.worker_started.load(Ordering::Acquire)
+            || RCU_STATE.worker_starting.load(Ordering::Acquire)
+        {
+            return;
+        }
+        RCU_STATE.worker_starting.store(true, Ordering::Release);
     }
 
     let closure = KernelThreadClosure::EmptyClosure((Box::new(worker_main), ()));
-    if KernelThreadMechanism::create_and_run(closure, "rcu_gp".to_string()).is_none() {
-        RCU_STATE.worker_started.store(false, Ordering::Release);
-        error!("failed to create RCU callback worker");
-        return;
-    }
+    KernelThreadMechanism::create_and_run(closure, "rcu_gp".to_string())
+        .expect("failed to create required RCU callback worker");
 
     RCU_STATE.wake_worker();
 }
 
+/// Requests terminal asynchronous shutdown of the RCU worker.
+///
+/// This is a teardown operation: the global RCU worker is initialized once
+/// and must not be restarted after shutdown has been requested.
 pub fn shutdown_worker() {
-    if !rcu_enabled() || !RCU_STATE.worker_started.load(Ordering::Acquire) {
+    if !rcu_enabled() {
         return;
     }
 
-    RCU_STATE.worker_should_stop.store(true, Ordering::Release);
-    RCU_STATE.wake_worker();
+    let wake_worker = {
+        let _inner = RCU_STATE.inner.lock_irqsave();
+        let wake_worker = RCU_STATE.worker_started.load(Ordering::Acquire)
+            || RCU_STATE.worker_starting.load(Ordering::Acquire);
+        RCU_STATE.worker_should_stop.store(true, Ordering::Release);
+        wake_worker
+    };
+    if wake_worker {
+        RCU_STATE.wake_worker();
+    }
 }
 
 /// Enters a non-preemptible, non-sleepable ordinary-RCU read-side section.
@@ -910,8 +881,9 @@ pub fn rcu_assign_pointer<T>(ptr: &AtomicPtr<T>, value: *mut T) {
 ///
 /// # Safety
 ///
-/// `head` must remain valid until `func` runs and must not be queued again
-/// before that invocation begins.
+/// `head` must remain initialized at the same address until `func` begins. It
+/// must not be queued again before that point. Clearing the duplicate state
+/// does not transfer ownership to an unsynchronized third party.
 pub(crate) unsafe fn call_rcu_raw(head: NonNull<RcuHead>, func: RcuRawCallback) {
     if !rcu_enabled() {
         // SAFETY: before RCU init there is no concurrent reader relying on
@@ -920,16 +892,20 @@ pub(crate) unsafe fn call_rcu_raw(head: NonNull<RcuHead>, func: RcuRawCallback) 
         return;
     }
 
-    // SAFETY: the caller guarantees that `head` is valid until callback
-    // completion and not queued twice concurrently.
-    let already = unsafe { head.as_ref().queued.swap(true, Ordering::AcqRel) };
-    if already {
+    // SAFETY: the caller guarantees that `head` remains initialized at this
+    // address until callback invocation starts.
+    if !unsafe { head.as_ref() }.try_claim() {
         panic!("call_rcu_raw received a duplicated rcu_head enqueue");
     }
 
     queue_raw_callback(head, func);
 }
 
+/// Defers a closure until after a future grace period.
+///
+/// This convenience API allocates before raw callback admission. It must not
+/// be called from IRQ or other contexts where allocation is forbidden; use an
+/// object-embedded [`RcuHead`] with `call_rcu_raw()` there.
 pub fn rcu_defer<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
@@ -939,9 +915,12 @@ where
         return;
     }
 
-    queue_deferred_callback(Box::new(f));
+    submit_deferred_rcu_call(Box::new(DeferredRcuCall::new(f)));
 }
 
+/// Defers destruction using the allocating [`rcu_defer`] helper.
+///
+/// This must not be called from IRQ or another non-allocating context.
 pub fn rcu_defer_drop<T>(value: T)
 where
     T: Send + 'static,
@@ -957,6 +936,8 @@ where
 /// On failure, the original reference is returned and has not been published
 /// to the RCU callback queue. The caller must keep it alive through a grace
 /// period before dropping it.
+///
+/// This helper still invokes the allocator and is not an IRQ-context API.
 pub(crate) fn try_rcu_defer_drop_arc<T>(value: Arc<T>) -> Result<(), Arc<T>>
 where
     T: Send + Sync + 'static,
@@ -967,13 +948,12 @@ where
     }
 
     let queued_value = value.clone();
-    let call: Box<dyn DeferredCall> = match Box::try_new(move || drop(queued_value)) {
-        Ok(call) => call,
-        Err(_) => return Err(value),
-    };
-
-    if let Err(call) = try_queue_deferred_callback(call) {
-        drop(call);
+    if try_queue_deferred_callback_with(
+        move || drop(queued_value),
+        |deferred| Box::try_new(deferred).map_err(|_| ()),
+    )
+    .is_err()
+    {
         return Err(value);
     }
 
@@ -1075,9 +1055,7 @@ pub fn rcu_barrier() {
     };
 
     loop {
-        if !RCU_STATE.worker_started.load(Ordering::Acquire) {
-            RCU_STATE.maybe_process_ready_callbacks_inline();
-        }
+        RCU_STATE.progress_and_drain_inline_if_no_worker();
 
         let done = {
             let inner = RCU_STATE.inner.lock_irqsave();
@@ -1088,6 +1066,7 @@ pub fn rcu_barrier() {
         }
 
         RCU_STATE.state_wait.wait_until(|| {
+            RCU_STATE.progress_and_drain_inline_if_no_worker();
             let completed = RCU_STATE
                 .inner
                 .lock_irqsave()
@@ -1254,19 +1233,18 @@ pub fn cpu_offline(cpu: ProcessorId) {
     RCU_STATE.wake_state_waiters();
     if wake_worker {
         RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
     }
 }
 
 #[allow(dead_code)]
-pub fn debug_snapshot() -> (u64, u64, u64, usize, usize) {
+pub fn debug_snapshot() -> (u64, u64, u64, usize, bool) {
     let inner = RCU_STATE.inner.lock_irqsave();
     (
         inner.gp.current().raw(),
         inner.gp.completed().raw(),
         inner.callbacks.completed_raw(),
-        inner.pending_callbacks.len(),
-        inner.ready_callbacks.len(),
+        inner.callback_queue.len(),
+        inner.has_ready_work(),
     )
 }
 

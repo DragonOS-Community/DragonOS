@@ -6,6 +6,8 @@ use core::{
 };
 
 use crate::{
+    arch::CurrentIrqArch,
+    exception::InterruptArch,
     ipc::sighand::SigHand,
     libs::{
         notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
@@ -123,10 +125,95 @@ unsafe fn rcu_selftest_callback(head: NonNull<RcuHead>) {
     probe.hits.fetch_add(1, Ordering::SeqCst);
 }
 
+#[repr(C)]
+struct RcuSelftestRequeueProbe {
+    head: RcuHead,
+    hits: Arc<AtomicUsize>,
+}
+
+unsafe fn rcu_selftest_requeue_callback(head: NonNull<RcuHead>) {
+    let probe = head.as_ptr().cast::<RcuSelftestRequeueProbe>();
+    // SAFETY: `head` is the first field of the live boxed probe.
+    let hit = unsafe { (*probe).hits.fetch_add(1, Ordering::SeqCst) };
+    if hit == 0 {
+        // SAFETY: callback invocation has detached and released this head, and
+        // the Box remains at the same address until the second invocation.
+        unsafe { call_rcu_raw(head, rcu_selftest_requeue_callback) };
+    } else {
+        // SAFETY: the second callback owns the Box transferred by the test.
+        drop(unsafe { Box::from_raw(probe) });
+    }
+}
+
+fn run_duplicate_claim_selftest() -> Result<(), &'static str> {
+    let head = Arc::new(RcuHead::new());
+    let successes = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(Completion::new());
+    let start = Arc::new(Completion::new());
+    let done = Arc::new(Completion::new());
+
+    let spawn = |name: &'static str| {
+        let head = head.clone();
+        let successes = successes.clone();
+        let ready = ready.clone();
+        let start = start.clone();
+        let done = done.clone();
+        let closure = KernelThreadClosure::EmptyClosure((
+            Box::new(move || {
+                ready.complete();
+                if start.wait_for_completion().is_err() {
+                    done.complete();
+                    return 1;
+                }
+                if head.try_claim() {
+                    successes.fetch_add(1, Ordering::SeqCst);
+                }
+                done.complete();
+                0
+            }),
+            (),
+        ));
+        KernelThreadMechanism::create_and_run(closure, name.to_string())
+    };
+
+    let first = spawn("rcu-duplicate-claim-a")
+        .ok_or("duplicate claim selftest could not create its first worker")?;
+    let Some(second) = spawn("rcu-duplicate-claim-b") else {
+        start.complete_all();
+        let _ = KernelThreadMechanism::stop(&first);
+        return Err("duplicate claim selftest could not create its second worker");
+    };
+
+    if ready.wait_for_completion().is_err() || ready.wait_for_completion().is_err() {
+        start.complete_all();
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&second);
+        return Err("duplicate claim selftest workers did not reach their start gate");
+    }
+    start.complete_all();
+    if done.wait_for_completion().is_err() || done.wait_for_completion().is_err() {
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&second);
+        return Err("duplicate claim selftest workers did not finish their claims");
+    }
+
+    let first_stopped = KernelThreadMechanism::stop(&first).is_ok();
+    let second_stopped = KernelThreadMechanism::stop(&second).is_ok();
+    if !first_stopped || !second_stopped {
+        return Err("duplicate claim selftest could not stop its workers");
+    }
+    if successes.load(Ordering::SeqCst) != 1 || !head.is_queued() {
+        return Err("duplicate claim did not have exactly one state transition");
+    }
+
+    Ok(())
+}
+
 fn run_pr1_selftest() -> Result<(), &'static str> {
     gp::run_state_machine_selftests()?;
     context::run_context_selftests()?;
     run_callback_generation_selftest()?;
+    run_duplicate_claim_selftest()?;
 
     if ProcessManager::current_pcb().rcu_read_depth() != 0 {
         return Err("initial rcu_read_depth was not zero");
@@ -155,9 +242,9 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     }
 
     rcu_barrier();
-    let (_, completed_gp_before, completed_cb_before, pending_before, ready_before) =
+    let (_, completed_gp_before, completed_cb_before, queued_before, ready_before) =
         debug_snapshot();
-    if pending_before != 0 || ready_before != 0 {
+    if queued_before != 0 || ready_before {
         return Err("rcu callback queues were not empty before blocked-reader selftest");
     }
 
@@ -175,7 +262,7 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
             Err("rcu_defer callback ran before leaving the read-side critical section")
         } else {
             note_context_switch();
-            let (_, completed_gp_mid, completed_cb_mid, pending_mid, ready_mid) = debug_snapshot();
+            let (_, completed_gp_mid, completed_cb_mid, queued_mid, ready_mid) = debug_snapshot();
 
             if blocked_hits.load(Ordering::SeqCst) != 0 {
                 Err("context switch inside rcu_read_lock executed callback early")
@@ -183,7 +270,7 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
                 Err("context switch inside rcu_read_lock incorrectly completed a grace period")
             } else if completed_cb_mid != completed_cb_before {
                 Err("context switch inside rcu_read_lock incorrectly completed a callback")
-            } else if pending_mid != 1 || ready_mid != 0 {
+            } else if queued_mid != 1 || ready_mid {
                 Err("context switch inside rcu_read_lock corrupted callback queue state")
             } else {
                 Ok(())
@@ -200,6 +287,21 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     }
 
     rcu_barrier();
+
+    let failed_allocation_drops = Arc::new(AtomicUsize::new(0));
+    let failed_allocation_probe = RcuSelftestDropProbe {
+        id: 30,
+        drops: failed_allocation_drops.clone(),
+    };
+    if try_queue_deferred_callback_with(move || drop(failed_allocation_probe), |_deferred| Err(()))
+        .is_ok()
+    {
+        return Err("injected deferred allocation failure unexpectedly published a callback");
+    }
+    if failed_allocation_drops.load(Ordering::SeqCst) != 1 {
+        return Err("deferred allocation failure did not return closure ownership");
+    }
+
     let callback_hits = Arc::new(AtomicUsize::new(0));
     let callback_probe = Box::new(RcuSelftestCallbackProbe {
         head: RcuHead::new(),
@@ -209,17 +311,42 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
 
     // SAFETY: `callback_probe` stays alive until `rcu_selftest_callback()`
     // reconstructs and consumes the allocation.
-    unsafe {
-        call_rcu_raw(
-            NonNull::new_unchecked(ptr::addr_of_mut!((*callback_probe).head)),
-            rcu_selftest_callback,
-        );
+    {
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        // SAFETY: `callback_probe` remains boxed at this address until the
+        // callback reconstructs it. Raw admission is allocation-free and is
+        // permitted while IRQs are disabled.
+        unsafe {
+            call_rcu_raw(
+                NonNull::new_unchecked(ptr::addr_of_mut!((*callback_probe).head)),
+                rcu_selftest_callback,
+            );
+        }
     }
 
     rcu_barrier();
 
     if callback_hits.load(Ordering::SeqCst) != 1 {
         return Err("call_rcu callback was not executed exactly once");
+    }
+
+    let requeue_hits = Arc::new(AtomicUsize::new(0));
+    let requeue_probe = Box::into_raw(Box::new(RcuSelftestRequeueProbe {
+        head: RcuHead::new(),
+        hits: requeue_hits.clone(),
+    }));
+    // SAFETY: the Box is transferred to the callback and stays at a stable
+    // address through both the initial admission and callback-side requeue.
+    unsafe {
+        call_rcu_raw(
+            NonNull::new_unchecked(ptr::addr_of_mut!((*requeue_probe).head)),
+            rcu_selftest_requeue_callback,
+        );
+    }
+    rcu_barrier();
+    rcu_barrier();
+    if requeue_hits.load(Ordering::SeqCst) != 2 {
+        return Err("callback-side RcuHead requeue did not execute exactly twice");
     }
 
     let deferred_drops = Arc::new(AtomicUsize::new(0));
@@ -269,9 +396,13 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
 }
 
 fn run_callback_generation_selftest() -> Result<(), &'static str> {
+    unsafe fn noop_callback(_head: NonNull<RcuHead>) {}
+
     let cpu0 = ProcessorId::new(0);
     let cpu1 = ProcessorId::new(1);
     let mut inner = RcuStateInner::new();
+    let first_head = RcuHead::new();
+    let second_head = RcuHead::new();
 
     let first_gp = inner.gp.request_future();
     if inner
@@ -282,35 +413,36 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
         return Err("callback generation selftest failed to start its first GP");
     }
 
-    // Admission and GP pumping are separate responsibilities. Keep this
-    // deterministic state-machine test independent of the live per-CPU
-    // context snapshots used by the production coordinator.
-    admit_callback_locked(&mut inner, CallbackKind::Deferred(Box::new(|| {})));
-    admit_callback_locked(&mut inner, CallbackKind::Deferred(Box::new(|| {})));
+    if !first_head.try_claim() || !second_head.try_claim() {
+        return Err("fresh callback generation heads could not be claimed");
+    }
+    enqueue_callback_locked(&mut inner, NonNull::from(&first_head), noop_callback);
+    enqueue_callback_locked(&mut inner, NonNull::from(&second_head), noop_callback);
 
     let expected_second_gp = first_gp.next();
-    if inner.pending_callbacks.len() != 2
-        || inner
-            .pending_callbacks
-            .iter()
-            .any(|callback| callback.target_gp != expected_second_gp)
+    if inner.callback_queue.len() != 2
+        || inner.callback_queue.front_target() != Some(expected_second_gp)
     {
         return Err("callback admitted during an active GP targeted the wrong generation");
+    }
+    if inner.has_worker_work() {
+        return Err("worker would spin on a future GP blocked by the active waiting mask");
     }
 
     if !inner.gp.report_quiescent_state(cpu0) {
         return Err("callback generation selftest could not complete its first waiting mask");
     }
-    RcuState::pump_grace_periods_with(
+    let first_ready_changed = RcuState::pump_grace_periods_with(
         &mut inner,
         || (CpuMask::from_cpu(cpu1), [0; PerCpu::MAX_CPU_NUM as usize]),
         |_| {},
         |_| {},
     );
-    if inner.gp.completed() != first_gp
+    if first_ready_changed
+        || inner.gp.completed() != first_gp
         || !inner.gp.is_waiting_for(cpu1)
-        || inner.pending_callbacks.len() != 2
-        || !inner.ready_callbacks.is_empty()
+        || inner.callback_queue.len() != 2
+        || inner.has_ready_work()
     {
         return Err("callbacks became ready before their post-admission GP completed");
     }
@@ -318,23 +450,31 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
     if !inner.gp.report_quiescent_state(cpu1) {
         return Err("callback generation selftest could not complete its second waiting mask");
     }
-    RcuState::pump_grace_periods_with(
+    let second_ready_changed = RcuState::pump_grace_periods_with(
         &mut inner,
         || (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
         |_| {},
         |_| {},
     );
-    if inner.gp.completed() != expected_second_gp
-        || !inner.pending_callbacks.is_empty()
-        || inner.ready_callbacks.len() != 2
+    if !second_ready_changed
+        || inner.gp.completed() != expected_second_gp
+        || inner.callback_queue.len() != 2
+        || !inner.has_ready_work()
     {
         return Err("callbacks did not become ready after their target GP completed");
     }
+    if !inner.has_worker_work() {
+        return Err("worker did not recognize a ready intrusive callback");
+    }
 
-    let first_callback = inner.ready_callbacks.pop_front().unwrap();
-    let second_callback = inner.ready_callbacks.pop_front().unwrap();
+    let completed_gp = inner.gp.completed();
+    let first_callback = inner.callback_queue.pop_ready(completed_gp).unwrap();
+    let second_callback = inner.callback_queue.pop_ready(completed_gp).unwrap();
     if second_callback.seq != first_callback.seq.next() {
         return Err("callback generation transition did not preserve admission FIFO");
+    }
+    if !inner.callback_queue.is_empty() {
+        return Err("callback generation transition did not drain its FIFO");
     }
 
     Ok(())

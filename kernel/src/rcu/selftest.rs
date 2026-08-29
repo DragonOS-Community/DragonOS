@@ -156,9 +156,7 @@ fn restore_cpu_state_after_selftest(cpu: ProcessorId, saved: RcuCpuState) {
         let mut inner = RCU_STATE.inner.lock_irqsave();
         let cpu_idx = cpu.data() as usize;
         inner.cpu_states[cpu_idx] = saved;
-        if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
-            inner.waiting_cpus.set(cpu, false);
-        }
+        report_quiescent_state_locked(&mut inner, cpu);
         RcuState::pump_grace_periods(&mut inner) || inner.has_ready_work()
     };
 
@@ -218,7 +216,7 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
         let inner = RCU_STATE.inner.lock_irqsave();
         if idle_hits.load(Ordering::SeqCst) != 0 {
             Some("idle IRQ callback ran before the interrupted CPU returned to idle")
-        } else if !inner.gp_active || !inner.waiting_cpus.get(cpu).unwrap_or(false) {
+        } else if !inner.gp.is_active() || !inner.gp.is_waiting_for(cpu) {
             Some("idle IRQ selftest did not put the current CPU in waiting_cpus")
         } else if inner.pending_callbacks.len() != 1 || !inner.ready_callbacks.is_empty() {
             Some("idle IRQ selftest corrupted callback queue state before irq_exit")
@@ -256,7 +254,7 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
 
     let post_exit_waiting = {
         let inner = RCU_STATE.inner.lock_irqsave();
-        inner.waiting_cpus.get(cpu).unwrap_or(false)
+        inner.gp.is_waiting_for(cpu)
     };
     if post_exit_waiting {
         return Err("idle IRQ exit left the current CPU in waiting_cpus");
@@ -276,6 +274,9 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
 }
 
 fn run_pr1_selftest() -> Result<(), &'static str> {
+    gp::run_state_machine_selftests()?;
+    run_callback_generation_selftest()?;
+
     if ProcessManager::current_pcb().rcu_read_depth() != 0 {
         return Err("initial rcu_read_depth was not zero");
     }
@@ -395,10 +396,10 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
         return Err("try_rcu_defer_drop_arc did not run after rcu_barrier");
     }
 
-    let completed_gp_before = RCU_STATE.inner.lock_irqsave().completed_gp_seq;
+    let completed_gp_before = RCU_STATE.inner.lock_irqsave().gp.completed();
     synchronize_rcu_noalloc();
-    let completed_gp_after = RCU_STATE.inner.lock_irqsave().completed_gp_seq;
-    if completed_gp_after <= completed_gp_before {
+    let completed_gp_after = RCU_STATE.inner.lock_irqsave().gp.completed();
+    if !completed_gp_after.has_reached(completed_gp_before.next()) {
         return Err("synchronize_rcu_noalloc did not complete a new grace period");
     }
 
@@ -413,6 +414,61 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
 
     if deferred_hits.load(Ordering::SeqCst) != 1 {
         return Err("rcu_defer closure did not run after rcu_barrier");
+    }
+
+    Ok(())
+}
+
+fn run_callback_generation_selftest() -> Result<(), &'static str> {
+    let cpu0 = ProcessorId::new(0);
+    let cpu1 = ProcessorId::new(1);
+    let mut inner = RcuStateInner::new();
+
+    let first_gp = inner.gp.request_future();
+    if inner.gp.start_requested(CpuMask::from_cpu(cpu0)) != first_gp {
+        return Err("callback generation selftest failed to start its first GP");
+    }
+
+    enqueue_callback_locked(&mut inner, CallbackKind::Deferred(Box::new(|| {})));
+    enqueue_callback_locked(&mut inner, CallbackKind::Deferred(Box::new(|| {})));
+
+    let expected_second_gp = first_gp.next();
+    if inner.pending_callbacks.len() != 2
+        || inner
+            .pending_callbacks
+            .iter()
+            .any(|callback| callback.target_gp != expected_second_gp)
+    {
+        return Err("callback admitted during an active GP targeted the wrong generation");
+    }
+
+    if !inner.gp.report_quiescent_state(cpu0) {
+        return Err("callback generation selftest could not complete its first waiting mask");
+    }
+    RcuState::pump_grace_periods_with(&mut inner, |_| CpuMask::from_cpu(cpu1));
+    if inner.gp.completed() != first_gp
+        || !inner.gp.is_waiting_for(cpu1)
+        || inner.pending_callbacks.len() != 2
+        || !inner.ready_callbacks.is_empty()
+    {
+        return Err("callbacks became ready before their post-admission GP completed");
+    }
+
+    if !inner.gp.report_quiescent_state(cpu1) {
+        return Err("callback generation selftest could not complete its second waiting mask");
+    }
+    RcuState::pump_grace_periods_with(&mut inner, |_| CpuMask::new());
+    if inner.gp.completed() != expected_second_gp
+        || !inner.pending_callbacks.is_empty()
+        || inner.ready_callbacks.len() != 2
+    {
+        return Err("callbacks did not become ready after their target GP completed");
+    }
+
+    let first_callback = inner.ready_callbacks.pop_front().unwrap();
+    let second_callback = inner.ready_callbacks.pop_front().unwrap();
+    if second_callback.seq != first_callback.seq.next() {
+        return Err("callback generation transition did not preserve admission FIFO");
     }
 
     Ok(())

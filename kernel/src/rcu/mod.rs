@@ -1,7 +1,22 @@
 #![allow(dead_code)]
 
-use alloc::{boxed::Box, collections::VecDeque, string::ToString, sync::Arc};
+//! DragonOS ordinary RCU.
+//!
+//! This is a non-preemptible, non-sleepable RCU flavor. Read-side critical
+//! sections may nest, but must remain on the creating task and must not block.
+//! A completed grace period covers every read-side critical section that
+//! existed before that GP began. It need not wait for readers that started
+//! afterward.
+//!
+//! Pointer publication uses Release operations and subscription uses Acquire
+//! operations. The global RCU state lock plus full barriers at real GP start,
+//! real quiescent-state reporting, GP completion, and synchronous return form
+//! the happens-before chain from callback admission to callback invocation or
+//! `synchronize_rcu()` return.
+
+use alloc::{boxed::Box, collections::VecDeque, rc::Rc, string::ToString, sync::Arc};
 use core::{
+    marker::PhantomData,
     ptr::{self, NonNull},
     sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering},
 };
@@ -19,7 +34,9 @@ use crate::{
     },
 };
 
+mod gp;
 mod selftest;
+use gp::{CallbackTracker, GracePeriodState, RcuSequence};
 pub use selftest::run_debug_selftests;
 
 pub(crate) type RcuRawCallback = unsafe fn(NonNull<RcuHead>);
@@ -49,6 +66,7 @@ impl RcuHead {
 
 pub struct RcuReadGuard {
     active: bool,
+    _not_send: PhantomData<Rc<()>>,
 }
 
 impl Drop for RcuReadGuard {
@@ -330,8 +348,8 @@ enum CallbackKind {
 }
 
 struct CallbackItem {
-    target_gp: u64,
-    seq: u64,
+    target_gp: RcuSequence,
+    seq: RcuSequence,
     kind: CallbackKind,
 }
 
@@ -343,13 +361,8 @@ struct RcuCpuState {
 }
 
 struct RcuStateInner {
-    gp_seq: u64,
-    completed_gp_seq: u64,
-    requested_gp_seq: u64,
-    next_callback_seq: u64,
-    completed_callback_seq: u64,
-    gp_active: bool,
-    waiting_cpus: CpuMask,
+    gp: GracePeriodState,
+    callbacks: CallbackTracker,
     cpu_states: [RcuCpuState; PerCpu::MAX_CPU_NUM as usize],
     pending_callbacks: VecDeque<CallbackItem>,
     ready_callbacks: VecDeque<CallbackItem>,
@@ -358,35 +371,20 @@ struct RcuStateInner {
 impl RcuStateInner {
     fn new() -> Self {
         Self {
-            gp_seq: 0,
-            completed_gp_seq: 0,
-            requested_gp_seq: 0,
-            next_callback_seq: 1,
-            completed_callback_seq: 0,
-            gp_active: false,
-            waiting_cpus: CpuMask::new(),
+            gp: GracePeriodState::new(),
+            callbacks: CallbackTracker::new(),
             cpu_states: [RcuCpuState::default(); PerCpu::MAX_CPU_NUM as usize],
             pending_callbacks: VecDeque::new(),
             ready_callbacks: VecDeque::new(),
         }
     }
 
-    fn allocate_callback_seq(&mut self) -> u64 {
-        let seq = self.next_callback_seq;
-        self.next_callback_seq += 1;
-        seq
-    }
-
-    fn request_future_gp(&mut self) -> u64 {
-        let target_gp = self.gp_seq + 1;
-        if self.requested_gp_seq < target_gp {
-            self.requested_gp_seq = target_gp;
-        }
-        target_gp
-    }
-
     fn has_ready_work(&self) -> bool {
         !self.ready_callbacks.is_empty()
+    }
+
+    fn has_drainable_work(&self) -> bool {
+        self.has_ready_work() && self.callbacks.drainer_available()
     }
 }
 
@@ -416,42 +414,61 @@ impl RcuState {
     }
 
     fn pump_grace_periods(inner: &mut RcuStateInner) -> bool {
+        Self::pump_grace_periods_with(inner, online_non_idle_cpus)
+    }
+
+    fn pump_grace_periods_with(
+        inner: &mut RcuStateInner,
+        mut waiting_snapshot: impl FnMut(&[RcuCpuState; PerCpu::MAX_CPU_NUM as usize]) -> CpuMask,
+    ) -> bool {
         let mut ready_changed = false;
         loop {
-            if inner.gp_active {
-                if !inner.waiting_cpus.is_empty() {
-                    break;
-                }
-                inner.completed_gp_seq = inner.gp_seq;
-                inner.gp_active = false;
+            if inner.gp.ready_to_complete() {
+                // Pair all real quiescent-state reports with GP completion.
+                // This is a GP slow path and does not affect RCU readers.
+                fence(Ordering::SeqCst);
+                let completed = inner.gp.complete_ready();
 
                 while inner
                     .pending_callbacks
                     .front()
-                    .is_some_and(|cb| cb.target_gp <= inner.completed_gp_seq)
+                    .is_some_and(|cb| cb.target_gp == completed)
                 {
                     if let Some(cb) = inner.pending_callbacks.pop_front() {
                         inner.ready_callbacks.push_back(cb);
                         ready_changed = true;
                     }
                 }
+                debug_assert!(
+                    inner
+                        .pending_callbacks
+                        .front()
+                        .is_none_or(|cb| !inner.gp.has_completed(cb.target_gp)),
+                    "pending RCU callback targets an already completed GP"
+                );
                 continue;
             }
 
-            let need_gp = inner.requested_gp_seq > inner.completed_gp_seq
-                || inner
-                    .pending_callbacks
-                    .front()
-                    .is_some_and(|cb| cb.target_gp > inner.completed_gp_seq);
-            if !need_gp {
+            if inner.gp.is_active() {
                 break;
             }
 
-            inner.gp_seq += 1;
-            inner.gp_active = true;
-            inner.waiting_cpus = online_non_idle_cpus(&inner.cpu_states);
+            if !inner.gp.has_request() {
+                break;
+            }
+
+            // Admission/request operations preceding this point must be
+            // ordered before the fresh CPU snapshot that defines GP start.
+            fence(Ordering::SeqCst);
+            let waiting_cpus = waiting_snapshot(&inner.cpu_states);
+            inner.gp.start_requested(waiting_cpus);
         }
 
+        debug_assert!(inner.gp.is_active() || !inner.gp.has_request());
+        debug_assert!(
+            inner.pending_callbacks.is_empty() || inner.gp.is_active() || inner.gp.has_request(),
+            "pending RCU callbacks exist without active or requested GP work"
+        );
         ready_changed
     }
 
@@ -472,10 +489,23 @@ impl RcuState {
     }
 
     fn process_ready_callbacks(&self) {
+        {
+            let mut inner = self.inner.lock_irqsave();
+            if !inner.callbacks.try_claim_drainer() {
+                return;
+            }
+        }
+
         loop {
             let next = {
                 let mut inner = self.inner.lock_irqsave();
-                inner.ready_callbacks.pop_front()
+                match inner.ready_callbacks.pop_front() {
+                    Some(callback) => Some(callback),
+                    None => {
+                        inner.callbacks.release_drainer();
+                        None
+                    }
+                }
             };
 
             let Some(callback) = next else {
@@ -497,7 +527,7 @@ impl RcuState {
 
             {
                 let mut inner = self.inner.lock_irqsave();
-                inner.completed_callback_seq = callback.seq;
+                inner.callbacks.complete(callback.seq);
             }
 
             self.wake_state_waiters();
@@ -552,17 +582,29 @@ fn enter_cpu_idle_eqs(inner: &mut RcuStateInner, cpu: ProcessorId) -> bool {
     debug_assert_eq!(inner.cpu_states[cpu_idx].irq_nesting, 0);
 
     inner.cpu_states[cpu_idx].in_idle_eqs = true;
-    let ready_changed = if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
-        inner.waiting_cpus.set(cpu, false);
-        RcuState::pump_grace_periods(inner)
-    } else {
-        false
-    };
+    let ready_changed =
+        report_quiescent_state_locked(inner, cpu) && RcuState::pump_grace_periods(inner);
     ready_changed || inner.has_ready_work()
 }
 
 fn exit_cpu_idle_eqs(inner: &mut RcuStateInner, cpu: ProcessorId) {
     inner.cpu_states[cpu.data() as usize].in_idle_eqs = false;
+}
+
+/// Reports a real quiescent state while `RcuState::inner` is held.
+///
+/// The full barrier is paid only when this CPU is actually a holdout for an
+/// active GP. Context switches, user returns, and duplicate reports that do
+/// not advance a GP stay free of this extra barrier.
+fn report_quiescent_state_locked(inner: &mut RcuStateInner, cpu: ProcessorId) -> bool {
+    if !inner.gp.is_waiting_for(cpu) {
+        return false;
+    }
+
+    fence(Ordering::SeqCst);
+    let cleared = inner.gp.report_quiescent_state(cpu);
+    debug_assert!(cleared, "RCU holdout disappeared before QS reporting");
+    cleared
 }
 
 fn report_quiescent_state(cpu: ProcessorId) {
@@ -572,9 +614,7 @@ fn report_quiescent_state(cpu: ProcessorId) {
 
     let (wake_worker, wake_waiters) = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
-            inner.waiting_cpus.set(cpu, false);
-        }
+        report_quiescent_state_locked(&mut inner, cpu);
         let ready_changed = RcuState::pump_grace_periods(&mut inner);
         (ready_changed || inner.has_ready_work(), true)
     };
@@ -609,8 +649,8 @@ fn try_reserve_callback_capacity(inner: &mut RcuStateInner) -> Result<(), ()> {
 }
 
 fn enqueue_callback_locked(inner: &mut RcuStateInner, kind: CallbackKind) -> bool {
-    let target_gp = inner.request_future_gp();
-    let seq = inner.allocate_callback_seq();
+    let target_gp = inner.gp.request_future();
+    let seq = inner.callbacks.admit();
     inner.pending_callbacks.push_back(CallbackItem {
         target_gp,
         seq,
@@ -673,7 +713,7 @@ fn worker_main() -> i32 {
                 return Some(());
             }
 
-            if RCU_STATE.inner.lock_irqsave().has_ready_work() {
+            if RCU_STATE.inner.lock_irqsave().has_drainable_work() {
                 return Some(());
             }
 
@@ -732,14 +772,25 @@ pub fn shutdown_worker() {
     RCU_STATE.wake_worker();
 }
 
+/// Enters a non-preemptible, non-sleepable ordinary-RCU read-side section.
+///
+/// Sections may nest. The returned guard is task-bound and must be dropped on
+/// the task that created it. Do not block or call an RCU synchronization API
+/// while the guard is alive.
 pub fn rcu_read_lock() -> RcuReadGuard {
     if !rcu_enabled() {
-        return RcuReadGuard { active: false };
+        return RcuReadGuard {
+            active: false,
+            _not_send: PhantomData,
+        };
     }
 
     ProcessManager::preempt_disable();
     ProcessManager::current_pcb().rcu_read_lock();
-    RcuReadGuard { active: true }
+    RcuReadGuard {
+        active: true,
+        _not_send: PhantomData,
+    }
 }
 
 pub fn rcu_read_unlock() {
@@ -761,16 +812,29 @@ pub fn rcu_read_lock_held() -> bool {
 }
 
 #[inline]
+/// Subscribes to a pointer published with `rcu_assign_pointer()`.
+///
+/// The returned raw pointer must only be dereferenced while protected by an
+/// ordinary-RCU read-side critical section or another proven lifetime pin.
 pub fn rcu_dereference<T>(ptr: &AtomicPtr<T>) -> *mut T {
     ptr.load(Ordering::Acquire)
 }
 
 #[inline]
+/// Publishes a fully initialized RCU-protected pointer with Release ordering.
 pub fn rcu_assign_pointer<T>(ptr: &AtomicPtr<T>, value: *mut T) {
     fence(Ordering::Release);
     ptr.store(value, Ordering::Release);
 }
 
+/// Queues `func` for exactly-once invocation after a GP that starts after
+/// admission. Before RCU initialization, boot-time no-reader rules make the
+/// callback execute synchronously instead.
+///
+/// # Safety
+///
+/// `head` must remain valid until `func` runs and must not be queued again
+/// before that invocation begins.
 pub(crate) unsafe fn call_rcu_raw(head: NonNull<RcuHead>, func: RcuRawCallback) {
     if !rcu_enabled() {
         // SAFETY: before RCU init there is no concurrent reader relying on
@@ -839,6 +903,10 @@ where
     Ok(())
 }
 
+/// Waits for a GP that starts after this call.
+///
+/// This function may sleep and must not be called from an RCU read-side
+/// critical section.
 pub fn synchronize_rcu() {
     if !rcu_enabled() {
         return;
@@ -851,7 +919,7 @@ pub fn synchronize_rcu() {
 
     let target_gp = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        let target_gp = inner.request_future_gp();
+        let target_gp = inner.gp.request_future();
         RcuState::pump_grace_periods(&mut inner);
         target_gp
     };
@@ -860,13 +928,14 @@ pub fn synchronize_rcu() {
     RCU_STATE.wake_worker();
 
     RCU_STATE.state_wait.wait_until(|| {
-        let completed = RCU_STATE.inner.lock_irqsave().completed_gp_seq;
-        if completed >= target_gp {
+        let completed = RCU_STATE.inner.lock_irqsave().gp.has_completed(target_gp);
+        if completed {
             Some(())
         } else {
             None
         }
     });
+    fence(Ordering::SeqCst);
 }
 
 /// Waits for a grace period without registering a waiter or allocating.
@@ -886,7 +955,7 @@ pub(crate) fn synchronize_rcu_noalloc() {
 
     let target_gp = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        let target_gp = inner.request_future_gp();
+        let target_gp = inner.gp.request_future();
         RcuState::pump_grace_periods(&mut inner);
         target_gp
     };
@@ -895,27 +964,38 @@ pub(crate) fn synchronize_rcu_noalloc() {
     RCU_STATE.wake_worker();
 
     loop {
-        let completed = RCU_STATE.inner.lock_irqsave().completed_gp_seq;
-        if completed >= target_gp {
+        let completed = RCU_STATE.inner.lock_irqsave().gp.has_completed(target_gp);
+        if completed {
             break;
         }
         sched_yield();
     }
+    fence(Ordering::SeqCst);
 }
 
+/// Waits until every callback admitted before this call has finished.
+///
+/// This does not necessarily start a GP when no callbacks are pending. It must
+/// not be called from an RCU read-side critical section or from an RCU callback
+/// that would be included in its own barrier snapshot.
 pub fn rcu_barrier() {
     if !rcu_enabled() {
         return;
     }
 
+    if rcu_read_lock_held() {
+        warn!("rcu_barrier() called inside rcu_read_lock() region");
+        debug_assert!(!rcu_read_lock_held());
+    }
+
     let target_cb = {
         let inner = RCU_STATE.inner.lock_irqsave();
-        inner.next_callback_seq.saturating_sub(1)
+        inner.callbacks.barrier_target()
     };
 
-    if target_cb == 0 {
+    let Some(target_cb) = target_cb else {
         return;
-    }
+    };
 
     loop {
         if !RCU_STATE.worker_started.load(Ordering::Acquire) {
@@ -924,15 +1004,19 @@ pub fn rcu_barrier() {
 
         let done = {
             let inner = RCU_STATE.inner.lock_irqsave();
-            inner.completed_callback_seq >= target_cb
+            inner.callbacks.has_completed(target_cb)
         };
         if done {
             return;
         }
 
         RCU_STATE.state_wait.wait_until(|| {
-            let completed = RCU_STATE.inner.lock_irqsave().completed_callback_seq;
-            if completed >= target_cb {
+            let completed = RCU_STATE
+                .inner
+                .lock_irqsave()
+                .callbacks
+                .has_completed(target_cb);
+            if completed {
                 Some(())
             } else {
                 None
@@ -1074,9 +1158,7 @@ pub fn cpu_offline(cpu: ProcessorId) {
 
     let wake_worker = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
-            inner.waiting_cpus.set(cpu, false);
-        }
+        report_quiescent_state_locked(&mut inner, cpu);
         let ready_changed = RcuState::pump_grace_periods(&mut inner);
         ready_changed || inner.has_ready_work()
     };
@@ -1092,9 +1174,9 @@ pub fn cpu_offline(cpu: ProcessorId) {
 pub fn debug_snapshot() -> (u64, u64, u64, usize, usize) {
     let inner = RCU_STATE.inner.lock_irqsave();
     (
-        inner.gp_seq,
-        inner.completed_gp_seq,
-        inner.completed_callback_seq,
+        inner.gp.current().raw(),
+        inner.gp.completed().raw(),
+        inner.callbacks.completed_raw(),
         inner.pending_callbacks.len(),
         inner.ready_callbacks.len(),
     )

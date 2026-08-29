@@ -166,21 +166,25 @@ sequenceDiagram
 
 ## 7. 回调生命周期
 
-回调在提交时绑定到一个尚未完成的宽限期世代。其生命周期如下：
+回调先进入当前 CPU 的局部队列，再由宽限期协调器按段归类。对应的宽限期完成后，回调进入可执行段，由回调执行器分批处理。
 
 ```mermaid
 flowchart LR
-    Admit[提交回调] --> Pending[等待目标宽限期]
-    Pending --> Ready[目标宽限期完成]
-    Ready --> Execute[回调执行器处理]
+    Admit[本 CPU 提交] --> Next[next: 尚未归类]
+    Next --> Wait[wait: 等待当前 GP]
+    Next --> NextReady[next-ready: 等待下一 GP]
+    NextReady --> Wait
+    Wait --> Done[done: GP 已完成]
+    Done --> Execute[有界批次执行]
 ```
 
-需要保持的原则是：
+这一过程遵循三个原则：
 
 - 回调不得早于目标宽限期完成；
-- 同一执行通道中的回调顺序必须稳定；
-- 上下文转换路径只负责报告进展，不直接执行任意回调；
-- 回调执行与上下文状态机解耦，避免在 IRQ-off、Idle 边界或非 watching 状态中运行未知逻辑。
+- 每个 CPU 的队列保持先入先出，CPU 之间不保证全局执行顺序；
+- 上下文转换只报告宽限期进展，不直接执行回调。
+
+需要等待此前回调全部执行完毕时，应使用 `rcu_barrier()`；`synchronize_rcu()` 只等待宽限期结束。分段模型、屏障和 CPU 迁移的详细设计见 [RCU 分段回调队列](segmented-callback-queues.md)。
 
 ## 8. 架构接入原则
 

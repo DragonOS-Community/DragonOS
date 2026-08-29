@@ -10,6 +10,7 @@
 namespace {
 
 constexpr const char* kRcuSelftestPath = "/sys/kernel/debug/rcu/selftest";
+constexpr const char* kRcuCallbacksPath = "/sys/kernel/debug/rcu/callbacks";
 
 std::string ReadAll(const char* path) {
     int fd = open(path, O_RDONLY);
@@ -65,6 +66,18 @@ TEST(RcuSelftest, ReportIsStableAcrossReads) {
     ExpectReportOk(first);
     ExpectReportOk(second);
     EXPECT_EQ(first, second);
+}
+
+TEST(RcuSelftest, CallbackQueueSnapshotIsPresentAndStablePerOpen) {
+    const std::string report = ReadAll(kRcuCallbacksPath);
+    ASSERT_FALSE(report.empty());
+    EXPECT_NE(std::string::npos, report.find("aggregate total=")) << report;
+    EXPECT_NE(std::string::npos, report.find(" done=")) << report;
+    EXPECT_NE(std::string::npos, report.find(" wait=")) << report;
+    EXPECT_NE(std::string::npos, report.find(" next_ready=")) << report;
+    EXPECT_NE(std::string::npos, report.find(" next=")) << report;
+    EXPECT_NE(std::string::npos, report.find(" executing=")) << report;
+    EXPECT_NE(std::string::npos, report.find("cpu=0 total=")) << report;
 }
 
 int main(int argc, char** argv) {

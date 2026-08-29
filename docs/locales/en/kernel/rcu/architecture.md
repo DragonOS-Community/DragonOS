@@ -166,21 +166,25 @@ Publishing context state, taking snapshots, and publishing grace-period activity
 
 ## 7. Callback Lifecycle
 
-A callback is associated at admission time with a grace-period generation that has not yet completed.
+A callback first enters the current CPU's local queue, where the grace-period coordinator classifies it by segment. After the required grace period completes, the callback moves to an executable segment and is processed in a bounded batch.
 
 ```mermaid
 flowchart LR
-    Admit[Admit callback] --> Pending[Wait for target grace period]
-    Pending --> Ready[Target grace period completes]
-    Ready --> Execute[Callback executor runs it]
+    Admit[Submit on this CPU] --> Next[next: unclassified]
+    Next --> Wait[wait: waiting for current GP]
+    Next --> NextReady[next-ready: waiting for next GP]
+    NextReady --> Wait
+    Wait --> Done[done: GP completed]
+    Done --> Execute[Execute in bounded batches]
 ```
 
-The following principles must hold:
+This process follows three principles:
 
 - A callback must not run before its target grace period completes.
-- Callback order within one execution channel must remain stable.
-- Context-transition paths report progress but do not directly execute arbitrary callbacks.
-- Callback execution remains separate from the context state machine, preventing unknown logic from running at IRQ-disabled boundaries, idle boundaries, or while the CPU is not watching.
+- Each per-CPU queue preserves FIFO order; no global execution order is guaranteed across CPUs.
+- Context-transition paths report grace-period progress but do not execute callbacks directly.
+
+Use `rcu_barrier()` when all previously submitted callbacks must finish; `synchronize_rcu()` waits only for a grace period to end. See [RCU Segmented Callback Queues](segmented-callback-queues.md) for the detailed segment, barrier, and CPU migration design.
 
 ## 8. Architecture Integration Principles
 

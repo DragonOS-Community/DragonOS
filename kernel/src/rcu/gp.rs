@@ -19,11 +19,13 @@ pub(super) struct RcuSequence(u64);
 
 impl RcuSequence {
     const ZERO: Self = Self(0);
-    const FIRST_CALLBACK: Self = Self(1);
-
     #[inline]
     pub(super) const fn raw(self) -> u64 {
         self.0
+    }
+
+    pub(super) const fn from_raw(value: u64) -> Self {
+        Self(value)
     }
 
     #[inline]
@@ -207,84 +209,6 @@ impl GracePeriodState {
     }
 }
 
-/// Callback admission/completion tickets plus unique drainer ownership.
-///
-/// Callback storage remains in `RcuStateInner`; this type only centralizes the
-/// ordering facts required by `rcu_barrier()`.
-pub(super) struct CallbackTracker {
-    next: RcuSequence,
-    next_completion: RcuSequence,
-    last_admitted: Option<RcuSequence>,
-    completed: Option<RcuSequence>,
-    draining: bool,
-}
-
-impl CallbackTracker {
-    pub(super) fn new() -> Self {
-        Self::with_next(RcuSequence::FIRST_CALLBACK)
-    }
-
-    fn with_next(next: RcuSequence) -> Self {
-        Self {
-            next,
-            next_completion: next,
-            last_admitted: None,
-            completed: None,
-            draining: false,
-        }
-    }
-
-    pub(super) fn admit(&mut self) -> RcuSequence {
-        let seq = self.next;
-        self.next = self.next.next();
-        self.last_admitted = Some(seq);
-        seq
-    }
-
-    pub(super) fn barrier_target(&self) -> Option<RcuSequence> {
-        self.last_admitted
-    }
-
-    pub(super) fn has_completed(&self, target: RcuSequence) -> bool {
-        self.completed
-            .is_some_and(|completed| completed.has_reached(target))
-    }
-
-    pub(super) fn complete(&mut self, seq: RcuSequence) {
-        debug_assert!(
-            self.last_admitted.is_some_and(|last| last.has_reached(seq)),
-            "completed a callback that was not admitted"
-        );
-        debug_assert_eq!(
-            seq, self.next_completion,
-            "RCU callbacks must complete in admission order"
-        );
-        self.completed = Some(seq);
-        self.next_completion = self.next_completion.next();
-    }
-
-    pub(super) fn try_claim_drainer(&mut self) -> bool {
-        if self.draining {
-            return false;
-        }
-        self.draining = true;
-        true
-    }
-
-    pub(super) fn release_drainer(&mut self) {
-        debug_assert!(self.draining, "released an unclaimed RCU callback drainer");
-        self.draining = false;
-    }
-
-    pub(super) fn drainer_available(&self) -> bool {
-        !self.draining
-    }
-
-    pub(super) fn completed_raw(&self) -> u64 {
-        self.completed.map_or(0, RcuSequence::raw)
-    }
-}
-
 fn one_cpu_mask(cpu: u32) -> CpuMask {
     CpuMask::from_cpu(ProcessorId::new(cpu))
 }
@@ -371,29 +295,6 @@ pub(super) fn run_state_machine_selftests() -> Result<(), &'static str> {
     {
         return Err("RCU GP sequence did not wrap from u64::MAX to zero");
     }
-
-    let mut callbacks = CallbackTracker::with_next(RcuSequence(u64::MAX));
-    let max_callback = callbacks.admit();
-    if callbacks.barrier_target() != Some(max_callback) || callbacks.has_completed(max_callback) {
-        return Err("RCU callback tracker corrupted its pre-wrap barrier target");
-    }
-    callbacks.complete(max_callback);
-    let zero_callback = callbacks.admit();
-    if zero_callback.raw() != 0 || callbacks.barrier_target() != Some(zero_callback) {
-        return Err("RCU callback tracker treated wrapped zero as an empty target");
-    }
-    callbacks.complete(zero_callback);
-    if !callbacks.has_completed(max_callback) || !callbacks.has_completed(zero_callback) {
-        return Err("RCU callback completion comparison failed across sequence wrap");
-    }
-    if !callbacks.try_claim_drainer() || callbacks.try_claim_drainer() {
-        return Err("RCU callback tracker allowed two simultaneous drainers");
-    }
-    callbacks.release_drainer();
-    if !callbacks.try_claim_drainer() {
-        return Err("RCU callback tracker did not release drainer ownership");
-    }
-    callbacks.release_drainer();
 
     Ok(())
 }

@@ -233,6 +233,19 @@ impl TcpSocket {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Returns an owned interface snapshot for paths that need to progress smoltcp.
+    ///
+    /// The `inner` guard is always released before this function returns. Callers may
+    /// therefore poll the interface without allowing `Iface::poll() -> notify()` to
+    /// recursively acquire `inner` while an outer read guard is still alive.
+    pub(super) fn stack_poll_iface_snapshot(&self) -> Option<Arc<dyn crate::net::Iface>> {
+        let inner = self.inner.read();
+        match inner.as_ref() {
+            Some(inner::Inner::SelfConnected(_)) | None => None,
+            Some(inner) => inner.iface().cloned(),
+        }
+    }
+
     #[inline]
     pub(crate) fn timestamp_enabled(&self) -> bool {
         self.options

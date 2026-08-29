@@ -21,7 +21,7 @@ use core::{
     sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering},
 };
 
-use log::{error, warn};
+use log::warn;
 
 use crate::{
     libs::{cpumask::CpuMask, spinlock::SpinLock, wait_queue::WaitQueue},
@@ -782,15 +782,8 @@ pub fn start_worker() {
     }
 
     let closure = KernelThreadClosure::EmptyClosure((Box::new(worker_main), ()));
-    if KernelThreadMechanism::create_and_run(closure, "rcu_gp".to_string()).is_none() {
-        {
-            let _inner = RCU_STATE.inner.lock_irqsave();
-            RCU_STATE.worker_starting.store(false, Ordering::Release);
-        }
-        RCU_STATE.wake_state_waiters();
-        error!("failed to create RCU callback worker");
-        return;
-    }
+    KernelThreadMechanism::create_and_run(closure, "rcu_gp".to_string())
+        .expect("failed to create required RCU callback worker");
 
     RCU_STATE.wake_worker();
 }

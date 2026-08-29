@@ -11,8 +11,17 @@ use crate::{
 #[inline(never)]
 pub fn smp_ap_start_stage2() -> ! {
     assert!(!CurrentIrqArch::is_irq_enabled());
+    let cpu = smp_get_processor_id();
+
+    // Match Linux's rcu_cpu_starting() placement: the AP is executing with
+    // interrupts disabled, and RCU admission precedes startup code that may
+    // use ordinary RCU. An already-active GP keeps its earlier snapshot.
+    crate::rcu::cpu_starting(cpu);
 
     if let Err(error) = do_ap_start_stage2() {
+        // Withdraw GP responsibility before publishing completion and
+        // entering the terminal park where this AP can no longer report.
+        crate::rcu::cpu_dying(cpu);
         smp_cpu_manager().complete_ap_thread(true, Err(error));
         park_failed_ap();
     }

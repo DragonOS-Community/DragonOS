@@ -415,6 +415,7 @@ impl RcuCpuCallbacks {
 }
 
 const RCU_CALLBACK_BATCH_LIMIT: usize = 64;
+const RCU_CALLBACK_CPU_QUANTUM: usize = 8;
 
 struct RcuState {
     initialized: AtomicBool,
@@ -679,25 +680,39 @@ impl RcuState {
             })
     }
 
-    fn pop_ready_round_robin(&self) -> Option<(usize, callback::ReadyRcuCallback)> {
+    fn pop_ready_from_cpu(&self, cpu: usize) -> Option<callback::ReadyRcuCallback> {
+        let callbacks = &self.cpu_callbacks[cpu];
+        // Most possible CPUs have no runnable callback. Avoid taking their
+        // queue locks during a scan; publishers store queue state before
+        // making this persistent predicate visible.
+        if !callbacks.needs_scan.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let mut state = callbacks.state.lock_irqsave();
+        let callback = state.segments.pop_ready()?;
+        debug_assert!(!state.executing);
+        state.executing = true;
+        let more = state.segments.has_ready() || state.segments.has_unclassified();
+        callbacks.needs_scan.store(more, Ordering::Release);
+        Some(callback)
+    }
+
+    fn pop_ready_round_robin(
+        &self,
+        preferred_cpu: Option<usize>,
+    ) -> Option<(usize, callback::ReadyRcuCallback)> {
         let cpu_count = PerCpu::MAX_CPU_NUM as usize;
+        if let Some(cpu) = preferred_cpu {
+            if let Some(callback) = self.pop_ready_from_cpu(cpu) {
+                return Some((cpu, callback));
+            }
+        }
+
         let start = self.next_scan_cpu.load(Ordering::Relaxed) % cpu_count;
         for offset in 0..cpu_count {
             let cpu = (start + offset) % cpu_count;
-            let callbacks = &self.cpu_callbacks[cpu];
-            // Most possible CPUs have no runnable callback. Avoid taking
-            // their queue locks on every callback in a busy CPU's batch; the
-            // flag is a persistent work predicate. Every false -> true
-            // publisher stores queue state first and then wakes the worker.
-            if !callbacks.needs_scan.load(Ordering::Acquire) {
-                continue;
-            }
-            let mut state = callbacks.state.lock_irqsave();
-            if let Some(callback) = state.segments.pop_ready() {
-                debug_assert!(!state.executing);
-                state.executing = true;
-                let more = state.segments.has_ready() || state.segments.has_unclassified();
-                callbacks.needs_scan.store(more, Ordering::Release);
+            if let Some(callback) = self.pop_ready_from_cpu(cpu) {
                 self.next_scan_cpu
                     .store((cpu + 1) % cpu_count, Ordering::Relaxed);
                 return Some((cpu, callback));
@@ -727,8 +742,10 @@ impl RcuState {
         // ready. One wake per batch is sufficient.
         self.wake_state_waiters();
         let mut count = 0;
+        let mut preferred_cpu = None;
+        let mut cpu_quantum = 0;
         while count < RCU_CALLBACK_BATCH_LIMIT {
-            let Some((cpu, callback)) = self.pop_ready_round_robin() else {
+            let Some((cpu, callback)) = self.pop_ready_round_robin(preferred_cpu) else {
                 break;
             };
             // SAFETY: `pop_ready()` detached the head, copied all state needed
@@ -738,6 +755,17 @@ impl RcuState {
             self.callbacks_invoked.fetch_add(1, Ordering::Relaxed);
             self.finish_callback(cpu);
             count += 1;
+
+            if preferred_cpu == Some(cpu) {
+                cpu_quantum += 1;
+            } else {
+                preferred_cpu = Some(cpu);
+                cpu_quantum = 1;
+            }
+            if cpu_quantum == RCU_CALLBACK_CPU_QUANTUM {
+                preferred_cpu = None;
+                cpu_quantum = 0;
+            }
         }
 
         let more = self.has_worker_work();
@@ -1001,6 +1029,11 @@ fn worker_main() -> i32 {
         RCU_STATE.worker_started.store(false, Ordering::Release);
     }
     RCU_STATE.wake_state_waiters();
+    // Publish the executor handoff to a barrier that observed the worker
+    // before shutdown. This wake must be unconditional: the exit path has no
+    // synchronization that requires it to observe a concurrent barrier's
+    // counter publication before deciding whether to wake.
+    RCU_STATE.barrier_wait.wake_all();
     0
 }
 

@@ -213,6 +213,7 @@ impl GracePeriodState {
 /// ordering facts required by `rcu_barrier()`.
 pub(super) struct CallbackTracker {
     next: RcuSequence,
+    next_completion: RcuSequence,
     last_admitted: Option<RcuSequence>,
     completed: Option<RcuSequence>,
     draining: bool,
@@ -226,6 +227,7 @@ impl CallbackTracker {
     fn with_next(next: RcuSequence) -> Self {
         Self {
             next,
+            next_completion: next,
             last_admitted: None,
             completed: None,
             draining: false,
@@ -253,14 +255,12 @@ impl CallbackTracker {
             self.last_admitted.is_some_and(|last| last.has_reached(seq)),
             "completed a callback that was not admitted"
         );
-        if let Some(completed) = self.completed {
-            debug_assert_eq!(
-                seq,
-                completed.next(),
-                "RCU callbacks must complete in admission order"
-            );
-        }
+        debug_assert_eq!(
+            seq, self.next_completion,
+            "RCU callbacks must complete in admission order"
+        );
         self.completed = Some(seq);
+        self.next_completion = self.next_completion.next();
     }
 
     pub(super) fn try_claim_drainer(&mut self) -> bool {

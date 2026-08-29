@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use super::{RcuRawCallback, gp::RcuSequence};
+use super::{gp::RcuSequence, RcuRawCallback};
 
 struct RcuHeadNode {
     next: Option<NonNull<RcuHead>>,

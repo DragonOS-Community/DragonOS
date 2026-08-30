@@ -836,6 +836,10 @@ impl VsockStreamSocket {
 }
 
 impl Socket for VsockStreamSocket {
+    fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
+        crate::process::namespace::net_namespace::INIT_NET_NAMESPACE.clone()
+    }
+
     fn fsnotify_watch_counter(&self) -> &AtomicUsize {
         &self.fsnotify_watches
     }

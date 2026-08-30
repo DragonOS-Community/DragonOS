@@ -384,6 +384,10 @@ impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
 where
     BoundNetlink<P::Message>: Bound<Endpoint = NetlinkSocketAddr>,
 {
+    fn netns(&self) -> Arc<NetNamespace> {
+        NetlinkSocket::netns(self)
+    }
+
     fn fsnotify_watch_counter(&self) -> &AtomicUsize {
         &self.fsnotify_watches
     }

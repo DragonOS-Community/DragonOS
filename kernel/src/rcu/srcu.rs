@@ -289,6 +289,14 @@ impl Drop for SrcuCallbackTaskGuard {
     }
 }
 
+fn in_srcu_callback_context() -> bool {
+    ProcessManager::initialized()
+        && ProcessManager::current_pcb()
+            .srcu_callback_domain
+            .load(Ordering::Acquire)
+            != 0
+}
+
 impl SrcuInner {
     fn new(id: u64, name: &'static str) -> Self {
         Self {
@@ -498,16 +506,7 @@ impl SrcuDomain {
         if in_interrupt() {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
-        if ProcessManager::initialized()
-            && (ProcessManager::current_pcb()
-                .srcu_task_state
-                .lock_irqsave()
-                .may_wait(self.inner.id)
-                || ProcessManager::current_pcb()
-                    .srcu_callback_domain
-                    .load(Ordering::Acquire)
-                    == self.inner.id)
-        {
+        if self.read_held_by_current() || in_srcu_callback_context() {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
         fence(Ordering::SeqCst);
@@ -536,12 +535,7 @@ impl SrcuDomain {
 
     pub(crate) fn validate_update_context(&self) -> Result<(), SystemError> {
         self.validate_deferred_update_context()?;
-        if self.read_held_by_current()
-            || ProcessManager::current_pcb()
-                .srcu_callback_domain
-                .load(Ordering::Acquire)
-                == self.inner.id
-        {
+        if self.read_held_by_current() || in_srcu_callback_context() {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
         Ok(())
@@ -628,16 +622,7 @@ impl SrcuDomain {
         if in_interrupt() {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
-        if ProcessManager::initialized()
-            && (ProcessManager::current_pcb()
-                .srcu_task_state
-                .lock_irqsave()
-                .may_wait(self.inner.id)
-                || ProcessManager::current_pcb()
-                    .srcu_callback_domain
-                    .load(Ordering::Acquire)
-                    == self.inner.id)
-        {
+        if self.read_held_by_current() || in_srcu_callback_context() {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
         if !SRCU_RUNTIME.worker_ready.load(Ordering::Acquire) {
@@ -667,7 +652,7 @@ impl SrcuDomain {
     }
 
     pub fn try_cleanup(self) -> Result<(), (Self, SystemError)> {
-        if in_interrupt() {
+        if in_interrupt() || in_srcu_callback_context() {
             return Err((self, SystemError::EDEADLK_OR_EDEADLOCK));
         }
         for idx in 0..2 {
@@ -990,6 +975,27 @@ pub(super) fn run_runtime_selftests() -> Result<(), &'static str> {
     let second = SrcuDomain::try_new("srcu_selftest_b")
         .map_err(|_| "failed to create second SRCU domain")?;
 
+    {
+        let current = ProcessManager::current_pcb();
+        let mut task_state = current.srcu_task_state.lock_irqsave();
+        let first_test_domain = u64::MAX - 1024;
+        let mut overflow_domain = first_test_domain;
+        while task_state.enter(overflow_domain) {
+            overflow_domain = overflow_domain
+                .checked_add(1)
+                .ok_or("SRCU task tracking did not overflow")?;
+        }
+        let overflow_is_conservative = task_state.may_wait(overflow_domain);
+        task_state.leave(overflow_domain, false);
+        while overflow_domain != first_test_domain {
+            overflow_domain -= 1;
+            task_state.leave(overflow_domain, true);
+        }
+        if !overflow_is_conservative {
+            return Err("SRCU task tracking overflow allowed a synchronous wait");
+        }
+    }
+
     let outer = first.read_lock();
     let inner = first.read_lock();
     if first.synchronize() != Err(SystemError::EDEADLK_OR_EDEADLOCK) {
@@ -1003,6 +1009,22 @@ pub(super) fn run_runtime_selftests() -> Result<(), &'static str> {
     first
         .synchronize()
         .map_err(|_| "SRCU synchronize failed after nested readers")?;
+
+    let cleanup_target = SrcuDomain::try_new("srcu_selftest_cleanup")
+        .map_err(|_| "failed to create SRCU cleanup test domain")?;
+    let cleanup_target = {
+        let _callback_task = SrcuCallbackTaskGuard::enter(first.inner.id);
+        if second.synchronize() != Err(SystemError::EDEADLK_OR_EDEADLOCK)
+            || second.barrier() != Err(SystemError::EDEADLK_OR_EDEADLOCK)
+            || second.validate_update_context() != Err(SystemError::EDEADLK_OR_EDEADLOCK)
+        {
+            return Err("cross-domain wait from an SRCU callback was not rejected");
+        }
+        match cleanup_target.try_cleanup() {
+            Err((domain, SystemError::EDEADLK_OR_EDEADLOCK)) => domain,
+            _ => return Err("cross-domain cleanup from an SRCU callback was not rejected"),
+        }
+    };
 
     let poll = first.start_poll_synchronize();
     while !first.poll_state_synchronize(poll) {
@@ -1033,6 +1055,9 @@ pub(super) fn run_runtime_selftests() -> Result<(), &'static str> {
     second
         .try_cleanup()
         .map_err(|_| "second SRCU domain cleanup failed")?;
+    cleanup_target
+        .try_cleanup()
+        .map_err(|_| "SRCU cleanup test domain cleanup failed")?;
     Ok(())
 }
 

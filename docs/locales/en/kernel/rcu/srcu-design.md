@@ -318,6 +318,12 @@ destruction should be handed to a dedicated workqueue or retained in updater
 context. This is distinct from the rule that application callbacks invoked by
 an SRCU notifier chain may sleep: the two run in different execution contexts.
 
+Because the shared executor advances grace periods and callbacks for every
+domain, an SRCU deferred callback must not synchronously wait for any SRCU
+domain's grace period, barrier, or cleanup. Waiting on a different domain still
+blocks the only executor that can advance that domain. Such dependencies must
+first be handed to an independent execution context.
+
 Under the current per-domain serial FIFO model, a barrier treats submissions
 before its linearization point as one contiguous prefix and waits for that
 prefix to complete. An implementation may represent the boundary with submitted

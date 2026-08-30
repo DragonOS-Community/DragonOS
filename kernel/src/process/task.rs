@@ -119,9 +119,14 @@ impl SrcuTaskState {
     }
 
     pub(crate) fn may_wait(&self, domain: u64) -> bool {
-        self.slots
-            .iter()
-            .any(|slot| slot.depth != 0 && slot.domain == domain)
+        // Reader entry must remain infallible and allocation-free. Once the
+        // fixed tracking slots overflow, domain identity is unavailable, so
+        // fail closed: a false negative here would deadlock synchronously.
+        self.overflow_depth != 0
+            || self
+                .slots
+                .iter()
+                .any(|slot| slot.depth != 0 && slot.domain == domain)
     }
 }
 

@@ -30,6 +30,7 @@ use crate::{
     syscall::user_buffer::UserBuffer,
     time::{
         syscall::{posix_clock_now, PosixClockID},
+        timekeeping::realtime_now_with_clock_set_seq,
         timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
         PosixTimeSpec, NSEC_PER_SEC,
     },
@@ -90,6 +91,7 @@ struct TimerFdState {
     cancel_pending: bool,
     generation: u64,
     settime_flags: TimerFdSettimeFlags,
+    observed_clock_set_seq: Option<u64>,
     registry_registered: bool,
     shutdown: bool,
 }
@@ -198,6 +200,7 @@ impl TimerFdInode {
                 cancel_pending: false,
                 generation: 0,
                 settime_flags: TimerFdSettimeFlags::empty(),
+                observed_clock_set_seq: None,
                 registry_registered: false,
                 shutdown: false,
             }),
@@ -450,7 +453,14 @@ impl TimerFdInode {
         } else {
             Self::relative_domain(clock_id)
         };
-        let now = domain.now_ns();
+        let (now, observed_clock_set_seq) = if domain == DeadlineDomain::Realtime
+            && flags.contains(TimerFdSettimeFlags::TFD_TIMER_ABSTIME)
+        {
+            let (now, seq) = realtime_now_with_clock_set_seq();
+            (now.to_ktime_ns(), Some(seq))
+        } else {
+            (domain.now_ns(), None)
+        };
         let deadline = if initial_ns == 0 {
             None
         } else if flags.contains(TimerFdSettimeFlags::TFD_TIMER_ABSTIME) {
@@ -472,6 +482,7 @@ impl TimerFdInode {
             state.ticks = 0;
             state.expired = false;
             state.settime_flags = flags;
+            state.observed_clock_set_seq = observed_clock_set_seq;
             state.registry_registered = registry_member;
             state.cancel_pending = old_cancel
                 && realtime_absolute
@@ -512,11 +523,16 @@ impl TimerFdInode {
 
     fn clock_was_set(&self) {
         let _operation = self.operation.lock();
+        let (realtime_now, clock_set_seq) = realtime_now_with_clock_set_seq();
         let (old_backend, deadline, domain, generation, notify) = {
             let mut state = self.state.lock_irqsave();
             if state.shutdown || !state.configured_realtime_absolute() {
                 return;
             }
+            if state.observed_clock_set_seq == Some(clock_set_seq) {
+                return;
+            }
+            state.observed_clock_set_seq = Some(clock_set_seq);
             let notify = state.cancel_on_set();
             if notify {
                 state.cancel_pending = true;
@@ -554,7 +570,7 @@ impl TimerFdInode {
         if let Some(old_backend) = old_backend {
             old_backend.cancel();
         }
-        let now = domain.now_ns();
+        let now = realtime_now.to_ktime_ns();
         if now >= deadline {
             let mut state = self.state.lock_irqsave();
             if !state.shutdown && state.generation == generation {

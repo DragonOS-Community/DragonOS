@@ -9,7 +9,7 @@ use crate::{
         },
     },
     ipc::{
-        id::IpcIdAllocator,
+        id::{IpcIdAllocator, ShmIpcIdAllocator},
         ipc_perm::{self, IpcPermView, PosixIpcPerm},
     },
     libs::mutex::Mutex,
@@ -355,7 +355,7 @@ impl Drop for SysVShmAttachGuard {
 #[derive(Debug)]
 pub struct ShmManager {
     /// ShmId分配器
-    id_allocator: IpcIdAllocator,
+    id_allocator: ShmIpcIdAllocator,
     /// 低位 IPC idx 映射共享内存信息表
     id2shm: HashMap<usize, KernelShm>,
     /// ShmKey映射ShmId表
@@ -377,7 +377,7 @@ impl ShmManager {
 
     pub fn new() -> Self {
         ShmManager {
-            id_allocator: IpcIdAllocator::new(PosixShmMetaInfo::SHMMNI).unwrap(),
+            id_allocator: ShmIpcIdAllocator::new(PosixShmMetaInfo::SHMMNI).unwrap(),
             id2shm: HashMap::new(),
             key2id: HashMap::new(),
             total_pages: 0,
@@ -455,6 +455,16 @@ impl ShmManager {
             .total_pages
             .checked_add(numpages)
             .ok_or(SystemError::ENOSPC)?;
+
+        self.id2shm
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        if key != IPC_PRIVATE {
+            self.key2id
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
+
         let ipc_id = self.id_allocator.alloc()?;
         let shm_id = ShmId::new(ipc_id.raw);
 

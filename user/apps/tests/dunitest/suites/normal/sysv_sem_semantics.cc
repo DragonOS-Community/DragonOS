@@ -447,6 +447,34 @@ TEST(SysVSem, IpcInfoAndSemInfo) {
     EXPECT_EQ(before.semaem + 5, info.semaem) << "SEM_INFO semaem is the semaphore count";
 }
 
+TEST(SysVSem, KeyedCreateRemovalRestoresAccountingAndAllowsReuse) {
+    struct seminfo before = {};
+    ASSERT_GE(SemCtl(0, 0, SEM_INFO, reinterpret_cast<unsigned long>(&before)), 0);
+
+    const key_t key = UniqueKey();
+    int semid = SemGet(key, 4, IPC_CREAT | IPC_EXCL | 0600);
+    ASSERT_GE(semid, 0) << "semget failed: errno=" << errno;
+    EXPECT_EQ(semid, SemGet(key, 0, 0));
+
+    struct seminfo created = {};
+    ASSERT_GE(SemCtl(0, 0, SEM_INFO, reinterpret_cast<unsigned long>(&created)), 0);
+    EXPECT_EQ(before.semusz + 1, created.semusz);
+    EXPECT_EQ(before.semaem + 4, created.semaem);
+
+    ASSERT_EQ(0, SemCtl(semid, 0, IPC_RMID, 0));
+    errno = 0;
+    EXPECT_EQ(-1, SemGet(key, 0, 0));
+    EXPECT_EQ(ENOENT, errno);
+
+    struct seminfo removed = {};
+    ASSERT_GE(SemCtl(0, 0, SEM_INFO, reinterpret_cast<unsigned long>(&removed)), 0);
+    EXPECT_EQ(before.semusz, removed.semusz);
+    EXPECT_EQ(before.semaem, removed.semaem);
+
+    SemSet reused(key, 4, IPC_CREAT | IPC_EXCL | 0600);
+    ASSERT_TRUE(reused.valid()) << "key must be reusable after IPC_RMID: errno=" << errno;
+}
+
 TEST(SysVSem, SetValGetVal) {
     SemSet sem(1, IPC_CREAT | 0600);
     ASSERT_TRUE(sem.valid());

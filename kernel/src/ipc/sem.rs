@@ -323,10 +323,18 @@ pub struct KernelSemSet {
 }
 
 impl KernelSemSet {
-    pub fn new(kern_ipc_perm: IpcPerm, nsems: usize) -> Self {
+    fn try_allocate_sems(nsems: usize) -> Result<Vec<KernelSem>, SystemError> {
+        let mut sems = Vec::new();
+        sems.try_reserve_exact(nsems)
+            .map_err(|_| SystemError::ENOMEM)?;
+        sems.resize(nsems, KernelSem { val: 0, pid: None });
+        Ok(sems)
+    }
+
+    fn new(kern_ipc_perm: IpcPerm, sems: Vec<KernelSem>) -> Self {
         KernelSemSet {
             kern_ipc_perm,
-            sems: core::iter::repeat_n(KernelSem { val: 0, pid: None }, nsems).collect(),
+            sems,
             sem_otime: 0,
             sem_ctime: PosixTimeSpec::now().tv_sec,
             waiters: VecDeque::new(),
@@ -496,6 +504,16 @@ impl SemManager {
             return Err(SystemError::ENOSPC);
         }
 
+        self.id2sem
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        if key != IPC_PRIVATE {
+            self.key2id
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
+        let sems = KernelSemSet::try_allocate_sems(nsems)?;
+
         let ipc_id = self.id_allocator.alloc()?;
         let sem_id = SemId::new(ipc_id.raw);
         let current_cred = ProcessManager::current_pcb().cred();
@@ -506,7 +524,7 @@ impl SemManager {
             semflg.bits() & SemFlags::PERM_MASK.bits(),
             ipc_id.seq,
         );
-        let set = KernelSemSet::new(kern_ipc_perm, nsems);
+        let set = KernelSemSet::new(kern_ipc_perm, sems);
 
         if key != IPC_PRIVATE {
             self.key2id.insert(key, sem_id);
@@ -929,7 +947,8 @@ mod tests {
     fn insert_test_set(manager: &mut SemManager, key: SemKey, vals: &[i32]) -> SemId {
         let ipc_id = manager.id_allocator.alloc().unwrap();
         let id = SemId::new(ipc_id.raw);
-        let mut set = KernelSemSet::new(test_perm(id, key, ipc_id.seq), vals.len());
+        let sems = KernelSemSet::try_allocate_sems(vals.len()).unwrap();
+        let mut set = KernelSemSet::new(test_perm(id, key, ipc_id.seq), sems);
         for (sem, val) in set.sems.iter_mut().zip(vals.iter().copied()) {
             sem.val = val;
         }

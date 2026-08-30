@@ -4,7 +4,6 @@ use crate::{
         types::{InterfaceFlags, InterfaceType},
         Iface, Operstate,
     },
-    libs::mutex::Mutex,
     net::socket::{
         netlink::{
             message::segment::{
@@ -33,16 +32,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::num::NonZero;
 use system_error::SystemError;
-
-lazy_static! {
-    /// Serialize RTM_SETLINK transactions through flag publication, operstate,
-    /// timer rearm, rename/MTU updates, and notification.
-    ///
-    /// Linux provides this boundary with RTNL. DragonOS does not yet expose a
-    /// general RTNL lock, so link mutation owns the smallest equivalent
-    /// serialization point here.
-    static ref RTNL_LINK_LOCK: Mutex<()> = Mutex::new(());
-}
 
 pub(super) fn do_get_link(
     request_segment: &LinkSegment,
@@ -208,7 +197,6 @@ pub(super) fn do_set_link(
     request_segment: &LinkSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let _rtnl_guard = RTNL_LINK_LOCK.lock();
     let iface = find_iface_for_setlink(request_segment, netns.clone())?;
     let updates = validate_setlink_request(request_segment, iface.as_ref())?;
 

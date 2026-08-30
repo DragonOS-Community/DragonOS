@@ -10,6 +10,14 @@ use crate::{
     time::{sleep::nanosleep, PosixTimeSpec},
 };
 
+enum DhcpControlEvent {
+    Configured {
+        address: wire::Ipv4Cidr,
+        router: Option<wire::Ipv4Address>,
+    },
+    Deconfigured,
+}
+
 pub fn net_init() -> Result<(), SystemError> {
     KernelThreadMechanism::create_and_run(
         KernelThreadClosure::StaticEmptyClosure((&(dhcp_worker as fn() -> i32), ())),
@@ -64,22 +72,37 @@ fn dhcp_query() -> Result<(), SystemError> {
     for i in 0..DHCP_TRY_ROUND {
         log::debug!("DHCP try round: {}", i);
         net_face.poll();
-        let mut binding = sockets();
-        let event = binding.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
+        let event = {
+            let mut binding = sockets();
+            binding
+                .get_mut::<dhcpv4::Socket>(dhcp_handle)
+                .poll()
+                .map(|event| match event {
+                    dhcpv4::Event::Configured(config) => DhcpControlEvent::Configured {
+                        address: config.address,
+                        router: config.router,
+                    },
+                    dhcpv4::Event::Deconfigured => DhcpControlEvent::Deconfigured,
+                })
+        };
 
         match event {
             None => {}
 
-            Some(dhcpv4::Event::Configured(config)) => {
+            Some(DhcpControlEvent::Configured { address, router }) => {
+                // The DHCP socket guard is released before RTNL. Lease commits
+                // share the same global serialization domain as userspace
+                // rtnetlink mutations without extending it over DHCP polling.
+                let _rtnl_guard = crate::net::rtnl::lock();
                 // debug!("Find Config!! {config:?}");
                 // debug!("Find ip address: {}", config.address);
                 // debug!("iface.ip_addrs={:?}", net_face.inner_iface.ip_addrs());
 
                 net_face
-                    .update_ip_addrs(&[wire::IpCidr::Ipv4(config.address)])
+                    .update_ip_addrs(&[wire::IpCidr::Ipv4(address)])
                     .ok();
 
-                if let Some(router) = config.router {
+                if let Some(router) = router {
                     let mut smol_iface = net_face.smol_iface().lock();
                     smol_iface.routes_mut().update(|table| {
                         let _ = table.push(smoltcp::iface::Route {
@@ -115,7 +138,8 @@ fn dhcp_query() -> Result<(), SystemError> {
                 }
             }
 
-            Some(dhcpv4::Event::Deconfigured) => {
+            Some(DhcpControlEvent::Deconfigured) => {
+                let _rtnl_guard = crate::net::rtnl::lock();
                 log::debug!("Dhcp v4 deconfigured");
                 net_face
                     .update_ip_addrs(&[smoltcp::wire::IpCidr::Ipv4(wire::Ipv4Cidr::new(
@@ -130,9 +154,6 @@ fn dhcp_query() -> Result<(), SystemError> {
                     .remove_default_ipv4_route();
             }
         }
-        // 在睡眠前释放锁
-        drop(binding);
-
         let sleep_time = PosixTimeSpec {
             tv_sec: 0,
             tv_nsec: DHCP_RETRY_INTERVAL_NS,

@@ -120,28 +120,13 @@ impl NetlinkRouteKernelSocket {
             let request_flags = SegHdrCommonFlags::from_bits_truncate(header.flags);
             let need_ack = request_flags.contains(SegHdrCommonFlags::ACK);
 
-            let response_segments = match segment {
-                RouteNlSegment::GetAddr(request) => addr::do_get_addr(request, netns.clone()),
-                RouteNlSegment::NewAddr(request) => addr::do_new_addr(request, netns.clone()),
-                RouteNlSegment::DelAddr(request) => addr::do_del_addr(request, netns.clone()),
-                RouteNlSegment::GetLink(request) => link::do_get_link(request, netns.clone()),
-                RouteNlSegment::SetLink(request) if seg_type == CSegmentType::DELLINK => {
-                    link::do_del_link(request, netns.clone())
-                }
-                RouteNlSegment::SetLink(request) => link::do_set_link(request, netns.clone()),
-                RouteNlSegment::GetRoute(request) if seg_type == CSegmentType::GETRULE => {
-                    route::do_get_rule(request, netns.clone())
-                }
-                RouteNlSegment::GetRoute(request) => route::do_get_route(request, netns.clone()),
-                RouteNlSegment::NewRoute(request) => route::do_new_route(request, netns.clone()),
-                RouteNlSegment::DelRoute(request) => route::do_del_route(request, netns.clone()),
-                RouteNlSegment::NewNeigh(request) => neigh::do_new_neigh(request, netns.clone()),
-                RouteNlSegment::GetNeigh(request) => neigh::do_get_neigh(request, netns.clone()),
-                RouteNlSegment::DelNeigh(request) => neigh::do_del_neigh(request, netns.clone()),
-                _ => {
-                    log::warn!("Unsupported route request segment type: {:?}", seg_type);
-                    Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
-                }
+            let response_segments = {
+                // Linux runs regular rtnetlink doit and dump handlers under
+                // RTNL unless a handler is explicitly registered as unlocked.
+                // Keep response delivery outside this scope so ACKs cannot
+                // extend the global control-plane critical section.
+                let _rtnl_guard = crate::net::rtnl::lock();
+                dispatch_request(segment, seg_type, netns.clone())
             };
 
             let response = match response_segments {
@@ -168,6 +153,36 @@ impl NetlinkRouteKernelSocket {
                     e
                 );
             }
+        }
+    }
+}
+
+fn dispatch_request(
+    segment: &RouteNlSegment,
+    seg_type: CSegmentType,
+    netns: Arc<NetNamespace>,
+) -> Result<alloc::vec::Vec<RouteNlSegment>, SystemError> {
+    match segment {
+        RouteNlSegment::GetAddr(request) => addr::do_get_addr(request, netns),
+        RouteNlSegment::NewAddr(request) => addr::do_new_addr(request, netns),
+        RouteNlSegment::DelAddr(request) => addr::do_del_addr(request, netns),
+        RouteNlSegment::GetLink(request) => link::do_get_link(request, netns),
+        RouteNlSegment::SetLink(request) if seg_type == CSegmentType::DELLINK => {
+            link::do_del_link(request, netns)
+        }
+        RouteNlSegment::SetLink(request) => link::do_set_link(request, netns),
+        RouteNlSegment::GetRoute(request) if seg_type == CSegmentType::GETRULE => {
+            route::do_get_rule(request, netns)
+        }
+        RouteNlSegment::GetRoute(request) => route::do_get_route(request, netns),
+        RouteNlSegment::NewRoute(request) => route::do_new_route(request, netns),
+        RouteNlSegment::DelRoute(request) => route::do_del_route(request, netns),
+        RouteNlSegment::NewNeigh(request) => neigh::do_new_neigh(request, netns),
+        RouteNlSegment::GetNeigh(request) => neigh::do_get_neigh(request, netns),
+        RouteNlSegment::DelNeigh(request) => neigh::do_del_neigh(request, netns),
+        _ => {
+            log::warn!("Unsupported route request segment type: {:?}", seg_type);
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
         }
     }
 }

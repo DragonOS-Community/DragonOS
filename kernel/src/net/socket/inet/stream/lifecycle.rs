@@ -1,6 +1,5 @@
 use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::inet::InetSocket;
-use crate::net::socket::inet::Types;
 use crate::net::tcp_close_defer::{
     DeferredTcpCloseKind, DeferredTcpCloseReason, DeferredTcpCloseRequest,
 };
@@ -143,20 +142,28 @@ impl TcpSocket {
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
         match writer.take().expect("Tcp inner::Inner is None") {
-            inner::Inner::Init(inner) => match inner.bind(local_endpoint, self.netns()) {
-                Ok(bound) => {
-                    if let inner::Init::Bound((ref bound, _)) = bound {
-                        bound
-                            .iface()
-                            .common()
-                            .bind_socket(self.self_ref.upgrade().unwrap());
+            inner::Inner::Init(inner) => {
+                let reuseaddr = self
+                    .so_reuseaddr()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let reuseport = self
+                    .so_reuseport()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                match inner.bind(local_endpoint, self.netns(), reuseaddr, reuseport) {
+                    Ok(bound) => {
+                        if let inner::Init::Bound((ref bound, _)) = bound {
+                            bound
+                                .iface()
+                                .common()
+                                .bind_socket(self.self_ref.upgrade().unwrap());
+                        }
+                        writer.replace(inner::Inner::Init(bound));
+                        Ok(())
                     }
-                    writer.replace(inner::Inner::Init(bound));
-                    Ok(())
-                }
-                Err((inner, err)) => {
-                    writer.replace(inner::Inner::Init(inner));
-                    Err(err)
+                    Err((inner, err)) => {
+                        writer.replace(inner::Inner::Init(inner));
+                        Err(err)
+                    }
                 }
             },
             any => {
@@ -172,7 +179,13 @@ impl TcpSocket {
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let (listening, err) = match inner {
             inner::Inner::Init(init) => {
-                let listen_result = init.listen(backlog, self.netns());
+                let reuseaddr = self
+                    .so_reuseaddr()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let reuseport = self
+                    .so_reuseport()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let listen_result = init.listen(backlog, self.netns(), reuseaddr, reuseport);
                 match listen_result {
                     Ok(listening) => {
                         // DragonOS backlog emulation: listener is represented by multiple
@@ -662,7 +675,9 @@ impl TcpSocket {
                     conn.with_mut(|socket| socket.abort());
                     let initial_state = conn.with(|socket| socket.state());
                     if conn.owns_port() {
-                        iface.port_manager().unbind_port(Types::Tcp, local_port);
+                        iface
+                            .port_manager()
+                            .unbind_tcp_port(local_port, iface.nic_id(), handle);
                     }
                     iface.common().defer_tcp_close(DeferredTcpCloseRequest {
                         handle,
@@ -688,7 +703,9 @@ impl TcpSocket {
                 es.with_mut(|socket| Self::apply_close_action(socket, close_action));
                 let initial_state = es.with(|socket| socket.state());
                 if es.owns_port() {
-                    iface.port_manager().unbind_port(Types::Tcp, local_port);
+                    iface
+                        .port_manager()
+                        .unbind_tcp_port(local_port, iface.nic_id(), es.handle());
                 }
                 iface.common().defer_tcp_close(DeferredTcpCloseRequest {
                     handle,
@@ -712,8 +729,11 @@ impl TcpSocket {
                 };
                 let port = sc.get_name().port;
                 let iface = sc.iface().clone();
+                let handle = sc.handle();
                 sc.release();
-                iface.port_manager().unbind_port(Types::Tcp, port);
+                iface
+                    .port_manager()
+                    .unbind_tcp_port(port, iface.nic_id(), handle);
                 writer.replace(inner::Inner::Closed(inner::Closed::new(ver)));
             }
             inner::Inner::Listening(mut ls) => {

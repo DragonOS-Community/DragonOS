@@ -239,6 +239,7 @@ impl TtyCore {
 
     pub fn tty_start(&self) {
         let mut flow = self.core.flow.lock_irqsave();
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
         if !self.tty_start_locked(&mut flow) {
             return;
         }
@@ -252,11 +253,13 @@ impl TtyCore {
     /// releasing any line-discipline locks it holds.
     pub(crate) fn tty_start_without_wakeup(&self) -> bool {
         let mut flow = self.core.flow.lock_irqsave();
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
         self.tty_start_locked(&mut flow)
     }
 
     pub fn tty_stop(&self) {
         let mut flow = self.core.flow.lock_irqsave();
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
         self.tty_stop_locked(&mut flow);
     }
 
@@ -266,6 +269,7 @@ impl TtyCore {
             return;
         }
         flow.tco_stopped = true;
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
         self.tty_stop_locked(&mut flow);
     }
 
@@ -275,6 +279,7 @@ impl TtyCore {
             return;
         }
         flow.tco_stopped = false;
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
         if !self.tty_start_locked(&mut flow) {
             return;
         }
@@ -297,18 +302,34 @@ impl TtyCore {
             return Ok(());
         }
 
-        let was_stopped = self.core.flow.lock_irqsave().stopped;
         let _write_guard = self.core.write_lock().lock_interruptible(false)?;
         let _termios_guard = self.core.termios_read_lock();
 
-        if was_stopped {
+        let (temporarily_started, transition_seq) = {
             let mut flow = self.core.flow.lock_irqsave();
-            self.tty_start_locked(&mut flow);
-        }
+            let transition_seq = flow.transition_seq;
+            let temporarily_started = self.tty_start_locked(&mut flow);
+            (temporarily_started, transition_seq)
+        };
         let _ = self.write(self.core(), &[ch], 1);
-        if was_stopped {
+        let mut should_wake = false;
+        if temporarily_started {
             let mut flow = self.core.flow.lock_irqsave();
-            self.tty_stop_locked(&mut flow);
+            // A concurrent flow-control request owns the final state. Restore
+            // the temporary stop only if no request raced with this fallback.
+            if flow.transition_seq == transition_seq && !flow.stopped {
+                self.tty_stop_locked(&mut flow);
+            } else if !flow.stopped {
+                // A start request can observe the temporary running state and
+                // skip its own wakeup. Complete that request after dropping
+                // every lock that write_wakeup may re-enter.
+                should_wake = true;
+            }
+        }
+        drop(_termios_guard);
+        drop(_write_guard);
+        if should_wake {
+            self.tty_wakeup();
         }
         Ok(())
     }
@@ -702,6 +723,9 @@ pub struct TtyFlowState {
     pub stopped: bool,
     /// 表示 TCO（Transmit Continuous Operation）流控是否被停止
     pub tco_stopped: bool,
+    /// Changes whenever an external start/stop request can supersede a
+    /// temporary state transition used by the xchar fallback.
+    transition_seq: usize,
 }
 
 #[derive(Debug)]

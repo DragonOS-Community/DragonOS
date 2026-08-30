@@ -1293,6 +1293,12 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
         let port =
             unsafe { PIO_PORTS.get(index).and_then(Option::as_ref) }.ok_or(SystemError::ENODEV)?;
         let _lifecycle_guard = port.open_close_lock.lock();
+        // Match Linux tty_port_close_start(): output stopped by TCOOFF cannot
+        // drain, so discard the software TX queue before waiting for bytes
+        // already submitted to the UART to leave the device.
+        if tty.core().flow_irqsave().tco_stopped {
+            port.clear_tx();
+        }
         let close_deadline = Instant::now() + SERIAL_8250_CLOSE_WAIT;
         let queue_drained = port
             .wait_for_tx_queue_empty_until(tty.core(), close_deadline)

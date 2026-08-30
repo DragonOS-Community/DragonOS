@@ -9,12 +9,14 @@
 #include <atomic>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <pty.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <poll.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace {
@@ -841,6 +843,31 @@ TEST(TtyTermios, Serial8250AppliesModernAndLegacySettings) {
     EXPECT_EQ(cfgetospeed(&legacy_back), static_cast<speed_t>(B19200));
     EXPECT_EQ(legacy_back.c_cflag & CSIZE, static_cast<tcflag_t>(CS8));
     EXPECT_EQ(legacy_back.c_cflag & PARENB, 0u);
+}
+
+TEST(TtyTermios, Serial8250CloseDoesNotWaitOnTcoStoppedQueue) {
+    UniqueFd serial(open("/dev/ttyS0", O_RDWR | O_NOCTTY));
+    if (serial.get() < 0) {
+        GTEST_SKIP() << "cannot open /dev/ttyS0: " << strerror(errno);
+        return;
+    }
+
+    ASSERT_EQ(tcflow(serial.get(), TCOOFF), 0) << strerror(errno);
+    constexpr char marker[] = "discard-on-paused-close";
+    ASSERT_EQ(write(serial.get(), marker, sizeof(marker) - 1),
+              static_cast<ssize_t>(sizeof(marker) - 1));
+
+    struct timespec started = {};
+    struct timespec finished = {};
+    ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &started), 0);
+    serial.reset();
+    ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &finished), 0);
+
+    const int64_t elapsed_ms =
+        static_cast<int64_t>(finished.tv_sec - started.tv_sec) * 1000 +
+        (finished.tv_nsec - started.tv_nsec) / 1000000;
+    EXPECT_LT(elapsed_ms, 2000)
+        << "close waited for a software queue that TCOOFF cannot drain";
 }
 
 /* --------------------------------------------------------------------------

@@ -199,6 +199,14 @@ std::vector<uint8_t> BuildRequest(uint16_t type, uint16_t flags, uint32_t seq) {
     return request;
 }
 
+std::vector<uint8_t> BuildZeroPayloadRequest(uint16_t type, uint16_t flags, uint32_t seq) {
+    auto request = BuildRequest(type, flags, seq);
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = NLMSG_LENGTH(0);
+    request.resize(header->nlmsg_len);
+    return request;
+}
+
 int RecvAck(int fd, uint32_t seq) {
     std::array<uint8_t, 8192> buffer{};
     for (;;) {
@@ -295,6 +303,23 @@ TEST(RtnetlinkPermissionSemantics, GetDumpsRemainAvailableWithoutNetAdmin) {
             if (actual != 0) return Failure(2000 + type, actual);
         }
         return Success();
+    });
+}
+
+TEST(RtnetlinkPermissionSemantics, ZeroPayloadMutationsAreAcknowledgedBeforeAuthorization) {
+    ExpectChildSuccess([] {
+        FdGuard fd(OpenRouteSocket());
+        if (fd.Get() < 0) return Failure(1, errno);
+        if (!DropAllCapabilities()) return Failure(2, errno);
+
+        auto request =
+            BuildZeroPayloadRequest(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 250);
+        int actual = SendAndRecvAck(fd.Get(), request, false);
+        if (actual != 0) return Failure(3, actual);
+
+        request = BuildZeroPayloadRequest(kRtmNewQdisc, NLM_F_REQUEST | NLM_F_ACK, 251);
+        actual = SendAndRecvAck(fd.Get(), request, false);
+        return actual == 0 ? Success() : Failure(4, actual);
     });
 }
 

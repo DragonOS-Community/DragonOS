@@ -104,17 +104,24 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
             }
 
             let payload_len = msg_len - size_of::<CMsgSegHdr>();
-            if rtnl_requires_net_admin(header.type_, payload_len) {
+            if payload_len == 0 && is_rtnl_message_type(header.type_) {
+                if flags.contains(SegHdrCommonFlags::ACK) {
+                    send_route_ack(&header, None, local_port, netns.clone());
+                }
+                continue;
+            }
+
+            if rtnl_requires_net_admin(header.type_) {
                 if let Err(error) = context.require_net_admin() {
-                    send_route_error_ack(&header, error, local_port, netns.clone());
+                    send_route_ack(&header, Some(error), local_port, netns.clone());
                     continue;
                 }
             }
 
             if CSegmentType::try_from(header.type_).is_err() {
-                send_route_error_ack(
+                send_route_ack(
                     &header,
-                    SystemError::EOPNOTSUPP_OR_ENOTSUP,
+                    Some(SystemError::EOPNOTSUPP_OR_ENOTSUP),
                     local_port,
                     netns.clone(),
                 );
@@ -197,31 +204,33 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
 /// Mirrors Linux `rtnl_msgtype_kind()`: RTM message kinds repeat in groups of
 /// four as NEW, DEL, GET, SET. Every non-GET userspace request in Linux's RTM
 /// range requires CAP_NET_ADMIN, including message types DragonOS does not yet
-/// implement. A zero-length payload stays on the existing malformed-message
-/// path instead of changing its error ordering.
-fn rtnl_requires_net_admin(message_type: u16, payload_len: usize) -> bool {
-    const RTM_BASE: u16 = 16;
-    const RTM_MAX: u16 = 123;
+/// implement. Linux's zero-payload success path is handled before this helper.
+fn rtnl_requires_net_admin(message_type: u16) -> bool {
     const RTM_GET_KIND: u16 = 2;
 
-    payload_len != 0
-        && (RTM_BASE..=RTM_MAX).contains(&message_type)
-        && ((message_type - RTM_BASE) & 3) != RTM_GET_KIND
+    is_rtnl_message_type(message_type) && ((message_type - RTM_BASE) & 3) != RTM_GET_KIND
 }
 
-fn send_route_error_ack(
+const RTM_BASE: u16 = 16;
+const RTM_MAX: u16 = 123;
+
+fn is_rtnl_message_type(message_type: u16) -> bool {
+    (RTM_BASE..=RTM_MAX).contains(&message_type)
+}
+
+fn send_route_ack(
     request_header: &CMsgSegHdr,
-    error: SystemError,
+    error: Option<SystemError>,
     dst_port: u32,
     netns: Arc<NetNamespace>,
 ) {
     use crate::net::socket::netlink::route::message::segment::RouteNlSegment;
 
-    let err_segment = ErrorSegment::new_from_request(request_header, Some(error));
+    let err_segment = ErrorSegment::new_from_request(request_header, error);
     let err_msg = RouteNlMessage::new(vec![RouteNlSegment::Error(err_segment)]);
     if let Err(e) = NetlinkRouteProtocol::unicast(dst_port, err_msg, netns) {
         log::warn!(
-            "netlink route: failed to deliver error ack to port {}: {:?}",
+            "netlink route: failed to deliver ack to port {}: {:?}",
             dst_port,
             e
         );

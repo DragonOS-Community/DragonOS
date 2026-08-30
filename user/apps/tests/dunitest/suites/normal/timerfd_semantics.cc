@@ -144,6 +144,44 @@ TEST(TimerFdSemantics, AbsoluteAndPastDeadlines) {
     EXPECT_EQ(1u, ticks);
 }
 
+TEST(TimerFdSemantics, SameDeadlineTimersRemainIndependent) {
+    constexpr int kTimerCount = 32;
+    int fds[kTimerCount];
+    pollfd poll_fds[kTimerCount];
+
+    itimerspec value = {};
+    ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &value.it_value));
+    value.it_value = AddMilliseconds(value.it_value, 500);
+
+    for (int i = 0; i < kTimerCount; ++i) {
+        fds[i] = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        ASSERT_GE(fds[i], 0) << strerror(errno);
+        ASSERT_EQ(0, timerfd_settime(fds[i], TFD_TIMER_ABSTIME, &value, nullptr));
+        poll_fds[i] = {fds[i], POLLIN, 0};
+    }
+
+    itimerspec disarm = {};
+    for (int i = 0; i < kTimerCount; i += 2) {
+        ASSERT_EQ(0, timerfd_settime(fds[i], 0, &disarm, nullptr));
+    }
+
+    ASSERT_EQ(kTimerCount / 2, poll(poll_fds, kTimerCount, 2000));
+    for (int i = 0; i < kTimerCount; ++i) {
+        uint64_t ticks = 0;
+        if (i % 2 == 0) {
+            EXPECT_EQ(0, poll_fds[i].revents);
+            errno = 0;
+            EXPECT_EQ(-1, read(fds[i], &ticks, sizeof(ticks)));
+            EXPECT_EQ(EAGAIN, errno);
+        } else {
+            EXPECT_EQ(POLLIN, poll_fds[i].revents);
+            ASSERT_EQ(8, read(fds[i], &ticks, sizeof(ticks)));
+            EXPECT_EQ(1u, ticks);
+        }
+        close(fds[i]);
+    }
+}
+
 TEST(TimerFdSemantics, GetOldDisarmAndFcntlNonblock) {
     UniqueFd fd(timerfd_create(CLOCK_REALTIME, 0));
     ASSERT_GE(fd.get(), 0) << strerror(errno);

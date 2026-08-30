@@ -45,7 +45,7 @@ impl Syscall for SysGetitimerHandle {
                 if let Some(current_itimer) = itimers.real.as_ref() {
                     itv.it_interval = current_itimer.config.it_interval;
                     let now = timer::clock();
-                    let expires = current_itimer.timer.inner().expire_jiffies;
+                    let expires = current_itimer.timer.expire_jiffies();
 
                     if expires > now {
                         let remaining_jiffies = Jiffies::new(expires - now);

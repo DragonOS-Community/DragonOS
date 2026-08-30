@@ -405,9 +405,29 @@ impl Socket for TcpSocket {
         // TCP: 不返回 peer 地址。
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let total = iovs.total_len();
-        let mut tmp = vec![0u8; total];
-        let n = self.recv(&mut tmp, flags)?;
-        let written = iovs.scatter(&tmp[..n])?;
+        let written = if flags.contains(PMSG::TRUNC) {
+            // Linux TCP MSG_TRUNC reports/consumes bytes without copying the
+            // payload, so an inaccessible iovec must not cause EFAULT.
+            let mut tmp = vec![0u8; total];
+            self.recv(&mut tmp, flags)?
+        } else {
+            let segments = iovs.user_buffer_segments(total)?;
+            let mut user_buffer =
+                unsafe { crate::syscall::user_buffer::UserBuffer::new_vectored(&segments, total) };
+
+            if flags.contains(PMSG::PEEK) {
+                // PEEK never consumes, so staging remains transactional while
+                // preserving its existing receive semantics.
+                let mut tmp = vec![0u8; total];
+                let n = self.recv(&mut tmp, flags)?;
+                user_buffer.write_to_user(0, &tmp[..n])?;
+                n
+            } else {
+                let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+                let waitall = flags.contains(PMSG::WAITALL);
+                self.recv_to_user_buffer_impl(&mut user_buffer, nonblock, waitall)?
+            }
+        };
 
         msg.msg_flags = 0;
         msg.msg_namelen = 0;

@@ -448,11 +448,12 @@ impl TcpSocket {
         Ok(total_read)
     }
 
-    pub(super) fn try_read_to_user_buffer(
+    fn try_recv_to_user_buffer(
         &self,
         user_buffer: &mut UserBuffer<'_>,
+        offset: usize,
     ) -> Result<usize, SystemError> {
-        let mut total_read = 0usize;
+        let mut total_read = offset;
 
         loop {
             if let Some(iface) = self.stack_poll_iface_snapshot() {
@@ -521,7 +522,7 @@ impl TcpSocket {
                     }
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    if total_read > 0 {
+                    if total_read > offset {
                         break;
                     }
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -530,13 +531,22 @@ impl TcpSocket {
             }
         }
 
-        self.finish_recv_progress(total_read > 0);
-        Ok(total_read)
+        self.finish_recv_progress(total_read > offset);
+        Ok(total_read - offset)
     }
 
-    pub(super) fn read_to_user_buffer_impl(
+    pub(super) fn try_read_to_user_buffer(
         &self,
         user_buffer: &mut UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        self.try_recv_to_user_buffer(user_buffer, 0)
+    }
+
+    pub(super) fn recv_to_user_buffer_impl(
+        &self,
+        user_buffer: &mut UserBuffer<'_>,
+        nonblock: bool,
+        waitall: bool,
     ) -> Result<usize, SystemError> {
         if self.is_recv_shutdown() {
             let limit = self.recv_shutdown.limit();
@@ -545,12 +555,19 @@ impl TcpSocket {
             }
         }
 
-        if self.is_nonblock() {
+        if nonblock {
             return self.try_read_to_user_buffer(user_buffer);
         }
 
+        let mut total_read = 0usize;
         loop {
-            match self.try_read_to_user_buffer(user_buffer) {
+            match self.try_recv_to_user_buffer(user_buffer, total_read) {
+                Ok(n) => {
+                    total_read += n;
+                    if n == 0 || total_read == user_buffer.len() || !waitall {
+                        return Ok(total_read);
+                    }
+                }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     if let Some(iface) = self.stack_poll_iface_snapshot() {
                         super::poll_util::poll_iface_until_quiescent(iface.as_ref());
@@ -576,11 +593,28 @@ impl TcpSocket {
                         },
                         self.recv_timeout(),
                     );
-                    wait_ret?;
+                    if let Err(error) = wait_ret {
+                        if total_read > 0 {
+                            return Ok(total_read);
+                        }
+                        return Err(error);
+                    }
                 }
-                result => return result,
+                Err(error) => {
+                    if total_read > 0 {
+                        return Ok(total_read);
+                    }
+                    return Err(error);
+                }
             }
         }
+    }
+
+    pub(super) fn read_to_user_buffer_impl(
+        &self,
+        user_buffer: &mut UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        self.recv_to_user_buffer_impl(user_buffer, self.is_nonblock(), false)
     }
 
     pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {

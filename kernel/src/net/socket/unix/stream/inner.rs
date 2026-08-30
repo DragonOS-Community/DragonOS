@@ -552,7 +552,7 @@ impl Connected {
 
     pub(super) fn try_recv_stream_recvmsg_meta(
         &self,
-        buf: &mut [u8],
+        out: &mut crate::syscall::user_buffer::UserBuffer<'_>,
         peek: bool,
         want_creds: bool,
     ) -> Result<StreamRecvmsgMeta, SystemError> {
@@ -570,19 +570,19 @@ impl Connected {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let max = core::cmp::min(buf.len(), avail_len);
+        let max = core::cmp::min(out.len(), avail_len);
         let plan = guard.plan_stream_recvmsg(max, want_creds);
         let n = plan.bytes;
 
         if n != 0 {
-            if peek {
-                if guard.peek_slice(&mut buf[..n]).is_none() {
-                    return Err(SystemError::EFAULT);
-                }
-            } else {
-                if guard.pop_slice_preserve_records(&mut buf[..n]).is_none() {
-                    return Err(SystemError::EFAULT);
-                }
+            let mut data = Vec::new();
+            data.try_reserve(n).map_err(|_| SystemError::ENOMEM)?;
+            data.resize(n, 0);
+            guard.peek_slice(&mut data).ok_or(SystemError::EFAULT)?;
+            out.write_to_user(0, &data)?;
+
+            if !peek {
+                guard.consume_preserve_records(n).ok_or(SystemError::EIO)?;
 
                 // Once any bytes of the rights-carrying record are consumed via
                 // recvmsg, rights are either delivered or discarded, but must not

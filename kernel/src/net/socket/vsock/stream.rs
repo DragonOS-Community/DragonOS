@@ -413,6 +413,25 @@ impl VsockStreamSocket {
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
+    fn recv_to_user_buffer_impl(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        nonblock: bool,
+    ) -> Result<usize, SystemError> {
+        if user_buffer.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            match self.try_read_to_user_buffer_once(user_buffer) {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                    wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// 向当前 socket 的接收缓冲区入队数据。
     ///
     /// # 参数
@@ -1326,18 +1345,7 @@ impl Socket for VsockStreamSocket {
         &self,
         user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
     ) -> Result<usize, SystemError> {
-        if user_buffer.is_empty() {
-            return Ok(0);
-        }
-
-        loop {
-            match self.try_read_to_user_buffer_once(user_buffer) {
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !self.is_nonblock() => {
-                    wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-                }
-                result => return result,
-            }
-        }
+        self.recv_to_user_buffer_impl(user_buffer, self.is_nonblock())
     }
 
     /// `recvfrom` 变体，地址参数对 stream 语义仅做兼容返回。
@@ -1362,9 +1370,18 @@ impl Socket for VsockStreamSocket {
     ) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let total = min(iovs.total_len(), DEFAULT_RECV_BUF_SIZE);
-        let mut tmp = vec![0u8; total];
-        let n = self.recv(&mut tmp, flags)?;
-        let written = iovs.scatter(&tmp[..n])?;
+        let segments = iovs.user_buffer_segments(total)?;
+        let mut user_buffer =
+            unsafe { crate::syscall::user_buffer::UserBuffer::new_vectored(&segments, total) };
+        let written = if flags.contains(PMSG::PEEK) {
+            let mut tmp = vec![0u8; total];
+            let n = self.recv(&mut tmp, flags)?;
+            user_buffer.write_to_user(0, &tmp[..n])?;
+            n
+        } else {
+            let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+            self.recv_to_user_buffer_impl(&mut user_buffer, nonblock)?
+        };
         msg.msg_flags = 0;
         msg.msg_namelen = 0;
         Ok(written)

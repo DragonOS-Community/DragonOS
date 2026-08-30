@@ -660,47 +660,24 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         Some(())
     }
 
-    /// Pop a slice while preserving record metadata for partially-consumed
-    /// records. This is used by recvmsg.
-    pub fn pop_slice_preserve_records(&mut self, buf: &mut [T]) -> Option<()> {
-        let rb = &self.ring_buffer;
-        let nitems = buf.len();
-
+    /// Advance the consumer after a successful recvmsg copy while retaining
+    /// metadata for a record that was only partially consumed.
+    pub fn consume_preserve_records(&mut self, nitems: usize) -> Option<()> {
         if nitems == 0 {
             return Some(());
         }
 
-        // Synchronize with resize(): capacity/offset must match backing storage.
+        let rb = &self.ring_buffer;
         let read_guard = rb.buffer.read();
-        let capacity = read_guard.len();
-
         let head = rb.head();
-        let tail = rb.tail();
-        let available = (tail - head).0;
+        let available = (rb.tail() - head).0;
         if available < nitems {
             return None;
         }
 
-        let offset = head.0 & (capacity - 1);
-
-        let mut start = offset;
-        let mut remaining_len = nitems;
-        let mut buf_start = 0;
-
-        if start + nitems > capacity {
-            let first_part_len = capacity - start;
-            buf[..first_part_len].copy_from_slice(&read_guard[start..start + first_part_len]);
-
-            start = 0;
-            remaining_len -= first_part_len;
-            buf_start = first_part_len;
-        }
-
-        buf[buf_start..buf_start + remaining_len]
-            .copy_from_slice(&read_guard[start..start + remaining_len]);
-
         rb.advance_head(head, nitems);
         rb.advance_records_to(head + Wrapping(nitems));
+        drop(read_guard);
         Some(())
     }
 

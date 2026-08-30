@@ -1007,7 +1007,7 @@ impl Socket for UnixStreamSocket {
 
         // Scatter destination is described by msg_iov/msg_iovlen in user memory.
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = iovs.new_buf(true)?;
+        let total = iovs.total_len();
 
         // Read payload first.
         let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
@@ -1017,6 +1017,7 @@ impl Socket for UnixStreamSocket {
         let (payload_copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights) = if self
             .is_seqpacket
         {
+            let mut buf = iovs.new_buf(true)?;
             loop {
                 match self
                     .inner
@@ -1031,6 +1032,15 @@ impl Socket for UnixStreamSocket {
                         let snapshot = connected.scm_snapshot_for_recvmsg();
                         match connected.try_recv_seqpacket_meta(&mut buf[..], peek) {
                             Ok((copy_len, orig_len, truncated)) => {
+                                if !peek {
+                                    self.wake_peer_writable();
+                                }
+                                if copy_len != 0 {
+                                    let copied = iovs.scatter(&buf[..copy_len])?;
+                                    if copied != copy_len {
+                                        return Err(SystemError::EFAULT);
+                                    }
+                                }
                                 let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
                                     orig_len
                                 } else {
@@ -1056,6 +1066,9 @@ impl Socket for UnixStreamSocket {
                 }
             }
         } else {
+            let segments = iovs.user_buffer_segments(total)?;
+            let mut user_buffer =
+                unsafe { crate::syscall::user_buffer::UserBuffer::new_vectored(&segments, total) };
             loop {
                 match self
                     .inner
@@ -1064,7 +1077,11 @@ impl Socket for UnixStreamSocket {
                     .expect("UnixStreamSocket inner is None")
                 {
                     Inner::Connected(connected) => {
-                        match connected.try_recv_stream_recvmsg_meta(&mut buf, peek, want_creds) {
+                        match connected.try_recv_stream_recvmsg_meta(
+                            &mut user_buffer,
+                            peek,
+                            want_creds,
+                        ) {
                             Ok(meta) => {
                                 let n = meta.copy_len;
                                 break (n, n, false, n, meta.scm_cred, meta.scm_rights);
@@ -1084,8 +1101,7 @@ impl Socket for UnixStreamSocket {
             }
         };
 
-        if payload_copy_len != 0 {
-            iovs.scatter(&buf[..payload_copy_len])?;
+        if !self.is_seqpacket && payload_copy_len != 0 {
             if !peek {
                 self.wake_peer_writable();
             }

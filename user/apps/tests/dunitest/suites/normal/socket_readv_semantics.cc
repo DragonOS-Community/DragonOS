@@ -9,7 +9,9 @@
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 namespace {
 
@@ -152,10 +154,7 @@ TEST(SocketReadvSemantics, TcpFaultDoesNotConsumeFailedChunk) {
     close(sockets[1]);
 }
 
-TEST(SocketReadvSemantics, UnixSeqpacketFaultConsumesRecord) {
-    int sockets[2] = {-1, -1};
-    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets)) << strerror(errno);
-
+void ExpectRecvmsgFaultPreservesStream(int sockets[2]) {
     constexpr std::array<char, 8> payload = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
     ASSERT_EQ(static_cast<ssize_t>(payload.size()),
               write(sockets[0], payload.data(), payload.size()));
@@ -169,19 +168,105 @@ TEST(SocketReadvSemantics, UnixSeqpacketFaultConsumesRecord) {
 
     std::array<char, 4> first = {};
     iovec iovs[2] = {{first.data(), first.size()}, {inaccessible, 4}};
+    msghdr msg = {};
+    msg.msg_iov = iovs;
+    msg.msg_iovlen = 2;
     errno = 0;
-    EXPECT_EQ(-1, readv(sockets[1], iovs, 2));
+    EXPECT_EQ(-1, recvmsg(sockets[1], &msg, 0));
     EXPECT_EQ(EFAULT, errno);
 
     ASSERT_NE(-1, fcntl(sockets[1], F_SETFL, O_NONBLOCK)) << strerror(errno);
-    char byte = 0;
-    errno = 0;
-    EXPECT_EQ(-1, read(sockets[1], &byte, 1));
-    EXPECT_EQ(EAGAIN, errno);
+    std::array<char, 8> remaining = {};
+    ASSERT_EQ(static_cast<ssize_t>(remaining.size()),
+              read(sockets[1], remaining.data(), remaining.size()));
+    EXPECT_EQ(0, std::memcmp(remaining.data(), payload.data(), payload.size()));
 
     EXPECT_EQ(0, munmap(inaccessible, static_cast<size_t>(page_size)));
     close(sockets[0]);
     close(sockets[1]);
+}
+
+TEST(SocketReadvSemantics, TcpRecvmsgFaultDoesNotConsumeFailedChunk) {
+    int sockets[2] = {-1, -1};
+    CreateTcpPair(sockets);
+    ASSERT_GE(sockets[0], 0);
+    ASSERT_GE(sockets[1], 0);
+    ExpectRecvmsgFaultPreservesStream(sockets);
+}
+
+TEST(SocketReadvSemantics, UnixStreamRecvmsgFaultDoesNotConsumeFailedChunk) {
+    int sockets[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) << strerror(errno);
+    ExpectRecvmsgFaultPreservesStream(sockets);
+}
+
+TEST(SocketReadvSemantics, TcpRecvmsgWaitAllFillsAllIovecs) {
+    int sockets[2] = {-1, -1};
+    CreateTcpPair(sockets);
+    ASSERT_GE(sockets[0], 0);
+    ASSERT_GE(sockets[1], 0);
+
+    ASSERT_EQ(4, write(sockets[0], "abcd", 4));
+    std::thread sender([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        EXPECT_EQ(4, write(sockets[0], "efgh", 4));
+    });
+
+    std::array<char, 4> first = {};
+    std::array<char, 4> second = {};
+    iovec iovs[2] = {{first.data(), first.size()}, {second.data(), second.size()}};
+    msghdr msg = {};
+    msg.msg_iov = iovs;
+    msg.msg_iovlen = 2;
+    EXPECT_EQ(8, recvmsg(sockets[1], &msg, MSG_WAITALL));
+    EXPECT_EQ(0, std::memcmp(first.data(), "abcd", 4));
+    EXPECT_EQ(0, std::memcmp(second.data(), "efgh", 4));
+
+    sender.join();
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
+TEST(SocketReadvSemantics, UnixSeqpacketFaultConsumesRecord) {
+    for (bool use_recvmsg : {false, true}) {
+        SCOPED_TRACE(use_recvmsg ? "recvmsg" : "readv");
+        int sockets[2] = {-1, -1};
+        ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets)) << strerror(errno);
+
+        constexpr std::array<char, 8> payload = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
+        ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+                  write(sockets[0], payload.data(), payload.size()));
+
+        const long page_size = sysconf(_SC_PAGESIZE);
+        ASSERT_GT(page_size, 0);
+        void* inaccessible =
+            mmap(nullptr, static_cast<size_t>(page_size), PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ASSERT_NE(MAP_FAILED, inaccessible) << strerror(errno);
+
+        std::array<char, 4> first = {};
+        iovec iovs[2] = {{first.data(), first.size()}, {inaccessible, 4}};
+        errno = 0;
+        if (use_recvmsg) {
+            msghdr msg = {};
+            msg.msg_iov = iovs;
+            msg.msg_iovlen = 2;
+            EXPECT_EQ(-1, recvmsg(sockets[1], &msg, 0));
+        } else {
+            EXPECT_EQ(-1, readv(sockets[1], iovs, 2));
+        }
+        EXPECT_EQ(EFAULT, errno);
+
+        ASSERT_NE(-1, fcntl(sockets[1], F_SETFL, O_NONBLOCK)) << strerror(errno);
+        char byte = 0;
+        errno = 0;
+        EXPECT_EQ(-1, read(sockets[1], &byte, 1));
+        EXPECT_EQ(EAGAIN, errno);
+
+        EXPECT_EQ(0, munmap(inaccessible, static_cast<size_t>(page_size)));
+        close(sockets[0]);
+        close(sockets[1]);
+    }
 }
 
 } // namespace

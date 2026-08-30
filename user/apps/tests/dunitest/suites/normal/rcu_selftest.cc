@@ -46,6 +46,7 @@ std::string ReadAll(const char* path) {
 void ExpectReportOk(const std::string& report) {
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("pr1=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("smp_litmus=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("pr2=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("pr3=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("pr5=ok\n")) << report;

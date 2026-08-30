@@ -38,6 +38,7 @@ normal/sched_affinity
 normal/sync_file_range
 normal/splice_concurrent_io
 normal/rcu_selftest
+normal/rcu_torture
 normal/kthread_selftest
 normal/restart_syscall_semantics
 normal/errseq_selftest

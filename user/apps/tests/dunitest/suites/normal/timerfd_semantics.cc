@@ -7,6 +7,7 @@
 #include <sys/epoll.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -96,6 +97,41 @@ TEST(TimerFdSemantics, OneShotPollReadAndReset) {
     uint64_t ticks = 0;
     ASSERT_EQ(static_cast<ssize_t>(sizeof(ticks)), read(fd.get(), &ticks, sizeof(ticks)));
     EXPECT_EQ(1u, ticks);
+    errno = 0;
+    EXPECT_EQ(-1, read(fd.get(), &ticks, sizeof(ticks)));
+    EXPECT_EQ(EAGAIN, errno);
+}
+
+TEST(TimerFdSemantics, VectoredReadUsesScalarFallbackSemantics) {
+    UniqueFd fd(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK));
+    ASSERT_GE(fd.get(), 0) << strerror(errno);
+
+    itimerspec expired = {};
+    expired.it_value.tv_nsec = 1;
+    ASSERT_EQ(0, timerfd_settime(fd.get(), TFD_TIMER_ABSTIME, &expired, nullptr));
+    pollfd ready = {fd.get(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&ready, 1, 1000));
+
+    uint32_t halves[2] = {};
+    iovec split[2] = {{&halves[0], sizeof(halves[0])},
+                      {&halves[1], sizeof(halves[1])}};
+    errno = 0;
+    EXPECT_EQ(-1, readv(fd.get(), split, 2));
+    EXPECT_EQ(EINVAL, errno);
+
+    uint64_t ticks = 0;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(ticks)),
+              read(fd.get(), &ticks, sizeof(ticks)));
+    EXPECT_EQ(1u, ticks);
+
+    ASSERT_EQ(0, timerfd_settime(fd.get(), TFD_TIMER_ABSTIME, &expired, nullptr));
+    ready.revents = 0;
+    ASSERT_EQ(1, poll(&ready, 1, 1000));
+
+    iovec invalid = {nullptr, sizeof(ticks)};
+    errno = 0;
+    EXPECT_EQ(-1, readv(fd.get(), &invalid, 1));
+    EXPECT_EQ(EFAULT, errno);
     errno = 0;
     EXPECT_EQ(-1, read(fd.get(), &ticks, sizeof(ticks)));
     EXPECT_EQ(EAGAIN, errno);

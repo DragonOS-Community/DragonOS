@@ -12,6 +12,7 @@ use crate::mm::VirtAddr;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::{copy_to_user_protected, user_accessible_len};
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -47,6 +48,13 @@ impl Syscall for SysReadVHandle {
 
         // Linux: limit per readv() to MAX_RW_COUNT = INT_MAX & ~(PAGE_SIZE-1)
         let max_rw_count = (i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1);
+
+        // Linux falls back to one `.read` call per iovec when an inode does
+        // not implement `.read_iter`. Record readers that consume data before
+        // copying it to userspace must keep that ordering for readv as well.
+        if file.supports_read_user() {
+            return readv_user_chunks(file.as_ref(), &iovecs, max_rw_count);
+        }
 
         if file.file_type() == FileType::Socket {
             // Socket readv is one underlying read, but ACCESS still belongs to
@@ -158,6 +166,45 @@ fn finish_readv(
     // boundary, not once per iovec or bounded implementation chunk.
     file.notify_io_event(FsEvent::ACCESS);
     Ok(total_read)
+}
+
+fn readv_user_chunks(
+    file: &crate::filesystem::vfs::file::File,
+    iovecs: &IoVecs,
+    max_rw_count: usize,
+) -> Result<usize, SystemError> {
+    let mut total_read = 0usize;
+
+    for one in iovecs.iovs() {
+        if total_read >= max_rw_count {
+            break;
+        }
+        let len = one.iov_len.min(max_rw_count - total_read);
+        if len == 0 {
+            continue;
+        }
+
+        let mut user_buffer = unsafe { UserBuffer::new(VirtAddr::new(one.iov_base as usize), len) };
+        let read_len = match file.read_user_syscall_chunk(len, &mut user_buffer) {
+            Ok(Some(read_len)) => read_len,
+            Ok(None) => {
+                debug_assert!(
+                    false,
+                    "supports_read_user without read_user_at implementation"
+                );
+                return Err(SystemError::ENOSYS);
+            }
+            Err(_) if total_read != 0 => return finish_readv(file, total_read),
+            Err(error) => return Err(error),
+        };
+        total_read = total_read.saturating_add(read_len);
+
+        if read_len != len {
+            break;
+        }
+    }
+
+    finish_readv(file, total_read)
 }
 
 impl SysReadVHandle {

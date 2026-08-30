@@ -107,15 +107,6 @@ impl IoVecs {
                 continue;
             }
 
-            // If the first byte isn't writable/readable at all, fail early with EFAULT.
-            // Partial accessibility is handled by the syscall implementation.
-            // Note: user_accessible_len returns 0 for null pointers (addr.is_null() check),
-            // so null pointer detection is covered here.
-            let accessible = user_accessible_len(base, one.iov_len, _readv /* check_write */);
-            if accessible == 0 {
-                return Err(SystemError::EFAULT);
-            }
-
             slices.push(one);
         }
 

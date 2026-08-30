@@ -1446,6 +1446,27 @@ impl File {
         len: usize,
         writer: &mut UserBuffer<'_>,
     ) -> Result<Option<usize>, SystemError> {
+        self.read_user_with_fsnotify(len, writer, true)
+    }
+
+    /// Read one userspace-buffer chunk for a vector syscall.
+    ///
+    /// The vector syscall publishes ACCESS once at its completion boundary,
+    /// rather than once per iovec processed by the fallback `.read` loop.
+    pub(crate) fn read_user_syscall_chunk(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_with_fsnotify(len, writer, false)
+    }
+
+    fn read_user_with_fsnotify(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        emit_fsnotify: bool,
+    ) -> Result<Option<usize>, SystemError> {
         let mode = *self.mode.read();
         let stream = mode.contains(FileMode::FMODE_STREAM);
         let offset = if stream {
@@ -1469,7 +1490,7 @@ impl File {
             return Ok(None);
         };
 
-        self.finalize_read(offset, read_len, !stream, true);
+        self.finalize_read(offset, read_len, !stream, emit_fsnotify);
         Ok(Some(read_len))
     }
 

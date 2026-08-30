@@ -285,7 +285,7 @@ impl TracePoint {
         }
         let domain = tracepoint_srcu()?;
         domain.validate_update_context()?;
-        let _update = self.callback_update.lock();
+        let update = self.callback_update.lock();
         let old = self.callbacks.load(Ordering::Acquire);
         if old.is_null() {
             return Err(SystemError::ENODEV);
@@ -295,8 +295,10 @@ impl TracePoint {
         change(&mut next)?;
         let next = Box::try_new(next).map_err(|_| SystemError::ENOMEM)?;
         let old = self.callbacks.swap(Box::into_raw(next), Ordering::AcqRel);
+        drop(update);
         domain.synchronize_after_publication();
         // SAFETY: old was removed exactly once and the GP covers every prior reader.
+        // Drop outside callback_update because callback-owned data may re-enter this tracepoint.
         unsafe { drop(Box::from_raw(old)) };
         Ok(())
     }
@@ -347,7 +349,9 @@ impl TracePoint {
         data: Box<dyn Any + Sync + Send>,
     ) -> Result<(), SystemError> {
         let ptr = func as usize;
-        self.update_callbacks(|snapshot| {
+        let data: Arc<dyn Any + Sync + Send> = data.into();
+        let retained = data.clone();
+        let result = self.update_callbacks(|snapshot| {
             if snapshot
                 .callbacks
                 .iter()
@@ -359,12 +363,13 @@ impl TracePoint {
                 .callbacks
                 .try_reserve(1)
                 .map_err(|_| SystemError::ENOMEM)?;
-            snapshot.callbacks.push(TracePointFunc {
-                func,
-                data: data.into(),
-            });
+            snapshot.callbacks.push(TracePointFunc { func, data });
             Ok(())
-        })
+        });
+        // Keep failed pre-publication cleanup from becoming a final Drop under
+        // callback_update; arbitrary data destruction happens after return.
+        drop(retained);
+        result
     }
 
     /// Unregister a callback function from the tracepoint
@@ -406,7 +411,8 @@ impl TracePoint {
         callback_id: usize,
         callback: Arc<dyn TracePointCallBackFunc>,
     ) -> Result<(), SystemError> {
-        self.update_callbacks(|snapshot| {
+        let retained = callback.clone();
+        let result = self.update_callbacks(|snapshot| {
             match snapshot
                 .raw_callbacks
                 .binary_search_by_key(&callback_id, |entry| entry.0)
@@ -423,7 +429,11 @@ impl TracePoint {
                     Ok(())
                 }
             }
-        })
+        });
+        // Keep fallible snapshot preparation from running a final callback
+        // destructor while callback_update is held.
+        drop(retained);
+        result
     }
 
     /// Unregister a raw callback function from the tracepoint
@@ -449,7 +459,7 @@ impl TracePoint {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
         domain.validate_update_context()?;
-        let _update = self.callback_update.lock();
+        let update = self.callback_update.lock();
         let old = self.callbacks.load(Ordering::Acquire);
         if old.is_null() {
             return Err(SystemError::ENODEV);
@@ -473,8 +483,10 @@ impl TracePoint {
         let next = Box::try_new(next).map_err(|_| SystemError::ENOMEM)?;
         self.acquire_enable()?;
         let old = self.callbacks.swap(Box::into_raw(next), Ordering::AcqRel);
+        drop(update);
         domain.synchronize_after_publication();
         // SAFETY: the old snapshot was removed once and the GP covers its readers.
+        // Drop outside callback_update because callback-owned data may re-enter this tracepoint.
         unsafe { drop(Box::from_raw(old)) };
         Ok(())
     }
@@ -490,7 +502,7 @@ impl TracePoint {
             return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
         domain.validate_update_context()?;
-        let _update = self.callback_update.lock();
+        let update = self.callback_update.lock();
         let old = self.callbacks.load(Ordering::Acquire);
         if old.is_null() {
             return Err(SystemError::ENODEV);
@@ -507,8 +519,10 @@ impl TracePoint {
         let next = Box::try_new(next).map_err(|_| SystemError::ENOMEM)?;
         self.release_enable()?;
         let old = self.callbacks.swap(Box::into_raw(next), Ordering::AcqRel);
+        drop(update);
         domain.synchronize_after_publication();
         // SAFETY: the old snapshot was removed once and the GP covers its readers.
+        // Drop outside callback_update because callback-owned data may re-enter this tracepoint.
         unsafe { drop(Box::from_raw(old)) };
         Ok(())
     }

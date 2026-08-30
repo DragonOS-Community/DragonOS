@@ -158,9 +158,16 @@ impl PerfEventOps for TracepointPerfEvent {
 
         let id = CALLBACK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let mut state = self.state.lock();
+        state
+            .callbacks
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
         if state.enabled {
             self.tp.register_raw_callback(id, callback.clone())?;
         }
+
+        // Capacity was reserved before any external publication, so this cannot allocate.
+        state.callbacks.push((id, callback));
 
         log::info!(
             "Registered BPF program for tracepoint: {}:{} with ID: {}",
@@ -168,7 +175,6 @@ impl PerfEventOps for TracepointPerfEvent {
             self.tp.name(),
             id
         );
-        state.callbacks.push((id, callback));
         Ok(())
     }
 

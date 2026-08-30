@@ -372,21 +372,21 @@ This rule keeps unknown destructor cost out of the shared SRCU executor.
 
 An SRCU notifier chain publishes an immutable, ordered callback snapshot. A
 caller enters the SRCU domain and walks the snapshot without holding the update
-lock, so notifier callbacks may sleep. Registration and removal have different
-synchronization requirements:
+lock, so notifier callbacks may sleep. DragonOS uses complete copy-on-write
+snapshots: after either insertion or removal, the updater waits for a grace
+period before releasing the old snapshot in its own context. Arbitrary user
+destructors therefore never run in the shared SRCU callback executor.
 
-- **registration** only adds an object. An old reader cannot dereference an
-  object that has been removed, so the new snapshot can be published
-  immediately and the old add-only snapshot reclaimed asynchronously.
-  Registration need not wait for current calls and may occur from a notifier
-  callback;
-- **unregistration** removes an object. Before returning, it must ensure that
-  old readers have exited and that an older asynchronous snapshot cannot later
-  become the object's last owner. Final destruction occurs in the unregistering
-  task;
-- the update lock serializes snapshot construction and publication only. It
-  must not be held across an operation that waits for current readers, or a
-  legal registration from a callback could form a lock-wait cycle.
+- the update lock covers snapshot construction and publication only; the
+  updater releases it before waiting for a grace period or destroying data;
+- every fallible allocation precedes publication, and an external ownership
+  pin prevents error cleanup from becoming a final user destructor under the
+  update lock;
+- registration and unregistration are sleepable updates and cannot modify the
+  same chain from one of its notifier callbacks, because that would wait for
+  the current reader itself;
+- when unregistration returns, prior readers have exited and final destruction
+  of the removed object occurs in the unregistering task.
 
 ```mermaid
 flowchart TD
@@ -394,13 +394,10 @@ flowchart TD
     READ --> RUN[Run callbacks without update lock]
     RUN --> EXIT[Exit SRCU]
 
-    REG[Register] --> ADD[Publish add-only snapshot]
-    ADD --> ASYNC[Asynchronously reclaim old snapshot]
-
-    UNREG[Unregister] --> REMOVE[Publish snapshot without target]
-    REMOVE --> GPWAIT[Wait for readers]
-    GPWAIT --> DRAIN[Drain older async snapshots]
-    DRAIN --> DROP[Destroy target in updater context]
+    REG[Register or unregister] --> BUILD[Build complete replacement snapshot]
+    BUILD --> PUB[Publish and release update lock]
+    PUB --> GPWAIT[Wait for prior readers]
+    GPWAIT --> DROP[Destroy old snapshot in updater context]
 ```
 
 The DragonOS reboot notifier is a real user of this pattern. Integrating a

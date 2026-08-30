@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use core::fmt::Debug;
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use log::warn;
 use system_error::SystemError;
 
@@ -149,28 +149,6 @@ where
     chain: SrcuArcSlot<NotifierChain<V, T>>,
 }
 
-#[repr(C)]
-struct SrcuNotifierReclaim<V, T>
-where
-    V: Clone + Copy + Send + Sync + 'static,
-    T: Send + Sync + 'static,
-{
-    head: crate::rcu::srcu::SrcuHead,
-    snapshot: Option<Arc<NotifierChain<V, T>>>,
-}
-
-unsafe fn reclaim_srcu_notifier_snapshot<V, T>(head: core::ptr::NonNull<crate::rcu::srcu::SrcuHead>)
-where
-    V: Clone + Copy + Send + Sync + 'static,
-    T: Send + Sync + 'static,
-{
-    // SAFETY: callback entry transfers ownership of the containing Box.
-    unsafe { head.as_ref().begin_callback() };
-    let reclaim = head.as_ptr().cast::<SrcuNotifierReclaim<V, T>>();
-    // SAFETY: head is the first repr(C) field and this allocation was queued once.
-    unsafe { drop(Box::from_raw(reclaim)) };
-}
-
 impl<V, T> core::fmt::Debug for SrcuNotifierChain<V, T>
 where
     V: Clone + Copy + Send + Sync + 'static,
@@ -214,57 +192,32 @@ where
             unsafe { self.chain.swap(new_chain) }
         };
         self.domain.synchronize_after_publication();
-        // Earlier register operations may still own add-only snapshots in
-        // deferred reclaim callbacks. Drain them before `old` is dropped so a
-        // removed user block can never be finally destroyed by the SRCU worker.
-        self.domain.barrier_after_publication();
         drop(old);
         Ok(())
     }
 
-    fn update_deferred(
-        &self,
-        change: impl FnOnce(&mut NotifierChain<V, T>) -> Result<(), SystemError>,
-    ) -> Result<(), SystemError> {
-        self.domain.validate_deferred_update_context()?;
-        let _update = self.update_lock.lock();
-        let mut new_chain = self
-            .chain
-            .with_read(&self.domain, NotifierChain::try_clone)?;
-        change(&mut new_chain)?;
-        let reclaim = Box::try_new(SrcuNotifierReclaim {
-            head: crate::rcu::srcu::SrcuHead::new(),
-            snapshot: None,
-        })
-        .map_err(|_| SystemError::ENOMEM)?;
-        let new_chain = Arc::try_new(new_chain).map_err(|_| SystemError::ENOMEM)?;
-        let reclaim = Box::into_raw(reclaim);
-        // SAFETY: the mutex serializes publication and the fresh reclaim head is stable.
-        unsafe {
-            (*reclaim).snapshot = Some(self.chain.swap(new_chain));
-            self.domain
-                .call_raw(
-                    core::ptr::NonNull::from(&(*reclaim).head),
-                    reclaim_srcu_notifier_snapshot::<V, T>,
-                )
-                .expect("fresh SRCU notifier reclaim head was rejected");
-        }
-        Ok(())
-    }
-
     pub fn register(&self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
-        self.update_deferred(|chain| chain.register(block, false))
+        let retained = block.clone();
+        let result = self.update_and_synchronize(|chain| chain.register(block, false));
+        drop(retained);
+        result
     }
 
     pub fn register_unique_prio(
         &self,
         block: Arc<dyn NotifierBlock<V, T>>,
     ) -> Result<(), SystemError> {
-        self.update_deferred(|chain| chain.register(block, true))
+        let retained = block.clone();
+        let result = self.update_and_synchronize(|chain| chain.register(block, true));
+        drop(retained);
+        result
     }
 
     pub fn unregister(&self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
-        self.update_and_synchronize(|chain| chain.unregister(block))
+        let retained = block.clone();
+        let result = self.update_and_synchronize(|chain| chain.unregister(block));
+        drop(retained);
+        result
     }
 
     pub fn call_chain(
@@ -283,25 +236,10 @@ where
         if let Err(error) = self.domain.barrier() {
             return Err((self, error));
         }
-        let Self {
-            update_lock,
-            domain,
-            chain,
-        } = self;
-        match domain.try_cleanup() {
-            Ok(()) => {
-                drop(chain);
-                drop(update_lock);
-                Ok(())
-            }
-            Err((domain, error)) => Err((
-                Self {
-                    update_lock,
-                    domain,
-                    chain,
-                },
-                error,
-            )),
+        // SAFETY: consuming the chain removes every public path to its private domain.
+        match unsafe { self.domain.try_cleanup_in_place() } {
+            Ok(()) => Ok(()),
+            Err(error) => Err((self, error)),
         }
     }
 }

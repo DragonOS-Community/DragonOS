@@ -303,14 +303,13 @@ flowchart LR
 ## 11. 通知链集成
 
 SRCU 通知链使用不可变的有序回调快照。调用侧进入 SRCU 域后直接遍历，不持有更新锁，因此回调
-可以睡眠。注册和注销具有不同的同步需求：
+可以睡眠。DragonOS 的快照是完整的 COW 对象；无论增加还是删除元素，发布后都必须等待宽限期，
+才能在更新者上下文释放旧快照。这样可以保证任意用户析构不会进入共享 SRCU callback 执行器。
 
-- **注册**只增加对象，不会让旧读者解引用已删除对象。新快照可以立即发布，旧的 add-only 快照
-  在宽限期后异步回收；注册不需要等待当前通知调用结束，也可以从通知回调中进行；
-- **注销**删除对象。返回前必须确保旧读者已经退出，并确保此前的异步快照不会在之后成为该对象
-  的最后持有者；最终析构发生在注销调用者上下文；
-- 更新锁只串行化快照构造与发布，不能跨越会等待当前读者的操作，否则通知回调内的合法注册可能
-  与更新者形成锁等待环。
+- 更新锁只串行化快照构造与发布，发布后立即释放；宽限期等待和旧快照析构都在锁外完成；
+- 所有可能失败的分配都在发布前完成，失败路径也保留外部所有权，避免在更新锁内执行最终用户析构；
+- 注册和注销都是可睡眠的更新操作，不能从同一通知链的 callback 内读取侧自修改，否则会等待自身；
+- 注销返回时，旧读者已经退出，目标对象的最终析构发生在注销调用者上下文。
 
 ```mermaid
 flowchart TD
@@ -318,13 +317,10 @@ flowchart TD
     READ --> RUN[Run callbacks without update lock]
     RUN --> EXIT[Exit SRCU]
 
-    REG[Register] --> ADD[Publish add-only snapshot]
-    ADD --> ASYNC[Asynchronously reclaim old snapshot]
-
-    UNREG[Unregister] --> REMOVE[Publish snapshot without target]
-    REMOVE --> GPWAIT[Wait for readers]
-    GPWAIT --> DRAIN[Drain older async snapshots]
-    DRAIN --> DROP[Destroy target in updater context]
+    REG[Register or unregister] --> BUILD[Build complete replacement snapshot]
+    BUILD --> PUB[Publish and release update lock]
+    PUB --> GPWAIT[Wait for prior readers]
+    GPWAIT --> DROP[Destroy old snapshot in updater context]
 ```
 
 DragonOS 的 reboot notifier 是该模式的实际使用者。选择真实消费者而不是构造演示接口，可以让

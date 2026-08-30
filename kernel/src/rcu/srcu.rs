@@ -592,7 +592,8 @@ impl SrcuDomain {
     /// `head` must remain at a stable address until `func` starts and must not
     /// already be queued in any SRCU domain. `func` must call
     /// [`SrcuHead::begin_callback`] as its first operation before requeueing or
-    /// freeing the containing allocation.
+    /// freeing the containing allocation. `func` must not panic: architectures
+    /// without kernel unwind recovery cannot isolate a failed callback.
     pub unsafe fn call_raw(
         &self,
         head: NonNull<SrcuHead>,
@@ -644,20 +645,18 @@ impl SrcuDomain {
         Ok(())
     }
 
-    pub(crate) fn barrier_after_publication(&self) {
-        self.validate_update_context()
-            .expect("SRCU update context changed after publication");
-        self.barrier()
-            .expect("prevalidated SRCU barrier failed after publication");
-    }
-
-    pub fn try_cleanup(self) -> Result<(), (Self, SystemError)> {
+    /// Unregisters this domain without consuming its Rust wrapper.
+    ///
+    /// # Safety
+    /// The caller must exclusively own the domain and prevent every future
+    /// reader, updater, and callback submission through another reference.
+    pub(crate) unsafe fn try_cleanup_in_place(&self) -> Result<(), SystemError> {
         if in_interrupt() || in_srcu_callback_context() {
-            return Err((self, SystemError::EDEADLK_OR_EDEADLOCK));
+            return Err(SystemError::EDEADLK_OR_EDEADLOCK);
         }
         for idx in 0..2 {
             if !self.inner.slot_balanced(idx) {
-                return Err((self, SystemError::EBUSY));
+                return Err(SystemError::EBUSY);
             }
         }
         let gp_busy = {
@@ -665,17 +664,25 @@ impl SrcuDomain {
             gp.phase != GpPhase::Idle || !seq_reached(gp.completed, gp.requested) || gp.waiters != 0
         };
         if gp_busy {
-            return Err((self, SystemError::EBUSY));
+            return Err(SystemError::EBUSY);
         }
         if self.inner.callbacks.lock_irqsave().len != 0
             || self.inner.callback_executing.load(Ordering::Acquire)
         {
-            return Err((self, SystemError::EBUSY));
+            return Err(SystemError::EBUSY);
         }
         SRCU_RUNTIME.unregister_and_wait(&self.inner);
         self.inner.active.store(false, Ordering::Release);
         fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    pub fn try_cleanup(self) -> Result<(), (Self, SystemError)> {
+        // SAFETY: consuming self proves that no other SrcuDomain wrapper exists.
+        match unsafe { self.try_cleanup_in_place() } {
+            Ok(()) => Ok(()),
+            Err(error) => Err((self, error)),
+        }
     }
 }
 

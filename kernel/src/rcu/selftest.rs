@@ -997,6 +997,8 @@ fn run_arc_slot_cross_thread_selftest() -> Result<(), &'static str> {
 
 fn run_pr1_selftest() -> Result<(), &'static str> {
     gp::run_state_machine_selftests()?;
+    super::srcu::run_state_machine_selftests()?;
+    super::srcu::run_runtime_selftests()?;
     progress::run_progress_selftests()?;
     if callback_duration_ns(100, 100 + RCU_SLOW_CALLBACK_NS) != Some(RCU_SLOW_CALLBACK_NS)
         || callback_duration_ns(0, 10).is_some()

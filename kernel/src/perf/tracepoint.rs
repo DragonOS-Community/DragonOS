@@ -31,7 +31,7 @@ pub struct TracepointPerfEvent {
 
 struct PerfTracepointState {
     enabled: bool,
-    callbacks: Vec<(usize, Arc<TracePointPerfCallBack>)>,
+    callbacks: Vec<(usize, Arc<dyn TracePointCallBackFunc>)>,
 }
 
 impl core::fmt::Debug for TracepointPerfEvent {
@@ -136,7 +136,7 @@ impl PerfEventOps for TracepointPerfEvent {
         }
 
         // create a callback to execute the ebpf prog
-        let callback;
+        let callback: Arc<dyn TracePointCallBackFunc>;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -159,7 +159,7 @@ impl PerfEventOps for TracepointPerfEvent {
         let id = CALLBACK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let mut state = self.state.lock();
         if state.enabled {
-            self.tp.register_raw_callback(id, callback.clone());
+            self.tp.register_raw_callback(id, callback.clone())?;
         }
 
         log::info!(
@@ -182,15 +182,7 @@ impl PerfEventOps for TracepointPerfEvent {
         if state.enabled {
             return Ok(());
         }
-        for (id, callback) in state.callbacks.iter() {
-            self.tp.register_raw_callback(*id, callback.clone());
-        }
-        if let Err(error) = self.tp.acquire_enable() {
-            for (id, _) in state.callbacks.iter() {
-                self.tp.unregister_raw_callback(*id);
-            }
-            return Err(error);
-        }
+        self.tp.enable_raw_callbacks(&state.callbacks)?;
         state.enabled = true;
         self.enable_ref_held.store(true, Ordering::Release);
         Ok(())
@@ -201,12 +193,7 @@ impl PerfEventOps for TracepointPerfEvent {
         if !state.enabled {
             return Ok(());
         }
-        // Disable the branch first. Existing callback snapshots retain their
-        // Arc references and may finish; no new snapshot can start afterward.
-        self.tp.release_enable()?;
-        for (id, _) in state.callbacks.iter() {
-            self.tp.unregister_raw_callback(*id);
-        }
+        self.tp.disable_raw_callbacks(&state.callbacks)?;
         state.enabled = false;
         self.enable_ref_held.store(false, Ordering::Release);
         Ok(())

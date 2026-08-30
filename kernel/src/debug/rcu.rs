@@ -74,6 +74,9 @@ struct RcuStateCallBack;
 struct RcuStatsCallBack;
 
 #[derive(Debug)]
+struct SrcuStateCallBack;
+
+#[derive(Debug)]
 struct RcuTortureCallBack;
 
 fn read_debug_text(
@@ -303,6 +306,7 @@ macro_rules! impl_rcu_snapshot_callback {
 
 impl_rcu_snapshot_callback!(RcuStateCallBack, crate::rcu::state_debug_report);
 impl_rcu_snapshot_callback!(RcuStatsCallBack, crate::rcu::stats_debug_report);
+impl_rcu_snapshot_callback!(SrcuStateCallBack, crate::rcu::srcu::state_debug_report);
 
 pub fn init_debugfs_rcu() -> Result<(), SystemError> {
     let debugfs = debugfs_kobj();
@@ -320,6 +324,19 @@ pub fn init_debugfs_rcu() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&RcuSelftestCallBack),
+    )?;
+    let srcu_root = rcu_root.add_dir(
+        "srcu".to_string(),
+        InodeMode::from_bits_truncate(0o555),
+        None,
+        Some(&RcuDirCallBack),
+    )?;
+    srcu_root.add_file(
+        "state".to_string(),
+        InodeMode::S_IRUGO,
+        Some(32 * 1024),
+        None,
+        Some(&SrcuStateCallBack),
     )?;
     rcu_root.add_file(
         "callbacks".to_string(),

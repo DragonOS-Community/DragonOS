@@ -262,6 +262,7 @@ extern "C" {
 
 /// Initialize the tracing events
 pub fn global_init_events() -> Result<TracingEventsManager, SystemError> {
+    point::tracepoint_srcu_init()?;
     static TRACE_POINT_ID: AtomicUsize = AtomicUsize::new(0);
     let events_manager = TracingEventsManager::new(TracePointMap::new());
     let tracepoint_data_start = _tracepoint as usize as *mut CommonTracePointMeta;
@@ -281,9 +282,9 @@ pub fn global_init_events() -> Result<TracingEventsManager, SystemError> {
     let mut tracepoint_map = events_manager.tracepoint_map();
     for tracepoint_meta in tracepoint_data {
         let tracepoint = tracepoint_meta.trace_point;
+        tracepoint.init_callbacks(tracepoint_meta.print_func, Box::new(()))?;
         let id = TRACE_POINT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         tracepoint.set_id(id as u32);
-        tracepoint.register(tracepoint_meta.print_func, Box::new(()));
         tracepoint_map.insert(id as u32, tracepoint);
         log::info!(
             "tracepoint registered: {}:{}",

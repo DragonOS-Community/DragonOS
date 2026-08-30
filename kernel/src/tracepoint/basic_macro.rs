@@ -90,27 +90,27 @@ macro_rules! unsafe_define_event_trace{
             pub fn [<register_trace_ $name>](
                 func: fn(&(dyn core::any::Any + Send + Sync), $($arg_type),*),
                 data: alloc::boxed::Box<dyn core::any::Any + Send + Sync>,
-            ) {
+            ) -> Result<(), system_error::SystemError> {
                 let func = unsafe {
                     core::mem::transmute::<
                         fn(&(dyn core::any::Any + Send + Sync), $($arg_type),*),
                         fn()
                     >(func)
                 };
-                [<__ $name>].register(func, data);
+                [<__ $name>].register(func, data)
             }
 
             #[allow(unused, non_snake_case)]
             pub fn [<unregister_trace_ $name>](
                 func: fn(&(dyn core::any::Any + Send + Sync), $($arg_type),*)
-            ) {
+            ) -> Result<(), system_error::SystemError> {
                 let func = unsafe {
                     core::mem::transmute::<
                         fn(&(dyn core::any::Any + Send + Sync), $($arg_type),*),
                         fn()
                     >(func)
                 };
-                [<__ $name>].unregister(func);
+                [<__ $name>].unregister(func)
             }
 
             #[derive(Debug)]
@@ -190,9 +190,7 @@ macro_rules! unsafe_define_event_trace{
                 event_buf.extend_from_slice(dynamic_value);
                 event_buf.push(0);
 
-                for callback in [<__ $name>].raw_callbacks_snapshot() {
-                    callback.call(&event_buf);
-                }
+                [<__ $name>].for_each_raw_callback(|callback| callback.call(&event_buf));
 
                 if [<__ $name>].is_trace_pipe_enabled() {
                     $crate::debug::tracing::trace_cmdline_push(common_pid as u32);
@@ -326,14 +324,14 @@ macro_rules! unsafe_define_event_trace{
                 }
             }
             #[allow(unused,non_snake_case)]
-            pub fn [<register_trace_ $name>](func: fn(& (dyn core::any::Any+Send+Sync), $($arg_type),*), data: alloc::boxed::Box<dyn core::any::Any+Send+Sync>){
+            pub fn [<register_trace_ $name>](func: fn(& (dyn core::any::Any+Send+Sync), $($arg_type),*), data: alloc::boxed::Box<dyn core::any::Any+Send+Sync>) -> Result<(), system_error::SystemError> {
                 let func = unsafe{core::mem::transmute::<fn(& (dyn core::any::Any+Send+Sync), $($arg_type),*), fn()>(func)};
-                [<__ $name>].register(func,data);
+                [<__ $name>].register(func,data)
             }
             #[allow(unused,non_snake_case)]
-            pub fn [<unregister_trace_ $name>](func: fn(& (dyn core::any::Any+Send+Sync), $($arg_type),*)){
+            pub fn [<unregister_trace_ $name>](func: fn(& (dyn core::any::Any+Send+Sync), $($arg_type),*)) -> Result<(), system_error::SystemError> {
                 let func = unsafe{core::mem::transmute::<fn(& (dyn core::any::Any+Send+Sync), $($arg_type),*), fn()>(func)};
-                [<__ $name>].unregister(func);
+                [<__ $name>].unregister(func)
             }
 
 
@@ -392,9 +390,7 @@ macro_rules! unsafe_define_event_trace{
                     )
                 };
 
-                for callback in [<__ $name>].raw_callbacks_snapshot() {
-                    callback.call(event_buf);
-                }
+                [<__ $name>].for_each_raw_callback(|callback| callback.call(event_buf));
 
                 if [<__ $name>].is_trace_pipe_enabled() {
                     $crate::debug::tracing::trace_cmdline_push(pid as u32);

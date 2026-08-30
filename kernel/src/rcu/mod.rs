@@ -51,6 +51,7 @@ mod context;
 mod gp;
 mod progress;
 mod selftest;
+pub mod srcu;
 mod torture;
 pub use callback::RcuHead;
 use callback::{RcuCallbackQueueDepth, RcuSegmentedCallbacks};
@@ -1488,6 +1489,7 @@ pub fn init() {
     drop(inner);
 
     RCU_STATE.initialized.store(true, Ordering::Release);
+    srcu::init();
 }
 
 pub fn start_worker() {
@@ -1518,6 +1520,7 @@ pub fn start_worker() {
     }
 
     RCU_STATE.wake_worker();
+    srcu::start_worker();
 }
 
 /// Requests terminal asynchronous shutdown of the RCU worker.

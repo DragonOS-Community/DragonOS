@@ -55,6 +55,81 @@ use crate::{
 
 use crate::process::{posix_timer, ptrace, rseq, seccomp};
 
+const SRCU_TASK_SLOTS: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct SrcuTaskSlot {
+    domain: u64,
+    depth: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct SrcuTaskState {
+    slots: [SrcuTaskSlot; SRCU_TASK_SLOTS],
+    overflow_depth: usize,
+}
+
+impl SrcuTaskState {
+    const fn new() -> Self {
+        Self {
+            slots: [SrcuTaskSlot {
+                domain: 0,
+                depth: 0,
+            }; SRCU_TASK_SLOTS],
+            overflow_depth: 0,
+        }
+    }
+
+    pub(crate) fn enter(&mut self, domain: u64) -> bool {
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.depth != 0 && slot.domain == domain)
+        {
+            slot.depth = slot.depth.checked_add(1).expect("SRCU task depth overflow");
+            return true;
+        }
+        if let Some(slot) = self.slots.iter_mut().find(|slot| slot.depth == 0) {
+            slot.domain = domain;
+            slot.depth = 1;
+            return true;
+        }
+        self.overflow_depth = self
+            .overflow_depth
+            .checked_add(1)
+            .expect("SRCU untracked depth overflow");
+        false
+    }
+
+    pub(crate) fn leave(&mut self, domain: u64, tracked: bool) {
+        if !tracked {
+            assert!(self.overflow_depth != 0, "SRCU untracked depth underflow");
+            self.overflow_depth -= 1;
+            return;
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.depth != 0 && slot.domain == domain)
+            .expect("SRCU task tracking mismatch");
+        slot.depth -= 1;
+        if slot.depth == 0 {
+            slot.domain = 0;
+        }
+    }
+
+    pub(crate) fn may_wait(&self, domain: u64) -> bool {
+        // Reader entry must remain infallible and allocation-free. Once the
+        // fixed tracking slots overflow, domain identity is unavailable, so
+        // fail closed: a false negative here would deadlock synchronously.
+        self.overflow_depth != 0
+            || self
+                .slots
+                .iter()
+                .any(|slot| slot.depth != 0 && slot.domain == domain)
+    }
+}
+
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// The PID of the current process.
@@ -79,6 +154,9 @@ pub struct ProcessControlBlock {
     pub(super) pagefault_disabled: AtomicUsize,
     /// RCU read-side nesting depth of the current process.
     pub(super) rcu_read_depth: AtomicUsize,
+    pub(crate) srcu_task_state: SpinLock<SrcuTaskState>,
+    pub(crate) tracepoint_srcu_depth: AtomicUsize,
+    pub(crate) srcu_callback_domain: AtomicU64,
 
     pub(super) flags: AtomicProcessFlags,
     /// Per-task uprobe XOL state. Kept in the process subsystem so exception
@@ -342,6 +420,9 @@ impl ProcessControlBlock {
                 preempt_count,
                 pagefault_disabled,
                 rcu_read_depth,
+                srcu_task_state: SpinLock::new(SrcuTaskState::new()),
+                tracepoint_srcu_depth: AtomicUsize::new(0),
+                srcu_callback_domain: AtomicU64::new(0),
                 flags,
                 visible_thread_accounted: AtomicBool::new(false),
                 task_lock: SpinLock::new(()),

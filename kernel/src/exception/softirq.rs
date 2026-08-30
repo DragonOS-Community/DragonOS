@@ -75,6 +75,7 @@ pub enum SoftirqNumber {
     VideoRefresh = 1, //帧缓冲区刷新软中断
     TASKLET = 2,
     RCU = 3,
+    SRCU = 4,
 }
 
 impl From<u64> for SoftirqNumber {
@@ -90,6 +91,7 @@ bitflags! {
         const VIDEO_REFRESH = 1 << 1;
         const TASKLET = 1 << 2;
         const RCU = 1 << 3;
+        const SRCU = 1 << 4;
     }
 }
 

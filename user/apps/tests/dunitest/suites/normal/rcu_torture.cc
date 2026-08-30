@@ -78,8 +78,17 @@ void RunSeed(uint64_t seed) {
     EXPECT_EQ(seed, Field(report, "seed")) << report;
     EXPECT_EQ(kRounds, Field(report, "rounds")) << report;
     EXPECT_EQ(kRounds, Field(report, "publishes")) << report;
-    EXPECT_GT(Field(report, "cpus"), 1u) << report;
-    EXPECT_GT(Field(report, "readers"), 1u) << report;
+    const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    ASSERT_GT(online_cpus, 0) << "sysconf(_SC_NPROCESSORS_ONLN) failed: errno=" << errno << " ("
+                              << strerror(errno) << ")";
+    const uint64_t reported_cpus = Field(report, "cpus");
+    const uint64_t readers = Field(report, "readers");
+    EXPECT_EQ(static_cast<uint64_t>(online_cpus), reported_cpus) << report;
+    EXPECT_GE(readers, 1u) << report;
+    EXPECT_LE(readers, reported_cpus) << report;
+    if (online_cpus > 1) {
+        EXPECT_GT(readers, 1u) << report;
+    }
     EXPECT_GT(Field(report, "reads"), 0u) << report;
     EXPECT_GT(Field(report, "synchronize_calls"), 0u) << report;
     EXPECT_GT(Field(report, "barrier_calls"), 0u) << report;

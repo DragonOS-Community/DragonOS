@@ -156,6 +156,43 @@ TEST(TimerFdSemantics, PeriodicAccumulatesMissedExpirations) {
     EXPECT_TRUE(current.it_value.tv_sec > 0 || current.it_value.tv_nsec > 0);
 }
 
+TEST(TimerFdSemantics, RealtimePeriodicRearmsAfterLazyExpiration) {
+    UniqueFd fd(timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK));
+    ASSERT_GE(fd.get(), 0) << strerror(errno);
+
+    timespec now = {};
+    ASSERT_EQ(0, clock_gettime(CLOCK_REALTIME, &now));
+    itimerspec value = {};
+    value.it_value = now;
+    value.it_value.tv_nsec += 20 * 1000 * 1000;
+    if (value.it_value.tv_nsec >= 1000 * 1000 * 1000) {
+        ++value.it_value.tv_sec;
+        value.it_value.tv_nsec -= 1000 * 1000 * 1000;
+    }
+    value.it_interval.tv_nsec = 20 * 1000 * 1000;
+    ASSERT_EQ(0, timerfd_settime(fd.get(), TFD_TIMER_ABSTIME, &value, nullptr));
+    usleep(55 * 1000);
+
+    uint64_t ticks = 0;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(ticks)),
+              read(fd.get(), &ticks, sizeof(ticks)));
+    EXPECT_GE(ticks, 1u);
+
+    itimerspec current = {};
+    ASSERT_EQ(0, timerfd_gettime(fd.get(), &current));
+    EXPECT_EQ(value.it_interval.tv_sec, current.it_interval.tv_sec);
+    EXPECT_EQ(value.it_interval.tv_nsec, current.it_interval.tv_nsec);
+    EXPECT_TRUE(current.it_value.tv_sec > 0 || current.it_value.tv_nsec > 0);
+
+    pollfd ready = {fd.get(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&ready, 1, 1000));
+    uint64_t next_ticks = 0;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(next_ticks)),
+              read(fd.get(), &next_ticks, sizeof(next_ticks)));
+    EXPECT_GE(next_ticks, 1u);
+
+}
+
 TEST(TimerFdSemantics, AbsoluteAndPastDeadlines) {
     UniqueFd fd(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK));
     ASSERT_GE(fd.get(), 0) << strerror(errno);

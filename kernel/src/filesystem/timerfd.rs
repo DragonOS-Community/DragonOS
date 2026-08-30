@@ -323,12 +323,43 @@ impl TimerFdInode {
         }
     }
 
-    fn advance_periodic_locked(state: &mut TimerFdState) -> Option<(u64, DeadlineDomain, u64)> {
+    fn prepare_periodic_rearm(&self) -> Option<(u64, u64)> {
+        let needs_registration = {
+            let state = self.state.lock_irqsave();
+            state.expired
+                && state.interval_ns != 0
+                && state.configured_realtime_absolute()
+                && !state.registry_registered
+        };
+        if !needs_registration {
+            return None;
+        }
+
+        // The caller holds operation. Register before observing realtime so a
+        // concurrent clock set is either included in this snapshot or finds
+        // this inode and waits for the rearm state to be published.
+        self.registry_add();
+        let (now, clock_set_seq) = realtime_now_with_clock_set_seq();
+        Some((now.to_ktime_ns(), clock_set_seq))
+    }
+
+    fn advance_periodic_locked(
+        state: &mut TimerFdState,
+        registration: Option<(u64, u64)>,
+    ) -> Option<(u64, DeadlineDomain, u64)> {
         if !state.expired || state.interval_ns == 0 {
             return None;
         }
+        if let Some((_, clock_set_seq)) = registration {
+            debug_assert!(state.configured_realtime_absolute());
+            debug_assert!(!state.registry_registered);
+            state.registry_registered = true;
+            state.observed_clock_set_seq = Some(clock_set_seq);
+        }
         let deadline = state.next_expiry_ns?;
-        let now = state.deadline_domain.now_ns();
+        let now = registration
+            .map(|(now, _)| now)
+            .unwrap_or_else(|| state.deadline_domain.now_ns());
         let next = if now >= deadline {
             let periods = (now - deadline) / state.interval_ns + 1;
             state.ticks = state.ticks.wrapping_add(periods - 1);
@@ -381,6 +412,7 @@ impl TimerFdInode {
             }
 
             let _operation = self.operation.lock();
+            let registration = self.prepare_periodic_rearm();
             let mut state = self.state.lock_irqsave();
             if state.cancel_pending {
                 Self::consume_cancel_locked(&mut state);
@@ -389,12 +421,14 @@ impl TimerFdInode {
             if state.ticks == 0 {
                 continue;
             }
-            let rearm = Self::advance_periodic_locked(&mut state);
+            let rearm = Self::advance_periodic_locked(&mut state, registration);
             let ticks = state.ticks;
             state.ticks = 0;
             state.expired = false;
-            let unregister =
-                state.interval_ns == 0 && state.registry_registered && !state.cancel_on_set();
+            let unregister = state.interval_ns == 0
+                && state.registry_registered
+                && state.configured_realtime_absolute()
+                && !state.cancel_on_set();
             if state.interval_ns == 0 {
                 // A consumed one-shot is logically disarmed.  Keeping its old
                 // deadline would let a later wall-clock set fire it again.
@@ -420,8 +454,9 @@ impl TimerFdInode {
 
     pub fn gettime(&self) -> Result<PosixItimerspec, SystemError> {
         let _operation = self.operation.lock();
+        let registration = self.prepare_periodic_rearm();
         let mut state = self.state.lock_irqsave();
-        let rearm = Self::advance_periodic_locked(&mut state);
+        let rearm = Self::advance_periodic_locked(&mut state, registration);
         let value = state.current_spec();
         drop(state);
         self.rearm_periodic(rearm)?;
@@ -442,9 +477,9 @@ impl TimerFdInode {
             (state.clock_id, state.registry_registered)
         };
         let realtime_absolute = Self::is_realtime_absolute(clock_id, flags);
-        let registry_member = realtime_absolute
+        let registry_candidate = realtime_absolute
             && (initial_ns != 0 || flags.contains(TimerFdSettimeFlags::TFD_TIMER_CANCEL_ON_SET));
-        if registry_member && !registry_registered {
+        if registry_candidate && !registry_registered {
             self.registry_add();
         }
 
@@ -468,8 +503,11 @@ impl TimerFdInode {
         } else {
             Some(now.saturating_add(initial_ns).min(KTIME_MAX_NS))
         };
+        let immediate = deadline.is_some_and(|expiry| expiry <= now);
+        let registry_member = registry_candidate
+            && (!immediate || flags.contains(TimerFdSettimeFlags::TFD_TIMER_CANCEL_ON_SET));
 
-        let (old, old_backend, generation, immediate, report_canceled) = {
+        let (old, old_backend, generation, report_canceled) = {
             let mut state = self.state.lock_irqsave();
             let old = state.current_spec();
             let old_backend = state.timer.take();
@@ -487,7 +525,6 @@ impl TimerFdInode {
             state.cancel_pending = old_cancel
                 && realtime_absolute
                 && flags.contains(TimerFdSettimeFlags::TFD_TIMER_CANCEL_ON_SET);
-            let immediate = deadline.is_some_and(|expiry| expiry <= now);
             if immediate {
                 state.expired = true;
                 state.ticks = 1;
@@ -496,13 +533,13 @@ impl TimerFdInode {
             if report_canceled {
                 state.cancel_pending = false;
             }
-            (old, old_backend, generation, immediate, report_canceled)
+            (old, old_backend, generation, report_canceled)
         };
 
         if let Some(old_backend) = old_backend {
             old_backend.cancel();
         }
-        if !registry_member && registry_registered {
+        if !registry_member && (registry_registered || registry_candidate) {
             self.registry_remove();
         }
         if let Some(deadline) = deadline.filter(|_| !immediate) {
@@ -526,6 +563,9 @@ impl TimerFdInode {
         let (realtime_now, clock_set_seq) = realtime_now_with_clock_set_seq();
         let (old_backend, deadline, domain, generation, notify) = {
             let mut state = self.state.lock_irqsave();
+            if !state.registry_registered {
+                return;
+            }
             if state.shutdown || !state.configured_realtime_absolute() {
                 return;
             }
@@ -549,7 +589,14 @@ impl TimerFdInode {
             // backend. read/gettime owns any subsequent periodic forward and
             // rearm; installing another backend here would duplicate it.
             if state.expired {
+                let unregister = state.registry_registered && !notify;
+                if unregister {
+                    state.registry_registered = false;
+                }
                 drop(state);
+                if unregister {
+                    self.registry_remove();
+                }
                 if notify {
                     self.notify_readable();
                 }
@@ -573,11 +620,21 @@ impl TimerFdInode {
         let now = realtime_now.to_ktime_ns();
         if now >= deadline {
             let mut state = self.state.lock_irqsave();
-            if !state.shutdown && state.generation == generation {
+            let unregister = if !state.shutdown && state.generation == generation {
                 state.expired = true;
                 state.ticks = state.ticks.wrapping_add(1);
-            }
+                let unregister = state.registry_registered && !notify;
+                if unregister {
+                    state.registry_registered = false;
+                }
+                unregister
+            } else {
+                false
+            };
             drop(state);
+            if unregister {
+                self.registry_remove();
+            }
             self.notify_readable();
         } else {
             let backend = self.new_backend(deadline, domain, generation);

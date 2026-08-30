@@ -373,6 +373,16 @@ struct RcuStateInner {
     participating_cpus: CpuMask,
 }
 
+struct GracePeriodPumpHooks<W, C, P, CC, PC, NS, NC> {
+    waiting_snapshot: W,
+    credit_context: C,
+    publish_active: P,
+    complete_callbacks: CC,
+    prepare_callbacks: PC,
+    note_gp_start: NS,
+    note_gp_complete: NC,
+}
+
 impl RcuStateInner {
     fn new() -> Self {
         Self {
@@ -544,15 +554,19 @@ impl RcuState {
         let ready_changed = Self::pump_grace_periods_with(
             inner,
             now,
-            participating_context_snapshot,
-            credit_context_progress_locked,
-            publish_gp_active,
-            |completed| RCU_STATE.complete_callback_gp(completed),
-            |starting| RCU_STATE.prepare_callback_gp_start(starting),
-            |_| {
-                RCU_STATE.stats.gp_started.fetch_add(1, Ordering::Relaxed);
+            GracePeriodPumpHooks {
+                waiting_snapshot: participating_context_snapshot,
+                credit_context: credit_context_progress_locked,
+                publish_active: publish_gp_active,
+                complete_callbacks: |completed| RCU_STATE.complete_callback_gp(completed),
+                prepare_callbacks: |starting| RCU_STATE.prepare_callback_gp_start(starting),
+                note_gp_start: |_| {
+                    RCU_STATE.stats.gp_started.fetch_add(1, Ordering::Relaxed);
+                },
+                note_gp_complete: |completed_progress| {
+                    RCU_STATE.record_gp_completion(completed_progress, now)
+                },
             },
-            |completed_progress| RCU_STATE.record_gp_completion(completed_progress, now),
         );
         RCU_STATE.publish_progress_deadline_locked(inner, now);
         ready_changed
@@ -577,17 +591,29 @@ impl RcuState {
         self.next_progress_at.store(deadline, Ordering::Release);
     }
 
-    fn pump_grace_periods_with(
+    fn pump_grace_periods_with<W, C, P, CC, PC, NS, NC>(
         inner: &mut RcuStateInner,
         now: u64,
-        mut waiting_snapshot: impl FnMut(&CpuMask) -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
-        mut credit_context: impl FnMut(&mut GracePeriodState) -> bool,
-        mut publish_active: impl FnMut(bool),
-        mut complete_callbacks: impl FnMut(RcuSequence) -> bool,
-        mut prepare_callbacks: impl FnMut(RcuSequence),
-        mut note_gp_start: impl FnMut(RcuSequence),
-        mut note_gp_complete: impl FnMut(ActiveGpProgress),
-    ) -> bool {
+        hooks: GracePeriodPumpHooks<W, C, P, CC, PC, NS, NC>,
+    ) -> bool
+    where
+        W: FnMut(&CpuMask) -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
+        C: FnMut(&mut GracePeriodState) -> bool,
+        P: FnMut(bool),
+        CC: FnMut(RcuSequence) -> bool,
+        PC: FnMut(RcuSequence),
+        NS: FnMut(RcuSequence),
+        NC: FnMut(ActiveGpProgress),
+    {
+        let GracePeriodPumpHooks {
+            mut waiting_snapshot,
+            mut credit_context,
+            mut publish_active,
+            mut complete_callbacks,
+            mut prepare_callbacks,
+            mut note_gp_start,
+            mut note_gp_complete,
+        } = hooks;
         let mut ready_changed = false;
         loop {
             if credit_context(&mut inner.gp) {
@@ -2153,11 +2179,7 @@ pub(crate) fn stats_debug_report() -> String {
     writeln!(
         report,
         "gp_average_ns={}",
-        if completed == 0 {
-            0
-        } else {
-            total_ns / completed
-        }
+        total_ns.checked_div(completed).unwrap_or(0)
     )
     .unwrap();
     writeln!(

@@ -209,6 +209,13 @@ fn run_slow_callback_budget_selftest() -> Result<(), &'static str> {
 }
 
 fn run_reschedule_escalation_selftest() -> Result<(), &'static str> {
+    if !crate::smp::kick_cpu_supported() {
+        // The policy and failure accounting remain covered on every
+        // architecture. This production-path test requires an implemented
+        // generic KickCpu IPI receiver.
+        return Ok(());
+    }
+
     let current_cpu = crate::smp::core::smp_get_processor_id();
     let Some(target_cpu) = smp_cpu_manager()
         .present_cpus()
@@ -840,13 +847,17 @@ fn pump_cpu_lifecycle_model(inner: &mut RcuStateInner) -> bool {
     RcuState::pump_grace_periods_with(
         inner,
         1,
-        |participants| (participants.clone(), [0; PerCpu::MAX_CPU_NUM as usize]),
-        |_| false,
-        |_| {},
-        |_| false,
-        |_| {},
-        |_| {},
-        |_| {},
+        GracePeriodPumpHooks {
+            waiting_snapshot: |participants: &CpuMask| {
+                (participants.clone(), [0; PerCpu::MAX_CPU_NUM as usize])
+            },
+            credit_context: |_: &mut GracePeriodState| false,
+            publish_active: |_| {},
+            complete_callbacks: |_| false,
+            prepare_callbacks: |_| {},
+            note_gp_start: |_| {},
+            note_gp_complete: |_| {},
+        },
     )
 }
 
@@ -858,13 +869,15 @@ fn run_immediate_gp_accounting_selftest() -> Result<(), &'static str> {
     RcuState::pump_grace_periods_with(
         &mut inner,
         42,
-        |_| (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
-        |_| false,
-        |_| {},
-        |_| false,
-        |_| {},
-        |_| starts += 1,
-        |_| completions += 1,
+        GracePeriodPumpHooks {
+            waiting_snapshot: |_: &CpuMask| (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
+            credit_context: |_: &mut GracePeriodState| false,
+            publish_active: |_| {},
+            complete_callbacks: |_| false,
+            prepare_callbacks: |_| {},
+            note_gp_start: |_| starts += 1,
+            note_gp_complete: |_| completions += 1,
+        },
     );
     if starts != 1 || completions != 1 || inner.gp.is_active() || inner.progress.is_some() {
         return Err("immediately completed RCU GP was not accounted exactly once");

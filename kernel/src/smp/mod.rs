@@ -18,6 +18,14 @@ pub mod cpu;
 pub mod init;
 mod syscall;
 
+/// Returns whether this build has a working generic KickCpu IPI path.
+///
+/// Keep this capability next to `kick_cpu()` so architecture bring-up cannot
+/// accidentally make callers infer support from CPU count alone.
+pub const fn kick_cpu_supported() -> bool {
+    cfg!(target_arch = "x86_64")
+}
+
 pub fn kick_cpu(cpu_id: ProcessorId) -> Result<(), SystemError> {
     if !smp_cpu_manager_initialized()
         || smp_cpu_manager().possible_cpus().get(cpu_id) != Some(true)

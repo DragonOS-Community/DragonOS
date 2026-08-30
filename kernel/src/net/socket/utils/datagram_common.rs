@@ -54,15 +54,22 @@ pub trait Bound {
         flags: PMSG,
     ) -> Result<(usize, usize, Self::Endpoint), SystemError>;
 
-    fn try_send(&self, buf: &[u8], to: &Self::Endpoint, flags: PMSG) -> Result<usize, SystemError>;
+    fn try_send(
+        &self,
+        buf: &[u8],
+        to: &Self::Endpoint,
+        flags: PMSG,
+        destination_is_explicit: bool,
+    ) -> Result<usize, SystemError>;
 
     fn try_send_vec(
         &self,
         buf: Vec<u8>,
         to: &Self::Endpoint,
         flags: PMSG,
+        destination_is_explicit: bool,
     ) -> Result<usize, SystemError> {
-        self.try_send(&buf, to, flags)
+        self.try_send(&buf, to, flags, destination_is_explicit)
     }
 
     fn check_io_events(&self) -> EPollEventType;

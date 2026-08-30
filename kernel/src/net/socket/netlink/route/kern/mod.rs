@@ -13,7 +13,10 @@ use crate::{
             SupportedNetlinkProtocol,
         },
     },
-    process::namespace::net_namespace::NetNamespace,
+    process::{
+        cred::{CAPFlags, Cred},
+        namespace::net_namespace::NetNamespace,
+    },
 };
 use alloc::sync::Arc;
 use core::marker::PhantomData;
@@ -26,6 +29,60 @@ mod route;
 mod utils;
 
 pub(crate) use link::notify_link_change;
+
+/// Per-send authorization and routing state for userspace rtnetlink requests.
+///
+/// Linux checks both the sending task's credentials and, unless an explicit
+/// destination was supplied, the credentials captured when the socket was
+/// opened. Both checks target the user namespace that owns the socket netns.
+pub(super) struct RtnlRequestContext {
+    sender_cred: Arc<Cred>,
+    opener_cred: Arc<Cred>,
+    netns: Arc<NetNamespace>,
+    port_id: u32,
+    destination_is_explicit: bool,
+}
+
+impl RtnlRequestContext {
+    pub(super) fn new(
+        sender_cred: Arc<Cred>,
+        opener_cred: Arc<Cred>,
+        netns: Arc<NetNamespace>,
+        port_id: u32,
+        destination_is_explicit: bool,
+    ) -> Self {
+        Self {
+            sender_cred,
+            opener_cred,
+            netns,
+            port_id,
+            destination_is_explicit,
+        }
+    }
+
+    pub(super) fn require_net_admin(&self) -> Result<(), SystemError> {
+        let target_user_ns = self.netns.user_ns();
+        if (!self.destination_is_explicit
+            && !self
+                .opener_cred
+                .has_capability_in_ns(target_user_ns, CAPFlags::CAP_NET_ADMIN))
+            || !self
+                .sender_cred
+                .has_capability_in_ns(target_user_ns, CAPFlags::CAP_NET_ADMIN)
+        {
+            return Err(SystemError::EPERM);
+        }
+        Ok(())
+    }
+
+    pub(super) fn netns(&self) -> Arc<NetNamespace> {
+        self.netns.clone()
+    }
+
+    pub(super) fn port_id(&self) -> u32 {
+        self.port_id
+    }
+}
 
 /// 负责处理 Netlink 路由相关的内核模块
 /// 每个 net namespace 都有一个独立的 NetlinkRouteKernelSocket
@@ -41,12 +98,9 @@ impl NetlinkRouteKernelSocket {
         }
     }
 
-    pub(super) fn request(
-        &self,
-        request: &RouteNlMessage,
-        dst_port: u32,
-        netns: Arc<NetNamespace>,
-    ) {
+    pub(super) fn request(&self, request: &RouteNlMessage, context: &RtnlRequestContext) {
+        let dst_port = context.port_id();
+        let netns = context.netns();
         for segment in request.segments() {
             let header = segment.header();
 

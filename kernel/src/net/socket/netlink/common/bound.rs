@@ -5,7 +5,7 @@ use crate::{
         receiver::MessageQueue,
         table::BoundHandle,
     },
-    process::namespace::net_namespace::NetNamespace,
+    process::{cred::Cred, namespace::net_namespace::NetNamespace},
 };
 use alloc::fmt::Debug;
 use alloc::sync::Arc;
@@ -17,6 +17,7 @@ pub struct BoundNetlink<Message: 'static + Debug> {
     pub(in crate::net::socket::netlink) remote_addr: NetlinkSocketAddr,
     pub(in crate::net::socket::netlink) receive_queue: MessageQueue<Message>,
     pub(in crate::net::socket::netlink) netns: Arc<NetNamespace>,
+    pub(in crate::net::socket::netlink) opener_cred: Arc<Cred>,
 }
 
 impl<Message: 'static + Debug> BoundNetlink<Message> {
@@ -24,12 +25,14 @@ impl<Message: 'static + Debug> BoundNetlink<Message> {
         handle: BoundHandle<Message>,
         message_queue: MessageQueue<Message>,
         netns: Arc<NetNamespace>,
+        opener_cred: Arc<Cred>,
     ) -> Self {
         Self {
             handle,
             remote_addr: NetlinkSocketAddr::new_unspecified(),
             receive_queue: message_queue,
             netns,
+            opener_cred,
         }
     }
 
@@ -64,5 +67,9 @@ impl<Message: 'static + Debug> BoundNetlink<Message> {
 
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
+    }
+
+    pub fn opener_cred(&self) -> Arc<Cred> {
+        self.opener_cred.clone()
     }
 }

@@ -637,6 +637,29 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         Some(())
     }
 
+    /// Advance the consumer without copying payload bytes.
+    ///
+    /// This is the commit operation for callers that already peeked and
+    /// delivered the bytes transactionally.
+    pub fn consume(&mut self, nitems: usize) -> Option<()> {
+        if nitems == 0 {
+            return Some(());
+        }
+
+        let rb = &self.ring_buffer;
+        let read_guard = rb.buffer.read();
+        let head = rb.head();
+        let available = (rb.tail() - head).0;
+        if available < nitems {
+            return None;
+        }
+
+        rb.advance_head(head, nitems);
+        rb.advance_scm_to(head + Wrapping(nitems));
+        drop(read_guard);
+        Some(())
+    }
+
     /// Pop a slice while preserving record metadata for partially-consumed
     /// records. This is used by recvmsg.
     pub fn pop_slice_preserve_records(&mut self, buf: &mut [T]) -> Option<()> {

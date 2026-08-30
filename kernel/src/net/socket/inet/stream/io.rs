@@ -278,14 +278,13 @@ impl TcpSocket {
             let want = user_remaining - total;
             let got = match socket.recv(|data| {
                 let take = core::cmp::min(want, data.len());
-                let copy = if take > 0 {
-                    user_buffer
-                        .write_to_user(offset + total, &data[..take])
-                        .map(|_| take)
-                } else {
-                    Ok(0)
-                };
-                (take, copy)
+                if take == 0 {
+                    return (0, Ok(0));
+                }
+                match user_buffer.write_to_user(offset + total, &data[..take]) {
+                    Ok(_) => (take, Ok(take)),
+                    Err(error) => (0, Err(error)),
+                }
             }) {
                 Ok(Ok(n)) => n,
                 Ok(Err(e)) => {

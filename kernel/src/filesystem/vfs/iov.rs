@@ -7,6 +7,7 @@ use crate::{
     syscall::user_access::{
         copy_from_user_protected, user_accessible_len, UserBufferReader, UserBufferWriter,
     },
+    syscall::user_buffer::UserBufferSegment,
 };
 
 /// Linux UIO_MAXIOV: maximum number of iovec structures per syscall
@@ -40,6 +41,29 @@ impl IoVecs {
     /// Borrow the validated iovec list.
     pub fn iovs(&self) -> &[IoVec] {
         &self.0
+    }
+
+    pub fn user_buffer_segments(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<UserBufferSegment>, SystemError> {
+        let mut segments = Vec::new();
+        segments
+            .try_reserve(self.0.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut remaining = limit;
+        for iov in &self.0 {
+            if remaining == 0 {
+                break;
+            }
+            let len = iov.iov_len.min(remaining);
+            segments.push(UserBufferSegment::new(
+                VirtAddr::new(iov.iov_base as usize),
+                len,
+            ));
+            remaining -= len;
+        }
+        Ok(segments)
     }
 
     /// Constructs `IoVecs` from an array of `IoVec` in userspace.

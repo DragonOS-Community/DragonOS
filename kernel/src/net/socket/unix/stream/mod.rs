@@ -959,11 +959,44 @@ impl Socket for UnixStreamSocket {
         &self,
         user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
     ) -> Result<usize, SystemError> {
-        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
-            self,
-            user_buffer,
-            self.recv_buffer_size(),
-        )
+        if user_buffer.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            let mut queue_consumed = false;
+            let result = match self.inner.read().as_ref().expect("inner is None") {
+                Inner::Connected(connected) => {
+                    connected.try_recv_to_user(user_buffer, self.is_seqpacket, &mut queue_consumed)
+                }
+                _ => Err(SystemError::ENOTCONN),
+            };
+            if queue_consumed {
+                self.wake_peer_writable();
+            }
+
+            match result {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !self.is_nonblocking() => {
+                    self.wait_queue.wait_event_interruptible_timeout(
+                        || self.can_recv(),
+                        self.recv_timeout(),
+                    )?;
+                }
+                Ok(n) => {
+                    if n == 0 {
+                        let ring_reset = self.take_connreset_from_peer();
+                        let socket_reset = self
+                            .connreset_pending
+                            .swap(false, core::sync::atomic::Ordering::SeqCst);
+                        if ring_reset || socket_reset {
+                            return Err(SystemError::ECONNRESET);
+                        }
+                    }
+                    return Ok(n);
+                }
+                result => return result,
+            }
+        }
     }
 
     fn recv_msg(&self, _msg: &mut MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {

@@ -59,9 +59,15 @@ impl Syscall for SysReadVHandle {
         if file.file_type() == FileType::Socket {
             // Socket readv is one underlying read, but ACCESS still belongs to
             // the readv completion boundary (including a zero-byte result).
-            let mut buf = iovecs.new_buf(true)?;
-            let nread = file.read_syscall_chunk(buf.len(), &mut buf)?;
-            iovecs.scatter(&buf[..nread])?;
+            let requested = iovecs.total_len().min(max_rw_count);
+            if requested == 0 {
+                return finish_readv(file.as_ref(), 0);
+            }
+            let segments = iovecs.user_buffer_segments(requested)?;
+            let mut user_buffer = unsafe { UserBuffer::new_vectored(&segments, requested) };
+            let inode = file.inode();
+            let socket = inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
+            let nread = socket.read_to_user_buffer(&mut user_buffer)?;
             return finish_readv(file.as_ref(), nread);
         }
 

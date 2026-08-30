@@ -370,6 +370,49 @@ impl VsockStreamSocket {
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
+    /// Copy one receive directly to userspace, consuming stream bytes only
+    /// after every protected copy succeeds.
+    fn try_read_to_user_buffer_once(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        let mut inner = self.inner.lock();
+
+        if inner.recv_shutdown {
+            inner.recv_buf.clear();
+            return Ok(0);
+        }
+
+        if !inner.recv_buf.is_empty() {
+            let n = min(user_buffer.len(), inner.recv_buf.len());
+            let (front, back) = inner.recv_buf.as_slices();
+            let front_n = min(n, front.len());
+            user_buffer.write_to_user(0, &front[..front_n])?;
+
+            let back_n = n - front_n;
+            if back_n > 0 {
+                user_buffer.write_to_user(front_n, &back[..back_n])?;
+            }
+
+            inner.recv_buf.drain(..n);
+            let wake_peer_writer = inner.peer_socket.as_ref().and_then(|weak| weak.upgrade());
+            drop(inner);
+            if let Some(peer) = wake_peer_writer {
+                peer.on_transport_credit_progress();
+            }
+            return Ok(n);
+        }
+
+        if let Some(error) = inner.pending_error.take() {
+            return Err(error);
+        }
+        if inner.peer_send_shutdown || inner.peer_closed || inner.state == VsockStreamState::Closed
+        {
+            return Ok(0);
+        }
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
     /// 向当前 socket 的接收缓冲区入队数据。
     ///
     /// # 参数
@@ -1283,11 +1326,18 @@ impl Socket for VsockStreamSocket {
         &self,
         user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
     ) -> Result<usize, SystemError> {
-        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
-            self,
-            user_buffer,
-            self.recv_buffer_size(),
-        )
+        if user_buffer.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            match self.try_read_to_user_buffer_once(user_buffer) {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !self.is_nonblock() => {
+                    wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// `recvfrom` 变体，地址参数对 stream 语义仅做兼容返回。

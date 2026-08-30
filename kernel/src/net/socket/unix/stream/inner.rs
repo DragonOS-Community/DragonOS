@@ -303,6 +303,76 @@ impl Connected {
         }
     }
 
+    /// Copy one read directly to userspace and commit queue consumption only
+    /// after the protected copy succeeds.
+    pub fn try_recv_to_user(
+        &self,
+        out: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        is_seqpacket: bool,
+        queue_consumed: &mut bool,
+    ) -> Result<usize, SystemError> {
+        *queue_consumed = false;
+        let mut guard = self.reader.lock();
+        if is_seqpacket {
+            if guard.len() < size_of::<u32>() {
+                if guard.is_read_shutdown() {
+                    return Ok(0);
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            let mut len_buf = [0u8; 4];
+            guard.peek_slice(&mut len_buf).ok_or(SystemError::EFAULT)?;
+            let record_len = u32::from_ne_bytes(len_buf) as usize;
+            if guard.len() < size_of::<u32>() + record_len {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            let copy_len = out.len().min(record_len);
+            let mut data = Vec::new();
+            data.try_reserve(copy_len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            data.resize(copy_len, 0);
+            let copy_result = if copy_len != 0 {
+                let payload = guard.head() + Wrapping(size_of::<u32>());
+                guard
+                    .peek_slice_at(payload, &mut data)
+                    .ok_or(SystemError::EFAULT)?;
+                out.write_to_user(0, &data).map(|_| copy_len)
+            } else {
+                Ok(0)
+            };
+
+            // Linux consumes a non-PEEK seqpacket record even when copying
+            // its payload to userspace faults. Stream sockets differ: their
+            // byte queue advances only after a successful copy.
+            guard
+                .consume(size_of::<u32>() + record_len)
+                .ok_or(SystemError::EIO)?;
+            *queue_consumed = true;
+            return copy_result;
+        }
+
+        let available = guard.len();
+        if available == 0 {
+            if guard.is_read_shutdown() {
+                return Ok(0);
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let copy_len = out.len().min(available);
+        let mut data = Vec::new();
+        data.try_reserve(copy_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        data.resize(copy_len, 0);
+        guard.peek_slice(&mut data).ok_or(SystemError::EFAULT)?;
+        out.write_to_user(0, &data)?;
+        guard.consume(copy_len).ok_or(SystemError::EIO)?;
+        *queue_consumed = true;
+        Ok(copy_len)
+    }
+
     pub fn try_peek(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
         if is_seqpacket {
             let (copy_len, _orig_len, _truncated) = self.try_recv_seqpacket_meta(buf, true)?;

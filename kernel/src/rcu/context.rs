@@ -214,8 +214,7 @@ pub(super) struct RcuContextTracker {
     /// Cooperative request for this CPU to reach a real scheduling/QS
     /// boundary. The coordinator clears it; the local tick only observes it.
     urgent_qs: AtomicBool,
-    /// Successful reschedule IPIs targeted at this CPU. Besides diagnostics,
-    /// this lets the production-path selftest identify its exact target.
+    /// RCU reschedule IPIs successfully submitted to this CPU.
     resched_ipis: AtomicU64,
 }
 
@@ -274,12 +273,12 @@ impl RcuContextTracker {
 
     #[inline]
     pub(super) fn note_resched_ipi(&self) {
-        self.resched_ipis.fetch_add(1, Ordering::Release);
+        self.resched_ipis.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
     pub(super) fn resched_ipis(&self) -> u64 {
-        self.resched_ipis.load(Ordering::Acquire)
+        self.resched_ipis.load(Ordering::Relaxed)
     }
 
     /// Returns one coherent view of all context fields.

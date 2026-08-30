@@ -230,7 +230,6 @@ fn run_reschedule_escalation_selftest() -> Result<(), &'static str> {
     // success condition below is per target CPU, so unrelated GP traffic on a
     // different CPU cannot satisfy this test.
     synchronize_rcu();
-    let submitted_before = RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis();
     let ready = Arc::new(Completion::new());
     let done = Arc::new(Completion::new());
     let saw_escalation = Arc::new(AtomicBool::new(false));
@@ -240,15 +239,20 @@ fn run_reschedule_escalation_selftest() -> Result<(), &'static str> {
     let closure = KernelThreadClosure::EmptyClosure((
         Box::new(move || {
             let preempt_guard = PreemptGuard::new();
+            let submitted_before = RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis();
+            let received_before = crate::smp::kick_cpu_received(target_cpu);
             let started = rcu_now();
             thread_ready.complete();
-            while RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis() == submitted_before
-                && !progress::elapsed_at_least(rcu_now(), started, 3_000_000_000)
+            while !(progress::elapsed_at_least(rcu_now(), started, 3_000_000_000)
+                || RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis()
+                    != submitted_before
+                    && crate::smp::kick_cpu_received(target_cpu) != received_before)
             {
                 core::hint::spin_loop();
             }
-            let escalated =
-                RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis() > submitted_before;
+            let escalated = RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis()
+                != submitted_before
+                && crate::smp::kick_cpu_received(target_cpu) != received_before;
             thread_saw.store(escalated, Ordering::Release);
             drop(preempt_guard);
             crate::sched::sched_yield();
@@ -562,6 +566,7 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     if RCU_SLOW_CALLBACK_NS < RCU_CALLBACK_TIME_BUDGET_NS {
         return Err("RCU slow callback threshold is below the batch time budget");
     }
+    crate::sched::clock::run_sched_clock_selftests()?;
     #[cfg(target_arch = "x86_64")]
     {
         let cycles = usize::MAX / 1_000_000 + 1;

@@ -312,6 +312,7 @@ impl SmpCpuManager {
         if !rcu::prepare_cpu_starting(cpu_id) {
             return Err(SystemError::EBUSY);
         }
+        crate::sched::clock::SchedClock::reset_cpu(cpu_id);
         unsafe { cpu_state.configure_bringup(target_state, true) };
         cpu_state.publish_state(CpuHpState::Starting);
 

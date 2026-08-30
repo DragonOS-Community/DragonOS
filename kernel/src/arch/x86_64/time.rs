@@ -12,9 +12,22 @@ pub fn time_init() {
 pub struct X86_64TimeArch;
 
 #[inline(always)]
+fn scale_by_ratio(value: usize, numerator: usize, denominator: usize) -> usize {
+    debug_assert_ne!(denominator, 0);
+    // `remainder < denominator`, so this proves that the only ordinary
+    // multiplication cannot overflow. The quotient term intentionally wraps
+    // with the architecture cycle counter, matching TimeArch's API.
+    debug_assert!(numerator <= usize::MAX / denominator);
+    let quotient = value / denominator;
+    let remainder = value - quotient * denominator;
+    quotient
+        .wrapping_mul(numerator)
+        .wrapping_add(remainder * numerator / denominator)
+}
+
+#[inline(always)]
 pub(crate) fn cycles_to_ns(cycles: usize, cpu_khz: u64) -> usize {
-    debug_assert_ne!(cpu_khz, 0);
-    ((cycles as u128 * 1_000_000u128) / cpu_khz as u128) as usize
+    scale_by_ratio(cycles, 1_000_000, cpu_khz as usize)
 }
 
 impl TimeArch for X86_64TimeArch {
@@ -24,7 +37,7 @@ impl TimeArch for X86_64TimeArch {
     }
 
     fn cal_expire_cycles(ns: usize) -> usize {
-        let delta = (ns as u128 * TSCManager::cpu_khz() as u128 / 1_000_000u128) as usize;
+        let delta = scale_by_ratio(ns, TSCManager::cpu_khz() as usize, 1_000_000);
         Self::get_cycles().wrapping_add(delta)
     }
 

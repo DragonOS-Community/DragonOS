@@ -1,5 +1,7 @@
 use system_error::SystemError;
 
+use ::core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{
     arch::{interrupt::ipi::send_ipi, CurrentSMPArch},
     exception::ipi::{IpiKind, IpiTarget},
@@ -18,12 +20,33 @@ pub mod cpu;
 pub mod init;
 mod syscall;
 
+#[repr(align(64))]
+struct KickCpuReceiveCounter(AtomicU64);
+
+static KICK_CPU_RECEIVED: [KickCpuReceiveCounter; crate::mm::percpu::PerCpu::MAX_CPU_NUM as usize] =
+    [const { KickCpuReceiveCounter(AtomicU64::new(0)) };
+        crate::mm::percpu::PerCpu::MAX_CPU_NUM as usize];
+
 /// Returns whether this build has a working generic KickCpu IPI path.
 ///
 /// Keep this capability next to `kick_cpu()` so architecture bring-up cannot
 /// accidentally make callers infer support from CPU count alone.
 pub const fn kick_cpu_supported() -> bool {
     cfg!(target_arch = "x86_64")
+}
+
+/// Records completed delivery of the generic reschedule IPI on this CPU.
+pub(crate) fn note_kick_cpu_received() {
+    let cpu = smp_get_processor_id();
+    KICK_CPU_RECEIVED[cpu.data() as usize]
+        .0
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn kick_cpu_received(cpu: ProcessorId) -> u64 {
+    KICK_CPU_RECEIVED[cpu.data() as usize]
+        .0
+        .load(Ordering::Relaxed)
 }
 
 pub fn kick_cpu(cpu_id: ProcessorId) -> Result<(), SystemError> {

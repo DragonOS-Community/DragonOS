@@ -58,6 +58,7 @@ mod sys_select;
 mod sys_statfs;
 mod sys_statx;
 mod sys_symlinkat;
+mod sys_timerfd;
 mod sys_truncate;
 mod sys_unlinkat;
 mod sys_utimensat;

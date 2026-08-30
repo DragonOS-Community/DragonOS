@@ -19,5 +19,6 @@ pub mod poll;
 pub mod procfs;
 pub mod ramfs;
 pub mod sysfs;
+pub mod timerfd;
 pub mod tmpfs;
 pub mod vfs;

@@ -368,8 +368,14 @@ pub fn do_gettimeofday() -> PosixTimeval {
 
 pub fn do_settimeofday64(time: PosixTimeSpec) -> Result<(), SystemError> {
     let requested = validate_settimeofday(time)?;
-    let mut tk = timekeeper().inner.write_irqsave();
-    settimeofday_locked(&mut tk, requested)
+    {
+        let mut tk = timekeeper().inner.write_irqsave();
+        settimeofday_locked(&mut tk, requested)?;
+    }
+    // timerfd may read the timekeeper while rebasing its monotonic backend;
+    // never call into it while holding the timekeeper write lock.
+    crate::filesystem::timerfd::timerfd_clock_was_set();
+    Ok(())
 }
 
 fn validate_settimeofday(time: PosixTimeSpec) -> Result<i128, SystemError> {

@@ -68,6 +68,7 @@ prctl_test
 exit_test
 setns_test
 eventfd_test
+timerfd_test
 poll_test
 rseq_test
 process_vm_read_write_test

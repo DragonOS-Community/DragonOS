@@ -676,6 +676,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         }
     }
 
+    /// Linux `noop_llseek`: ignore offset/whence and return the current f_pos.
+    ///
+    /// This is distinct from random-access support. Anonymous stream-like
+    /// files such as timerfd may opt in while still rejecting pread/pwrite.
+    fn has_noop_llseek(&self) -> bool {
+        false
+    }
+
     /// 是否允许 pread（随机读，不推进文件偏移）。
     ///
     /// 默认：对 stream 文件返回 false；对非 stream 默认允许。

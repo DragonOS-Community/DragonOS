@@ -343,6 +343,8 @@ pub enum FilePrivateData {
     Overlayfs(OverlayFilePrivateData),
     /// kernfs/debugfs per-open callback state.
     Kernfs(Option<KernFilePrivateData>),
+    /// timerfd open-file-description flags (notably O_NONBLOCK).
+    TimerFd(FileFlags),
     /// 不需要文件私有信息
     Unused,
 }
@@ -409,6 +411,7 @@ impl FilePrivateData {
             FilePrivateData::Overlayfs(pdata) => {
                 pdata.set_flags(flags)?;
             }
+            FilePrivateData::TimerFd(current) => *current = flags,
             _ => {}
         }
         Ok(())
@@ -1452,9 +1455,6 @@ impl File {
         };
 
         self.readable()?;
-        if len == 0 {
-            return Ok(Some(0));
-        }
         if writer.len() < len {
             return Err(SystemError::ENOBUFS);
         }
@@ -2137,6 +2137,9 @@ impl File {
         // Linux 语义：O_PATH fd 的 lseek 返回 EBADF（优先于 ESPIPE）。
         if mode.contains(FileMode::FMODE_PATH) {
             return Err(SystemError::EBADF);
+        }
+        if self.inode.has_noop_llseek() {
+            return Ok(self.offset.load(Ordering::SeqCst));
         }
         if mode.contains(FileMode::FMODE_STREAM) || !mode.contains(FileMode::FMODE_LSEEK) {
             return Err(SystemError::ESPIPE);

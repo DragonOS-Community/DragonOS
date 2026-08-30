@@ -124,8 +124,11 @@ impl IpcPerm {
         mode: u32,
         user_ns: &Arc<UserNamespace>,
     ) -> Result<(), SystemError> {
-        self.uid = make_kuid(user_ns, uid)?;
-        self.gid = make_kgid(user_ns, gid)?;
+        let uid = make_kuid(user_ns, uid)?;
+        let gid = make_kgid(user_ns, gid)?;
+
+        self.uid = uid;
+        self.gid = gid;
         self.mode = mode & PERM_MASK;
         Ok(())
     }

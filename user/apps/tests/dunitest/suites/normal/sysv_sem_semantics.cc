@@ -360,6 +360,33 @@ TEST(SysVSem, IpcSetMode) {
     EXPECT_EQ(0644, static_cast<int>(ds.sem_perm.mode & 0777));
 }
 
+TEST(SysVSem, IpcSetInvalidGidDoesNotPartiallyUpdate) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to inspect the set after transferring ownership";
+    }
+
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+
+    struct semid_ds before = {};
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, IPC_STAT, reinterpret_cast<unsigned long>(&before)));
+
+    struct semid_ds update = before;
+    update.sem_perm.uid = 1234;
+    update.sem_perm.gid = UINT32_MAX;
+    update.sem_perm.mode = 0644;
+
+    errno = 0;
+    EXPECT_EQ(-1, SemCtl(sem.id(), 0, IPC_SET, reinterpret_cast<unsigned long>(&update)));
+    EXPECT_EQ(EINVAL, errno);
+
+    struct semid_ds after = {};
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, IPC_STAT, reinterpret_cast<unsigned long>(&after)));
+    EXPECT_EQ(before.sem_perm.uid, after.sem_perm.uid);
+    EXPECT_EQ(before.sem_perm.gid, after.sem_perm.gid);
+    EXPECT_EQ(before.sem_perm.mode & 0777, after.sem_perm.mode & 0777);
+}
+
 TEST(SysVSem, OwnerCanControlModeZeroSet) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);

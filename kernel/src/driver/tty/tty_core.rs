@@ -141,6 +141,8 @@ impl TtyCore {
             read_wq: EventWaitQueue::new(),
             write_wq: EventWaitQueue::new(),
             write_lock: TtySleepLock::new(),
+            open_close_lock: TtySleepLock::new(),
+            open_files: AtomicUsize::new(0),
             job_control_lock: TtySleepLock::new(),
             port: RwLock::new(None),
             index,
@@ -225,12 +227,23 @@ impl TtyCore {
         true
     }
 
+    fn tty_stop_locked(&self, flow: &mut TtyFlowState) -> bool {
+        if flow.stopped {
+            return false;
+        }
+
+        flow.stopped = true;
+        let _ = self.stop(self.core());
+        true
+    }
+
     pub fn tty_start(&self) {
         let mut flow = self.core.flow.lock_irqsave();
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
         if !self.tty_start_locked(&mut flow) {
             return;
         }
-
+        drop(flow);
         self.tty_wakeup();
     }
 
@@ -240,17 +253,89 @@ impl TtyCore {
     /// releasing any line-discipline locks it holds.
     pub(crate) fn tty_start_without_wakeup(&self) -> bool {
         let mut flow = self.core.flow.lock_irqsave();
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
         self.tty_start_locked(&mut flow)
     }
 
     pub fn tty_stop(&self) {
         let mut flow = self.core.flow.lock_irqsave();
-        if flow.stopped {
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
+        self.tty_stop_locked(&mut flow);
+    }
+
+    pub fn tty_stop_tco(&self) {
+        let mut flow = self.core.flow.lock_irqsave();
+        if flow.tco_stopped {
             return;
         }
-        flow.stopped = true;
+        flow.tco_stopped = true;
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
+        self.tty_stop_locked(&mut flow);
+    }
 
-        let _ = self.stop(self.core());
+    pub fn tty_start_tco(&self) {
+        let mut flow = self.core.flow.lock_irqsave();
+        if !flow.tco_stopped {
+            return;
+        }
+        flow.tco_stopped = false;
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
+        if !self.tty_start_locked(&mut flow) {
+            return;
+        }
+        drop(flow);
+        self.tty_wakeup();
+    }
+
+    /// Send a software flow-control character without output post-processing.
+    pub fn tty_send_xchar(&self, ch: u8) -> Result<(), SystemError> {
+        let hook_result = {
+            let _termios_guard = self.core.termios_read_lock();
+            self.core
+                .tty_driver
+                .driver_funcs()
+                .send_xchar(self.core(), ch)
+        };
+        if hook_result != Err(SystemError::ENOSYS) {
+            // Linux's send_xchar hook is void: an implemented driver path is
+            // best-effort and never exposes a device error to userspace.
+            return Ok(());
+        }
+
+        let _write_guard = self.core.write_lock().lock_interruptible(false)?;
+        let _termios_guard = self.core.termios_read_lock();
+
+        let (temporarily_started, transition_seq) = {
+            let mut flow = self.core.flow.lock_irqsave();
+            let transition_seq = flow.transition_seq;
+            let temporarily_started = self.tty_start_locked(&mut flow);
+            (temporarily_started, transition_seq)
+        };
+        let _ = self.write(self.core(), &[ch], 1);
+        let mut should_wake = false;
+        if temporarily_started {
+            let mut flow = self.core.flow.lock_irqsave();
+            // A concurrent flow-control request owns the final state. Restore
+            // the temporary stop only if no request raced with this fallback.
+            if flow.transition_seq == transition_seq && !flow.stopped {
+                self.tty_stop_locked(&mut flow);
+            } else if !flow.stopped {
+                // A start request can observe the temporary running state and
+                // skip its own wakeup. Complete that request after dropping
+                // every lock that write_wakeup may re-enter.
+                should_wake = true;
+            }
+        }
+        drop(_termios_guard);
+        drop(_write_guard);
+        if should_wake {
+            self.tty_wakeup();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reset_flow_state(&self) {
+        *self.core.flow.lock_irqsave() = TtyFlowState::default();
     }
 
     pub fn tty_wakeup(&self) {
@@ -638,6 +723,9 @@ pub struct TtyFlowState {
     pub stopped: bool,
     /// 表示 TCO（Transmit Continuous Operation）流控是否被停止
     pub tco_stopped: bool,
+    /// Changes whenever an external start/stop request can supersede a
+    /// temporary state transition used by the xchar fallback.
+    transition_seq: usize,
 }
 
 #[derive(Debug)]
@@ -660,6 +748,11 @@ pub struct TtyCoreData {
     write_wq: EventWaitQueue,
     /// 串行化整个 tty write 调用，等价于 Linux tty->atomic_write_lock。
     write_lock: TtySleepLock,
+    /// Serializes non-PTY first-open/last-close driver lifecycle callbacks.
+    open_close_lock: TtySleepLock,
+    /// User file descriptions; unlike `count`, this excludes the driver's
+    /// persistent table reference.
+    open_files: AtomicUsize,
     /// Serializes controlling-session changes with hangup.
     job_control_lock: TtySleepLock,
     /// 端口
@@ -871,6 +964,25 @@ impl TtyCoreData {
         &self.write_lock
     }
 
+    pub(crate) fn open_close_lock(&self) -> &TtySleepLock {
+        &self.open_close_lock
+    }
+
+    /// Caller must hold `open_close_lock`.
+    pub(crate) fn begin_file_open(&self) -> bool {
+        self.open_files.fetch_add(1, Ordering::SeqCst) == 0
+    }
+
+    /// Caller must hold `open_close_lock`.
+    pub(crate) fn end_file_open(&self) -> bool {
+        let count = self.open_files.load(Ordering::SeqCst);
+        if count == 0 {
+            return false;
+        }
+        self.open_files.store(count - 1, Ordering::SeqCst);
+        count == 1
+    }
+
     #[inline]
     pub fn job_control_lock(&self) -> &TtySleepLock {
         &self.job_control_lock
@@ -982,6 +1094,12 @@ impl TtyCoreData {
 
             while nr != 0 {
                 if !rescan {
+                    // Match Linux's `while (!stopped)` plus
+                    // `goto rescan_last_byte`: stop before consuming a new
+                    // byte, but always finish a byte already marked rescan.
+                    if self.flow.lock_irqsave().stopped {
+                        break;
+                    }
                     ch = buf[offset] as u32;
                     offset += 1;
                     nr -= 1;
@@ -1044,6 +1162,11 @@ impl TtyOperation for TtyCore {
     }
 
     #[inline]
+    fn send_xchar(&self, tty: &TtyCoreData, ch: u8) -> Result<(), SystemError> {
+        self.core().tty_driver.driver_funcs().send_xchar(tty, ch)
+    }
+
+    #[inline]
     fn install(&self, driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         return self.core().tty_driver.driver_funcs().install(driver, tty);
     }
@@ -1083,6 +1206,9 @@ impl TtyOperation for TtyCore {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        let non_pty = tty.core().driver().tty_driver_type() != TtyDriverType::Pty;
+        let _open_close_guard = non_pty.then(|| tty.core().open_close_lock().lock());
+        let is_non_pty_last = non_pty && tty.core().end_file_open();
         self.core().dec_count();
         let cnt = self.core().count();
         // TODO: fix pty slave close issue
@@ -1090,7 +1216,7 @@ impl TtyOperation for TtyCore {
         let is_pty_slave_last = cnt == 1 && subtype == TtyDriverSubType::PtySlave;
         let is_pty_master_last = cnt == 1 && subtype == TtyDriverSubType::PtyMaster;
         let final_release = !self.core().count_valid();
-        if final_release || is_pty_slave_last || is_pty_master_last {
+        if final_release || is_pty_slave_last || is_pty_master_last || is_non_pty_last {
             // log::debug!(
             //     "TtyCore close: ref count: {}, tty: {}",
             //     cnt,
@@ -1101,6 +1227,9 @@ impl TtyOperation for TtyCore {
             // the peer keeps the tty structure count at one. The controlling
             // session remains attached in that case and may reopen /dev/tty;
             // only a true final structure release clears it here.
+            if final_release || is_non_pty_last {
+                self.reset_flow_state();
+            }
             if final_release {
                 let _ = TtyJobCtrlManager::remove_session_tty(&tty);
             }
@@ -1298,4 +1427,14 @@ impl TtyFlushArg {
     pub const TCOFLUSH: usize = 1;
     /// 丢弃所有待处理输入和输出数据
     pub const TCIOFLUSH: usize = 2;
+}
+
+pub struct TtyFlowArg;
+
+#[allow(dead_code)]
+impl TtyFlowArg {
+    pub const TCOOFF: usize = 0;
+    pub const TCOON: usize = 1;
+    pub const TCIOFF: usize = 2;
+    pub const TCION: usize = 3;
 }

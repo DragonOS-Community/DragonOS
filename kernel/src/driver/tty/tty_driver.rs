@@ -520,6 +520,14 @@ pub trait TtyOperation: Sync + Send + Debug {
         self.write(tty, &[ch], 1).map(|_| ())
     }
 
+    /// Send a high-priority software flow-control character.
+    ///
+    /// Drivers without a priority path return `ENOSYS` so the TTY core can
+    /// use Linux's write-serialized fallback.
+    fn send_xchar(&self, _tty: &TtyCoreData, _ch: u8) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
     fn start(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }

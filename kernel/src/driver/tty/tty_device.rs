@@ -329,8 +329,17 @@ impl IndexNode for TtyDevice {
 
         tty.core().contorl_info_irqsave().clear_dead_session();
 
+        let non_pty = tty.core().driver().tty_driver_type() != TtyDriverType::Pty;
+        let open_close_guard = non_pty.then(|| tty.core().open_close_lock().lock());
+        let first_open = non_pty && tty.core().begin_file_open();
+        if first_open {
+            tty.reset_flow_state();
+        }
         let ret = tty.open(tty.core());
         if let Err(err) = ret {
+            if non_pty {
+                tty.core().end_file_open();
+            }
             tty.core().dec_count();
             *data = FilePrivateData::Unused;
             if err == SystemError::ENOSYS {
@@ -343,6 +352,7 @@ impl IndexNode for TtyDevice {
         // Linux. Do not clear a hangup which raced with this open: its
         // generation change marks this file as one of the hung-up instances.
         tty.core().finish_file_open(hangup_generation);
+        drop(open_close_guard);
 
         let driver = tty.core().driver();
         // 考虑 O_NOCTTY：显式指定则不设置控制终端；pty master 也不会成为控制终端。

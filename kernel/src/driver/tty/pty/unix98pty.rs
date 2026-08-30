@@ -1009,9 +1009,14 @@ impl TtyOperation for Unix98PtyDriverInner {
 
         let link = core.checked_link()?;
 
+        if !link.core().contorl_info_irqsave().packet {
+            return Ok(());
+        }
+
         let mut ctrl = core.contorl_info_irqsave();
         ctrl.pktstatus.remove(TtyPacketStatus::TIOCPKT_STOP);
         ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_START);
+        drop(ctrl);
 
         let events =
             EPollEventType::EPOLLPRI | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
@@ -1028,9 +1033,14 @@ impl TtyOperation for Unix98PtyDriverInner {
 
         let link = core.checked_link()?;
 
+        if !link.core().contorl_info_irqsave().packet {
+            return Ok(());
+        }
+
         let mut ctrl = core.contorl_info_irqsave();
         ctrl.pktstatus.remove(TtyPacketStatus::TIOCPKT_START);
         ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_STOP);
+        drop(ctrl);
 
         let events =
             EPollEventType::EPOLLPRI | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;

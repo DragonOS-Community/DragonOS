@@ -46,7 +46,14 @@ std::string ReadAll(const char* path) {
 void ExpectReportOk(const std::string& report) {
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("pr1=ok\n")) << report;
-    EXPECT_NE(std::string::npos, report.find("smp_litmus=ok\n")) << report;
+    const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    ASSERT_GT(online_cpus, 0) << "sysconf(_SC_NPROCESSORS_ONLN) failed: errno=" << errno << " ("
+                              << strerror(errno) << ")";
+    if (online_cpus == 1) {
+        EXPECT_NE(std::string::npos, report.find("smp_litmus=skip:no-remote-cpu\n")) << report;
+    } else {
+        EXPECT_NE(std::string::npos, report.find("smp_litmus=ok\n")) << report;
+    }
     EXPECT_NE(std::string::npos, report.find("pr2=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("pr3=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("pr5=ok\n")) << report;

@@ -521,13 +521,12 @@ impl TcpSocket {
                         break;
                     }
                 }
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                Err(e) => {
                     if total_read > offset {
                         break;
                     }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return Err(e);
                 }
-                Err(e) => return Err(e),
             }
         }
 

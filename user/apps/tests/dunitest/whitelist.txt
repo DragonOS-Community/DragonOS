@@ -54,6 +54,7 @@ normal/tcp_self_connect_semantics
 normal/poll_timeout_semantics
 normal/udp_ipv6_send_semantics
 normal/socket_getsockopt_semantics
+normal/socket_readv_semantics
 normal/unix_socket_shutdown
 fuse/fuse_core
 fuse/fuse_extended

@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/utsname.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -14,6 +15,11 @@
 #include <thread>
 
 namespace {
+
+bool IsDragonOS() {
+    utsname name = {};
+    return uname(&name) == 0 && std::strstr(name.release, "dragonos") != nullptr;
+}
 
 void CreateTcpPair(int sockets[2]) {
     int listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -148,6 +154,53 @@ TEST(SocketReadvSemantics, TcpFaultDoesNotConsumeFailedChunk) {
     ASSERT_EQ(static_cast<ssize_t>(remaining.size()),
               read(sockets[1], remaining.data(), remaining.size()));
     EXPECT_EQ(0, std::memcmp(remaining.data(), payload.data(), payload.size()));
+
+    EXPECT_EQ(0, munmap(inaccessible, static_cast<size_t>(page_size)));
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
+TEST(SocketReadvSemantics, TcpWrappedRxFaultReturnsCommittedPrefix) {
+    if (!IsDragonOS()) {
+        GTEST_SKIP() << "smoltcp receive-ring regression test";
+    }
+
+    int sockets[2] = {-1, -1};
+    CreateTcpPair(sockets);
+    ASSERT_GE(sockets[0], 0);
+    ASSERT_GE(sockets[1], 0);
+
+    // DragonOS doubles SO_RCVBUF and clamps it to the Linux minimum of 2304 bytes.
+    // Draining 2300 bytes leaves the smoltcp ring cursor four bytes before its end,
+    // so the next eight-byte payload occupies two contiguous receive regions.
+    int requested_recv_buffer = 1152;
+    ASSERT_EQ(0, setsockopt(sockets[1], SOL_SOCKET, SO_RCVBUF,
+                           &requested_recv_buffer, sizeof(requested_recv_buffer)))
+        << strerror(errno);
+    std::array<char, 2300> cursor_advance = {};
+    ASSERT_EQ(static_cast<ssize_t>(cursor_advance.size()),
+              write(sockets[0], cursor_advance.data(), cursor_advance.size()));
+    std::array<char, 2300> drained = {};
+    ASSERT_EQ(static_cast<ssize_t>(drained.size()),
+              read(sockets[1], drained.data(), drained.size()));
+
+    ASSERT_EQ(8, write(sockets[0], "abcdefgh", 8));
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    void* inaccessible =
+        mmap(nullptr, static_cast<size_t>(page_size), PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, inaccessible) << strerror(errno);
+
+    std::array<char, 4> first = {};
+    iovec iovs[2] = {{first.data(), first.size()}, {inaccessible, 4}};
+    EXPECT_EQ(4, readv(sockets[1], iovs, 2));
+    EXPECT_EQ(0, std::memcmp(first.data(), "abcd", 4));
+
+    std::array<char, 4> remaining = {};
+    ASSERT_EQ(4, read(sockets[1], remaining.data(), remaining.size()));
+    EXPECT_EQ(0, std::memcmp(remaining.data(), "efgh", 4));
 
     EXPECT_EQ(0, munmap(inaccessible, static_cast<size_t>(page_size)));
     close(sockets[0]);

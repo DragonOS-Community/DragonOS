@@ -2,7 +2,7 @@ use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::Debug,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
 use crate::{
@@ -553,6 +553,448 @@ fn run_duplicate_claim_selftest() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn request_selftest_gp() -> gp::RcuSequence {
+    let target = {
+        let mut inner = RCU_STATE.inner.lock_irqsave();
+        let target = inner.gp.request_future();
+        RcuState::pump_grace_periods(&mut inner);
+        target
+    };
+    RCU_STATE.wake_state_waiters();
+    RCU_STATE.wake_worker();
+    target
+}
+
+fn wait_for_selftest_gp_active(target: gp::RcuSequence, required_cpu: ProcessorId) -> bool {
+    let started = rcu_now();
+    loop {
+        let inner = RCU_STATE.inner.lock_irqsave();
+        if inner.gp.current() == target
+            && !inner.gp.has_completed(target)
+            && inner.gp.is_waiting_for(required_cpu)
+        {
+            return true;
+        }
+        drop(inner);
+        if progress::elapsed_at_least(rcu_now(), started, 1_000_000_000) {
+            return false;
+        }
+        sched_yield();
+    }
+}
+
+fn wait_for_selftest_gp(target: gp::RcuSequence) {
+    RCU_STATE.state_wait.wait_until(|| {
+        RCU_STATE
+            .inner
+            .lock_irqsave()
+            .gp
+            .has_completed(target)
+            .then_some(())
+    });
+    fence(Ordering::SeqCst);
+}
+
+fn selftest_gp_completed(target: gp::RcuSequence) -> bool {
+    RCU_STATE.inner.lock_irqsave().gp.has_completed(target)
+}
+
+fn selftest_remote_cpu() -> Option<ProcessorId> {
+    let current = crate::smp::core::smp_get_processor_id();
+    smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .find(|cpu| *cpu != current && smp_cpu_manager().is_online_cpu(*cpu))
+}
+
+fn run_sync_read_litmus_selftest() -> Result<(), &'static str> {
+    let Some(reader_cpu) = selftest_remote_cpu() else {
+        // The fixed schedule needs a reader to remain non-preemptible while
+        // the updater and coordinator make progress on another CPU.
+        return Ok(());
+    };
+    synchronize_rcu();
+
+    let current_cpu = crate::smp::core::smp_get_processor_id();
+    let x = Arc::new(AtomicUsize::new(0));
+    let y = Arc::new(AtomicUsize::new(0));
+    let allow_y = Arc::new(AtomicBool::new(false));
+    let reader_entered = Arc::new(Completion::new());
+    let releaser_done = Arc::new(Completion::new());
+    let saw_active_gp = Arc::new(AtomicBool::new(false));
+    let target_gp = Arc::new(SpinLock::new(None));
+
+    let reader_x = x.clone();
+    let reader_y = y.clone();
+    let reader_allow_y = allow_y.clone();
+    let reader_entered_worker = reader_entered.clone();
+    let reader_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let _guard = rcu_read_lock();
+            reader_x.store(1, Ordering::Release);
+            reader_entered_worker.complete();
+            while !reader_allow_y.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            reader_y.store(1, Ordering::Relaxed);
+            0
+        }),
+        (),
+    ));
+    let Some(reader) = KernelThreadMechanism::create_on_cpu(
+        reader_closure,
+        "rcu-sync-read-reader".to_string(),
+        reader_cpu,
+    ) else {
+        return Err("RCU+sync+read could not create its reader");
+    };
+    let releaser_allow_y = allow_y.clone();
+    let releaser_done_worker = releaser_done.clone();
+    let releaser_saw_active_gp = saw_active_gp.clone();
+    let releaser_target_gp = target_gp.clone();
+    let releaser_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let target = releaser_target_gp
+                .lock_irqsave()
+                .expect("RCU+sync+read target GP was not published");
+            let active = wait_for_selftest_gp_active(target, reader_cpu);
+            releaser_saw_active_gp.store(active, Ordering::Release);
+            releaser_allow_y.store(true, Ordering::Release);
+            releaser_done_worker.complete();
+            i32::from(!active)
+        }),
+        (),
+    ));
+    let Some(releaser) = KernelThreadMechanism::create_on_cpu(
+        releaser_closure,
+        "rcu-sync-read-releaser".to_string(),
+        current_cpu,
+    ) else {
+        allow_y.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        return Err("RCU+sync+read could not create its GP releaser");
+    };
+    if ProcessManager::wakeup(&reader).is_err() || reader_entered.wait_for_completion().is_err() {
+        allow_y.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        let _ = KernelThreadMechanism::stop(&releaser);
+        return Err("RCU+sync+read reader did not enter");
+    }
+    let target = request_selftest_gp();
+    *target_gp.lock_irqsave() = Some(target);
+    if ProcessManager::wakeup(&releaser).is_err() {
+        allow_y.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        let _ = KernelThreadMechanism::stop(&releaser);
+        return Err("RCU+sync+read GP releaser did not start");
+    }
+
+    let x_before_gp = x.load(Ordering::Acquire);
+    wait_for_selftest_gp(target);
+    let y_after_gp = y.load(Ordering::Relaxed);
+    let completed = releaser_done.wait_for_completion().is_ok();
+    let reader_stopped = KernelThreadMechanism::stop(&reader).is_ok();
+    let releaser_stopped = KernelThreadMechanism::stop(&releaser).is_ok();
+    if !saw_active_gp.load(Ordering::Acquire) || !completed || !reader_stopped || !releaser_stopped
+    {
+        return Err("RCU+sync+read fixed schedule did not complete");
+    }
+    if x_before_gp != 1 || y_after_gp != 1 {
+        return Err("RCU+sync+read observed x=1 after y remained zero across a GP");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RcuSyncFreeNode {
+    value: AtomicUsize,
+}
+
+fn run_sync_free_litmus_selftest() -> Result<(), &'static str> {
+    let Some(reader_cpu) = selftest_remote_cpu() else {
+        return Ok(());
+    };
+    synchronize_rcu();
+
+    let current_cpu = crate::smp::core::smp_get_processor_id();
+    let old = Arc::new(RcuSyncFreeNode {
+        value: AtomicUsize::new(1),
+    });
+    let new = Arc::new(RcuSyncFreeNode {
+        value: AtomicUsize::new(1),
+    });
+    let published = Arc::new(AtomicPtr::new(Arc::as_ptr(&old) as *mut RcuSyncFreeNode));
+    let allow_read = Arc::new(AtomicBool::new(false));
+    let reader_loaded = Arc::new(Completion::new());
+    let releaser_done = Arc::new(Completion::new());
+    let saw_active_gp = Arc::new(AtomicBool::new(false));
+    let target_gp = Arc::new(SpinLock::new(None));
+    let observed = Arc::new(AtomicUsize::new(usize::MAX));
+
+    let reader_published = published.clone();
+    let reader_allow = allow_read.clone();
+    let reader_loaded_worker = reader_loaded.clone();
+    let reader_observed = observed.clone();
+    let reader_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let _guard = rcu_read_lock();
+            let object = rcu_dereference(&reader_published);
+            reader_loaded_worker.complete();
+            while !reader_allow.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            if object.is_null() {
+                reader_observed.store(usize::MAX - 1, Ordering::Release);
+                return 1;
+            }
+            // SAFETY: the old Arc is retained by the coordinator and RCU
+            // additionally protects this dereference in the tested schedule.
+            reader_observed.store(
+                unsafe { &*object }.value.load(Ordering::Relaxed),
+                Ordering::Release,
+            );
+            0
+        }),
+        (),
+    ));
+    let Some(reader) = KernelThreadMechanism::create_on_cpu(
+        reader_closure,
+        "rcu-sync-free-reader".to_string(),
+        reader_cpu,
+    ) else {
+        return Err("RCU+sync+free could not create its reader");
+    };
+    let releaser_allow_read = allow_read.clone();
+    let releaser_done_worker = releaser_done.clone();
+    let releaser_saw_active_gp = saw_active_gp.clone();
+    let releaser_target_gp = target_gp.clone();
+    let releaser_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let target = releaser_target_gp
+                .lock_irqsave()
+                .expect("RCU+sync+free target GP was not published");
+            let active = wait_for_selftest_gp_active(target, reader_cpu);
+            releaser_saw_active_gp.store(active, Ordering::Release);
+            releaser_allow_read.store(true, Ordering::Release);
+            releaser_done_worker.complete();
+            i32::from(!active)
+        }),
+        (),
+    ));
+    let Some(releaser) = KernelThreadMechanism::create_on_cpu(
+        releaser_closure,
+        "rcu-sync-free-releaser".to_string(),
+        current_cpu,
+    ) else {
+        allow_read.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        return Err("RCU+sync+free could not create its GP releaser");
+    };
+    if ProcessManager::wakeup(&reader).is_err() || reader_loaded.wait_for_completion().is_err() {
+        allow_read.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        let _ = KernelThreadMechanism::stop(&releaser);
+        return Err("RCU+sync+free reader did not load the old pointer");
+    }
+    rcu_assign_pointer(&published, Arc::as_ptr(&new) as *mut RcuSyncFreeNode);
+    let target = request_selftest_gp();
+    *target_gp.lock_irqsave() = Some(target);
+    if ProcessManager::wakeup(&releaser).is_err() {
+        allow_read.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        let _ = KernelThreadMechanism::stop(&releaser);
+        return Err("RCU+sync+free GP releaser did not start");
+    }
+
+    wait_for_selftest_gp(target);
+    old.value.store(0, Ordering::Relaxed);
+    let completed = releaser_done.wait_for_completion().is_ok();
+    let reader_stopped = KernelThreadMechanism::stop(&reader).is_ok();
+    let releaser_stopped = KernelThreadMechanism::stop(&releaser).is_ok();
+    if !saw_active_gp.load(Ordering::Acquire) || !completed || !reader_stopped || !releaser_stopped
+    {
+        return Err("RCU+sync+free fixed schedule did not complete");
+    }
+    if observed.load(Ordering::Acquire) != 1 {
+        return Err("RCU+sync+free reader observed the GP-after destruction write");
+    }
+    Ok(())
+}
+
+fn run_reader_handoff_selftest() -> Result<(), &'static str> {
+    let Some(first_cpu) = selftest_remote_cpu() else {
+        return Ok(());
+    };
+    synchronize_rcu();
+
+    let coordinator_cpu = crate::smp::core::smp_get_processor_id();
+    let release_first = Arc::new(AtomicBool::new(false));
+    let first_entered = Arc::new(Completion::new());
+    let successor_done = Arc::new(Completion::new());
+    let target_gp = Arc::new(SpinLock::new(None));
+    let completed_during_successor = Arc::new(AtomicBool::new(false));
+
+    let first_release = release_first.clone();
+    let first_entered_worker = first_entered.clone();
+    let first_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let _guard = rcu_read_lock();
+            first_entered_worker.complete();
+            while !first_release.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            0
+        }),
+        (),
+    ));
+    let Some(first) = KernelThreadMechanism::create_on_cpu(
+        first_closure,
+        "rcu-reader-handoff-first".to_string(),
+        first_cpu,
+    ) else {
+        return Err("RCU reader handoff could not create its first reader");
+    };
+
+    let successor_release = release_first.clone();
+    let successor_done_worker = successor_done.clone();
+    let successor_target = target_gp.clone();
+    let successor_completed = completed_during_successor.clone();
+    let successor_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let _guard = rcu_read_lock();
+            let target = successor_target
+                .lock_irqsave()
+                .expect("RCU reader handoff target GP was not published");
+            // The readers overlap: the successor enters before it releases
+            // the reader that was present at target-GP start.
+            successor_release.store(true, Ordering::Release);
+            let started = rcu_now();
+            while !selftest_gp_completed(target)
+                && !progress::elapsed_at_least(rcu_now(), started, 1_000_000_000)
+            {
+                core::hint::spin_loop();
+            }
+            successor_completed.store(selftest_gp_completed(target), Ordering::Release);
+            successor_done_worker.complete();
+            0
+        }),
+        (),
+    ));
+    let Some(successor) = KernelThreadMechanism::create_on_cpu(
+        successor_closure,
+        "rcu-reader-handoff-successor".to_string(),
+        coordinator_cpu,
+    ) else {
+        release_first.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&first);
+        return Err("RCU reader handoff could not create its successor");
+    };
+
+    if ProcessManager::wakeup(&first).is_err() || first_entered.wait_for_completion().is_err() {
+        release_first.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&successor);
+        return Err("RCU reader handoff first reader did not enter");
+    }
+    let target = request_selftest_gp();
+    if !wait_for_selftest_gp_active(target, first_cpu) {
+        release_first.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&successor);
+        return Err("RCU reader handoff target GP did not start");
+    }
+    *target_gp.lock_irqsave() = Some(target);
+    if ProcessManager::wakeup(&successor).is_err() || successor_done.wait_for_completion().is_err()
+    {
+        release_first.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&successor);
+        return Err("RCU reader handoff successor did not finish");
+    }
+
+    let first_stopped = KernelThreadMechanism::stop(&first).is_ok();
+    let successor_stopped = KernelThreadMechanism::stop(&successor).is_ok();
+    wait_for_selftest_gp(target);
+    if !first_stopped || !successor_stopped || !completed_during_successor.load(Ordering::Acquire) {
+        return Err("RCU target GP did not progress across overlapping reader handoff");
+    }
+    Ok(())
+}
+
+fn run_arc_slot_cross_thread_selftest() -> Result<(), &'static str> {
+    const REPLACEMENTS: usize = 64;
+    let initial_drops = Arc::new(AtomicUsize::new(0));
+    let replacement_drops = Arc::new(AtomicUsize::new(0));
+    let slot = Arc::new(RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
+        id: 40,
+        drops: initial_drops.clone(),
+    })));
+    let reader_loaded = Arc::new(Completion::new());
+    let allow_drop = Arc::new(AtomicBool::new(false));
+    let reader_ok = Arc::new(AtomicBool::new(false));
+
+    let reader_slot = slot.clone();
+    let reader_loaded_worker = reader_loaded.clone();
+    let reader_allow_drop = allow_drop.clone();
+    let reader_ok_worker = reader_ok.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let pinned = reader_slot.load();
+            reader_loaded_worker.complete();
+            while !reader_allow_drop.load(Ordering::Acquire) {
+                sched_yield();
+            }
+            reader_ok_worker.store(pinned.id == 40, Ordering::Release);
+            drop(pinned);
+            0
+        }),
+        (),
+    ));
+    let Some(reader) =
+        KernelThreadMechanism::create_and_run(closure, "rcu-arc-slot-cross-thread".to_string())
+    else {
+        return Err("RcuArcSlot cross-thread test could not create its reader");
+    };
+    if reader_loaded.wait_for_completion().is_err() {
+        allow_drop.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        return Err("RcuArcSlot cross-thread reader did not pin the initial object");
+    }
+
+    for index in 0..REPLACEMENTS {
+        slot.store_deferred(Arc::new(RcuSelftestDropProbe {
+            id: 41 + index,
+            drops: replacement_drops.clone(),
+        }));
+    }
+    rcu_barrier();
+    if initial_drops.load(Ordering::Acquire) != 0 {
+        allow_drop.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuArcSlot dropped a cross-thread pinned snapshot early");
+    }
+
+    allow_drop.store(true, Ordering::Release);
+    if KernelThreadMechanism::stop(&reader).is_err() || !reader_ok.load(Ordering::Acquire) {
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuArcSlot cross-thread reader did not retain its snapshot");
+    }
+    if initial_drops.load(Ordering::Acquire) != 1 {
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuArcSlot initial snapshot was not dropped after the final pin");
+    }
+    drop(slot);
+    rcu_barrier();
+    if replacement_drops.load(Ordering::Acquire) != REPLACEMENTS {
+        return Err("RcuArcSlot replacements were not dropped exactly once");
+    }
+    Ok(())
+}
+
 fn run_pr1_selftest() -> Result<(), &'static str> {
     gp::run_state_machine_selftests()?;
     progress::run_progress_selftests()?;
@@ -588,6 +1030,10 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     run_reschedule_escalation_selftest()?;
     run_smp_callback_barrier_selftest()?;
     run_concurrent_barrier_selftest()?;
+    run_sync_read_litmus_selftest()?;
+    run_sync_free_litmus_selftest()?;
+    run_reader_handoff_selftest()?;
+    run_arc_slot_cross_thread_selftest()?;
 
     if ProcessManager::current_pcb().rcu_read_depth() != 0 {
         return Err("initial rcu_read_depth was not zero");
@@ -1676,6 +2122,7 @@ fn run_pr5_selftest() -> Result<(), &'static str> {
 }
 
 pub fn run_debug_selftests() -> String {
+    let has_remote_cpu = selftest_remote_cpu().is_some();
     let pr1 = run_pr1_selftest();
     let pr2 = run_pr2_selftest();
     let pr3 = run_pr3_selftest();
@@ -1689,10 +2136,17 @@ pub fn run_debug_selftests() -> String {
         "status=fail\n"
     });
 
-    match pr1 {
+    match &pr1 {
         Ok(()) => report.push_str("pr1=ok\n"),
         Err(reason) => report.push_str(&format!("pr1=fail:{reason}\n")),
     }
+    report.push_str(if pr1.is_err() {
+        "smp_litmus=not-completed\n"
+    } else if has_remote_cpu {
+        "smp_litmus=ok\n"
+    } else {
+        "smp_litmus=skip:no-remote-cpu\n"
+    });
 
     match pr2 {
         Ok(()) => report.push_str("pr2=ok\n"),

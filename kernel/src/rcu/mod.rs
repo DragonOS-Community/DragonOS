@@ -51,6 +51,7 @@ mod context;
 mod gp;
 mod progress;
 mod selftest;
+mod torture;
 pub use callback::RcuHead;
 use callback::{RcuCallbackQueueDepth, RcuSegmentedCallbacks};
 use context::{
@@ -62,6 +63,7 @@ use progress::{
     validate_and_commit_stall, ActiveGpProgress, ProgressActions, ProgressCpuMask, StallCandidate,
 };
 pub use selftest::run_debug_selftests;
+pub(crate) use torture::{run_torture, RcuTortureConfig};
 
 pub(crate) type RcuRawCallback = unsafe fn(NonNull<RcuHead>);
 

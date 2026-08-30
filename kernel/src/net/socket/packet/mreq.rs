@@ -28,6 +28,7 @@ fn mreq_match(a: &PacketMreq, b: &PacketMreq) -> bool {
 impl super::PacketSocket {
     pub(super) fn add_membership(&self, value: &[u8]) -> Result<(), SystemError> {
         let mreq = parse_mreq(value)?;
+        let _rtnl_guard = crate::net::rtnl::lock();
         let iface = self.find_iface(mreq.mr_ifindex as u32)?;
         validate_add_mreq(&mreq, iface.mac().as_bytes().len())?;
 
@@ -58,6 +59,7 @@ impl super::PacketSocket {
     pub(super) fn drop_membership(&self, value: &[u8]) -> Result<(), SystemError> {
         let mreq = parse_mreq(value)?;
 
+        let _rtnl_guard = crate::net::rtnl::lock();
         let mut state = self.memberships.lock();
         let Some(pos) = state
             .entries
@@ -83,7 +85,7 @@ impl super::PacketSocket {
         Ok(())
     }
 
-    pub(crate) fn revert_all_memberships(&self) {
+    pub(super) fn revert_all_memberships(&self, _rtnl_guard: &crate::net::rtnl::RtnlGuard) {
         let entries = {
             let mut state = self.memberships.lock();
             state.closed = true;

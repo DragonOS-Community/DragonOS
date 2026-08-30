@@ -423,7 +423,7 @@ struct RcuState {
     worker_started: AtomicBool,
     worker_should_stop: AtomicBool,
     gp_active: AtomicBool,
-    contexts: [RcuContextTracker; PerCpu::MAX_CPU_NUM as usize],
+    contexts: Box<[RcuContextTracker]>,
     cpu_callbacks: Box<[RcuCpuCallbacks]>,
     inner: SpinLock<RcuStateInner>,
     callback_ownership: SpinLock<()>,
@@ -440,9 +440,11 @@ struct RcuState {
 
 impl RcuState {
     fn new() -> Self {
-        // Construct the cache-line-aligned per-CPU records directly in heap
-        // storage. Materializing the complete array in this function's stack
-        // frame can exhaust the BSP's fixed 32-KiB boot stack.
+        // Construct both per-CPU arrays directly in heap storage. Embedding
+        // contexts in RcuState makes lazy initialization reserve a large stack
+        // frame even on the already-initialized fast path.
+        let mut contexts = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
+        contexts.resize_with(PerCpu::MAX_CPU_NUM as usize, RcuContextTracker::new);
         let mut cpu_callbacks = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
         cpu_callbacks.resize_with(PerCpu::MAX_CPU_NUM as usize, RcuCpuCallbacks::new);
 
@@ -452,7 +454,7 @@ impl RcuState {
             worker_started: AtomicBool::new(false),
             worker_should_stop: AtomicBool::new(false),
             gp_active: AtomicBool::new(false),
-            contexts: [const { RcuContextTracker::new() }; PerCpu::MAX_CPU_NUM as usize],
+            contexts: contexts.into_boxed_slice(),
             cpu_callbacks: cpu_callbacks.into_boxed_slice(),
             inner: SpinLock::new(RcuStateInner::new()),
             callback_ownership: SpinLock::new(()),

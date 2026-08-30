@@ -1101,10 +1101,8 @@ impl Socket for UnixStreamSocket {
             }
         };
 
-        if !self.is_seqpacket && payload_copy_len != 0 {
-            if !peek {
-                self.wake_peer_writable();
-            }
+        if !self.is_seqpacket && payload_copy_len != 0 && !peek {
+            self.wake_peer_writable();
         }
 
         // Default: no flags.

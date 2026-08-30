@@ -638,8 +638,8 @@ GDT_Table:
     .quad 0x00affb000000ffff // 6 用户64位代码段描述符 0x30
     .quad 0x00cf9a000000ffff // 7 内核32位代码段描述符 0x38
     .quad 0x00cf92000000ffff // 8 内核32位数据段描述符 0x40
-    // Entry 9 is reserved. Entries 10..265 hold 128 per-CPU TSS descriptors.
-    .fill 257, 8, 0
+    // Entry 9 is reserved. Entries 10..41 hold 16 per-CPU TSS descriptors.
+    .fill 33, 8, 0
 .global GDT_END
 GDT_END:
 

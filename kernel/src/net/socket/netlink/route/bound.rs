@@ -13,13 +13,16 @@ use crate::{
                 },
                 ProtocolSegment, NLMSG_ALIGN,
             },
-            route::{kern::NetlinkRouteKernelSocket, message::RouteNlMessage},
+            route::{
+                kern::{NetlinkRouteKernelSocket, RtnlRequestContext},
+                message::RouteNlMessage,
+            },
             table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
         },
         utils::datagram_common,
         PMSG,
     },
-    process::namespace::net_namespace::NetNamespace,
+    process::{namespace::net_namespace::NetNamespace, ProcessManager},
 };
 use alloc::sync::Arc;
 use core::mem::size_of;
@@ -49,6 +52,7 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
         buf: &[u8],
         to: &Self::Endpoint,
         _flags: crate::net::socket::PMSG,
+        destination_is_explicit: bool,
     ) -> Result<usize, SystemError> {
         if *to != NetlinkSocketAddr::new_unspecified() {
             return Err(SystemError::ENOTCONN);
@@ -57,6 +61,13 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
         let sum_lens = buf.len();
         let local_port = self.handle.port();
         let netns = self.netns();
+        let context = RtnlRequestContext::new(
+            ProcessManager::current_pcb().cred(),
+            self.opener_cred(),
+            netns.clone(),
+            local_port,
+            destination_is_explicit,
+        );
 
         let Some(route_kernel) = netns.get_netlink_kernel_socket_by_protocol(
             crate::net::socket::netlink::table::StandardNetlinkProtocol::ROUTE.into(),
@@ -90,6 +101,14 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
             let flags = SegHdrCommonFlags::from_bits_truncate(header.flags);
             if !flags.contains(SegHdrCommonFlags::REQUEST) {
                 continue;
+            }
+
+            let payload_len = msg_len - size_of::<CMsgSegHdr>();
+            if rtnl_requires_net_admin(header.type_, payload_len) {
+                if let Err(error) = context.require_net_admin() {
+                    send_route_error_ack(&header, error, local_port, netns.clone());
+                    continue;
+                }
             }
 
             if CSegmentType::try_from(header.type_).is_err() {
@@ -126,7 +145,7 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
                 }
             }
 
-            route_kernel_socket.request(&nlmsg, local_port, netns.clone());
+            route_kernel_socket.request(&nlmsg, &context);
 
             // gVisor 测例常以 sizeof(req) 发送，nlmsg_len 之后多为结构体尾部零填充，勿当作下一条消息。
             if offset < buf.len() && buf[offset..].iter().all(|&b| b == 0) {
@@ -173,6 +192,21 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
     fn check_io_events(&self) -> EPollEventType {
         self.check_io_events_common()
     }
+}
+
+/// Mirrors Linux `rtnl_msgtype_kind()`: RTM message kinds repeat in groups of
+/// four as NEW, DEL, GET, SET. Every non-GET userspace request in Linux's RTM
+/// range requires CAP_NET_ADMIN, including message types DragonOS does not yet
+/// implement. A zero-length payload stays on the existing malformed-message
+/// path instead of changing its error ordering.
+fn rtnl_requires_net_admin(message_type: u16, payload_len: usize) -> bool {
+    const RTM_BASE: u16 = 16;
+    const RTM_MAX: u16 = 123;
+    const RTM_GET_KIND: u16 = 2;
+
+    payload_len != 0
+        && (RTM_BASE..=RTM_MAX).contains(&message_type)
+        && ((message_type - RTM_BASE) & 3) != RTM_GET_KIND
 }
 
 fn send_route_error_ack(

@@ -7,7 +7,10 @@ use crate::{
 
 use self::{
     core::smp_get_processor_id,
-    cpu::{smp_cpu_manager, smp_cpu_manager_init, CpuHpCpuState, ProcessorId},
+    cpu::{
+        smp_cpu_manager, smp_cpu_manager_init, smp_cpu_manager_initialized, CpuHpCpuState,
+        ProcessorId,
+    },
 };
 
 pub mod core;
@@ -16,10 +19,24 @@ pub mod init;
 mod syscall;
 
 pub fn kick_cpu(cpu_id: ProcessorId) -> Result<(), SystemError> {
-    // todo: 增加对cpu_id的有效性检查
+    if !smp_cpu_manager_initialized()
+        || smp_cpu_manager().possible_cpus().get(cpu_id) != Some(true)
+        || !smp_cpu_manager().is_online_cpu(cpu_id)
+    {
+        return Err(SystemError::ENODEV);
+    }
 
-    send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu_id));
-    return Ok(());
+    #[cfg(target_arch = "x86_64")]
+    {
+        send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu_id));
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = cpu_id;
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
 }
 
 pub trait SMPArch {

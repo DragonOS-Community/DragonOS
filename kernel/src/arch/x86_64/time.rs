@@ -11,6 +11,12 @@ pub fn time_init() {
 
 pub struct X86_64TimeArch;
 
+#[inline(always)]
+pub(crate) fn cycles_to_ns(cycles: usize, cpu_khz: u64) -> usize {
+    debug_assert_ne!(cpu_khz, 0);
+    ((cycles as u128 * 1_000_000u128) / cpu_khz as u128) as usize
+}
+
 impl TimeArch for X86_64TimeArch {
     #[inline(always)]
     fn get_cycles() -> usize {
@@ -18,12 +24,13 @@ impl TimeArch for X86_64TimeArch {
     }
 
     fn cal_expire_cycles(ns: usize) -> usize {
-        Self::get_cycles() + ns * TSCManager::cpu_khz() as usize / 1000000
+        let delta = (ns as u128 * TSCManager::cpu_khz() as u128 / 1_000_000u128) as usize;
+        Self::get_cycles().wrapping_add(delta)
     }
 
     /// 将CPU的时钟周期数转换为纳秒
     #[inline(always)]
     fn cycles2ns(cycles: usize) -> usize {
-        cycles * 1000000 / TSCManager::cpu_khz() as usize
+        cycles_to_ns(cycles, TSCManager::cpu_khz())
     }
 }

@@ -477,6 +477,7 @@ impl KernelThreadMechanism {
 
     /// Creates and wakes a per-CPU kthread. Its affinity cannot be changed by
     /// userspace after creation.
+    #[allow(dead_code)]
     pub fn create_and_run_on_cpu(
         func: KernelThreadClosure,
         name: String,

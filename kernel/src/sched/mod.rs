@@ -104,6 +104,10 @@ pub fn cpu_is_online(cpu: ProcessorId) -> bool {
     smp_cpu_manager().is_online_cpu(cpu)
 }
 
+pub(crate) fn try_current_task(cpu: ProcessorId) -> Option<Arc<ProcessControlBlock>> {
+    cpu_rq(cpu.data() as usize).try_current_task()
+}
+
 pub fn nr_iowait() -> u32 {
     smp_cpu_manager()
         .present_cpus()
@@ -573,6 +577,17 @@ impl CpuRunQueue {
             core::hint::spin_loop();
         };
         (self.force_mut_locked(), guard)
+    }
+
+    /// Best-effort current-task snapshot for lockup diagnostics.
+    ///
+    /// The caller must tolerate `None`: a stalled CPU may itself hold the
+    /// runqueue lock, so diagnostic code must never spin waiting for it.
+    pub(crate) fn try_current_task(&self) -> Option<Arc<ProcessControlBlock>> {
+        let guard = self.lock.try_lock_irqsave().ok()?;
+        let current = self.current();
+        drop(guard);
+        Some(current)
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -1112,7 +1127,6 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
         }
     }
 
-    crate::rcu::note_context_switch();
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
     let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -1128,6 +1142,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
             }
         }
     };
+    crate::rcu::note_context_switch(&prev);
 
     // TODO: hrtick_clear(rq);
 

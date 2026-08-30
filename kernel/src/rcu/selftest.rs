@@ -16,6 +16,7 @@ use crate::{
     },
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
+        preempt::PreemptGuard,
         ProcessManager,
     },
     sched::completion::Completion,
@@ -153,6 +154,123 @@ fn run_callback_flood_selftest() -> Result<(), &'static str> {
     rcu_barrier();
     if hits.load(Ordering::SeqCst) != callbacks {
         return Err("RCU callback flood did not drain across bounded batches");
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct RcuSlowCallbackProbe {
+    head: RcuHead,
+    hits: Arc<AtomicUsize>,
+}
+
+unsafe fn rcu_slow_selftest_callback(head: NonNull<RcuHead>) {
+    // SAFETY: the callback owns the Box allocated below and consumes it once.
+    let probe = unsafe { Box::from_raw(head.as_ptr() as *mut RcuSlowCallbackProbe) };
+    let started = rcu_now();
+    while !progress::elapsed_at_least(rcu_now(), started, RCU_SLOW_CALLBACK_NS + 1_000_000) {
+        core::hint::spin_loop();
+    }
+    probe.hits.fetch_add(1, Ordering::SeqCst);
+}
+
+fn run_slow_callback_budget_selftest() -> Result<(), &'static str> {
+    let slow_before = RCU_STATE.stats.slow_callbacks.load(Ordering::Acquire);
+    let budget_before = RCU_STATE
+        .stats
+        .callback_time_budget_hits
+        .load(Ordering::Acquire);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let probe = Box::into_raw(Box::new(RcuSlowCallbackProbe {
+        head: RcuHead::new(),
+        hits: hits.clone(),
+    }));
+    // SAFETY: ownership of the stable Box transfers to the callback.
+    unsafe {
+        call_rcu_raw(
+            NonNull::new_unchecked(ptr::addr_of_mut!((*probe).head)),
+            rcu_slow_selftest_callback,
+        );
+    }
+    rcu_barrier();
+
+    if hits.load(Ordering::SeqCst) != 1
+        || RCU_STATE.stats.slow_callbacks.load(Ordering::Acquire) <= slow_before
+        || RCU_STATE
+            .stats
+            .callback_time_budget_hits
+            .load(Ordering::Acquire)
+            <= budget_before
+        || RCU_STATE.stats.max_callback_ns.load(Ordering::Acquire) < RCU_SLOW_CALLBACK_NS
+    {
+        return Err("RCU slow callback did not trigger time-budget diagnostics");
+    }
+    Ok(())
+}
+
+fn run_reschedule_escalation_selftest() -> Result<(), &'static str> {
+    let current_cpu = crate::smp::core::smp_get_processor_id();
+    let Some(target_cpu) = smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .find(|cpu| *cpu != current_cpu && smp_cpu_manager().is_online_cpu(*cpu))
+    else {
+        // UP configurations cannot exercise a remote reschedule IPI.
+        return Ok(());
+    };
+
+    // Finish any pre-existing GP before constructing the target holdout. The
+    // success condition below is per target CPU, so unrelated GP traffic on a
+    // different CPU cannot satisfy this test.
+    synchronize_rcu();
+    let submitted_before = RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis();
+    let ready = Arc::new(Completion::new());
+    let done = Arc::new(Completion::new());
+    let saw_escalation = Arc::new(AtomicBool::new(false));
+    let thread_ready = ready.clone();
+    let thread_done = done.clone();
+    let thread_saw = saw_escalation.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let preempt_guard = PreemptGuard::new();
+            let started = rcu_now();
+            thread_ready.complete();
+            while RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis() == submitted_before
+                && !progress::elapsed_at_least(rcu_now(), started, 3_000_000_000)
+            {
+                core::hint::spin_loop();
+            }
+            let escalated =
+                RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis() > submitted_before;
+            thread_saw.store(escalated, Ordering::Release);
+            drop(preempt_guard);
+            crate::sched::sched_yield();
+            thread_done.complete();
+            i32::from(!escalated)
+        }),
+        (),
+    ));
+    let Some(worker) = KernelThreadMechanism::create_on_cpu(
+        closure,
+        "rcu-resched-holdout".to_string(),
+        target_cpu,
+    ) else {
+        return Err("RCU reschedule selftest could not create its holdout task");
+    };
+    if ProcessManager::wakeup(&worker).is_err() {
+        let _ = KernelThreadMechanism::stop(&worker);
+        return Err("RCU reschedule selftest could not wake its holdout task");
+    }
+    if ready.wait_for_completion().is_err() {
+        let _ = KernelThreadMechanism::stop(&worker);
+        return Err("RCU reschedule selftest holdout did not start");
+    }
+
+    synchronize_rcu();
+    let done_result = done.wait_for_completion();
+    let stop_result = KernelThreadMechanism::stop(&worker);
+    if done_result.is_err() || stop_result.is_err() || !saw_escalation.load(Ordering::Acquire) {
+        return Err("RCU holdout did not recover through reschedule escalation");
     }
     Ok(())
 }
@@ -426,13 +544,36 @@ fn run_duplicate_claim_selftest() -> Result<(), &'static str> {
 
 fn run_pr1_selftest() -> Result<(), &'static str> {
     gp::run_state_machine_selftests()?;
+    progress::run_progress_selftests()?;
+    if callback_duration_ns(100, 100 + RCU_SLOW_CALLBACK_NS) != Some(RCU_SLOW_CALLBACK_NS)
+        || callback_duration_ns(0, 10).is_some()
+        || callback_duration_ns(100, 99).is_some()
+        || callback_duration_ns(100, 200) != Some(100)
+    {
+        return Err("RCU callback duration validation accepted an invalid clock sample");
+    }
+    if RCU_SLOW_CALLBACK_NS < RCU_CALLBACK_TIME_BUDGET_NS {
+        return Err("RCU slow callback threshold is below the batch time budget");
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let cycles = usize::MAX / 1_000_000 + 1;
+        let khz = 3_000_000;
+        let expected = ((cycles as u128 * 1_000_000u128) / khz as u128) as usize;
+        if crate::arch::time::cycles_to_ns(cycles, khz) != expected {
+            return Err("x86 cycles-to-nanoseconds conversion overflowed");
+        }
+    }
     context::run_context_selftests()?;
     callback::run_segmented_callback_selftests()?;
     run_callback_generation_selftest()?;
     run_duplicate_claim_selftest()?;
     run_cpu_hotplug_lifecycle_selftest()?;
     run_cpu_hotplug_concurrent_selftest()?;
+    run_immediate_gp_accounting_selftest()?;
     run_callback_flood_selftest()?;
+    run_slow_callback_budget_selftest()?;
+    run_reschedule_escalation_selftest()?;
     run_smp_callback_barrier_selftest()?;
     run_concurrent_barrier_selftest()?;
 
@@ -482,7 +623,7 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
         if blocked_hits.load(Ordering::SeqCst) != 0 {
             Err("rcu_defer callback ran before leaving the read-side critical section")
         } else {
-            note_context_switch();
+            note_context_switch(&ProcessManager::current_pcb());
             let (_, completed_gp_mid, completed_cb_mid, queued_mid, ready_mid) = debug_snapshot();
 
             if blocked_hits.load(Ordering::SeqCst) != 0 {
@@ -499,7 +640,7 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
         }
     };
 
-    note_context_switch();
+    note_context_switch(&ProcessManager::current_pcb());
     rcu_barrier();
     blocked_result?;
 
@@ -698,12 +839,37 @@ fn run_callback_generation_selftest() -> Result<(), &'static str> {
 fn pump_cpu_lifecycle_model(inner: &mut RcuStateInner) -> bool {
     RcuState::pump_grace_periods_with(
         inner,
+        1,
         |participants| (participants.clone(), [0; PerCpu::MAX_CPU_NUM as usize]),
-        |_| {},
+        |_| false,
         |_| {},
         |_| false,
         |_| {},
+        |_| {},
+        |_| {},
     )
+}
+
+fn run_immediate_gp_accounting_selftest() -> Result<(), &'static str> {
+    let mut inner = RcuStateInner::new();
+    inner.gp.request_future();
+    let mut starts = 0usize;
+    let mut completions = 0usize;
+    RcuState::pump_grace_periods_with(
+        &mut inner,
+        42,
+        |_| (CpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize]),
+        |_| false,
+        |_| {},
+        |_| false,
+        |_| {},
+        |_| starts += 1,
+        |_| completions += 1,
+    );
+    if starts != 1 || completions != 1 || inner.gp.is_active() || inner.progress.is_some() {
+        return Err("immediately completed RCU GP was not accounted exactly once");
+    }
+    Ok(())
 }
 
 fn run_cpu_hotplug_lifecycle_selftest() -> Result<(), &'static str> {

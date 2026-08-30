@@ -23,5 +23,6 @@ fn tick_periodic(cpu_id: ProcessorId, trap_frame: &TrapFrame) {
         run_local_timer();
     }
 
+    crate::rcu::scheduler_tick();
     ProcessManager::update_process_times(trap_frame.is_from_user());
 }

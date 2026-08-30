@@ -25,28 +25,31 @@ use core::{
     fmt::Write,
     marker::PhantomData,
     ptr::{self, NonNull},
-    sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
 };
 
 use log::warn;
 
 use crate::{
+    exception::softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
     libs::{cpumask::CpuMask, mutex::Mutex, spinlock::SpinLock, wait_queue::WaitQueue},
     mm::percpu::PerCpu,
     process::{
         kthread::KernelThreadClosure, kthread::KernelThreadMechanism, preempt::PreemptGuard,
-        ProcessManager,
+        ProcessFlags, ProcessManager,
     },
-    sched::{cond_resched, sched_yield, SchedPolicy},
+    sched::{clock::SchedClock, cond_resched, sched_yield, SchedPolicy},
     smp::{
         core::smp_get_processor_id,
         cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
+        kick_cpu,
     },
 };
 
 mod callback;
 mod context;
 mod gp;
+mod progress;
 mod selftest;
 pub use callback::RcuHead;
 use callback::{RcuCallbackQueueDepth, RcuSegmentedCallbacks};
@@ -55,6 +58,9 @@ use context::{
     IrqEntry, RcuContextTracker,
 };
 use gp::{GracePeriodState, RcuSequence};
+use progress::{
+    validate_and_commit_stall, ActiveGpProgress, ProgressActions, ProgressCpuMask, StallCandidate,
+};
 pub use selftest::run_debug_selftests;
 
 pub(crate) type RcuRawCallback = unsafe fn(NonNull<RcuHead>);
@@ -359,6 +365,9 @@ where
 
 struct RcuStateInner {
     gp: GracePeriodState,
+    progress: Option<ActiveGpProgress>,
+    /// Fixed-size diagnostic handoff from timer IRQ to the RCU worker.
+    pending_stall: Option<StallCandidate>,
     /// CPUs that have executed the RCU starting hook and are eligible for
     /// future GP snapshots. The active GP keeps its own immutable snapshot.
     participating_cpus: CpuMask,
@@ -368,7 +377,45 @@ impl RcuStateInner {
     fn new() -> Self {
         Self {
             gp: GracePeriodState::new(),
+            progress: None,
+            pending_stall: None,
             participating_cpus: CpuMask::new(),
+        }
+    }
+}
+
+struct RcuStats {
+    gp_started: AtomicU64,
+    gp_completed: AtomicU64,
+    gp_total_ns: AtomicU64,
+    gp_max_ns: AtomicU64,
+    soft_requests: AtomicU64,
+    ipi_attempted: AtomicU64,
+    ipi_submitted: AtomicU64,
+    ipi_failed: AtomicU64,
+    stall_reports: AtomicU64,
+    callback_batches: AtomicU64,
+    callback_time_budget_hits: AtomicU64,
+    slow_callbacks: AtomicU64,
+    max_callback_ns: AtomicU64,
+}
+
+impl RcuStats {
+    const fn new() -> Self {
+        Self {
+            gp_started: AtomicU64::new(0),
+            gp_completed: AtomicU64::new(0),
+            gp_total_ns: AtomicU64::new(0),
+            gp_max_ns: AtomicU64::new(0),
+            soft_requests: AtomicU64::new(0),
+            ipi_attempted: AtomicU64::new(0),
+            ipi_submitted: AtomicU64::new(0),
+            ipi_failed: AtomicU64::new(0),
+            stall_reports: AtomicU64::new(0),
+            callback_batches: AtomicU64::new(0),
+            callback_time_budget_hits: AtomicU64::new(0),
+            slow_callbacks: AtomicU64::new(0),
+            max_callback_ns: AtomicU64::new(0),
         }
     }
 }
@@ -416,6 +463,18 @@ impl RcuCpuCallbacks {
 
 const RCU_CALLBACK_BATCH_LIMIT: usize = 64;
 const RCU_CALLBACK_CPU_QUANTUM: usize = 8;
+const RCU_CALLBACK_TIME_BUDGET_NS: u64 = 3_000_000;
+const RCU_SLOW_CALLBACK_NS: u64 = 10_000_000;
+const RCU_SLOW_WARNING_INTERVAL_NS: u64 = 1_000_000_000;
+
+#[inline]
+fn callback_duration_ns(started_at: u64, finished_at: u64) -> Option<u64> {
+    if started_at == 0 || !progress::deadline_reached(finished_at, started_at) {
+        None
+    } else {
+        Some(finished_at.wrapping_sub(started_at))
+    }
+}
 
 struct RcuState {
     initialized: AtomicBool,
@@ -423,6 +482,7 @@ struct RcuState {
     worker_started: AtomicBool,
     worker_should_stop: AtomicBool,
     gp_active: AtomicBool,
+    next_progress_at: AtomicU64,
     contexts: Box<[RcuContextTracker]>,
     cpu_callbacks: Box<[RcuCpuCallbacks]>,
     inner: SpinLock<RcuStateInner>,
@@ -431,6 +491,8 @@ struct RcuState {
     worker_kick_pending: AtomicBool,
     next_scan_cpu: AtomicUsize,
     callbacks_invoked: AtomicUsize,
+    stats: RcuStats,
+    next_slow_warning_at: AtomicU64,
     barrier_mutex: Mutex<()>,
     barrier_remaining: AtomicUsize,
     barrier_wait: WaitQueue,
@@ -454,6 +516,7 @@ impl RcuState {
             worker_started: AtomicBool::new(false),
             worker_should_stop: AtomicBool::new(false),
             gp_active: AtomicBool::new(false),
+            next_progress_at: AtomicU64::new(0),
             contexts: contexts.into_boxed_slice(),
             cpu_callbacks: cpu_callbacks.into_boxed_slice(),
             inner: SpinLock::new(RcuStateInner::new()),
@@ -462,6 +525,8 @@ impl RcuState {
             worker_kick_pending: AtomicBool::new(false),
             next_scan_cpu: AtomicUsize::new(0),
             callbacks_invoked: AtomicUsize::new(0),
+            stats: RcuStats::new(),
+            next_slow_warning_at: AtomicU64::new(0),
             barrier_mutex: Mutex::new(()),
             barrier_remaining: AtomicUsize::new(0),
             barrier_wait: WaitQueue::default(),
@@ -475,33 +540,73 @@ impl RcuState {
     }
 
     fn pump_grace_periods(inner: &mut RcuStateInner) -> bool {
-        Self::pump_grace_periods_with(
+        let now = rcu_now();
+        let ready_changed = Self::pump_grace_periods_with(
             inner,
+            now,
             participating_context_snapshot,
             credit_context_progress_locked,
             publish_gp_active,
             |completed| RCU_STATE.complete_callback_gp(completed),
             |starting| RCU_STATE.prepare_callback_gp_start(starting),
-        )
+            |_| {
+                RCU_STATE.stats.gp_started.fetch_add(1, Ordering::Relaxed);
+            },
+            |completed_progress| RCU_STATE.record_gp_completion(completed_progress, now),
+        );
+        RCU_STATE.publish_progress_deadline_locked(inner, now);
+        ready_changed
+    }
+
+    fn record_gp_completion(&self, progress: ActiveGpProgress, now: u64) {
+        let elapsed = now.wrapping_sub(progress.started_at());
+        self.stats.gp_completed.fetch_add(1, Ordering::Relaxed);
+        self.stats.gp_total_ns.fetch_add(elapsed, Ordering::Relaxed);
+        self.stats.gp_max_ns.fetch_max(elapsed, Ordering::Relaxed);
+        for context in &self.contexts {
+            context.clear_urgent_qs();
+        }
+    }
+
+    fn publish_progress_deadline_locked(&self, inner: &RcuStateInner, now: u64) {
+        let deadline = inner
+            .progress
+            .as_ref()
+            .map(|progress| progress.next_deadline(now))
+            .unwrap_or(0);
+        self.next_progress_at.store(deadline, Ordering::Release);
     }
 
     fn pump_grace_periods_with(
         inner: &mut RcuStateInner,
+        now: u64,
         mut waiting_snapshot: impl FnMut(&CpuMask) -> (CpuMask, [u64; PerCpu::MAX_CPU_NUM as usize]),
-        mut credit_context: impl FnMut(&mut GracePeriodState),
+        mut credit_context: impl FnMut(&mut GracePeriodState) -> bool,
         mut publish_active: impl FnMut(bool),
         mut complete_callbacks: impl FnMut(RcuSequence) -> bool,
         mut prepare_callbacks: impl FnMut(RcuSequence),
+        mut note_gp_start: impl FnMut(RcuSequence),
+        mut note_gp_complete: impl FnMut(ActiveGpProgress),
     ) -> bool {
         let mut ready_changed = false;
         loop {
-            credit_context(&mut inner.gp);
+            if credit_context(&mut inner.gp) {
+                if let Some(progress) = inner.progress.as_mut() {
+                    progress.note_progress(now);
+                }
+            }
 
             if inner.gp.ready_to_complete() {
                 // Pair all real quiescent-state reports with GP completion.
                 // This is a GP slow path and does not affect RCU readers.
                 fence(Ordering::SeqCst);
+                let progress = inner
+                    .progress
+                    .take()
+                    .expect("ready RCU GP has no progress metadata");
                 let completed = inner.gp.complete_ready();
+                debug_assert_eq!(progress.seq(), completed);
+                note_gp_complete(progress);
                 ready_changed |= complete_callbacks(completed);
                 continue;
             }
@@ -523,6 +628,8 @@ impl RcuState {
             let (waiting_cpus, context_generations) = waiting_snapshot(&inner.participating_cpus);
             let started = inner.gp.start_requested(waiting_cpus, context_generations);
             debug_assert_eq!(started, starting);
+            inner.progress = Some(ActiveGpProgress::new(started, now));
+            note_gp_start(started);
         }
 
         publish_active(inner.gp.is_active());
@@ -644,7 +751,9 @@ impl RcuState {
             return true;
         }
         let inner = self.inner.lock_irqsave();
-        inner.gp.ready_to_complete() || (!inner.gp.is_active() && inner.gp.has_request())
+        inner.pending_stall.is_some()
+            || inner.gp.ready_to_complete()
+            || (!inner.gp.is_active() && inner.gp.has_request())
     }
 
     fn wake_state_waiters(&self) {
@@ -657,6 +766,185 @@ impl RcuState {
         // waitqueue's internal lock.
         if !self.worker_kick_pending.swap(true, Ordering::AcqRel) {
             self.worker_wait.wake_all();
+        }
+    }
+
+    fn defer_worker_wake(&self) {
+        // Timer hardirq publishes only an atomic bit and a per-CPU softirq.
+        // WaitQueue wakeup may free waiter nodes, so it belongs in bottom-half
+        // context instead of the scheduler tick.
+        if !self.worker_kick_pending.swap(true, Ordering::AcqRel) {
+            softirq_vectors().raise_softirq(SoftirqNumber::RCU);
+        }
+    }
+
+    fn flush_deferred_worker_wake(&self) {
+        if self.worker_kick_pending.load(Ordering::Acquire) {
+            self.worker_wait.wake_all();
+        }
+    }
+
+    fn claim_progress_actions(&self, now: u64) -> Option<ProgressActions> {
+        let mut inner = self.inner.try_lock_irqsave().ok()?;
+        if !inner.gp.is_active() {
+            return None;
+        }
+        let deadline = self.next_progress_at.load(Ordering::Acquire);
+        if !progress::deadline_reached(now, deadline) {
+            return None;
+        }
+
+        if credit_context_progress_locked(&mut inner.gp) {
+            if let Some(progress) = inner.progress.as_mut() {
+                progress.note_progress(now);
+            }
+        }
+        if inner.gp.ready_to_complete() {
+            self.next_progress_at.store(0, Ordering::Release);
+            drop(inner);
+            self.defer_worker_wake();
+            return None;
+        }
+
+        let holdouts = ProgressCpuMask::from_cpu_mask(
+            inner
+                .gp
+                .waiting_cpus_ref()
+                .expect("active RCU GP has no holdout state"),
+        );
+        let active_seq = inner.gp.current();
+        let progress = inner
+            .progress
+            .as_mut()
+            .expect("active RCU GP has no progress metadata");
+        debug_assert_eq!(progress.seq(), active_seq);
+        let mut actions = progress.actions(now, holdouts);
+        for cpu in actions.soft.iter_cpu() {
+            self.contexts[cpu.data() as usize].request_urgent_qs();
+        }
+        self.next_progress_at
+            .store(actions.next_deadline, Ordering::Release);
+        if let Some(candidate) = actions.stall.take() {
+            inner.pending_stall = Some(candidate);
+        }
+        Some(actions)
+    }
+
+    fn execute_progress_actions(&self, actions: ProgressActions) {
+        if !actions.soft.is_empty() {
+            self.stats.soft_requests.fetch_add(1, Ordering::Relaxed);
+        }
+
+        for cpu in actions.resched.iter_cpu() {
+            self.stats.ipi_attempted.fetch_add(1, Ordering::Relaxed);
+            if kick_cpu(cpu).is_ok() {
+                self.stats.ipi_submitted.fetch_add(1, Ordering::Relaxed);
+                self.contexts[cpu.data() as usize].note_resched_ipi();
+            } else {
+                self.stats.ipi_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // The worker performs another GP scan and emits any queued diagnostic
+        // in process context. This wake is also the worker's bounded progress
+        // role for active GPs; it does not depend on CPU0 jiffies.
+        self.defer_worker_wake();
+    }
+
+    fn process_pending_stall(&self) {
+        let candidate = self.inner.lock_irqsave().pending_stall.take();
+        if let Some(candidate) = candidate {
+            self.emit_stall_report(rcu_now(), candidate);
+        }
+    }
+
+    fn emit_stall_report(&self, now: u64, mut candidate: StallCandidate) {
+        let mut inner = self.inner.lock_irqsave();
+        if !inner.gp.is_active() || inner.gp.current() != candidate.seq {
+            return;
+        }
+        let current_seq = inner.gp.current();
+        let current_holdouts = ProgressCpuMask::from_cpu_mask(
+            inner
+                .gp
+                .waiting_cpus_ref()
+                .expect("active RCU GP has no holdout state"),
+        );
+        let Some(progress) = inner.progress.as_mut() else {
+            return;
+        };
+        let Some(committed) =
+            validate_and_commit_stall(current_seq, current_holdouts, progress, candidate, now)
+        else {
+            return;
+        };
+        candidate = committed;
+        self.next_progress_at
+            .store(progress.next_deadline(now), Ordering::Release);
+        drop(inner);
+
+        self.stats.stall_reports.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "RCU stall snapshot: gp={} report={} age_ms={} no_progress_ms={}",
+            candidate.seq.raw(),
+            candidate.report_number,
+            now.wrapping_sub(candidate.started_at) / 1_000_000,
+            now.wrapping_sub(candidate.last_progress_at) / 1_000_000,
+        );
+        for cpu in candidate.holdouts.iter_cpu() {
+            let context = &self.contexts[cpu.data() as usize];
+            let snapshot = context.snapshot();
+            let task = crate::sched::try_current_task(cpu);
+            let depth = self.cpu_callbacks[cpu.data() as usize]
+                .state
+                .try_lock_irqsave()
+                .ok()
+                .map(|state| state.depth());
+            warn!(
+                "RCU holdout cpu={} context={:?} irq={} nmi={} generation={} urgent={}",
+                cpu.data(),
+                snapshot.base(),
+                snapshot.irq_depth(),
+                snapshot.nmi_depth(),
+                snapshot.generation(),
+                context.urgent_qs(),
+            );
+            if let Some(task) = task {
+                if let Some(basic) = task.try_basic() {
+                    warn!(
+                        "RCU holdout task cpu={} pid={} name={} preempt={} read_depth={}",
+                        cpu.data(),
+                        task.raw_pid().data(),
+                        basic.name(),
+                        task.preempt_count(),
+                        task.rcu_read_depth(),
+                    );
+                } else {
+                    warn!(
+                        "RCU holdout task cpu={} pid={} name=<lock-busy> preempt={} read_depth={}",
+                        cpu.data(),
+                        task.raw_pid().data(),
+                        task.preempt_count(),
+                        task.rcu_read_depth(),
+                    );
+                }
+            } else {
+                warn!("RCU holdout task cpu={} <rq-lock-busy>", cpu.data());
+            }
+            if let Some(depth) = depth {
+                warn!(
+                    "RCU holdout callbacks cpu={} total={} done={} wait={} next_ready={} next={} executing={}",
+                    cpu.data(),
+                    depth.total(),
+                    depth.done,
+                    depth.wait,
+                    depth.next_ready,
+                    depth.next,
+                    depth.executing,
+                );
+            } else {
+                warn!("RCU holdout callbacks cpu={} <queue-lock-busy>", cpu.data());
+            }
         }
     }
 
@@ -733,8 +1021,8 @@ impl RcuState {
     }
 
     fn process_callback_batch(&self) -> usize {
+        self.process_pending_stall();
         let Some(_executor) = self.try_claim_executor() else {
-            self.wake_worker();
             return 0;
         };
 
@@ -744,6 +1032,8 @@ impl RcuState {
         // ready. One wake per batch is sufficient.
         self.wake_state_waiters();
         let mut count = 0;
+        let mut batch_elapsed_ns = 0u64;
+        let mut time_budget_hit = false;
         let mut preferred_cpu = None;
         let mut cpu_quantum = 0;
         while count < RCU_CALLBACK_BATCH_LIMIT {
@@ -753,10 +1043,51 @@ impl RcuState {
             // SAFETY: `pop_ready()` detached the head, copied all state needed
             // after invocation, and released duplicate ownership. The unsafe
             // admission contract keeps the head valid until this call starts.
+            let started_at = rcu_now();
             unsafe { (callback.func)(callback.head) };
+            let finished_at = rcu_now();
             self.callbacks_invoked.fetch_add(1, Ordering::Relaxed);
             self.finish_callback(cpu);
             count += 1;
+
+            if let Some(duration) = callback_duration_ns(started_at, finished_at) {
+                batch_elapsed_ns = batch_elapsed_ns.saturating_add(duration);
+                self.stats
+                    .max_callback_ns
+                    .fetch_max(duration, Ordering::Relaxed);
+                if duration >= RCU_SLOW_CALLBACK_NS {
+                    let slow_count = self
+                        .stats
+                        .slow_callbacks
+                        .fetch_add(1, Ordering::Relaxed)
+                        .wrapping_add(1);
+                    let next_warning = self.next_slow_warning_at.load(Ordering::Acquire);
+                    if next_warning == 0 || progress::deadline_reached(finished_at, next_warning) {
+                        let next = finished_at.wrapping_add(RCU_SLOW_WARNING_INTERVAL_NS);
+                        if self
+                            .next_slow_warning_at
+                            .compare_exchange(
+                                next_warning,
+                                next,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            warn!(
+                                "slow RCU callback: queue_cpu={} duration_us={} slow_count={} batch_count={}",
+                                cpu,
+                                duration / 1_000,
+                                slow_count,
+                                count,
+                            );
+                        }
+                    }
+                }
+                if batch_elapsed_ns >= RCU_CALLBACK_TIME_BUDGET_NS {
+                    time_budget_hit = true;
+                }
+            }
 
             if preferred_cpu == Some(cpu) {
                 cpu_quantum += 1;
@@ -768,6 +1099,18 @@ impl RcuState {
                 preferred_cpu = None;
                 cpu_quantum = 0;
             }
+            if time_budget_hit {
+                break;
+            }
+        }
+
+        if count != 0 {
+            self.stats.callback_batches.fetch_add(1, Ordering::Relaxed);
+        }
+        if time_budget_hit {
+            self.stats
+                .callback_time_budget_hits
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         let more = self.has_worker_work();
@@ -805,6 +1148,11 @@ fn rcu_enabled() -> bool {
     RCU_STATE.is_initialized()
 }
 
+#[inline]
+fn rcu_now() -> u64 {
+    SchedClock::sched_clock_cpu(smp_get_processor_id())
+}
+
 fn publish_gp_active(active: bool) {
     // Production callers hold `RCU_STATE.inner`, so GP-active publishers are
     // serialized. Avoid a write RMW on the common inactive -> inactive path:
@@ -820,6 +1168,47 @@ fn publish_gp_active(active: bool) {
             context.clear_gp_report();
         }
     }
+}
+
+/// Scheduler-tick hook for cooperative QS requests and bounded GP progress.
+///
+/// The inactive path performs only two cold atomic loads. Deadline work uses
+/// a try-lock so a diagnostic facility cannot make a timer interrupt spin on
+/// a remote CPU holding the RCU coordinator lock.
+pub fn scheduler_tick() {
+    if !rcu_enabled() {
+        return;
+    }
+
+    let cpu = smp_get_processor_id();
+    if RCU_STATE.contexts[cpu.data() as usize].urgent_qs() {
+        ProcessManager::current_pcb()
+            .flags()
+            .insert(ProcessFlags::NEED_SCHEDULE);
+    }
+
+    if !RCU_STATE.gp_active.load(Ordering::Acquire) {
+        return;
+    }
+    let now = rcu_now();
+    if now == 0 {
+        return;
+    }
+    let deadline = RCU_STATE.next_progress_at.load(Ordering::Acquire);
+    if !progress::deadline_reached(now, deadline) {
+        return;
+    }
+
+    scheduler_tick_slow(now);
+}
+
+#[cold]
+#[inline(never)]
+fn scheduler_tick_slow(now: u64) {
+    let Some(actions) = RCU_STATE.claim_progress_actions(now) else {
+        return;
+    };
+    RCU_STATE.execute_progress_actions(actions);
 }
 
 fn participating_context_snapshot(
@@ -849,7 +1238,8 @@ fn current_task_is_idle() -> bool {
 }
 
 #[inline]
-fn credit_context_progress_locked(gp: &mut GracePeriodState) {
+fn credit_context_progress_locked(gp: &mut GracePeriodState) -> bool {
+    let mut progressed = false;
     for cpu_idx in 0..PerCpu::MAX_CPU_NUM as usize {
         let cpu = ProcessorId::new(cpu_idx as u32);
         if !gp.is_waiting_for(cpu) {
@@ -859,8 +1249,11 @@ fn credit_context_progress_locked(gp: &mut GracePeriodState) {
         let snapshot = context.snapshot();
         if gp.report_context_progress(cpu, snapshot.generation(), snapshot.in_eqs()) {
             context.clear_gp_report();
+            context.clear_urgent_qs();
+            progressed = true;
         }
     }
+    progressed
 }
 
 /// Reports a real quiescent state while `RcuState::inner` is held.
@@ -877,7 +1270,12 @@ fn report_quiescent_state_locked(inner: &mut RcuStateInner, cpu: ProcessorId) ->
     let cleared = inner.gp.report_quiescent_state(cpu);
     debug_assert!(cleared, "RCU holdout disappeared before QS reporting");
     if cleared {
-        RCU_STATE.contexts[cpu.data() as usize].clear_gp_report();
+        let context = &RCU_STATE.contexts[cpu.data() as usize];
+        context.clear_gp_report();
+        context.clear_urgent_qs();
+        if let Some(progress) = inner.progress.as_mut() {
+            progress.note_progress(rcu_now());
+        }
     }
     cleared
 }
@@ -893,8 +1291,10 @@ fn cpu_starting_locked(inner: &mut RcuStateInner, cpu: ProcessorId) {
 fn cpu_dying_locked(inner: &mut RcuStateInner, cpu: ProcessorId) {
     inner.participating_cpus.set(cpu, false);
     report_quiescent_state_locked(inner, cpu);
+    RCU_STATE.contexts[cpu.data() as usize].clear_urgent_qs();
 }
 
+#[inline(never)]
 fn report_quiescent_state(cpu: ProcessorId) {
     if !rcu_enabled() {
         return;
@@ -985,6 +1385,15 @@ where
     Ok(())
 }
 
+#[derive(Debug)]
+struct RcuSoftirq;
+
+impl SoftirqVec for RcuSoftirq {
+    fn run(&self) {
+        RCU_STATE.flush_deferred_worker_wake();
+    }
+}
+
 fn worker_main() -> i32 {
     {
         let _inner = RCU_STATE.inner.lock_irqsave();
@@ -999,20 +1408,17 @@ fn worker_main() -> i32 {
                 return Some(());
             }
 
-            if RCU_STATE.has_worker_work() {
-                return Some(());
-            }
-
-            // Retire the coalesced kick only after observing no work, then
-            // recheck. A publisher racing either side of this store will
-            // therefore be observed by the predicate or issue a fresh wake.
-            RCU_STATE
-                .worker_kick_pending
-                .store(false, Ordering::Release);
+            // Consume a pure progress kick even when no callback or completed
+            // GP is visible yet. This gives the worker one bounded rescan after
+            // a scheduler-tick escalation. Consuming before the work check also
+            // avoids retaining an ordinary callback kick for an empty batch.
+            let had_kick = RCU_STATE.worker_kick_pending.swap(false, Ordering::AcqRel);
             if RCU_STATE.worker_should_stop.load(Ordering::Acquire) {
                 return Some(());
             }
-            if RCU_STATE.has_worker_work() {
+            // A publisher racing after the exchange either makes work visible
+            // to this check or observes `false` and issues a fresh wake.
+            if had_kick || RCU_STATE.has_worker_work() {
                 return Some(());
             }
 
@@ -1072,14 +1478,15 @@ pub fn start_worker() {
         RCU_STATE.worker_starting.store(true, Ordering::Release);
     }
 
-    let worker_cpu = smp_get_processor_id();
+    softirq_vectors()
+        .register_softirq(SoftirqNumber::RCU, Arc::new(RcuSoftirq))
+        .expect("failed to register the RCU softirq");
+
     let closure = KernelThreadClosure::EmptyClosure((Box::new(worker_main), ()));
-    if KernelThreadMechanism::create_and_run_on_cpu(closure, "rcu_gp".to_string(), worker_cpu)
-        .is_none()
-    {
+    if KernelThreadMechanism::create_and_run(closure, "rcu_gp".to_string()).is_none() {
         let _inner = RCU_STATE.inner.lock_irqsave();
         RCU_STATE.worker_starting.store(false, Ordering::Release);
-        panic!("failed to create the bound RCU callback worker");
+        panic!("failed to create the RCU callback worker");
     }
 
     RCU_STATE.wake_worker();
@@ -1394,12 +1801,11 @@ unsafe fn rcu_barrier_callback(_head: NonNull<RcuHead>) {
     }
 }
 
-pub fn note_context_switch() {
+pub fn note_context_switch(current: &crate::process::ProcessControlBlock) {
     if !rcu_enabled() {
         return;
     }
 
-    let current = ProcessManager::current_pcb();
     if current.rcu_read_depth() != 0 {
         warn!("context switch observed while still inside rcu_read_lock()");
         debug_assert_eq!(current.rcu_read_depth(), 0);
@@ -1676,6 +2082,119 @@ pub(crate) fn callback_queue_debug_report() -> String {
         )
         .expect("writing RCU per-CPU callback snapshot to String failed");
     }
+    report
+}
+
+pub(crate) fn state_debug_report() -> String {
+    let inner = RCU_STATE.inner.lock_irqsave();
+    let current = inner.gp.current().raw();
+    let completed = inner.gp.completed().raw();
+    let holdouts = inner
+        .gp
+        .waiting_cpus_ref()
+        .map(ProgressCpuMask::from_cpu_mask)
+        .unwrap_or_else(ProgressCpuMask::new);
+    let progress = inner.progress.as_ref().map(|progress| {
+        (
+            progress.started_at(),
+            progress.last_progress_at(),
+            progress.seq().raw(),
+        )
+    });
+    drop(inner);
+    let now = rcu_now();
+
+    let mut report = String::new();
+    writeln!(
+        report,
+        "active={} current_seq={} completed_seq={} next_progress_ns={}",
+        usize::from(progress.is_some()),
+        current,
+        completed,
+        RCU_STATE.next_progress_at.load(Ordering::Acquire),
+    )
+    .expect("writing RCU state snapshot failed");
+    if let Some((started, last_progress, seq)) = progress {
+        writeln!(
+            report,
+            "gp_seq={} age_ms={} no_progress_ms={}",
+            seq,
+            now.wrapping_sub(started) / 1_000_000,
+            now.wrapping_sub(last_progress) / 1_000_000,
+        )
+        .expect("writing RCU progress snapshot failed");
+    }
+    for cpu in holdouts.iter_cpu() {
+        let context = &RCU_STATE.contexts[cpu.data() as usize];
+        let snapshot = context.snapshot();
+        writeln!(
+            report,
+            "holdout_cpu={} context={:?} irq={} nmi={} generation={} urgent={}",
+            cpu.data(),
+            snapshot.base(),
+            snapshot.irq_depth(),
+            snapshot.nmi_depth(),
+            snapshot.generation(),
+            usize::from(context.urgent_qs()),
+        )
+        .expect("writing RCU holdout snapshot failed");
+    }
+    report
+}
+
+pub(crate) fn stats_debug_report() -> String {
+    let stats = &RCU_STATE.stats;
+    let started = stats.gp_started.load(Ordering::Relaxed);
+    let completed = stats.gp_completed.load(Ordering::Relaxed);
+    let total_ns = stats.gp_total_ns.load(Ordering::Relaxed);
+    let mut report = String::new();
+    writeln!(report, "gp_started={started}").unwrap();
+    writeln!(report, "gp_completed={completed}").unwrap();
+    writeln!(
+        report,
+        "gp_average_ns={}",
+        if completed == 0 {
+            0
+        } else {
+            total_ns / completed
+        }
+    )
+    .unwrap();
+    writeln!(
+        report,
+        "gp_max_ns={}",
+        stats.gp_max_ns.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        report,
+        "soft_requests={}",
+        stats.soft_requests.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        report,
+        "ipi_attempted={} ipi_submitted={} ipi_failed={}",
+        stats.ipi_attempted.load(Ordering::Relaxed),
+        stats.ipi_submitted.load(Ordering::Relaxed),
+        stats.ipi_failed.load(Ordering::Relaxed),
+    )
+    .unwrap();
+    writeln!(
+        report,
+        "stall_reports={}",
+        stats.stall_reports.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        report,
+        "callback_batches={} callback_time_budget_hits={} slow_callbacks={} max_callback_ns={}",
+        stats.callback_batches.load(Ordering::Relaxed),
+        stats.callback_time_budget_hits.load(Ordering::Relaxed),
+        stats.slow_callbacks.load(Ordering::Relaxed),
+        stats.max_callback_ns.load(Ordering::Relaxed),
+    )
+    .unwrap();
     report
 }
 

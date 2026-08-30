@@ -656,6 +656,11 @@ impl ProcessControlBlock {
         return self.basic.read_irqsave();
     }
 
+    /// Non-blocking basic-info snapshot guard for lockup diagnostics.
+    pub(crate) fn try_basic(&self) -> Option<RwLockReadGuard<'_, ProcessBasicInfo>> {
+        self.basic.try_read_irqsave()
+    }
+
     /// Acquire the exec_update_lock read lock
     pub fn exec_update_read(&self) -> crate::libs::rwsem::RwSemReadGuard<'_, ()> {
         self.exec_update_lock.read()

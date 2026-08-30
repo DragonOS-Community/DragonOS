@@ -73,6 +73,7 @@ impl IrqHandler for KickCpuIpiHandler {
         ProcessManager::current_pcb()
             .flags()
             .insert(ProcessFlags::NEED_SCHEDULE);
+        crate::smp::note_kick_cpu_received();
         Ok(IrqReturn::Handled)
     }
 }

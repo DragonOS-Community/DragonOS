@@ -211,6 +211,11 @@ pub(super) struct RcuContextTracker {
     /// Coordinator-owned filter for the GP slow path. The GP waiting mask,
     /// not this hint, remains the source of truth for progress.
     gp_report_needed: AtomicBool,
+    /// Cooperative request for this CPU to reach a real scheduling/QS
+    /// boundary. The coordinator clears it; the local tick only observes it.
+    urgent_qs: AtomicBool,
+    /// RCU reschedule IPIs successfully submitted to this CPU.
+    resched_ipis: AtomicU64,
 }
 
 impl RcuContextTracker {
@@ -218,6 +223,8 @@ impl RcuContextTracker {
         Self {
             state: AtomicU64::new(BaseContext::Kernel as u64),
             gp_report_needed: AtomicBool::new(false),
+            urgent_qs: AtomicBool::new(false),
+            resched_ipis: AtomicU64::new(0),
         }
     }
 
@@ -228,6 +235,7 @@ impl RcuContextTracker {
     /// local context transition because the AP has not started executing yet.
     pub(super) fn reset_for_cpu_starting(&self) {
         self.gp_report_needed.store(false, Ordering::SeqCst);
+        self.urgent_qs.store(false, Ordering::Release);
         self.state
             .store(BaseContext::Kernel as u64, Ordering::SeqCst);
     }
@@ -246,6 +254,31 @@ impl RcuContextTracker {
     #[inline]
     pub(super) fn gp_report_needed(&self) -> bool {
         self.gp_report_needed.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    pub(super) fn request_urgent_qs(&self) {
+        self.urgent_qs.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub(super) fn urgent_qs(&self) -> bool {
+        self.urgent_qs.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(super) fn clear_urgent_qs(&self) {
+        self.urgent_qs.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub(super) fn note_resched_ipi(&self) {
+        self.resched_ipis.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn resched_ipis(&self) -> u64 {
+        self.resched_ipis.load(Ordering::Relaxed)
     }
 
     /// Returns one coherent view of all context fields.
@@ -663,6 +696,8 @@ pub(super) fn run_context_selftests() -> Result<(), &'static str> {
     let overflow_irq = RcuContextTracker {
         state: AtomicU64::new(with_irq_depth(BaseContext::Kernel as u64, MAX_DEPTH)),
         gp_report_needed: AtomicBool::new(false),
+        urgent_qs: AtomicBool::new(false),
+        resched_ipis: AtomicU64::new(0),
     };
     if overflow_irq.irq_enter() != Err(ContextTransitionError::IrqDepthOverflow) {
         return Err("IRQ depth overflow was not rejected");
@@ -670,6 +705,8 @@ pub(super) fn run_context_selftests() -> Result<(), &'static str> {
     let overflow_nmi = RcuContextTracker {
         state: AtomicU64::new(with_nmi_depth(BaseContext::Kernel as u64, MAX_DEPTH)),
         gp_report_needed: AtomicBool::new(false),
+        urgent_qs: AtomicBool::new(false),
+        resched_ipis: AtomicU64::new(0),
     };
     if overflow_nmi.nmi_enter() != Err(ContextTransitionError::NmiDepthOverflow) {
         return Err("NMI depth overflow was not rejected");
@@ -704,6 +741,25 @@ pub(super) fn run_context_selftests() -> Result<(), &'static str> {
     mismatch
         .irq_exit(&outer_irq, IrqDisposition::ResumeInterrupted)
         .map_err(|_| "outer IRQ mismatch cleanup failed")?;
+
+    let urgent = RcuContextTracker::new();
+    urgent.request_urgent_qs();
+    if !urgent.urgent_qs() {
+        return Err("urgent-QS request was not published");
+    }
+    // Local observation deliberately does not consume the request.
+    if !urgent.urgent_qs() {
+        return Err("urgent-QS request was consumed by a reader");
+    }
+    urgent.clear_urgent_qs();
+    if urgent.urgent_qs() {
+        return Err("urgent-QS request was not cleared by the coordinator");
+    }
+    urgent.request_urgent_qs();
+    urgent.reset_for_cpu_starting();
+    if urgent.urgent_qs() {
+        return Err("CPU starting reset retained an old urgent-QS request");
+    }
 
     Ok(())
 }

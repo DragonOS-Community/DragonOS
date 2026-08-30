@@ -11,6 +11,8 @@ namespace {
 
 constexpr const char* kRcuSelftestPath = "/sys/kernel/debug/rcu/selftest";
 constexpr const char* kRcuCallbacksPath = "/sys/kernel/debug/rcu/callbacks";
+constexpr const char* kRcuStatePath = "/sys/kernel/debug/rcu/state";
+constexpr const char* kRcuStatsPath = "/sys/kernel/debug/rcu/stats";
 
 std::string ReadAll(const char* path) {
     int fd = open(path, O_RDONLY);
@@ -78,6 +80,25 @@ TEST(RcuSelftest, CallbackQueueSnapshotIsPresentAndStablePerOpen) {
     EXPECT_NE(std::string::npos, report.find(" next=")) << report;
     EXPECT_NE(std::string::npos, report.find(" executing=")) << report;
     EXPECT_NE(std::string::npos, report.find("cpu=0 total=")) << report;
+}
+
+TEST(RcuSelftest, ProgressStateSnapshotIsPresent) {
+    const std::string report = ReadAll(kRcuStatePath);
+    ASSERT_FALSE(report.empty());
+    EXPECT_NE(std::string::npos, report.find("active=")) << report;
+    EXPECT_NE(std::string::npos, report.find("current_seq=")) << report;
+    EXPECT_NE(std::string::npos, report.find("completed_seq=")) << report;
+    EXPECT_NE(std::string::npos, report.find("next_progress_ns=")) << report;
+}
+
+TEST(RcuSelftest, ProgressStatisticsArePresent) {
+    const std::string report = ReadAll(kRcuStatsPath);
+    ASSERT_FALSE(report.empty());
+    EXPECT_NE(std::string::npos, report.find("gp_started=")) << report;
+    EXPECT_NE(std::string::npos, report.find("gp_completed=")) << report;
+    EXPECT_NE(std::string::npos, report.find("ipi_attempted=")) << report;
+    EXPECT_NE(std::string::npos, report.find("callback_time_budget_hits=")) << report;
+    EXPECT_NE(std::string::npos, report.find("slow_callbacks=")) << report;
 }
 
 int main(int argc, char** argv) {

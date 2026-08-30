@@ -120,6 +120,10 @@ impl GracePeriodState {
             .unwrap_or(false)
     }
 
+    pub(super) fn waiting_cpus_ref(&self) -> Option<&CpuMask> {
+        self.active.as_ref().map(|active| &active.waiting_cpus)
+    }
+
     /// Clears a CPU from the active GP. Repeated/non-waiting reports are
     /// intentionally idempotent and return false.
     pub(super) fn report_quiescent_state(&mut self, cpu: ProcessorId) -> bool {

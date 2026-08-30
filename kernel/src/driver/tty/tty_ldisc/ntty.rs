@@ -15,7 +15,7 @@ use crate::{
         },
         termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
         tty_core::{
-            EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus,
+            EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyFlowArg, TtyIoctlCmd, TtyPacketStatus,
             TtySleepLock,
         },
         tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
@@ -108,7 +108,25 @@ impl NTtyLinediscipline {
     fn ioctl_helper(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
         match cmd {
             TtyIoctlCmd::TCXONC => {
-                todo!()
+                TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
+                match arg {
+                    TtyFlowArg::TCOOFF => tty.tty_stop_tco(),
+                    TtyFlowArg::TCOON => tty.tty_start_tco(),
+                    TtyFlowArg::TCIOFF | TtyFlowArg::TCION => {
+                        let termios = tty.core().committed_termios_snapshot();
+                        let index = if arg == TtyFlowArg::TCIOFF {
+                            ControlCharIndex::VSTOP
+                        } else {
+                            ControlCharIndex::VSTART
+                        };
+                        let ch = termios.control_characters[index];
+                        if ch != ControlCharIndex::DISABLE_CHAR {
+                            tty.tty_send_xchar(ch)?;
+                        }
+                    }
+                    _ => return Err(SystemError::EINVAL),
+                }
+                Ok(0)
             }
             TtyIoctlCmd::TCFLSH => TtyCore::tty_perform_flush(tty, arg),
             _ => {

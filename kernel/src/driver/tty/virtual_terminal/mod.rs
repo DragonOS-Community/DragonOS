@@ -433,13 +433,19 @@ impl TtyOperation for TtyConsoleDriverInner {
         Ok(())
     }
 
-    fn write_room(&self, _tty: &TtyCoreData) -> usize {
+    fn write_room(&self, tty: &TtyCoreData) -> usize {
+        if tty.flow_irqsave().stopped {
+            return 0;
+        }
         32768
     }
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
     #[inline(never)]
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        if tty.flow_irqsave().stopped {
+            return Ok(0);
+        }
         // if String::from_utf8_lossy(buf) == "Hello world!\n" {
         //     loop {}
         // }

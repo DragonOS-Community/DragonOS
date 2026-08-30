@@ -13,6 +13,7 @@
 #include <pty.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -121,6 +122,219 @@ PtyPair OpenRawPty() {
     }
 
     return pair;
+}
+
+bool SetNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return false;
+    }
+    int updated = fcntl(fd, F_GETFL, 0);
+    return updated >= 0 && (updated & O_NONBLOCK) != 0;
+}
+
+bool DrainNonBlocking(int fd) {
+    char buf[64];
+    while (read(fd, buf, sizeof(buf)) > 0) {
+    }
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
+ssize_t ReadEventually(int fd, void* buf, size_t len, int timeout_ms = 1000) {
+    struct pollfd pfd = {fd, POLLIN | POLLPRI, 0};
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0) {
+        errno = rc == 0 ? ETIMEDOUT : errno;
+        return -1;
+    }
+    return read(fd, buf, len);
+}
+
+struct BlockingWriterArgs {
+    int fd = -1;
+    std::atomic<bool> started{false};
+    std::atomic<bool> done{false};
+    ssize_t rc = -1;
+    int saved_errno = 0;
+};
+
+void* BlockingWrite(void* opaque) {
+    auto* args = static_cast<BlockingWriterArgs*>(opaque);
+    const char marker[] = "wake";
+    args->started.store(true, std::memory_order_release);
+    args->rc = write(args->fd, marker, sizeof(marker) - 1);
+    args->saved_errno = errno;
+    args->done.store(true, std::memory_order_release);
+    return nullptr;
+}
+
+bool WaitForAtomic(const std::atomic<bool>& flag, int timeout_ms) {
+    for (int elapsed = 0; elapsed < timeout_ms; ++elapsed) {
+        if (flag.load(std::memory_order_acquire)) {
+            return true;
+        }
+        usleep(1000);
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+TEST(TtyTermios, TcxoncActionsAndOutputFlow) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_GE(pty.slave.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+    ASSERT_TRUE(SetNonBlocking(pty.slave.get())) << strerror(errno);
+
+    EXPECT_EQ(tcflow(pty.slave.get(), TCOON), 0) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(ioctl(pty.slave.get(), TCXONC, 4), -1);
+    EXPECT_EQ(errno, EINVAL);
+
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOOFF), 0) << strerror(errno);
+    const char marker[] = "flow";
+    errno = 0;
+    EXPECT_EQ(write(pty.slave.get(), marker, sizeof(marker) - 1), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+    char buf[sizeof(marker)] = {};
+    errno = 0;
+    EXPECT_EQ(read(pty.master.get(), buf, sizeof(buf)), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOON), 0) << strerror(errno);
+    ASSERT_EQ(write(pty.slave.get(), marker, sizeof(marker) - 1),
+              static_cast<ssize_t>(sizeof(marker) - 1));
+    ASSERT_EQ(ReadEventually(pty.master.get(), buf, sizeof(marker) - 1),
+              static_cast<ssize_t>(sizeof(marker) - 1));
+    EXPECT_EQ(memcmp(buf, marker, sizeof(marker) - 1), 0);
+}
+
+TEST(TtyTermios, TcxoncStartWakesBlockedWriter) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_GE(pty.slave.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOOFF), 0) << strerror(errno);
+
+    BlockingWriterArgs args;
+    args.fd = pty.slave.get();
+    pthread_t writer;
+    ASSERT_EQ(pthread_create(&writer, nullptr, BlockingWrite, &args), 0);
+
+    // From this point onward every path restores flow and joins the thread.
+    const bool started = WaitForAtomic(args.started, 1000);
+    const bool remained_blocked = started && !WaitForAtomic(args.done, 20);
+    errno = 0;
+    const int start_rc = tcflow(pty.slave.get(), TCOON);
+    const int start_errno = errno;
+    const bool woke = WaitForAtomic(args.done, 1000);
+    if (!woke) {
+        // Closing the peer wakes the blocked slave writer with an error.
+        pty.master.reset();
+    }
+    const int join_rc = pthread_join(writer, nullptr);
+
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(remained_blocked);
+    EXPECT_EQ(start_rc, 0) << strerror(start_errno);
+    EXPECT_TRUE(woke);
+    EXPECT_EQ(join_rc, 0);
+    EXPECT_EQ(args.rc, 4) << "errno=" << args.saved_errno << " ("
+                          << strerror(args.saved_errno) << ")";
+    if (woke && args.rc == 4 && pty.master.get() >= 0) {
+        char marker[4] = {};
+        ASSERT_EQ(ReadEventually(pty.master.get(), marker, sizeof(marker)), 4);
+        EXPECT_EQ(memcmp(marker, "wake", sizeof(marker)), 0);
+    }
+}
+
+TEST(TtyTermios, TcxoncSendsRawConfiguredCharacters) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+
+    struct termios term = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0);
+    term.c_cc[VSTOP] = 'X';
+    term.c_cc[VSTART] = 'Y';
+    ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &term), 0);
+    ASSERT_TRUE(DrainNonBlocking(pty.master.get())) << strerror(errno);
+
+    char ch = 0;
+    ASSERT_EQ(tcflow(pty.slave.get(), TCIOFF), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), &ch, 1), 1);
+    EXPECT_EQ(ch, 'X');
+    ASSERT_EQ(tcflow(pty.slave.get(), TCION), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), &ch, 1), 1);
+    EXPECT_EQ(ch, 'Y');
+}
+
+TEST(TtyTermios, TcxoncPriorityCharacterBypassesOpost) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+
+    struct termios term = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0);
+    term.c_oflag = OPOST | ONLCR;
+    term.c_cc[VSTOP] = '\n';
+    ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &term), 0);
+    ASSERT_TRUE(DrainNonBlocking(pty.master.get())) << strerror(errno);
+
+    char bytes[2] = {};
+    ASSERT_EQ(tcflow(pty.slave.get(), TCIOFF), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), bytes, sizeof(bytes)), 1);
+    EXPECT_EQ(bytes[0], '\n');
+    usleep(20000);
+    errno = 0;
+    EXPECT_EQ(read(pty.master.get(), bytes, sizeof(bytes)), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+}
+
+TEST(TtyTermios, TcxoncDisabledCharactersAreSilent) {
+    for (int action : {TCIOFF, TCION}) {
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.master.get(), 0);
+        ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+        struct termios term = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0);
+        term.c_cc[action == TCIOFF ? VSTOP : VSTART] = _POSIX_VDISABLE;
+        ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &term), 0);
+        ASSERT_TRUE(DrainNonBlocking(pty.master.get())) << strerror(errno);
+        ASSERT_EQ(tcflow(pty.slave.get(), action), 0);
+        for (int i = 0; i < 20; ++i) {
+            char ch = 0;
+            errno = 0;
+            ASSERT_EQ(read(pty.master.get(), &ch, 1), -1);
+            ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+            usleep(1000);
+        }
+    }
+}
+
+TEST(TtyTermios, TcxoncPacketModeReportsIdempotentTransitions) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+    int enabled = 1;
+    ASSERT_EQ(ioctl(pty.master.get(), TIOCPKT, &enabled), 0) << strerror(errno);
+    ASSERT_TRUE(DrainNonBlocking(pty.master.get())) << strerror(errno);
+
+    unsigned char status = 0;
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOOFF), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), &status, 1), 1);
+    EXPECT_NE(status & TIOCPKT_STOP, 0);
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOOFF), 0);
+    errno = 0;
+    EXPECT_EQ(read(pty.master.get(), &status, 1), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOON), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), &status, 1), 1);
+    EXPECT_NE(status & TIOCPKT_START, 0);
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOON), 0);
+    errno = 0;
+    EXPECT_EQ(read(pty.master.get(), &status, 1), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
 struct TcsetattrThreadArgs {

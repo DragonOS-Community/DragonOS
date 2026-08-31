@@ -331,6 +331,9 @@ impl UdpSocket {
                 Ok(())
             }
             IpOption::MULTICAST_IF => {
+                // Keep validation and the two-field configuration publish
+                // atomic with respect to send-side interface selection.
+                let _placement = self.iface_placement.write();
                 use crate::net::socket::inet::common::multicast::{
                     find_iface_by_ifindex, find_iface_by_ipv4, parse_mreqn_for_multicast_if,
                 };

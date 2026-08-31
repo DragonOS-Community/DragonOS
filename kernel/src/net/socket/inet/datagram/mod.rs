@@ -80,6 +80,10 @@ struct UdpErrQueueEntry {
 #[derive(Debug)]
 pub struct UdpSocket {
     inner: RwSem<Option<UdpInner>>,
+    /// Stabilizes the smoltcp socket's interface placement across send-side
+    /// polling. Ordinary unicast sends share the read side; temporary interface
+    /// moves and control/lifecycle updates take the write side.
+    iface_placement: RwSem<()>,
     nonblock: AtomicBool,
     shutdown: AtomicU8,
     wait_queue: WaitQueue,
@@ -179,6 +183,7 @@ impl UdpSocket {
         let netns = ProcessManager::current_netns();
         Arc::new_cyclic(|me| Self {
             inner: RwSem::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
+            iface_placement: RwSem::new(()),
             nonblock: AtomicBool::new(nonblock),
             shutdown: AtomicU8::new(0),
             wait_queue: WaitQueue::default(),
@@ -260,6 +265,11 @@ impl UdpSocket {
         &self,
         update: &mut DeviceBindingUpdate<'_>,
     ) -> Result<(), SystemError> {
+        // `prepare_update()` already holds the device-binding writer lock.
+        // Keep this ordering consistent with send: binding writer -> placement
+        // writer -> inner. This prevents a multicast send from restoring an
+        // interface after a newer SO_BINDTODEVICE update has committed.
+        let _placement = self.iface_placement.write();
         let mut inner = self.inner.write();
         match inner.as_mut().ok_or(SystemError::EBADF)? {
             UdpInner::Unbound(_) => update.commit(),
@@ -480,6 +490,7 @@ impl UdpSocket {
     }
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
+        let _placement = self.iface_placement.write();
         let mut inner = self.inner.write();
 
         // Check socket state first without taking
@@ -614,6 +625,7 @@ impl UdpSocket {
     /// Recreates the socket with new buffer sizes if it's already bound.
     /// This is needed because smoltcp doesn't support resizing socket buffers dynamically.
     fn recreate_socket_if_bound(&self) -> Result<(), SystemError> {
+        let _placement = self.iface_placement.write();
         let mut inner_guard = self.inner.write();
 
         // Check if socket is bound
@@ -693,6 +705,7 @@ impl UdpSocket {
     }
 
     pub fn close(&self) {
+        let _placement = self.iface_placement.write();
         let mut inner = self.inner.write();
         if let Some(UdpInner::Bound(bound)) = &mut *inner {
             self.netns
@@ -715,6 +728,7 @@ impl UdpSocket {
     }
 
     fn disconnect_udp(&self) -> Result<(), SystemError> {
+        let _placement = self.iface_placement.write();
         let mut inner_guard = self.inner.write();
         let should_unbind = match inner_guard.as_ref() {
             Some(UdpInner::Bound(bound)) => {
@@ -1052,6 +1066,29 @@ impl UdpSocket {
                 return Err(SystemError::EINVAL);
             }
         }
+
+        let placement = self.iface_placement.read();
+        let explicit = to.map(Endpoint::Ip);
+        let is_multicast = self
+            .connected_or_explicit_send_dest(explicit.as_ref())
+            .is_some_and(|dest| dest.addr.is_multicast());
+        if is_multicast {
+            drop(placement);
+            let _placement = self.iface_placement.write();
+            return self.try_send_with_stable_iface(buf, to);
+        }
+
+        self.try_send_with_stable_iface(buf, to)
+    }
+
+    fn try_send_with_stable_iface(
+        &self,
+        buf: &[u8],
+        to: Option<smoltcp::wire::IpEndpoint>,
+    ) -> Result<usize, SystemError> {
+        // The caller's placement guard intentionally spans polling below.
+        // `inner` cannot remain locked because notifications may re-enter
+        // socket event checks.
 
         // Send data and snapshot the delivery metadata before releasing inner.
         let (
@@ -1513,6 +1550,9 @@ impl Socket for UdpSocket {
                     return self.disconnect_udp();
                 }
 
+                // The connected peer participates in send-side interface
+                // selection, so keep it stable while readers classify a send.
+                let _placement = self.iface_placement.write();
                 let remote = Self::normalize_unspecified_dest(remote);
                 if !self.is_bound() {
                     self.bind_ephemeral(remote.addr)?;

@@ -70,6 +70,7 @@ pub fn initial_kernel_thread() -> i32 {
 fn kernel_init() -> Result<(), SystemError> {
     KernelThreadMechanism::init_stage2();
     rcu::start_worker();
+    crate::misc::reboot::reboot_notifier_init()?;
     kenrel_init_freeable()?;
     set_system_state(SystemState::FreeingInitMem);
     if super::initramfs_enabled() {

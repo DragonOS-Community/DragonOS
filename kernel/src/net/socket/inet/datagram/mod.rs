@@ -1310,6 +1310,10 @@ impl UdpSocket {
 }
 
 impl Socket for UdpSocket {
+    fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
+        UdpSocket::netns(self)
+    }
+
     fn fsnotify_watch_counter(&self) -> &AtomicUsize {
         &self.fsnotify_watches
     }

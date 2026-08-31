@@ -33,6 +33,10 @@ mod stream_core;
 pub use stream_core::TcpSocket;
 
 impl Socket for TcpSocket {
+    fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
+        TcpSocket::netns(self)
+    }
+
     fn fsnotify_watch_counter(&self) -> &AtomicUsize {
         &self.fsnotify_watches
     }

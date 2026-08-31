@@ -11,6 +11,7 @@ use crate::{
         posix::{MsgHdr, SockAddr},
         socket::common::{EPollItems, ShutdownBit},
     },
+    process::namespace::net_namespace::NetNamespace,
 };
 // use crate::filesystem::epoll::event_poll::EventPoll;
 use alloc::{sync::Arc, vec::Vec};
@@ -38,6 +39,12 @@ pub struct SocketMmapLayout {
 /// ## Reference
 /// - [Posix standard](https://pubs.opengion.org/onlinepubs/9699919799/)
 pub trait Socket: PollableInode + IndexNode {
+    /// Network namespace captured when this socket was created.
+    ///
+    /// Generic socket ioctls must use this stable namespace rather than the
+    /// calling task's current namespace, matching Linux `sock_net(sk)`.
+    fn netns(&self) -> Arc<NetNamespace>;
+
     /// Number of fsnotify marks attached to this anonymous socket inode.
     fn fsnotify_watch_counter(&self) -> &AtomicUsize;
 

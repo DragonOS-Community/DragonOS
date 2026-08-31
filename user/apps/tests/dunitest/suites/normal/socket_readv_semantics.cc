@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -94,6 +95,37 @@ TEST(SocketReadvSemantics, FaultingLaterIovecPreservesUnreadData) {
     ASSERT_NE(-1, fcntl(sockets[1], F_SETFL, O_NONBLOCK)) << strerror(errno);
     std::array<char, 8> remaining = {};
     ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+              read(sockets[1], remaining.data(), remaining.size()));
+    EXPECT_EQ(0, std::memcmp(remaining.data(), payload.data(), payload.size()));
+
+    EXPECT_EQ(0, munmap(inaccessible, static_cast<size_t>(page_size)));
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
+TEST(SocketReadvSemantics, Preadv2CurrentOffsetFaultPreservesStream) {
+    int sockets[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) << strerror(errno);
+
+    constexpr std::array<char, 8> payload = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
+    ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+              write(sockets[0], payload.data(), payload.size()));
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    void* inaccessible =
+        mmap(nullptr, static_cast<size_t>(page_size), PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, inaccessible) << strerror(errno);
+
+    iovec iov = {inaccessible, payload.size()};
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_preadv2, sockets[1], &iov, 1, -1L, -1L, 0L));
+    EXPECT_EQ(EFAULT, errno);
+
+    ASSERT_NE(-1, fcntl(sockets[1], F_SETFL, O_NONBLOCK)) << strerror(errno);
+    std::array<char, 8> remaining = {};
+    ASSERT_EQ(static_cast<ssize_t>(remaining.size()),
               read(sockets[1], remaining.data(), remaining.size()));
     EXPECT_EQ(0, std::memcmp(remaining.data(), payload.data(), payload.size()));
 

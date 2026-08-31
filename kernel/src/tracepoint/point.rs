@@ -1,12 +1,15 @@
 use crate::{
     debug::jump_label::{disable_maskable_key, enable_maskable_key, MaskableStaticFalseKey},
-    libs::{mutex::Mutex, spinlock::SpinLock},
+    libs::mutex::Mutex,
+    process::ProcessManager,
+    rcu::srcu::SrcuDomain,
 };
-use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     fmt::Debug,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    ptr,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 };
 use system_error::SystemError;
 
@@ -45,13 +48,100 @@ pub struct TracePoint {
     system: &'static str,
     key: &'static MaskableStaticFalseKey,
     id: AtomicU32,
-    callback: SpinLock<Option<Arc<[TracePointFunc]>>>,
-    raw_callback: SpinLock<BTreeMap<usize, Arc<dyn TracePointCallBackFunc>>>,
+    callbacks: AtomicPtr<TracePointSnapshot>,
+    callback_update: Mutex<()>,
     enable_state: Mutex<TracePointEnableState>,
     trace_pipe_enabled: AtomicBool,
     trace_entry_fmt_func: fn(&[u8]) -> String,
     trace_print_func: fn() -> String,
     flags: u8,
+}
+
+struct TracePointSnapshot {
+    callbacks: Vec<TracePointFunc>,
+    raw_callbacks: Vec<(usize, Arc<dyn TracePointCallBackFunc>)>,
+}
+
+impl TracePointSnapshot {
+    fn new() -> Self {
+        Self {
+            callbacks: Vec::new(),
+            raw_callbacks: Vec::new(),
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self, SystemError> {
+        let mut callbacks = Vec::new();
+        callbacks
+            .try_reserve_exact(self.callbacks.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        callbacks.extend(self.callbacks.iter().cloned());
+        let mut raw_callbacks = Vec::new();
+        raw_callbacks
+            .try_reserve_exact(self.raw_callbacks.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        raw_callbacks.extend(self.raw_callbacks.iter().cloned());
+        Ok(Self {
+            callbacks,
+            raw_callbacks,
+        })
+    }
+}
+
+static TRACEPOINT_SRCU: AtomicPtr<SrcuDomain> = AtomicPtr::new(ptr::null_mut());
+
+fn tracepoint_srcu() -> Result<&'static SrcuDomain, SystemError> {
+    let ptr = TRACEPOINT_SRCU.load(Ordering::Acquire);
+    if ptr.is_null() {
+        Err(SystemError::ENODEV)
+    } else {
+        // SAFETY: the global tracepoint domain is intentionally never destroyed.
+        Ok(unsafe { &*ptr })
+    }
+}
+
+pub(crate) fn tracepoint_srcu_init() -> Result<(), SystemError> {
+    if !TRACEPOINT_SRCU.load(Ordering::Acquire).is_null() {
+        return Ok(());
+    }
+    let domain =
+        Box::try_new(SrcuDomain::try_new("tracepoint")?).map_err(|_| SystemError::ENOMEM)?;
+    let raw = Box::into_raw(domain);
+    if TRACEPOINT_SRCU
+        .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // SAFETY: another initializer won publication; this Box was never shared.
+        unsafe { drop(Box::from_raw(raw)) };
+    }
+    Ok(())
+}
+
+struct TracepointDepthGuard;
+
+impl TracepointDepthGuard {
+    fn enter() -> Self {
+        ProcessManager::current_pcb()
+            .tracepoint_srcu_depth
+            .fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+fn tracepoint_read_held_by_current() -> bool {
+    ProcessManager::current_pcb()
+        .tracepoint_srcu_depth
+        .load(Ordering::Relaxed)
+        != 0
+}
+
+impl Drop for TracepointDepthGuard {
+    fn drop(&mut self) {
+        let previous = ProcessManager::current_pcb()
+            .tracepoint_srcu_depth
+            .fetch_sub(1, Ordering::Relaxed);
+        assert!(previous != 0, "tracepoint SRCU depth underflow");
+    }
 }
 
 #[derive(Debug)]
@@ -146,14 +236,71 @@ impl TracePoint {
             flags: 0,
             trace_entry_fmt_func: fmt_func,
             trace_print_func,
-            callback: SpinLock::new(None),
-            raw_callback: SpinLock::new(BTreeMap::new()),
+            callbacks: AtomicPtr::new(ptr::null_mut()),
+            callback_update: Mutex::new(()),
             enable_state: Mutex::new(TracePointEnableState {
                 users: 0,
                 trace_pipe_enabled: false,
             }),
             trace_pipe_enabled: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn init_callbacks(
+        &self,
+        func: fn(),
+        data: Box<dyn Any + Sync + Send>,
+    ) -> Result<(), SystemError> {
+        if !self.callbacks.load(Ordering::Acquire).is_null() {
+            return Ok(());
+        }
+        let mut snapshot = TracePointSnapshot::new();
+        snapshot
+            .callbacks
+            .try_reserve_exact(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        snapshot.callbacks.push(TracePointFunc {
+            func,
+            data: data.into(),
+        });
+        let snapshot = Box::try_new(snapshot).map_err(|_| SystemError::ENOMEM)?;
+        let raw = Box::into_raw(snapshot);
+        if self
+            .callbacks
+            .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // SAFETY: this allocation was not published.
+            unsafe { drop(Box::from_raw(raw)) };
+        }
+        Ok(())
+    }
+
+    fn update_callbacks(
+        &self,
+        change: impl FnOnce(&mut TracePointSnapshot) -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        if tracepoint_read_held_by_current() {
+            return Err(SystemError::EDEADLK_OR_EDEADLOCK);
+        }
+        let domain = tracepoint_srcu()?;
+        domain.validate_update_context()?;
+        let update = self.callback_update.lock();
+        let old = self.callbacks.load(Ordering::Acquire);
+        if old.is_null() {
+            return Err(SystemError::ENODEV);
+        }
+        // SAFETY: callback_update serializes publication and old remains owned by the slot.
+        let mut next = unsafe { &*old }.try_clone()?;
+        change(&mut next)?;
+        let next = Box::try_new(next).map_err(|_| SystemError::ENOMEM)?;
+        let old = self.callbacks.swap(Box::into_raw(next), Ordering::AcqRel);
+        drop(update);
+        domain.synchronize_after_publication();
+        // SAFETY: old was removed exactly once and the GP covers every prior reader.
+        // Drop outside callback_update because callback-owned data may re-enter this tracepoint.
+        unsafe { drop(Box::from_raw(old)) };
+        Ok(())
     }
 
     /// Returns the name of the tracepoint.
@@ -196,56 +343,63 @@ impl TracePoint {
     }
 
     /// Register a callback function to the tracepoint
-    pub fn register(&self, func: fn(), data: Box<dyn Any + Sync + Send>) {
+    pub fn register(
+        &self,
+        func: fn(),
+        data: Box<dyn Any + Sync + Send>,
+    ) -> Result<(), SystemError> {
         let ptr = func as usize;
-        let mut callbacks = self.callback.lock();
-        if callbacks
-            .as_deref()
-            .is_some_and(|current| current.iter().any(|item| item.func as usize == ptr))
-        {
-            return;
-        }
-
-        let mut updated = callbacks
-            .as_deref()
-            .map(<[TracePointFunc]>::to_vec)
-            .unwrap_or_default();
-        updated.push(TracePointFunc {
-            func,
-            data: data.into(),
+        let data: Arc<dyn Any + Sync + Send> = data.into();
+        let retained = data.clone();
+        let result = self.update_callbacks(|snapshot| {
+            if snapshot
+                .callbacks
+                .iter()
+                .any(|item| item.func as usize == ptr)
+            {
+                return Err(SystemError::EEXIST);
+            }
+            snapshot
+                .callbacks
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+            snapshot.callbacks.push(TracePointFunc { func, data });
+            Ok(())
         });
-        *callbacks = Some(updated.into());
+        // Keep failed pre-publication cleanup from becoming a final Drop under
+        // callback_update; arbitrary data destruction happens after return.
+        drop(retained);
+        result
     }
 
     /// Unregister a callback function from the tracepoint
-    pub fn unregister(&self, func: fn()) {
+    pub fn unregister(&self, func: fn()) -> Result<(), SystemError> {
         let func_ptr = func as usize;
-        let mut callbacks = self.callback.lock();
-        let Some(current) = callbacks.as_deref() else {
-            return;
-        };
-        let updated: Vec<_> = current
-            .iter()
-            .filter(|item| item.func as usize != func_ptr)
-            .cloned()
-            .collect();
-        if updated.len() == current.len() {
-            return;
-        }
-        *callbacks = if updated.is_empty() {
-            None
-        } else {
-            Some(updated.into())
-        };
+        self.update_callbacks(|snapshot| {
+            let index = snapshot
+                .callbacks
+                .iter()
+                .position(|item| item.func as usize == func_ptr)
+                .ok_or(SystemError::ENOENT)?;
+            snapshot.callbacks.remove(index);
+            Ok(())
+        })
     }
 
     /// Iterate over all registered callback functions
     pub fn callback_list(&self, f: &dyn Fn(&TracePointFunc)) {
-        let callbacks = self.callback.lock().clone();
-        if let Some(callbacks) = callbacks {
-            for trace_func in callbacks.iter() {
-                f(trace_func);
-            }
+        let Ok(domain) = tracepoint_srcu() else {
+            return;
+        };
+        let _guard = domain.read_lock_notrace();
+        let _depth = TracepointDepthGuard::enter();
+        let snapshot = self.callbacks.load(Ordering::Acquire);
+        if snapshot.is_null() {
+            return;
+        }
+        // SAFETY: snapshot reclamation waits for this SRCU guard.
+        for trace_func in unsafe { &*snapshot }.callbacks.iter() {
+            f(trace_func);
         }
     }
 
@@ -256,16 +410,121 @@ impl TracePoint {
         &self,
         callback_id: usize,
         callback: Arc<dyn TracePointCallBackFunc>,
-    ) {
-        self.raw_callback
-            .lock()
-            .entry(callback_id)
-            .or_insert(callback);
+    ) -> Result<(), SystemError> {
+        let retained = callback.clone();
+        let result = self.update_callbacks(|snapshot| {
+            match snapshot
+                .raw_callbacks
+                .binary_search_by_key(&callback_id, |entry| entry.0)
+            {
+                Ok(_) => Err(SystemError::EEXIST),
+                Err(index) => {
+                    snapshot
+                        .raw_callbacks
+                        .try_reserve(1)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    snapshot
+                        .raw_callbacks
+                        .insert(index, (callback_id, callback));
+                    Ok(())
+                }
+            }
+        });
+        // Keep fallible snapshot preparation from running a final callback
+        // destructor while callback_update is held.
+        drop(retained);
+        result
     }
 
     /// Unregister a raw callback function from the tracepoint
-    pub fn unregister_raw_callback(&self, callback_id: usize) {
-        self.raw_callback.lock().remove(&callback_id);
+    pub fn unregister_raw_callback(&self, callback_id: usize) -> Result<(), SystemError> {
+        self.update_callbacks(|snapshot| {
+            let index = snapshot
+                .raw_callbacks
+                .binary_search_by_key(&callback_id, |entry| entry.0)
+                .map_err(|_| SystemError::ENOENT)?;
+            snapshot.raw_callbacks.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Atomically installs a group of raw callbacks and acquires one enable
+    /// reference. Either the whole group becomes visible, or nothing changes.
+    pub(crate) fn enable_raw_callbacks(
+        &self,
+        callbacks: &[(usize, Arc<dyn TracePointCallBackFunc>)],
+    ) -> Result<(), SystemError> {
+        let domain = tracepoint_srcu()?;
+        if tracepoint_read_held_by_current() {
+            return Err(SystemError::EDEADLK_OR_EDEADLOCK);
+        }
+        domain.validate_update_context()?;
+        let update = self.callback_update.lock();
+        let old = self.callbacks.load(Ordering::Acquire);
+        if old.is_null() {
+            return Err(SystemError::ENODEV);
+        }
+        // SAFETY: publication is serialized and the slot still owns `old`.
+        let mut next = unsafe { &*old }.try_clone()?;
+        next.raw_callbacks
+            .try_reserve(callbacks.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for (callback_id, callback) in callbacks {
+            match next
+                .raw_callbacks
+                .binary_search_by_key(callback_id, |entry| entry.0)
+            {
+                Ok(_) => return Err(SystemError::EEXIST),
+                Err(index) => next
+                    .raw_callbacks
+                    .insert(index, (*callback_id, callback.clone())),
+            }
+        }
+        let next = Box::try_new(next).map_err(|_| SystemError::ENOMEM)?;
+        self.acquire_enable()?;
+        let old = self.callbacks.swap(Box::into_raw(next), Ordering::AcqRel);
+        drop(update);
+        domain.synchronize_after_publication();
+        // SAFETY: the old snapshot was removed once and the GP covers its readers.
+        // Drop outside callback_update because callback-owned data may re-enter this tracepoint.
+        unsafe { drop(Box::from_raw(old)) };
+        Ok(())
+    }
+
+    /// Atomically removes a group of raw callbacks and releases one enable
+    /// reference. Preparation completes before either externally visible step.
+    pub(crate) fn disable_raw_callbacks(
+        &self,
+        callbacks: &[(usize, Arc<dyn TracePointCallBackFunc>)],
+    ) -> Result<(), SystemError> {
+        let domain = tracepoint_srcu()?;
+        if tracepoint_read_held_by_current() {
+            return Err(SystemError::EDEADLK_OR_EDEADLOCK);
+        }
+        domain.validate_update_context()?;
+        let update = self.callback_update.lock();
+        let old = self.callbacks.load(Ordering::Acquire);
+        if old.is_null() {
+            return Err(SystemError::ENODEV);
+        }
+        // SAFETY: publication is serialized and the slot still owns `old`.
+        let mut next = unsafe { &*old }.try_clone()?;
+        for (callback_id, _) in callbacks {
+            let index = next
+                .raw_callbacks
+                .binary_search_by_key(callback_id, |entry| entry.0)
+                .map_err(|_| SystemError::ENOENT)?;
+            next.raw_callbacks.remove(index);
+        }
+        let next = Box::try_new(next).map_err(|_| SystemError::ENOMEM)?;
+        self.release_enable()?;
+        let old = self.callbacks.swap(Box::into_raw(next), Ordering::AcqRel);
+        drop(update);
+        domain.synchronize_after_publication();
+        // SAFETY: the old snapshot was removed once and the GP covers its readers.
+        // Drop outside callback_update because callback-owned data may re-enter this tracepoint.
+        unsafe { drop(Box::from_raw(old)) };
+        Ok(())
     }
 
     /// Snapshot all registered raw callbacks.
@@ -273,8 +532,28 @@ impl TracePoint {
     /// Callback execution may allocate and run arbitrary BPF code, so it must
     /// not happen while the registry spin lock is held. `Arc` keeps callbacks
     /// alive when an owner unregisters after this snapshot was taken.
-    pub fn raw_callbacks_snapshot(&self) -> Vec<Arc<dyn TracePointCallBackFunc>> {
-        self.raw_callback.lock().values().cloned().collect()
+    pub fn for_each_raw_callback(&self, mut f: impl FnMut(&dyn TracePointCallBackFunc)) {
+        let Ok(domain) = tracepoint_srcu() else {
+            return;
+        };
+        if tracepoint_read_held_by_current() {
+            self.for_each_raw_snapshot(&mut f);
+            return;
+        }
+        let _guard = domain.read_lock_notrace();
+        let _depth = TracepointDepthGuard::enter();
+        self.for_each_raw_snapshot(&mut f);
+    }
+
+    fn for_each_raw_snapshot(&self, f: &mut impl FnMut(&dyn TracePointCallBackFunc)) {
+        let snapshot = self.callbacks.load(Ordering::Acquire);
+        if snapshot.is_null() {
+            return;
+        }
+        // SAFETY: snapshot reclamation waits for this SRCU guard.
+        for (_, callback) in unsafe { &*snapshot }.raw_callbacks.iter() {
+            f(callback.as_ref());
+        }
     }
 
     /// Acquire one active consumer reference.

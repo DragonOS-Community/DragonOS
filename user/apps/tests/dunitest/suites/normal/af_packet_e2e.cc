@@ -169,38 +169,14 @@ int GetIfIndex(int any_fd, const std::string& ifname) {
     return ifr.ifr_ifindex;
 }
 
-// Get local MAC: ioctl(SIOCGIFHWADDR) → sysfs → fallback MAC. Never fails.
-void GetIfHwaddr(int any_fd, const std::string& ifname, uint8_t mac[6]) {
+// Get the local MAC through the standard Linux network-device query ABI.
+bool GetIfHwaddr(int any_fd, const std::string& ifname, uint8_t mac[6]) {
     struct ifreq ifr;
     std::memset(&ifr, 0, sizeof(ifr));
     std::strncpy(ifr.ifr_name, ifname.c_str(), IFNAMSIZ - 1);
-    if (ioctl(any_fd, SIOCGIFHWADDR, &ifr) == 0) {
-        std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
-        bool allzero = true;
-        for (int i = 0; i < 6; ++i) {
-            if (mac[i]) {
-                allzero = false;
-                break;
-            }
-        }
-        if (!allzero) return;
-    }
-    // fall back to sysfs
-    char path[64];
-    std::snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifname.c_str());
-    FILE* f = std::fopen(path, "r");
-    if (f) {
-        unsigned int v[6];
-        int n = std::fscanf(f, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
-        std::fclose(f);
-        if (n == 6) {
-            for (int i = 0; i < 6; ++i) mac[i] = static_cast<uint8_t>(v[i]);
-            return;
-        }
-    }
-    // final fallback: default QEMU virtio-net MAC
-    static const uint8_t kDefaultMac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
-    std::memcpy(mac, kDefaultMac, 6);
+    if (ioctl(any_fd, SIOCGIFHWADDR, &ifr) != 0) return false;
+    std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    return true;
 }
 
 // Build a broadcast ARP request frame (ether_header + ArpHdr), length = kArpFrameLen
@@ -309,7 +285,10 @@ int MakeBoundRaw(const std::string& ifname, int ifindex, uint8_t mac[6]) {
         close(fd);
         return -1;
     }
-    GetIfHwaddr(fd, ifname, mac);
+    if (!GetIfHwaddr(fd, ifname, mac)) {
+        close(fd);
+        return -1;
+    }
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
@@ -372,7 +351,7 @@ TEST(AfPacketE2E, RawSendtoAndSendmsg) {
     ASSERT_GE(raw_fd.Get(), 0) << ErrnoString(errno);
 
     uint8_t local_mac[6];
-    GetIfHwaddr(raw_fd.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(raw_fd.Get(), ifname, local_mac)) << ErrnoString(errno);
     uint8_t frame[kArpFrameLen];
     BuildArpRequest(frame, local_mac);
     uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -411,7 +390,7 @@ TEST(AfPacketE2E, SendmsgIovecGather) {
     ASSERT_GE(raw_fd.Get(), 0) << ErrnoString(errno);
 
     uint8_t local_mac[6];
-    GetIfHwaddr(raw_fd.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(raw_fd.Get(), ifname, local_mac)) << ErrnoString(errno);
     uint8_t frame[kArpFrameLen];
     BuildArpRequest(frame, local_mac);
 
@@ -591,7 +570,7 @@ TEST(AfPacketE2E, DgramSendReturnsLayer3PayloadLen) {
         << ErrnoString(errno);
 
     uint8_t local_mac[6];
-    GetIfHwaddr(dgram_fd.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(dgram_fd.Get(), ifname, local_mac)) << ErrnoString(errno);
 
     // DGRAM sends only L3 payload (ARP 28 bytes), kernel adds Ethernet header
     ArpHdr arp;
@@ -642,7 +621,7 @@ TEST(AfPacketE2E, DgramReceivesHeaderOnlyFrameWithoutFilter) {
         << ErrnoString(errno);
 
     uint8_t local_mac[6];
-    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(sender.Get(), ifname, local_mac)) << ErrnoString(errno);
     uint8_t frame[kEthHdrLen]{};
     std::memset(frame, 0xff, 6);
     std::memcpy(frame + 6, local_mac, 6);
@@ -690,7 +669,7 @@ TEST(AfPacketE2E, WildcardRecvmsgTruncAndAuxdata) {
         << ErrnoString(errno);
 
     uint8_t local_mac[6];
-    GetIfHwaddr(fd.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(fd.Get(), ifname, local_mac)) << ErrnoString(errno);
     Stimulate(fd.Get(), ifindex, local_mac);
 
     uint8_t short_buf[8]{};
@@ -782,7 +761,7 @@ TEST(AfPacketE2E, VethAcceptsFullMtuVlanFrame) {
     FdGuard fd(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
     uint8_t local_mac[6];
-    GetIfHwaddr(fd.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(fd.Get(), ifname, local_mac)) << ErrnoString(errno);
 
     uint8_t frame[kVlanFrameLen]{};
     std::memset(frame, 0xff, 6);
@@ -908,7 +887,7 @@ TEST(AfPacketE2E, ReceiveBufferSizeControlsQueuedBytes) {
               0);
 
     uint8_t local_mac[6];
-    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(sender.Get(), ifname, local_mac)) << ErrnoString(errno);
     uint8_t frame[512]{};
     std::memset(frame, 0xff, 6);
     std::memcpy(frame + 6, local_mac, 6);
@@ -974,7 +953,7 @@ TEST(AfPacketE2E, ClassicFilterSnaplenAndRuntimeErrorsAreFailClosed) {
     ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
 
     uint8_t local_mac[6];
-    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(sender.Get(), ifname, local_mac)) << ErrnoString(errno);
     uint8_t frame[96]{};
     std::memset(frame, 0xff, 6);
     std::memcpy(frame + 6, local_mac, 6);
@@ -1073,7 +1052,7 @@ TEST(AfPacketE2E, FilterReplacementPreservesReceiveState) {
         << ErrnoString(errno);
 
     uint8_t local_mac[6];
-    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(sender.Get(), ifname, local_mac)) << ErrnoString(errno);
     uint8_t frame[96]{};
     std::memset(frame, 0xff, 6);
     std::memcpy(frame + 6, local_mac, 6);
@@ -1151,13 +1130,18 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
     ASSERT_EQ(setsockopt(second.Get(), SOL_PACKET, PACKET_FANOUT, &fanout, sizeof(fanout)), 0)
         << ErrnoString(errno);
 
+    static uint32_t fanout_run;
+    const uint32_t fanout_magic =
+        0x46414e4fU ^ (static_cast<uint32_t>(getpid()) << 8) ^ ++fanout_run;
+
     uint8_t local_mac[6];
-    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    ASSERT_TRUE(GetIfHwaddr(sender.Get(), ifname, local_mac)) << ErrnoString(errno);
     uint8_t frame[96]{};
     std::memset(frame, 0xff, 6);
     std::memcpy(frame + 6, local_mac, 6);
     frame[12] = static_cast<uint8_t>(kFanoutEtherType >> 8);
     frame[13] = static_cast<uint8_t>(kFanoutEtherType);
+    std::memcpy(frame + kEthHdrLen, &fanout_magic, sizeof(fanout_magic));
 
     struct sockaddr_ll dst{};
     dst.sll_family = AF_PACKET;
@@ -1169,17 +1153,35 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
 
     constexpr int kFrames = 16;
     for (int sequence = 0; sequence < kFrames; ++sequence) {
-        std::memcpy(frame + kEthHdrLen, &sequence, sizeof(sequence));
+        std::memcpy(frame + kEthHdrLen + sizeof(fanout_magic), &sequence, sizeof(sequence));
         ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
                          reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
                   static_cast<ssize_t>(sizeof(frame)))
             << ErrnoString(errno);
     }
 
-    auto drain = [](int fd) {
+    int seen[kFrames]{};
+    auto drain = [&](int fd) {
         uint8_t buffer[128];
         int count = 0;
-        while (recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT) > 0) ++count;
+        ssize_t received;
+        while ((received = recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT)) > 0) {
+            if (received < kEthHdrLen + static_cast<ssize_t>(sizeof(fanout_magic) + sizeof(int))) {
+                continue;
+            }
+            uint32_t magic;
+            std::memcpy(&magic, buffer + kEthHdrLen, sizeof(magic));
+            if (magic != fanout_magic) continue;
+
+            int sequence;
+            std::memcpy(&sequence, buffer + kEthHdrLen + sizeof(magic), sizeof(sequence));
+            if (sequence < 0 || sequence >= kFrames) {
+                ADD_FAILURE() << "fanout frame has invalid sequence=" << sequence;
+                continue;
+            }
+            ++seen[sequence];
+            ++count;
+        }
         return count;
     };
     const int first_count = drain(first.Get());
@@ -1189,6 +1191,9 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
         << " second=" << second_count;
     EXPECT_EQ(first_count, kFrames / 2);
     EXPECT_EQ(second_count, kFrames / 2);
+    for (int sequence = 0; sequence < kFrames; ++sequence) {
+        EXPECT_EQ(seen[sequence], 1) << "sequence=" << sequence;
+    }
 }
 
 int main(int argc, char** argv) {

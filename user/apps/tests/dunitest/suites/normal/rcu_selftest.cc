@@ -13,6 +13,7 @@ constexpr const char* kRcuSelftestPath = "/sys/kernel/debug/rcu/selftest";
 constexpr const char* kRcuCallbacksPath = "/sys/kernel/debug/rcu/callbacks";
 constexpr const char* kRcuStatePath = "/sys/kernel/debug/rcu/state";
 constexpr const char* kRcuStatsPath = "/sys/kernel/debug/rcu/stats";
+constexpr const char* kSrcuStatePath = "/sys/kernel/debug/rcu/srcu/state";
 
 std::string ReadAll(const char* path) {
     int fd = open(path, O_RDONLY);
@@ -107,6 +108,26 @@ TEST(RcuSelftest, ProgressStatisticsArePresent) {
     EXPECT_NE(std::string::npos, report.find("ipi_attempted=")) << report;
     EXPECT_NE(std::string::npos, report.find("callback_time_budget_hits=")) << report;
     EXPECT_NE(std::string::npos, report.find("slow_callbacks=")) << report;
+}
+
+TEST(RcuSelftest, SrcuDomainsArePresentAndQuiescent) {
+    // Opening the shared selftest file runs the deterministic SRCU state and
+    // runtime checks before this state snapshot is inspected.
+    const std::string selftest = ReadAll(kRcuSelftestPath);
+    ASSERT_FALSE(selftest.empty());
+    ExpectReportOk(selftest);
+
+    const std::string state = ReadAll(kSrcuStatePath);
+    ASSERT_FALSE(state.empty());
+    for (const char* name : {"name=tracepoint", "name=reboot_notifier"}) {
+        const size_t start = state.find(name);
+        ASSERT_NE(std::string::npos, start) << state;
+        const size_t end = state.find('\n', start);
+        const std::string line = state.substr(start, end - start);
+        EXPECT_NE(std::string::npos, line.find("active=true")) << line;
+        EXPECT_NE(std::string::npos, line.find("callbacks=0")) << line;
+        EXPECT_NE(std::string::npos, line.find("executing=false")) << line;
+    }
 }
 
 int main(int argc, char** argv) {

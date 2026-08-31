@@ -12,3 +12,4 @@ RCU.
 
    architecture
    segmented-callback-queues
+   srcu-design

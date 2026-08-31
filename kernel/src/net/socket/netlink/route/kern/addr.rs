@@ -80,17 +80,20 @@ pub(super) fn do_new_addr(
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let (iface, cidr, changed) = add_addr(request_segment, netns.clone())?;
+    let iface = lookup_iface_by_index(request_segment, netns.clone())?;
+    let cidr = parse_cidr(request_segment)?;
+    let notification = addr_to_segment(
+        &kernel_notify_header(CSegmentType::NEWADDR),
+        &iface,
+        cidr,
+        CSegmentType::NEWADDR,
+    )?;
+    let changed = add_addr(request_segment, &iface, cidr)?;
     if changed {
         multicast_notify(
             netns,
             addr_notify_group(cidr.address()),
-            RouteNlSegment::NewAddr(addr_to_segment(
-                &kernel_notify_header(CSegmentType::NEWADDR),
-                &iface,
-                cidr,
-                CSegmentType::NEWADDR,
-            )?),
+            RouteNlSegment::NewAddr(notification),
         );
     }
     Ok(Vec::new())
@@ -100,26 +103,28 @@ pub(super) fn do_del_addr(
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let (iface, cidr) = del_addr(request_segment, netns.clone())?;
+    let iface = lookup_iface_by_index(request_segment, netns.clone())?;
+    let cidr = parse_cidr(request_segment)?;
+    let notification = addr_to_segment(
+        &kernel_notify_header(CSegmentType::DELADDR),
+        &iface,
+        cidr,
+        CSegmentType::DELADDR,
+    )?;
+    del_addr(&iface, cidr)?;
     multicast_notify(
         netns,
         addr_notify_group(cidr.address()),
-        RouteNlSegment::DelAddr(addr_to_segment(
-            &kernel_notify_header(CSegmentType::DELADDR),
-            &iface,
-            cidr,
-            CSegmentType::DELADDR,
-        )?),
+        RouteNlSegment::DelAddr(notification),
     );
     Ok(Vec::new())
 }
 
 fn add_addr(
     request_segment: &AddrSegment,
-    netns: Arc<NetNamespace>,
-) -> Result<(Arc<dyn Iface>, IpCidr, bool), SystemError> {
-    let iface = lookup_iface_by_index(request_segment, netns)?;
-    let cidr = parse_cidr(request_segment)?;
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+) -> Result<bool, SystemError> {
     let flags = NewRequestFlags::from_bits_truncate(request_segment.header().flags);
 
     let mut exists = false;
@@ -144,7 +149,7 @@ fn add_addr(
 
     if exists {
         if flags.contains(NewRequestFlags::REPLACE) {
-            return Ok((iface, cidr, false));
+            return Ok(false);
         }
         return Err(SystemError::EEXIST);
     }
@@ -153,23 +158,17 @@ fn add_addr(
         return Err(SystemError::ENOSPC);
     }
 
-    if let Err(err) = add_local_route(&iface, cidr) {
-        rollback_added_addr(&iface, cidr);
+    if let Err(err) = add_local_route(iface, cidr) {
+        rollback_added_addr(iface, cidr);
         return Err(err);
     }
 
-    sync_router_ip_addrs(&iface);
+    sync_router_ip_addrs(iface);
 
-    Ok((iface, cidr, true))
+    Ok(true)
 }
 
-fn del_addr(
-    request_segment: &AddrSegment,
-    netns: Arc<NetNamespace>,
-) -> Result<(Arc<dyn Iface>, IpCidr), SystemError> {
-    let iface = lookup_iface_by_index(request_segment, netns)?;
-    let cidr = parse_cidr(request_segment)?;
-
+fn del_addr(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemError> {
     let mut removed = false;
 
     iface.smol_iface().lock().update_ip_addrs(|ip_addrs| {
@@ -183,10 +182,10 @@ fn del_addr(
         return Err(SystemError::EADDRNOTAVAIL);
     }
 
-    remove_local_route(&iface, cidr);
-    sync_router_ip_addrs(&iface);
+    remove_local_route(iface, cidr);
+    sync_router_ip_addrs(iface);
 
-    Ok((iface, cidr))
+    Ok(())
 }
 
 fn lookup_iface_by_index(

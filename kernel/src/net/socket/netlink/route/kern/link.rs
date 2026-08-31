@@ -4,7 +4,6 @@ use crate::{
         types::{InterfaceFlags, InterfaceType},
         Iface, Operstate,
     },
-    libs::mutex::Mutex,
     net::socket::{
         netlink::{
             message::segment::{
@@ -33,16 +32,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::num::NonZero;
 use system_error::SystemError;
-
-lazy_static! {
-    /// Serialize RTM_SETLINK transactions through flag publication, operstate,
-    /// timer rearm, rename/MTU updates, and notification.
-    ///
-    /// Linux provides this boundary with RTNL. DragonOS does not yet expose a
-    /// general RTNL lock, so link mutation owns the smallest equivalent
-    /// serialization point here.
-    static ref RTNL_LINK_LOCK: Mutex<()> = Mutex::new(());
-}
 
 pub(super) fn do_get_link(
     request_segment: &LinkSegment,
@@ -147,6 +136,7 @@ fn iface_to_link_message(
     iface: &Arc<dyn Iface>,
 ) -> Result<LinkSegment, SystemError> {
     let flags = iface.common().link_flags_snapshot()?;
+    let user_visible_flags = iface.project_user_visible_flags(flags.configured);
     let header = CMsgSegHdr {
         len: 0,
         type_: msg_type as _,
@@ -159,7 +149,7 @@ fn iface_to_link_message(
         family: AddressFamily::Unspecified,
         type_: iface.type_(),
         index: NonZero::new(iface.nic_id() as u32),
-        flags: flags.configured,
+        flags: user_visible_flags,
         change: LinkMessageFlags::empty(),
         pad: None,
     };
@@ -208,7 +198,6 @@ pub(super) fn do_set_link(
     request_segment: &LinkSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let _rtnl_guard = RTNL_LINK_LOCK.lock();
     let iface = find_iface_for_setlink(request_segment, netns.clone())?;
     let updates = validate_setlink_request(request_segment, iface.as_ref())?;
 
@@ -231,12 +220,13 @@ pub(super) fn do_set_link(
     if change_mask.contains(InterfaceFlags::UP) {
         let was_up = old_flags.contains(InterfaceFlags::UP);
         let is_up = new_flags.contains(InterfaceFlags::UP);
-        let operstate = if is_up {
-            Operstate::IF_OPER_UP
+        if is_up {
+            iface.set_operstate(Operstate::IF_OPER_UP);
+            iface.set_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
         } else {
-            Operstate::IF_OPER_DOWN
-        };
-        iface.set_operstate(operstate);
+            iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
+            iface.set_operstate(Operstate::IF_OPER_DOWN);
+        }
 
         if was_up != is_up {
             if is_up {

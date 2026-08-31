@@ -7,7 +7,8 @@ use crate::{
     init::initial_kthread::{set_system_state, SystemState},
     libs::{
         mutex::Mutex,
-        notifier::{BlockingNotifierChain, NotifierBlock},
+        notifier::{BlockingNotifierChain, NotifierBlock, SrcuNotifierChain},
+        spinlock::SpinLock,
     },
     misc::syscore::syscore_shutdown,
     syscall::user_access::check_and_clone_cstr,
@@ -22,11 +23,10 @@ const LINUX_REBOOT_MAGIC2B: u32 = 369367448;
 const LINUX_REBOOT_MAGIC2C: u32 = 537993216;
 
 static mut C_A_D: bool = true;
-lazy_static! {
-    /// 注册此通知链的回调函数通常属于内核子系统或驱动程序
-    static ref REBOOT_NOTIFIER_LIST: Mutex<BlockingNotifierChain<RebootNotifyEvent, String>> =
-        Mutex::new(BlockingNotifierChain::new());
-}
+/// Explicitly initialized after the SRCU worker is available. This avoids a
+/// fallible lazy allocation first occurring on the shutdown path.
+static REBOOT_NOTIFIER_LIST: SpinLock<Option<Arc<SrcuNotifierChain<RebootNotifyEvent, String>>>> =
+    SpinLock::new(None);
 lazy_static! {
     /// 注册此通知链的回调函数通常是与硬件相关的重启准备处理程序
     static ref RESTART_PERP_HANDLER_LIST: Mutex<BlockingNotifierChain<RebootNotifyEvent, String>> =
@@ -105,8 +105,11 @@ fn power_off_handlers_snapshot() -> Vec<Arc<dyn PowerOffHandler>> {
 pub fn register_reboot_notifier(
     notifier: Arc<dyn NotifierBlock<RebootNotifyEvent, String>>,
 ) -> Result<(), SystemError> {
-    let mut reboot_notifier_list = REBOOT_NOTIFIER_LIST.lock();
-    return reboot_notifier_list.register(notifier);
+    let chain = REBOOT_NOTIFIER_LIST
+        .lock_irqsave()
+        .clone()
+        .ok_or(SystemError::ENODEV)?;
+    chain.register(notifier)
 }
 
 /// # 功能
@@ -116,8 +119,29 @@ pub fn register_reboot_notifier(
 pub fn unregister_reboot_notifier(
     notifier: Arc<dyn NotifierBlock<RebootNotifyEvent, String>>,
 ) -> Result<(), SystemError> {
-    let mut reboot_notifier_list = REBOOT_NOTIFIER_LIST.lock();
-    return reboot_notifier_list.unregister(notifier);
+    let chain = REBOOT_NOTIFIER_LIST
+        .lock_irqsave()
+        .clone()
+        .ok_or(SystemError::ENODEV)?;
+    chain.unregister(notifier)
+}
+
+pub fn reboot_notifier_init() -> Result<(), SystemError> {
+    let chain = Arc::try_new(SrcuNotifierChain::try_new("reboot_notifier")?)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let mut slot = REBOOT_NOTIFIER_LIST.lock_irqsave();
+    if slot.is_some() {
+        return Err(SystemError::EBUSY);
+    }
+    *slot = Some(chain);
+    Ok(())
+}
+
+fn reboot_notifier_chain() -> Arc<SrcuNotifierChain<RebootNotifyEvent, String>> {
+    REBOOT_NOTIFIER_LIST
+        .lock_irqsave()
+        .clone()
+        .expect("reboot notifier used before initialization")
 }
 
 #[derive(Debug)]
@@ -278,9 +302,7 @@ fn kernel_restart_prepare(cmd: Option<&str>) {
     } else {
         String::new()
     };
-    REBOOT_NOTIFIER_LIST
-        .lock()
-        .call_chain(RebootNotifyEvent::Restart, Some(&cmd), None);
+    reboot_notifier_chain().call_chain(RebootNotifyEvent::Restart, Some(&cmd), None);
 
     set_system_state(SystemState::Restart);
 
@@ -316,7 +338,7 @@ pub fn kernel_shutdown_prepare(state: SystemState) {
     } else {
         RebootNotifyEvent::PowerOff
     };
-    REBOOT_NOTIFIER_LIST.lock().call_chain(event, None, None);
+    reboot_notifier_chain().call_chain(event, None, None);
 
     set_system_state(state);
 

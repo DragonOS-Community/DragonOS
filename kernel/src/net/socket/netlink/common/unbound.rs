@@ -12,7 +12,7 @@ use crate::{
         },
         utils::datagram_common,
     },
-    process::namespace::net_namespace::NetNamespace,
+    process::{cred::Cred, namespace::net_namespace::NetNamespace},
 };
 use alloc::sync::Arc;
 use core::marker::PhantomData;
@@ -23,15 +23,21 @@ pub struct UnboundNetlink<P: SupportedNetlinkProtocol> {
     groups: GroupIdSet,
     epoll_items: Arc<EPollItems>,
     fasync_items: Arc<FAsyncItems>,
+    opener_cred: Arc<Cred>,
     phantom: PhantomData<BoundNetlink<P::Message>>,
 }
 
 impl<P: SupportedNetlinkProtocol> UnboundNetlink<P> {
-    pub(super) fn new(epoll_items: Arc<EPollItems>, fasync_items: Arc<FAsyncItems>) -> Self {
+    pub(super) fn new(
+        epoll_items: Arc<EPollItems>,
+        fasync_items: Arc<FAsyncItems>,
+        opener_cred: Arc<Cred>,
+    ) -> Self {
         Self {
             groups: GroupIdSet::new_empty(),
             epoll_items,
             fasync_items,
+            opener_cred,
             phantom: PhantomData,
         }
     }
@@ -75,7 +81,12 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
             <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver, netns.clone())?
         };
 
-        Ok(BoundNetlink::new(bound_handle, message_queue, netns))
+        Ok(BoundNetlink::new(
+            bound_handle,
+            message_queue,
+            netns,
+            self.opener_cred.clone(),
+        ))
     }
 
     fn bind_ephemeral(
@@ -101,7 +112,12 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
             <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver, netns.clone())?
         };
 
-        Ok(BoundNetlink::new(bound_handle, message_queue, netns))
+        Ok(BoundNetlink::new(
+            bound_handle,
+            message_queue,
+            netns,
+            self.opener_cred.clone(),
+        ))
     }
 
     fn check_io_events(&self) -> EPollEventType {

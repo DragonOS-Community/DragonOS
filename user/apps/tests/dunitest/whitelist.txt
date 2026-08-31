@@ -55,6 +55,7 @@ normal/poll_timeout_semantics
 normal/udp_ipv6_send_semantics
 normal/socket_getsockopt_semantics
 normal/socket_readv_semantics
+normal/socket_ioctl_netdev_query
 normal/unix_socket_shutdown
 fuse/fuse_core
 fuse/fuse_extended
@@ -107,6 +108,8 @@ normal/perf_bpf_mmap
 normal/af_packet_e2e
 normal/af_packet_mcast
 normal/rtnetlink_link_semantics
+normal/rtnetlink_permission_semantics
+normal/rtnetlink_serialization_semantics
 normal/tty_termios
 normal/inotify_dir_watch
 normal/inotify_events

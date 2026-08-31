@@ -10,6 +10,7 @@ pub mod neighbor;
 pub mod net_core;
 pub mod posix;
 pub mod routing;
+mod rtnl;
 pub mod socket;
 pub mod syscall;
 pub mod tcp_close_defer;

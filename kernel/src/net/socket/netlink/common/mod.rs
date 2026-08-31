@@ -82,7 +82,8 @@ where
         let wait_queue = Arc::new(WaitQueue::default());
         let epoll_items = Arc::new(EPollItems::default());
         let fasync_items = Arc::new(FAsyncItems::default());
-        let unbound = UnboundNetlink::new(epoll_items.clone(), fasync_items.clone());
+        let opener_cred = ProcessManager::current_pcb().cred();
+        let unbound = UnboundNetlink::new(epoll_items.clone(), fasync_items.clone(), opener_cred);
         Arc::new(Self {
             inner: RwSem::new(Inner::Unbound(unbound)),
             is_nonblocking: AtomicBool::new(is_nonblocking),
@@ -107,6 +108,7 @@ where
         to: Option<NetlinkSocketAddr>,
         flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
+        let destination_is_explicit = to.is_some();
         let send_bytes = select_remote_and_bind(
             &self.inner,
             to,
@@ -117,7 +119,7 @@ where
                     self.netns(),
                 )
             },
-            |bound, remote| bound.try_send(buf, &remote, flags),
+            |bound, remote| bound.try_send(buf, &remote, flags, destination_is_explicit),
         )?;
         // todo pollee invalidate??
 
@@ -130,6 +132,7 @@ where
         to: Option<NetlinkSocketAddr>,
         flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
+        let destination_is_explicit = to.is_some();
         let send_bytes = select_remote_and_bind(
             &self.inner,
             to,
@@ -140,7 +143,7 @@ where
                     self.netns(),
                 )
             },
-            |bound, remote| bound.try_send_vec(buf, &remote, flags),
+            |bound, remote| bound.try_send_vec(buf, &remote, flags, destination_is_explicit),
         )?;
 
         Ok(send_bytes)
@@ -381,6 +384,10 @@ impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
 where
     BoundNetlink<P::Message>: Bound<Endpoint = NetlinkSocketAddr>,
 {
+    fn netns(&self) -> Arc<NetNamespace> {
+        NetlinkSocket::netns(self)
+    }
+
     fn fsnotify_watch_counter(&self) -> &AtomicUsize {
         &self.fsnotify_watches
     }

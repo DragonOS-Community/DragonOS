@@ -142,33 +142,30 @@ pub(super) fn do_new_route(
         return Err(SystemError::EEXIST);
     }
 
+    let notification = route_to_segment(
+        &kernel_notify_header(CSegmentType::NEWROUTE),
+        CSegmentType::NEWROUTE,
+        &iface,
+        RouteView {
+            destination: parsed.destination,
+            source: parsed.source,
+            gateway: parsed.gateway,
+            priority: parsed.priority,
+            table,
+            protocol: request_segment.body().protocol as u8,
+            scope: request_segment.body().scope as u8,
+            kind: request_segment.body().type_ as u8,
+            flags: RouteFlags::empty(),
+        },
+    )?;
+
+    sync_iface_route_table(&iface, &parsed)?;
     iface.common().upsert_netlink_route(entry);
 
-    if let Err(err) = sync_iface_route_table(&iface, &parsed) {
-        iface
-            .common()
-            .remove_netlink_route(parsed.destination, parsed.source, table);
-        return Err(err);
-    }
     multicast_notify(
         netns,
         route_notify_group(parsed.destination.address()),
-        RouteNlSegment::NewRoute(route_to_segment(
-            &kernel_notify_header(CSegmentType::NEWROUTE),
-            CSegmentType::NEWROUTE,
-            &iface,
-            RouteView {
-                destination: parsed.destination,
-                source: parsed.source,
-                gateway: parsed.gateway,
-                priority: parsed.priority,
-                table,
-                protocol: request_segment.body().protocol as u8,
-                scope: request_segment.body().scope as u8,
-                kind: request_segment.body().type_ as u8,
-                flags: RouteFlags::empty(),
-            },
-        )?),
+        RouteNlSegment::NewRoute(notification),
     );
     Ok(Vec::new())
 }
@@ -185,6 +182,22 @@ pub(super) fn do_del_route(
         .ok_or(SystemError::ENODEV)?;
 
     let table = effective_route_table(parsed.table);
+    let notification = route_to_segment(
+        &kernel_notify_header(CSegmentType::DELROUTE),
+        CSegmentType::DELROUTE,
+        &iface,
+        RouteView {
+            destination: parsed.destination,
+            source: parsed.source,
+            gateway: parsed.gateway,
+            priority: parsed.priority,
+            table,
+            protocol: request_segment.body().protocol as u8,
+            scope: request_segment.body().scope as u8,
+            kind: request_segment.body().type_ as u8,
+            flags: RouteFlags::empty(),
+        },
+    )?;
     if !iface
         .common()
         .remove_netlink_route(parsed.destination, parsed.source, table)
@@ -202,22 +215,7 @@ pub(super) fn do_del_route(
     multicast_notify(
         netns,
         route_notify_group(parsed.destination.address()),
-        RouteNlSegment::DelRoute(route_to_segment(
-            &kernel_notify_header(CSegmentType::DELROUTE),
-            CSegmentType::DELROUTE,
-            &iface,
-            RouteView {
-                destination: parsed.destination,
-                source: parsed.source,
-                gateway: parsed.gateway,
-                priority: parsed.priority,
-                table,
-                protocol: request_segment.body().protocol as u8,
-                scope: request_segment.body().scope as u8,
-                kind: request_segment.body().type_ as u8,
-                flags: RouteFlags::empty(),
-            },
-        )?),
+        RouteNlSegment::DelRoute(notification),
     );
     Ok(Vec::new())
 }
@@ -440,21 +438,36 @@ fn sync_iface_route_table(
     iface: &Arc<dyn Iface>,
     route: &ParsedRouteRequest,
 ) -> Result<(), SystemError> {
+    let new_route = smoltcp::iface::Route {
+        cidr: route.destination,
+        via_router: route.gateway,
+        preferred_until: None,
+        expires_at: None,
+    };
     let mut push_failed = false;
     iface.smol_iface().lock().routes_mut().update(|routes| {
-        routes.retain(|existing| {
-            existing.cidr != route.destination || is_local_connected_route(iface, existing)
-        });
+        // Replacing in place cannot fail when the fixed-capacity table is full.
+        // Canonicalize legacy duplicates while preserving connected routes.
+        let mut first_match = None;
+        let mut index = 0;
+        while index < routes.len() {
+            let replaceable = routes[index].cidr == route.destination
+                && !is_local_connected_route(iface, &routes[index]);
+            if !replaceable {
+                index += 1;
+                continue;
+            }
 
-        if routes
-            .push(smoltcp::iface::Route {
-                cidr: route.destination,
-                via_router: route.gateway,
-                preferred_until: None,
-                expires_at: None,
-            })
-            .is_err()
-        {
+            if first_match.is_none() {
+                routes[index] = new_route;
+                first_match = Some(index);
+                index += 1;
+            } else {
+                routes.remove(index);
+            }
+        }
+
+        if first_match.is_none() && routes.push(new_route).is_err() {
             push_failed = true;
         }
     });

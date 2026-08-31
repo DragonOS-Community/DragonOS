@@ -63,6 +63,7 @@ impl datagram_common::Bound for BoundNetlink<KobjectUeventMessage> {
         buf: &[u8],
         to: &Self::Endpoint,
         _flags: PMSG,
+        _destination_is_explicit: bool,
     ) -> Result<usize, SystemError> {
         let sent_len = buf.len();
         let message = KobjectUeventMessage::try_new(buf)?;
@@ -74,6 +75,7 @@ impl datagram_common::Bound for BoundNetlink<KobjectUeventMessage> {
         buf: Vec<u8>,
         to: &Self::Endpoint,
         _flags: PMSG,
+        _destination_is_explicit: bool,
     ) -> Result<usize, SystemError> {
         let sent_len = buf.len();
         let message = KobjectUeventMessage::from_vec(buf);

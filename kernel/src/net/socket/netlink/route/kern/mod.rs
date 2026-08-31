@@ -22,7 +22,7 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 use system_error::SystemError;
 
-mod addr;
+pub(super) mod addr;
 mod link;
 mod neigh;
 mod route;
@@ -125,8 +125,8 @@ impl NetlinkRouteKernelSocket {
                 // RTNL unless a handler is explicitly registered as unlocked.
                 // Keep response delivery outside this scope so ACKs cannot
                 // extend the global control-plane critical section.
-                let _rtnl_guard = crate::net::rtnl::lock();
-                dispatch_request(segment, seg_type, netns.clone())
+                let rtnl_guard = crate::net::rtnl::lock();
+                dispatch_request(&rtnl_guard, segment, seg_type, netns.clone())
             };
 
             let response = match response_segments {
@@ -158,14 +158,15 @@ impl NetlinkRouteKernelSocket {
 }
 
 fn dispatch_request(
+    rtnl: &crate::net::rtnl::RtnlGuard,
     segment: &RouteNlSegment,
     seg_type: CSegmentType,
     netns: Arc<NetNamespace>,
 ) -> Result<alloc::vec::Vec<RouteNlSegment>, SystemError> {
     match segment {
         RouteNlSegment::GetAddr(request) => addr::do_get_addr(request, netns),
-        RouteNlSegment::NewAddr(request) => addr::do_new_addr(request, netns),
-        RouteNlSegment::DelAddr(request) => addr::do_del_addr(request, netns),
+        RouteNlSegment::NewAddr(request) => addr::do_new_addr(rtnl, request, netns),
+        RouteNlSegment::DelAddr(request) => addr::do_del_addr(rtnl, request, netns),
         RouteNlSegment::GetLink(request) => link::do_get_link(request, netns),
         RouteNlSegment::SetLink(request) if seg_type == CSegmentType::DELLINK => {
             link::do_del_link(request, netns)

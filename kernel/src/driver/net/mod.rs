@@ -135,16 +135,6 @@ pub trait Iface: crate::driver::base::device::Device {
         false
     }
 
-    /// # `update_ip_addrs`
-    /// 用于更新接口的 IP 地址
-    /// ## 参数
-    /// - `ip_addrs` ：一个包含 `smoltcp::wire::IpCidr` 的切片，表示要设置的 IP 地址和子网掩码
-    /// ## 返回值
-    /// - 如果 `ip_addrs` 的长度不为 1，返回 `Err(SystemError::EINVAL)`，表示输入参数无效
-    fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
-        self.common().update_ip_addrs(ip_addrs)
-    }
-
     /// @brief 获取smoltcp的网卡接口类型
     #[inline(always)]
     fn smol_iface(&self) -> &Mutex<smoltcp::iface::Interface> {
@@ -619,23 +609,6 @@ impl IfaceCommon {
         if let Some(netns) = self.net_namespace() {
             netns.notify_deadline_changed();
         }
-    }
-
-    pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.smol_iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
-            }
-        });
-        return Ok(());
     }
 
     // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发

@@ -3,6 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::Operstate,
+    net::address::{AddressMutation, AddressMutationOutcome},
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
         namespace::net_namespace::INIT_NET_NAMESPACE,
@@ -69,6 +70,9 @@ fn dhcp_query() -> Result<(), SystemError> {
 
     const DHCP_RETRY_INTERVAL_NS: i64 = 50_000_000;
     const DHCP_TRY_ROUND: u16 = 200;
+    // Ownership is deliberately scoped to this one-shot worker invocation.
+    // PR-08 owns the longer-lived lease state machine.
+    let mut owned_address: Option<wire::IpCidr> = None;
     for i in 0..DHCP_TRY_ROUND {
         log::debug!("DHCP try round: {}", i);
         net_face.poll();
@@ -93,14 +97,43 @@ fn dhcp_query() -> Result<(), SystemError> {
                 // The DHCP socket guard is released before RTNL. Lease commits
                 // share the same global serialization domain as userspace
                 // rtnetlink mutations without extending it over DHCP polling.
-                let _rtnl_guard = crate::net::rtnl::lock();
+                let rtnl_guard = crate::net::rtnl::lock();
+                revalidate_dhcp_iface(&net_face)?;
                 // debug!("Find Config!! {config:?}");
                 // debug!("Find ip address: {}", config.address);
                 // debug!("iface.ip_addrs={:?}", net_face.inner_iface.ip_addrs());
 
-                net_face
-                    .update_ip_addrs(&[wire::IpCidr::Ipv4(address)])
-                    .ok();
+                let requested = wire::IpCidr::Ipv4(address);
+                let mutation = match owned_address {
+                    None => AddressMutation::Add(requested),
+                    Some(old) if old == requested => AddressMutation::Replace(requested),
+                    Some(old) => AddressMutation::ExchangeOwned {
+                        old,
+                        new: requested,
+                    },
+                };
+                match crate::net::address::mutate_address(&rtnl_guard, &net_face, mutation) {
+                    Ok(outcome) => {
+                        owned_address = match outcome {
+                            AddressMutationOutcome::Added(effective)
+                            | AddressMutationOutcome::Replaced(effective) => Some(effective),
+                            AddressMutationOutcome::Exchanged { new, .. } => Some(new),
+                            AddressMutationOutcome::Deleted(_) => unreachable!(),
+                        };
+                        crate::net::socket::netlink::notify_address_outcome(
+                            INIT_NET_NAMESPACE.clone(),
+                            &net_face,
+                            outcome,
+                        );
+                    }
+                    Err(SystemError::EEXIST) if owned_address.is_none() => {
+                        // A pre-existing address remains owned by its original
+                        // writer. DHCP may use it for this invocation but must
+                        // never delete or exchange it later.
+                        log::debug!("DHCP address {requested} already configured");
+                    }
+                    Err(err) => return Err(err),
+                }
 
                 if let Some(router) = router {
                     let mut smol_iface = net_face.smol_iface().lock();
@@ -139,14 +172,28 @@ fn dhcp_query() -> Result<(), SystemError> {
             }
 
             Some(DhcpControlEvent::Deconfigured) => {
-                let _rtnl_guard = crate::net::rtnl::lock();
+                let rtnl_guard = crate::net::rtnl::lock();
+                revalidate_dhcp_iface(&net_face)?;
                 log::debug!("Dhcp v4 deconfigured");
-                net_face
-                    .update_ip_addrs(&[smoltcp::wire::IpCidr::Ipv4(wire::Ipv4Cidr::new(
-                        wire::Ipv4Address::UNSPECIFIED,
-                        0,
-                    ))])
-                    .ok();
+                if let Some(owned) = owned_address.take() {
+                    match crate::net::address::mutate_address(
+                        &rtnl_guard,
+                        &net_face,
+                        AddressMutation::Delete(owned),
+                    ) {
+                        Ok(outcome) => crate::net::socket::netlink::notify_address_outcome(
+                            INIT_NET_NAMESPACE.clone(),
+                            &net_face,
+                            outcome,
+                        ),
+                        Err(SystemError::EADDRNOTAVAIL) => {
+                            // A concurrent authorized control-plane writer may
+                            // already have removed the object between events.
+                            log::debug!("owned DHCP address {owned} was already removed");
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
                 net_face
                     .smol_iface()
                     .lock()
@@ -162,4 +209,15 @@ fn dhcp_query() -> Result<(), SystemError> {
     }
 
     return Err(SystemError::ETIMEDOUT);
+}
+
+fn revalidate_dhcp_iface(
+    iface: &alloc::sync::Arc<dyn crate::driver::net::Iface>,
+) -> Result<(), SystemError> {
+    let devices = INIT_NET_NAMESPACE.device_list();
+    let current = devices.get(&iface.nic_id()).ok_or(SystemError::ENODEV)?;
+    if !alloc::sync::Arc::ptr_eq(current, iface) {
+        return Err(SystemError::ENODEV);
+    }
+    Ok(())
 }

@@ -110,6 +110,7 @@ normal/af_packet_mcast
 normal/rtnetlink_link_semantics
 normal/rtnetlink_permission_semantics
 normal/rtnetlink_serialization_semantics
+normal/udp_bind_to_device_semantics
 normal/tty_termios
 normal/inotify_dir_watch
 normal/inotify_events

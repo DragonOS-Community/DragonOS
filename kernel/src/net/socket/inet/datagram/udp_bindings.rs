@@ -1,23 +1,25 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
+use hashbrown::HashMap;
 use jhash::jhash2;
 use smoltcp::wire::{IpAddress, IpEndpoint};
+use system_error::SystemError;
 
-use crate::libs::rwsem::RwSem;
-use crate::process::namespace::net_namespace::NetNamespace;
-use crate::process::namespace::NamespaceOps;
+use crate::arch::rand::rand;
+use crate::libs::mutex::Mutex;
 
 use super::UdpSocket;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct UdpBinding {
-    netns_id: usize,
     socket: Weak<UdpSocket>,
     addr: IpAddress,
-    port: u16,
+    /// Bind-time reuseport group membership. Unlike SO_REUSEADDR conflict
+    /// checks, Linux reuseport delivery membership is not the live option bit.
     reuseport: bool,
+    bind_id: usize,
     bound_seq: u64,
 }
 
@@ -28,149 +30,269 @@ struct UdpBindingMatch {
     bound_seq: u64,
 }
 
-static BIND_SEQ: AtomicU64 = AtomicU64::new(1);
-
-lazy_static! {
-    static ref UDP_BINDINGS: RwSem<Vec<UdpBinding>> = RwSem::new(Vec::new());
+/// Per-network-namespace UDP port reservation and local-delivery table.
+///
+/// Device binding is intentionally not cached in an entry. Conflict checks and
+/// delivery read each socket's authoritative `SocketDeviceBinding` so changing
+/// SO_BINDTODEVICE cannot leave a stale port-table projection.
+#[derive(Debug)]
+pub struct UdpBindingTable {
+    bindings: Mutex<HashMap<u16, Vec<UdpBinding>>>,
+    next_ephemeral: AtomicU16,
+    bind_seq: AtomicU64,
 }
 
-pub fn register_udp_binding(
-    netns: &Arc<NetNamespace>,
-    socket: Weak<UdpSocket>,
-    addr: IpAddress,
-    port: u16,
-    _reuseaddr: bool,
-    reuseport: bool,
-) {
-    let netns_id = netns.ns_common().nsid.data();
-    let bound_seq = BIND_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut guard = UDP_BINDINGS.write();
-    guard.push(UdpBinding {
-        netns_id,
-        socket,
-        addr,
-        port,
-        reuseport,
-        bound_seq,
-    });
-    guard.retain(|b| b.socket.strong_count() > 0);
-}
-
-pub fn unregister_udp_binding(netns: &Arc<NetNamespace>, socket: &Weak<UdpSocket>) {
-    let netns_id = netns.ns_common().nsid.data();
-    let mut guard = UDP_BINDINGS.write();
-    guard.retain(|b| b.netns_id != netns_id || b.socket.as_ptr() != socket.as_ptr());
-    guard.retain(|b| b.socket.strong_count() > 0);
-}
-
-pub fn deliver_unicast_loopback(
-    netns: &Arc<NetNamespace>,
-    dest: IpEndpoint,
-    src: IpEndpoint,
-    ifindex: i32,
-    payload: &[u8],
-) -> usize {
-    let candidates = match_udp_bindings(netns, dest.addr, dest.port);
-    if candidates.is_empty() {
-        return 0;
-    }
-
-    let chosen = if candidates.iter().any(|c| c.reuseport) {
-        choose_reuseport_socket(&candidates, dest, src)
-    } else {
-        choose_recent_socket(&candidates)
-    };
-
-    if let Some(sock) = chosen {
-        if sock.inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload) {
-            return 1;
+impl Default for UdpBindingTable {
+    fn default() -> Self {
+        Self {
+            bindings: Mutex::new(HashMap::new()),
+            next_ephemeral: AtomicU16::new(0),
+            bind_seq: AtomicU64::new(1),
         }
     }
-    0
 }
 
-pub fn deliver_multicast_all(
-    netns: &Arc<NetNamespace>,
-    dest: IpEndpoint,
-    src: IpEndpoint,
-    ifindex: i32,
-    payload: &[u8],
-) -> usize {
-    let candidates = match_udp_bindings(netns, dest.addr, dest.port);
-    if candidates.is_empty() {
-        return 0;
+impl UdpBindingTable {
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind(
+        &self,
+        socket: Weak<UdpSocket>,
+        addr: IpAddress,
+        port: u16,
+        reuseaddr: bool,
+        reuseport: bool,
+        bind_id: usize,
+        prospective_ifindex: usize,
+    ) -> Result<(), SystemError> {
+        if port == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let mut bindings = self.bindings.lock();
+        let bucket = bindings.entry(port).or_default();
+        Self::cleanup_bucket(bucket);
+        if Self::conflicts(
+            bucket,
+            addr,
+            reuseaddr,
+            reuseport,
+            prospective_ifindex,
+            bind_id,
+        ) {
+            return Err(SystemError::EADDRINUSE);
+        }
+        bucket.push(UdpBinding {
+            socket,
+            addr,
+            reuseport,
+            bind_id,
+            bound_seq: self.bind_seq.fetch_add(1, Ordering::Relaxed),
+        });
+        Ok(())
     }
-    let multiaddr = match dest.addr {
-        IpAddress::Ipv4(addr) => {
-            let octets = addr.octets();
-            u32::from_ne_bytes(octets)
-        }
-        _ => return 0,
-    };
-    let mut delivered = 0;
-    for cand in candidates {
-        let multicast_all = cand.socket.ip_multicast_all.load(Ordering::Relaxed);
-        if !multicast_all
-            && !cand
-                .socket
-                .has_ipv4_multicast_membership(multiaddr, ifindex)
-        {
-            continue;
-        }
-        if cand
-            .socket
-            .inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
-        {
-            delivered += 1;
-        }
-    }
-    delivered
-}
 
-pub fn deliver_broadcast_all(
-    netns: &Arc<NetNamespace>,
-    dest: IpEndpoint,
-    src: IpEndpoint,
-    ifindex: i32,
-    payload: &[u8],
-) -> usize {
-    let candidates = match_udp_bindings(netns, dest.addr, dest.port);
-    if candidates.is_empty() {
-        return 0;
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_ephemeral(
+        &self,
+        socket: Weak<UdpSocket>,
+        addr: IpAddress,
+        reuseaddr: bool,
+        reuseport: bool,
+        bind_id: usize,
+        prospective_ifindex: usize,
+        range: (u16, u16),
+    ) -> Result<u16, SystemError> {
+        let (min, max) = range;
+        if min == 0 || max == 0 || min > max {
+            return Err(SystemError::EINVAL);
+        }
+        let count = (max - min) as u32 + 1;
+        let current = self.next_ephemeral.load(Ordering::Relaxed);
+        if current < min || current > max {
+            self.next_ephemeral
+                .store(min + (rand() % count as usize) as u16, Ordering::Relaxed);
+        }
+
+        let mut bindings = self.bindings.lock();
+        for _ in 0..count {
+            let old = self
+                .next_ephemeral
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+                    let cur = if cur < min || cur > max { min } else { cur };
+                    Some(if cur >= max { min } else { cur + 1 })
+                })
+                .unwrap_or_else(|cur| cur);
+            let port = if old < min || old >= max {
+                min
+            } else {
+                old + 1
+            };
+            let bucket = bindings.entry(port).or_default();
+            Self::cleanup_bucket(bucket);
+            if Self::conflicts(
+                bucket,
+                addr,
+                reuseaddr,
+                reuseport,
+                prospective_ifindex,
+                bind_id,
+            ) {
+                continue;
+            }
+            bucket.push(UdpBinding {
+                socket,
+                addr,
+                reuseport,
+                bind_id,
+                bound_seq: self.bind_seq.fetch_add(1, Ordering::Relaxed),
+            });
+            return Ok(port);
+        }
+        Err(SystemError::EADDRINUSE)
     }
-    let mut delivered = 0;
-    for cand in candidates {
-        if cand
-            .socket
-            .inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
-        {
-            delivered += 1;
+
+    pub fn unbind(&self, port: u16, bind_id: usize) {
+        let mut bindings = self.bindings.lock();
+        let remove_bucket = if let Some(bucket) = bindings.get_mut(&port) {
+            bucket
+                .retain(|binding| binding.bind_id != bind_id && binding.socket.strong_count() > 0);
+            bucket.is_empty()
+        } else {
+            false
+        };
+        if remove_bucket {
+            bindings.remove(&port);
         }
     }
-    delivered
-}
 
-fn match_udp_bindings(
-    netns: &Arc<NetNamespace>,
-    dest_addr: IpAddress,
-    dest_port: u16,
-) -> Vec<UdpBindingMatch> {
-    let netns_id = netns.ns_common().nsid.data();
-    let mut guard = UDP_BINDINGS.write();
-    guard.retain(|b| b.socket.strong_count() > 0);
-    guard
-        .iter()
-        .filter(|b| b.netns_id == netns_id)
-        .filter(|b| b.port == dest_port)
-        .filter(|b| udp_addr_match(b.addr, dest_addr))
-        .filter_map(|b| {
-            b.socket.upgrade().map(|sock| UdpBindingMatch {
-                socket: sock,
-                reuseport: b.reuseport,
-                bound_seq: b.bound_seq,
+    pub fn deliver_unicast(
+        &self,
+        dest: IpEndpoint,
+        src: IpEndpoint,
+        ifindex: i32,
+        payload: &[u8],
+    ) -> usize {
+        let candidates = self.match_bindings(dest.addr, dest.port, ifindex);
+        let chosen = if candidates.iter().any(|candidate| candidate.reuseport) {
+            choose_reuseport_socket(&candidates, dest, src)
+        } else {
+            choose_recent_socket(&candidates)
+        };
+        chosen
+            .filter(|socket| {
+                socket.inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
             })
+            .map_or(0, |_| 1)
+    }
+
+    pub fn deliver_multicast(
+        &self,
+        dest: IpEndpoint,
+        src: IpEndpoint,
+        ifindex: i32,
+        payload: &[u8],
+    ) -> usize {
+        let candidates = self.match_bindings(dest.addr, dest.port, ifindex);
+        let multiaddr = match dest.addr {
+            IpAddress::Ipv4(addr) => u32::from_ne_bytes(addr.octets()),
+            _ => return 0,
+        };
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.socket.ip_multicast_all.load(Ordering::Relaxed)
+                    || candidate
+                        .socket
+                        .has_ipv4_multicast_membership(multiaddr, ifindex)
+            })
+            .filter(|candidate| {
+                candidate
+                    .socket
+                    .inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
+            })
+            .count()
+    }
+
+    pub fn deliver_broadcast(
+        &self,
+        dest: IpEndpoint,
+        src: IpEndpoint,
+        ifindex: i32,
+        payload: &[u8],
+    ) -> usize {
+        self.match_bindings(dest.addr, dest.port, ifindex)
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .socket
+                    .inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
+            })
+            .count()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conflicts(
+        bindings: &[UdpBinding],
+        addr: IpAddress,
+        reuseaddr: bool,
+        reuseport: bool,
+        prospective_ifindex: usize,
+        bind_id: usize,
+    ) -> bool {
+        bindings.iter().any(|binding| {
+            if binding.bind_id == bind_id || !udp_addrs_conflict(binding.addr, addr) {
+                return false;
+            }
+            let Some(socket) = binding.socket.upgrade() else {
+                return false;
+            };
+            let existing_ifindex = socket.bound_device_ifindex();
+            if existing_ifindex != 0
+                && prospective_ifindex != 0
+                && existing_ifindex != prospective_ifindex
+            {
+                return false;
+            }
+            let (existing_reuseaddr, _) = socket.reuse_options();
+            !((reuseport && binding.reuseport) || (reuseaddr && existing_reuseaddr))
         })
-        .collect()
+    }
+
+    fn match_bindings(
+        &self,
+        dest_addr: IpAddress,
+        dest_port: u16,
+        ingress_ifindex: i32,
+    ) -> Vec<UdpBindingMatch> {
+        let mut bindings = self.bindings.lock();
+        let Some(bucket) = bindings.get_mut(&dest_port) else {
+            return Vec::new();
+        };
+        Self::cleanup_bucket(bucket);
+        bucket
+            .iter()
+            .filter(|binding| udp_addr_match(binding.addr, dest_addr))
+            .filter_map(|binding| {
+                let socket = binding.socket.upgrade()?;
+                if ingress_ifindex <= 0 || !socket.device_binding_allows(ingress_ifindex as usize) {
+                    return None;
+                }
+                Some(UdpBindingMatch {
+                    socket,
+                    reuseport: binding.reuseport,
+                    bound_seq: binding.bound_seq,
+                })
+            })
+            .collect()
+    }
+
+    fn cleanup_bucket(bindings: &mut Vec<UdpBinding>) {
+        bindings.retain(|binding| binding.socket.strong_count() > 0);
+    }
+}
+
+#[inline]
+fn udp_addrs_conflict(a: IpAddress, b: IpAddress) -> bool {
+    a.version() == b.version() && (a.is_unspecified() || b.is_unspecified() || a == b)
 }
 
 #[inline]
@@ -178,20 +300,17 @@ fn udp_addr_match(bound_addr: IpAddress, dest_addr: IpAddress) -> bool {
     if bound_addr.version() != dest_addr.version() {
         return false;
     }
-    if bound_addr.is_unspecified() {
-        return true;
-    }
-    if dest_addr.is_multicast() || dest_addr.is_broadcast() {
-        return true;
-    }
-    bound_addr == dest_addr
+    bound_addr.is_unspecified()
+        || dest_addr.is_multicast()
+        || dest_addr.is_broadcast()
+        || bound_addr == dest_addr
 }
 
 fn choose_recent_socket(candidates: &[UdpBindingMatch]) -> Option<Arc<UdpSocket>> {
     candidates
         .iter()
-        .max_by_key(|c| c.bound_seq)
-        .map(|c| c.socket.clone())
+        .max_by_key(|candidate| candidate.bound_seq)
+        .map(|candidate| candidate.socket.clone())
 }
 
 fn choose_reuseport_socket(
@@ -199,14 +318,17 @@ fn choose_reuseport_socket(
     dest: IpEndpoint,
     src: IpEndpoint,
 ) -> Option<Arc<UdpSocket>> {
-    let reuseport: Vec<&UdpBindingMatch> = candidates.iter().filter(|c| c.reuseport).collect();
+    let reuseport: Vec<&UdpBindingMatch> = candidates
+        .iter()
+        .filter(|candidate| candidate.reuseport)
+        .collect();
     if reuseport.is_empty() {
         return None;
     }
-
-    let hash = udp_4tuple_hash(dest, src);
-    let idx = (hash as usize) % reuseport.len();
-    reuseport.get(idx).map(|c| c.socket.clone())
+    let index = (udp_4tuple_hash(dest, src) as usize) % reuseport.len();
+    reuseport
+        .get(index)
+        .map(|candidate| candidate.socket.clone())
 }
 
 fn udp_4tuple_hash(dest: IpEndpoint, src: IpEndpoint) -> u32 {
@@ -214,25 +336,23 @@ fn udp_4tuple_hash(dest: IpEndpoint, src: IpEndpoint) -> u32 {
     let dst_port = dest.port as u32;
     match (dest.addr, src.addr) {
         (IpAddress::Ipv4(dst), IpAddress::Ipv4(src)) => {
-            let data = [src.to_bits(), dst.to_bits(), src_port, dst_port];
-            jhash2(&data, 0)
+            jhash2(&[src.to_bits(), dst.to_bits(), src_port, dst_port], 0)
         }
         (IpAddress::Ipv6(dst), IpAddress::Ipv6(src)) => {
-            let src_oct = src.octets();
-            let dst_oct = dst.octets();
-            let data = [
-                u32::from_be_bytes([src_oct[0], src_oct[1], src_oct[2], src_oct[3]]),
-                u32::from_be_bytes([src_oct[4], src_oct[5], src_oct[6], src_oct[7]]),
-                u32::from_be_bytes([dst_oct[0], dst_oct[1], dst_oct[2], dst_oct[3]]),
-                u32::from_be_bytes([dst_oct[4], dst_oct[5], dst_oct[6], dst_oct[7]]),
-                src_port,
-                dst_port,
-            ];
-            jhash2(&data, 0)
+            let src_octets = src.octets();
+            let dst_octets = dst.octets();
+            jhash2(
+                &[
+                    u32::from_be_bytes(src_octets[0..4].try_into().unwrap()),
+                    u32::from_be_bytes(src_octets[4..8].try_into().unwrap()),
+                    u32::from_be_bytes(dst_octets[0..4].try_into().unwrap()),
+                    u32::from_be_bytes(dst_octets[4..8].try_into().unwrap()),
+                    src_port,
+                    dst_port,
+                ],
+                0,
+            )
         }
-        _ => {
-            let data = [src_port, dst_port, 0, 0];
-            jhash2(&data, 0)
-        }
+        _ => jhash2(&[src_port, dst_port, 0, 0], 0),
     }
 }

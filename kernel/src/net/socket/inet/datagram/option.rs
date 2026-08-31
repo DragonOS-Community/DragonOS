@@ -112,6 +112,10 @@ impl UdpSocket {
                 self.so_reuseaddr.store(v != 0, Ordering::Relaxed);
                 Ok(())
             }
+            PSO::BINDTODEVICE => {
+                let mut update = self.device_binding.prepare_update(&self.netns, val)?;
+                self.apply_device_binding(&mut update)
+            }
             PSO::BROADCAST => {
                 if val.len() < core::mem::size_of::<i32>() {
                     return Err(SystemError::EINVAL);
@@ -229,6 +233,7 @@ impl UdpSocket {
                 value,
                 self.so_reuseaddr.load(Ordering::Relaxed) as i32,
             )),
+            PSO::BINDTODEVICE => self.device_binding.get(&self.netns, value),
             PSO::BROADCAST => Ok(write_i32_getsockopt(
                 value,
                 self.so_broadcast.load(Ordering::Relaxed) as i32,
@@ -325,12 +330,32 @@ impl UdpSocket {
                 self.ip_multicast_all.store(on, Ordering::Relaxed);
                 Ok(())
             }
-            IpOption::MULTICAST_IF => apply_ipv4_multicast_if(
-                &self.netns,
-                val,
-                &self.ip_multicast_ifindex,
-                &self.ip_multicast_addr,
-            ),
+            IpOption::MULTICAST_IF => {
+                // Keep validation and the two-field configuration publish
+                // atomic with respect to send-side interface selection.
+                let _placement = self.iface_placement.write();
+                use crate::net::socket::inet::common::multicast::{
+                    find_iface_by_ifindex, find_iface_by_ipv4, parse_mreqn_for_multicast_if,
+                };
+                let (addr, index) = parse_mreqn_for_multicast_if(val)?;
+                let selected = if index != 0 {
+                    find_iface_by_ifindex(&self.netns, index)
+                } else if addr != 0 {
+                    find_iface_by_ipv4(&self.netns, addr)
+                } else {
+                    None
+                };
+                let bound = self.bound_device_ifindex();
+                if bound != 0 && selected.is_some_and(|iface| iface.nic_id() != bound) {
+                    return Err(SystemError::EINVAL);
+                }
+                apply_ipv4_multicast_if(
+                    &self.netns,
+                    val,
+                    &self.ip_multicast_ifindex,
+                    &self.ip_multicast_addr,
+                )
+            }
             IpOption::PKTINFO => {
                 if val.len() < core::mem::size_of::<i32>() {
                     return Err(SystemError::EINVAL);

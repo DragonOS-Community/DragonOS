@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use smoltcp;
 use system_error::SystemError;
@@ -8,6 +8,8 @@ use crate::{
     process::namespace::net_namespace::NetNamespace,
 };
 
+use super::UdpSocket;
+
 pub type SmolUdpSocket = smoltcp::socket::udp::Socket<'static>;
 
 pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
@@ -16,6 +18,15 @@ pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024; // 128 KB
 pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024; // 128 KB
                                                    // Minimum buffer size (Linux uses 256 bytes minimum)
+
+pub struct UdpBindContext {
+    pub netns: Arc<NetNamespace>,
+    pub socket: Weak<UdpSocket>,
+    pub reuseaddr: bool,
+    pub reuseport: bool,
+    pub bind_id: usize,
+    pub bound_ifindex: usize,
+}
 
 #[derive(Debug)]
 pub struct UnboundUdp {
@@ -80,32 +91,48 @@ impl UnboundUdp {
     pub fn bind(
         self,
         local_endpoint: smoltcp::wire::IpEndpoint,
-        netns: Arc<NetNamespace>,
-        reuseaddr: bool,
-        reuseport: bool,
-        bind_id: usize,
+        context: UdpBindContext,
     ) -> Result<BoundUdp, SystemError> {
-        let inner = BoundInner::bind(self.socket, &local_endpoint.addr, netns)?;
+        let UdpBindContext {
+            netns,
+            socket,
+            reuseaddr,
+            reuseport,
+            bind_id,
+            bound_ifindex,
+        } = context;
+        let inner = BoundInner::bind(self.socket, &local_endpoint.addr, netns.clone())?;
         let bind_addr = local_endpoint.addr;
-        let bind_port = if local_endpoint.port == 0 {
-            let port = inner
-                .port_manager()
-                .bind_udp_ephemeral_port(bind_addr, reuseaddr, reuseport, bind_id)?;
-            // log::debug!("UnboundUdp::bind: allocated ephemeral port {}", port);
-            port
-        } else {
-            inner.port_manager().bind_udp_port(
-                local_endpoint.port,
+        let bind_port_result = if local_endpoint.port == 0 {
+            netns.udp_bindings().bind_ephemeral(
+                socket,
                 bind_addr,
                 reuseaddr,
                 reuseport,
                 bind_id,
-            )?;
-            // log::debug!(
-            //     "UnboundUdp::bind: explicit bind to port {}",
-            //     local_endpoint.port
-            // );
-            local_endpoint.port
+                bound_ifindex,
+                netns.local_port_range(),
+            )
+        } else {
+            netns
+                .udp_bindings()
+                .bind(
+                    socket,
+                    bind_addr,
+                    local_endpoint.port,
+                    reuseaddr,
+                    reuseport,
+                    bind_id,
+                    bound_ifindex,
+                )
+                .map(|()| local_endpoint.port)
+        };
+        let bind_port = match bind_port_result {
+            Ok(port) => port,
+            Err(err) => {
+                inner.release();
+                return Err(err);
+            }
         };
 
         if bind_addr.is_unspecified() {
@@ -113,7 +140,8 @@ impl UnboundUdp {
                 .with_mut::<smoltcp::socket::udp::Socket, _, _>(|socket| socket.bind(bind_port))
                 .is_err()
             {
-                inner.port_manager().unbind_udp_port(bind_port, bind_id);
+                netns.udp_bindings().unbind(bind_port, bind_id);
+                inner.release();
                 return Err(SystemError::EINVAL);
             }
         } else if inner
@@ -122,33 +150,113 @@ impl UnboundUdp {
             })
             .is_err()
         {
-            inner.port_manager().unbind_udp_port(bind_port, bind_id);
+            netns.udp_bindings().unbind(bind_port, bind_id);
+            inner.release();
             return Err(SystemError::EINVAL);
         }
-        let port_mgr_ifindex = inner.iface().nic_id();
         Ok(BoundUdp {
             inner,
             remote: Mutex::new(None),
             explicitly_bound: true,
             has_preconnect_data: Mutex::new(false),
+        })
+    }
+
+    pub fn bind_on_iface(
+        self,
+        iface: Arc<dyn Iface>,
+        local_endpoint: smoltcp::wire::IpEndpoint,
+        context: UdpBindContext,
+    ) -> Result<BoundUdp, SystemError> {
+        let UdpBindContext {
+            netns,
+            socket,
+            reuseaddr,
+            reuseport,
             bind_id,
-            port_mgr_ifindex,
+            bound_ifindex,
+        } = context;
+        let inner = BoundInner::bind_on_iface(self.socket, iface, netns.clone())?;
+        let bind_addr = local_endpoint.addr;
+        let bind_port_result = if local_endpoint.port == 0 {
+            netns.udp_bindings().bind_ephemeral(
+                socket,
+                bind_addr,
+                reuseaddr,
+                reuseport,
+                bind_id,
+                bound_ifindex,
+                netns.local_port_range(),
+            )
+        } else {
+            netns
+                .udp_bindings()
+                .bind(
+                    socket,
+                    bind_addr,
+                    local_endpoint.port,
+                    reuseaddr,
+                    reuseport,
+                    bind_id,
+                    bound_ifindex,
+                )
+                .map(|()| local_endpoint.port)
+        };
+        let bind_port = match bind_port_result {
+            Ok(port) => port,
+            Err(err) => {
+                inner.release();
+                return Err(err);
+            }
+        };
+
+        let endpoint = if bind_addr.is_unspecified() {
+            smoltcp::wire::IpListenEndpoint::from(bind_port)
+        } else {
+            smoltcp::wire::IpListenEndpoint::from(smoltcp::wire::IpEndpoint::new(
+                bind_addr, bind_port,
+            ))
+        };
+        if inner
+            .with_mut::<SmolUdpSocket, _, _>(|socket| socket.bind(endpoint))
+            .is_err()
+        {
+            netns.udp_bindings().unbind(bind_port, bind_id);
+            inner.release();
+            return Err(SystemError::EINVAL);
+        }
+
+        Ok(BoundUdp {
+            inner,
+            remote: Mutex::new(None),
+            explicitly_bound: true,
+            has_preconnect_data: Mutex::new(false),
         })
     }
 
     pub fn bind_ephemeral(
         self,
         remote: smoltcp::wire::IpAddress,
-        netns: Arc<NetNamespace>,
-        reuseaddr: bool,
-        reuseport: bool,
-        bind_id: usize,
+        context: UdpBindContext,
     ) -> Result<BoundUdp, SystemError> {
-        let (inner, local_addr) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
-        let bound_port = match inner
-            .port_manager()
-            .bind_udp_ephemeral_port(local_addr, reuseaddr, reuseport, bind_id)
-        {
+        let UdpBindContext {
+            netns,
+            socket,
+            reuseaddr,
+            reuseport,
+            bind_id,
+            bound_ifindex,
+        } = context;
+        let (inner, local_addr) = BoundInner::bind_ephemeral(self.socket, remote, netns.clone())?;
+        let bound_port = match netns.udp_bindings().bind_ephemeral(
+            socket,
+            local_addr,
+            reuseaddr,
+            reuseport,
+            bind_id,
+            bound_ifindex,
+            netns.local_port_range(),
+        ) {
             Ok(port) => port,
             Err(e) => {
                 inner.release();
@@ -167,7 +275,7 @@ impl UnboundUdp {
                 .with_mut::<smoltcp::socket::udp::Socket, _, _>(|socket| socket.bind(bound_port))
                 .is_err()
             {
-                inner.port_manager().unbind_udp_port(bound_port, bind_id);
+                netns.udp_bindings().unbind(bound_port, bind_id);
                 inner.release();
                 return Err(SystemError::EINVAL);
             }
@@ -177,19 +285,16 @@ impl UnboundUdp {
             })
             .is_err()
         {
-            inner.port_manager().unbind_udp_port(bound_port, bind_id);
+            netns.udp_bindings().unbind(bound_port, bind_id);
             inner.release();
             return Err(SystemError::EINVAL);
         }
 
-        let port_mgr_ifindex = inner.iface().nic_id();
         Ok(BoundUdp {
             inner,
             remote: Mutex::new(None),
             explicitly_bound: false,
             has_preconnect_data: Mutex::new(false),
-            bind_id,
-            port_mgr_ifindex,
         })
     }
 
@@ -197,16 +302,26 @@ impl UnboundUdp {
         self,
         iface: Arc<dyn Iface>,
         local_addr: smoltcp::wire::IpAddress,
-        netns: Arc<NetNamespace>,
-        reuseaddr: bool,
-        reuseport: bool,
-        bind_id: usize,
+        context: UdpBindContext,
     ) -> Result<BoundUdp, SystemError> {
-        let inner = BoundInner::bind_on_iface(self.socket, iface, netns)?;
-        let bound_port = match inner
-            .port_manager()
-            .bind_udp_ephemeral_port(local_addr, reuseaddr, reuseport, bind_id)
-        {
+        let UdpBindContext {
+            netns,
+            socket,
+            reuseaddr,
+            reuseport,
+            bind_id,
+            bound_ifindex,
+        } = context;
+        let inner = BoundInner::bind_on_iface(self.socket, iface, netns.clone())?;
+        let bound_port = match netns.udp_bindings().bind_ephemeral(
+            socket,
+            local_addr,
+            reuseaddr,
+            reuseport,
+            bind_id,
+            bound_ifindex,
+            netns.local_port_range(),
+        ) {
             Ok(port) => port,
             Err(e) => {
                 inner.release();
@@ -220,19 +335,16 @@ impl UnboundUdp {
             })
             .is_err()
         {
-            inner.port_manager().unbind_udp_port(bound_port, bind_id);
+            netns.udp_bindings().unbind(bound_port, bind_id);
             inner.release();
             return Err(SystemError::EINVAL);
         }
 
-        let port_mgr_ifindex = inner.iface().nic_id();
         Ok(BoundUdp {
             inner,
             remote: Mutex::new(None),
             explicitly_bound: false,
             has_preconnect_data: Mutex::new(false),
-            bind_id,
-            port_mgr_ifindex,
         })
     }
 }
@@ -248,11 +360,12 @@ pub struct BoundUdp {
     /// udp socket queue 中，而不是先针对connect进行filter操作。这里做workaround, 当connect是检查是否有包
     /// 在缓冲区，如果有，第一个包我们走非connect而不是connect的recv方法（即接受第一个非connect对端对应的包）
     has_preconnect_data: Mutex<bool>,
-    bind_id: usize,
-    port_mgr_ifindex: usize,
 }
 
 impl BoundUdp {
+    pub fn set_explicitly_bound(&mut self, explicitly_bound: bool) {
+        self.explicitly_bound = explicitly_bound;
+    }
     pub fn with_mut_socket<F, T>(&self, f: F) -> T
     where
         F: FnMut(&mut SmolUdpSocket) -> T,
@@ -729,17 +842,10 @@ impl BoundUdp {
     }
 
     pub fn close(&self) {
-        let netns = self.inner.netns();
-        crate::net::socket::inet::common::multicast::find_iface_by_ifindex(
-            &netns,
-            self.port_mgr_ifindex as i32,
-        )
-        .unwrap_or_else(|| self.inner.iface().clone())
-        .port_manager()
-        .unbind_udp_port(self.endpoint().port, self.bind_id);
         self.with_mut_socket(|socket| {
             socket.close();
         });
+        self.inner.release();
     }
 }
 

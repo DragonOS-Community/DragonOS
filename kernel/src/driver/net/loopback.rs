@@ -13,7 +13,7 @@ use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::net::generate_iface_id;
+use crate::net::LOOPBACK_IFINDEX;
 use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use crate::time::Instant;
 use alloc::collections::VecDeque;
@@ -319,7 +319,7 @@ impl LoopbackInterface {
     pub const DEVICE_NAME: &str = "lo";
 
     /// ## `new` 是一个公共函数，用于创建一个新的 `LoopbackInterface` 实例。
-    /// 生成一个新的接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
+    /// 使用 Linux 约定的 loopback 接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
     /// 设置接口的 IP 地址为 127.0.0.1。
     /// Saves a cloneable driver handle; the underlying queue and the interface
     /// back-reference are protected by a shared lock.
@@ -330,7 +330,7 @@ impl LoopbackInterface {
     /// ## 返回值
     /// 返回一个 `Arc<Self>`，即一个指向新创建的 `LoopbackInterface` 实例的智能指针。
     pub fn new(driver: LoopbackDriver) -> Arc<Self> {
-        Self::new_with_ifindex(driver, generate_iface_id())
+        Self::new_with_ifindex(driver, LOOPBACK_IFINDEX)
     }
 
     /// 在指定网络命名空间中创建 loopback，使用给定的 per-netns ifindex（Linux 新 netns 中 lo 通常为 1）。

@@ -16,8 +16,11 @@ pub mod syscall;
 pub mod tcp_close_defer;
 pub mod tcp_listener_backlog;
 
+/// Linux reserves interface index 1 for the loopback device in every netns.
+pub const LOOPBACK_IFINDEX: usize = 1;
+
 /// 生成网络接口的id (全局自增)
 pub fn generate_iface_id() -> usize {
-    static IFACE_ID: AtomicUsize = AtomicUsize::new(1);
+    static IFACE_ID: AtomicUsize = AtomicUsize::new(LOOPBACK_IFINDEX + 1);
     return IFACE_ID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 }

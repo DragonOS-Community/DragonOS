@@ -494,7 +494,7 @@ impl NetNamespace {
         let counter = get_next_netns_counter();
         let loopback = crate::driver::net::loopback::LoopbackInterface::new_with_ifindex(
             crate::driver::net::loopback::LoopbackDriver::default(),
-            1,
+            crate::net::LOOPBACK_IFINDEX,
         );
 
         let inner = InnerNetNamespace {

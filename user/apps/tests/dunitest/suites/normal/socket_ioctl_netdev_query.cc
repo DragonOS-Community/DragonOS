@@ -99,7 +99,7 @@ TEST(SocketIoctlNetdevQuery, LoopbackFieldsAndUnionWidths) {
     struct ifreq ifr {};
     InitIfreq(&ifr, "lo");
     ASSERT_EQ(ioctl(fd.get(), SIOCGIFINDEX, &ifr), 0) << strerror(errno);
-    EXPECT_GT(ifr.ifr_ifindex, 0);
+    EXPECT_EQ(ifr.ifr_ifindex, 1);
     ExpectSentinelFrom(ifr, sizeof(int));
 
     InitIfreq(&ifr, "lo");

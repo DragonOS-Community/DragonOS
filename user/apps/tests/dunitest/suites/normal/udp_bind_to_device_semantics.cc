@@ -31,6 +31,20 @@ void BindToLoopback(int fd) {
             << strerror(errno);
 }
 
+std::string FindNonLoopbackInterface() {
+    std::string name;
+    struct if_nameindex* interfaces = if_nameindex();
+    if (interfaces == nullptr) return name;
+    for (struct if_nameindex* current = interfaces; current->if_index != 0; ++current) {
+        if (strcmp(current->if_name, "lo") != 0) {
+            name = current->if_name;
+            break;
+        }
+    }
+    if_freenameindex(interfaces);
+    return name;
+}
+
 }  // namespace
 
 TEST(UdpBindToDevice, UnboundGetsockoptHasZeroLengthAndDoesNotWrite) {
@@ -107,17 +121,49 @@ TEST(UdpBindToDevice, LoopbackDatagramUsesBoundInterface) {
     EXPECT_EQ(memcmp(received, payload, sizeof(payload)), 0);
 }
 
+TEST(UdpBindToDevice, WildcardLocalSendSelectsInterfaceSourceAddress) {
+    FdGuard receiver(socket(AF_INET, SOCK_DGRAM, 0));
+    FdGuard sender(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.Get(), 0);
+    ASSERT_GE(sender.Get(), 0);
+
+    sockaddr_in receiver_address = {};
+    receiver_address.sin_family = AF_INET;
+    receiver_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&receiver_address),
+                   sizeof(receiver_address)),
+              0)
+            << strerror(errno);
+    socklen_t receiver_address_len = sizeof(receiver_address);
+    ASSERT_EQ(getsockname(receiver.Get(), reinterpret_cast<sockaddr*>(&receiver_address),
+                          &receiver_address_len),
+              0);
+
+    sockaddr_in wildcard = {};
+    wildcard.sin_family = AF_INET;
+    wildcard.sin_addr.s_addr = htonl(INADDR_ANY);
+    ASSERT_EQ(bind(sender.Get(), reinterpret_cast<sockaddr*>(&wildcard), sizeof(wildcard)), 0)
+            << strerror(errno);
+
+    const char payload[] = "wildcard-source";
+    ASSERT_EQ(sendto(sender.Get(), payload, sizeof(payload), 0,
+                     reinterpret_cast<sockaddr*>(&receiver_address), sizeof(receiver_address)),
+              static_cast<ssize_t>(sizeof(payload)))
+            << strerror(errno);
+
+    char received[sizeof(payload)] = {};
+    sockaddr_in peer = {};
+    socklen_t peer_len = sizeof(peer);
+    ASSERT_EQ(recvfrom(receiver.Get(), received, sizeof(received), 0,
+                       reinterpret_cast<sockaddr*>(&peer), &peer_len),
+              static_cast<ssize_t>(sizeof(payload)))
+            << strerror(errno);
+    EXPECT_EQ(peer.sin_addr.s_addr, htonl(INADDR_LOOPBACK));
+    EXPECT_EQ(memcmp(received, payload, sizeof(payload)), 0);
+}
+
 TEST(UdpBindToDevice, PortConflictsIncludeTheBoundDeviceDimension) {
-    std::string non_loopback;
-    struct if_nameindex* interfaces = if_nameindex();
-    ASSERT_NE(interfaces, nullptr);
-    for (struct if_nameindex* current = interfaces; current->if_index != 0; ++current) {
-        if (strcmp(current->if_name, "lo") != 0) {
-            non_loopback = current->if_name;
-            break;
-        }
-    }
-    if_freenameindex(interfaces);
+    const std::string non_loopback = FindNonLoopbackInterface();
     if (non_loopback.empty()) GTEST_SKIP() << "no non-loopback interface";
 
     FdGuard loopback(socket(AF_INET, SOCK_DGRAM, 0));
@@ -144,6 +190,40 @@ TEST(UdpBindToDevice, PortConflictsIncludeTheBoundDeviceDimension) {
     errno = 0;
     EXPECT_EQ(bind(wildcard.Get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)), -1);
     EXPECT_EQ(errno, EADDRINUSE);
+}
+
+TEST(UdpBindToDevice, LocalFastPathDoesNotCrossBoundInterface) {
+    const std::string non_loopback = FindNonLoopbackInterface();
+    if (non_loopback.empty()) GTEST_SKIP() << "no non-loopback interface";
+
+    FdGuard receiver(socket(AF_INET, SOCK_DGRAM, 0));
+    FdGuard sender(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.Get(), 0);
+    ASSERT_GE(sender.Get(), 0);
+
+    ASSERT_EQ(setsockopt(sender.Get(), SOL_SOCKET, SO_BINDTODEVICE, non_loopback.c_str(),
+                         non_loopback.size() + 1),
+              0)
+            << strerror(errno);
+
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0)
+            << strerror(errno);
+    socklen_t address_len = sizeof(address);
+    ASSERT_EQ(getsockname(receiver.Get(), reinterpret_cast<sockaddr*>(&address), &address_len), 0);
+
+    const char payload[] = "wrong-interface";
+    ASSERT_EQ(sendto(sender.Get(), payload, sizeof(payload), 0,
+                     reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+              static_cast<ssize_t>(sizeof(payload)))
+            << strerror(errno);
+
+    char received[sizeof(payload)] = {};
+    errno = 0;
+    EXPECT_EQ(recv(receiver.Get(), received, sizeof(received), MSG_DONTWAIT), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
 }
 
 TEST(UdpBindToDevice, ReuseOptionsAreReadAtBindConflictTime) {

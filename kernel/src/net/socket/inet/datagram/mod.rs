@@ -28,10 +28,7 @@ use core::sync::atomic::{
 use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion, Ipv4Address};
 
 use super::{
-    common::{
-        ensure_bound_dual_stack_remote_compatible, loopback_iface_contains_v4, DeviceBindingUpdate,
-        SocketDeviceBinding,
-    },
+    common::{ensure_bound_dual_stack_remote_compatible, DeviceBindingUpdate, SocketDeviceBinding},
     InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6,
 };
 
@@ -717,6 +714,36 @@ impl UdpSocket {
         // unbound socket just drop (only need to free memory)
     }
 
+    fn disconnect_udp(&self) -> Result<(), SystemError> {
+        let mut inner_guard = self.inner.write();
+        let should_unbind = match inner_guard.as_ref() {
+            Some(UdpInner::Bound(bound)) => {
+                bound.disconnect();
+                bound.should_unbind_on_disconnect()
+            }
+            Some(UdpInner::Unbound(_)) => return Ok(()),
+            None => return Err(SystemError::EBADF),
+        };
+
+        if should_unbind {
+            let Some(UdpInner::Bound(bound)) = inner_guard.take() else {
+                unreachable!();
+            };
+            self.netns
+                .udp_bindings()
+                .unbind(bound.endpoint().port, self.bind_id());
+            multicast_loopback::multicast_registry().unregister_all(&self.self_ref);
+            bound
+                .inner()
+                .iface()
+                .common()
+                .unbind_socket(self.self_ref.upgrade().unwrap());
+            bound.close();
+            inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
+        }
+        Ok(())
+    }
+
     pub fn try_recv(
         &self,
         buf: &mut [u8],
@@ -996,6 +1023,24 @@ impl UdpSocket {
             .map(Self::normalize_unspecified_dest)
     }
 
+    fn local_send_source_endpoint(
+        &self,
+        local: IpListenEndpoint,
+        dest_addr: smoltcp::wire::IpAddress,
+        ifindex: Option<i32>,
+    ) -> IpEndpoint {
+        let local_addr = local
+            .addr
+            .filter(|addr| !addr.is_unspecified())
+            .or_else(|| {
+                let ifindex = usize::try_from(ifindex?).ok()?;
+                let iface = self.netns.device_list().get(&ifindex).cloned()?;
+                crate::net::socket::inet::common::pick_configured_source_addr(&iface, &dest_addr)
+            })
+            .unwrap_or_else(|| self.unspecified_addr());
+        IpEndpoint::new(local_addr, local.port)
+    }
+
     pub fn try_send(
         &self,
         buf: &[u8],
@@ -1008,7 +1053,7 @@ impl UdpSocket {
             }
         }
 
-        // Send data and get iface reference, then release lock before polling
+        // Send data and snapshot the delivery metadata before releasing inner.
         let (
             result,
             send_iface,
@@ -1016,7 +1061,8 @@ impl UdpSocket {
             dest_is_broadcast,
             loopback_send,
             send_iface_is_loopback,
-            mcast_ifindex,
+            local_delivery_ifindex,
+            src_endpoint,
             restore_iface,
         ) = {
             let mut inner_guard = self.inner.write();
@@ -1101,37 +1147,39 @@ impl UdpSocket {
                             .map(|lo| lo.nic_id() == bound_iface.nic_id())
                             .unwrap_or(false)
                     };
-                    let is_loopback = match dest.addr {
-                        Ipv4(v4) => v4.is_loopback(),
-                        Ipv6(v6) => v6.is_loopback(),
-                    };
-                    let is_loopback_local_subnet = match dest.addr {
-                        Ipv4(v4) => loopback_iface_contains_v4(&bound_iface, v4),
-                        Ipv6(_) => false,
-                    };
-                    let has_local_delivery_iface = !is_multicast
-                        && crate::net::socket::inet::common::get_iface_to_bind(
-                            &dest.addr,
-                            self.netns(),
-                        )
-                        .is_some();
                     let loopback_broadcast = self
                         .netns
                         .loopback_iface()
                         .map(|lo| lo.smol_iface().lock().inner.is_broadcast(&dest.addr))
                         .unwrap_or(false);
-                    let is_broadcast = loopback_broadcast
-                        || (send_iface_is_loopback
-                            && bound_iface
-                                .smol_iface()
-                                .lock()
-                                .inner
-                                .is_broadcast(&dest.addr));
-                    let should_loopback_send = has_local_delivery_iface
-                        || is_loopback
-                        || is_loopback_local_subnet
-                        || ((is_multicast || is_broadcast)
-                            && (send_iface_is_loopback || loopback_broadcast));
+                    let bound_iface_is_broadcast = bound_iface
+                        .smol_iface()
+                        .lock()
+                        .inner
+                        .is_broadcast(&dest.addr);
+                    let is_broadcast = loopback_broadcast || bound_iface_is_broadcast;
+                    let local_delivery_ifindex =
+                        if device_ifindex != 0 && (is_multicast || bound_iface_is_broadcast) {
+                            Some(device_ifindex)
+                        } else if is_multicast && mcast_ifindex != 0 {
+                            Some(mcast_ifindex)
+                        } else {
+                            crate::net::socket::inet::common::get_iface_to_bind(
+                                &dest.addr,
+                                self.netns(),
+                            )
+                            .map(|iface| iface.nic_id() as i32)
+                        };
+                    let binding_allows_local_delivery = local_delivery_ifindex
+                        .is_some_and(|ifindex| device_ifindex == 0 || device_ifindex == ifindex);
+                    let should_loopback_send = binding_allows_local_delivery
+                        && ((!is_multicast && local_delivery_ifindex.is_some())
+                            || (is_multicast && (send_iface_is_loopback || loopback_broadcast)));
+                    let src_endpoint = self.local_send_source_endpoint(
+                        bound.endpoint(),
+                        dest.addr,
+                        local_delivery_ifindex,
+                    );
                     if should_loopback_send {
                         let max_payload =
                             bound.with_socket(|socket| socket.payload_send_capacity());
@@ -1142,7 +1190,8 @@ impl UdpSocket {
                             is_broadcast,
                             true,
                             send_iface_is_loopback,
-                            mcast_ifindex,
+                            local_delivery_ifindex,
+                            src_endpoint,
                             None,
                         )
                     } else {
@@ -1171,32 +1220,19 @@ impl UdpSocket {
                             is_broadcast,
                             false,
                             send_iface_is_loopback,
-                            mcast_ifindex,
+                            local_delivery_ifindex,
+                            src_endpoint,
                             restore_iface,
                         )
                     }
                 }
                 _ => return Err(SystemError::ENOTCONN),
             }
-        }; // Lock released here
+        }; // `inner` is released here.
 
         if loopback_send {
             if let Some(dest) = dest {
-                let src_endpoint = match self.inner.read().as_ref() {
-                    Some(UdpInner::Bound(bound)) => {
-                        let local = bound.endpoint();
-                        let local_addr = local.addr.unwrap_or_else(|| self.unspecified_addr());
-                        IpEndpoint::new(local_addr, local.port)
-                    }
-                    _ => IpEndpoint::new(self.unspecified_addr(), 0),
-                };
-                let ifindex = if dest.addr.is_multicast() && mcast_ifindex != 0 {
-                    mcast_ifindex
-                } else {
-                    crate::net::socket::inet::common::get_iface_to_bind(&dest.addr, self.netns())
-                        .map(|iface| iface.nic_id() as i32)
-                        .unwrap_or_else(|| send_iface.nic_id() as i32)
-                };
+                let ifindex = local_delivery_ifindex.unwrap_or_else(|| send_iface.nic_id() as i32);
                 if dest.addr.is_multicast() {
                     if let Ipv4(addr) = dest.addr {
                         let octets = addr.octets();
@@ -1241,8 +1277,8 @@ impl UdpSocket {
             return result;
         }
 
-        // Poll AFTER releasing the lock to avoid deadlock
-        // when socket sends to itself on loopback
+        // Poll after releasing inner. This is required because polling notifies all
+        // sockets on the interface and may re-enter this socket's event checks.
         Self::poll_iface_until_quiescent(send_iface.as_ref());
 
         if let Some(orig_iface) = restore_iface {
@@ -1255,28 +1291,16 @@ impl UdpSocket {
         // Multicast loopback: if sending to a multicast address and loopback is enabled,
         // deliver the packet to all local sockets that have joined the group
         if result.is_ok() {
-            if let Some(dest) = dest.or_else(|| match self.inner.read().as_ref() {
-                Some(UdpInner::Bound(bound)) => bound.remote_endpoint().ok(),
-                _ => None,
-            }) {
+            if let Some(dest) = dest {
                 let allow_mcast_loop =
                     self.is_multicast_loopback_enabled() || send_iface_is_loopback;
                 if dest.addr.is_multicast() && allow_mcast_loop {
-                    // Get the source endpoint (this socket's local address)
-                    let src_endpoint = match self.inner.read().as_ref() {
-                        Some(UdpInner::Bound(bound)) => {
-                            let local = bound.endpoint();
-                            let local_addr = local.addr.unwrap_or_else(|| self.unspecified_addr());
-                            IpEndpoint::new(local_addr, local.port)
-                        }
-                        _ => IpEndpoint::new(self.unspecified_addr(), 0),
-                    };
-
                     // Get multicast address and interface index
                     if let Ipv4(addr) = dest.addr {
                         let octets = addr.octets();
                         let multiaddr = u32::from_ne_bytes(octets);
-                        let ifindex = self.get_multicast_ifindex();
+                        let ifindex =
+                            local_delivery_ifindex.unwrap_or_else(|| self.get_multicast_ifindex());
 
                         if multicast_loopback::multicast_registry().has_membership(
                             self.netns.ns_common().nsid.data(),
@@ -1486,37 +1510,7 @@ impl Socket for UdpSocket {
                 // Port 0 is treated as disconnect (like AF_UNSPEC)
                 // This matches Linux behavior where connect() to port 0 succeeds but disconnects the socket
                 if remote.port == 0 {
-                    // log::debug!("UDP connect: port 0 treated as disconnect");
-                    // Disconnect logic - same as AF_UNSPEC case
-                    let should_unbind = {
-                        match self.inner.read().as_ref() {
-                            Some(UdpInner::Bound(inner)) => {
-                                inner.disconnect();
-                                inner.should_unbind_on_disconnect()
-                            }
-                            Some(UdpInner::Unbound(_)) => return Ok(()), // Already disconnected
-                            None => return Err(SystemError::EBADF),
-                        }
-                    };
-
-                    if should_unbind {
-                        // Socket was implicitly bound by connect, unbind it
-                        let mut inner_guard = self.inner.write();
-                        if let Some(UdpInner::Bound(bound)) = inner_guard.take() {
-                            self.netns
-                                .udp_bindings()
-                                .unbind(bound.endpoint().port, self.bind_id());
-                            multicast_loopback::multicast_registry().unregister_all(&self.self_ref);
-                            bound
-                                .inner()
-                                .iface()
-                                .common()
-                                .unbind_socket(self.self_ref.upgrade().unwrap());
-                            bound.close();
-                            inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
-                        }
-                    }
-                    return Ok(());
+                    return self.disconnect_udp();
                 }
 
                 let remote = Self::normalize_unspecified_dest(remote);
@@ -1536,37 +1530,8 @@ impl Socket for UdpSocket {
                 }
             }
             Endpoint::Unspecified => {
-                // AF_UNSPEC: disconnect the UDP socket (clear remote endpoint)
-                // If socket was implicitly bound (by connect), unbind it
-                let should_unbind = {
-                    match self.inner.read().as_ref() {
-                        Some(UdpInner::Bound(inner)) => {
-                            inner.disconnect();
-                            inner.should_unbind_on_disconnect()
-                        }
-                        Some(UdpInner::Unbound(_)) => return Ok(()), // Already disconnected
-                        None => return Err(SystemError::EBADF),
-                    }
-                };
-
-                if should_unbind {
-                    // Socket was implicitly bound by connect, unbind it
-                    let mut inner_guard = self.inner.write();
-                    if let Some(UdpInner::Bound(bound)) = inner_guard.take() {
-                        self.netns
-                            .udp_bindings()
-                            .unbind(bound.endpoint().port, self.bind_id());
-                        multicast_loopback::multicast_registry().unregister_all(&self.self_ref);
-                        bound
-                            .inner()
-                            .iface()
-                            .common()
-                            .unbind_socket(self.self_ref.upgrade().unwrap());
-                        bound.close();
-                        inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
-                    }
-                }
-                Ok(())
+                // AF_UNSPEC disconnects and drops an implicit bind.
+                self.disconnect_udp()
             }
             _ => Err(SystemError::EAFNOSUPPORT),
         }

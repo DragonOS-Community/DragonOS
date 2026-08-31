@@ -7,6 +7,7 @@ use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::routing::Router;
+use crate::net::socket::inet::datagram::udp_bindings::UdpBindingTable;
 use crate::net::socket::netlink::table::{
     generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
 };
@@ -14,7 +15,6 @@ use crate::net::socket::packet::{
     membership_value, FanoutGroup, FanoutJoinParams, PacketIngressMetadata, PacketSocket,
 };
 use crate::net::socket::unix::ns::UnixAbstractTable;
-use crate::net::LOOPBACK_IFINDEX;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
 use crate::process::namespace::{nsproxy::NsProxy, NamespaceOps, NamespaceType};
@@ -88,6 +88,8 @@ pub struct NetNamespace {
     /// 注意：该结构会在 bind/connect 等路径被访问，且这些路径可能会获取可睡眠的 Mutex，
     /// 因此这里使用可睡眠的 `RwSem`，避免自旋锁 + schedule 的组合导致崩溃。
     device_list: RwSem<BTreeMap<usize, Arc<dyn Iface>>>,
+    /// Per-netns UDP port reservation and local-delivery table.
+    udp_bindings: UdpBindingTable,
     /// Lock-free read-side snapshot for AF_PACKET delivery from NAPI context.
     packet_sockets: RcuArcSlot<PacketSocketRegistrySnapshot>,
     /// Serializes all plain/fanout topology updates and owns group IDs.
@@ -469,6 +471,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            udp_bindings: UdpBindingTable::default(),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
@@ -491,7 +494,7 @@ impl NetNamespace {
         let counter = get_next_netns_counter();
         let loopback = crate::driver::net::loopback::LoopbackInterface::new_with_ifindex(
             crate::driver::net::loopback::LoopbackDriver::default(),
-            LOOPBACK_IFINDEX,
+            crate::net::LOOPBACK_IFINDEX,
         );
 
         let inner = InnerNetNamespace {
@@ -508,6 +511,7 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            udp_bindings: UdpBindingTable::default(),
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
@@ -553,6 +557,10 @@ impl NetNamespace {
 
     pub fn device_list(&self) -> RwSemReadGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
         self.device_list.read()
+    }
+
+    pub(crate) fn udp_bindings(&self) -> &UdpBindingTable {
+        &self.udp_bindings
     }
 
     pub fn register_packet_socket(&self, socket: Weak<PacketSocket>) -> Result<(), SystemError> {

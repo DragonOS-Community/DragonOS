@@ -13,6 +13,7 @@ use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
+use crate::net::socket::inet::common::SocketDeviceBinding;
 use crate::process::namespace::net_namespace::NetNamespace;
 
 use inner::RawInner;
@@ -69,6 +70,8 @@ pub struct RawSocket {
     self_ref: Weak<Self>,
     /// 网络命名空间
     netns: Arc<NetNamespace>,
+    /// SO_BINDTODEVICE authoritative interface index.
+    device_binding: SocketDeviceBinding,
     /// epoll 项
     epoll_items: EPollItems,
     /// fasync 项

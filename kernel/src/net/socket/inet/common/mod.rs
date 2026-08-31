@@ -5,6 +5,8 @@ use alloc::sync::Arc;
 
 pub mod port;
 pub use port::PortManager;
+mod device_binding;
+pub use device_binding::{DeviceBindingUpdate, SocketDeviceBinding};
 pub mod multicast;
 pub use multicast::{apply_ipv4_membership, apply_ipv4_multicast_if, Ipv4MulticastMembership};
 use system_error::SystemError;
@@ -164,13 +166,29 @@ impl BoundInner {
     }
 
     pub fn move_udp_to_iface(&mut self, iface: Arc<dyn Iface>) -> Result<(), SystemError> {
+        self.move_udp_to_iface_with(iface, || {})
+    }
+
+    /// Move a UDP socket between smoltcp interface socket sets. `detached` is
+    /// invoked after removal from the old set and before publication in the new
+    /// set, which gives callers one linearization point for related state.
+    pub fn move_udp_to_iface_with<F>(
+        &mut self,
+        iface: Arc<dyn Iface>,
+        detached: F,
+    ) -> Result<(), SystemError>
+    where
+        F: FnOnce(),
+    {
         if Arc::ptr_eq(&self.iface, &iface) {
+            detached();
             return Ok(());
         }
         let socket = self.iface.sockets().lock().remove(self.handle);
         let smoltcp::socket::Socket::Udp(socket) = socket else {
             return Err(SystemError::EINVAL);
         };
+        detached();
         let handle = iface.sockets().lock().add(socket);
         self.iface = iface;
         self.handle = handle;
@@ -245,7 +263,7 @@ pub fn normalize_unspecified_endpoint_to_loopback(
 }
 
 #[inline]
-fn get_iface_for_local_bind(
+pub(crate) fn get_iface_for_local_bind(
     ip_addr: &smoltcp::wire::IpAddress,
     netns: &Arc<NetNamespace>,
 ) -> Option<Arc<dyn Iface>> {
@@ -438,7 +456,7 @@ fn no_source_addr_error(remote_ip_addr: &smoltcp::wire::IpAddress) -> SystemErro
     }
 }
 
-fn pick_configured_source_addr(
+pub(crate) fn pick_configured_source_addr(
     iface: &Arc<dyn Iface>,
     remote_ip_addr: &smoltcp::wire::IpAddress,
 ) -> Option<smoltcp::wire::IpAddress> {
@@ -494,7 +512,7 @@ fn bind_addr_not_found_error(
 /// 1. Use the explicitly set default interface
 /// 2. Find an interface with a matching address family (IPv6 socket -> interface with IPv6 address)
 /// 3. Fall back to the first available interface
-fn select_iface_for_unspecified(
+pub(crate) fn select_iface_for_unspecified(
     address: &smoltcp::wire::IpAddress,
     netns: &Arc<NetNamespace>,
 ) -> Result<Arc<dyn Iface>, SystemError> {

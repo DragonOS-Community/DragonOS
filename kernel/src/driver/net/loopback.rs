@@ -318,8 +318,22 @@ impl Debug for LoopbackInterface {
 impl LoopbackInterface {
     pub const DEVICE_NAME: &str = "lo";
 
-    /// Create a loopback interface with the namespace-local ifindex supplied
-    /// by the caller. Linux reserves ifindex 1 for this device in every netns.
+    /// ## `new` 是一个公共函数，用于创建一个新的 `LoopbackInterface` 实例。
+    /// 使用 Linux 约定的 loopback 接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
+    /// 设置接口的 IP 地址为 127.0.0.1。
+    /// Saves a cloneable driver handle; the underlying queue and the interface
+    /// back-reference are protected by a shared lock.
+    /// 创建一个新的 `LoopbackInterface` 实例，包含驱动器、接口 ID、接口和名称，并将其封装在一个 `Arc` 中。
+    /// ## 参数
+    /// - `driver`：一个 `LoopbackDriver` 实例，用于驱动网络环回操作。
+    ///
+    /// ## 返回值
+    /// 返回一个 `Arc<Self>`，即一个指向新创建的 `LoopbackInterface` 实例的智能指针。
+    pub fn new(driver: LoopbackDriver) -> Arc<Self> {
+        Self::new_with_ifindex(driver, LOOPBACK_IFINDEX)
+    }
+
+    /// 在指定网络命名空间中创建 loopback，使用给定的 per-netns ifindex（Linux 新 netns 中 lo 通常为 1）。
     pub fn new_with_ifindex(mut driver: LoopbackDriver, ifindex: usize) -> Arc<Self> {
         use smoltcp::phy::Device;
 
@@ -628,9 +642,7 @@ impl Iface for LoopbackInterface {
 }
 
 pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
-    // Match Linux's per-netns invariant and avoid depending on the link-order
-    // of device initcalls that also allocate interface indices.
-    let iface = LoopbackInterface::new_with_ifindex(LoopbackDriver::default(), LOOPBACK_IFINDEX);
+    let iface = LoopbackInterface::new(LoopbackDriver::default());
     // 标识网络设备已经启动
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
 

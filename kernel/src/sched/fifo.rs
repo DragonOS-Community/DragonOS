@@ -2,7 +2,7 @@ use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 
 use crate::{process::ProcessControlBlock, sched::prio::MAX_RT_PRIO};
 
-use super::{CpuRunQueue, DequeueFlag, EnqueueFlag, PrioUtil, SchedPolicy, Scheduler, WakeupFlags};
+use super::{CpuRunQueue, DequeueFlag, EnqueueFlag, PrioUtil, SchedClass, Scheduler, WakeupFlags};
 
 #[derive(Debug)]
 pub struct FifoRunQueue {
@@ -124,9 +124,7 @@ impl Scheduler for FifoScheduler {
 
     fn yield_task(rq: &mut CpuRunQueue) {
         let curr = rq.current();
-        if curr.sched_info().policy() != SchedPolicy::FIFO {
-            return;
-        }
+        debug_assert_eq!(curr.sched_info().sched_class(), SchedClass::Realtime);
         rq.fifo.yield_current(&curr);
         rq.resched_current();
     }
@@ -137,10 +135,7 @@ impl Scheduler for FifoScheduler {
         _flags: WakeupFlags,
     ) {
         let curr = rq.current();
-        if curr.sched_info().policy() != SchedPolicy::FIFO {
-            rq.resched_current();
-            return;
-        }
+        debug_assert_eq!(curr.sched_info().sched_class(), SchedClass::Realtime);
 
         let new_prio = Self::rt_prio(pcb);
         let curr_prio = Self::rt_prio(&curr);
@@ -161,10 +156,7 @@ impl Scheduler for FifoScheduler {
     }
 
     fn tick(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, _queued: bool) {
-        if pcb.sched_info().policy() != SchedPolicy::FIFO {
-            rq.resched_current();
-            return;
-        }
+        debug_assert_eq!(pcb.sched_info().sched_class(), SchedClass::Realtime);
 
         let Some(highest) = rq.fifo.highest_prio() else {
             return;

@@ -65,7 +65,15 @@ impl StatusFileOps {
             .on_cpu()
             .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
-        let priority = pcb.sched_info().policy();
+        // Preserve this pre-existing DragonOS field while Linux policy and
+        // effective scheduler class are represented separately.
+        let priority = match sched_info_guard.sched_class() {
+            crate::sched::SchedClass::Idle => "IDLE",
+            _ => match sched_info_guard.policy() {
+                crate::sched::LinuxSchedPolicy::Normal => "CFS",
+                crate::sched::LinuxSchedPolicy::Fifo => "FIFO",
+            },
+        };
         let vrtime = pcb.sched_info().sched_entity.vruntime;
         let time = pcb.sched_info().sched_entity.sum_exec_runtime;
         let start_time = pcb.sched_info().sched_entity.exec_start;
@@ -141,7 +149,7 @@ impl StatusFileOps {
         // Kthread
         pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
-        pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
+        pdata.append(&mut format!("\npriority:\t{}", priority).as_bytes().to_owned());
 
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 

@@ -1,4 +1,4 @@
-use crate::sched::SchedPolicy;
+use crate::sched::LinuxSchedPolicy;
 
 /// Legacy Linux scheduler parameter ABI.
 ///
@@ -35,11 +35,9 @@ pub(super) fn legacy_policy_priority_range(policy: i32) -> Option<(i32, i32)> {
 }
 
 #[inline]
-pub(super) fn policy_to_linux(policy: SchedPolicy) -> i32 {
+pub(super) fn policy_to_linux(policy: LinuxSchedPolicy) -> i32 {
     match policy {
-        SchedPolicy::CFS => SCHED_OTHER,
-        SchedPolicy::FIFO => SCHED_FIFO,
-        SchedPolicy::RT => SCHED_RR,
-        SchedPolicy::IDLE => SCHED_IDLE,
+        LinuxSchedPolicy::Normal => SCHED_OTHER,
+        LinuxSchedPolicy::Fifo => SCHED_FIFO,
     }
 }

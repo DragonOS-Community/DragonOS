@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <pthread.h>
 #include <poll.h>
@@ -53,6 +54,41 @@ long RawGetPriorityMin(uint64_t policy) {
 bool IsDragonOS() {
     struct utsname info {};
     return uname(&info) == 0 && strstr(info.release, "dragonos") != nullptr;
+}
+
+bool ReadAggregateIdleClassTicks(uint64_t* idle_class_ticks) {
+    FILE* stat = fopen("/proc/stat", "r");
+    if (stat == nullptr) return false;
+
+    char label[8] = {};
+    unsigned long long user = 0;
+    unsigned long long nice = 0;
+    unsigned long long system = 0;
+    unsigned long long idle = 0;
+    unsigned long long iowait = 0;
+    const int fields = fscanf(stat, "%7s %llu %llu %llu %llu %llu", label, &user, &nice,
+                              &system, &idle, &iowait);
+    const int close_result = fclose(stat);
+    if (fields != 6 || close_result != 0 || strcmp(label, "cpu") != 0) return false;
+
+    *idle_class_ticks = static_cast<uint64_t>(idle) + static_cast<uint64_t>(iowait);
+    return true;
+}
+
+bool ReadSelfSchedulerLabel(char* label, size_t label_size) {
+    if (label_size < 16) return false;
+    FILE* status = fopen("/proc/self/status", "r");
+    if (status == nullptr) return false;
+
+    char line[128] = {};
+    bool found = false;
+    while (fgets(line, sizeof(line), status) != nullptr) {
+        if (strncmp(line, "priority:\t", 10) != 0) continue;
+        found = sscanf(line + 10, "%15s", label) == 1;
+        break;
+    }
+    const int close_result = fclose(status);
+    return found && close_result == 0;
 }
 
 int WaitForChild(pid_t child) {
@@ -179,6 +215,28 @@ TEST(SchedGetScheduler, CurrentAndErrorsMatchLinux) {
     errno = 0;
     EXPECT_EQ(-1, sched_getscheduler(INT_MAX));
     EXPECT_EQ(ESRCH, errno);
+}
+
+TEST(SchedGetScheduler, ProcStatusKeepsLegacyClassLabel) {
+    if (!IsDragonOS()) GTEST_SKIP() << "DragonOS-specific proc status field";
+
+    char label[16] = {};
+    ASSERT_TRUE(ReadSelfSchedulerLabel(label, sizeof(label)))
+        << "failed to read priority field from /proc/self/status";
+    EXPECT_STREQ("CFS", label);
+}
+
+TEST(SchedClassAccounting, IdleClassTicksAdvanceWhileCallerSleeps) {
+    if (!IsDragonOS()) GTEST_SKIP() << "DragonOS idle-class accounting regression";
+
+    uint64_t before = 0;
+    ASSERT_TRUE(ReadAggregateIdleClassTicks(&before))
+        << "failed to parse aggregate /proc/stat cpu line";
+    ASSERT_EQ(0, usleep(300 * 1000)) << strerror(errno);
+    uint64_t after = 0;
+    ASSERT_TRUE(ReadAggregateIdleClassTicks(&after))
+        << "failed to parse aggregate /proc/stat cpu line";
+    EXPECT_GT(after, before) << "idle-class accounting did not advance while the test slept";
 }
 
 TEST(SchedPriorityQueries, KnownPolicyMatrixMatchesLinux) {

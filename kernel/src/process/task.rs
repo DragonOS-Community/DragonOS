@@ -398,7 +398,12 @@ impl ProcessControlBlock {
         let initial_sighand = SigHand::new();
         initial_sighand.attach_task_ref();
 
-        let sched_info = ProcessSchedulerInfo::new(None);
+        let initial_sched_class = if is_idle {
+            crate::sched::SchedClass::Idle
+        } else {
+            crate::sched::SchedClass::Fair
+        };
+        let sched_info = ProcessSchedulerInfo::new(None, initial_sched_class);
 
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find_task_by_vpid(ppid)
             .map(|p| Arc::downgrade(&p))

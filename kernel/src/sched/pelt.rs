@@ -6,7 +6,7 @@ use crate::process::ProcessControlBlock;
 
 use super::{
     fair::{CfsRunQueue, FairSchedEntity},
-    CpuRunQueue, LoadWeight, SchedPolicy, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
+    CpuRunQueue, LoadWeight, SchedClass, SCHED_CAPACITY_SCALE, SCHED_CAPACITY_SHIFT,
 };
 
 const RUNNABLE_AVG_Y_N_INV: [u32; 32] = [
@@ -174,7 +174,7 @@ impl SchedulerAvg {
 
         let cap = (cpu_scale as isize - cfs_rq.avg.util_avg as isize) / 2;
 
-        if pcb.sched_info().policy() != SchedPolicy::CFS {
+        if pcb.sched_info().sched_class() != SchedClass::Fair {
             sa.last_update_time = cfs_rq.cfs_rq_clock_pelt();
         }
 

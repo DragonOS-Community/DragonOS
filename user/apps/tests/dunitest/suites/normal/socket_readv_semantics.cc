@@ -10,10 +10,12 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -256,6 +258,55 @@ TEST(SocketReadvSemantics, TcpWrappedRxFaultReturnsCommittedPrefix) {
     EXPECT_EQ(0, std::memcmp(remaining.data(), "efgh", 4));
 
     EXPECT_EQ(0, munmap(inaccessible, static_cast<size_t>(page_size)));
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
+TEST(SocketReadvSemantics, ConcurrentTcpReadvDoesNotDuplicateStreamData) {
+    int sockets[2] = {-1, -1};
+    CreateTcpPair(sockets);
+    ASSERT_GE(sockets[0], 0);
+    ASSERT_GE(sockets[1], 0);
+
+    std::array<unsigned char, 251> payload = {};
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<unsigned char>(i);
+    }
+    ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+              write(sockets[0], payload.data(), payload.size()));
+    ASSERT_EQ(0, shutdown(sockets[0], SHUT_WR)) << strerror(errno);
+
+    auto reader = [&] {
+        std::vector<unsigned char> received;
+        for (;;) {
+            unsigned char byte = 0;
+            iovec iov = {&byte, sizeof(byte)};
+            const ssize_t size = readv(sockets[1], &iov, 1);
+            if (size == 0) {
+                break;
+            }
+            EXPECT_EQ(1, size) << strerror(errno);
+            if (size != 1) {
+                break;
+            }
+            received.push_back(byte);
+            std::this_thread::yield();
+        }
+        return received;
+    };
+
+    std::vector<unsigned char> first;
+    std::vector<unsigned char> second;
+    std::thread first_reader([&] { first = reader(); });
+    std::thread second_reader([&] { second = reader(); });
+    first_reader.join();
+    second_reader.join();
+
+    first.insert(first.end(), second.begin(), second.end());
+    ASSERT_EQ(payload.size(), first.size());
+    std::sort(first.begin(), first.end());
+    EXPECT_TRUE(std::equal(first.begin(), first.end(), payload.begin()));
+
     close(sockets[0]);
     close(sockets[1]);
 }

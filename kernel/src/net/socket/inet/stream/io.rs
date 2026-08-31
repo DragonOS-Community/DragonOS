@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::vec;
 
 use system_error::SystemError;
 
@@ -13,6 +14,8 @@ use alloc::sync::Weak;
 use super::constants;
 use super::inner;
 use super::TcpSocket;
+
+const USER_RECV_STAGING_SIZE: usize = 64 * 1024;
 
 #[inline]
 fn discard_recv_queue(socket: &mut smoltcp::socket::tcp::Socket) {
@@ -233,7 +236,7 @@ impl TcpSocket {
 
     fn recv_established_to_user(
         &self,
-        socket: &mut smoltcp::socket::tcp::Socket,
+        established: &inner::Established,
         user_buffer: &mut UserBuffer<'_>,
         offset: usize,
     ) -> Result<usize, SystemError> {
@@ -246,7 +249,7 @@ impl TcpSocket {
         if is_recv_shutdown {
             let remaining = self.recv_shutdown.remaining_limit();
             if remaining == 0 {
-                discard_recv_queue(socket);
+                established.with_mut(discard_recv_queue);
                 return Ok(0);
             }
             user_remaining = core::cmp::min(user_remaining, remaining);
@@ -256,62 +259,94 @@ impl TcpSocket {
             return Ok(0);
         }
 
-        if !socket.can_recv() {
-            if !socket.may_recv() {
-                return match socket.recv(|_data| (0usize, ())) {
-                    Ok(()) => Ok(0),
-                    Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
-                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                        Err(SystemError::ECONNRESET)
-                    }
-                };
+        // Avoid allocating the staging buffer for the common nonblocking EAGAIN path.
+        let readable = established.with_mut(|socket| {
+            if socket.can_recv() {
+                return Ok(true);
             }
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            if socket.may_recv() {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            match socket.recv(|_data| (0usize, ())) {
+                Ok(()) | Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(false),
+                Err(smoltcp::socket::tcp::RecvError::InvalidState) => Err(SystemError::ECONNRESET),
+            }
+        })?;
+        if !readable {
+            return Ok(0);
         }
+
+        // User pages may fault and sleep. Copy through a bounded kernel buffer so the
+        // interface-wide SocketSet lock is never held while touching userspace.
+        let mut staging = vec![0u8; core::cmp::min(user_remaining, USER_RECV_STAGING_SIZE)];
 
         let mut total = 0usize;
         while total < user_remaining {
-            if !socket.can_recv() {
-                break;
-            }
-
             let want = user_remaining - total;
-            let got = match socket.recv(|data| {
-                let take = core::cmp::min(want, data.len());
-                if take == 0 {
-                    return (0, Ok(0));
+            let staged = established.with_mut(|socket| {
+                if !socket.can_recv() {
+                    return 0;
                 }
-                match user_buffer.write_to_user(offset + total, &data[..take]) {
-                    Ok(_) => (take, Ok(take)),
-                    Err(error) => (0, Err(error)),
-                }
-            }) {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => {
-                    if e == SystemError::EFAULT && total > 0 {
-                        break;
+                match socket.peek(core::cmp::min(want, staging.len())) {
+                    Ok(data) => {
+                        let size = data.len();
+                        staging[..size].copy_from_slice(data);
+                        size
                     }
-                    return Err(e);
+                    Err(_) => 0,
                 }
-                Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
-                    return Err(SystemError::ENOTCONN);
-                }
-                Err(smoltcp::socket::tcp::RecvError::Finished) => {
-                    return Ok(total);
-                }
-            };
-
-            if got == 0 {
+            });
+            if staged == 0 {
                 break;
             }
-            total += got;
+
+            if let Err(error) = user_buffer.write_to_user(offset + total, &staging[..staged]) {
+                if error == SystemError::EFAULT && total > 0 {
+                    break;
+                }
+                return Err(error);
+            }
+
+            // Ingress can append bytes while the SocketSet lock is dropped; a terminal state
+            // transition can instead clear the queue. recv_lock excludes local consumers, so the
+            // head cannot otherwise move. Require the snapshotted contiguous length before
+            // consuming; if the queue was cleared, the copied bytes linearize immediately before
+            // that terminal transition.
+            let committed = established.with_mut(|socket| {
+                socket
+                    .recv(|data| {
+                        if data.len() >= staged {
+                            (staged, true)
+                        } else {
+                            (0, false)
+                        }
+                    })
+                    .unwrap_or_default()
+            });
+
+            total += staged;
+            if !committed {
+                break;
+            }
         }
 
         if total == 0 {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            // The stack may have processed FIN/RST after the allocation-time readiness probe.
+            // Re-evaluate the terminal state instead of turning EOF into a spurious EAGAIN.
+            return established.with_mut(|socket| {
+                if socket.can_recv() || socket.may_recv() {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                match socket.recv(|_data| (0usize, ())) {
+                    Ok(()) | Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
+                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                        Err(SystemError::ECONNRESET)
+                    }
+                }
+            });
         }
         if is_recv_shutdown && self.recv_shutdown.record_read(total) {
-            discard_recv_queue(socket);
+            established.with_mut(discard_recv_queue);
         }
         Ok(total)
     }
@@ -339,6 +374,7 @@ impl TcpSocket {
         buf: &mut [u8],
         flags: PMSG,
     ) -> Result<usize, SystemError> {
+        let recv_guard = self.recv_lock.lock();
         let mut total_read = 0;
 
         loop {
@@ -443,6 +479,7 @@ impl TcpSocket {
 
         // For self-connect, consuming bytes frees space for senders waiting on EPOLLOUT.
         // Wake waiters and refresh pollee after we actually consumed data.
+        drop(recv_guard);
         self.finish_recv_progress(total_read > 0 && !flags.contains(PMSG::PEEK));
 
         Ok(total_read)
@@ -453,6 +490,7 @@ impl TcpSocket {
         user_buffer: &mut UserBuffer<'_>,
         offset: usize,
     ) -> Result<usize, SystemError> {
+        let recv_guard = self.recv_lock.lock();
         let mut total_read = offset;
 
         loop {
@@ -469,9 +507,9 @@ impl TcpSocket {
                 .as_ref()
                 .expect("Tcp inner::Inner is None")
             {
-                inner::Inner::Established(established) => established.with_mut(|socket| {
-                    self.recv_established_to_user(socket, user_buffer, total_read)
-                }),
+                inner::Inner::Established(established) => {
+                    self.recv_established_to_user(established, user_buffer, total_read)
+                }
                 inner::Inner::SelfConnected(sc) => {
                     let mut limit = user_buffer.len().saturating_sub(total_read);
                     let mut recv_exhausted = false;
@@ -530,6 +568,7 @@ impl TcpSocket {
             }
         }
 
+        drop(recv_guard);
         self.finish_recv_progress(total_read > offset);
         Ok(total_read - offset)
     }

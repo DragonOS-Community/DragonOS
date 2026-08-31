@@ -149,6 +149,17 @@ int GetIfIndex(const std::string& ifname) {
     return ifr.ifr_ifindex;
 }
 
+std::optional<unsigned int> GetIfFlags(const std::string& ifname) {
+    struct ifreq ifr {};
+    std::strncpy(ifr.ifr_name, ifname.c_str(), IFNAMSIZ - 1);
+
+    FdGuard control(socket(AF_INET, SOCK_DGRAM, 0));
+    if (control.Get() < 0 || ioctl(control.Get(), SIOCGIFFLAGS, &ifr) < 0) {
+        return std::nullopt;
+    }
+    return static_cast<unsigned short>(ifr.ifr_flags);
+}
+
 // Probe for a NIC and create a SOCK_RAW socket.
 // GTEST_SKIP if no NIC or insufficient permissions; the returned FdGuard holds a valid fd.
 // Returns ifindex, outputs socket fd via out_fd.
@@ -575,6 +586,46 @@ TEST(AfPacketMcast, DuplicateMembershipAndCloseUseOneDeviceReference) {
     auto closed = GetLinkSnapshot(route_fd.Get(), ifindex, ++seq);
     ASSERT_TRUE(closed.has_value());
     EXPECT_EQ(closed->promiscuity, baseline->promiscuity);
+}
+
+TEST(AfPacketMcast, MembershipCountsDoNotChangeConfiguredFlags) {
+    const std::string ifname = DiscoverIfname();
+    FdGuard packet_fd;
+    const int ifindex = SetupMcastEnv(&packet_fd);
+    if (ifindex == -1) GTEST_SKIP() << "No usable NIC found";
+    ASSERT_NE(ifindex, -2) << ErrnoString(errno);
+
+    FdGuard route_fd(OpenRouteSocket());
+    ASSERT_GE(route_fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 125;
+    const auto baseline = GetLinkSnapshot(route_fd.Get(), ifindex, ++seq);
+    const auto baseline_ioctl = GetIfFlags(ifname);
+    ASSERT_TRUE(baseline.has_value());
+    ASSERT_TRUE(baseline_ioctl.has_value());
+
+    PacketMreq promisc {};
+    promisc.mr_ifindex = ifindex;
+    promisc.mr_type = PACKET_MR_PROMISC;
+    PacketMreq allmulti = promisc;
+    allmulti.mr_type = PACKET_MR_ALLMULTI;
+    ASSERT_EQ(setsockopt(packet_fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &promisc,
+                         sizeof(promisc)),
+              0);
+    ASSERT_EQ(setsockopt(packet_fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &allmulti,
+                         sizeof(allmulti)),
+              0);
+
+    const auto active = GetLinkSnapshot(route_fd.Get(), ifindex, ++seq);
+    const auto active_ioctl = GetIfFlags(ifname);
+    ASSERT_TRUE(active.has_value());
+    ASSERT_TRUE(active_ioctl.has_value());
+    EXPECT_EQ(active->promiscuity, baseline->promiscuity + 1);
+    EXPECT_EQ(active->allmulti, baseline->allmulti + 1);
+
+    constexpr unsigned int kConfiguredModes = IFF_PROMISC | IFF_ALLMULTI;
+    EXPECT_EQ(active->configured_flags & kConfiguredModes,
+              baseline->configured_flags & kConfiguredModes);
+    EXPECT_EQ(*active_ioctl & kConfiguredModes, *baseline_ioctl & kConfiguredModes);
 }
 
 TEST(AfPacketMcast, FanoutCloseReleasesPromiscMembership) {

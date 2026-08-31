@@ -465,6 +465,10 @@ impl Iface for E1000EInterface {
         self.inner().netdevice_common.state |= state;
     }
 
+    fn clear_net_state(&self, state: NetDeivceState) {
+        self.inner().netdevice_common.state &= !state;
+    }
+
     fn operstate(&self) -> Operstate {
         return self.inner().netdevice_common.operstate;
     }

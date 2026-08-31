@@ -121,7 +121,7 @@ pub(super) fn handle_netdev_query(
 
     match cmd {
         SIOCGIFINDEX => ifreq.set_i32(iface.nic_id() as i32),
-        SIOCGIFFLAGS => ifreq.set_flags(iface.flags().bits()),
+        SIOCGIFFLAGS => ifreq.set_flags(iface.user_visible_flags().bits()),
         SIOCGIFMTU => ifreq.set_i32(iface.mtu() as i32),
         SIOCGIFHWADDR => ifreq.set_hwaddr(&iface),
         _ => return Err(SystemError::ENOTTY),

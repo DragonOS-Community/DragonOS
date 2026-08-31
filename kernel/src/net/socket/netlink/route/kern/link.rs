@@ -136,6 +136,7 @@ fn iface_to_link_message(
     iface: &Arc<dyn Iface>,
 ) -> Result<LinkSegment, SystemError> {
     let flags = iface.common().link_flags_snapshot()?;
+    let user_visible_flags = iface.project_user_visible_flags(flags.configured);
     let header = CMsgSegHdr {
         len: 0,
         type_: msg_type as _,
@@ -148,7 +149,7 @@ fn iface_to_link_message(
         family: AddressFamily::Unspecified,
         type_: iface.type_(),
         index: NonZero::new(iface.nic_id() as u32),
-        flags: flags.configured,
+        flags: user_visible_flags,
         change: LinkMessageFlags::empty(),
         pad: None,
     };
@@ -219,12 +220,13 @@ pub(super) fn do_set_link(
     if change_mask.contains(InterfaceFlags::UP) {
         let was_up = old_flags.contains(InterfaceFlags::UP);
         let is_up = new_flags.contains(InterfaceFlags::UP);
-        let operstate = if is_up {
-            Operstate::IF_OPER_UP
+        if is_up {
+            iface.set_operstate(Operstate::IF_OPER_UP);
+            iface.set_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
         } else {
-            Operstate::IF_OPER_DOWN
-        };
-        iface.set_operstate(operstate);
+            iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
+            iface.set_operstate(Operstate::IF_OPER_DOWN);
+        }
 
         if was_up != is_up {
             if is_up {

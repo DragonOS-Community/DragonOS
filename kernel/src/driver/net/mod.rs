@@ -168,6 +168,9 @@ pub trait Iface: crate::driver::base::device::Device {
 
     fn set_net_state(&self, state: NetDeivceState);
 
+    /// Clear lifecycle state bits previously set with `set_net_state`.
+    fn clear_net_state(&self, state: NetDeivceState);
+
     fn operstate(&self) -> Operstate;
 
     fn set_operstate(&self, state: Operstate);
@@ -182,6 +185,39 @@ pub trait Iface: crate::driver::base::device::Device {
 
     fn flags(&self) -> InterfaceFlags {
         self.common().flags()
+    }
+
+    /// Flags exported through Linux network-device user APIs.
+    ///
+    /// Like Linux `dev_get_flags()`, runtime flags are derived from the
+    /// device lifecycle, operational state, and carrier state instead of
+    /// exposing their cached initialization values.
+    fn user_visible_flags(&self) -> InterfaceFlags {
+        self.project_user_visible_flags(self.common().configured_flags())
+    }
+
+    /// Project one configured-flags snapshot into the Linux userspace view.
+    fn project_user_visible_flags(&self, mut flags: InterfaceFlags) -> InterfaceFlags {
+        flags.remove(InterfaceFlags::RUNNING | InterfaceFlags::LOWER_UP | InterfaceFlags::DORMANT);
+
+        let state = self.net_state();
+        if !state.contains(NetDeivceState::__LINK_STATE_START) {
+            return flags;
+        }
+
+        if matches!(
+            self.operstate(),
+            Operstate::IF_OPER_UP | Operstate::IF_OPER_UNKNOWN
+        ) {
+            flags.insert(InterfaceFlags::RUNNING);
+        }
+        if !state.contains(NetDeivceState::__LINK_STATE_NOCARRIER) {
+            flags.insert(InterfaceFlags::LOWER_UP);
+        }
+        if state.contains(NetDeivceState::__LINK_STATE_DORMANT) {
+            flags.insert(InterfaceFlags::DORMANT);
+        }
+        flags
     }
 
     fn type_(&self) -> InterfaceType {
@@ -707,6 +743,10 @@ impl IfaceCommon {
                 configured.contains(InterfaceFlags::ALLMULTI),
             )?,
         })
+    }
+
+    pub fn configured_flags(&self) -> InterfaceFlags {
+        InterfaceFlags::from_bits_truncate(self.receive_mode.lock().configured_flags)
     }
 
     pub fn type_(&self) -> InterfaceType {

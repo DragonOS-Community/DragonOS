@@ -28,10 +28,12 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 // ---- Manually define constants (DragonOS musl may lack if_packet.h) ----
 
@@ -50,6 +52,9 @@
 // PACKET_OUTGOING: loopback packet marker for locally-originated packets (Linux if_packet.h)
 #ifndef PACKET_OUTGOING
 #define PACKET_OUTGOING 4
+#endif
+#ifndef PACKET_BROADCAST
+#define PACKET_BROADCAST 1
 #endif
 #ifndef PACKET_AUXDATA
 #define PACKET_AUXDATA 8
@@ -89,6 +94,15 @@ inline constexpr int kEthFrameLen = 1514;
 inline constexpr uint16_t kPrivateEtherType = 0x88b5;
 inline constexpr uint16_t kFanoutEtherType = 0x88b6;
 inline constexpr uint16_t kVlanEtherType = 0x8100;
+inline constexpr size_t kIpv4HeaderLen = 20;
+inline constexpr size_t kUdpHeaderLen = 8;
+inline constexpr size_t kDhcpPayloadLen = 300;
+inline constexpr size_t kDhcpL3PacketLen = kIpv4HeaderLen + kUdpHeaderLen + kDhcpPayloadLen;
+inline constexpr size_t kBootpXidOffset = 4;
+inline constexpr size_t kDhcpCookieOffset = 236;
+inline constexpr size_t kDhcpOptionsOffset = 240;
+inline constexpr int kDhcpReceiveDeadlineMs = 1500;
+inline constexpr int kDhcpReceivePacketLimit = 256;
 
 inline constexpr const char* kLocalIp = "10.0.2.15";
 inline constexpr const char* kGateway = "10.0.2.2";
@@ -117,6 +131,9 @@ struct PacketAuxdata {
     uint16_t tp_vlan_tci;
     uint16_t tp_vlan_tpid;
 };
+static_assert(sizeof(PacketAuxdata) == 20, "tpacket_auxdata ABI size must be 20 bytes");
+static_assert(offsetof(PacketAuxdata, tp_net) == 14,
+              "tpacket_auxdata tp_net ABI offset must be 14");
 
 // RAII fd guard
 class FdGuard {
@@ -174,9 +191,136 @@ bool GetIfHwaddr(int any_fd, const std::string& ifname, uint8_t mac[6]) {
     struct ifreq ifr;
     std::memset(&ifr, 0, sizeof(ifr));
     std::strncpy(ifr.ifr_name, ifname.c_str(), IFNAMSIZ - 1);
-    if (ioctl(any_fd, SIOCGIFHWADDR, &ifr) != 0) return false;
+    if (ioctl(any_fd, SIOCGIFHWADDR, &ifr) != 0 ||
+        ifr.ifr_hwaddr.sa_family != ARPHRD_ETHER) {
+        return false;
+    }
     std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
     return true;
+}
+
+bool IsUpBroadcastInterface(int any_fd, const std::string& ifname) {
+    struct ifreq ifr;
+    std::memset(&ifr, 0, sizeof(ifr));
+    std::strncpy(ifr.ifr_name, ifname.c_str(), IFNAMSIZ - 1);
+    if (ioctl(any_fd, SIOCGIFFLAGS, &ifr) != 0) return false;
+    return (ifr.ifr_flags & (IFF_UP | IFF_BROADCAST)) == (IFF_UP | IFF_BROADCAST);
+}
+
+void WriteBe16(uint8_t* out, uint16_t value) {
+    out[0] = static_cast<uint8_t>(value >> 8);
+    out[1] = static_cast<uint8_t>(value);
+}
+
+void WriteBe32(uint8_t* out, uint32_t value) {
+    out[0] = static_cast<uint8_t>(value >> 24);
+    out[1] = static_cast<uint8_t>(value >> 16);
+    out[2] = static_cast<uint8_t>(value >> 8);
+    out[3] = static_cast<uint8_t>(value);
+}
+
+uint32_t AddChecksumWords(uint32_t sum, const uint8_t* data, size_t len) {
+    while (len >= 2) {
+        sum += static_cast<uint16_t>((static_cast<uint16_t>(data[0]) << 8) | data[1]);
+        data += 2;
+        len -= 2;
+    }
+    if (len != 0) sum += static_cast<uint16_t>(data[0]) << 8;
+    return sum;
+}
+
+uint16_t FinishChecksum(uint32_t sum) {
+    while ((sum >> 16) != 0) sum = (sum & 0xffffU) + (sum >> 16);
+    return static_cast<uint16_t>(~sum);
+}
+
+uint16_t InternetChecksum(const uint8_t* data, size_t len) {
+    return FinishChecksum(AddChecksumWords(0, data, len));
+}
+
+std::vector<uint8_t> BuildDhcpPacket(bool reply, uint32_t xid,
+                                     const uint8_t client_mac[ETH_ALEN]) {
+    std::vector<uint8_t> packet(kDhcpL3PacketLen, 0);
+    uint8_t* ip = packet.data();
+    uint8_t* udp = ip + kIpv4HeaderLen;
+    uint8_t* dhcp = udp + kUdpHeaderLen;
+
+    ip[0] = 0x45;
+    WriteBe16(ip + 2, static_cast<uint16_t>(packet.size()));
+    WriteBe16(ip + 4, static_cast<uint16_t>(xid));
+    WriteBe16(ip + 6, 0x4000);  // Don't fragment.
+    ip[8] = 64;
+    ip[9] = IPPROTO_UDP;
+    if (reply) {
+        ip[12] = 111;
+        ip[13] = 111;
+        ip[14] = 11;
+        ip[15] = 1;
+    }
+    std::memset(ip + 16, 0xff, 4);
+
+    WriteBe16(udp, reply ? 67 : 68);
+    WriteBe16(udp + 2, reply ? 68 : 67);
+    WriteBe16(udp + 4, static_cast<uint16_t>(kUdpHeaderLen + kDhcpPayloadLen));
+
+    dhcp[0] = reply ? 2 : 1;  // BOOTREPLY / BOOTREQUEST.
+    dhcp[1] = 1;              // Ethernet.
+    dhcp[2] = ETH_ALEN;
+    WriteBe32(dhcp + kBootpXidOffset, xid);
+    WriteBe16(dhcp + 10, 0x8000);  // Broadcast reply requested.
+    if (reply) {
+        dhcp[16] = 111;
+        dhcp[17] = 111;
+        dhcp[18] = 11;
+        dhcp[19] = 42;
+    }
+    std::memcpy(dhcp + 28, client_mac, ETH_ALEN);
+    WriteBe32(dhcp + kDhcpCookieOffset, 0x63825363U);
+    dhcp[kDhcpOptionsOffset] = 53;  // DHCP message type.
+    dhcp[kDhcpOptionsOffset + 1] = 1;
+    dhcp[kDhcpOptionsOffset + 2] = reply ? 2 : 1;  // OFFER / DISCOVER.
+    dhcp[kDhcpOptionsOffset + 3] = 255;            // END.
+
+    WriteBe16(ip + 10, InternetChecksum(ip, kIpv4HeaderLen));
+
+    uint32_t udp_sum = AddChecksumWords(0, ip + 12, 8);
+    const uint16_t udp_len = static_cast<uint16_t>(kUdpHeaderLen + kDhcpPayloadLen);
+    const uint8_t pseudo[] = {0, IPPROTO_UDP, static_cast<uint8_t>(udp_len >> 8),
+                              static_cast<uint8_t>(udp_len)};
+    udp_sum = AddChecksumWords(udp_sum, pseudo, sizeof(pseudo));
+    udp_sum = AddChecksumWords(udp_sum, udp, udp_len);
+    const uint16_t udp_checksum = FinishChecksum(udp_sum);
+    WriteBe16(udp + 6, udp_checksum == 0 ? 0xffff : udp_checksum);
+    return packet;
+}
+
+bool MatchesDhcpXid(const uint8_t* data, size_t len, size_t l3_offset, uint32_t xid) {
+    const size_t xid_offset = l3_offset + kIpv4HeaderLen + kUdpHeaderLen + kBootpXidOffset;
+    return xid_offset + sizeof(xid) <= len && data[xid_offset] == static_cast<uint8_t>(xid >> 24) &&
+           data[xid_offset + 1] == static_cast<uint8_t>(xid >> 16) &&
+           data[xid_offset + 2] == static_cast<uint8_t>(xid >> 8) &&
+           data[xid_offset + 3] == static_cast<uint8_t>(xid);
+}
+
+bool HasValidDhcpPacketChecksums(const std::vector<uint8_t>& packet) {
+    if (packet.size() != kDhcpL3PacketLen || InternetChecksum(packet.data(), kIpv4HeaderLen) != 0) {
+        return false;
+    }
+    const uint8_t* ip = packet.data();
+    const uint8_t* udp = ip + kIpv4HeaderLen;
+    const uint16_t udp_len = static_cast<uint16_t>(kUdpHeaderLen + kDhcpPayloadLen);
+    const uint8_t pseudo[] = {0, IPPROTO_UDP, static_cast<uint8_t>(udp_len >> 8),
+                              static_cast<uint8_t>(udp_len)};
+    uint32_t sum = AddChecksumWords(0, ip + 12, 8);
+    sum = AddChecksumWords(sum, pseudo, sizeof(pseudo));
+    sum = AddChecksumWords(sum, udp, udp_len);
+    return FinishChecksum(sum) == 0;
+}
+
+int64_t MonotonicMillis() {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
 }
 
 // Build a broadcast ARP request frame (ether_header + ArpHdr), length = kArpFrameLen
@@ -596,6 +740,248 @@ TEST(AfPacketE2E, DgramSendReturnsLayer3PayloadLen) {
                        reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst));
     ASSERT_EQ(n, static_cast<ssize_t>(sizeof(arp)))
         << "DGRAM sendto should return L3 payload length 28: " << ErrnoString(errno);
+}
+
+TEST(AfPacketE2E, DgramIpv4BroadcastBuildsLinuxCompatibleEthernetFrame) {
+    const std::string ifname = "veth1";
+    FdGuard ctrl(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(ctrl.Get(), 0) << ErrnoString(errno);
+    const int ifindex = GetIfIndex(ctrl.Get(), ifname);
+    ASSERT_GT(ifindex, 0) << "required AF_PACKET fixture veth1 is unavailable";
+    ASSERT_TRUE(IsUpBroadcastInterface(ctrl.Get(), ifname))
+        << "veth1 must be an up broadcast interface: " << ErrnoString(errno);
+
+    uint8_t local_mac[ETH_ALEN];
+    ASSERT_TRUE(GetIfHwaddr(ctrl.Get(), ifname, local_mac))
+        << "veth1 must expose an Ethernet hardware address: " << ErrnoString(errno);
+
+    // Linux outgoing packet taps are delivered through the ETH_P_ALL hook.
+    // The udhcpc-compatible socket under test remains SOCK_DGRAM/ETH_P_IP.
+    FdGuard observer(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
+    FdGuard sender(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)));
+    ASSERT_GE(observer.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    struct sockaddr_ll bind_addr{};
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(ETH_P_ALL);
+    bind_addr.sll_ifindex = ifindex;
+    ASSERT_EQ(bind(observer.Get(), reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)), 0)
+        << ErrnoString(errno);
+    bind_addr.sll_protocol = htons(ETH_P_IP);
+    ASSERT_EQ(bind(sender.Get(), reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)), 0)
+        << ErrnoString(errno);
+
+    static uint32_t run;
+    const uint32_t xid = 0x44354300U ^ (static_cast<uint32_t>(getpid()) << 8) ^ ++run;
+    const std::vector<uint8_t> packet = BuildDhcpPacket(false, xid, local_mac);
+    ASSERT_TRUE(HasValidDhcpPacketChecksums(packet));
+
+    uint8_t broadcast[ETH_ALEN];
+    std::memset(broadcast, 0xff, sizeof(broadcast));
+    struct sockaddr_ll destination{};
+    destination.sll_family = AF_PACKET;
+    destination.sll_protocol = htons(ETH_P_IP);
+    destination.sll_ifindex = ifindex;
+    destination.sll_hatype = ARPHRD_ETHER;
+    destination.sll_halen = ETH_ALEN;
+    std::memcpy(destination.sll_addr, broadcast, ETH_ALEN);
+    ASSERT_EQ(sendto(sender.Get(), packet.data(), packet.size(), 0,
+                     reinterpret_cast<sockaddr*>(&destination), sizeof(destination)),
+              static_cast<ssize_t>(packet.size()))
+        << "SOCK_DGRAM must return the L3 DHCP packet length: " << ErrnoString(errno);
+
+    std::vector<uint8_t> frame(kEthHdrLen + packet.size());
+    struct sockaddr_ll from{};
+    socklen_t from_len = sizeof(from);
+    ssize_t received = -1;
+    bool found = false;
+    int observed = 0;
+    const int64_t start = MonotonicMillis();
+    ASSERT_GE(start, 0);
+    const int64_t deadline = start + kDhcpReceiveDeadlineMs;
+    while (observed < kDhcpReceivePacketLimit && MonotonicMillis() < deadline) {
+        std::memset(frame.data(), 0, frame.size());
+        std::memset(&from, 0, sizeof(from));
+        from_len = sizeof(from);
+        // MSG_TRUNC makes recvfrom return the complete on-wire frame length, so
+        // an unexpectedly longer frame cannot pass through buffer truncation.
+        received = recvfrom(observer.Get(), frame.data(), frame.size(), MSG_DONTWAIT | MSG_TRUNC,
+                            reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (received < 0) {
+            ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << ErrnoString(errno);
+            usleep(10 * 1000);
+            continue;
+        }
+        ++observed;
+        const size_t captured = static_cast<size_t>(received) < frame.size()
+                                    ? static_cast<size_t>(received)
+                                    : frame.size();
+        if (from.sll_ifindex == ifindex && from.sll_pkttype == PACKET_OUTGOING &&
+            ntohs(from.sll_protocol) == ETH_P_IP &&
+            MatchesDhcpXid(frame.data(), captured, kEthHdrLen, xid)) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found) << "timed out waiting for the DHCP outgoing frame after observing "
+                       << observed << " packet(s)";
+    ASSERT_EQ(received, static_cast<ssize_t>(frame.size()));
+    ASSERT_EQ(from_len, sizeof(from));
+    EXPECT_EQ(from.sll_family, AF_PACKET);
+    EXPECT_EQ(ntohs(from.sll_protocol), ETH_P_IP);
+    EXPECT_EQ(from.sll_ifindex, ifindex);
+    EXPECT_EQ(from.sll_hatype, ARPHRD_ETHER);
+    EXPECT_EQ(from.sll_pkttype, PACKET_OUTGOING);
+    EXPECT_EQ(from.sll_halen, ETH_ALEN);
+    EXPECT_EQ(std::memcmp(from.sll_addr, local_mac, ETH_ALEN), 0);
+    EXPECT_EQ(std::memcmp(frame.data(), broadcast, ETH_ALEN), 0);
+    EXPECT_EQ(std::memcmp(frame.data() + ETH_ALEN, local_mac, ETH_ALEN), 0);
+    EXPECT_EQ(frame[12], 0x08);
+    EXPECT_EQ(frame[13], 0x00);
+    EXPECT_EQ(std::memcmp(frame.data() + kEthHdrLen, packet.data(), packet.size()), 0);
+}
+
+TEST(AfPacketE2E, DgramIpv4RecvmsgReportsLinuxCompatibleAuxdata) {
+    const std::string injector_ifname = "veth1";
+    const std::string receiver_ifname = "veth2";
+    FdGuard ctrl(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(ctrl.Get(), 0) << ErrnoString(errno);
+    const int injector_ifindex = GetIfIndex(ctrl.Get(), injector_ifname);
+    const int receiver_ifindex = GetIfIndex(ctrl.Get(), receiver_ifname);
+    ASSERT_GT(injector_ifindex, 0) << "required AF_PACKET fixture veth1 is unavailable";
+    ASSERT_GT(receiver_ifindex, 0) << "required AF_PACKET fixture veth2 is unavailable";
+    ASSERT_TRUE(IsUpBroadcastInterface(ctrl.Get(), injector_ifname));
+    ASSERT_TRUE(IsUpBroadcastInterface(ctrl.Get(), receiver_ifname));
+
+    uint8_t injector_mac[ETH_ALEN];
+    uint8_t receiver_mac[ETH_ALEN];
+    ASSERT_TRUE(GetIfHwaddr(ctrl.Get(), injector_ifname, injector_mac));
+    ASSERT_TRUE(GetIfHwaddr(ctrl.Get(), receiver_ifname, receiver_mac));
+
+    FdGuard receiver(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)));
+    FdGuard injector(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP)));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(injector.Get(), 0) << ErrnoString(errno);
+
+    struct sockaddr_ll receiver_bind{};
+    receiver_bind.sll_family = AF_PACKET;
+    receiver_bind.sll_protocol = htons(ETH_P_IP);
+    receiver_bind.sll_ifindex = receiver_ifindex;
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&receiver_bind),
+                   sizeof(receiver_bind)),
+              0)
+        << ErrnoString(errno);
+    int enabled = 1;
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_PACKET, PACKET_AUXDATA, &enabled,
+                         sizeof(enabled)),
+              0)
+        << ErrnoString(errno);
+
+    struct sockaddr_ll injector_bind{};
+    injector_bind.sll_family = AF_PACKET;
+    injector_bind.sll_protocol = htons(ETH_P_IP);
+    injector_bind.sll_ifindex = injector_ifindex;
+    ASSERT_EQ(bind(injector.Get(), reinterpret_cast<sockaddr*>(&injector_bind),
+                   sizeof(injector_bind)),
+              0)
+        << ErrnoString(errno);
+
+    static uint32_t run;
+    const uint32_t xid = 0x44354f00U ^ (static_cast<uint32_t>(getpid()) << 8) ^ ++run;
+    const std::vector<uint8_t> packet = BuildDhcpPacket(true, xid, receiver_mac);
+    ASSERT_TRUE(HasValidDhcpPacketChecksums(packet));
+
+    std::vector<uint8_t> frame(kEthHdrLen + packet.size());
+    std::memset(frame.data(), 0xff, ETH_ALEN);
+    std::memcpy(frame.data() + ETH_ALEN, injector_mac, ETH_ALEN);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    std::memcpy(frame.data() + kEthHdrLen, packet.data(), packet.size());
+
+    struct sockaddr_ll destination{};
+    destination.sll_family = AF_PACKET;
+    destination.sll_protocol = htons(ETH_P_IP);
+    destination.sll_ifindex = injector_ifindex;
+    destination.sll_hatype = ARPHRD_ETHER;
+    destination.sll_halen = ETH_ALEN;
+    std::memset(destination.sll_addr, 0xff, ETH_ALEN);
+    ASSERT_EQ(sendto(injector.Get(), frame.data(), frame.size(), 0,
+                     reinterpret_cast<sockaddr*>(&destination), sizeof(destination)),
+              static_cast<ssize_t>(frame.size()))
+        << ErrnoString(errno);
+
+    std::vector<uint8_t> received(packet.size());
+    struct sockaddr_ll from{};
+    alignas(struct cmsghdr) uint8_t control[CMSG_SPACE(sizeof(PacketAuxdata))]{};
+    struct iovec iov{};
+    struct msghdr msg{};
+    ssize_t received_len = -1;
+    bool found = false;
+    int observed = 0;
+    const int64_t start = MonotonicMillis();
+    ASSERT_GE(start, 0);
+    const int64_t deadline = start + kDhcpReceiveDeadlineMs;
+    while (observed < kDhcpReceivePacketLimit && MonotonicMillis() < deadline) {
+        std::memset(received.data(), 0, received.size());
+        std::memset(&from, 0, sizeof(from));
+        std::memset(control, 0, sizeof(control));
+        iov.iov_base = received.data();
+        iov.iov_len = received.size();
+        std::memset(&msg, 0, sizeof(msg));
+        msg.msg_name = &from;
+        msg.msg_namelen = sizeof(from);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+        received_len = recvmsg(receiver.Get(), &msg, MSG_DONTWAIT);
+        if (received_len < 0) {
+            ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << ErrnoString(errno);
+            usleep(10 * 1000);
+            continue;
+        }
+        ++observed;
+        if (from.sll_ifindex == receiver_ifindex && from.sll_pkttype == PACKET_BROADCAST &&
+            ntohs(from.sll_protocol) == ETH_P_IP &&
+            MatchesDhcpXid(received.data(), static_cast<size_t>(received_len), 0, xid)) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found) << "timed out waiting for the DHCP ingress frame after observing "
+                       << observed << " packet(s)";
+    ASSERT_EQ(received_len, static_cast<ssize_t>(packet.size()));
+    EXPECT_EQ(std::memcmp(received.data(), packet.data(), packet.size()), 0);
+    EXPECT_EQ(msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC), 0);
+    EXPECT_EQ(msg.msg_namelen, sizeof(from));
+    EXPECT_EQ(from.sll_family, AF_PACKET);
+    EXPECT_EQ(ntohs(from.sll_protocol), ETH_P_IP);
+    EXPECT_EQ(from.sll_ifindex, receiver_ifindex);
+    EXPECT_EQ(from.sll_hatype, ARPHRD_ETHER);
+    EXPECT_EQ(from.sll_pkttype, PACKET_BROADCAST);
+    EXPECT_EQ(from.sll_halen, ETH_ALEN);
+    EXPECT_EQ(std::memcmp(from.sll_addr, injector_mac, ETH_ALEN), 0);
+
+    const PacketAuxdata* aux = nullptr;
+    int aux_count = 0;
+    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+         cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_PACKET && cmsg->cmsg_type == PACKET_AUXDATA) {
+            ASSERT_GE(cmsg->cmsg_len, CMSG_LEN(sizeof(PacketAuxdata)));
+            aux = reinterpret_cast<const PacketAuxdata*>(CMSG_DATA(cmsg));
+            ++aux_count;
+        }
+    }
+    ASSERT_EQ(aux_count, 1);
+    ASSERT_NE(aux, nullptr);
+    EXPECT_EQ(aux->tp_status, static_cast<uint32_t>(TP_STATUS_USER));
+    EXPECT_EQ(aux->tp_len, packet.size());
+    EXPECT_EQ(aux->tp_snaplen, packet.size());
+    EXPECT_EQ(aux->tp_mac, 0);
+    EXPECT_EQ(aux->tp_net, 0);
+    EXPECT_EQ(aux->tp_vlan_tci, 0);
+    EXPECT_EQ(aux->tp_vlan_tpid, 0);
 }
 
 TEST(AfPacketE2E, DgramReceivesHeaderOnlyFrameWithoutFilter) {

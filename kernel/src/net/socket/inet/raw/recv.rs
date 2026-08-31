@@ -497,7 +497,7 @@ impl RawSocket {
             }
         };
         let user_recv_size = full_user_len.min(user_len);
-        iovs.scatter(&user_data[..user_recv_size])?;
+        iovs.scatter_exact(&user_data[..user_recv_size])?;
 
         // 默认不设置任何 flags。
         msg.msg_flags = 0;

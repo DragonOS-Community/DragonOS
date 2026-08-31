@@ -959,7 +959,7 @@ impl Socket for UnixDatagramSocket {
             }
         };
 
-        iovs.scatter(&buf[..payload_copy_len])?;
+        iovs.scatter_exact(&buf[..payload_copy_len])?;
 
         // 写回来源地址
         let endpoint = sender_addr

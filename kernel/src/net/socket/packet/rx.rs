@@ -1050,10 +1050,7 @@ impl PacketSocket {
         }
         let packet = self.wait_dequeue(flags)?;
         let copy_len = capacity.min(packet.data.len());
-        let written = iovs.scatter(&packet.data[..copy_len])?;
-        if written != copy_len {
-            return Err(SystemError::EFAULT);
-        }
+        iovs.scatter_exact(&packet.data[..copy_len])?;
         if !msg.msg_name.is_null() {
             let full = core::mem::size_of::<SockAddrLl>();
             let n = (msg.msg_namelen as usize).min(full);

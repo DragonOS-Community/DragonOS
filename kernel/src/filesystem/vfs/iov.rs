@@ -270,6 +270,18 @@ impl IoVecs {
         Ok(total_written)
     }
 
+    /// Scatters the complete input or reports a user-memory fault.
+    ///
+    /// This is intended for record-oriented readers, where a short copy is an
+    /// error even though the record may already have been consumed. Bytes
+    /// copied before the fault are not rolled back.
+    pub fn scatter_exact(&self, data: &[u8]) -> Result<(), SystemError> {
+        if self.scatter(data)? != data.len() {
+            return Err(SystemError::EFAULT);
+        }
+        Ok(())
+    }
+
     /// Creates a buffer with capacity equal to the total length of all IoVecs.
     ///
     /// # Arguments

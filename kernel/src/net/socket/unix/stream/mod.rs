@@ -1036,10 +1036,7 @@ impl Socket for UnixStreamSocket {
                                     self.wake_peer_writable();
                                 }
                                 if copy_len != 0 {
-                                    let copied = iovs.scatter(&buf[..copy_len])?;
-                                    if copied != copy_len {
-                                        return Err(SystemError::EFAULT);
-                                    }
+                                    iovs.scatter_exact(&buf[..copy_len])?;
                                 }
                                 let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
                                     orig_len

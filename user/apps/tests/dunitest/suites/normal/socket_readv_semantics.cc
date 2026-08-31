@@ -46,6 +46,27 @@ void CreateTcpPair(int sockets[2]) {
     close(listener);
 }
 
+void CreateUdpPair(int sockets[2]) {
+    sockets[1] = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(sockets[1], 0) << strerror(errno);
+
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    ASSERT_EQ(0, bind(sockets[1], reinterpret_cast<sockaddr*>(&address), sizeof(address)))
+        << strerror(errno);
+
+    socklen_t address_len = sizeof(address);
+    ASSERT_EQ(0, getsockname(sockets[1], reinterpret_cast<sockaddr*>(&address), &address_len))
+        << strerror(errno);
+
+    sockets[0] = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(sockets[0], 0) << strerror(errno);
+    ASSERT_EQ(0, connect(sockets[0], reinterpret_cast<sockaddr*>(&address), sizeof(address)))
+        << strerror(errno);
+}
+
 TEST(SocketReadvSemantics, FaultingLaterIovecPreservesUnreadData) {
     int sockets[2] = {-1, -1};
     ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) << strerror(errno);
@@ -320,6 +341,60 @@ TEST(SocketReadvSemantics, UnixSeqpacketFaultConsumesRecord) {
         close(sockets[0]);
         close(sockets[1]);
     }
+}
+
+void ExpectDatagramRecvmsgFaultSemantics(int sockets[2]) {
+    constexpr std::array<char, 8> payload = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    void* inaccessible =
+        mmap(nullptr, static_cast<size_t>(page_size), PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, inaccessible) << strerror(errno);
+
+    for (bool peek : {false, true}) {
+        SCOPED_TRACE(peek ? "MSG_PEEK" : "consume");
+        ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+                  send(sockets[0], payload.data(), payload.size(), 0));
+
+        std::array<char, 4> first = {};
+        iovec iovs[2] = {{first.data(), first.size()}, {inaccessible, 4}};
+        msghdr msg = {};
+        msg.msg_iov = iovs;
+        msg.msg_iovlen = 2;
+        errno = 0;
+        EXPECT_EQ(-1, recvmsg(sockets[1], &msg, peek ? MSG_PEEK : 0));
+        EXPECT_EQ(EFAULT, errno);
+
+        std::array<char, 8> received = {};
+        if (peek) {
+            ASSERT_EQ(static_cast<ssize_t>(received.size()),
+                      recv(sockets[1], received.data(), received.size(), 0));
+            EXPECT_EQ(0, std::memcmp(received.data(), payload.data(), payload.size()));
+        } else {
+            errno = 0;
+            EXPECT_EQ(-1, recv(sockets[1], received.data(), received.size(), MSG_DONTWAIT));
+            EXPECT_EQ(EAGAIN, errno);
+        }
+    }
+
+    EXPECT_EQ(0, munmap(inaccessible, static_cast<size_t>(page_size)));
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
+TEST(SocketReadvSemantics, UdpRecvmsgFaultHonorsDatagramConsumption) {
+    int sockets[2] = {-1, -1};
+    CreateUdpPair(sockets);
+    ASSERT_GE(sockets[0], 0);
+    ASSERT_GE(sockets[1], 0);
+    ExpectDatagramRecvmsgFaultSemantics(sockets);
+}
+
+TEST(SocketReadvSemantics, UnixDatagramRecvmsgFaultHonorsDatagramConsumption) {
+    int sockets[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets)) << strerror(errno);
+    ExpectDatagramRecvmsgFaultSemantics(sockets);
 }
 
 } // namespace

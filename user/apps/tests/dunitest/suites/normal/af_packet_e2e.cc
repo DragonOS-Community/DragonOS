@@ -1129,6 +1129,10 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
     ASSERT_EQ(setsockopt(second.Get(), SOL_PACKET, PACKET_FANOUT, &fanout, sizeof(fanout)), 0)
         << ErrnoString(errno);
 
+    static uint32_t fanout_run;
+    const uint32_t fanout_magic =
+        0x46414e4fU ^ (static_cast<uint32_t>(getpid()) << 8) ^ ++fanout_run;
+
     uint8_t local_mac[6];
     ASSERT_TRUE(GetIfHwaddr(sender.Get(), ifname, local_mac)) << ErrnoString(errno);
     uint8_t frame[96]{};
@@ -1136,6 +1140,7 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
     std::memcpy(frame + 6, local_mac, 6);
     frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
     frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+    std::memcpy(frame + kEthHdrLen, &fanout_magic, sizeof(fanout_magic));
 
     struct sockaddr_ll dst{};
     dst.sll_family = AF_PACKET;
@@ -1147,17 +1152,35 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
 
     constexpr int kFrames = 16;
     for (int sequence = 0; sequence < kFrames; ++sequence) {
-        std::memcpy(frame + kEthHdrLen, &sequence, sizeof(sequence));
+        std::memcpy(frame + kEthHdrLen + sizeof(fanout_magic), &sequence, sizeof(sequence));
         ASSERT_EQ(sendto(sender.Get(), frame, sizeof(frame), 0,
                          reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
                   static_cast<ssize_t>(sizeof(frame)))
             << ErrnoString(errno);
     }
 
-    auto drain = [](int fd) {
+    int seen[kFrames]{};
+    auto drain = [&](int fd) {
         uint8_t buffer[128];
         int count = 0;
-        while (recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT) > 0) ++count;
+        ssize_t received;
+        while ((received = recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT)) > 0) {
+            if (received < kEthHdrLen + static_cast<ssize_t>(sizeof(fanout_magic) + sizeof(int))) {
+                continue;
+            }
+            uint32_t magic;
+            std::memcpy(&magic, buffer + kEthHdrLen, sizeof(magic));
+            if (magic != fanout_magic) continue;
+
+            int sequence;
+            std::memcpy(&sequence, buffer + kEthHdrLen + sizeof(magic), sizeof(sequence));
+            if (sequence < 0 || sequence >= kFrames) {
+                ADD_FAILURE() << "fanout frame has invalid sequence=" << sequence;
+                continue;
+            }
+            ++seen[sequence];
+            ++count;
+        }
         return count;
     };
     const int first_count = drain(first.Get());
@@ -1167,6 +1190,9 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
         << " second=" << second_count;
     EXPECT_EQ(first_count, kFrames / 2);
     EXPECT_EQ(second_count, kFrames / 2);
+    for (int sequence = 0; sequence < kFrames; ++sequence) {
+        EXPECT_EQ(seen[sequence], 1) << "sequence=" << sequence;
+    }
 }
 
 int main(int argc, char** argv) {

@@ -72,6 +72,10 @@ pub trait Iface: crate::driver::base::device::Device {
 
     /// # `mac`
     /// 获取网卡的MAC地址
+    ///
+    /// This method is used from the RX data path while the caller may already
+    /// hold [`IfaceCommon::smol_iface`]. Implementations must therefore read
+    /// device metadata directly and must not acquire `smol_iface` again.
     fn mac(&self) -> smoltcp::wire::EthernetAddress;
 
     /// # `name`

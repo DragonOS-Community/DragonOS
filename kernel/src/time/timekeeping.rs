@@ -102,6 +102,7 @@ pub struct TimekeeperData {
     raw: Option<TimekeeperReadBase>,
     realtime_offset_ns: i128,
     boottime_offset_ns: u64,
+    clock_was_set_seq: u64,
     clocksource_generation: u64,
 }
 
@@ -112,6 +113,7 @@ impl TimekeeperData {
             raw: None,
             realtime_offset_ns: 0,
             boottime_offset_ns: 0,
+            clock_was_set_seq: 0,
             clocksource_generation: 0,
         }
     }
@@ -327,6 +329,14 @@ pub fn realtime_now() -> PosixTimeSpec {
     ns_to_timespec(tk.realtime_ns())
 }
 
+/// Return realtime and the wall-clock change epoch from one snapshot.
+/// Timerfd uses the epoch to distinguish a delayed notification from a clock
+/// change that happened before the timer was armed.
+pub fn realtime_now_with_clock_set_seq() -> (PosixTimeSpec, u64) {
+    let tk = timekeeper().inner.read_irqsave();
+    (ns_to_timespec(tk.realtime_ns()), tk.clock_was_set_seq)
+}
+
 pub fn monotonic_now() -> PosixTimeSpec {
     let tk = timekeeper().inner.read_irqsave();
     ns_to_timespec(tk.monotonic_ns() as i128)
@@ -368,8 +378,14 @@ pub fn do_gettimeofday() -> PosixTimeval {
 
 pub fn do_settimeofday64(time: PosixTimeSpec) -> Result<(), SystemError> {
     let requested = validate_settimeofday(time)?;
-    let mut tk = timekeeper().inner.write_irqsave();
-    settimeofday_locked(&mut tk, requested)
+    {
+        let mut tk = timekeeper().inner.write_irqsave();
+        settimeofday_locked(&mut tk, requested)?;
+    }
+    // timerfd may read the timekeeper while rebasing its monotonic backend;
+    // never call into it while holding the timekeeper write lock.
+    crate::filesystem::timerfd::timerfd_clock_was_set();
+    Ok(())
 }
 
 fn validate_settimeofday(time: PosixTimeSpec) -> Result<i128, SystemError> {
@@ -408,7 +424,10 @@ fn settimeofday_locked(tk: &mut TimekeeperData, requested: i128) -> Result<(), S
     let _boot_epoch = realtime_offset
         .checked_sub(tk.boottime_offset_ns as i128)
         .ok_or(SystemError::EOVERFLOW)?;
-    tk.realtime_offset_ns = realtime_offset;
+    if tk.realtime_offset_ns != realtime_offset {
+        tk.realtime_offset_ns = realtime_offset;
+        tk.clock_was_set_seq = tk.clock_was_set_seq.wrapping_add(1);
+    }
     Ok(())
 }
 

@@ -963,11 +963,44 @@ impl Socket for UnixStreamSocket {
         &self,
         user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
     ) -> Result<usize, SystemError> {
-        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
-            self,
-            user_buffer,
-            self.recv_buffer_size(),
-        )
+        if user_buffer.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            let mut queue_consumed = false;
+            let result = match self.inner.read().as_ref().expect("inner is None") {
+                Inner::Connected(connected) => {
+                    connected.try_recv_to_user(user_buffer, self.is_seqpacket, &mut queue_consumed)
+                }
+                _ => Err(SystemError::ENOTCONN),
+            };
+            if queue_consumed {
+                self.wake_peer_writable();
+            }
+
+            match result {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !self.is_nonblocking() => {
+                    self.wait_queue.wait_event_interruptible_timeout(
+                        || self.can_recv(),
+                        self.recv_timeout(),
+                    )?;
+                }
+                Ok(n) => {
+                    if n == 0 {
+                        let ring_reset = self.take_connreset_from_peer();
+                        let socket_reset = self
+                            .connreset_pending
+                            .swap(false, core::sync::atomic::Ordering::SeqCst);
+                        if ring_reset || socket_reset {
+                            return Err(SystemError::ECONNRESET);
+                        }
+                    }
+                    return Ok(n);
+                }
+                result => return result,
+            }
+        }
     }
 
     fn recv_msg(&self, _msg: &mut MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
@@ -978,7 +1011,7 @@ impl Socket for UnixStreamSocket {
 
         // Scatter destination is described by msg_iov/msg_iovlen in user memory.
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = iovs.new_buf(true)?;
+        let total = iovs.total_len();
 
         // Read payload first.
         let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
@@ -988,6 +1021,7 @@ impl Socket for UnixStreamSocket {
         let (payload_copy_len, orig_len, truncated, ret_len, scm_cred, scm_rights) = if self
             .is_seqpacket
         {
+            let mut buf = iovs.new_buf(true)?;
             loop {
                 match self
                     .inner
@@ -1002,6 +1036,12 @@ impl Socket for UnixStreamSocket {
                         let snapshot = connected.scm_snapshot_for_recvmsg();
                         match connected.try_recv_seqpacket_meta(&mut buf[..], peek) {
                             Ok((copy_len, orig_len, truncated)) => {
+                                if !peek {
+                                    self.wake_peer_writable();
+                                }
+                                if copy_len != 0 {
+                                    iovs.scatter_exact(&buf[..copy_len])?;
+                                }
                                 let ret_len = if _flags.contains(socket::PMSG::TRUNC) {
                                     orig_len
                                 } else {
@@ -1027,6 +1067,9 @@ impl Socket for UnixStreamSocket {
                 }
             }
         } else {
+            let segments = iovs.user_buffer_segments(total)?;
+            let mut user_buffer =
+                unsafe { crate::syscall::user_buffer::UserBuffer::new_vectored(&segments, total) };
             loop {
                 match self
                     .inner
@@ -1035,7 +1078,11 @@ impl Socket for UnixStreamSocket {
                     .expect("UnixStreamSocket inner is None")
                 {
                     Inner::Connected(connected) => {
-                        match connected.try_recv_stream_recvmsg_meta(&mut buf, peek, want_creds) {
+                        match connected.try_recv_stream_recvmsg_meta(
+                            &mut user_buffer,
+                            peek,
+                            want_creds,
+                        ) {
                             Ok(meta) => {
                                 let n = meta.copy_len;
                                 break (n, n, false, n, meta.scm_cred, meta.scm_rights);
@@ -1055,11 +1102,8 @@ impl Socket for UnixStreamSocket {
             }
         };
 
-        if payload_copy_len != 0 {
-            iovs.scatter(&buf[..payload_copy_len])?;
-            if !peek {
-                self.wake_peer_writable();
-            }
+        if !self.is_seqpacket && payload_copy_len != 0 && !peek {
+            self.wake_peer_writable();
         }
 
         // Default: no flags.

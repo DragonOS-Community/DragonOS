@@ -7,6 +7,7 @@ use crate::{
     syscall::user_access::{
         copy_from_user_protected, user_accessible_len, UserBufferReader, UserBufferWriter,
     },
+    syscall::user_buffer::UserBufferSegment,
 };
 
 /// Linux UIO_MAXIOV: maximum number of iovec structures per syscall
@@ -40,6 +41,29 @@ impl IoVecs {
     /// Borrow the validated iovec list.
     pub fn iovs(&self) -> &[IoVec] {
         &self.0
+    }
+
+    pub fn user_buffer_segments(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<UserBufferSegment>, SystemError> {
+        let mut segments = Vec::new();
+        segments
+            .try_reserve(self.0.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut remaining = limit;
+        for iov in &self.0 {
+            if remaining == 0 {
+                break;
+            }
+            let len = iov.iov_len.min(remaining);
+            segments.push(UserBufferSegment::new(
+                VirtAddr::new(iov.iov_base as usize),
+                len,
+            ));
+            remaining -= len;
+        }
+        Ok(segments)
     }
 
     /// Constructs `IoVecs` from an array of `IoVec` in userspace.
@@ -105,15 +129,6 @@ impl IoVecs {
             // Skip zero-length iovecs after validation
             if one.iov_len == 0 {
                 continue;
-            }
-
-            // If the first byte isn't writable/readable at all, fail early with EFAULT.
-            // Partial accessibility is handled by the syscall implementation.
-            // Note: user_accessible_len returns 0 for null pointers (addr.is_null() check),
-            // so null pointer detection is covered here.
-            let accessible = user_accessible_len(base, one.iov_len, _readv /* check_write */);
-            if accessible == 0 {
-                return Err(SystemError::EFAULT);
             }
 
             slices.push(one);
@@ -253,6 +268,18 @@ impl IoVecs {
         }
 
         Ok(total_written)
+    }
+
+    /// Scatters the complete input or reports a user-memory fault.
+    ///
+    /// This is intended for record-oriented readers, where a short copy is an
+    /// error even though the record may already have been consumed. Bytes
+    /// copied before the fault are not rolled back.
+    pub fn scatter_exact(&self, data: &[u8]) -> Result<(), SystemError> {
+        if self.scatter(data)? != data.len() {
+            return Err(SystemError::EFAULT);
+        }
+        Ok(())
     }
 
     /// Creates a buffer with capacity equal to the total length of all IoVecs.

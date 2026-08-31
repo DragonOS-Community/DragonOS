@@ -1976,7 +1976,7 @@ impl Socket for UdpSocket {
         // );
 
         // Scatter received data to user iovecs
-        iovs.scatter(&buf[..copy_len])?;
+        iovs.scatter_exact(&buf[..copy_len])?;
 
         // Write source address if requested
         if !msg.msg_name.is_null() {

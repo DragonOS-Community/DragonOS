@@ -5,11 +5,7 @@ use core::{
     time::Duration,
 };
 
-use alloc::{
-    boxed::Box,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 use log::{error, info, warn};
 use system_error::SystemError;
 
@@ -31,7 +27,8 @@ const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
 static TIMER_JIFFIES: AtomicU64 = AtomicU64::new(0);
 
 lazy_static! {
-    pub static ref TIMER_LIST: SpinLock<Vec<(u64, Arc<Timer>)>> = SpinLock::new(Vec::new());
+    pub static ref TIMER_LIST: SpinLock<BTreeMap<(u64, usize), Arc<Timer>>> =
+        SpinLock::new(BTreeMap::new());
 }
 
 /// 定时器要执行的函数的特征
@@ -105,6 +102,7 @@ impl TimerFunction for WakeUpHelper {
 
 #[derive(Debug)]
 pub struct Timer {
+    expire_jiffies: u64,
     inner: SpinLock<InnerTimer>,
 }
 
@@ -118,15 +116,12 @@ impl Timer {
     /// @return 定时器结构体
     pub fn new(timer_func: Box<dyn TimerFunction>, expire_jiffies: u64) -> Arc<Self> {
         let result: Arc<Timer> = Arc::new(Timer {
+            expire_jiffies,
             inner: SpinLock::new(InnerTimer {
-                expire_jiffies,
                 timer_func: Some(timer_func),
-                self_ref: Weak::default(),
                 triggered: false,
             }),
         });
-
-        result.inner.lock().self_ref = Arc::downgrade(&result);
 
         return result;
     }
@@ -135,41 +130,22 @@ impl Timer {
         return self.inner.lock_irqsave();
     }
 
-    /// @brief 将定时器插入到定时器链表中
-    pub fn activate(&self) {
-        let mut timer_list = TIMER_LIST.lock_irqsave();
-        let inner_guard = self.inner();
+    fn queue_key(&self) -> (u64, usize) {
+        (self.expire_jiffies, self as *const Self as usize)
+    }
 
-        // 链表为空，则直接插入
-        if timer_list.is_empty() {
-            // FIXME push_timer
-            timer_list.push((
-                inner_guard.expire_jiffies,
-                inner_guard.self_ref.upgrade().unwrap(),
-            ));
+    pub fn expire_jiffies(&self) -> u64 {
+        self.expire_jiffies
+    }
 
-            drop(inner_guard);
-            drop(timer_list);
-            compiler_fence(Ordering::SeqCst);
-
-            return;
+    /// @brief 将定时器插入到定时器队列中
+    pub fn activate(self: &Arc<Self>) {
+        let replaced = TIMER_LIST
+            .lock_irqsave()
+            .insert(self.queue_key(), self.clone());
+        if replaced.is_some() {
+            warn!("Timer already in list");
         }
-        let expire_jiffies = inner_guard.expire_jiffies;
-        let self_arc = inner_guard.self_ref.upgrade().unwrap();
-        drop(inner_guard);
-        let mut split_pos: usize = timer_list.len();
-        for (pos, elt) in timer_list.iter().enumerate() {
-            if Arc::ptr_eq(&self_arc, &elt.1) {
-                warn!("Timer already in list");
-            }
-            if elt.0 > expire_jiffies {
-                split_pos = pos;
-                break;
-            }
-        }
-        timer_list.insert(split_pos, (expire_jiffies, self_arc));
-
-        drop(timer_list);
     }
 
     #[inline]
@@ -194,11 +170,8 @@ impl Timer {
 
     /// ## 取消定时器任务
     pub fn cancel(&self) -> bool {
-        let this_arc = self.inner().self_ref.upgrade().unwrap();
-        TIMER_LIST
-            .lock_irqsave()
-            .extract_if(.., |x| Arc::ptr_eq(&this_arc, &x.1))
-            .for_each(drop);
+        let removed = TIMER_LIST.lock_irqsave().remove(&self.queue_key());
+        drop(removed);
         true
     }
 }
@@ -206,12 +179,8 @@ impl Timer {
 /// 定时器类型
 #[derive(Debug)]
 pub struct InnerTimer {
-    /// 定时器结束时刻
-    pub expire_jiffies: u64,
     /// 定时器需要执行的函数结构体
     pub timer_func: Option<Box<dyn TimerFunction>>,
-    /// self_ref
-    self_ref: Weak<Timer>,
     /// 判断该计时器是否触发
     triggered: bool,
 }
@@ -253,17 +222,15 @@ impl SoftirqVec for DoTimerSoftirq {
             }
             let mut timer_list = timer_list.unwrap();
 
-            if timer_list.is_empty() {
+            let Some((&(front_jiffies, _), _)) = timer_list.first_key_value() else {
                 break;
-            }
-
-            let (front_jiffies, timer_list_front) = timer_list.first().unwrap().clone();
+            };
             // debug!("to lock timer_list_front");
 
             if front_jiffies >= TIMER_JIFFIES.load(Ordering::SeqCst) {
                 break;
             }
-            timer_list.remove(0);
+            let (_, timer_list_front) = timer_list.pop_first().unwrap();
             drop(timer_list);
             timer_list_front.run();
         }
@@ -352,13 +319,10 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
         match TIMER_LIST.try_lock_irqsave() {
             Ok(timer_list) => {
                 // debug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
-                if timer_list.is_empty() {
-                    // debug!("timer_list is empty");
-                    return Ok(0);
-                } else {
-                    // debug!("timer_list not empty");
-                    return Ok(timer_list.first().unwrap().0);
-                }
+                return Ok(timer_list
+                    .first_key_value()
+                    .map(|(key, _)| key.0)
+                    .unwrap_or(0));
             }
             // 加锁失败返回啥？？
             Err(_) => continue,

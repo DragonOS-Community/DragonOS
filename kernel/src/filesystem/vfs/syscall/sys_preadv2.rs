@@ -5,10 +5,11 @@ use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_PREADV2;
 use crate::filesystem::vfs::iov::{IoVec, IoVecs};
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 
-use super::sys_preadv::{do_preadv, read_iovecs};
+use super::sys_preadv::do_preadv;
+use super::sys_read::get_read_file;
+use super::sys_readv::read_iovecs;
 
 // Linux 兼容的 RWF 标志位（preadv2 专用）
 const RWF_HIPRI: usize = 0x0000_0001;
@@ -124,17 +125,9 @@ pub fn do_preadv2(
 
     // offset == -1 -> 使用当前文件偏移（行为与 readv 相同）
     if offset == -1 {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let fd_table_guard = binding.read();
-
-        let file = fd_table_guard
-            .get_file_by_fd(fd)
-            .ok_or(SystemError::EBADF)?;
-
-        // 读路径会负责 O_PATH / 读权限检查
-        drop(fd_table_guard);
-
-        return read_iovecs(file.as_ref(), iovecs, None);
+        let file = get_read_file(fd)?;
+        file.readable()?;
+        return read_iovecs(file.as_ref(), iovecs);
     }
 
     // offset 为非负时，直接复用现有的 preadv 实现，保持语义一致

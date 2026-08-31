@@ -45,19 +45,19 @@ impl Syscall for SysReadHandle {
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
 
-        // POSIX: len==0 succeeds and returns 0 without touching the buffer pointer.
-        if len == 0 {
-            return Ok(0);
-        }
-
         if frame.is_from_user() {
             read_into_user_buffer(fd, buf_vaddr, len)
         } else {
+            let file = get_read_file(fd)?;
+            if len == 0 {
+                let mut empty = [];
+                return do_read_file(file.as_ref(), &mut empty);
+            }
             // 内核态：直接借用内核缓冲区
             let mut user_buffer_writer =
                 UserBufferWriter::new(buf_vaddr, len, frame.is_from_user())?;
             let user_buf = user_buffer_writer.buffer(0)?;
-            do_read(fd, user_buf)
+            do_read_file(file.as_ref(), user_buf)
         }
     }
 
@@ -96,20 +96,6 @@ impl SysReadHandle {
 
 syscall_table_macros::declare_syscall!(SYS_READ, SysReadHandle);
 
-/// Internal implementation of the read operation
-///
-/// # Arguments
-/// * `fd` - File descriptor to read from
-/// * `buf` - Buffer to store read data
-///
-/// # Returns
-/// * `Ok(usize)` - Number of bytes successfully read
-/// * `Err(SystemError)` - Error code if operation fails
-pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
-    let file = get_read_file(fd)?;
-    do_read_file(file.as_ref(), buf)
-}
-
 pub(super) fn get_read_file(fd: i32) -> Result<Arc<File>, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
@@ -137,17 +123,7 @@ fn do_read_file(file: &File, buf: &mut [u8]) -> Result<usize, SystemError> {
 /// Linux semantics: if a fault happens after some bytes are copied, return the number
 /// of bytes copied instead of -EFAULT.
 fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize, SystemError> {
-    // 用户态：先计算可写入长度，避免直接写入无效用户页。
-    let accessible =
-        user_accessible_len(VirtAddr::new(user_ptr as usize), len, true /*write*/);
-    if accessible == 0 {
-        return Err(SystemError::EFAULT);
-    }
-
     let file = get_read_file(fd)?;
-    if file.file_type() == FileType::Socket {
-        return read_socket_into_user_buffer(file.as_ref(), user_ptr, accessible);
-    }
 
     // Some record streams must own the whole userspace read boundary. In
     // particular, inotify decides whether to wait again and consumes a record
@@ -155,7 +131,11 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
     // Use the original count here so a partially mapped range faults at the
     // exact record copy instead of being silently shortened to `accessible`.
     if file.supports_read_user() {
-        let mut direct_buffer = UserBuffer::new_protected(user_ptr, len, true)?;
+        // Do not validate the complete `count` range here.  Linux record
+        // readers first apply their count rule and then touch only the bytes
+        // they actually return (timerfd, for example, always writes 8 bytes).
+        // Every access through UserBuffer remains exception-table protected.
+        let mut direct_buffer = unsafe { UserBuffer::new(VirtAddr::new(user_ptr as usize), len) };
         if let Some(read_len) = file.read_user(len, &mut direct_buffer)? {
             return Ok(read_len);
         }
@@ -163,6 +143,25 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
             false,
             "supports_read_user without read_user_at implementation"
         );
+    }
+
+    // Linux still validates the descriptor and access mode for a zero-length
+    // read. Direct-user inodes above own any type-specific count==0 rule.
+    if len == 0 {
+        file.readable()?;
+        return Ok(0);
+    }
+
+    // Ordinary buffered reads may probe the mapped prefix up front. Record
+    // streams that require consume-before-copy semantics were dispatched above.
+    let accessible =
+        user_accessible_len(VirtAddr::new(user_ptr as usize), len, true /*write*/);
+    if accessible == 0 {
+        return Err(SystemError::EFAULT);
+    }
+
+    if file.file_type() == FileType::Socket {
+        return read_socket_into_user_buffer(file.as_ref(), user_ptr, accessible);
     }
 
     // Keep the kernel-side buffer modest to avoid huge allocations/long critical sections.

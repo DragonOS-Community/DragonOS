@@ -343,6 +343,8 @@ pub enum FilePrivateData {
     Overlayfs(OverlayFilePrivateData),
     /// kernfs/debugfs per-open callback state.
     Kernfs(Option<KernFilePrivateData>),
+    /// timerfd open-file-description flags (notably O_NONBLOCK).
+    TimerFd(FileFlags),
     /// 不需要文件私有信息
     Unused,
 }
@@ -409,6 +411,7 @@ impl FilePrivateData {
             FilePrivateData::Overlayfs(pdata) => {
                 pdata.set_flags(flags)?;
             }
+            FilePrivateData::TimerFd(current) => *current = flags,
             _ => {}
         }
         Ok(())
@@ -1443,6 +1446,27 @@ impl File {
         len: usize,
         writer: &mut UserBuffer<'_>,
     ) -> Result<Option<usize>, SystemError> {
+        self.read_user_with_fsnotify(len, writer, true)
+    }
+
+    /// Read one userspace-buffer chunk for a vector syscall.
+    ///
+    /// The vector syscall publishes ACCESS once at its completion boundary,
+    /// rather than once per iovec processed by the fallback `.read` loop.
+    pub(crate) fn read_user_syscall_chunk(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_with_fsnotify(len, writer, false)
+    }
+
+    fn read_user_with_fsnotify(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        emit_fsnotify: bool,
+    ) -> Result<Option<usize>, SystemError> {
         let mode = *self.mode.read();
         let stream = mode.contains(FileMode::FMODE_STREAM);
         let offset = if stream {
@@ -1452,9 +1476,6 @@ impl File {
         };
 
         self.readable()?;
-        if len == 0 {
-            return Ok(Some(0));
-        }
         if writer.len() < len {
             return Err(SystemError::ENOBUFS);
         }
@@ -1469,7 +1490,7 @@ impl File {
             return Ok(None);
         };
 
-        self.finalize_read(offset, read_len, !stream, true);
+        self.finalize_read(offset, read_len, !stream, emit_fsnotify);
         Ok(Some(read_len))
     }
 
@@ -2137,6 +2158,9 @@ impl File {
         // Linux 语义：O_PATH fd 的 lseek 返回 EBADF（优先于 ESPIPE）。
         if mode.contains(FileMode::FMODE_PATH) {
             return Err(SystemError::EBADF);
+        }
+        if self.inode.has_noop_llseek() {
+            return Ok(self.offset.load(Ordering::SeqCst));
         }
         if mode.contains(FileMode::FMODE_STREAM) || !mode.contains(FileMode::FMODE_LSEEK) {
             return Err(SystemError::ESPIPE);

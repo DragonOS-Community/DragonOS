@@ -486,7 +486,7 @@ where
         let mut buf = iovs.new_buf(true)?;
 
         let (copy_len, orig_len, endpoint) = self.recv_from_inner(&mut buf, flags, None)?;
-        iovs.scatter(&buf[..copy_len])?;
+        iovs.scatter_exact(&buf[..copy_len])?;
 
         if !msg.msg_name.is_null() {
             let actual_len = endpoint.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;

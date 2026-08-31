@@ -151,6 +151,9 @@ pub struct TcpSocket {
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
     pub(crate) cork_buf: Mutex<Vec<u8>>,
+    /// Serializes readers while a receive transaction temporarily drops the interface-wide
+    /// SocketSet lock to copy data to userspace.
+    pub(crate) recv_lock: Mutex<()>,
     pub(crate) cork_flush_in_progress: AtomicBool,
     pub(crate) cork_timer_active: AtomicBool,
     pub(crate) recv_shutdown: ShutdownRecvTracker,
@@ -182,6 +185,7 @@ impl TcpSocket {
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
             cork_buf: Mutex::new(Vec::new()),
+            recv_lock: Mutex::new(()),
             cork_flush_in_progress: AtomicBool::new(false),
             cork_timer_active: AtomicBool::new(false),
             recv_shutdown: ShutdownRecvTracker::new(),

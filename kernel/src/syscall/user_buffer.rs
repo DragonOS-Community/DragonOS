@@ -10,13 +10,27 @@ use system_error::SystemError;
 ///
 /// 这个类型封装了对用户空间内存的访问，确保所有读写操作
 /// 都通过异常表机制处理可能的页错误
+#[derive(Clone, Copy)]
+pub struct UserBufferSegment {
+    addr: VirtAddr,
+    len: usize,
+}
+
+impl UserBufferSegment {
+    pub fn new(addr: VirtAddr, len: usize) -> Self {
+        Self { addr, len }
+    }
+}
+
+enum UserBufferBacking<'a> {
+    Contiguous(VirtAddr),
+    Vectored(&'a [UserBufferSegment]),
+}
+
 pub struct UserBuffer<'a> {
-    /// 用户空间地址
-    user_addr: VirtAddr,
+    backing: UserBufferBacking<'a>,
     /// 缓冲区长度
     len: usize,
-    /// 生命周期标记
-    _phantom: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> UserBuffer<'a> {
@@ -39,9 +53,8 @@ impl<'a> UserBuffer<'a> {
             access_ok(user_addr, len).map_err(|_| SystemError::EFAULT)?;
         }
         Ok(Self {
-            user_addr,
+            backing: UserBufferBacking::Contiguous(user_addr),
             len,
-            _phantom: core::marker::PhantomData,
         })
     }
 
@@ -55,9 +68,25 @@ impl<'a> UserBuffer<'a> {
     /// 调用者必须确保地址和长度是有效的用户空间范围
     pub(crate) unsafe fn new(addr: VirtAddr, len: usize) -> Self {
         Self {
-            user_addr: addr,
+            backing: UserBufferBacking::Contiguous(addr),
             len,
-            _phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// Create a protected logical buffer backed by multiple userspace ranges.
+    ///
+    /// The caller must keep `segments` alive and ensure their combined length
+    /// is at least `len`. Individual accesses remain exception-table protected.
+    pub(crate) unsafe fn new_vectored(segments: &'a [UserBufferSegment], len: usize) -> Self {
+        debug_assert!(
+            segments
+                .iter()
+                .fold(0usize, |total, segment| total.saturating_add(segment.len))
+                >= len
+        );
+        Self {
+            backing: UserBufferBacking::Vectored(segments),
+            len,
         }
     }
 
@@ -72,7 +101,13 @@ impl<'a> UserBuffer<'a> {
     }
 
     pub fn user_addr(&self) -> VirtAddr {
-        self.user_addr
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => *addr,
+            UserBufferBacking::Vectored(segments) => segments
+                .first()
+                .map(|segment| segment.addr)
+                .unwrap_or_default(),
+        }
     }
 
     /// 从用户缓冲区读取数据到内核缓冲区
@@ -97,10 +132,40 @@ impl<'a> UserBuffer<'a> {
             return Ok(0);
         }
 
-        let src_addr = VirtAddr::new(self.user_addr.data() + offset);
-
-        unsafe {
-            crate::syscall::user_access::copy_from_user_protected(&mut dst[..copy_len], src_addr)
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => unsafe {
+                crate::syscall::user_access::copy_from_user_protected(
+                    &mut dst[..copy_len],
+                    *addr + offset,
+                )
+            },
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                let mut copied = 0usize;
+                for segment in *segments {
+                    if skip >= segment.len {
+                        skip -= segment.len;
+                        continue;
+                    }
+                    let chunk = (segment.len - skip).min(copy_len - copied);
+                    unsafe {
+                        crate::syscall::user_access::copy_from_user_protected(
+                            &mut dst[copied..copied + chunk],
+                            segment.addr + skip,
+                        )?;
+                    }
+                    copied += chunk;
+                    skip = 0;
+                    if copied == copy_len {
+                        break;
+                    }
+                }
+                if copied == copy_len {
+                    Ok(copied)
+                } else {
+                    Err(SystemError::EFAULT)
+                }
+            }
         }
     }
 
@@ -126,9 +191,41 @@ impl<'a> UserBuffer<'a> {
             return Ok(0);
         }
 
-        let dst_addr = VirtAddr::new(self.user_addr.data() + offset);
-
-        unsafe { crate::syscall::user_access::copy_to_user_protected(dst_addr, &src[..copy_len]) }
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => unsafe {
+                crate::syscall::user_access::copy_to_user_protected(
+                    *addr + offset,
+                    &src[..copy_len],
+                )
+            },
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                let mut copied = 0usize;
+                for segment in *segments {
+                    if skip >= segment.len {
+                        skip -= segment.len;
+                        continue;
+                    }
+                    let chunk = (segment.len - skip).min(copy_len - copied);
+                    unsafe {
+                        crate::syscall::user_access::copy_to_user_protected(
+                            segment.addr + skip,
+                            &src[copied..copied + chunk],
+                        )?;
+                    }
+                    copied += chunk;
+                    skip = 0;
+                    if copied == copy_len {
+                        break;
+                    }
+                }
+                if copied == copy_len {
+                    Ok(copied)
+                } else {
+                    Err(SystemError::EFAULT)
+                }
+            }
+        }
     }
 
     /// 从用户缓冲区读取单个值
@@ -277,8 +374,33 @@ impl<'a> UserBuffer<'a> {
             return Ok(());
         }
 
-        let dst_addr = crate::mm::VirtAddr::new(self.user_addr.data() + offset);
-        unsafe { clear_user_cow_protected(dst_addr, clear_len) }.map(|_| ())
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => {
+                unsafe { clear_user_cow_protected(*addr + offset, clear_len) }.map(|_| ())
+            }
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                let mut cleared = 0usize;
+                for segment in *segments {
+                    if skip >= segment.len {
+                        skip -= segment.len;
+                        continue;
+                    }
+                    let chunk = (segment.len - skip).min(clear_len - cleared);
+                    unsafe { clear_user_cow_protected(segment.addr + skip, chunk)? };
+                    cleared += chunk;
+                    skip = 0;
+                    if cleared == clear_len {
+                        break;
+                    }
+                }
+                if cleared == clear_len {
+                    Ok(())
+                } else {
+                    Err(SystemError::EFAULT)
+                }
+            }
+        }
     }
 
     /// 将整个用户缓冲区清零

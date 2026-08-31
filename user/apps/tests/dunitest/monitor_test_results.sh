@@ -110,7 +110,11 @@ while true; do
         fi
     fi
 
-    if [ "$serial_exists" = true ] && [ "$((now - last_output_time))" -gt "$IDLE_TIMEOUT" ]; then
+    # Before the runner prints its start marker, TEST_START_TIMEOUT is the
+    # authoritative bound. Applying the shorter idle timeout in that phase
+    # makes the configured startup budget ineffective on slow CI guests.
+    if [ "$serial_exists" = true ] && [ "$test_started" = true ] && \
+        [ "$((now - last_output_time))" -gt "$IDLE_TIMEOUT" ]; then
         echo "[dunit-monitor] 错误: 超过 ${IDLE_TIMEOUT} 秒无新输出"
         cleanup
         exit 1

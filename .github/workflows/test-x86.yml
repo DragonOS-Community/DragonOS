@@ -20,7 +20,7 @@ jobs:
   integration-test:
     name: Integration Test
     runs-on: ubuntu-latest
-    # Allow the 50-minute guest test budget plus build, cleanup, and diagnostics.
+    # Allow the 55-minute guest test budget plus build, cleanup, and diagnostics.
     timeout-minutes: 75
     container:
       image: dragonos/dragonos-dev:v1.23

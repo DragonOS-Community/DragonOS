@@ -87,6 +87,7 @@ inline constexpr int kArpFrameLen = kEthHdrLen + kArpPktLen;  // 42
 inline constexpr size_t kVlanFrameLen = 1518;
 inline constexpr int kEthFrameLen = 1514;
 inline constexpr uint16_t kPrivateEtherType = 0x88b5;
+inline constexpr uint16_t kFanoutEtherType = 0x88b6;
 inline constexpr uint16_t kVlanEtherType = 0x8100;
 
 inline constexpr const char* kLocalIp = "10.0.2.15";
@@ -297,7 +298,7 @@ void Stimulate(int tx_fd, int ifindex, const uint8_t local_mac[6]) {
 
 // Create a SOCK_RAW socket bound to the specified interface, return fd or -1.
 int MakeBoundRaw(const std::string& ifname, int ifindex, uint8_t mac[6]) {
-    int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    int fd = socket(AF_PACKET, SOCK_RAW, 0);
     if (fd < 0) return -1;
     struct sockaddr_ll sa;
     std::memset(&sa, 0, sizeof(sa));
@@ -623,7 +624,7 @@ TEST(AfPacketE2E, DgramReceivesHeaderOnlyFrameWithoutFilter) {
     int ifindex = ProbeIfindex(ifname);
     ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic zero-length receive testing";
 
-    FdGuard receiver(socket(AF_PACKET, SOCK_DGRAM, htons(kPrivateEtherType)));
+    FdGuard receiver(socket(AF_PACKET, SOCK_DGRAM, 0));
     FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
     ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
     ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
@@ -877,7 +878,7 @@ TEST(AfPacketE2E, ReceiveBufferSizeControlsQueuedBytes) {
     ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic AF_PACKET queue testing";
 
     auto make_receiver = [ifindex]() {
-        int fd = socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType));
+        int fd = socket(AF_PACKET, SOCK_RAW, 0);
         if (fd < 0) return fd;
         struct sockaddr_ll bind_addr{};
         bind_addr.sll_family = AF_PACKET;
@@ -952,7 +953,7 @@ TEST(AfPacketE2E, ClassicFilterSnaplenAndRuntimeErrorsAreFailClosed) {
     ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic cBPF testing";
 
     auto make_receiver = [ifindex]() {
-        int fd = socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType));
+        int fd = socket(AF_PACKET, SOCK_RAW, 0);
         if (fd < 0) return fd;
         struct sockaddr_ll bind_addr{};
         bind_addr.sll_family = AF_PACKET;
@@ -1023,7 +1024,7 @@ TEST(AfPacketE2E, ClassicFilterSnaplenAndRuntimeErrorsAreFailClosed) {
     EXPECT_EQ(recv(receiver.Get(), buffer, sizeof(buffer), 0), -1);
     EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << ErrnoString(errno);
 
-    FdGuard arp_receiver(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP)));
+    FdGuard arp_receiver(socket(AF_PACKET, SOCK_RAW, 0));
     ASSERT_GE(arp_receiver.Get(), 0) << ErrnoString(errno);
     struct sockaddr_ll arp_bind{};
     arp_bind.sll_family = AF_PACKET;
@@ -1056,7 +1057,7 @@ TEST(AfPacketE2E, FilterReplacementPreservesReceiveState) {
     int ifindex = ProbeIfindex(ifname);
     ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic cBPF testing";
 
-    FdGuard receiver(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    FdGuard receiver(socket(AF_PACKET, SOCK_RAW, 0));
     FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
     ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
     ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
@@ -1124,11 +1125,11 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
     ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic fanout testing";
 
     auto make_receiver = [ifindex]() {
-        int fd = socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType));
+        int fd = socket(AF_PACKET, SOCK_RAW, 0);
         if (fd < 0) return fd;
         struct sockaddr_ll addr{};
         addr.sll_family = AF_PACKET;
-        addr.sll_protocol = htons(kPrivateEtherType);
+        addr.sll_protocol = htons(kFanoutEtherType);
         addr.sll_ifindex = ifindex;
         if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
             close(fd);
@@ -1139,7 +1140,7 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
 
     FdGuard first(make_receiver());
     FdGuard second(make_receiver());
-    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kFanoutEtherType)));
     ASSERT_GE(first.Get(), 0) << ErrnoString(errno);
     ASSERT_GE(second.Get(), 0) << ErrnoString(errno);
     ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
@@ -1155,12 +1156,12 @@ TEST(AfPacketE2E, FanoutLbDeliversExactlyOneCopyPerFrame) {
     uint8_t frame[96]{};
     std::memset(frame, 0xff, 6);
     std::memcpy(frame + 6, local_mac, 6);
-    frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
-    frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+    frame[12] = static_cast<uint8_t>(kFanoutEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kFanoutEtherType);
 
     struct sockaddr_ll dst{};
     dst.sll_family = AF_PACKET;
-    dst.sll_protocol = htons(kPrivateEtherType);
+    dst.sll_protocol = htons(kFanoutEtherType);
     dst.sll_ifindex = ifindex;
     dst.sll_hatype = ARPHRD_ETHER;
     dst.sll_halen = ETH_ALEN;

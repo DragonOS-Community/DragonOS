@@ -286,6 +286,10 @@ pub fn deliver_ip_to_packet_sockets(iface: &Arc<dyn Iface>, packet: &[u8], pkt_t
 }
 
 impl Socket for PacketSocket {
+    fn netns(&self) -> Arc<NetNamespace> {
+        PacketSocket::netns(self)
+    }
+
     fn fsnotify_watch_counter(&self) -> &AtomicUsize {
         &self.fsnotify_watches
     }

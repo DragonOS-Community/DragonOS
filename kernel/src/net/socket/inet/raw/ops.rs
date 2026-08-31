@@ -13,6 +13,10 @@ use super::{InetSocket, RawSocket};
 type EP = crate::filesystem::epoll::EPollEventType;
 
 impl crate::net::socket::Socket for RawSocket {
+    fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
+        RawSocket::netns(self)
+    }
+
     fn fsnotify_watch_counter(&self) -> &core::sync::atomic::AtomicUsize {
         &self.fsnotify_watches
     }

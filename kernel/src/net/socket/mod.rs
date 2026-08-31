@@ -4,6 +4,7 @@ pub mod endpoint;
 mod family;
 pub mod inet;
 mod inode;
+mod ioctl;
 pub mod netlink;
 pub mod packet;
 mod posix;

@@ -42,6 +42,14 @@ long RawSetScheduler(pid_t tid, int policy, const RawSchedParam* param) {
     return syscall(SYS_sched_setscheduler, tid, policy, param);
 }
 
+long RawGetPriorityMax(uint64_t policy) {
+    return syscall(SYS_sched_get_priority_max, policy);
+}
+
+long RawGetPriorityMin(uint64_t policy) {
+    return syscall(SYS_sched_get_priority_min, policy);
+}
+
 bool IsDragonOS() {
     struct utsname info {};
     return uname(&info) == 0 && strstr(info.release, "dragonos") != nullptr;
@@ -171,6 +179,54 @@ TEST(SchedGetScheduler, CurrentAndErrorsMatchLinux) {
     errno = 0;
     EXPECT_EQ(-1, sched_getscheduler(INT_MAX));
     EXPECT_EQ(ESRCH, errno);
+}
+
+TEST(SchedPriorityQueries, KnownPolicyMatrixMatchesLinux) {
+    struct PolicyRange {
+        int policy;
+        int maximum;
+        int minimum;
+    };
+    const PolicyRange ranges[] = {
+        {SCHED_OTHER, 0, 0},    {SCHED_FIFO, 99, 1}, {SCHED_RR, 99, 1},
+        {SCHED_BATCH, 0, 0},    {SCHED_IDLE, 0, 0},  {SCHED_DEADLINE, 0, 0},
+    };
+
+    for (const auto& range : ranges) {
+        EXPECT_EQ(range.maximum, sched_get_priority_max(range.policy))
+            << "policy=" << range.policy << ": " << strerror(errno);
+        EXPECT_EQ(range.minimum, sched_get_priority_min(range.policy))
+            << "policy=" << range.policy << ": " << strerror(errno);
+    }
+}
+
+TEST(SchedPriorityQueries, InvalidPoliciesReturnEinval) {
+    const int invalid_policies[] = {
+        -1, 4, 7, SCHED_OTHER | SCHED_RESET_ON_FORK, SCHED_FIFO | SCHED_RESET_ON_FORK, INT_MAX,
+    };
+
+    for (int policy : invalid_policies) {
+        errno = 0;
+        EXPECT_EQ(-1, sched_get_priority_max(policy)) << "policy=" << policy;
+        EXPECT_EQ(EINVAL, errno) << "policy=" << policy;
+        errno = 0;
+        EXPECT_EQ(-1, sched_get_priority_min(policy)) << "policy=" << policy;
+        EXPECT_EQ(EINVAL, errno) << "policy=" << policy;
+    }
+}
+
+TEST(SchedPriorityQueries, RawSyscallUsesSignedIntAbi) {
+    constexpr uint64_t kNonzeroHighBits = uint64_t {1} << 32;
+
+    EXPECT_EQ(99, RawGetPriorityMax(kNonzeroHighBits | SCHED_FIFO));
+    EXPECT_EQ(1, RawGetPriorityMin(kNonzeroHighBits | SCHED_FIFO));
+
+    errno = 0;
+    EXPECT_EQ(-1, RawGetPriorityMax(kNonzeroHighBits | 4));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawGetPriorityMin(kNonzeroHighBits | 4));
+    EXPECT_EQ(EINVAL, errno);
 }
 
 TEST(SchedSetScheduler, ErrorOrderingAndPolicyMatrix) {

@@ -20,6 +20,20 @@ pub(super) const SCHED_IDLE: i32 = 5;
 pub(super) const SCHED_DEADLINE: i32 = 6;
 pub(super) const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
 
+/// Returns the legacy scheduler priority range as `(min, max)`.
+///
+/// Keep this table aligned with Linux's `sched_get_priority_{min,max}` ABI.
+/// Policy flags are intentionally rejected because these syscalls accept a
+/// policy value, not the flag-bearing value returned by `sched_getscheduler`.
+#[inline]
+pub(super) fn legacy_policy_priority_range(policy: i32) -> Option<(i32, i32)> {
+    match policy {
+        SCHED_FIFO | SCHED_RR => Some((1, crate::sched::prio::MAX_RT_PRIO - 1)),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Some((0, 0)),
+        _ => None,
+    }
+}
+
 #[inline]
 pub(super) fn policy_to_linux(policy: SchedPolicy) -> i32 {
     match policy {

@@ -804,7 +804,9 @@ TEST(AfPacketE2E, DgramIpv4BroadcastBuildsLinuxCompatibleEthernetFrame) {
         std::memset(frame.data(), 0, frame.size());
         std::memset(&from, 0, sizeof(from));
         from_len = sizeof(from);
-        received = recvfrom(observer.Get(), frame.data(), frame.size(), MSG_DONTWAIT,
+        // MSG_TRUNC makes recvfrom return the complete on-wire frame length, so
+        // an unexpectedly longer frame cannot pass through buffer truncation.
+        received = recvfrom(observer.Get(), frame.data(), frame.size(), MSG_DONTWAIT | MSG_TRUNC,
                             reinterpret_cast<sockaddr*>(&from), &from_len);
         if (received < 0) {
             ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << ErrnoString(errno);
@@ -812,9 +814,12 @@ TEST(AfPacketE2E, DgramIpv4BroadcastBuildsLinuxCompatibleEthernetFrame) {
             continue;
         }
         ++observed;
+        const size_t captured = static_cast<size_t>(received) < frame.size()
+                                    ? static_cast<size_t>(received)
+                                    : frame.size();
         if (from.sll_ifindex == ifindex && from.sll_pkttype == PACKET_OUTGOING &&
             ntohs(from.sll_protocol) == ETH_P_IP &&
-            MatchesDhcpXid(frame.data(), static_cast<size_t>(received), kEthHdrLen, xid)) {
+            MatchesDhcpXid(frame.data(), captured, kEthHdrLen, xid)) {
             found = true;
             break;
         }

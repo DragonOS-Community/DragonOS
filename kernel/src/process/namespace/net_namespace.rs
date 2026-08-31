@@ -14,6 +14,7 @@ use crate::net::socket::packet::{
     membership_value, FanoutGroup, FanoutJoinParams, PacketIngressMetadata, PacketSocket,
 };
 use crate::net::socket::unix::ns::UnixAbstractTable;
+use crate::net::LOOPBACK_IFINDEX;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
 use crate::process::namespace::{nsproxy::NsProxy, NamespaceOps, NamespaceType};
@@ -490,7 +491,7 @@ impl NetNamespace {
         let counter = get_next_netns_counter();
         let loopback = crate::driver::net::loopback::LoopbackInterface::new_with_ifindex(
             crate::driver::net::loopback::LoopbackDriver::default(),
-            1,
+            LOOPBACK_IFINDEX,
         );
 
         let inner = InnerNetNamespace {

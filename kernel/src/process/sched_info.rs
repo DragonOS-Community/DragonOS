@@ -79,6 +79,7 @@ pub struct SchedInfo {
 pub struct PiProtected {
     pub cpus_allowed: CpuMask,
     pub nr_cpus_allowed: usize,
+    sched_reset_on_fork: bool,
 }
 
 impl PiProtected {
@@ -87,12 +88,23 @@ impl PiProtected {
         Self {
             cpus_allowed,
             nr_cpus_allowed,
+            sched_reset_on_fork: false,
         }
     }
 
     pub fn set_cpus_allowed(&mut self, new_mask: CpuMask) {
         self.cpus_allowed = new_mask;
         self.nr_cpus_allowed = self.cpus_allowed.iter_cpu().count();
+    }
+
+    #[inline]
+    pub fn sched_reset_on_fork(&self) -> bool {
+        self.sched_reset_on_fork
+    }
+
+    #[inline]
+    pub fn set_sched_reset_on_fork(&mut self, reset: bool) {
+        self.sched_reset_on_fork = reset;
     }
 }
 

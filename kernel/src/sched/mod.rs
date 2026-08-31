@@ -1300,20 +1300,37 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
 
 pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     let current = ProcessManager::current_pcb();
-    let fork_prio = current.sched_info().normal_prio();
+    let (mut fork_prio, mut fork_static_prio, parent_policy, reset_on_fork) = {
+        let pi_guard = current.sched_info().pi_lock_irqsave();
+        (
+            current.sched_info().normal_prio(),
+            current.sched_info().static_prio(),
+            current.sched_info().policy(),
+            pi_guard.sched_reset_on_fork(),
+        )
+    };
+
+    // This PR can only set RESET_ON_FORK on CFS tasks. Match Linux's fair
+    // policy rule: preserve non-negative nice, but reset negative nice to 0.
+    if reset_on_fork && parent_policy == SchedPolicy::CFS && fork_static_prio < prio::DEFAULT_PRIO {
+        fork_prio = prio::DEFAULT_PRIO;
+        fork_static_prio = prio::DEFAULT_PRIO;
+    }
 
     // 子进程是 TASK_NEW，不可见。可以直接写裸字段
     // 子进程继承父进程的 prio、static_prio、normal_prio
     pcb.sched_info().set_prio(fork_prio);
-    pcb.sched_info()
-        .set_static_prio(current.sched_info().static_prio());
+    pcb.sched_info().set_static_prio(fork_static_prio);
     pcb.sched_info().set_normal_prio(fork_prio);
+    pcb.sched_info()
+        .pi_lock_irqsave()
+        .set_sched_reset_on_fork(false);
 
     if PrioUtil::dl_prio(fork_prio) {
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     } else if PrioUtil::rt_prio(fork_prio) {
         // 子进程继承父进程的调度策略（FIFO/RR），而非统一设为 RT
-        pcb.sched_info().set_policy(current.sched_info().policy());
+        pcb.sched_info().set_policy(parent_policy);
     } else {
         pcb.sched_info().set_policy(SchedPolicy::CFS);
     }
@@ -1322,7 +1339,7 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         .sched_entity()
         .force_mut()
         .load
-        .set_load_weight_from_prio(current.sched_info().static_prio());
+        .set_load_weight_from_prio(fork_static_prio);
 
     pcb.sched_info()
         .sched_entity()

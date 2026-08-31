@@ -1,4 +1,3 @@
-use alloc::string::String;
 use core::fmt::Debug;
 
 use super::constants::{SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX};
@@ -100,9 +99,6 @@ pub struct RawSocketOptions {
     /// SO_RCVBUF: 返回给 getsockopt 的 sk_rcvbuf（Linux 会将 setsockopt 的值 *2 后存储）
     pub sock_rcvbuf: u32,
 
-    /// SO_BINDTODEVICE: 绑定的设备名（不含 '\0'）
-    pub bind_to_device: Option<String>,
-
     /// SO_LINGER
     pub linger_onoff: i32,
     pub linger_linger: i32,
@@ -137,7 +133,6 @@ impl Default for RawSocketOptions {
             // 初始值设为 sysctl_*mem_max * 2，与 Linux 默认行为一致。
             sock_sndbuf: SYSCTL_WMEM_MAX.saturating_mul(2),
             sock_rcvbuf: SYSCTL_RMEM_MAX.saturating_mul(2),
-            bind_to_device: None,
             linger_onoff: 0,
             linger_linger: 0,
             filter_attached: false,

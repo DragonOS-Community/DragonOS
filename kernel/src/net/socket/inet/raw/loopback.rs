@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion, UdpPacket};
 
+use crate::driver::net::Iface;
 use crate::libs::rwsem::RwSem;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::namespace::NamespaceOps;
@@ -142,11 +143,13 @@ fn should_deliver_to_socket(s: &RawSocket, ctx: &LoopbackDeliverContext) -> bool
         }
     }
 
-    // 4. SO_BINDTODEVICE：loopback 快速路径视为来自 lo
-    if let Some(dev) = &s.options.read().bind_to_device {
-        if dev.as_str() != "lo" {
+    // 4. SO_BINDTODEVICE：loopback 快速路径视为来自当前 netns 的 lo
+    if let Some(lo) = s.netns.loopback_iface() {
+        if !s.device_binding.allows(lo.nic_id()) {
             return false;
         }
+    } else if s.device_binding.ifindex() != 0 {
+        return false;
     }
 
     // 5. bind(2) 目的地址过滤

@@ -1,7 +1,5 @@
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 use hashbrown::HashMap;
-use smoltcp::wire::IpAddress;
 use system_error::SystemError;
 
 use crate::{
@@ -12,21 +10,20 @@ use crate::{
 
 use super::Types::{self, *};
 
-/// # TCP 和 UDP 的端口管理器。
-/// 如果 TCP/UDP 的 socket 绑定了某个端口，它会在对应的表中记录，以检测端口冲突。
+/// Per-interface TCP port manager.
+///
+/// UDP reservations are network-namespace-wide and live in `UdpBindingTable`,
+/// because Linux device-bound sockets can legally share a port across ifaces.
 #[derive(Debug)]
 pub struct PortManager {
     // TCP 端口记录表
     tcp_port_table: Mutex<HashMap<u16, RawPid>>,
-    // UDP 端口记录表
-    udp_port_table: Mutex<HashMap<u16, Vec<UdpPortBinding>>>,
 }
 
 impl Default for PortManager {
     fn default() -> Self {
         Self {
             tcp_port_table: Mutex::new(HashMap::new()),
-            udp_port_table: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -73,13 +70,6 @@ impl PortManager {
 
             // 使用 ListenTable 检查端口是否被占用
             match socket_type {
-                Udp => {
-                    let guard = self.udp_port_table.lock();
-                    if guard.get(&port).is_none() {
-                        drop(guard);
-                        return Ok(port);
-                    }
-                }
                 Tcp => {
                     let guard = self.tcp_port_table.lock();
                     if guard.get(&port).is_none() {
@@ -117,57 +107,15 @@ impl PortManager {
         Err(SystemError::EADDRINUSE)
     }
 
-    /// UDP: 绑定随机端口（支持 reuseaddr/reuseport 规则）
-    pub fn bind_udp_ephemeral_port(
-        &self,
-        addr: IpAddress,
-        reuseaddr: bool,
-        reuseport: bool,
-        bind_id: usize,
-    ) -> Result<u16, SystemError> {
-        let (min, max) = Self::local_port_range();
-        let range = (max - min) as u32 + 1;
-        if range == 0 {
-            return Err(SystemError::EINVAL);
-        }
-        let mut remaining = range;
-        while remaining > 0 {
-            let port = self.get_ephemeral_port(Types::Udp)?;
-            match self.bind_udp_port(port, addr, reuseaddr, reuseport, bind_id) {
-                Ok(()) => return Ok(port),
-                Err(SystemError::EADDRINUSE) => {
-                    // Race: another thread grabbed the port after we checked.
-                    remaining -= 1;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(SystemError::EADDRINUSE)
-    }
-
     /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP 对应的表中记录
     ///
-    /// UDP 复用逻辑请使用 `bind_udp_port`
     pub fn bind_port(&self, socket_type: Types, port: u16) -> Result<(), SystemError> {
-        if port > 0 {
-            match socket_type {
-                Udp => {
-                    let mut guard = self.udp_port_table.lock();
-                    if guard.get(&port).is_some() {
-                        return Err(SystemError::EADDRINUSE);
-                    }
-                    guard.insert(port, Vec::new());
-                }
-                Tcp => {
-                    let mut guard = self.tcp_port_table.lock();
-                    if guard.get(&port).is_some() {
-                        return Err(SystemError::EADDRINUSE);
-                    }
-                    guard.insert(port, ProcessManager::current_pid());
-                }
-                _ => {}
-            };
+        if port > 0 && socket_type == Tcp {
+            let mut guard = self.tcp_port_table.lock();
+            if guard.get(&port).is_some() {
+                return Err(SystemError::EADDRINUSE);
+            }
+            guard.insert(port, ProcessManager::current_pid());
         }
         return Ok(());
     }
@@ -175,76 +123,8 @@ impl PortManager {
     /// @brief 在对应的端口记录表中将端口和 socket 解绑
     /// should call this function when socket is closed or aborted
     pub fn unbind_port(&self, socket_type: Types, port: u16) {
-        match socket_type {
-            Udp => {
-                self.udp_port_table.lock().remove(&port);
-            }
-            Tcp => {
-                self.tcp_port_table.lock().remove(&port);
-            }
-            _ => {}
+        if socket_type == Tcp {
+            self.tcp_port_table.lock().remove(&port);
         };
     }
-
-    /// UDP: 绑定端口，支持 SO_REUSEADDR/SO_REUSEPORT
-    pub fn bind_udp_port(
-        &self,
-        port: u16,
-        addr: IpAddress,
-        reuseaddr: bool,
-        reuseport: bool,
-        bind_id: usize,
-    ) -> Result<(), SystemError> {
-        if port == 0 {
-            return Err(SystemError::EINVAL);
-        }
-        let mut guard = self.udp_port_table.lock();
-        let bindings = guard.entry(port).or_default();
-        for binding in bindings.iter() {
-            if !udp_addrs_conflict(addr, binding.addr) {
-                continue;
-            }
-            let share_ok = (reuseport && binding.reuseport) || (reuseaddr && binding.reuseaddr);
-            if !share_ok {
-                return Err(SystemError::EADDRINUSE);
-            }
-        }
-        bindings.push(UdpPortBinding {
-            addr,
-            reuseaddr,
-            reuseport,
-            bind_id,
-        });
-        Ok(())
-    }
-
-    /// UDP: 解绑端口（按 bind_id）
-    pub fn unbind_udp_port(&self, port: u16, bind_id: usize) {
-        let mut guard = self.udp_port_table.lock();
-        if let Some(list) = guard.get_mut(&port) {
-            list.retain(|b| b.bind_id != bind_id);
-            if list.is_empty() {
-                guard.remove(&port);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct UdpPortBinding {
-    addr: IpAddress,
-    reuseaddr: bool,
-    reuseport: bool,
-    bind_id: usize,
-}
-
-#[inline]
-fn udp_addrs_conflict(a: IpAddress, b: IpAddress) -> bool {
-    if a.version() != b.version() {
-        return false;
-    }
-    if a.is_unspecified() || b.is_unspecified() {
-        return true;
-    }
-    a == b
 }

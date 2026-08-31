@@ -1,5 +1,3 @@
-use alloc::string::String;
-
 use smoltcp::wire::IpProtocol;
 use system_error::SystemError;
 
@@ -13,7 +11,7 @@ use crate::net::socket::common::{
     write_timeval_opt, write_u32_getsockopt,
 };
 use crate::net::socket::inet::common::{apply_ipv4_membership, apply_ipv4_multicast_if};
-use crate::net::socket::{IpOption, IFNAMSIZ, PIPV6, PRAW, PSO};
+use crate::net::socket::{IpOption, PIPV6, PRAW, PSO};
 
 fn sock_buf_u32_from_opt(val: &[u8]) -> Result<u32, SystemError> {
     if val.len() < 4 {
@@ -52,27 +50,7 @@ impl RawSocket {
         match PSO::try_from(name as u32) {
             Ok(PSO::SNDBUF) => Ok(write_u32_getsockopt(value, self.options.read().sock_sndbuf)),
             Ok(PSO::RCVBUF) => Ok(write_u32_getsockopt(value, self.options.read().sock_rcvbuf)),
-            Ok(PSO::BINDTODEVICE) => {
-                let name = self
-                    .options
-                    .read()
-                    .bind_to_device
-                    .clone()
-                    .unwrap_or_default();
-                if name.is_empty() {
-                    return Ok(0);
-                }
-                if value.len() < IFNAMSIZ {
-                    return Err(SystemError::EINVAL);
-                }
-                let need = core::cmp::min(name.len() + 1, IFNAMSIZ);
-                let bytes = name.as_bytes();
-                let name_len = core::cmp::min(bytes.len(), need.saturating_sub(1));
-                let copy_len = core::cmp::min(name_len, need.saturating_sub(1));
-                value[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                value[copy_len] = 0;
-                Ok(need)
-            }
+            Ok(PSO::BINDTODEVICE) => self.device_binding.get(&self.netns, value),
             Ok(PSO::LINGER) => {
                 let opts = self.options.read();
                 Ok(write_linger_getsockopt(
@@ -252,22 +230,8 @@ impl RawSocket {
                 Ok(())
             }
             Ok(PSO::BINDTODEVICE) => {
-                let end = val.iter().position(|&b| b == 0).unwrap_or(val.len());
-                let name_bytes = &val[..end];
-                if name_bytes.is_empty() {
-                    self.options.write().bind_to_device = None;
-                    return Ok(());
-                }
-                let name = core::str::from_utf8(name_bytes).map_err(|_| SystemError::EINVAL)?;
-                let found = self
-                    .netns
-                    .device_list()
-                    .values()
-                    .any(|iface| iface.iface_name() == name);
-                if !found {
-                    return Err(SystemError::ENODEV);
-                }
-                self.options.write().bind_to_device = Some(String::from(name));
+                let mut update = self.device_binding.prepare_update(&self.netns, val)?;
+                update.commit();
                 Ok(())
             }
             Ok(PSO::DETACH_FILTER) => {

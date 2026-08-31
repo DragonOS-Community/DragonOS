@@ -79,6 +79,7 @@ impl RawSocket {
             fsnotify_watches: core::sync::atomic::AtomicUsize::new(0),
             self_ref: me.clone(),
             netns,
+            device_binding: crate::net::socket::inet::common::SocketDeviceBinding::default(),
             epoll_items: crate::net::socket::common::EPollItems::default(),
             fasync_items: crate::filesystem::vfs::fasync::FAsyncItems::default(),
             ip_version,

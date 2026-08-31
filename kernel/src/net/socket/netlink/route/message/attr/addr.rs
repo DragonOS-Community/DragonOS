@@ -101,7 +101,11 @@ impl Attribute for AddrAttr {
                 addr.copy_from_slice(buf);
                 AddrAttr::Local(addr)
             }
-            (AddrAttrClass::LABEL, 1..=IFNAME_SIZE) => {
+            (AddrAttrClass::LABEL, 1..) => {
+                let effective_len = buf.len() - usize::from(buf.last() == Some(&0));
+                if effective_len >= IFNAME_SIZE {
+                    return Err(SystemError::ERANGE);
+                }
                 // 查找第一个0字节作为结尾，否则用全部
                 let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
                 let cstr = CString::new(&buf[..nul_pos]).map_err(|_| SystemError::EINVAL)?;

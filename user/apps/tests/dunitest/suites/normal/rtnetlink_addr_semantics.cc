@@ -67,6 +67,7 @@ struct DumpedAddress {
     IpBytes local;
     uint8_t prefix_len = 0;
     uint32_t ifindex = 0;
+    std::string label;
 };
 
 struct RouteSpec {
@@ -194,8 +195,18 @@ int SetLinkUp(int fd, uint32_t ifindex, uint32_t sequence) {
     return SendAndReceiveAck(fd, request);
 }
 
+int SetLinkName(int fd, uint32_t ifindex, const char* name, uint32_t sequence) {
+    auto request = NewRequest<ifinfomsg>(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, sequence);
+    auto* message = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(request.data()));
+    message->ifi_family = AF_UNSPEC;
+    message->ifi_index = static_cast<int>(ifindex);
+    AddAttr(&request, IFLA_IFNAME, name, std::strlen(name) + 1);
+    return SendAndReceiveAck(fd, request);
+}
+
 int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& address,
-                  bool include_local, bool include_address, uint32_t sequence) {
+                  bool include_local, bool include_address, uint32_t sequence,
+                  const char* label = nullptr) {
     auto request = NewRequest<ifaddrmsg>(type, flags, sequence);
     auto* message = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(request.data()));
     message->ifa_family = address.family;
@@ -209,6 +220,7 @@ int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& addr
     if (include_address) {
         AddAttr(&request, IFA_ADDRESS, address.local.bytes.data(), address.local.length);
     }
+    if (label != nullptr) AddAttr(&request, IFA_LABEL, label, std::strlen(label) + 1);
     return SendAndReceiveAck(fd, request);
 }
 
@@ -260,6 +272,12 @@ int DumpAddresses(int fd, int family, uint32_t sequence, std::vector<DumpedAddre
             int attr_length = IFA_PAYLOAD(header);
             for (auto* attr = IFA_RTA(message); RTA_OK(attr, attr_length);
                  attr = RTA_NEXT(attr, attr_length)) {
+                if (attr->rta_type == IFA_LABEL && RTA_PAYLOAD(attr) > 0) {
+                    address.label.assign(static_cast<const char*>(RTA_DATA(attr)),
+                                         strnlen(static_cast<const char*>(RTA_DATA(attr)),
+                                                 RTA_PAYLOAD(attr)));
+                    continue;
+                }
                 if ((attr->rta_type != IFA_LOCAL && attr->rta_type != IFA_ADDRESS) ||
                     RTA_PAYLOAD(attr) < address.local.length) {
                     continue;
@@ -343,6 +361,19 @@ int CountAddress(int fd, const AddressSpec& expected, uint32_t sequence) {
     return count;
 }
 
+int CountAddressWithLabel(int fd, const AddressSpec& expected, const char* label,
+                          uint32_t sequence) {
+    std::vector<DumpedAddress> addresses;
+    if (const int error = DumpAddresses(fd, expected.family, sequence, &addresses); error != 0) {
+        return -error;
+    }
+    return static_cast<int>(std::count_if(addresses.begin(), addresses.end(), [&](const auto& item) {
+        return item.family == expected.family && item.ifindex == expected.ifindex &&
+               item.prefix_len == expected.prefix_len && SameAddress(item.local, expected.local) &&
+               item.label == label;
+    }));
+}
+
 int CountRoute(int fd, const RouteSpec& expected, uint32_t sequence) {
     std::vector<DumpedRoute> routes;
     if (const int error = DumpRoutes(fd, sequence, &routes); error != 0) return -error;
@@ -357,7 +388,7 @@ int CountRoute(int fd, const RouteSpec& expected, uint32_t sequence) {
 }
 
 bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
-                                const AddressSpec& expected) {
+                                const AddressSpec& expected, const char* label = nullptr) {
     if (header->nlmsg_type != type) return false;
     const auto* message = reinterpret_cast<const ifaddrmsg*>(NLMSG_DATA(header));
     if (message->ifa_family != expected.family || message->ifa_index != expected.ifindex ||
@@ -365,15 +396,21 @@ bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
         return false;
     }
     int attr_length = IFA_PAYLOAD(header);
+    bool address_matches = false;
+    bool label_matches = label == nullptr;
     for (auto* attr = IFA_RTA(message); RTA_OK(attr, attr_length);
          attr = RTA_NEXT(attr, attr_length)) {
         if ((attr->rta_type == IFA_LOCAL || attr->rta_type == IFA_ADDRESS) &&
             RTA_PAYLOAD(attr) >= expected.local.length &&
             std::memcmp(RTA_DATA(attr), expected.local.bytes.data(), expected.local.length) == 0) {
-            return true;
+            address_matches = true;
+        } else if (attr->rta_type == IFA_LABEL && label != nullptr && RTA_PAYLOAD(attr) > 0 &&
+                   strncmp(static_cast<const char*>(RTA_DATA(attr)), label, RTA_PAYLOAD(attr)) ==
+                       0) {
+            label_matches = true;
         }
     }
-    return false;
+    return address_matches && label_matches;
 }
 
 void DrainNotifications(int fd) {
@@ -386,7 +423,8 @@ void DrainNotifications(int fd) {
     }
 }
 
-int CountAddressNotifications(int fd, uint16_t type, const AddressSpec& address) {
+int CountAddressNotifications(int fd, uint16_t type, const AddressSpec& address,
+                              const char* label = nullptr) {
     std::array<uint8_t, 16384> buffer{};
     int count = 0;
     bool received_any = false;
@@ -402,7 +440,7 @@ int CountAddressNotifications(int fd, uint16_t type, const AddressSpec& address)
         int remaining = static_cast<int>(received);
         for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
              NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
-            if (NotificationMatchesAddress(header, type, address)) ++count;
+            if (NotificationMatchesAddress(header, type, address, label)) ++count;
         }
     }
 }
@@ -652,6 +690,59 @@ int RunIdentityFlagsAndErrorPriority() {
         return 4100;
     }
 
+    const AddressSpec alias = MakeAddress(AF_INET, "198.51.100.44", 24, ifindex);
+    DrainNotifications(notifications.Get());
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, alias, true, true,
+                      ++sequence, "lo:1") != 0 ||
+        CountAddressWithLabel(fd.Get(), alias, "lo:1", ++sequence) != 1 ||
+        CountAddressNotifications(notifications.Get(), RTM_NEWADDR, alias, "lo:1") != 1) {
+        return 4150;
+    }
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE, alias,
+                      true, true, ++sequence, "lo:9") != 0 ||
+        CountAddressWithLabel(fd.Get(), alias, "lo:1", ++sequence) != 1) {
+        return 4155;
+    }
+    if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, alias, true, true,
+                      ++sequence, "lo:2") != EADDRNOTAVAIL ||
+        CountAddressWithLabel(fd.Get(), alias, "lo:1", ++sequence) != 1) {
+        return 4160;
+    }
+    DrainNotifications(notifications.Get());
+    if (SetLinkName(fd.Get(), ifindex, "ren0", ++sequence) != 0 ||
+        CountAddressWithLabel(fd.Get(), alias, "ren0:1", ++sequence) != 1 ||
+        CountAddressNotifications(notifications.Get(), RTM_NEWADDR, alias, "ren0:1") != 1 ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, alias, true, true,
+                      ++sequence, "lo:1") != EADDRNOTAVAIL) {
+        return 4165;
+    }
+    if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, alias, true, true,
+                      ++sequence, "ren0:1") != 0 ||
+        CountAddress(fd.Get(), alias, ++sequence) != 0 ||
+        CountAddressNotifications(notifications.Get(), RTM_DELADDR, alias, "ren0:1") != 1) {
+        return 4170;
+    }
+
+    const AddressSpec long_label = MakeAddress(AF_INET, "198.51.100.45", 24, ifindex);
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, long_label, true,
+                      true, ++sequence, "1234567890123456") != ERANGE) {
+        return 4180;
+    }
+    const AddressSpec empty_label = MakeAddress(AF_INET, "198.51.100.46", 24, ifindex);
+    DrainNotifications(notifications.Get());
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, empty_label, true,
+                      true, ++sequence, "") != 0 ||
+        CountAddressWithLabel(fd.Get(), empty_label, "", ++sequence) != 1 ||
+        CountAddressNotifications(notifications.Get(), RTM_NEWADDR, empty_label, "") != 1 ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, empty_label, true, true,
+                      ++sequence, "") != 0 ||
+        CountAddressNotifications(notifications.Get(), RTM_DELADDR, empty_label, "") != 1) {
+        return 4190;
+    }
+
     const AddressSpec absent = MakeAddress(AF_INET, "203.0.113.77", 24, ifindex);
     if (ChangeAddress(fd.Get(), RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE, absent,
                       true, true, ++sequence) != 0 ||
@@ -754,6 +845,7 @@ int RunAddressRollbackAndCapacityRelease() {
         return error == kHostHasNoFixedRouteCapacity ? error : 6100 + error;
     }
     if (fillers.empty()) return 6200;
+    const size_t route_capacity = fillers.size();
 
     const AddressSpec address = MakeAddress(AF_INET, "203.0.113.1", 24, ifindex);
     const RouteSpec connected{Ipv4("203.0.113.0"), 24, ifindex};
@@ -785,117 +877,189 @@ int RunAddressRollbackAndCapacityRelease() {
         return 6700;
     }
 
-    // The current route model has no owner tag. A same-value explicit route
-    // must nevertheless survive deletion of the address projection.
-    const RouteSpec explicit_same_value{Ipv4("203.0.113.1"), 24, ifindex};
-    if (ChangeRoute(fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
-                    explicit_same_value, ++sequence) != 0) {
-        return 6750;
-    }
-
+    const RouteSpec explicit_same_value{Ipv4("203.0.113.0"), 24, ifindex};
     fillers.clear();
     if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers,
                                                &failed_route);
         error != 0) {
         return 6800 + error;
     }
-    if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, address, true, true,
-                      ++sequence) != 0 ||
-        CountAddress(fd.Get(), address, ++sequence) != 0 ||
-        CountRoute(fd.Get(), connected, ++sequence) < 1) {
-        return 6900;
+    if (fillers.size() + 1 != route_capacity)
+        return 6900 + static_cast<int>(fillers.size());
+    // The table is full, but the explicit route is a second logical owner of
+    // the address's canonical projection and therefore needs no new slot.
+    if (ChangeRoute(fd.Get(), RTM_NEWROUTE,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                    explicit_same_value, ++sequence) != 0) {
+        return 6905;
+    }
+    if (const int error = ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK,
+                                        address, true, true, ++sequence);
+        error != 0) {
+        return 6910 + error;
+    }
+    if (CountAddress(fd.Get(), address, ++sequence) != 0) return 6920;
+    if (CountRoute(fd.Get(), connected, ++sequence) != 1) return 6930;
+    if (ChangeRoute(fd.Get(), RTM_NEWROUTE,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, failed_route,
+                    ++sequence) != ENOSPC) {
+        return 6940;
+    }
+    if (const int error = ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
+                                      explicit_same_value, ++sequence);
+        error != 0) {
+        return 6950 + error;
     }
     if (ChangeRoute(fd.Get(), RTM_NEWROUTE,
                     NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, failed_route,
                     ++sequence) != 0) {
-        return 7000;
-    }
-    const RouteSpec capacity_probe{Ipv4("192.88.99.0"), 24, ifindex};
-    if (ChangeRoute(fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, capacity_probe,
-                    ++sequence) != ENOSPC ||
-        ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, explicit_same_value,
-                    ++sequence) != 0 ||
-        ChangeRoute(fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, capacity_probe,
-                    ++sequence) != 0) {
-        return 7050;
-    }
-    if (ChangeAddress(fd.Get(), RTM_NEWADDR,
-                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, address, true, true,
-                      ++sequence) != ENOSPC) {
-        return 7100;
-    }
-    if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, capacity_probe,
-                    ++sequence) != 0 ||
-        ChangeAddress(fd.Get(), RTM_NEWADDR,
-                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, address, true, true,
-                      ++sequence) != 0) {
-        return 7200;
-    }
-    if (CountAddress(fd.Get(), address, ++sequence) != 1 ||
-        CountRoute(fd.Get(), connected, ++sequence) < 1) {
-        return 7300;
+        return 6960;
     }
 
-    // Repeat the ownership check with the opposite creation order. An
-    // explicit route must not satisfy a later address's dedicated projection.
-    if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, address, true, true,
-                      ++sequence) != 0 ||
-        ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, failed_route,
+    if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, failed_route,
                     ++sequence) != 0) {
-        return 7400;
+        return 7000;
     }
     for (auto iterator = fillers.rbegin(); iterator != fillers.rend(); ++iterator) {
-        if (const int error = ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
-                                          *iterator, ++sequence);
-            error != 0) {
-            return 7450 + error;
+        if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, *iterator,
+                        ++sequence) != 0) {
+            return 7100;
         }
     }
+
+    // Repeat with the opposite creation order and delete the explicit owner
+    // while the address still exists. The shared projection must remain until
+    // the final owner disappears, then release exactly one physical slot.
     if (ChangeRoute(fd.Get(), RTM_NEWROUTE,
                     NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
                     explicit_same_value, ++sequence) != 0) {
-        return 7500;
+        return 7200;
     }
-
     fillers.clear();
     if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers,
                                                &failed_route);
-        error != 0 || fillers.empty()) {
-        return 7600 + (error < 0 ? 0 : error);
+        error != 0 || fillers.size() + 1 != route_capacity) {
+        return 7300 + (error > 0 ? error : 0);
     }
+    // Exercise the inverse full-table fast path: the address shares the
+    // already projected explicit route.
     if (ChangeAddress(fd.Get(), RTM_NEWADDR,
                       NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, address, true, true,
-                      ++sequence) != ENOSPC ||
-        CountAddress(fd.Get(), address, ++sequence) != 0) {
-        return 7700;
+                      ++sequence) != 0) {
+        return 7350;
     }
-    const RouteSpec released = fillers.back();
-    fillers.pop_back();
-    if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, released,
+    if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, explicit_same_value,
+                    ++sequence) != 0 ||
+        ChangeRoute(fd.Get(), RTM_NEWROUTE,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, failed_route,
+                    ++sequence) != ENOSPC ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, address, true, true,
+                      ++sequence) != 0 ||
+        ChangeRoute(fd.Get(), RTM_NEWROUTE,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, failed_route,
+                    ++sequence) != 0) {
+        return 7400;
+    }
+    return 0;
+}
+
+int RunSharedAddressAndExplicitRouteProjection() {
+    FdGuard fd;
+    uint32_t ifindex = 0;
+    uint32_t sequence = 4000;
+    if (const int error = PrepareNamespace(&fd, &ifindex, &sequence); error != 0) return error;
+    if (!IsDragonOS()) return kHostHasNoFixedRouteCapacity;
+
+    const AddressSpec address = MakeAddress(AF_INET, "203.0.113.1", 24, ifindex);
+    const RouteSpec route{Ipv4("203.0.113.0"), 24, ifindex};
+
+    std::vector<RouteSpec> fillers;
+    RouteSpec failed{};
+    if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers, &failed);
+        error != 0 || fillers.empty()) {
+        return 8350 + (error > 0 ? error : 0);
+    }
+    const size_t route_capacity = fillers.size();
+    for (auto iterator = fillers.rbegin(); iterator != fillers.rend(); ++iterator) {
+        if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, *iterator,
+                        ++sequence) != 0) {
+            return 8375;
+        }
+    }
+    fillers.clear();
+
+    if (ChangeRoute(fd.Get(), RTM_NEWROUTE,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
                     ++sequence) != 0 ||
         ChangeAddress(fd.Get(), RTM_NEWADDR,
                       NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, address, true, true,
                       ++sequence) != 0 ||
+        ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++sequence) != 0 ||
         ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, address, true, true,
+                      ++sequence) != 0) {
+        return 8400;
+    }
+
+    if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers, &failed);
+        error != 0 || fillers.size() != route_capacity) {
+        return 8500 + (error > 0 ? error : static_cast<int>(fillers.size()));
+    }
+    for (auto iterator = fillers.rbegin(); iterator != fillers.rend(); ++iterator) {
+        if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, *iterator,
+                        ++sequence) != 0) {
+            return 8600;
+        }
+    }
+
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, address, true, true,
                       ++sequence) != 0 ||
         ChangeRoute(fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, released,
-                    ++sequence) != 0) {
-        return 7800;
-    }
-    const RouteSpec explicit_first_probe{Ipv4("192.88.100.0"), 24, ifindex};
-    if (ChangeRoute(fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
-                    explicit_first_probe, ++sequence) != ENOSPC ||
-        ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, explicit_same_value,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
                     ++sequence) != 0 ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, address, true, true,
+                      ++sequence) != 0 ||
+        ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++sequence) != 0) {
+        return 8700;
+    }
+
+    fillers.clear();
+    if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers, &failed);
+        error != 0 || fillers.size() != route_capacity) {
+        return 8800 + (error > 0 ? error : static_cast<int>(fillers.size()));
+    }
+    for (auto iterator = fillers.rbegin(); iterator != fillers.rend(); ++iterator) {
+        if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, *iterator,
+                        ++sequence) != 0) {
+            return 8900;
+        }
+    }
+
+    const AddressSpec second = MakeAddress(AF_INET, "203.0.113.2", 24, ifindex);
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, address, true, true,
+                      ++sequence) != 0 ||
+        ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, second, true, true,
+                      ++sequence) != 0) {
+        return 9000;
+    }
+    fillers.clear();
+    if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers, &failed);
+        error != 0 || fillers.size() + 1 != route_capacity) {
+        return 9100 + (error > 0 ? error : static_cast<int>(fillers.size()));
+    }
+    if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, address, true, true,
+                      ++sequence) != 0 ||
         ChangeRoute(fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
-                    explicit_first_probe, ++sequence) != 0) {
-        return 7900;
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, failed,
+                    ++sequence) != ENOSPC ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, second, true, true,
+                      ++sequence) != 0 ||
+        ChangeRoute(fd.Get(), RTM_NEWROUTE,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, failed,
+                    ++sequence) != 0) {
+        return 9200;
     }
     return 0;
 }
@@ -979,6 +1143,24 @@ TEST(RtnetlinkAddressSemantics, InvalidAddressCannotPanicKernel) {
 TEST(RtnetlinkAddressSemantics, CapacityFailureRollsBackAndDeleteReleasesRouteSlot) {
     const ChildOutcome outcome = RunWithWatchdog(RunAddressRollbackAndCapacityRelease);
     ASSERT_FALSE(outcome.timed_out) << "address capacity rollback path deadlocked";
+    ASSERT_TRUE(WIFEXITED(outcome.wait_status));
+    if (outcome.stage == kNamespaceUnavailable) {
+        if (!IsDragonOS()) GTEST_SKIP() << "host does not permit a fresh user/network namespace";
+        FAIL() << "DragonOS failed to create the required fresh user/network namespace";
+    }
+    if (outcome.stage == kHostHasNoFixedRouteCapacity) {
+        if (!IsDragonOS()) {
+            GTEST_SKIP() << "Linux FIB has no DragonOS smoltcp fixed-capacity ENOSPC boundary";
+        }
+        FAIL() << "DragonOS route table did not reach ENOSPC within the bounded dynamic fill";
+    }
+    EXPECT_EQ(outcome.stage, 0) << "encoded stage/error=" << outcome.stage;
+    EXPECT_EQ(WEXITSTATUS(outcome.wait_status), 0);
+}
+
+TEST(RtnetlinkAddressSemantics, AddressAndExplicitRouteShareOneDataPlaneProjection) {
+    const ChildOutcome outcome = RunWithWatchdog(RunSharedAddressAndExplicitRouteProjection);
+    ASSERT_FALSE(outcome.timed_out) << "shared address/route projection path deadlocked";
     ASSERT_TRUE(WIFEXITED(outcome.wait_status));
     if (outcome.stage == kNamespaceUnavailable) {
         if (!IsDragonOS()) GTEST_SKIP() << "host does not permit a fresh user/network namespace";

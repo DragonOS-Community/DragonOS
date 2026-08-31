@@ -171,7 +171,7 @@ fn dispatch_request(
         RouteNlSegment::SetLink(request) if seg_type == CSegmentType::DELLINK => {
             link::do_del_link(request, netns)
         }
-        RouteNlSegment::SetLink(request) => link::do_set_link(request, netns),
+        RouteNlSegment::SetLink(request) => link::do_set_link(rtnl, request, netns),
         RouteNlSegment::GetRoute(request) if seg_type == CSegmentType::GETRULE => {
             route::do_get_rule(request, netns)
         }

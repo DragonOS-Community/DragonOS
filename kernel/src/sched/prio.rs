@@ -30,4 +30,13 @@ impl PrioUtil {
     pub fn rt_prio(prio: i32) -> bool {
         return prio < MAX_RT_PRIO;
     }
+
+    /// Convert the internal RT priority (0..=98, high to low) to the legacy
+    /// Linux userspace value (99..=1).
+    #[inline]
+    pub fn internal_rt_prio_to_user(prio: i32) -> Option<i32> {
+        (0..MAX_RT_PRIO - 1)
+            .contains(&prio)
+            .then_some((MAX_RT_PRIO - 1) - prio)
+    }
 }

@@ -1,6 +1,31 @@
 /// 调度系统调用相关的工具函数
-use crate::process::cred::CAPFlags;
-use crate::process::ProcessControlBlock;
+use alloc::sync::Arc;
+
+use system_error::SystemError;
+
+use crate::process::cred::{CAPFlags, Cred};
+use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
+
+/// Resolve a legacy scheduler syscall PID as a thread ID in the caller's
+/// active PID namespace.
+pub(super) fn find_sched_target(pid: i32) -> Result<Arc<ProcessControlBlock>, SystemError> {
+    if pid < 0 {
+        return Err(SystemError::EINVAL);
+    }
+
+    if pid == 0 {
+        Ok(ProcessManager::current_pcb())
+    } else {
+        ProcessManager::find_task_by_vpid(RawPid::from(pid as usize)).ok_or(SystemError::ESRCH)
+    }
+}
+
+/// Linux sched_setscheduler owner rule: the caller's effective UID must match
+/// either the target's real or effective UID.
+#[inline]
+pub(super) fn same_sched_owner(current: &Cred, target: &Cred) -> bool {
+    current.euid == target.euid || current.euid == target.uid
+}
 
 /// 检查当前进程是否有权限查询目标进程的调度信息
 ///

@@ -705,7 +705,7 @@ impl VirtIOBlkDevice {
 
         if let Some(io_thread) = io_thread {
             // 设置FIFO调度策略
-            if let Err(err) = ProcessManager::set_fifo_policy(&io_thread, MAX_RT_PRIO - 1) {
+            if let Err(err) = ProcessManager::set_fifo_policy(&io_thread, MAX_RT_PRIO - 2) {
                 error!("Failed to set FIFO policy for {}: {:?}", thread_name, err);
             }
 

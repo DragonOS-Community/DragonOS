@@ -351,6 +351,7 @@ impl phy::Device for VethDriver {
 pub struct VethInterface {
     driver: VethDriver,
     common: IfaceCommon,
+    mac_address: EthernetAddress,
     inner: SpinLock<VethCommonData>,
     locked_kobj_state: LockedKObjectState,
 }
@@ -382,7 +383,8 @@ impl VethInterface {
             (iface_id >> 8) as u8,
             iface_id as u8,
         ];
-        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
+        let mac_address = EthernetAddress(mac);
+        let hw_addr = HardwareAddress::Ethernet(mac_address);
         let mut iface_config = smoltcp::iface::Config::new(hw_addr);
         iface_config.random_seed = rand() as u64;
         let mut iface = smoltcp::iface::Interface::new(
@@ -409,6 +411,7 @@ impl VethInterface {
                 flags,
                 iface,
             ),
+            mac_address,
             inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
         });
@@ -649,11 +652,7 @@ impl Iface for VethInterface {
     }
 
     fn mac(&self) -> EthernetAddress {
-        if let HardwareAddress::Ethernet(mac) = self.common.smol_iface.lock().hardware_addr() {
-            mac
-        } else {
-            EthernetAddress([0, 0, 0, 0, 0, 0])
-        }
+        self.mac_address
     }
 
     fn poll(&self) -> bool {

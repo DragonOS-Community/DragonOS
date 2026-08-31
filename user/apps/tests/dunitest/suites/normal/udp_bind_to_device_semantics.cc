@@ -201,6 +201,9 @@ TEST(UdpBindToDevice, LocalFastPathDoesNotCrossBoundInterface) {
     ASSERT_GE(receiver.Get(), 0);
     ASSERT_GE(sender.Get(), 0);
 
+    timeval timeout = {.tv_sec = 0, .tv_usec = 100000};
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+
     ASSERT_EQ(setsockopt(sender.Get(), SOL_SOCKET, SO_BINDTODEVICE, non_loopback.c_str(),
                          non_loopback.size() + 1),
               0)
@@ -222,8 +225,14 @@ TEST(UdpBindToDevice, LocalFastPathDoesNotCrossBoundInterface) {
 
     char received[sizeof(payload)] = {};
     errno = 0;
-    EXPECT_EQ(recv(receiver.Get(), received, sizeof(received), MSG_DONTWAIT), -1);
+    EXPECT_EQ(recv(receiver.Get(), received, sizeof(received), 0), -1);
     EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+
+    ASSERT_EQ(sendto(sender.Get(), payload, sizeof(payload), 0,
+                     reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+              static_cast<ssize_t>(sizeof(payload)))
+            << "the bound interface must remain usable after processing ingress: "
+            << strerror(errno);
 }
 
 TEST(UdpBindToDevice, ReuseOptionsAreReadAtBindConflictTime) {

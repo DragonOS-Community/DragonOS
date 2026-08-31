@@ -141,14 +141,14 @@ impl ProcessManager {
             return Err(SystemError::EPERM);
         }
 
-        if !(0..crate::sched::prio::MAX_RT_PRIO).contains(&prio) {
+        if !(0..crate::sched::prio::MAX_RT_PRIO - 1).contains(&prio) {
             return Err(SystemError::EINVAL);
         }
 
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
         // Lock ordering: pi_lock → rq_lock, matching Linux task_rq_lock().
-        let pi_guard = pcb.sched_info().pi_lock_irqsave();
+        let mut pi_guard = pcb.sched_info().pi_lock_irqsave();
 
         let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
         let update_clock = target_cpu == smp_get_processor_id();
@@ -201,6 +201,11 @@ impl ProcessManager {
         pcb.sched_info().set_policy(SchedPolicy::FIFO);
         pcb.sched_info().set_prio(prio);
         pcb.sched_info().set_normal_prio(prio);
+        // This internal API has no RESET_ON_FORK argument. Do not carry a
+        // stale CFS flag into FIFO, where this PR deliberately does not
+        // implement the otherwise unreachable RT fork-reset path.
+        pi_guard.set_sched_reset_on_fork(false);
+        debug_assert!(!pi_guard.sched_reset_on_fork());
 
         // Re-enqueue.
         if queued {

@@ -8,8 +8,8 @@ use crate::{
     exception::InterruptArch,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     sched::{
-        cpu_rq, enqueue_task_on_cpu, select_task_rq, DequeueFlag, EnqueueFlag, OnRq, SchedPolicy,
-        Scheduler, WakeupFlags,
+        cpu_rq, enqueue_task_on_cpu, select_task_rq, DequeueFlag, EnqueueFlag, LinuxSchedPolicy,
+        OnRq, SchedClass, Scheduler, WakeupFlags,
     },
     smp::{core::smp_get_processor_id, kick_cpu},
 };
@@ -159,7 +159,7 @@ impl ProcessManager {
         }
 
         // Read task state under the lock.
-        let old_policy = pcb.sched_info().policy();
+        let old_class = pcb.sched_info().sched_class();
         let queued = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued;
 
         // Determine whether the target is the currently running task on this rq.
@@ -177,17 +177,16 @@ impl ProcessManager {
         // A running task must first be put_prev_task to yield its current
         // execution position.
         if running {
-            match old_policy {
-                SchedPolicy::FIFO => {
+            match old_class {
+                SchedClass::Realtime => {
                     crate::sched::fifo::FifoScheduler::put_prev_task(rq, pcb.clone())
                 }
-                SchedPolicy::CFS => {
+                SchedClass::Fair => {
                     crate::sched::fair::CompletelyFairScheduler::put_prev_task(rq, pcb.clone())
                 }
-                SchedPolicy::IDLE => {
+                SchedClass::Idle => {
                     crate::sched::idle::IdleScheduler::put_prev_task(rq, pcb.clone())
                 }
-                SchedPolicy::RT => todo!("RT scheduler not implemented yet"),
             }
         }
 
@@ -198,7 +197,7 @@ impl ProcessManager {
         //     already passes the kernel prio)
         //   - static_prio is left unchanged (Linux only modifies static_prio for
         //     fair_policy, core.c:7528-7529)
-        pcb.sched_info().set_policy(SchedPolicy::FIFO);
+        pcb.sched_info().set_policy(LinuxSchedPolicy::Fifo);
         pcb.sched_info().set_prio(prio);
         pcb.sched_info().set_normal_prio(prio);
         // This internal API has no RESET_ON_FORK argument. Do not carry a
@@ -218,15 +217,7 @@ impl ProcessManager {
         // Matches Linux __sched_setscheduler: after a running task changes its
         // policy, set_next_task is required.
         if running {
-            match pcb.sched_info().policy() {
-                SchedPolicy::FIFO => {
-                    crate::sched::fifo::FifoScheduler::set_next_task(rq, pcb.clone());
-                }
-                SchedPolicy::CFS => {
-                    crate::sched::fair::CompletelyFairScheduler::set_next_task(rq, pcb.clone());
-                }
-                _ => {}
-            }
+            crate::sched::fifo::FifoScheduler::set_next_task(rq, pcb.clone());
         }
 
         // check_class_changed → preemption check.

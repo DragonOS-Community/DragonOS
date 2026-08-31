@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_SCHED_GETPARAM},
-    sched::{prio::PrioUtil, SchedPolicy},
+    sched::{prio::PrioUtil, LinuxSchedPolicy},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferWriter,
@@ -38,9 +38,9 @@ impl Syscall for SysSchedGetparam {
         };
 
         let sched_priority = match policy {
-            SchedPolicy::CFS | SchedPolicy::IDLE => 0,
-            SchedPolicy::RT | SchedPolicy::FIFO => PrioUtil::internal_rt_prio_to_user(normal_prio)
-                .ok_or_else(|| {
+            LinuxSchedPolicy::Normal => 0,
+            LinuxSchedPolicy::Fifo => {
+                PrioUtil::internal_rt_prio_to_user(normal_prio).ok_or_else(|| {
                     log::error!(
                         "task {} has invalid internal RT priority {}",
                         target.raw_pid().data(),
@@ -52,7 +52,8 @@ impl Syscall for SysSchedGetparam {
                         target.raw_pid().data()
                     );
                     SystemError::EIO
-                })?,
+                })?
+            }
         };
 
         let sched_param = KernelSchedParam { sched_priority };

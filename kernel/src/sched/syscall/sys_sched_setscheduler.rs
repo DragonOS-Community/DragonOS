@@ -8,7 +8,7 @@ use crate::{
         cred::{capable, CAPFlags},
         ProcessManager,
     },
-    sched::SchedPolicy,
+    sched::LinuxSchedPolicy,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferReader,
@@ -95,7 +95,7 @@ impl Syscall for SysSchedSetscheduler {
 
         loop {
             let mut pi_guard = target.sched_info().pi_lock_irqsave();
-            if target.sched_info().policy() != SchedPolicy::CFS {
+            if target.sched_info().policy() != LinuxSchedPolicy::Normal {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
 

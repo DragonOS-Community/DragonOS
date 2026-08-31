@@ -38,7 +38,7 @@ use crate::{
         kthread::KernelThreadClosure, kthread::KernelThreadMechanism, preempt::PreemptGuard,
         ProcessFlags, ProcessManager,
     },
-    sched::{clock::SchedClock, cond_resched, sched_yield, SchedPolicy},
+    sched::{clock::SchedClock, cond_resched, sched_yield, SchedClass},
     smp::{
         core::smp_get_processor_id,
         cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
@@ -1263,7 +1263,7 @@ fn participating_context_snapshot(
 
 #[inline]
 fn current_task_is_idle() -> bool {
-    ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE
+    ProcessManager::current_pcb().sched_info().sched_class() == SchedClass::Idle
 }
 
 #[inline]

@@ -11,7 +11,9 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::{ProcessControlBlock, ProcessState},
-    sched::{cpu_is_online, fair::FairSchedEntity, prio::MAX_PRIO, OnRq, SchedPolicy},
+    sched::{
+        cpu_is_online, fair::FairSchedEntity, prio::MAX_PRIO, LinuxSchedPolicy, OnRq, SchedClass,
+    },
     smp::cpu::{AtomicProcessorId, ProcessorId},
 };
 
@@ -42,8 +44,10 @@ pub struct ProcessSchedulerInfo {
     /// Time slice managed by the real-time scheduler.
     // rt_time_slice: AtomicIsize,
     pub sched_stat: RwLock<SchedInfo>,
-    /// Scheduling policy (protected by rq_lock / pi_lock).
+    /// Linux base scheduling policy (protected by rq_lock / pi_lock).
     sched_policy: AtomicU8,
+    /// Effective scheduler class (protected by rq_lock / pi_lock).
+    sched_class: AtomicU8,
     /// CFS scheduling entity.
     pub sched_entity: Arc<FairSchedEntity>,
     pub on_rq: SpinLock<OnRq>,
@@ -122,7 +126,7 @@ impl ProcessSchedulerInfo {
     }
 
     #[inline(never)]
-    pub fn new(on_cpu: Option<ProcessorId>) -> Self {
+    pub fn new(on_cpu: Option<ProcessorId>, initial_class: SchedClass) -> Self {
         let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
         let cpus_allowed = Self::default_cpus_allowed();
         return Self {
@@ -135,7 +139,8 @@ impl ProcessSchedulerInfo {
             // rt_time_slice: AtomicIsize::new(0),
             // priority: SchedPriority::new(100).unwrap(),
             sched_stat: RwLock::new(SchedInfo::default()),
-            sched_policy: AtomicU8::new(SchedPolicy::CFS.to_u8()),
+            sched_policy: AtomicU8::new(LinuxSchedPolicy::Normal.to_u8()),
+            sched_class: AtomicU8::new(initial_class.to_u8()),
             sched_entity: FairSchedEntity::new(),
             on_rq: SpinLock::new(OnRq::None),
             placement: SpinLock::new(NewTaskPlacement::default()),
@@ -347,14 +352,27 @@ impl ProcessSchedulerInfo {
 
     /// Read the scheduling policy.
     #[inline]
-    pub fn policy(&self) -> SchedPolicy {
-        SchedPolicy::from_u8(self.sched_policy.load(Ordering::Relaxed))
+    pub fn policy(&self) -> LinuxSchedPolicy {
+        LinuxSchedPolicy::from_u8(self.sched_policy.load(Ordering::Relaxed))
     }
 
-    /// Set the scheduling policy.
+    /// Set the Linux base policy and its effective base class.
+    ///
+    /// The task must either be unpublished or protected by the existing
+    /// scheduler policy-change lock domain (`pi_lock` and, when applicable,
+    /// its runqueue lock). A future priority-inheritance path may override the
+    /// effective class separately.
     #[inline]
-    pub fn set_policy(&self, policy: SchedPolicy) {
+    pub(crate) fn set_policy(&self, policy: LinuxSchedPolicy) {
+        self.sched_class
+            .store(policy.base_sched_class().to_u8(), Ordering::Relaxed);
         self.sched_policy.store(policy.to_u8(), Ordering::Relaxed);
+    }
+
+    /// Read the scheduler class currently responsible for this task.
+    #[inline]
+    pub fn sched_class(&self) -> SchedClass {
+        SchedClass::from_u8(self.sched_class.load(Ordering::Relaxed))
     }
 
     /// Read the dynamic priority.

@@ -17,8 +17,8 @@ use alloc::sync::{Arc, Weak};
 
 use super::pelt::{add_positive, sub_positive, SchedulerAvg, UpdateAvgFlags, PELT_MIN_DIVIDER};
 use super::{
-    CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, SchedPolicy, Scheduler, TaskGroup,
-    WakeupFlags, SCHED_CAPACITY_SHIFT,
+    CpuRunQueue, DequeueFlag, EnqueueFlag, LoadWeight, OnRq, Scheduler, TaskGroup, WakeupFlags,
+    SCHED_CAPACITY_SHIFT,
 };
 
 /// 用于设置 CPU-bound 任务的最小抢占粒度的参数。
@@ -161,7 +161,7 @@ impl FairSchedEntity {
     #[inline]
     pub fn is_idle(&self) -> bool {
         if self.is_task() {
-            return self.pcb().sched_info().policy() == SchedPolicy::IDLE;
+            return false;
         }
 
         return self.cfs_rq().is_idle();
@@ -1398,7 +1398,7 @@ impl Scheduler for CompletelyFairScheduler {
             Arc::ptr_eq(&se.cfs_rq(), &rq.cfs_rq()),
             "enqueue: SE's cfs_rq must match target rq's cfs_rq"
         );
-        let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
+        let mut idle_h_nr_running = false;
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
             if se.on_rq() {
                 return (false, false);
@@ -1460,7 +1460,7 @@ impl Scheduler for CompletelyFairScheduler {
         mut flags: DequeueFlag,
     ) {
         let mut se = pcb.sched_info().sched_entity();
-        let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
+        let mut idle_h_nr_running = false;
         let task_sleep = flags.contains(DequeueFlag::DEQUEUE_SLEEP);
         let was_sched_idle = rq.sched_idle_rq();
 
@@ -1593,16 +1593,7 @@ impl Scheduler for CompletelyFairScheduler {
             return;
         }
 
-        if unlikely(curr.sched_info().policy() == SchedPolicy::IDLE)
-            && likely(pcb.sched_info().policy() != SchedPolicy::IDLE)
-        {
-            rq.resched_current();
-            return;
-        }
-
-        if unlikely(pcb.sched_info().policy() != SchedPolicy::CFS)
-            || !SCHED_FEATURES.contains(SchedFeature::WAKEUP_PREEMPTION)
-        {
+        if !SCHED_FEATURES.contains(SchedFeature::WAKEUP_PREEMPTION) {
             return;
         }
 

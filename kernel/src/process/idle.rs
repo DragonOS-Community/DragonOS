@@ -85,14 +85,14 @@ impl ProcessManager {
                 .force_mut()
                 .set_cfs(Arc::downgrade(&rq.cfs_rq()));
 
+            debug_assert_eq!(
+                idle_pcb.sched_info().sched_class(),
+                crate::sched::SchedClass::Idle
+            );
+
             // 释放顺序：先 rq_lock，再 pi_lock
             drop(rq_guard);
             drop(pi_guard);
-
-            // 在锁外设置调度策略
-            idle_pcb
-                .sched_info()
-                .set_policy(crate::sched::SchedPolicy::IDLE);
 
             v.push(idle_pcb);
         }

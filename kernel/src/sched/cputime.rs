@@ -12,7 +12,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 
-use super::{clock::SchedClock, cpu_irq_time, cpu_rq, prio::PrioUtil, SchedPolicy};
+use super::{clock::SchedClock, cpu_irq_time, cpu_rq, prio::PrioUtil, SchedClass};
 
 /// CPU 时间类型枚举（对齐 Linux kernel_stat.h 的 cpu_usage_stat）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,8 +204,8 @@ impl CpuTimeFunc {
         let kcpustat = kcpustat_this_cpu();
 
         // 判断是否是 idle 进程
-        let policy = pcb.sched_info().policy();
-        if policy == SchedPolicy::IDLE {
+        let sched_class = pcb.sched_info().sched_class();
+        if sched_class == SchedClass::Idle {
             // idle 进程：根据 nr_iowait 区分 IDLE 和 IOWAIT
             let cpu_id = smp_get_processor_id();
             let rq = cpu_rq(cpu_id.data() as usize);
@@ -241,7 +241,7 @@ impl CpuTimeFunc {
         }
 
         // 只有非 idle 进程才累加 sum_exec_runtime
-        if policy != SchedPolicy::IDLE {
+        if sched_class != SchedClass::Idle {
             pcb.add_sum_exec_runtime(accounted_cputime);
         }
 

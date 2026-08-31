@@ -9,6 +9,7 @@ pub mod fifo_demo;
 pub mod idle;
 pub mod loadavg;
 pub mod pelt;
+pub mod policy;
 pub mod prio;
 pub mod syscall;
 
@@ -59,6 +60,8 @@ use self::{
     prio::{PrioUtil, MAX_RT_PRIO},
 };
 
+pub use policy::{LinuxSchedPolicy, SchedClass};
+
 static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
 pub static IDLE_CPUS: AtomicCpuMask = AtomicCpuMask::new();
 
@@ -91,7 +94,7 @@ pub fn cpu_rq(cpu: usize) -> Arc<CpuRunQueue> {
 
 #[inline]
 fn task_is_idle(pcb: &Arc<ProcessControlBlock>) -> bool {
-    pcb.sched_info().policy() == SchedPolicy::IDLE
+    pcb.sched_info().sched_class() == SchedClass::Idle
 }
 
 #[inline]
@@ -209,7 +212,8 @@ pub fn select_task_rq(
             .unwrap_or(prev_cpu)
     };
 
-    if pcb.flags().contains(ProcessFlags::KTHREAD) || pcb.sched_info().policy() != SchedPolicy::CFS
+    if pcb.flags().contains(ProcessFlags::KTHREAD)
+        || pcb.sched_info().sched_class() != SchedClass::Fair
     {
         return fallback_cpu;
     }
@@ -283,41 +287,6 @@ pub trait Scheduler {
     fn task_fork(pcb: Arc<ProcessControlBlock>);
 
     fn put_prev_task(rq: &mut CpuRunQueue, prev: Arc<ProcessControlBlock>);
-}
-
-/// 调度策略
-///
-/// 裸字段，由调用者持 rq_lock 或 pi_lock 保护。
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
-pub enum SchedPolicy {
-    /// 实时进程
-    RT = 0,
-    /// 先进先出调度
-    FIFO = 1,
-    /// 完全公平调度
-    CFS = 2,
-    /// IDLE
-    IDLE = 3,
-}
-
-impl SchedPolicy {
-    #[inline]
-    pub fn to_u8(self) -> u8 {
-        self as u8
-    }
-
-    #[inline]
-    pub fn from_u8(val: u8) -> Self {
-        match val {
-            0 => SchedPolicy::RT,
-            1 => SchedPolicy::FIFO,
-            2 => SchedPolicy::CFS,
-            3 => SchedPolicy::IDLE,
-            _ => panic!("Invalid SchedPolicy value: {val}"),
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -617,11 +586,10 @@ impl CpuRunQueue {
             }
         }
 
-        match pcb.sched_info().policy() {
-            SchedPolicy::CFS => CompletelyFairScheduler::enqueue(self, pcb, flags),
-            SchedPolicy::FIFO => FifoScheduler::enqueue(self, pcb, flags),
-            SchedPolicy::RT => todo!(),
-            SchedPolicy::IDLE => IdleScheduler::enqueue(self, pcb, flags),
+        match pcb.sched_info().sched_class() {
+            SchedClass::Realtime => FifoScheduler::enqueue(self, pcb, flags),
+            SchedClass::Fair => CompletelyFairScheduler::enqueue(self, pcb, flags),
+            SchedClass::Idle => IdleScheduler::enqueue(self, pcb, flags),
         }
 
         // TODO:https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sched/core.c#239
@@ -648,11 +616,10 @@ impl CpuRunQueue {
             }
         }
 
-        match pcb.sched_info().policy() {
-            SchedPolicy::CFS => CompletelyFairScheduler::dequeue(self, pcb, flags),
-            SchedPolicy::FIFO => FifoScheduler::dequeue(self, pcb, flags),
-            SchedPolicy::RT => todo!(),
-            SchedPolicy::IDLE => IdleScheduler::dequeue(self, pcb, flags),
+        match pcb.sched_info().sched_class() {
+            SchedClass::Realtime => FifoScheduler::dequeue(self, pcb, flags),
+            SchedClass::Fair => CompletelyFairScheduler::dequeue(self, pcb, flags),
+            SchedClass::Idle => IdleScheduler::dequeue(self, pcb, flags),
         }
     }
 
@@ -675,18 +642,19 @@ impl CpuRunQueue {
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
-    #[allow(clippy::comparison_chain)]
     pub fn check_preempt_current(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
-        if pcb.sched_info().policy() == self.current().sched_info().policy() {
-            match self.current().sched_info().policy() {
-                SchedPolicy::CFS => {
+        let current_class = self.current().sched_info().sched_class();
+        let waking_class = pcb.sched_info().sched_class();
+
+        if waking_class == current_class {
+            match current_class {
+                SchedClass::Fair => {
                     CompletelyFairScheduler::check_preempt_current(self, pcb, flags)
                 }
-                SchedPolicy::FIFO => FifoScheduler::check_preempt_current(self, pcb, flags),
-                SchedPolicy::RT => todo!(),
-                SchedPolicy::IDLE => IdleScheduler::check_preempt_current(self, pcb, flags),
+                SchedClass::Realtime => FifoScheduler::check_preempt_current(self, pcb, flags),
+                SchedClass::Idle => IdleScheduler::check_preempt_current(self, pcb, flags),
             }
-        } else if pcb.sched_info().policy() < self.current().sched_info().policy() {
+        } else if waking_class.outranks(current_class) {
             // 调度优先级更高
             self.resched_current();
         }
@@ -711,27 +679,25 @@ impl CpuRunQueue {
     ///
     /// CFS 的 wakeup-preempt 需要像 Linux `check_preempt_wakeup()` 一样先更新当前实体；
     /// 调用者若不能证明已持目标 rq lock 并更新 rq clock，就必须在这里跳过。
-    #[allow(clippy::comparison_chain)]
     pub fn check_preempt_remote(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
         let current = self.current();
-        let current_policy = current.sched_info().policy();
-        let next_policy = pcb.sched_info().policy();
+        let current_class = current.sched_info().sched_class();
+        let next_class = pcb.sched_info().sched_class();
 
         if current.flags().contains(ProcessFlags::NEED_SCHEDULE) {
-            if current_policy == SchedPolicy::IDLE {
+            if current_class == SchedClass::Idle {
                 self.resched_current();
             }
             return;
         }
 
-        if next_policy < current_policy {
+        if next_class.outranks(current_class) {
             self.resched_current();
-        } else if next_policy == current_policy {
-            match current_policy {
-                SchedPolicy::CFS => {}
-                SchedPolicy::FIFO => FifoScheduler::check_preempt_current(self, pcb, flags),
-                SchedPolicy::RT => todo!(),
-                SchedPolicy::IDLE => IdleScheduler::check_preempt_current(self, pcb, flags),
+        } else if next_class == current_class {
+            match current_class {
+                SchedClass::Fair => {}
+                SchedClass::Realtime => FifoScheduler::check_preempt_current(self, pcb, flags),
+                SchedClass::Idle => IdleScheduler::check_preempt_current(self, pcb, flags),
             }
         }
 
@@ -893,7 +859,7 @@ impl CpuRunQueue {
 
         // A remote idle CPU may be halted; kick it even if the flag was already
         // set so it observes the pending reschedule promptly.
-        if already_requested && current.sched_info().policy() != SchedPolicy::IDLE {
+        if already_requested && current.sched_info().sched_class() != SchedClass::Idle {
             return;
         }
 
@@ -926,14 +892,13 @@ impl CpuRunQueue {
         let next = next.unwrap_or_else(|| self.idle.upgrade().unwrap());
 
         if !Arc::ptr_eq(&prev, &next) {
-            match prev.sched_info().policy() {
-                SchedPolicy::FIFO => FifoScheduler::put_prev_task(self, prev),
-                SchedPolicy::RT => todo!(),
-                SchedPolicy::CFS => CompletelyFairScheduler::put_prev_task(self, prev),
-                SchedPolicy::IDLE => IdleScheduler::put_prev_task(self, prev),
+            match prev.sched_info().sched_class() {
+                SchedClass::Realtime => FifoScheduler::put_prev_task(self, prev),
+                SchedClass::Fair => CompletelyFairScheduler::put_prev_task(self, prev),
+                SchedClass::Idle => IdleScheduler::put_prev_task(self, prev),
             }
 
-            if next.sched_info().policy() == SchedPolicy::CFS {
+            if next.sched_info().sched_class() == SchedClass::Fair {
                 CompletelyFairScheduler::set_next_task(self, next.clone());
             }
         }
@@ -1065,11 +1030,10 @@ pub fn scheduler_tick() {
 
     // 更新请求队列时钟
     rq.update_rq_clock();
-    match current.sched_info().policy() {
-        SchedPolicy::CFS => CompletelyFairScheduler::tick(rq, current, false),
-        SchedPolicy::FIFO => FifoScheduler::tick(rq, current, false),
-        SchedPolicy::RT => todo!(),
-        SchedPolicy::IDLE => IdleScheduler::tick(rq, current, false),
+    match current.sched_info().sched_class() {
+        SchedClass::Realtime => FifoScheduler::tick(rq, current, false),
+        SchedClass::Fair => CompletelyFairScheduler::tick(rq, current, false),
+        SchedClass::Idle => IdleScheduler::tick(rq, current, false),
     }
 
     rq.calculate_global_load_tick();
@@ -1234,7 +1198,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
                 DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
             );
 
-            if prev.sched_info().policy() == SchedPolicy::CFS {
+            if prev.sched_info().sched_class() == SchedClass::Fair {
                 let mut se = prev.sched_info().sched_entity();
                 crate::sched::fair::FairSchedEntity::for_each_in_group(&mut se, |se| {
                     se.cfs_rq().force_mut().set_current(Weak::default());
@@ -1312,7 +1276,10 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
     // This PR can only set RESET_ON_FORK on CFS tasks. Match Linux's fair
     // policy rule: preserve non-negative nice, but reset negative nice to 0.
-    if reset_on_fork && parent_policy == SchedPolicy::CFS && fork_static_prio < prio::DEFAULT_PRIO {
+    if reset_on_fork
+        && parent_policy == LinuxSchedPolicy::Normal
+        && fork_static_prio < prio::DEFAULT_PRIO
+    {
         fork_prio = prio::DEFAULT_PRIO;
         fork_static_prio = prio::DEFAULT_PRIO;
     }
@@ -1329,10 +1296,10 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     if PrioUtil::dl_prio(fork_prio) {
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     } else if PrioUtil::rt_prio(fork_prio) {
-        // 子进程继承父进程的调度策略（FIFO/RR），而非统一设为 RT
+        // 实时子进程继承父进程的基础策略。
         pcb.sched_info().set_policy(parent_policy);
     } else {
-        pcb.sched_info().set_policy(SchedPolicy::CFS);
+        pcb.sched_info().set_policy(LinuxSchedPolicy::Normal);
     }
 
     pcb.sched_info()
@@ -1353,11 +1320,10 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
     let fork_cpu = smp_get_processor_id();
 
     __set_task_cpu(pcb, fork_cpu);
-    match pcb.sched_info().policy() {
-        SchedPolicy::RT => todo!(),
-        SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
-        SchedPolicy::CFS => CompletelyFairScheduler::task_fork(pcb.clone()),
-        SchedPolicy::IDLE => todo!(),
+    match pcb.sched_info().sched_class() {
+        SchedClass::Realtime => FifoScheduler::task_fork(pcb.clone()),
+        SchedClass::Fair => CompletelyFairScheduler::task_fork(pcb.clone()),
+        SchedClass::Idle => unreachable!("a fork child cannot use the idle scheduling class"),
     }
 
     debug_assert_eq!(
@@ -1524,11 +1490,10 @@ pub fn sched_yield() {
 
     // TODO: schedstat_inc(rq->yld_count);
 
-    match pcb.sched_info().policy() {
-        SchedPolicy::CFS => CompletelyFairScheduler::yield_task(rq),
-        SchedPolicy::FIFO => FifoScheduler::yield_task(rq),
-        SchedPolicy::RT => rq.resched_current(),
-        SchedPolicy::IDLE => {}
+    match pcb.sched_info().sched_class() {
+        SchedClass::Realtime => FifoScheduler::yield_task(rq),
+        SchedClass::Fair => CompletelyFairScheduler::yield_task(rq),
+        SchedClass::Idle => {}
     }
 
     let preempt_guard = PreemptGuard::new();

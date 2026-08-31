@@ -72,6 +72,29 @@ impl AsyncWritebackPermit {
         }
     }
 
+    /// Wait for production writeback to drain, then reserve the complete
+    /// budget atomically with respect to normal acquisition and retry
+    /// registration. The debug selftest needs exclusive ownership of every
+    /// slot, but it may run immediately after another test has queued
+    /// asynchronous writeback.
+    fn acquire_all_for_selftest() -> Vec<Self> {
+        ASYNC_WRITEBACK_WAIT.wait_until(|| {
+            let retries = ASYNC_WRITEBACK_RETRIES.lock();
+            if !retries.is_empty() || ASYNC_WRITEBACK_BATCHES.load(Ordering::Acquire) != 0 {
+                return None;
+            }
+
+            let mut permits = Vec::with_capacity(MAX_ASYNC_WRITEBACK_BATCHES);
+            for _ in 0..MAX_ASYNC_WRITEBACK_BATCHES {
+                let Some(permit) = Self::try_acquire_locked() else {
+                    unreachable!("idle writeback budget must have every slot available");
+                };
+                permits.push(permit);
+            }
+            Some(permits)
+        })
+    }
+
     /// Arrange a one-shot, non-blocking retry when a global batch slot is
     /// available.  A release transfers its permit directly to the FIFO head,
     /// so `sync_file_range(WRITE)` neither sleeps nor races queued waiters for
@@ -134,20 +157,7 @@ impl Drop for AsyncWritebackPermit {
 /// cancellation, FIFO permit handoff, and that cancelled tickets never
 /// receive a grant.
 pub(super) fn run_async_writeback_budget_retry_selftest() -> bool {
-    if !ASYNC_WRITEBACK_RETRIES.lock().is_empty()
-        || ASYNC_WRITEBACK_BATCHES.load(Ordering::Acquire) != 0
-    {
-        return false;
-    }
-
-    let mut permits = Vec::with_capacity(MAX_ASYNC_WRITEBACK_BATCHES);
-    for _ in 0..MAX_ASYNC_WRITEBACK_BATCHES {
-        let Some(permit) = AsyncWritebackPermit::try_acquire() else {
-            drop(permits);
-            return false;
-        };
-        permits.push(permit);
-    }
+    let mut permits = AsyncWritebackPermit::acquire_all_for_selftest();
 
     let cache = PageCache::new_unowned(None, None);
     let predecessor_page = match cache.get_or_create_page_zero(0) {

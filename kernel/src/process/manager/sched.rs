@@ -179,7 +179,7 @@ impl ProcessManager {
         if running {
             match old_class {
                 SchedClass::Realtime => {
-                    crate::sched::fifo::FifoScheduler::put_prev_task(rq, pcb.clone())
+                    crate::sched::realtime::RealtimeScheduler::put_prev_task(rq, pcb.clone())
                 }
                 SchedClass::Fair => {
                     crate::sched::fair::CompletelyFairScheduler::put_prev_task(rq, pcb.clone())
@@ -217,7 +217,7 @@ impl ProcessManager {
         // Matches Linux __sched_setscheduler: after a running task changes its
         // policy, set_next_task is required.
         if running {
-            crate::sched::fifo::FifoScheduler::set_next_task(rq, pcb.clone());
+            crate::sched::realtime::RealtimeScheduler::set_next_task(rq, pcb.clone());
         }
 
         // check_class_changed → preemption check.

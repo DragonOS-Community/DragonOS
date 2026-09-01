@@ -3,7 +3,6 @@ pub mod completion;
 pub mod cputime;
 pub mod fair;
 pub mod fair_tree;
-pub mod fifo;
 #[cfg(feature = "fifo_demo")]
 pub mod fifo_demo;
 pub mod idle;
@@ -11,6 +10,7 @@ pub mod loadavg;
 pub mod pelt;
 pub mod policy;
 pub mod prio;
+pub mod realtime;
 pub mod syscall;
 
 use core::{
@@ -56,8 +56,8 @@ use self::{
     clock::{ClockUpdataFlag, SchedClock},
     cputime::{irq_time_read, CpuTimeFunc, IrqTime},
     fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
-    fifo::FifoScheduler,
     prio::{PrioUtil, MAX_RT_PRIO},
+    realtime::RealtimeScheduler,
 };
 
 pub use policy::{LinuxSchedPolicy, SchedClass};
@@ -471,7 +471,7 @@ pub struct CpuRunQueue {
     /// CFS调度器
     cfs: Arc<CfsRunQueue>,
 
-    fifo: fifo::FifoRunQueue,
+    rt: realtime::RealtimeRunQueue,
 
     clock_pelt: u64,
     lost_idle_time: u64,
@@ -510,7 +510,7 @@ impl CpuRunQueue {
             calc_load_update: clock() + (5 * HZ + 1),
             calc_load_active: 0,
             cfs: Arc::new(CfsRunQueue::new()),
-            fifo: fifo::FifoRunQueue::new(),
+            rt: realtime::RealtimeRunQueue::new(),
             clock_pelt: 0,
             lost_idle_time: 0,
             clock_idle: 0,
@@ -587,7 +587,7 @@ impl CpuRunQueue {
         }
 
         match pcb.sched_info().sched_class() {
-            SchedClass::Realtime => FifoScheduler::enqueue(self, pcb, flags),
+            SchedClass::Realtime => RealtimeScheduler::enqueue(self, pcb, flags),
             SchedClass::Fair => CompletelyFairScheduler::enqueue(self, pcb, flags),
             SchedClass::Idle => IdleScheduler::enqueue(self, pcb, flags),
         }
@@ -617,7 +617,7 @@ impl CpuRunQueue {
         }
 
         match pcb.sched_info().sched_class() {
-            SchedClass::Realtime => FifoScheduler::dequeue(self, pcb, flags),
+            SchedClass::Realtime => RealtimeScheduler::dequeue(self, pcb, flags),
             SchedClass::Fair => CompletelyFairScheduler::dequeue(self, pcb, flags),
             SchedClass::Idle => IdleScheduler::dequeue(self, pcb, flags),
         }
@@ -651,7 +651,7 @@ impl CpuRunQueue {
                 SchedClass::Fair => {
                     CompletelyFairScheduler::check_preempt_current(self, pcb, flags)
                 }
-                SchedClass::Realtime => FifoScheduler::check_preempt_current(self, pcb, flags),
+                SchedClass::Realtime => RealtimeScheduler::check_preempt_current(self, pcb, flags),
                 SchedClass::Idle => IdleScheduler::check_preempt_current(self, pcb, flags),
             }
         } else if waking_class.outranks(current_class) {
@@ -696,7 +696,7 @@ impl CpuRunQueue {
         } else if next_class == current_class {
             match current_class {
                 SchedClass::Fair => {}
-                SchedClass::Realtime => FifoScheduler::check_preempt_current(self, pcb, flags),
+                SchedClass::Realtime => RealtimeScheduler::check_preempt_current(self, pcb, flags),
                 SchedClass::Idle => IdleScheduler::check_preempt_current(self, pcb, flags),
             }
         }
@@ -873,8 +873,8 @@ impl CpuRunQueue {
 
         let mut next: Option<Arc<ProcessControlBlock>> = None;
 
-        if self.fifo.nr_running() > 0 {
-            next = FifoScheduler::pick_next_task(self, Some(prev.clone()));
+        if self.rt.nr_running() > 0 {
+            next = RealtimeScheduler::pick_next_task(self, Some(prev.clone()));
         }
 
         if next.is_none() {
@@ -893,7 +893,7 @@ impl CpuRunQueue {
 
         if !Arc::ptr_eq(&prev, &next) {
             match prev.sched_info().sched_class() {
-                SchedClass::Realtime => FifoScheduler::put_prev_task(self, prev),
+                SchedClass::Realtime => RealtimeScheduler::put_prev_task(self, prev),
                 SchedClass::Fair => CompletelyFairScheduler::put_prev_task(self, prev),
                 SchedClass::Idle => IdleScheduler::put_prev_task(self, prev),
             }
@@ -1031,7 +1031,7 @@ pub fn scheduler_tick() {
     // 更新请求队列时钟
     rq.update_rq_clock();
     match current.sched_info().sched_class() {
-        SchedClass::Realtime => FifoScheduler::tick(rq, current, false),
+        SchedClass::Realtime => RealtimeScheduler::tick(rq, current, false),
         SchedClass::Fair => CompletelyFairScheduler::tick(rq, current, false),
         SchedClass::Idle => IdleScheduler::tick(rq, current, false),
     }
@@ -1321,7 +1321,7 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
 
     __set_task_cpu(pcb, fork_cpu);
     match pcb.sched_info().sched_class() {
-        SchedClass::Realtime => FifoScheduler::task_fork(pcb.clone()),
+        SchedClass::Realtime => RealtimeScheduler::task_fork(pcb.clone()),
         SchedClass::Fair => CompletelyFairScheduler::task_fork(pcb.clone()),
         SchedClass::Idle => unreachable!("a fork child cannot use the idle scheduling class"),
     }
@@ -1491,7 +1491,7 @@ pub fn sched_yield() {
     // TODO: schedstat_inc(rq->yld_count);
 
     match pcb.sched_info().sched_class() {
-        SchedClass::Realtime => FifoScheduler::yield_task(rq),
+        SchedClass::Realtime => RealtimeScheduler::yield_task(rq),
         SchedClass::Fair => CompletelyFairScheduler::yield_task(rq),
         SchedClass::Idle => {}
     }

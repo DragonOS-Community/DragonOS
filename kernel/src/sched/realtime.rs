@@ -4,6 +4,11 @@ use crate::{process::ProcessControlBlock, sched::prio::MAX_RT_PRIO};
 
 use super::{CpuRunQueue, DequeueFlag, EnqueueFlag, PrioUtil, SchedClass, Scheduler, WakeupFlags};
 
+/// Match Linux's default root realtime bandwidth: reserve 5% of each CPU for
+/// non-RT work in every one-second period.
+const RT_PERIOD_NS: u64 = 1_000_000_000;
+const RT_RUNTIME_NS: u64 = 950_000_000;
+
 const _: () = {
     assert!(MAX_RT_PRIO > 1);
     assert!(MAX_RT_PRIO <= u128::BITS as i32);
@@ -18,6 +23,10 @@ pub struct RealtimeRunQueue {
     queues: Vec<VecDeque<Arc<ProcessControlBlock>>>,
     active: u128,
     nr_running: usize,
+    runtime_used: u64,
+    period_start: Option<u64>,
+    exec_start: Option<u64>,
+    throttled: bool,
 }
 
 impl RealtimeRunQueue {
@@ -28,12 +37,77 @@ impl RealtimeRunQueue {
             queues,
             active: 0,
             nr_running: 0,
+            runtime_used: 0,
+            period_start: None,
+            exec_start: None,
+            throttled: false,
         }
     }
 
     #[inline]
     pub fn nr_running(&self) -> usize {
         self.nr_running
+    }
+
+    #[inline]
+    pub fn is_throttled(&self) -> bool {
+        self.throttled
+    }
+
+    /// Account the current RT task before advancing the bandwidth period.
+    ///
+    /// This order preserves runtime debt when a non-preemptible kernel path
+    /// crosses one or more period boundaries before reaching the scheduler.
+    fn update_current(&mut self, clock_task: u64, clock: u64) {
+        if let Some(exec_start) = self.exec_start {
+            self.runtime_used = self
+                .runtime_used
+                .saturating_add(clock_task.saturating_sub(exec_start));
+            self.exec_start = Some(clock_task);
+        }
+        self.update_period(clock);
+    }
+
+    fn update_period(&mut self, clock: u64) {
+        let Some(period_start) = self.period_start.as_mut() else {
+            self.period_start = Some(clock - clock % RT_PERIOD_NS);
+            self.update_throttled();
+            return;
+        };
+        let elapsed = clock.saturating_sub(*period_start);
+
+        if elapsed >= RT_PERIOD_NS {
+            let elapsed_periods = elapsed / RT_PERIOD_NS;
+            *period_start =
+                period_start.saturating_add(elapsed_periods.saturating_mul(RT_PERIOD_NS));
+            self.runtime_used = self
+                .runtime_used
+                .saturating_sub(elapsed_periods.saturating_mul(RT_RUNTIME_NS));
+        }
+
+        self.update_throttled();
+    }
+
+    fn update_throttled(&mut self) {
+        // Linux uses hysteresis at the exact runtime boundary: `>` enters
+        // throttling, while an already-throttled rq needs `<` to leave it.
+        if self.throttled {
+            if self.runtime_used < RT_RUNTIME_NS {
+                self.throttled = false;
+            }
+        } else if self.runtime_used > RT_RUNTIME_NS {
+            self.throttled = true;
+        }
+    }
+
+    #[inline]
+    fn set_current(&mut self, clock_task: u64) {
+        self.exec_start = Some(clock_task);
+    }
+
+    #[inline]
+    fn clear_current(&mut self) {
+        self.exec_start = None;
     }
 
     #[inline]
@@ -185,29 +259,61 @@ impl RealtimeScheduler {
         pcb.sched_info().prio()
     }
 
-    /// Set a realtime task as the current task for its class.
-    ///
-    /// DragonOS does not yet maintain a separate current RT entity, so there
-    /// is no class-local state to update here.
+    /// Bring the local RT bandwidth state up to date under the rq lock.
+    pub fn update_bandwidth(rq: &mut CpuRunQueue, current_class: SchedClass) {
+        let was_throttled = rq.rt.is_throttled();
+        if current_class == SchedClass::Realtime {
+            rq.rt.update_current(rq.clock_task, rq.clock);
+        } else {
+            rq.rt.update_period(rq.clock);
+        }
+
+        if !was_throttled && rq.rt.is_throttled() {
+            // Match Linux's dequeue_top_rt_rq(): throttled RT tasks stay on
+            // their class queue but no longer contribute to the top-level rq.
+            let nr_running = rq.rt.nr_running();
+            rq.sub_nr_running(nr_running);
+            rq.resched_current();
+        } else if was_throttled && !rq.rt.is_throttled() {
+            let nr_running = rq.rt.nr_running();
+            rq.add_nr_running(nr_running);
+            if nr_running > 0 {
+                rq.resched_current();
+            }
+        }
+    }
+
+    /// Start charging the selected realtime task on this runqueue.
     pub fn set_next_task(
-        _rq: &mut super::CpuRunQueue,
+        rq: &mut super::CpuRunQueue,
         _pcb: alloc::sync::Arc<crate::process::ProcessControlBlock>,
     ) {
+        rq.rt.set_current(rq.clock_task);
+        if rq.rt.is_throttled() {
+            // This is reachable when a running Fair task is changed to RT on
+            // an already-throttled rq. Charge its bounded tail, then switch it
+            // out instead of letting the policy transaction bypass bandwidth.
+            rq.resched_current();
+        }
     }
 }
 
 impl Scheduler for RealtimeScheduler {
     fn enqueue(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag) {
+        let current_class = rq.current().sched_info().sched_class();
+        Self::update_bandwidth(rq, current_class);
         if flags.contains(EnqueueFlag::ENQUEUE_HEAD) {
             rq.rt.enqueue_head(pcb);
         } else {
             rq.rt.enqueue_tail(pcb);
         }
-        rq.add_nr_running(1);
+        if !rq.rt.is_throttled() {
+            rq.add_nr_running(1);
+        }
     }
 
     fn dequeue(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, _flags: DequeueFlag) {
-        if rq.rt.dequeue(&pcb) {
+        if rq.rt.dequeue(&pcb) && !rq.rt.is_throttled() {
             rq.sub_nr_running(1);
         }
     }
@@ -243,6 +349,9 @@ impl Scheduler for RealtimeScheduler {
         rq: &mut CpuRunQueue,
         _pcb: Option<Arc<ProcessControlBlock>>,
     ) -> Option<Arc<ProcessControlBlock>> {
+        if rq.rt.is_throttled() {
+            return None;
+        }
         rq.rt.pick_next()
     }
 
@@ -261,5 +370,8 @@ impl Scheduler for RealtimeScheduler {
 
     fn task_fork(_pcb: Arc<ProcessControlBlock>) {}
 
-    fn put_prev_task(_rq: &mut CpuRunQueue, _prev: Arc<ProcessControlBlock>) {}
+    fn put_prev_task(rq: &mut CpuRunQueue, _prev: Arc<ProcessControlBlock>) {
+        Self::update_bandwidth(rq, SchedClass::Realtime);
+        rq.rt.clear_current();
+    }
 }

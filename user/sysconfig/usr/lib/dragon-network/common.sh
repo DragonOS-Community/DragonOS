@@ -203,6 +203,13 @@ dn_stat_is_root_config_dir() {
     [ "$((0$mode & 022))" -eq 0 ] || { [ "$mode" = 777 ] && dn_is_fat_path "$path"; }
 }
 
+dn_require_config_dir_chain() {
+    local path
+    for path in "$@"; do
+        dn_stat_is_root_config_dir "$path" || return 1
+    done
+}
+
 dn_ensure_root_dir() {
     local path mode
     path=$1
@@ -312,8 +319,9 @@ dn_load_config_file() {
 dn_load_config() {
     local iface
     iface=$1
-    dn_stat_is_root_config_dir "$DN_CONFIG_DIR" || {
-        dn_log "$iface" "$DN_CONFIG_DIR must be a trusted root-owned directory"
+    dn_require_config_dir_chain / /etc /etc/dragonos "$DN_NETWORK_CONFIG_DIR" \
+        "$DN_CONFIG_DIR" || {
+        dn_log "$iface" "configuration directory chain is not trusted"
         return 1
     }
     dn_load_config_file "$iface" "$DN_CONFIG_DIR/$iface.conf"
@@ -322,8 +330,8 @@ dn_load_config() {
 dn_load_default_config() {
     local iface
     iface=$1
-    dn_stat_is_root_config_dir "$DN_NETWORK_CONFIG_DIR" || {
-        dn_log "$iface" "$DN_NETWORK_CONFIG_DIR must be a trusted root-owned directory"
+    dn_require_config_dir_chain / /etc /etc/dragonos "$DN_NETWORK_CONFIG_DIR" || {
+        dn_log "$iface" "default configuration directory chain is not trusted"
         return 1
     }
     dn_load_config_file "$iface" "$DN_DEFAULT_CONFIG"
@@ -855,8 +863,8 @@ dn_rebuild_dns_locked() {
     dns_count=0
     search_line=
     search_total=0
-    dn_stat_is_root_config_dir /etc || {
-        dn_log dns "/etc must be a trusted root-owned directory"
+    dn_require_config_dir_chain / /etc || {
+        dn_log dns "/etc directory chain is not trusted"
         return 1
     }
     if [ -e "$DN_RESOLV_CONF" ] || [ -L "$DN_RESOLV_CONF" ]; then

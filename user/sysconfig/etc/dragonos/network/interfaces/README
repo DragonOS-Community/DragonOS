@@ -1,18 +1,27 @@
 dragon-network interface configuration
 ======================================
 
-This directory is intentionally empty by default.  Files named IFACE.conf are
-only read after an administrator explicitly runs:
+Files named IFACE.conf are strict per-interface policy.  At boot,
+dragon-network-boot selects the lowest-ifindex eth* interface.  A configuration
+for that interface overrides /etc/dragonos/network/default.conf; an invalid or
+rejected file is an error and never falls back to the default policy.  Other
+interfaces remain unmanaged at boot and can be started explicitly:
 
     /usr/sbin/dragon-network start IFACE
 
-PR-07 does not start this service from rcS.  Until the default ownership switch
-is made in PR-08, do not enable DHCP on the physical eth* interface already
-managed by the kernel DHCP worker.  Use an isolated interface such as veth1.
+The shipped /etc/dragonos/network/default.conf uses mode dhcp.  To leave the
+selected primary interface unmanaged at boot, set its effective policy to mode
+external: update IFACE.conf when one exists, otherwise update default.conf.
 
 The format is data, not shell syntax.  Each non-comment line is a key followed
 by one value.  Unknown keys, duplicate scalar keys, unsafe ownership/modes, and
 invalid values are rejected.  dns and search are repeatable list keys.
+
+On filesystems with Unix modes, configuration paths must be root-owned and not
+group- or world-writable.  DragonOS FAT has no Unix mode bits and reports
+root-owned 0777 paths; the controller accepts that exception only after verifying
+the FAT filesystem magic.  The strict parser still treats configuration as data,
+but FAT permissions do not isolate policy files from local writers.
 
 DHCP:
 
@@ -39,6 +48,6 @@ Commands:
     dragon-network status IFACE
 
 The service uses only /bin/busybox ip and stores private per-interface state in
-/run/dragon-network/interfaces.  Its atomically generated, multi-interface DNS
-view is /run/dragon-network/resolv.conf.  PR-07 does not replace or rewrite
-/etc/resolv.conf.
+/run/dragon-network/interfaces.  It derives the complete DNS view from committed
+lease state and atomically replaces the regular /etc/resolv.conf file.  Static
+and external/unmanaged policies do not start udhcpc.

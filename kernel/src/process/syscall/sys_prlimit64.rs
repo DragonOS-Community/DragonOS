@@ -103,21 +103,22 @@ pub fn do_prlimit64(
         ProcessManager::find_task_by_vpid(pid).ok_or(SystemError::ESRCH)?
     };
 
-    // 读取旧限制
-    if let Some(mut writer) = writer {
-        let cur = target.get_rlimit(resource);
-        let rlimit = writer.buffer::<RLimit64>(0)?;
-        rlimit[0].rlim_cur = cur.rlim_cur;
-        rlimit[0].rlim_max = cur.rlim_max;
-    }
-
-    // 设置新限制
-    if !new_limit.is_null() {
+    // Copy the new value first, then obtain the old value from the same
+    // serialized update that replaces it. This keeps prlimit(old, new)
+    // coherent when another thread in the group updates a shared limit.
+    let old_value = if !new_limit.is_null() {
         // 从用户拷贝新值
         let reader = UserBufferReader::new(new_limit, core::mem::size_of::<RLimit64>(), true)?;
         let newval = reader.read_one_from_user::<RLimit64>(0)?;
         // 应用到目标进程
-        target.set_rlimit(resource, newval)?;
+        target.set_rlimit(resource, newval)?
+    } else {
+        target.get_rlimit(resource)
+    };
+
+    if let Some(mut writer) = writer {
+        let rlimit = writer.buffer::<RLimit64>(0)?;
+        rlimit[0] = old_value;
     }
 
     Ok(0)

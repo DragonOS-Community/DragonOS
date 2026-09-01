@@ -287,7 +287,11 @@ impl ProcessManager {
         let name = current_pcb.basic().name().to_string();
 
         args.verify()?;
-        let pcb = ProcessControlBlock::new(name, new_kstack);
+        let pcb = ProcessControlBlock::new(
+            name,
+            new_kstack,
+            args.flags.contains(CloneFlags::CLONE_THREAD),
+        );
         let ptrace_fork_session = Self::copy_process(&current_pcb, &pcb, args, current_trapframe)
             .map_err(|e| {
             error!(
@@ -768,8 +772,10 @@ impl ProcessManager {
             )
         });
 
-        // 继承 rlimit
-        pcb.inherit_rlimits_from(current_pcb);
+        // Resource limits were shared (CLONE_THREAD) or copied (fork) when
+        // the unpublished PCB was constructed. Preserve the existing eager
+        // RLIMIT_NOFILE fd-table sizing after copy_files().
+        pcb.sync_fd_table_to_nofile_limit();
 
         // 继承 executable_path
         // 修复：fork时需要复制父进程的可执行文件路径，而不是使用进程名

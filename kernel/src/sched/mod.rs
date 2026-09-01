@@ -1354,7 +1354,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
 
 pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     let current = ProcessManager::current_pcb();
-    let (mut fork_prio, mut fork_static_prio, parent_policy, reset_on_fork) = {
+    let (mut fork_prio, mut fork_static_prio, mut fork_policy, reset_on_fork) = {
         let pi_guard = current.sched_info().pi_lock_irqsave();
         (
             current.sched_info().normal_prio(),
@@ -1364,14 +1364,18 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         )
     };
 
-    // This PR can only set RESET_ON_FORK on CFS tasks. Match Linux's fair
-    // policy rule: preserve non-negative nice, but reset negative nice to 0.
-    if reset_on_fork
-        && parent_policy == LinuxSchedPolicy::Normal
-        && fork_static_prio < prio::DEFAULT_PRIO
-    {
-        fork_prio = prio::DEFAULT_PRIO;
-        fork_static_prio = prio::DEFAULT_PRIO;
+    if reset_on_fork {
+        if fork_policy == LinuxSchedPolicy::Fifo {
+            // Linux resets RT children to SCHED_NORMAL at nice 0.
+            fork_policy = LinuxSchedPolicy::Normal;
+            fork_prio = prio::DEFAULT_PRIO;
+            fork_static_prio = prio::DEFAULT_PRIO;
+        } else if fork_static_prio < prio::DEFAULT_PRIO {
+            // Fair children preserve non-negative nice, but reset negative
+            // nice to zero when RESET_ON_FORK is set.
+            fork_prio = prio::DEFAULT_PRIO;
+            fork_static_prio = prio::DEFAULT_PRIO;
+        }
     }
 
     // 子进程是 TASK_NEW，不可见。可以直接写裸字段
@@ -1385,12 +1389,13 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
     if PrioUtil::dl_prio(fork_prio) {
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    } else if PrioUtil::rt_prio(fork_prio) {
-        // 实时子进程继承父进程的基础策略。
-        pcb.sched_info().set_policy(parent_policy);
-    } else {
-        pcb.sched_info().set_policy(LinuxSchedPolicy::Normal);
     }
+    debug_assert_eq!(
+        PrioUtil::rt_prio(fork_prio),
+        fork_policy == LinuxSchedPolicy::Fifo,
+        "fork policy and inherited normal priority disagree"
+    );
+    pcb.sched_info().set_policy(fork_policy);
 
     pcb.sched_info()
         .sched_entity()

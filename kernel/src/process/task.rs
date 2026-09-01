@@ -304,8 +304,9 @@ pub struct ProcessControlBlock {
     /// Process command line (used for /proc/<pid>/cmdline; Linux semantics: argv
     /// entries are separated by '\0').
     pub(super) cmdline: RwLock<Vec<u8>>,
-    /// Resource limit (rlimit) array.
-    pub(super) rlimits: RwLock<[RLimit64; RLimitID::Nlimits as usize]>,
+    /// Resource limits are shared by a thread group, like Linux's
+    /// `signal_struct::rlim`. A process fork receives a copied Arc.
+    pub(super) rlimits: Arc<RwLock<[RLimit64; RLimitID::Nlimits as usize]>>,
 }
 
 impl ProcessControlBlock {
@@ -315,12 +316,20 @@ impl ProcessControlBlock {
     ///
     /// - `name`: The process name.
     /// - `kstack`: The kernel stack for the process.
+    /// - `share_resource_limits`: share the current thread group's limits for
+    ///   `CLONE_THREAD`; otherwise snapshot them for a new process.
     ///
     /// ## Returns
     ///
     /// A new PCB.
-    pub fn new(name: String, kstack: KernelStack) -> Arc<Self> {
-        return Self::do_create_pcb(name, kstack, false);
+    pub fn new(name: String, kstack: KernelStack, share_resource_limits: bool) -> Arc<Self> {
+        let current = ProcessManager::current_pcb();
+        let rlimits = if share_resource_limits {
+            current.rlimits.clone()
+        } else {
+            Arc::new(RwLock::new(*current.rlimits.read()))
+        };
+        return Self::do_create_pcb(name, kstack, false, Some(rlimits));
     }
 
     /// Create a new idle process.
@@ -329,7 +338,7 @@ impl ProcessControlBlock {
     /// initialization.
     pub fn new_idle(cpu_id: u32, kstack: KernelStack) -> Arc<Self> {
         let name = format!("idle-{}", cpu_id);
-        return Self::do_create_pcb(name, kstack, true);
+        return Self::do_create_pcb(name, kstack, true, None);
     }
 
     /// Returns whether the process is a kernel thread.
@@ -352,7 +361,12 @@ impl ProcessControlBlock {
     }
 
     #[inline(never)]
-    fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
+    fn do_create_pcb(
+        name: String,
+        kstack: KernelStack,
+        is_idle: bool,
+        rlimits: Option<Arc<RwLock<[RLimit64; RLimitID::Nlimits as usize]>>>,
+    ) -> Arc<Self> {
         // Initialize the namespace proxy.
         let nsproxy = if is_idle {
             // The idle process uses the root namespace.
@@ -478,7 +492,9 @@ impl ProcessControlBlock {
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
                 cmdline: RwLock::new(Vec::new()),
-                rlimits: RwLock::new(Self::default_rlimits()),
+                rlimits: rlimits
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RwLock::new(Self::default_rlimits()))),
                 #[cfg(target_arch = "x86_64")]
                 uprobe: super::uprobe::TaskXolState::new(),
             };
@@ -571,7 +587,7 @@ impl ProcessControlBlock {
         &self,
         res: RLimitID,
         newv: crate::process::resource::RLimit64,
-    ) -> Result<(), system_error::SystemError> {
+    ) -> Result<crate::process::resource::RLimit64, system_error::SystemError> {
         use system_error::SystemError;
         if newv.rlim_cur > newv.rlim_max {
             return Err(SystemError::EINVAL);
@@ -591,41 +607,43 @@ impl ProcessControlBlock {
             }
         }
 
-        let cur = self.rlimits.read()[res as usize];
-        if newv.rlim_max > cur.rlim_max {
-            let cred = self.cred();
-            if !cred.has_capability(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE) {
+        // The whole thread group shares this lock. Compare the hard limit and
+        // publish the replacement in one critical section, matching Linux's
+        // group-leader task_lock serialization. Otherwise a writer authorized
+        // against a stale hard limit could restore a concurrently lowered one.
+        let can_raise_hard =
+            crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE);
+        let cur = {
+            let mut rlimits = self.rlimits.write();
+            let cur = rlimits[res as usize];
+            if newv.rlim_max > cur.rlim_max && !can_raise_hard {
                 return Err(SystemError::EPERM);
             }
-        }
+            rlimits[res as usize] = newv;
+            cur
+        };
 
-        // Update the rlimit.
-        self.rlimits.write()[res as usize] = newv;
-
-        // If RLIMIT_NOFILE changed, adjust the file descriptor table.
+        // File-descriptor allocation always enforces the shared limit and
+        // grows on demand. Keep eager resizing as a lock-order-safe
+        // best-effort optimization; a failure must not roll back over a newer
+        // concurrent group update.
         if res == RLimitID::Nofile {
             if let Err(e) = self.adjust_fd_table_for_rlimit_change(newv.rlim_cur as usize) {
-                // If adjustment fails, roll back the rlimit.
-                self.rlimits.write()[res as usize] = cur;
-                return Err(e);
+                warn!("Failed to resize fd table after RLIMIT_NOFILE update: {e:?}");
             }
         }
 
-        Ok(())
+        Ok(cur)
     }
 
-    /// Inherit all rlimits from the parent process.
-    pub fn inherit_rlimits_from(&self, parent: &Arc<ProcessControlBlock>) {
-        let src = *parent.rlimits.read();
-        *self.rlimits.write() = src;
-
-        // After inheritance, adjust the file descriptor table to match the new
-        // RLIMIT_NOFILE.
-        let nofile_limit = src[RLimitID::Nofile as usize].rlim_cur as usize;
+    /// Match the eager fd-table capacity optimization to the resource limits
+    /// already shared or copied when this PCB was constructed. Allocation
+    /// paths still enforce the shared RLIMIT_NOFILE on every operation.
+    pub(crate) fn sync_fd_table_to_nofile_limit(&self) {
+        let nofile_limit = self.get_rlimit(RLimitID::Nofile).rlim_cur as usize;
         if let Err(e) = self.adjust_fd_table_for_rlimit_change(nofile_limit) {
-            // If adjustment fails, log the error but do not block inheritance.
             error!(
-                "Failed to adjust fd table after inheriting rlimits: {:?}",
+                "Failed to adjust fd table after inheriting RLIMIT_NOFILE: {:?}",
                 e
             );
         }

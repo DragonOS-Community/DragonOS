@@ -76,7 +76,7 @@ pub fn do_clone(
     let new_kstack = KernelStack::new()?;
     let name = current_pcb.basic().name().to_string();
 
-    let pcb = ProcessControlBlock::new(name, new_kstack);
+    let pcb = ProcessControlBlock::new(name, new_kstack, flags.contains(CloneFlags::CLONE_THREAD));
     // 克隆pcb
     let ptrace_fork_session = ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 

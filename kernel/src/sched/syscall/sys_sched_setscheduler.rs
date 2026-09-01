@@ -6,9 +6,10 @@ use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_SCHED_SETSCHEDULER},
     process::{
         cred::{capable, CAPFlags},
-        ProcessManager,
+        resource::RLimitID,
+        ProcessManager, SchedChangeRequest,
     },
-    sched::LinuxSchedPolicy,
+    sched::{prio::PrioUtil, LinuxSchedPolicy},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferReader,
@@ -26,32 +27,87 @@ use super::{
 struct SysSchedSetscheduler;
 
 impl SysSchedSetscheduler {
-    fn validate_policy(policy: i32, priority: i32) -> Result<bool, SystemError> {
+    fn build_request(policy: i32, priority: i32) -> Result<SchedChangeRequest, SystemError> {
         let base_policy = policy & !SCHED_RESET_ON_FORK;
+        let reset_on_fork = policy & SCHED_RESET_ON_FORK != 0;
         match base_policy {
             SCHED_OTHER => {
                 if priority != 0 {
                     return Err(SystemError::EINVAL);
                 }
-                Ok(true)
+                Ok(SchedChangeRequest::Normal { reset_on_fork })
             }
-            SCHED_FIFO | SCHED_RR => {
-                if !(1..=99).contains(&priority) {
-                    return Err(SystemError::EINVAL);
-                }
-                Ok(false)
+            SCHED_FIFO => {
+                let priority =
+                    PrioUtil::user_rt_prio_to_internal(priority).ok_or(SystemError::EINVAL)?;
+                Ok(SchedChangeRequest::Fifo {
+                    priority,
+                    reset_on_fork,
+                })
+            }
+            SCHED_RR => {
+                PrioUtil::user_rt_prio_to_internal(priority).ok_or(SystemError::EINVAL)?;
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
             }
             SCHED_BATCH | SCHED_IDLE => {
                 if priority != 0 {
                     return Err(SystemError::EINVAL);
                 }
-                Ok(false)
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
             }
             // The legacy ABI has no runtime/deadline/period fields, so it
             // cannot express a valid SCHED_DEADLINE request.
             SCHED_DEADLINE => Err(SystemError::EINVAL),
             _ => Err(SystemError::EINVAL),
         }
+    }
+
+    /// Check the Linux unprivileged sched_setscheduler rules without invoking
+    /// capability lookup while a scheduler spin lock is held.
+    fn unprivileged_allowed(
+        target: &alloc::sync::Arc<crate::process::ProcessControlBlock>,
+        request: SchedChangeRequest,
+    ) -> Result<bool, SystemError> {
+        let current = ProcessManager::current_pcb();
+        if !same_sched_owner(&current.cred(), &target.cred()) {
+            return Ok(false);
+        }
+
+        let rtprio_limit = match request {
+            SchedChangeRequest::Fifo { .. } => Some(target.get_rlimit(RLimitID::Rtprio).rlim_cur),
+            SchedChangeRequest::Normal { .. } => None,
+        };
+        let pi_guard = target.sched_info().pi_lock_irqsave();
+        let reset_on_fork = match request {
+            SchedChangeRequest::Normal { reset_on_fork }
+            | SchedChangeRequest::Fifo { reset_on_fork, .. } => reset_on_fork,
+        };
+        if pi_guard.sched_reset_on_fork() && !reset_on_fork {
+            return Ok(false);
+        }
+
+        let SchedChangeRequest::Fifo { priority, .. } = request else {
+            return Ok(true);
+        };
+        let new_user_priority =
+            PrioUtil::internal_rt_prio_to_user(priority).ok_or(SystemError::EINVAL)?;
+        let old_policy = target.sched_info().policy();
+        let old_user_priority = match old_policy {
+            LinuxSchedPolicy::Normal => 0,
+            LinuxSchedPolicy::Fifo => {
+                PrioUtil::internal_rt_prio_to_user(target.sched_info().normal_prio())
+                    .ok_or(SystemError::EIO)?
+            }
+        };
+        let rtprio_limit = rtprio_limit.expect("FIFO authorization must read RLIMIT_RTPRIO");
+
+        if old_policy != LinuxSchedPolicy::Fifo && rtprio_limit == 0 {
+            return Ok(false);
+        }
+        if new_user_priority > old_user_priority && new_user_priority as u64 > rtprio_limit {
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -83,36 +139,13 @@ impl Syscall for SysSchedSetscheduler {
         let sched_param: KernelSchedParam = reader.buffer_protected(0)?.read_one(0)?;
 
         let target = find_sched_target(pid)?;
-        let supported_fast_path = Self::validate_policy(policy, sched_param.sched_priority)?;
-        if !supported_fast_path {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        let request = Self::build_request(policy, sched_param.sched_priority)?;
+        if !Self::unprivileged_allowed(&target, request)? && !capable(CAPFlags::CAP_SYS_NICE) {
+            return Err(SystemError::EPERM);
         }
 
-        let reset_on_fork = policy & SCHED_RESET_ON_FORK != 0;
-        let current = ProcessManager::current_pcb();
-        let same_owner = same_sched_owner(&current.cred(), &target.cred());
-        let mut privileged = false;
-
-        loop {
-            let mut pi_guard = target.sched_info().pi_lock_irqsave();
-            if target.sched_info().policy() != LinuxSchedPolicy::Normal {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
-
-            let clearing_protected_flag = pi_guard.sched_reset_on_fork() && !reset_on_fork;
-            if (same_owner && !clearing_protected_flag) || privileged {
-                pi_guard.set_sched_reset_on_fork(reset_on_fork);
-                return Ok(0);
-            }
-
-            // Capability lookup may take user-namespace locks. Never perform
-            // it while holding a scheduler spin lock.
-            drop(pi_guard);
-            if !capable(CAPFlags::CAP_SYS_NICE) {
-                return Err(SystemError::EPERM);
-            }
-            privileged = true;
-        }
+        ProcessManager::set_scheduler(&target, request)?;
+        Ok(0)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

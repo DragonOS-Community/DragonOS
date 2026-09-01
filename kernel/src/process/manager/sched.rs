@@ -173,12 +173,21 @@ impl ProcessManager {
             let rq = cpu_rq(target_cpu.data() as usize);
             let (rq, rq_guard) = rq.self_lock();
 
-            let stable = pcb.sched_info().on_cpu() == Some(target_cpu)
-                && *pcb.sched_info().on_rq.lock_irqsave() != OnRq::Migrating;
+            let migrating = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating;
+            let stable = pcb.sched_info().on_cpu() == Some(target_cpu) && !migrating;
             if !stable {
                 drop(rq_guard);
                 drop(pi_guard);
-                core::hint::spin_loop();
+                // Match Linux task_rq_lock(): do not repeatedly contend on
+                // pi_lock while the migration owner is moving the task
+                // between runqueues. The owner publishes a stable rq before
+                // clearing Migrating, after which the outer loop samples the
+                // task CPU again.
+                if migrating {
+                    while *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
+                        core::hint::spin_loop();
+                    }
+                }
                 continue;
             }
 

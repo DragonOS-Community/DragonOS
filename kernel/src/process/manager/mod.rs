@@ -432,20 +432,29 @@ impl ProcessManager {
             // that lock through enqueue. A later affinity update will then
             // either observe this legal placement or migrate it again.
             let pi_guard = prev_pcb.sched_info().pi_lock_irqsave();
-            // stop_task() can win after schedule dequeues prev but before this
-            // tail obtains pi_lock. Likewise, wakeup_stop() can enqueue it
-            // after finish_running() and before this check. Only a still
-            // runnable, still off-rq task belongs to this migration owner;
-            // otherwise leave the stopped or already-enqueued state intact.
+            // DEQUEUE_MOVE keeps on_rq=Migrating until this owner holds
+            // pi_lock. This excludes task_rq_lock-style mutations against the
+            // old rq throughout the switch tail. stop_task() may still make
+            // the task non-runnable first; wakeup_stop() may make it runnable
+            // again, but leaves the migration enqueue to this owner.
             let still_owns_migration = prev_pcb.sched_info().state().is_runnable()
-                && *prev_pcb.sched_info().on_rq.lock_irqsave() == OnRq::None;
+                && *prev_pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating;
             if still_owns_migration {
                 let allowed = pi_guard.cpus_allowed.clone();
                 let dest_cpu =
                     select_task_rq(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, &allowed);
+                // The remaining None interval is protected by pi_lock. Clear
+                // Migrating before activate_task(), which publishes Queued on
+                // the destination rq.
+                *prev_pcb.sched_info().on_rq.lock_irqsave() = OnRq::None;
                 prev_pcb.sched_info().set_on_cpu(None);
                 enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
+            } else if *prev_pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
+                // A stop won the race. The task is now genuinely off-rq and
+                // wakeup_stop() will enqueue it if it later becomes runnable.
+                *prev_pcb.sched_info().on_rq.lock_irqsave() = OnRq::None;
             }
+            debug_assert_ne!(*prev_pcb.sched_info().on_rq.lock_irqsave(), OnRq::Migrating);
             drop(pi_guard);
         }
 

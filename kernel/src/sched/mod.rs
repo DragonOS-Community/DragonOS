@@ -1277,7 +1277,11 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
                 });
             }
 
-            *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
+            // Keep task_cpu unstable until the switch tail owns pi_lock and
+            // commits the destination enqueue. External task_rq_lock-style
+            // operations must not mutate scheduler state against the old rq
+            // during this lockless migration interval.
+            debug_assert_eq!(*prev.sched_info().on_rq.lock_irqsave(), OnRq::Migrating);
             migrate_prev_to = Some(dest_cpu);
         }
     }

@@ -1,3 +1,4 @@
+use crate::net::address::canonical_projection_cidr;
 use crate::{
     driver::net::{Iface, NetlinkRouteEntry},
     net::socket::{
@@ -41,7 +42,9 @@ fn effective_route_table(table: u8) -> u8 {
     }
 }
 
-fn route_entry_key(entry: &NetlinkRouteEntry) -> (IpCidr, u8, Option<(IpAddress, u8)>) {
+type RouteEntryKey = (IpCidr, u8, Option<(IpAddress, u8)>);
+
+fn route_entry_key(entry: &NetlinkRouteEntry) -> RouteEntryKey {
     (
         entry.destination,
         entry.table,
@@ -52,13 +55,17 @@ fn route_entry_key(entry: &NetlinkRouteEntry) -> (IpCidr, u8, Option<(IpAddress,
     )
 }
 
-fn netlink_route_exists(iface: &Arc<dyn Iface>, entry: &NetlinkRouteEntry) -> bool {
+fn find_netlink_route(
+    iface: &Arc<dyn Iface>,
+    entry: &NetlinkRouteEntry,
+) -> Option<NetlinkRouteEntry> {
     let key = route_entry_key(entry);
     iface
         .common()
         .netlink_routes()
         .iter()
-        .any(|existing| route_entry_key(existing) == key)
+        .find(|existing| route_entry_key(existing) == key)
+        .cloned()
 }
 
 pub(super) fn do_get_route(
@@ -138,7 +145,8 @@ pub(super) fn do_new_route(
 
     let replace = NewRequestFlags::from_bits_truncate(request_segment.header().flags)
         .contains(NewRequestFlags::REPLACE);
-    if netlink_route_exists(&iface, &entry) && !replace {
+    let previous = find_netlink_route(&iface, &entry);
+    if previous.is_some() && !replace {
         return Err(SystemError::EEXIST);
     }
 
@@ -159,7 +167,7 @@ pub(super) fn do_new_route(
         },
     )?;
 
-    sync_iface_route_table(&iface, &parsed)?;
+    sync_iface_route_table(&iface, &parsed, previous.as_ref())?;
     iface.common().upsert_netlink_route(entry);
 
     multicast_notify(
@@ -198,20 +206,12 @@ pub(super) fn do_del_route(
             flags: RouteFlags::empty(),
         },
     )?;
-    if !iface
+    let removed = iface
         .common()
         .remove_netlink_route(parsed.destination, parsed.source, table)
-    {
-        return Err(SystemError::ESRCH);
-    }
+        .ok_or(SystemError::ESRCH)?;
 
-    sync_iface_route_table_remove(
-        &iface,
-        parsed.destination,
-        parsed.source,
-        parsed.gateway,
-        table,
-    );
+    sync_iface_route_table_remove(&iface, &removed);
     multicast_notify(
         netns,
         route_notify_group(parsed.destination.address()),
@@ -437,66 +437,160 @@ fn route_to_segment(
 fn sync_iface_route_table(
     iface: &Arc<dyn Iface>,
     route: &ParsedRouteRequest,
+    previous: Option<&NetlinkRouteEntry>,
 ) -> Result<(), SystemError> {
     let new_route = smoltcp::iface::Route {
-        cidr: route.destination,
+        cidr: canonical_projection_cidr(route.destination),
         via_router: route.gateway,
         preferred_until: None,
         expires_at: None,
     };
-    let mut push_failed = false;
+    let replaced_key = previous.map(route_entry_key);
+    let new_has_other_owner =
+        projection_has_other_owner(iface, new_route.cidr, new_route.via_router, replaced_key);
+    let old_has_other_owner = previous.is_some_and(|old| {
+        projection_has_other_owner(iface, old.destination, old.gateway, replaced_key)
+    });
+    let mut projection_ready = false;
+    let mut reused_old_projection = false;
     iface.smol_iface().lock().routes_mut().update(|routes| {
-        // Replacing in place cannot fail when the fixed-capacity table is full.
-        // Canonicalize legacy duplicates while preserving connected routes.
-        let mut first_match = None;
-        let mut index = 0;
-        while index < routes.len() {
-            let replaceable = routes[index].cidr == route.destination
-                && !is_local_connected_route(iface, &routes[index]);
-            if !replaceable {
-                index += 1;
-                continue;
-            }
-
-            if first_match.is_none() {
+        let same_as_previous = previous.is_some_and(|old| {
+            same_projection(
+                old.destination,
+                old.gateway,
+                new_route.cidr,
+                new_route.via_router,
+            )
+        });
+        if (same_as_previous || new_has_other_owner)
+            && routes.iter().any(|existing| {
+                same_projection(
+                    existing.cidr,
+                    existing.via_router,
+                    new_route.cidr,
+                    new_route.via_router,
+                )
+            })
+        {
+            projection_ready = true;
+        } else if let Some(old) = previous.filter(|old| {
+            !same_projection(
+                old.destination,
+                old.gateway,
+                new_route.cidr,
+                new_route.via_router,
+            ) && !old_has_other_owner
+        }) {
+            if let Some(index) = routes.iter().rposition(|existing| {
+                same_projection(
+                    existing.cidr,
+                    existing.via_router,
+                    old.destination,
+                    old.gateway,
+                )
+            }) {
                 routes[index] = new_route;
-                first_match = Some(index);
-                index += 1;
-            } else {
-                routes.remove(index);
+                projection_ready = true;
+                reused_old_projection = true;
             }
         }
 
-        if first_match.is_none() && routes.push(new_route).is_err() {
-            push_failed = true;
+        if !projection_ready {
+            projection_ready = routes.push(new_route).is_ok();
+        }
+        if !projection_ready {
+            return;
+        }
+
+        if let Some(old) = previous.filter(|old| {
+            !same_projection(
+                old.destination,
+                old.gateway,
+                new_route.cidr,
+                new_route.via_router,
+            )
+        }) {
+            if !old_has_other_owner && !reused_old_projection {
+                if let Some(index) = routes.iter().rposition(|existing| {
+                    same_projection(
+                        existing.cidr,
+                        existing.via_router,
+                        old.destination,
+                        old.gateway,
+                    )
+                }) {
+                    routes.remove(index);
+                }
+            }
         }
     });
-    if push_failed {
-        Err(SystemError::ENOSPC)
-    } else {
+    if projection_ready {
         Ok(())
+    } else {
+        Err(SystemError::ENOSPC)
     }
 }
 
-fn sync_iface_route_table_remove(
+fn sync_iface_route_table_remove(iface: &Arc<dyn Iface>, removed: &NetlinkRouteEntry) {
+    let preserve_projection = address_owns_projection(iface, removed.destination, removed.gateway)
+        || iface.common().netlink_routes().iter().any(|existing| {
+            same_projection(
+                existing.destination,
+                existing.gateway,
+                removed.destination,
+                removed.gateway,
+            )
+        });
+    if !preserve_projection {
+        iface.smol_iface().lock().routes_mut().update(|routes| {
+            if let Some(index) = routes.iter().rposition(|existing| {
+                same_projection(
+                    existing.cidr,
+                    existing.via_router,
+                    removed.destination,
+                    removed.gateway,
+                )
+            }) {
+                routes.remove(index);
+            }
+        });
+    }
+}
+
+fn projection_has_other_owner(
     iface: &Arc<dyn Iface>,
     destination: IpCidr,
-    source: Option<IpCidr>,
     gateway: Option<IpAddress>,
-    table: u8,
-) {
-    iface.smol_iface().lock().routes_mut().update(|routes| {
-        routes.retain(|existing| {
-            if is_local_connected_route(iface, existing) {
-                return true;
-            }
-            if existing.cidr != destination {
-                return true;
-            }
-            existing.via_router != gateway
-        });
-    });
-    let _ = (source, table);
+    excluded_key: Option<RouteEntryKey>,
+) -> bool {
+    address_owns_projection(iface, destination, gateway)
+        || iface.common().netlink_routes().iter().any(|existing| {
+            Some(route_entry_key(existing)) != excluded_key
+                && same_projection(existing.destination, existing.gateway, destination, gateway)
+        })
+}
+
+fn address_owns_projection(
+    iface: &Arc<dyn Iface>,
+    destination: IpCidr,
+    gateway: Option<IpAddress>,
+) -> bool {
+    gateway.is_none()
+        && iface
+            .common()
+            .ip_addrs()
+            .iter()
+            .any(|cidr| canonical_projection_cidr(*cidr) == canonical_projection_cidr(destination))
+}
+
+fn same_projection(
+    left_cidr: IpCidr,
+    left_gateway: Option<IpAddress>,
+    right_cidr: IpCidr,
+    right_gateway: Option<IpAddress>,
+) -> bool {
+    canonical_projection_cidr(left_cidr) == canonical_projection_cidr(right_cidr)
+        && left_gateway == right_gateway
 }
 
 fn family_matches(requested_family: AddressFamily, actual_family: AddressFamily) -> bool {
@@ -579,10 +673,6 @@ fn route_destination_prefix(cidr: IpCidr) -> IpAddress {
             IpAddress::Ipv6(Ipv6Address::from(octets))
         }
     }
-}
-
-fn is_local_connected_route(iface: &Arc<dyn Iface>, route: &smoltcp::iface::Route) -> bool {
-    route.via_router.is_none() && iface.common().ip_addrs().contains(&route.cidr)
 }
 
 fn route_notify_group(ip: IpAddress) -> u32 {

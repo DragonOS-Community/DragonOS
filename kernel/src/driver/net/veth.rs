@@ -450,32 +450,6 @@ impl VethInterface {
         self.inner.lock()
     }
 
-    /// # `update_ip_addrs`
-    /// 更新虚拟以太网设备的 IP 地址
-    /// ## 参数
-    /// - `cidr`: 要添加的 IP 地址和子网掩码
-    /// ## 描述
-    /// 该方法会将指定的 IP 地址添加到虚拟以太网设备的 IP 地址列表中。
-    /// 如果添加失败（例如列表已满），则会触发 panic。
-    pub fn update_ip_addrs(&self, cidr: IpCidr) {
-        let iface = &mut self.common.smol_iface.lock();
-        iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs.push(cidr).expect("Push ipCidr failed: full");
-        });
-        self.common.router_common_data.ip_addrs.write().push(cidr);
-
-        // // 直接更新对端的arp_table
-        // self.inner.lock().peer_veth.upgrade().map(|peer| {
-        //     peer.common
-        //         .router_common_data
-        //         .arp_table
-        //         .write()
-        //         .insert(cidr.address(), self.mac())
-        // });
-
-        // log::info!("VethInterface {} updated IP address: {}", self.name, addr);
-    }
-
     /// # `add_default_route_to_peer`
     /// 添加默认路由到对端虚拟以太网设备
     /// ## 参数
@@ -789,19 +763,23 @@ fn veth_route_test() {
 
     let addr1 = IpAddress::v4(192, 168, 1, 1);
     let cidr1 = IpCidr::new(addr1, 24);
-    iface_ns1.update_ip_addrs(cidr1);
+    crate::net::address::initialize_address(&(iface_ns1.clone() as Arc<dyn Iface>), cidr1)
+        .expect("initialize veth address");
 
     let addr2 = IpAddress::v4(192, 168, 1, 254);
     let cidr2 = IpCidr::new(addr2, 24);
-    iface_host1.update_ip_addrs(cidr2);
+    crate::net::address::initialize_address(&(iface_host1.clone() as Arc<dyn Iface>), cidr2)
+        .expect("initialize veth address");
 
     let addr3 = IpAddress::v4(192, 168, 2, 254);
     let cidr3 = IpCidr::new(addr3, 24);
-    iface_host2.update_ip_addrs(cidr3);
+    crate::net::address::initialize_address(&(iface_host2.clone() as Arc<dyn Iface>), cidr3)
+        .expect("initialize veth address");
 
     let addr4 = IpAddress::v4(192, 168, 2, 3);
     let cidr4 = IpCidr::new(addr4, 24);
-    iface_ns2.update_ip_addrs(cidr4);
+    crate::net::address::initialize_address(&(iface_ns2.clone() as Arc<dyn Iface>), cidr4)
+        .expect("initialize veth address");
 
     // 添加默认路由
     iface_ns1.add_default_route_to_peer(addr2);
@@ -880,11 +858,13 @@ fn veth_epoll_test() {
 
     let addr1 = IpAddress::v4(111, 111, 11, 1);
     let cidr1 = IpCidr::new(addr1, 24);
-    iface1.update_ip_addrs(cidr1);
+    crate::net::address::initialize_address(&(iface1.clone() as Arc<dyn Iface>), cidr1)
+        .expect("initialize veth address");
 
     let addr2 = IpAddress::v4(111, 111, 11, 2);
     let cidr2 = IpCidr::new(addr2, 24);
-    iface2.update_ip_addrs(cidr2);
+    crate::net::address::initialize_address(&(iface2.clone() as Arc<dyn Iface>), cidr2)
+        .expect("initialize veth address");
 
     iface1.add_default_route_to_peer(addr2);
     iface2.add_default_route_to_peer(addr1);

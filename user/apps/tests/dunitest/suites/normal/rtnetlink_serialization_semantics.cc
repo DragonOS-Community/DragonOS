@@ -55,6 +55,7 @@ struct RouteSpec {
     uint8_t table = RT_TABLE_MAIN;
     uint32_t source = 0;
     uint8_t source_prefix_len = 0;
+    uint32_t gateway = 0;
 };
 
 struct ChildOutcome {
@@ -190,6 +191,9 @@ int ChangeRoute(int fd, uint16_t type, uint16_t flags, const RouteSpec& route, u
     AddAttr(&request, RTA_OIF, &route.ifindex, sizeof(route.ifindex));
     if (route.source_prefix_len != 0) {
         AddAttr(&request, RTA_SRC, &route.source, sizeof(route.source));
+    }
+    if (route.gateway != 0) {
+        AddAttr(&request, RTA_GATEWAY, &route.gateway, sizeof(route.gateway));
     }
     return SendAndRecvAck(fd, request);
 }
@@ -531,16 +535,12 @@ int RunFailedRouteAtomicity() {
                     NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, preserved,
                     seq++) != 0 ||
         ChangeRoute(request_fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, shadow, seq++) != 0 ||
-        ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, shadow, seq++) !=
-            0) {
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, shadow, seq++) != 0) {
         return 5000;
     }
-    // DragonOS currently projects route keys with the same destination onto
-    // one smoltcp entry. Removing the source-specific shadow key leaves the
-    // source-agnostic control record present while removing that projection,
-    // exposing the historical replace rollback failure through public
-    // rtnetlink operations.
+    // The source-specific shadow and source-agnostic record share one physical
+    // projection. Replacing one owner with a different gateway must allocate a
+    // second projection while retaining the old one for the shadow owner.
     DrainNotifications(notify_fd.Get());
 
     std::vector<RouteSpec> added;
@@ -590,8 +590,10 @@ int RunFailedRouteAtomicity() {
 
     // Replacing the preserved control record needs a new projection and must
     // fail atomically when the data-plane table is full.
+    RouteSpec replacement = preserved;
+    replacement.gateway = Ipv4("127.0.0.1");
     if (ChangeRoute(request_fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE, preserved,
+                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE, replacement,
                     seq++) != ENOSPC) {
         return 9000;
     }
@@ -604,20 +606,6 @@ int RunFailedRouteAtomicity() {
     if (notification > 0) return 11000;
     if (notification < 0) return 11000 - notification;
 
-    FdGuard udp(socket(AF_INET, SOCK_DGRAM, 0));
-    if (udp.Get() < 0) return 8000 + errno;
-    sockaddr_in destination{};
-    destination.sin_family = AF_INET;
-    destination.sin_port = htons(9);
-    destination.sin_addr.s_addr = preserved.dst | htonl(1);
-    const char payload = 'x';
-    errno = 0;
-    if (sendto(udp.Get(), &payload, sizeof(payload), 0,
-               reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) >= 0 ||
-        errno != ENETUNREACH) {
-        return 12000 + errno;
-    }
-
     for (const auto& route : added) {
         const int error =
             ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, seq++);
@@ -626,6 +614,10 @@ int RunFailedRouteAtomicity() {
     if (ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, preserved,
                     seq++) != 0) {
         return 14000;
+    }
+    if (ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, shadow, seq++) !=
+        0) {
+        return 15000;
     }
     return 0;
 }

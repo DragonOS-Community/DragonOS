@@ -3,6 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::Operstate,
+    net::address::AddressLease,
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
         namespace::net_namespace::INIT_NET_NAMESPACE,
@@ -69,6 +70,10 @@ fn dhcp_query() -> Result<(), SystemError> {
 
     const DHCP_RETRY_INTERVAL_NS: i64 = 50_000_000;
     const DHCP_TRY_ROUND: u16 = 200;
+    // Ownership is deliberately scoped to this one-shot worker invocation.
+    // PR-08 owns the longer-lived lease state machine.
+    let mut owned_address: Option<AddressLease> = None;
+    let mut owned_router: Option<wire::Ipv4Address> = None;
     for i in 0..DHCP_TRY_ROUND {
         log::debug!("DHCP try round: {}", i);
         net_face.poll();
@@ -93,14 +98,52 @@ fn dhcp_query() -> Result<(), SystemError> {
                 // The DHCP socket guard is released before RTNL. Lease commits
                 // share the same global serialization domain as userspace
                 // rtnetlink mutations without extending it over DHCP polling.
-                let _rtnl_guard = crate::net::rtnl::lock();
+                let rtnl_guard = crate::net::rtnl::lock();
+                revalidate_dhcp_iface(&net_face)?;
                 // debug!("Find Config!! {config:?}");
                 // debug!("Find ip address: {}", config.address);
                 // debug!("iface.ip_addrs={:?}", net_face.inner_iface.ip_addrs());
 
-                net_face
-                    .update_ip_addrs(&[wire::IpCidr::Ipv4(address)])
-                    .ok();
+                let requested = wire::IpCidr::Ipv4(address);
+                let commit = match owned_address {
+                    None => {
+                        crate::net::address::add_owned_address(&rtnl_guard, &net_face, requested)
+                    }
+                    Some(old) => crate::net::address::exchange_owned_address(
+                        &rtnl_guard,
+                        &net_face,
+                        old,
+                        requested,
+                    ),
+                };
+                let commit = match commit {
+                    Err(SystemError::ESTALE) if owned_address.is_some() => {
+                        // An authorized writer deleted the old object. A
+                        // same-CIDR re-add is a different object, so retry as
+                        // an unowned acquisition instead of acting on the
+                        // stale cross-event lease.
+                        owned_address = None;
+                        crate::net::address::add_owned_address(&rtnl_guard, &net_face, requested)
+                    }
+                    result => result,
+                };
+                match commit {
+                    Ok((outcome, lease)) => {
+                        owned_address = Some(lease);
+                        crate::net::socket::netlink::notify_address_outcome(
+                            INIT_NET_NAMESPACE.clone(),
+                            &net_face,
+                            outcome,
+                        );
+                    }
+                    Err(SystemError::EEXIST) if owned_address.is_none() => {
+                        // A pre-existing address remains owned by its original
+                        // writer. DHCP may use it for this invocation but must
+                        // never delete or exchange it later.
+                        log::debug!("DHCP address {requested} already configured");
+                    }
+                    Err(err) => return Err(err),
+                }
 
                 if let Some(router) = router {
                     let mut smol_iface = net_face.smol_iface().lock();
@@ -115,9 +158,7 @@ fn dhcp_query() -> Result<(), SystemError> {
                             expires_at: None,
                         });
                     });
-                    if smol_iface
-                        .routes_mut()
-                        .add_default_ipv4_route(router)
+                    if update_dhcp_default_route(&mut smol_iface, &mut owned_router, Some(router))
                         .is_err()
                     {
                         log::warn!("Route table full");
@@ -130,28 +171,38 @@ fn dhcp_query() -> Result<(), SystemError> {
                         return Ok(());
                     }
                 } else {
-                    net_face
-                        .smol_iface()
-                        .lock()
-                        .routes_mut()
-                        .remove_default_ipv4_route();
+                    update_dhcp_default_route(
+                        &mut net_face.smol_iface().lock(),
+                        &mut owned_router,
+                        None,
+                    )?;
                 }
             }
 
             Some(DhcpControlEvent::Deconfigured) => {
-                let _rtnl_guard = crate::net::rtnl::lock();
+                let rtnl_guard = crate::net::rtnl::lock();
+                revalidate_dhcp_iface(&net_face)?;
                 log::debug!("Dhcp v4 deconfigured");
-                net_face
-                    .update_ip_addrs(&[smoltcp::wire::IpCidr::Ipv4(wire::Ipv4Cidr::new(
-                        wire::Ipv4Address::UNSPECIFIED,
-                        0,
-                    ))])
-                    .ok();
-                net_face
-                    .smol_iface()
-                    .lock()
-                    .routes_mut()
-                    .remove_default_ipv4_route();
+                if let Some(owned) = owned_address.take() {
+                    match crate::net::address::delete_owned_address(&rtnl_guard, &net_face, owned) {
+                        Ok(outcome) => crate::net::socket::netlink::notify_address_outcome(
+                            INIT_NET_NAMESPACE.clone(),
+                            &net_face,
+                            outcome,
+                        ),
+                        Err(SystemError::ESTALE | SystemError::EADDRNOTAVAIL) => {
+                            // A concurrent authorized control-plane writer may
+                            // already have removed the object between events.
+                            log::debug!("owned DHCP address {} was already replaced", owned.cidr());
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                update_dhcp_default_route(
+                    &mut net_face.smol_iface().lock(),
+                    &mut owned_router,
+                    None,
+                )?;
             }
         }
         let sleep_time = PosixTimeSpec {
@@ -162,4 +213,79 @@ fn dhcp_query() -> Result<(), SystemError> {
     }
 
     return Err(SystemError::ETIMEDOUT);
+}
+
+/// Updates only the default-route projection owned by this DHCP worker.
+///
+/// smoltcp's convenience API removes an arbitrary IPv4 default route before
+/// adding a new one. That is unsafe once userspace can own a distinct default
+/// route through rtnetlink, so the worker remembers and mutates its exact
+/// projection instead.
+fn update_dhcp_default_route(
+    iface: &mut smoltcp::iface::Interface,
+    owned: &mut Option<wire::Ipv4Address>,
+    requested: Option<wire::Ipv4Address>,
+) -> Result<(), SystemError> {
+    let old = *owned;
+    let mut committed = requested.is_none();
+    iface.routes_mut().update(|routes| match (old, requested) {
+        (Some(old), Some(new)) if old == new => {
+            committed = routes.iter().any(|route| {
+                route.cidr
+                    == wire::IpCidr::Ipv4(wire::Ipv4Cidr::new(wire::Ipv4Address::UNSPECIFIED, 0))
+                    && route.via_router == Some(wire::IpAddress::Ipv4(old))
+            });
+            if !committed {
+                committed = routes
+                    .push(smoltcp::iface::Route::new_ipv4_gateway(old))
+                    .is_ok();
+            }
+        }
+        (Some(old), Some(new)) => {
+            if let Some(index) = routes.iter().rposition(|route| {
+                route.cidr
+                    == wire::IpCidr::Ipv4(wire::Ipv4Cidr::new(wire::Ipv4Address::UNSPECIFIED, 0))
+                    && route.via_router == Some(wire::IpAddress::Ipv4(old))
+            }) {
+                routes[index] = smoltcp::iface::Route::new_ipv4_gateway(new);
+                committed = true;
+            } else {
+                committed = routes
+                    .push(smoltcp::iface::Route::new_ipv4_gateway(new))
+                    .is_ok();
+            }
+        }
+        (None, Some(new)) => {
+            committed = routes
+                .push(smoltcp::iface::Route::new_ipv4_gateway(new))
+                .is_ok();
+        }
+        (Some(old), None) => {
+            if let Some(index) = routes.iter().rposition(|route| {
+                route.cidr
+                    == wire::IpCidr::Ipv4(wire::Ipv4Cidr::new(wire::Ipv4Address::UNSPECIFIED, 0))
+                    && route.via_router == Some(wire::IpAddress::Ipv4(old))
+            }) {
+                routes.remove(index);
+            }
+        }
+        (None, None) => {}
+    });
+
+    if !committed {
+        return Err(SystemError::ENOSPC);
+    }
+    *owned = requested;
+    Ok(())
+}
+
+fn revalidate_dhcp_iface(
+    iface: &alloc::sync::Arc<dyn crate::driver::net::Iface>,
+) -> Result<(), SystemError> {
+    let devices = INIT_NET_NAMESPACE.device_list();
+    let current = devices.get(&iface.nic_id()).ok_or(SystemError::ENODEV)?;
+    if !alloc::sync::Arc::ptr_eq(current, iface) {
+        return Err(SystemError::ENODEV);
+    }
+    Ok(())
 }

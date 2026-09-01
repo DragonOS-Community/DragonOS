@@ -317,10 +317,14 @@ fn bridge_probe() {
     let addr4 = IpAddress::v4(200, 0, 0, 4);
     let cidr4 = IpCidr::new(addr4, 24);
 
-    iface1.update_ip_addrs(cidr1);
-    iface2.update_ip_addrs(cidr2);
-    iface3.update_ip_addrs(cidr3);
-    iface4.update_ip_addrs(cidr4);
+    crate::net::address::initialize_address(&(iface1.clone() as Arc<dyn Iface>), cidr1)
+        .expect("initialize veth address");
+    crate::net::address::initialize_address(&(iface2.clone() as Arc<dyn Iface>), cidr2)
+        .expect("initialize veth address");
+    crate::net::address::initialize_address(&(iface3.clone() as Arc<dyn Iface>), cidr3)
+        .expect("initialize veth address");
+    crate::net::address::initialize_address(&(iface4.clone() as Arc<dyn Iface>), cidr4)
+        .expect("initialize veth address");
 
     iface1.add_default_route_to_peer(addr2);
     iface2.add_default_route_to_peer(addr1);

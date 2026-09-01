@@ -195,6 +195,7 @@ pub(super) fn do_del_link(
 }
 
 pub(super) fn do_set_link(
+    rtnl: &crate::net::rtnl::RtnlGuard,
     request_segment: &LinkSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
@@ -240,6 +241,12 @@ pub(super) fn do_set_link(
         }
     }
 
+    let renamed_addresses = if let Some(ref name) = updates.name {
+        crate::net::address::rename_address_labels(rtnl, &iface, name)?
+    } else {
+        Vec::new()
+    };
+
     if let Some(name) = updates.name {
         iface.set_name(name);
     }
@@ -249,6 +256,9 @@ pub(super) fn do_set_link(
     }
 
     notify_link_change(&iface);
+    for cidr in renamed_addresses {
+        super::addr::notify_address_change(netns.clone(), &iface, cidr);
+    }
 
     Ok(Vec::new())
 }

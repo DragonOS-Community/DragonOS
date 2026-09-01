@@ -1,3 +1,4 @@
+use alloc::ffi::CString;
 use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
@@ -62,6 +63,18 @@ pub enum Operstate {
     IF_OPER_DORMANT = 5,
     /// 网络接口已启用
     IF_OPER_UP = 6,
+}
+
+/// Control-plane metadata attached to one configured interface address.
+///
+/// `label == None` means the interface's current primary name. Keeping that
+/// distinction avoids stale labels after a device rename while preserving an
+/// explicitly supplied Linux IFA_LABEL alias verbatim.
+#[derive(Debug, Clone)]
+pub(crate) struct AddressMetadata {
+    pub cidr: smoltcp::wire::IpCidr,
+    pub label: Option<CString>,
+    pub owner_token: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -133,16 +146,6 @@ pub trait Iface: crate::driver::base::device::Device {
     #[inline]
     fn should_drop_rx_packet(&self, _packet: &[u8]) -> bool {
         false
-    }
-
-    /// # `update_ip_addrs`
-    /// 用于更新接口的 IP 地址
-    /// ## 参数
-    /// - `ip_addrs` ：一个包含 `smoltcp::wire::IpCidr` 的切片，表示要设置的 IP 地址和子网掩码
-    /// ## 返回值
-    /// - 如果 `ip_addrs` 的长度不为 1，返回 `Err(SystemError::EINVAL)`，表示输入参数无效
-    fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
-        self.common().update_ip_addrs(ip_addrs)
     }
 
     /// @brief 获取smoltcp的网卡接口类型
@@ -334,6 +337,10 @@ pub struct IfaceCommon {
     /// NAPI 结构体
     napi_struct: RwLock<Option<Arc<NapiStruct>>>,
     netlink_routes: RwSem<Vec<NetlinkRouteEntry>>,
+    /// Per-address control-plane state committed together with smoltcp's
+    /// address list. It carries Linux IFA_LABEL semantics and opaque ownership
+    /// tokens for in-kernel actors such as DHCP.
+    address_metadata: Mutex<Vec<AddressMetadata>>,
     static_neighbors: RwSem<Vec<StaticNeighborEntry>>,
     /// TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket（Linux-like）。
     tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer,
@@ -367,6 +374,15 @@ impl IfaceCommon {
             .ip_addrs
             .write()
             .extend_from_slice(iface.ip_addrs());
+        let address_metadata = iface
+            .ip_addrs()
+            .iter()
+            .map(|cidr| AddressMetadata {
+                cidr: *cidr,
+                label: None,
+                owner_token: None,
+            })
+            .collect();
         IfaceCommon {
             iface_id,
             name: RwLock::new(name),
@@ -382,6 +398,7 @@ impl IfaceCommon {
             type_,
             napi_struct: RwLock::new(None),
             netlink_routes: RwSem::new(Vec::new()),
+            address_metadata: Mutex::new(address_metadata),
             static_neighbors: RwSem::new(Vec::new()),
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
             tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
@@ -621,23 +638,6 @@ impl IfaceCommon {
         }
     }
 
-    pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {
-        if ip_addrs.len() != 1 {
-            return Err(SystemError::EINVAL);
-        }
-
-        self.smol_iface.lock().update_ip_addrs(|addrs| {
-            let dest = addrs.iter_mut().next();
-
-            if let Some(dest) = dest {
-                *dest = ip_addrs[0];
-            } else {
-                addrs.push(ip_addrs[0]).expect("Push ipCidr failed: full");
-            }
-        });
-        return Ok(());
-    }
-
     // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发
     pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
         Arc::make_mut(&mut *self.bounds.write()).push(socket);
@@ -769,6 +769,10 @@ impl IfaceCommon {
         self.netlink_routes.read()
     }
 
+    pub(crate) fn address_metadata(&self) -> &Mutex<Vec<AddressMetadata>> {
+        &self.address_metadata
+    }
+
     pub fn upsert_netlink_route(&self, route: NetlinkRouteEntry) {
         let mut routes = self.netlink_routes.write();
         if let Some(existing) = routes.iter_mut().find(|existing| {
@@ -794,11 +798,10 @@ impl IfaceCommon {
         destination: smoltcp::wire::IpCidr,
         source: Option<smoltcp::wire::IpCidr>,
         table: u8,
-    ) -> bool {
+    ) -> Option<NetlinkRouteEntry> {
         let mut routes = self.netlink_routes.write();
-        let before = routes.len();
-        routes.retain(|existing| {
-            !(existing.destination == destination
+        let index = routes.iter().position(|existing| {
+            existing.destination == destination
                 && existing.table == table
                 && existing
                     .source
@@ -806,9 +809,9 @@ impl IfaceCommon {
                     .map(|cidr| (cidr.address(), cidr.prefix_len()))
                     == source
                         .as_ref()
-                        .map(|cidr| (cidr.address(), cidr.prefix_len())))
-        });
-        routes.len() != before
+                        .map(|cidr| (cidr.address(), cidr.prefix_len()))
+        })?;
+        Some(routes.remove(index))
     }
 
     pub fn static_neighbors(&self) -> RwSemReadGuard<'_, Vec<StaticNeighborEntry>> {

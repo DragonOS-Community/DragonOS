@@ -36,6 +36,7 @@ enum SchedulerUpdate {
     Replace(SchedChangeRequest),
     Parameters {
         expected_policy: LinuxSchedPolicy,
+        expected_rt_priority: Option<i32>,
         rt_priority: Option<i32>,
     },
 }
@@ -168,18 +169,20 @@ impl ProcessManager {
     /// Atomically update only the scheduler parameters of a task whose base
     /// policy is expected to remain unchanged.
     ///
-    /// A `false` result means the policy changed before the runqueue-locked
-    /// commit point. The syscall layer must revalidate and authorize the new
-    /// policy before retrying.
+    /// A `false` result means policy or an authorization-dependent RT priority
+    /// changed before the runqueue-locked commit point. The syscall layer must
+    /// revalidate and authorize the new state before retrying.
     pub(crate) fn set_scheduler_param(
         pcb: &Arc<ProcessControlBlock>,
         expected_policy: LinuxSchedPolicy,
+        expected_rt_priority: Option<i32>,
         rt_priority: Option<i32>,
     ) -> Result<bool, SystemError> {
         Self::update_scheduler(
             pcb,
             SchedulerUpdate::Parameters {
                 expected_policy,
+                expected_rt_priority,
                 rt_priority,
             },
         )
@@ -194,12 +197,14 @@ impl ProcessManager {
             | SchedulerUpdate::Replace(SchedChangeRequest::Rr { priority, .. }) => Some(priority),
             SchedulerUpdate::Parameters {
                 expected_policy: LinuxSchedPolicy::Fifo | LinuxSchedPolicy::Rr,
+                expected_rt_priority: Some(_),
                 rt_priority: Some(priority),
                 ..
             } => Some(priority),
             SchedulerUpdate::Replace(SchedChangeRequest::Normal { .. })
             | SchedulerUpdate::Parameters {
                 expected_policy: LinuxSchedPolicy::Normal,
+                expected_rt_priority: None,
                 rt_priority: None,
             } => None,
             SchedulerUpdate::Parameters { .. } => return Err(SystemError::EINVAL),
@@ -269,9 +274,12 @@ impl ProcessManager {
                 }) => (LinuxSchedPolicy::Rr, priority, reset_on_fork),
                 SchedulerUpdate::Parameters {
                     expected_policy,
+                    expected_rt_priority,
                     rt_priority,
                 } => {
-                    if old_policy != expected_policy {
+                    if old_policy != expected_policy
+                        || expected_rt_priority.is_some_and(|priority| old_normal_prio != priority)
+                    {
                         return Ok(false);
                     }
                     let priority = match expected_policy {

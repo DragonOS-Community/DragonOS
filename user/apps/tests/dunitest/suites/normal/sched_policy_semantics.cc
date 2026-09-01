@@ -1166,6 +1166,73 @@ TEST(SchedSetParam, UnprivilegedRlimitRaiseLowerAndNoop) {
     EXPECT_EQ(0, RunIsolatedScenario(SetParamRlimitScenario));
 }
 
+struct SetParamPriorityRaceState {
+    std::atomic<int> ready {0};
+    std::atomic<int> start {0};
+    pid_t target = -1;
+};
+
+struct SetParamPriorityRaceWriter {
+    SetParamPriorityRaceState* state = nullptr;
+    int priority = 0;
+    int result = -1;
+};
+
+void* SetParamPriorityRaceWorker(void* arg) {
+    auto* writer = static_cast<SetParamPriorityRaceWriter*>(arg);
+    writer->state->ready.fetch_add(1, std::memory_order_release);
+    while (writer->state->start.load(std::memory_order_acquire) == 0) sched_yield();
+
+    RawSchedParam param {writer->priority};
+    errno = 0;
+    writer->result = RawSetParam(writer->state->target, &param) == 0 ? 0 : errno;
+    return nullptr;
+}
+
+int SetParamPriorityAuthorizationRaceScenario() {
+    constexpr int kHighWriters = 16;
+    constexpr int kWriterCount = kHighWriters + 1;
+    struct rlimit high {10, 10};
+    if (setrlimit(RLIMIT_RTPRIO, &high) != 0) return 10 + errno;
+    if (syscall(SYS_setresuid, 1001, 1001, 1001) != 0) return 20 + errno;
+    if (!SetPolicy(0, SCHED_RR, 10)) return 30 + errno;
+
+    struct rlimit zero {0, 10};
+    if (setrlimit(RLIMIT_RTPRIO, &zero) != 0) return 40 + errno;
+
+    SetParamPriorityRaceState state;
+    state.target = static_cast<pid_t>(syscall(SYS_gettid));
+    pthread_t threads[kWriterCount] {};
+    SetParamPriorityRaceWriter writers[kWriterCount] {};
+    for (int index = 0; index < kWriterCount; ++index) {
+        writers[index].state = &state;
+        writers[index].priority = index == kHighWriters ? 1 : 10;
+        if (pthread_create(&threads[index], nullptr, SetParamPriorityRaceWorker,
+                           &writers[index]) != 0) {
+            return 50 + index;
+        }
+    }
+
+    while (state.ready.load(std::memory_order_acquire) != kWriterCount) sched_yield();
+    state.start.store(1, std::memory_order_release);
+    for (int index = 0; index < kWriterCount; ++index) {
+        if (pthread_join(threads[index], nullptr) != 0) return 80 + index;
+    }
+
+    if (writers[kHighWriters].result != 0) return 110 + writers[kHighWriters].result;
+    for (int index = 0; index < kHighWriters; ++index) {
+        if (writers[index].result != 0 && writers[index].result != EPERM) return 140 + index;
+    }
+    return ReadPolicyAndPriority(0, SCHED_RR, 1) ? 0 : 170;
+}
+
+TEST(SchedSetParam, ConcurrentPriorityChangeRetriesAuthorization) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        ASSERT_EQ(0, RunIsolatedScenario(SetParamPriorityAuthorizationRaceScenario));
+    }
+}
+
 struct SharedFifoState {
     int sequence_index;
     char sequence[4];

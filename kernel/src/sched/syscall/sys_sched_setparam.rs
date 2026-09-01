@@ -23,6 +23,7 @@ use super::{
 
 struct PreparedUpdate {
     policy: LinuxSchedPolicy,
+    expected_rt_priority: Option<i32>,
     rt_priority: Option<i32>,
     unprivileged_allowed: bool,
 }
@@ -30,8 +31,9 @@ struct PreparedUpdate {
 struct SysSchedSetparam;
 
 impl SysSchedSetparam {
-    /// Validate and authorize a priority update against one policy snapshot.
-    /// The manager checks that the same policy is still current at commit.
+    /// Validate and authorize a priority update against one scheduler snapshot.
+    /// The manager checks that the authorization-dependent state is still
+    /// current at commit.
     fn prepare_update(
         target: &Arc<ProcessControlBlock>,
         user_priority: i32,
@@ -42,28 +44,29 @@ impl SysSchedSetparam {
 
         let pi_guard = target.sched_info().pi_lock_irqsave();
         let policy = target.sched_info().policy();
-        let (rt_priority, within_limit) = match policy {
+        let (expected_rt_priority, rt_priority, within_limit) = match policy {
             LinuxSchedPolicy::Normal => {
                 if user_priority != 0 {
                     return Err(SystemError::EINVAL);
                 }
-                (None, true)
+                (None, None, true)
             }
             LinuxSchedPolicy::Fifo | LinuxSchedPolicy::Rr => {
                 let priority =
                     PrioUtil::user_rt_prio_to_internal(user_priority).ok_or(SystemError::EINVAL)?;
+                let old_rt_priority = target.sched_info().normal_prio();
                 let old_user_priority =
-                    PrioUtil::internal_rt_prio_to_user(target.sched_info().normal_prio())
-                        .ok_or(SystemError::EIO)?;
+                    PrioUtil::internal_rt_prio_to_user(old_rt_priority).ok_or(SystemError::EIO)?;
                 let within_limit =
                     user_priority <= old_user_priority || user_priority as u64 <= rtprio_limit;
-                (Some(priority), within_limit)
+                (Some(old_rt_priority), Some(priority), within_limit)
             }
         };
         drop(pi_guard);
 
         Ok(PreparedUpdate {
             policy,
+            expected_rt_priority,
             rt_priority,
             unprivileged_allowed: same_owner && within_limit,
         })
@@ -98,8 +101,12 @@ impl Syscall for SysSchedSetparam {
             if !prepared.unprivileged_allowed && !capable(CAPFlags::CAP_SYS_NICE) {
                 return Err(SystemError::EPERM);
             }
-            if ProcessManager::set_scheduler_param(&target, prepared.policy, prepared.rt_priority)?
-            {
+            if ProcessManager::set_scheduler_param(
+                &target,
+                prepared.policy,
+                prepared.expected_rt_priority,
+                prepared.rt_priority,
+            )? {
                 return Ok(0);
             }
         }

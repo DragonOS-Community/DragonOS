@@ -5,6 +5,7 @@ mod sys_sched_get_priority;
 mod sys_sched_getparam;
 mod sys_sched_getscheduler;
 mod sys_sched_rr_get_interval;
+mod sys_sched_setparam;
 mod sys_sched_setscheduler;
 mod sys_sched_yield;
 mod types;

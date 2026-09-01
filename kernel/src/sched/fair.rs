@@ -858,18 +858,42 @@ impl CfsRunQueue {
             se.force_mut().update_load_avg(self, now);
         }
 
-        let mut decayed = self.update_self_load_avg(now);
-        decayed |= se.force_mut().propagate_entity_load_avg() as u32;
+        let mut _decayed = self.update_self_load_avg(now);
+        _decayed |= se.force_mut().propagate_entity_load_avg() as u32;
 
-        if se.avg.last_update_time > 0 && flags.contains(UpdateAvgFlags::DO_ATTACH) {
-            todo!()
-        } else if flags.contains(UpdateAvgFlags::DO_ATTACH) {
+        if se.avg.last_update_time == 0 && flags.contains(UpdateAvgFlags::DO_ATTACH) {
+            self.attach_entity_load_avg(se);
+        } else if flags.contains(UpdateAvgFlags::DO_DETACH) {
             self.detach_entity_load_avg(se);
-        } else if decayed > 0 {
-            // cfs_rq_util_change
-
-            todo!()
         }
+    }
+
+    /// Attach an entity's PELT contribution to this CFS runqueue.
+    ///
+    /// The CFS rq average must be current before this method is called.
+    fn attach_entity_load_avg(&mut self, se: &Arc<FairSchedEntity>) {
+        let divider = self.avg.get_pelt_divider();
+        let scaled_weight = LoadWeight::scale_load_down(se.load.weight);
+
+        let se_mut = se.force_mut();
+        se_mut.avg.last_update_time = self.avg.last_update_time;
+        se_mut.avg.period_contrib = self.avg.period_contrib;
+        se_mut.avg.util_sum = (se_mut.avg.util_avg * divider) as u64;
+        se_mut.avg.runnable_sum = (se_mut.avg.runnable_avg * divider) as u64;
+        se_mut.avg.load_sum = (se_mut.avg.load_avg * divider) as u64;
+        se_mut.avg.load_sum = if scaled_weight < se_mut.avg.load_sum {
+            se_mut.avg.load_sum / scaled_weight
+        } else {
+            1
+        };
+
+        self.enqueue_load_avg(se.clone());
+        self.avg.util_avg += se.avg.util_avg;
+        self.avg.util_sum += se.avg.util_sum;
+        self.avg.runnable_avg += se.avg.runnable_avg;
+        self.avg.runnable_sum += se.avg.runnable_sum;
+        self.propagate = 1;
+        self.prop_runnable_sum += se.avg.load_sum as isize;
     }
 
     /// 将实体的负载均值与对应cfs分离
@@ -877,24 +901,21 @@ impl CfsRunQueue {
         self.dequeue_load_avg(se);
 
         sub_positive(&mut self.avg.util_avg, se.avg.util_avg);
-        sub_positive(&mut (self.avg.util_sum as usize), se.avg.util_sum as usize);
+        self.avg.util_sum = self.avg.util_sum.saturating_sub(se.avg.util_sum);
         self.avg.util_sum = self
             .avg
             .util_sum
             .max((self.avg.util_avg * PELT_MIN_DIVIDER) as u64);
 
         sub_positive(&mut self.avg.runnable_avg, se.avg.runnable_avg);
-        sub_positive(
-            &mut (self.avg.runnable_sum as usize),
-            se.avg.runnable_sum as usize,
-        );
+        self.avg.runnable_sum = self.avg.runnable_sum.saturating_sub(se.avg.runnable_sum);
         self.avg.runnable_sum = self
             .avg
             .runnable_sum
             .max((self.avg.runnable_avg * PELT_MIN_DIVIDER) as u64);
 
         self.propagate = 1;
-        self.prop_runnable_sum += se.avg.load_sum as isize;
+        self.prop_runnable_sum -= se.avg.load_sum as isize;
     }
 
     fn update_self_load_avg(&mut self, now: u64) -> u32 {
@@ -1356,6 +1377,42 @@ impl Default for CfsRunQueue {
 pub struct CompletelyFairScheduler;
 
 impl CompletelyFairScheduler {
+    fn detach_task_load_avg(rq: &mut CpuRunQueue, pcb: &Arc<ProcessControlBlock>) {
+        let se = pcb.sched_info().sched_entity();
+        debug_assert!(Arc::ptr_eq(&se.cfs_rq(), &rq.cfs_rq()));
+        if se.avg.last_update_time == 0 {
+            return;
+        }
+
+        let cfs = se.cfs_rq();
+        let cfs = cfs.force_mut();
+        cfs.update_load_avg(&se, UpdateAvgFlags::empty());
+        cfs.detach_entity_load_avg(&se);
+    }
+
+    /// Remove a task's PELT contribution when it leaves the fair class.
+    pub fn switched_from_fair(rq: &mut CpuRunQueue, pcb: &Arc<ProcessControlBlock>) {
+        Self::detach_task_load_avg(rq, pcb);
+    }
+
+    /// Attach a task's PELT contribution before it enters the fair class.
+    pub fn switched_to_fair(rq: &mut CpuRunQueue, pcb: &Arc<ProcessControlBlock>) {
+        let se = pcb.sched_info().sched_entity();
+        debug_assert!(Arc::ptr_eq(&se.cfs_rq(), &rq.cfs_rq()));
+        let cfs = se.cfs_rq();
+        let cfs = cfs.force_mut();
+        // Linux enables ATTACH_AGE_LOAD by default: age a detached entity to
+        // the destination rq clock before restoring its contribution.
+        cfs.update_load_avg(&se, UpdateAvgFlags::empty());
+        cfs.attach_entity_load_avg(&se);
+    }
+
+    /// Remove the final PELT contribution after a Fair task exits and leaves
+    /// its runqueue. Sleeping tasks deliberately remain attached.
+    pub(crate) fn task_dead_fair(rq: &mut CpuRunQueue, pcb: &Arc<ProcessControlBlock>) {
+        Self::detach_task_load_avg(rq, pcb);
+    }
+
     pub fn set_next_task(_rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
         let mut se = next.sched_info().sched_entity();
         FairSchedEntity::for_each_in_group(&mut se, |se| {

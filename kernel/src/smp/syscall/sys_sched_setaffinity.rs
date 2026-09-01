@@ -7,9 +7,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_SETAFFINITY;
 use crate::libs::cpumask::CpuMask;
 use crate::process::{kthread::KernelThreadFlags, ProcessFlags, ProcessManager, RawPid};
-use crate::sched::{
-    request_task_migration, select_task_rq, syscall::util::has_sched_setaffinity_permission,
-};
+use crate::sched::syscall::util::has_sched_setaffinity_permission;
 use crate::smp::cpu::smp_cpu_manager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -69,35 +67,8 @@ impl Syscall for SysSchedSetaffinity {
         }
 
         // Keep affinity publication and the corresponding placement decision
-        // in one pi_lock critical section. Otherwise two concurrent callers
-        // can publish masks in one order but execute their migrations in the
-        // opposite order.
-        let mut pi_guard = target_pcb.sched_info().pi_lock_irqsave();
-        pi_guard.set_cpus_allowed(mask.clone());
-
-        if target_pcb.sched_info().is_new_task() {
-            return Ok(0);
-        }
-
-        // A previous affinity request may have left a migration for a running
-        // task to be consumed in schedule tail. Do not let a newer mask retain
-        // an now-illegal destination.
-        if target_pcb
-            .sched_info()
-            .migrate_to()
-            .is_some_and(|cpu| !mask.get(cpu).unwrap_or(false))
-        {
-            target_pcb.sched_info().set_migrate_to(None);
-            target_pcb.flags().remove(ProcessFlags::NEED_MIGRATE);
-        }
-
-        if let Some(cpu) = target_pcb.sched_info().on_cpu() {
-            if !mask.get(cpu).unwrap_or(false) {
-                let dest_cpu =
-                    select_task_rq(&target_pcb, cpu, crate::sched::WakeupFlags::WF_TTWU, &mask);
-                request_task_migration(&target_pcb, dest_cpu)?;
-            }
-        }
+        // in one pi_lock critical section inside the process manager.
+        ProcessManager::set_cpus_allowed(&target_pcb, mask)?;
 
         Ok(0)
     }

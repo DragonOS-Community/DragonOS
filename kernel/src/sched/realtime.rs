@@ -109,6 +109,15 @@ impl RealtimeRunQueue {
         self.assert_consistent();
     }
 
+    pub fn enqueue_head(&mut self, pcb: Arc<ProcessControlBlock>) {
+        let prio = Self::prio_index(&pcb);
+        self.assert_not_queued(&pcb);
+        self.queues[prio].push_front(pcb);
+        self.set_active(prio);
+        self.nr_running += 1;
+        self.assert_consistent();
+    }
+
     pub fn dequeue(&mut self, pcb: &Arc<ProcessControlBlock>) -> bool {
         self.assert_consistent();
         let prio = Self::prio_index(pcb);
@@ -188,8 +197,12 @@ impl RealtimeScheduler {
 }
 
 impl Scheduler for RealtimeScheduler {
-    fn enqueue(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, _flags: EnqueueFlag) {
-        rq.rt.enqueue_tail(pcb);
+    fn enqueue(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag) {
+        if flags.contains(EnqueueFlag::ENQUEUE_HEAD) {
+            rq.rt.enqueue_head(pcb);
+        } else {
+            rq.rt.enqueue_tail(pcb);
+        }
         rq.add_nr_running(1);
     }
 

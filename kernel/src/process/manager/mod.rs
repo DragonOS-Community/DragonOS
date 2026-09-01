@@ -30,6 +30,7 @@ use crate::{
 
 mod exit;
 mod sched;
+pub(crate) use sched::SchedChangeRequest;
 
 #[derive(Debug)]
 pub struct ProcessManager;

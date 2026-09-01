@@ -1,0 +1,93 @@
+#!/bin/busybox sh
+
+set -f
+
+. /usr/lib/dragon-network/common.sh
+
+dn_first_router() {
+    local value first
+    first=
+    for value in ${router:-}; do
+        dn_valid_host_ipv4 "$value" || return 1
+        [ -n "$first" ] || first=$value
+    done
+    DN_DHCP_ROUTER=$first
+}
+
+dn_dhcp_prefix() {
+    if [ -z "${subnet:-}" ]; then
+        [ -z "${mask:-}" ] || return 1
+        DN_PREFIX=32
+        return 0
+    fi
+    dn_prefix_from_netmask "$subnet" || return 1
+    if [ -n "${mask:-}" ]; then
+        dn_valid_prefix "$mask" && [ "$mask" -eq "$DN_PREFIX" ] || return 1
+    fi
+    return 0
+}
+
+dn_validate_dhcp_event() {
+    local value search_values
+    dn_valid_host_ipv4 "${ip:-}" || return 1
+    dn_dhcp_prefix || return 1
+    dn_first_router || return 1
+    dn_valid_ipv4_list "${dns:-}" || return 1
+
+    if [ -n "${search:-}" ]; then
+        search_values=$search
+    else
+        search_values=${domain:-}
+    fi
+    dn_valid_domain_list "$search_values" || return 1
+    if [ -n "${lease:-}" ]; then
+        dn_valid_uint "$lease" || return 1
+    fi
+
+    DN_DHCP_ADDRESS="$ip/$DN_PREFIX"
+    DN_DHCP_GATEWAY_ROUTE=
+    if [ "$DN_PREFIX" -eq 32 ] && [ -n "$DN_DHCP_ROUTER" ]; then
+        DN_DHCP_GATEWAY_ROUTE="$DN_DHCP_ROUTER/32"
+    fi
+    DN_DHCP_DNS=${dns:-}
+    DN_DHCP_SEARCH=$search_values
+    return 0
+}
+
+[ "$#" -eq 1 ] || {
+    dn_log udhcpc "missing DHCP event"
+    exit 2
+}
+event=$1
+iface=${interface:-}
+dn_valid_ifname "$iface" || {
+    dn_log udhcpc "invalid interface name"
+    exit 1
+}
+dn_init_runtime && dn_init_interface_runtime "$iface" || exit 1
+
+case "$event" in
+    deconfig)
+        dn_deconfigure "$iface"
+        ;;
+    bound | renew)
+        dn_load_config "$iface" && [ "$DN_CONFIG_MODE" = dhcp ] || {
+            dn_write_error "$iface" "DHCP event rejected because mode is not dhcp"
+            exit 1
+        }
+        dn_validate_dhcp_event || {
+            dn_write_error "$iface" "invalid DHCP lease data for $event"
+            exit 1
+        }
+        dn_apply "$iface" dhcp "$DN_DHCP_ADDRESS" "$DN_DHCP_ROUTER" \
+            "$DN_DHCP_GATEWAY_ROUTE" "$DN_DHCP_DNS" "$DN_DHCP_SEARCH"
+        ;;
+    nak | leasefail)
+        # BusyBox drives the following state transition and deconfig event.
+        exit 0
+        ;;
+    *)
+        dn_write_error "$iface" "unsupported DHCP event: $event"
+        exit 1
+        ;;
+esac

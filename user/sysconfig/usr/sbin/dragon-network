@@ -1,0 +1,287 @@
+#!/bin/busybox sh
+
+set -f
+
+. /usr/lib/dragon-network/common.sh
+
+dn_usage() {
+    echo "usage: dragon-network {start|stop|renew|status} IFACE" >&2
+    exit 2
+}
+
+dn_pid_value() {
+    local pid
+    [ -f "$DN_PID_FILE" ] && [ ! -L "$DN_PID_FILE" ] || return 1
+    IFS= read -r pid < "$DN_PID_FILE" || return 1
+    dn_valid_uint "$pid" && [ "$pid" -gt 1 ] || return 1
+    DN_CLIENT_PID=$pid
+    return 0
+}
+
+dn_pid_matches_client() {
+    local iface pid cmdline old_ifs arg previous saw_udhcpc iface_count pid_count script_count saw_foreground saw_release
+    iface=$1
+    dn_pid_value || return 1
+    pid=$DN_CLIENT_PID
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    cmdline=$($DN_BUSYBOX tr '\000' '\n' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+    old_ifs=$IFS
+    IFS='
+'
+    set -- $cmdline
+    IFS=$old_ifs
+    saw_udhcpc=0
+    iface_count=0
+    pid_count=0
+    script_count=0
+    saw_foreground=0
+    saw_release=0
+    previous=
+    for arg in "$@"; do
+        [ "$arg" = udhcpc ] && saw_udhcpc=1
+        if [ "$previous" = -i ]; then
+            [ "$arg" = "$iface" ] || return 1
+            iface_count=$((iface_count + 1))
+        fi
+        if [ "$previous" = -p ]; then
+            [ "$arg" = "$DN_PID_FILE" ] || return 1
+            pid_count=$((pid_count + 1))
+        fi
+        if [ "$previous" = -s ]; then
+            [ "$arg" = "$DN_UDHCPC_SCRIPT" ] || return 1
+            script_count=$((script_count + 1))
+        fi
+        [ "$arg" = -f ] && saw_foreground=1
+        [ "$arg" = -R ] && saw_release=1
+        previous=$arg
+    done
+    [ "$saw_udhcpc" -eq 1 ] && [ "$iface_count" -eq 1 ] && [ "$pid_count" -eq 1 ] &&
+        [ "$script_count" -eq 1 ] && [ "$saw_foreground" -eq 1 ] &&
+        [ "$saw_release" -eq 1 ] && $DN_BUSYBOX kill -0 "$pid" 2>/dev/null
+}
+
+dn_remove_stale_pid() {
+    [ ! -e "$DN_PID_FILE" ] || $DN_BUSYBOX rm -f "$DN_PID_FILE"
+}
+
+dn_process_alive() {
+    local pid stat rest state
+    pid=$1
+    $DN_BUSYBOX kill -0 "$pid" 2>/dev/null || return 1
+    [ -r "/proc/$pid/stat" ] || return 0
+    IFS= read -r stat < "/proc/$pid/stat" || return 0
+    # Field 2 is parenthesized and may contain spaces. Stripping the longest
+    # `*) ` prefix leaves the Linux-compatible state character as field 3.
+    rest=${stat##*) }
+    [ "$rest" != "$stat" ] || return 0
+    state=${rest%% *}
+    [ "$state" != Z ] && [ "$state" != X ]
+}
+
+dn_wait_for_exit() {
+    local pid limit attempt
+    pid=$1
+    limit=$2
+    attempt=0
+    while [ "$attempt" -lt "$limit" ]; do
+        dn_process_alive "$pid" || return 0
+        $DN_BUSYBOX sleep 1
+        attempt=$((attempt + 1))
+    done
+    ! dn_process_alive "$pid"
+}
+
+dn_finish_failed_start() {
+    local iface child_pid message
+    iface=$1
+    child_pid=$2
+    message=$3
+    wait "$child_pid" 2>/dev/null || :
+    dn_remove_stale_pid || {
+        dn_write_error "$iface" "failed to remove invalid udhcpc pidfile"
+        return 1
+    }
+    if dn_deconfigure "$iface"; then
+        dn_write_error "$iface" "$message"
+    else
+        dn_write_error "$iface" "failed to clean network after invalid udhcpc startup"
+    fi
+    return 1
+}
+
+dn_stop_client_locked() {
+    local iface pid
+    iface=$1
+    if ! dn_pid_matches_client "$iface"; then
+        dn_remove_stale_pid || return 1
+        return 0
+    fi
+    pid=$DN_CLIENT_PID
+    if ! $DN_BUSYBOX kill -TERM "$pid" 2>/dev/null; then
+        # The validated client may exit between the identity check and kill(2).
+        # Treat that as an idempotent stop, but never hide a real signalling
+        # failure while the same client is still alive.
+        if ! dn_pid_matches_client "$iface"; then
+            dn_remove_stale_pid || return 1
+            return 0
+        fi
+        return 1
+    fi
+    if ! dn_wait_for_exit "$pid" 5; then
+        dn_write_error "$iface" "udhcpc did not stop within 5 seconds"
+        return 1
+    fi
+    dn_remove_stale_pid || return 1
+    return 0
+}
+
+dn_start_dhcp_locked() {
+    local iface attempt child_pid pid_from_file
+    iface=$1
+    if dn_pid_matches_client "$iface"; then
+        return 0
+    fi
+    dn_remove_stale_pid || return 1
+    dn_deconfigure "$iface" || return 1
+    $DN_BUSYBOX ip link set dev "$iface" up || return 1
+
+    (
+        exec 9>&-
+        exec $DN_BUSYBOX env -i $DN_BUSYBOX udhcpc -f -R -i "$iface" \
+            -s "$DN_UDHCPC_SCRIPT" -p "$DN_PID_FILE"
+    ) </dev/null >/dev/null 2>&1 &
+    child_pid=$!
+
+    attempt=0
+    while [ "$attempt" -lt 3 ]; do
+        if ! dn_process_alive "$child_pid"; then
+            dn_finish_failed_start "$iface" "$child_pid" "udhcpc exited during startup"
+            return 1
+        fi
+        if dn_pid_value; then
+            pid_from_file=$DN_CLIENT_PID
+            if [ "$pid_from_file" = "$child_pid" ] && dn_pid_matches_client "$iface"; then
+                dn_clear_error
+                return 0
+            fi
+        fi
+        $DN_BUSYBOX sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    $DN_BUSYBOX kill -TERM "$child_pid" 2>/dev/null || :
+    if ! dn_wait_for_exit "$child_pid" 5; then
+        # No valid pidfile exists on this path, so leaving the known child
+        # alive would let a later start create a competing DHCP client.
+        $DN_BUSYBOX kill -KILL "$child_pid" 2>/dev/null || :
+        if ! dn_wait_for_exit "$child_pid" 5; then
+            dn_write_error "$iface" "invalid udhcpc startup could not be terminated"
+            return 1
+        fi
+    fi
+    dn_finish_failed_start "$iface" "$child_pid" "udhcpc did not publish a valid pidfile"
+    return 1
+}
+
+dn_start_static_locked() {
+    local iface prefix gateway_route
+    iface=$1
+    dn_stop_client_locked "$iface" || return 1
+    $DN_BUSYBOX ip link set dev "$iface" up || return 1
+    prefix=${DN_CONFIG_ADDRESS#*/}
+    gateway_route=
+    if [ "$prefix" = 32 ] && [ -n "$DN_CONFIG_GATEWAY" ]; then
+        gateway_route="$DN_CONFIG_GATEWAY/32"
+    fi
+    dn_apply "$iface" static "$DN_CONFIG_ADDRESS" "$DN_CONFIG_GATEWAY" "$gateway_route" \
+        "$DN_CONFIG_DNS" "$DN_CONFIG_SEARCH"
+}
+
+dn_start_unmanaged_locked() {
+    local iface
+    iface=$1
+    dn_stop_client_locked "$iface" || return 1
+    dn_deconfigure "$iface"
+}
+
+dn_status_locked() {
+    local iface running result
+    iface=$1
+    running=0
+    result=0
+    if dn_pid_matches_client "$iface"; then
+        echo "$iface: dhcp client running (pid $DN_CLIENT_PID)"
+        running=1
+    else
+        dn_remove_stale_pid || return 1
+    fi
+    dn_acquire_state_lock || return 1
+    if ! dn_load_pending; then
+        echo "$iface: invalid pending transaction state" >&2
+        result=1
+    elif [ "$DN_PENDING_PRESENT" -eq 1 ]; then
+        echo "$iface: dragon-network transaction recovery pending" >&2
+        result=1
+    elif ! dn_load_lease "$DN_LEASE_FILE"; then
+        echo "$iface: invalid committed lease state" >&2
+        result=1
+    elif [ "$DN_LEASE_PRESENT" -eq 1 ]; then
+        echo "$iface: $DN_LEASE_OWNER configuration committed"
+    elif [ "$running" -eq 1 ]; then
+        echo "$iface: awaiting DHCP lease"
+    else
+        echo "$iface: unmanaged"
+    fi
+    [ ! -f "$DN_ERROR_FILE" ] || {
+        printf '%s: last error: ' "$iface"
+        $DN_BUSYBOX cat "$DN_ERROR_FILE"
+    }
+    exec 7>&-
+    return "$result"
+}
+
+[ "$#" -eq 2 ] || dn_usage
+command=$1
+iface=$2
+dn_valid_ifname "$iface" || {
+    dn_log "$iface" "invalid interface name"
+    exit 2
+}
+dn_init_runtime && dn_init_interface_runtime "$iface" || exit 1
+
+control_lock="$DN_IFACE_RUN/control.lock"
+[ ! -L "$control_lock" ] || exit 1
+: > "$control_lock" || exit 1
+$DN_BUSYBOX chmod 0600 "$control_lock" || exit 1
+exec 9>"$control_lock" || exit 1
+$DN_BUSYBOX flock -x 9 || exit 1
+
+case "$command" in
+    start)
+        dn_load_config "$iface" || {
+            dn_write_error "$iface" "invalid interface configuration"
+            exit 1
+        }
+        case "$DN_CONFIG_MODE" in
+            dhcp) dn_start_dhcp_locked "$iface" ;;
+            static) dn_start_static_locked "$iface" ;;
+            unmanaged) dn_start_unmanaged_locked "$iface" ;;
+        esac
+        ;;
+    stop)
+        dn_stop_client_locked "$iface" && dn_deconfigure "$iface"
+        ;;
+    renew)
+        if dn_pid_matches_client "$iface"; then
+            $DN_BUSYBOX kill -USR1 "$DN_CLIENT_PID"
+        else
+            dn_remove_stale_pid
+            dn_write_error "$iface" "no running DHCP client to renew"
+            false
+        fi
+        ;;
+    status)
+        dn_status_locked "$iface"
+        ;;
+    *) dn_usage ;;
+esac

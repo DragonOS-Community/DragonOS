@@ -1,0 +1,44 @@
+dragon-network interface configuration
+======================================
+
+This directory is intentionally empty by default.  Files named IFACE.conf are
+only read after an administrator explicitly runs:
+
+    /usr/sbin/dragon-network start IFACE
+
+PR-07 does not start this service from rcS.  Until the default ownership switch
+is made in PR-08, do not enable DHCP on the physical eth* interface already
+managed by the kernel DHCP worker.  Use an isolated interface such as veth1.
+
+The format is data, not shell syntax.  Each non-comment line is a key followed
+by one value.  Unknown keys, duplicate scalar keys, unsafe ownership/modes, and
+invalid values are rejected.  dns and search are repeatable list keys.
+
+DHCP:
+
+    mode dhcp
+
+Static IPv4:
+
+    mode static
+    address 192.0.2.10/24
+    gateway 192.0.2.1
+    dns 192.0.2.53
+    dns 192.0.2.54
+    search example.test
+
+External ownership (unmanaged is an alias):
+
+    mode external
+
+Commands:
+
+    dragon-network start IFACE
+    dragon-network stop IFACE
+    dragon-network renew IFACE
+    dragon-network status IFACE
+
+The service uses only /bin/busybox ip and stores private per-interface state in
+/run/dragon-network/interfaces.  Its atomically generated, multi-interface DNS
+view is /run/dragon-network/resolv.conf.  PR-07 does not replace or rewrite
+/etc/resolv.conf.

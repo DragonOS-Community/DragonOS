@@ -19,7 +19,9 @@ use crate::{
     net::socket::inet::{common::PortManager, InetSocket},
     process::ProcessState,
 };
-use smoltcp::phy::{Device as SmolDevice, DeviceCapabilities, RxToken};
+use smoltcp::phy::{
+    Device as SmolDevice, DeviceCapabilities, PacketMeta, RxToken, TxToken as SmolTxToken,
+};
 use system_error::SystemError;
 
 pub mod bridge;
@@ -193,6 +195,11 @@ pub trait Iface: crate::driver::base::device::Device {
         ip_packet: &[u8],
         broadcast: bool,
     ) -> Result<(), SystemError> {
+        let mut owned_packet = Vec::new();
+        owned_packet
+            .try_reserve_exact(ip_packet.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        owned_packet.extend_from_slice(ip_packet);
         let packet = LocalInputPacket {
             destination_mac: if broadcast {
                 smoltcp::wire::EthernetAddress::BROADCAST
@@ -200,7 +207,7 @@ pub trait Iface: crate::driver::base::device::Device {
                 self.mac()
             },
             source_mac,
-            ip_packet: ip_packet.to_vec(),
+            ip_packet: owned_packet,
         };
 
         let napi = self.napi_struct();
@@ -412,16 +419,22 @@ impl LocalInputPacket {
         self.ip_packet.len()
     }
 
-    fn into_frame(self, medium: smoltcp::phy::Medium) -> Vec<u8> {
+    fn into_frame(self, medium: smoltcp::phy::Medium) -> Result<Vec<u8>, SystemError> {
         if medium == smoltcp::phy::Medium::Ip {
-            return self.ip_packet;
+            return Ok(self.ip_packet);
         }
-        let mut frame = Vec::with_capacity(14 + self.ip_packet.len());
+        let frame_len = 14usize
+            .checked_add(self.ip_packet.len())
+            .ok_or(SystemError::EMSGSIZE)?;
+        let mut frame = Vec::new();
+        frame
+            .try_reserve_exact(frame_len)
+            .map_err(|_| SystemError::ENOMEM)?;
         frame.extend_from_slice(&self.destination_mac.0);
         frame.extend_from_slice(&self.source_mac.0);
         frame.extend_from_slice(&[0x08, 0x00]);
         frame.extend_from_slice(&self.ip_packet);
-        frame
+        Ok(frame)
     }
 }
 
@@ -435,6 +448,7 @@ struct LocalInputQueueState {
 #[derive(Debug)]
 struct LocalInputQueue {
     state: SpinLock<LocalInputQueueState>,
+    response_scratch: SpinLock<Vec<u8>>,
 }
 
 impl LocalInputQueue {
@@ -448,6 +462,7 @@ impl LocalInputQueue {
                 bytes: 0,
                 accepting,
             }),
+            response_scratch: SpinLock::new(Vec::new()),
         }
     }
 
@@ -461,6 +476,10 @@ impl LocalInputQueue {
         {
             return Err(SystemError::ENOBUFS);
         }
+        state
+            .packets
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
         state.bytes += packet.len();
         state.packets.push_back(packet);
         Ok(())
@@ -505,6 +524,107 @@ struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
     queue: &'a LocalInputQueue,
 }
 
+/// An owned response buffer temporarily checked out from an interface-local
+/// pool. Pool locking is limited to checkout/return; smoltcp and driver
+/// callbacks never run while holding it.
+struct LocalInputScratch<'a> {
+    buffer: Option<Vec<u8>>,
+    pool: &'a SpinLock<Vec<u8>>,
+}
+
+impl<'a> LocalInputScratch<'a> {
+    fn checkout(pool: &'a SpinLock<Vec<u8>>, capacity: usize) -> Option<Self> {
+        let mut buffer = {
+            let mut pooled = pool.lock();
+            core::mem::take(&mut *pooled)
+        };
+        buffer.clear();
+        if buffer.try_reserve_exact(capacity).is_err() {
+            *pool.lock() = buffer;
+            return None;
+        }
+        Some(Self {
+            buffer: Some(buffer),
+            pool,
+        })
+    }
+
+    fn resize(&mut self, len: usize) -> &mut [u8] {
+        let buffer = self
+            .buffer
+            .as_mut()
+            .expect("checked-out scratch always owns its buffer");
+        debug_assert!(len <= buffer.capacity());
+        buffer.resize(len, 0);
+        buffer.as_mut_slice()
+    }
+}
+
+impl Drop for LocalInputScratch<'_> {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let mut pooled = self.pool.lock();
+        if buffer.capacity() > pooled.capacity() {
+            *pooled = buffer;
+        }
+    }
+}
+
+/// A response token paired with namespace-local ingress.
+///
+/// Local ingress must not wait for a physical TX descriptor merely because
+/// smoltcp requires every RX token to be paired with a TX token. The deferred
+/// variant asks the driver for a descriptor only when processing the packet
+/// actually produces a response. Standalone egress keeps using `Ready`, and
+/// therefore retains the driver's normal backpressure semantics.
+enum LocalInputTxToken<'a, D: SmolDevice + ?Sized> {
+    Ready(D::TxToken<'a>),
+    Deferred {
+        device: &'a mut D,
+        timestamp: smoltcp::time::Instant,
+        meta: PacketMeta,
+        scratch: LocalInputScratch<'a>,
+    },
+}
+
+impl<D: SmolDevice + ?Sized> SmolTxToken for LocalInputTxToken<'_, D> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        match self {
+            Self::Ready(token) => token.consume(len, f),
+            Self::Deferred {
+                device,
+                timestamp,
+                meta,
+                mut scratch,
+            } => {
+                if let Some(mut token) = device.transmit(timestamp) {
+                    token.set_meta(meta);
+                    return token.consume(len, f);
+                }
+
+                // Congested links may drop a response, but consuming the
+                // local packet must still complete. This mirrors receive-side
+                // deferred tokens in physical drivers: build the response so
+                // smoltcp can commit its state, then discard it if no TX slot
+                // became available.
+                f(scratch.resize(len))
+            }
+        }
+    }
+
+    fn set_meta(&mut self, meta: PacketMeta) {
+        match self {
+            Self::Ready(token) => token.set_meta(meta),
+            Self::Deferred { meta: stored, .. } => *stored = meta,
+        }
+    }
+}
+
 impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
     fn new(device: &'a mut D, queue: &'a LocalInputQueue) -> Self {
         Self { device, queue }
@@ -517,7 +637,7 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
     where
         Self: 'a;
     type TxToken<'a>
-        = D::TxToken<'a>
+        = LocalInputTxToken<'a, D>
     where
         Self: 'a;
 
@@ -528,15 +648,28 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
         if self.queue.is_empty() {
             return None;
         }
-        let medium = self.device.capabilities().medium;
-        let tx = self.device.transmit(timestamp)?;
+        let capabilities = self.device.capabilities();
+        let scratch = LocalInputScratch::checkout(
+            &self.queue.response_scratch,
+            capabilities.max_transmission_unit,
+        )?;
         let packet = self.queue.pop()?;
-        let frame = packet.into_frame(medium);
-        Some((LocalInputRxToken { frame }, tx))
+        let frame = packet.into_frame(capabilities.medium).ok()?;
+        Some((
+            LocalInputRxToken { frame },
+            LocalInputTxToken::Deferred {
+                device: self.device,
+                timestamp,
+                meta: PacketMeta::default(),
+                scratch,
+            },
+        ))
     }
 
     fn transmit(&mut self, timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        self.device.transmit(timestamp)
+        self.device
+            .transmit(timestamp)
+            .map(LocalInputTxToken::Ready)
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -1056,6 +1189,15 @@ impl IfaceCommon {
         state.configured_flags = configured;
         self.publish_effective_flags(&state);
         Ok((old, InterfaceFlags::from_bits_truncate(configured)))
+    }
+
+    /// Restores a configuration snapshot after a later step in the same RTNL
+    /// transaction fails. Receive-mode reference counts are independent and
+    /// remain untouched; publication itself cannot fail.
+    pub(crate) fn restore_configured_flags(&self, configured: InterfaceFlags) {
+        let mut state = self.receive_mode.lock();
+        state.configured_flags = configured.bits();
+        self.publish_effective_flags(&state);
     }
 
     pub fn link_flags_snapshot(&self) -> Result<LinkFlagsSnapshot, SystemError> {

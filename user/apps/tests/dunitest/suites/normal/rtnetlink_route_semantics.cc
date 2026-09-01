@@ -181,7 +181,8 @@ int SetLinkUp(int fd, uint32_t ifindex, bool up, uint32_t seq) {
     return RecvAck(fd, seq);
 }
 
-int SendRouteRequest(int fd, uint16_t type, uint16_t flags, const RouteSpec& route, uint32_t seq) {
+int SendRouteRequest(int fd, uint16_t type, uint16_t flags, const RouteSpec& route, uint32_t seq,
+                     uint16_t extra_attr_type = 0) {
     alignas(nlmsghdr) char buf[512] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
     auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
@@ -215,6 +216,10 @@ int SendRouteRequest(int fd, uint16_t type, uint16_t flags, const RouteSpec& rou
     if (route.preferred_source.has_value()) {
         AddAttr(nlh, sizeof(buf), RTA_PREFSRC, &*route.preferred_source,
                 sizeof(*route.preferred_source));
+    }
+    if (extra_attr_type != 0) {
+        uint32_t opaque = 0x12345678;
+        AddAttr(nlh, sizeof(buf), extra_attr_type, &opaque, sizeof(opaque));
     }
 
     if (send(fd, nlh, nlh->nlmsg_len, 0) != static_cast<ssize_t>(nlh->nlmsg_len)) {
@@ -748,6 +753,27 @@ TEST(RtnetlinkRouteSemantics, DefaultDevRouteWithoutGatewaySucceeds) {
                                ++seq),
               0);
     EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, NonStrictRequestsIgnoreUnknownAttributes) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2250;
+    uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+
+    RouteSpec route = MakeIpv4Route("198.18.87.0", 24, lo);
+    DeleteRouteIfPresent(fd.Get(), route, &seq);
+    constexpr uint16_t kUnknownRouteAttribute = RTA_MAX + 1;
+
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq, kUnknownRouteAttribute),
+              0);
+    EXPECT_TRUE(FindRoute(fd.Get(), route, ++seq).has_value());
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq,
+                               kUnknownRouteAttribute),
               0);
 }
 

@@ -9,7 +9,7 @@ use super::{
     RT_SCOPE_LINK,
 };
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(in crate::net) struct FibTable {
     entries: Vec<RouteEntry>,
 }
@@ -44,10 +44,14 @@ impl<'a> FibEditor<'a> {
         }
     }
 
-    fn record(&mut self, oif: u32) {
+    fn record(&mut self, oif: u32) -> Result<(), SystemError> {
         if !self.affected_oifs.contains(&oif) {
+            self.affected_oifs
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
             self.affected_oifs.push(oif);
         }
+        Ok(())
     }
 
     pub(super) fn insert(
@@ -58,22 +62,22 @@ impl<'a> FibEditor<'a> {
         let outcome = self.fib.insert(route, flags)?;
         match outcome {
             RouteMutationOutcome::Added { route, .. } | RouteMutationOutcome::Unchanged(route) => {
-                self.record(route.oif)
+                self.record(route.oif)?
             }
             RouteMutationOutcome::Replaced { old, new } => {
-                self.record(old.oif);
-                self.record(new.oif);
+                self.record(old.oif)?;
+                self.record(new.oif)?;
             }
         }
         Ok(outcome)
     }
 
-    pub(super) fn insert_derived(&mut self, route: RouteEntry) -> bool {
-        let inserted = self.fib.insert_derived(route);
+    pub(super) fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
+        let inserted = self.fib.insert_derived(route)?;
         if inserted {
-            self.record(route.oif);
+            self.record(route.oif)?;
         }
-        inserted
+        Ok(inserted)
     }
 
     pub(super) fn delete(
@@ -81,22 +85,25 @@ impl<'a> FibEditor<'a> {
         selector: RouteDeleteSelector,
     ) -> Result<RouteEntry, SystemError> {
         let removed = self.fib.delete(selector)?;
-        self.record(removed.oif);
+        self.record(removed.oif)?;
         Ok(removed)
     }
 
-    pub(super) fn remove_where(&mut self, mut predicate: impl FnMut(RouteEntry) -> bool) {
-        let mut removed_oifs = Vec::new();
-        self.fib.entries.retain(|route| {
-            let remove = predicate(*route);
-            if remove && !removed_oifs.contains(&route.oif) {
-                removed_oifs.push(route.oif);
+    pub(super) fn remove_where(
+        &mut self,
+        predicate: impl Fn(RouteEntry) -> bool,
+    ) -> Result<(), SystemError> {
+        // Record every affected projection before mutating the candidate. If
+        // bookkeeping allocation fails, the transaction can still abort with
+        // its candidate untouched.
+        for index in 0..self.fib.entries.len() {
+            let route = self.fib.entries[index];
+            if predicate(route) {
+                self.record(route.oif)?;
             }
-            !remove
-        });
-        for oif in removed_oifs {
-            self.record(oif);
         }
+        self.fib.entries.retain(|route| !predicate(*route));
+        Ok(())
     }
 
     pub(super) fn finish(self) -> Vec<u32> {
@@ -188,8 +195,17 @@ impl BroadcastLookup {
 }
 
 impl FibTable {
-    pub(super) fn snapshot(&self) -> Vec<RouteEntry> {
-        self.entries.clone()
+    pub(super) fn try_clone(&self) -> Result<Self, SystemError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        entries.extend_from_slice(&self.entries);
+        Ok(Self { entries })
+    }
+
+    pub(super) fn snapshot(&self) -> Result<Vec<RouteEntry>, SystemError> {
+        Ok(self.try_clone()?.entries)
     }
 
     pub(super) fn entries(&self) -> &[RouteEntry] {
@@ -300,22 +316,27 @@ impl FibTable {
         route: RouteEntry,
         flags: RouteNewFlags,
     ) -> Result<RouteMutationOutcome, SystemError> {
-        let group: Vec<usize> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, existing)| conflict_group(*existing, route).then_some(index))
-            .collect();
-        let exact = group
-            .iter()
-            .copied()
-            .find(|index| self.entries[*index] == route);
+        // A conflict group is contiguous by the insertion invariant. Track
+        // its bounds directly instead of allocating a temporary index vector
+        // for every route request.
+        let mut first = None;
+        let mut last = None;
+        let mut exact = None;
+        for (index, existing) in self.entries.iter().copied().enumerate() {
+            if conflict_group(existing, route) {
+                first.get_or_insert(index);
+                last = Some(index);
+                if existing == route {
+                    exact = Some(index);
+                }
+            }
+        }
 
-        if flags.excl && !group.is_empty() {
+        if flags.excl && first.is_some() {
             return Err(SystemError::EEXIST);
         }
         if flags.replace {
-            if let Some(first) = group.first().copied() {
+            if let Some(first) = first {
                 if is_ipv4(route.destination.address()) {
                     if exact == Some(first) {
                         return Ok(RouteMutationOutcome::Unchanged(route));
@@ -337,15 +358,15 @@ impl FibTable {
         if !flags.create {
             return Err(SystemError::ENOENT);
         }
-        if !is_ipv4(route.destination.address()) && !group.is_empty() {
+        if !is_ipv4(route.destination.address()) && first.is_some() {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
-        let position = if let Some(last) = group.last().copied() {
+        let position = if let Some(last) = last {
             if flags.append {
                 last + 1
             } else {
-                group[0]
+                first.expect("a last conflict implies a first conflict")
             }
         } else {
             self.entries
@@ -355,16 +376,19 @@ impl FibTable {
                 })
                 .unwrap_or(self.entries.len())
         };
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
         self.entries.insert(position, route);
         Ok(RouteMutationOutcome::Added {
             route,
-            appended: flags.append && !group.is_empty(),
+            appended: flags.append && first.is_some(),
         })
     }
 
-    pub(super) fn insert_derived(&mut self, route: RouteEntry) -> bool {
+    pub(super) fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
         if self.entries.contains(&route) {
-            return false;
+            return Ok(false);
         }
         let position = self
             .entries
@@ -373,8 +397,11 @@ impl FibTable {
                 same_prefix_domain(*existing, route) && existing.priority > route.priority
             })
             .unwrap_or(self.entries.len());
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
         self.entries.insert(position, route);
-        true
+        Ok(true)
     }
 
     pub(super) fn delete(
@@ -389,7 +416,7 @@ impl FibTable {
         Ok(self.entries.remove(index))
     }
 
-    pub(super) fn delta_from(&self, before: &Self) -> FibDelta {
+    pub(super) fn delta_from(&self, before: &Self) -> Result<FibDelta, SystemError> {
         diff_routes(&before.entries, &self.entries)
     }
 
@@ -401,6 +428,9 @@ impl FibTable {
         deleted_address: Option<IpAddress>,
     ) -> Result<PreferredSourceTransitions, SystemError> {
         let mut changed_existing_prefixes = Vec::new();
+        changed_existing_prefixes
+            .try_reserve_exact(before_routes.len())
+            .map_err(|_| SystemError::ENOMEM)?;
         for old in before_routes.iter().copied() {
             if after_routes.contains(&old) {
                 continue;
@@ -420,7 +450,7 @@ impl FibTable {
                         .iter()
                         .any(|old| same_derived_slot(*old, new)))
             {
-                self.insert_derived(new);
+                self.insert_derived(new)?;
             }
         }
 
@@ -441,6 +471,14 @@ impl FibTable {
                     }
                     let old = self.entries[index];
                     self.entries[index].preferred_source = None;
+                    transitions
+                        .removed
+                        .try_reserve(1)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    transitions
+                        .added
+                        .try_reserve(1)
+                        .map_err(|_| SystemError::ENOMEM)?;
                     transitions.removed.push(old);
                     transitions.added.push(self.entries[index]);
                 }
@@ -457,23 +495,34 @@ pub(super) struct PreferredSourceTransitions {
     pub added: Vec<RouteEntry>,
 }
 
-fn diff_routes(before: &[RouteEntry], after: &[RouteEntry]) -> FibDelta {
-    let mut before_index = before.to_vec();
+fn diff_routes(before: &[RouteEntry], after: &[RouteEntry]) -> Result<FibDelta, SystemError> {
+    let mut before_index = Vec::new();
+    before_index
+        .try_reserve_exact(before.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    before_index.extend_from_slice(before);
     before_index.sort_unstable();
-    let mut after_index = after.to_vec();
+    let mut after_index = Vec::new();
+    after_index
+        .try_reserve_exact(after.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    after_index.extend_from_slice(after);
     after_index.sort_unstable();
-    FibDelta {
-        removed: before
-            .iter()
-            .copied()
-            .filter(|entry| after_index.binary_search(entry).is_err())
-            .collect(),
-        added: after
-            .iter()
-            .copied()
-            .filter(|entry| before_index.binary_search(entry).is_err())
-            .collect(),
+    let mut removed = Vec::new();
+    for entry in before.iter().copied() {
+        if after_index.binary_search(&entry).is_err() {
+            removed.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            removed.push(entry);
+        }
     }
+    let mut added = Vec::new();
+    for entry in after.iter().copied() {
+        if before_index.binary_search(&entry).is_err() {
+            added.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            added.push(entry);
+        }
+    }
+    Ok(FibDelta { removed, added })
 }
 
 fn same_derived_slot(left: RouteEntry, right: RouteEntry) -> bool {

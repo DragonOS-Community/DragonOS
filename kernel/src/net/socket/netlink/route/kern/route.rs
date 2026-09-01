@@ -438,7 +438,7 @@ fn dump_routes(
     // so its default dump path follows Linux's lenient mode and ignores them.
     let family = request.body().family;
     let mut response = Vec::new();
-    for entry in route::snapshot(&netns) {
+    for entry in route::snapshot(&netns)? {
         if family_matches(family, family_of_ip(entry.destination.address())) {
             response.push(RouteNlSegment::NewRoute(route_to_segment(
                 request.header(),

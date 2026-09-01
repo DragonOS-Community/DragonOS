@@ -222,6 +222,8 @@ pub(super) fn do_set_link(
     if change_mask.contains(InterfaceFlags::UP) {
         let was_up = old_flags.contains(InterfaceFlags::UP);
         let is_up = new_flags.contains(InterfaceFlags::UP);
+        let old_operstate = iface.operstate();
+        let old_net_state = iface.net_state();
         if is_up {
             iface.set_operstate(Operstate::IF_OPER_UP);
             iface.set_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
@@ -231,9 +233,28 @@ pub(super) fn do_set_link(
         }
 
         if was_up != is_up {
-            route_changes = Some(crate::net::route::link_state_changed(
-                rtnl, &netns, &iface, is_up,
-            )?);
+            route_changes = match crate::net::route::link_state_changed(rtnl, &netns, &iface, is_up)
+            {
+                Ok(changes) => Some(changes),
+                Err(error) => {
+                    // FIB preparation is fallible. Restore the already
+                    // published link state if it cannot be committed, so the
+                    // caller never observes flags and authoritative routes
+                    // describing different transitions.
+                    iface.common().restore_configured_flags(old_flags);
+                    iface.set_operstate(old_operstate);
+                    if old_net_state
+                        .contains(crate::driver::net::NetDeivceState::__LINK_STATE_START)
+                    {
+                        iface.set_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
+                    } else {
+                        iface.clear_net_state(
+                            crate::driver::net::NetDeivceState::__LINK_STATE_START,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             if is_up {
                 if let Some(napi) = iface.napi_struct() {
                     napi_schedule(napi);

@@ -103,7 +103,9 @@ pub(crate) fn lookup_on_iface(
     netns.router().fib.read().lookup_on_iface(destination, oif)
 }
 
-pub(crate) fn snapshot(netns: &Arc<NetNamespace>) -> alloc::vec::Vec<RouteEntry> {
+pub(crate) fn snapshot(
+    netns: &Arc<NetNamespace>,
+) -> Result<alloc::vec::Vec<RouteEntry>, SystemError> {
     netns.router().fib.read().snapshot()
 }
 

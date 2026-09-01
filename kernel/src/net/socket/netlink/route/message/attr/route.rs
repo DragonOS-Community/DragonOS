@@ -92,8 +92,13 @@ impl Attribute for RouteAttr {
         Self: Sized,
     {
         let payload_len = header.payload_len();
-        let class = RouteAttrClass::try_from(header.type_())
-            .map_err(|_| SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        // Linux's default (non-strict) rtnetlink parsing ignores attributes
+        // newer than the receiver understands. DragonOS does not expose
+        // NETLINK_GET_STRICT_CHK yet, so preserve that forward-compatible
+        // behavior instead of rejecting the complete request.
+        let Ok(class) = RouteAttrClass::try_from(header.type_()) else {
+            return Ok(None);
+        };
 
         let attr = match class {
             RouteAttrClass::DST | RouteAttrClass::SRC if payload_len <= 16 => {

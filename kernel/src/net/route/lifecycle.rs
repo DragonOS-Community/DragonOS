@@ -24,15 +24,15 @@ pub(crate) fn register_iface(
     iface: &Arc<dyn Iface>,
     devices: &[Arc<dyn Iface>],
 ) -> Result<(), SystemError> {
-    let addresses = iface.common().ip_addrs().to_vec();
+    let addresses = try_clone_slice(&iface.common().ip_addrs())?;
     let staged = iface.common().take_bootstrap_routes();
     iface
         .smol_iface()
         .lock()
         .set_route_table_includes_connected_prefixes(true);
     let result = transact_with_devices(rtnl, netns, devices, |candidate| {
-        for route in derived_address_entries(iface, &addresses) {
-            candidate.insert_derived(route);
+        for route in derived_address_entries(iface, &addresses)? {
+            candidate.insert_derived(route)?;
         }
         for route in staged.iter().copied() {
             let route = RouteEntry {
@@ -50,7 +50,7 @@ pub(crate) fn register_iface(
                 nexthop_flags: route.nexthop_flags,
             };
             validate_entry_on_iface(iface, route)?;
-            candidate.insert_derived(route);
+            candidate.insert_derived(route)?;
         }
         Ok(())
     });
@@ -72,7 +72,7 @@ pub(crate) fn unregister_iface(
     devices: &[Arc<dyn Iface>],
 ) -> Result<(), SystemError> {
     transact_with_devices(rtnl, netns, devices, |candidate| {
-        candidate.remove_where(|route| route.oif == ifindex);
+        candidate.remove_where(|route| route.oif == ifindex)?;
         Ok(())
     })
 }
@@ -85,16 +85,23 @@ pub(crate) fn link_state_changed(
     iface: &Arc<dyn Iface>,
     is_up: bool,
 ) -> Result<RouteNotifications, SystemError> {
-    let devices: Vec<Arc<dyn Iface>> = netns.device_list().values().cloned().collect();
+    let device_list = netns.device_list();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(device_list.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    devices.extend(device_list.values().cloned());
+    drop(device_list);
     let ifindex = iface.nic_id() as u32;
     transact_with_devices(rtnl, netns, &devices, |candidate| {
         if is_up {
             let mut added = Vec::new();
-            for entry in derived_address_entries(iface, &iface.common().ip_addrs()) {
+            for entry in derived_address_entries(iface, &iface.common().ip_addrs())? {
                 if is_ipv4(entry.destination.address())
                     && (entry.table == RT_TABLE_MAIN || entry.kind == RTN_BROADCAST)
-                    && candidate.insert_derived(entry)
+                    && candidate.insert_derived(entry)?
                 {
+                    added.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
                     added.push(entry);
                 }
             }
@@ -109,7 +116,7 @@ pub(crate) fn link_state_changed(
                     && !(entry.table == RT_TABLE_LOCAL
                         && entry.kind == RTN_LOCAL
                         && entry.scope == RT_SCOPE_HOST)
-            });
+            })?;
             Ok(RouteNotifications::default())
         }
     })
@@ -137,10 +144,10 @@ impl PreparedAddressRouteCommit {
         deleted_address: Option<IpAddress>,
     ) -> Result<Self, SystemError> {
         let ifindex = iface.nic_id() as u32;
-        let before = netns.router().fib.read().clone();
-        let mut candidate = before.clone();
-        let before_routes = derived_address_entries(iface, before_addresses);
-        let after_routes = derived_address_entries(iface, after_addresses);
+        let before = netns.router().fib.read().try_clone()?;
+        let mut candidate = before.try_clone()?;
+        let before_routes = derived_address_entries(iface, before_addresses)?;
+        let after_routes = derived_address_entries(iface, after_addresses)?;
         let mut silent = candidate.reconcile_address_routes(
             &before_routes,
             &after_routes,
@@ -157,8 +164,8 @@ impl PreparedAddressRouteCommit {
             return Err(SystemError::ENOSPC);
         }
 
-        let projection = projection_for_iface(&candidate, ifindex);
-        let mut notifications = candidate.delta_from(&before).into_notifications();
+        let projection = projection_for_iface(&candidate, ifindex)?;
+        let mut notifications = candidate.delta_from(&before)?.into_notifications();
         silent.removed.sort_unstable();
         silent.added.sort_unstable();
         notifications
@@ -172,7 +179,7 @@ impl PreparedAddressRouteCommit {
             candidate,
             projection,
             notifications,
-            after_addresses: after_addresses.to_vec(),
+            after_addresses: try_clone_slice(after_addresses)?,
             metadata,
         })
     }
@@ -204,9 +211,7 @@ impl PreparedAddressRouteCommit {
         drop(smol_iface);
         *iface.common().address_metadata().lock() = metadata;
         let mut mirror = iface.router_common().ip_addrs.write();
-        mirror.clear();
-        mirror.extend_from_slice(&after_addresses);
-        drop(mirror);
+        *mirror = after_addresses;
         *current = candidate;
         notifications
     }
@@ -232,26 +237,33 @@ pub(crate) fn commit_addresses(
     Ok(prepared.publish(netns, iface))
 }
 
-fn derived_address_entries(iface: &Arc<dyn Iface>, addresses: &[IpCidr]) -> Vec<RouteEntry> {
+fn derived_address_entries(
+    iface: &Arc<dyn Iface>,
+    addresses: &[IpCidr],
+) -> Result<Vec<RouteEntry>, SystemError> {
     let mut result = Vec::new();
     for cidr in addresses.iter().copied() {
-        for entry in entries_for_address(iface, cidr, primary_for_prefix(addresses, cidr)) {
+        for entry in entries_for_address(iface, cidr, primary_for_prefix(addresses, cidr))? {
             if !result.contains(&entry) {
+                result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
                 result.push(entry);
             }
         }
     }
-    result
+    Ok(result)
 }
 
 fn entries_for_address(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
     primary: Option<IpAddress>,
-) -> Vec<RouteEntry> {
+) -> Result<Vec<RouteEntry>, SystemError> {
     let ipv4 = is_ipv4(cidr.address());
     let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
     let mut result = Vec::new();
+    result
+        .try_reserve_exact(3)
+        .map_err(|_| SystemError::ENOMEM)?;
     let connected = RouteEntry {
         destination: canonical_cidr(cidr),
         source: None,
@@ -329,7 +341,16 @@ fn entries_for_address(
             }
         }
     }
+    Ok(result)
+}
+
+fn try_clone_slice<T: Clone>(source: &[T]) -> Result<Vec<T>, SystemError> {
+    let mut result = Vec::new();
     result
+        .try_reserve_exact(source.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    result.extend_from_slice(source);
+    Ok(result)
 }
 
 fn host_cidr(address: IpAddress) -> IpCidr {

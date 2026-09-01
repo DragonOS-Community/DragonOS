@@ -269,8 +269,8 @@ impl NetnsPoller {
         for _ in 0..DIRECT_POLL_BATCH {
             match iface.common().poll_scope() {
                 IfacePollScope::None => return false,
-                IfacePollScope::Full if !iface.poll() => return false,
-                IfacePollScope::Full => {}
+                IfacePollScope::LocalOnly | IfacePollScope::Full if !iface.poll() => return false,
+                IfacePollScope::LocalOnly | IfacePollScope::Full => {}
             }
         }
         true

@@ -48,7 +48,7 @@ impl NapiStruct {
         if let Some(iface) = self.net_device.upgrade() {
             let result = match iface.common().poll_scope() {
                 IfacePollScope::None => NapiPollResult::idle(),
-                IfacePollScope::Full => iface.poll_napi(budget),
+                IfacePollScope::LocalOnly | IfacePollScope::Full => iface.poll_napi(budget),
             };
             return Some((iface, result));
         } else {

@@ -33,6 +33,10 @@ use log::info;
 use smoltcp::{phy, wire::HardwareAddress};
 use system_error::SystemError;
 
+const E1000E_IP_MTU: usize = 1500;
+const E1000E_STACK_FRAME_SIZE: usize = E1000E_IP_MTU + 14;
+const E1000E_HARDWARE_FRAME_LIMIT: usize = 1536;
+
 use super::e1000e::{E1000EBuffer, E1000EDevice};
 use super::irq::e1000e_irq_manager;
 use crate::driver::base::device::DeviceId;
@@ -190,8 +194,7 @@ impl E1000EDriver {
     /// The submitted DMA buffer remains owned by the TX ring until DD is
     /// observed when that descriptor is reused.
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        const MAX_FRAME_LEN: usize = 1536;
-        if frame.len() > MAX_FRAME_LEN || frame.len() > u16::MAX as usize {
+        if frame.len() > E1000E_HARDWARE_FRAME_LIMIT || frame.len() > u16::MAX as usize {
             return Err(SystemError::EMSGSIZE);
         }
 
@@ -275,7 +278,7 @@ impl phy::Device for E1000EDriver {
         // 网卡的最大传输单元. 请与IP层的MTU进行区分。这个值应当是网卡的最大传输单元，而不是IP层的MTU。
         // The maximum size of the received packet is limited by the 82574 hardware to 1536 bytes. Packets larger then 1536 bytes are silently discarded. Any packet smaller than 1536 bytes is processed by the 82574.
         // 82574l manual pp205
-        caps.max_transmission_unit = 1536;
+        caps.max_transmission_unit = E1000E_STACK_FRAME_SIZE;
         /*
            Maximum burst size, in terms of MTU.
            The network device is unable to send or receive bursts large than the value returned by this function.
@@ -288,8 +291,6 @@ impl phy::Device for E1000EDriver {
 
 impl E1000EInterface {
     pub fn new(mut driver: E1000EDriver) -> Arc<Self> {
-        use smoltcp::phy::Device;
-
         let iface_id = generate_iface_id();
         let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
             smoltcp::wire::EthernetAddress(driver.inner.lock().mac_address()),
@@ -305,7 +306,7 @@ impl E1000EInterface {
             | InterfaceFlags::MULTICAST
             | InterfaceFlags::LOWER_UP;
         let name = format!("eth{}", iface_id);
-        let mtu = driver.capabilities().max_transmission_unit;
+        let mtu = E1000E_IP_MTU;
 
         let iface = Arc::new(E1000EInterface {
             driver,

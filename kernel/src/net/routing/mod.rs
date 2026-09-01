@@ -154,6 +154,7 @@ pub trait RouterEnableDevice: Iface {
                         }
                         interface
                             .inject_local_ipv4_packet(
+                                self.nic_id() as u32,
                                 ether_frame.src_addr(),
                                 ipv4_packet_mut.as_ref(),
                                 false,
@@ -167,6 +168,7 @@ pub trait RouterEnableDevice: Iface {
                         }
                         interface
                             .inject_local_ipv4_packet(
+                                self.nic_id() as u32,
                                 ether_frame.src_addr(),
                                 ipv4_packet_mut.as_ref(),
                                 true,

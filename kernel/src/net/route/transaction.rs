@@ -15,6 +15,42 @@ struct ProjectionPlan {
     replacements: Vec<(Arc<dyn Iface>, Vec<SmolRoute>)>,
 }
 
+/// A route mutation whose allocations and validation have completed.
+///
+/// RTNL keeps route writers and topology stable between `prepare` and
+/// `publish`. Publication only swaps owned projections and the candidate FIB,
+/// so callers may safely commit adjacent non-fallible device state in the
+/// same control-plane transition.
+pub(super) struct PreparedTransaction<'rtnl, T> {
+    _rtnl: &'rtnl RtnlGuard,
+    before: FibTable,
+    candidate: FibTable,
+    plan: ProjectionPlan,
+    outcome: T,
+}
+
+impl<T> PreparedTransaction<'_, T> {
+    pub(super) fn publish(self, netns: &Arc<NetNamespace>) -> T {
+        self.publish_around(netns, || {}, || {})
+    }
+
+    pub(super) fn publish_around(
+        self,
+        netns: &Arc<NetNamespace>,
+        before_routes: impl FnOnce(),
+        after_routes: impl FnOnce(),
+    ) -> T {
+        let router = netns.router();
+        let mut current = router.fib.write();
+        debug_assert_eq!(*current, self.before);
+        before_routes();
+        self.plan.publish();
+        *current = self.candidate;
+        after_routes();
+        self.outcome
+    }
+}
+
 impl ProjectionPlan {
     fn prepare(
         before: &FibTable,
@@ -66,11 +102,20 @@ pub(super) fn transact<T>(
 }
 
 pub(super) fn transact_with_devices<T>(
-    _rtnl: &RtnlGuard,
+    rtnl: &RtnlGuard,
     netns: &Arc<NetNamespace>,
     devices: &[Arc<dyn Iface>],
     mutate: impl FnOnce(&mut FibEditor) -> Result<T, SystemError>,
 ) -> Result<T, SystemError> {
+    Ok(prepare_with_devices(rtnl, netns, devices, mutate)?.publish(netns))
+}
+
+pub(super) fn prepare_with_devices<'rtnl, T>(
+    rtnl: &'rtnl RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    devices: &[Arc<dyn Iface>],
+    mutate: impl FnOnce(&mut FibEditor) -> Result<T, SystemError>,
+) -> Result<PreparedTransaction<'rtnl, T>, SystemError> {
     let router = netns.router();
     // RTNL keeps topology and writers stable. Candidate construction and
     // projection preparation stay outside the FIB write-side critical path.
@@ -84,11 +129,13 @@ pub(super) fn transact_with_devices<T>(
     let affected_oifs = editor.finish();
     let plan = ProjectionPlan::prepare(&before, &candidate, &affected_oifs, devices)?;
 
-    let mut current = router.fib.write();
-    debug_assert_eq!(*current, before);
-    plan.publish();
-    *current = candidate;
-    Ok(outcome)
+    Ok(PreparedTransaction {
+        _rtnl: rtnl,
+        before,
+        candidate,
+        plan,
+        outcome,
+    })
 }
 
 pub(super) fn projection_for_iface(

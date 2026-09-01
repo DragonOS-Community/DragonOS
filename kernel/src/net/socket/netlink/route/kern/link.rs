@@ -214,56 +214,45 @@ pub(super) fn do_set_link(
 
     let change_mask = InterfaceFlags::from_bits_truncate(request_segment.body().change.bits());
     let requested_flags = InterfaceFlags::from_bits_truncate(request_segment.body().flags.bits());
-    let (old_flags, new_flags) = iface
+    let prepared_flags = iface
         .common()
-        .update_configured_flags(requested_flags, change_mask)?;
+        .prepare_configured_flags(requested_flags, change_mask)?;
+    let was_up = prepared_flags.old_flags().contains(InterfaceFlags::UP);
+    let is_up = prepared_flags.new_flags().contains(InterfaceFlags::UP);
+    let prepared_routes = if change_mask.contains(InterfaceFlags::UP) && was_up != is_up {
+        Some(crate::net::route::prepare_link_state_change(
+            rtnl, &netns, &iface, is_up,
+        )?)
+    } else {
+        None
+    };
 
     let mut route_changes = None;
-    if change_mask.contains(InterfaceFlags::UP) {
-        let was_up = old_flags.contains(InterfaceFlags::UP);
-        let is_up = new_flags.contains(InterfaceFlags::UP);
-        let old_operstate = iface.operstate();
-        let old_net_state = iface.net_state();
-        if is_up {
-            iface.set_operstate(Operstate::IF_OPER_UP);
-            iface.set_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
+    if let Some(prepared_routes) = prepared_routes {
+        route_changes = Some(prepared_routes.publish(&netns, is_up, || {
+            publish_link_flags_and_state(&iface, prepared_flags, is_up);
+        }));
+    } else {
+        // Linux applies the requested administrative state even when IFF_UP
+        // already has the requested value. Keep the runtime lifecycle in sync
+        // on such idempotent SETLINK requests; only FIB publication depends on
+        // an actual UP/DOWN transition.
+        if change_mask.contains(InterfaceFlags::UP) {
+            publish_link_flags_and_state(&iface, prepared_flags, is_up);
         } else {
-            iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
-            iface.set_operstate(Operstate::IF_OPER_DOWN);
+            iface.common().publish_configured_flags(prepared_flags);
         }
+    }
 
-        if was_up != is_up {
-            route_changes = match crate::net::route::link_state_changed(rtnl, &netns, &iface, is_up)
-            {
-                Ok(changes) => Some(changes),
-                Err(error) => {
-                    // FIB preparation is fallible. Restore the already
-                    // published link state if it cannot be committed, so the
-                    // caller never observes flags and authoritative routes
-                    // describing different transitions.
-                    iface.common().restore_configured_flags(old_flags);
-                    iface.set_operstate(old_operstate);
-                    if old_net_state
-                        .contains(crate::driver::net::NetDeivceState::__LINK_STATE_START)
-                    {
-                        iface.set_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
-                    } else {
-                        iface.clear_net_state(
-                            crate::driver::net::NetDeivceState::__LINK_STATE_START,
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            if is_up {
-                if let Some(napi) = iface.napi_struct() {
-                    napi_schedule(napi);
-                } else {
-                    netns.wakeup_poll_thread();
-                }
+    if change_mask.contains(InterfaceFlags::UP) && was_up != is_up {
+        if is_up {
+            if let Some(napi) = iface.napi_struct() {
+                napi_schedule(napi);
+            } else {
+                netns.wakeup_poll_thread();
             }
-            netns.notify_deadline_changed();
         }
+        netns.notify_deadline_changed();
     }
 
     let renamed_addresses = if let Some(ref name) = updates.name {
@@ -289,6 +278,21 @@ pub(super) fn do_set_link(
     }
 
     Ok(Vec::new())
+}
+
+fn publish_link_flags_and_state(
+    iface: &Arc<dyn Iface>,
+    prepared_flags: crate::driver::net::PreparedConfiguredFlags,
+    is_up: bool,
+) {
+    iface.common().publish_configured_flags(prepared_flags);
+    if is_up {
+        iface.set_operstate(Operstate::IF_OPER_UP);
+        iface.set_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
+    } else {
+        iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
+        iface.set_operstate(Operstate::IF_OPER_DOWN);
+    }
 }
 
 fn notify_link_route_changes(

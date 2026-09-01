@@ -9,21 +9,80 @@ mod transaction;
 mod types;
 mod validation;
 
-use alloc::sync::Arc;
+use alloc::{collections::BTreeMap, sync::Arc};
 
 use smoltcp::wire::IpAddress;
 use system_error::SystemError;
 
-use crate::{net::rtnl::RtnlGuard, process::namespace::net_namespace::NetNamespace};
+use crate::libs::rwsem::RwSemReadGuard;
+use crate::{
+    driver::net::Iface,
+    net::{routing::Router, rtnl::RtnlGuard},
+    process::namespace::net_namespace::NetNamespace,
+};
 
 use fib::FibEditor;
 pub(in crate::net) use fib::FibTable;
 pub(crate) use lifecycle::{
-    commit_addresses, link_state_changed, register_iface, unregister_iface,
+    commit_addresses, prepare_link_state_change, register_iface, unregister_iface,
 };
-use transaction::{projection_for_iface, transact, transact_with_devices};
+use transaction::{
+    prepare_with_devices, projection_for_iface, transact, transact_with_devices,
+    PreparedTransaction,
+};
 pub(crate) use types::*;
 use validation::{validate_entry, validate_entry_on_iface, validate_gateway_iface};
+
+pub(crate) struct OutputRouteGuard<'a> {
+    fib: RwSemReadGuard<'a, FibTable>,
+    devices: RwSemReadGuard<'a, BTreeMap<usize, Arc<dyn Iface>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputRouteDecision {
+    pub(crate) oif: u32,
+    pub(crate) next_hop: IpAddress,
+    pub(crate) ip_mtu: usize,
+}
+
+impl OutputRouteGuard<'_> {
+    pub(crate) fn lookup(
+        &self,
+        destination: IpAddress,
+        oif: Option<u32>,
+    ) -> Option<OutputRouteDecision> {
+        let route = if is_limited_broadcast(destination) {
+            match oif {
+                Some(oif) => RouteLookupResult::limited_broadcast(oif),
+                None => self
+                    .fib
+                    .lookup_output(destination)
+                    .map(RouteLookupResult::into_limited_broadcast)?,
+            }
+        } else {
+            match oif {
+                Some(oif) => self.fib.lookup_on_iface(destination, oif),
+                None => self.fib.lookup_output(destination),
+            }?
+        };
+        let iface = self.devices.get(&(route.oif as usize))?;
+        Some(OutputRouteDecision {
+            oif: route.oif,
+            next_hop: route.next_hop,
+            ip_mtu: iface.mtu(),
+        })
+    }
+}
+
+pub(crate) fn lock_output_routes<'a>(
+    router: &'a Router,
+    devices: RwSemReadGuard<'a, BTreeMap<usize, Arc<dyn Iface>>>,
+) -> OutputRouteGuard<'a> {
+    OutputRouteGuard {
+        fib: router.fib.read(),
+        devices,
+    }
+}
 
 pub(crate) fn add_route(
     rtnl: &RtnlGuard,

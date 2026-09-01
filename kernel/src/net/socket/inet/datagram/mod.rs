@@ -763,19 +763,8 @@ impl UdpSocket {
         buf: &mut [u8],
         peek: bool,
     ) -> Result<(usize, smoltcp::wire::IpEndpoint, usize), SystemError> {
-        // First, check loopback queue (multicast/unicast)
-        if let Some((copy_len, endpoint, orig_len, _dst, _ifindex)) =
-            self.try_recv_loopback(buf, peek)
-        {
-            return Ok((copy_len, endpoint, orig_len));
-        }
-
-        // Then check smoltcp socket
-        match self.inner.read().as_ref().ok_or(SystemError::EBADF)? {
-            UdpInner::Bound(bound) => bound.try_recv(buf, peek),
-            // UDP is connectionless - unbound socket just has no data yet
-            UdpInner::Unbound(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-        }
+        let (copy_len, endpoint, orig_len, _, _) = self.try_recv_with_meta(buf, peek)?;
+        Ok((copy_len, endpoint, orig_len))
     }
 
     pub fn try_recv_with_meta(
@@ -803,8 +792,14 @@ impl UdpSocket {
             Some(UdpInner::Bound(bound)) => bound,
             _ => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
         };
-        let ifindex = bound.inner().iface().nic_id() as i32;
-        let (copy_len, endpoint, orig_len, dst_addr) = bound.try_recv_with_metadata(buf, peek)?;
+        let bound_ifindex = bound.inner().iface().nic_id() as i32;
+        let device_ifindex = self.bound_device_ifindex();
+        let (copy_len, endpoint, orig_len, dst_addr, meta) =
+            bound.try_recv_with_metadata(buf, peek, device_ifindex, bound_ifindex as usize)?;
+        let ifindex = i32::try_from(meta.id)
+            .ok()
+            .filter(|ifindex| *ifindex != 0)
+            .unwrap_or(bound_ifindex);
         let dst_addr = dst_addr.unwrap_or_else(|| self.unspecified_addr());
         Ok((copy_len, endpoint, orig_len, dst_addr, ifindex))
     }
@@ -1249,7 +1244,14 @@ impl UdpSocket {
                             }
                         }
 
-                        let ret = bound.try_send(buf, Some(dest));
+                        let egress_ifindex = if device_ifindex != 0 {
+                            device_ifindex as u32
+                        } else if is_multicast && mcast_ifindex != 0 {
+                            mcast_ifindex as u32
+                        } else {
+                            0
+                        };
+                        let ret = bound.try_send(buf, Some(dest), egress_ifindex);
                         (
                             ret,
                             send_iface,

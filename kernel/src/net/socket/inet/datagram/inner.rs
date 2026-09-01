@@ -435,179 +435,19 @@ impl BoundUdp {
         !self.explicitly_bound
     }
 
-    #[inline]
-    pub fn try_recv(
-        &self,
-        buf: &mut [u8],
-        peek: bool,
-    ) -> Result<(usize, smoltcp::wire::IpEndpoint, usize), SystemError> {
-        let remote = *self.remote.lock();
-
-        self.with_mut_socket(|socket| {
-            let endpoint_addr = socket.endpoint().addr;
-            // If connected, filter packets by source address (except pre-connect packets)
-
-            let mut has_preconnect_guard = self.has_preconnect_data.lock();
-            let has_preconnect = *has_preconnect_guard;
-            // let has_preconnect = false;
-            if has_preconnect {
-                *has_preconnect_guard = false;
-            }
-            drop(has_preconnect_guard);
-            let should_filter = remote.is_some() && !has_preconnect;
-            if should_filter {
-                let expected_remote = remote.unwrap();
-                // log::debug!("try_recv: connected mode, expected_remote={:?}, buf_len={}, can_recv={}",
-                //     expected_remote, buf.len(), socket.can_recv());
-
-                // Loop to skip packets from unexpected sources
-                loop {
-                    if !socket.can_recv() {
-                        // log::debug!("try_recv: can_recv=false, returning EAGAIN");
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-
-                    // Peek to check source address before receiving
-                    // Note: peek() instead of peek_slice() because peek_slice() returns Truncated
-                    // error when buffer is smaller than packet, but we still want to receive it
-                    match socket.peek() {
-                        Ok((payload, metadata)) => {
-                            if let (Some(bound), Some(dst)) =
-                                (endpoint_addr, metadata.local_address)
-                            {
-                                if bound != dst
-                                    && (dst.is_multicast()
-                                        || dst.is_broadcast()
-                                        || bound.is_multicast()
-                                        || bound.is_broadcast())
-                                {
-                                    let _ = socket.recv();
-                                    continue;
-                                }
-                            }
-                            // log::debug!("try_recv: peeked {} bytes from {:?}, buf_len={}", payload.len(), metadata.endpoint, buf.len());
-                            if metadata.endpoint == expected_remote {
-                                // Source matches
-
-                                // Special case: zero-length buffer
-                                if buf.is_empty() {
-                                    // log::debug!("try_recv: zero-length buffer in connected mode, returning 0 bytes");
-                                    return Ok((0, expected_remote, payload.len()));
-                                }
-
-                                if peek {
-                                    // MSG_PEEK: just copy the data we peeked
-                                    let copy_len = core::cmp::min(buf.len(), payload.len());
-                                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                    // log::debug!("try_recv: peek succeeded, size={}", copy_len);
-                                    return Ok((copy_len, expected_remote, payload.len()));
-                                } else {
-                                    // Receive the packet
-                                    let (recv_buf, _metadata) =
-                                        socket.recv().map_err(|_| SystemError::ENOBUFS)?;
-                                    let length = core::cmp::min(buf.len(), recv_buf.len());
-                                    buf[..length].copy_from_slice(&recv_buf[..length]);
-                                    debug_assert_eq!(expected_remote, _metadata.endpoint);
-                                    return Ok((length, expected_remote, recv_buf.len()));
-                                }
-                            } else {
-                                // just drop the packet
-                                let _ = socket.recv();
-                                continue;
-                            }
-                        }
-                        Err(smoltcp::socket::udp::RecvError::Exhausted) => {
-                            return Err(SystemError::ENOBUFS)
-                        }
-                        Err(_e) => return Err(SystemError::EIO),
-                    }
-                }
-            } else {
-                // log::debug!("try_recv: unconnected mode, buf_len={}, can_recv={}", buf.len(), socket.can_recv());
-                // Not connected, receive from any source
-
-                // Special case: if buffer length is 0, just peek to check if data exists
-                if buf.is_empty() {
-                    loop {
-                        if !socket.can_recv() {
-                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                        }
-                        match socket.peek() {
-                            Ok((payload, metadata)) => {
-                                if let (Some(bound), Some(dst)) =
-                                    (endpoint_addr, metadata.local_address)
-                                {
-                                    if bound != dst
-                                        && (dst.is_multicast()
-                                            || dst.is_broadcast()
-                                            || bound.is_multicast()
-                                            || bound.is_broadcast())
-                                    {
-                                        let _ = socket.recv();
-                                        continue;
-                                    }
-                                }
-                                return Ok((0, metadata.endpoint, payload.len()));
-                            }
-                            Err(smoltcp::socket::udp::RecvError::Exhausted) => {
-                                return Err(SystemError::ENOBUFS)
-                            }
-                            Err(_e) => return Err(SystemError::EIO),
-                        }
-                    }
-                }
-
-                loop {
-                    if !socket.can_recv() {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-                    match socket.peek() {
-                        Ok((payload, metadata)) => {
-                            if let (Some(bound), Some(dst)) =
-                                (endpoint_addr, metadata.local_address)
-                            {
-                                if bound != dst
-                                    && (dst.is_multicast()
-                                        || dst.is_broadcast()
-                                        || bound.is_multicast()
-                                        || bound.is_broadcast())
-                                {
-                                    let _ = socket.recv();
-                                    continue;
-                                }
-                            }
-                            if peek {
-                                let copy_len = core::cmp::min(buf.len(), payload.len());
-                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                return Ok((copy_len, metadata.endpoint, payload.len()));
-                            } else {
-                                let (recv_buf, recv_meta) =
-                                    socket.recv().map_err(|_| SystemError::ENOBUFS)?;
-                                let length = core::cmp::min(buf.len(), recv_buf.len());
-                                buf[..length].copy_from_slice(&recv_buf[..length]);
-                                return Ok((length, recv_meta.endpoint, recv_buf.len()));
-                            }
-                        }
-                        Err(smoltcp::socket::udp::RecvError::Exhausted) => {
-                            return Err(SystemError::ENOBUFS)
-                        }
-                        Err(_e) => return Err(SystemError::EIO),
-                    }
-                }
-            }
-        })
-    }
-
     pub fn try_recv_with_metadata(
         &self,
         buf: &mut [u8],
         peek: bool,
+        bound_device_ifindex: usize,
+        stack_ifindex: usize,
     ) -> Result<
         (
             usize,
             smoltcp::wire::IpEndpoint,
             usize,
             Option<smoltcp::wire::IpAddress>,
+            smoltcp::phy::PacketMeta,
         ),
         SystemError,
     > {
@@ -623,152 +463,67 @@ impl BoundUdp {
             drop(has_preconnect_guard);
             let should_filter = remote.is_some() && !has_preconnect;
 
-            if should_filter {
-                let expected_remote = remote.unwrap();
-                loop {
-                    if !socket.can_recv() {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-                    match socket.peek() {
-                        Ok((payload, metadata)) => {
-                            if let (Some(bound), Some(dst)) =
-                                (endpoint_addr, metadata.local_address)
-                            {
-                                if bound != dst
-                                    && (dst.is_multicast()
-                                        || dst.is_broadcast()
-                                        || bound.is_multicast()
-                                        || bound.is_broadcast())
-                                {
-                                    let _ = socket.recv();
-                                    continue;
-                                }
-                            }
-                            if metadata.endpoint == expected_remote {
-                                if buf.is_empty() {
-                                    return Ok((
-                                        0,
-                                        expected_remote,
-                                        payload.len(),
-                                        metadata.local_address,
-                                    ));
-                                }
-                                if peek {
-                                    let copy_len = core::cmp::min(buf.len(), payload.len());
-                                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                    return Ok((
-                                        copy_len,
-                                        expected_remote,
-                                        payload.len(),
-                                        metadata.local_address,
-                                    ));
-                                } else {
-                                    let (recv_buf, recv_meta) =
-                                        socket.recv().map_err(|_| SystemError::ENOBUFS)?;
-                                    let length = core::cmp::min(buf.len(), recv_buf.len());
-                                    buf[..length].copy_from_slice(&recv_buf[..length]);
-                                    debug_assert_eq!(expected_remote, recv_meta.endpoint);
-                                    return Ok((
-                                        length,
-                                        expected_remote,
-                                        recv_buf.len(),
-                                        recv_meta.local_address,
-                                    ));
-                                }
-                            } else {
-                                let _ = socket.recv();
-                                continue;
-                            }
-                        }
-                        Err(smoltcp::socket::udp::RecvError::Exhausted) => {
-                            return Err(SystemError::ENOBUFS)
-                        }
-                        Err(_e) => return Err(SystemError::EIO),
-                    }
+            loop {
+                if !socket.can_recv() {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
-            } else {
-                if buf.is_empty() {
-                    loop {
-                        if !socket.can_recv() {
-                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                        }
-                        match socket.peek() {
-                            Ok((payload, metadata)) => {
-                                if let (Some(bound), Some(dst)) =
-                                    (endpoint_addr, metadata.local_address)
-                                {
-                                    if bound != dst
-                                        && (dst.is_multicast()
-                                            || dst.is_broadcast()
-                                            || bound.is_multicast()
-                                            || bound.is_broadcast())
-                                    {
-                                        let _ = socket.recv();
-                                        continue;
-                                    }
-                                }
-                                return Ok((
-                                    0,
-                                    metadata.endpoint,
-                                    payload.len(),
-                                    metadata.local_address,
-                                ));
-                            }
-                            Err(smoltcp::socket::udp::RecvError::Exhausted) => {
-                                return Err(SystemError::ENOBUFS)
-                            }
-                            Err(_e) => return Err(SystemError::EIO),
-                        }
-                    }
+                let (payload, metadata) = socket.peek().map_err(|error| match error {
+                    smoltcp::socket::udp::RecvError::Exhausted => SystemError::ENOBUFS,
+                    _ => SystemError::EIO,
+                })?;
+                let destination_mismatch = matches!(
+                    (endpoint_addr, metadata.local_address),
+                    (Some(bound), Some(dst))
+                        if bound != dst
+                            && (dst.is_multicast()
+                                || dst.is_broadcast()
+                                || bound.is_multicast()
+                                || bound.is_broadcast())
+                );
+                let ingress_ifindex = usize::try_from(metadata.meta.id)
+                    .ok()
+                    .filter(|ifindex| *ifindex != 0)
+                    .unwrap_or(stack_ifindex);
+                let device_mismatch =
+                    bound_device_ifindex != 0 && bound_device_ifindex != ingress_ifindex;
+                let remote_mismatch =
+                    should_filter && remote.is_some_and(|expected| expected != metadata.endpoint);
+                if destination_mismatch || device_mismatch || remote_mismatch {
+                    let _ = socket.recv();
+                    continue;
                 }
 
-                loop {
-                    if !socket.can_recv() {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-                    match socket.peek() {
-                        Ok((payload, metadata)) => {
-                            if let (Some(bound), Some(dst)) =
-                                (endpoint_addr, metadata.local_address)
-                            {
-                                if bound != dst
-                                    && (dst.is_multicast()
-                                        || dst.is_broadcast()
-                                        || bound.is_multicast()
-                                        || bound.is_broadcast())
-                                {
-                                    let _ = socket.recv();
-                                    continue;
-                                }
-                            }
-                            if peek {
-                                let copy_len = core::cmp::min(buf.len(), payload.len());
-                                buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-                                return Ok((
-                                    copy_len,
-                                    metadata.endpoint,
-                                    payload.len(),
-                                    metadata.local_address,
-                                ));
-                            } else {
-                                let (recv_buf, recv_meta) =
-                                    socket.recv().map_err(|_| SystemError::ENOBUFS)?;
-                                let length = core::cmp::min(buf.len(), recv_buf.len());
-                                buf[..length].copy_from_slice(&recv_buf[..length]);
-                                return Ok((
-                                    length,
-                                    recv_meta.endpoint,
-                                    recv_buf.len(),
-                                    recv_meta.local_address,
-                                ));
-                            }
-                        }
-                        Err(smoltcp::socket::udp::RecvError::Exhausted) => {
-                            return Err(SystemError::ENOBUFS)
-                        }
-                        Err(_e) => return Err(SystemError::EIO),
-                    }
+                if buf.is_empty() {
+                    return Ok((
+                        0,
+                        metadata.endpoint,
+                        payload.len(),
+                        metadata.local_address,
+                        metadata.meta,
+                    ));
                 }
+                if peek {
+                    let copy_len = core::cmp::min(buf.len(), payload.len());
+                    buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                    return Ok((
+                        copy_len,
+                        metadata.endpoint,
+                        payload.len(),
+                        metadata.local_address,
+                        metadata.meta,
+                    ));
+                }
+
+                let (recv_buf, recv_meta) = socket.recv().map_err(|_| SystemError::ENOBUFS)?;
+                let length = core::cmp::min(buf.len(), recv_buf.len());
+                buf[..length].copy_from_slice(&recv_buf[..length]);
+                return Ok((
+                    length,
+                    recv_meta.endpoint,
+                    recv_buf.len(),
+                    recv_meta.local_address,
+                    recv_meta.meta,
+                ));
             }
         })
     }
@@ -777,6 +532,7 @@ impl BoundUdp {
         &self,
         buf: &[u8],
         to: Option<smoltcp::wire::IpEndpoint>,
+        egress_ifindex: u32,
     ) -> Result<usize, SystemError> {
         let connected_remote = *self.remote.lock();
         let mut remote = to.or(connected_remote).ok_or(SystemError::ENOTCONN)?;
@@ -813,7 +569,9 @@ impl BoundUdp {
                 return Err(SystemError::EMSGSIZE);
             }
             if socket.can_send() {
-                match socket.send_slice(buf, remote) {
+                let mut metadata = smoltcp::socket::udp::UdpMetadata::from(remote);
+                metadata.meta.id = egress_ifindex;
+                match socket.send_slice(buf, metadata) {
                     Ok(_) => {
                         // log::debug!("try_send: send successful");
                         Ok(buf.len())

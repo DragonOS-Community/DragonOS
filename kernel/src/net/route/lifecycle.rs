@@ -13,9 +13,10 @@ use crate::{
 };
 
 use super::{
-    canonical_cidr, is_ipv4, projection_for_iface, transact_with_devices, validate_entry_on_iface,
-    FibTable, RouteEntry, RouteNotifications, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTPROT_KERNEL,
-    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN,
+    canonical_cidr, is_ipv4, prepare_with_devices, projection_for_iface, transact_with_devices,
+    validate_entry_on_iface, FibTable, PreparedTransaction, RouteEntry, RouteNotifications,
+    RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_HOST, RT_SCOPE_LINK,
+    RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN,
 };
 
 pub(crate) fn register_iface(
@@ -79,12 +80,35 @@ pub(crate) fn unregister_iface(
 
 /// Applies Linux's IPv4 device-state FIB lifecycle. Ordinary NETDEV_DOWN
 /// purges are intentionally silent at the rtnetlink notification boundary.
-pub(crate) fn link_state_changed(
-    rtnl: &RtnlGuard,
+pub(crate) struct PreparedLinkStateChange<'rtnl> {
+    transaction: PreparedTransaction<'rtnl, RouteNotifications>,
+}
+
+impl PreparedLinkStateChange<'_> {
+    /// Publishes only preallocated state. RTNL guarantees that the FIB and
+    /// topology still match the snapshot captured during preparation.
+    pub(crate) fn publish(
+        self,
+        netns: &Arc<NetNamespace>,
+        is_up: bool,
+        publish_link_state: impl FnOnce(),
+    ) -> RouteNotifications {
+        if is_up {
+            self.transaction
+                .publish_around(netns, || {}, publish_link_state)
+        } else {
+            self.transaction
+                .publish_around(netns, publish_link_state, || {})
+        }
+    }
+}
+
+pub(crate) fn prepare_link_state_change<'rtnl>(
+    rtnl: &'rtnl RtnlGuard,
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     is_up: bool,
-) -> Result<RouteNotifications, SystemError> {
+) -> Result<PreparedLinkStateChange<'rtnl>, SystemError> {
     let device_list = netns.device_list();
     let mut devices = Vec::new();
     devices
@@ -93,10 +117,12 @@ pub(crate) fn link_state_changed(
     devices.extend(device_list.values().cloned());
     drop(device_list);
     let ifindex = iface.nic_id() as u32;
-    transact_with_devices(rtnl, netns, &devices, |candidate| {
+    let transaction = prepare_with_devices(rtnl, netns, &devices, |candidate| {
         if is_up {
             let mut added = Vec::new();
-            for entry in derived_address_entries(iface, &iface.common().ip_addrs())? {
+            for entry in
+                derived_address_entries_for_link_state(iface, &iface.common().ip_addrs(), true)?
+            {
                 if is_ipv4(entry.destination.address())
                     && (entry.table == RT_TABLE_MAIN || entry.kind == RTN_BROADCAST)
                     && candidate.insert_derived(entry)?
@@ -119,7 +145,8 @@ pub(crate) fn link_state_changed(
             })?;
             Ok(RouteNotifications::default())
         }
-    })
+    })?;
+    Ok(PreparedLinkStateChange { transaction })
 }
 
 /// A fully prepared address/FIB commit. Construction may fail; publication is
@@ -241,9 +268,21 @@ fn derived_address_entries(
     iface: &Arc<dyn Iface>,
     addresses: &[IpCidr],
 ) -> Result<Vec<RouteEntry>, SystemError> {
+    derived_address_entries_for_link_state(
+        iface,
+        addresses,
+        iface.flags().contains(InterfaceFlags::UP),
+    )
+}
+
+fn derived_address_entries_for_link_state(
+    iface: &Arc<dyn Iface>,
+    addresses: &[IpCidr],
+    is_up: bool,
+) -> Result<Vec<RouteEntry>, SystemError> {
     let mut result = Vec::new();
     for cidr in addresses.iter().copied() {
-        for entry in entries_for_address(iface, cidr, primary_for_prefix(addresses, cidr))? {
+        for entry in entries_for_address(iface, cidr, primary_for_prefix(addresses, cidr), is_up)? {
             if !result.contains(&entry) {
                 result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
                 result.push(entry);
@@ -257,6 +296,7 @@ fn entries_for_address(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
     primary: Option<IpAddress>,
+    is_up: bool,
 ) -> Result<Vec<RouteEntry>, SystemError> {
     let ipv4 = is_ipv4(cidr.address());
     let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
@@ -295,9 +335,7 @@ fn entries_for_address(
     let add_connected = match cidr {
         IpCidr::Ipv4(cidr) => {
             let octets = cidr.network().address().octets();
-            (loopback || cidr.prefix_len() < 32)
-                && octets[0] != 0
-                && (loopback || iface.flags().contains(InterfaceFlags::UP))
+            (loopback || cidr.prefix_len() < 32) && octets[0] != 0 && (loopback || is_up)
         }
         IpCidr::Ipv6(_) => true,
     };
@@ -323,10 +361,7 @@ fn entries_for_address(
         result.push(local);
     }
     if let IpCidr::Ipv4(cidr) = cidr {
-        if cidr.prefix_len() < 31
-            && cidr.network().address().octets()[0] != 0
-            && iface.flags().contains(InterfaceFlags::UP)
-        {
+        if cidr.prefix_len() < 31 && cidr.network().address().octets()[0] != 0 && is_up {
             if let Some(broadcast) = cidr.broadcast() {
                 result.push(RouteEntry {
                     destination: IpCidr::Ipv4(Ipv4Cidr::new(broadcast, 32)),

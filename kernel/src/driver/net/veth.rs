@@ -1,5 +1,5 @@
 use super::bridge::BridgeEnableDevice;
-use super::{BootstrapRoute, Iface, IfaceCommon};
+use super::{BootstrapRoute, Iface, IfaceCommon, IfacePollScope};
 use super::{NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
@@ -33,6 +33,9 @@ use smoltcp::phy::{self, RxToken};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, HardwareAddress, IpAddress, IpCidr};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
+
+const VETH_IP_MTU: usize = 1500;
+const VETH_MAX_FRAME_SIZE: usize = VETH_IP_MTU + 14;
 
 pub struct Veth {
     name: String,
@@ -331,7 +334,7 @@ impl phy::Device for VethDriver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500;
+        caps.max_transmission_unit = VETH_MAX_FRAME_SIZE;
         caps.medium = smoltcp::phy::Medium::Ethernet;
         caps
     }
@@ -389,8 +392,6 @@ impl VethInterface {
     }
 
     pub fn new(driver: VethDriver) -> Arc<Self> {
-        use smoltcp::phy::Device;
-
         let iface_id = generate_iface_id();
         let mac = [
             0x02,
@@ -416,7 +417,7 @@ impl VethInterface {
             | InterfaceFlags::UP
             | InterfaceFlags::RUNNING
             | InterfaceFlags::LOWER_UP;
-        let mtu = driver.capabilities().max_transmission_unit;
+        let mtu = VETH_IP_MTU;
 
         let device = Arc::new(VethInterface {
             driver: driver.clone(),
@@ -606,15 +607,24 @@ impl Iface for VethInterface {
     }
 
     fn poll(&self) -> bool {
-        // log::info!("VethInterface {} polling normal", self.name);
         let mut driver = self.driver.clone();
-        let routed = driver.prepare_ingress(64);
-        self.common.poll(&mut driver) || routed != 0 || driver.has_pending_ingress()
-        // self.clear_recv_buffer();
+        match self.common.poll_scope() {
+            IfacePollScope::None => false,
+            IfacePollScope::LocalOnly => self.common.poll(&mut driver),
+            IfacePollScope::Full => {
+                let routed = driver.prepare_ingress(64);
+                self.common.poll(&mut driver) || routed != 0 || driver.has_pending_ingress()
+            }
+        }
     }
 
     fn poll_napi(&self, budget: usize) -> super::napi::NapiPollResult {
         let mut driver = self.driver.clone();
+        match self.common.poll_scope() {
+            IfacePollScope::None => return super::napi::NapiPollResult::idle(),
+            IfacePollScope::LocalOnly => return self.common.poll_napi(&mut driver, budget),
+            IfacePollScope::Full => {}
+        }
         // When both queues are backlogged, reserve bounded progress for each
         // side. A single active queue may still use the full NAPI budget.
         let local_backlogged = driver.has_local_ingress() || self.common().has_local_input();

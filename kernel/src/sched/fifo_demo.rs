@@ -211,6 +211,110 @@ fn run_fifo_pair(cpu: ProcessorId) {
     log::info!("fifo_demo status=ok cpu={}", cpu.data());
 }
 
+struct BandwidthState {
+    runner_started: AtomicBool,
+    observer_ran: AtomicBool,
+    runner_resumed: AtomicBool,
+    abort: AtomicBool,
+}
+
+impl BandwidthState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            runner_started: AtomicBool::new(false),
+            observer_ran: AtomicBool::new(false),
+            runner_resumed: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+        })
+    }
+}
+
+fn bandwidth_runner_closure(state: Arc<BandwidthState>) -> KernelThreadClosure {
+    KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            state.runner_started.store(true, Ordering::Release);
+            let started = clock();
+            while !state.observer_ran.load(Ordering::Acquire)
+                && !state.abort.load(Ordering::Acquire)
+                && clock().wrapping_sub(started) < TEST_TIMEOUT_TICKS
+            {
+                core::hint::spin_loop();
+            }
+
+            if state.observer_ran.load(Ordering::Acquire) {
+                state.runner_resumed.store(true, Ordering::Release);
+                0
+            } else {
+                1
+            }
+        }),
+        (),
+    ))
+}
+
+fn bandwidth_observer_closure(state: Arc<BandwidthState>) -> KernelThreadClosure {
+    KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            state.observer_ran.store(true, Ordering::Release);
+            let started = clock();
+            while !state.runner_resumed.load(Ordering::Acquire)
+                && !state.abort.load(Ordering::Acquire)
+                && clock().wrapping_sub(started) < TEST_TIMEOUT_TICKS
+            {
+                // Remain runnable until the FIFO runner becomes eligible
+                // again. This prevents observer exit from being mistaken for
+                // period replenishment, and avoids advancing the period from
+                // a voluntary schedule path so the tick hook is exercised.
+                core::hint::spin_loop();
+            }
+            i32::from(
+                !state.runner_resumed.load(Ordering::Acquire)
+                    && !state.abort.load(Ordering::Acquire),
+            )
+        }),
+        (),
+    ))
+}
+
+fn run_runtime_throttling(cpu: ProcessorId) {
+    let state = BandwidthState::new();
+    let runner = KernelThreadMechanism::create_on_cpu(
+        bandwidth_runner_closure(state.clone()),
+        "fifo_bandwidth_runner".into(),
+        cpu,
+    )
+    .expect("failed to create bandwidth runner");
+    let observer = KernelThreadMechanism::create_on_cpu(
+        bandwidth_observer_closure(state.clone()),
+        "fifo_bandwidth_observer".into(),
+        cpu,
+    )
+    .expect("failed to create bandwidth observer");
+    let workers = [runner.clone(), observer.clone()];
+
+    let mut ok = workers.iter().all(wait_off_rq);
+    ok &= ProcessManager::set_fifo_policy(&runner, FIFO_PRIO).is_ok();
+    ok &= ProcessManager::wakeup(&runner).is_ok();
+    ok &= wait_until(|| state.runner_started.load(Ordering::Acquire));
+
+    // The runner never yields, sleeps, or exits before this observer runs.
+    // Therefore the Fair observer can run only after the local RT class is
+    // throttled and skipped by task selection.
+    ok &= ProcessManager::wakeup(&observer).is_ok();
+    ok &= wait_until(|| state.observer_ran.load(Ordering::Acquire));
+
+    // The FIFO runner remains queued while throttled. Seeing it resume proves
+    // that period replenishment made the RT class eligible again.
+    ok &= wait_until(|| state.runner_resumed.load(Ordering::Acquire));
+    if !ok {
+        state.abort.store(true, Ordering::Release);
+    }
+
+    reap_workers(&workers);
+    assert!(ok, "realtime runtime throttling scenario failed");
+    log::info!("fifo_demo runtime_throttling=ok cpu={}", cpu.data());
+}
+
 struct RemoteTransitionState {
     runner_started: AtomicBool,
     runner_release: AtomicBool,
@@ -847,6 +951,7 @@ pub fn fifo_demo_init() {
 
     for &cpu in cpus.iter().take(2) {
         run_fifo_pair(cpu);
+        run_runtime_throttling(cpu);
     }
 
     let control_cpu = smp_get_processor_id();

@@ -706,6 +706,10 @@ impl CpuRunQueue {
         let current_class = self.current().sched_info().sched_class();
         let waking_class = pcb.sched_info().sched_class();
 
+        if waking_class == SchedClass::Realtime && self.rt.is_throttled() {
+            return;
+        }
+
         if waking_class == current_class {
             match current_class {
                 SchedClass::Fair => {
@@ -743,6 +747,10 @@ impl CpuRunQueue {
         let current = self.current();
         let current_class = current.sched_info().sched_class();
         let next_class = pcb.sched_info().sched_class();
+
+        if next_class == SchedClass::Realtime && self.rt.is_throttled() {
+            return;
+        }
 
         if current.flags().contains(ProcessFlags::NEED_SCHEDULE) {
             if current_class == SchedClass::Idle {
@@ -931,6 +939,12 @@ impl CpuRunQueue {
     pub fn pick_next_task(&mut self, prev: Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
         debug_assert_eq!(prev.sched_info().on_cpu(), Some(self.cpu));
 
+        // RT runtime must be current before class selection. DragonOS picks
+        // `next` before calling put_prev_task(), so accounting only there can
+        // select another RT task from a runqueue which has already exhausted
+        // its bandwidth.
+        RealtimeScheduler::update_bandwidth(self, prev.sched_info().sched_class());
+
         let mut next: Option<Arc<ProcessControlBlock>> = None;
 
         if self.rt.nr_running() > 0 {
@@ -945,6 +959,7 @@ impl CpuRunQueue {
             && !task_is_idle(&prev)
             && prev.sched_info().state().is_runnable()
             && *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued
+            && !(prev.sched_info().sched_class() == SchedClass::Realtime && self.rt.is_throttled())
         {
             next = Some(prev.clone());
         }
@@ -958,8 +973,10 @@ impl CpuRunQueue {
                 SchedClass::Idle => IdleScheduler::put_prev_task(self, prev),
             }
 
-            if next.sched_info().sched_class() == SchedClass::Fair {
-                CompletelyFairScheduler::set_next_task(self, next.clone());
+            match next.sched_info().sched_class() {
+                SchedClass::Realtime => RealtimeScheduler::set_next_task(self, next.clone()),
+                SchedClass::Fair => CompletelyFairScheduler::set_next_task(self, next.clone()),
+                SchedClass::Idle => {}
             }
         }
 
@@ -1093,7 +1110,9 @@ pub fn scheduler_tick() {
 
     // 更新请求队列时钟
     rq.update_rq_clock();
-    match current.sched_info().sched_class() {
+    let current_class = current.sched_info().sched_class();
+    RealtimeScheduler::update_bandwidth(rq, current_class);
+    match current_class {
         SchedClass::Realtime => RealtimeScheduler::tick(rq, current, false),
         SchedClass::Fair => CompletelyFairScheduler::tick(rq, current, false),
         SchedClass::Idle => IdleScheduler::tick(rq, current, false),

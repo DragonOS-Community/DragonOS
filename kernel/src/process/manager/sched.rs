@@ -6,13 +6,25 @@ use system_error::SystemError;
 use crate::{
     arch::{cpu::current_cpu_id, CurrentIrqArch},
     exception::InterruptArch,
+    libs::cpumask::CpuMask,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     sched::{
         cpu_rq, enqueue_task_on_cpu, select_task_rq, DequeueFlag, EnqueueFlag, LinuxSchedPolicy,
-        OnRq, SchedClass, Scheduler, WakeupFlags,
+        OnRq, SchedClass, WakeupFlags,
     },
     smp::{core::smp_get_processor_id, kick_cpu},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchedChangeRequest {
+    #[allow(dead_code)]
+    Normal {
+        reset_on_fork: bool,
+    },
+    Fifo {
+        priority: i32,
+    },
+}
 
 impl ProcessManager {
     /// Wake up a process.
@@ -131,106 +143,170 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// Set the specified kernel thread to the SCHED_FIFO scheduling policy.
-    ///
-    /// task_rq_lock → update_rq_clock → read queued/running →
-    /// dequeue/put_prev → modify parameters → enqueue → check_class_changed →
-    /// unlock
+    /// Atomically change the base scheduler parameters of an already placed task.
+    pub(crate) fn set_scheduler(
+        pcb: &Arc<ProcessControlBlock>,
+        request: SchedChangeRequest,
+    ) -> Result<(), SystemError> {
+        if let SchedChangeRequest::Fifo { priority } = request {
+            if !(0..crate::sched::prio::MAX_RT_PRIO - 1).contains(&priority) {
+                return Err(SystemError::EINVAL);
+            }
+        }
+
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        loop {
+            // Lock ordering matches Linux task_rq_lock(): pi_lock -> rq_lock.
+            let mut pi_guard = pcb.sched_info().pi_lock_irqsave();
+            let old_class = pcb.sched_info().sched_class();
+            if old_class == SchedClass::Idle {
+                return Err(SystemError::EINVAL);
+            }
+
+            // Published tasks retain their last rq while sleeping or exiting.
+            // A task without a CPU can have a Fair entity bound to another rq,
+            // so this PR deliberately rejects that unplaced state.
+            let Some(target_cpu) = pcb.sched_info().on_cpu() else {
+                return Err(SystemError::EINVAL);
+            };
+            let rq = cpu_rq(target_cpu.data() as usize);
+            let (rq, rq_guard) = rq.self_lock();
+
+            let migrating = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating;
+            let stable = pcb.sched_info().on_cpu() == Some(target_cpu) && !migrating;
+            if !stable {
+                drop(rq_guard);
+                drop(pi_guard);
+                // Match Linux task_rq_lock(): do not repeatedly contend on
+                // pi_lock while the migration owner is moving the task
+                // between runqueues. The owner publishes a stable rq before
+                // clearing Migrating, after which the outer loop samples the
+                // task CPU again.
+                if migrating {
+                    while *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
+                        core::hint::spin_loop();
+                    }
+                }
+                continue;
+            }
+
+            rq.update_rq_clock();
+
+            let old_policy = pcb.sched_info().policy();
+            let old_prio = pcb.sched_info().prio();
+            let old_reset = pi_guard.sched_reset_on_fork();
+            let (new_policy, new_prio, new_reset) = match request {
+                SchedChangeRequest::Normal { reset_on_fork } => (
+                    LinuxSchedPolicy::Normal,
+                    pcb.sched_info().static_prio(),
+                    reset_on_fork,
+                ),
+                SchedChangeRequest::Fifo { priority } => (LinuxSchedPolicy::Fifo, priority, false),
+            };
+            let new_class = new_policy.base_sched_class();
+
+            if old_policy == new_policy && old_prio == new_prio && old_reset == new_reset {
+                drop(rq_guard);
+                drop(pi_guard);
+                return Ok(());
+            }
+
+            let queued = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued;
+            let running = Arc::ptr_eq(&rq.current(), pcb);
+            // The final switch-out removes a dead Fair entity's PELT
+            // contribution. Linux still permits scheduler parameter updates
+            // for dead tasks, but such an off-rq task must not be attached
+            // again after its task-dead accounting has completed.
+            let account_class_change = !pcb.sched_info().state().is_exited() || queued || running;
+
+            if queued {
+                rq.dequeue_task(
+                    pcb.clone(),
+                    DequeueFlag::DEQUEUE_SAVE
+                        | DequeueFlag::DEQUEUE_MOVE
+                        | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
+            }
+            if running {
+                rq.put_prev_task_for_class(old_class, pcb.clone());
+            }
+            if account_class_change
+                && old_class == SchedClass::Fair
+                && new_class != SchedClass::Fair
+            {
+                crate::sched::fair::CompletelyFairScheduler::switched_from_fair(rq, pcb);
+            }
+
+            pcb.sched_info().set_policy(new_policy);
+            pcb.sched_info().set_prio(new_prio);
+            pcb.sched_info().set_normal_prio(new_prio);
+            pi_guard.set_sched_reset_on_fork(new_reset);
+
+            if account_class_change
+                && old_class != SchedClass::Fair
+                && new_class == SchedClass::Fair
+            {
+                crate::sched::fair::CompletelyFairScheduler::switched_to_fair(rq, pcb);
+            }
+
+            if queued {
+                let mut flags = EnqueueFlag::ENQUEUE_RESTORE
+                    | EnqueueFlag::ENQUEUE_MOVE
+                    | EnqueueFlag::ENQUEUE_NOCLOCK;
+                if old_prio < new_prio {
+                    flags |= EnqueueFlag::ENQUEUE_HEAD;
+                }
+                rq.enqueue_task(pcb.clone(), flags);
+            }
+            if running {
+                rq.set_next_task_for_class(new_class, pcb.clone());
+            }
+
+            rq.check_scheduler_changed(pcb, old_class, old_prio);
+
+            drop(rq_guard);
+            drop(pi_guard);
+            return Ok(());
+        }
+    }
+
+    /// Set a trusted kernel thread to the SCHED_FIFO policy.
     pub fn set_fifo_policy(pcb: &Arc<ProcessControlBlock>, prio: i32) -> Result<(), SystemError> {
         if !pcb.flags().contains(ProcessFlags::KTHREAD) {
             return Err(SystemError::EPERM);
         }
 
-        if !(0..crate::sched::prio::MAX_RT_PRIO - 1).contains(&prio) {
-            return Err(SystemError::EINVAL);
-        }
+        Self::set_scheduler(pcb, SchedChangeRequest::Fifo { priority: prio })
+    }
 
-        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-        // Lock ordering: pi_lock → rq_lock, matching Linux task_rq_lock().
+    /// Publish a validated affinity mask and apply any required migration.
+    pub(crate) fn set_cpus_allowed(
+        pcb: &Arc<ProcessControlBlock>,
+        mask: CpuMask,
+    ) -> Result<(), SystemError> {
         let mut pi_guard = pcb.sched_info().pi_lock_irqsave();
+        pi_guard.set_cpus_allowed(mask.clone());
 
-        let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
-        let update_clock = target_cpu == smp_get_processor_id();
-        let rq = cpu_rq(target_cpu.data() as usize);
-        let (rq, rq_guard) = rq.self_lock();
-        if update_clock {
-            rq.update_rq_clock();
+        if pcb.sched_info().is_new_task() {
+            return Ok(());
         }
 
-        // Read task state under the lock.
-        let old_class = pcb.sched_info().sched_class();
-        let queued = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued;
-
-        // Determine whether the target is the currently running task on this rq.
-        let running = Arc::ptr_eq(&rq.current(), pcb);
-
-        // First dequeue the task from the scheduler, then modify parameters,
-        // and finally re-enqueue.
-        if queued {
-            rq.dequeue_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_NOCLOCK | DequeueFlag::DEQUEUE_SAVE,
-            );
+        if pcb
+            .sched_info()
+            .migrate_to()
+            .is_some_and(|cpu| !mask.get(cpu).unwrap_or(false))
+        {
+            pcb.sched_info().set_migrate_to(None);
+            pcb.flags().remove(ProcessFlags::NEED_MIGRATE);
         }
 
-        // A running task must first be put_prev_task to yield its current
-        // execution position.
-        if running {
-            match old_class {
-                SchedClass::Realtime => {
-                    crate::sched::realtime::RealtimeScheduler::put_prev_task(rq, pcb.clone())
-                }
-                SchedClass::Fair => {
-                    crate::sched::fair::CompletelyFairScheduler::put_prev_task(rq, pcb.clone())
-                }
-                SchedClass::Idle => {
-                    crate::sched::idle::IdleScheduler::put_prev_task(rq, pcb.clone())
-                }
+        if let Some(cpu) = pcb.sched_info().on_cpu() {
+            if !mask.get(cpu).unwrap_or(false) {
+                let dest_cpu = select_task_rq(pcb, cpu, WakeupFlags::WF_TTWU, &mask);
+                crate::sched::request_task_migration(pcb, dest_cpu)?;
             }
         }
-
-        // Modify scheduling parameters (under rq_lock protection).
-        // Matches Linux __setscheduler_params + __setscheduler_prio:
-        //   - policy set to FIFO
-        //   - prio = normal_prio = MAX_RT_PRIO - 1 - rt_priority (the caller
-        //     already passes the kernel prio)
-        //   - static_prio is left unchanged (Linux only modifies static_prio for
-        //     fair_policy, core.c:7528-7529)
-        pcb.sched_info().set_policy(LinuxSchedPolicy::Fifo);
-        pcb.sched_info().set_prio(prio);
-        pcb.sched_info().set_normal_prio(prio);
-        // This internal API has no RESET_ON_FORK argument. Do not carry a
-        // stale CFS flag into FIFO, where this PR deliberately does not
-        // implement the otherwise unreachable RT fork-reset path.
-        pi_guard.set_sched_reset_on_fork(false);
-        debug_assert!(!pi_guard.sched_reset_on_fork());
-
-        // Re-enqueue.
-        if queued {
-            rq.enqueue_task(
-                pcb.clone(),
-                EnqueueFlag::ENQUEUE_NOCLOCK | EnqueueFlag::ENQUEUE_RESTORE,
-            );
-        }
-
-        // Matches Linux __sched_setscheduler: after a running task changes its
-        // policy, set_next_task is required.
-        if running {
-            crate::sched::realtime::RealtimeScheduler::set_next_task(rq, pcb.clone());
-        }
-
-        // check_class_changed → preemption check.
-        if update_clock {
-            rq.check_preempt_current(pcb, WakeupFlags::empty());
-        } else {
-            rq.check_preempt_remote(pcb, WakeupFlags::empty());
-        }
-
-        // Release order: rq_lock first, then pi_lock, matching Linux
-        // task_rq_unlock().
-        drop(rq_guard);
-        drop(pi_guard);
 
         Ok(())
     }

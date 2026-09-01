@@ -62,7 +62,7 @@ use self::{
 
 pub use policy::{LinuxSchedPolicy, SchedClass};
 
-static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
+static mut CPU_IRQ_TIME: Option<Vec<&'static IrqTime>> = None;
 pub static IDLE_CPUS: AtomicCpuMask = AtomicCpuMask::new();
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
@@ -77,8 +77,8 @@ pub const SCHED_CAPACITY_SHIFT: u64 = SCHED_FIXEDPOINT_SHIFT;
 pub const SCHED_CAPACITY_SCALE: u64 = 1 << SCHED_CAPACITY_SHIFT;
 
 #[inline]
-pub fn cpu_irq_time(cpu: ProcessorId) -> &'static mut IrqTime {
-    unsafe { CPU_IRQ_TIME.as_mut().unwrap()[cpu.data() as usize] }
+pub(crate) fn cpu_irq_time(cpu: ProcessorId) -> &'static IrqTime {
+    unsafe { CPU_IRQ_TIME.as_ref().unwrap()[cpu.data() as usize] }
 }
 
 #[inline]
@@ -623,15 +623,75 @@ impl CpuRunQueue {
         }
     }
 
+    pub(crate) fn put_prev_task_for_class(
+        &mut self,
+        class: SchedClass,
+        pcb: Arc<ProcessControlBlock>,
+    ) {
+        match class {
+            SchedClass::Realtime => RealtimeScheduler::put_prev_task(self, pcb),
+            SchedClass::Fair => CompletelyFairScheduler::put_prev_task(self, pcb),
+            SchedClass::Idle => IdleScheduler::put_prev_task(self, pcb),
+        }
+    }
+
+    pub(crate) fn set_next_task_for_class(
+        &mut self,
+        class: SchedClass,
+        pcb: Arc<ProcessControlBlock>,
+    ) {
+        match class {
+            SchedClass::Realtime => RealtimeScheduler::set_next_task(self, pcb),
+            SchedClass::Fair => CompletelyFairScheduler::set_next_task(self, pcb),
+            SchedClass::Idle => unreachable!("scheduler changes cannot target the idle class"),
+        }
+    }
+
+    /// Apply the reachable subset of Linux `check_class_changed()` semantics.
+    pub(crate) fn check_scheduler_changed(
+        &mut self,
+        pcb: &Arc<ProcessControlBlock>,
+        old_class: SchedClass,
+        old_prio: i32,
+    ) {
+        if *pcb.sched_info().on_rq.lock_irqsave() != OnRq::Queued {
+            return;
+        }
+
+        let new_class = pcb.sched_info().sched_class();
+        let new_prio = pcb.sched_info().prio();
+        if old_class == new_class && old_prio == new_prio {
+            return;
+        }
+
+        if !Arc::ptr_eq(&self.current(), pcb) {
+            self.check_preempt_current(pcb, WakeupFlags::empty());
+            return;
+        }
+
+        if old_class != new_class {
+            if old_class == SchedClass::Realtime && new_class == SchedClass::Fair {
+                self.resched_current();
+            }
+            return;
+        }
+
+        if new_class == SchedClass::Realtime
+            && new_prio > old_prio
+            && self
+                .rt
+                .highest_prio()
+                .is_some_and(|highest| highest < new_prio as usize)
+        {
+            self.resched_current();
+        }
+    }
+
     /// 将任务加入运行队列，设置 on_rq = Queued。
     pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
         // 1. 迁移标志处理
         if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
-        }
-
-        if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
-            todo!()
         }
 
         // 2. enqueue_task
@@ -950,6 +1010,9 @@ bitflags! {
         const ENQUEUE_MOVE	= 0x04;
         const ENQUEUE_NOCLOCK	= 0x08;
 
+        /// Place a realtime task at the head of its priority bucket.
+        const ENQUEUE_HEAD      = 0x10;
+
         const ENQUEUE_MIGRATED	= 0x40;
 
         const ENQUEUE_INITIAL	= 0x80;
@@ -1163,6 +1226,10 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
                     DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
                 );
 
+                if prev_state.is_exited() && prev.sched_info().sched_class() == SchedClass::Fair {
+                    CompletelyFairScheduler::task_dead_fair(rq, &prev);
+                }
+
                 // nr_iowait++ happens after deactivate_task.
                 if prev_state.is_blocked() && prev.flags().contains(ProcessFlags::IN_IOWAIT) {
                     rq.nr_iowait.fetch_add(1, Ordering::Relaxed);
@@ -1206,7 +1273,11 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
                 });
             }
 
-            *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
+            // Keep task_cpu unstable until the switch tail owns pi_lock and
+            // commits the destination enqueue. External task_rq_lock-style
+            // operations must not mutate scheduler state against the old rq
+            // during this lockless migration interval.
+            debug_assert_eq!(*prev.sched_info().on_rq.lock_irqsave(), OnRq::Migrating);
             migrate_prev_to = Some(dest_cpu);
         }
     }
@@ -1340,6 +1411,14 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
         cpu
     );
 
+    let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+    let old_cpu = pcb.sched_info().on_cpu();
+    if pcb.sched_info().sched_class() == SchedClass::Fair
+        && (on_rq == OnRq::Migrating || old_cpu.is_some_and(|old_cpu| old_cpu != cpu))
+    {
+        CompletelyFairScheduler::prepare_task_rq_migration(pcb);
+    }
+
     // TODO: Fixme There is not implement group sched;
     let se = pcb.sched_info().sched_entity();
     let rq = cpu_rq(cpu.data() as usize);
@@ -1399,12 +1478,9 @@ pub fn request_task_migration(
     }
 
     let rq = cpu_rq(src_cpu.data() as usize);
-    let update_clock = src_cpu == smp_get_processor_id();
     let (rq, _guard) = rq.self_lock();
 
-    if update_clock {
-        rq.update_rq_clock();
-    }
+    rq.update_rq_clock();
 
     if Arc::ptr_eq(&rq.current(), pcb) {
         pcb.sched_info().set_migrate_to(Some(dest_cpu));
@@ -1419,13 +1495,11 @@ pub fn request_task_migration(
     }
 
     if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
-        rq.dequeue_task(
+        rq.deactivate_task(
             pcb.clone(),
             DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
         );
         crate::process::rseq::Rseq::on_migrate(pcb);
-        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::None;
-        pcb.sched_info().set_on_cpu(None);
         drop(_guard);
 
         pcb.sched_info().wait_until_not_running();
@@ -1455,11 +1529,11 @@ pub fn take_current_migration_target(current: &Arc<ProcessControlBlock>) -> Opti
 pub fn sched_init() {
     // 初始化percpu变量
     unsafe {
-        CPU_IRQ_TIME = Some(Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize));
-        CPU_IRQ_TIME
-            .as_mut()
-            .unwrap()
-            .resize_with(PerCpu::MAX_CPU_NUM as usize, || Box::leak(Box::default()));
+        let mut irq_times = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
+        for cpu in 0..PerCpu::MAX_CPU_NUM {
+            irq_times.push(Box::leak(Box::new(IrqTime::new(ProcessorId::new(cpu)))) as &'static _);
+        }
+        CPU_IRQ_TIME = Some(irq_times);
 
         let mut cpu_runqueue = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
         for cpu in 0..PerCpu::MAX_CPU_NUM as usize {

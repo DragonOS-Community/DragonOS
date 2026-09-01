@@ -23,13 +23,14 @@ use crate::{
         cred::SUID_DUMP_USER, namespace::user_namespace::INIT_USER_NAMESPACE, ProcessControlBlock,
         RawPid,
     },
-    sched::{cpu_rq, enqueue_task_on_cpu, select_task_rq, OnRq, WakeupFlags},
+    sched::{cpu_rq, enqueue_task_on_cpu, select_task_rq, OnRq, SchedClass, WakeupFlags},
     smp::{core::smp_get_processor_id, cpu::ProcessorId, kick_cpu},
     syscall::user_access::write_one_to_user_protected,
 };
 
 mod exit;
 mod sched;
+pub(crate) use sched::SchedChangeRequest;
 
 #[derive(Debug)]
 pub struct ProcessManager;
@@ -431,20 +432,40 @@ impl ProcessManager {
             // that lock through enqueue. A later affinity update will then
             // either observe this legal placement or migrate it again.
             let pi_guard = prev_pcb.sched_info().pi_lock_irqsave();
-            // stop_task() can win after schedule dequeues prev but before this
-            // tail obtains pi_lock. Likewise, wakeup_stop() can enqueue it
-            // after finish_running() and before this check. Only a still
-            // runnable, still off-rq task belongs to this migration owner;
-            // otherwise leave the stopped or already-enqueued state intact.
+            // DEQUEUE_MOVE keeps on_rq=Migrating until this owner holds
+            // pi_lock. This excludes task_rq_lock-style mutations against the
+            // old rq throughout the switch tail. stop_task() may still make
+            // the task non-runnable first; wakeup_stop() may make it runnable
+            // again, but leaves the migration enqueue to this owner.
             let still_owns_migration = prev_pcb.sched_info().state().is_runnable()
-                && *prev_pcb.sched_info().on_rq.lock_irqsave() == OnRq::None;
+                && *prev_pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating;
             if still_owns_migration {
                 let allowed = pi_guard.cpus_allowed.clone();
                 let dest_cpu =
                     select_task_rq(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, &allowed);
-                prev_pcb.sched_info().set_on_cpu(None);
+                // Keep Migrating through activate_task() so the destination
+                // class receives ENQUEUE_MIGRATED and publishes Queued only
+                // after its accounting is committed.
                 enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
+            } else if *prev_pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
+                // An asynchronous stop can win after a Fair task detached
+                // from the source rq. Restore Linux's sleeping-task PELT
+                // attachment before publishing a genuine off-rq state.
+                if prev_pcb.sched_info().sched_class() == SchedClass::Fair {
+                    let src_cpu = prev_pcb
+                        .sched_info()
+                        .on_cpu()
+                        .expect("a cancelled current migration must retain its source CPU");
+                    let src_rq = cpu_rq(src_cpu.data() as usize);
+                    let (src_rq, _src_rq_guard) = src_rq.self_lock();
+                    src_rq.update_rq_clock();
+                    crate::sched::fair::CompletelyFairScheduler::cancel_task_rq_migration(
+                        src_rq, &prev_pcb,
+                    );
+                }
+                *prev_pcb.sched_info().on_rq.lock_irqsave() = OnRq::None;
             }
+            debug_assert_ne!(*prev_pcb.sched_info().on_rq.lock_irqsave(), OnRq::Migrating);
             drop(pi_guard);
         }
 

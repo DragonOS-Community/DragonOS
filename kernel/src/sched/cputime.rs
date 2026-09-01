@@ -1,4 +1,7 @@
-use core::sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
@@ -108,78 +111,90 @@ pub fn init_kernel_cpu_stat() {
 }
 
 pub fn irq_time_read(cpu: ProcessorId) -> u64 {
-    compiler_fence(Ordering::SeqCst);
-    let irqtime = cpu_irq_time(cpu);
-
-    let mut total;
-
-    loop {
-        let seq = irqtime.sync.load(Ordering::SeqCst);
-        total = irqtime.total;
-
-        if seq == irqtime.sync.load(Ordering::SeqCst) {
-            break;
-        }
-    }
-    compiler_fence(Ordering::SeqCst);
-    total
+    cpu_irq_time(cpu).total.load(Ordering::Relaxed)
 }
 
 #[derive(Debug, Default)]
-pub struct IrqTime {
-    pub total: u64,
-    pub tick_delta: u64,
-    pub hardirq_delta: u64,
-    pub softirq_delta: u64,
-    pub irq_start_time: u64,
-    pub sync: AtomicUsize,
+struct IrqTimeLocal {
+    tick_delta: u64,
+    hardirq_delta: u64,
+    softirq_delta: u64,
+    irq_start_time: u64,
 }
 
-impl IrqTime {
-    pub fn account_delta(&mut self, delta: u64, is_hardirq: bool) {
-        // 开始更改时增加序列号
-        self.sync.fetch_add(1, Ordering::SeqCst);
-        self.total += delta;
-        self.tick_delta += delta;
+#[derive(Debug)]
+pub(crate) struct IrqTime {
+    owner: ProcessorId,
+    total: AtomicU64,
+    local: UnsafeCell<IrqTimeLocal>,
+}
 
-        // 根据中断类型分别记录
-        if is_hardirq {
-            self.hardirq_delta += delta;
-        } else {
-            self.softirq_delta += delta;
+// `total` is the only cross-CPU field and is atomic. `local` is accessed only
+// by `owner` with local IRQs disabled, as enforced by `with_local()`.
+unsafe impl Sync for IrqTime {}
+
+impl IrqTime {
+    pub(crate) fn new(owner: ProcessorId) -> Self {
+        Self {
+            owner,
+            total: AtomicU64::new(0),
+            local: UnsafeCell::new(IrqTimeLocal::default()),
         }
     }
 
-    pub fn irqtime_tick_accounted(&mut self, max: u64) -> (u64, u64, u64) {
-        let total_delta = self.tick_delta.min(max);
-        let hardirq_delta = self.hardirq_delta.min(total_delta);
-        let softirq_delta = self.softirq_delta.min(total_delta - hardirq_delta);
+    #[inline]
+    fn with_local<R>(&self, f: impl FnOnce(&mut IrqTimeLocal) -> R) -> R {
+        debug_assert_eq!(self.owner, smp_get_processor_id());
+        debug_assert!(!CurrentIrqArch::is_irq_enabled());
 
-        self.tick_delta -= total_delta;
-        self.hardirq_delta -= hardirq_delta;
-        self.softirq_delta -= softirq_delta;
-
-        (total_delta, hardirq_delta, softirq_delta)
+        // SAFETY: each instance has one owner CPU. All callers run on that CPU
+        // with IRQs disabled, so local fields cannot be accessed concurrently.
+        f(unsafe { &mut *self.local.get() })
     }
 
-    pub fn irqtime_start() {
-        let cpu = smp_get_processor_id();
-        let irq_time = cpu_irq_time(cpu);
-        compiler_fence(Ordering::SeqCst);
-        irq_time.irq_start_time = SchedClock::sched_clock_cpu(cpu) as u64;
-        compiler_fence(Ordering::SeqCst);
+    fn account_delta(&self, delta: u64, is_hardirq: bool) {
+        self.total.fetch_add(delta, Ordering::Relaxed);
+        self.with_local(|local| {
+            local.tick_delta += delta;
+
+            // 根据中断类型分别记录
+            if is_hardirq {
+                local.hardirq_delta += delta;
+            } else {
+                local.softirq_delta += delta;
+            }
+        });
     }
 
-    pub fn irqtime_account_irq(_pcb: Arc<ProcessControlBlock>, is_hardirq: bool) {
-        compiler_fence(Ordering::SeqCst);
+    fn irqtime_tick_accounted(&self, max: u64) -> (u64, u64, u64) {
+        self.with_local(|local| {
+            let total_delta = local.tick_delta.min(max);
+            let hardirq_delta = local.hardirq_delta.min(total_delta);
+            let softirq_delta = local.softirq_delta.min(total_delta - hardirq_delta);
+
+            local.tick_delta -= total_delta;
+            local.hardirq_delta -= hardirq_delta;
+            local.softirq_delta -= softirq_delta;
+
+            (total_delta, hardirq_delta, softirq_delta)
+        })
+    }
+
+    pub(crate) fn irqtime_start() {
         let cpu = smp_get_processor_id();
         let irq_time = cpu_irq_time(cpu);
-        compiler_fence(Ordering::SeqCst);
-        let delta = SchedClock::sched_clock_cpu(cpu) as u64 - irq_time.irq_start_time;
-        compiler_fence(Ordering::SeqCst);
+        irq_time.with_local(|local| {
+            local.irq_start_time = SchedClock::sched_clock_cpu(cpu) as u64;
+        });
+    }
+
+    pub(crate) fn irqtime_account_irq(_pcb: Arc<ProcessControlBlock>, is_hardirq: bool) {
+        let cpu = smp_get_processor_id();
+        let irq_time = cpu_irq_time(cpu);
+        let irq_start_time = irq_time.with_local(|local| local.irq_start_time);
+        let delta = SchedClock::sched_clock_cpu(cpu) as u64 - irq_start_time;
 
         irq_time.account_delta(delta, is_hardirq);
-        compiler_fence(Ordering::SeqCst);
     }
 }
 

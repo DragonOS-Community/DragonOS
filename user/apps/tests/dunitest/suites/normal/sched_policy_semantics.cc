@@ -57,6 +57,10 @@ long RawGetPriorityMin(uint64_t policy) {
     return syscall(SYS_sched_get_priority_min, policy);
 }
 
+long RawRrGetInterval(pid_t tid, struct timespec* interval) {
+    return syscall(SYS_sched_rr_get_interval, tid, interval);
+}
+
 bool IsDragonOS() {
     struct utsname info {};
     return uname(&info) == 0 && strstr(info.release, "dragonos") != nullptr;
@@ -355,6 +359,27 @@ TEST(SchedGetScheduler, ProcStatusKeepsLegacyClassLabel) {
     EXPECT_STREQ("CFS", label);
 }
 
+TEST(SchedRrInterval, CurrentAndErrorsMatchLinux) {
+    struct timespec interval {-1, -1};
+    EXPECT_EQ(0, RawRrGetInterval(0, &interval)) << strerror(errno);
+    EXPECT_GE(interval.tv_sec, 0);
+    EXPECT_GE(interval.tv_nsec, 0);
+    EXPECT_LT(interval.tv_nsec, 1000 * 1000 * 1000);
+
+    errno = 0;
+    EXPECT_EQ(-1, RawRrGetInterval(-1, &interval));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawRrGetInterval(INT_MAX, nullptr));
+    EXPECT_EQ(ESRCH, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawRrGetInterval(0, nullptr));
+    EXPECT_EQ(EFAULT, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawRrGetInterval(0, reinterpret_cast<struct timespec*>(1)));
+    EXPECT_EQ(EFAULT, errno);
+}
+
 TEST(SchedClassAccounting, IdleClassTicksAdvanceWhileCallerSleeps) {
     if (!IsDragonOS()) GTEST_SKIP() << "DragonOS idle-class accounting regression";
 
@@ -494,6 +519,35 @@ TEST(SchedRrPolicy, FairFifoRrRoundTrip) {
     EXPECT_EQ(0, RunIsolatedScenario(RrRoundTripScenario));
 }
 
+int RrIntervalPolicyScenario() {
+    struct timespec interval {-1, -1};
+    if (!SetPolicy(0, SCHED_RR, 20)) return 50;
+    if (RawRrGetInterval(0, &interval) != 0 || interval.tv_sec != 0 ||
+        interval.tv_nsec != 100 * 1000 * 1000) {
+        return 51;
+    }
+
+    if (!SetPolicy(0, SCHED_FIFO, 20)) return 52;
+    interval = {-1, -1};
+    if (sched_rr_get_interval(0, &interval) != 0 || interval.tv_sec != 0 ||
+        interval.tv_nsec != 0) {
+        return 53;
+    }
+
+    if (!SetPolicy(0, SCHED_OTHER, 0)) return 54;
+    interval = {-1, -1};
+    if (RawRrGetInterval(0, &interval) != 0 || interval.tv_sec != 0 ||
+        interval.tv_nsec != 0) {
+        return 55;
+    }
+    return 0;
+}
+
+TEST(SchedRrInterval, PolicyIntervalsMatchLinux) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(RrIntervalPolicyScenario));
+}
+
 int FifoForkScenario() {
     if (!SetPolicy(0, SCHED_FIFO, 20)) return 20;
     pid_t inherited = fork();
@@ -609,6 +663,11 @@ TEST(SchedSetScheduler, OtherTidAndNestedCloneReset) {
         FAIL() << "worker did not publish its TID within 5 seconds";
     }
     const pid_t tid = state.tid.load(std::memory_order_acquire);
+    struct timespec interval {-1, -1};
+    EXPECT_EQ(0, RawRrGetInterval(tid, &interval)) << strerror(errno);
+    EXPECT_GE(interval.tv_sec, 0);
+    EXPECT_GE(interval.tv_nsec, 0);
+    EXPECT_LT(interval.tv_nsec, 1000 * 1000 * 1000);
     RawSchedParam zero {0};
     EXPECT_EQ(0, RawSetScheduler(tid, SCHED_OTHER | SCHED_RESET_ON_FORK, &zero)) << strerror(errno);
     EXPECT_EQ(SCHED_OTHER | SCHED_RESET_ON_FORK, sched_getscheduler(tid));

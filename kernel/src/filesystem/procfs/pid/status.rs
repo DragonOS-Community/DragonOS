@@ -72,6 +72,7 @@ impl StatusFileOps {
             _ => match sched_info_guard.policy() {
                 crate::sched::LinuxSchedPolicy::Normal => "CFS",
                 crate::sched::LinuxSchedPolicy::Fifo => "FIFO",
+                crate::sched::LinuxSchedPolicy::Rr => "RR",
             },
         };
         let vrtime = pcb.sched_info().sched_entity.vruntime;

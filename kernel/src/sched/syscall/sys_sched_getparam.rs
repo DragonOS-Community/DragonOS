@@ -39,7 +39,7 @@ impl Syscall for SysSchedGetparam {
 
         let sched_priority = match policy {
             LinuxSchedPolicy::Normal => 0,
-            LinuxSchedPolicy::Fifo => {
+            LinuxSchedPolicy::Fifo | LinuxSchedPolicy::Rr => {
                 PrioUtil::internal_rt_prio_to_user(normal_prio).ok_or_else(|| {
                     log::error!(
                         "task {} has invalid internal RT priority {}",

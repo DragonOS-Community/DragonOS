@@ -1365,7 +1365,7 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     };
 
     if reset_on_fork {
-        if fork_policy == LinuxSchedPolicy::Fifo {
+        if fork_policy.is_realtime() {
             // Linux resets RT children to SCHED_NORMAL at nice 0.
             fork_policy = LinuxSchedPolicy::Normal;
             fork_prio = prio::DEFAULT_PRIO;
@@ -1392,7 +1392,7 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     }
     debug_assert_eq!(
         PrioUtil::rt_prio(fork_prio),
-        fork_policy == LinuxSchedPolicy::Fifo,
+        fork_policy.is_realtime(),
         "fork policy and inherited normal priority disagree"
     );
     pcb.sched_info().set_policy(fork_policy);

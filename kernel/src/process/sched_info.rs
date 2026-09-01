@@ -41,8 +41,12 @@ pub struct ProcessSchedulerInfo {
     // priority: SchedPriority,
     /// Virtual runtime of the current process.
     // virtual_runtime: AtomicIsize,
-    /// Time slice managed by the real-time scheduler.
-    // rt_time_slice: AtomicIsize,
+    /// Remaining SCHED_RR time slice in scheduler ticks.
+    ///
+    /// Semantic writes are serialized by the task's runqueue lock. The
+    /// atomic provides interior mutability consistent with the other
+    /// scheduler fields; it is not an independent synchronization domain.
+    rr_time_slice_remaining: AtomicU32,
     pub sched_stat: RwLock<SchedInfo>,
     /// Linux base scheduling policy (protected by rq_lock / pi_lock).
     sched_policy: AtomicU8,
@@ -136,7 +140,7 @@ impl ProcessSchedulerInfo {
             state_atomic: AtomicU32::new(ProcessState::Blocked(false).to_u32()),
             pi_lock: SpinLock::new(PiProtected::new(cpus_allowed)),
             // virtual_runtime: AtomicIsize::new(0),
-            // rt_time_slice: AtomicIsize::new(0),
+            rr_time_slice_remaining: AtomicU32::new(crate::sched::realtime::RR_TIMESLICE_TICKS),
             // priority: SchedPriority::new(100).unwrap(),
             sched_stat: RwLock::new(SchedInfo::default()),
             sched_policy: AtomicU8::new(LinuxSchedPolicy::Normal.to_u8()),
@@ -338,17 +342,16 @@ impl ProcessSchedulerInfo {
     //     self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
     // }
 
-    // pub fn rt_time_slice(&self) -> isize {
-    //     return self.rt_time_slice.load(Ordering::SeqCst);
-    // }
+    #[inline]
+    pub(crate) fn rr_time_slice_remaining(&self) -> u32 {
+        self.rr_time_slice_remaining.load(Ordering::Relaxed)
+    }
 
-    // pub fn set_rt_time_slice(&self, rt_time_slice: isize) {
-    //     self.rt_time_slice.store(rt_time_slice, Ordering::SeqCst);
-    // }
-
-    // pub fn increase_rt_time_slice(&self, delta: isize) {
-    //     self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
-    // }
+    #[inline]
+    pub(crate) fn set_rr_time_slice_remaining(&self, remaining: u32) {
+        self.rr_time_slice_remaining
+            .store(remaining, Ordering::Relaxed);
+    }
 
     /// Read the scheduling policy.
     #[inline]

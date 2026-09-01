@@ -46,8 +46,12 @@ impl SysSchedSetscheduler {
                 })
             }
             SCHED_RR => {
-                PrioUtil::user_rt_prio_to_internal(priority).ok_or(SystemError::EINVAL)?;
-                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+                let priority =
+                    PrioUtil::user_rt_prio_to_internal(priority).ok_or(SystemError::EINVAL)?;
+                Ok(SchedChangeRequest::Rr {
+                    priority,
+                    reset_on_fork,
+                })
             }
             SCHED_BATCH | SCHED_IDLE => {
                 if priority != 0 {
@@ -74,34 +78,39 @@ impl SysSchedSetscheduler {
         }
 
         let rtprio_limit = match request {
-            SchedChangeRequest::Fifo { .. } => Some(target.get_rlimit(RLimitID::Rtprio).rlim_cur),
+            SchedChangeRequest::Fifo { .. } | SchedChangeRequest::Rr { .. } => {
+                Some(target.get_rlimit(RLimitID::Rtprio).rlim_cur)
+            }
             SchedChangeRequest::Normal { .. } => None,
         };
         let pi_guard = target.sched_info().pi_lock_irqsave();
         let reset_on_fork = match request {
             SchedChangeRequest::Normal { reset_on_fork }
-            | SchedChangeRequest::Fifo { reset_on_fork, .. } => reset_on_fork,
+            | SchedChangeRequest::Fifo { reset_on_fork, .. }
+            | SchedChangeRequest::Rr { reset_on_fork, .. } => reset_on_fork,
         };
         if pi_guard.sched_reset_on_fork() && !reset_on_fork {
             return Ok(false);
         }
 
-        let SchedChangeRequest::Fifo { priority, .. } = request else {
-            return Ok(true);
+        let (new_policy, priority) = match request {
+            SchedChangeRequest::Normal { .. } => return Ok(true),
+            SchedChangeRequest::Fifo { priority, .. } => (LinuxSchedPolicy::Fifo, priority),
+            SchedChangeRequest::Rr { priority, .. } => (LinuxSchedPolicy::Rr, priority),
         };
         let new_user_priority =
             PrioUtil::internal_rt_prio_to_user(priority).ok_or(SystemError::EINVAL)?;
         let old_policy = target.sched_info().policy();
         let old_user_priority = match old_policy {
             LinuxSchedPolicy::Normal => 0,
-            LinuxSchedPolicy::Fifo => {
+            LinuxSchedPolicy::Fifo | LinuxSchedPolicy::Rr => {
                 PrioUtil::internal_rt_prio_to_user(target.sched_info().normal_prio())
                     .ok_or(SystemError::EIO)?
             }
         };
-        let rtprio_limit = rtprio_limit.expect("FIFO authorization must read RLIMIT_RTPRIO");
+        let rtprio_limit = rtprio_limit.expect("RT authorization must read RLIMIT_RTPRIO");
 
-        if old_policy != LinuxSchedPolicy::Fifo && rtprio_limit == 0 {
+        if old_policy != new_policy && rtprio_limit == 0 {
             return Ok(false);
         }
         if new_user_priority > old_user_priority && new_user_priority as u64 > rtprio_limit {

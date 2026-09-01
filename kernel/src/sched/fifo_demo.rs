@@ -602,10 +602,14 @@ fn affinity_target_closure(state: Arc<AffinityRaceState>) -> KernelThreadClosure
     KernelThreadClosure::EmptyClosure((
         Box::new(move || {
             state.target_started.store(true, Ordering::Release);
-            let started = clock();
-            while !state.abort.load(Ordering::Acquire)
-                && clock().wrapping_sub(started) < TEST_TIMEOUT_TICKS
-            {
+            let mut race_started = None;
+            while !state.abort.load(Ordering::Acquire) {
+                if state.start.load(Ordering::Acquire) {
+                    let started = *race_started.get_or_insert_with(clock);
+                    if clock().wrapping_sub(started) >= TEST_TIMEOUT_TICKS {
+                        break;
+                    }
+                }
                 let cpu = smp_get_processor_id().data() as usize;
                 if cpu < usize::BITS as usize {
                     state.visited_cpus.fetch_or(1usize << cpu, Ordering::AcqRel);
@@ -684,6 +688,46 @@ fn run_policy_affinity_race(control_cpu: ProcessorId, remote_cpus: &[ProcessorId
     ok &= wait_off_rq(&controller);
     ok &= ProcessManager::wakeup(&target).is_ok();
     ok &= wait_until(|| state.target_started.load(Ordering::Acquire));
+
+    // Deterministically cover both Fair and FIFO migrated enqueue before the
+    // policy/affinity race. The concurrent rounds below then stress the same
+    // transactions without relying on their relative scheduling order for
+    // basic migration coverage.
+    if remote_cpus.len() >= 2 {
+        let second_remote = remote_cpus[1];
+        assert!(
+            ProcessManager::set_cpus_allowed(&target, CpuMask::from_cpu(second_remote)).is_ok(),
+            "Fair migration preflight affinity update failed"
+        );
+        assert!(
+            wait_until(|| target.sched_info().on_cpu() == Some(second_remote)),
+            "Fair migration preflight did not reach the destination CPU"
+        );
+        assert!(
+            ProcessManager::set_scheduler(&target, SchedChangeRequest::Fifo { priority: 50 })
+                .is_ok(),
+            "FIFO migration preflight policy update failed"
+        );
+        assert!(
+            ProcessManager::set_cpus_allowed(&target, initial_mask.clone()).is_ok(),
+            "FIFO migration preflight affinity update failed"
+        );
+        assert!(
+            wait_until(|| target.sched_info().on_cpu() == Some(first_remote)),
+            "FIFO migration preflight did not reach the destination CPU"
+        );
+        assert!(
+            ProcessManager::set_scheduler(
+                &target,
+                SchedChangeRequest::Normal {
+                    reset_on_fork: false,
+                },
+            )
+            .is_ok(),
+            "migration preflight failed to restore the Fair policy"
+        );
+    }
+
     ok &= ProcessManager::wakeup(&controller).is_ok();
     state.start.store(true, Ordering::Release);
 

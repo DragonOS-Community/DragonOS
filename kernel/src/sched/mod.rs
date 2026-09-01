@@ -694,10 +694,6 @@ impl CpuRunQueue {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
         }
 
-        if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
-            todo!()
-        }
-
         // 2. enqueue_task
         self.enqueue_task(pcb.clone(), flags);
 
@@ -1415,6 +1411,14 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
         cpu
     );
 
+    let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+    let old_cpu = pcb.sched_info().on_cpu();
+    if pcb.sched_info().sched_class() == SchedClass::Fair
+        && (on_rq == OnRq::Migrating || old_cpu.is_some_and(|old_cpu| old_cpu != cpu))
+    {
+        CompletelyFairScheduler::prepare_task_rq_migration(pcb);
+    }
+
     // TODO: Fixme There is not implement group sched;
     let se = pcb.sched_info().sched_entity();
     let rq = cpu_rq(cpu.data() as usize);
@@ -1474,12 +1478,9 @@ pub fn request_task_migration(
     }
 
     let rq = cpu_rq(src_cpu.data() as usize);
-    let update_clock = src_cpu == smp_get_processor_id();
     let (rq, _guard) = rq.self_lock();
 
-    if update_clock {
-        rq.update_rq_clock();
-    }
+    rq.update_rq_clock();
 
     if Arc::ptr_eq(&rq.current(), pcb) {
         pcb.sched_info().set_migrate_to(Some(dest_cpu));
@@ -1494,13 +1495,11 @@ pub fn request_task_migration(
     }
 
     if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
-        rq.dequeue_task(
+        rq.deactivate_task(
             pcb.clone(),
             DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
         );
         crate::process::rseq::Rseq::on_migrate(pcb);
-        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::None;
-        pcb.sched_info().set_on_cpu(None);
         drop(_guard);
 
         pcb.sched_info().wait_until_not_running();

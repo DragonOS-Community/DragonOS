@@ -997,6 +997,14 @@ impl CfsRunQueue {
 
     /// 将实体加入队列
     pub fn enqueue_entity(&mut self, se: &Arc<FairSchedEntity>, flags: EnqueueFlag) {
+        #[cfg(any(debug_assertions, feature = "fifo_demo"))]
+        if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
+            assert_eq!(
+                se.avg.last_update_time, 0,
+                "a migrated Fair entity must be detached before destination enqueue"
+            );
+        }
+
         let is_curr = self.is_curr(se);
 
         if is_curr {
@@ -1036,7 +1044,7 @@ impl CfsRunQueue {
     pub fn dequeue_entity(&mut self, se: &Arc<FairSchedEntity>, flags: DequeueFlag) {
         let mut action = UpdateAvgFlags::UPDATE_TG;
 
-        if se.is_task() && se.on_rq == OnRq::Migrating {
+        if se.is_task() && *se.pcb().sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
             action |= UpdateAvgFlags::DO_DETACH;
         }
 
@@ -1395,8 +1403,7 @@ impl CompletelyFairScheduler {
         Self::detach_task_load_avg(rq, pcb);
     }
 
-    /// Attach a task's PELT contribution before it enters the fair class.
-    pub fn switched_to_fair(rq: &mut CpuRunQueue, pcb: &Arc<ProcessControlBlock>) {
+    fn attach_task_load_avg(rq: &mut CpuRunQueue, pcb: &Arc<ProcessControlBlock>) {
         let se = pcb.sched_info().sched_entity();
         debug_assert!(Arc::ptr_eq(&se.cfs_rq(), &rq.cfs_rq()));
         let cfs = se.cfs_rq();
@@ -1405,6 +1412,40 @@ impl CompletelyFairScheduler {
         // the destination rq clock before restoring its contribution.
         cfs.update_load_avg(&se, UpdateAvgFlags::empty());
         cfs.attach_entity_load_avg(&se);
+    }
+
+    /// Attach a task's PELT contribution before it enters the fair class.
+    pub fn switched_to_fair(rq: &mut CpuRunQueue, pcb: &Arc<ProcessControlBlock>) {
+        Self::attach_task_load_avg(rq, pcb);
+    }
+
+    /// Prepare a Fair entity before changing its CPU/CFS runqueue binding.
+    ///
+    /// A runnable migration has already detached under the source rq lock.
+    /// Sleeping tasks remain attached on Linux, so a wakeup migration must
+    /// synchronize and detach that contribution from the retained source rq.
+    pub(crate) fn prepare_task_rq_migration(pcb: &Arc<ProcessControlBlock>) {
+        let se = pcb.sched_info().sched_entity();
+        if se.avg.last_update_time == 0 {
+            return;
+        }
+
+        if *pcb.sched_info().on_rq.lock_irqsave() != OnRq::Migrating {
+            let old_rq = se.cfs_rq().rq();
+            let (old_rq, _old_rq_guard) = old_rq.self_lock();
+            old_rq.update_rq_clock();
+            Self::detach_task_load_avg(old_rq, pcb);
+        }
+
+        // A zero timestamp tells destination enqueue_entity() to attach the
+        // migrated entity to its new CFS runqueue.
+        se.force_mut().avg.last_update_time = 0;
+    }
+
+    /// Restore the source PELT attachment when an asynchronous stop cancels
+    /// a current-task migration after source dequeue.
+    pub(crate) fn cancel_task_rq_migration(rq: &mut CpuRunQueue, pcb: &Arc<ProcessControlBlock>) {
+        Self::attach_task_load_avg(rq, pcb);
     }
 
     /// Remove the final PELT contribution after a Fair task exits and leaves

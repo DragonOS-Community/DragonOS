@@ -49,6 +49,10 @@ long RawSetScheduler(pid_t tid, int policy, const RawSchedParam* param) {
     return syscall(SYS_sched_setscheduler, tid, policy, param);
 }
 
+long RawSetParam(pid_t tid, const RawSchedParam* param) {
+    return syscall(SYS_sched_setparam, tid, param);
+}
+
 long RawGetPriorityMax(uint64_t policy) {
     return syscall(SYS_sched_get_priority_max, policy);
 }
@@ -285,6 +289,34 @@ TEST(SchedParamAbi, GetParamWritesExactlyFourBytes) {
     for (uint8_t byte : value.canary) EXPECT_EQ(0xa5, byte);
 }
 
+TEST(SchedSetParam, CurrentOtherPriorityZero) {
+    RawSchedParam param {0};
+    EXPECT_EQ(0, RawSetParam(0, &param)) << strerror(errno);
+    EXPECT_TRUE(ReadPolicyAndPriority(0, SCHED_OTHER, 0));
+}
+
+TEST(SchedSetParam, ErrorOrderingMatchesLinux) {
+    RawSchedParam zero {0};
+    RawSchedParam invalid {INT_MAX};
+    constexpr pid_t kMissingTid = INT_MAX;
+
+    errno = 0;
+    EXPECT_EQ(-1, RawSetParam(-1, &zero));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawSetParam(0, nullptr));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawSetParam(kMissingTid, reinterpret_cast<RawSchedParam*>(-1)));
+    EXPECT_EQ(EFAULT, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawSetParam(kMissingTid, &invalid));
+    EXPECT_EQ(ESRCH, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawSetParam(0, &invalid));
+    EXPECT_EQ(EINVAL, errno);
+}
+
 TEST(SchedParamAbi, SetParamReadsExactlyFourBytes) {
     const long page_size = sysconf(_SC_PAGESIZE);
     ASSERT_GT(page_size, 0);
@@ -299,7 +331,8 @@ TEST(SchedParamAbi, SetParamReadsExactlyFourBytes) {
     pid_t child = fork();
     ASSERT_GE(child, 0) << strerror(errno);
     if (child == 0) {
-        _exit(RawSetScheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK, param) == 0 ? 0 : errno);
+        if (RawSetScheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK, param) != 0) _exit(errno);
+        _exit(RawSetParam(0, param) == 0 ? 0 : errno);
     }
     EXPECT_EQ(0, WaitForChild(child));
     EXPECT_EQ(0, munmap(mapping, static_cast<size_t>(page_size) * 2));
@@ -312,10 +345,11 @@ TEST(SchedParamAbi, LibcWrapperInterop) {
         struct sched_param param {};
         param.sched_priority = 0;
         if (sched_setscheduler(0, SCHED_OTHER | SCHED_RESET_ON_FORK, &param) != 0) _exit(10);
+        if (sched_setparam(0, &param) != 0) _exit(11);
         struct sched_param out {};
         memset(&out, 0xa5, sizeof(out));
-        if (sched_getparam(0, &out) != 0 || out.sched_priority != 0) _exit(11);
-        if (sched_getscheduler(0) != (SCHED_OTHER | SCHED_RESET_ON_FORK)) _exit(12);
+        if (sched_getparam(0, &out) != 0 || out.sched_priority != 0) _exit(12);
+        if (sched_getscheduler(0) != (SCHED_OTHER | SCHED_RESET_ON_FORK)) _exit(13);
         _exit(0);
     }
     EXPECT_EQ(0, WaitForChild(child));
@@ -548,6 +582,49 @@ TEST(SchedRrInterval, PolicyIntervalsMatchLinux) {
     EXPECT_EQ(0, RunIsolatedScenario(RrIntervalPolicyScenario));
 }
 
+int SetParamStateScenario() {
+    RawSchedParam zero {0};
+    if (!SetPolicy(0, SCHED_OTHER | SCHED_RESET_ON_FORK, 0)) return 10 + errno;
+    if (RawSetParam(0, &zero) != 0 ||
+        !ReadPolicyAndPriority(0, SCHED_OTHER | SCHED_RESET_ON_FORK, 0)) {
+        return 20 + errno;
+    }
+
+    if (!SetPolicy(0, SCHED_FIFO | SCHED_RESET_ON_FORK, 10)) return 50 + errno;
+    constexpr int priorities[] = {1, 99};
+    for (int priority : priorities) {
+        RawSchedParam param {priority};
+        if (RawSetParam(0, &param) != 0 ||
+            !ReadPolicyAndPriority(0, SCHED_FIFO | SCHED_RESET_ON_FORK, priority)) {
+            return 60 + errno;
+        }
+    }
+    struct timespec interval {-1, -1};
+    if (RawRrGetInterval(0, &interval) != 0 || interval.tv_sec != 0 ||
+        interval.tv_nsec != 0) {
+        return 70 + errno;
+    }
+
+    if (!SetPolicy(0, SCHED_RR | SCHED_RESET_ON_FORK, 20)) return 80 + errno;
+    RawSchedParam rr {30};
+    if (RawSetParam(0, &rr) != 0 ||
+        !ReadPolicyAndPriority(0, SCHED_RR | SCHED_RESET_ON_FORK, 30)) {
+        return 90 + errno;
+    }
+    interval = {-1, -1};
+    if (RawRrGetInterval(0, &interval) != 0 || interval.tv_sec != 0 ||
+        interval.tv_nsec != 100 * 1000 * 1000) {
+        return 100 + errno;
+    }
+
+    return SetPolicy(0, SCHED_OTHER, 0) ? 0 : 110 + errno;
+}
+
+TEST(SchedSetParam, PreservesPolicyResetAndConfiguredQuantum) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RT support";
+    EXPECT_EQ(0, RunIsolatedScenario(SetParamStateScenario));
+}
+
 int FifoForkScenario() {
     if (!SetPolicy(0, SCHED_FIFO, 20)) return 20;
     pid_t inherited = fork();
@@ -680,6 +757,30 @@ TEST(SchedSetScheduler, OtherTidAndNestedCloneReset) {
     EXPECT_EQ(ESRCH, errno);
 }
 
+TEST(SchedSetParam, OtherTidPreservesResetFlag) {
+    WorkerState state;
+    pthread_t worker;
+    ASSERT_EQ(0, pthread_create(&worker, nullptr, FlagWorker, &state));
+    for (int attempt = 0;
+         attempt < 500 && state.tid.load(std::memory_order_acquire) == 0; ++attempt) {
+        usleep(10 * 1000);
+    }
+    const pid_t tid = state.tid.load(std::memory_order_acquire);
+    if (tid <= 0) {
+        state.proceed.store(1, std::memory_order_release);
+        pthread_join(worker, nullptr);
+        FAIL() << "worker did not publish its TID within 5 seconds";
+    }
+
+    RawSchedParam zero {0};
+    EXPECT_EQ(0, RawSetScheduler(tid, SCHED_OTHER | SCHED_RESET_ON_FORK, &zero)) << strerror(errno);
+    EXPECT_EQ(0, RawSetParam(tid, &zero)) << strerror(errno);
+    EXPECT_EQ(SCHED_OTHER | SCHED_RESET_ON_FORK, sched_getscheduler(tid));
+    state.proceed.store(1, std::memory_order_release);
+    ASSERT_EQ(0, pthread_join(worker, nullptr));
+    EXPECT_EQ(0, state.result);
+}
+
 int RunCredentialCaller(pid_t target, uid_t ruid, uid_t euid, bool set_flag,
                         int expected_errno, bool expect_get_success) {
     pid_t caller = fork();
@@ -695,6 +796,20 @@ int RunCredentialCaller(pid_t target, uid_t ruid, uid_t euid, bool set_flag,
         errno = 0;
         long result = RawSetScheduler(
             target, set_flag ? SCHED_OTHER | SCHED_RESET_ON_FORK : SCHED_OTHER, &zero);
+        if (expected_errno == 0) _exit(result == 0 ? 0 : 30 + errno);
+        _exit(result == -1 && errno == expected_errno ? 0 : 60 + errno);
+    }
+    return WaitForChild(caller);
+}
+
+int RunSetParamCredentialCaller(pid_t target, uid_t ruid, uid_t euid, int expected_errno) {
+    pid_t caller = fork();
+    if (caller < 0) return 200;
+    if (caller == 0) {
+        if (setresuid(ruid, euid, euid) != 0) _exit(100 + errno);
+        RawSchedParam zero {0};
+        errno = 0;
+        const long result = RawSetParam(target, &zero);
         if (expected_errno == 0) _exit(result == 0 ? 0 : 30 + errno);
         _exit(result == -1 && errno == expected_errno ? 0 : 60 + errno);
     }
@@ -727,6 +842,10 @@ TEST(SchedPermission, OwnerCapabilityAndProtectedClearMatrix) {
 
     // Cross-owner queries are unrestricted, while setters require owner or
     // CAP_SYS_NICE. Matching only current real UID must not authorize.
+    EXPECT_EQ(0, RunSetParamCredentialCaller(target, 1002, 1002, EPERM));
+    EXPECT_EQ(0, RunSetParamCredentialCaller(target, 1002, 1001, 0));
+    RawSchedParam zero {0};
+    EXPECT_EQ(0, RawSetParam(target, &zero)) << strerror(errno);
     EXPECT_EQ(0, RunCredentialCaller(target, 1002, 1002, true, EPERM, true));
     EXPECT_EQ(0, RunCredentialCaller(target, 1001, 1002, true, EPERM, true));
 
@@ -737,7 +856,6 @@ TEST(SchedPermission, OwnerCapabilityAndProtectedClearMatrix) {
     EXPECT_EQ(SCHED_OTHER | SCHED_RESET_ON_FORK, sched_getscheduler(target));
 
     // The root parent has CAP_SYS_NICE in the initial namespace and may clear.
-    RawSchedParam zero {0};
     EXPECT_EQ(0, RawSetScheduler(target, SCHED_OTHER, &zero)) << strerror(errno);
     EXPECT_EQ(SCHED_OTHER, sched_getscheduler(target));
 
@@ -1011,6 +1129,108 @@ int RrRlimitScenario() {
 TEST(SchedRrRlimit, PriorityAndExactPolicyRules) {
     if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
     EXPECT_EQ(0, RunIsolatedScenario(RrRlimitScenario));
+}
+
+int SetParamRlimitScenario() {
+    struct rlimit high {10, 10};
+    if (setrlimit(RLIMIT_RTPRIO, &high) != 0) return 10 + errno;
+    if (syscall(SYS_setresuid, 1001, 1001, 1001) != 0) return 20 + errno;
+    if (!SetPolicy(0, SCHED_RR, 10)) return 30 + errno;
+
+    RawSchedParam raised {11};
+    errno = 0;
+    if (RawSetParam(0, &raised) == 0 || errno != EPERM ||
+        !ReadPolicyAndPriority(0, SCHED_RR, 10)) {
+        return 40 + errno;
+    }
+
+    struct rlimit low {0, 10};
+    if (setrlimit(RLIMIT_RTPRIO, &low) != 0) return 50 + errno;
+    RawSchedParam lowered {1};
+    if (RawSetParam(0, &lowered) != 0 ||
+        !ReadPolicyAndPriority(0, SCHED_RR, 1)) {
+        return 60 + errno;
+    }
+    RawSchedParam increase {2};
+    errno = 0;
+    if (RawSetParam(0, &increase) == 0 || errno != EPERM ||
+        !ReadPolicyAndPriority(0, SCHED_RR, 1)) {
+        return 70 + errno;
+    }
+    if (RawSetParam(0, &lowered) != 0) return 80 + errno;
+    return SetPolicy(0, SCHED_OTHER, 0) ? 0 : 90 + errno;
+}
+
+TEST(SchedSetParam, UnprivilegedRlimitRaiseLowerAndNoop) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(SetParamRlimitScenario));
+}
+
+struct SetParamPriorityRaceState {
+    std::atomic<int> ready {0};
+    std::atomic<int> start {0};
+    pid_t target = -1;
+};
+
+struct SetParamPriorityRaceWriter {
+    SetParamPriorityRaceState* state = nullptr;
+    int priority = 0;
+    int result = -1;
+};
+
+void* SetParamPriorityRaceWorker(void* arg) {
+    auto* writer = static_cast<SetParamPriorityRaceWriter*>(arg);
+    writer->state->ready.fetch_add(1, std::memory_order_release);
+    while (writer->state->start.load(std::memory_order_acquire) == 0) sched_yield();
+
+    RawSchedParam param {writer->priority};
+    errno = 0;
+    writer->result = RawSetParam(writer->state->target, &param) == 0 ? 0 : errno;
+    return nullptr;
+}
+
+int SetParamPriorityAuthorizationRaceScenario() {
+    constexpr int kHighWriters = 16;
+    constexpr int kWriterCount = kHighWriters + 1;
+    struct rlimit high {10, 10};
+    if (setrlimit(RLIMIT_RTPRIO, &high) != 0) return 10 + errno;
+    if (syscall(SYS_setresuid, 1001, 1001, 1001) != 0) return 20 + errno;
+    if (!SetPolicy(0, SCHED_RR, 10)) return 30 + errno;
+
+    struct rlimit zero {0, 10};
+    if (setrlimit(RLIMIT_RTPRIO, &zero) != 0) return 40 + errno;
+
+    SetParamPriorityRaceState state;
+    state.target = static_cast<pid_t>(syscall(SYS_gettid));
+    pthread_t threads[kWriterCount] {};
+    SetParamPriorityRaceWriter writers[kWriterCount] {};
+    for (int index = 0; index < kWriterCount; ++index) {
+        writers[index].state = &state;
+        writers[index].priority = index == kHighWriters ? 1 : 10;
+        if (pthread_create(&threads[index], nullptr, SetParamPriorityRaceWorker,
+                           &writers[index]) != 0) {
+            return 50 + index;
+        }
+    }
+
+    while (state.ready.load(std::memory_order_acquire) != kWriterCount) sched_yield();
+    state.start.store(1, std::memory_order_release);
+    for (int index = 0; index < kWriterCount; ++index) {
+        if (pthread_join(threads[index], nullptr) != 0) return 80 + index;
+    }
+
+    if (writers[kHighWriters].result != 0) return 110 + writers[kHighWriters].result;
+    for (int index = 0; index < kHighWriters; ++index) {
+        if (writers[index].result != 0 && writers[index].result != EPERM) return 140 + index;
+    }
+    return ReadPolicyAndPriority(0, SCHED_RR, 1) ? 0 : 170;
+}
+
+TEST(SchedSetParam, ConcurrentPriorityChangeRetriesAuthorization) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        ASSERT_EQ(0, RunIsolatedScenario(SetParamPriorityAuthorizationRaceScenario));
+    }
 }
 
 struct SharedFifoState {
@@ -1301,8 +1521,10 @@ int ResetOnlyKeepsQueueOrderScenario() {
     }
 
     if (!SetPolicy(0, SCHED_FIFO, 50)) return 57;
+    RawSchedParam unchanged {20};
     if (kill(first, SIGCONT) != 0 || kill(second, SIGCONT) != 0 ||
-        !SetPolicy(first, SCHED_FIFO | SCHED_RESET_ON_FORK, 20)) {
+        !SetPolicy(first, SCHED_FIFO | SCHED_RESET_ON_FORK, 20) ||
+        RawSetParam(first, &unchanged) != 0) {
         (void)SetPolicy(0, SCHED_OTHER, 0);
         return 58;
     }
@@ -1594,6 +1816,120 @@ int FifoRemoteScenario() {
     return stress_result == 0 ? 0 : 54;
 }
 
+int SetParamRemoteRunningScenario() {
+    int controller_cpu = -1;
+    int worker_cpu = -1;
+    if (!PickAllowedCpus(&controller_cpu, &worker_cpu) || worker_cpu < 0 ||
+        !PinTask(0, controller_cpu)) {
+        return 60;
+    }
+    SharedFifoState* state = NewSharedFifoState();
+    if (state == nullptr) return 61;
+
+    pid_t worker = fork();
+    if (worker < 0) return 62;
+    if (worker == 0) {
+        if (!PinTask(0, worker_cpu) || !SetPolicy(0, SCHED_FIFO, 10)) _exit(20);
+        __atomic_store_n(&state->stress_started, 1, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&state->stress_release, __ATOMIC_ACQUIRE) == 0) {
+            __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        }
+        _exit(0);
+    }
+    ChildGuard worker_guard(worker);
+    bool started = false;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        if (__atomic_load_n(&state->stress_started, __ATOMIC_ACQUIRE) == 1) {
+            started = true;
+            break;
+        }
+        usleep(10 * 1000);
+    }
+    if (!started) return 63;
+
+    for (int round = 0; round < 64; ++round) {
+        const int priority = (round & 1) == 0 ? 1 : 99;
+        RawSchedParam param {priority};
+        if (RawSetParam(worker, &param) != 0 ||
+            !ReadPolicyAndPriority(worker, SCHED_FIFO, priority)) {
+            return 64 + errno;
+        }
+    }
+    __atomic_store_n(&state->stress_release, 1, __ATOMIC_RELEASE);
+    const int worker_result = WaitForChild(worker);
+    worker_guard.Release();
+    munmap(state, sizeof(*state));
+    return worker_result == 0 ? 0 : 65;
+}
+
+struct SetParamPolicyRaceState {
+    std::atomic<int> tid {0};
+    std::atomic<int> start {0};
+    std::atomic<int> stop {0};
+    int worker_cpu = -1;
+    int result = -1;
+};
+
+void* SetParamPolicyRaceWorker(void* arg) {
+    auto* state = static_cast<SetParamPolicyRaceState*>(arg);
+    if (!PinTask(0, state->worker_cpu) || !SetPolicy(0, SCHED_RR, 10)) {
+        state->result = 10 + errno;
+        state->tid.store(-1, std::memory_order_release);
+        return nullptr;
+    }
+    state->tid.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
+    while (state->start.load(std::memory_order_acquire) == 0) sched_yield();
+
+    int round = 0;
+    while (state->stop.load(std::memory_order_acquire) == 0) {
+        RawSchedParam param {(round++ & 1) == 0 ? 1 : 99};
+        if (RawSetParam(0, &param) != 0) {
+            state->result = 20 + errno;
+            return nullptr;
+        }
+        sched_yield();
+    }
+    state->result = SetPolicy(0, SCHED_OTHER, 0) ? 0 : 30 + errno;
+    return nullptr;
+}
+
+int SetParamPolicyRaceScenario() {
+    int controller_cpu = -1;
+    int worker_cpu = -1;
+    if (!PickAllowedCpus(&controller_cpu, &worker_cpu) || worker_cpu < 0 ||
+        !PinTask(0, controller_cpu)) {
+        return 70;
+    }
+
+    SetParamPolicyRaceState state;
+    state.worker_cpu = worker_cpu;
+    pthread_t worker;
+    if (pthread_create(&worker, nullptr, SetParamPolicyRaceWorker, &state) != 0) return 71;
+    for (int attempt = 0; attempt < 200 && state.tid.load(std::memory_order_acquire) == 0;
+         ++attempt) {
+        usleep(10 * 1000);
+    }
+    const int tid = state.tid.load(std::memory_order_acquire);
+    if (tid <= 0) {
+        state.start.store(1, std::memory_order_release);
+        pthread_join(worker, nullptr);
+        return 72;
+    }
+
+    state.start.store(1, std::memory_order_release);
+    for (int round = 0; round < 256; ++round) {
+        const int policy = (round & 1) == 0 ? SCHED_FIFO : SCHED_RR;
+        if (!SetPolicy(tid, policy, 20)) {
+            state.stop.store(1, std::memory_order_release);
+            pthread_join(worker, nullptr);
+            return 73 + errno;
+        }
+    }
+    state.stop.store(1, std::memory_order_release);
+    if (pthread_join(worker, nullptr) != 0) return 74;
+    return state.result;
+}
+
 TEST(SchedFifoBehavior, SamePriorityYieldMovesCurrentToTail) {
     if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace FIFO support";
     EXPECT_EQ(0, RunIsolatedScenario(FifoYieldScenario));
@@ -1629,7 +1965,7 @@ TEST(SchedRrBehavior, BlockedWakeupJoinsPriorityTail) {
     EXPECT_EQ(0, RunIsolatedScenario(RrBlockedWakeTailScenario));
 }
 
-TEST(SchedPolicyChange, ResetOnlyDoesNotMoveQueuedTask) {
+TEST(SchedPolicyChange, ResetAndSetParamNoopDoNotMoveQueuedTask) {
     if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace FIFO support";
     EXPECT_EQ(0, RunIsolatedScenario(ResetOnlyKeepsQueueOrderScenario));
 }
@@ -1646,6 +1982,24 @@ TEST(SchedFifoSmp, RemotePreemptionAndRunningTargetStress) {
     ASSERT_TRUE(PickAllowedCpus(&first, &second));
     if (second < 0) GTEST_SKIP() << "requires at least two allowed CPUs";
     EXPECT_EQ(0, RunIsolatedScenario(FifoRemoteScenario));
+}
+
+TEST(SchedSetParam, RemoteRunningTaskPriorityStress) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace FIFO support";
+    int first = -1;
+    int second = -1;
+    ASSERT_TRUE(PickAllowedCpus(&first, &second));
+    if (second < 0) GTEST_SKIP() << "requires at least two allowed CPUs";
+    EXPECT_EQ(0, RunIsolatedScenario(SetParamRemoteRunningScenario));
+}
+
+TEST(SchedSetParam, PolicyChangeRaceRetriesWithFreshValidation) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RT support";
+    int first = -1;
+    int second = -1;
+    ASSERT_TRUE(PickAllowedCpus(&first, &second));
+    if (second < 0) GTEST_SKIP() << "requires at least two allowed CPUs";
+    EXPECT_EQ(0, RunIsolatedScenario(SetParamPolicyRaceScenario));
 }
 
 TEST(SchedRrSmp, RemoteRunqueueRotatesSamePriorityTasks) {

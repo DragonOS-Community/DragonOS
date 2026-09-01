@@ -31,6 +31,16 @@ pub(crate) enum SchedChangeRequest {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerUpdate {
+    Replace(SchedChangeRequest),
+    Parameters {
+        expected_policy: LinuxSchedPolicy,
+        expected_rt_priority: Option<i32>,
+        rt_priority: Option<i32>,
+    },
+}
+
 impl ProcessManager {
     /// Wake up a process.
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
@@ -153,12 +163,56 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         request: SchedChangeRequest,
     ) -> Result<(), SystemError> {
-        if let SchedChangeRequest::Fifo { priority, .. } | SchedChangeRequest::Rr { priority, .. } =
-            request
+        Self::update_scheduler(pcb, SchedulerUpdate::Replace(request)).map(|_| ())
+    }
+
+    /// Atomically update only the scheduler parameters of a task whose base
+    /// policy is expected to remain unchanged.
+    ///
+    /// A `false` result means policy or an authorization-dependent RT priority
+    /// changed before the runqueue-locked commit point. The syscall layer must
+    /// revalidate and authorize the new state before retrying.
+    pub(crate) fn set_scheduler_param(
+        pcb: &Arc<ProcessControlBlock>,
+        expected_policy: LinuxSchedPolicy,
+        expected_rt_priority: Option<i32>,
+        rt_priority: Option<i32>,
+    ) -> Result<bool, SystemError> {
+        Self::update_scheduler(
+            pcb,
+            SchedulerUpdate::Parameters {
+                expected_policy,
+                expected_rt_priority,
+                rt_priority,
+            },
+        )
+    }
+
+    fn update_scheduler(
+        pcb: &Arc<ProcessControlBlock>,
+        update: SchedulerUpdate,
+    ) -> Result<bool, SystemError> {
+        let rt_priority = match update {
+            SchedulerUpdate::Replace(SchedChangeRequest::Fifo { priority, .. })
+            | SchedulerUpdate::Replace(SchedChangeRequest::Rr { priority, .. }) => Some(priority),
+            SchedulerUpdate::Parameters {
+                expected_policy: LinuxSchedPolicy::Fifo | LinuxSchedPolicy::Rr,
+                expected_rt_priority: Some(_),
+                rt_priority: Some(priority),
+                ..
+            } => Some(priority),
+            SchedulerUpdate::Replace(SchedChangeRequest::Normal { .. })
+            | SchedulerUpdate::Parameters {
+                expected_policy: LinuxSchedPolicy::Normal,
+                expected_rt_priority: None,
+                rt_priority: None,
+            } => None,
+            SchedulerUpdate::Parameters { .. } => return Err(SystemError::EINVAL),
+        };
+        if rt_priority
+            .is_some_and(|priority| !(0..crate::sched::prio::MAX_RT_PRIO - 1).contains(&priority))
         {
-            if !(0..crate::sched::prio::MAX_RT_PRIO - 1).contains(&priority) {
-                return Err(SystemError::EINVAL);
-            }
+            return Err(SystemError::EINVAL);
         }
 
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -204,20 +258,38 @@ impl ProcessManager {
             let old_prio = pcb.sched_info().prio();
             let old_normal_prio = pcb.sched_info().normal_prio();
             let old_reset = pi_guard.sched_reset_on_fork();
-            let (new_policy, new_prio, new_reset) = match request {
-                SchedChangeRequest::Normal { reset_on_fork } => (
+            let (new_policy, new_prio, new_reset) = match update {
+                SchedulerUpdate::Replace(SchedChangeRequest::Normal { reset_on_fork }) => (
                     LinuxSchedPolicy::Normal,
                     pcb.sched_info().static_prio(),
                     reset_on_fork,
                 ),
-                SchedChangeRequest::Fifo {
+                SchedulerUpdate::Replace(SchedChangeRequest::Fifo {
                     priority,
                     reset_on_fork,
-                } => (LinuxSchedPolicy::Fifo, priority, reset_on_fork),
-                SchedChangeRequest::Rr {
+                }) => (LinuxSchedPolicy::Fifo, priority, reset_on_fork),
+                SchedulerUpdate::Replace(SchedChangeRequest::Rr {
                     priority,
                     reset_on_fork,
-                } => (LinuxSchedPolicy::Rr, priority, reset_on_fork),
+                }) => (LinuxSchedPolicy::Rr, priority, reset_on_fork),
+                SchedulerUpdate::Parameters {
+                    expected_policy,
+                    expected_rt_priority,
+                    rt_priority,
+                } => {
+                    if old_policy != expected_policy
+                        || expected_rt_priority.is_some_and(|priority| old_normal_prio != priority)
+                    {
+                        return Ok(false);
+                    }
+                    let priority = match expected_policy {
+                        LinuxSchedPolicy::Normal => pcb.sched_info().static_prio(),
+                        LinuxSchedPolicy::Fifo | LinuxSchedPolicy::Rr => {
+                            rt_priority.expect("RT parameter update validated before locking")
+                        }
+                    };
+                    (old_policy, priority, old_reset)
+                }
             };
             let new_class = new_policy.base_sched_class();
 
@@ -229,7 +301,7 @@ impl ProcessManager {
                 }
                 drop(rq_guard);
                 drop(pi_guard);
-                return Ok(());
+                return Ok(true);
             }
 
             let queued = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued;
@@ -287,7 +359,7 @@ impl ProcessManager {
 
             drop(rq_guard);
             drop(pi_guard);
-            return Ok(());
+            return Ok(true);
         }
     }
 

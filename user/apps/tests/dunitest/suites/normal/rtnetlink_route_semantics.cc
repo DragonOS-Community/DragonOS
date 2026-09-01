@@ -1170,6 +1170,57 @@ TEST(RtnetlinkRouteSemantics, LoopbackIpv4SubnetUsesLinuxLocalRouteIdentity) {
               0);
 }
 
+TEST(RtnetlinkRouteSemantics, TransientBroadcastAndMulticastLookupsFollowLinuxFibSemantics) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 5250;
+    uint32_t veth = if_nametoindex("veth-host1");
+    ASSERT_NE(veth, 0u);
+
+    auto limited = LookupIpv4Route(fd.Get(), "255.255.255.255", ++seq, veth);
+    ASSERT_TRUE(limited.has_value());
+    EXPECT_EQ(limited->table, RT_TABLE_MAIN);
+    EXPECT_EQ(limited->kind, RTN_BROADCAST);
+    EXPECT_EQ(limited->prefix_len, 32);
+    EXPECT_EQ(limited->oif, veth);
+    EXPECT_FALSE(limited->gateway.has_value());
+    bool dumped_limited_broadcast = false;
+    for (const auto& route : DumpRoutes(fd.Get(), ++seq)) {
+        if (route.dst == Ipv4("255.255.255.255") && route.prefix_len == 32) {
+            dumped_limited_broadcast = true;
+            break;
+        }
+    }
+    EXPECT_FALSE(dumped_limited_broadcast)
+            << "limited broadcast must remain a transient lookup decision";
+
+    RouteSpec multicast = MakeIpv4Route("239.1.0.0", 16, veth);
+    multicast.gateway = Ipv4("192.168.1.1");
+    multicast.priority = 5250;
+    DeleteRouteIfPresent(fd.Get(), multicast, &seq);
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                               multicast, ++seq),
+              0);
+
+    for (const auto oif : {std::optional<uint32_t>{}, std::optional<uint32_t>{veth}}) {
+        auto lookup = LookupIpv4Route(fd.Get(), "239.1.1.1", ++seq, oif);
+        if (!lookup.has_value()) {
+            ADD_FAILURE() << "multicast lookup failed";
+            continue;
+        }
+        EXPECT_EQ(lookup->table, RT_TABLE_MAIN);
+        EXPECT_EQ(lookup->kind, RTN_MULTICAST);
+        EXPECT_EQ(lookup->prefix_len, 32);
+        EXPECT_EQ(lookup->oif, veth);
+        EXPECT_EQ(lookup->gateway, multicast.gateway);
+    }
+
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, multicast,
+                               ++seq),
+              0);
+}
+
 TEST(RtnetlinkRouteSemantics, AddressNotificationPrecedesDerivedRouteNotification) {
     FdGuard fd(OpenRouteSocket());
     FdGuard listener(OpenRouteListener(RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE));

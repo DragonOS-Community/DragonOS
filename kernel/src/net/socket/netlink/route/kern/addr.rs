@@ -131,7 +131,7 @@ pub(super) fn do_del_addr(
     Ok(Vec::new())
 }
 
-fn notify_route_changes(netns: &Arc<NetNamespace>, changes: crate::net::route::RouteChanges) {
+fn notify_route_changes(netns: &Arc<NetNamespace>, changes: crate::net::route::RouteNotifications) {
     for removed in changes.removed {
         if let Err(error) = super::route::notify_route(netns, CSegmentType::DELROUTE, removed) {
             log::warn!(

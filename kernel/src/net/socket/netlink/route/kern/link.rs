@@ -261,17 +261,29 @@ pub(super) fn do_set_link(
 
     notify_link_change(&iface);
     if let Some(changes) = route_changes {
-        for added in changes.added {
-            if let Err(error) = super::route::notify_route(&netns, CSegmentType::NEWROUTE, added) {
-                log::warn!("failed to notify link-up connected route: {:?}", error);
-            }
-        }
+        notify_link_route_changes(&netns, changes);
     }
     for cidr in renamed_addresses {
         super::addr::notify_address_change(netns.clone(), &iface, cidr);
     }
 
     Ok(Vec::new())
+}
+
+fn notify_link_route_changes(
+    netns: &Arc<NetNamespace>,
+    changes: crate::net::route::RouteNotifications,
+) {
+    // Linux 6.6's NETDEV_DOWN path marks IPv4 nexthops dead and fib_flush()
+    // removes the aliases without RTM_DELROUTE. Link-up address-derived routes
+    // are regular insertions and do emit RTM_NEWROUTE. Keep that asymmetric ABI
+    // policy here instead of treating the internal FIB delta as notifications.
+    let crate::net::route::RouteNotifications { added, removed: _ } = changes;
+    for route in added {
+        if let Err(error) = super::route::notify_route(netns, CSegmentType::NEWROUTE, route) {
+            log::warn!("failed to notify link-up connected route: {:?}", error);
+        }
+    }
 }
 
 fn find_iface_for_setlink(

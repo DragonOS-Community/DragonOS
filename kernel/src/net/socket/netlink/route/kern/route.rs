@@ -433,26 +433,9 @@ fn dump_routes(
     request: &RouteSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    validate_lookup_tos(request.body().family, request.body().tos)?;
-    if !request.body().flags.is_empty()
-        || request.body().src_len != 0
-        || request.body().dst_len != 0
-        || request.body().scope != RouteScope::Universe as u8
-    {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-    if request.body().table != RouteTable::Unspec as u8
-        || request.body().protocol != RouteProtocol::Unspec as u8
-        || request.body().type_ != RouteType::Unspec as u8
-        || request.attrs().iter().any(|attr| {
-            matches!(
-                attr,
-                RouteAttr::Table(_) | RouteAttr::Oif(_) | RouteAttr::Iif(_)
-            )
-        })
-    {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
+    // Linux applies rtmsg header/attribute dump filters only when the socket
+    // enabled NETLINK_GET_STRICT_CHK. DragonOS does not expose that opt-in yet,
+    // so its default dump path follows Linux's lenient mode and ignores them.
     let family = request.body().family;
     let mut response = Vec::new();
     for entry in route::snapshot(&netns) {
@@ -516,7 +499,7 @@ fn lookup_route(
     let selected_source = if requested_source.is_some() {
         None
     } else {
-        decision.preferred_source.or_else(|| {
+        decision.source.preferred().or_else(|| {
             crate::net::socket::inet::common::pick_configured_source_addr(&iface, &destination)
         })
     };

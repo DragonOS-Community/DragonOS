@@ -30,7 +30,7 @@ pub(crate) enum AddressMutationOutcome {
 
 pub(in crate::net) struct AddressMutationCommit {
     pub outcome: AddressMutationOutcome,
-    pub route_changes: crate::net::route::RouteChanges,
+    pub route_changes: crate::net::route::RouteNotifications,
 }
 
 #[derive(Debug, Clone, Copy)]

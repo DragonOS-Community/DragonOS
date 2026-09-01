@@ -410,8 +410,7 @@ fn get_ephemeral_iface(
         && !remote_ip_addr.is_multicast()
         && !remote_ip_addr.is_broadcast()
     {
-        let decision =
-            crate::net::route::lookup(&netns, *remote_ip_addr).ok_or(SystemError::ENETUNREACH)?;
+        let decision = crate::net::route::lookup(&netns, *remote_ip_addr).ok_or(no_source_error)?;
         let iface = netns
             .device_list()
             .get(&(decision.oif as usize))
@@ -479,8 +478,8 @@ fn route_source_from_decision(
     decision: crate::net::route::RouteLookupResult,
 ) -> Result<smoltcp::wire::IpAddress, SystemError> {
     debug_assert_eq!(decision.oif as usize, iface.nic_id());
-    match decision.preferred_source {
-        Some(source)
+    match decision.source {
+        crate::net::route::RouteSourcePolicy::Preferred(source)
             if iface
                 .common()
                 .ip_addrs()
@@ -489,8 +488,14 @@ fn route_source_from_decision(
         {
             Ok(source)
         }
-        Some(_) => Err(no_source_addr_error(remote)),
-        None => pick_configured_source_addr(iface, remote).ok_or(no_source_addr_error(remote)),
+        crate::net::route::RouteSourcePolicy::Preferred(_) => Err(no_source_addr_error(remote)),
+        crate::net::route::RouteSourcePolicy::SelectConfigured => {
+            pick_configured_source_addr(iface, remote).ok_or(no_source_addr_error(remote))
+        }
+        crate::net::route::RouteSourcePolicy::AllowUnspecified => {
+            Ok(pick_configured_source_addr(iface, remote)
+                .unwrap_or(smoltcp::wire::IpAddress::v4(0, 0, 0, 0)))
+        }
     }
 }
 

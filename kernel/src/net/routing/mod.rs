@@ -36,7 +36,7 @@ pub enum IngressRouteDecision {
 #[derive(Debug)]
 pub struct Router {
     /// Authoritative Linux-visible route state for this network namespace.
-    pub(crate) fib: RwSem<crate::net::route::FibTable>,
+    pub(in crate::net) fib: RwSem<crate::net::route::FibTable>,
     pub(self) nat_tracker: Arc<ConnTracker>,
     pub ns: RwSem<Weak<NetNamespace>>,
 }
@@ -60,9 +60,13 @@ impl Router {
         })
     }
 
-    pub fn lookup_ingress_route(&self, dest_ip: IpAddress) -> Option<IngressRouteDecision> {
+    pub fn lookup_ingress_route(
+        &self,
+        dest_ip: IpAddress,
+        ingress_oif: u32,
+    ) -> Option<IngressRouteDecision> {
         let netns = self.ns.read().upgrade()?;
-        let decision = crate::net::route::lookup_ingress(&netns, dest_ip)?;
+        let decision = crate::net::route::lookup_ingress(&netns, dest_ip, ingress_oif)?;
         let interface = netns.device_list().get(&(decision.oif as usize)).cloned()?;
         match decision.matched.kind {
             crate::net::route::RTN_LOCAL => Some(IngressRouteDecision::Local(interface)),
@@ -132,13 +136,14 @@ pub trait RouterEnableDevice: Iface {
                 // must never re-enter the forwarding path.
                 let router = self.netns_router();
 
-                let decision = match router.lookup_ingress_route(dst_ip.into()) {
-                    Some(d) => d,
-                    None => {
-                        log::warn!("No route to {}", dst_ip);
-                        return Err(None);
-                    }
-                };
+                let decision =
+                    match router.lookup_ingress_route(dst_ip.into(), self.nic_id() as u32) {
+                        Some(d) => d,
+                        None => {
+                            log::warn!("No route to {}", dst_ip);
+                            return Err(None);
+                        }
+                    };
 
                 drop(router);
 

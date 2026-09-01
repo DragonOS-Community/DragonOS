@@ -39,4 +39,13 @@ impl PrioUtil {
             .contains(&prio)
             .then_some((MAX_RT_PRIO - 1) - prio)
     }
+
+    /// Convert the legacy Linux userspace RT priority (1..=99, high to low)
+    /// to DragonOS's internal priority (98..=0, low numeric value wins).
+    #[inline]
+    pub fn user_rt_prio_to_internal(prio: i32) -> Option<i32> {
+        (1..MAX_RT_PRIO)
+            .contains(&prio)
+            .then_some((MAX_RT_PRIO - 1) - prio)
+    }
 }

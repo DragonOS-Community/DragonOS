@@ -23,6 +23,7 @@ pub(crate) enum SchedChangeRequest {
     },
     Fifo {
         priority: i32,
+        reset_on_fork: bool,
     },
 }
 
@@ -148,7 +149,7 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         request: SchedChangeRequest,
     ) -> Result<(), SystemError> {
-        if let SchedChangeRequest::Fifo { priority } = request {
+        if let SchedChangeRequest::Fifo { priority, .. } = request {
             if !(0..crate::sched::prio::MAX_RT_PRIO - 1).contains(&priority) {
                 return Err(SystemError::EINVAL);
             }
@@ -202,7 +203,10 @@ impl ProcessManager {
                     pcb.sched_info().static_prio(),
                     reset_on_fork,
                 ),
-                SchedChangeRequest::Fifo { priority } => (LinuxSchedPolicy::Fifo, priority, false),
+                SchedChangeRequest::Fifo {
+                    priority,
+                    reset_on_fork,
+                } => (LinuxSchedPolicy::Fifo, priority, reset_on_fork),
             };
             let new_class = new_policy.base_sched_class();
 
@@ -277,7 +281,13 @@ impl ProcessManager {
             return Err(SystemError::EPERM);
         }
 
-        Self::set_scheduler(pcb, SchedChangeRequest::Fifo { priority: prio })
+        Self::set_scheduler(
+            pcb,
+            SchedChangeRequest::Fifo {
+                priority: prio,
+                reset_on_fork: false,
+            },
+        )
     }
 
     /// Publish a validated affinity mask and apply any required migration.

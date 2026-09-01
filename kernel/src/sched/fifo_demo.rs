@@ -437,8 +437,13 @@ fn run_remote_class_transitions(cpu: ProcessorId) {
         observer.sched_info().prio(),
         *observer.sched_info().on_rq.lock_irqsave(),
     );
-    ok &= ProcessManager::set_scheduler(&observer, SchedChangeRequest::Fifo { priority: -1 })
-        == Err(system_error::SystemError::EINVAL);
+    ok &= ProcessManager::set_scheduler(
+        &observer,
+        SchedChangeRequest::Fifo {
+            priority: -1,
+            reset_on_fork: false,
+        },
+    ) == Err(system_error::SystemError::EINVAL);
     ok &= invalid_snapshot
         == (
             observer.sched_info().policy(),
@@ -452,6 +457,7 @@ fn run_remote_class_transitions(cpu: ProcessorId) {
         &candidate,
         SchedChangeRequest::Fifo {
             priority: CANDIDATE_PRIO,
+            reset_on_fork: false,
         },
     )
     .is_ok();
@@ -625,6 +631,7 @@ fn run_priority_order_changes(cpu: ProcessorId) {
         &target,
         SchedChangeRequest::Fifo {
             priority: MAX_RT_PRIO,
+            reset_on_fork: false,
         },
     ) == Err(system_error::SystemError::EINVAL);
     let reset_after = target.sched_info().pi_lock_irqsave().sched_reset_on_fork();
@@ -642,6 +649,7 @@ fn run_priority_order_changes(cpu: ProcessorId) {
         &target,
         SchedChangeRequest::Fifo {
             priority: SHARED_PRIO,
+            reset_on_fork: false,
         },
     )
     .is_ok();
@@ -654,6 +662,7 @@ fn run_priority_order_changes(cpu: ProcessorId) {
         &target,
         SchedChangeRequest::Fifo {
             priority: LOWERED_PRIO,
+            reset_on_fork: false,
         },
     )
     .is_ok();
@@ -808,8 +817,14 @@ fn run_policy_affinity_race(control_cpu: ProcessorId, remote_cpus: &[ProcessorId
             "Fair migration preflight did not reach the destination CPU"
         );
         assert!(
-            ProcessManager::set_scheduler(&target, SchedChangeRequest::Fifo { priority: 50 })
-                .is_ok(),
+            ProcessManager::set_scheduler(
+                &target,
+                SchedChangeRequest::Fifo {
+                    priority: 50,
+                    reset_on_fork: false,
+                },
+            )
+            .is_ok(),
             "FIFO migration preflight policy update failed"
         );
         assert!(
@@ -837,7 +852,10 @@ fn run_policy_affinity_race(control_cpu: ProcessorId, remote_cpus: &[ProcessorId
 
     for round in 0..AFFINITY_RACE_ROUNDS {
         let request = if round & 1 == 0 {
-            SchedChangeRequest::Fifo { priority: 50 }
+            SchedChangeRequest::Fifo {
+                priority: 50,
+                reset_on_fork: false,
+            }
         } else {
             SchedChangeRequest::Normal {
                 reset_on_fork: false,
@@ -915,7 +933,10 @@ fn run_policy_exit_race(cpu: ProcessorId) {
         // the remaining teardown and the final Exited -> schedule transition.
         for change in 0..4 {
             let request = if change & 1 == 0 {
-                SchedChangeRequest::Fifo { priority: 45 }
+                SchedChangeRequest::Fifo {
+                    priority: 45,
+                    reset_on_fork: false,
+                }
             } else {
                 SchedChangeRequest::Normal {
                     reset_on_fork: false,

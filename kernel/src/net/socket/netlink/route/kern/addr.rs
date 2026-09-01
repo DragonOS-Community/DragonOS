@@ -109,8 +109,9 @@ pub(super) fn do_new_addr(
         } else {
             AddressMutation::Add(cidr)
         };
-    let outcome = crate::net::address::mutate_labeled_address(rtnl, &iface, mutation, label)?;
-    notify_address_outcome(netns, &iface, outcome);
+    let commit = crate::net::address::mutate_labeled_address(rtnl, &iface, mutation, label)?;
+    notify_address_outcome(netns.clone(), &iface, commit.outcome);
+    notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
 }
 
@@ -124,9 +125,29 @@ pub(super) fn do_del_addr(
     let iface = lookup_iface_by_index(request_segment, &netns)?;
     let cidr = resolve_delete_cidr(&iface, selector)?;
     let deleted_label = crate::net::address::address_label(&iface, cidr)?;
-    let outcome = crate::net::address::mutate_address(rtnl, &iface, AddressMutation::Delete(cidr))?;
-    notify_address_outcome_with_label(netns, &iface, outcome, Some(&deleted_label));
+    let commit = crate::net::address::mutate_address(rtnl, &iface, AddressMutation::Delete(cidr))?;
+    notify_address_outcome_with_label(netns.clone(), &iface, commit.outcome, Some(&deleted_label));
+    notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
+}
+
+fn notify_route_changes(netns: &Arc<NetNamespace>, changes: crate::net::route::RouteChanges) {
+    for removed in changes.removed {
+        if let Err(error) = super::route::notify_route(netns, CSegmentType::DELROUTE, removed) {
+            log::warn!(
+                "failed to notify address-derived route deletion: {:?}",
+                error
+            );
+        }
+    }
+    for added in changes.added {
+        if let Err(error) = super::route::notify_route(netns, CSegmentType::NEWROUTE, added) {
+            log::warn!(
+                "failed to notify address-derived route addition: {:?}",
+                error
+            );
+        }
+    }
 }
 
 fn lookup_iface_by_index(

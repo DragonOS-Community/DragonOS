@@ -847,11 +847,10 @@ impl VirtioInterface {
 
 impl Drop for VirtioInterface {
     fn drop(&mut self) {
-        // 从全局的网卡接口信息表中删除这个网卡的接口信息
-        // NET_DEVICES.write_irqsave().remove(&self.nic_id());
-        if let Some(ns) = self.net_namespace() {
-            ns.remove_device(&self.nic_id());
-        }
+        debug_assert!(
+            self.net_namespace().is_none(),
+            "VirtioInterface dropped while still registered in a network namespace"
+        );
     }
 }
 
@@ -1464,10 +1463,7 @@ impl VirtIODriver for VirtIONetDriver {
         // NET_DEVICES
         //     .write_irqsave()
         //     .insert(iface.nic_id(), iface.clone());
-        INIT_NET_NAMESPACE.add_device(iface.clone());
-        iface
-            .iface_common
-            .set_net_namespace(INIT_NET_NAMESPACE.clone());
+        INIT_NET_NAMESPACE.add_device(iface.clone())?;
         INIT_NET_NAMESPACE.set_default_iface(iface.clone());
 
         virtio_irq_manager()

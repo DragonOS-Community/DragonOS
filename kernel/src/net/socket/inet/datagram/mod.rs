@@ -966,8 +966,8 @@ impl UdpSocket {
         let Some(iface) = self.device_binding.resolve_iface(&self.netns)? else {
             return Ok(None);
         };
-        let local = crate::net::socket::inet::common::pick_configured_source_addr(&iface, &remote)
-            .ok_or(SystemError::EADDRNOTAVAIL)?;
+        let local =
+            crate::net::socket::inet::common::route_source_on_iface(&self.netns, &iface, &remote)?;
         Ok(Some((iface, local)))
     }
 

@@ -551,8 +551,9 @@ pub fn e1000e_driver_init(device: E1000EDevice, dev_id: Arc<DeviceId>) {
     // NET_DEVICES
     //     .write_irqsave()
     //     .insert(iface.nic_id(), iface.clone());
-    INIT_NET_NAMESPACE.add_device(iface.clone());
-    iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
+    INIT_NET_NAMESPACE
+        .add_device(iface.clone())
+        .expect("register e1000e interface in root netns");
 
     info!("e1000e driver init successfully!\tMAC: [{}]", mac);
 

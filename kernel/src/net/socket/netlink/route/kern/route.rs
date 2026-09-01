@@ -1,222 +1,218 @@
-use crate::net::address::canonical_projection_cidr;
 use crate::{
-    driver::net::{Iface, NetlinkRouteEntry},
-    net::socket::{
-        netlink::{
-            message::segment::{
-                header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags, SegHdrCommonFlags},
-                CSegmentType,
-            },
-            route::{
-                kern::utils::{
-                    finish_response, kernel_notify_header, multicast_notify, RTMGRP_IPV4_ROUTE,
-                    RTMGRP_IPV6_ROUTE,
+    driver::net::types::InterfaceFlags,
+    net::{
+        route::{
+            self, RouteDeleteSelector, RouteEntry, RouteMutationOutcome, RouteNewFlags,
+            RTN_UNICAST, RTPROT_BOOT, RT_TABLE_MAIN,
+        },
+        rtnl::RtnlGuard,
+        socket::{
+            netlink::{
+                message::segment::{
+                    header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags},
+                    CSegmentType,
                 },
-                message::{
-                    attr::route::RouteAttr,
-                    segment::{
-                        route::{
-                            RouteFlags, RouteProtocol, RouteScope, RouteSegment, RouteSegmentBody,
-                            RouteTable, RouteType,
+                route::{
+                    kern::utils::{
+                        finish_response, kernel_notify_header, multicast_notify, RTMGRP_IPV4_ROUTE,
+                        RTMGRP_IPV6_ROUTE,
+                    },
+                    message::{
+                        attr::route::RouteAttr,
+                        segment::{
+                            route::{
+                                RouteFlags, RouteProtocol, RouteScope, RouteSegment,
+                                RouteSegmentBody, RouteTable, RouteType,
+                            },
+                            RouteNlSegment,
                         },
-                        RouteNlSegment,
                     },
                 },
             },
+            AddressFamily,
         },
-        AddressFamily,
     },
     process::namespace::net_namespace::NetNamespace,
 };
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec, vec::Vec};
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
 use system_error::SystemError;
 
-/// `rtm_table == 0` 表示 RT_TABLE_MAIN（254），与 Linux 一致。
-fn effective_route_table(table: u8) -> u8 {
-    if table == 0 {
-        RouteTable::Main as u8
+const IP6_RT_PRIO_USER: u32 = 1024;
+const RTN_MAX: u8 = 11;
+
+fn effective_route_table(header: u8, attr: Option<u32>) -> u32 {
+    let table = attr.unwrap_or(header as u32);
+    if table == RouteTable::Unspec as u32 {
+        RT_TABLE_MAIN
     } else {
         table
     }
 }
 
-type RouteEntryKey = (IpCidr, u8, Option<(IpAddress, u8)>);
-
-fn route_entry_key(entry: &NetlinkRouteEntry) -> RouteEntryKey {
-    (
-        entry.destination,
-        entry.table,
-        entry
-            .source
-            .as_ref()
-            .map(|cidr| (cidr.address(), cidr.prefix_len())),
-    )
-}
-
-fn find_netlink_route(
-    iface: &Arc<dyn Iface>,
-    entry: &NetlinkRouteEntry,
-) -> Option<NetlinkRouteEntry> {
-    let key = route_entry_key(entry);
-    iface
-        .common()
-        .netlink_routes()
-        .iter()
-        .find(|existing| route_entry_key(existing) == key)
-        .cloned()
-}
-
 pub(super) fn do_get_route(
-    request_segment: &RouteSegment,
+    request: &RouteSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let dump_all = GetRequestFlags::from_bits_truncate(request_segment.header().flags)
-        .contains(GetRequestFlags::DUMP);
-    if !dump_all {
-        if request_segment
-            .body()
-            .flags
-            .contains(RouteFlags::LOOKUP_TABLE)
-        {
-            return do_lookup_route(request_segment, netns);
-        }
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    if GetRequestFlags::from_bits_truncate(request.header().flags).contains(GetRequestFlags::DUMP) {
+        return dump_routes(request, netns);
     }
-
-    let requested_family = request_segment.body().family;
-    let mut response = Vec::new();
-
-    for (_, iface) in netns.device_list().iter() {
-        response.extend(build_connected_route_segments(
-            request_segment,
-            iface,
-            requested_family,
-        )?);
-        response.extend(build_netlink_route_segments(
-            request_segment,
-            iface,
-            requested_family,
-        )?);
-    }
-
-    finish_response(request_segment.header(), true, &mut response);
-    Ok(response)
+    lookup_route(request, netns)
 }
 
-/// RTM_GETRULE：当前仅支持 DUMP 语义，返回空规则表 + NLMSG_DONE。
 pub(super) fn do_get_rule(
-    request_segment: &RouteSegment,
+    request: &RouteSegment,
     _netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let dump_all = GetRequestFlags::from_bits_truncate(request_segment.header().flags)
-        .contains(GetRequestFlags::DUMP);
-    if !dump_all {
+    if !GetRequestFlags::from_bits_truncate(request.header().flags).contains(GetRequestFlags::DUMP)
+    {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     let mut response = Vec::new();
-    finish_response(request_segment.header(), true, &mut response);
+    finish_response(request.header(), true, &mut response);
     Ok(response)
 }
 
 pub(super) fn do_new_route(
-    request_segment: &RouteSegment,
+    rtnl: &RtnlGuard,
+    request: &RouteSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let parsed = ParsedRouteRequest::from_segment(request_segment)?;
-    let iface = netns
-        .device_list()
-        .get(&(parsed.oif as usize))
-        .cloned()
-        .ok_or(SystemError::ENODEV)?;
-
-    let table = effective_route_table(parsed.table);
-    let entry = NetlinkRouteEntry {
-        destination: parsed.destination,
-        source: parsed.source,
-        gateway: parsed.gateway,
-        priority: parsed.priority,
-        table,
-        protocol: request_segment.body().protocol as u8,
-        scope: request_segment.body().scope as u8,
-        kind: request_segment.body().type_ as u8,
-    };
-
-    let replace = NewRequestFlags::from_bits_truncate(request_segment.header().flags)
-        .contains(NewRequestFlags::REPLACE);
-    let previous = find_netlink_route(&iface, &entry);
-    if previous.is_some() && !replace {
-        return Err(SystemError::EEXIST);
+    validate_new_request(request)?;
+    let parsed = ParsedRouteRequest::from_segment(request)?;
+    let table = effective_route_table(request.body().table, parsed.table);
+    let onlink = request.body().flags.contains(RouteFlags::ONLINK);
+    if request.body().family == AddressFamily::INet6
+        && parsed
+            .gateway
+            .is_some_and(|gateway| gateway.is_unspecified())
+    {
+        return Err(SystemError::EINVAL);
     }
-
-    let notification = route_to_segment(
-        &kernel_notify_header(CSegmentType::NEWROUTE),
-        CSegmentType::NEWROUTE,
-        &iface,
-        RouteView {
-            destination: parsed.destination,
-            source: parsed.source,
-            gateway: parsed.gateway,
-            priority: parsed.priority,
+    let gateway = normalize_ip(parsed.gateway);
+    let oif = match gateway {
+        Some(gateway) => route::resolve_gateway_oif(
+            &netns,
+            gateway,
             table,
-            protocol: request_segment.body().protocol as u8,
-            scope: request_segment.body().scope as u8,
-            kind: request_segment.body().type_ as u8,
-            flags: RouteFlags::empty(),
+            parsed.oif.filter(|oif| *oif != 0),
+            onlink,
+            request.body().scope,
+        )?,
+        None => parsed
+            .oif
+            .filter(|oif| *oif != 0)
+            .ok_or(SystemError::EINVAL)?,
+    };
+    let entry = RouteEntry {
+        destination: route::canonical_cidr(parsed.destination),
+        source: parsed.source,
+        preferred_source: normalize_ip(parsed.preferred_source),
+        table,
+        priority: if request.body().family == AddressFamily::INet6 {
+            parsed
+                .priority
+                .filter(|priority| *priority != 0)
+                .unwrap_or(IP6_RT_PRIO_USER)
+        } else {
+            parsed.priority.unwrap_or(0)
+        },
+        tos: request.body().tos,
+        protocol: if request.body().protocol == RouteProtocol::Unspec as u8 {
+            RTPROT_BOOT
+        } else {
+            request.body().protocol
+        },
+        scope: if request.body().family == AddressFamily::INet6 {
+            RouteScope::Universe as u8
+        } else {
+            request.body().scope
+        },
+        kind: if request.body().type_ == RouteType::Unspec as u8 {
+            RTN_UNICAST
+        } else {
+            request.body().type_
+        },
+        oif,
+        gateway,
+        nexthop_flags: if onlink {
+            RouteFlags::ONLINK.bits() as u8
+        } else {
+            0
+        },
+    };
+    let nl_flags = NewRequestFlags::from_bits_truncate(request.header().flags);
+    let outcome = route::add_route(
+        rtnl,
+        &netns,
+        entry,
+        RouteNewFlags {
+            replace: nl_flags.contains(NewRequestFlags::REPLACE),
+            excl: nl_flags.contains(NewRequestFlags::EXCL),
+            create: nl_flags.contains(NewRequestFlags::CREATE),
+            append: nl_flags.contains(NewRequestFlags::APPEND),
         },
     )?;
-
-    sync_iface_route_table(&iface, &parsed, previous.as_ref())?;
-    iface.common().upsert_netlink_route(entry);
-
-    multicast_notify(
-        netns,
-        route_notify_group(parsed.destination.address()),
-        RouteNlSegment::NewRoute(notification),
-    );
+    match outcome {
+        RouteMutationOutcome::Added {
+            route: added,
+            appended,
+        } => {
+            let mut notification_flags = NewRequestFlags::CREATE;
+            if appended {
+                notification_flags.insert(NewRequestFlags::APPEND);
+            }
+            notify_route_with_flags(
+                &netns,
+                CSegmentType::NEWROUTE,
+                added,
+                notification_flags.bits(),
+            )?;
+        }
+        RouteMutationOutcome::Replaced { new, .. } => notify_route_with_flags(
+            &netns,
+            CSegmentType::NEWROUTE,
+            new,
+            NewRequestFlags::REPLACE.bits(),
+        )?,
+        RouteMutationOutcome::Unchanged(_) => {}
+    }
     Ok(Vec::new())
 }
 
 pub(super) fn do_del_route(
-    request_segment: &RouteSegment,
+    rtnl: &RtnlGuard,
+    request: &RouteSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let parsed = ParsedRouteRequest::from_segment(request_segment)?;
-    let iface = netns
-        .device_list()
-        .get(&(parsed.oif as usize))
-        .cloned()
-        .ok_or(SystemError::ENODEV)?;
-
-    let table = effective_route_table(parsed.table);
-    let notification = route_to_segment(
-        &kernel_notify_header(CSegmentType::DELROUTE),
-        CSegmentType::DELROUTE,
-        &iface,
-        RouteView {
-            destination: parsed.destination,
-            source: parsed.source,
-            gateway: parsed.gateway,
-            priority: parsed.priority,
+    validate_delete_request(request)?;
+    let parsed = ParsedRouteRequest::from_segment(request)?;
+    let table = effective_route_table(request.body().table, parsed.table);
+    let ipv4 = request.body().family == AddressFamily::INet;
+    let gateway = normalize_ip(parsed.gateway);
+    let removed = route::delete_route(
+        rtnl,
+        &netns,
+        RouteDeleteSelector {
+            destination: route::canonical_cidr(parsed.destination),
             table,
-            protocol: request_segment.body().protocol as u8,
-            scope: request_segment.body().scope as u8,
-            kind: request_segment.body().type_ as u8,
-            flags: RouteFlags::empty(),
+            priority: parsed.priority.filter(|priority| *priority != 0),
+            tos: ipv4.then_some(request.body().tos).filter(|tos| *tos != 0),
+            protocol: (request.body().protocol != RouteProtocol::Unspec as u8)
+                .then_some(request.body().protocol),
+            scope: (ipv4 && request.body().scope != RouteScope::Nowhere as u8)
+                .then_some(request.body().scope),
+            kind: (ipv4 && request.body().type_ != RouteType::Unspec as u8)
+                .then_some(request.body().type_),
+            oif: parsed.oif.filter(|oif| *oif != 0),
+            gateway_specified: gateway.is_some() || (!ipv4 && parsed.gateway.is_some()),
+            gateway,
+            preferred_source: ipv4
+                .then(|| normalize_ip(parsed.preferred_source))
+                .flatten(),
         },
     )?;
-    let removed = iface
-        .common()
-        .remove_netlink_route(parsed.destination, parsed.source, table)
-        .ok_or(SystemError::ESRCH)?;
-
-    sync_iface_route_table_remove(&iface, &removed);
-    multicast_notify(
-        netns,
-        route_notify_group(parsed.destination.address()),
-        RouteNlSegment::DelRoute(notification),
-    );
+    notify_route(&netns, CSegmentType::DELROUTE, removed)?;
     Ok(Vec::new())
 }
 
@@ -224,377 +220,423 @@ pub(super) fn do_del_route(
 struct ParsedRouteRequest {
     destination: IpCidr,
     source: Option<IpCidr>,
+    preferred_source: Option<IpAddress>,
     gateway: Option<IpAddress>,
-    oif: u32,
-    priority: u32,
-    table: u8,
+    oif: Option<u32>,
+    iif: Option<u32>,
+    priority: Option<u32>,
+    table: Option<u32>,
 }
 
 impl ParsedRouteRequest {
     fn from_segment(segment: &RouteSegment) -> Result<Self, SystemError> {
         let family = segment.body().family;
-        let mut destination = default_cidr(family)?;
-        let mut source = None;
-        let mut gateway = None;
-        let mut oif = None;
-        let mut priority = 0;
-        let mut table = segment.body().table as u8;
-
+        let mut parsed = Self {
+            destination: default_cidr(family, segment.body().dst_len)?,
+            source: None,
+            preferred_source: None,
+            gateway: None,
+            oif: None,
+            iif: None,
+            priority: None,
+            table: None,
+        };
         for attr in segment.attrs() {
             match attr {
                 RouteAttr::Dst(bytes) => {
-                    destination = parse_cidr(bytes, segment.body().dst_len, family)?;
+                    parsed.destination = parse_cidr(bytes, segment.body().dst_len, family)?;
                 }
                 RouteAttr::Src(bytes) => {
-                    source = Some(parse_cidr(bytes, segment.body().src_len, family)?);
+                    parsed.source = Some(parse_cidr(bytes, segment.body().src_len, family)?);
                 }
                 RouteAttr::Prefsrc(bytes) => {
-                    source = Some(parse_cidr(bytes, 0, family)?);
+                    parsed.preferred_source = Some(parse_ip(bytes, family)?);
                 }
-                RouteAttr::Gateway(bytes) => gateway = Some(parse_ip(bytes, family)?),
-                RouteAttr::Oif(index) => oif = Some(*index),
-                RouteAttr::Priority(metric) => priority = *metric,
-                RouteAttr::Table(route_table) => table = *route_table as u8,
-                RouteAttr::Iif(_) => {}
+                RouteAttr::Gateway(bytes) => parsed.gateway = Some(parse_ip(bytes, family)?),
+                RouteAttr::Oif(index) => parsed.oif = Some(*index),
+                RouteAttr::Priority(metric) => parsed.priority = Some(*metric),
+                RouteAttr::Table(table) => parsed.table = Some(*table),
+                RouteAttr::Iif(index) => parsed.iif = Some(*index),
             }
         }
-
-        let oif = oif.ok_or(SystemError::EINVAL)?;
-        Ok(Self {
-            destination,
-            source,
-            gateway,
-            oif,
-            priority,
-            table,
-        })
+        Ok(parsed)
     }
 }
 
-fn build_connected_route_segments(
-    request_segment: &RouteSegment,
-    iface: &Arc<dyn Iface>,
-    requested_family: AddressFamily,
-) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let mut segments = Vec::new();
-    for cidr in iface.common().ip_addrs().iter() {
-        let family = family_of_ip(cidr.address());
-        if !family_matches(requested_family, family) {
-            continue;
+fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
+    validate_mutation_family(request.body().family)?;
+    validate_mutation_tos(request.body().family, request.body().tos)?;
+    if request.body().flags.bits() & !RouteFlags::ONLINK.bits() != 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if request.body().type_ > RTN_MAX {
+        return Err(SystemError::EINVAL);
+    }
+    if request.body().type_ != RouteType::Unspec as u8
+        && request.body().type_ != RouteType::Unicast as u8
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    let gateway = request.attrs().iter().find_map(|attr| match attr {
+        RouteAttr::Gateway(bytes) => parse_ip(bytes, request.body().family).ok(),
+        _ => None,
+    });
+    if request.body().family == AddressFamily::INet
+        && (request.body().scope > RouteScope::Host as u8
+            || request.body().scope == RouteScope::Host as u8 && normalize_ip(gateway).is_some())
+    {
+        return Err(SystemError::EINVAL);
+    }
+    if request.body().src_len != 0
+        || request
+            .attrs()
+            .iter()
+            .any(|attr| matches!(attr, RouteAttr::Src(_) | RouteAttr::Iif(_)))
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    validate_prefix_lengths(request)?;
+
+    if request.body().flags.contains(RouteFlags::ONLINK) {
+        let oif = request.attrs().iter().find_map(|attr| match attr {
+            RouteAttr::Oif(oif) => Some(*oif),
+            _ => None,
+        });
+        if normalize_ip(gateway).is_none() || oif.is_none_or(|oif| oif == 0) {
+            return Err(SystemError::EINVAL);
         }
+    }
+    Ok(())
+}
 
-        let scope = if iface.name() == "lo" {
-            RouteScope::Host
-        } else {
-            RouteScope::Link
-        };
+fn validate_delete_request(request: &RouteSegment) -> Result<(), SystemError> {
+    validate_mutation_family(request.body().family)?;
+    validate_mutation_tos(request.body().family, request.body().tos)?;
+    if !request.body().flags.is_empty() {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if request.body().type_ > RTN_MAX {
+        return Err(SystemError::EINVAL);
+    }
+    if request.body().src_len != 0
+        || request
+            .attrs()
+            .iter()
+            .any(|attr| matches!(attr, RouteAttr::Src(_) | RouteAttr::Iif(_)))
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    validate_prefix_lengths(request)
+}
 
-        segments.push(RouteNlSegment::NewRoute(route_to_segment(
-            request_segment.header(),
-            CSegmentType::NEWROUTE,
-            iface,
-            RouteView {
-                destination: *cidr,
-                source: None,
-                gateway: None,
-                priority: 0,
-                table: RouteTable::Main as u8,
-                protocol: RouteProtocol::Kernel as u8,
-                scope: scope as u8,
-                kind: RouteType::Unicast as u8,
-                flags: RouteFlags::empty(),
-            },
-        )?));
+fn validate_get_request(request: &RouteSegment) -> Result<(), SystemError> {
+    validate_mutation_family(request.body().family)?;
+    validate_lookup_tos(request.body().family, request.body().tos)?;
+    let host_len = match request.body().family {
+        AddressFamily::INet => 32,
+        AddressFamily::INet6 => 128,
+        _ => unreachable!(),
+    };
+    if (request.body().src_len != 0 && request.body().src_len != host_len)
+        || (request.body().dst_len != 0 && request.body().dst_len != host_len)
+        || request.body().table != RouteTable::Unspec as u8
+        || request.body().protocol != RouteProtocol::Unspec as u8
+        || request.body().scope != RouteScope::Universe as u8
+        || request.body().type_ != RouteType::Unspec as u8
+    {
+        return Err(SystemError::EINVAL);
+    }
+    let has_src = request
+        .attrs()
+        .iter()
+        .any(|attr| matches!(attr, RouteAttr::Src(_)));
+    let has_dst = request
+        .attrs()
+        .iter()
+        .any(|attr| matches!(attr, RouteAttr::Dst(_)));
+    if has_src != (request.body().src_len != 0) || has_dst != (request.body().dst_len != 0) {
+        return Err(SystemError::EINVAL);
+    }
+    if request.attrs().iter().any(|attr| {
+        matches!(
+            attr,
+            RouteAttr::Gateway(_)
+                | RouteAttr::Prefsrc(_)
+                | RouteAttr::Priority(_)
+                | RouteAttr::Table(_)
+        )
+    }) {
+        return Err(SystemError::EINVAL);
     }
 
-    Ok(segments)
+    if request.body().flags.contains(RouteFlags::FIB_MATCH) {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    match request.body().family {
+        AddressFamily::INet => {
+            if request.body().flags.bits() & !RouteFlags::LOOKUP_TABLE.bits() != 0 {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        AddressFamily::INet6 if !request.body().flags.is_empty() => {
+            return Err(SystemError::EINVAL)
+        }
+        AddressFamily::INet6 => {}
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
-fn build_netlink_route_segments(
-    request_segment: &RouteSegment,
-    iface: &Arc<dyn Iface>,
-    requested_family: AddressFamily,
-) -> Result<Vec<RouteNlSegment>, SystemError> {
-    iface
-        .common()
-        .netlink_routes()
-        .iter()
-        .filter(|route| family_matches(requested_family, family_of_ip(route.destination.address())))
-        .map(|route| {
-            route_to_segment(
-                request_segment.header(),
-                CSegmentType::NEWROUTE,
-                iface,
-                RouteView {
-                    destination: route.destination,
-                    source: route.source,
-                    gateway: route.gateway,
-                    priority: route.priority,
-                    table: route.table,
-                    protocol: route.protocol,
-                    scope: route.scope,
-                    kind: route.kind,
-                    flags: RouteFlags::empty(),
-                },
-            )
-            .map(RouteNlSegment::NewRoute)
-        })
-        .collect()
+fn validate_mutation_family(family: AddressFamily) -> Result<(), SystemError> {
+    match family {
+        AddressFamily::INet | AddressFamily::INet6 => Ok(()),
+        _ => Err(SystemError::EAFNOSUPPORT),
+    }
 }
 
-fn do_lookup_route(
-    request_segment: &RouteSegment,
+fn validate_mutation_tos(family: AddressFamily, tos: u8) -> Result<(), SystemError> {
+    if tos == 0 {
+        return Ok(());
+    }
+    match family {
+        AddressFamily::INet if tos & 0x03 != 0 => Err(SystemError::EINVAL),
+        AddressFamily::INet => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+        AddressFamily::INet6 => Err(SystemError::EINVAL),
+        _ => Err(SystemError::EAFNOSUPPORT),
+    }
+}
+
+fn validate_lookup_tos(family: AddressFamily, tos: u8) -> Result<(), SystemError> {
+    if tos == 0 {
+        return Ok(());
+    }
+    match family {
+        AddressFamily::INet | AddressFamily::INet6 => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+        AddressFamily::Unspecified => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+        _ => Err(SystemError::EAFNOSUPPORT),
+    }
+}
+
+fn validate_prefix_lengths(request: &RouteSegment) -> Result<(), SystemError> {
+    let max = match request.body().family {
+        AddressFamily::INet => 32,
+        AddressFamily::INet6 => 128,
+        _ => return Err(SystemError::EAFNOSUPPORT),
+    };
+    if request.body().dst_len > max || request.body().src_len > max {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
+}
+
+fn dump_routes(
+    request: &RouteSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let family = request_segment.body().family;
-    let mut destination = default_cidr(family)?;
-    for attr in request_segment.attrs() {
-        if let RouteAttr::Dst(bytes) = attr {
-            destination = parse_cidr(bytes, request_segment.body().dst_len, family)?;
+    validate_lookup_tos(request.body().family, request.body().tos)?;
+    if !request.body().flags.is_empty()
+        || request.body().src_len != 0
+        || request.body().dst_len != 0
+        || request.body().scope != RouteScope::Universe as u8
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if request.body().table != RouteTable::Unspec as u8
+        || request.body().protocol != RouteProtocol::Unspec as u8
+        || request.body().type_ != RouteType::Unspec as u8
+        || request.attrs().iter().any(|attr| {
+            matches!(
+                attr,
+                RouteAttr::Table(_) | RouteAttr::Oif(_) | RouteAttr::Iif(_)
+            )
+        })
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    let family = request.body().family;
+    let mut response = Vec::new();
+    for entry in route::snapshot(&netns) {
+        if family_matches(family, family_of_ip(entry.destination.address())) {
+            response.push(RouteNlSegment::NewRoute(route_to_segment(
+                request.header(),
+                CSegmentType::NEWROUTE,
+                entry,
+                RouteFlags::empty(),
+                false,
+                0,
+            )?));
         }
     }
-
-    let lo = netns.loopback_iface().ok_or(SystemError::ENODEV)?;
-    let iface: Arc<dyn Iface> = lo;
-
-    let segment = route_to_segment(
-        request_segment.header(),
-        CSegmentType::NEWROUTE,
-        &iface,
-        RouteView {
-            destination,
-            source: None,
-            gateway: None,
-            priority: 0,
-            table: RouteTable::Main as u8,
-            protocol: RouteProtocol::Kernel as u8,
-            scope: RouteScope::Host as u8,
-            kind: RouteType::Unicast as u8,
-            flags: RouteFlags::CLONED,
-        },
-    )?;
-
-    Ok(vec![RouteNlSegment::NewRoute(segment)])
+    finish_response(request.header(), true, &mut response);
+    Ok(response)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RouteView {
-    destination: IpCidr,
-    source: Option<IpCidr>,
-    gateway: Option<IpAddress>,
-    priority: u32,
-    table: u8,
-    protocol: u8,
-    scope: u8,
-    kind: u8,
-    flags: RouteFlags,
+fn lookup_route(
+    request: &RouteSegment,
+    netns: Arc<NetNamespace>,
+) -> Result<Vec<RouteNlSegment>, SystemError> {
+    validate_get_request(request)?;
+    let parsed = ParsedRouteRequest::from_segment(request)?;
+    let destination = parsed.destination.address();
+    let requested_oif = parsed.oif.filter(|oif| *oif != 0);
+    if parsed.iif.is_some_and(|iif| iif != 0) {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if let Some(oif) = requested_oif {
+        ensure_iface_up(&netns, oif)?;
+    }
+    let decision = match requested_oif {
+        Some(oif) => route::lookup_on_iface(&netns, destination, oif),
+        None => route::lookup(&netns, destination),
+    }
+    .ok_or(SystemError::ENETUNREACH)?;
+    let iface = netns
+        .device_list()
+        .get(&(decision.oif as usize))
+        .cloned()
+        .ok_or(SystemError::ENODEV)?;
+    let requested_source = parsed
+        .source
+        .map(|source| source.address())
+        .filter(|source| !source.is_unspecified());
+    if requested_source.is_some_and(|source| !source.is_unicast()) {
+        return Err(SystemError::EINVAL);
+    }
+    if requested_source.is_some_and(|source| {
+        !netns.device_list().values().any(|candidate| {
+            candidate
+                .common()
+                .ip_addrs()
+                .iter()
+                .any(|cidr| cidr.address() == source)
+        })
+    }) {
+        return Err(SystemError::ENETUNREACH);
+    }
+    let selected_source = if requested_source.is_some() {
+        None
+    } else {
+        decision.preferred_source.or_else(|| {
+            crate::net::socket::inet::common::pick_configured_source_addr(&iface, &destination)
+        })
+    };
+    let host = host_cidr(destination);
+    let output = RouteEntry {
+        destination: host,
+        source: requested_source.map(host_cidr),
+        preferred_source: selected_source,
+        table: decision.table,
+        protocol: RouteProtocol::Unspec as u8,
+        scope: RouteScope::Universe as u8,
+        ..decision.matched
+    };
+    Ok(vec![RouteNlSegment::NewRoute(route_to_segment(
+        request.header(),
+        CSegmentType::NEWROUTE,
+        output,
+        RouteFlags::CLONED,
+        true,
+        0,
+    )?)])
+}
+
+pub(super) fn notify_route(
+    netns: &Arc<NetNamespace>,
+    kind: CSegmentType,
+    route: RouteEntry,
+) -> Result<(), SystemError> {
+    let flags = if kind == CSegmentType::NEWROUTE {
+        (NewRequestFlags::CREATE | NewRequestFlags::APPEND).bits()
+    } else {
+        0
+    };
+    notify_route_with_flags(netns, kind, route, flags)
+}
+
+fn notify_route_with_flags(
+    netns: &Arc<NetNamespace>,
+    kind: CSegmentType,
+    route: RouteEntry,
+    nlmsg_flags: u16,
+) -> Result<(), SystemError> {
+    let segment = route_to_segment(
+        &kernel_notify_header(kind),
+        kind,
+        route,
+        RouteFlags::empty(),
+        false,
+        nlmsg_flags,
+    )?;
+    multicast_notify(
+        netns.clone(),
+        route_notify_group(route.destination.address()),
+        match kind {
+            CSegmentType::NEWROUTE => RouteNlSegment::NewRoute(segment),
+            CSegmentType::DELROUTE => RouteNlSegment::DelRoute(segment),
+            _ => unreachable!(),
+        },
+    );
+    Ok(())
 }
 
 fn route_to_segment(
     request_header: &CMsgSegHdr,
     msg_type: CSegmentType,
-    iface: &Arc<dyn Iface>,
-    route: RouteView,
-) -> Result<crate::net::socket::netlink::route::message::segment::route::RouteSegment, SystemError>
-{
-    let family = family_of_ip(route.destination.address());
-    let header = crate::net::socket::netlink::message::segment::header::CMsgSegHdr {
+    route: RouteEntry,
+    flags: RouteFlags,
+    output: bool,
+    nlmsg_flags: u16,
+) -> Result<RouteSegment, SystemError> {
+    let body = RouteSegmentBody {
+        family: family_of_ip(route.destination.address()),
+        dst_len: route.destination.prefix_len(),
+        src_len: route.source.map_or(0, |source| source.prefix_len()),
+        tos: route.tos,
+        table: if route.table <= u8::MAX as u32 {
+            route.table as u8
+        } else {
+            RouteTable::Compat as u8
+        },
+        protocol: route.protocol,
+        scope: route.scope,
+        type_: route.kind,
+        flags: if output {
+            flags
+        } else {
+            flags | RouteFlags::from_bits_truncate(route.nexthop_flags as u32)
+        },
+    };
+    let header = CMsgSegHdr {
         len: 0,
         type_: msg_type as u16,
-        flags: SegHdrCommonFlags::empty().bits(),
+        flags: nlmsg_flags,
         seq: request_header.seq,
         pid: request_header.pid,
     };
-    let body = RouteSegmentBody {
-        family,
-        dst_len: route.destination.prefix_len(),
-        src_len: route.source.map(|cidr| cidr.prefix_len()).unwrap_or(0),
-        tos: 0,
-        table: RouteTable::try_from(route.table).unwrap_or(RouteTable::Main),
-        protocol: RouteProtocol::try_from(route.protocol).unwrap_or(RouteProtocol::Boot),
-        scope: RouteScope::try_from(route.scope).unwrap_or(RouteScope::Universe),
-        type_: RouteType::try_from(route.kind).unwrap_or(RouteType::Unicast),
-        flags: route.flags,
-    };
-
-    let mut attrs = vec![
-        RouteAttr::Dst(ip_to_bytes(route_destination_prefix(route.destination))),
-        RouteAttr::Oif(iface.nic_id() as u32),
-    ];
+    let mut attrs = Vec::new();
+    if route.destination.prefix_len() != 0 {
+        attrs.push(RouteAttr::Dst(ip_to_bytes(route.destination.address())));
+    }
+    attrs.push(RouteAttr::Oif(route.oif));
+    attrs.push(RouteAttr::Table(route.table));
     if let Some(source) = route.source {
         attrs.push(RouteAttr::Src(ip_to_bytes(source.address())));
+    }
+    if let Some(source) = route.preferred_source {
+        attrs.push(RouteAttr::Prefsrc(ip_to_bytes(source)));
     }
     if let Some(gateway) = route.gateway {
         attrs.push(RouteAttr::Gateway(ip_to_bytes(gateway)));
     }
-    if route.priority != 0 {
+    if route.priority != 0 && (!output || matches!(route.destination.address(), IpAddress::Ipv6(_)))
+    {
         attrs.push(RouteAttr::Priority(route.priority));
     }
-
     Ok(RouteSegment::new(header, body, attrs))
 }
 
-fn sync_iface_route_table(
-    iface: &Arc<dyn Iface>,
-    route: &ParsedRouteRequest,
-    previous: Option<&NetlinkRouteEntry>,
-) -> Result<(), SystemError> {
-    let new_route = smoltcp::iface::Route {
-        cidr: canonical_projection_cidr(route.destination),
-        via_router: route.gateway,
-        preferred_until: None,
-        expires_at: None,
-    };
-    let replaced_key = previous.map(route_entry_key);
-    let new_has_other_owner =
-        projection_has_other_owner(iface, new_route.cidr, new_route.via_router, replaced_key);
-    let old_has_other_owner = previous.is_some_and(|old| {
-        projection_has_other_owner(iface, old.destination, old.gateway, replaced_key)
-    });
-    let mut projection_ready = false;
-    let mut reused_old_projection = false;
-    iface.smol_iface().lock().routes_mut().update(|routes| {
-        let same_as_previous = previous.is_some_and(|old| {
-            same_projection(
-                old.destination,
-                old.gateway,
-                new_route.cidr,
-                new_route.via_router,
-            )
-        });
-        if (same_as_previous || new_has_other_owner)
-            && routes.iter().any(|existing| {
-                same_projection(
-                    existing.cidr,
-                    existing.via_router,
-                    new_route.cidr,
-                    new_route.via_router,
-                )
-            })
-        {
-            projection_ready = true;
-        } else if let Some(old) = previous.filter(|old| {
-            !same_projection(
-                old.destination,
-                old.gateway,
-                new_route.cidr,
-                new_route.via_router,
-            ) && !old_has_other_owner
-        }) {
-            if let Some(index) = routes.iter().rposition(|existing| {
-                same_projection(
-                    existing.cidr,
-                    existing.via_router,
-                    old.destination,
-                    old.gateway,
-                )
-            }) {
-                routes[index] = new_route;
-                projection_ready = true;
-                reused_old_projection = true;
-            }
-        }
-
-        if !projection_ready {
-            projection_ready = routes.push(new_route).is_ok();
-        }
-        if !projection_ready {
-            return;
-        }
-
-        if let Some(old) = previous.filter(|old| {
-            !same_projection(
-                old.destination,
-                old.gateway,
-                new_route.cidr,
-                new_route.via_router,
-            )
-        }) {
-            if !old_has_other_owner && !reused_old_projection {
-                if let Some(index) = routes.iter().rposition(|existing| {
-                    same_projection(
-                        existing.cidr,
-                        existing.via_router,
-                        old.destination,
-                        old.gateway,
-                    )
-                }) {
-                    routes.remove(index);
-                }
-            }
-        }
-    });
-    if projection_ready {
-        Ok(())
-    } else {
-        Err(SystemError::ENOSPC)
-    }
-}
-
-fn sync_iface_route_table_remove(iface: &Arc<dyn Iface>, removed: &NetlinkRouteEntry) {
-    let preserve_projection = address_owns_projection(iface, removed.destination, removed.gateway)
-        || iface.common().netlink_routes().iter().any(|existing| {
-            same_projection(
-                existing.destination,
-                existing.gateway,
-                removed.destination,
-                removed.gateway,
-            )
-        });
-    if !preserve_projection {
-        iface.smol_iface().lock().routes_mut().update(|routes| {
-            if let Some(index) = routes.iter().rposition(|existing| {
-                same_projection(
-                    existing.cidr,
-                    existing.via_router,
-                    removed.destination,
-                    removed.gateway,
-                )
-            }) {
-                routes.remove(index);
-            }
-        });
-    }
-}
-
-fn projection_has_other_owner(
-    iface: &Arc<dyn Iface>,
-    destination: IpCidr,
-    gateway: Option<IpAddress>,
-    excluded_key: Option<RouteEntryKey>,
-) -> bool {
-    address_owns_projection(iface, destination, gateway)
-        || iface.common().netlink_routes().iter().any(|existing| {
-            Some(route_entry_key(existing)) != excluded_key
-                && same_projection(existing.destination, existing.gateway, destination, gateway)
-        })
-}
-
-fn address_owns_projection(
-    iface: &Arc<dyn Iface>,
-    destination: IpCidr,
-    gateway: Option<IpAddress>,
-) -> bool {
-    gateway.is_none()
-        && iface
-            .common()
-            .ip_addrs()
-            .iter()
-            .any(|cidr| canonical_projection_cidr(*cidr) == canonical_projection_cidr(destination))
-}
-
-fn same_projection(
-    left_cidr: IpCidr,
-    left_gateway: Option<IpAddress>,
-    right_cidr: IpCidr,
-    right_gateway: Option<IpAddress>,
-) -> bool {
-    canonical_projection_cidr(left_cidr) == canonical_projection_cidr(right_cidr)
-        && left_gateway == right_gateway
-}
-
-fn family_matches(requested_family: AddressFamily, actual_family: AddressFamily) -> bool {
-    requested_family == AddressFamily::Unspecified || requested_family == actual_family
+fn family_matches(requested: AddressFamily, actual: AddressFamily) -> bool {
+    requested == AddressFamily::Unspecified || requested == actual
 }
 
 fn family_of_ip(ip: IpAddress) -> AddressFamily {
@@ -604,41 +646,57 @@ fn family_of_ip(ip: IpAddress) -> AddressFamily {
     }
 }
 
-fn default_cidr(family: AddressFamily) -> Result<IpCidr, SystemError> {
+fn default_cidr(family: AddressFamily, prefix_len: u8) -> Result<IpCidr, SystemError> {
     match family {
-        AddressFamily::INet => Ok(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0))),
-        AddressFamily::INet6 => Ok(IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0))),
+        AddressFamily::INet if prefix_len <= 32 => Ok(IpCidr::Ipv4(Ipv4Cidr::new(
+            Ipv4Address::UNSPECIFIED,
+            prefix_len,
+        ))),
+        AddressFamily::INet6 if prefix_len <= 128 => Ok(IpCidr::Ipv6(Ipv6Cidr::new(
+            Ipv6Address::UNSPECIFIED,
+            prefix_len,
+        ))),
         _ => Err(SystemError::EAFNOSUPPORT),
     }
 }
 
-fn parse_cidr(bytes: &[u8], prefix_len: u8, family: AddressFamily) -> Result<IpCidr, SystemError> {
-    let ip = parse_ip(bytes, family)?;
-    match ip {
-        IpAddress::Ipv4(addr) if prefix_len <= 32 => {
-            Ok(IpCidr::Ipv4(Ipv4Cidr::new(addr, prefix_len)))
-        }
-        IpAddress::Ipv6(addr) if prefix_len <= 128 => {
-            Ok(IpCidr::Ipv6(Ipv6Cidr::new(addr, prefix_len)))
-        }
-        _ => Err(SystemError::EINVAL),
+fn host_cidr(address: IpAddress) -> IpCidr {
+    match address {
+        IpAddress::Ipv4(address) => IpCidr::Ipv4(Ipv4Cidr::new(address, 32)),
+        IpAddress::Ipv6(address) => IpCidr::Ipv6(Ipv6Cidr::new(address, 128)),
     }
+}
+
+fn parse_cidr(bytes: &[u8], prefix_len: u8, family: AddressFamily) -> Result<IpCidr, SystemError> {
+    let cidr = match family {
+        AddressFamily::INet if prefix_len <= 32 && bytes.len() == 4 => IpCidr::Ipv4(Ipv4Cidr::new(
+            Ipv4Address::from_octets(bytes.try_into().map_err(|_| SystemError::EINVAL)?),
+            prefix_len,
+        )),
+        AddressFamily::INet6
+            if prefix_len <= 128
+                && bytes.len() >= usize::from(prefix_len).div_ceil(8)
+                && bytes.len() <= 16 =>
+        {
+            let mut octets = [0; 16];
+            octets[..bytes.len()].copy_from_slice(bytes);
+            IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::from_octets(octets), prefix_len))
+        }
+        _ => return Err(SystemError::EINVAL),
+    };
+    if matches!(cidr, IpCidr::Ipv4(_)) && route::canonical_cidr(cidr) != cidr {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(cidr)
 }
 
 fn parse_ip(bytes: &[u8], family: AddressFamily) -> Result<IpAddress, SystemError> {
     match family {
-        AddressFamily::INet if bytes.len() == 4 => Ok(IpAddress::Ipv4(Ipv4Address::new(
-            bytes[0], bytes[1], bytes[2], bytes[3],
+        AddressFamily::INet if bytes.len() == 4 => Ok(IpAddress::Ipv4(Ipv4Address::from_octets(
+            bytes.try_into().map_err(|_| SystemError::EINVAL)?,
         ))),
-        AddressFamily::INet6 if bytes.len() == 16 => Ok(IpAddress::Ipv6(Ipv6Address::new(
-            u16::from_be_bytes([bytes[0], bytes[1]]),
-            u16::from_be_bytes([bytes[2], bytes[3]]),
-            u16::from_be_bytes([bytes[4], bytes[5]]),
-            u16::from_be_bytes([bytes[6], bytes[7]]),
-            u16::from_be_bytes([bytes[8], bytes[9]]),
-            u16::from_be_bytes([bytes[10], bytes[11]]),
-            u16::from_be_bytes([bytes[12], bytes[13]]),
-            u16::from_be_bytes([bytes[14], bytes[15]]),
+        AddressFamily::INet6 if bytes.len() == 16 => Ok(IpAddress::Ipv6(Ipv6Address::from_octets(
+            bytes.try_into().map_err(|_| SystemError::EINVAL)?,
         ))),
         _ => Err(SystemError::EINVAL),
     }
@@ -646,33 +704,25 @@ fn parse_ip(bytes: &[u8], family: AddressFamily) -> Result<IpAddress, SystemErro
 
 fn ip_to_bytes(ip: IpAddress) -> Vec<u8> {
     match ip {
-        IpAddress::Ipv4(addr) => addr.octets().to_vec(),
-        IpAddress::Ipv6(addr) => addr.octets().to_vec(),
+        IpAddress::Ipv4(address) => address.octets().to_vec(),
+        IpAddress::Ipv6(address) => address.octets().to_vec(),
     }
 }
 
-fn route_destination_prefix(cidr: IpCidr) -> IpAddress {
-    match cidr {
-        IpCidr::Ipv4(cidr) => IpAddress::Ipv4(cidr.network().address()),
-        IpCidr::Ipv6(cidr) => {
-            let mut octets = cidr.address().octets();
-            let prefix_len = cidr.prefix_len() as usize;
-            let full_bytes = prefix_len / 8;
-            let partial_bits = prefix_len % 8;
+fn normalize_ip(ip: Option<IpAddress>) -> Option<IpAddress> {
+    ip.filter(|address| !address.is_unspecified())
+}
 
-            if partial_bits != 0 && full_bytes < octets.len() {
-                octets[full_bytes] &= 0xffu8 << (8 - partial_bits);
-            }
-            for byte in octets
-                .iter_mut()
-                .skip(full_bytes + usize::from(partial_bits != 0))
-            {
-                *byte = 0;
-            }
-
-            IpAddress::Ipv6(Ipv6Address::from(octets))
-        }
+fn ensure_iface_up(netns: &Arc<NetNamespace>, oif: u32) -> Result<(), SystemError> {
+    let iface = netns
+        .device_list()
+        .get(&(oif as usize))
+        .cloned()
+        .ok_or(SystemError::ENODEV)?;
+    if !iface.flags().contains(InterfaceFlags::UP) {
+        return Err(SystemError::ENETUNREACH);
     }
+    Ok(())
 }
 
 fn route_notify_group(ip: IpAddress) -> u32 {

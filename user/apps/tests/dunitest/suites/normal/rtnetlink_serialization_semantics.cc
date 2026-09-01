@@ -53,6 +53,7 @@ struct RouteSpec {
     uint8_t prefix_len;
     uint32_t ifindex;
     uint8_t table = RT_TABLE_MAIN;
+    uint32_t priority = 0;
     uint32_t source = 0;
     uint8_t source_prefix_len = 0;
     uint32_t gateway = 0;
@@ -185,10 +186,13 @@ int ChangeRoute(int fd, uint16_t type, uint16_t flags, const RouteSpec& route, u
     message->rtm_src_len = route.source_prefix_len;
     message->rtm_table = route.table;
     message->rtm_protocol = RTPROT_STATIC;
-    message->rtm_scope = RT_SCOPE_LINK;
+    message->rtm_scope = route.gateway == 0 ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
     message->rtm_type = RTN_UNICAST;
     AddAttr(&request, RTA_DST, &route.dst, sizeof(route.dst));
     AddAttr(&request, RTA_OIF, &route.ifindex, sizeof(route.ifindex));
+    if (route.priority != 0) {
+        AddAttr(&request, RTA_PRIORITY, &route.priority, sizeof(route.priority));
+    }
     if (route.source_prefix_len != 0) {
         AddAttr(&request, RTA_SRC, &route.source, sizeof(route.source));
     }
@@ -221,6 +225,7 @@ bool MessageContainsRoute(const nlmsghdr* header, const RouteSpec& route) {
 
     uint32_t destination = 0;
     uint32_t ifindex = 0;
+    uint32_t priority = 0;
     uint32_t source = 0;
     int attr_len = RTM_PAYLOAD(header);
     for (auto* attr = RTM_RTA(message); RTA_OK(attr, attr_len);
@@ -229,11 +234,14 @@ bool MessageContainsRoute(const nlmsghdr* header, const RouteSpec& route) {
             std::memcpy(&destination, RTA_DATA(attr), sizeof(destination));
         } else if (attr->rta_type == RTA_OIF && RTA_PAYLOAD(attr) >= sizeof(ifindex)) {
             std::memcpy(&ifindex, RTA_DATA(attr), sizeof(ifindex));
+        } else if (attr->rta_type == RTA_PRIORITY && RTA_PAYLOAD(attr) >= sizeof(priority)) {
+            std::memcpy(&priority, RTA_DATA(attr), sizeof(priority));
         } else if (attr->rta_type == RTA_SRC && RTA_PAYLOAD(attr) >= sizeof(source)) {
             std::memcpy(&source, RTA_DATA(attr), sizeof(source));
         }
     }
-    return destination == route.dst && ifindex == route.ifindex && source == route.source;
+    return destination == route.dst && ifindex == route.ifindex && priority == route.priority &&
+           source == route.source;
 }
 
 int DumpRoutes(int fd, uint32_t seq, const RouteSpec* probe = nullptr,
@@ -512,7 +520,7 @@ int HasRouteNotification(int fd, const RouteSpec& route) {
     }
 }
 
-int RunFailedRouteAtomicity() {
+int RunRouteGrowthAndReplacement() {
     if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 1000 + errno;
     FdGuard request_fd(OpenRouteSocket());
     FdGuard notify_fd(OpenRouteSocket(RTMGRP_IPV4_ROUTE));
@@ -528,15 +536,19 @@ int RunFailedRouteAtomicity() {
 
     const RouteSpec preserved{Ipv4("198.29.0.0"), 24, ifindex};
     RouteSpec shadow = preserved;
-    shadow.source = Ipv4("198.28.0.1");
-    shadow.source_prefix_len = 32;
+    shadow.priority = 100;
     uint32_t seq = 100;
-    if (ChangeRoute(request_fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, preserved,
-                    seq++) != 0 ||
-        ChangeRoute(request_fd.Get(), RTM_NEWROUTE,
-                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, shadow, seq++) != 0) {
-        return 5000;
+    if (const int error = ChangeRoute(request_fd.Get(), RTM_NEWROUTE,
+                                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                      preserved, seq++);
+        error != 0) {
+        return 5000 + error;
+    }
+    if (const int error = ChangeRoute(request_fd.Get(), RTM_NEWROUTE,
+                                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                      shadow, seq++);
+        error != 0) {
+        return 5100 + error;
     }
     // The source-specific shadow and source-agnostic record share one physical
     // projection. Replacing one owner with a different gateway must allocate a
@@ -563,13 +575,39 @@ int RunFailedRouteAtomicity() {
     }
 
     if (failure_error != ENOSPC) {
-        for (const auto& route : added) {
-            (void)ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route,
-                              seq++);
+        if (added.size() != kMaxRouteFillAttempts) return 5600;
+        int last_count = 0;
+        if (DumpRoutes(request_fd.Get(), seq++, &added.back(), &last_count) != 0 ||
+            last_count != 1) {
+            return 5700 + last_count;
         }
-        (void)ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, preserved,
-                          seq++);
-        return kCapacityNotReached;
+
+        RouteSpec replacement = preserved;
+        replacement.gateway = Ipv4("127.0.0.2");
+        if (ChangeRoute(request_fd.Get(), RTM_NEWROUTE,
+                        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE, replacement,
+                        seq++) != 0) {
+            return 5800;
+        }
+        int replacement_count = 0;
+        if (DumpRoutes(request_fd.Get(), seq++, &replacement, &replacement_count) != 0 ||
+            replacement_count != 1) {
+            return 5900 + replacement_count;
+        }
+
+        for (const auto& route : added) {
+            if (ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route,
+                            seq++) != 0) {
+                return 5950;
+            }
+        }
+        if (ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, replacement,
+                        seq++) != 0 ||
+            ChangeRoute(request_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, shadow,
+                        seq++) != 0) {
+            return 5975;
+        }
+        return 0;
     }
 
     if (added.empty()) return 6000;
@@ -591,7 +629,7 @@ int RunFailedRouteAtomicity() {
     // Replacing the preserved control record needs a new projection and must
     // fail atomically when the data-plane table is full.
     RouteSpec replacement = preserved;
-    replacement.gateway = Ipv4("127.0.0.1");
+    replacement.gateway = Ipv4("127.0.0.2");
     if (ChangeRoute(request_fd.Get(), RTM_NEWROUTE,
                     NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE, replacement,
                     seq++) != ENOSPC) {
@@ -677,8 +715,8 @@ TEST(RtnetlinkSerializationSemantics, ConcurrentMutationsAndDumpsComplete) {
     EXPECT_EQ(WEXITSTATUS(outcome.exit_status), 0);
 }
 
-TEST(RtnetlinkSerializationSemantics, FailedRouteHasNoCommitOrSuccessNotification) {
-    const ChildOutcome outcome = RunWithWatchdog(RunFailedRouteAtomicity);
+TEST(RtnetlinkSerializationSemantics, RouteGrowthAndReplacementRemainSerialized) {
+    const ChildOutcome outcome = RunWithWatchdog(RunRouteGrowthAndReplacement);
     ASSERT_FALSE(outcome.timed_out) << "rtnetlink failure path deadlocked";
     ASSERT_TRUE(WIFEXITED(outcome.exit_status));
     if (outcome.stage == kCapacityNotReached) {
@@ -687,7 +725,7 @@ TEST(RtnetlinkSerializationSemantics, FailedRouteHasNoCommitOrSuccessNotificatio
         if (std::strstr(name.release, "dragonos") == nullptr) {
             GTEST_SKIP() << "Linux FIB has no DragonOS smoltcp fixed-capacity ENOSPC boundary";
         }
-        FAIL() << "DragonOS route table did not reach ENOSPC within the bounded fill loop";
+        FAIL() << "DragonOS route scalability test did not run";
     }
     EXPECT_EQ(outcome.stage, 0) << "encoded stage/error=" << outcome.stage;
     EXPECT_EQ(WEXITSTATUS(outcome.exit_status), 0);

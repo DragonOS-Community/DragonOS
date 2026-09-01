@@ -878,7 +878,7 @@ int FillRoutesToCapacity(int fd, uint32_t ifindex, uint32_t* sequence,
     return kHostHasNoFixedRouteCapacity;
 }
 
-int RunAddressRollbackAndCapacityRelease() {
+int RunRouteGrowthAndAddressMutation() {
     FdGuard fd;
     uint32_t ifindex = 0;
     uint32_t sequence = 3000;
@@ -889,10 +889,33 @@ int RunAddressRollbackAndCapacityRelease() {
 
     std::vector<RouteSpec> fillers;
     RouteSpec failed_route{};
-    if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers,
-                                               &failed_route);
-        error != 0) {
-        return error == kHostHasNoFixedRouteCapacity ? error : 6100 + error;
+    const int fill_error =
+        FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers, &failed_route);
+    if (fill_error == kHostHasNoFixedRouteCapacity) {
+        const AddressSpec scalable_address = MakeAddress(AF_INET, "203.0.113.1", 24, ifindex);
+        const RouteSpec scalable_connected{Ipv4("203.0.113.0"), 24, ifindex};
+        if (fillers.size() != kMaxRouteFillAttempts ||
+            ChangeAddress(fd.Get(), RTM_NEWADDR,
+                          NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                          scalable_address, true, true, ++sequence) != 0 ||
+            CountAddress(fd.Get(), scalable_address, ++sequence) != 1 ||
+            CountRoute(fd.Get(), scalable_connected, ++sequence) < 1) {
+            return 6050;
+        }
+        if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, scalable_address,
+                          true, true, ++sequence) != 0) {
+            return 6075;
+        }
+        for (auto iterator = fillers.rbegin(); iterator != fillers.rend(); ++iterator) {
+            if (ChangeRoute(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, *iterator,
+                            ++sequence) != 0) {
+                return 6090;
+            }
+        }
+        return 0;
+    }
+    if (fill_error != 0) {
+        return 6100 + fill_error;
     }
     if (fillers.empty()) return 6200;
     const size_t route_capacity = fillers.size();
@@ -1025,9 +1048,11 @@ int RunSharedAddressAndExplicitRouteProjection() {
 
     std::vector<RouteSpec> fillers;
     RouteSpec failed{};
-    if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers, &failed);
-        error != 0 || fillers.empty()) {
-        return 8350 + (error > 0 ? error : 0);
+    const int first_fill_error =
+        FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers, &failed);
+    const bool dynamic_projection = first_fill_error == kHostHasNoFixedRouteCapacity;
+    if ((!dynamic_projection && first_fill_error != 0) || fillers.empty()) {
+        return 8350 + (first_fill_error > 0 ? first_fill_error : 0);
     }
     const size_t route_capacity = fillers.size();
     for (auto iterator = fillers.rbegin(); iterator != fillers.rend(); ++iterator) {
@@ -1049,6 +1074,8 @@ int RunSharedAddressAndExplicitRouteProjection() {
                       ++sequence) != 0) {
         return 8400;
     }
+
+    if (dynamic_projection) return 0;
 
     if (const int error = FillRoutesToCapacity(fd.Get(), ifindex, &sequence, &fillers, &failed);
         error != 0 || fillers.size() != route_capacity) {
@@ -1190,8 +1217,8 @@ TEST(RtnetlinkAddressSemantics, InvalidAddressCannotPanicKernel) {
                           "invalid address request hung or panicked the kernel");
 }
 
-TEST(RtnetlinkAddressSemantics, CapacityFailureRollsBackAndDeleteReleasesRouteSlot) {
-    const ChildOutcome outcome = RunWithWatchdog(RunAddressRollbackAndCapacityRelease);
+TEST(RtnetlinkAddressSemantics, RouteGrowthAndAddressMutationRemainTransactional) {
+    const ChildOutcome outcome = RunWithWatchdog(RunRouteGrowthAndAddressMutation);
     ASSERT_FALSE(outcome.timed_out) << "address capacity rollback path deadlocked";
     ASSERT_TRUE(WIFEXITED(outcome.wait_status));
     if (outcome.stage == kNamespaceUnavailable) {
@@ -1199,10 +1226,7 @@ TEST(RtnetlinkAddressSemantics, CapacityFailureRollsBackAndDeleteReleasesRouteSl
         FAIL() << "DragonOS failed to create the required fresh user/network namespace";
     }
     if (outcome.stage == kHostHasNoFixedRouteCapacity) {
-        if (!IsDragonOS()) {
-            GTEST_SKIP() << "Linux FIB has no DragonOS smoltcp fixed-capacity ENOSPC boundary";
-        }
-        FAIL() << "DragonOS route table did not reach ENOSPC within the bounded dynamic fill";
+        GTEST_SKIP() << "host route scalability is outside this DragonOS projection test";
     }
     EXPECT_EQ(outcome.stage, 0) << "encoded stage/error=" << outcome.stage;
     EXPECT_EQ(WEXITSTATUS(outcome.wait_status), 0);
@@ -1217,10 +1241,7 @@ TEST(RtnetlinkAddressSemantics, AddressAndExplicitRouteShareOneDataPlaneProjecti
         FAIL() << "DragonOS failed to create the required fresh user/network namespace";
     }
     if (outcome.stage == kHostHasNoFixedRouteCapacity) {
-        if (!IsDragonOS()) {
-            GTEST_SKIP() << "Linux FIB has no DragonOS smoltcp fixed-capacity ENOSPC boundary";
-        }
-        FAIL() << "DragonOS route table did not reach ENOSPC within the bounded dynamic fill";
+        GTEST_SKIP() << "host route scalability is outside this DragonOS projection test";
     }
     EXPECT_EQ(outcome.stage, 0) << "encoded stage/error=" << outcome.stage;
     EXPECT_EQ(WEXITSTATUS(outcome.wait_status), 0);

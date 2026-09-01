@@ -1,3 +1,4 @@
+use alloc::collections::VecDeque;
 use alloc::ffi::CString;
 use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};
@@ -10,6 +11,7 @@ use sysfs::netdev_register_kobject;
 use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard};
+use crate::libs::spinlock::SpinLock;
 use crate::net::routing::RouterEnableDeviceCommon;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
@@ -17,7 +19,7 @@ use crate::{
     net::socket::inet::{common::PortManager, InetSocket},
     process::ProcessState,
 };
-use smoltcp;
+use smoltcp::phy::{Device as SmolDevice, DeviceCapabilities, RxToken};
 use system_error::SystemError;
 
 pub mod bridge;
@@ -30,6 +32,21 @@ pub mod sysfs;
 pub mod types;
 pub mod veth;
 pub mod virtio_net;
+
+kernel_cmdline_param_arg!(
+    NET_TEST_FIXTURES_PARAM,
+    "dragonos.net_test_fixtures",
+    false,
+    false
+);
+
+/// Whether boot-only networking fixtures should be installed in the initial
+/// network namespace. Production boots leave this disabled; test runners opt
+/// in explicitly so synthetic veth and bridge devices cannot pollute the
+/// system route table or device namespace.
+pub(crate) fn net_test_fixtures_enabled() -> bool {
+    NET_TEST_FIXTURES_PARAM.value_bool().unwrap_or(false)
+}
 
 bitflags! {
     pub struct NetDeivceState: u16 {
@@ -74,6 +91,27 @@ pub enum Operstate {
 pub(crate) struct AddressMetadata {
     pub cidr: smoltcp::wire::IpCidr,
     pub label: Option<CString>,
+}
+
+/// Lossless route state accumulated while an interface is being constructed.
+///
+/// This is only a hand-off buffer: once the interface is published, its
+/// network namespace FIB owns the route and the smoltcp table is a projection
+/// of that FIB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BootstrapRoute {
+    pub destination: smoltcp::wire::IpCidr,
+    pub source: Option<smoltcp::wire::IpCidr>,
+    pub preferred_source: Option<smoltcp::wire::IpAddress>,
+    pub table: u32,
+    pub priority: u32,
+    pub tos: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub kind: u8,
+    pub oif: u32,
+    pub gateway: Option<smoltcp::wire::IpAddress>,
+    pub nexthop_flags: u8,
 }
 
 #[allow(dead_code)]
@@ -135,6 +173,50 @@ pub trait Iface: crate::driver::base::device::Device {
         Err(SystemError::ENOSYS)
     }
 
+    /// Sends an already-routed IP packet through this interface. Only devices
+    /// that participate in DragonOS software forwarding need to override it.
+    fn route_and_send(
+        &self,
+        _next_hop: &smoltcp::wire::IpAddress,
+        _ip_packet: &[u8],
+    ) -> Result<(), SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+
+    /// Hands a namespace-local IPv4 packet to this interface's protocol stack
+    /// without emitting it on the link. The shared queue in `IfaceCommon`
+    /// makes local delivery a protocol-stack capability rather than an
+    /// optional device-driver feature.
+    fn inject_local_ipv4_packet(
+        &self,
+        source_mac: smoltcp::wire::EthernetAddress,
+        ip_packet: &[u8],
+        broadcast: bool,
+    ) -> Result<(), SystemError> {
+        let packet = LocalInputPacket {
+            destination_mac: if broadcast {
+                smoltcp::wire::EthernetAddress::BROADCAST
+            } else {
+                self.mac()
+            },
+            source_mac,
+            ip_packet: ip_packet.to_vec(),
+        };
+
+        let napi = self.napi_struct();
+        let netns = napi.is_none().then(|| self.net_namespace()).flatten();
+        if napi.is_none() && netns.is_none() {
+            return Err(SystemError::ENODEV);
+        }
+        self.common().enqueue_local_input(packet)?;
+        if let Some(napi) = napi {
+            napi::napi_schedule(napi);
+        } else if let Some(netns) = netns {
+            netns.wakeup_poll_thread();
+        }
+        Ok(())
+    }
+
     /// # `should_drop_rx_packet`
     /// 驱动收包入口可选调用：询问“上层(协议栈/Socket 语义)”是否需要丢弃该包。
     ///
@@ -187,6 +269,10 @@ pub trait Iface: crate::driver::base::device::Device {
 
     fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
         self.common().set_net_namespace(ns);
+    }
+
+    fn clear_net_namespace(&self) {
+        self.common().clear_net_namespace();
     }
 
     fn flags(&self) -> InterfaceFlags {
@@ -268,18 +354,6 @@ impl Default for NetDeviceCommonData {
 }
 
 #[derive(Debug, Clone)]
-pub struct NetlinkRouteEntry {
-    pub destination: smoltcp::wire::IpCidr,
-    pub source: Option<smoltcp::wire::IpCidr>,
-    pub gateway: Option<smoltcp::wire::IpAddress>,
-    pub priority: u32,
-    pub table: u8,
-    pub protocol: u8,
-    pub scope: u8,
-    pub kind: u8,
-}
-
-#[derive(Debug, Clone)]
 pub struct StaticNeighborEntry {
     pub ip_addr: smoltcp::wire::IpAddress,
     pub hw_addr: smoltcp::wire::HardwareAddress,
@@ -313,6 +387,163 @@ pub struct LinkFlagsSnapshot {
     pub allmulti: u32,
 }
 
+struct LocalInputRxToken {
+    frame: Vec<u8>,
+}
+
+impl RxToken for LocalInputRxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.frame)
+    }
+}
+
+#[derive(Debug)]
+struct LocalInputPacket {
+    destination_mac: smoltcp::wire::EthernetAddress,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: Vec<u8>,
+}
+
+impl LocalInputPacket {
+    fn len(&self) -> usize {
+        self.ip_packet.len()
+    }
+
+    fn into_frame(self, medium: smoltcp::phy::Medium) -> Vec<u8> {
+        if medium == smoltcp::phy::Medium::Ip {
+            return self.ip_packet;
+        }
+        let mut frame = Vec::with_capacity(14 + self.ip_packet.len());
+        frame.extend_from_slice(&self.destination_mac.0);
+        frame.extend_from_slice(&self.source_mac.0);
+        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.extend_from_slice(&self.ip_packet);
+        frame
+    }
+}
+
+#[derive(Debug)]
+struct LocalInputQueueState {
+    packets: VecDeque<LocalInputPacket>,
+    bytes: usize,
+    accepting: bool,
+}
+
+#[derive(Debug)]
+struct LocalInputQueue {
+    state: SpinLock<LocalInputQueueState>,
+}
+
+impl LocalInputQueue {
+    const MAX_FRAMES: usize = 1024;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+
+    fn new(accepting: bool) -> Self {
+        Self {
+            state: SpinLock::new(LocalInputQueueState {
+                packets: VecDeque::new(),
+                bytes: 0,
+                accepting,
+            }),
+        }
+    }
+
+    fn enqueue(&self, packet: LocalInputPacket) -> Result<(), SystemError> {
+        let mut state = self.state.lock();
+        if !state.accepting {
+            return Err(SystemError::ENETDOWN);
+        }
+        if state.packets.len() >= Self::MAX_FRAMES
+            || state.bytes.saturating_add(packet.len()) > Self::MAX_BYTES
+        {
+            return Err(SystemError::ENOBUFS);
+        }
+        state.bytes += packet.len();
+        state.packets.push_back(packet);
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<LocalInputPacket> {
+        let mut state = self.state.lock();
+        let packet = state.packets.pop_front()?;
+        state.bytes -= packet.len();
+        Some(packet)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state.lock().packets.is_empty()
+    }
+
+    /// Linearizes local-input admission with link transitions. Disabling also
+    /// drops packets accepted before the DOWN publication, so a later UP can
+    /// never replay stale namespace-local traffic.
+    fn set_accepting(&self, accepting: bool) {
+        let mut state = self.state.lock();
+        state.accepting = accepting;
+        if !accepting {
+            state.packets.clear();
+            state.bytes = 0;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum IfacePollScope {
+    None,
+    Full,
+}
+
+/// A receive-only view over the shared namespace-local input queue. Replies
+/// use the real device's transmit token, so ARP/L2 and driver ownership remain
+/// with the target interface while the injected frame never enters its wire
+/// receive ring.
+struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
+    device: &'a mut D,
+    queue: &'a LocalInputQueue,
+}
+
+impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
+    fn new(device: &'a mut D, queue: &'a LocalInputQueue) -> Self {
+        Self { device, queue }
+    }
+}
+
+impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
+    type RxToken<'a>
+        = LocalInputRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = D::TxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(
+        &mut self,
+        timestamp: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        let medium = self.device.capabilities().medium;
+        let tx = self.device.transmit(timestamp)?;
+        let packet = self.queue.pop()?;
+        let frame = packet.into_frame(medium);
+        Some((LocalInputRxToken { frame }, tx))
+    }
+
+    fn transmit(&mut self, timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        self.device.transmit(timestamp)
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.device.capabilities()
+    }
+}
+
 pub struct IfaceCommon {
     iface_id: usize,
     name: RwLock<String>,
@@ -335,11 +566,17 @@ pub struct IfaceCommon {
     router_common_data: RouterEnableDeviceCommon,
     /// NAPI 结构体
     napi_struct: RwLock<Option<Arc<NapiStruct>>>,
-    netlink_routes: RwSem<Vec<NetlinkRouteEntry>>,
+    /// Namespace-local frames handed to this interface's protocol stack.
+    /// This is shared by every interface implementation so weak-host local
+    /// delivery never depends on a driver-specific receive queue.
+    local_input_queue: LocalInputQueue,
     /// Per-address control-plane state committed together with smoltcp's
     /// address list. It carries Linux IFA_LABEL semantics and opaque ownership
     /// tokens for in-kernel actors such as DHCP.
     address_metadata: Mutex<Vec<AddressMetadata>>,
+    /// Routes supplied by constructors before the interface joins a netns.
+    /// Drained transactionally by netns registration; never authoritative.
+    bootstrap_routes: Mutex<Vec<BootstrapRoute>>,
     static_neighbors: RwSem<Vec<StaticNeighborEntry>>,
     /// TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket（Linux-like）。
     tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer,
@@ -395,8 +632,9 @@ impl IfaceCommon {
             mtu: AtomicUsize::new(mtu),
             type_,
             napi_struct: RwLock::new(None),
-            netlink_routes: RwSem::new(Vec::new()),
+            local_input_queue: LocalInputQueue::new(flags.contains(InterfaceFlags::UP)),
             address_metadata: Mutex::new(address_metadata),
+            bootstrap_routes: Mutex::new(Vec::new()),
             static_neighbors: RwSem::new(Vec::new()),
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
             tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
@@ -459,6 +697,22 @@ impl IfaceCommon {
             .should_drop_backlog_full_tcp_syn_ip(packet)
     }
 
+    fn enqueue_local_input(&self, packet: LocalInputPacket) -> Result<(), SystemError> {
+        self.local_input_queue.enqueue(packet)
+    }
+
+    pub(crate) fn has_local_input(&self) -> bool {
+        !self.local_input_queue.is_empty()
+    }
+
+    pub(crate) fn poll_scope(&self) -> IfacePollScope {
+        if self.flags().contains(InterfaceFlags::UP) {
+            IfacePollScope::Full
+        } else {
+            IfacePollScope::None
+        }
+    }
+
     /// Defer removing a TCP socket from the SocketSet until it reaches Closed.
     pub fn defer_tcp_close(&self, request: crate::net::tcp_close_defer::DeferredTcpCloseRequest) {
         let now = crate::time::Instant::now().into();
@@ -469,6 +723,11 @@ impl IfaceCommon {
     where
         D: smoltcp::phy::Device + ?Sized,
     {
+        match self.poll_scope() {
+            IfacePollScope::None => return false,
+            IfacePollScope::Full => {}
+        }
+
         let timestamp = crate::time::Instant::now().into();
         let mut sockets = self.sockets.lock();
         let mut interface = self.smol_iface.lock();
@@ -478,6 +737,12 @@ impl IfaceCommon {
             .refresh_listen_socket_present(&sockets);
 
         let (has_events, poll_again, deadline_rearm) = {
+            let local_result = if self.has_local_input() {
+                let mut local_device = LocalInputDevice::new(device, &self.local_input_queue);
+                Some(interface.poll(timestamp, &mut local_device, &mut sockets))
+            } else {
+                None
+            };
             let poll_result = interface.poll(timestamp, device, &mut sockets);
 
             // Reclaim/advance orphaned TCP sockets after smoltcp has processed ingress.
@@ -488,8 +753,10 @@ impl IfaceCommon {
             let poll_at = interface.poll_at(timestamp, &sockets);
             let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
             (
-                matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged),
-                poll_again,
+                local_result.is_some_and(|result| {
+                    matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
+                }) || matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged),
+                poll_again || self.has_local_input(),
                 deadline_rearm,
             )
         };
@@ -550,6 +817,11 @@ impl IfaceCommon {
     where
         D: smoltcp::phy::Device + ?Sized,
     {
+        match self.poll_scope() {
+            IfacePollScope::None => return napi::NapiPollResult::idle(),
+            IfacePollScope::Full => {}
+        }
+
         let timestamp = crate::time::Instant::now().into();
         let mut sockets = self.sockets.lock();
         let mut interface = self.smol_iface.lock();
@@ -561,16 +833,50 @@ impl IfaceCommon {
         let mut processed = 0usize;
         let mut had_packet = false;
 
-        for _ in 0..budget {
+        // Reserve at most half of the first pass for namespace-local handoff,
+        // then poll the hardware/device queue. If the device has no work, use
+        // the remaining budget for local input. This keeps both sources
+        // progressing without reducing throughput when only one is active.
+        let local_first_budget = budget.div_ceil(2);
+        {
+            let mut local_device = LocalInputDevice::new(device, &self.local_input_queue);
+            for _ in 0..local_first_budget {
+                match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets) {
+                    smoltcp::iface::PollIngressSingleResult::None => break,
+                    smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                    | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                        had_packet = true;
+                        processed += 1;
+                    }
+                }
+            }
+        }
+
+        let device_budget = budget - processed;
+        let mut device_processed = 0usize;
+        for _ in 0..device_budget {
             match interface.poll_ingress_single(timestamp, device, &mut sockets) {
                 smoltcp::iface::PollIngressSingleResult::None => break,
-                smoltcp::iface::PollIngressSingleResult::PacketProcessed => {
+                smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
                     had_packet = true;
                     processed += 1;
+                    device_processed += 1;
                 }
-                smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                    had_packet = true;
-                    processed += 1;
+            }
+        }
+
+        let remaining = device_budget - device_processed;
+        if remaining > 0 && self.has_local_input() {
+            let mut local_device = LocalInputDevice::new(device, &self.local_input_queue);
+            for _ in 0..remaining {
+                match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets) {
+                    smoltcp::iface::PollIngressSingleResult::None => break,
+                    smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                    | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                        had_packet = true;
+                        processed += 1;
+                    }
                 }
             }
         }
@@ -596,7 +902,10 @@ impl IfaceCommon {
         // - 但仍有 ACK / window update / 后续 egress 需要立即发送；
         // - NAPI 线程却错误睡眠，直到下一次外部事件才继续推进，
         //   导致 send done 后 recv 端偶发卡住。
-        napi::NapiPollResult::new(processed, (had_packet && processed == budget) || poll_again)
+        napi::NapiPollResult::new(
+            processed,
+            (had_packet && processed == budget) || poll_again || self.has_local_input(),
+        )
     }
 
     /// Publish smoltcp's next scheduling decision while both smoltcp
@@ -695,6 +1004,24 @@ impl IfaceCommon {
         *guard = Arc::downgrade(&ns);
     }
 
+    pub fn clear_net_namespace(&self) {
+        *self.net_namespace.write() = Weak::new();
+    }
+
+    /// Runs a construction-time mutation while preventing namespace
+    /// publication from starting. This is the lifecycle barrier shared by
+    /// all bootstrap state owned by an interface.
+    pub(crate) fn with_unpublished<T>(
+        &self,
+        mutation: impl FnOnce() -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        let namespace = self.net_namespace.read();
+        if namespace.upgrade().is_some() {
+            return Err(SystemError::EBUSY);
+        }
+        mutation()
+    }
+
     pub fn name(&self) -> String {
         self.name.read().clone()
     }
@@ -763,53 +1090,39 @@ impl IfaceCommon {
         self.mtu.store(mtu, Ordering::Relaxed);
     }
 
-    pub fn netlink_routes(&self) -> RwSemReadGuard<'_, Vec<NetlinkRouteEntry>> {
-        self.netlink_routes.read()
-    }
-
     pub(crate) fn address_metadata(&self) -> &Mutex<Vec<AddressMetadata>> {
         &self.address_metadata
     }
 
-    pub fn upsert_netlink_route(&self, route: NetlinkRouteEntry) {
-        let mut routes = self.netlink_routes.write();
-        if let Some(existing) = routes.iter_mut().find(|existing| {
-            existing.destination == route.destination
-                && existing.table == route.table
-                && existing
-                    .source
-                    .as_ref()
-                    .map(|cidr| (cidr.address(), cidr.prefix_len()))
-                    == route
-                        .source
-                        .as_ref()
-                        .map(|cidr| (cidr.address(), cidr.prefix_len()))
-        }) {
-            *existing = route;
-        } else {
+    /// Stages a route before publication. Holding the namespace read guard
+    /// closes the race with `set_net_namespace()` during registration.
+    pub(crate) fn stage_bootstrap_route(&self, route: BootstrapRoute) -> Result<(), SystemError> {
+        self.with_unpublished(|| {
+            let expected_oif = u32::try_from(self.iface_id).map_err(|_| SystemError::EOVERFLOW)?;
+            if route.oif != expected_oif {
+                return Err(SystemError::EINVAL);
+            }
+
+            let mut routes = self.bootstrap_routes.lock();
+            if routes.contains(&route) {
+                return Err(SystemError::EEXIST);
+            }
+            routes.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
             routes.push(route);
-        }
+            Ok(())
+        })
     }
 
-    pub fn remove_netlink_route(
-        &self,
-        destination: smoltcp::wire::IpCidr,
-        source: Option<smoltcp::wire::IpCidr>,
-        table: u8,
-    ) -> Option<NetlinkRouteEntry> {
-        let mut routes = self.netlink_routes.write();
-        let index = routes.iter().position(|existing| {
-            existing.destination == destination
-                && existing.table == table
-                && existing
-                    .source
-                    .as_ref()
-                    .map(|cidr| (cidr.address(), cidr.prefix_len()))
-                    == source
-                        .as_ref()
-                        .map(|cidr| (cidr.address(), cidr.prefix_len()))
-        })?;
-        Some(routes.remove(index))
+    /// Transfers unpublished routes to netns registration without cloning.
+    pub(crate) fn take_bootstrap_routes(&self) -> Vec<BootstrapRoute> {
+        core::mem::take(&mut *self.bootstrap_routes.lock())
+    }
+
+    /// Restores the hand-off buffer when netns registration rolls back.
+    pub(crate) fn restore_bootstrap_routes(&self, routes: Vec<BootstrapRoute>) {
+        let mut staged = self.bootstrap_routes.lock();
+        debug_assert!(staged.is_empty());
+        *staged = routes;
     }
 
     pub fn static_neighbors(&self) -> RwSemReadGuard<'_, Vec<StaticNeighborEntry>> {
@@ -884,5 +1197,7 @@ impl IfaceCommon {
             effective |= InterfaceFlags::ALLMULTI.bits();
         }
         self.flags.store(effective, Ordering::Release);
+        self.local_input_queue
+            .set_accepting(effective & InterfaceFlags::UP.bits() != 0);
     }
 }

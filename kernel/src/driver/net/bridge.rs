@@ -326,19 +326,15 @@ fn bridge_probe() {
     crate::net::address::initialize_address(&(iface4.clone() as Arc<dyn Iface>), cidr4)
         .expect("initialize veth address");
 
-    iface1.add_default_route_to_peer(addr2);
-    iface2.add_default_route_to_peer(addr1);
-    iface3.add_default_route_to_peer(addr4);
-    iface4.add_default_route_to_peer(addr3);
-
     // iface1.add_direct_route(cidr4, addr2);
 
     let turn_on = |a: &Arc<VethInterface>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        INIT_NET_NAMESPACE.add_device(a.clone());
-        a.common().set_net_namespace(INIT_NET_NAMESPACE.clone());
+        INIT_NET_NAMESPACE
+            .add_device(a.clone())
+            .expect("register bridge fixture interface in root netns");
 
         register_netdevice(a.clone()).expect("register veth device failed");
     };
@@ -360,7 +356,8 @@ fn bridge_probe() {
 
 #[unified_init(INITCALL_DEVICE)]
 pub fn bridge_init() -> Result<(), SystemError> {
-    bridge_probe();
-    // log::info!("bridge initialized.");
+    if super::net_test_fixtures_enabled() {
+        bridge_probe();
+    }
     Ok(())
 }

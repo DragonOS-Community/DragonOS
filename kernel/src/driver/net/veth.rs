@@ -1,5 +1,5 @@
 use super::bridge::BridgeEnableDevice;
-use super::{Iface, IfaceCommon};
+use super::{BootstrapRoute, Iface, IfaceCommon};
 use super::{NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
@@ -16,12 +16,13 @@ use crate::driver::net::register_netdevice;
 use crate::driver::net::types::InterfaceFlags;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
+use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::generate_iface_id;
-use crate::net::routing::{DnatRule, RouteEntry, RouterEnableDevice, SnatRule};
+use crate::net::route::{RTN_UNICAST, RTPROT_BOOT, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN};
+use crate::net::routing::RouterEnableDevice;
 use crate::process::namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE};
-use crate::process::ProcessManager;
 use alloc::collections::VecDeque;
 use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
@@ -35,7 +36,12 @@ use unified_init::macros::unified_init;
 
 pub struct Veth {
     name: String,
-    rx_queue: VecDeque<Vec<u8>>,
+    /// Frames awaiting bridge/routing classification. Classification may
+    /// consult the authoritative FIB and therefore must run outside smoltcp's
+    /// interface lock.
+    pending_rx_queue: VecDeque<Vec<u8>>,
+    /// Frames classified for local smoltcp delivery.
+    local_rx_queue: VecDeque<Vec<u8>>,
     /// 对端的 `VethInterface`，在完成数据发送的时候会使用到
     peer: Weak<VethInterface>,
     self_iface_ref: Weak<VethInterface>,
@@ -45,7 +51,8 @@ impl Veth {
     pub fn new(name: String) -> Self {
         Veth {
             name,
-            rx_queue: VecDeque::new(),
+            pending_rx_queue: VecDeque::new(),
+            local_rx_queue: VecDeque::new(),
             peer: Weak::new(),
             self_iface_ref: Weak::new(),
         }
@@ -55,14 +62,6 @@ impl Veth {
         self.peer = Arc::downgrade(peer);
     }
 
-    pub fn send_to_peer(&self, data: &[u8]) {
-        if let Some(peer) = self.peer.upgrade() {
-            // log::info!("Veth {} trying to send", self.name);
-
-            Self::to_peer(&peer, data);
-        }
-    }
-
     pub(self) fn to_peer(peer: &Arc<VethInterface>, data: &[u8]) {
         let _ = Self::to_peer_owned(peer, data.to_vec());
     }
@@ -70,7 +69,7 @@ impl Veth {
     fn to_peer_owned(peer: &Arc<VethInterface>, data: Vec<u8>) -> Result<(), SystemError> {
         let napi = peer.napi_struct().ok_or(SystemError::ENOBUFS)?;
         let mut peer_veth = peer.driver.inner.lock();
-        peer_veth.rx_queue.push_back(data);
+        peer_veth.pending_rx_queue.push_back(data);
 
         // {
         //     let ether = EthernetFrame::new_checked(data).unwrap();
@@ -119,55 +118,8 @@ impl Veth {
         bridge.handle_frame(bridge_data.id, data);
     }
 
-    /// 经过路由发送，返回是否发送成功
-    fn to_router(&self, data: &[u8]) -> bool {
-        let Some(self_iface) = self.self_iface_ref.upgrade() else {
-            return false;
-        };
-
-        let frame: EthernetFrame<&[u8]> = EthernetFrame::new_checked(data).unwrap();
-        // log::info!("trying to go to router");
-        match self_iface.handle_routable_packet(&frame) {
-            Ok(_) => {
-                // log::info!("successfully sent to router");
-                true
-            }
-            // 先不管错误，直接告诉外面没有经过路由发送出去
-            Err(Some(err)) => {
-                log::error!("Router error: {:?}", err);
-                false
-            }
-            Err(_) => {
-                // log::info!("not routed");
-                false
-            }
-        }
-    }
-
-    pub fn recv_from_peer(&mut self) -> Option<Vec<u8>> {
-        // log::info!("Veth {} trying to receive", self.name);
-        let data = self.rx_queue.pop_front()?;
-
-        if let Some(bridge_common_data) = self
-            .self_iface_ref
-            .upgrade()
-            .unwrap()
-            .inner
-            .lock()
-            .bridge_common_data
-            .as_ref()
-        {
-            // log::info!("Veth {} sending data to bridge", self.name);
-            Self::to_bridge(bridge_common_data, &data);
-            return None;
-        }
-
-        // 说明获取的包发给进入路由了，无须返回
-        if self.to_router(&data) {
-            return None;
-        }
-
-        Some(data)
+    pub fn recv_local(&mut self) -> Option<Vec<u8>> {
+        self.local_rx_queue.pop_front()
     }
 
     pub fn name(&self) -> &str {
@@ -178,6 +130,9 @@ impl Veth {
 #[derive(Clone)]
 pub struct VethDriver {
     pub inner: Arc<SpinLock<Veth>>,
+    /// Serializes dequeue, classification, and local enqueue as one ordered
+    /// ingress batch across NAPI, netns, and synchronous socket pollers.
+    ingress_classification_lock: Arc<Mutex<()>>,
     /// A shared weak reference to the owning network interface, used for packet
     /// socket delivery.
     iface: Arc<SpinLock<Weak<dyn Iface>>>,
@@ -191,7 +146,67 @@ impl Debug for VethDriver {
     }
 }
 
+enum IngressDisposition {
+    Consumed,
+    Local,
+}
+
 impl VethDriver {
+    /// Classifies a bounded batch before smoltcp locks its interface. Routed
+    /// and bridged frames are consumed here; local frames move to the queue
+    /// exposed through `Device::receive`.
+    fn prepare_ingress(&self, scan_budget: usize) -> usize {
+        let _classification_guard = self.ingress_classification_lock.lock();
+        let mut consumed = 0;
+        for _ in 0..scan_budget {
+            let data = {
+                let mut veth = self.inner.lock();
+                veth.pending_rx_queue.pop_front()
+            };
+            let Some(data) = data else {
+                break;
+            };
+
+            match self.classify_and_consume(&data) {
+                IngressDisposition::Consumed => consumed += 1,
+                IngressDisposition::Local => {
+                    self.inner.lock().local_rx_queue.push_back(data);
+                }
+            }
+        }
+        consumed
+    }
+
+    fn classify_and_consume(&self, data: &[u8]) -> IngressDisposition {
+        let Some(iface) = self.inner.lock().self_iface_ref.upgrade() else {
+            return IngressDisposition::Local;
+        };
+        if let Some(bridge_data) = iface.common_bridge_data() {
+            Veth::to_bridge(&bridge_data, data);
+            return IngressDisposition::Consumed;
+        }
+
+        let Ok(frame) = EthernetFrame::new_checked(data) else {
+            return IngressDisposition::Local;
+        };
+        match iface.handle_routable_packet(&frame) {
+            Ok(()) => IngressDisposition::Consumed,
+            Err(Some(error)) => {
+                log::error!("Router error: {:?}", error);
+                IngressDisposition::Consumed
+            }
+            Err(None) => IngressDisposition::Local,
+        }
+    }
+
+    fn has_pending_ingress(&self) -> bool {
+        !self.inner.lock().pending_rx_queue.is_empty()
+    }
+
+    fn has_local_ingress(&self) -> bool {
+        !self.inner.lock().local_rx_queue.is_empty()
+    }
+
     const MAX_UNTAGGED_FRAME_LEN: usize = 1514;
     const MAX_VLAN_FRAME_LEN: usize = Self::MAX_UNTAGGED_FRAME_LEN + 4;
 
@@ -222,10 +237,12 @@ impl VethDriver {
 
         let driver1 = VethDriver {
             inner: dev1,
+            ingress_classification_lock: Arc::new(Mutex::new(())),
             iface: Arc::new(SpinLock::new(Weak::<VethInterface>::new())),
         };
         let driver2 = VethDriver {
             inner: dev2,
+            ingress_classification_lock: Arc::new(Mutex::new(())),
             iface: Arc::new(SpinLock::new(Weak::<VethInterface>::new())),
         };
 
@@ -324,7 +341,7 @@ impl phy::Device for VethDriver {
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut guard = self.inner.lock();
-        guard.recv_from_peer().map(|buf| {
+        guard.recv_local().map(|buf| {
             // log::info!("VethDriver received data: {:?}", buf);
             (
                 VethRxToken {
@@ -449,47 +466,6 @@ impl VethInterface {
     fn inner(&self) -> SpinLockGuard<'_, VethCommonData> {
         self.inner.lock()
     }
-
-    /// # `add_default_route_to_peer`
-    /// 添加默认路由到对端虚拟以太网设备
-    /// ## 参数
-    /// - `peer_ip`: 对端设备的 IP 地址
-    /// ## 描述
-    /// 该方法会在当前虚拟以太网设备的路由表中
-    /// 添加一条默认路由，
-    /// 指向对端虚拟以太网设备的 IP 地址。
-    /// 如果添加失败，则会触发 panic。
-    ///
-    pub fn add_default_route_to_peer(&self, peer_ip: IpAddress) {
-        let iface = &mut self.common.smol_iface.lock();
-        // iface.update_ip_addrs(|ip_addrs| {
-        //     ip_addrs.push(self_cidr).expect("Push ipCidr failed: full");
-        // });
-        iface.routes_mut().update(|routes_map| {
-            routes_map
-                .push(smoltcp::iface::Route {
-                    cidr: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-                    via_router: Some(peer_ip),
-                    preferred_until: None,
-                    expires_at: None,
-                })
-                .expect("Add default route to peer failed");
-        });
-    }
-
-    // pub fn add_direct_route(&self, cidr: IpCidr, via_router: IpAddress) {
-    //     let iface = &mut self.common.smol_iface.lock_irqsave();
-    //     iface.routes_mut().update(|routes_map| {
-    //         routes_map
-    //             .push(smoltcp::iface::Route {
-    //                 cidr,
-    //                 via_router: Some(via_router),
-    //                 preferred_until: None,
-    //                 expires_at: None,
-    //             })
-    //             .expect("Add direct route failed");
-    //     });
-    // }
 }
 
 impl KObject for VethInterface {
@@ -632,13 +608,28 @@ impl Iface for VethInterface {
     fn poll(&self) -> bool {
         // log::info!("VethInterface {} polling normal", self.name);
         let mut driver = self.driver.clone();
-        self.common.poll(&mut driver)
+        let routed = driver.prepare_ingress(64);
+        self.common.poll(&mut driver) || routed != 0 || driver.has_pending_ingress()
         // self.clear_recv_buffer();
     }
 
     fn poll_napi(&self, budget: usize) -> super::napi::NapiPollResult {
         let mut driver = self.driver.clone();
-        self.common.poll_napi(&mut driver, budget)
+        // When both queues are backlogged, reserve bounded progress for each
+        // side. A single active queue may still use the full NAPI budget.
+        let local_backlogged = driver.has_local_ingress() || self.common().has_local_input();
+        let both_backlogged = local_backlogged && driver.has_pending_ingress();
+        let local_budget = if both_backlogged {
+            budget.div_ceil(2)
+        } else {
+            budget
+        };
+        let smoltcp = self.common.poll_napi(&mut driver, local_budget);
+        let routed = driver.prepare_ingress(budget - smoltcp.work_done);
+        super::napi::NapiPollResult::new(
+            routed + smoltcp.work_done,
+            smoltcp.poll_again || driver.has_pending_ingress() || driver.has_local_ingress(),
+        )
     }
 
     fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
@@ -651,6 +642,17 @@ impl Iface for VethInterface {
             );
         }
         Ok(())
+    }
+
+    fn route_and_send(&self, _next_hop: &IpAddress, ip_packet: &[u8]) -> Result<(), SystemError> {
+        let dst_mac = self.peer_veth().mac();
+        let src_mac = self.mac();
+        let mut frame = Vec::with_capacity(14 + ip_packet.len());
+        frame.extend_from_slice(&dst_mac.0);
+        frame.extend_from_slice(&src_mac.0);
+        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.extend_from_slice(ip_packet);
+        self.driver.submit_frame(frame)
     }
 
     fn addr_assign_type(&self) -> u8 {
@@ -724,38 +726,7 @@ impl BridgeEnableDevice for VethInterface {
     }
 }
 
-impl RouterEnableDevice for VethInterface {
-    fn route_and_send(&self, _next_hop: &IpAddress, ip_packet: &[u8]) {
-        // log::info!(
-        //     "VethInterface {} routing packet to {}",
-        //     self.iface_name(),
-        //     next_hop
-        // );
-
-        // 构造以太网帧
-        let dst_mac = self.peer_veth().mac();
-        let src_mac = self.mac();
-
-        // 以太网类型为 IPv4
-        let ethertype = [0x08, 0x00];
-
-        let mut frame = Vec::with_capacity(14 + ip_packet.len());
-        frame.extend_from_slice(&dst_mac.0);
-        frame.extend_from_slice(&src_mac.0);
-        frame.extend_from_slice(&ethertype);
-        frame.extend_from_slice(ip_packet);
-
-        // 发送到对端
-        self.driver.inner.lock().send_to_peer(&frame);
-    }
-
-    fn is_my_ip(&self, ip: IpAddress) -> bool {
-        self.common
-            .ip_addrs()
-            .iter()
-            .any(|cidr| cidr.contains_addr(&ip))
-    }
-}
+impl RouterEnableDevice for VethInterface {}
 
 fn veth_route_test() {
     let (iface_ns1, iface_host1) = VethInterface::new_pair("veth-ns1", "veth-host1");
@@ -781,76 +752,48 @@ fn veth_route_test() {
     crate::net::address::initialize_address(&(iface_ns2.clone() as Arc<dyn Iface>), cidr4)
         .expect("initialize veth address");
 
-    // 添加默认路由
-    iface_ns1.add_default_route_to_peer(addr2);
-    iface_host1.add_default_route_to_peer(addr1);
-
-    iface_host2.add_default_route_to_peer(addr4);
-    iface_ns2.add_default_route_to_peer(addr3);
+    // The fixture lives in one real netns. Endpoints use explicit host routes
+    // to enter through their peers; ingress then exercises namespace-local
+    // handoff to the interface that owns the destination address.
+    for (iface, destination, gateway, scope) in [
+        (&iface_ns1, addr4, Some(addr2), RT_SCOPE_UNIVERSE),
+        (&iface_ns2, addr1, Some(addr3), RT_SCOPE_UNIVERSE),
+        (&iface_host1, addr1, None, crate::net::route::RT_SCOPE_LINK),
+        (&iface_host2, addr4, None, crate::net::route::RT_SCOPE_LINK),
+    ] {
+        let oif = u32::try_from(iface.nic_id()).expect("fixture ifindex overflow");
+        iface
+            .common
+            .stage_bootstrap_route(BootstrapRoute {
+                destination: IpCidr::new(destination, 32),
+                source: None,
+                preferred_source: None,
+                table: RT_TABLE_MAIN,
+                priority: 0,
+                tos: 0,
+                protocol: RTPROT_BOOT,
+                scope,
+                kind: RTN_UNICAST,
+                oif,
+                gateway,
+                nexthop_flags: 0,
+            })
+            .expect("stage veth fixture host route");
+    }
 
     let turn_on = |a: &Arc<VethInterface>, ns: Arc<NetNamespace>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        ns.add_device(a.clone());
-        a.common().set_net_namespace(ns.clone());
+        ns.add_device(a.clone())
+            .expect("register veth fixture interface in netns");
         register_netdevice(a.clone()).expect("register veth device failed");
     };
-
-    let ns1 = NetNamespace::new_empty(ProcessManager::current_user_ns()).unwrap();
-    let ns2 = NetNamespace::new_empty(ProcessManager::current_user_ns()).unwrap();
-
-    let router_ns1 = ns1.router();
-    // 任何发往 192.168.1.0/24 网络的数据包都是本地邻居，可以直接从 veth-ns1 发送。
-    let dest = IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24);
-    let route = RouteEntry::new_connected(dest, iface_ns1.clone());
-    router_ns1.add_route(route);
-    // 任何不匹配其他路由的数据包，都应该通过 veth-ns1 接口发送给下一跳 192.168.1.254。
-    let next_hop = IpAddress::v4(192, 168, 1, 254);
-    let route = RouteEntry::new_default(next_hop, iface_ns1.clone());
-    router_ns1.add_route(route);
-
-    let router_ns2 = ns2.router();
-    // 任何发往 192.168.2.0/24 网络的数据包都是本地邻居，可以直接从 veth-ns2 发送
-    let dest = IpCidr::new(IpAddress::v4(192, 168, 2, 0), 24);
-    let route = RouteEntry::new_connected(dest, iface_ns2.clone());
-    router_ns2.add_route(route);
-    // 任何不匹配其他路由的数据包，都应该通过 veth-ns2 接口发送给下一跳 192.168.2.254
-    let next_hop = IpAddress::v4(192, 168, 2, 254);
-    let route = RouteEntry::new_default(next_hop, iface_ns2.clone());
-    router_ns2.add_route(route);
-
-    let host_router = INIT_NET_NAMESPACE.router();
-    // 任何发往 192.168.1.0/24 网络的数据包，都应该从 veth-host1 接口直接发送
-    let dest = IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24);
-    let route = RouteEntry::new_connected(dest, iface_host1.clone());
-    host_router.add_route(route);
-    // 任何发往 192.168.2.0/24 网络的数据包，都应该从 veth-host2 接口直接发送
-    let dest = IpCidr::new(IpAddress::v4(192, 168, 2, 0), 24);
-    let route = RouteEntry::new_connected(dest, iface_host2.clone());
-    host_router.add_route(route);
 
     turn_on(&iface_ns1, INIT_NET_NAMESPACE.clone());
     turn_on(&iface_ns2, INIT_NET_NAMESPACE.clone());
     turn_on(&iface_host1, INIT_NET_NAMESPACE.clone());
     turn_on(&iface_host2, INIT_NET_NAMESPACE.clone());
-
-    let snat_rules = vec![SnatRule {
-        // 匹配所有来自 192.168.1.0/24 网络的流量
-        source_cidr: "192.168.1.0/24".parse().unwrap(),
-        // 将源地址转换为 192.168.2.254(hardcode)
-        nat_ip: IpAddress::v4(192, 168, 2, 254),
-    }];
-
-    let dnat_rules = vec![DnatRule {
-        external_addr: IpAddress::v4(192, 168, 2, 1),
-        internal_addr: IpAddress::v4(192, 168, 2, 3),
-        internal_port: None,
-        external_port: None,
-    }];
-
-    host_router.nat_tracker().update_snat_rules(snat_rules);
-    host_router.nat_tracker().update_dnat_rules(dnat_rules);
 }
 
 fn veth_epoll_test() {
@@ -866,15 +809,12 @@ fn veth_epoll_test() {
     crate::net::address::initialize_address(&(iface2.clone() as Arc<dyn Iface>), cidr2)
         .expect("initialize veth address");
 
-    iface1.add_default_route_to_peer(addr2);
-    iface2.add_default_route_to_peer(addr1);
-
     let turn_on = |a: &Arc<VethInterface>, ns: Arc<NetNamespace>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        ns.add_device(a.clone());
-        a.common().set_net_namespace(ns.clone());
+        ns.add_device(a.clone())
+            .expect("register veth fixture interface in netns");
         register_netdevice(a.clone()).expect("register veth device failed");
     };
 
@@ -884,8 +824,10 @@ fn veth_epoll_test() {
 
 #[unified_init(INITCALL_DEVICE)]
 pub fn veth_init() -> Result<(), SystemError> {
-    veth_epoll_test();
-    veth_route_test();
-    log::info!("Veth pair initialized.");
+    if super::net_test_fixtures_enabled() {
+        veth_epoll_test();
+        veth_route_test();
+        log::info!("Veth test fixtures initialized.");
+    }
     Ok(())
 }

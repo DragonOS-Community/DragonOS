@@ -6,10 +6,7 @@
 
 use alloc::{ffi::CString, format, sync::Arc, vec::Vec};
 
-use smoltcp::{
-    iface::Route,
-    wire::{IpAddress, IpCidr, Ipv6AddressExt, Ipv6Cidr},
-};
+use smoltcp::wire::{IpAddress, IpCidr};
 use system_error::SystemError;
 
 use crate::{
@@ -31,6 +28,11 @@ pub(crate) enum AddressMutationOutcome {
     Replaced(IpCidr),
 }
 
+pub(in crate::net) struct AddressMutationCommit {
+    pub outcome: AddressMutationOutcome,
+    pub route_changes: crate::net::route::RouteChanges,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CommitMutation {
     Plain(AddressMutation),
@@ -38,20 +40,20 @@ enum CommitMutation {
 
 /// Mutates an address on an interface that is already visible in a netns.
 pub(in crate::net) fn mutate_address(
-    _rtnl: &RtnlGuard,
+    rtnl: &RtnlGuard,
     iface: &Arc<dyn Iface>,
     mutation: AddressMutation,
-) -> Result<AddressMutationOutcome, SystemError> {
-    commit(iface, CommitMutation::Plain(mutation), None)
+) -> Result<AddressMutationCommit, SystemError> {
+    commit_published(rtnl, iface, CommitMutation::Plain(mutation), None)
 }
 
 pub(in crate::net) fn mutate_labeled_address(
-    _rtnl: &RtnlGuard,
+    rtnl: &RtnlGuard,
     iface: &Arc<dyn Iface>,
     mutation: AddressMutation,
     label: Option<CString>,
-) -> Result<AddressMutationOutcome, SystemError> {
-    commit(iface, CommitMutation::Plain(mutation), label)
+) -> Result<AddressMutationCommit, SystemError> {
+    commit_published(rtnl, iface, CommitMutation::Plain(mutation), label)
 }
 
 pub(in crate::net) fn address_label(
@@ -146,37 +148,28 @@ pub(in crate::net) fn rename_address_labels(
 /// second, weaker address mutation path. Published interfaces must use
 /// [`mutate_address`] under RTNL.
 pub(crate) fn initialize_address(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemError> {
-    if iface.net_namespace().is_some() {
-        return Err(SystemError::EBUSY);
-    }
-    commit(
-        iface,
-        CommitMutation::Plain(AddressMutation::Add(cidr)),
-        None,
-    )
-    .map(|_| ())
+    iface.common().with_unpublished(|| {
+        commit_unpublished(
+            iface,
+            CommitMutation::Plain(AddressMutation::Add(cidr)),
+            None,
+        )
+        .map(|_| ())
+    })
 }
 
-fn commit(
+fn commit_unpublished(
     iface: &Arc<dyn Iface>,
     mutation: CommitMutation,
     requested_label: Option<CString>,
 ) -> Result<AddressMutationOutcome, SystemError> {
     validate_mutation(mutation)?;
 
-    let CommitMutation::Plain(address_mutation) = mutation;
-    let cidr = match address_mutation {
-        AddressMutation::Add(cidr)
-        | AddressMutation::Delete(cidr)
-        | AddressMutation::Replace(cidr) => cidr,
-    };
-    let old_explicit_owner = has_explicit_connected_owner(iface, cidr);
-
     let mut smol_iface = iface.smol_iface().lock();
     let mut metadata = iface.common().address_metadata().lock();
     let outcome = match mutation {
         CommitMutation::Plain(AddressMutation::Add(cidr)) => {
-            let outcome = add(&mut smol_iface, cidr, old_explicit_owner)?;
+            let outcome = add(&mut smol_iface, cidr)?;
             metadata.push(AddressMetadata {
                 cidr,
                 label: requested_label,
@@ -184,12 +177,12 @@ fn commit(
             outcome
         }
         CommitMutation::Plain(AddressMutation::Delete(cidr)) => {
-            let outcome = delete(&mut smol_iface, cidr, old_explicit_owner)?;
+            let outcome = delete(&mut smol_iface, cidr)?;
             metadata.retain(|entry| entry.cidr != cidr);
             outcome
         }
         CommitMutation::Plain(AddressMutation::Replace(cidr)) => {
-            let outcome = replace(&mut smol_iface, cidr, old_explicit_owner)?;
+            let outcome = replace(&mut smol_iface, cidr)?;
             if matches!(outcome, AddressMutationOutcome::Added(_)) {
                 metadata.push(AddressMetadata {
                     cidr,
@@ -209,6 +202,73 @@ fn commit(
     projection.extend_from_slice(&snapshot);
 
     Ok(outcome)
+}
+
+fn commit_published(
+    rtnl: &RtnlGuard,
+    iface: &Arc<dyn Iface>,
+    mutation: CommitMutation,
+    requested_label: Option<CString>,
+) -> Result<AddressMutationCommit, SystemError> {
+    validate_mutation(mutation)?;
+    let netns = iface.net_namespace().ok_or(SystemError::ENODEV)?;
+    let before = iface.router_common().ip_addrs.read().clone();
+    let mut after = before.clone();
+    let mut metadata = iface.common().address_metadata().lock().clone();
+
+    let outcome = match mutation {
+        CommitMutation::Plain(AddressMutation::Add(cidr)) => {
+            if find_for_new_or_replace(&after, cidr).is_some() {
+                return Err(SystemError::EEXIST);
+            }
+            insert_address_candidate(&mut after, cidr);
+            metadata.push(AddressMetadata {
+                cidr,
+                label: requested_label,
+            });
+            AddressMutationOutcome::Added(cidr)
+        }
+        CommitMutation::Plain(AddressMutation::Delete(cidr)) => {
+            let index = find_for_delete(&after, cidr).ok_or(SystemError::EADDRNOTAVAIL)?;
+            let effective = after.remove(index);
+            metadata.retain(|entry| entry.cidr != effective);
+            AddressMutationOutcome::Deleted(effective)
+        }
+        CommitMutation::Plain(AddressMutation::Replace(cidr)) => {
+            if let Some(index) = find_for_new_or_replace(&after, cidr) {
+                AddressMutationOutcome::Replaced(after[index])
+            } else {
+                insert_address_candidate(&mut after, cidr);
+                metadata.push(AddressMetadata {
+                    cidr,
+                    label: requested_label,
+                });
+                AddressMutationOutcome::Added(cidr)
+            }
+        }
+    };
+    let deleted = match outcome {
+        AddressMutationOutcome::Deleted(cidr) => Some(cidr.address()),
+        _ => None,
+    };
+    let route_changes = crate::net::route::commit_addresses(
+        rtnl, &netns, iface, &before, &after, metadata, deleted,
+    )?;
+    Ok(AddressMutationCommit {
+        outcome,
+        route_changes,
+    })
+}
+
+fn insert_address_candidate(addresses: &mut Vec<IpCidr>, cidr: IpCidr) {
+    let index = match cidr.address() {
+        IpAddress::Ipv4(_) => addresses
+            .iter()
+            .position(|item| matches!(item.address(), IpAddress::Ipv6(_)))
+            .unwrap_or(addresses.len()),
+        IpAddress::Ipv6(_) => addresses.len(),
+    };
+    addresses.insert(index, cidr);
 }
 
 fn validate_mutation(mutation: CommitMutation) -> Result<(), SystemError> {
@@ -232,7 +292,6 @@ fn validate_cidr(cidr: IpCidr) -> Result<(), SystemError> {
 fn add(
     iface: &mut smoltcp::iface::Interface,
     cidr: IpCidr,
-    share_existing_projection: bool,
 ) -> Result<AddressMutationOutcome, SystemError> {
     if find_for_new_or_replace(iface.ip_addrs(), cidr).is_some() {
         return Err(SystemError::EEXIST);
@@ -253,43 +312,18 @@ fn add(
         return Err(SystemError::ENOSPC);
     }
 
-    let share_existing_projection = share_existing_projection
-        || iface
-            .ip_addrs()
-            .iter()
-            .any(|configured| same_connected_projection(*configured, cidr));
-    if !insert_connected_route(iface, cidr, share_existing_projection) {
-        iface.update_ip_addrs(|addresses| {
-            if let Some(index) = addresses.iter().position(|item| *item == cidr) {
-                addresses.remove(index);
-            }
-        });
-        return Err(SystemError::ENOSPC);
-    }
-
     Ok(AddressMutationOutcome::Added(cidr))
 }
 
 fn delete(
     iface: &mut smoltcp::iface::Interface,
     cidr: IpCidr,
-    preserve_connected_route: bool,
 ) -> Result<AddressMutationOutcome, SystemError> {
     let index = find_for_delete(iface.ip_addrs(), cidr).ok_or(SystemError::EADDRNOTAVAIL)?;
     let effective = iface.ip_addrs()[index];
-    let preserve_connected_route = preserve_connected_route
-        || iface
-            .ip_addrs()
-            .iter()
-            .enumerate()
-            .any(|(other, configured)| {
-                other != index && same_connected_projection(*configured, effective)
-            });
-
     iface.update_ip_addrs(|addresses| {
         addresses.remove(index);
     });
-    set_connected_route_presence(iface, effective, preserve_connected_route);
 
     Ok(AddressMutationOutcome::Deleted(effective))
 }
@@ -297,16 +331,11 @@ fn delete(
 fn replace(
     iface: &mut smoltcp::iface::Interface,
     cidr: IpCidr,
-    share_existing_projection: bool,
 ) -> Result<AddressMutationOutcome, SystemError> {
     let Some(index) = find_for_new_or_replace(iface.ip_addrs(), cidr) else {
-        return add(iface, cidr, share_existing_projection);
+        return add(iface, cidr);
     };
     let effective = iface.ip_addrs()[index];
-
-    if !ensure_connected_route(iface, effective, true) {
-        return Err(SystemError::ENOSPC);
-    }
     Ok(AddressMutationOutcome::Replaced(effective))
 }
 
@@ -328,78 +357,4 @@ fn same_new_or_replace_identity(configured: IpCidr, requested: IpCidr) -> bool {
         (IpAddress::Ipv6(configured), IpAddress::Ipv6(requested)) => configured == requested,
         _ => false,
     }
-}
-
-fn ensure_connected_route(
-    iface: &mut smoltcp::iface::Interface,
-    cidr: IpCidr,
-    share_existing_projection: bool,
-) -> bool {
-    let mut ready = false;
-    iface.routes_mut().update(|routes| {
-        if share_existing_projection && routes.iter().any(|route| is_connected(route, cidr)) {
-            ready = true;
-        } else {
-            ready = routes.push(connected_route(cidr)).is_ok();
-        }
-    });
-    ready
-}
-
-fn insert_connected_route(
-    iface: &mut smoltcp::iface::Interface,
-    cidr: IpCidr,
-    share_existing_projection: bool,
-) -> bool {
-    ensure_connected_route(iface, cidr, share_existing_projection)
-}
-
-fn set_connected_route_presence(
-    iface: &mut smoltcp::iface::Interface,
-    cidr: IpCidr,
-    present: bool,
-) {
-    iface.routes_mut().update(|routes| {
-        if !present {
-            if let Some(index) = routes.iter().rposition(|route| is_connected(route, cidr)) {
-                routes.remove(index);
-            }
-        }
-    });
-}
-
-fn has_explicit_connected_owner(iface: &Arc<dyn Iface>, cidr: IpCidr) -> bool {
-    iface
-        .common()
-        .netlink_routes()
-        .iter()
-        .any(|route| route.gateway.is_none() && same_connected_projection(route.destination, cidr))
-}
-
-fn connected_route(cidr: IpCidr) -> Route {
-    Route {
-        cidr: canonical_projection_cidr(cidr),
-        via_router: None,
-        preferred_until: None,
-        expires_at: None,
-    }
-}
-
-#[inline]
-fn is_connected(route: &Route, cidr: IpCidr) -> bool {
-    same_connected_projection(route.cidr, cidr) && route.via_router.is_none()
-}
-
-pub(crate) fn canonical_projection_cidr(cidr: IpCidr) -> IpCidr {
-    match cidr {
-        IpCidr::Ipv4(cidr) => IpCidr::Ipv4(cidr.network()),
-        IpCidr::Ipv6(cidr) => IpCidr::Ipv6(Ipv6Cidr::new(
-            cidr.address().mask(cidr.prefix_len()).into(),
-            cidr.prefix_len(),
-        )),
-    }
-}
-
-fn same_connected_projection(left: IpCidr, right: IpCidr) -> bool {
-    canonical_projection_cidr(left) == canonical_projection_cidr(right)
 }

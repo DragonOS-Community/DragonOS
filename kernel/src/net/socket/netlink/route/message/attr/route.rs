@@ -92,21 +92,21 @@ impl Attribute for RouteAttr {
         Self: Sized,
     {
         let payload_len = header.payload_len();
-        let Ok(class) = RouteAttrClass::try_from(header.type_()) else {
-            return Ok(None);
-        };
+        let class = RouteAttrClass::try_from(header.type_())
+            .map_err(|_| SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
 
         let attr = match class {
-            RouteAttrClass::DST
-            | RouteAttrClass::SRC
-            | RouteAttrClass::GATEWAY
-            | RouteAttrClass::PREFSRC
-                if matches!(payload_len, 4 | 16) =>
-            {
+            RouteAttrClass::DST | RouteAttrClass::SRC if payload_len <= 16 => {
                 let bytes = payload_buf.to_vec();
                 match class {
                     RouteAttrClass::DST => RouteAttr::Dst(bytes),
                     RouteAttrClass::SRC => RouteAttr::Src(bytes),
+                    _ => unreachable!(),
+                }
+            }
+            RouteAttrClass::GATEWAY | RouteAttrClass::PREFSRC if matches!(payload_len, 4 | 16) => {
+                let bytes = payload_buf.to_vec();
+                match class {
                     RouteAttrClass::GATEWAY => RouteAttr::Gateway(bytes),
                     RouteAttrClass::PREFSRC => RouteAttr::Prefsrc(bytes),
                     _ => unreachable!(),
@@ -123,13 +123,13 @@ impl Attribute for RouteAttr {
                     _ => unreachable!(),
                 }
             }
-            RouteAttrClass::TABLE if payload_len == 1 => RouteAttr::Table(payload_buf[0] as u32),
             RouteAttrClass::TABLE if payload_len == 4 => {
                 RouteAttr::Table(*convert_one_from_raw_buf::<u32>(payload_buf)?)
             }
-            RouteAttrClass::METRICS | RouteAttrClass::MULTIPATH | RouteAttrClass::UNSPEC => {
-                return Ok(None);
+            RouteAttrClass::METRICS | RouteAttrClass::MULTIPATH => {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
+            RouteAttrClass::UNSPEC => return Ok(None),
             _ => return Err(SystemError::EINVAL),
         };
 

@@ -8,107 +8,43 @@ use crate::net::routing::nat::NatPolicy;
 use crate::net::routing::nat::SnatPolicy;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
 use smoltcp::wire::{EthernetFrame, IpAddress, IpCidr, Ipv4Packet};
 use system_error::SystemError;
 
 mod nat;
 pub mod uapi;
 
-pub use nat::{DnatRule, SnatRule};
-
-#[derive(Debug, Clone)]
-pub struct RouteEntry {
-    /// 目标网络
-    pub destination: IpCidr,
-    /// 下一跳地址（如果是直连网络则为None）
-    pub next_hop: Option<IpAddress>,
-    /// 出接口
-    pub interface: Weak<dyn RouterEnableDevice>,
-    /// 路由优先级（数值越小优先级越高）
-    pub metric: u32,
-    /// 路由类型
-    pub route_type: RouteType,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RouteType {
-    /// 直连路由
-    Connected,
-    /// 静态路由
-    Static,
-    /// 默认路由
-    Default,
-}
-
-impl RouteEntry {
-    pub fn new_connected(destination: IpCidr, interface: Arc<dyn RouterEnableDevice>) -> Self {
-        RouteEntry {
-            destination,
-            next_hop: None,
-            interface: Arc::downgrade(&interface),
-            metric: 0,
-            route_type: RouteType::Connected,
-        }
-    }
-
-    pub fn new_static(
-        destination: IpCidr,
-        next_hop: IpAddress,
-        interface: Arc<dyn RouterEnableDevice>,
-        metric: u32,
-    ) -> Self {
-        RouteEntry {
-            destination,
-            next_hop: Some(next_hop),
-            interface: Arc::downgrade(&interface),
-            metric,
-            route_type: RouteType::Static,
-        }
-    }
-
-    pub fn new_default(next_hop: IpAddress, interface: Arc<dyn RouterEnableDevice>) -> Self {
-        RouteEntry {
-            destination: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-            next_hop: Some(next_hop),
-            interface: Arc::downgrade(&interface),
-            metric: 100,
-            route_type: RouteType::Default,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct RouteTable {
-    pub entries: Vec<RouteEntry>,
-}
-
 /// 路由决策结果
 #[derive(Debug)]
 pub struct RouteDecision {
     /// 出接口
-    pub interface: Arc<dyn RouterEnableDevice>,
+    pub interface: Arc<dyn Iface>,
     /// 下一跳地址（先写在这里
     pub next_hop: IpAddress,
 }
 
 #[derive(Debug)]
+pub enum IngressRouteDecision {
+    Local(Arc<dyn Iface>),
+    Broadcast(Arc<dyn Iface>),
+    Forward(RouteDecision),
+}
+
+#[derive(Debug)]
 pub struct Router {
-    name: String,
-    /// 路由表 //todo 后面再优化LC-trie，现在先简单用一个Vec
-    route_table: RwSem<RouteTable>,
+    /// Authoritative Linux-visible route state for this network namespace.
+    pub(crate) fib: RwSem<crate::net::route::FibTable>,
     pub(self) nat_tracker: Arc<ConnTracker>,
     pub ns: RwSem<Weak<NetNamespace>>,
 }
 
 impl Router {
-    pub fn new(name: String) -> Arc<Self> {
+    pub fn new(_name: String) -> Arc<Self> {
         Arc::new(Self {
-            name: name.clone(),
-            route_table: RwSem::new(RouteTable::default()),
+            fib: RwSem::new(crate::net::route::FibTable::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
             ns: RwSem::new(Weak::default()),
         })
@@ -118,62 +54,31 @@ impl Router {
     /// 注意： 这个Router实例不会启动轮询线程
     pub fn new_empty() -> Arc<Self> {
         Arc::new(Self {
-            name: "empty_router".to_string(),
-            route_table: RwSem::new(RouteTable::default()),
+            fib: RwSem::new(crate::net::route::FibTable::default()),
             ns: RwSem::new(Weak::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
         })
     }
 
-    pub fn add_route(&self, route: RouteEntry) {
-        let mut guard = self.route_table.write();
-        let entries = &mut guard.entries;
-        let pos = entries
-            .iter()
-            .position(|r| r.metric > route.metric)
-            .unwrap_or(entries.len());
-
-        entries.insert(pos, route);
-        log::info!("Router {}: Added route to routing table", self.name);
-    }
-
-    pub fn remove_route(&self, destination: IpCidr) {
-        self.route_table
-            .write()
-            .entries
-            .retain(|route| route.destination != destination);
-    }
-
-    pub fn lookup_route(&self, dest_ip: IpAddress) -> Option<RouteDecision> {
-        let guard = self.route_table.read();
-        // 按最长前缀匹配原则查找路由
-        let best = guard
-            .entries
-            .iter()
-            .filter(|route| {
-                route.interface.strong_count() > 0 && route.destination.contains_addr(&dest_ip)
-            })
-            .max_by_key(|route| route.destination.prefix_len());
-
-        if let Some(entry) = best {
-            if let Some(interface) = entry.interface.upgrade() {
-                let next_hop = entry.next_hop.unwrap_or(dest_ip);
-                return Some(RouteDecision {
+    pub fn lookup_ingress_route(&self, dest_ip: IpAddress) -> Option<IngressRouteDecision> {
+        let netns = self.ns.read().upgrade()?;
+        let decision = crate::net::route::lookup_ingress(&netns, dest_ip)?;
+        let interface = netns.device_list().get(&(decision.oif as usize)).cloned()?;
+        match decision.matched.kind {
+            crate::net::route::RTN_LOCAL => Some(IngressRouteDecision::Local(interface)),
+            crate::net::route::RTN_BROADCAST => Some(IngressRouteDecision::Broadcast(interface)),
+            crate::net::route::RTN_UNICAST
+                if interface
+                    .flags()
+                    .contains(crate::driver::net::types::InterfaceFlags::UP) =>
+            {
+                Some(IngressRouteDecision::Forward(RouteDecision {
                     interface,
-                    next_hop,
-                });
+                    next_hop: decision.next_hop,
+                }))
             }
+            _ => None,
         }
-
-        None
-    }
-
-    /// 清理无效的路由表项（接口已经不存在的）
-    pub fn cleanup_routes(&mut self) {
-        self.route_table
-            .write()
-            .entries
-            .retain(|route| route.interface.strong_count() > 0);
     }
 
     pub fn nat_tracker(&self) -> Arc<ConnTracker> {
@@ -222,25 +127,12 @@ pub trait RouterEnableDevice: Iface {
 
                 let dst_ip = ipv4_packet_mut.dst_addr();
 
-                // 检查TTL
-                if ipv4_packet_mut.hop_limit() <= 1 {
-                    log::warn!("TTL exceeded for packet to {}", dst_ip);
-                    return Err(Some(SystemError::EINVAL));
-                }
-
-                // 检查是否是发给自己的包（目标IP是否是自己的IP）
-                if self.is_my_ip(dst_ip.into()) {
-                    // todo 按照linux的逻辑，只要包的目标ip在当前网络命名空间里面，就直接进入本地协议栈处理
-                    // todo 但是我们的操作系统中每个接口都是独立的，并没有统一处理和分发（socket），所有这里必须将包放到对应iface的接收队列里面
-                    // 交给本地协议栈处理
-                    // log::info!("Packet destined for local interface {}", self.iface_name());
-                    return Err(None);
-                }
-
-                // 查询当前网络命名空间下的路由表
+                // Classify through the namespace local table before the main
+                // table, just like Linux ingress routing. Local destinations
+                // must never re-enter the forwarding path.
                 let router = self.netns_router();
 
-                let decision = match router.lookup_route(dst_ip.into()) {
+                let decision = match router.lookup_ingress_route(dst_ip.into()) {
                     Some(d) => d,
                     None => {
                         log::warn!("No route to {}", dst_ip);
@@ -250,15 +142,45 @@ pub trait RouterEnableDevice: Iface {
 
                 drop(router);
 
+                let decision = match decision {
+                    IngressRouteDecision::Local(interface) => {
+                        if interface.nic_id() == self.nic_id() {
+                            return Err(None);
+                        }
+                        interface
+                            .inject_local_ipv4_packet(
+                                ether_frame.src_addr(),
+                                ipv4_packet_mut.as_ref(),
+                                false,
+                            )
+                            .map_err(Some)?;
+                        return Ok(());
+                    }
+                    IngressRouteDecision::Broadcast(interface) => {
+                        if interface.nic_id() == self.nic_id() {
+                            return Err(None);
+                        }
+                        interface
+                            .inject_local_ipv4_packet(
+                                ether_frame.src_addr(),
+                                ipv4_packet_mut.as_ref(),
+                                true,
+                            )
+                            .map_err(Some)?;
+                        return Ok(());
+                    }
+                    IngressRouteDecision::Forward(decision) => decision,
+                };
+
+                // TTL is consumed only by forwarding, never by local input.
+                if ipv4_packet_mut.hop_limit() <= 1 {
+                    log::warn!("TTL exceeded for packet to {}", dst_ip);
+                    return Err(Some(SystemError::EINVAL));
+                }
+
                 // === POST-ROUTING HOOK ===
 
-                let decision_src_ip = decision.interface.common().ipv4_addr().unwrap();
-                self.post_routing_hook(
-                    &maybe_tuple,
-                    &decision_src_ip,
-                    &mut ipv4_packet_mut,
-                    &pkt_status,
-                );
+                self.post_routing_hook(&maybe_tuple, &mut ipv4_packet_mut, &pkt_status);
                 ipv4_packet_mut.fill_checksum();
 
                 // === POST-ROUTING HOOK END ===
@@ -281,7 +203,8 @@ pub trait RouterEnableDevice: Iface {
                 let next_hop = &decision.next_hop;
                 decision
                     .interface
-                    .route_and_send(next_hop, ipv4_packet_mut.as_ref());
+                    .route_and_send(next_hop, ipv4_packet_mut.as_ref())
+                    .map_err(Some)?;
 
                 // log::info!("Routed packet from {} to {} ", self.iface_name(), dst_ip);
                 Ok(())
@@ -383,7 +306,6 @@ pub trait RouterEnableDevice: Iface {
     fn post_routing_hook(
         &self,
         tuple: &Option<FiveTuple>,
-        _decision_src_ip: &Ipv4Addr,
         ipv4_packet_mut: &mut Ipv4Packet<&mut Vec<u8>>,
         pkt_status: &NatPktStatus,
     ) {
@@ -433,12 +355,6 @@ pub trait RouterEnableDevice: Iface {
 
             //TODO 应该加一个判断snat，可以支持直接改成出口接口的ip
             // // 修改源IP地址
-            // let new_src_ip: IpAddress = if let IpAddress::Ipv4(new_src_ip) = new_src_ip {
-            //     new_src_ip.into()
-            // } else {
-            //     (*decision_src_ip).into()
-            // };
-
             SnatPolicy::update_src(
                 tuple.dst_addr,
                 new_src_ip,
@@ -451,17 +367,8 @@ pub trait RouterEnableDevice: Iface {
         }
     }
 
-    /// 路由器决定通过此接口发送包时调用此方法
-    /// 同Linux的ndo_start_xmit()
-    ///
-    /// todo 在这里查询arp_table，找到目标IP对应的mac地址然后拼接，如果找不到的话就需要主动发送arp请求去查询mac地址了，手伸不到smoltcp内部:(
-    /// 后续需要将arp查询的逻辑从smoltcp中抽离出来
-    fn route_and_send(&self, next_hop: &IpAddress, ip_packet: &[u8]);
-
     /// 检查IP地址是否是当前接口的IP
     /// todo 这里实现有误，不应该判断是否当前接口的IP，而是应该判断是否是当前网络命名空间的IP
-    fn is_my_ip(&self, ip: IpAddress) -> bool;
-
     fn netns_router(&self) -> Arc<Router> {
         self.net_namespace()
             .map_or_else(init_netns_router, |ns| ns.router())

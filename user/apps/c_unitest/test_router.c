@@ -9,10 +9,11 @@
 #include <unistd.h>
 
 #define SERVER_IP "192.168.2.3"
-#define FAKE_SERVER_IP "192.168.2.1"
 #define CLIENT_IP "192.168.1.1"
 #define PORT 34254
 #define BUFFER_SIZE 1024
+#define SERVER_DEVICE "veth-ns2"
+#define CLIENT_DEVICE "veth-ns1"
 
 // 错误处理函数
 void handle_error_message(const char *message) {
@@ -29,6 +30,13 @@ void *server_func(void *arg) {
 
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         handle_error_message("[server] Failed to create socket");
+    }
+    if (setsockopt(sockfd,
+                   SOL_SOCKET,
+                   SO_BINDTODEVICE,
+                   SERVER_DEVICE,
+                   sizeof(SERVER_DEVICE)) < 0) {
+        handle_error_message("[server] Failed to bind to " SERVER_DEVICE);
     }
 
     memset(&server_addr, 0, sizeof(server_addr));
@@ -97,6 +105,13 @@ void *client_func(void *arg) {
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         handle_error_message("[client] Failed to create socket");
     }
+    if (setsockopt(sockfd,
+                   SOL_SOCKET,
+                   SO_BINDTODEVICE,
+                   CLIENT_DEVICE,
+                   sizeof(CLIENT_DEVICE)) < 0) {
+        handle_error_message("[client] Failed to bind to " CLIENT_DEVICE);
+    }
 
     memset(&client_addr, 0, sizeof(client_addr));
     client_addr.sin_family = AF_INET;
@@ -114,7 +129,7 @@ void *client_func(void *arg) {
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    if (inet_pton(AF_INET, FAKE_SERVER_IP, &server_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
         handle_error_message("[client] Invalid server IP address for connect");
     }
 

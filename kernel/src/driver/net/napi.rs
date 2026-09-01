@@ -1,4 +1,4 @@
-use crate::driver::net::{types::InterfaceFlags, Iface};
+use crate::driver::net::{Iface, IfacePollScope};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
@@ -46,10 +46,10 @@ impl NapiStruct {
 
     fn poll(&self, budget: usize) -> Option<(Arc<dyn Iface>, NapiPollResult)> {
         if let Some(iface) = self.net_device.upgrade() {
-            if !iface.flags().contains(InterfaceFlags::UP) {
-                return Some((iface, NapiPollResult::idle()));
-            }
-            let result = iface.poll_napi(budget);
+            let result = match iface.common().poll_scope() {
+                IfacePollScope::None => NapiPollResult::idle(),
+                IfacePollScope::Full => iface.poll_napi(budget),
+            };
             return Some((iface, result));
         } else {
             log::error!(

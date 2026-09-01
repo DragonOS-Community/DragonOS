@@ -218,6 +218,7 @@ pub(super) fn do_set_link(
         .common()
         .update_configured_flags(requested_flags, change_mask)?;
 
+    let mut route_changes = None;
     if change_mask.contains(InterfaceFlags::UP) {
         let was_up = old_flags.contains(InterfaceFlags::UP);
         let is_up = new_flags.contains(InterfaceFlags::UP);
@@ -230,6 +231,9 @@ pub(super) fn do_set_link(
         }
 
         if was_up != is_up {
+            route_changes = Some(crate::net::route::link_state_changed(
+                rtnl, &netns, &iface, is_up,
+            )?);
             if is_up {
                 if let Some(napi) = iface.napi_struct() {
                     napi_schedule(napi);
@@ -256,6 +260,13 @@ pub(super) fn do_set_link(
     }
 
     notify_link_change(&iface);
+    if let Some(changes) = route_changes {
+        for added in changes.added {
+            if let Err(error) = super::route::notify_route(&netns, CSegmentType::NEWROUTE, added) {
+                log::warn!("failed to notify link-up connected route: {:?}", error);
+            }
+        }
+    }
     for cidr in renamed_addresses {
         super::addr::notify_address_change(netns.clone(), &iface, cidr);
     }

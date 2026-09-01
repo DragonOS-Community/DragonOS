@@ -400,9 +400,31 @@ fn get_ephemeral_iface(
     remote_ip_addr: &smoltcp::wire::IpAddress,
     netns: Arc<NetNamespace>,
 ) -> Result<(Arc<dyn Iface>, smoltcp::wire::IpAddress), SystemError> {
-    let default_iface = netns.default_iface();
     let no_source_error = no_source_addr_error(remote_ip_addr);
     let loopback_dst = is_loopback_destination(remote_ip_addr);
+
+    // Unicast egress is decided exclusively by the authoritative per-netns
+    // FIB. A miss must not fall back to default_iface or device iteration,
+    // otherwise RTM_GETROUTE and the actual packet path disagree.
+    if !remote_ip_addr.is_unspecified()
+        && !remote_ip_addr.is_multicast()
+        && !remote_ip_addr.is_broadcast()
+    {
+        let decision =
+            crate::net::route::lookup(&netns, *remote_ip_addr).ok_or(SystemError::ENETUNREACH)?;
+        let iface = netns
+            .device_list()
+            .get(&(decision.oif as usize))
+            .cloned()
+            .ok_or(SystemError::ENETUNREACH)?;
+        ensure_iface_up(&iface)?;
+        // An explicit FIB decision is authoritative, including routes that
+        // deliberately send non-loopback destinations through `lo`.
+        let source = route_source_from_decision(&iface, remote_ip_addr, decision)?;
+        return Ok((iface, source));
+    }
+
+    let default_iface = netns.default_iface();
 
     if let Some(iface) = get_iface_to_bind(remote_ip_addr, netns.clone()) {
         if iface_allowed_for_remote(&iface, loopback_dst) {
@@ -437,8 +459,52 @@ fn get_ephemeral_iface(
     Err(no_source_error)
 }
 
+pub(crate) fn route_source_on_iface(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    remote: &smoltcp::wire::IpAddress,
+) -> Result<smoltcp::wire::IpAddress, SystemError> {
+    ensure_iface_up(iface)?;
+    if remote.is_unspecified() || remote.is_multicast() || remote.is_broadcast() {
+        return pick_configured_source_addr(iface, remote).ok_or(no_source_addr_error(remote));
+    }
+    let decision = crate::net::route::lookup_on_iface(netns, *remote, iface.nic_id() as u32)
+        .ok_or(SystemError::ENETUNREACH)?;
+    route_source_from_decision(iface, remote, decision)
+}
+
+fn route_source_from_decision(
+    iface: &Arc<dyn Iface>,
+    remote: &smoltcp::wire::IpAddress,
+    decision: crate::net::route::RouteLookupResult,
+) -> Result<smoltcp::wire::IpAddress, SystemError> {
+    debug_assert_eq!(decision.oif as usize, iface.nic_id());
+    match decision.preferred_source {
+        Some(source)
+            if iface
+                .common()
+                .ip_addrs()
+                .iter()
+                .any(|cidr| cidr.address() == source) =>
+        {
+            Ok(source)
+        }
+        Some(_) => Err(no_source_addr_error(remote)),
+        None => pick_configured_source_addr(iface, remote).ok_or(no_source_addr_error(remote)),
+    }
+}
+
+fn ensure_iface_up(iface: &Arc<dyn Iface>) -> Result<(), SystemError> {
+    if iface.flags().contains(InterfaceFlags::UP) {
+        Ok(())
+    } else {
+        Err(SystemError::ENETDOWN)
+    }
+}
+
 fn iface_allowed_for_remote(iface: &Arc<dyn Iface>, loopback_dst: bool) -> bool {
-    iface.flags().contains(InterfaceFlags::LOOPBACK) == loopback_dst
+    let flags = iface.flags();
+    flags.contains(InterfaceFlags::UP) && flags.contains(InterfaceFlags::LOOPBACK) == loopback_dst
 }
 
 fn no_source_addr_error(remote_ip_addr: &smoltcp::wire::IpAddress) -> SystemError {

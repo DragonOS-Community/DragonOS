@@ -7,6 +7,7 @@
 pub enum LinuxSchedPolicy {
     Normal = 0,
     Fifo = 1,
+    Rr = 2,
 }
 
 impl LinuxSchedPolicy {
@@ -15,8 +16,13 @@ impl LinuxSchedPolicy {
     pub const fn base_sched_class(self) -> SchedClass {
         match self {
             Self::Normal => SchedClass::Fair,
-            Self::Fifo => SchedClass::Realtime,
+            Self::Fifo | Self::Rr => SchedClass::Realtime,
         }
+    }
+
+    #[inline]
+    pub const fn is_realtime(self) -> bool {
+        matches!(self, Self::Fifo | Self::Rr)
     }
 
     #[inline]
@@ -29,6 +35,7 @@ impl LinuxSchedPolicy {
         match value {
             0 => Self::Normal,
             1 => Self::Fifo,
+            2 => Self::Rr,
             _ => panic!("invalid Linux scheduling policy"),
         }
     }
@@ -75,6 +82,7 @@ impl SchedClass {
 const _: () = {
     assert!(LinuxSchedPolicy::Normal.base_sched_class() as u8 == SchedClass::Fair as u8);
     assert!(LinuxSchedPolicy::Fifo.base_sched_class() as u8 == SchedClass::Realtime as u8);
+    assert!(LinuxSchedPolicy::Rr.base_sched_class() as u8 == SchedClass::Realtime as u8);
     assert!(SchedClass::Realtime.outranks(SchedClass::Fair));
     assert!(SchedClass::Realtime.outranks(SchedClass::Idle));
     assert!(SchedClass::Fair.outranks(SchedClass::Idle));

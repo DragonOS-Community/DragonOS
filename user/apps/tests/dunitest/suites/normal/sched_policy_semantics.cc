@@ -16,6 +16,7 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef SCHED_RESET_ON_FORK
@@ -235,6 +236,41 @@ bool ReadByteWithTimeout(int fd, int timeout_ms) {
     return result == 1 && (poll_fd.revents & POLLIN) != 0 && ReadByte(fd);
 }
 
+bool WaitForBlockedTask(pid_t pid, int timeout_ms = 2000) {
+    char path[64] = {};
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    const int attempts = timeout_ms;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        FILE* stat = fopen(path, "r");
+        if (stat != nullptr) {
+            char line[512] = {};
+            const bool read_ok = fgets(line, sizeof(line), stat) != nullptr;
+            fclose(stat);
+            if (read_ok) {
+                const char* comm_end = strrchr(line, ')');
+                if (comm_end != nullptr && comm_end[1] == ' ' &&
+                    (comm_end[2] == 'S' || comm_end[2] == 'D')) {
+                    return true;
+                }
+            }
+        }
+        usleep(1000);
+    }
+    return false;
+}
+
+uint64_t ThreadCpuTimeNs() {
+    struct timespec now {};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return UINT64_MAX;
+    return static_cast<uint64_t>(now.tv_sec) * 1000 * 1000 * 1000 +
+           static_cast<uint64_t>(now.tv_nsec);
+}
+
+int CurrentCpu() {
+    unsigned int cpu = 0;
+    return syscall(SYS_getcpu, &cpu, nullptr, nullptr) == 0 ? static_cast<int>(cpu) : -1;
+}
+
 TEST(SchedParamAbi, GetParamWritesExactlyFourBytes) {
     RawSchedParamWithCanary value {};
     value.param.sched_priority = -1;
@@ -411,10 +447,16 @@ TEST(SchedSetScheduler, ErrorOrderingAndPolicyMatrix) {
     errno = 0;
     EXPECT_EQ(-1, RawSetScheduler(0, SCHED_FIFO, &zero));
     EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawSetScheduler(0, SCHED_RR, &zero));
+    EXPECT_EQ(EINVAL, errno);
 
     errno = 0;
     RawSchedParam hundred {100};
     EXPECT_EQ(-1, RawSetScheduler(0, SCHED_FIFO, &hundred));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, RawSetScheduler(0, SCHED_RR, &hundred));
     EXPECT_EQ(EINVAL, errno);
 }
 
@@ -430,6 +472,26 @@ int FifoRoundTripScenario() {
 TEST(SchedFifoPolicy, FairFifoPriorityRoundTrip) {
     if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace FIFO support";
     EXPECT_EQ(0, RunIsolatedScenario(FifoRoundTripScenario));
+}
+
+int RrRoundTripScenario() {
+    if (!SetPolicy(0, SCHED_RR, 1)) return 30;
+    if (!ReadPolicyAndPriority(0, SCHED_RR, 1)) return 31;
+    char label[16] = {};
+    if (!ReadSelfSchedulerLabel(label, sizeof(label)) || strcmp(label, "RR") != 0) return 32;
+    if (!SetPolicy(0, SCHED_RR, 99)) return 33;
+    if (!ReadPolicyAndPriority(0, SCHED_RR, 99)) return 34;
+    if (!SetPolicy(0, SCHED_FIFO, 99)) return 35;
+    if (!ReadPolicyAndPriority(0, SCHED_FIFO, 99)) return 36;
+    if (!SetPolicy(0, SCHED_RR, 99)) return 37;
+    if (!ReadPolicyAndPriority(0, SCHED_RR, 99)) return 38;
+    if (!SetPolicy(0, SCHED_OTHER, 0)) return 39;
+    return ReadPolicyAndPriority(0, SCHED_OTHER, 0) ? 0 : 40;
+}
+
+TEST(SchedRrPolicy, FairFifoRrRoundTrip) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(RrRoundTripScenario));
 }
 
 int FifoForkScenario() {
@@ -455,6 +517,31 @@ int FifoForkScenario() {
 TEST(SchedFifoReset, ForkInheritanceAndResetOnFork) {
     if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace FIFO support";
     EXPECT_EQ(0, RunIsolatedScenario(FifoForkScenario));
+}
+
+int RrForkScenario() {
+    if (!SetPolicy(0, SCHED_RR, 20)) return 40;
+    pid_t inherited = fork();
+    if (inherited < 0) return 41;
+    if (inherited == 0) {
+        _exit(ReadPolicyAndPriority(0, SCHED_RR, 20) ? 0 : 42);
+    }
+    if (WaitForChild(inherited) != 0) return 43;
+
+    if (!SetPolicy(0, SCHED_RR | SCHED_RESET_ON_FORK, 20)) return 44;
+    pid_t reset = fork();
+    if (reset < 0) return 45;
+    if (reset == 0) {
+        _exit(ReadPolicyAndPriority(0, SCHED_OTHER, 0) ? 0 : 46);
+    }
+    if (WaitForChild(reset) != 0) return 47;
+    if (!ReadPolicyAndPriority(0, SCHED_RR | SCHED_RESET_ON_FORK, 20)) return 48;
+    return SetPolicy(0, SCHED_OTHER, 0) ? 0 : 49;
+}
+
+TEST(SchedRrReset, ForkInheritanceAndResetOnFork) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(RrForkScenario));
 }
 
 TEST(SchedSetScheduler, SelfResetFlagRoundTripAndFork) {
@@ -836,6 +923,37 @@ TEST(SchedFifoRlimit, NestedUserNamespaceCannotRaiseHardLimit) {
     EXPECT_EQ(0, RunIsolatedScenario(NestedUserNamespaceRlimitScenario));
 }
 
+int RrRlimitScenario() {
+    struct rlimit high {10, 10};
+    if (setrlimit(RLIMIT_RTPRIO, &high) != 0) return 10 + errno;
+    if (syscall(SYS_setresuid, 1001, 1001, 1001) != 0) return 20 + errno;
+
+    if (!SetPolicy(0, SCHED_RR, 10)) return 30 + errno;
+    errno = 0;
+    if (SetPolicy(0, SCHED_RR, 11) || errno != EPERM) return 40 + errno;
+
+    struct rlimit low {0, 10};
+    if (setrlimit(RLIMIT_RTPRIO, &low) != 0) return 50 + errno;
+    if (!SetPolicy(0, SCHED_RR, 1)) return 60 + errno;
+
+    errno = 0;
+    if (SetPolicy(0, SCHED_FIFO, 1) || errno != EPERM) return 70 + errno;
+    if (!ReadPolicyAndPriority(0, SCHED_RR, 1)) return 80;
+    if (!SetPolicy(0, SCHED_OTHER, 0)) return 81 + errno;
+
+    errno = 0;
+    if (SetPolicy(0, SCHED_RR, 1) || errno != EPERM) {
+        (void)SetPolicy(0, SCHED_OTHER, 0);
+        return 90 + errno;
+    }
+    return 0;
+}
+
+TEST(SchedRrRlimit, PriorityAndExactPolicyRules) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(RrRlimitScenario));
+}
+
 struct SharedFifoState {
     int sequence_index;
     char sequence[4];
@@ -860,6 +978,332 @@ void RecordEvent(SharedFifoState* state, char event) {
     if (position >= 0 && position < static_cast<int>(sizeof(state->sequence))) {
         state->sequence[position] = event;
     }
+}
+
+struct SharedRtState {
+    int sequence_index;
+    char sequence[4];
+    int first_done;
+    int peer_ran_early;
+    int started_on_cpu1;
+    int seen_cpu0;
+};
+
+SharedRtState* NewSharedRtState() {
+    void* mapping = mmap(nullptr, sizeof(SharedRtState), PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return nullptr;
+    memset(mapping, 0, sizeof(SharedRtState));
+    return static_cast<SharedRtState*>(mapping);
+}
+
+void RecordEvent(SharedRtState* state, char event) {
+    int position = __atomic_fetch_add(&state->sequence_index, 1, __ATOMIC_SEQ_CST);
+    if (position >= 0 && position < static_cast<int>(sizeof(state->sequence))) {
+        state->sequence[position] = event;
+    }
+}
+
+bool SequenceIs(const SharedRtState* state, const char* expected, int count) {
+    if (__atomic_load_n(&state->sequence_index, __ATOMIC_SEQ_CST) != count) return false;
+    return memcmp(state->sequence, expected, static_cast<size_t>(count)) == 0;
+}
+
+int OrderedRotationScenario(bool remote, bool mixed_fifo_peer) {
+    int controller_cpu = -1;
+    int worker_cpu = -1;
+    if (!PickAllowedCpus(&controller_cpu, remote ? &worker_cpu : nullptr)) return 10;
+    if (remote && worker_cpu < 0) return 11;
+    if (!PinTask(0, controller_cpu)) return 12;
+    if (!remote) worker_cpu = controller_cpu;
+
+    SharedRtState* state = NewSharedRtState();
+    if (state == nullptr) return 13;
+
+    pid_t first = fork();
+    if (first < 0) return 14;
+    if (first == 0) {
+        raise(SIGSTOP);
+        RecordEvent(state, 'A');
+        while (__atomic_load_n(&state->sequence_index, __ATOMIC_ACQUIRE) < 2) {
+            __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        }
+        RecordEvent(state, 'A');
+        _exit(0);
+    }
+    ChildGuard first_guard(first);
+    if (!WaitStopped(first) || !PinTask(first, worker_cpu) ||
+        !SetPolicy(first, SCHED_RR, 20)) {
+        return 15;
+    }
+
+    pid_t second = fork();
+    if (second < 0) return 16;
+    if (second == 0) {
+        raise(SIGSTOP);
+        RecordEvent(state, 'B');
+        if (mixed_fifo_peer && sched_yield() != 0) _exit(20);
+        while (__atomic_load_n(&state->sequence_index, __ATOMIC_ACQUIRE) < 3) {
+            __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        }
+        _exit(0);
+    }
+    ChildGuard second_guard(second);
+    const int second_policy = mixed_fifo_peer ? SCHED_FIFO : SCHED_RR;
+    if (!WaitStopped(second) || !PinTask(second, worker_cpu) ||
+        !SetPolicy(second, second_policy, 20)) {
+        return 17;
+    }
+
+    if (!remote && !SetPolicy(0, SCHED_FIFO, 50)) return 18;
+    if (kill(first, SIGCONT) != 0 || kill(second, SIGCONT) != 0) {
+        if (!remote) (void)SetPolicy(0, SCHED_OTHER, 0);
+        return 19;
+    }
+    if (!remote && !SetPolicy(0, SCHED_OTHER, 0)) return 21;
+
+    const int first_result = WaitForChild(first);
+    first_guard.Release();
+    const int second_result = WaitForChild(second);
+    second_guard.Release();
+    const bool ordered = SequenceIs(state, "ABA", 3);
+    munmap(state, sizeof(*state));
+    return first_result == 0 && second_result == 0 && ordered ? 0 : 22;
+}
+
+int RrRotationScenario() {
+    return OrderedRotationScenario(false, false);
+}
+
+int MixedRotationScenario() {
+    return OrderedRotationScenario(false, true);
+}
+
+int RemoteRrRotationScenario() {
+    return OrderedRotationScenario(true, false);
+}
+
+int NoPrematurePeerScenario(int first_policy, int first_priority, int second_policy,
+                            int second_priority) {
+    int cpu = -1;
+    if (!PickAllowedCpus(&cpu) || !PinTask(0, cpu)) return 30;
+    SharedRtState* state = NewSharedRtState();
+    if (state == nullptr) return 31;
+
+    pid_t first = fork();
+    if (first < 0) return 32;
+    if (first == 0) {
+        raise(SIGSTOP);
+        const uint64_t start = ThreadCpuTimeNs();
+        if (start == UINT64_MAX) _exit(20);
+        for (;;) {
+            const uint64_t now = ThreadCpuTimeNs();
+            if (now == UINT64_MAX) _exit(21);
+            if (__atomic_load_n(&state->peer_ran_early, __ATOMIC_ACQUIRE) != 0) _exit(22);
+            if (now - start >= 300 * 1000 * 1000ULL) break;
+        }
+        __atomic_store_n(&state->first_done, 1, __ATOMIC_RELEASE);
+        _exit(0);
+    }
+    ChildGuard first_guard(first);
+    if (!WaitStopped(first) || !PinTask(first, cpu) ||
+        !SetPolicy(first, first_policy, first_priority)) {
+        return 33;
+    }
+
+    pid_t second = fork();
+    if (second < 0) return 34;
+    if (second == 0) {
+        raise(SIGSTOP);
+        if (__atomic_load_n(&state->first_done, __ATOMIC_ACQUIRE) == 0) {
+            __atomic_store_n(&state->peer_ran_early, 1, __ATOMIC_RELEASE);
+        }
+        _exit(0);
+    }
+    ChildGuard second_guard(second);
+    if (!WaitStopped(second) || !PinTask(second, cpu) ||
+        !SetPolicy(second, second_policy, second_priority)) {
+        return 35;
+    }
+
+    if (!SetPolicy(0, SCHED_FIFO, 50)) return 36;
+    if (kill(first, SIGCONT) != 0 || kill(second, SIGCONT) != 0) {
+        (void)SetPolicy(0, SCHED_OTHER, 0);
+        return 37;
+    }
+    if (!SetPolicy(0, SCHED_OTHER, 0)) return 38;
+
+    const int first_result = WaitForChild(first);
+    first_guard.Release();
+    const int second_result = WaitForChild(second);
+    second_guard.Release();
+    const bool correct = __atomic_load_n(&state->first_done, __ATOMIC_ACQUIRE) == 1 &&
+                         __atomic_load_n(&state->peer_ran_early, __ATOMIC_ACQUIRE) == 0;
+    munmap(state, sizeof(*state));
+    return first_result == 0 && second_result == 0 && correct ? 0 : 39;
+}
+
+int RrPriorityIsolationScenario() {
+    return NoPrematurePeerScenario(SCHED_RR, 20, SCHED_RR, 10);
+}
+
+int FifoNoTimesliceScenario() {
+    return NoPrematurePeerScenario(SCHED_FIFO, 20, SCHED_FIFO, 20);
+}
+
+int RrBlockedWakeTailScenario() {
+    int cpu = -1;
+    if (!PickAllowedCpus(&cpu) || !PinTask(0, cpu)) return 40;
+    SharedRtState* state = NewSharedRtState();
+    if (state == nullptr) return 41;
+    int ready[2];
+    int wake[2];
+    if (pipe(ready) != 0 || pipe(wake) != 0) return 42;
+
+    pid_t blocked = fork();
+    if (blocked < 0) return 43;
+    if (blocked == 0) {
+        close(ready[0]);
+        close(wake[1]);
+        WriteByteOrExit(ready[1], 'r');
+        close(ready[1]);
+        if (!ReadByte(wake[0])) _exit(20);
+        RecordEvent(state, 'B');
+        _exit(0);
+    }
+    ChildGuard blocked_guard(blocked);
+    close(ready[1]);
+    close(wake[0]);
+    if (!ReadByteWithTimeout(ready[0], 2000) || !WaitForBlockedTask(blocked) ||
+        !PinTask(blocked, cpu) || !SetPolicy(blocked, SCHED_RR, 20)) {
+        return 44;
+    }
+    close(ready[0]);
+
+    pid_t first = fork();
+    if (first < 0) return 45;
+    if (first == 0) {
+        raise(SIGSTOP);
+        RecordEvent(state, 'A');
+        if (sched_yield() != 0) _exit(21);
+        _exit(0);
+    }
+    ChildGuard first_guard(first);
+    if (!WaitStopped(first) || !PinTask(first, cpu) || !SetPolicy(first, SCHED_FIFO, 20)) {
+        return 46;
+    }
+
+    if (!SetPolicy(0, SCHED_FIFO, 50)) return 47;
+    if (kill(first, SIGCONT) != 0 || write(wake[1], "x", 1) != 1) {
+        (void)SetPolicy(0, SCHED_OTHER, 0);
+        return 48;
+    }
+    close(wake[1]);
+    if (!SetPolicy(0, SCHED_OTHER, 0)) return 49;
+
+    const int first_result = WaitForChild(first);
+    first_guard.Release();
+    const int blocked_result = WaitForChild(blocked);
+    blocked_guard.Release();
+    const bool ordered = SequenceIs(state, "AB", 2);
+    munmap(state, sizeof(*state));
+    return first_result == 0 && blocked_result == 0 && ordered ? 0 : 50;
+}
+
+int ResetOnlyKeepsQueueOrderScenario() {
+    int cpu = -1;
+    if (!PickAllowedCpus(&cpu) || !PinTask(0, cpu)) return 51;
+    SharedRtState* state = NewSharedRtState();
+    if (state == nullptr) return 52;
+
+    pid_t first = fork();
+    if (first < 0) return 53;
+    if (first == 0) {
+        raise(SIGSTOP);
+        RecordEvent(state, 'A');
+        if (sched_yield() != 0) _exit(20);
+        _exit(0);
+    }
+    ChildGuard first_guard(first);
+    if (!WaitStopped(first) || !PinTask(first, cpu) || !SetPolicy(first, SCHED_FIFO, 20)) {
+        return 54;
+    }
+
+    pid_t second = fork();
+    if (second < 0) return 55;
+    if (second == 0) {
+        raise(SIGSTOP);
+        RecordEvent(state, 'B');
+        _exit(0);
+    }
+    ChildGuard second_guard(second);
+    if (!WaitStopped(second) || !PinTask(second, cpu) || !SetPolicy(second, SCHED_FIFO, 20)) {
+        return 56;
+    }
+
+    if (!SetPolicy(0, SCHED_FIFO, 50)) return 57;
+    if (kill(first, SIGCONT) != 0 || kill(second, SIGCONT) != 0 ||
+        !SetPolicy(first, SCHED_FIFO | SCHED_RESET_ON_FORK, 20)) {
+        (void)SetPolicy(0, SCHED_OTHER, 0);
+        return 58;
+    }
+    if (!SetPolicy(0, SCHED_OTHER, 0)) return 59;
+
+    const int first_result = WaitForChild(first);
+    first_guard.Release();
+    const int second_result = WaitForChild(second);
+    second_guard.Release();
+    const bool ordered = SequenceIs(state, "AB", 2);
+    munmap(state, sizeof(*state));
+    return first_result == 0 && second_result == 0 && ordered ? 0 : 60;
+}
+
+int RrAffinityMigrationScenario() {
+    int controller_cpu = -1;
+    int worker_cpu = -1;
+    if (!PickAllowedCpus(&controller_cpu, &worker_cpu) || worker_cpu < 0 ||
+        !PinTask(0, controller_cpu)) {
+        return 61;
+    }
+    SharedRtState* state = NewSharedRtState();
+    if (state == nullptr) return 62;
+
+    pid_t worker = fork();
+    if (worker < 0) return 63;
+    if (worker == 0) {
+        raise(SIGSTOP);
+        if (CurrentCpu() != worker_cpu) _exit(20);
+        __atomic_store_n(&state->started_on_cpu1, 1, __ATOMIC_RELEASE);
+        for (;;) {
+            const int cpu = CurrentCpu();
+            if (cpu < 0) _exit(21);
+            if (cpu == controller_cpu) {
+                __atomic_store_n(&state->seen_cpu0, 1, __ATOMIC_RELEASE);
+                _exit(0);
+            }
+        }
+    }
+    ChildGuard worker_guard(worker);
+    if (!WaitStopped(worker) || !PinTask(worker, worker_cpu) ||
+        !SetPolicy(worker, SCHED_RR, 20) || kill(worker, SIGCONT) != 0) {
+        return 64;
+    }
+
+    bool started = false;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        if (__atomic_load_n(&state->started_on_cpu1, __ATOMIC_ACQUIRE) != 0) {
+            started = true;
+            break;
+        }
+        usleep(10 * 1000);
+    }
+    if (!started || !PinTask(worker, controller_cpu)) return 65;
+
+    const int worker_result = WaitForChild(worker);
+    worker_guard.Release();
+    const bool migrated = __atomic_load_n(&state->seen_cpu0, __ATOMIC_ACQUIRE) == 1;
+    munmap(state, sizeof(*state));
+    return worker_result == 0 && migrated ? 0 : 66;
 }
 
 int FifoYieldScenario() {
@@ -914,7 +1358,7 @@ int FifoYieldScenario() {
     return first_result == 0 && second_result == 0 && ordered ? 0 : 19;
 }
 
-int FifoThrottlingScenario() {
+int RealtimeThrottlingScenario(int policy) {
     int cpu = -1;
     if (!PickAllowedCpus(&cpu) || !PinTask(0, cpu)) return 30;
     SharedFifoState* state = NewSharedFifoState();
@@ -932,7 +1376,7 @@ int FifoThrottlingScenario() {
         __atomic_store_n(&state->throttle_stage, 3, __ATOMIC_RELEASE);
         _exit(0);
     }
-    if (!WaitStopped(runner) || !PinTask(runner, cpu) || !SetPolicy(runner, SCHED_FIFO, 20)) {
+    if (!WaitStopped(runner) || !PinTask(runner, cpu) || !SetPolicy(runner, policy, 20)) {
         kill(runner, SIGKILL);
         return 33;
     }
@@ -976,6 +1420,14 @@ int FifoThrottlingScenario() {
     bool completed = __atomic_load_n(&state->throttle_stage, __ATOMIC_ACQUIRE) == 3;
     munmap(state, sizeof(*state));
     return runner_result == 0 && observer_result == 0 && completed ? 0 : 39;
+}
+
+int FifoThrottlingScenario() {
+    return RealtimeThrottlingScenario(SCHED_FIFO);
+}
+
+int RrThrottlingScenario() {
+    return RealtimeThrottlingScenario(SCHED_RR);
 }
 
 int FifoRemoteScenario() {
@@ -1093,6 +1545,41 @@ TEST(SchedFifoBehavior, RuntimeThrottlingLetsFairRunAndRecovers) {
     EXPECT_EQ(0, RunIsolatedScenario(FifoThrottlingScenario));
 }
 
+TEST(SchedRrBehavior, SamePriorityQuantumRotates) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(RrRotationScenario));
+}
+
+TEST(SchedRrBehavior, DifferentPriorityDoesNotRotate) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(RrPriorityIsolationScenario));
+}
+
+TEST(SchedRrBehavior, FifoDoesNotAcquireTimeslicing) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(FifoNoTimesliceScenario));
+}
+
+TEST(SchedRrBehavior, FifoAndRrSharePriorityQueue) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(MixedRotationScenario));
+}
+
+TEST(SchedRrBehavior, BlockedWakeupJoinsPriorityTail) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(RrBlockedWakeTailScenario));
+}
+
+TEST(SchedPolicyChange, ResetOnlyDoesNotMoveQueuedTask) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace FIFO support";
+    EXPECT_EQ(0, RunIsolatedScenario(ResetOnlyKeepsQueueOrderScenario));
+}
+
+TEST(SchedRrBehavior, RuntimeThrottlingLetsFairRunAndRecovers) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    EXPECT_EQ(0, RunIsolatedScenario(RrThrottlingScenario));
+}
+
 TEST(SchedFifoSmp, RemotePreemptionAndRunningTargetStress) {
     if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace FIFO support";
     int first = -1;
@@ -1100,6 +1587,24 @@ TEST(SchedFifoSmp, RemotePreemptionAndRunningTargetStress) {
     ASSERT_TRUE(PickAllowedCpus(&first, &second));
     if (second < 0) GTEST_SKIP() << "requires at least two allowed CPUs";
     EXPECT_EQ(0, RunIsolatedScenario(FifoRemoteScenario));
+}
+
+TEST(SchedRrSmp, RemoteRunqueueRotatesSamePriorityTasks) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    int first = -1;
+    int second = -1;
+    ASSERT_TRUE(PickAllowedCpus(&first, &second));
+    if (second < 0) GTEST_SKIP() << "requires at least two allowed CPUs";
+    EXPECT_EQ(0, RunIsolatedScenario(RemoteRrRotationScenario));
+}
+
+TEST(SchedRrSmp, RunningTaskMigratesToAllowedCpu) {
+    if (!IsDragonOS()) GTEST_SKIP() << "requires DragonOS userspace RR support";
+    int first = -1;
+    int second = -1;
+    ASSERT_TRUE(PickAllowedCpus(&first, &second));
+    if (second < 0) GTEST_SKIP() << "requires at least two allowed CPUs";
+    EXPECT_EQ(0, RunIsolatedScenario(RrAffinityMigrationScenario));
 }
 
 }  // namespace

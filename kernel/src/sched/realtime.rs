@@ -1,6 +1,10 @@
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 
-use crate::{process::ProcessControlBlock, sched::prio::MAX_RT_PRIO};
+use crate::{
+    process::ProcessControlBlock,
+    sched::{prio::MAX_RT_PRIO, LinuxSchedPolicy},
+    time::clocksource::HZ,
+};
 
 use super::{CpuRunQueue, DequeueFlag, EnqueueFlag, PrioUtil, SchedClass, Scheduler, WakeupFlags};
 
@@ -9,9 +13,13 @@ use super::{CpuRunQueue, DequeueFlag, EnqueueFlag, PrioUtil, SchedClass, Schedul
 const RT_PERIOD_NS: u64 = 1_000_000_000;
 const RT_RUNTIME_NS: u64 = 950_000_000;
 
+/// Linux's default SCHED_RR quantum, expressed in scheduler ticks.
+pub(crate) const RR_TIMESLICE_TICKS: u32 = (100 * HZ / 1000) as u32;
+
 const _: () = {
     assert!(MAX_RT_PRIO > 1);
     assert!(MAX_RT_PRIO <= u128::BITS as i32);
+    assert!(RR_TIMESLICE_TICKS > 0);
 };
 
 /// Per-CPU runqueue shared by every policy in the realtime scheduling class.
@@ -238,6 +246,26 @@ impl RealtimeRunQueue {
         true
     }
 
+    /// Move an existing task to the tail only when its priority bucket has a
+    /// peer which can run next.
+    fn requeue_to_tail_if_peer(&mut self, pcb: &Arc<ProcessControlBlock>) -> bool {
+        self.assert_consistent();
+        let prio = Self::prio_index(pcb);
+
+        #[cfg(any(debug_assertions, feature = "fifo_demo"))]
+        assert!(
+            self.queues[prio]
+                .iter()
+                .any(|queued| Arc::ptr_eq(queued, pcb)),
+            "realtime task is not queued"
+        );
+
+        if self.queues[prio].len() <= 1 {
+            return false;
+        }
+        self.requeue_to_tail(pcb)
+    }
+
     pub fn pick_next(&self) -> Option<Arc<ProcessControlBlock>> {
         let prio = self.highest_prio()?;
         self.queues[prio].front().cloned()
@@ -364,6 +392,26 @@ impl Scheduler for RealtimeScheduler {
 
         let curr_prio = Self::rt_prio(&pcb);
         if PrioUtil::rt_prio(curr_prio) && (highest as i32) < curr_prio {
+            rq.resched_current();
+        }
+
+        if pcb.sched_info().policy() != LinuxSchedPolicy::Rr {
+            return;
+        }
+
+        let remaining = pcb.sched_info().rr_time_slice_remaining();
+        debug_assert!(remaining > 0, "RR task has an empty time slice");
+        if remaining > 1 {
+            pcb.sched_info().set_rr_time_slice_remaining(remaining - 1);
+            return;
+        }
+
+        // Linux reloads an exhausted slice even when this is the only task in
+        // its priority bucket, but only rotates and reschedules when a peer can
+        // run next.
+        pcb.sched_info()
+            .set_rr_time_slice_remaining(RR_TIMESLICE_TICKS);
+        if rq.rt.requeue_to_tail_if_peer(&pcb) {
             rq.resched_current();
         }
     }

@@ -25,6 +25,10 @@ pub(crate) enum SchedChangeRequest {
         priority: i32,
         reset_on_fork: bool,
     },
+    Rr {
+        priority: i32,
+        reset_on_fork: bool,
+    },
 }
 
 impl ProcessManager {
@@ -149,7 +153,9 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         request: SchedChangeRequest,
     ) -> Result<(), SystemError> {
-        if let SchedChangeRequest::Fifo { priority, .. } = request {
+        if let SchedChangeRequest::Fifo { priority, .. } | SchedChangeRequest::Rr { priority, .. } =
+            request
+        {
             if !(0..crate::sched::prio::MAX_RT_PRIO - 1).contains(&priority) {
                 return Err(SystemError::EINVAL);
             }
@@ -196,6 +202,7 @@ impl ProcessManager {
 
             let old_policy = pcb.sched_info().policy();
             let old_prio = pcb.sched_info().prio();
+            let old_normal_prio = pcb.sched_info().normal_prio();
             let old_reset = pi_guard.sched_reset_on_fork();
             let (new_policy, new_prio, new_reset) = match request {
                 SchedChangeRequest::Normal { reset_on_fork } => (
@@ -207,10 +214,19 @@ impl ProcessManager {
                     priority,
                     reset_on_fork,
                 } => (LinuxSchedPolicy::Fifo, priority, reset_on_fork),
+                SchedChangeRequest::Rr {
+                    priority,
+                    reset_on_fork,
+                } => (LinuxSchedPolicy::Rr, priority, reset_on_fork),
             };
             let new_class = new_policy.base_sched_class();
 
-            if old_policy == new_policy && old_prio == new_prio && old_reset == new_reset {
+            // Linux treats a reset-on-fork-only update as a parameter fast
+            // path: it must not disturb the task's position in its queue.
+            if old_policy == new_policy && old_normal_prio == new_prio {
+                if old_reset != new_reset {
+                    pi_guard.set_sched_reset_on_fork(new_reset);
+                }
                 drop(rq_guard);
                 drop(pi_guard);
                 return Ok(());

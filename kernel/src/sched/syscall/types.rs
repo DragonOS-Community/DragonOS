@@ -39,5 +39,6 @@ pub(super) fn policy_to_linux(policy: LinuxSchedPolicy) -> i32 {
     match policy {
         LinuxSchedPolicy::Normal => SCHED_OTHER,
         LinuxSchedPolicy::Fifo => SCHED_FIFO,
+        LinuxSchedPolicy::Rr => SCHED_RR,
     }
 }

@@ -57,11 +57,3 @@ pub fn create_netlink_socket(
 pub(crate) fn notify_link_change(iface: &Arc<dyn crate::driver::net::Iface>) {
     route::kern::notify_link_change(iface);
 }
-
-pub(crate) fn notify_address_outcome(
-    netns: Arc<crate::process::namespace::net_namespace::NetNamespace>,
-    iface: &Arc<dyn crate::driver::net::Iface>,
-    outcome: crate::net::address::AddressMutationOutcome,
-) {
-    route::notify_address_outcome(netns, iface, outcome);
-}

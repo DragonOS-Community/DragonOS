@@ -71,15 +71,11 @@ case "$event" in
         dn_deconfigure "$iface"
         ;;
     bound | renew)
-        dn_load_config "$iface" && [ "$DN_CONFIG_MODE" = dhcp ] || {
-            dn_write_error "$iface" "DHCP event rejected because mode is not dhcp"
-            exit 1
-        }
         dn_validate_dhcp_event || {
             dn_write_error "$iface" "invalid DHCP lease data for $event"
             exit 1
         }
-        dn_apply "$iface" dhcp "$DN_DHCP_ADDRESS" "$DN_DHCP_ROUTER" \
+        dn_apply_active_dhcp "$iface" dhcp "$DN_DHCP_ADDRESS" "$DN_DHCP_ROUTER" \
             "$DN_DHCP_GATEWAY_ROUTE" "$DN_DHCP_DNS" "$DN_DHCP_SEARCH"
         ;;
     nak | leasefail)

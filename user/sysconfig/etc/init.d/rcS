@@ -11,8 +11,7 @@ if [ ! -d /tmp ]; then
 fi
 mount -t tmpfs tmpfs /tmp || /bin/busybox mount -t tmpfs tmpfs /tmp
 
-# Runtime state must not survive reboot. Network services are not started here;
-# PR-08 owns the later switch from kernel DHCP to userspace policy.
+# Runtime state must not survive reboot.
 if [ ! -d /run ]; then
     mkdir -p /run
 fi
@@ -22,6 +21,10 @@ if ! /bin/busybox mountpoint -q /run; then
     else
         echo "[rcS] Warning: failed to mount /run tmpfs"
     fi
+fi
+
+if ! /usr/sbin/dragon-network-boot; then
+    echo "[rcS] Warning: failed to apply userspace network policy"
 fi
 
 # 如果 rootfs 中带有 apt，则按 Ubuntu 24.04 的 deb822 sources 格式切换到 USTC HTTP 源。

@@ -8,7 +8,6 @@ use crate::driver::net::Iface;
 
 pub(crate) mod address;
 pub mod neighbor;
-pub mod net_core;
 pub mod posix;
 pub mod routing;
 mod rtnl;

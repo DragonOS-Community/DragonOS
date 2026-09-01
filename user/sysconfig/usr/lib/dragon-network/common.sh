@@ -6,8 +6,10 @@
 DN_BUSYBOX=/bin/busybox
 DN_RUN=/run/dragon-network
 DN_INTERFACES_RUN="$DN_RUN/interfaces"
-DN_RESOLV_CONF="$DN_RUN/resolv.conf"
-DN_CONFIG_DIR=/etc/dragonos/network/interfaces
+DN_RESOLV_CONF=/etc/resolv.conf
+DN_NETWORK_CONFIG_DIR=/etc/dragonos/network
+DN_CONFIG_DIR="$DN_NETWORK_CONFIG_DIR/interfaces"
+DN_DEFAULT_CONFIG="$DN_NETWORK_CONFIG_DIR/default.conf"
 DN_UDHCPC_SCRIPT=/usr/lib/dragon-network/udhcpc.script
 
 dn_log() {
@@ -180,6 +182,27 @@ dn_stat_is_root_mode() {
     [ "$uid" = 0 ] && [ "$mode" = "$expected" ] && [ "$kind" = directory ]
 }
 
+dn_is_fat_path() {
+    # Linux UAPI MSDOS_SUPER_MAGIC. DragonOS FAT currently synthesizes 0777
+    # because the on-disk format has no Unix mode bits.
+    [ "$($DN_BUSYBOX stat -f -c %t "$1" 2>/dev/null)" = 4d44 ]
+}
+
+dn_stat_is_root_config_dir() {
+    local path uid mode kind
+    path=$1
+    [ ! -L "$path" ] || return 1
+    uid=$($DN_BUSYBOX stat -c %u "$path" 2>/dev/null) || return 1
+    mode=$($DN_BUSYBOX stat -c %a "$path" 2>/dev/null) || return 1
+    kind=$($DN_BUSYBOX stat -c %F "$path" 2>/dev/null) || return 1
+    [ "$uid" = 0 ] && [ "$kind" = directory ] || return 1
+    case "$mode" in
+        [0-7][0-7][0-7]) ;;
+        *) return 1 ;;
+    esac
+    [ "$((0$mode & 022))" -eq 0 ] || { [ "$mode" = 777 ] && dn_is_fat_path "$path"; }
+}
+
 dn_ensure_root_dir() {
     local path mode
     path=$1
@@ -199,9 +222,14 @@ dn_require_config_file() {
     kind=$($DN_BUSYBOX stat -c %F "$path" 2>/dev/null) || return 1
     [ "$uid" = 0 ] && [ "$kind" = "regular file" ] || return 1
     case "$mode" in
-        400 | 440 | 444 | 600 | 640 | 644) return 0 ;;
+        [0-7][0-7][0-7]) ;;
+        *) return 1 ;;
     esac
-    return 1
+    # Execute bits are harmless for parsed data.  On filesystems with Unix modes,
+    # only root may write it.  DragonOS FAT synthesizes 0777, so that exception is
+    # limited to a verified FAT superblock; the strict parser and root-only
+    # committed runtime generation remain the policy boundary.
+    [ "$((0$mode & 022))" -eq 0 ] || { [ "$mode" = 777 ] && dn_is_fat_path "$path"; }
 }
 
 dn_reset_config_vars() {
@@ -212,16 +240,12 @@ dn_reset_config_vars() {
     DN_CONFIG_SEARCH=
 }
 
-dn_load_config() {
+dn_load_config_file() {
     local iface file line key value seen_mode seen_address seen_gateway
     iface=$1
-    file="$DN_CONFIG_DIR/$iface.conf"
-    dn_stat_is_root_mode "$DN_CONFIG_DIR" 755 || {
-        dn_log "$iface" "$DN_CONFIG_DIR must be a root-owned 0755 directory"
-        return 1
-    }
+    file=$2
     dn_require_config_file "$file" || {
-        dn_log "$iface" "configuration must be a root-owned, non-writable regular file: $file"
+        dn_log "$iface" "configuration must be a root-owned regular file not writable by group or other: $file"
         return 1
     }
 
@@ -285,6 +309,26 @@ dn_load_config() {
     return 0
 }
 
+dn_load_config() {
+    local iface
+    iface=$1
+    dn_stat_is_root_config_dir "$DN_CONFIG_DIR" || {
+        dn_log "$iface" "$DN_CONFIG_DIR must be a trusted root-owned directory"
+        return 1
+    }
+    dn_load_config_file "$iface" "$DN_CONFIG_DIR/$iface.conf"
+}
+
+dn_load_default_config() {
+    local iface
+    iface=$1
+    dn_stat_is_root_config_dir "$DN_NETWORK_CONFIG_DIR" || {
+        dn_log "$iface" "$DN_NETWORK_CONFIG_DIR must be a trusted root-owned directory"
+        return 1
+    }
+    dn_load_config_file "$iface" "$DN_DEFAULT_CONFIG"
+}
+
 dn_init_runtime() {
     local fs_type
     [ -d /run ] && [ ! -L /run ] || {
@@ -327,7 +371,52 @@ dn_init_interface_runtime() {
     DN_PENDING_FILE="$dir/pending"
     DN_PID_FILE="$dir/udhcpc.pid"
     DN_ERROR_FILE="$dir/last-error"
+    DN_POLICY_SOURCE_FILE="$dir/policy-source"
     return 0
+}
+
+dn_write_policy_source() {
+    local source tmp
+    source=$1
+    case "$source" in default | interface) ;; *) return 1 ;; esac
+    tmp="$DN_POLICY_SOURCE_FILE.tmp.$$"
+    (umask 077 && printf 'source %s\n' "$source" > "$tmp") || {
+        $DN_BUSYBOX rm -f "$tmp"
+        return 1
+    }
+    $DN_BUSYBOX chmod 0600 "$tmp" && $DN_BUSYBOX mv -f "$tmp" "$DN_POLICY_SOURCE_FILE" || {
+        $DN_BUSYBOX rm -f "$tmp"
+        return 1
+    }
+}
+
+dn_clear_policy_source() {
+    [ ! -e "$DN_POLICY_SOURCE_FILE" ] && [ ! -L "$DN_POLICY_SOURCE_FILE" ] ||
+        $DN_BUSYBOX rm -f "$DN_POLICY_SOURCE_FILE"
+}
+
+dn_load_policy_source() {
+    local key value extra uid mode kind seen
+    [ -f "$DN_POLICY_SOURCE_FILE" ] && [ ! -L "$DN_POLICY_SOURCE_FILE" ] || return 1
+    uid=$($DN_BUSYBOX stat -c %u "$DN_POLICY_SOURCE_FILE" 2>/dev/null) || return 1
+    mode=$($DN_BUSYBOX stat -c %a "$DN_POLICY_SOURCE_FILE" 2>/dev/null) || return 1
+    kind=$($DN_BUSYBOX stat -c %F "$DN_POLICY_SOURCE_FILE" 2>/dev/null) || return 1
+    [ "$uid" = 0 ] && [ "$mode" = 600 ] && [ "$kind" = "regular file" ] || return 1
+    seen=0
+    while IFS=' ' read -r key value extra || [ -n "$key$value$extra" ]; do
+        [ "$seen" -eq 0 ] && [ "$key" = source ] && [ -n "$value" ] &&
+            [ -z "$extra" ] || return 1
+        case "$value" in default | interface) DN_POLICY_SOURCE=$value ;; *) return 1 ;; esac
+        seen=1
+    done < "$DN_POLICY_SOURCE_FILE"
+    [ "$seen" -eq 1 ]
+}
+
+dn_require_active_dhcp_policy() {
+    # The root-only runtime marker is the committed policy generation. Config
+    # edits take effect only through a serialized controller start, just like
+    # other network managers; lease callbacks must not re-read mutable storage.
+    dn_load_policy_source
 }
 
 dn_write_error() {
@@ -766,7 +855,18 @@ dn_rebuild_dns_locked() {
     dns_count=0
     search_line=
     search_total=0
+    dn_stat_is_root_config_dir /etc || {
+        dn_log dns "/etc must be a trusted root-owned directory"
+        return 1
+    }
+    if [ -e "$DN_RESOLV_CONF" ] || [ -L "$DN_RESOLV_CONF" ]; then
+        [ -f "$DN_RESOLV_CONF" ] && [ ! -L "$DN_RESOLV_CONF" ] || {
+            dn_log dns "$DN_RESOLV_CONF must be a regular file"
+            return 1
+        }
+    fi
     tmp="$DN_RESOLV_CONF.tmp.$$"
+    [ ! -L "$tmp" ] || return 1
     : > "$tmp" || return 1
 
     restore_noglob=0
@@ -1137,6 +1237,24 @@ dn_apply() {
     dn_init_runtime && dn_init_interface_runtime "$iface" && dn_acquire_state_lock || return 1
     dn_apply_locked "$@"
     result=$?
+    exec 7>&-
+    return "$result"
+}
+
+dn_apply_active_dhcp() {
+    local iface result
+    iface=$1
+    dn_init_runtime && dn_init_interface_runtime "$iface" && dn_acquire_state_lock || return 1
+    if ! dn_require_active_dhcp_policy; then
+        dn_write_error "$iface" "DHCP event rejected because the active policy is not dhcp"
+        result=1
+    else
+        # Policy validation and lease commit share state.lock. A callback that
+        # loses a race with stop/static/unmanaged therefore cannot resurrect
+        # an obsolete DHCP address, route, or resolver state.
+        dn_apply_locked "$@"
+        result=$?
+    fi
     exec 7>&-
     return "$result"
 }

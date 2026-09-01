@@ -67,6 +67,7 @@ struct DumpedAddress {
     IpBytes local;
     uint8_t prefix_len = 0;
     uint32_t ifindex = 0;
+    bool has_label = false;
     std::string label;
 };
 
@@ -206,7 +207,8 @@ int SetLinkName(int fd, uint32_t ifindex, const char* name, uint32_t sequence) {
 
 int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& address,
                   bool include_local, bool include_address, uint32_t sequence,
-                  const char* label = nullptr) {
+                  const char* label = nullptr,
+                  std::optional<size_t> label_length = std::nullopt) {
     auto request = NewRequest<ifaddrmsg>(type, flags, sequence);
     auto* message = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(request.data()));
     message->ifa_family = address.family;
@@ -220,7 +222,9 @@ int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& addr
     if (include_address) {
         AddAttr(&request, IFA_ADDRESS, address.local.bytes.data(), address.local.length);
     }
-    if (label != nullptr) AddAttr(&request, IFA_LABEL, label, std::strlen(label) + 1);
+    if (label != nullptr) {
+        AddAttr(&request, IFA_LABEL, label, label_length.value_or(std::strlen(label) + 1));
+    }
     return SendAndReceiveAck(fd, request);
 }
 
@@ -272,10 +276,13 @@ int DumpAddresses(int fd, int family, uint32_t sequence, std::vector<DumpedAddre
             int attr_length = IFA_PAYLOAD(header);
             for (auto* attr = IFA_RTA(message); RTA_OK(attr, attr_length);
                  attr = RTA_NEXT(attr, attr_length)) {
-                if (attr->rta_type == IFA_LABEL && RTA_PAYLOAD(attr) > 0) {
-                    address.label.assign(static_cast<const char*>(RTA_DATA(attr)),
-                                         strnlen(static_cast<const char*>(RTA_DATA(attr)),
-                                                 RTA_PAYLOAD(attr)));
+                if (attr->rta_type == IFA_LABEL) {
+                    address.has_label = true;
+                    if (RTA_PAYLOAD(attr) > 0) {
+                        address.label.assign(static_cast<const char*>(RTA_DATA(attr)),
+                                             strnlen(static_cast<const char*>(RTA_DATA(attr)),
+                                                     RTA_PAYLOAD(attr)));
+                    }
                     continue;
                 }
                 if ((attr->rta_type != IFA_LOCAL && attr->rta_type != IFA_ADDRESS) ||
@@ -374,6 +381,18 @@ int CountAddressWithLabel(int fd, const AddressSpec& expected, const char* label
     }));
 }
 
+int CountAddressWithoutLabel(int fd, const AddressSpec& expected, uint32_t sequence) {
+    std::vector<DumpedAddress> addresses;
+    if (const int error = DumpAddresses(fd, expected.family, sequence, &addresses); error != 0) {
+        return -error;
+    }
+    return static_cast<int>(std::count_if(addresses.begin(), addresses.end(), [&](const auto& item) {
+        return item.family == expected.family && item.ifindex == expected.ifindex &&
+               item.prefix_len == expected.prefix_len && SameAddress(item.local, expected.local) &&
+               !item.has_label;
+    }));
+}
+
 int CountRoute(int fd, const RouteSpec& expected, uint32_t sequence) {
     std::vector<DumpedRoute> routes;
     if (const int error = DumpRoutes(fd, sequence, &routes); error != 0) return -error;
@@ -388,7 +407,8 @@ int CountRoute(int fd, const RouteSpec& expected, uint32_t sequence) {
 }
 
 bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
-                                const AddressSpec& expected, const char* label = nullptr) {
+                                const AddressSpec& expected, const char* label = nullptr,
+                                bool require_label_absent = false) {
     if (header->nlmsg_type != type) return false;
     const auto* message = reinterpret_cast<const ifaddrmsg*>(NLMSG_DATA(header));
     if (message->ifa_family != expected.family || message->ifa_index != expected.ifindex ||
@@ -398,6 +418,7 @@ bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
     int attr_length = IFA_PAYLOAD(header);
     bool address_matches = false;
     bool label_matches = label == nullptr;
+    bool has_label = false;
     for (auto* attr = IFA_RTA(message); RTA_OK(attr, attr_length);
          attr = RTA_NEXT(attr, attr_length)) {
         if ((attr->rta_type == IFA_LOCAL || attr->rta_type == IFA_ADDRESS) &&
@@ -407,10 +428,13 @@ bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
         } else if (attr->rta_type == IFA_LABEL && label != nullptr && RTA_PAYLOAD(attr) > 0 &&
                    strncmp(static_cast<const char*>(RTA_DATA(attr)), label, RTA_PAYLOAD(attr)) ==
                        0) {
+            has_label = true;
             label_matches = true;
+        } else if (attr->rta_type == IFA_LABEL) {
+            has_label = true;
         }
     }
-    return address_matches && label_matches;
+    return address_matches && label_matches && (!require_label_absent || !has_label);
 }
 
 void DrainNotifications(int fd) {
@@ -424,7 +448,7 @@ void DrainNotifications(int fd) {
 }
 
 int CountAddressNotifications(int fd, uint16_t type, const AddressSpec& address,
-                              const char* label = nullptr) {
+                              const char* label = nullptr, bool require_label_absent = false) {
     std::array<uint8_t, 16384> buffer{};
     int count = 0;
     bool received_any = false;
@@ -440,7 +464,9 @@ int CountAddressNotifications(int fd, uint16_t type, const AddressSpec& address,
         int remaining = static_cast<int>(received);
         for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
              NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
-            if (NotificationMatchesAddress(header, type, address, label)) ++count;
+            if (NotificationMatchesAddress(header, type, address, label, require_label_absent)) {
+                ++count;
+            }
         }
     }
 }
@@ -615,9 +641,14 @@ int RunIdentityFlagsAndErrorPriority() {
 
     const AddressSpec ipv6 = MakeAddress(AF_INET6, "2001:db8:2::1", 64, ifindex);
     const AddressSpec ipv6_other_prefix = MakeAddress(AF_INET6, "2001:db8:2::1", 96, ifindex);
+    constexpr char kIgnoredIpv6Label[] =
+        "1234567890123456123456789012345612345678901234561234567890123456";
+    DrainNotifications(notifications.Get());
     if (ChangeAddress(fd.Get(), RTM_NEWADDR,
                       NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, ipv6, false, true,
-                      ++sequence) != 0 ||
+                      ++sequence, kIgnoredIpv6Label) != 0 ||
+        CountAddressWithoutLabel(fd.Get(), ipv6, ++sequence) != 1 ||
+        CountAddressNotifications(notifications.Get(), RTM_NEWADDR, ipv6, nullptr, true) != 1 ||
         ChangeAddress(fd.Get(), RTM_NEWADDR,
                       NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, ipv6_other_prefix,
                       false, true, ++sequence) != EEXIST) {
@@ -625,7 +656,7 @@ int RunIdentityFlagsAndErrorPriority() {
     }
     DrainNotifications(notifications.Get());
     if (ChangeAddress(fd.Get(), RTM_NEWADDR, NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE,
-                      ipv6_other_prefix, false, true, ++sequence) != 0) {
+                      ipv6_other_prefix, false, true, ++sequence, "", 0) != 0) {
         return 3600;
     }
     if (CountAddress(fd.Get(), ipv6, ++sequence) != 1) return 3601;
@@ -636,7 +667,8 @@ int RunIdentityFlagsAndErrorPriority() {
     if (ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, ipv6_other_prefix,
                       false, true, ++sequence) != EADDRNOTAVAIL ||
         ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, ipv6, false, true,
-                      ++sequence) != 0) {
+                      ++sequence, kIgnoredIpv6Label) != 0 ||
+        CountAddressNotifications(notifications.Get(), RTM_DELADDR, ipv6, nullptr, true) != 1) {
         return 3700;
     }
 
@@ -725,8 +757,20 @@ int RunIdentityFlagsAndErrorPriority() {
     }
 
     const AddressSpec long_label = MakeAddress(AF_INET, "198.51.100.45", 24, ifindex);
+    AddressSpec long_label_unknown = long_label;
+    long_label_unknown.ifindex = 0x7fffffffu;
+    const AddressSpec zero_address = MakeAddress(AF_INET, "0.0.0.0", 0, ifindex);
     if (ChangeAddress(fd.Get(), RTM_NEWADDR,
                       NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, long_label, true,
+                      true, ++sequence, "", 0) != ERANGE ||
+        ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, long_label, true,
+                      true, ++sequence, "1234567890123456") != ERANGE ||
+        ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                      long_label_unknown, true, true, ++sequence, "1234567890123456") != ERANGE ||
+        ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, zero_address, true,
                       true, ++sequence, "1234567890123456") != ERANGE) {
         return 4180;
     }
@@ -735,11 +779,17 @@ int RunIdentityFlagsAndErrorPriority() {
     if (ChangeAddress(fd.Get(), RTM_NEWADDR,
                       NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, empty_label, true,
                       true, ++sequence, "") != 0 ||
-        CountAddressWithLabel(fd.Get(), empty_label, "", ++sequence) != 1 ||
-        CountAddressNotifications(notifications.Get(), RTM_NEWADDR, empty_label, "") != 1 ||
+        CountAddressWithoutLabel(fd.Get(), empty_label, ++sequence) != 1 ||
+        CountAddressNotifications(notifications.Get(), RTM_NEWADDR, empty_label, nullptr, true) !=
+            1 ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, empty_label, true, true,
+                      ++sequence, "", 0) != ERANGE ||
+        ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, empty_label, true, true,
+                      ++sequence, "lo") != EADDRNOTAVAIL ||
         ChangeAddress(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, empty_label, true, true,
                       ++sequence, "") != 0 ||
-        CountAddressNotifications(notifications.Get(), RTM_DELADDR, empty_label, "") != 1) {
+        CountAddressNotifications(notifications.Get(), RTM_DELADDR, empty_label, nullptr, true) !=
+            1) {
         return 4190;
     }
 

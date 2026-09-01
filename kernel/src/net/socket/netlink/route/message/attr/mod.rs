@@ -7,7 +7,7 @@ pub mod neigh;
 pub mod route;
 
 /// 网卡名字长度
-const IFNAME_SIZE: usize = 16;
+pub(in crate::net::socket::netlink::route) const IFNAME_SIZE: usize = 16;
 
 pub(super) fn convert_one_from_raw_buf<T>(src: &[u8]) -> Result<&T, SystemError> {
     log::info!("convert_one_from_raw_buf: src.len() = {}", src.len());

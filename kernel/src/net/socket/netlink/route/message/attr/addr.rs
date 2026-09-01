@@ -1,5 +1,4 @@
-use crate::net::socket::netlink::{message::attr::Attribute, route::message::attr::IFNAME_SIZE};
-use alloc::ffi::CString;
+use crate::net::socket::netlink::message::attr::Attribute;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -46,7 +45,9 @@ impl TryFrom<u16> for AddrAttrClass {
 pub enum AddrAttr {
     Address(Vec<u8>),
     Local(Vec<u8>),
-    Label(CString),
+    /// Raw IFA_LABEL payload. Validation is address-family specific: IPv4
+    /// uses NLA_STRING(IFNAMSIZ - 1), while Linux ignores it for IPv6.
+    Label(Vec<u8>),
 }
 
 impl AddrAttr {
@@ -68,7 +69,7 @@ impl Attribute for AddrAttr {
         match self {
             AddrAttr::Address(addr) => addr.as_ref(),
             AddrAttr::Local(addr) => addr.as_ref(),
-            AddrAttr::Label(label) => label.to_bytes_with_nul(),
+            AddrAttr::Label(label) => label.as_slice(),
         }
     }
 
@@ -101,17 +102,8 @@ impl Attribute for AddrAttr {
                 addr.copy_from_slice(buf);
                 AddrAttr::Local(addr)
             }
-            (AddrAttrClass::LABEL, 1..) => {
-                let effective_len = buf.len() - usize::from(buf.last() == Some(&0));
-                if effective_len >= IFNAME_SIZE {
-                    return Err(SystemError::ERANGE);
-                }
-                // 查找第一个0字节作为结尾，否则用全部
-                let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                let cstr = CString::new(&buf[..nul_pos]).map_err(|_| SystemError::EINVAL)?;
-                AddrAttr::Label(cstr)
-            }
-            (AddrAttrClass::ADDRESS | AddrAttrClass::LOCAL | AddrAttrClass::LABEL, _) => {
+            (AddrAttrClass::LABEL, _) => AddrAttr::Label(buf.to_vec()),
+            (AddrAttrClass::ADDRESS | AddrAttrClass::LOCAL, _) => {
                 log::warn!(
                     "address attribute `{:?}` contains invalid payload",
                     addr_class

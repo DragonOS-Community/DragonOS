@@ -12,7 +12,7 @@ use crate::{
                     RTMGRP_IPV6_IFADDR,
                 },
                 message::{
-                    attr::addr::AddrAttr,
+                    attr::{addr::AddrAttr, IFNAME_SIZE},
                     segment::{
                         addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, RtScope},
                         RouteNlSegment,
@@ -85,6 +85,9 @@ pub(super) fn do_new_addr(
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
+    // Linux applies the IPv4 attribute policy before address, device, and
+    // special-case validation. Preserve that errno priority here.
+    let label = parse_request_label(request_segment)?;
     let cidr = parse_new_cidr(request_segment)?;
     let iface = lookup_iface_by_index(request_segment, &netns)?;
 
@@ -100,7 +103,6 @@ pub(super) fn do_new_addr(
     }
 
     let flags = NewRequestFlags::from_bits_truncate(request_segment.header().flags);
-    let label = find_label_attr(request_segment).cloned();
     let mutation =
         if flags.contains(NewRequestFlags::REPLACE) && !flags.contains(NewRequestFlags::EXCL) {
             AddressMutation::Replace(cidr)
@@ -117,7 +119,8 @@ pub(super) fn do_del_addr(
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let selector = parse_delete_selector(request_segment)?;
+    let label = parse_request_label(request_segment)?;
+    let selector = parse_delete_selector(request_segment, label)?;
     let iface = lookup_iface_by_index(request_segment, &netns)?;
     let cidr = resolve_delete_cidr(&iface, selector)?;
     let deleted_label = crate::net::address::address_label(&iface, cidr)?;
@@ -186,7 +189,10 @@ struct DeleteSelector {
     label: Option<CString>,
 }
 
-fn parse_delete_selector(request_segment: &AddrSegment) -> Result<DeleteSelector, SystemError> {
+fn parse_delete_selector(
+    request_segment: &AddrSegment,
+    label: Option<CString>,
+) -> Result<DeleteSelector, SystemError> {
     let family = AddressFamily::try_from(request_segment.body().family as u16)
         .map_err(|_| SystemError::EAFNOSUPPORT)?;
     let prefix_len = request_segment.body().prefix_len;
@@ -226,10 +232,7 @@ fn parse_delete_selector(request_segment: &AddrSegment) -> Result<DeleteSelector
         _ => return Err(SystemError::EAFNOSUPPORT),
     };
 
-    Ok(DeleteSelector {
-        match_,
-        label: find_label_attr(request_segment).cloned(),
-    })
+    Ok(DeleteSelector { match_, label })
 }
 
 fn resolve_delete_cidr(
@@ -275,11 +278,38 @@ fn find_address_attr(request_segment: &AddrSegment, local: bool) -> Option<&[u8]
     })
 }
 
-fn find_label_attr(request_segment: &AddrSegment) -> Option<&CString> {
-    request_segment.attrs().iter().find_map(|attr| match attr {
-        AddrAttr::Label(label) => Some(label),
-        _ => None,
-    })
+fn parse_ipv4_label_attr(request_segment: &AddrSegment) -> Result<Option<CString>, SystemError> {
+    let mut parsed = None;
+    for attr in request_segment.attrs() {
+        if let AddrAttr::Label(payload) = attr {
+            parsed = Some(parse_ipv4_label(payload)?);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_request_label(request_segment: &AddrSegment) -> Result<Option<CString>, SystemError> {
+    // IFA_LABEL is an IPv4 alias attribute. Linux's IPv6 policy leaves it
+    // untyped and the IPv6 handlers ignore it, regardless of payload length.
+    match AddressFamily::try_from(request_segment.body().family as u16) {
+        Ok(AddressFamily::INet) => parse_ipv4_label_attr(request_segment),
+        _ => Ok(None),
+    }
+}
+
+fn parse_ipv4_label(payload: &[u8]) -> Result<CString, SystemError> {
+    if payload.is_empty() {
+        return Err(SystemError::ERANGE);
+    }
+    let effective_len = payload.len() - usize::from(payload.last() == Some(&0));
+    if effective_len >= IFNAME_SIZE {
+        return Err(SystemError::ERANGE);
+    }
+    let nul_pos = payload
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(payload.len());
+    CString::new(&payload[..nul_pos]).map_err(|_| SystemError::EINVAL)
 }
 
 fn parse_ip_cidr(
@@ -372,15 +402,19 @@ fn addr_to_segment(
         index: NonZeroU32::new(iface.nic_id() as u32),
     };
 
-    let label = match label_override {
-        Some(label) => label.clone(),
-        None => crate::net::address::address_label(iface, cidr)?,
-    };
-    let attrs = vec![
-        AddrAttr::Address(octets.clone()),
-        AddrAttr::Label(label),
-        AddrAttr::Local(octets),
-    ];
+    let mut attrs = vec![AddrAttr::Address(octets.clone())];
+    if matches!(cidr.address(), IpAddress::Ipv4(_)) {
+        let label = match label_override {
+            Some(label) => label.clone(),
+            None => crate::net::address::address_label(iface, cidr)?,
+        };
+        // Linux keeps an explicit empty label for IPv4 delete matching but
+        // inet_fill_ifaddr() omits IFA_LABEL when ifa_label[0] is NUL.
+        if !label.as_bytes().is_empty() {
+            attrs.push(AddrAttr::Label(label.to_bytes_with_nul().to_vec()));
+        }
+    }
+    attrs.push(AddrAttr::Local(octets));
 
     Ok(AddrSegment::new(header, addr_message, attrs))
 }

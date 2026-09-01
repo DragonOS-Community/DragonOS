@@ -448,10 +448,6 @@ fn notify_address_outcome_with_label(
         AddressMutationOutcome::Deleted(cidr) => {
             notify_one(netns, iface, cidr, CSegmentType::DELADDR, deleted_label)
         }
-        AddressMutationOutcome::Exchanged { old, new } => {
-            notify_one(netns.clone(), iface, old, CSegmentType::DELADDR, None);
-            notify_one(netns, iface, new, CSegmentType::NEWADDR, None);
-        }
     }
 }
 

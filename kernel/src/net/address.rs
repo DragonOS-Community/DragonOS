@@ -5,7 +5,6 @@
 //! projection are committed under one smoltcp interface lock.
 
 use alloc::{ffi::CString, format, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use smoltcp::{
     iface::Route,
@@ -30,40 +29,12 @@ pub(crate) enum AddressMutationOutcome {
     Added(IpCidr),
     Deleted(IpCidr),
     Replaced(IpCidr),
-    Exchanged { old: IpCidr, new: IpCidr },
-}
-
-/// Identity of an address object created by an in-kernel control plane.
-///
-/// The token is deliberately opaque outside this module. A userspace
-/// delete/re-add of the same CIDR creates a different object and invalidates
-/// the old token, preventing cross-event ABA ownership bugs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::net) struct AddressLease {
-    cidr: IpCidr,
-    token: u64,
-}
-
-impl AddressLease {
-    pub(in crate::net) fn cidr(self) -> IpCidr {
-        self.cidr
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum CommitMutation {
     Plain(AddressMutation),
-    AddOwned { cidr: IpCidr, token: u64 },
-    DeleteOwned(AddressLease),
-    ExchangeOwned { old: AddressLease, new: IpCidr },
 }
-
-struct CommitResult {
-    outcome: AddressMutationOutcome,
-    lease: Option<AddressLease>,
-}
-
-static NEXT_ADDRESS_OWNER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Mutates an address on an interface that is already visible in a netns.
 pub(in crate::net) fn mutate_address(
@@ -71,7 +42,7 @@ pub(in crate::net) fn mutate_address(
     iface: &Arc<dyn Iface>,
     mutation: AddressMutation,
 ) -> Result<AddressMutationOutcome, SystemError> {
-    commit(iface, CommitMutation::Plain(mutation), None).map(|result| result.outcome)
+    commit(iface, CommitMutation::Plain(mutation), None)
 }
 
 pub(in crate::net) fn mutate_labeled_address(
@@ -80,45 +51,7 @@ pub(in crate::net) fn mutate_labeled_address(
     mutation: AddressMutation,
     label: Option<CString>,
 ) -> Result<AddressMutationOutcome, SystemError> {
-    commit(iface, CommitMutation::Plain(mutation), label).map(|result| result.outcome)
-}
-
-pub(in crate::net) fn add_owned_address(
-    _rtnl: &RtnlGuard,
-    iface: &Arc<dyn Iface>,
-    cidr: IpCidr,
-) -> Result<(AddressMutationOutcome, AddressLease), SystemError> {
-    let token = NEXT_ADDRESS_OWNER_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| SystemError::EOVERFLOW)?;
-    let result = commit(iface, CommitMutation::AddOwned { cidr, token }, None)?;
-    Ok((
-        result.outcome,
-        result.lease.expect("owned add returns a lease"),
-    ))
-}
-
-pub(in crate::net) fn exchange_owned_address(
-    _rtnl: &RtnlGuard,
-    iface: &Arc<dyn Iface>,
-    old: AddressLease,
-    new: IpCidr,
-) -> Result<(AddressMutationOutcome, AddressLease), SystemError> {
-    let result = commit(iface, CommitMutation::ExchangeOwned { old, new }, None)?;
-    Ok((
-        result.outcome,
-        result.lease.expect("owned exchange returns a lease"),
-    ))
-}
-
-pub(in crate::net) fn delete_owned_address(
-    _rtnl: &RtnlGuard,
-    iface: &Arc<dyn Iface>,
-    lease: AddressLease,
-) -> Result<AddressMutationOutcome, SystemError> {
-    commit(iface, CommitMutation::DeleteOwned(lease), None).map(|result| result.outcome)
+    commit(iface, CommitMutation::Plain(mutation), label)
 }
 
 pub(in crate::net) fn address_label(
@@ -228,40 +161,32 @@ fn commit(
     iface: &Arc<dyn Iface>,
     mutation: CommitMutation,
     requested_label: Option<CString>,
-) -> Result<CommitResult, SystemError> {
+) -> Result<AddressMutationOutcome, SystemError> {
     validate_mutation(mutation)?;
 
-    let old_explicit_owner = match mutation {
-        CommitMutation::Plain(AddressMutation::Add(cidr))
-        | CommitMutation::Plain(AddressMutation::Delete(cidr))
-        | CommitMutation::Plain(AddressMutation::Replace(cidr))
-        | CommitMutation::AddOwned { cidr, .. }
-        | CommitMutation::DeleteOwned(AddressLease { cidr, .. }) => {
-            has_explicit_connected_owner(iface, cidr)
-        }
-        CommitMutation::ExchangeOwned { old, .. } => has_explicit_connected_owner(iface, old.cidr),
+    let CommitMutation::Plain(address_mutation) = mutation;
+    let cidr = match address_mutation {
+        AddressMutation::Add(cidr)
+        | AddressMutation::Delete(cidr)
+        | AddressMutation::Replace(cidr) => cidr,
     };
-    let new_explicit_owner = match mutation {
-        CommitMutation::ExchangeOwned { new, .. } => has_explicit_connected_owner(iface, new),
-        _ => false,
-    };
+    let old_explicit_owner = has_explicit_connected_owner(iface, cidr);
 
     let mut smol_iface = iface.smol_iface().lock();
     let mut metadata = iface.common().address_metadata().lock();
-    let (outcome, lease) = match mutation {
+    let outcome = match mutation {
         CommitMutation::Plain(AddressMutation::Add(cidr)) => {
             let outcome = add(&mut smol_iface, cidr, old_explicit_owner)?;
             metadata.push(AddressMetadata {
                 cidr,
                 label: requested_label,
-                owner_token: None,
             });
-            (outcome, None)
+            outcome
         }
         CommitMutation::Plain(AddressMutation::Delete(cidr)) => {
             let outcome = delete(&mut smol_iface, cidr, old_explicit_owner)?;
             metadata.retain(|entry| entry.cidr != cidr);
-            (outcome, None)
+            outcome
         }
         CommitMutation::Plain(AddressMutation::Replace(cidr)) => {
             let outcome = replace(&mut smol_iface, cidr, old_explicit_owner)?;
@@ -269,51 +194,9 @@ fn commit(
                 metadata.push(AddressMetadata {
                     cidr,
                     label: requested_label,
-                    owner_token: None,
                 });
             }
-            (outcome, None)
-        }
-        CommitMutation::AddOwned { cidr, token } => {
-            let outcome = add(&mut smol_iface, cidr, old_explicit_owner)?;
-            metadata.push(AddressMetadata {
-                cidr,
-                label: None,
-                owner_token: Some(token),
-            });
-            (outcome, Some(AddressLease { cidr, token }))
-        }
-        CommitMutation::DeleteOwned(lease) => {
-            let owner_index = metadata
-                .iter()
-                .position(|entry| {
-                    entry.cidr == lease.cidr && entry.owner_token == Some(lease.token)
-                })
-                .ok_or(SystemError::ESTALE)?;
-            let outcome = delete(&mut smol_iface, lease.cidr, old_explicit_owner)?;
-            metadata.remove(owner_index);
-            (outcome, None)
-        }
-        CommitMutation::ExchangeOwned { old, new } => {
-            let owner_index = metadata
-                .iter()
-                .position(|entry| entry.cidr == old.cidr && entry.owner_token == Some(old.token))
-                .ok_or(SystemError::ESTALE)?;
-            let outcome = exchange_owned(
-                &mut smol_iface,
-                old.cidr,
-                new,
-                old_explicit_owner,
-                new_explicit_owner,
-            )?;
-            metadata[owner_index].cidr = new;
-            (
-                outcome,
-                Some(AddressLease {
-                    cidr: new,
-                    token: old.token,
-                }),
-            )
+            outcome
         }
     };
 
@@ -325,25 +208,14 @@ fn commit(
     projection.clear();
     projection.extend_from_slice(&snapshot);
 
-    Ok(CommitResult { outcome, lease })
+    Ok(outcome)
 }
 
 fn validate_mutation(mutation: CommitMutation) -> Result<(), SystemError> {
     match mutation {
         CommitMutation::Plain(AddressMutation::Add(cidr))
         | CommitMutation::Plain(AddressMutation::Delete(cidr))
-        | CommitMutation::Plain(AddressMutation::Replace(cidr))
-        | CommitMutation::AddOwned { cidr, .. }
-        | CommitMutation::DeleteOwned(AddressLease { cidr, .. }) => validate_cidr(cidr),
-        CommitMutation::ExchangeOwned { old, new } => {
-            validate_cidr(old.cidr)?;
-            validate_cidr(new)?;
-            if same_family(old.cidr, new) {
-                Ok(())
-            } else {
-                Err(SystemError::EINVAL)
-            }
-        }
+        | CommitMutation::Plain(AddressMutation::Replace(cidr)) => validate_cidr(cidr),
     }
 }
 
@@ -438,84 +310,6 @@ fn replace(
     Ok(AddressMutationOutcome::Replaced(effective))
 }
 
-fn exchange_owned(
-    iface: &mut smoltcp::iface::Interface,
-    old: IpCidr,
-    new: IpCidr,
-    old_has_explicit_owner: bool,
-    new_has_explicit_owner: bool,
-) -> Result<AddressMutationOutcome, SystemError> {
-    let old_index = find_for_delete(iface.ip_addrs(), old).ok_or(SystemError::EADDRNOTAVAIL)?;
-    let old_has_explicit_owner = old_has_explicit_owner
-        || iface
-            .ip_addrs()
-            .iter()
-            .enumerate()
-            .any(|(index, configured)| {
-                index != old_index && same_connected_projection(*configured, old)
-            });
-    let new_has_explicit_owner = new_has_explicit_owner
-        || iface
-            .ip_addrs()
-            .iter()
-            .enumerate()
-            .any(|(index, configured)| {
-                index != old_index && same_connected_projection(*configured, new)
-            });
-    if old == new {
-        if !ensure_connected_route(iface, old, true) {
-            return Err(SystemError::ENOSPC);
-        }
-        return Ok(AddressMutationOutcome::Replaced(old));
-    }
-    if iface
-        .ip_addrs()
-        .iter()
-        .enumerate()
-        .any(|(index, configured)| {
-            index != old_index && same_new_or_replace_identity(*configured, new)
-        })
-    {
-        return Err(SystemError::EEXIST);
-    }
-    if canonical_projection_cidr(old) == canonical_projection_cidr(new) {
-        if !ensure_connected_route(iface, old, true) {
-            return Err(SystemError::ENOSPC);
-        }
-        iface.update_ip_addrs(|addresses| addresses[old_index] = new);
-        return Ok(AddressMutationOutcome::Exchanged { old, new });
-    }
-
-    // Prepare the route transition first. If the old projection has no other
-    // logical owner, its fixed-capacity slot can be reused in place. Otherwise
-    // the old projection must remain and a missing new projection needs a free
-    // slot. Replacing the address at a known index cannot fail, so ENOSPC still
-    // leaves the old state intact.
-    let mut route_ready = false;
-    iface.routes_mut().update(|routes| {
-        if new_has_explicit_owner && routes.iter().any(|route| is_connected(route, new)) {
-            route_ready = true;
-        } else if !old_has_explicit_owner {
-            if let Some(index) = routes.iter().rposition(|route| is_connected(route, old)) {
-                routes[index].cidr = new;
-                route_ready = true;
-            } else {
-                route_ready = routes.push(connected_route(new)).is_ok();
-            }
-        } else {
-            route_ready = routes.push(connected_route(new)).is_ok();
-        }
-    });
-    if !route_ready {
-        return Err(SystemError::ENOSPC);
-    }
-
-    iface.update_ip_addrs(|addresses| addresses[old_index] = new);
-    set_connected_route_presence(iface, old, old_has_explicit_owner);
-    set_connected_route_presence(iface, new, true);
-    Ok(AddressMutationOutcome::Exchanged { old, new })
-}
-
 fn find_for_new_or_replace(addresses: &[IpCidr], requested: IpCidr) -> Option<usize> {
     addresses
         .iter()
@@ -534,13 +328,6 @@ fn same_new_or_replace_identity(configured: IpCidr, requested: IpCidr) -> bool {
         (IpAddress::Ipv6(configured), IpAddress::Ipv6(requested)) => configured == requested,
         _ => false,
     }
-}
-
-fn same_family(left: IpCidr, right: IpCidr) -> bool {
-    matches!(
-        (left.address(), right.address()),
-        (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) | (IpAddress::Ipv6(_), IpAddress::Ipv6(_))
-    )
 }
 
 fn ensure_connected_route(

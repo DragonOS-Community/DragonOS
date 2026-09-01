@@ -1,0 +1,71 @@
+#!/bin/busybox sh
+
+set -f
+
+. /usr/lib/dragon-network/common.sh
+
+dn_init_runtime || exit 1
+dn_rebuild_dns || {
+    dn_log boot "failed to initialize managed resolver configuration"
+    exit 1
+}
+
+links=$($DN_BUSYBOX ip -o link show 2>/dev/null) || {
+    dn_log boot "failed to enumerate network interfaces"
+    exit 1
+}
+
+primary_iface=
+primary_ifindex=
+old_ifs=$IFS
+IFS='
+'
+for line in $links; do
+    IFS=$old_ifs
+    set -- $line
+    [ "$#" -ge 2 ] || {
+        IFS='
+'
+        continue
+    }
+
+    ifindex=${1%:}
+    displayed_name=${2%:}
+    [ "$ifindex" != "$1" ] && [ "$displayed_name" != "$2" ] &&
+        dn_valid_uint "$ifindex" && [ "$ifindex" -gt 0 ] || {
+        IFS='
+'
+        continue
+    }
+
+    iface=${displayed_name%%@*}
+    dn_valid_ifname "$iface" || {
+        IFS='
+'
+        continue
+    }
+    case "$iface" in
+        eth*) ;;
+        *)
+            IFS='
+'
+            continue
+            ;;
+    esac
+
+    if [ -z "$primary_ifindex" ] || [ "$ifindex" -lt "$primary_ifindex" ]; then
+        primary_ifindex=$ifindex
+        primary_iface=$iface
+    fi
+    IFS='
+'
+done
+IFS=$old_ifs
+
+[ -n "$primary_iface" ] || exit 0
+$DN_BUSYBOX ip link show dev "$primary_iface" >/dev/null 2>&1 || {
+    dn_log boot "primary interface disappeared: $primary_iface"
+    exit 1
+}
+
+exec /usr/sbin/dragon-network start-boot "$primary_iface"

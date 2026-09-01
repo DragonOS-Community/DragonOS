@@ -74,7 +74,6 @@ pub enum Operstate {
 pub(crate) struct AddressMetadata {
     pub cidr: smoltcp::wire::IpCidr,
     pub label: Option<CString>,
-    pub owner_token: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -380,7 +379,6 @@ impl IfaceCommon {
             .map(|cidr| AddressMetadata {
                 cidr: *cidr,
                 label: None,
-                owner_token: None,
             })
             .collect();
         IfaceCommon {

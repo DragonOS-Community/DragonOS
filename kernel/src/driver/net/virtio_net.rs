@@ -1275,7 +1275,14 @@ impl Iface for VirtioInterface {
     fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
         // submit_frame() owns the outgoing packet-socket tap for all virtio
         // transmit paths, including raw frames.
-        self.device_inner.try_raw_transmit(frame)
+        self.device_inner.try_raw_transmit(frame)?;
+        // AF_PACKET bypasses smoltcp's socket send path. Request this
+        // NAPI-owned device to reap TX and consume an immediate response
+        // without imposing a synchronous full-stack poll on other drivers.
+        if let Some(napi) = self.napi_struct() {
+            napi_schedule(napi);
+        }
+        Ok(())
     }
 
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {

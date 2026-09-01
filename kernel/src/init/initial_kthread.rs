@@ -13,7 +13,6 @@ use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::net::e1000e::e1000e::e1000e_init,
     filesystem::vfs::vcore::mount_root_fs,
-    net::net_core::net_init,
     process::{
         exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
         ProcessFlags, ProcessManager,
@@ -87,9 +86,6 @@ fn kernel_init() -> Result<(), SystemError> {
     stdio_init().expect("Failed to initialize stdio");
 
     e1000e_init();
-    net_init().unwrap_or_else(|err| {
-        error!("Failed to initialize network: {:?}", err);
-    });
 
     #[cfg(feature = "fifo_demo")]
     crate::sched::fifo_demo::fifo_demo_init();

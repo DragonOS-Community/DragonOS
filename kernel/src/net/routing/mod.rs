@@ -1,5 +1,5 @@
 use crate::driver::net::Iface;
-use crate::libs::rwsem::RwSem;
+use crate::libs::rwsem::{RwSem, RwSemWriteGuard};
 use crate::net::routing::nat::ConnTracker;
 use crate::net::routing::nat::DnatPolicy;
 use crate::net::routing::nat::FiveTuple;
@@ -11,6 +11,7 @@ use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use smoltcp::wire::{EthernetFrame, IpAddress, IpCidr, Ipv4Packet};
 use system_error::SystemError;
 
@@ -39,6 +40,44 @@ pub struct Router {
     pub(in crate::net) fib: RwSem<crate::net::route::FibTable>,
     pub(self) nat_tracker: Arc<ConnTracker>,
     pub ns: RwSem<Weak<NetNamespace>>,
+    /// Derived execution mode for the IPv4 built-in default-table rule. A
+    /// flat per-interface smoltcp route cache cannot encode table-wide RPDB
+    /// priority, so affected namespaces route host output through the FIB.
+    authoritative_ipv4_output: AtomicBool,
+}
+
+/// Write access to the namespace FIB.
+///
+/// The execution mode is derived from the committed FIB and therefore must
+/// be published after every mutation, including address-lifecycle updates.
+/// Keeping that invariant in the guard prevents individual writers from
+/// having to remember a second state update.
+pub(in crate::net) struct RouterFibWriteGuard<'a> {
+    fib: RwSemWriteGuard<'a, crate::net::route::FibTable>,
+    authoritative_ipv4_output: &'a AtomicBool,
+}
+
+impl core::ops::Deref for RouterFibWriteGuard<'_> {
+    type Target = crate::net::route::FibTable;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fib
+    }
+}
+
+impl core::ops::DerefMut for RouterFibWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fib
+    }
+}
+
+impl Drop for RouterFibWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.authoritative_ipv4_output.store(
+            self.fib.requires_authoritative_ipv4_output(),
+            Ordering::Release,
+        );
+    }
 }
 
 impl Router {
@@ -47,6 +86,7 @@ impl Router {
             fib: RwSem::new(crate::net::route::FibTable::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
             ns: RwSem::new(Weak::default()),
+            authoritative_ipv4_output: AtomicBool::new(false),
         })
     }
 
@@ -57,7 +97,19 @@ impl Router {
             fib: RwSem::new(crate::net::route::FibTable::default()),
             ns: RwSem::new(Weak::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
+            authoritative_ipv4_output: AtomicBool::new(false),
         })
+    }
+
+    pub(in crate::net) fn fib_write(&self) -> RouterFibWriteGuard<'_> {
+        RouterFibWriteGuard {
+            fib: self.fib.write(),
+            authoritative_ipv4_output: &self.authoritative_ipv4_output,
+        }
+    }
+
+    pub(crate) fn requires_authoritative_ipv4_output(&self) -> bool {
+        self.authoritative_ipv4_output.load(Ordering::Acquire)
     }
 
     pub fn lookup_ingress_route(
@@ -131,9 +183,9 @@ pub trait RouterEnableDevice: Iface {
 
                 let dst_ip = ipv4_packet_mut.dst_addr();
 
-                // Classify through the namespace local table before the main
-                // table, just like Linux ingress routing. Local destinations
-                // must never re-enter the forwarding path.
+                // Classify through the namespace built-in rule chain, just
+                // like Linux ingress routing. Local destinations must never
+                // re-enter the forwarding path.
                 let router = self.netns_router();
 
                 let decision =

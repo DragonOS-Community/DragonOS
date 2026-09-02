@@ -230,7 +230,7 @@ impl PreparedAddressRouteCommit {
             metadata,
         } = self;
         let router = netns.router();
-        let mut current = router.fib.write();
+        let mut current = router.fib_write();
         debug_assert_eq!(*current, before);
         let mut smol_iface = iface.smol_iface().lock();
         smol_iface.update_ip_addrs(|addresses| {

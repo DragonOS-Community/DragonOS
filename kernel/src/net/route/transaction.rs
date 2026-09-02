@@ -37,7 +37,7 @@ struct PreparedFibEdit<'rtnl, T> {
 impl<T> PreparedFibEdit<'_, T> {
     fn publish(self, netns: &Arc<NetNamespace>) -> T {
         let router = netns.router();
-        let mut fib = router.fib.write();
+        let mut fib = router.fib_write();
         self.projection.publish();
         fib.apply_edit(self.edit);
         self.outcome
@@ -176,7 +176,7 @@ impl<T> PreparedTransaction<'_, T> {
         after_routes: impl FnOnce(),
     ) -> T {
         let router = netns.router();
-        let mut current = router.fib.write();
+        let mut current = router.fib_write();
         before_routes();
         self.plan.publish();
         *current = self.candidate;
@@ -239,7 +239,7 @@ pub(super) fn transact_single<T>(
     drop(device_list);
 
     let router = netns.router();
-    let mut fib = router.fib.write();
+    let mut fib = router.fib_write();
     let planned = plan(&fib)?;
     fib.reserve_edit(planned.edit)?;
     let projection = match IncrementalProjectionPlan::prepare(&fib, planned.edit, &devices) {

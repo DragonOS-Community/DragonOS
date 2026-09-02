@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 
 use smoltcp::wire::{IpAddress, IpCidr, Ipv6AddressExt, Ipv6Cidr};
 
+pub(crate) const RT_TABLE_DEFAULT: u32 = 253;
 pub(crate) const RT_TABLE_MAIN: u32 = 254;
 pub(crate) const RT_TABLE_LOCAL: u32 = 255;
 pub(crate) const RTPROT_KERNEL: u8 = 2;
@@ -227,6 +228,17 @@ pub(super) fn same_family(left: IpAddress, right: IpAddress) -> bool {
 
 pub(super) fn same_family_option(reference: IpAddress, candidate: Option<IpAddress>) -> bool {
     candidate.is_none_or(|candidate| same_family(reference, candidate))
+}
+
+/// The policy-free built-in rule chain exposed by Linux before userspace adds
+/// custom RPDB rules. IPv4 has a final default-table rule; IPv6 does not.
+pub(super) fn builtin_rule_tables(destination: IpAddress) -> &'static [u32] {
+    const IPV4: &[u32] = &[RT_TABLE_LOCAL, RT_TABLE_MAIN, RT_TABLE_DEFAULT];
+    const IPV6: &[u32] = &[RT_TABLE_LOCAL, RT_TABLE_MAIN];
+    match destination {
+        IpAddress::Ipv4(_) => IPV4,
+        IpAddress::Ipv6(_) => IPV6,
+    }
 }
 
 pub(super) fn is_ipv4(address: IpAddress) -> bool {

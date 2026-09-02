@@ -45,6 +45,7 @@ pub(crate) struct OutputRouteDecision {
     pub(crate) next_hop: IpAddress,
     pub(crate) ip_mtu: usize,
     pub(crate) kind: u8,
+    pub(crate) table: u32,
 }
 
 impl OutputRouteGuard<'_> {
@@ -60,6 +61,7 @@ impl OutputRouteGuard<'_> {
             next_hop: route.next_hop,
             ip_mtu: iface.mtu(),
             kind: route.matched.kind,
+            table: route.table,
         })
     }
 }
@@ -99,7 +101,7 @@ pub(crate) fn lookup(
     lookup_output_fib(&netns.router().fib.read(), destination, None)
 }
 
-/// Classifies an ingress destination through Linux's local-before-main rule.
+/// Classifies ingress through Linux's family-specific built-in rule chain.
 /// The caller must locally deliver RTN_LOCAL/RTN_BROADCAST results and may
 /// forward only RTN_UNICAST results.
 pub(crate) fn lookup_ingress(

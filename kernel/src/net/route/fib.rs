@@ -4,10 +4,11 @@ use smoltcp::wire::IpAddress;
 use system_error::SystemError;
 
 use super::{
+    builtin_rule_tables,
     fib_index::{projection_key, FibIndex, ProjectionKey},
     is_ipv4, same_family, RouteDeleteSelector, RouteEntry, RouteLookupResult, RouteMutationOutcome,
     RouteNewFlags, RouteNotifications, RouteSourcePolicy, RTN_BROADCAST, RT_SCOPE_LINK,
-    RT_TABLE_LOCAL,
+    RT_TABLE_DEFAULT, RT_TABLE_LOCAL,
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -551,9 +552,20 @@ impl FibTable {
         })
     }
 
+    fn lookup_builtin_rules(
+        &self,
+        destination: IpAddress,
+        mut key: impl FnMut(u32) -> FibLookupKey,
+    ) -> Option<RouteLookupResult> {
+        builtin_rule_tables(destination)
+            .iter()
+            .find_map(|table| self.lookup_key(key(*table)))
+    }
+
     pub(super) fn lookup_output(&self, destination: IpAddress) -> Option<RouteLookupResult> {
-        self.lookup_key(FibLookupKey::output(destination, super::RT_TABLE_LOCAL))
-            .or_else(|| self.lookup_key(FibLookupKey::output(destination, super::RT_TABLE_MAIN)))
+        self.lookup_builtin_rules(destination, |table| {
+            FibLookupKey::output(destination, table)
+        })
     }
 
     pub(super) fn lookup_on_iface(
@@ -561,17 +573,8 @@ impl FibTable {
         destination: IpAddress,
         oif: u32,
     ) -> Option<RouteLookupResult> {
-        self.lookup_key(FibLookupKey::on_iface(
-            destination,
-            super::RT_TABLE_LOCAL,
-            oif,
-        ))
-        .or_else(|| {
-            self.lookup_key(FibLookupKey::on_iface(
-                destination,
-                super::RT_TABLE_MAIN,
-                oif,
-            ))
+        self.lookup_builtin_rules(destination, |table| {
+            FibLookupKey::on_iface(destination, table, oif)
         })
         // Linux IPv4 treats an explicit output interface as an on-link route
         // when the normal FIB lookup misses.  This applies to every unicast
@@ -590,8 +593,20 @@ impl FibTable {
         destination: IpAddress,
         ingress_oif: u32,
     ) -> Option<RouteLookupResult> {
-        self.lookup_key(FibLookupKey::ingress_local(destination, ingress_oif))
-            .or_else(|| self.lookup_key(FibLookupKey::output(destination, super::RT_TABLE_MAIN)))
+        self.lookup_builtin_rules(destination, |table| {
+            if table == RT_TABLE_LOCAL {
+                FibLookupKey::ingress_local(destination, ingress_oif)
+            } else {
+                FibLookupKey::output(destination, table)
+            }
+        })
+    }
+
+    /// A flat smoltcp LPM projection cannot preserve RPDB table priority when
+    /// a more-specific default-table route overlaps a main-table route. Keep
+    /// such namespaces on the authoritative IPv4 egress path instead.
+    pub(in crate::net) fn requires_authoritative_ipv4_output(&self) -> bool {
+        self.index.has_ipv4_routes(RT_TABLE_DEFAULT)
     }
 
     pub(super) fn resolve_gateway(

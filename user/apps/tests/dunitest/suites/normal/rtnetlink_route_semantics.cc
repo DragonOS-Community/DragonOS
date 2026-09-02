@@ -4,12 +4,16 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/if_addr.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -712,7 +716,121 @@ bool SawIpv6RouteNotification(int fd, const char* destination, uint8_t prefix_le
     }
 }
 
+int RunIpv4BuiltinRuleChain() {
+    FdGuard fd(OpenRouteSocket());
+    if (fd.Get() < 0) return 1000 + errno;
+    const uint32_t egress = if_nametoindex("veth1");
+    if (egress == 0) return 2000 + errno;
+    uint32_t seq = 1;
+
+    RouteSpec fallback = MakeIpv4Route("203.0.113.0", 24, egress);
+    fallback.gateway = Ipv4("111.111.11.2");
+    fallback.table = RT_TABLE_DEFAULT;
+    if (const int error = SendRouteRequest(
+                fd.Get(), RTM_NEWROUTE,
+                NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, fallback, seq++);
+        error != 0) {
+        return 3000 + error;
+    }
+
+    // RPDB priority is table-wide: even a less-specific main-table route must
+    // win before the IPv4 default table is consulted.
+    RouteSpec main = MakeIpv4Route("203.0.0.0", 16, egress);
+    if (const int error = SendRouteRequest(
+                fd.Get(), RTM_NEWROUTE,
+                NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, main, seq++);
+        error != 0) {
+        return 4000 + error;
+    }
+    auto lookup = LookupIpv4Route(fd.Get(), "203.0.113.7", seq++);
+    if (!lookup.has_value() || lookup->table != RT_TABLE_MAIN) return 5000;
+    if (const int error = SendRouteRequest(fd.Get(), RTM_DELROUTE,
+                                           NLM_F_REQUEST | NLM_F_ACK, main, seq++);
+        error != 0) {
+        return 6000 + error;
+    }
+
+    lookup = LookupIpv4Route(fd.Get(), "203.0.113.7", seq++);
+    if (!lookup.has_value() || lookup->table != RT_TABLE_DEFAULT) return 7000;
+    lookup = LookupIpv4Route(fd.Get(), "203.0.113.7", seq++, egress);
+    if (!lookup.has_value() || lookup->table != RT_TABLE_DEFAULT) return 8000;
+
+    FdGuard observer(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
+    if (observer.Get() < 0) return 9000 + errno;
+    sockaddr_ll packet_bind = {};
+    packet_bind.sll_family = AF_PACKET;
+    packet_bind.sll_protocol = htons(ETH_P_ALL);
+    packet_bind.sll_ifindex = egress;
+    if (bind(observer.Get(), reinterpret_cast<sockaddr*>(&packet_bind), sizeof(packet_bind)) != 0) {
+        return 10000 + errno;
+    }
+    timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    if (setsockopt(observer.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        return 11000 + errno;
+    }
+
+    FdGuard socket_fd(socket(AF_INET, SOCK_DGRAM, 0));
+    if (socket_fd.Get() < 0) return 12000 + errno;
+    sockaddr_in remote = {};
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(9);
+    remote.sin_addr.s_addr = Ipv4("203.0.113.7");
+    if (connect(socket_fd.Get(), reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) != 0) {
+        return 13000 + errno;
+    }
+    constexpr char payload[] = "default-table-dataplane";
+    if (send(socket_fd.Get(), payload, sizeof(payload), 0) != static_cast<ssize_t>(sizeof(payload))) {
+        return 14000 + errno;
+    }
+
+    char frame[2048] = {};
+    for (;;) {
+        const ssize_t length = recv(observer.Get(), frame, sizeof(frame), 0);
+        if (length < 0) return 15000 + errno;
+        size_t ip_offset = 0;
+        uint16_t ether_type = 0;
+        if (length >= static_cast<ssize_t>(ETH_HLEN)) {
+            std::memcpy(&ether_type, frame + 12, sizeof(ether_type));
+        }
+        if (ntohs(ether_type) == ETH_P_IP) {
+            ip_offset = ETH_HLEN;
+        }
+        if (length < static_cast<ssize_t>(ip_offset + 20) ||
+            (static_cast<uint8_t>(frame[ip_offset]) >> 4) != 4) {
+            continue;
+        }
+        uint32_t destination = 0;
+        std::memcpy(&destination, frame + ip_offset + 16, sizeof(destination));
+        if (destination == remote.sin_addr.s_addr) return 0;
+    }
+}
+
 }  // namespace
+
+TEST(RtnetlinkRouteSemantics, Ipv4BuiltinRulesFallBackFromMainToDefaultTable) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << ErrnoString(errno);
+    if (child == 0) {
+        const int result = RunIpv4BuiltinRuleChain();
+        if (result != 0) dprintf(STDERR_FILENO, "builtin rule child failed: %d\n", result);
+        _exit(result == 0 ? 0 : 1);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child) << ErrnoString(errno);
+    FdGuard cleanup(OpenRouteSocket());
+    ASSERT_GE(cleanup.Get(), 0);
+    uint32_t cleanup_seq = 100;
+    const uint32_t egress = if_nametoindex("veth1");
+    RouteSpec main = MakeIpv4Route("203.0.0.0", 16, egress);
+    RouteSpec fallback = MakeIpv4Route("203.0.113.0", 24, egress);
+    fallback.gateway = Ipv4("111.111.11.2");
+    fallback.table = RT_TABLE_DEFAULT;
+    DeleteRouteIfPresent(cleanup.Get(), main, &cleanup_seq);
+    DeleteRouteIfPresent(cleanup.Get(), fallback, &cleanup_seq);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
 
 TEST(RtnetlinkRouteSemantics, OnLinkRouteWithUnspecTableDumpsAsMainWithoutGateway) {
     FdGuard fd(OpenRouteSocket());

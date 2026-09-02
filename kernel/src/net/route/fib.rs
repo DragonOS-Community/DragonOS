@@ -5,10 +5,10 @@ use system_error::SystemError;
 
 use super::{
     builtin_rule_tables,
-    fib_index::{projection_key, FibIndex, ProjectionKey},
+    fib_index::{projection_key, BroadcastLookup, FibIndex, ProjectionKey},
     is_ipv4, same_family, RouteDeleteSelector, RouteEntry, RouteLookupResult, RouteMutationOutcome,
-    RouteNewFlags, RouteNotifications, RouteSourcePolicy, RTN_BROADCAST, RT_SCOPE_LINK,
-    RT_TABLE_DEFAULT, RT_TABLE_LOCAL,
+    RouteNewFlags, RouteNotifications, RouteSourcePolicy, RT_SCOPE_LINK, RT_TABLE_DEFAULT,
+    RT_TABLE_LOCAL,
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -177,13 +177,6 @@ impl<'a> FibEditor<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum BroadcastLookup {
-    Exclude,
-    Any,
-    OnIface(u32),
-}
-
-#[derive(Clone, Copy)]
 struct FibLookupKey {
     destination: IpAddress,
     table: u32,
@@ -245,16 +238,6 @@ impl FibLookupKey {
             required_oif,
             minimum_scope,
             broadcast: BroadcastLookup::Exclude,
-        }
-    }
-}
-
-impl BroadcastLookup {
-    fn matches(self, oif: u32) -> bool {
-        match self {
-            Self::Exclude => false,
-            Self::Any => true,
-            Self::OnIface(required) => required == oif,
         }
     }
 }
@@ -431,11 +414,12 @@ impl FibTable {
             } => {
                 debug_assert_eq!(index, self.entries.len());
                 self.entries.push(route);
-                self.index.commit_insert(index, route, before);
+                self.index
+                    .commit_insert(index, route, before, &self.entries);
             }
             FibEdit::Replace { index, old, new } => {
                 self.entries[index] = new;
-                self.index.commit_replace(index, old, new);
+                self.index.commit_replace(index, old, new, &self.entries);
             }
             FibEdit::Delete { index, route } => {
                 let removed = self.remove_at(index);
@@ -450,7 +434,7 @@ impl FibTable {
         let last_index = self.entries.len() - 1;
         let moved = (index != last_index).then(|| (last_index, self.entries[last_index]));
         let removed = self.entries.swap_remove(index);
-        self.index.commit_remove(index, route, moved);
+        self.index.commit_remove(index, route, moved, &self.entries);
         removed
     }
 
@@ -531,13 +515,9 @@ impl FibTable {
             &self.entries,
             key.destination,
             key.table,
-            !matches!(key.broadcast, BroadcastLookup::Exclude),
-            |_, route| {
-                (route.kind != RTN_BROADCAST || key.broadcast.matches(route.oif))
-                    && key.required_oif.is_none_or(|oif| route.oif == oif)
-                    && key.minimum_scope.is_none_or(|scope| route.scope >= scope)
-                    && same_family(route.destination.address(), key.destination)
-            },
+            key.required_oif,
+            key.minimum_scope,
+            key.broadcast,
         )?;
         let route = self.entries[route_index];
         Some(RouteLookupResult {

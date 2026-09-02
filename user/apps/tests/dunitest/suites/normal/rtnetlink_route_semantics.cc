@@ -742,7 +742,10 @@ int RunIpv4BuiltinRuleChain() {
         error != 0) {
         return 4000 + error;
     }
-    auto lookup = LookupIpv4Route(fd.Get(), "203.0.113.7", seq++);
+    // Constrain both lookups to the interface owned by this test. The shared
+    // dunitest guest may already have an unrelated main-table default route;
+    // Linux correctly stops at that route for an unconstrained lookup.
+    auto lookup = LookupIpv4Route(fd.Get(), "203.0.113.7", seq++, egress);
     if (!lookup.has_value() || lookup->table != RT_TABLE_MAIN) return 5000;
     if (const int error = SendRouteRequest(fd.Get(), RTM_DELROUTE,
                                            NLM_F_REQUEST | NLM_F_ACK, main, seq++);
@@ -750,10 +753,8 @@ int RunIpv4BuiltinRuleChain() {
         return 6000 + error;
     }
 
-    lookup = LookupIpv4Route(fd.Get(), "203.0.113.7", seq++);
-    if (!lookup.has_value() || lookup->table != RT_TABLE_DEFAULT) return 7000;
     lookup = LookupIpv4Route(fd.Get(), "203.0.113.7", seq++, egress);
-    if (!lookup.has_value() || lookup->table != RT_TABLE_DEFAULT) return 8000;
+    if (!lookup.has_value() || lookup->table != RT_TABLE_DEFAULT) return 7000;
 
     FdGuard observer(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
     if (observer.Get() < 0) return 9000 + errno;
@@ -771,22 +772,26 @@ int RunIpv4BuiltinRuleChain() {
 
     FdGuard socket_fd(socket(AF_INET, SOCK_DGRAM, 0));
     if (socket_fd.Get() < 0) return 12000 + errno;
+    constexpr char device[] = "veth1";
+    if (setsockopt(socket_fd.Get(), SOL_SOCKET, SO_BINDTODEVICE, device, sizeof(device)) != 0) {
+        return 13000 + errno;
+    }
     sockaddr_in remote = {};
     remote.sin_family = AF_INET;
     remote.sin_port = htons(9);
     remote.sin_addr.s_addr = Ipv4("203.0.113.7");
     if (connect(socket_fd.Get(), reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) != 0) {
-        return 13000 + errno;
+        return 14000 + errno;
     }
     constexpr char payload[] = "default-table-dataplane";
     if (send(socket_fd.Get(), payload, sizeof(payload), 0) != static_cast<ssize_t>(sizeof(payload))) {
-        return 14000 + errno;
+        return 15000 + errno;
     }
 
     char frame[2048] = {};
     for (;;) {
         const ssize_t length = recv(observer.Get(), frame, sizeof(frame), 0);
-        if (length < 0) return 15000 + errno;
+        if (length < 0) return 16000 + errno;
         size_t ip_offset = 0;
         uint16_t ether_type = 0;
         if (length >= static_cast<ssize_t>(ETH_HLEN)) {

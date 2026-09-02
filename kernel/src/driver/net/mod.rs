@@ -1388,7 +1388,7 @@ pub(crate) enum IfacePollScope {
 /// underlying device path.
 struct LocalInputDevice<'a, D: SmolDevice + ?Sized> {
     device: &'a mut D,
-    queue: &'a LocalInputQueue,
+    common: &'a IfaceCommon,
     route_policy: &'a crate::net::route::OutputRouteGuard<'a>,
     owner_ifindex: u32,
     owner_is_up: bool,
@@ -1623,14 +1623,14 @@ impl SmolTxToken for LocalInputTxToken<'_> {
 impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
     fn new(
         device: &'a mut D,
-        queue: &'a LocalInputQueue,
+        common: &'a IfaceCommon,
         route_policy: &'a crate::net::route::OutputRouteGuard<'a>,
         owner_ifindex: u32,
         owner_is_up: bool,
     ) -> Self {
         Self {
             device,
-            queue,
+            common,
             route_policy,
             owner_ifindex,
             owner_is_up,
@@ -1639,7 +1639,7 @@ impl<'a, D: SmolDevice + ?Sized> LocalInputDevice<'a, D> {
 
     fn tx_token(&self) -> Option<LocalInputTxToken<'a>> {
         local_tx_token(
-            self.queue,
+            &self.common.local_input_queue,
             self.route_policy,
             self.owner_ifindex,
             self.owner_is_up,
@@ -1692,7 +1692,15 @@ impl<D: SmolDevice + ?Sized> SmolDevice for LocalInputDevice<'_, D> {
         // output queue is full, smoltcp observes device backpressure and the
         // input remains queued for a later poll.
         let tx_token = self.tx_token()?;
-        let packet = self.queue.pop()?;
+        let packet = self.common.local_input_queue.pop()?;
+        // Namespace-local delivery is an ingress path in its own right.
+        // Apply the same pre-stack policy as a driver receive queue so a
+        // routed local packet cannot bypass listener/backlog semantics. Stop
+        // this ingress round after one policy drop to keep NAPI work bounded;
+        // the non-empty local queue schedules the next round.
+        if self.common.should_drop_rx_packet(&packet.ip_packet) {
+            return None;
+        }
         let ingress_ifindex = packet.ingress_ifindex;
         let frame = packet.into_frame(self.device.capabilities().medium).ok()?;
         let mut meta = PacketMeta::default();
@@ -2411,7 +2419,7 @@ impl IfaceCommon {
             {
                 let mut local_device = LocalInputDevice::new(
                     device,
-                    &self.local_input_queue,
+                    self,
                     route_policy.as_ref().unwrap(),
                     self.iface_id as u32,
                     owner_is_up,
@@ -2558,7 +2566,7 @@ impl IfaceCommon {
         if routed_this_round {
             let mut local_device = LocalInputDevice::new(
                 device,
-                &self.local_input_queue,
+                self,
                 route_policy.as_ref().unwrap(),
                 self.iface_id as u32,
                 owner_is_up,
@@ -2618,7 +2626,7 @@ impl IfaceCommon {
         if routed_this_round && remaining > 0 && self.has_local_input() {
             let mut local_device = LocalInputDevice::new(
                 device,
-                &self.local_input_queue,
+                self,
                 route_policy.as_ref().unwrap(),
                 self.iface_id as u32,
                 owner_is_up,
@@ -2639,7 +2647,7 @@ impl IfaceCommon {
         if routed_this_round {
             let mut local_device = LocalInputDevice::new(
                 device,
-                &self.local_input_queue,
+                self,
                 route_policy.as_ref().unwrap(),
                 self.iface_id as u32,
                 owner_is_up,

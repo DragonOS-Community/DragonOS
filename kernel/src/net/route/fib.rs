@@ -4,14 +4,15 @@ use smoltcp::wire::IpAddress;
 use system_error::SystemError;
 
 use super::{
-    is_ipv4, same_family, RouteDeleteSelector, RouteEntry, RouteLookupResult, RouteMutationOutcome,
-    RouteNewFlags, RouteNotifications, RouteSourcePolicy, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST,
+    fib_index::FibIndex, is_ipv4, same_family, RouteDeleteSelector, RouteEntry, RouteLookupResult,
+    RouteMutationOutcome, RouteNewFlags, RouteNotifications, RouteSourcePolicy, RTN_BROADCAST,
     RT_SCOPE_LINK,
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(in crate::net) struct FibTable {
     entries: Vec<RouteEntry>,
+    index: FibIndex,
 }
 
 pub(super) struct FibDelta {
@@ -106,8 +107,24 @@ impl<'a> FibEditor<'a> {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> Vec<u32> {
-        self.affected_oifs
+    pub(super) fn reconcile_address_routes(
+        &mut self,
+        before_routes: &[RouteEntry],
+        after_routes: &[RouteEntry],
+        ifindex: u32,
+        deleted_address: Option<IpAddress>,
+    ) -> Result<PreferredSourceTransitions, SystemError> {
+        // Reserve mutation bookkeeping first. On failure, the candidate is
+        // still untouched; on success, finish() is the single index rebuild
+        // boundary shared with every other FIB edit.
+        self.record(ifindex)?;
+        self.fib
+            .reconcile_address_routes(before_routes, after_routes, ifindex, deleted_address)
+    }
+
+    pub(super) fn finish(self) -> Result<Vec<u32>, SystemError> {
+        self.fib.rebuild_index()?;
+        Ok(self.affected_oifs)
     }
 }
 
@@ -201,7 +218,10 @@ impl FibTable {
             .try_reserve_exact(self.entries.len())
             .map_err(|_| SystemError::ENOMEM)?;
         entries.extend_from_slice(&self.entries);
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            index: self.index.try_clone()?,
+        })
     }
 
     pub(super) fn snapshot(&self) -> Result<Vec<RouteEntry>, SystemError> {
@@ -212,39 +232,35 @@ impl FibTable {
         &self.entries
     }
 
+    fn rebuild_index(&mut self) -> Result<(), SystemError> {
+        self.index = FibIndex::build(&self.entries)?;
+        Ok(())
+    }
+
     fn lookup_key(&self, key: FibLookupKey) -> Option<RouteLookupResult> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, route)| {
-                route.table == key.table
-                    && (route.kind == RTN_UNICAST
-                        || route.kind == RTN_LOCAL
-                        || route.kind == RTN_BROADCAST && key.broadcast.matches(route.oif))
-                    && route.source.is_none()
-                    && route.tos == 0
+        let route_index = self.index.lookup(
+            &self.entries,
+            key.destination,
+            key.table,
+            !matches!(key.broadcast, BroadcastLookup::Exclude),
+            |_, route| {
+                (route.kind != RTN_BROADCAST || key.broadcast.matches(route.oif))
                     && key.required_oif.is_none_or(|oif| route.oif == oif)
                     && key.minimum_scope.is_none_or(|scope| route.scope >= scope)
                     && same_family(route.destination.address(), key.destination)
-                    && route.destination.contains_addr(&key.destination)
-            })
-            .max_by(|(left_index, left), (right_index, right)| {
-                left.destination
-                    .prefix_len()
-                    .cmp(&right.destination.prefix_len())
-                    .then_with(|| right.priority.cmp(&left.priority))
-                    .then_with(|| right_index.cmp(left_index))
-            })
-            .map(|(_, route)| RouteLookupResult {
-                oif: route.oif,
-                next_hop: route.gateway.unwrap_or(key.destination),
-                source: route
-                    .preferred_source
-                    .map(RouteSourcePolicy::Preferred)
-                    .unwrap_or(RouteSourcePolicy::SelectConfigured),
-                table: route.table,
-                matched: *route,
-            })
+            },
+        )?;
+        let route = self.entries[route_index];
+        Some(RouteLookupResult {
+            oif: route.oif,
+            next_hop: route.gateway.unwrap_or(key.destination),
+            source: route
+                .preferred_source
+                .map(RouteSourcePolicy::Preferred)
+                .unwrap_or(RouteSourcePolicy::SelectConfigured),
+            table: route.table,
+            matched: route,
+        })
     }
 
     pub(super) fn lookup_output(&self, destination: IpAddress) -> Option<RouteLookupResult> {
@@ -311,7 +327,7 @@ impl FibTable {
         Some(winner.oif)
     }
 
-    pub(super) fn insert(
+    fn insert(
         &mut self,
         route: RouteEntry,
         flags: RouteNewFlags,
@@ -386,7 +402,7 @@ impl FibTable {
         })
     }
 
-    pub(super) fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
+    fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
         if self.entries.contains(&route) {
             return Ok(false);
         }
@@ -404,10 +420,7 @@ impl FibTable {
         Ok(true)
     }
 
-    pub(super) fn delete(
-        &mut self,
-        selector: RouteDeleteSelector,
-    ) -> Result<RouteEntry, SystemError> {
+    fn delete(&mut self, selector: RouteDeleteSelector) -> Result<RouteEntry, SystemError> {
         let index = self
             .entries
             .iter()
@@ -420,7 +433,7 @@ impl FibTable {
         diff_routes(&before.entries, &self.entries)
     }
 
-    pub(super) fn reconcile_address_routes(
+    fn reconcile_address_routes(
         &mut self,
         before_routes: &[RouteEntry],
         after_routes: &[RouteEntry],

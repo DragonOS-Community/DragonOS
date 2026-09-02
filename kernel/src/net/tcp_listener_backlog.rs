@@ -130,6 +130,12 @@ impl TcpListenerBacklog {
                 if pkt4.next_header() != IpProtocol::Tcp {
                     return false;
                 }
+                // A non-initial fragment does not contain a TCP header. Its
+                // payload is arbitrary stream data and must never be parsed
+                // as SYN flags or ports by the pre-stack backlog policy.
+                if pkt4.frag_offset() != 0 {
+                    return false;
+                }
                 if let Ok(tcp) = TcpPacket::new_checked(pkt4.payload()) {
                     dst_port = Some(tcp.dst_port());
                     is_pure_syn = tcp.syn() && !tcp.ack();
@@ -172,6 +178,11 @@ impl TcpListenerBacklog {
                     // Fragment header: fixed 8 bytes, [next] at first byte.
                     44 => {
                         if off + 8 > data.len() {
+                            return false;
+                        }
+                        let fragment_offset_and_flags =
+                            u16::from_be_bytes([data[off + 2], data[off + 3]]);
+                        if fragment_offset_and_flags & 0xfff8 != 0 {
                             return false;
                         }
                         let nh = data[off];

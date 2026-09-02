@@ -126,7 +126,7 @@ pub(super) fn prepare_with_devices<'rtnl, T>(
     let mut candidate = before.try_clone()?;
     let mut editor = FibEditor::new(&mut candidate);
     let outcome = mutate(&mut editor)?;
-    let affected_oifs = editor.finish();
+    let affected_oifs = editor.finish()?;
     let plan = ProjectionPlan::prepare(&before, &candidate, &affected_oifs, devices)?;
 
     Ok(PreparedTransaction {

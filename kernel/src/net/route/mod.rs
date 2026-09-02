@@ -4,6 +4,7 @@
 //! interface/address lifecycle live in cohesive submodules.
 
 mod fib;
+mod fib_index;
 mod lifecycle;
 mod transaction;
 mod types;

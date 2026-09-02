@@ -14,9 +14,9 @@ use crate::{
 
 use super::{
     canonical_cidr, is_ipv4, prepare_with_devices, projection_for_iface, transact_with_devices,
-    validate_entry_on_iface, FibTable, PreparedTransaction, RouteEntry, RouteNotifications,
-    RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_HOST, RT_SCOPE_LINK,
-    RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN,
+    validate_entry_on_iface, FibEditor, FibTable, PreparedTransaction, RouteEntry,
+    RouteNotifications, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_HOST,
+    RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN,
 };
 
 pub(crate) fn register_iface(
@@ -175,12 +175,14 @@ impl PreparedAddressRouteCommit {
         let mut candidate = before.try_clone()?;
         let before_routes = derived_address_entries(iface, before_addresses)?;
         let after_routes = derived_address_entries(iface, after_addresses)?;
-        let mut silent = candidate.reconcile_address_routes(
+        let mut editor = FibEditor::new(&mut candidate);
+        let mut silent = editor.reconcile_address_routes(
             &before_routes,
             &after_routes,
             ifindex,
             deleted_address,
         )?;
+        let _affected_oifs = editor.finish()?;
 
         let mut address_capacity = 0;
         iface

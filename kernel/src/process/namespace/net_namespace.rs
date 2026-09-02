@@ -53,6 +53,25 @@ pub static mut NETNS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const PACKET_SOCKET_CLEANUP_RETRY_MIN: Duration = Duration::from_millis(100);
 const PACKET_SOCKET_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(5);
 
+fn try_snapshot_devices(
+    devices: &BTreeMap<usize, Arc<dyn Iface>>,
+    additional: Option<&Arc<dyn Iface>>,
+) -> Result<Vec<Arc<dyn Iface>>, SystemError> {
+    let count = devices
+        .len()
+        .checked_add(usize::from(additional.is_some()))
+        .ok_or(SystemError::ENOMEM)?;
+    let mut participants = Vec::new();
+    participants
+        .try_reserve_exact(count)
+        .map_err(|_| SystemError::ENOMEM)?;
+    participants.extend(devices.values().cloned());
+    if let Some(device) = additional {
+        participants.push(device.clone());
+    }
+    Ok(participants)
+}
+
 #[unified_init(INITCALL_SUBSYS)]
 pub fn root_net_namespace_init() -> Result<(), SystemError> {
     // 创建root网络命名空间的轮询线程
@@ -1021,11 +1040,14 @@ impl NetNamespace {
         if device.net_namespace().is_some() {
             return Err(SystemError::EBUSY);
         }
+        // Build every fallible transaction input while the device is still
+        // unpublished. The write guard keeps the topology stable, and the new
+        // interface is appended explicitly for projection preparation.
+        let participants = try_snapshot_devices(&devices, Some(&device))?;
         let netns = self.self_ref.upgrade().unwrap();
         device.set_net_namespace(netns.clone());
         devices.insert(device.nic_id(), device.clone());
         let iface = device.clone();
-        let participants: Vec<Arc<dyn Iface>> = devices.values().cloned().collect();
         if let Err(error) = crate::net::route::register_iface(&rtnl, &netns, &iface, &participants)
         {
             devices.remove(&device.nic_id());
@@ -1054,7 +1076,17 @@ impl NetNamespace {
             return;
         }
         let netns = self.self_ref.upgrade().unwrap();
-        let participants: Vec<Arc<dyn Iface>> = devices.values().cloned().collect();
+        let participants = match try_snapshot_devices(&devices, None) {
+            Ok(participants) => participants,
+            Err(error) => {
+                log::error!(
+                    "failed to snapshot interfaces before removing {}: {:?}",
+                    nic_id,
+                    error
+                );
+                return;
+            }
+        };
         if let Err(error) =
             crate::net::route::unregister_iface(&rtnl, &netns, *nic_id as u32, &participants)
         {

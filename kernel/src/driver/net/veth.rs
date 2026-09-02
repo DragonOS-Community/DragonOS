@@ -160,7 +160,7 @@ impl VethDriver {
     /// exposed through `Device::receive`.
     fn prepare_ingress(&self, scan_budget: usize) -> usize {
         let _classification_guard = self.ingress_classification_lock.lock();
-        let mut consumed = 0;
+        let mut scanned = 0;
         for _ in 0..scan_budget {
             let data = {
                 let mut veth = self.inner.lock();
@@ -169,15 +169,16 @@ impl VethDriver {
             let Some(data) = data else {
                 break;
             };
+            scanned += 1;
 
             match self.classify_and_consume(&data) {
-                IngressDisposition::Consumed => consumed += 1,
+                IngressDisposition::Consumed => {}
                 IngressDisposition::Local => {
                     self.inner.lock().local_rx_queue.push_back(data);
                 }
             }
         }
-        consumed
+        scanned
     }
 
     fn classify_and_consume(&self, data: &[u8]) -> IngressDisposition {
@@ -612,8 +613,8 @@ impl Iface for VethInterface {
             IfacePollScope::None => false,
             IfacePollScope::LocalOnly => self.common.poll(&mut driver),
             IfacePollScope::Full => {
-                let routed = driver.prepare_ingress(64);
-                self.common.poll(&mut driver) || routed != 0 || driver.has_pending_ingress()
+                let prepared = driver.prepare_ingress(64);
+                self.common.poll(&mut driver) || prepared != 0 || driver.has_pending_ingress()
             }
         }
     }
@@ -635,9 +636,12 @@ impl Iface for VethInterface {
             budget
         };
         let smoltcp = self.common.poll_napi(&mut driver, local_budget);
-        let routed = driver.prepare_ingress(budget - smoltcp.work_done);
+        // Classification is real receive work even when a frame is moved to
+        // the local smoltcp queue for a later pass. Charge every scanned frame
+        // to this NAPI instance so the global packet budget remains fair.
+        let prepared = driver.prepare_ingress(budget - smoltcp.work_done);
         super::napi::NapiPollResult::new(
-            routed + smoltcp.work_done,
+            prepared + smoltcp.work_done,
             smoltcp.poll_again || driver.has_pending_ingress() || driver.has_local_ingress(),
         )
     }

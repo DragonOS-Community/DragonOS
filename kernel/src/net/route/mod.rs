@@ -53,20 +53,7 @@ impl OutputRouteGuard<'_> {
         destination: IpAddress,
         oif: Option<u32>,
     ) -> Option<OutputRouteDecision> {
-        let route = if is_limited_broadcast(destination) {
-            match oif {
-                Some(oif) => RouteLookupResult::limited_broadcast(oif),
-                None => self
-                    .fib
-                    .lookup_output(destination)
-                    .map(RouteLookupResult::into_limited_broadcast)?,
-            }
-        } else {
-            match oif {
-                Some(oif) => self.fib.lookup_on_iface(destination, oif),
-                None => self.fib.lookup_output(destination),
-            }?
-        };
+        let route = lookup_output_fib(&self.fib, destination, oif)?;
         let iface = self.devices.get(&(route.oif as usize))?;
         Some(OutputRouteDecision {
             oif: route.oif,
@@ -109,23 +96,7 @@ pub(crate) fn lookup(
     netns: &Arc<NetNamespace>,
     destination: IpAddress,
 ) -> Option<RouteLookupResult> {
-    if is_limited_broadcast(destination) {
-        return netns
-            .router()
-            .fib
-            .read()
-            .lookup_output(destination)
-            .map(RouteLookupResult::into_limited_broadcast);
-    }
-    if let Some(multicast) = ipv4_multicast(destination) {
-        return netns
-            .router()
-            .fib
-            .read()
-            .lookup_output(destination)
-            .map(|decision| decision.into_multicast(multicast));
-    }
-    netns.router().fib.read().lookup_output(destination)
+    lookup_output_fib(&netns.router().fib.read(), destination, None)
 }
 
 /// Classifies an ingress destination through Linux's local-before-main rule.
@@ -151,18 +122,34 @@ pub(crate) fn lookup_on_iface(
     destination: IpAddress,
     oif: u32,
 ) -> Option<RouteLookupResult> {
+    lookup_output_fib(&netns.router().fib.read(), destination, Some(oif))
+}
+
+/// Applies the destination-specific output classification shared by immediate
+/// socket lookup and deferred namespace-routed output. Keeping this policy at
+/// the FIB boundary prevents one output path from retaining a gateway for
+/// limited-broadcast or IPv4 multicast traffic.
+fn lookup_output_fib(
+    fib: &FibTable,
+    destination: IpAddress,
+    oif: Option<u32>,
+) -> Option<RouteLookupResult> {
     if is_limited_broadcast(destination) {
-        return Some(RouteLookupResult::limited_broadcast(oif));
+        return match oif {
+            Some(oif) => Some(RouteLookupResult::limited_broadcast(oif)),
+            None => fib
+                .lookup_output(destination)
+                .map(RouteLookupResult::into_limited_broadcast),
+        };
     }
-    if let Some(destination) = ipv4_multicast(destination) {
-        return netns
-            .router()
-            .fib
-            .read()
-            .lookup_on_iface(IpAddress::Ipv4(destination), oif)
-            .map(|decision| decision.into_multicast(destination));
+    let route = match oif {
+        Some(oif) => fib.lookup_on_iface(destination, oif),
+        None => fib.lookup_output(destination),
+    }?;
+    if let Some(multicast) = ipv4_multicast(destination) {
+        return Some(route.into_multicast(multicast));
     }
-    netns.router().fib.read().lookup_on_iface(destination, oif)
+    Some(route)
 }
 
 pub(crate) fn snapshot(

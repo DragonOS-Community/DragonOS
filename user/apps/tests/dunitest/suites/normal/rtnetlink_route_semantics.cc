@@ -1319,6 +1319,29 @@ TEST(RtnetlinkRouteSemantics, TransientBroadcastAndMulticastLookupsFollowLinuxFi
     EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, multicast,
                                ++seq),
               0);
+
+    RouteSpec less_specific = MakeIpv4Route("224.0.0.0", 3, veth);
+    less_specific.gateway = Ipv4("192.168.1.1");
+    less_specific.priority = 5251;
+    DeleteRouteIfPresent(fd.Get(), less_specific, &seq);
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                               less_specific, ++seq),
+              0);
+
+    for (const auto oif : {std::optional<uint32_t>{}, std::optional<uint32_t>{veth}}) {
+        auto lookup = LookupIpv4Route(fd.Get(), "239.1.1.1", ++seq, oif);
+        ASSERT_TRUE(lookup.has_value());
+        EXPECT_EQ(lookup->kind, RTN_MULTICAST);
+        EXPECT_EQ(lookup->prefix_len, 32);
+        EXPECT_EQ(lookup->oif, veth);
+        EXPECT_FALSE(lookup->gateway.has_value())
+                << "a route less specific than 224/4 must not retain its gateway";
+    }
+
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
+                               less_specific, ++seq),
+              0);
 }
 
 TEST(RtnetlinkRouteSemantics, AddressNotificationPrecedesDerivedRouteNotification) {

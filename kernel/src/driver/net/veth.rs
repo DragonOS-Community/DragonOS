@@ -268,6 +268,13 @@ impl VethDriver {
 
     fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
         Self::validate_frame_len(&frame)?;
+        if let Some(iface) = self.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                &frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
         let peer = self
             .inner
             .lock()
@@ -294,13 +301,6 @@ impl phy::TxToken for VethTxToken {
     {
         let mut buf = vec![0; len];
         let result = f(&mut buf);
-        if let Some(iface) = self.driver.iface() {
-            crate::net::socket::packet::deliver_to_packet_sockets(
-                &iface,
-                &buf,
-                crate::net::socket::packet::PacketType::Outgoing,
-            );
-        }
         let _ = self.driver.submit_frame(buf);
         result
     }
@@ -643,25 +643,10 @@ impl Iface for VethInterface {
     }
 
     fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        self.driver.try_raw_transmit(frame)?;
-        if let Some(iface) = self.driver.iface() {
-            crate::net::socket::packet::deliver_to_packet_sockets(
-                &iface,
-                frame,
-                crate::net::socket::packet::PacketType::Outgoing,
-            );
-        }
-        Ok(())
+        self.driver.try_raw_transmit(frame)
     }
 
-    fn route_and_send(&self, _next_hop: &IpAddress, ip_packet: &[u8]) -> Result<(), SystemError> {
-        let dst_mac = self.peer_veth().mac();
-        let src_mac = self.mac();
-        let mut frame = Vec::with_capacity(14 + ip_packet.len());
-        frame.extend_from_slice(&dst_mac.0);
-        frame.extend_from_slice(&src_mac.0);
-        frame.extend_from_slice(&[0x08, 0x00]);
-        frame.extend_from_slice(ip_packet);
+    fn raw_transmit_owned(&self, frame: Vec<u8>) -> Result<(), SystemError> {
         self.driver.submit_frame(frame)
     }
 

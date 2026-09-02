@@ -1021,6 +1021,24 @@ TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
                                NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
                                ++seq),
               0);
+
+    FdGuard receiver(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    timeval timeout = {};
+    timeout.tv_sec = 2;
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+    sockaddr_in local_endpoint = {};
+    local_endpoint.sin_family = AF_INET;
+    local_endpoint.sin_addr.s_addr = Ipv4("192.168.1.254");
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&local_endpoint),
+                   sizeof(local_endpoint)),
+              0)
+        << ErrnoString(errno);
+    socklen_t endpoint_len = sizeof(local_endpoint);
+    ASSERT_EQ(getsockname(receiver.Get(), reinterpret_cast<sockaddr*>(&local_endpoint),
+                          &endpoint_len),
+              0);
+
     ASSERT_EQ(SetLinkUp(fd.Get(), veth, false, ++seq), 0);
 
     int add_error = SendRouteRequest(fd.Get(), RTM_NEWROUTE,
@@ -1029,6 +1047,16 @@ TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
     bool dumped_while_down = FindRoute(fd.Get(), route, ++seq).has_value();
     auto lookup_while_down = LookupIpv4Route(fd.Get(), "198.18.222.1", ++seq);
     auto local_while_down = LookupIpv4Route(fd.Get(), "192.168.1.254", ++seq);
+    FdGuard sender(socket(AF_INET, SOCK_DGRAM, 0));
+    ssize_t sent = sender.Get() < 0
+                       ? -1
+                       : sendto(sender.Get(), "x", 1, 0,
+                                reinterpret_cast<sockaddr*>(&local_endpoint),
+                                sizeof(local_endpoint));
+    int send_error = sent < 0 ? errno : 0;
+    char payload = 0;
+    ssize_t received = sent < 0 ? -1 : recv(receiver.Get(), &payload, sizeof(payload), 0);
+    int receive_error = received < 0 ? errno : 0;
     int restore_error = SetLinkUp(fd.Get(), veth, true, ++seq);
 
     EXPECT_EQ(add_error, ENETDOWN);
@@ -1039,6 +1067,9 @@ TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
     EXPECT_EQ(local_while_down->table, RT_TABLE_LOCAL);
     EXPECT_EQ(local_while_down->kind, RTN_LOCAL);
     EXPECT_EQ(local_while_down->oif, veth);
+    EXPECT_EQ(sent, 1) << ErrnoString(send_error);
+    EXPECT_EQ(received, 1) << ErrnoString(receive_error);
+    EXPECT_EQ(payload, 'x');
     ASSERT_EQ(restore_error, 0);
 }
 

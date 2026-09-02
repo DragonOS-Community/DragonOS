@@ -210,7 +210,7 @@ pub trait RouterEnableDevice: Iface {
                 let next_hop = &decision.next_hop;
                 decision
                     .interface
-                    .route_and_send(next_hop, ipv4_packet_mut.as_ref())
+                    .route_and_send_or_queue(next_hop, ipv4_packet_mut.as_ref())
                     .map_err(Some)?;
 
                 // log::info!("Routed packet from {} to {} ", self.iface_name(), dst_ip);

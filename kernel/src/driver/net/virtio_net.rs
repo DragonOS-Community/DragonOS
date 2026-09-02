@@ -1198,11 +1198,12 @@ impl Iface for VirtioInterface {
 
     fn poll_napi(&self, budget: usize) -> super::napi::NapiPollResult {
         let mut device = self.device_inner.clone();
-        {
+        let tx_available = {
             let mut driver = device.inner.lock_irqsave();
-            if let Err(err) = driver.reap_tx_completions() {
+            let tx_completed = driver.reap_tx_completions().unwrap_or_else(|err| {
                 error!("virtio-net TX completion failed before NAPI poll: {err:?}");
-            }
+                0
+            });
             if driver.poisoned {
                 // Return through the normal completion hook once so it can
                 // atomically move this NAPI instance to DISABLE. Continuing
@@ -1210,6 +1211,12 @@ impl Iface for VirtioInterface {
                 // the failed device refuses every transmit reservation.
                 return super::napi::NapiPollResult::idle();
             }
+            tx_completed != 0
+        };
+        if tx_available {
+            // We already own this NAPI poll cycle, so make the egress-owned
+            // packets runnable without scheduling a redundant cycle.
+            self.common().release_tx_backpressure();
         }
         self.iface_common.poll_napi(&mut device, budget)
     }
@@ -1244,12 +1251,14 @@ impl Iface for VirtioInterface {
             }
             CompleteState::Completed => {
                 let mut acquired = false;
+                let tx_available;
                 {
                     let mut driver = self.device_inner.inner.lock_irqsave();
                     let tx_completed = driver.reap_tx_completions().unwrap_or_else(|err| {
                         error!("virtio-net TX completion failed during NAPI complete: {err:?}");
                         0
                     });
+                    tx_available = tx_completed != 0;
                     let has_rx = driver.has_rx_completion().unwrap_or_else(|err| {
                         error!(
                             "virtio-net RX completion check failed during NAPI complete: {err:?}"
@@ -1263,6 +1272,9 @@ impl Iface for VirtioInterface {
                         driver.inner.disable_interrupts();
                         acquired = true;
                     }
+                }
+                if tx_available {
+                    self.common().notify_tx_available();
                 }
                 if acquired {
                     __napi_schedule(napi);

@@ -3,8 +3,9 @@ use alloc::ffi::CString;
 use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
+use core::cell::Cell;
 use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use net_poll_state::{DueResult, PollDeadline, PublishResult};
 use sysfs::netdev_register_kobject;
 
@@ -116,6 +117,23 @@ pub(crate) struct BootstrapRoute {
     pub nexthop_flags: u8,
 }
 
+#[derive(Debug)]
+pub enum RouteSendError {
+    /// Neighbor discovery has started; retrying before this deadline cannot progress it.
+    RetryAt {
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+    },
+    /// A device or packet error with normal errno semantics.
+    Failed(SystemError),
+}
+
+impl From<SystemError> for RouteSendError {
+    fn from(error: SystemError) -> Self {
+        Self::Failed(error)
+    }
+}
+
 #[allow(dead_code)]
 pub trait Iface: crate::driver::base::device::Device {
     /// # `common`
@@ -175,14 +193,141 @@ pub trait Iface: crate::driver::base::device::Device {
         Err(SystemError::ENOSYS)
     }
 
-    /// Sends an already-routed IP packet through this interface. Only devices
-    /// that participate in DragonOS software forwarding need to override it.
+    /// Submit a frame whose allocation may be transferred to the driver.
+    /// Drivers with an owned receive queue can override this to avoid copying;
+    /// borrowed-only DMA drivers keep the common fallback.
+    fn raw_transmit_owned(&self, frame: Vec<u8>) -> Result<(), SystemError> {
+        self.raw_transmit(&frame)
+    }
+
+    /// Sends an already-routed IPv4 packet through this interface.
+    ///
+    /// Ethernet devices share this implementation so FIB eligibility cannot
+    /// drift from driver-specific forwarding hooks. smoltcp resolves the
+    /// explicit next hop (or uses a permanent rtnetlink neighbor) while the
+    /// caller-owned token only prepares a frame. The driver is invoked after
+    /// releasing the smoltcp lock.
     fn route_and_send(
         &self,
-        _next_hop: &smoltcp::wire::IpAddress,
-        _ip_packet: &[u8],
+        next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+    ) -> Result<(), RouteSendError> {
+        let smoltcp::wire::IpAddress::Ipv4(next_hop) = *next_hop else {
+            return Err(SystemError::EAFNOSUPPORT.into());
+        };
+        let frame_capacity = (14usize + ip_packet.len()).max(42);
+        let mut frame = Vec::new();
+        frame
+            .try_reserve_exact(frame_capacity)
+            .map_err(|_| RouteSendError::Failed(SystemError::ENOMEM))?;
+        let frame_prepared = Cell::new(false);
+        let permanent_neighbor = self
+            .common()
+            .static_neighbors()
+            .iter()
+            .find(|entry| entry.ip_addr == smoltcp::wire::IpAddress::Ipv4(next_hop))
+            .map(|entry| entry.hw_addr);
+
+        let dispatch = {
+            let mut interface = self.smol_iface().lock();
+            interface.dispatch_ipv4_packet(
+                crate::time::Instant::now().into(),
+                PreparedFrameTxToken {
+                    frame: &mut frame,
+                    prepared: &frame_prepared,
+                },
+                next_hop,
+                permanent_neighbor,
+                ip_packet,
+            )
+        };
+
+        let probe_sent = frame_prepared.get();
+        if probe_sent {
+            self.raw_transmit_owned(frame)
+                .map_err(RouteSendError::Failed)?;
+        }
+        match dispatch {
+            Ok(()) => Ok(()),
+            Err(smoltcp::iface::Ipv4PacketDispatchError::NeighborPending { retry_at }) => {
+                Err(RouteSendError::RetryAt {
+                    retry_at,
+                    probe_sent,
+                })
+            }
+            Err(smoltcp::iface::Ipv4PacketDispatchError::NoRoute) => {
+                Err(SystemError::ENETUNREACH.into())
+            }
+            Err(smoltcp::iface::Ipv4PacketDispatchError::Malformed)
+            | Err(smoltcp::iface::Ipv4PacketDispatchError::InvalidHardwareAddress) => {
+                Err(SystemError::EINVAL.into())
+            }
+        }
+    }
+
+    /// Send an already-routed IPv4 packet, transferring ownership to this
+    /// interface's bounded output queue when immediate progress is impossible.
+    /// The caller may consume the ingress packet after this returns `Ok(())`.
+    fn route_and_send_or_queue(
+        &self,
+        next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
     ) -> Result<(), SystemError> {
-        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        let smoltcp::wire::IpAddress::Ipv4(next_hop) = *next_hop else {
+            return Err(SystemError::EAFNOSUPPORT);
+        };
+        let napi = self.napi_struct();
+        let netns = napi.is_none().then(|| self.net_namespace()).flatten();
+        if napi.is_none() && netns.is_none() {
+            return Err(SystemError::ENODEV);
+        }
+        if let Some(retry_at) = self.common().enqueue_existing_routed_output(
+            self.nic_id() as u32,
+            next_hop,
+            ip_packet,
+        )? {
+            self.common().schedule_local_output(retry_at, napi, netns);
+            return Ok(());
+        }
+        let tx_generation = self.common().tx_completion_generation();
+        let (retry_at, probe_sent) =
+            match self.route_and_send(&smoltcp::wire::IpAddress::Ipv4(next_hop), ip_packet) {
+                Ok(()) => return Ok(()),
+                Err(RouteSendError::RetryAt {
+                    retry_at,
+                    probe_sent,
+                }) => (retry_at, probe_sent),
+                Err(RouteSendError::Failed(SystemError::ENOBUFS))
+                | Err(RouteSendError::Failed(SystemError::EAGAIN_OR_EWOULDBLOCK)) => {
+                    let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+                    let delay_us = self.common().next_local_output_tx_backoff_us();
+                    let retry_at = now + smoltcp::time::Duration::from_micros(delay_us);
+                    let (packet, reservation) = self.common().prepare_routed_output(
+                        self.nic_id() as u32,
+                        next_hop,
+                        ip_packet,
+                    )?;
+                    reservation.requeue_backpressured(packet, retry_at);
+                    let retry_at = if self.common().release_tx_backpressure_after(tx_generation) {
+                        now
+                    } else {
+                        retry_at
+                    };
+                    self.common().schedule_local_output(retry_at, napi, netns);
+                    return Ok(());
+                }
+                Err(RouteSendError::Failed(error)) => return Err(error),
+            };
+
+        self.common().enqueue_routed_output(
+            self.nic_id() as u32,
+            next_hop,
+            ip_packet,
+            retry_at,
+            probe_sent,
+        )?;
+        self.common().schedule_local_output(retry_at, napi, netns);
+        Ok(())
     }
 
     /// Hands a namespace-local IPv4 packet to this interface's protocol stack
@@ -341,6 +486,24 @@ pub trait Iface: crate::driver::base::device::Device {
     }
 }
 
+struct PreparedFrameTxToken<'a> {
+    frame: &'a mut Vec<u8>,
+    prepared: &'a Cell<bool>,
+}
+
+impl SmolTxToken for PreparedFrameTxToken<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        debug_assert!(len <= self.frame.capacity());
+        self.frame.resize(len, 0);
+        let result = f(self.frame.as_mut_slice());
+        self.prepared.set(true);
+        result
+    }
+}
+
 /// 网络设备的公共数据
 #[derive(Debug)]
 pub struct NetDeviceCommonData {
@@ -479,11 +642,34 @@ struct LocalOutputPacket {
     frame: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct BackpressuredLocalOutput {
+    retry_at: smoltcp::time::Instant,
+    packet: LocalOutputPacket,
+}
+
+#[derive(Debug)]
+struct DeferredRouteBucket {
+    oif: u32,
+    next_hop: smoltcp::wire::Ipv4Address,
+    retry_at: smoltcp::time::Instant,
+    probes: u8,
+    probe_in_flight: bool,
+    probe_bytes: usize,
+    resolved: bool,
+    packets: VecDeque<LocalOutputPacket>,
+    bytes: usize,
+}
+
 /// Immutable output policy chosen before entering the smoltcp serialization
 /// locks. A queued packet is never reclassified against a later FIB snapshot.
 #[derive(Debug, Clone, Copy)]
 enum LocalOutputDisposition {
     NativeOwner,
+    Local {
+        oif: u32,
+        ip_mtu: usize,
+    },
     Routed {
         oif: u32,
         next_hop: smoltcp::wire::Ipv4Address,
@@ -494,13 +680,27 @@ enum LocalOutputDisposition {
 
 impl LocalOutputDisposition {
     const DROP_CONTEXT: u64 = 0;
+    const LOCAL_CONTEXT: u64 = 1 << 63;
 
     fn routed_context(oif: u32, next_hop: smoltcp::wire::Ipv4Address) -> u64 {
         debug_assert_ne!(oif, 0);
+        debug_assert_eq!(oif & (1 << 31), 0);
         ((oif as u64) << 32) | u32::from_be_bytes(next_hop.octets()) as u64
     }
 
-    fn from_routed_context(context: u64, ip_mtu: usize) -> Self {
+    fn local_context(oif: u32) -> u64 {
+        debug_assert_ne!(oif, 0);
+        debug_assert_eq!(oif & (1 << 31), 0);
+        Self::LOCAL_CONTEXT | ((oif as u64) << 32)
+    }
+
+    fn from_context(context: u64, ip_mtu: usize) -> Self {
+        if context & Self::LOCAL_CONTEXT != 0 {
+            return Self::Local {
+                oif: ((context >> 32) as u32) & !(1 << 31),
+                ip_mtu,
+            };
+        }
         let oif = (context >> 32) as u32;
         if oif == 0 {
             return Self::Drop;
@@ -517,6 +717,9 @@ impl LocalOutputDisposition {
 #[derive(Debug, Default)]
 struct LocalOutputQueueState {
     packets: VecDeque<LocalOutputPacket>,
+    backpressured: VecDeque<BackpressuredLocalOutput>,
+    deferred_routes: Vec<DeferredRouteBucket>,
+    frames: usize,
     bytes: usize,
     reserved_frames: usize,
     reserved_bytes: usize,
@@ -538,6 +741,7 @@ struct LocalInputQueue {
 
 struct LocalOutputDrainGuard<'a> {
     draining: &'a AtomicBool,
+    active: bool,
 }
 
 struct LocalOutputReservation<'a> {
@@ -546,13 +750,63 @@ struct LocalOutputReservation<'a> {
     active: bool,
 }
 
+enum LocalOutputPop<'a> {
+    Ready(
+        LocalOutputPacket,
+        LocalOutputReservation<'a>,
+        Option<DeferredRouteKey>,
+    ),
+    DeferredUntil(smoltcp::time::Instant),
+    Empty,
+}
+
+enum ExistingDeferredCommit<'a> {
+    Queued(smoltcp::time::Instant),
+    Missing(LocalOutputPacket, LocalOutputReservation<'a>),
+    Full(LocalOutputPacket, LocalOutputReservation<'a>),
+}
+
+enum ExistingDeferredEnqueue<'a> {
+    Queued(smoltcp::time::Instant),
+    Missing(LocalOutputPacket, LocalOutputReservation<'a>),
+    Full(LocalOutputPacket),
+}
+
+enum AdmittedRoutedOutput {
+    Sent(LocalOutputPacket),
+    Queued(smoltcp::time::Instant),
+    Drop(LocalOutputPacket, SystemError),
+}
+
+#[derive(Clone, Copy)]
+struct DeferredRouteKey {
+    oif: u32,
+    next_hop: smoltcp::wire::Ipv4Address,
+}
+
 impl Drop for LocalOutputDrainGuard<'_> {
     fn drop(&mut self) {
-        self.draining.store(false, Ordering::Release);
+        if self.active {
+            self.draining.store(false, Ordering::Release);
+        }
     }
 }
 
-impl LocalOutputReservation<'_> {
+impl LocalOutputDrainGuard<'_> {
+    /// Release drain ownership while serializing the final empty observation
+    /// with output producers. A producer is therefore either observed here or
+    /// acquires drain ownership after this handoff.
+    fn finish_and_has_output(mut self, output: &SpinLock<LocalOutputQueueState>) -> bool {
+        let output = output.lock();
+        self.draining.store(false, Ordering::Release);
+        self.active = false;
+        !output.packets.is_empty()
+            || !output.backpressured.is_empty()
+            || !output.deferred_routes.is_empty()
+    }
+}
+
+impl<'a> LocalOutputReservation<'a> {
     /// Move this token's byte reservation without changing the queue-wide
     /// frame reservation. This is used when routing selects a larger MTU.
     fn try_resize(&mut self, bytes: usize) -> bool {
@@ -582,33 +836,215 @@ impl LocalOutputReservation<'_> {
             .take()
             .expect("an admitted local output token owns its scratch buffer");
         debug_assert_eq!(frame.capacity(), self.bytes);
-        self.commit_packet(
-            LocalOutputPacket {
-                medium,
-                meta,
-                disposition,
-                frame,
-            },
-            false,
-        );
+        self.commit_packet(LocalOutputPacket {
+            medium,
+            meta,
+            disposition,
+            frame,
+        });
     }
 
-    fn requeue_front(self, packet: LocalOutputPacket) {
-        self.commit_packet(packet, true);
-    }
-
-    fn commit_packet(mut self, packet: LocalOutputPacket, front: bool) {
+    fn requeue_backpressured(
+        mut self,
+        packet: LocalOutputPacket,
+        retry_at: smoltcp::time::Instant,
+    ) {
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
         let mut output = self.output.lock();
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
+        output.frames += 1;
         output.bytes += self.bytes;
-        if front {
-            output.packets.push_front(packet);
+        let queued = BackpressuredLocalOutput { retry_at, packet };
+        if output
+            .backpressured
+            .back()
+            .is_none_or(|tail| tail.retry_at <= retry_at)
+        {
+            output.backpressured.push_back(queued);
         } else {
-            output.packets.push_back(packet);
+            let index = output
+                .backpressured
+                .iter()
+                .position(|queued| queued.retry_at > retry_at)
+                .expect("a later backpressure deadline exists");
+            output.backpressured.insert(index, queued);
         }
         self.active = false;
+    }
+
+    fn requeue_deferred(
+        self,
+        packet: LocalOutputPacket,
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+    ) -> Result<(), LocalOutputPacket> {
+        self.commit_deferred_packet(packet, retry_at, probe_sent, true)
+    }
+
+    fn commit_packet(mut self, packet: LocalOutputPacket) {
+        debug_assert_eq!(packet.frame.capacity(), self.bytes);
+        let mut output = self.output.lock();
+        output.reserved_frames -= 1;
+        output.reserved_bytes -= self.bytes;
+        output.frames += 1;
+        output.bytes += self.bytes;
+        output.packets.push_back(packet);
+        self.active = false;
+    }
+
+    fn commit_deferred_packet(
+        mut self,
+        packet: LocalOutputPacket,
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+        advance_existing_probe: bool,
+    ) -> Result<(), LocalOutputPacket> {
+        let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition else {
+            return Err(packet);
+        };
+        let mut output = self.output.lock();
+        let bucket_index = output
+            .deferred_routes
+            .iter()
+            .position(|bucket| bucket.oif == oif && bucket.next_hop == next_hop);
+        if let Some(index) = bucket_index {
+            let bucket = &mut output.deferred_routes[index];
+            if bucket.packets.len() + usize::from(bucket.probe_in_flight)
+                >= LocalInputQueue::MAX_DEFERRED_FRAMES_PER_NEIGHBOR
+                || bucket
+                    .bytes
+                    .saturating_add(bucket.probe_bytes)
+                    .saturating_add(self.bytes)
+                    > LocalInputQueue::MAX_DEFERRED_BYTES_PER_NEIGHBOR
+                || bucket.packets.try_reserve(1).is_err()
+            {
+                drop(output);
+                return Err(packet);
+            }
+            bucket.retry_at = if probe_sent || advance_existing_probe {
+                retry_at
+            } else {
+                bucket.retry_at.min(retry_at)
+            };
+            if probe_sent {
+                bucket.probes = bucket.probes.saturating_add(1);
+            }
+            bucket.bytes += self.bytes;
+            bucket.packets.push_back(packet);
+        } else {
+            if output.deferred_routes.try_reserve(1).is_err() {
+                drop(output);
+                return Err(packet);
+            }
+            let mut packets = VecDeque::new();
+            if packets.try_reserve(1).is_err() {
+                drop(output);
+                return Err(packet);
+            }
+            packets.push_back(packet);
+            output.deferred_routes.push(DeferredRouteBucket {
+                oif,
+                next_hop,
+                retry_at,
+                probes: u8::from(probe_sent),
+                probe_in_flight: false,
+                probe_bytes: 0,
+                resolved: false,
+                packets,
+                bytes: self.bytes,
+            });
+        }
+        output.reserved_frames -= 1;
+        output.reserved_bytes -= self.bytes;
+        output.frames += 1;
+        output.bytes += self.bytes;
+        self.active = false;
+        Ok(())
+    }
+
+    /// Atomically join an existing neighbor-resolution bucket after routing
+    /// has selected the actual egress interface.
+    fn commit_existing_deferred(mut self, packet: LocalOutputPacket) -> ExistingDeferredCommit<'a> {
+        let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition else {
+            return ExistingDeferredCommit::Missing(packet, self);
+        };
+        debug_assert_eq!(packet.frame.capacity(), self.bytes);
+        let mut output = self.output.lock();
+        let Some(index) = output
+            .deferred_routes
+            .iter()
+            .position(|bucket| bucket.oif == oif && bucket.next_hop == next_hop)
+        else {
+            drop(output);
+            return ExistingDeferredCommit::Missing(packet, self);
+        };
+        let bucket = &mut output.deferred_routes[index];
+        if bucket.packets.len() + usize::from(bucket.probe_in_flight)
+            >= LocalInputQueue::MAX_DEFERRED_FRAMES_PER_NEIGHBOR
+            || bucket
+                .bytes
+                .saturating_add(bucket.probe_bytes)
+                .saturating_add(self.bytes)
+                > LocalInputQueue::MAX_DEFERRED_BYTES_PER_NEIGHBOR
+            || bucket.packets.try_reserve(1).is_err()
+        {
+            drop(output);
+            return ExistingDeferredCommit::Full(packet, self);
+        }
+        let retry_at = bucket.retry_at;
+        bucket.bytes += self.bytes;
+        bucket.packets.push_back(packet);
+        output.reserved_frames -= 1;
+        output.reserved_bytes -= self.bytes;
+        output.frames += 1;
+        output.bytes += self.bytes;
+        self.active = false;
+        ExistingDeferredCommit::Queued(retry_at)
+    }
+
+    fn finish_deferred_probe(
+        mut self,
+        packet: LocalOutputPacket,
+        key: DeferredRouteKey,
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+    ) -> Result<bool, LocalOutputPacket> {
+        debug_assert_eq!(packet.frame.capacity(), self.bytes);
+        let mut output = self.output.lock();
+        let Some(index) = output.deferred_routes.iter().position(|bucket| {
+            bucket.oif == key.oif && bucket.next_hop == key.next_hop && bucket.probe_in_flight
+        }) else {
+            drop(output);
+            return Err(packet);
+        };
+
+        let resolved = output.deferred_routes[index].resolved;
+        {
+            let bucket = &mut output.deferred_routes[index];
+            debug_assert_eq!(bucket.probe_bytes, self.bytes);
+            bucket.probe_in_flight = false;
+            bucket.probe_bytes = 0;
+            bucket.bytes += self.bytes;
+            bucket.packets.push_front(packet);
+            if !resolved {
+                bucket.retry_at = retry_at;
+                if probe_sent {
+                    bucket.probes = bucket.probes.saturating_add(1);
+                }
+            }
+        }
+
+        output.reserved_frames -= 1;
+        output.reserved_bytes -= self.bytes;
+        output.frames += 1;
+        output.bytes += self.bytes;
+        if resolved {
+            let mut bucket = output.deferred_routes.swap_remove(index);
+            output.packets.append(&mut bucket.packets);
+        }
+        self.active = false;
+        Ok(resolved)
     }
 }
 
@@ -626,6 +1062,9 @@ impl Drop for LocalOutputReservation<'_> {
 impl LocalInputQueue {
     const MAX_FRAMES: usize = 1024;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_DEFERRED_FRAMES_PER_NEIGHBOR: usize = 64;
+    const MAX_DEFERRED_BYTES_PER_NEIGHBOR: usize = 256 * 1024;
+    const MAX_NEIGHBOR_PROBES: u8 = 3;
     const MAX_SCRATCH_FRAMES: usize = 64;
     const MAX_SCRATCH_BYTES: usize = 256 * 1024;
 
@@ -670,11 +1109,24 @@ impl LocalInputQueue {
 
     fn reserve_output(&self) -> Option<LocalOutputReservation<'_>> {
         let mut output = self.output.lock();
-        if output.packets.len().saturating_add(output.reserved_frames) >= Self::MAX_FRAMES {
+        if output.frames.saturating_add(output.reserved_frames) >= Self::MAX_FRAMES {
             return None;
         }
-        let additional = output.reserved_frames.saturating_add(1);
+        let additional = output
+            .frames
+            .saturating_add(output.reserved_frames)
+            .saturating_add(1)
+            .saturating_sub(output.packets.len());
         output.packets.try_reserve(additional).ok()?;
+        let additional_backpressured = output
+            .frames
+            .saturating_add(output.reserved_frames)
+            .saturating_add(1)
+            .saturating_sub(output.backpressured.len());
+        output
+            .backpressured
+            .try_reserve(additional_backpressured)
+            .ok()?;
         output.reserved_frames += 1;
         Some(LocalOutputReservation {
             output: &self.output,
@@ -683,25 +1135,186 @@ impl LocalInputQueue {
         })
     }
 
-    fn pop_output(&self) -> Option<(LocalOutputPacket, LocalOutputReservation<'_>)> {
+    fn pop_ready_output(
+        &self,
+        now: smoltcp::time::Instant,
+        prefer_deferred: bool,
+    ) -> LocalOutputPop<'_> {
         let mut output = self.output.lock();
-        let packet = output.packets.pop_front()?;
-        let bytes = packet.frame.capacity();
-        output.bytes -= bytes;
-        output.reserved_frames += 1;
-        output.reserved_bytes += bytes;
-        Some((
-            packet,
-            LocalOutputReservation {
-                output: &self.output,
-                bytes,
-                active: true,
-            },
-        ))
+        while output
+            .backpressured
+            .front()
+            .is_some_and(|queued| queued.retry_at <= now)
+        {
+            let queued = output
+                .backpressured
+                .pop_front()
+                .expect("front was observed above");
+            output.packets.push_back(queued.packet);
+        }
+        let due_index = (prefer_deferred || output.packets.is_empty()).then(|| {
+            output
+                .deferred_routes
+                .iter()
+                .position(|bucket| !bucket.probe_in_flight && bucket.retry_at <= now)
+        });
+        let due_index = due_index.flatten();
+        // Give one due neighbor bucket priority per drain round. The rest of
+        // the round preserves FIFO service for ready output.
+        let take_deferred = due_index.is_some() && (prefer_deferred || output.packets.is_empty());
+        let (packet, probe_key) = if take_deferred {
+            let index = due_index.expect("take_deferred requires a due bucket");
+            if output.deferred_routes[index].resolved
+                || output.deferred_routes[index].probes >= Self::MAX_NEIGHBOR_PROBES
+            {
+                let mut bucket = output.deferred_routes.swap_remove(index);
+                if !bucket.resolved {
+                    for packet in bucket.packets.iter_mut() {
+                        packet.disposition = LocalOutputDisposition::Drop;
+                    }
+                }
+                let packet = bucket.packets.pop_front();
+                output.packets.append(&mut bucket.packets);
+                (packet, None)
+            } else {
+                let bucket = &mut output.deferred_routes[index];
+                let packet = bucket
+                    .packets
+                    .pop_front()
+                    .expect("a deferred route bucket is never empty");
+                let bytes = packet.frame.capacity();
+                bucket.bytes -= bytes;
+                bucket.probe_in_flight = true;
+                bucket.probe_bytes = bytes;
+                (
+                    Some(packet),
+                    Some(DeferredRouteKey {
+                        oif: bucket.oif,
+                        next_hop: bucket.next_hop,
+                    }),
+                )
+            }
+        } else if let Some(packet) = output.packets.pop_front() {
+            (Some(packet), None)
+        } else {
+            (None, None)
+        };
+        if let Some(packet) = packet {
+            let bytes = packet.frame.capacity();
+            output.frames -= 1;
+            output.bytes -= bytes;
+            output.reserved_frames += 1;
+            output.reserved_bytes += bytes;
+            return LocalOutputPop::Ready(
+                packet,
+                LocalOutputReservation {
+                    output: &self.output,
+                    bytes,
+                    active: true,
+                },
+                probe_key,
+            );
+        }
+        match output
+            .deferred_routes
+            .iter()
+            .filter(|bucket| !bucket.probe_in_flight)
+            .map(|bucket| bucket.retry_at)
+            .chain(output.backpressured.front().map(|queued| queued.retry_at))
+            .min()
+        {
+            Some(retry_at) => LocalOutputPop::DeferredUntil(retry_at),
+            None => LocalOutputPop::Empty,
+        }
     }
 
     fn has_output(&self) -> bool {
-        !self.output.lock().packets.is_empty()
+        let output = self.output.lock();
+        !output.packets.is_empty()
+            || !output.backpressured.is_empty()
+            || !output.deferred_routes.is_empty()
+    }
+
+    fn release_backpressured_outputs(&self) -> bool {
+        let mut output = self.output.lock();
+        if output.backpressured.is_empty() {
+            return false;
+        }
+        while let Some(queued) = output.backpressured.pop_front() {
+            output.packets.push_back(queued.packet);
+        }
+        true
+    }
+
+    fn has_deferred_output(&self) -> bool {
+        !self.output.lock().deferred_routes.is_empty()
+    }
+
+    fn release_resolved_outputs(
+        &self,
+        mut is_resolved: impl FnMut(smoltcp::wire::Ipv4Address) -> bool,
+    ) {
+        let mut output = self.output.lock();
+        let mut index = 0;
+        while index < output.deferred_routes.len() {
+            if is_resolved(output.deferred_routes[index].next_hop) {
+                if output.deferred_routes[index].probe_in_flight {
+                    output.deferred_routes[index].resolved = true;
+                    index += 1;
+                } else {
+                    let mut bucket = output.deferred_routes.swap_remove(index);
+                    output.packets.append(&mut bucket.packets);
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn release_neighbor(&self, oif: u32, next_hop: smoltcp::wire::Ipv4Address) -> bool {
+        let mut output = self.output.lock();
+        let Some(index) = output
+            .deferred_routes
+            .iter()
+            .position(|bucket| bucket.oif == oif && bucket.next_hop == next_hop)
+        else {
+            return false;
+        };
+        if output.deferred_routes[index].probe_in_flight {
+            output.deferred_routes[index].resolved = true;
+        } else {
+            let mut bucket = output.deferred_routes.swap_remove(index);
+            output.packets.append(&mut bucket.packets);
+        }
+        true
+    }
+
+    fn complete_deferred_probe_success(&self, key: DeferredRouteKey) {
+        let mut output = self.output.lock();
+        let Some(index) = output.deferred_routes.iter().position(|bucket| {
+            bucket.oif == key.oif && bucket.next_hop == key.next_hop && bucket.probe_in_flight
+        }) else {
+            return;
+        };
+        let mut bucket = output.deferred_routes.swap_remove(index);
+        output.packets.append(&mut bucket.packets);
+    }
+
+    /// Fail only the in-flight representative. Other packets in this bucket
+    /// may still be valid and remain eligible for independent processing.
+    fn complete_deferred_packet_failure(&self, key: DeferredRouteKey) {
+        let mut output = self.output.lock();
+        let Some(index) = output.deferred_routes.iter().position(|bucket| {
+            bucket.oif == key.oif && bucket.next_hop == key.next_hop && bucket.probe_in_flight
+        }) else {
+            return;
+        };
+        let bucket = &mut output.deferred_routes[index];
+        bucket.probe_in_flight = false;
+        bucket.probe_bytes = 0;
+        if bucket.packets.is_empty() {
+            output.deferred_routes.swap_remove(index);
+        }
     }
 
     fn clear_routed_if_idle(
@@ -718,6 +1331,8 @@ impl LocalInputQueue {
         let output = self.output.lock();
         if input.packets.is_empty()
             && output.packets.is_empty()
+            && output.backpressured.is_empty()
+            && output.deferred_routes.is_empty()
             && output.reserved_frames == 0
             && bound_socket_count.load(Ordering::Acquire) == 0
             && !deferred_close_pending
@@ -733,7 +1348,12 @@ impl LocalInputQueue {
             .ok()?;
         Some(LocalOutputDrainGuard {
             draining: &self.output_draining,
+            active: true,
         })
+    }
+
+    fn finish_output_drain(&self, guard: LocalOutputDrainGuard<'_>) -> bool {
+        guard.finish_and_has_output(&self.output)
     }
 
     fn recycle_output(&self, frame: Vec<u8>) {
@@ -893,6 +1513,27 @@ impl SmolTxToken for LocalInputTxToken<'_> {
         }
         let constrained_oif = (meta.id != 0).then_some(meta.id);
         if let Some(route) = self.route_policy.lookup(destination, constrained_oif) {
+            if route.kind == crate::net::route::RTN_LOCAL {
+                let route_ip_mtu = core::cmp::min(route.ip_mtu, u16::MAX as usize);
+                let ip_mtu = if self
+                    .scratch
+                    .try_ensure_capacity(route_ip_mtu, &mut self.reservation)
+                {
+                    route_ip_mtu
+                } else {
+                    core::cmp::min(route_ip_mtu, self.owner_ip_mtu)
+                };
+                self.medium = smoltcp::phy::Medium::Ip;
+                self.disposition = LocalOutputDisposition::Local {
+                    oif: route.oif,
+                    ip_mtu,
+                };
+                return Some(smoltcp::phy::TxEgressOverride {
+                    medium: smoltcp::phy::Medium::Ip,
+                    ip_mtu,
+                    context: LocalOutputDisposition::local_context(route.oif),
+                });
+            }
             if route.oif == self.owner_ifindex && self.owner_is_up {
                 return None;
             }
@@ -950,8 +1591,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             return false;
         }
         self.medium = egress.medium;
-        self.disposition =
-            LocalOutputDisposition::from_routed_context(egress.context, egress.ip_mtu);
+        self.disposition = LocalOutputDisposition::from_context(egress.context, egress.ip_mtu);
         true
     }
 
@@ -1111,12 +1751,125 @@ impl<D: SmolDevice + ?Sized> SmolDevice for RoutedTxDevice<'_, D> {
     }
 }
 
+enum LocalOutputTransmitResult {
+    Sent(LocalOutputPacket),
+    RetrySoon(LocalOutputPacket),
+    RetryAt {
+        packet: LocalOutputPacket,
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+    },
+    Drop(LocalOutputPacket, SystemError),
+}
+
+fn output_error(packet: LocalOutputPacket, error: SystemError) -> LocalOutputTransmitResult {
+    match error {
+        SystemError::ENOBUFS | SystemError::EAGAIN_OR_EWOULDBLOCK => {
+            LocalOutputTransmitResult::RetrySoon(packet)
+        }
+        _ => LocalOutputTransmitResult::Drop(packet, error),
+    }
+}
+
+fn transmit_routed_stack_output(
+    iface: &dyn Iface,
+    packet: LocalOutputPacket,
+) -> LocalOutputTransmitResult {
+    let LocalOutputDisposition::Routed {
+        next_hop, ip_mtu, ..
+    } = packet.disposition
+    else {
+        return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
+    };
+    if packet.medium != smoltcp::phy::Medium::Ip
+        || packet.frame.len() > ip_mtu
+        || packet.frame.first().map(|byte| byte >> 4) != Some(4)
+    {
+        return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
+    }
+    if !iface.flags().contains(InterfaceFlags::UP) || packet.frame.len() > iface.mtu() {
+        let error = if !iface.flags().contains(InterfaceFlags::UP) {
+            SystemError::ENETDOWN
+        } else {
+            SystemError::EMSGSIZE
+        };
+        return LocalOutputTransmitResult::Drop(packet, error);
+    }
+    match iface.route_and_send(&smoltcp::wire::IpAddress::Ipv4(next_hop), &packet.frame) {
+        Ok(()) => LocalOutputTransmitResult::Sent(packet),
+        Err(RouteSendError::RetryAt {
+            retry_at,
+            probe_sent,
+        }) => LocalOutputTransmitResult::RetryAt {
+            packet,
+            retry_at,
+            probe_sent,
+        },
+        Err(RouteSendError::Failed(error)) => output_error(packet, error),
+    }
+}
+
+/// Transmit a routed packet after the actual egress has reserved queue
+/// capacity. Any retry is committed to that egress before the caller releases
+/// its source reservation, so TX-completion wakeups always target the owner of
+/// the backpressured resource.
+fn transmit_admitted_routed_output(
+    iface: &dyn Iface,
+    packet: LocalOutputPacket,
+    reservation: LocalOutputReservation<'_>,
+) -> AdmittedRoutedOutput {
+    let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition else {
+        drop(reservation);
+        return AdmittedRoutedOutput::Drop(packet, SystemError::EINVAL);
+    };
+    let tx_generation = iface.common().tx_completion_generation();
+    match transmit_routed_stack_output(iface, packet) {
+        LocalOutputTransmitResult::Sent(packet) => {
+            iface.common().reset_local_output_tx_backoff();
+            iface
+                .common()
+                .local_input_queue
+                .release_neighbor(oif, next_hop);
+            drop(reservation);
+            AdmittedRoutedOutput::Sent(packet)
+        }
+        LocalOutputTransmitResult::RetrySoon(packet) => {
+            let delay_us = iface.common().next_local_output_tx_backoff_us();
+            let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+            let retry_at = now + smoltcp::time::Duration::from_micros(delay_us);
+            reservation.requeue_backpressured(packet, retry_at);
+            let retry_at = if iface.common().release_tx_backpressure_after(tx_generation) {
+                now
+            } else {
+                retry_at
+            };
+            AdmittedRoutedOutput::Queued(retry_at)
+        }
+        LocalOutputTransmitResult::RetryAt {
+            packet,
+            retry_at,
+            probe_sent,
+        } => {
+            iface.common().reset_local_output_tx_backoff();
+            match reservation.requeue_deferred(packet, retry_at, probe_sent) {
+                Ok(()) => AdmittedRoutedOutput::Queued(retry_at),
+                Err(packet) => AdmittedRoutedOutput::Drop(packet, SystemError::ENOBUFS),
+            }
+        }
+        LocalOutputTransmitResult::Drop(packet, error) => {
+            iface.common().reset_local_output_tx_backoff();
+            drop(reservation);
+            AdmittedRoutedOutput::Drop(packet, error)
+        }
+    }
+}
+
 fn transmit_local_stack_output<D>(
     netns: &Arc<NetNamespace>,
     owner_is_up: bool,
     device: &mut D,
     packet: LocalOutputPacket,
-) -> Result<LocalOutputPacket, LocalOutputPacket>
+) -> LocalOutputTransmitResult
 where
     D: SmolDevice + ?Sized,
 {
@@ -1124,29 +1877,36 @@ where
         LocalOutputDisposition::NativeOwner => {
             transmit_native_output_if_up(device, packet, owner_is_up)
         }
-        LocalOutputDisposition::Drop => Ok(packet),
-        LocalOutputDisposition::Routed {
-            oif,
-            next_hop,
-            ip_mtu,
-        } => {
+        LocalOutputDisposition::Drop => {
+            LocalOutputTransmitResult::Drop(packet, SystemError::ENETUNREACH)
+        }
+        LocalOutputDisposition::Local { oif, ip_mtu } => {
             if packet.medium != smoltcp::phy::Medium::Ip
                 || packet.frame.len() > ip_mtu
                 || packet.frame.first().map(|byte| byte >> 4) != Some(4)
             {
-                return Ok(packet);
+                return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
             }
             let Some(iface) = netns.device_list().get(&(oif as usize)).cloned() else {
-                return Ok(packet);
+                return LocalOutputTransmitResult::Drop(packet, SystemError::ENODEV);
             };
-            if !iface.flags().contains(InterfaceFlags::UP) || packet.frame.len() > iface.mtu() {
-                return Ok(packet);
+            if packet.frame.len() > iface.mtu() {
+                return LocalOutputTransmitResult::Drop(packet, SystemError::EMSGSIZE);
             }
-            match iface.route_and_send(&smoltcp::wire::IpAddress::Ipv4(next_hop), &packet.frame) {
-                Ok(()) => Ok(packet),
-                Err(SystemError::ENOBUFS) => Err(packet),
-                Err(_) => Ok(packet),
+            match iface.inject_local_ipv4_packet(oif, iface.mac(), &packet.frame, false) {
+                Ok(()) => LocalOutputTransmitResult::Sent(packet),
+                // This is receive-backlog congestion, not physical TX
+                // backpressure. Linux may drop locally delivered packets when
+                // the receive backlog is full; a TX completion cannot make
+                // this target input queue writable.
+                Err(error) => LocalOutputTransmitResult::Drop(packet, error),
             }
+        }
+        LocalOutputDisposition::Routed { oif, .. } => {
+            let Some(iface) = netns.device_list().get(&(oif as usize)).cloned() else {
+                return LocalOutputTransmitResult::Drop(packet, SystemError::ENODEV);
+            };
+            transmit_routed_stack_output(iface.as_ref(), packet)
         }
     }
 }
@@ -1155,31 +1915,28 @@ fn transmit_native_output_if_up<D>(
     device: &mut D,
     packet: LocalOutputPacket,
     owner_is_up: bool,
-) -> Result<LocalOutputPacket, LocalOutputPacket>
+) -> LocalOutputTransmitResult
 where
     D: SmolDevice + ?Sized,
 {
     if !owner_is_up {
-        return Ok(packet);
+        return LocalOutputTransmitResult::Drop(packet, SystemError::ENETDOWN);
     }
     transmit_native_output(device, packet)
 }
 
-fn transmit_native_output<D>(
-    device: &mut D,
-    packet: LocalOutputPacket,
-) -> Result<LocalOutputPacket, LocalOutputPacket>
+fn transmit_native_output<D>(device: &mut D, packet: LocalOutputPacket) -> LocalOutputTransmitResult
 where
     D: SmolDevice + ?Sized,
 {
     let Some(mut token) = device.transmit(crate::time::Instant::now().into()) else {
-        return Err(packet);
+        return LocalOutputTransmitResult::RetrySoon(packet);
     };
     token.set_meta(packet.meta);
     token.consume(packet.frame.len(), |buffer| {
         buffer.copy_from_slice(&packet.frame);
     });
-    Ok(packet)
+    LocalOutputTransmitResult::Sent(packet)
 }
 
 pub struct IfaceCommon {
@@ -1204,6 +1961,13 @@ pub struct IfaceCommon {
     /// Scheduler-owned future protocol deadline. Immediate work stays with
     /// the current poll owner and is never armed here.
     poll_deadline: PollDeadline,
+    /// Bounded fallback delay for local-output device backpressure. Individual
+    /// packets retain their not-before deadline across unrelated poll wakes.
+    local_output_tx_backoff_us: AtomicU64,
+    /// Monotonic handshake between TX completion and backpressure enqueue.
+    /// A producer that observes a change after enqueue promotes the packet
+    /// itself; otherwise the later completion notification does so.
+    tx_completion_generation: AtomicU64,
     /// 网络命名空间
     net_namespace: RwLock<Weak<NetNamespace>>,
     /// 路由相关数据
@@ -1231,6 +1995,20 @@ pub struct IfaceCommon {
     receive_mode: Mutex<ReceiveModeState>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LocalOutputDrainResult {
+    Quiescent,
+    BudgetExhausted,
+    Backpressured,
+    Contended,
+}
+
+impl LocalOutputDrainResult {
+    fn needs_immediate_poll(self) -> bool {
+        matches!(self, Self::BudgetExhausted)
+    }
+}
+
 impl fmt::Debug for IfaceCommon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IfaceCommon")
@@ -1242,6 +2020,8 @@ impl fmt::Debug for IfaceCommon {
 
 impl IfaceCommon {
     const LOCAL_OUTPUT_POLL_BUDGET: usize = 64;
+    const LOCAL_OUTPUT_TX_BACKOFF_MIN_US: u64 = 1_000;
+    const LOCAL_OUTPUT_TX_BACKOFF_MAX_US: u64 = 100_000;
 
     pub fn new(
         iface_id: usize,
@@ -1274,6 +2054,8 @@ impl IfaceCommon {
             namespace_routed_stack: AtomicBool::new(false),
             port_manager: PortManager::default(),
             poll_deadline: PollDeadline::new(),
+            local_output_tx_backoff_us: AtomicU64::new(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US),
+            tx_completion_generation: AtomicU64::new(0),
             net_namespace: RwLock::new(Weak::new()),
             router_common_data,
             flags: AtomicU32::new(flags.bits()),
@@ -1349,8 +2131,202 @@ impl IfaceCommon {
         self.local_input_queue.enqueue(packet)
     }
 
+    fn enqueue_routed_output(
+        &self,
+        oif: u32,
+        next_hop: smoltcp::wire::Ipv4Address,
+        ip_packet: &[u8],
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+    ) -> Result<(), SystemError> {
+        let (packet, reservation) = self.prepare_routed_output(oif, next_hop, ip_packet)?;
+        if let Err(packet) = reservation.commit_deferred_packet(packet, retry_at, probe_sent, false)
+        {
+            self.local_input_queue.recycle_output(packet.frame);
+            return Err(SystemError::ENOBUFS);
+        }
+        Ok(())
+    }
+
+    fn prepare_routed_output(
+        &self,
+        oif: u32,
+        next_hop: smoltcp::wire::Ipv4Address,
+        ip_packet: &[u8],
+    ) -> Result<(LocalOutputPacket, LocalOutputReservation<'_>), SystemError> {
+        if ip_packet.len() > self.mtu.load(Ordering::Acquire) {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let mut reservation = self
+            .local_input_queue
+            .reserve_output()
+            .ok_or(SystemError::ENOBUFS)?;
+        let mut scratch =
+            LocalInputScratch::checkout(&self.local_input_queue.response_scratch, ip_packet.len())
+                .ok_or(SystemError::ENOMEM)?;
+        if !reservation.try_resize(scratch.capacity()) {
+            return Err(SystemError::ENOBUFS);
+        }
+        scratch.resize(ip_packet.len()).copy_from_slice(ip_packet);
+        let frame = scratch
+            .take()
+            .expect("a deferred routed packet owns its scratch buffer");
+        Ok((
+            LocalOutputPacket {
+                medium: smoltcp::phy::Medium::Ip,
+                meta: PacketMeta::default(),
+                disposition: LocalOutputDisposition::Routed {
+                    oif,
+                    next_hop,
+                    ip_mtu: self.mtu.load(Ordering::Acquire),
+                },
+                frame,
+            },
+            reservation,
+        ))
+    }
+
+    /// Join a pending neighbor atomically if it still exists. A bucket that
+    /// resolves between the optimistic presence check and commit is reported
+    /// as missing; callers then use the immediate transmit path and never
+    /// recreate a bucket with a stale deadline.
+    fn enqueue_existing_routed_output(
+        &self,
+        oif: u32,
+        next_hop: smoltcp::wire::Ipv4Address,
+        ip_packet: &[u8],
+    ) -> Result<Option<smoltcp::time::Instant>, SystemError> {
+        let pending = self
+            .local_input_queue
+            .output
+            .lock()
+            .deferred_routes
+            .iter()
+            .any(|bucket| bucket.oif == oif && bucket.next_hop == next_hop);
+        if !pending {
+            return Ok(None);
+        }
+        let (packet, reservation) = self.prepare_routed_output(oif, next_hop, ip_packet)?;
+        match reservation.commit_existing_deferred(packet) {
+            ExistingDeferredCommit::Queued(retry_at) => Ok(Some(retry_at)),
+            ExistingDeferredCommit::Missing(packet, reservation) => {
+                drop(reservation);
+                self.local_input_queue.recycle_output(packet.frame);
+                Ok(None)
+            }
+            ExistingDeferredCommit::Full(packet, reservation) => {
+                drop(reservation);
+                self.local_input_queue.recycle_output(packet.frame);
+                Err(SystemError::ENOBUFS)
+            }
+        }
+    }
+
+    fn enqueue_existing_deferred_output(
+        &self,
+        packet: LocalOutputPacket,
+    ) -> ExistingDeferredEnqueue<'_> {
+        let Some(mut reservation) = self.local_input_queue.reserve_output() else {
+            return ExistingDeferredEnqueue::Full(packet);
+        };
+        if !reservation.try_resize(packet.frame.capacity()) {
+            return ExistingDeferredEnqueue::Full(packet);
+        }
+        match reservation.commit_existing_deferred(packet) {
+            ExistingDeferredCommit::Queued(retry_at) => ExistingDeferredEnqueue::Queued(retry_at),
+            ExistingDeferredCommit::Missing(packet, reservation) => {
+                ExistingDeferredEnqueue::Missing(packet, reservation)
+            }
+            ExistingDeferredCommit::Full(packet, reservation) => {
+                drop(reservation);
+                ExistingDeferredEnqueue::Full(packet)
+            }
+        }
+    }
+
+    fn schedule_local_output(
+        &self,
+        retry_at: smoltcp::time::Instant,
+        napi: Option<Arc<NapiStruct>>,
+        netns: Option<Arc<NetNamespace>>,
+    ) {
+        self.namespace_routed_stack.store(true, Ordering::Release);
+        self.defer_local_output_retry_at(retry_at);
+        if let Some(napi) = napi {
+            napi::napi_schedule(napi);
+        } else if let Some(netns) = netns {
+            netns.wakeup_poll_thread();
+        }
+    }
+
+    fn schedule_registered_local_output(&self, retry_at: smoltcp::time::Instant) {
+        let napi = self.napi_struct.read().clone();
+        let netns = napi
+            .is_none()
+            .then(|| self.net_namespace.read().upgrade())
+            .flatten();
+        self.schedule_local_output(retry_at, napi, netns);
+    }
+
+    /// Make device-backpressured output runnable after the driver reports TX
+    /// completion. The per-packet deadlines remain a fallback for drivers that
+    /// cannot provide a precise completion notification.
+    pub(crate) fn release_tx_backpressure(&self) -> bool {
+        self.tx_completion_generation
+            .fetch_add(1, Ordering::Release);
+        let released = self.local_input_queue.release_backpressured_outputs();
+        if released {
+            self.reset_local_output_tx_backoff();
+        }
+        released
+    }
+
+    fn tx_completion_generation(&self) -> u64 {
+        self.tx_completion_generation.load(Ordering::Acquire)
+    }
+
+    /// Close the completion-before-enqueue race without coupling queue locks
+    /// to the driver. If the generation is unchanged, a later completion must
+    /// observe the queued packet; if it changed, this side performs the
+    /// release that the earlier notification could not see.
+    fn release_tx_backpressure_after(&self, observed_generation: u64) -> bool {
+        if self.tx_completion_generation() == observed_generation {
+            return false;
+        }
+        let released = self.local_input_queue.release_backpressured_outputs();
+        if released {
+            self.reset_local_output_tx_backoff();
+        }
+        released
+    }
+
+    pub(crate) fn notify_tx_available(&self) {
+        if !self.release_tx_backpressure() {
+            return;
+        }
+        self.schedule_registered_local_output(crate::time::Instant::now().into());
+    }
+
     pub(crate) fn has_local_input(&self) -> bool {
         !self.local_input_queue.is_empty()
+    }
+
+    fn release_resolved_routed_outputs(
+        &self,
+        interface: &mut smoltcp::iface::Interface,
+        timestamp: smoltcp::time::Instant,
+    ) {
+        if !self.local_input_queue.has_deferred_output() {
+            return;
+        }
+        let static_neighbors = self.static_neighbors.read();
+        self.local_input_queue.release_resolved_outputs(|next_hop| {
+            static_neighbors
+                .iter()
+                .any(|entry| entry.ip_addr == smoltcp::wire::IpAddress::Ipv4(next_hop))
+                || interface
+                    .is_neighbor_resolved(timestamp, smoltcp::wire::IpAddress::Ipv4(next_hop))
+        });
     }
 
     fn has_local_work(&self) -> bool {
@@ -1466,6 +2442,8 @@ impl IfaceCommon {
             // scheduled immediately instead of waiting for an unrelated future poll.
             self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
 
+            self.release_resolved_routed_outputs(&mut interface, timestamp);
+
             let poll_at = interface.poll_at(timestamp, &sockets);
             let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
             (
@@ -1485,7 +2463,7 @@ impl IfaceCommon {
         drop(sockets);
         drop(route_policy);
         drop(router);
-        let output_pending = self.drain_local_outputs(device, Self::LOCAL_OUTPUT_POLL_BUDGET);
+        let output_drain = self.drain_local_outputs(device, Self::LOCAL_OUTPUT_POLL_BUDGET);
         self.clear_namespace_routing_if_idle();
         self.notify_deadline_rearm(deadline_rearm);
 
@@ -1515,7 +2493,7 @@ impl IfaceCommon {
         // （例如 loopback 二次往返、ACK/window update、仅 egress 前进等）。
         // 如果这里只返回 `has_events`，快路径会过早停止，剩余工作只能等下一次外部事件，
         // 在 blocking TCP 大包场景就会表现为 send/recv 偶发永久卡住。
-        has_events || poll_again || output_pending
+        has_events || poll_again || output_drain.needs_immediate_poll()
     }
 
     /// Atomically classify and, when due, claim this interface's future
@@ -1671,6 +2649,8 @@ impl IfaceCommon {
             let _ = interface.poll_egress(timestamp, device, &mut sockets);
         }
 
+        self.release_resolved_routed_outputs(&mut interface, timestamp);
+
         let poll_at = interface.poll_at(timestamp, &sockets);
         let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
 
@@ -1679,7 +2659,7 @@ impl IfaceCommon {
         drop(sockets);
         drop(route_policy);
         drop(router);
-        let output_pending = self.drain_local_outputs(device, budget);
+        let output_drain = self.drain_local_outputs(device, budget);
         self.clear_namespace_routing_if_idle();
         self.notify_deadline_rearm(deadline_rearm);
         self.notify_all_bound_sockets();
@@ -1698,44 +2678,243 @@ impl IfaceCommon {
             (had_packet && processed == budget)
                 || poll_again
                 || self.has_local_input()
-                || output_pending,
+                || output_drain.needs_immediate_poll(),
         )
     }
 
-    fn drain_local_outputs<D>(&self, device: &mut D, budget: usize) -> bool
+    fn drain_local_outputs<D>(&self, device: &mut D, budget: usize) -> LocalOutputDrainResult
     where
         D: SmolDevice + ?Sized,
     {
         let Some(netns) = self.net_namespace() else {
-            return false;
+            return LocalOutputDrainResult::Quiescent;
         };
         let Some(drain_guard) = self.local_input_queue.try_begin_output_drain() else {
-            return self.local_input_queue.has_output();
-        };
-        for _ in 0..budget {
-            let Some((output, in_flight)) = self.local_input_queue.pop_output() else {
-                drop(drain_guard);
-                return false;
+            return if self.local_input_queue.has_output() {
+                LocalOutputDrainResult::BudgetExhausted
+            } else {
+                LocalOutputDrainResult::Contended
             };
+        };
+        let mut prefer_deferred = true;
+        for _ in 0..budget {
+            let (mut output, mut in_flight, deferred_probe) = match self
+                .local_input_queue
+                .pop_ready_output(crate::time::Instant::now().into(), prefer_deferred)
+            {
+                LocalOutputPop::Ready(output, in_flight, deferred_probe) => {
+                    (output, in_flight, deferred_probe)
+                }
+                LocalOutputPop::DeferredUntil(retry_at) => {
+                    drop(drain_guard);
+                    self.defer_local_output_retry_at(retry_at);
+                    return LocalOutputDrainResult::Backpressured;
+                }
+                LocalOutputPop::Empty => {
+                    return if self.local_input_queue.finish_output_drain(drain_guard) {
+                        LocalOutputDrainResult::BudgetExhausted
+                    } else {
+                        LocalOutputDrainResult::Quiescent
+                    };
+                }
+            };
+            prefer_deferred = false;
+
+            // Admission belongs to the actual egress interface. Atomically
+            // join an existing neighbor bucket before attempting transmit so
+            // neither same-owner nor cross-owner output can bypass it.
+            if deferred_probe.is_none() {
+                if let LocalOutputDisposition::Routed { oif, .. } = output.disposition {
+                    if oif == self.iface_id as u32 {
+                        match in_flight.commit_existing_deferred(output) {
+                            ExistingDeferredCommit::Queued(retry_at) => {
+                                self.defer_local_output_retry_at(retry_at);
+                                continue;
+                            }
+                            ExistingDeferredCommit::Missing(packet, reservation) => {
+                                output = packet;
+                                in_flight = reservation;
+                            }
+                            ExistingDeferredCommit::Full(packet, reservation) => {
+                                log::debug!(
+                                    "dropping deferred output on {}: per-neighbor queue full",
+                                    self.name()
+                                );
+                                drop(reservation);
+                                self.local_input_queue.recycle_output(packet.frame);
+                                continue;
+                            }
+                        }
+                    } else if let Some(egress) = netns.device_list().get(&(oif as usize)).cloned() {
+                        match egress.common().enqueue_existing_deferred_output(output) {
+                            ExistingDeferredEnqueue::Queued(retry_at) => {
+                                drop(in_flight);
+                                egress.common().schedule_registered_local_output(retry_at);
+                                continue;
+                            }
+                            ExistingDeferredEnqueue::Missing(packet, egress_reservation) => {
+                                match transmit_admitted_routed_output(
+                                    egress.as_ref(),
+                                    packet,
+                                    egress_reservation,
+                                ) {
+                                    AdmittedRoutedOutput::Sent(packet) => {
+                                        drop(in_flight);
+                                        self.local_input_queue.recycle_output(packet.frame);
+                                    }
+                                    AdmittedRoutedOutput::Queued(retry_at) => {
+                                        drop(in_flight);
+                                        egress.common().schedule_registered_local_output(retry_at);
+                                    }
+                                    AdmittedRoutedOutput::Drop(packet, error) => {
+                                        log::debug!(
+                                            "dropping routed output on {}: {:?}",
+                                            egress.name(),
+                                            error
+                                        );
+                                        drop(in_flight);
+                                        self.local_input_queue.recycle_output(packet.frame);
+                                    }
+                                }
+                                continue;
+                            }
+                            ExistingDeferredEnqueue::Full(packet) => {
+                                log::debug!(
+                                    "dropping deferred output on {}: egress queue full",
+                                    egress.name()
+                                );
+                                drop(in_flight);
+                                self.local_input_queue.recycle_output(packet.frame);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            let tx_generation = self.tx_completion_generation();
             match transmit_local_stack_output(
                 &netns,
                 self.flags().contains(InterfaceFlags::UP),
                 device,
                 output,
             ) {
-                Ok(output) => {
+                LocalOutputTransmitResult::Sent(output) => {
+                    self.reset_local_output_tx_backoff();
+                    if let Some(key) = deferred_probe {
+                        self.local_input_queue.complete_deferred_probe_success(key);
+                    } else if let LocalOutputDisposition::Routed { oif, next_hop, .. } =
+                        output.disposition
+                    {
+                        self.local_input_queue.release_neighbor(oif, next_hop);
+                    }
                     drop(in_flight);
                     self.local_input_queue.recycle_output(output.frame);
                 }
-                Err(output) => {
-                    in_flight.requeue_front(output);
-                    drop(drain_guard);
-                    return true;
+                LocalOutputTransmitResult::Drop(output, error) => {
+                    self.reset_local_output_tx_backoff();
+                    log::debug!("dropping deferred output on {}: {:?}", self.name(), error);
+                    if let Some(key) = deferred_probe {
+                        self.local_input_queue.complete_deferred_packet_failure(key);
+                    }
+                    drop(in_flight);
+                    self.local_input_queue.recycle_output(output.frame);
+                }
+                LocalOutputTransmitResult::RetrySoon(output) => {
+                    let delay_us = self.next_local_output_tx_backoff_us();
+                    let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+                    let retry_at = now + smoltcp::time::Duration::from_micros(delay_us);
+                    if let Some(key) = deferred_probe {
+                        // A failed physical submission waits on TX capacity,
+                        // not on neighbor resolution. Return the representative
+                        // to the typed TX-backpressure queue while leaving the
+                        // remaining neighbor bucket eligible for another probe.
+                        self.local_input_queue.complete_deferred_packet_failure(key);
+                    }
+                    in_flight.requeue_backpressured(output, retry_at);
+                    if !self.release_tx_backpressure_after(tx_generation) {
+                        self.defer_local_output_retry_at(retry_at);
+                    }
+                    continue;
+                }
+                LocalOutputTransmitResult::RetryAt {
+                    packet,
+                    retry_at,
+                    probe_sent,
+                } => {
+                    self.reset_local_output_tx_backoff();
+                    let LocalOutputDisposition::Routed { oif, .. } = packet.disposition else {
+                        unreachable!("only routed output performs neighbor discovery");
+                    };
+                    if let Some(key) = deferred_probe {
+                        debug_assert_eq!(oif, self.iface_id as u32);
+                        match in_flight.finish_deferred_probe(packet, key, retry_at, probe_sent) {
+                            Ok(resolved) => {
+                                if !resolved {
+                                    self.defer_local_output_retry_at(retry_at);
+                                }
+                            }
+                            Err(packet) => {
+                                self.local_input_queue.complete_deferred_packet_failure(key);
+                                self.local_input_queue.recycle_output(packet.frame);
+                            }
+                        }
+                    } else if oif == self.iface_id as u32 {
+                        match in_flight.requeue_deferred(packet, retry_at, probe_sent) {
+                            Ok(()) => self.defer_local_output_retry_at(retry_at),
+                            Err(packet) => {
+                                log::debug!(
+                                    "dropping deferred output on {}: per-neighbor queue full",
+                                    self.name()
+                                );
+                                self.local_input_queue.recycle_output(packet.frame);
+                            }
+                        }
+                    } else {
+                        // Cross-egress packets are admitted and transmitted in
+                        // the branch above, while a deferred probe is always
+                        // owned by this interface's neighbor bucket.
+                        debug_assert!(deferred_probe.is_some());
+                        drop(in_flight);
+                        self.local_input_queue.recycle_output(packet.frame);
+                    }
+                    continue;
                 }
             }
         }
-        drop(drain_guard);
-        self.local_input_queue.has_output()
+        if self.local_input_queue.finish_output_drain(drain_guard) {
+            LocalOutputDrainResult::BudgetExhausted
+        } else {
+            LocalOutputDrainResult::Quiescent
+        }
+    }
+
+    fn next_local_output_tx_backoff_us(&self) -> u64 {
+        self.local_output_tx_backoff_us
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(
+                    current
+                        .saturating_mul(2)
+                        .min(Self::LOCAL_OUTPUT_TX_BACKOFF_MAX_US),
+                )
+            })
+            .unwrap_or(Self::LOCAL_OUTPUT_TX_BACKOFF_MAX_US)
+    }
+
+    fn reset_local_output_tx_backoff(&self) {
+        self.local_output_tx_backoff_us
+            .store(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US, Ordering::Release);
+    }
+
+    fn defer_local_output_retry_at(&self, retry_at: smoltcp::time::Instant) {
+        let now_us = crate::time::Instant::now().total_micros().max(0) as u64;
+        let retry_us = (retry_at.total_micros().max(0) as u64).max(now_us.saturating_add(1));
+        self.publish_local_output_retry(now_us, retry_us);
+    }
+
+    fn publish_local_output_retry(&self, now_us: u64, retry_us: u64) {
+        let rearm = self.poll_deadline.publish_earlier_future(now_us, retry_us)
+            == PublishResult::RearmRequired;
+        self.notify_deadline_rearm(rearm);
     }
 
     /// Publish smoltcp's next scheduling decision while both smoltcp
@@ -1981,6 +3160,7 @@ impl IfaceCommon {
     }
 
     pub fn set_static_neighbor(&self, entry: StaticNeighborEntry) {
+        let ip_addr = entry.ip_addr;
         let mut neighbors = self.static_neighbors.write();
         if let Some(existing) = neighbors
             .iter_mut()
@@ -1989,6 +3169,16 @@ impl IfaceCommon {
             *existing = entry;
         } else {
             neighbors.push(entry);
+        }
+        drop(neighbors);
+        let smoltcp::wire::IpAddress::Ipv4(next_hop) = ip_addr else {
+            return;
+        };
+        if self
+            .local_input_queue
+            .release_neighbor(self.iface_id as u32, next_hop)
+        {
+            self.schedule_registered_local_output(crate::time::Instant::now().into());
         }
     }
 

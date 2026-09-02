@@ -113,6 +113,7 @@ impl Socket for TcpSocket {
             match self.check_connect() {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     // log::debug!("TcpSocket::connect: wait for Established");
+                    let mut completed = None;
                     wq_wait_event_interruptible!(
                         self.wait_queue(),
                         {
@@ -123,13 +124,27 @@ impl Socket for TcpSocket {
                             // 这里把 check_connect() 本身作为条件的一部分：
                             // - 入队 waker 后再次检查时会主动 poll 并完成状态转换
                             // - 即使错过了一次 wake，也不会永远睡下去
-                            !matches!(
-                                self.check_connect(),
-                                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                            )
+                            if completed.is_some() {
+                                true
+                            } else {
+                                let result = self.check_connect();
+                                if matches!(result, Err(SystemError::EAGAIN_OR_EWOULDBLOCK)) {
+                                    false
+                                } else {
+                                    completed = Some(result);
+                                    true
+                                }
+                            }
                         },
                         {}
                     )?;
+                    // The wait predicate performs the state transition from
+                    // Connecting. Return that exact one-shot result instead
+                    // of calling check_connect() again after it has replaced
+                    // the state with Init or Established.
+                    if let Some(result) = completed {
+                        break result;
+                    }
                 }
                 result => {
                     // log::debug!("TcpSocket::connect: done -> {:?}", result);

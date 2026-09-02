@@ -583,6 +583,15 @@ impl Iface for LoopbackInterface {
         Ok(())
     }
 
+    fn route_and_send(
+        &self,
+        _next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+    ) -> Result<(), super::RouteSendError> {
+        self.inject_local_ipv4_packet(self.nic_id() as u32, self.mac(), ip_packet, false)
+            .map_err(Into::into)
+    }
+
     fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {
         self.common.should_drop_rx_packet(packet)
     }

@@ -43,6 +43,7 @@ pub(crate) struct OutputRouteDecision {
     pub(crate) oif: u32,
     pub(crate) next_hop: IpAddress,
     pub(crate) ip_mtu: usize,
+    pub(crate) kind: u8,
 }
 
 impl OutputRouteGuard<'_> {
@@ -70,6 +71,7 @@ impl OutputRouteGuard<'_> {
             oif: route.oif,
             next_hop: route.next_hop,
             ip_mtu: iface.mtu(),
+            kind: route.matched.kind,
         })
     }
 }

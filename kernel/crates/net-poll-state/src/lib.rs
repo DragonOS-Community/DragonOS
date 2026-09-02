@@ -54,6 +54,33 @@ impl PollDeadline {
         }
     }
 
+    /// Add a future deadline without postponing an earlier published one.
+    ///
+    /// This is used by independent work sources, such as device-backpressure
+    /// retries, which share the protocol scheduler but do not own its current
+    /// deadline. An overdue value is replaceable because the scheduler has not
+    /// claimed it yet and must be notified to classify the new future value.
+    pub fn publish_earlier_future(&self, now_us: u64, new_us: u64) -> PublishResult {
+        debug_assert!(new_us > now_us);
+        debug_assert_ne!(new_us, DISARMED);
+
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            if observed != DISARMED && observed > now_us && observed <= new_us {
+                return PublishResult::Unchanged;
+            }
+            match self.0.compare_exchange_weak(
+                observed,
+                new_us,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return PublishResult::RearmRequired,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
     /// Remove the scheduler-owned deadline.
     ///
     /// A poller which already armed the old timeout may wake once early; no
@@ -157,6 +184,36 @@ mod tests {
         );
         assert_eq!(
             deadline.publish_future(30, 50),
+            PublishResult::RearmRequired
+        );
+        assert_eq!(deadline.classify_and_claim(30), DueResult::Future(50));
+    }
+
+    #[test]
+    fn additive_publish_never_postpones_an_earlier_deadline() {
+        let deadline = PollDeadline::new();
+        assert_eq!(
+            deadline.publish_earlier_future(10, 100),
+            PublishResult::RearmRequired
+        );
+        assert_eq!(
+            deadline.publish_earlier_future(10, 120),
+            PublishResult::Unchanged
+        );
+        assert_eq!(deadline.load(), Some(100));
+        assert_eq!(
+            deadline.publish_earlier_future(10, 80),
+            PublishResult::RearmRequired
+        );
+        assert_eq!(deadline.load(), Some(80));
+    }
+
+    #[test]
+    fn additive_publish_replaces_an_unclaimed_overdue_deadline() {
+        let deadline = PollDeadline::new();
+        deadline.publish_future(10, 20);
+        assert_eq!(
+            deadline.publish_earlier_future(30, 50),
             PublishResult::RearmRequired
         );
         assert_eq!(deadline.classify_and_claim(30), DueResult::Future(50));

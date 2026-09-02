@@ -416,7 +416,7 @@ fn get_ephemeral_iface(
             .get(&(decision.oif as usize))
             .cloned()
             .ok_or(SystemError::ENETUNREACH)?;
-        ensure_iface_up(&iface)?;
+        ensure_iface_up_for_route(&iface, decision.matched.kind)?;
         // An explicit FIB decision is authoritative, including routes that
         // deliberately send non-loopback destinations through `lo`.
         let source = route_source_from_decision(&iface, remote_ip_addr, decision)?;
@@ -463,13 +463,21 @@ pub(crate) fn route_source_on_iface(
     iface: &Arc<dyn Iface>,
     remote: &smoltcp::wire::IpAddress,
 ) -> Result<smoltcp::wire::IpAddress, SystemError> {
-    ensure_iface_up(iface)?;
     if remote.is_unspecified() || remote.is_multicast() || remote.is_broadcast() {
+        ensure_iface_up(iface)?;
         return pick_configured_source_addr(iface, remote).ok_or(no_source_addr_error(remote));
     }
     let decision = crate::net::route::lookup_on_iface(netns, *remote, iface.nic_id() as u32)
         .ok_or(SystemError::ENETUNREACH)?;
+    ensure_iface_up_for_route(iface, decision.matched.kind)?;
     route_source_from_decision(iface, remote, decision)
+}
+
+fn ensure_iface_up_for_route(iface: &Arc<dyn Iface>, kind: u8) -> Result<(), SystemError> {
+    if kind == crate::net::route::RTN_LOCAL {
+        return Ok(());
+    }
+    ensure_iface_up(iface)
 }
 
 fn route_source_from_decision(

@@ -148,7 +148,15 @@ fn net_rx_action() {
 
         while let Some(napi) = active.pop_front() {
             let elapsed = crate::time::Instant::now().total_micros() - started_at;
-            if polls_left == 0 || packets_left == 0 || elapsed >= NET_RX_TIME_BUDGET_US {
+            // The worker is preemptible. If it is descheduled after sampling
+            // `started_at` but before the first poll, the elapsed-time budget
+            // may already be exhausted when it resumes. Requeueing without
+            // one poll would permit a zero-progress yield/requeue livelock.
+            let attempted_poll = polls_left < NET_RX_POLL_BUDGET;
+            if polls_left == 0
+                || packets_left == 0
+                || (attempted_poll && elapsed >= NET_RX_TIME_BUDGET_US)
+            {
                 active.push_front(napi);
                 break;
             }

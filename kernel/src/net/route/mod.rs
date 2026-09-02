@@ -26,10 +26,11 @@ use fib::FibEditor;
 pub(in crate::net) use fib::FibTable;
 pub(crate) use lifecycle::{
     commit_addresses, prepare_link_state_change, register_iface, unregister_iface,
+    PreparedLinkStateChange,
 };
 use transaction::{
     prepare_with_devices, projection_for_iface, transact_single, transact_with_devices,
-    PreparedTransaction,
+    PreparedTransaction, ProjectionPlan,
 };
 pub(crate) use types::*;
 use validation::{validate_entry, validate_entry_on_iface, validate_gateway_iface};

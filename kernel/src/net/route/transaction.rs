@@ -12,7 +12,7 @@ use super::{
     FibEditor, FibTable,
 };
 
-struct ProjectionPlan {
+pub(super) struct ProjectionPlan {
     replacements: Vec<(Arc<dyn Iface>, Vec<SmolRoute>)>,
 }
 
@@ -186,7 +186,7 @@ impl<T> PreparedTransaction<'_, T> {
 }
 
 impl ProjectionPlan {
-    fn prepare(
+    pub(super) fn prepare(
         before: &FibTable,
         after: &FibTable,
         affected_oifs: &[u32],
@@ -211,7 +211,7 @@ impl ProjectionPlan {
         Ok(Self { replacements })
     }
 
-    fn publish(self) {
+    pub(super) fn publish(self) {
         for (iface, mut projection) in self.replacements {
             iface.smol_iface().lock().routes_mut().update(|routes| {
                 core::mem::swap(routes, &mut projection);

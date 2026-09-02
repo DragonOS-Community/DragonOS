@@ -5,6 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::{types::InterfaceFlags, Iface},
+    net::address::{iface_has_address, netns_has_address, source_address_usable_on_iface},
     process::namespace::net_namespace::NetNamespace,
 };
 
@@ -21,10 +22,11 @@ pub(super) fn validate_entry(
         .get(&(route.oif as usize))
         .cloned()
         .ok_or(SystemError::ENODEV)?;
-    validate_entry_on_iface(&iface, route)
+    validate_entry_on_iface(netns, &iface, route)
 }
 
 pub(super) fn validate_entry_on_iface(
+    netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     route: RouteEntry,
 ) -> Result<(), SystemError> {
@@ -50,13 +52,8 @@ pub(super) fn validate_entry_on_iface(
         return Err(SystemError::ENETDOWN);
     }
     if let Some(source) = route.preferred_source {
-        if !iface
-            .common()
-            .ip_addrs()
-            .iter()
-            .any(|cidr| cidr.address() == source)
-        {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        if !source_address_usable_on_iface(netns, iface, source) {
+            return Err(SystemError::EINVAL);
         }
     }
     if route.nexthop_flags != 0 && route.scope >= RT_SCOPE_LINK {
@@ -81,32 +78,16 @@ pub(super) fn validate_gateway_iface(
         .ok_or(SystemError::ENODEV)?;
     if !is_ipv4(gateway) {
         let gateway_is_local = if is_ipv6_link_local(gateway) {
-            iface
-                .common()
-                .ip_addrs()
-                .iter()
-                .any(|cidr| cidr.address() == gateway)
+            iface_has_address(&iface, gateway)
         } else {
-            netns.device_list().values().any(|candidate| {
-                candidate
-                    .common()
-                    .ip_addrs()
-                    .iter()
-                    .any(|cidr| cidr.address() == gateway)
-            })
+            netns_has_address(netns, gateway)
         };
         if iface.flags().contains(InterfaceFlags::LOOPBACK) || gateway_is_local {
             return Err(SystemError::EINVAL);
         }
     }
     if let IpAddress::Ipv4(gateway) = gateway {
-        if onlink
-            && iface
-                .common()
-                .ip_addrs()
-                .iter()
-                .any(|cidr| cidr.address() == IpAddress::Ipv4(gateway))
-        {
+        if onlink && iface_has_address(&iface, IpAddress::Ipv4(gateway)) {
             return Err(SystemError::EINVAL);
         }
         let invalid_endpoint = iface.common().ip_addrs().iter().any(|cidr| {

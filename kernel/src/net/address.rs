@@ -4,7 +4,7 @@
 //! address list, its connected-route projection, and the router compatibility
 //! projection are committed under one smoltcp interface lock.
 
-use alloc::{ffi::CString, format, sync::Arc, vec::Vec};
+use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 
 use smoltcp::wire::{IpAddress, IpCidr};
 use system_error::SystemError;
@@ -117,54 +117,120 @@ pub(in crate::net) fn address_snapshot(
         .collect()
 }
 
-/// Applies Linux's IPv4 alias-label rename rules while RTNL is held.
-pub(in crate::net) fn rename_address_labels(
-    _rtnl: &RtnlGuard,
-    iface: &Arc<dyn Iface>,
-    new_name: &str,
-) -> Result<Vec<IpCidr>, SystemError> {
-    const IFNAME_MAX: usize = 15;
+/// A fully allocated IPv4 address-label rename.
+///
+/// Construction is fallible, but publication only moves owned state. Holding
+/// RTNL across both phases keeps the address list and metadata generation
+/// stable without teaching the address layer about SETLINK orchestration.
+pub(in crate::net) struct PreparedAddressLabelRename {
+    metadata: Vec<AddressMetadata>,
+    renamed_ipv4: Vec<IpCidr>,
+}
 
-    let old_name = iface.iface_name();
-    let mut metadata = iface.common().address_metadata().lock();
-    let mut renamed = Vec::new();
-    let mut ordinal = 0usize;
-    for entry in metadata
-        .iter_mut()
-        .filter(|entry| matches!(entry.cidr, IpCidr::Ipv4(_)))
-    {
-        ordinal += 1;
-        renamed.push(entry.cidr);
-        if ordinal == 1 {
-            entry.label = None;
-            continue;
+impl PreparedAddressLabelRename {
+    /// Applies Linux's IPv4 alias-label rename rules to an owned candidate.
+    pub(in crate::net) fn prepare(
+        _rtnl: &RtnlGuard,
+        iface: &Arc<dyn Iface>,
+        new_name: &str,
+    ) -> Result<Self, SystemError> {
+        const IFNAME_MAX: usize = 15;
+
+        let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
+        let ipv4_count = metadata
+            .iter()
+            .filter(|entry| matches!(entry.cidr, IpCidr::Ipv4(_)))
+            .count();
+        let mut renamed_ipv4 = Vec::new();
+        renamed_ipv4
+            .try_reserve_exact(ipv4_count)
+            .map_err(|_| SystemError::ENOMEM)?;
+
+        // Interface names are bounded by IFNAMSIZ. Copy the old name to the
+        // stack so the name lock is never held across label allocation.
+        let mut old_name = [0u8; IFNAME_MAX + 1];
+        let old_name_len = iface.common().with_iface_name(|name| {
+            let copied = name.len().min(old_name.len());
+            old_name[..copied].copy_from_slice(&name.as_bytes()[..copied]);
+            copied
+        });
+        let old_name = &old_name[..old_name_len];
+
+        let mut ordinal = 0usize;
+        for entry in metadata
+            .iter_mut()
+            .filter(|entry| matches!(entry.cidr, IpCidr::Ipv4(_)))
+        {
+            ordinal += 1;
+            renamed_ipv4.push(entry.cidr);
+            if ordinal == 1 {
+                entry.label = None;
+                continue;
+            }
+
+            let old_label = entry
+                .label
+                .as_ref()
+                .map(|label| label.as_bytes())
+                .unwrap_or(old_name);
+            let mut generated_suffix = [0u8; 1 + 3 * core::mem::size_of::<usize>()];
+            let suffix = match old_label.iter().position(|byte| *byte == b':') {
+                Some(index) => &old_label[index..],
+                None => decimal_alias_suffix(ordinal, &mut generated_suffix),
+            };
+            let suffix = if suffix.len() > IFNAME_MAX {
+                &suffix[suffix.len() - IFNAME_MAX..]
+            } else {
+                suffix
+            };
+            let prefix_len = new_name.len().min(IFNAME_MAX - suffix.len());
+            entry.label = Some(try_build_label(&new_name.as_bytes()[..prefix_len], suffix)?);
         }
 
-        let old_label = entry
-            .label
-            .as_ref()
-            .map(|label| label.as_bytes())
-            .unwrap_or_else(|| old_name.as_bytes());
-        let generated_suffix;
-        let suffix = match old_label.iter().position(|byte| *byte == b':') {
-            Some(index) => &old_label[index..],
-            None => {
-                generated_suffix = format!(":{ordinal}").into_bytes();
-                generated_suffix.as_slice()
-            }
-        };
-        let suffix = if suffix.len() > IFNAME_MAX {
-            &suffix[suffix.len() - IFNAME_MAX..]
-        } else {
-            suffix
-        };
-        let prefix_len = new_name.len().min(IFNAME_MAX - suffix.len());
-        let mut label = Vec::with_capacity(prefix_len + suffix.len());
-        label.extend_from_slice(&new_name.as_bytes()[..prefix_len]);
-        label.extend_from_slice(suffix);
-        entry.label = Some(CString::new(label).map_err(|_| SystemError::EINVAL)?);
+        Ok(Self {
+            metadata,
+            renamed_ipv4,
+        })
     }
-    Ok(renamed)
+
+    /// Publishes the prepared interface name and labels without allocation.
+    pub(in crate::net) fn publish(self, iface: &Arc<dyn Iface>, new_name: String) -> Vec<IpCidr> {
+        iface
+            .common()
+            .publish_name_and_address_metadata(new_name, self.metadata);
+        self.renamed_ipv4
+    }
+}
+
+fn decimal_alias_suffix(mut ordinal: usize, storage: &mut [u8]) -> &[u8] {
+    let mut cursor = storage.len();
+    loop {
+        cursor -= 1;
+        storage[cursor] = b'0' + (ordinal % 10) as u8;
+        ordinal /= 10;
+        if ordinal == 0 {
+            break;
+        }
+    }
+    cursor -= 1;
+    storage[cursor] = b':';
+    &storage[cursor..]
+}
+
+fn try_build_label(prefix: &[u8], suffix: &[u8]) -> Result<CString, SystemError> {
+    let payload_len = prefix
+        .len()
+        .checked_add(suffix.len())
+        .ok_or(SystemError::ENOMEM)?;
+    let allocation_len = payload_len.checked_add(1).ok_or(SystemError::ENOMEM)?;
+    let mut label = Vec::new();
+    label
+        .try_reserve_exact(allocation_len)
+        .map_err(|_| SystemError::ENOMEM)?;
+    label.extend_from_slice(prefix);
+    label.extend_from_slice(suffix);
+    label.push(0);
+    CString::from_vec_with_nul(label).map_err(|_| SystemError::EINVAL)
 }
 
 /// Initializes an address before an interface is published in a netns.
@@ -442,5 +508,104 @@ fn same_new_or_replace_identity(configured: IpCidr, requested: IpCidr) -> bool {
         (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) => configured == requested,
         (IpAddress::Ipv6(configured), IpAddress::Ipv6(requested)) => configured == requested,
         _ => false,
+    }
+}
+
+/// Returns whether `address` is configured on `iface`.
+///
+/// Keep address-ownership queries next to the authoritative address mutation
+/// core so route validation and socket source selection cannot grow subtly
+/// different notions of a local address.
+pub(crate) fn iface_has_address(iface: &Arc<dyn Iface>, address: IpAddress) -> bool {
+    iface
+        .common()
+        .ip_addrs()
+        .iter()
+        .any(|cidr| cidr.address() == address)
+}
+
+/// Returns whether `address` is configured anywhere in `netns`.
+pub(crate) fn netns_has_address(
+    netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    address: IpAddress,
+) -> bool {
+    netns
+        .device_list()
+        .values()
+        .any(|iface| iface_has_address(iface, address))
+}
+
+/// Applies Linux's weak-host source-address ownership rule for the single L3
+/// domain represented by a DragonOS network namespace. IPv4 and global IPv6
+/// addresses may be selected across interfaces; interface-scoped IPv6
+/// addresses must belong to the egress interface.
+pub(crate) fn source_address_usable_on_iface(
+    netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    address: IpAddress,
+) -> bool {
+    if source_address_requires_iface(address) {
+        iface_has_address(iface, address)
+    } else {
+        netns_has_address(netns, address)
+    }
+}
+
+/// Read-only address ownership view for a not-yet-published interface change.
+///
+/// Address deletion prepares the replacement FIB before publishing the new
+/// interface address list. This view substitutes that candidate list while
+/// using one namespace snapshot for every FIB entry, avoiding nested device
+/// list locking and keeping family/scope policy centralized.
+pub(crate) struct CandidateAddressOwnership<'a> {
+    devices: &'a alloc::collections::BTreeMap<usize, Arc<dyn Iface>>,
+    changed_iface: &'a Arc<dyn Iface>,
+    changed_addresses: &'a [IpCidr],
+}
+
+impl<'a> CandidateAddressOwnership<'a> {
+    pub(crate) fn new(
+        devices: &'a alloc::collections::BTreeMap<usize, Arc<dyn Iface>>,
+        changed_iface: &'a Arc<dyn Iface>,
+        changed_addresses: &'a [IpCidr],
+    ) -> Self {
+        Self {
+            devices,
+            changed_iface,
+            changed_addresses,
+        }
+    }
+
+    fn iface_has_address(&self, iface: &Arc<dyn Iface>, address: IpAddress) -> bool {
+        if Arc::ptr_eq(iface, self.changed_iface) {
+            self.changed_addresses
+                .iter()
+                .any(|cidr| cidr.address() == address)
+        } else {
+            iface_has_address(iface, address)
+        }
+    }
+
+    pub(crate) fn source_usable_on_oif(&self, oif: u32, address: IpAddress) -> bool {
+        let Some(egress_iface) = self.devices.get(&(oif as usize)) else {
+            return false;
+        };
+        if source_address_requires_iface(address) {
+            self.iface_has_address(egress_iface, address)
+        } else {
+            self.devices
+                .values()
+                .any(|iface| self.iface_has_address(iface, address))
+        }
+    }
+}
+
+fn source_address_requires_iface(address: IpAddress) -> bool {
+    match address {
+        IpAddress::Ipv4(_) => false,
+        IpAddress::Ipv6(address) => {
+            let octets = address.octets();
+            address.is_loopback() || octets[0] == 0xfe && octets[1] & 0xc0 == 0x80
+        }
     }
 }

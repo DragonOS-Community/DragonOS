@@ -50,6 +50,8 @@ pub struct RouteSegmentBody {
     pub protocol: u8,
     pub scope: u8,
     pub type_: u8,
+    /// Exact wire value retained for operation-specific policy checks.
+    pub raw_flags: u32,
     pub flags: RouteFlags,
 }
 
@@ -183,7 +185,11 @@ impl TryFrom<CRtMsg> for RouteSegmentBody {
 
     fn try_from(value: CRtMsg) -> Result<Self, Self::Error> {
         let family = AddressFamily::try_from(value.family as u16)?;
-        let flags = RouteFlags::from_bits(value.flags).ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        // The wire layer must preserve future flag bits. Whether a bit is
+        // accepted is operation-specific: Linux's non-strict dump ignores
+        // unknown bits, while mutation and lookup validators apply their own
+        // supported masks.
+        let flags = RouteFlags::from_bits_truncate(value.flags);
 
         Ok(Self {
             family,
@@ -194,6 +200,7 @@ impl TryFrom<CRtMsg> for RouteSegmentBody {
             protocol: value.protocol,
             scope: value.scope,
             type_: value.type_,
+            raw_flags: value.flags,
             flags,
         })
     }
@@ -210,7 +217,7 @@ impl From<RouteSegmentBody> for CRtMsg {
             protocol: body.protocol,
             scope: body.scope,
             type_: body.type_,
-            flags: body.flags.bits(),
+            flags: body.raw_flags,
         }
     }
 }

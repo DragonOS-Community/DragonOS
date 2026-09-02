@@ -496,6 +496,10 @@ impl InnerIrqDesc {
         self.actions.retain(|a| !Arc::ptr_eq(a, action));
     }
 
+    pub fn remove_action_at(&mut self, index: usize) -> Arc<IrqAction> {
+        self.actions.remove(index)
+    }
+
     pub fn internal_state(&self) -> &IrqDescState {
         &self.desc_internal_state
     }

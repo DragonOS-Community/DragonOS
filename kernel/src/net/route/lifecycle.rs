@@ -8,13 +8,14 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::{types::InterfaceFlags, AddressMetadata, Iface},
+    net::address::CandidateAddressOwnership,
     net::rtnl::RtnlGuard,
     process::namespace::net_namespace::NetNamespace,
 };
 
 use super::{
     canonical_cidr, is_ipv4, prepare_with_devices, projection_for_iface, transact_with_devices,
-    validate_entry_on_iface, FibEditor, FibTable, PreparedTransaction, RouteEntry,
+    validate_entry_on_iface, FibEditor, FibTable, PreparedTransaction, ProjectionPlan, RouteEntry,
     RouteNotifications, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_HOST,
     RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN,
 };
@@ -50,7 +51,7 @@ pub(crate) fn register_iface(
                 gateway: route.gateway,
                 nexthop_flags: route.nexthop_flags,
             };
-            validate_entry_on_iface(iface, route)?;
+            validate_entry_on_iface(netns, iface, route)?;
             candidate.insert_derived(route)?;
         }
         Ok(())
@@ -163,6 +164,7 @@ struct PreparedAddressRouteCommit {
     before: FibTable,
     candidate: FibTable,
     projection: Vec<SmolRoute>,
+    other_projections: ProjectionPlan,
     notifications: RouteNotifications,
     after_addresses: Vec<IpCidr>,
     metadata: Vec<AddressMetadata>,
@@ -182,14 +184,32 @@ impl PreparedAddressRouteCommit {
         let mut candidate = before.try_clone()?;
         let before_routes = derived_address_entries(iface, before_addresses)?;
         let after_routes = derived_address_entries(iface, after_addresses)?;
+        let device_list = netns.device_list();
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(device_list.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        devices.extend(device_list.values().cloned());
         let mut editor = FibEditor::new(&mut candidate);
-        let mut silent = editor.reconcile_address_routes(
-            &before_routes,
-            &after_routes,
-            ifindex,
-            deleted_address,
-        )?;
-        let _affected_oifs = editor.finish()?;
+        let mut silent = {
+            let ownership = CandidateAddressOwnership::new(&device_list, iface, after_addresses);
+            editor.reconcile_address_routes(
+                &before_routes,
+                &after_routes,
+                ifindex,
+                deleted_address,
+                |entry| {
+                    ownership.source_usable_on_oif(
+                        entry.oif,
+                        entry.preferred_source.expect(
+                            "preferred-source filter only calls this predicate for a match",
+                        ),
+                    )
+                },
+            )
+        }?;
+        drop(device_list);
+        let affected_oifs = editor.finish()?;
 
         let mut address_capacity = 0;
         iface
@@ -201,6 +221,13 @@ impl PreparedAddressRouteCommit {
         }
 
         let projection = projection_for_iface(&candidate, ifindex)?;
+        let mut other_oifs = Vec::new();
+        other_oifs
+            .try_reserve_exact(affected_oifs.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        other_oifs.extend(affected_oifs.iter().copied().filter(|oif| *oif != ifindex));
+        let other_projections =
+            ProjectionPlan::prepare(&before, &candidate, &other_oifs, &devices)?;
         let mut notifications = candidate.delta_from(&before)?.into_notifications();
         silent.removed.sort_unstable();
         silent.added.sort_unstable();
@@ -214,6 +241,7 @@ impl PreparedAddressRouteCommit {
             before,
             candidate,
             projection,
+            other_projections,
             notifications,
             after_addresses: try_clone_slice(after_addresses)?,
             metadata,
@@ -225,6 +253,7 @@ impl PreparedAddressRouteCommit {
             before,
             candidate,
             mut projection,
+            other_projections,
             notifications,
             after_addresses,
             metadata,
@@ -245,6 +274,7 @@ impl PreparedAddressRouteCommit {
             core::mem::swap(routes, &mut projection);
         });
         drop(smol_iface);
+        other_projections.publish();
         *iface.common().address_metadata().lock() = metadata;
         let mut mirror = iface.router_common().ip_addrs.write();
         *mirror = after_addresses;

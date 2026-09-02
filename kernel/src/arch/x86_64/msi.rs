@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use system_error::SystemError;
 
@@ -15,46 +15,61 @@ const PCI_MSI_VECTOR_INT80: u32 = 128;
 const PCI_MSI_VECTOR_LAST: u32 = 150;
 
 struct PciMsiVectorAllocator {
-    next: AtomicU32,
+    allocated: [AtomicU64; 2],
 }
 
 impl PciMsiVectorAllocator {
     const fn new() -> Self {
         Self {
-            next: AtomicU32::new(PCI_MSI_VECTOR_FIRST),
+            allocated: [AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
     fn alloc(&self) -> Option<IrqNumber> {
-        loop {
-            let current = self.next.load(Ordering::Relaxed);
-            if current > PCI_MSI_VECTOR_LAST {
-                return None;
-            }
-            let next = if current == PCI_MSI_VECTOR_INT80 - 1 {
-                PCI_MSI_VECTOR_INT80 + 1
-            } else {
-                current + 1
-            };
-            if self
-                .next
-                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Some(IrqNumber::new(current));
+        for slot in 0..Self::SLOT_COUNT {
+            let word = slot / 64;
+            let mask = 1u64 << (slot % 64);
+            if self.allocated[word].fetch_or(mask, Ordering::AcqRel) & mask == 0 {
+                let vector = if slot < 64 {
+                    PCI_MSI_VECTOR_FIRST + slot as u32
+                } else {
+                    PCI_MSI_VECTOR_FIRST + slot as u32 + 1
+                };
+                return Some(IrqNumber::new(vector));
             }
         }
+        None
     }
+
+    fn release(&self, vector: IrqNumber) {
+        let value = vector.data();
+        let slot = if (PCI_MSI_VECTOR_FIRST..PCI_MSI_VECTOR_INT80).contains(&value) {
+            value - PCI_MSI_VECTOR_FIRST
+        } else if (PCI_MSI_VECTOR_INT80 + 1..=PCI_MSI_VECTOR_LAST).contains(&value) {
+            value - PCI_MSI_VECTOR_FIRST - 1
+        } else {
+            return;
+        } as usize;
+        let word = slot / 64;
+        let mask = 1u64 << (slot % 64);
+        self.allocated[word].fetch_and(!mask, Ordering::AcqRel);
+    }
+
+    const SLOT_COUNT: usize = (PCI_MSI_VECTOR_LAST - PCI_MSI_VECTOR_FIRST) as usize;
 }
 
 static PCI_MSI_VECTOR_ALLOCATOR: PciMsiVectorAllocator = PciMsiVectorAllocator::new();
 
 /// Reserves a CPU vector from the x86 range owned by PCI MSI/MSI-X.
 ///
-/// Vectors are intentionally not reused. DragonOS does not yet have a safe PCI `free_irq`
-/// lifecycle, so reuse could route a live MSI action to a different device.
 pub fn arch_pci_msi_vector_alloc() -> Option<IrqNumber> {
     PCI_MSI_VECTOR_ALLOCATOR.alloc()
+}
+
+/// Releases a vector only after the owning IRQ action has been synchronously
+/// removed, making reuse safe.
+pub fn arch_pci_msi_vector_release(vector: IrqNumber) {
+    PCI_MSI_VECTOR_ALLOCATOR.release(vector);
 }
 
 /// Rebinds an allocated vector from the blanket IOAPIC setup to message-interrupt semantics.
@@ -97,7 +112,7 @@ pub fn arch_msi_message_data(vector: u16, _processor: u16, trigger: TriggerMode)
 
 #[cfg(test)]
 mod tests {
-    use super::{PciMsiVectorAllocator, PCI_MSI_VECTOR_LAST};
+    use super::{IrqNumber, PciMsiVectorAllocator, PCI_MSI_VECTOR_LAST};
 
     #[test]
     fn pci_msi_vector_allocator_skips_int80_and_exhausts() {
@@ -114,5 +129,9 @@ mod tests {
         assert_eq!(vectors.last().copied(), Some(PCI_MSI_VECTOR_LAST));
         assert_eq!(vectors.len(), 86);
         assert_eq!(allocator.alloc(), None);
+
+        let released = IrqNumber::new(vectors[17]);
+        allocator.release(released);
+        assert_eq!(allocator.alloc(), Some(released));
     }
 }

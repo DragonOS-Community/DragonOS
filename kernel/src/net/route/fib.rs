@@ -156,19 +156,45 @@ impl<'a> FibEditor<'a> {
         Ok(removed)
     }
 
-    pub(super) fn reconcile_address_routes(
+    pub(super) fn reconcile_address_routes<F>(
         &mut self,
         before_routes: &[RouteEntry],
         after_routes: &[RouteEntry],
         ifindex: u32,
         deleted_address: Option<IpAddress>,
-    ) -> Result<PreferredSourceTransitions, SystemError> {
+        preferred_source_remains_usable: F,
+    ) -> Result<PreferredSourceTransitions, SystemError>
+    where
+        F: Fn(RouteEntry) -> bool,
+    {
         // Reserve mutation bookkeeping first. On failure, the candidate is
         // still untouched; subsequent edits keep the candidate's index in
         // lockstep with its authoritative route vector.
         self.record(ifindex)?;
-        self.fib
-            .reconcile_address_routes(before_routes, after_routes, ifindex, deleted_address)
+        if let Some(deleted) = deleted_address {
+            let mut affected_oifs = Vec::new();
+            affected_oifs
+                .try_reserve_exact(self.fib.entries.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            for entry in self.fib.entries.iter().copied() {
+                if entry.preferred_source == Some(deleted)
+                    && !preferred_source_remains_usable(entry)
+                    && (!is_ipv4(deleted) || entry.table == super::RT_TABLE_MAIN)
+                    && !affected_oifs.contains(&entry.oif)
+                {
+                    affected_oifs.push(entry.oif);
+                }
+            }
+            for oif in affected_oifs {
+                self.record(oif)?;
+            }
+        }
+        self.fib.reconcile_address_routes(
+            before_routes,
+            after_routes,
+            deleted_address,
+            preferred_source_remains_usable,
+        )
     }
 
     pub(super) fn finish(self) -> Result<Vec<u32>, SystemError> {
@@ -638,13 +664,16 @@ impl FibTable {
         diff_routes(&before.entries, &self.entries)
     }
 
-    fn reconcile_address_routes(
+    fn reconcile_address_routes<F>(
         &mut self,
         before_routes: &[RouteEntry],
         after_routes: &[RouteEntry],
-        ifindex: u32,
         deleted_address: Option<IpAddress>,
-    ) -> Result<PreferredSourceTransitions, SystemError> {
+        preferred_source_remains_usable: F,
+    ) -> Result<PreferredSourceTransitions, SystemError>
+    where
+        F: Fn(RouteEntry) -> bool,
+    {
         let mut changed_existing_prefixes = Vec::new();
         changed_existing_prefixes
             .try_reserve_exact(before_routes.len())
@@ -678,15 +707,22 @@ impl FibTable {
             while index < self.entries.len() {
                 let entry = self.entries[index];
                 if entry.preferred_source == Some(deleted)
-                    && !(entry.oif == ifindex && after_routes.contains(&entry))
+                    && !preferred_source_remains_usable(entry)
                 {
-                    if entry.oif != ifindex {
-                        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-                    }
                     if is_ipv4(deleted) {
+                        // fib_sync_down_addr() only invalidates the L3
+                        // domain's forwarding table. DragonOS has no VRF/L3
+                        // master yet, so that table is RT_TABLE_MAIN.
+                        if entry.table != super::RT_TABLE_MAIN {
+                            index += 1;
+                            continue;
+                        }
                         self.remove_at(index);
                         continue;
                     }
+                    // Linux IPv6 keeps the route and silently drops a stale
+                    // preferred source. Global IPv6 preferred sources can be
+                    // cross-interface within the namespace's L3 domain.
                     let old = self.entries[index];
                     self.entries[index].preferred_source = None;
                     transitions

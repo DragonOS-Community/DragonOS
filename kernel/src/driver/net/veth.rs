@@ -784,9 +784,7 @@ fn veth_route_test() {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        ns.add_device(a.clone())
-            .expect("register veth fixture interface in netns");
-        register_netdevice(a.clone()).expect("register veth device failed");
+        register_netdevice(&ns, a.clone()).expect("register veth fixture interface");
     };
 
     turn_on(&iface_ns1, INIT_NET_NAMESPACE.clone());
@@ -812,9 +810,7 @@ fn veth_epoll_test() {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        ns.add_device(a.clone())
-            .expect("register veth fixture interface in netns");
-        register_netdevice(a.clone()).expect("register veth device failed");
+        register_netdevice(&ns, a.clone()).expect("register veth fixture interface");
     };
 
     turn_on(&iface1, INIT_NET_NAMESPACE.clone());

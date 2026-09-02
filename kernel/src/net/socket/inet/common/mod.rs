@@ -1,5 +1,7 @@
 use crate::{
-    driver::net::types::InterfaceFlags, net::Iface, process::namespace::net_namespace::NetNamespace,
+    driver::net::types::InterfaceFlags,
+    net::{address::source_address_usable_on_iface, Iface},
+    process::namespace::net_namespace::NetNamespace,
 };
 use alloc::sync::Arc;
 
@@ -419,7 +421,7 @@ fn get_ephemeral_iface(
         ensure_iface_up_for_route(&iface, decision.matched.kind)?;
         // An explicit FIB decision is authoritative, including routes that
         // deliberately send non-loopback destinations through `lo`.
-        let source = route_source_from_decision(&iface, remote_ip_addr, decision)?;
+        let source = route_source_from_decision(&netns, &iface, remote_ip_addr, decision)?;
         return Ok((iface, source));
     }
 
@@ -470,7 +472,7 @@ pub(crate) fn route_source_on_iface(
     let decision = crate::net::route::lookup_on_iface(netns, *remote, iface.nic_id() as u32)
         .ok_or(SystemError::ENETUNREACH)?;
     ensure_iface_up_for_route(iface, decision.matched.kind)?;
-    route_source_from_decision(iface, remote, decision)
+    route_source_from_decision(netns, iface, remote, decision)
 }
 
 fn ensure_iface_up_for_route(iface: &Arc<dyn Iface>, kind: u8) -> Result<(), SystemError> {
@@ -481,6 +483,7 @@ fn ensure_iface_up_for_route(iface: &Arc<dyn Iface>, kind: u8) -> Result<(), Sys
 }
 
 fn route_source_from_decision(
+    netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     remote: &smoltcp::wire::IpAddress,
     decision: crate::net::route::RouteLookupResult,
@@ -488,11 +491,7 @@ fn route_source_from_decision(
     debug_assert_eq!(decision.oif as usize, iface.nic_id());
     match decision.source {
         crate::net::route::RouteSourcePolicy::Preferred(source)
-            if iface
-                .common()
-                .ip_addrs()
-                .iter()
-                .any(|cidr| cidr.address() == source) =>
+            if source_address_usable_on_iface(netns, iface, source) =>
         {
             Ok(source)
         }

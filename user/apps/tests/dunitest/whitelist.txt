@@ -110,6 +110,8 @@ normal/af_packet_e2e
 normal/af_packet_mcast
 normal/rtnetlink_link_semantics
 normal/rtnetlink_permission_semantics
+normal/rtnetlink_addr_semantics
+normal/rtnetlink_route_lifecycle_semantics
 normal/rtnetlink_route_semantics
 normal/rtnetlink_serialization_semantics
 normal/udp_bind_to_device_semantics

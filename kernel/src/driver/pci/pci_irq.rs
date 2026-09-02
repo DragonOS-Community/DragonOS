@@ -49,6 +49,7 @@ pub enum PciIrqError {
     BarGetVaddrFailed,
     MaskNotSupported,
     IrqNotInited,
+    IrqAlreadyConfigured,
 }
 
 /// PCI设备的中断类型
@@ -151,6 +152,21 @@ bitflags! {
 
 /// PciDeviceStructure的子trait，使用继承以直接使用PciDeviceStructure里的接口
 pub trait PciInterrupt: PciDeviceStructure {
+    /// Verifies that the caller may begin a new IRQ ownership transaction.
+    /// The caller must hold this function's `irq_lifecycle` mutex.
+    fn ensure_irq_unowned(&self) -> Result<(), PciError> {
+        let irq_type = self
+            .irq_type_mut()
+            .ok_or(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq))?;
+        let vectors = self
+            .irq_vector_mut()
+            .ok_or(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq))?;
+        if !matches!(*irq_type.read(), IrqType::Unused) || !vectors.read().is_empty() {
+            return Err(PciError::PciIrqError(PciIrqError::IrqAlreadyConfigured));
+        }
+        Ok(())
+    }
+
     /// @brief PCI设备调用该函数选择中断类型
     /// @param self PCI设备的可变引用
     /// @param flag 选择的中断类型（支持多个选择），如PCI_IRQ_ALL_TYPES表示所有中断类型均可，让系统按顺序进行选择
@@ -317,7 +333,14 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
     fn irq_install(&self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_vector) = self.irq_vector_mut() {
-            if msg.irq_common_message.irq_index as usize > irq_vector.read().len() {
+            let vector_len = irq_vector.read().len();
+            // Current irqdesc teardown has exact single-action ownership but
+            // no atomic batch primitive. Reject multi-vector publication
+            // until setup and removal can commit as one batch.
+            if vector_len != 1 {
+                return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
+            }
+            if msg.irq_common_message.irq_index as usize >= vector_len {
                 return Err(PciError::PciIrqError(PciIrqError::InvalidIrqIndex(
                     msg.irq_common_message.irq_index,
                 )));
@@ -325,7 +348,8 @@ pub trait PciInterrupt: PciDeviceStructure {
         }
         self.irq_enable(false)?; //中断设置更改前先关闭对应PCI设备的中断
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type.read() {
+            let irq_kind = *irq_type.read();
+            match irq_kind {
                 IrqType::Msix { .. } => {
                     return self.msix_install(msg);
                 }
@@ -348,7 +372,8 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
     fn msi_install(&self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type.read() {
+            let irq_kind = *irq_type.read();
+            match irq_kind {
                 IrqType::Msi {
                     address_64,
                     irq_max_num,
@@ -356,14 +381,42 @@ pub trait PciInterrupt: PciDeviceStructure {
                     ..
                 } => {
                     // 注意：MSI中断分配的中断号必须连续且大小为2的倍数
-                    if self.irq_vector_mut().unwrap().read().len() > irq_max_num as usize {
+                    let vectors = self.irq_vector_mut().unwrap().read().clone();
+                    if vectors.len() > irq_max_num as usize {
                         return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
                     }
-                    let irq_num = self.irq_vector_mut().unwrap().read()
-                        [msg.irq_common_message.irq_index as usize];
-
-                    let irq_num = IrqNumber::new(irq_num.into());
+                    let irq_num = vectors
+                        .get(msg.irq_common_message.irq_index as usize)
+                        .copied()
+                        .ok_or(PciError::PciIrqError(PciIrqError::InvalidIrqIndex(
+                            msg.irq_common_message.irq_index,
+                        )))?;
                     let common_msg = &msg.irq_common_message;
+
+                    // Prepare every validation which can fail before the IRQ
+                    // action becomes visible in irqdesc.
+                    let programming = if common_msg.irq_index == 0 {
+                        let trigger = match &msg.irq_specific_message {
+                            IrqSpecificMsg::Legacy => {
+                                return Err(PciError::PciIrqError(PciIrqError::IrqTypeUnmatch));
+                            }
+                            IrqSpecificMsg::Msi { trigger_mode, .. } => *trigger_mode,
+                        };
+                        let multiple_message_enable = match vectors.len() {
+                            1 => 0,
+                            2 => 1,
+                            4 => 2,
+                            8 => 3,
+                            16 => 4,
+                            32 => 5,
+                            _ => {
+                                return Err(PciError::PciIrqError(PciIrqError::MxiIrqNumWrong));
+                            }
+                        };
+                        Some((trigger, multiple_message_enable))
+                    } else {
+                        None
+                    };
 
                     let result = irq_manager().request_irq(
                         irq_num,
@@ -398,14 +451,8 @@ pub trait PciInterrupt: PciDeviceStructure {
                     }
 
                     // MSI中断只需配置一次PCI寄存器
-                    if common_msg.irq_index == 0 {
+                    if let Some((trigger, multiple_message_enable)) = programming {
                         let msg_address = arch_msi_message_address(0);
-                        let trigger = match msg.irq_specific_message {
-                            IrqSpecificMsg::Legacy => {
-                                return Err(PciError::PciIrqError(PciIrqError::IrqTypeUnmatch));
-                            }
-                            IrqSpecificMsg::Msi { trigger_mode, .. } => trigger_mode,
-                        };
                         let msg_data = arch_msi_message_data(irq_num.data() as u16, 0, trigger);
                         // 写入Message Data和Message Address
                         if address_64 {
@@ -441,59 +488,14 @@ pub trait PciInterrupt: PciDeviceStructure {
                             cap_offset.into(),
                         );
                         let message_control = (data >> 16) as u16;
-                        match self.irq_vector_mut().unwrap().read().len() {
-                            1 => {
-                                let temp = message_control & (!0x0070);
-                                pci_root_0().write_config(
-                                    self.common_header().bus_device_function,
-                                    cap_offset.into(),
-                                    (temp as u32) << 16,
-                                );
-                            }
-                            2 => {
-                                let temp = message_control & (!0x0070);
-                                pci_root_0().write_config(
-                                    self.common_header().bus_device_function,
-                                    cap_offset.into(),
-                                    ((temp | (0x0001 << 4)) as u32) << 16,
-                                );
-                            }
-                            4 => {
-                                let temp = message_control & (!0x0070);
-                                pci_root_0().write_config(
-                                    self.common_header().bus_device_function,
-                                    cap_offset.into(),
-                                    ((temp | (0x0002 << 4)) as u32) << 16,
-                                );
-                            }
-                            8 => {
-                                let temp = message_control & (!0x0070);
-                                pci_root_0().write_config(
-                                    self.common_header().bus_device_function,
-                                    cap_offset.into(),
-                                    ((temp | (0x0003 << 4)) as u32) << 16,
-                                );
-                            }
-                            16 => {
-                                let temp = message_control & (!0x0070);
-                                pci_root_0().write_config(
-                                    self.common_header().bus_device_function,
-                                    cap_offset.into(),
-                                    ((temp | (0x0004 << 4)) as u32) << 16,
-                                );
-                            }
-                            32 => {
-                                let temp = message_control & (!0x0070);
-                                pci_root_0().write_config(
-                                    self.common_header().bus_device_function,
-                                    cap_offset.into(),
-                                    ((temp | (0x0005 << 4)) as u32) << 16,
-                                );
-                            }
-                            _ => {
-                                return Err(PciError::PciIrqError(PciIrqError::MxiIrqNumWrong));
-                            }
-                        }
+                        let capability_header = data & 0xffff;
+                        let message_control =
+                            (message_control & !0x0070) | ((multiple_message_enable as u16) << 4);
+                        pci_root_0().write_config(
+                            self.common_header().bus_device_function,
+                            cap_offset.into(),
+                            capability_header | (message_control as u32) << 16,
+                        );
                     }
                     return Ok(0);
                 }
@@ -513,20 +515,52 @@ pub trait PciInterrupt: PciDeviceStructure {
     /// @return 一切正常返回Ok(0),有错误返回对应错误原因
     fn msix_install(&self, msg: PciIrqMsg) -> Result<u8, PciError> {
         if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type.read() {
+            let irq_kind = *irq_type.read();
+            match irq_kind {
                 IrqType::Msix {
                     irq_max_num,
                     msix_table_bar,
                     msix_table_offset,
                     ..
                 } => {
-                    if self.irq_vector_mut().unwrap().read().len() > irq_max_num as usize {
+                    let vectors = self.irq_vector_mut().unwrap().read().clone();
+                    if vectors.len() > irq_max_num as usize {
                         return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
                     }
-                    let irq_num = self.irq_vector_mut().unwrap().read()
-                        [msg.irq_common_message.irq_index as usize];
+                    let irq_num = vectors
+                        .get(msg.irq_common_message.irq_index as usize)
+                        .copied()
+                        .ok_or(PciError::PciIrqError(PciIrqError::InvalidIrqIndex(
+                            msg.irq_common_message.irq_index,
+                        )))?;
 
                     let common_msg = &msg.irq_common_message;
+
+                    // Resolve every device-provided MSI-X table parameter
+                    // before request_irq publishes an action.
+                    let trigger = match &msg.irq_specific_message {
+                        IrqSpecificMsg::Legacy => {
+                            return Err(PciError::PciIrqError(PciIrqError::IrqTypeUnmatch));
+                        }
+                        IrqSpecificMsg::Msi { trigger_mode, .. } => *trigger_mode,
+                    };
+                    let msix_entry = {
+                        let pcistandardbar = self
+                            .bar()
+                            .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?
+                            .read();
+                        let msix_bar = pcistandardbar.get_bar(msix_table_bar)?;
+                        let vaddr = msix_bar
+                            .virtual_address_at(
+                                u64::from(msix_table_offset)
+                                    + msg.irq_common_message.irq_index as u64
+                                        * size_of::<MsixEntry>() as u64,
+                                size_of::<MsixEntry>(),
+                            )
+                            .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?;
+                        NonNull::new(vaddr.data() as *mut MsixEntry)
+                            .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?
+                    };
 
                     let result = irq_manager().request_irq(
                         irq_num,
@@ -561,28 +595,7 @@ pub trait PciInterrupt: PciDeviceStructure {
                     }
 
                     let msg_address = arch_msi_message_address(0);
-                    let trigger = match msg.irq_specific_message {
-                        IrqSpecificMsg::Legacy => {
-                            return Err(PciError::PciIrqError(PciIrqError::IrqTypeUnmatch));
-                        }
-                        IrqSpecificMsg::Msi { trigger_mode, .. } => trigger_mode,
-                    };
                     let msg_data = arch_msi_message_data(irq_num.data() as u16, 0, trigger);
-                    //写入Message Data和Message Address
-                    let pcistandardbar = self
-                        .bar()
-                        .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?
-                        .read();
-                    let msix_bar = pcistandardbar.get_bar(msix_table_bar)?;
-                    let vaddr: crate::mm::VirtAddr = msix_bar
-                        .virtual_address_at(
-                            u64::from(msix_table_offset)
-                                + msg.irq_common_message.irq_index as u64
-                                    * size_of::<MsixEntry>() as u64,
-                            size_of::<MsixEntry>(),
-                        )
-                        .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?;
-                    let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     // 这里的操作并不适用于所有架构，需要再优化，msg_upper_data并不一定为0
                     unsafe {
                         volwrite!(msix_entry, vector_control, 0);
@@ -603,130 +616,150 @@ pub trait PciInterrupt: PciDeviceStructure {
         return Err(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq));
     }
     /// @brief 进行PCI设备中断的卸载
-    /// @param self PCI设备的可变引用
-    fn irq_uninstall(&mut self) -> Result<u8, PciError> {
+    /// @param self PCI设备引用；中断状态由内部锁保护
+    fn irq_uninstall(&self, dev_id: Option<&Arc<DeviceId>>) -> Result<u8, PciError> {
+        let _lifecycle_guard = self.common_header().irq_lifecycle.lock();
+        self.irq_uninstall_locked(dev_id)
+    }
+
+    /// Allocation-free teardown with the caller holding `irq_lifecycle`.
+    fn irq_uninstall_locked(&self, dev_id: Option<&Arc<DeviceId>>) -> Result<u8, PciError> {
         self.irq_enable(false)?; //中断设置更改前先关闭对应PCI设备的中断
-        if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type.read() {
-                IrqType::Msix { .. } => {
-                    return self.msix_uninstall();
-                }
-                IrqType::Msi { .. } => {
-                    return self.msi_uninstall();
-                }
-                IrqType::Unused => {
-                    return Err(PciError::PciIrqError(PciIrqError::IrqNotInited));
-                }
-                _ => {
-                    return Err(PciError::PciIrqError(PciIrqError::IrqTypeNotSupported));
-                }
+        let irq_type = self
+            .irq_type_mut()
+            .ok_or(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq))?;
+        // Snapshot state protected by preemption-disabling locks before the
+        // synchronous free_irq path. free_irq may schedule while waiting for
+        // an in-flight handler, so no PCI RwLock guard may cross this point.
+        let irq_kind = *irq_type.read();
+        let vectors = if let Some(vectors) = self.irq_vector_mut() {
+            let mut vectors = vectors.write();
+            if vectors.len() > 1 {
+                return Err(PciError::PciIrqError(PciIrqError::DeviceIrqOverflow));
             }
-        }
-        return Err(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq));
+            core::mem::take(&mut *vectors)
+        } else {
+            Vec::new()
+        };
+        let result = match irq_kind {
+            IrqType::Msix {
+                msix_table_bar,
+                msix_table_offset,
+                ..
+            } => self.msix_uninstall(dev_id, &vectors, msix_table_bar, msix_table_offset),
+            IrqType::Msi {
+                address_64,
+                cap_offset,
+                ..
+            } => self.msi_uninstall(dev_id, &vectors, address_64, cap_offset),
+            IrqType::Unused => Err(PciError::PciIrqError(PciIrqError::IrqNotInited)),
+            _ => Err(PciError::PciIrqError(PciIrqError::IrqTypeNotSupported)),
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // Restore the device's vector bookkeeping when mode-specific
+                // teardown reports failure; taking the Vec must not itself
+                // change the externally visible retry state.
+                if let Some(irq_vectors) = self.irq_vector_mut() {
+                    *irq_vectors.write() = vectors;
+                }
+                return Err(error);
+            }
+        };
+        *irq_type.write() = IrqType::Unused;
+        Ok(result)
     }
     /// @brief 进行PCI设备中断的卸载（MSI）
     /// @param self PCI设备的可变引用
-    fn msi_uninstall(&self) -> Result<u8, PciError> {
-        if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type.read() {
-                IrqType::Msi {
-                    address_64,
-                    cap_offset,
-                    ..
-                } => {
-                    for vector in self.irq_vector_mut().unwrap().read().iter() {
-                        let irq = IrqNumber::new((*vector).into());
-                        irq_manager().free_irq(irq, None);
-                    }
-                    pci_root_0().write_config(
-                        self.common_header().bus_device_function,
-                        cap_offset.into(),
-                        0,
-                    );
-                    pci_root_0().write_config(
-                        self.common_header().bus_device_function,
-                        (cap_offset + 4).into(),
-                        0,
-                    );
-                    pci_root_0().write_config(
-                        self.common_header().bus_device_function,
-                        (cap_offset + 8).into(),
-                        0,
-                    );
-                    if address_64 {
-                        pci_root_0().write_config(
-                            self.common_header().bus_device_function,
-                            (cap_offset + 12).into(),
-                            0,
-                        );
-                    }
-                    return Ok(0);
-                }
-                IrqType::Unused => {
-                    return Err(PciError::PciIrqError(PciIrqError::IrqNotInited));
-                }
-                _ => {
-                    return Err(PciError::PciIrqError(PciIrqError::IrqTypeUnmatch));
-                }
-            }
+    fn msi_uninstall(
+        &self,
+        dev_id: Option<&Arc<DeviceId>>,
+        vectors: &[IrqNumber],
+        address_64: bool,
+        cap_offset: u8,
+    ) -> Result<u8, PciError> {
+        for vector in vectors {
+            let irq = IrqNumber::new((*vector).into());
+            irq_manager()
+                .free_irq(irq, dev_id)
+                .map_err(|_| PciError::PciIrqError(PciIrqError::InvalidIrqNum(irq)))?;
         }
-        return Err(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq));
+        // irq_enable(false) already cleared MSI Enable. Preserve
+        // the capability header and only clear programmed message
+        // payload so capability discovery and reprobe remain valid.
+        pci_root_0().write_config(
+            self.common_header().bus_device_function,
+            (cap_offset + 4).into(),
+            0,
+        );
+        pci_root_0().write_config(
+            self.common_header().bus_device_function,
+            (cap_offset + 8).into(),
+            0,
+        );
+        if address_64 {
+            pci_root_0().write_config(
+                self.common_header().bus_device_function,
+                (cap_offset + 12).into(),
+                0,
+            );
+        }
+        Ok(0)
     }
     /// @brief 进行PCI设备中断的卸载(MSIX)
     /// @param self PCI设备的可变引用
-    fn msix_uninstall(&self) -> Result<u8, PciError> {
-        if let Some(irq_type) = self.irq_type_mut() {
-            match *irq_type.read() {
-                IrqType::Msix {
-                    irq_max_num,
-                    cap_offset,
-                    msix_table_bar,
-                    msix_table_offset,
-                    ..
-                } => {
-                    for vector in self.irq_vector_mut().unwrap().read().iter() {
-                        let irq = IrqNumber::new((*vector).into());
-                        irq_manager().free_irq(irq, None);
-                    }
-                    pci_root_0().write_config(
-                        self.common_header().bus_device_function,
-                        cap_offset.into(),
-                        0,
-                    );
-                    let pcistandardbar = self
-                        .bar()
-                        .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))
-                        .unwrap()
-                        .read();
-                    let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
-                    for index in 0..irq_max_num {
-                        let vaddr = msix_bar
-                            .virtual_address_at(
-                                u64::from(msix_table_offset)
-                                    + index as u64 * size_of::<MsixEntry>() as u64,
-                                size_of::<MsixEntry>(),
-                            )
-                            .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))
-                            .unwrap();
-                        let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
-                        unsafe {
-                            volwrite!(msix_entry, vector_control, 0);
-                            volwrite!(msix_entry, msg_data, 0);
-                            volwrite!(msix_entry, msg_upper_addr, 0);
-                            volwrite!(msix_entry, msg_addr, 0);
-                        }
-                    }
-                    return Ok(0);
-                }
-                IrqType::Unused => {
-                    return Err(PciError::PciIrqError(PciIrqError::IrqNotInited));
-                }
-                _ => {
-                    return Err(PciError::PciIrqError(PciIrqError::IrqTypeUnmatch));
+    fn msix_uninstall(
+        &self,
+        dev_id: Option<&Arc<DeviceId>>,
+        vectors: &[IrqNumber],
+        msix_table_bar: u8,
+        msix_table_offset: u32,
+    ) -> Result<u8, PciError> {
+        // Validate every entry this driver actually programmed before
+        // removing any published action. The capability's total table size is
+        // device-provided and is not a teardown ownership boundary.
+        let programmed_entries = if vectors.is_empty() {
+            None
+        } else {
+            let pcistandardbar = self
+                .bar()
+                .ok_or(PciError::PciIrqError(PciIrqError::PciBarNotInited))?
+                .read();
+            let msix_bar = pcistandardbar.get_bar(msix_table_bar)?;
+            let table_bytes = vectors
+                .len()
+                .checked_mul(size_of::<MsixEntry>())
+                .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?;
+            let vaddr = msix_bar
+                .virtual_address_at(u64::from(msix_table_offset), table_bytes)
+                .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?;
+            Some(
+                NonNull::new(vaddr.data() as *mut MsixEntry)
+                    .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?,
+            )
+        };
+        for vector in vectors {
+            let irq = IrqNumber::new((*vector).into());
+            irq_manager()
+                .free_irq(irq, dev_id)
+                .map_err(|_| PciError::PciIrqError(PciIrqError::InvalidIrqNum(irq)))?;
+        }
+        if let Some(programmed_entries) = programmed_entries {
+            for index in 0..vectors.len() {
+                // SAFETY: the complete owned span was bounds-checked before
+                // free_irq, and PCI BAR mappings stay stable for device life.
+                let msix_entry =
+                    unsafe { NonNull::new_unchecked(programmed_entries.as_ptr().add(index)) };
+                unsafe {
+                    volwrite!(msix_entry, vector_control, 1);
+                    volwrite!(msix_entry, msg_data, 0);
+                    volwrite!(msix_entry, msg_upper_addr, 0);
+                    volwrite!(msix_entry, msg_addr, 0);
                 }
             }
         }
-        return Err(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq));
+        Ok(0)
     }
     /// @brief 屏蔽相应位置的中断
     /// @param self PCI设备的可变引用

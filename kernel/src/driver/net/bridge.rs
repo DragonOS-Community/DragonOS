@@ -332,11 +332,8 @@ fn bridge_probe() {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        INIT_NET_NAMESPACE
-            .add_device(a.clone())
+        register_netdevice(&INIT_NET_NAMESPACE, a.clone())
             .expect("register bridge fixture interface in root netns");
-
-        register_netdevice(a.clone()).expect("register veth device failed");
     };
 
     turn_on(&iface1);

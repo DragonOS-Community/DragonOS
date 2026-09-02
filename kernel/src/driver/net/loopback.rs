@@ -635,8 +635,6 @@ pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
     // 标识网络设备已经启动
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
 
-    register_netdevice(iface.clone()).expect("register lo device failed");
-
     iface
 }
 
@@ -656,8 +654,7 @@ pub fn loopback_driver_init() {
 
         let iface = generate_loopback_iface_default();
 
-        INIT_NET_NAMESPACE
-            .add_device(iface.clone())
+        register_netdevice(&INIT_NET_NAMESPACE, iface.clone())
             .expect("register loopback in root netns");
         INIT_NET_NAMESPACE.set_loopback_iface(iface.clone());
     });

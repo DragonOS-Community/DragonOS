@@ -327,7 +327,7 @@ impl E1000EInterface {
         });
 
         // 设置 NAPI：让收包处理走 bounded poll（对齐 Linux NAPI/ksoftirqd）。
-        let napi_struct = NapiStruct::new(iface.clone(), 10);
+        let napi_struct = NapiStruct::new_disabled(iface.clone(), 10);
         *iface.common.napi_struct.write() = Some(napi_struct);
 
         // 设置 driver 对接口的弱引用，用于 packet socket 分发
@@ -541,32 +541,41 @@ impl KObject for E1000EInterface {
     }
 }
 
-pub fn e1000e_driver_init(device: E1000EDevice, dev_id: Arc<DeviceId>) {
+pub fn e1000e_driver_init(device: E1000EDevice, dev_id: Arc<DeviceId>) -> Result<(), SystemError> {
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&device.mac_address());
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
     // 标识网络设备已经启动
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
 
-    // 将网卡的接口信息注册到全局的网卡接口信息表中
-    // NET_DEVICES
-    //     .write_irqsave()
-    //     .insert(iface.nic_id(), iface.clone());
-    INIT_NET_NAMESPACE
-        .add_device(iface.clone())
-        .expect("register e1000e interface in root netns");
-
-    info!("e1000e driver init successfully!\tMAC: [{}]", mac);
-
-    register_netdevice(iface.clone()).expect("register lo device failed");
-
     // 注册 IRQ -> NAPI 映射：使 e1000e IRQ handler 在 hardirq 内直接 napi_schedule，
     // 避免唤醒 netns 线程扫描 device_list（对齐 Linux NAPI 语义）。
+    let mut napi_registered = false;
     if let Some(napi) = iface.napi_struct() {
-        e1000e_irq_manager()
-            .register_napi(dev_id, napi)
-            .expect("register e1000e napi irq mapping failed");
+        e1000e_irq_manager().register_napi(dev_id.clone(), napi)?;
+        napi_registered = true;
     } else {
         log::warn!("e1000e iface has no napi_struct; irq mapping not registered");
     }
+
+    if let Err(error) = register_netdevice(&INIT_NET_NAMESPACE, iface.clone()) {
+        let teardown = iface.driver.inner.lock().prepare_quiesce();
+        if let Some(teardown) = teardown {
+            teardown.finish();
+        }
+        if napi_registered {
+            e1000e_irq_manager().unregister_napi(&dev_id);
+        }
+        return Err(error);
+    }
+
+    if let Some(napi) = iface.napi_struct() {
+        crate::driver::net::napi::napi_enable(&napi);
+        // Drain work which may have arrived while the provisional IRQ mapping
+        // was intentionally unable to schedule NAPI.
+        crate::driver::net::napi::napi_schedule(napi);
+    }
+
+    info!("e1000e driver init successfully!\tMAC: [{}]", mac);
+    Ok(())
 }

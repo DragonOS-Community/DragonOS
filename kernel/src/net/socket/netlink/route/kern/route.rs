@@ -266,7 +266,7 @@ impl ParsedRouteRequest {
 fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
     validate_mutation_family(request.body().family)?;
     validate_mutation_tos(request.body().family, request.body().tos)?;
-    if request.body().flags.bits() & !RouteFlags::ONLINK.bits() != 0 {
+    if request.body().raw_flags & !RouteFlags::ONLINK.bits() != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     if request.body().type_ > RTN_MAX {
@@ -312,7 +312,7 @@ fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
 fn validate_delete_request(request: &RouteSegment) -> Result<(), SystemError> {
     validate_mutation_family(request.body().family)?;
     validate_mutation_tos(request.body().family, request.body().tos)?;
-    if !request.body().flags.is_empty() {
+    if request.body().raw_flags != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     if request.body().type_ > RTN_MAX {
@@ -374,13 +374,11 @@ fn validate_get_request(request: &RouteSegment) -> Result<(), SystemError> {
     }
     match request.body().family {
         AddressFamily::INet => {
-            if request.body().flags.bits() & !RouteFlags::LOOKUP_TABLE.bits() != 0 {
+            if request.body().raw_flags & !RouteFlags::LOOKUP_TABLE.bits() != 0 {
                 return Err(SystemError::EINVAL);
             }
         }
-        AddressFamily::INet6 if !request.body().flags.is_empty() => {
-            return Err(SystemError::EINVAL)
-        }
+        AddressFamily::INet6 if request.body().raw_flags != 0 => return Err(SystemError::EINVAL),
         AddressFamily::INet6 => {}
         _ => unreachable!(),
     }
@@ -582,6 +580,11 @@ fn route_to_segment(
     output: bool,
     nlmsg_flags: u16,
 ) -> Result<RouteSegment, SystemError> {
+    let body_flags = if output {
+        flags
+    } else {
+        flags | RouteFlags::from_bits_truncate(route.nexthop_flags as u32)
+    };
     let body = RouteSegmentBody {
         family: family_of_ip(route.destination.address()),
         dst_len: route.destination.prefix_len(),
@@ -595,11 +598,8 @@ fn route_to_segment(
         protocol: route.protocol,
         scope: route.scope,
         type_: route.kind,
-        flags: if output {
-            flags
-        } else {
-            flags | RouteFlags::from_bits_truncate(route.nexthop_flags as u32)
-        },
+        raw_flags: body_flags.bits(),
+        flags: body_flags,
     };
     let header = CMsgSegHdr {
         len: 0,

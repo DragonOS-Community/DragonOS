@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
@@ -203,6 +204,28 @@ int SetLinkName(int fd, uint32_t ifindex, const char* name, uint32_t sequence) {
     message->ifi_index = static_cast<int>(ifindex);
     AddAttr(&request, IFLA_IFNAME, name, std::strlen(name) + 1);
     return SendAndReceiveAck(fd, request);
+}
+
+int SetLinkNameAndState(int fd, uint32_t ifindex, const char* name, bool up,
+                        uint32_t sequence, std::optional<uint32_t> mtu = std::nullopt) {
+    auto request = NewRequest<ifinfomsg>(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, sequence);
+    auto* message = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(request.data()));
+    message->ifi_family = AF_UNSPEC;
+    message->ifi_index = static_cast<int>(ifindex);
+    message->ifi_flags = up ? IFF_UP : 0;
+    message->ifi_change = IFF_UP;
+    AddAttr(&request, IFLA_IFNAME, name, std::strlen(name) + 1);
+    if (mtu.has_value()) AddAttr(&request, IFLA_MTU, &*mtu, sizeof(*mtu));
+    return SendAndReceiveAck(fd, request);
+}
+
+std::optional<bool> LinkIsUp(const char* name) {
+    FdGuard fd(socket(AF_INET, SOCK_DGRAM, 0));
+    if (fd.Get() < 0) return std::nullopt;
+    ifreq request{};
+    std::strncpy(request.ifr_name, name, IFNAMSIZ - 1);
+    if (ioctl(fd.Get(), SIOCGIFFLAGS, &request) != 0) return std::nullopt;
+    return (request.ifr_flags & IFF_UP) != 0;
 }
 
 int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& address,
@@ -807,6 +830,58 @@ int RunIdentityFlagsAndErrorPriority() {
     return 0;
 }
 
+int RunCombinedRenameAndLinkState() {
+    FdGuard fd;
+    uint32_t ifindex = 0;
+    uint32_t sequence = 1800;
+    if (const int error = PrepareNamespace(&fd, &ifindex, &sequence); error != 0) return error;
+    FdGuard notifications(OpenRouteSocket(RTMGRP_IPV4_IFADDR));
+    if (notifications.Get() < 0) return 4400 + errno;
+
+    const AddressSpec primary = MakeAddress(AF_INET, "127.0.0.1", 8, ifindex);
+    const AddressSpec preserved = MakeAddress(AF_INET, "198.51.100.51", 24, ifindex);
+    const AddressSpec generated = MakeAddress(AF_INET, "198.51.100.52", 24, ifindex);
+    if (ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, preserved, true,
+                      true, ++sequence, "lo:7") != 0 ||
+        ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, generated, true,
+                      true, ++sequence, "plain") != 0) {
+        return 4410;
+    }
+
+    // A later invalid attribute must reject the whole combined request before
+    // publishing either the requested name or administrative state.
+    if (SetLinkNameAndState(fd.Get(), ifindex, "bad0", false, ++sequence, 0) != EINVAL ||
+        if_nametoindex("lo") != ifindex || if_nametoindex("bad0") != 0 ||
+        LinkIsUp("lo") != std::optional<bool>(true)) {
+        return 4420;
+    }
+
+    DrainNotifications(notifications.Get());
+    if (SetLinkNameAndState(fd.Get(), ifindex, "txn0", false, ++sequence) != 0 ||
+        if_nametoindex("txn0") != ifindex || if_nametoindex("lo") != 0 ||
+        LinkIsUp("txn0") != std::optional<bool>(false) ||
+        CountAddressWithLabel(fd.Get(), primary, "txn0", ++sequence) != 1 ||
+        CountAddressWithLabel(fd.Get(), preserved, "txn0:7", ++sequence) != 1 ||
+        CountAddressWithLabel(fd.Get(), generated, "txn0:3", ++sequence) != 1 ||
+        CountAddressNotifications(notifications.Get(), RTM_NEWADDR, preserved, "txn0:7") != 1) {
+        return 4430;
+    }
+
+    DrainNotifications(notifications.Get());
+    if (SetLinkNameAndState(fd.Get(), ifindex, "txn1", true, ++sequence) != 0 ||
+        if_nametoindex("txn1") != ifindex || if_nametoindex("txn0") != 0 ||
+        LinkIsUp("txn1") != std::optional<bool>(true) ||
+        CountAddressWithLabel(fd.Get(), primary, "txn1", ++sequence) != 1 ||
+        CountAddressWithLabel(fd.Get(), preserved, "txn1:7", ++sequence) != 1 ||
+        CountAddressWithLabel(fd.Get(), generated, "txn1:3", ++sequence) != 1 ||
+        CountAddressNotifications(notifications.Get(), RTM_NEWADDR, generated, "txn1:3") != 1) {
+        return 4440;
+    }
+    return 0;
+}
+
 int RunInvalidAddressSafety() {
     FdGuard fd;
     uint32_t ifindex = 0;
@@ -1210,6 +1285,11 @@ TEST(RtnetlinkAddressSemantics, MultipleAddressesStayConsistentAcrossAddrRouteAn
 TEST(RtnetlinkAddressSemantics, DuplicateReplaceDeleteAndParserSemanticsMatchLinux) {
     ExpectSuccessfulChild(RunWithWatchdog(RunIdentityFlagsAndErrorPriority),
                           "address identity or error-priority request deadlocked");
+}
+
+TEST(RtnetlinkAddressSemantics, CombinedRenameAndLinkStatePublishesOnePreparedGeneration) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunCombinedRenameAndLinkState),
+                          "combined link rename/state transaction deadlocked");
 }
 
 TEST(RtnetlinkAddressSemantics, InvalidAddressCannotPanicKernel) {

@@ -44,6 +44,14 @@ impl NapiStruct {
         })
     }
 
+    /// Creates a NAPI instance that cannot be scheduled until its device
+    /// registration transaction has committed.
+    pub fn new_disabled(net_device: Arc<dyn Iface>, weight: usize) -> Arc<Self> {
+        let napi = Self::new(net_device, weight);
+        napi_disable(&napi);
+        napi
+    }
+
     fn poll(&self, budget: usize) -> Option<(Arc<dyn Iface>, NapiPollResult)> {
         if let Some(iface) = self.net_device.upgrade() {
             let result = match iface.common().poll_scope() {
@@ -225,6 +233,14 @@ pub fn napi_complete(napi: Arc<NapiStruct>) {
 /// a scheduler and orphan its newly acquired owner.
 pub(crate) fn napi_disable(napi: &NapiStruct) {
     napi_state::disable(&napi.state);
+}
+
+/// Publishes a previously disabled NAPI instance after device registration.
+pub(crate) fn napi_enable(napi: &NapiStruct) {
+    napi.state.fetch_and(
+        !NapiState::DISABLE.bits(),
+        core::sync::atomic::Ordering::Release,
+    );
 }
 
 pub(crate) fn napi_schedule_prep(napi: &NapiStruct) -> ScheduleState {

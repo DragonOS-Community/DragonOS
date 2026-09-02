@@ -299,15 +299,15 @@ fn notify_link_route_changes(
     netns: &Arc<NetNamespace>,
     changes: crate::net::route::RouteNotifications,
 ) {
-    // Linux 6.6's NETDEV_DOWN path marks IPv4 nexthops dead and fib_flush()
-    // removes the aliases without RTM_DELROUTE. Link-up address-derived routes
-    // are regular insertions and do emit RTM_NEWROUTE. Keep that asymmetric ABI
-    // policy here instead of treating the internal FIB delta as notifications.
-    let crate::net::route::RouteNotifications { added, removed: _ } = changes;
+    // Linux 6.6 withdraws IPv4 aliases silently through fib_flush(), while
+    // fib6_ifdown emits RTM_DELROUTE. Link-up address-derived routes are regular
+    // insertions and emit RTM_NEWROUTE for both families.
+    let crate::net::route::RouteNotifications { added, removed } = changes;
+    for route in removed {
+        super::route::notify_route(netns, CSegmentType::DELROUTE, route);
+    }
     for route in added {
-        if let Err(error) = super::route::notify_route(netns, CSegmentType::NEWROUTE, route) {
-            log::warn!("failed to notify link-up connected route: {:?}", error);
-        }
+        super::route::notify_route(netns, CSegmentType::NEWROUTE, route);
     }
 }
 

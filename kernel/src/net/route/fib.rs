@@ -4,9 +4,10 @@ use smoltcp::wire::IpAddress;
 use system_error::SystemError;
 
 use super::{
-    fib_index::FibIndex, is_ipv4, same_family, RouteDeleteSelector, RouteEntry, RouteLookupResult,
-    RouteMutationOutcome, RouteNewFlags, RouteNotifications, RouteSourcePolicy, RTN_BROADCAST,
-    RT_SCOPE_LINK,
+    fib_index::{projection_key, FibIndex, ProjectionKey},
+    is_ipv4, same_family, RouteDeleteSelector, RouteEntry, RouteLookupResult, RouteMutationOutcome,
+    RouteNewFlags, RouteNotifications, RouteSourcePolicy, RTN_BROADCAST, RT_SCOPE_LINK,
+    RT_TABLE_LOCAL,
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -18,6 +19,51 @@ pub(in crate::net) struct FibTable {
 pub(super) struct FibDelta {
     pub removed: Vec<RouteEntry>,
     pub added: Vec<RouteEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum FibEdit {
+    Insert {
+        index: usize,
+        route: RouteEntry,
+        before: Option<usize>,
+    },
+    Replace {
+        index: usize,
+        old: RouteEntry,
+        new: RouteEntry,
+    },
+    Delete {
+        index: usize,
+        route: RouteEntry,
+    },
+    None,
+}
+
+pub(super) struct PlannedFibMutation<T> {
+    pub edit: FibEdit,
+    pub outcome: T,
+}
+
+impl FibEdit {
+    fn removes_index(self, index: usize) -> bool {
+        matches!(
+            self,
+            Self::Replace {
+                index: removed, ..
+            } | Self::Delete {
+                index: removed, ..
+            } if removed == index
+        )
+    }
+
+    fn inserted_route(self) -> Option<(usize, RouteEntry)> {
+        match self {
+            Self::Insert { index, route, .. } => Some((index, route)),
+            Self::Replace { index, new, .. } => Some((index, new)),
+            Self::Delete { .. } | Self::None => None,
+        }
+    }
 }
 
 impl FibDelta {
@@ -55,24 +101,6 @@ impl<'a> FibEditor<'a> {
         Ok(())
     }
 
-    pub(super) fn insert(
-        &mut self,
-        route: RouteEntry,
-        flags: RouteNewFlags,
-    ) -> Result<RouteMutationOutcome, SystemError> {
-        let outcome = self.fib.insert(route, flags)?;
-        match outcome {
-            RouteMutationOutcome::Added { route, .. } | RouteMutationOutcome::Unchanged(route) => {
-                self.record(route.oif)?
-            }
-            RouteMutationOutcome::Replaced { old, new } => {
-                self.record(old.oif)?;
-                self.record(new.oif)?;
-            }
-        }
-        Ok(outcome)
-    }
-
     pub(super) fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
         let inserted = self.fib.insert_derived(route)?;
         if inserted {
@@ -81,30 +109,50 @@ impl<'a> FibEditor<'a> {
         Ok(inserted)
     }
 
-    pub(super) fn delete(
-        &mut self,
-        selector: RouteDeleteSelector,
-    ) -> Result<RouteEntry, SystemError> {
-        let removed = self.fib.delete(selector)?;
-        self.record(removed.oif)?;
-        Ok(removed)
-    }
-
     pub(super) fn remove_where(
         &mut self,
         predicate: impl Fn(RouteEntry) -> bool,
-    ) -> Result<(), SystemError> {
+    ) -> Result<Vec<RouteEntry>, SystemError> {
         // Record every affected projection before mutating the candidate. If
         // bookkeeping allocation fails, the transaction can still abort with
         // its candidate untouched.
+        let removed_count = self
+            .fib
+            .entries
+            .iter()
+            .filter(|route| predicate(**route))
+            .count();
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(removed_count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut old_to_new = Vec::new();
+        old_to_new
+            .try_reserve_exact(self.fib.entries.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut next_index = 0;
         for index in 0..self.fib.entries.len() {
             let route = self.fib.entries[index];
             if predicate(route) {
                 self.record(route.oif)?;
+                removed.push(route);
+                old_to_new.push(None);
+            } else {
+                old_to_new.push(Some(next_index));
+                next_index += 1;
             }
         }
-        self.fib.entries.retain(|route| !predicate(*route));
-        Ok(())
+        if removed.is_empty() {
+            return Ok(removed);
+        }
+        let mut old_index = 0;
+        self.fib.entries.retain(|_| {
+            let retain = old_to_new[old_index].is_some();
+            old_index += 1;
+            retain
+        });
+        self.fib.index.commit_retain(&old_to_new, &self.fib.entries);
+        Ok(removed)
     }
 
     pub(super) fn reconcile_address_routes(
@@ -115,15 +163,14 @@ impl<'a> FibEditor<'a> {
         deleted_address: Option<IpAddress>,
     ) -> Result<PreferredSourceTransitions, SystemError> {
         // Reserve mutation bookkeeping first. On failure, the candidate is
-        // still untouched; on success, finish() is the single index rebuild
-        // boundary shared with every other FIB edit.
+        // still untouched; subsequent edits keep the candidate's index in
+        // lockstep with its authoritative route vector.
         self.record(ifindex)?;
         self.fib
             .reconcile_address_routes(before_routes, after_routes, ifindex, deleted_address)
     }
 
     pub(super) fn finish(self) -> Result<Vec<u32>, SystemError> {
-        self.fib.rebuild_index()?;
         Ok(self.affected_oifs)
     }
 }
@@ -228,13 +275,254 @@ impl FibTable {
         Ok(self.try_clone()?.entries)
     }
 
-    pub(super) fn entries(&self) -> &[RouteEntry] {
-        &self.entries
+    pub(super) fn projection_for_iface(
+        &self,
+        ifindex: u32,
+    ) -> Result<Vec<smoltcp::iface::Route>, SystemError> {
+        self.index.projection_for_iface(&self.entries, ifindex)
     }
 
-    fn rebuild_index(&mut self) -> Result<(), SystemError> {
-        self.index = FibIndex::build(&self.entries)?;
-        Ok(())
+    pub(super) fn plan_insert(
+        &self,
+        route: RouteEntry,
+        flags: RouteNewFlags,
+    ) -> Result<PlannedFibMutation<RouteMutationOutcome>, SystemError> {
+        let mut first = None;
+        let mut last = None;
+        let mut exact = None;
+        let candidates = self.index.prefix_candidates(route);
+        for (position, index) in candidates.iter().copied().enumerate() {
+            let existing = self.entries[index];
+            if conflict_group(existing, route) {
+                first.get_or_insert((position, index));
+                last = Some((position, index));
+                if existing == route {
+                    exact = Some(index);
+                }
+            }
+        }
+
+        if flags.excl && first.is_some() {
+            return Err(SystemError::EEXIST);
+        }
+        if flags.replace {
+            if let Some((_, first)) = first {
+                if is_ipv4(route.destination.address()) {
+                    if exact == Some(first) {
+                        return Ok(PlannedFibMutation {
+                            edit: FibEdit::None,
+                            outcome: RouteMutationOutcome::Unchanged(route),
+                        });
+                    }
+                    if exact.is_some() {
+                        return Err(SystemError::EEXIST);
+                    }
+                }
+                let old = self.entries[first];
+                return Ok(PlannedFibMutation {
+                    edit: FibEdit::Replace {
+                        index: first,
+                        old,
+                        new: route,
+                    },
+                    outcome: RouteMutationOutcome::Replaced { old, new: route },
+                });
+            }
+            if !flags.create {
+                return Err(SystemError::ENOENT);
+            }
+        } else if exact.is_some() {
+            return Err(SystemError::EEXIST);
+        }
+
+        if !flags.create {
+            return Err(SystemError::ENOENT);
+        }
+        if !is_ipv4(route.destination.address()) && first.is_some() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+
+        let before = if let Some((last_position, _)) = last {
+            if flags.append {
+                candidates.get(last_position + 1).copied()
+            } else {
+                Some(first.expect("a last conflict implies a first conflict").1)
+            }
+        } else {
+            candidates
+                .iter()
+                .copied()
+                .find(|index| self.entries[*index].priority > route.priority)
+        };
+        Ok(PlannedFibMutation {
+            edit: FibEdit::Insert {
+                index: self.entries.len(),
+                route,
+                before,
+            },
+            outcome: RouteMutationOutcome::Added {
+                route,
+                appended: flags.append && first.is_some(),
+            },
+        })
+    }
+
+    pub(super) fn plan_delete(
+        &self,
+        selector: RouteDeleteSelector,
+    ) -> Result<PlannedFibMutation<RouteEntry>, SystemError> {
+        let probe = RouteEntry {
+            destination: selector.destination,
+            table: selector.table,
+            source: None,
+            preferred_source: None,
+            priority: 0,
+            tos: 0,
+            protocol: 0,
+            scope: 0,
+            kind: 0,
+            oif: 0,
+            gateway: None,
+            nexthop_flags: 0,
+        };
+        let index = self
+            .index
+            .prefix_candidates(probe)
+            .iter()
+            .copied()
+            .find(|index| delete_matches(self.entries[*index], selector))
+            .ok_or(SystemError::ESRCH)?;
+        let route = self.entries[index];
+        Ok(PlannedFibMutation {
+            edit: FibEdit::Delete { index, route },
+            outcome: route,
+        })
+    }
+
+    pub(super) fn reserve_edit(&mut self, edit: FibEdit) -> Result<(), SystemError> {
+        match edit {
+            FibEdit::Insert { route, .. } => {
+                self.entries
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                self.index.prepare_insert(route)
+            }
+            FibEdit::Replace { new, .. } => self.index.prepare_insert(new),
+            FibEdit::Delete { .. } | FibEdit::None => Ok(()),
+        }
+    }
+
+    pub(super) fn cancel_edit_reservation(&mut self, edit: FibEdit) {
+        match edit {
+            FibEdit::Insert { route, .. } | FibEdit::Replace { new: route, .. } => {
+                self.index.cancel_insert_reservation(route)
+            }
+            FibEdit::Delete { .. } | FibEdit::None => {}
+        }
+    }
+
+    pub(super) fn apply_edit(&mut self, edit: FibEdit) {
+        match edit {
+            FibEdit::Insert {
+                index,
+                route,
+                before,
+            } => {
+                debug_assert_eq!(index, self.entries.len());
+                self.entries.push(route);
+                self.index.commit_insert(index, route, before);
+            }
+            FibEdit::Replace { index, old, new } => {
+                self.entries[index] = new;
+                self.index.commit_replace(index, old, new);
+            }
+            FibEdit::Delete { index, route } => {
+                let removed = self.remove_at(index);
+                debug_assert_eq!(removed, route);
+            }
+            FibEdit::None => {}
+        }
+    }
+
+    fn remove_at(&mut self, index: usize) -> RouteEntry {
+        let route = self.entries[index];
+        let last_index = self.entries.len() - 1;
+        let moved = (index != last_index).then(|| (last_index, self.entries[last_index]));
+        let removed = self.entries.swap_remove(index);
+        self.index.commit_remove(index, route, moved);
+        removed
+    }
+
+    pub(super) fn projection_keys(edit: FibEdit) -> [Option<ProjectionKey>; 2] {
+        let mut keys = [None, None];
+        let mut add_key = |key: Option<ProjectionKey>| {
+            if let Some(key) = key {
+                if keys[0] != Some(key) {
+                    if keys[0].is_none() {
+                        keys[0] = Some(key);
+                    } else {
+                        keys[1] = Some(key);
+                    }
+                }
+            }
+        };
+        match edit {
+            FibEdit::Insert { route, .. } => add_key(projection_key(route)),
+            FibEdit::Replace { old, new, .. } => {
+                add_key(projection_key(old));
+                add_key(projection_key(new));
+            }
+            FibEdit::Delete { route, .. } => add_key(projection_key(route)),
+            FibEdit::None => {}
+        }
+        keys
+    }
+
+    pub(super) fn projection_winner(
+        &self,
+        key: ProjectionKey,
+        edit: Option<FibEdit>,
+    ) -> Option<RouteEntry> {
+        let mut winner: Option<(RouteEntry, usize)> = None;
+        for index in self.index.projection_candidates(key).iter().copied() {
+            if edit.is_some_and(|edit| edit.removes_index(index)) {
+                continue;
+            }
+            let route = self.entries[index];
+            let mut order = self.index.route_order(index, route);
+            if let Some(FibEdit::Insert {
+                route: inserted,
+                before,
+                ..
+            }) = edit
+            {
+                if same_prefix_domain(inserted, route) {
+                    let inserted_order = before
+                        .map(|before| self.index.route_order(before, self.entries[before]))
+                        .unwrap_or_else(|| self.index.prefix_candidates(inserted).len());
+                    if order >= inserted_order {
+                        order += 1;
+                    }
+                }
+            }
+            choose_projection_winner(&mut winner, route, order);
+        }
+        if let Some(edit) = edit {
+            if let Some((index, route)) = edit.inserted_route() {
+                if projection_key(route) == Some(key) {
+                    let before = match edit {
+                        FibEdit::Insert { before, .. } => before,
+                        FibEdit::Replace { .. } => Some(index),
+                        FibEdit::Delete { .. } | FibEdit::None => None,
+                    };
+                    let order = before
+                        .map(|before| self.index.route_order(before, self.entries[before]))
+                        .unwrap_or_else(|| self.index.prefix_candidates(route).len());
+                    choose_projection_winner(&mut winner, route, order);
+                }
+            }
+        }
+        winner.map(|(route, _)| route)
     }
 
     fn lookup_key(&self, key: FibLookupKey) -> Option<RouteLookupResult> {
@@ -327,106 +615,28 @@ impl FibTable {
         Some(winner.oif)
     }
 
-    fn insert(
-        &mut self,
-        route: RouteEntry,
-        flags: RouteNewFlags,
-    ) -> Result<RouteMutationOutcome, SystemError> {
-        // A conflict group is contiguous by the insertion invariant. Track
-        // its bounds directly instead of allocating a temporary index vector
-        // for every route request.
-        let mut first = None;
-        let mut last = None;
-        let mut exact = None;
-        for (index, existing) in self.entries.iter().copied().enumerate() {
-            if conflict_group(existing, route) {
-                first.get_or_insert(index);
-                last = Some(index);
-                if existing == route {
-                    exact = Some(index);
-                }
-            }
-        }
-
-        if flags.excl && first.is_some() {
-            return Err(SystemError::EEXIST);
-        }
-        if flags.replace {
-            if let Some(first) = first {
-                if is_ipv4(route.destination.address()) {
-                    if exact == Some(first) {
-                        return Ok(RouteMutationOutcome::Unchanged(route));
-                    }
-                    if exact.is_some() {
-                        return Err(SystemError::EEXIST);
-                    }
-                }
-                let old = core::mem::replace(&mut self.entries[first], route);
-                return Ok(RouteMutationOutcome::Replaced { old, new: route });
-            }
-            if !flags.create {
-                return Err(SystemError::ENOENT);
-            }
-        } else if exact.is_some() {
-            return Err(SystemError::EEXIST);
-        }
-
-        if !flags.create {
-            return Err(SystemError::ENOENT);
-        }
-        if !is_ipv4(route.destination.address()) && first.is_some() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-
-        let position = if let Some(last) = last {
-            if flags.append {
-                last + 1
-            } else {
-                first.expect("a last conflict implies a first conflict")
-            }
-        } else {
-            self.entries
-                .iter()
-                .position(|existing| {
-                    same_prefix_domain(*existing, route) && existing.priority > route.priority
-                })
-                .unwrap_or(self.entries.len())
-        };
-        self.entries
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
-        self.entries.insert(position, route);
-        Ok(RouteMutationOutcome::Added {
-            route,
-            appended: flags.append && first.is_some(),
-        })
-    }
-
     fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
         if self.entries.contains(&route) {
             return Ok(false);
         }
-        let position = self
-            .entries
+        let before = self
+            .index
+            .prefix_candidates(route)
             .iter()
-            .position(|existing| {
-                same_prefix_domain(*existing, route) && existing.priority > route.priority
-            })
-            .unwrap_or(self.entries.len());
-        self.entries
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
-        self.entries.insert(position, route);
+            .copied()
+            .find(|index| self.entries[*index].priority > route.priority);
+        let index = self.entries.len();
+        self.reserve_edit(FibEdit::Insert {
+            index,
+            route,
+            before,
+        })?;
+        self.apply_edit(FibEdit::Insert {
+            index,
+            route,
+            before,
+        });
         Ok(true)
-    }
-
-    fn delete(&mut self, selector: RouteDeleteSelector) -> Result<RouteEntry, SystemError> {
-        let index = self
-            .entries
-            .iter()
-            .position(|route| delete_matches(*route, selector))
-            .ok_or(SystemError::ESRCH)?;
-        Ok(self.entries.remove(index))
     }
 
     pub(super) fn delta_from(&self, before: &Self) -> Result<FibDelta, SystemError> {
@@ -449,7 +659,7 @@ impl FibTable {
                 continue;
             }
             if let Some(index) = self.entries.iter().position(|entry| *entry == old) {
-                self.entries.remove(index);
+                self.remove_at(index);
                 if after_routes.iter().any(|new| same_derived_slot(*new, old)) {
                     changed_existing_prefixes.push(old);
                 }
@@ -479,7 +689,7 @@ impl FibTable {
                         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                     }
                     if is_ipv4(deleted) {
-                        self.entries.remove(index);
+                        self.remove_at(index);
                         continue;
                     }
                     let old = self.entries[index];
@@ -543,6 +753,28 @@ fn same_derived_slot(left: RouteEntry, right: RouteEntry) -> bool {
         && left.table == right.table
         && left.kind == right.kind
         && left.oif == right.oif
+}
+
+fn choose_projection_winner(
+    winner: &mut Option<(RouteEntry, usize)>,
+    route: RouteEntry,
+    index: usize,
+) {
+    let preference = (
+        u8::from(route.table != RT_TABLE_LOCAL),
+        route.priority,
+        index,
+    );
+    if winner.is_none_or(|(current, current_index)| {
+        preference
+            < (
+                u8::from(current.table != RT_TABLE_LOCAL),
+                current.priority,
+                current_index,
+            )
+    }) {
+        *winner = Some((route, index));
+    }
 }
 
 fn delete_matches(route: RouteEntry, selector: RouteDeleteSelector) -> bool {

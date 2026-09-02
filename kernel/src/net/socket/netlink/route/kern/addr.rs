@@ -133,20 +133,10 @@ pub(super) fn do_del_addr(
 
 fn notify_route_changes(netns: &Arc<NetNamespace>, changes: crate::net::route::RouteNotifications) {
     for removed in changes.removed {
-        if let Err(error) = super::route::notify_route(netns, CSegmentType::DELROUTE, removed) {
-            log::warn!(
-                "failed to notify address-derived route deletion: {:?}",
-                error
-            );
-        }
+        super::route::notify_route(netns, CSegmentType::DELROUTE, removed);
     }
     for added in changes.added {
-        if let Err(error) = super::route::notify_route(netns, CSegmentType::NEWROUTE, added) {
-            log::warn!(
-                "failed to notify address-derived route addition: {:?}",
-                error
-            );
-        }
+        super::route::notify_route(netns, CSegmentType::NEWROUTE, added);
     }
 }
 

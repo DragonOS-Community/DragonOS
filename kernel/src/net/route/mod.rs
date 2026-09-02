@@ -28,7 +28,7 @@ pub(crate) use lifecycle::{
     commit_addresses, prepare_link_state_change, register_iface, unregister_iface,
 };
 use transaction::{
-    prepare_with_devices, projection_for_iface, transact, transact_with_devices,
+    prepare_with_devices, projection_for_iface, transact_single, transact_with_devices,
     PreparedTransaction,
 };
 pub(crate) use types::*;
@@ -94,7 +94,7 @@ pub(crate) fn add_route(
     flags: RouteNewFlags,
 ) -> Result<RouteMutationOutcome, SystemError> {
     validate_entry(netns, route)?;
-    transact(rtnl, netns, |candidate| candidate.insert(route, flags))
+    transact_single(rtnl, netns, |fib| fib.plan_insert(route, flags))
 }
 
 pub(crate) fn delete_route(
@@ -102,7 +102,7 @@ pub(crate) fn delete_route(
     netns: &Arc<NetNamespace>,
     selector: RouteDeleteSelector,
 ) -> Result<RouteEntry, SystemError> {
-    transact(rtnl, netns, |candidate| candidate.delete(selector))
+    transact_single(rtnl, netns, |fib| fib.plan_delete(selector))
 }
 
 pub(crate) fn lookup(

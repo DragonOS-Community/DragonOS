@@ -123,8 +123,9 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
             for entry in
                 derived_address_entries_for_link_state(iface, &iface.common().ip_addrs(), true)?
             {
-                if is_ipv4(entry.destination.address())
-                    && (entry.table == RT_TABLE_MAIN || entry.kind == RTN_BROADCAST)
+                if (!is_ipv4(entry.destination.address())
+                    || entry.table == RT_TABLE_MAIN
+                    || entry.kind == RTN_BROADCAST)
                     && candidate.insert_derived(entry)?
                 {
                     added.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
@@ -136,14 +137,20 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
                 added,
             })
         } else {
-            candidate.remove_where(|entry| {
+            let mut removed = candidate.remove_where(|entry| {
                 entry.oif == ifindex
-                    && is_ipv4(entry.destination.address())
-                    && !(entry.table == RT_TABLE_LOCAL
+                    && !(is_ipv4(entry.destination.address())
+                        && entry.table == RT_TABLE_LOCAL
                         && entry.kind == RTN_LOCAL
                         && entry.scope == RT_SCOPE_HOST)
             })?;
-            Ok(RouteNotifications::default())
+            // Linux emits IPv6 route deletion notifications from fib6_ifdown.
+            // IPv4 link-down aliases are withdrawn silently by fib_flush().
+            removed.retain(|entry| !is_ipv4(entry.destination.address()));
+            Ok(RouteNotifications {
+                removed,
+                added: Vec::new(),
+            })
         }
     })?;
     Ok(PreparedLinkStateChange { transaction })

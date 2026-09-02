@@ -167,14 +167,14 @@ pub(super) fn do_new_route(
                 CSegmentType::NEWROUTE,
                 added,
                 notification_flags.bits(),
-            )?;
+            );
         }
         RouteMutationOutcome::Replaced { new, .. } => notify_route_with_flags(
             &netns,
             CSegmentType::NEWROUTE,
             new,
             NewRequestFlags::REPLACE.bits(),
-        )?,
+        ),
         RouteMutationOutcome::Unchanged(_) => {}
     }
     Ok(Vec::new())
@@ -212,7 +212,7 @@ pub(super) fn do_del_route(
                 .flatten(),
         },
     )?;
-    notify_route(&netns, CSegmentType::DELROUTE, removed)?;
+    notify_route(&netns, CSegmentType::DELROUTE, removed);
     Ok(Vec::new())
 }
 
@@ -531,11 +531,7 @@ fn lookup_route(
     )?)])
 }
 
-pub(super) fn notify_route(
-    netns: &Arc<NetNamespace>,
-    kind: CSegmentType,
-    route: RouteEntry,
-) -> Result<(), SystemError> {
+pub(super) fn notify_route(netns: &Arc<NetNamespace>, kind: CSegmentType, route: RouteEntry) {
     let flags = if kind == CSegmentType::NEWROUTE {
         (NewRequestFlags::CREATE | NewRequestFlags::APPEND).bits()
     } else {
@@ -549,15 +545,24 @@ fn notify_route_with_flags(
     kind: CSegmentType,
     route: RouteEntry,
     nlmsg_flags: u16,
-) -> Result<(), SystemError> {
-    let segment = route_to_segment(
+) {
+    let segment = match route_to_segment(
         &kernel_notify_header(kind),
         kind,
         route,
         RouteFlags::empty(),
         false,
         nlmsg_flags,
-    )?;
+    ) {
+        Ok(segment) => segment,
+        Err(error) => {
+            // Route publication has already committed. Linux treats rtnetlink
+            // multicast allocation failure as a notification loss, not as a
+            // failed mutation that callers should retry.
+            log::warn!("failed to serialize route notification: {:?}", error);
+            return;
+        }
+    };
     multicast_notify(
         netns.clone(),
         route_notify_group(route.destination.address()),
@@ -567,7 +572,6 @@ fn notify_route_with_flags(
             _ => unreachable!(),
         },
     );
-    Ok(())
 }
 
 fn route_to_segment(

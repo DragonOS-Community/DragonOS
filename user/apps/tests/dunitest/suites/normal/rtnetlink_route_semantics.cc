@@ -683,7 +683,8 @@ int SendIpv6AddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex,
     return RecvAck(fd, seq);
 }
 
-bool SawIpv6RouteNotification(int fd, const char* destination, uint8_t prefix_len) {
+bool SawIpv6RouteNotification(int fd, const char* destination, uint8_t prefix_len,
+                              uint16_t expected_type = 0) {
     in6_addr expected = {};
     EXPECT_EQ(inet_pton(AF_INET6, destination, &expected), 1);
     int status_flags = fcntl(fd, F_GETFL, 0);
@@ -696,6 +697,7 @@ bool SawIpv6RouteNotification(int fd, const char* destination, uint8_t prefix_le
         for (auto* msg = reinterpret_cast<nlmsghdr*>(buf); NLMSG_OK(msg, len);
              msg = NLMSG_NEXT(msg, len)) {
             if (msg->nlmsg_type != RTM_NEWROUTE && msg->nlmsg_type != RTM_DELROUTE) continue;
+            if (expected_type != 0 && msg->nlmsg_type != expected_type) continue;
             auto* route_msg = reinterpret_cast<rtmsg*>(NLMSG_DATA(msg));
             if (route_msg->rtm_family != AF_INET6 || route_msg->rtm_dst_len != prefix_len)
                 continue;
@@ -1071,6 +1073,47 @@ TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
     EXPECT_EQ(received, 1) << ErrnoString(receive_error);
     EXPECT_EQ(payload, 'x');
     ASSERT_EQ(restore_error, 0);
+}
+
+TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
+    FdGuard sender(OpenRouteSocket());
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2990;
+    uint32_t veth = if_nametoindex("veth-host1");
+    ASSERT_NE(veth, 0u);
+    constexpr const char* kDestination = "2001:db8:ffff:222::";
+    constexpr const char* kAddress = "2001:db8:ffff:223::1";
+    constexpr const char* kConnected = "2001:db8:ffff:223::";
+
+    ASSERT_EQ(SetLinkUp(sender.Get(), veth, true, ++seq), 0);
+    (void)SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
+                              kAddress, 64, ++seq);
+    ASSERT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_NEWADDR,
+                                  NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, veth,
+                                  kAddress, 64, ++seq),
+              0);
+    ASSERT_TRUE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    (void)SendIpv6RouteRequest(sender.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
+                               kDestination, 64, veth, RT_SCOPE_NOWHERE, ++seq);
+    ASSERT_EQ(SendIpv6RouteRequest(sender.Get(), RTM_NEWROUTE,
+                                   NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                   kDestination, 64, veth, RT_SCOPE_LINK, ++seq),
+              0);
+    ASSERT_TRUE(FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq).has_value());
+
+    FdGuard listener(OpenRouteListener(RTMGRP_IPV6_ROUTE));
+    ASSERT_GE(listener.Get(), 0) << ErrnoString(errno);
+    ASSERT_EQ(SetLinkUp(sender.Get(), veth, false, ++seq), 0);
+
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq).has_value());
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kDestination, 64, RTM_DELROUTE));
+    ASSERT_EQ(SetLinkUp(sender.Get(), veth, true, ++seq), 0);
+    EXPECT_TRUE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kConnected, 64, RTM_NEWROUTE));
+    EXPECT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
+                                  kAddress, 64, ++seq),
+              0);
 }
 
 TEST(RtnetlinkRouteSemantics, RouteProjectionScalesBeyondFormerFixedCapacity) {

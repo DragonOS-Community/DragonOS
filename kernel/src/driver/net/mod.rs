@@ -7,7 +7,7 @@ use core::cell::Cell;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use net_poll_state::{DueResult, PollDeadline, PublishResult};
-use sysfs::netdev_register_kobject;
+use sysfs::{netdev_register_kobject, netdev_unregister_kobject};
 
 use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
@@ -546,6 +546,15 @@ fn register_netdevice(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
     dev.set_net_state(NetDeivceState::__LINK_STATE_PRESENT);
 
     return Ok(());
+}
+
+/// Undo a successful [`register_netdevice`] when a later probe stage fails.
+///
+/// Callers must remove the interface from its network namespace first if it
+/// was already added there.
+fn unregister_netdevice(dev: Arc<dyn Iface>) {
+    dev.clear_net_state(NetDeivceState::__LINK_STATE_PRESENT);
+    netdev_unregister_kobject(dev);
 }
 
 #[derive(Debug)]

@@ -14,7 +14,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 use intertrait::cast::CastArc;
-use log::error;
+use log::{error, warn};
 use system_error::SystemError;
 
 use super::{class::sys_class_net_instance, Iface, NetDeivceState, Operstate};
@@ -35,7 +35,7 @@ pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
 
     device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
     let ifname = dev.iface_name();
-    <dyn KObject>::kobject_uevent(
+    if let Err(error) = <dyn KObject>::kobject_uevent(
         &(dev.clone() as Arc<dyn KObject>),
         "add",
         &[
@@ -43,9 +43,38 @@ pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
             ("DEVNAME", ifname.clone()),
             ("INTERFACE", ifname),
         ],
-    )?;
+    ) {
+        // Multicast may have delivered the add event to earlier subscribers
+        // before a later enqueue failed. Pair it with a best-effort remove.
+        netdev_unregister_kobject(dev);
+        return Err(error);
+    }
 
-    return Ok(());
+    Ok(())
+}
+
+/// Remove a netdevice kobject after it has been announced to userspace.
+///
+/// The removal notification is best effort: teardown must still complete if
+/// notification allocation or delivery fails.
+pub fn netdev_unregister_kobject(dev: Arc<dyn Iface>) {
+    let ifname = dev.iface_name();
+    if let Err(error) = <dyn KObject>::kobject_uevent(
+        &(dev.clone() as Arc<dyn KObject>),
+        "remove",
+        &[
+            ("SUBSYSTEM", "net".into()),
+            ("DEVNAME", ifname.clone()),
+            ("INTERFACE", ifname),
+        ],
+    ) {
+        warn!(
+            "failed to emit removal uevent for netdevice '{}': {:?}",
+            dev.iface_name(),
+            error
+        );
+    }
+    device_manager().remove(&(dev as Arc<dyn Device>));
 }
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/net/core/net-sysfs.c

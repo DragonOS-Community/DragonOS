@@ -75,7 +75,7 @@ pub(super) fn do_get_addr(
         _ => 0,
     });
 
-    finish_response(request_segment.header(), dump_all, &mut responce);
+    finish_response(request_segment.header(), dump_all, &mut responce)?;
 
     Ok(responce)
 }

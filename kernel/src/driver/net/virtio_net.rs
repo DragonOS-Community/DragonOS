@@ -39,6 +39,7 @@ use crate::{
             },
             register_netdevice,
             types::InterfaceFlags,
+            unregister_netdevice,
         },
         virtio::{
             irq::virtio_irq_manager,
@@ -1468,14 +1469,18 @@ impl VirtIODriver for VirtIONetDriver {
         // 在sysfs中注册iface
         register_netdevice(iface.clone() as Arc<dyn Iface>)?;
 
-        // 将virtio_net_device和iface关联起来
-        virtio_net_device.set_iface(&iface);
-
         // 将网卡的接口信息注册到全局的网卡接口信息表中
         // NET_DEVICES
         //     .write_irqsave()
         //     .insert(iface.nic_id(), iface.clone());
-        INIT_NET_NAMESPACE.add_device(iface.clone())?;
+        if let Err(error) = INIT_NET_NAMESPACE.add_device(iface.clone()) {
+            unregister_netdevice(iface.clone() as Arc<dyn Iface>);
+            return Err(error);
+        }
+
+        // Publish the device-to-interface link only after all fallible
+        // registration stages have completed.
+        virtio_net_device.set_iface(&iface);
         INIT_NET_NAMESPACE.set_default_iface(iface.clone());
 
         virtio_irq_manager()

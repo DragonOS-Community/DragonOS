@@ -69,7 +69,7 @@ pub(super) fn do_get_rule(
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     let mut response = Vec::new();
-    finish_response(request.header(), true, &mut response);
+    finish_response(request.header(), true, &mut response)?;
     Ok(response)
 }
 
@@ -437,8 +437,16 @@ fn dump_routes(
     // enabled NETLINK_GET_STRICT_CHK. DragonOS does not expose that opt-in yet,
     // so its default dump path follows Linux's lenient mode and ignores them.
     let family = request.body().family;
+    let entries = route::snapshot(&netns)?;
+    let route_count = entries
+        .iter()
+        .filter(|entry| family_matches(family, family_of_ip(entry.destination.address())))
+        .count();
     let mut response = Vec::new();
-    for entry in route::snapshot(&netns)? {
+    response
+        .try_reserve(route_count.checked_add(1).ok_or(SystemError::ENOMEM)?)
+        .map_err(|_| SystemError::ENOMEM)?;
+    for entry in entries {
         if family_matches(family, family_of_ip(entry.destination.address())) {
             response.push(RouteNlSegment::NewRoute(route_to_segment(
                 request.header(),
@@ -450,7 +458,7 @@ fn dump_routes(
             )?));
         }
     }
-    finish_response(request.header(), true, &mut response);
+    finish_response(request.header(), true, &mut response)?;
     Ok(response)
 }
 
@@ -596,26 +604,45 @@ fn route_to_segment(
         seq: request_header.seq,
         pid: request_header.pid,
     };
-    let mut attrs = Vec::new();
+    let mut attrs = FallibleRouteAttrs::new();
     if route.destination.prefix_len() != 0 {
-        attrs.push(RouteAttr::Dst(ip_to_bytes(route.destination.address())));
+        attrs.push(RouteAttr::Dst(ip_to_bytes(route.destination.address())?))?;
     }
-    attrs.push(RouteAttr::Oif(route.oif));
-    attrs.push(RouteAttr::Table(route.table));
+    attrs.push(RouteAttr::Oif(route.oif))?;
+    attrs.push(RouteAttr::Table(route.table))?;
     if let Some(source) = route.source {
-        attrs.push(RouteAttr::Src(ip_to_bytes(source.address())));
+        attrs.push(RouteAttr::Src(ip_to_bytes(source.address())?))?;
     }
     if let Some(source) = route.preferred_source {
-        attrs.push(RouteAttr::Prefsrc(ip_to_bytes(source)));
+        attrs.push(RouteAttr::Prefsrc(ip_to_bytes(source)?))?;
     }
     if let Some(gateway) = route.gateway {
-        attrs.push(RouteAttr::Gateway(ip_to_bytes(gateway)));
+        attrs.push(RouteAttr::Gateway(ip_to_bytes(gateway)?))?;
     }
     if route.priority != 0 && (!output || matches!(route.destination.address(), IpAddress::Ipv6(_)))
     {
-        attrs.push(RouteAttr::Priority(route.priority));
+        attrs.push(RouteAttr::Priority(route.priority))?;
     }
-    Ok(RouteSegment::new(header, body, attrs))
+    Ok(RouteSegment::new(header, body, attrs.into_inner()))
+}
+
+/// Route attribute builder whose only append operation is allocation-aware.
+struct FallibleRouteAttrs(Vec<RouteAttr>);
+
+impl FallibleRouteAttrs {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, attr: RouteAttr) -> Result<(), SystemError> {
+        self.0.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        self.0.push(attr);
+        Ok(())
+    }
+
+    fn into_inner(self) -> Vec<RouteAttr> {
+        self.0
+    }
 }
 
 fn family_matches(requested: AddressFamily, actual: AddressFamily) -> bool {
@@ -685,11 +712,20 @@ fn parse_ip(bytes: &[u8], family: AddressFamily) -> Result<IpAddress, SystemErro
     }
 }
 
-fn ip_to_bytes(ip: IpAddress) -> Vec<u8> {
+fn ip_to_bytes(ip: IpAddress) -> Result<Vec<u8>, SystemError> {
+    let len = match ip {
+        IpAddress::Ipv4(_) => 4,
+        IpAddress::Ipv6(_) => 16,
+    };
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| SystemError::ENOMEM)?;
     match ip {
-        IpAddress::Ipv4(address) => address.octets().to_vec(),
-        IpAddress::Ipv6(address) => address.octets().to_vec(),
+        IpAddress::Ipv4(address) => bytes.extend_from_slice(&address.octets()),
+        IpAddress::Ipv6(address) => bytes.extend_from_slice(&address.octets()),
     }
+    Ok(bytes)
 }
 
 fn normalize_ip(ip: Option<IpAddress>) -> Option<IpAddress> {

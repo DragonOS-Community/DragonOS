@@ -118,9 +118,26 @@ impl Socket for UdpSocket {
                 if !self.is_bound() {
                     self.bind_ephemeral(remote.addr)?;
                 }
+                let local = match self.inner.read().as_ref() {
+                    Some(UdpInner::Bound(inner)) => inner.endpoint(),
+                    Some(_) => return Err(SystemError::ENOTCONN),
+                    None => return Err(SystemError::EBADF),
+                };
+                let connected_source = output_flow::resolve_wildcard_ipv4(
+                    &self.netns,
+                    local,
+                    remote.addr,
+                    self.device_binding
+                        .resolve_iface(&self.netns)?
+                        .map(|iface| iface.nic_id() as u32),
+                    None,
+                    remote.addr.is_multicast(),
+                    remote.addr.is_broadcast(),
+                )?
+                .map(|flow| flow.source);
                 match self.inner.read().as_ref() {
                     Some(UdpInner::Bound(inner)) => {
-                        inner.connect(remote);
+                        inner.connect(remote, connected_source);
                         if !self.multicast_loopback_rx.lock().is_empty() {
                             inner.set_preconnect_data(true);
                         }
@@ -453,6 +470,8 @@ impl Socket for UdpSocket {
                 // return the actual local address that would be used for the connection
                 let local_addr = if let Some(addr) = addr {
                     addr
+                } else if let Some(source) = bound.connected_source() {
+                    source
                 } else {
                     // Socket is bound to ANY - check if connected
                     if let Ok(remote) = bound.remote_endpoint() {

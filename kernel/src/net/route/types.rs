@@ -15,7 +15,7 @@ pub(crate) const RTN_LOCAL: u8 = 2;
 pub(crate) const RTN_BROADCAST: u8 = 3;
 pub(crate) const RTN_MULTICAST: u8 = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RouteEntry {
     pub destination: IpCidr,
     pub source: Option<IpCidr>,

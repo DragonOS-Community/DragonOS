@@ -491,6 +491,11 @@ TEST(RtnetlinkRouteSemantics, CrossInterfacePreferredSourceDrivesOutputAndAddres
 
     FdGuard socket_fd(socket(AF_INET, SOCK_DGRAM, 0));
     ASSERT_GE(socket_fd.Get(), 0) << ErrnoString(errno);
+    sockaddr_in wildcard = {};
+    wildcard.sin_family = AF_INET;
+    wildcard.sin_addr.s_addr = htonl(INADDR_ANY);
+    ASSERT_EQ(bind(socket_fd.Get(), reinterpret_cast<sockaddr*>(&wildcard), sizeof(wildcard)), 0)
+            << ErrnoString(errno);
     constexpr char device[] = "veth1";
     ASSERT_EQ(setsockopt(socket_fd.Get(), SOL_SOCKET, SO_BINDTODEVICE, device, sizeof(device)), 0)
             << ErrnoString(errno);
@@ -500,6 +505,13 @@ TEST(RtnetlinkRouteSemantics, CrossInterfacePreferredSourceDrivesOutputAndAddres
     remote.sin_addr.s_addr = Ipv4(kDestination);
     ASSERT_EQ(connect(socket_fd.Get(), reinterpret_cast<sockaddr*>(&remote), sizeof(remote)), 0)
             << ErrnoString(errno);
+    sockaddr_in selected_local = {};
+    socklen_t selected_local_len = sizeof(selected_local);
+    ASSERT_EQ(getsockname(socket_fd.Get(), reinterpret_cast<sockaddr*>(&selected_local),
+                          &selected_local_len),
+              0)
+            << ErrnoString(errno);
+    EXPECT_EQ(selected_local.sin_addr.s_addr, Ipv4(kSource));
     constexpr char payload[] = "cross-interface-prefsrc";
     ASSERT_EQ(send(socket_fd.Get(), payload, sizeof(payload), 0),
               static_cast<ssize_t>(sizeof(payload)))

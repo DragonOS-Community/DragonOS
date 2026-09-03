@@ -10,6 +10,11 @@ use super::{
     RT_SCOPE_LINK, RT_TABLE_LOCAL,
 };
 
+mod alias;
+
+use alias::AliasIndex;
+pub(super) use alias::{AliasInsertAnalysis, AliasOrder, AliasPlacement};
+
 const RT_SCOPE_NOWHERE: u8 = 255;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -122,7 +127,7 @@ impl ScopeWinners {
         route_index: usize,
         route: RouteEntry,
         routes: &[RouteEntry],
-        prefix_rank: &[usize],
+        alias_order: &[AliasOrder],
     ) {
         for requirement in ScopeRequirement::ALL {
             if !requirement.matches(route.scope) {
@@ -130,7 +135,7 @@ impl ScopeWinners {
             }
             let winner = &mut self.0[requirement.index()];
             if winner
-                .is_none_or(|current| route_precedes(route_index, current, routes, prefix_rank))
+                .is_none_or(|current| route_precedes(route_index, current, routes, alias_order))
             {
                 *winner = Some(route_index);
             }
@@ -178,14 +183,14 @@ impl CandidateWinners {
         route_index: usize,
         route: RouteEntry,
         routes: &[RouteEntry],
-        prefix_rank: &[usize],
+        alias_order: &[AliasOrder],
     ) {
         self.any_oif
-            .consider(route_index, route, routes, prefix_rank);
+            .consider(route_index, route, routes, alias_order);
         self.by_oif
             .entry(route.oif)
             .or_default()
-            .consider(route_index, route, routes, prefix_rank);
+            .consider(route_index, route, routes, alias_order);
     }
 }
 
@@ -276,15 +281,17 @@ impl ProjectionKey {
 /// `winners` preselects every selector used by packet-path lookups, so an
 /// exact-prefix lookup never scans an attacker-controlled alias list while
 /// holding the FIB lock. Lifecycle edits rebuild only affected prefix winners.
-/// `prefix_rank` keeps semantic alias order independent of authoritative
-/// vector slots moved by `swap_remove`.
+/// `alias_order` keeps semantic alias order independent of authoritative
+/// vector slots moved by `swap_remove`, without shifting a whole prefix on
+/// prepend.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct FibIndex {
     all: HashMap<PrefixKey, Vec<usize>>,
+    alias: AliasIndex,
     winners: HashMap<PrefixKey, PrefixWinners>,
     projection: HashMap<ProjectionKey, Vec<usize>>,
+    projection_winners: HashMap<ProjectionKey, usize>,
     prefix_counts: HashMap<PrefixDomain, Vec<PrefixLengthCount>>,
-    prefix_rank: Vec<usize>,
 }
 
 impl FibIndex {
@@ -293,7 +300,9 @@ impl FibIndex {
         let mut index = Self::default();
         for (route_index, route) in routes.iter().copied().enumerate() {
             index.prepare_insert(route)?;
-            index.commit_insert(route_index, route, None, routes);
+            // Test rebuilds receive routes in semantic alias order.
+            let placement = index.append_placement(route);
+            index.commit_insert(route_index, route, placement, routes);
         }
         Ok(index)
     }
@@ -301,10 +310,11 @@ impl FibIndex {
     pub(super) fn try_clone(&self) -> Result<Self, SystemError> {
         Ok(Self {
             all: try_clone_buckets(&self.all)?,
+            alias: self.alias.try_clone()?,
             winners: try_clone_winners(&self.winners)?,
             projection: try_clone_buckets(&self.projection)?,
+            projection_winners: try_clone_map(&self.projection_winners)?,
             prefix_counts: try_clone_prefix_counts(&self.prefix_counts)?,
-            prefix_rank: try_clone_vec(&self.prefix_rank)?,
         })
     }
 
@@ -318,9 +328,7 @@ impl FibIndex {
     /// Reserve every bucket needed by a later infallible commit.
     pub(super) fn prepare_insert(&mut self, route: RouteEntry) -> Result<(), SystemError> {
         let result = (|| {
-            self.prefix_rank
-                .try_reserve(1)
-                .map_err(|_| SystemError::ENOMEM)?;
+            self.alias.prepare_insert(route)?;
             reserve_bucket(
                 &mut self.all,
                 PrefixKey::new(route.table, route.destination),
@@ -331,6 +339,11 @@ impl FibIndex {
             }
             if let Some(key) = projection_key(route) {
                 reserve_bucket(&mut self.projection, key)?;
+                if !self.projection_winners.contains_key(&key) {
+                    self.projection_winners
+                        .try_reserve(1)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                }
             }
             Ok(())
         })();
@@ -362,27 +375,12 @@ impl FibIndex {
         &mut self,
         route_index: usize,
         route: RouteEntry,
-        before: Option<usize>,
+        placement: AliasPlacement,
         routes: &[RouteEntry],
     ) {
         let prefix = PrefixKey::new(route.table, route.destination);
-        let rank = before
-            .map(|before| self.prefix_rank[before])
-            .unwrap_or_else(|| self.all.get(&prefix).map_or(0, Vec::len));
-        // A tail insertion does not change any existing rank. Only an
-        // explicit insertion-before needs to shift the following aliases.
-        if before.is_some() {
-            if let Some(indices) = self.all.get(&prefix) {
-                for index in indices {
-                    if self.prefix_rank[*index] >= rank {
-                        self.prefix_rank[*index] += 1;
-                    }
-                }
-            }
-        }
-        debug_assert_eq!(route_index, self.prefix_rank.len());
-        self.prefix_rank.push(rank);
-        insert_reserved_bucket(&mut self.all, prefix, route_index, before);
+        self.alias.commit_insert(route_index, route, placement);
+        insert_reserved_bucket(&mut self.all, prefix, route_index, None);
         if indexable(route) {
             update_prefix_count(&mut self.prefix_counts, route, true);
             // Existing winners remain valid across insertion: relative order
@@ -393,10 +391,20 @@ impl FibIndex {
                 .get_mut(&prefix)
                 .expect("winner prefix must be reserved before commit")
                 .candidates_mut(route)
-                .consider(route_index, route, routes, &self.prefix_rank);
+                .consider(route_index, route, routes, self.alias.orders());
         }
         if let Some(key) = projection_key(route) {
             insert_reserved_bucket(&mut self.projection, key, route_index, None);
+            let replace = self
+                .projection_winners
+                .get(&key)
+                .copied()
+                .is_none_or(|current| {
+                    projection_route_precedes(route_index, current, routes, self.alias.orders())
+                });
+            if replace {
+                self.projection_winners.insert(key, route_index);
+            }
         }
     }
 
@@ -412,23 +420,22 @@ impl FibIndex {
             .winners
             .get(&prefix)
             .is_some_and(|winners| winners.references(route_index));
-        let removed_rank = self.prefix_rank[route_index];
+        let projection = projection_key(route);
+        let removed_was_projection_winner =
+            projection.is_some_and(|key| self.projection_winners.get(&key) == Some(&route_index));
         remove_index(
             &mut self.all,
             &PrefixKey::new(route.table, route.destination),
             route_index,
         );
-        if let Some(key) = projection_key(route) {
+        if let Some(key) = projection {
             remove_index(&mut self.projection, &key, route_index);
         }
-        if let Some(indices) = self.all.get(&prefix) {
-            for index in indices {
-                if self.prefix_rank[*index] > removed_rank {
-                    self.prefix_rank[*index] -= 1;
-                }
-            }
-        }
-        self.prefix_rank.swap_remove(route_index);
+        self.alias.commit_remove(
+            route_index,
+            route,
+            self.all.get(&prefix).map(Vec::as_slice).unwrap_or_default(),
+        );
         if indexable(route) {
             update_prefix_count(&mut self.prefix_counts, route, false);
             remove_empty_prefix_domain(&mut self.prefix_counts, route);
@@ -439,6 +446,9 @@ impl FibIndex {
         if removed_was_winner {
             self.rebuild_winners(prefix, routes);
         }
+        if let Some(key) = projection.filter(|_| removed_was_projection_winner) {
+            self.rebuild_projection_winner(key, routes);
+        }
     }
 
     /// Apply a stable compaction of the authoritative route vector.
@@ -448,7 +458,6 @@ impl FibIndex {
     /// prefix aliases keep their semantic insertion order even when earlier
     /// single-route removals have made physical vector order differ from it.
     pub(super) fn commit_retain(&mut self, old_to_new: &[Option<usize>], routes: &[RouteEntry]) {
-        debug_assert_eq!(old_to_new.len(), self.prefix_rank.len());
         debug_assert_eq!(
             old_to_new.iter().filter(|index| index.is_some()).count(),
             routes.len()
@@ -457,13 +466,7 @@ impl FibIndex {
         remap_retained_indices(&mut self.all, old_to_new);
         remap_retained_indices(&mut self.projection, old_to_new);
 
-        self.prefix_rank.truncate(routes.len());
-        self.prefix_rank.fill(0);
-        for indices in self.all.values() {
-            for (rank, route_index) in indices.iter().copied().enumerate() {
-                self.prefix_rank[route_index] = rank;
-            }
-        }
+        self.alias.commit_retain(old_to_new, routes);
 
         for counts in self.prefix_counts.values_mut() {
             counts.clear();
@@ -473,6 +476,7 @@ impl FibIndex {
         }
         self.prefix_counts.retain(|_, counts| !counts.is_empty());
         self.rebuild_all_winners(routes);
+        self.rebuild_all_projection_winners(routes);
     }
 
     pub(super) fn commit_replace(
@@ -503,6 +507,9 @@ impl FibIndex {
 
         let old_projection = projection_key(old);
         let new_projection = projection_key(new);
+        let old_was_projection_winner = old_projection
+            .is_some_and(|key| self.projection_winners.get(&key) == Some(&route_index));
+        self.alias.commit_replace(route_index, old, new);
         if old_projection != new_projection {
             if let Some(key) = old_projection {
                 remove_index(&mut self.projection, &key, route_index);
@@ -518,8 +525,57 @@ impl FibIndex {
                 .get_mut(&new_prefix)
                 .expect("winner prefix must be reserved before replace")
                 .candidates_mut(new)
-                .consider(route_index, new, routes, &self.prefix_rank);
+                .consider(route_index, new, routes, self.alias.orders());
         }
+        if old_projection != new_projection {
+            if let Some(key) = old_projection.filter(|_| old_was_projection_winner) {
+                self.rebuild_projection_winner(key, routes);
+            }
+            if let Some(key) = new_projection {
+                let replace = self
+                    .projection_winners
+                    .get(&key)
+                    .copied()
+                    .is_none_or(|current| {
+                        projection_route_precedes(route_index, current, routes, self.alias.orders())
+                    });
+                if replace {
+                    self.projection_winners.insert(key, route_index);
+                }
+            }
+        }
+    }
+
+    pub(super) fn analyze_insert(&self, route: RouteEntry) -> AliasInsertAnalysis {
+        self.alias.analyze_insert(route)
+    }
+
+    pub(super) fn append_placement(&self, route: RouteEntry) -> AliasPlacement {
+        self.alias.append_placement(route)
+    }
+
+    pub(super) fn planned_order(&self, route: RouteEntry, placement: AliasPlacement) -> AliasOrder {
+        self.alias.planned_order(route, placement)
+    }
+
+    pub(super) fn projection_winner(&self, key: ProjectionKey) -> Option<usize> {
+        self.projection_winners.get(&key).copied()
+    }
+
+    pub(super) fn projected_insert_precedes(
+        &self,
+        route: RouteEntry,
+        placement: AliasPlacement,
+        current_index: usize,
+        current: RouteEntry,
+    ) -> bool {
+        (
+            u8::from(route.table != RT_TABLE_LOCAL),
+            self.planned_order(route, placement),
+        ) < (
+            u8::from(current.table != RT_TABLE_LOCAL),
+            self.alias.order(current_index),
+        )
     }
 
     pub(super) fn prefix_candidates(&self, route: RouteEntry) -> &[usize] {
@@ -536,9 +592,8 @@ impl FibIndex {
             .unwrap_or_default()
     }
 
-    pub(super) fn route_order(&self, route_index: usize, route: RouteEntry) -> usize {
-        debug_assert!(self.prefix_candidates(route).contains(&route_index));
-        self.prefix_rank[route_index]
+    pub(super) fn order_key(&self, route_index: usize) -> AliasOrder {
+        self.alias.order(route_index)
     }
 
     pub(super) fn projection_for_iface(
@@ -547,7 +602,7 @@ impl FibIndex {
         ifindex: u32,
     ) -> Result<Vec<SmolRoute>, SystemError> {
         let count = self
-            .projection
+            .projection_winners
             .keys()
             .filter(|key| key.oif == ifindex)
             .count();
@@ -555,20 +610,12 @@ impl FibIndex {
         projection
             .try_reserve_exact(count)
             .map_err(|_| SystemError::ENOMEM)?;
-        for (key, candidates) in self.projection.iter().filter(|(key, _)| key.oif == ifindex) {
-            let winner = candidates
-                .iter()
-                .copied()
-                .min_by_key(|index| {
-                    let route = routes[*index];
-                    (
-                        u8::from(route.table != RT_TABLE_LOCAL),
-                        route.priority,
-                        self.route_order(*index, route),
-                    )
-                })
-                .expect("projection buckets cannot be empty");
-            let route = routes[winner];
+        for (key, winner) in self
+            .projection_winners
+            .iter()
+            .filter(|(key, _)| key.oif == ifindex)
+        {
+            let route = routes[*winner];
             projection.push(SmolRoute {
                 cidr: key.cidr(),
                 via_router: route.gateway,
@@ -627,10 +674,7 @@ impl FibIndex {
             .prefix_len()
             .cmp(&right_route.destination.prefix_len())
             .then_with(|| right_route.priority.cmp(&left_route.priority))
-            .then_with(|| {
-                self.route_order(right, right_route)
-                    .cmp(&self.route_order(left, left_route))
-            })
+            .then_with(|| self.alias.order(right).cmp(&self.alias.order(left)))
             .is_ge();
         if left_is_preferred {
             left
@@ -640,6 +684,7 @@ impl FibIndex {
     }
 
     fn replace_route_index(&mut self, old_index: usize, new_index: usize, route: RouteEntry) {
+        self.alias.remap_moved(old_index, new_index, route);
         replace_index(
             &mut self.all,
             &PrefixKey::new(route.table, route.destination),
@@ -648,12 +693,47 @@ impl FibIndex {
         );
         if let Some(key) = projection_key(route) {
             replace_index(&mut self.projection, &key, old_index, new_index);
+            if self.projection_winners.get(&key) == Some(&old_index) {
+                self.projection_winners.insert(key, new_index);
+            }
         }
         if let Some(winners) = self
             .winners
             .get_mut(&PrefixKey::new(route.table, route.destination))
         {
             winners.replace_index(old_index, new_index);
+        }
+    }
+
+    fn rebuild_projection_winner(&mut self, key: ProjectionKey, routes: &[RouteEntry]) {
+        let winner = self.projection.get(&key).and_then(|indices| {
+            indices.iter().copied().min_by(|left, right| {
+                projection_order(*left, routes, self.alias.orders()).cmp(&projection_order(
+                    *right,
+                    routes,
+                    self.alias.orders(),
+                ))
+            })
+        });
+        match winner {
+            Some(winner) => {
+                self.projection_winners.insert(key, winner);
+            }
+            None => {
+                self.projection_winners.remove(&key);
+            }
+        }
+    }
+
+    fn rebuild_all_projection_winners(&mut self, routes: &[RouteEntry]) {
+        self.projection_winners.clear();
+        for (key, indices) in &self.projection {
+            let winner = indices
+                .iter()
+                .copied()
+                .min_by_key(|index| projection_order(*index, routes, self.alias.orders()))
+                .expect("projection buckets cannot be empty");
+            self.projection_winners.insert(*key, winner);
         }
     }
 
@@ -674,7 +754,7 @@ impl FibIndex {
                         route_index,
                         route,
                         routes,
-                        &self.prefix_rank,
+                        self.alias.orders(),
                     );
                 }
             }
@@ -700,7 +780,7 @@ impl FibIndex {
                         route_index,
                         route,
                         routes,
-                        &self.prefix_rank,
+                        self.alias.orders(),
                     );
                 }
             }
@@ -727,6 +807,19 @@ where
         copied.extend_from_slice(indices);
         cloned.insert(*key, copied);
     }
+    Ok(cloned)
+}
+
+fn try_clone_map<K, V>(source: &HashMap<K, V>) -> Result<HashMap<K, V>, SystemError>
+where
+    K: Copy + Eq + core::hash::Hash,
+    V: Copy,
+{
+    let mut cloned = HashMap::new();
+    cloned
+        .try_reserve(source.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    cloned.extend(source.iter().map(|(key, value)| (*key, *value)));
     Ok(cloned)
 }
 
@@ -776,15 +869,6 @@ fn try_clone_prefix_counts(
         copied.extend_from_slice(lengths);
         cloned.insert(*domain, copied);
     }
-    Ok(cloned)
-}
-
-fn try_clone_vec(source: &[usize]) -> Result<Vec<usize>, SystemError> {
-    let mut cloned = Vec::new();
-    cloned
-        .try_reserve_exact(source.len())
-        .map_err(|_| SystemError::ENOMEM)?;
-    cloned.extend_from_slice(source);
     Ok(cloned)
 }
 
@@ -911,11 +995,31 @@ where
 fn route_precedes(
     candidate: usize,
     current: usize,
-    routes: &[RouteEntry],
-    prefix_rank: &[usize],
+    _routes: &[RouteEntry],
+    alias_order: &[AliasOrder],
 ) -> bool {
-    (routes[candidate].priority, prefix_rank[candidate])
-        < (routes[current].priority, prefix_rank[current])
+    alias_order[candidate] < alias_order[current]
+}
+
+fn projection_order(
+    route_index: usize,
+    routes: &[RouteEntry],
+    alias_order: &[AliasOrder],
+) -> (u8, AliasOrder) {
+    (
+        u8::from(routes[route_index].table != RT_TABLE_LOCAL),
+        alias_order[route_index],
+    )
+}
+
+fn projection_route_precedes(
+    candidate: usize,
+    current: usize,
+    routes: &[RouteEntry],
+    alias_order: &[AliasOrder],
+) -> bool {
+    projection_order(candidate, routes, alias_order)
+        < projection_order(current, routes, alias_order)
 }
 
 fn reserve_prefix_domain(
@@ -1024,7 +1128,7 @@ mod tests {
 
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
-    use super::{BroadcastLookup, FibIndex};
+    use super::{AliasPlacement, BroadcastLookup, FibIndex};
     use crate::net::route::{
         RouteEntry, RTN_BROADCAST, RTN_UNICAST, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_MAIN,
     };
@@ -1083,9 +1187,10 @@ mod tests {
         ];
         let mut index = FibIndex::build(&routes).unwrap();
         let added = route([192, 0, 2, 0], 24, 10, RTN_UNICAST);
+        let placement = index.analyze_insert(added).placement;
         index.prepare_insert(added).unwrap();
         routes.push(added);
-        index.commit_insert(2, added, Some(1), &routes);
+        index.commit_insert(2, added, placement, &routes);
         let destination = IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 9));
         assert_eq!(
             index.lookup(
@@ -1127,15 +1232,64 @@ mod tests {
                 RT_SCOPE_LINK
             };
 
+            let placement = index.analyze_insert(added).placement;
             index.prepare_insert(added).unwrap();
-            let before = index.prefix_candidates(added).first().copied();
             routes.push(added);
-            index.commit_insert(routes.len() - 1, added, before, &routes);
+            index.commit_insert(routes.len() - 1, added, placement, &routes);
 
             let mut rebuilt = index.try_clone().unwrap();
             rebuilt.rebuild_all_winners(&routes);
+            rebuilt.rebuild_all_projection_winners(&routes);
             assert_eq!(index, rebuilt);
         }
+    }
+
+    #[test]
+    fn bulk_alias_insert_keeps_constant_time_metadata_and_semantic_order() {
+        let mut routes = Vec::new();
+        let mut semantic_order = Vec::new();
+        let mut index = FibIndex::default();
+
+        for ordinal in 0..512_u32 {
+            let mut added = route([192, 0, 2, 0], 24, ordinal % 31, RTN_UNICAST);
+            added.protocol = (ordinal % 255) as u8;
+            added.gateway = Some(IpAddress::Ipv4(Ipv4Address::new(
+                198,
+                51,
+                (ordinal / 256) as u8,
+                (ordinal % 256) as u8,
+            )));
+            let analysis = index.analyze_insert(added);
+            let expected_position = semantic_order
+                .iter()
+                .position(|candidate| routes[*candidate].priority >= added.priority)
+                .unwrap_or(semantic_order.len());
+            let placement = analysis.placement;
+
+            index.prepare_insert(added).unwrap();
+            let route_index = routes.len();
+            routes.push(added);
+            index.commit_insert(route_index, added, placement, &routes);
+            // The physical bucket must only append. Reintroducing Vec::insert
+            // here makes constructing one prefix deterministically quadratic.
+            assert_eq!(index.prefix_candidates(added).last(), Some(&route_index));
+            semantic_order.insert(expected_position, route_index);
+        }
+
+        let mut indexed_order: Vec<_> = (0..routes.len()).collect();
+        indexed_order.sort_unstable_by_key(|route_index| index.order_key(*route_index));
+        assert_eq!(indexed_order, semantic_order);
+        assert_eq!(
+            index.projection_winner(super::ProjectionKey::new(1, routes[0].destination)),
+            semantic_order.first().copied()
+        );
+        assert!(routes
+            .iter()
+            .all(|route| index.analyze_insert(*route).exact.is_some()));
+        assert!(matches!(
+            index.analyze_insert(routes[0]).placement,
+            AliasPlacement::Prepend
+        ));
     }
 
     #[test]
@@ -1207,7 +1361,7 @@ mod tests {
             ),
             Some(1)
         );
-        assert_eq!(index.prefix_rank, [1, 0]);
+        assert!(index.order_key(0) > index.order_key(1));
     }
 
     #[test]

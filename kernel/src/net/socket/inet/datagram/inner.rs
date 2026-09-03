@@ -19,6 +19,17 @@ pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024; // 128 KB
 pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024; // 128 KB
                                                    // Minimum buffer size (Linux uses 256 bytes minimum)
 
+fn output_metadata(
+    remote: smoltcp::wire::IpEndpoint,
+    egress_ifindex: u32,
+    local_address: Option<smoltcp::wire::IpAddress>,
+) -> smoltcp::socket::udp::UdpMetadata {
+    let mut metadata = smoltcp::socket::udp::UdpMetadata::from(remote);
+    metadata.meta.id = egress_ifindex;
+    metadata.local_address = local_address;
+    metadata
+}
+
 pub struct UdpBindContext {
     pub netns: Arc<NetNamespace>,
     pub socket: Weak<UdpSocket>,
@@ -156,7 +167,7 @@ impl UnboundUdp {
         }
         Ok(BoundUdp {
             inner,
-            remote: Mutex::new(None),
+            connection: Mutex::new(None),
             explicitly_bound: true,
             has_preconnect_data: Mutex::new(false),
         })
@@ -228,7 +239,7 @@ impl UnboundUdp {
 
         Ok(BoundUdp {
             inner,
-            remote: Mutex::new(None),
+            connection: Mutex::new(None),
             explicitly_bound: true,
             has_preconnect_data: Mutex::new(false),
         })
@@ -292,7 +303,7 @@ impl UnboundUdp {
 
         Ok(BoundUdp {
             inner,
-            remote: Mutex::new(None),
+            connection: Mutex::new(None),
             explicitly_bound: false,
             has_preconnect_data: Mutex::new(false),
         })
@@ -342,7 +353,7 @@ impl UnboundUdp {
 
         Ok(BoundUdp {
             inner,
-            remote: Mutex::new(None),
+            connection: Mutex::new(None),
             explicitly_bound: false,
             has_preconnect_data: Mutex::new(false),
         })
@@ -352,7 +363,7 @@ impl UnboundUdp {
 #[derive(Debug)]
 pub struct BoundUdp {
     inner: BoundInner,
-    remote: Mutex<Option<smoltcp::wire::IpEndpoint>>,
+    connection: Mutex<Option<UdpConnection>>,
     /// True if socket was explicitly bound by user, false if implicitly bound by connect
     explicitly_bound: bool,
     /// Whether there were buffered packets at connect time - if true, allow next recv without filtering
@@ -360,6 +371,12 @@ pub struct BoundUdp {
     /// udp socket queue 中，而不是先针对connect进行filter操作。这里做workaround, 当connect是检查是否有包
     /// 在缓冲区，如果有，第一个包我们走非connect而不是connect的recv方法（即接受第一个非connect对端对应的包）
     has_preconnect_data: Mutex<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UdpConnection {
+    remote: smoltcp::wire::IpEndpoint,
+    source: Option<smoltcp::wire::IpAddress>,
 }
 
 impl BoundUdp {
@@ -386,14 +403,16 @@ impl BoundUdp {
     }
 
     pub fn remote_endpoint(&self) -> Result<smoltcp::wire::IpEndpoint, SystemError> {
-        self.remote
-            .lock()
-            .as_ref()
-            .cloned()
+        (*self.connection.lock())
+            .map(|connection| connection.remote)
             .ok_or(SystemError::ENOTCONN)
     }
 
-    pub fn connect(&self, remote: smoltcp::wire::IpEndpoint) {
+    pub fn connect(
+        &self,
+        remote: smoltcp::wire::IpEndpoint,
+        source: Option<smoltcp::wire::IpAddress>,
+    ) {
         // let _local = self.endpoint();
         // log::debug!(
         //     "BoundUdp::connect: local={:?}, connecting to remote={:?}",
@@ -406,7 +425,13 @@ impl BoundUdp {
         *self.has_preconnect_data.lock() = has_buffered;
         // log::debug!("BoundUdp::connect: has pre-connect data = {}", has_buffered);
 
-        self.remote.lock().replace(remote);
+        self.connection
+            .lock()
+            .replace(UdpConnection { remote, source });
+    }
+
+    pub fn connected_source(&self) -> Option<smoltcp::wire::IpAddress> {
+        (*self.connection.lock()).and_then(|connection| connection.source)
     }
 
     pub fn set_preconnect_data(&self, has_data: bool) {
@@ -427,7 +452,7 @@ impl BoundUdp {
     }
 
     pub fn disconnect(&self) {
-        self.remote.lock().take();
+        self.connection.lock().take();
     }
 
     /// Returns true if this socket should be unbound on disconnect
@@ -451,7 +476,9 @@ impl BoundUdp {
         ),
         SystemError,
     > {
-        let remote = *self.remote.lock();
+        let connection = *self.connection.lock();
+        let remote = connection.map(|connection| connection.remote);
+        let connected_source = connection.and_then(|connection| connection.source);
 
         self.with_mut_socket(|socket| {
             let endpoint_addr = socket.endpoint().addr;
@@ -488,7 +515,17 @@ impl BoundUdp {
                     bound_device_ifindex != 0 && bound_device_ifindex != ingress_ifindex;
                 let remote_mismatch =
                     should_filter && remote.is_some_and(|expected| expected != metadata.endpoint);
-                if destination_mismatch || device_mismatch || remote_mismatch {
+                let connected_destination_mismatch = should_filter
+                    && connected_source.is_some_and(|source| {
+                        metadata
+                            .local_address
+                            .is_some_and(|destination| destination != source)
+                    });
+                if destination_mismatch
+                    || connected_destination_mismatch
+                    || device_mismatch
+                    || remote_mismatch
+                {
                     let _ = socket.recv();
                     continue;
                 }
@@ -533,8 +570,9 @@ impl BoundUdp {
         buf: &[u8],
         to: Option<smoltcp::wire::IpEndpoint>,
         egress_ifindex: u32,
+        local_address: Option<smoltcp::wire::IpAddress>,
     ) -> Result<usize, SystemError> {
-        let connected_remote = *self.remote.lock();
+        let connected_remote = (*self.connection.lock()).map(|connection| connection.remote);
         let mut remote = to.or(connected_remote).ok_or(SystemError::ENOTCONN)?;
 
         // Validate port - sending to port 0 is invalid
@@ -569,8 +607,7 @@ impl BoundUdp {
                 return Err(SystemError::EMSGSIZE);
             }
             if socket.can_send() {
-                let mut metadata = smoltcp::socket::udp::UdpMetadata::from(remote);
-                metadata.meta.id = egress_ifindex;
+                let metadata = output_metadata(remote, egress_ifindex, local_address);
                 match socket.send_slice(buf, metadata) {
                     Ok(_) => {
                         // log::debug!("try_send: send successful");
@@ -604,6 +641,32 @@ impl BoundUdp {
             socket.close();
         });
         self.inner.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_metadata;
+    use smoltcp::wire::{IpAddress, IpEndpoint};
+
+    #[test]
+    fn output_metadata_keeps_route_source_and_oif_together() {
+        let remote = IpEndpoint::new(IpAddress::v4(203, 0, 113, 1), 9000);
+        let source = IpAddress::v4(198, 51, 100, 2);
+        let metadata = output_metadata(remote, 17, Some(source));
+
+        assert_eq!(metadata.endpoint, remote);
+        assert_eq!(metadata.local_address, Some(source));
+        assert_eq!(metadata.meta.id, 17);
+    }
+
+    #[test]
+    fn output_metadata_does_not_invent_a_source_for_fixed_endpoints() {
+        let remote = IpEndpoint::new(IpAddress::v4(203, 0, 113, 1), 9000);
+        let metadata = output_metadata(remote, 0, None);
+
+        assert_eq!(metadata.local_address, None);
+        assert_eq!(metadata.meta.id, 0);
     }
 }
 

@@ -36,6 +36,7 @@ use super::{
 };
 
 mod option;
+mod output_flow;
 mod socket_impl;
 
 pub mod inner;
@@ -44,6 +45,7 @@ pub(crate) mod udp_bindings;
 
 type EP = crate::filesystem::epoll::EPollEventType;
 const IFACE_POLL_BATCH_ROUNDS: usize = 128;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct SockExtendedErr {
@@ -655,6 +657,7 @@ impl UdpSocket {
         // Save current state before recreating
         let local_ep = bound.endpoint();
         let remote_ep = bound.remote_endpoint().ok(); // May be None if not connected
+        let connected_source = bound.connected_source();
         let explicitly_bound = !bound.should_unbind_on_disconnect();
         let old_iface = bound.inner().iface().clone();
         // log::debug!(
@@ -704,7 +707,7 @@ impl UdpSocket {
         let mut bound = bound;
         bound.set_explicitly_bound(explicitly_bound);
         if let Some(remote) = remote_ep {
-            bound.connect(remote);
+            bound.connect(remote, connected_source);
         }
 
         // Restore the binding in the interface
@@ -1049,24 +1052,6 @@ impl UdpSocket {
             .map(Self::normalize_unspecified_dest)
     }
 
-    fn local_send_source_endpoint(
-        &self,
-        local: IpListenEndpoint,
-        dest_addr: smoltcp::wire::IpAddress,
-        ifindex: Option<i32>,
-    ) -> IpEndpoint {
-        let local_addr = local
-            .addr
-            .filter(|addr| !addr.is_unspecified())
-            .or_else(|| {
-                let ifindex = usize::try_from(ifindex?).ok()?;
-                let iface = self.netns.device_list().get(&ifindex).cloned()?;
-                crate::net::socket::inet::common::pick_configured_source_addr(&iface, &dest_addr)
-            })
-            .unwrap_or_else(|| self.unspecified_addr());
-        IpEndpoint::new(local_addr, local.port)
-    }
-
     pub fn try_send(
         &self,
         buf: &[u8],
@@ -1101,6 +1086,32 @@ impl UdpSocket {
         // The caller's placement guard intentionally spans polling below.
         // `inner` cannot remain locked because notifications may re-enter
         // socket event checks.
+
+        // Resolve wildcard unicast flow state before taking the send-side
+        // inner lock. The placement guard keeps endpoint/device state stable
+        // across this lookup and the later enqueue.
+        let output_flow_request = {
+            let inner = self.inner.read();
+            if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
+                to.or_else(|| bound.remote_endpoint().ok())
+                    .map(Self::normalize_unspecified_dest)
+                    .map(|dest| (bound.endpoint(), dest, bound.connected_source()))
+            } else {
+                None
+            }
+        };
+        let mut resolved_output_flow = match output_flow_request {
+            Some((local, dest, connected_source)) => output_flow::resolve_wildcard_ipv4(
+                &self.netns,
+                local,
+                dest.addr,
+                (self.bound_device_ifindex() != 0).then_some(self.bound_device_ifindex() as u32),
+                connected_source,
+                dest.addr.is_multicast(),
+                dest.addr.is_broadcast(),
+            )?,
+            None => None,
+        };
 
         // Send data and snapshot the delivery metadata before releasing inner.
         let (
@@ -1211,6 +1222,11 @@ impl UdpSocket {
                         .inner
                         .is_broadcast(&dest.addr);
                     let is_broadcast = loopback_broadcast || bound_iface_is_broadcast;
+                    let output_flow = if is_multicast || is_broadcast {
+                        None
+                    } else {
+                        resolved_output_flow.take()
+                    };
                     let local_delivery_ifindex =
                         if device_ifindex != 0 && (is_multicast || bound_iface_is_broadcast) {
                             Some(device_ifindex)
@@ -1228,10 +1244,13 @@ impl UdpSocket {
                     let should_loopback_send = binding_allows_local_delivery
                         && ((!is_multicast && local_delivery_ifindex.is_some())
                             || (is_multicast && (send_iface_is_loopback || loopback_broadcast)));
-                    let src_endpoint = self.local_send_source_endpoint(
+                    let src_endpoint = output_flow::local_source_endpoint(
+                        &self.netns,
                         bound.endpoint(),
                         dest.addr,
                         local_delivery_ifindex,
+                        output_flow,
+                        self.unspecified_addr(),
                     );
                     if should_loopback_send {
                         let max_payload =
@@ -1265,14 +1284,21 @@ impl UdpSocket {
                             }
                         }
 
-                        let egress_ifindex = if device_ifindex != 0 {
+                        let egress_ifindex = if let Some(flow) = output_flow {
+                            flow.oif
+                        } else if device_ifindex != 0 {
                             device_ifindex as u32
                         } else if is_multicast && mcast_ifindex != 0 {
                             mcast_ifindex as u32
                         } else {
                             0
                         };
-                        let ret = bound.try_send(buf, Some(dest), egress_ifindex);
+                        let ret = bound.try_send(
+                            buf,
+                            Some(dest),
+                            egress_ifindex,
+                            output_flow.map(|flow| flow.source),
+                        );
                         (
                             ret,
                             send_iface,

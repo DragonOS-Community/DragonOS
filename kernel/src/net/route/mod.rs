@@ -6,6 +6,7 @@
 mod fib;
 mod fib_index;
 mod lifecycle;
+mod source;
 mod transaction;
 mod types;
 mod validation;
@@ -17,7 +18,7 @@ use system_error::SystemError;
 
 use crate::libs::rwsem::RwSemReadGuard;
 use crate::{
-    driver::net::{types::InterfaceFlags, Iface},
+    driver::net::Iface,
     net::{routing::Router, rtnl::RtnlGuard},
     process::namespace::net_namespace::NetNamespace,
 };
@@ -28,6 +29,7 @@ pub(crate) use lifecycle::{
     commit_addresses, prepare_link_state_change, register_iface, unregister_iface,
     PreparedLinkStateChange,
 };
+pub(crate) use source::{resolve_ipv4_output_flow, resolve_ipv4_route, Ipv4OutputFlow};
 use transaction::{
     prepare_with_devices, projection_for_iface, transact_single, transact_with_devices,
     PreparedTransaction, ProjectionPlan,
@@ -47,12 +49,6 @@ pub(crate) struct OutputRouteDecision {
     pub(crate) ip_mtu: usize,
     pub(crate) kind: u8,
     pub(crate) table: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Ipv4OutputFlow {
-    pub(crate) oif: u32,
-    pub(crate) source: IpAddress,
 }
 
 impl OutputRouteGuard<'_> {
@@ -132,81 +128,6 @@ pub(crate) fn lookup_on_iface(
     oif: u32,
 ) -> Option<RouteLookupResult> {
     lookup_output_fib(&netns.router().fib.read(), destination, Some(oif))
-}
-
-/// Resolves the egress and automatic source for one IPv4 output flow while
-/// holding the FIB, device topology, and authoritative address projections in
-/// one read-side snapshot.
-pub(crate) fn resolve_ipv4_output_flow(
-    netns: &Arc<NetNamespace>,
-    destination: IpAddress,
-    required_oif: Option<u32>,
-    fixed_source: Option<IpAddress>,
-) -> Result<Ipv4OutputFlow, SystemError> {
-    if !matches!(destination, IpAddress::Ipv4(_)) {
-        return Err(SystemError::EAFNOSUPPORT);
-    }
-
-    // Match the data-plane lock order: topology before FIB. Address commits
-    // publish their route and address mirror while excluding this FIB reader.
-    let devices = netns.device_list();
-    let router = netns.router();
-    let fib = router.fib.read();
-    let decision =
-        lookup_output_fib(&fib, destination, required_oif).ok_or(SystemError::ENETUNREACH)?;
-    let iface = devices
-        .get(&(decision.oif as usize))
-        .ok_or(SystemError::ENETUNREACH)?;
-    if decision.matched.kind != RTN_LOCAL && !iface.flags().contains(InterfaceFlags::UP) {
-        return Err(SystemError::ENETDOWN);
-    }
-
-    let source_is_local = |source: IpAddress| {
-        devices.values().any(|candidate| {
-            candidate
-                .router_common()
-                .ip_addrs
-                .read()
-                .iter()
-                .any(|cidr| cidr.address() == source)
-        })
-    };
-    let source = if let Some(source) = fixed_source {
-        if !matches!(source, IpAddress::Ipv4(_)) || !source_is_local(source) {
-            return Err(SystemError::ENETUNREACH);
-        }
-        source
-    } else {
-        match decision.source {
-            RouteSourcePolicy::Preferred(source) => source_is_local(source)
-                .then_some(source)
-                .ok_or(SystemError::ENETUNREACH)?,
-            RouteSourcePolicy::SelectConfigured | RouteSourcePolicy::AllowUnspecified => {
-                let configured = iface
-                    .router_common()
-                    .ip_addrs
-                    .read()
-                    .iter()
-                    .find_map(|cidr| match cidr.address() {
-                        IpAddress::Ipv4(address) => Some(IpAddress::Ipv4(address)),
-                        IpAddress::Ipv6(_) => None,
-                    });
-                match (configured, decision.source) {
-                    (Some(source), _) => source,
-                    (None, RouteSourcePolicy::AllowUnspecified) => IpAddress::v4(0, 0, 0, 0),
-                    (None, RouteSourcePolicy::SelectConfigured) => {
-                        return Err(SystemError::ENETUNREACH)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-    };
-
-    Ok(Ipv4OutputFlow {
-        oif: decision.oif,
-        source,
-    })
 }
 
 /// Resolves the protocol-stack owner that receives packets for an exact local

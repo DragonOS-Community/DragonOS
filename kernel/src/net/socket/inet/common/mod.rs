@@ -450,6 +450,16 @@ fn get_ephemeral_bind_target(
         && !remote_ip_addr.is_multicast()
         && !remote_ip_addr.is_broadcast()
     {
+        if matches!(remote_ip_addr, smoltcp::wire::IpAddress::Ipv4(_)) {
+            let resolved =
+                crate::net::route::resolve_ipv4_route(&netns, *remote_ip_addr, None, None)?;
+            let iface = netns
+                .device_list()
+                .get(&(resolved.decision.oif as usize))
+                .cloned()
+                .ok_or(SystemError::ENETUNREACH)?;
+            return ephemeral_target_for_source(&netns, iface, resolved.source, no_source_error);
+        }
         let decision = crate::net::route::lookup(&netns, *remote_ip_addr)
             .ok_or_else(|| no_source_error.clone())?;
         let iface = netns
@@ -460,7 +470,7 @@ fn get_ephemeral_bind_target(
         ensure_iface_up_for_route(&iface, decision.matched.kind)?;
         // An explicit FIB decision is authoritative, including routes that
         // deliberately send non-loopback destinations through `lo`.
-        let source = route_source_from_decision(&netns, &iface, remote_ip_addr, decision)?;
+        let source = ipv6_route_source_from_decision(&netns, &iface, remote_ip_addr, decision)?;
         return ephemeral_target_for_source(&netns, iface, source, no_source_error);
     }
 
@@ -554,10 +564,19 @@ pub(crate) fn route_source_on_iface(
         ensure_iface_up(iface)?;
         return pick_configured_source_addr(iface, remote).ok_or(no_source_addr_error(remote));
     }
+    if matches!(remote, smoltcp::wire::IpAddress::Ipv4(_)) {
+        return crate::net::route::resolve_ipv4_route(
+            netns,
+            *remote,
+            Some(iface.nic_id() as u32),
+            None,
+        )
+        .map(|resolved| resolved.source);
+    }
     let decision = crate::net::route::lookup_on_iface(netns, *remote, iface.nic_id() as u32)
         .ok_or(SystemError::ENETUNREACH)?;
     ensure_iface_up_for_route(iface, decision.matched.kind)?;
-    route_source_from_decision(netns, iface, remote, decision)
+    ipv6_route_source_from_decision(netns, iface, remote, decision)
 }
 
 fn ensure_iface_up_for_route(iface: &Arc<dyn Iface>, kind: u8) -> Result<(), SystemError> {
@@ -567,13 +586,14 @@ fn ensure_iface_up_for_route(iface: &Arc<dyn Iface>, kind: u8) -> Result<(), Sys
     ensure_iface_up(iface)
 }
 
-fn route_source_from_decision(
+fn ipv6_route_source_from_decision(
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     remote: &smoltcp::wire::IpAddress,
     decision: crate::net::route::RouteLookupResult,
 ) -> Result<smoltcp::wire::IpAddress, SystemError> {
     debug_assert_eq!(decision.oif as usize, iface.nic_id());
+    debug_assert!(matches!(remote, smoltcp::wire::IpAddress::Ipv6(_)));
     match decision.source {
         crate::net::route::RouteSourcePolicy::Preferred(source)
             if source_address_usable_on_iface(netns, iface, source) =>

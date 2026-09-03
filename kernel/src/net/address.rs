@@ -6,7 +6,7 @@
 
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 
-use smoltcp::wire::{IpAddress, IpCidr};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 use system_error::SystemError;
 
 use crate::{
@@ -522,6 +522,36 @@ pub(crate) fn iface_has_address(iface: &Arc<dyn Iface>, address: IpAddress) -> b
         .ip_addrs()
         .iter()
         .any(|cidr| cidr.address() == address)
+}
+
+/// Selects the IPv4 source that Linux's `inet_select_addr()` would use for an
+/// output route on this interface.
+///
+/// A gateway is the only subnet-selection hint used by IPv4 FIB output. For a
+/// direct route Linux passes an unspecified `nh_gw4`, so the first configured
+/// IPv4 address remains the fallback instead of matching the final remote.
+pub(crate) fn select_ipv4_source_address(
+    iface: &Arc<dyn Iface>,
+    gateway: Option<Ipv4Address>,
+) -> Option<IpAddress> {
+    select_ipv4_source_from(iface.common().ip_addrs().as_slice(), gateway)
+}
+
+fn select_ipv4_source_from(
+    addresses: &[IpCidr],
+    gateway: Option<Ipv4Address>,
+) -> Option<IpAddress> {
+    let mut fallback = None;
+    for cidr in addresses {
+        let IpCidr::Ipv4(cidr) = cidr else {
+            continue;
+        };
+        fallback.get_or_insert(IpAddress::Ipv4(cidr.address()));
+        if gateway.is_some_and(|gateway| cidr.contains_addr(&gateway)) {
+            return Some(IpAddress::Ipv4(cidr.address()));
+        }
+    }
+    fallback
 }
 
 /// Returns whether `address` is configured anywhere in `netns`.

@@ -580,6 +580,103 @@ TEST(RtnetlinkRouteSemantics, CrossInterfacePreferredSourceDrivesOutputAndAddres
               0);
 }
 
+TEST(RtnetlinkRouteSemantics, GatewaySelectsSourceFromItsInterfacePrefix) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 6810;
+    const uint32_t egress = if_nametoindex("veth1");
+    ASSERT_NE(egress, 0u);
+    constexpr const char* kSource = "198.18.220.1";
+    constexpr const char* kGateway = "198.18.220.254";
+    constexpr const char* kDestination = "198.18.221.7";
+
+    RouteSpec route = MakeIpv4Route("198.18.221.0", 24, egress);
+    route.gateway = Ipv4(kGateway);
+    route.priority = 6810;
+    DeleteRouteIfPresent(fd.Get(), route, &seq);
+    DeleteAddrIfPresent(fd.Get(), egress, kSource, 24, &seq);
+    ASSERT_EQ(SendAddrRequest(fd.Get(), RTM_NEWADDR,
+                              NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, egress,
+                              kSource, 24, ++seq),
+              0);
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              0);
+
+    auto lookup = LookupIpv4Route(fd.Get(), kDestination, ++seq, egress);
+    ASSERT_TRUE(lookup.has_value());
+    ASSERT_TRUE(lookup->preferred_source.has_value());
+    EXPECT_EQ(*lookup->preferred_source, Ipv4(kSource));
+
+    FdGuard connected(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(connected.Get(), 0) << ErrnoString(errno);
+    constexpr char device[] = "veth1";
+    ASSERT_EQ(setsockopt(connected.Get(), SOL_SOCKET, SO_BINDTODEVICE, device, sizeof(device)), 0)
+        << ErrnoString(errno);
+    sockaddr_in remote = {};
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(9);
+    remote.sin_addr.s_addr = Ipv4(kDestination);
+    ASSERT_EQ(connect(connected.Get(), reinterpret_cast<sockaddr*>(&remote), sizeof(remote)), 0)
+        << ErrnoString(errno);
+    sockaddr_in selected_local = {};
+    socklen_t selected_local_len = sizeof(selected_local);
+    ASSERT_EQ(getsockname(connected.Get(), reinterpret_cast<sockaddr*>(&selected_local),
+                          &selected_local_len),
+              0)
+        << ErrnoString(errno);
+    EXPECT_EQ(selected_local.sin_addr.s_addr, Ipv4(kSource));
+
+    FdGuard observer(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP)));
+    ASSERT_GE(observer.Get(), 0) << ErrnoString(errno);
+    sockaddr_ll packet_bind = {};
+    packet_bind.sll_family = AF_PACKET;
+    packet_bind.sll_protocol = htons(ETH_P_ARP);
+    packet_bind.sll_ifindex = egress;
+    ASSERT_EQ(bind(observer.Get(), reinterpret_cast<sockaddr*>(&packet_bind), sizeof(packet_bind)),
+              0)
+        << ErrnoString(errno);
+    timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    ASSERT_EQ(setsockopt(observer.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0)
+        << ErrnoString(errno);
+
+    FdGuard wildcard(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(wildcard.Get(), 0) << ErrnoString(errno);
+    sockaddr_in any = {};
+    any.sin_family = AF_INET;
+    any.sin_addr.s_addr = htonl(INADDR_ANY);
+    ASSERT_EQ(bind(wildcard.Get(), reinterpret_cast<sockaddr*>(&any), sizeof(any)), 0)
+        << ErrnoString(errno);
+    ASSERT_EQ(setsockopt(wildcard.Get(), SOL_SOCKET, SO_BINDTODEVICE, device, sizeof(device)), 0)
+        << ErrnoString(errno);
+    constexpr char payload[] = "gateway-source";
+    ASSERT_EQ(sendto(wildcard.Get(), payload, sizeof(payload), 0,
+                     reinterpret_cast<sockaddr*>(&remote), sizeof(remote)),
+              static_cast<ssize_t>(sizeof(payload)))
+        << ErrnoString(errno);
+
+    bool saw_gateway_arp = false;
+    char frame[2048] = {};
+    while (!saw_gateway_arp) {
+        const ssize_t length = recv(observer.Get(), frame, sizeof(frame), 0);
+        if (length < 0) break;
+        if (length < ETH_HLEN + 28) continue;
+        uint32_t sender = 0;
+        uint32_t target = 0;
+        std::memcpy(&sender, frame + ETH_HLEN + 14, sizeof(sender));
+        std::memcpy(&target, frame + ETH_HLEN + 24, sizeof(target));
+        saw_gateway_arp = sender == Ipv4(kSource) && target == Ipv4(kGateway);
+    }
+    EXPECT_TRUE(saw_gateway_arp);
+
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq),
+              0);
+    EXPECT_EQ(SendAddrRequest(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, egress, kSource,
+                              24, ++seq),
+              0);
+}
+
 TEST(RtnetlinkRouteSemantics, CrossInterfacePreferredSourceOwnsTransportStack) {
     FdGuard fd(OpenRouteSocket());
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);

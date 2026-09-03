@@ -474,16 +474,6 @@ fn lookup_route(
     if let Some(oif) = requested_oif {
         ensure_iface_up(&netns, oif)?;
     }
-    let decision = match requested_oif {
-        Some(oif) => route::lookup_on_iface(&netns, destination, oif),
-        None => route::lookup(&netns, destination),
-    }
-    .ok_or(SystemError::ENETUNREACH)?;
-    let iface = netns
-        .device_list()
-        .get(&(decision.oif as usize))
-        .cloned()
-        .ok_or(SystemError::ENODEV)?;
     let requested_source = parsed
         .source
         .map(|source| source.address())
@@ -502,12 +492,33 @@ fn lookup_route(
     }) {
         return Err(SystemError::ENETUNREACH);
     }
-    let selected_source = if requested_source.is_some() {
-        None
+    let (decision, selected_source) = if matches!(destination, IpAddress::Ipv4(_)) {
+        let resolved =
+            route::resolve_ipv4_route(&netns, destination, requested_oif, requested_source)?;
+        let selected = requested_source
+            .is_none()
+            .then_some(resolved.source)
+            .filter(|source| !source.is_unspecified());
+        (resolved.decision, selected)
     } else {
-        decision.source.preferred().or_else(|| {
-            crate::net::socket::inet::common::pick_configured_source_addr(&iface, &destination)
-        })
+        let decision = match requested_oif {
+            Some(oif) => route::lookup_on_iface(&netns, destination, oif),
+            None => route::lookup(&netns, destination),
+        }
+        .ok_or(SystemError::ENETUNREACH)?;
+        let iface = netns
+            .device_list()
+            .get(&(decision.oif as usize))
+            .cloned()
+            .ok_or(SystemError::ENODEV)?;
+        let selected = if requested_source.is_some() {
+            None
+        } else {
+            decision.source.preferred().or_else(|| {
+                crate::net::socket::inet::common::pick_configured_source_addr(&iface, &destination)
+            })
+        };
+        (decision, selected)
     };
     let host = host_cidr(destination);
     let output = RouteEntry {

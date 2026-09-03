@@ -60,24 +60,10 @@ pub struct IfaceCommon {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum LocalOutputDrainResult {
-    Quiescent,
-    BudgetExhausted,
-    Backpressured,
-    Contended,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PollModeRecheck {
     Current,
     Routed,
     Authoritative,
-}
-
-impl LocalOutputDrainResult {
-    fn needs_immediate_poll(self) -> bool {
-        matches!(self, Self::BudgetExhausted)
-    }
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -742,11 +728,25 @@ impl IfaceCommon {
         let mut processed = 0usize;
         let mut had_packet = false;
 
+        // Local output is packet work too: it performs route/neighbor
+        // classification and transmission rather than merely reaping TX
+        // completions. Reserve half the shared NAPI budget when it is already
+        // backlogged, then let either side consume unused capacity.
+        let ingress_budget = if self.local_input_queue.has_ready_output(timestamp) {
+            budget.div_ceil(2)
+        } else {
+            budget
+        };
+
         // Reserve at most half of the first pass for namespace-local handoff,
         // then poll the hardware/device queue. If the device has no work, use
         // the remaining budget for local input. This keeps both sources
         // progressing without reducing throughput when only one is active.
-        let local_first_budget = budget.div_ceil(2);
+        let local_first_budget = if scope == IfacePollScope::Full {
+            ingress_budget.div_ceil(2)
+        } else {
+            ingress_budget
+        };
         if routed_this_round {
             let mut local_device = LocalInputDevice::new(
                 device,
@@ -769,7 +769,7 @@ impl IfaceCommon {
         }
 
         let device_budget = if scope == IfacePollScope::Full {
-            budget - processed
+            ingress_budget - processed
         } else {
             0
         };
@@ -866,7 +866,7 @@ impl IfaceCommon {
         drop(sockets);
         drop(route_policy);
         drop(router);
-        let output_drain = self.drain_local_outputs(device, budget);
+        let output_drain = self.drain_local_outputs(device, budget - processed);
         self.clear_namespace_routing_if_idle();
         self.notify_deadline_rearm(deadline_rearm);
         self.notify_all_bound_sockets();
@@ -881,8 +881,8 @@ impl IfaceCommon {
         // - NAPI 线程却错误睡眠，直到下一次外部事件才继续推进，
         //   导致 send done 后 recv 端偶发卡住。
         napi::NapiPollResult::new(
-            processed,
-            (had_packet && processed == budget)
+            processed + output_drain.work_done,
+            (had_packet && processed == ingress_budget)
                 || poll_again
                 || self.has_local_input()
                 || output_drain.needs_immediate_poll(),
@@ -894,16 +894,17 @@ impl IfaceCommon {
         D: SmolDevice + ?Sized,
     {
         let Some(netns) = self.net_namespace() else {
-            return LocalOutputDrainResult::Quiescent;
+            return LocalOutputDrainResult::new(0, LocalOutputDrainState::Quiescent);
         };
         let Some(drain_guard) = self.local_input_queue.try_begin_output_drain() else {
             return if self.local_input_queue.has_output() {
-                LocalOutputDrainResult::BudgetExhausted
+                LocalOutputDrainResult::new(0, LocalOutputDrainState::BudgetExhausted)
             } else {
-                LocalOutputDrainResult::Contended
+                LocalOutputDrainResult::new(0, LocalOutputDrainState::Contended)
             };
         };
         let mut prefer_deferred = true;
+        let mut work_done = 0;
         for _ in 0..budget {
             let (mut output, mut in_flight, deferred_probe) = match self
                 .local_input_queue
@@ -915,16 +916,23 @@ impl IfaceCommon {
                 LocalOutputPop::DeferredUntil(retry_at) => {
                     drop(drain_guard);
                     self.defer_local_output_retry_at(retry_at);
-                    return LocalOutputDrainResult::Backpressured;
+                    return LocalOutputDrainResult::new(
+                        work_done,
+                        LocalOutputDrainState::Backpressured,
+                    );
                 }
                 LocalOutputPop::Empty => {
                     return if self.local_input_queue.finish_output_drain(drain_guard) {
-                        LocalOutputDrainResult::BudgetExhausted
+                        LocalOutputDrainResult::new(
+                            work_done,
+                            LocalOutputDrainState::BudgetExhausted,
+                        )
                     } else {
-                        LocalOutputDrainResult::Quiescent
+                        LocalOutputDrainResult::new(work_done, LocalOutputDrainState::Quiescent)
                     };
                 }
             };
+            work_done += 1;
             prefer_deferred = false;
 
             // Admission belongs to the actual egress interface. Atomically
@@ -1089,9 +1097,9 @@ impl IfaceCommon {
             }
         }
         if self.local_input_queue.finish_output_drain(drain_guard) {
-            LocalOutputDrainResult::BudgetExhausted
+            LocalOutputDrainResult::new(work_done, LocalOutputDrainState::BudgetExhausted)
         } else {
-            LocalOutputDrainResult::Quiescent
+            LocalOutputDrainResult::new(work_done, LocalOutputDrainState::Quiescent)
         }
     }
 

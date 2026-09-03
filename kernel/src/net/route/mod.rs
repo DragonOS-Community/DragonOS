@@ -205,13 +205,8 @@ pub(crate) fn resolve_gateway_oif(
     let fib = router.fib.read();
     let minimum_scope =
         is_ipv4(gateway).then_some(route_scope.saturating_add(1).max(RT_SCOPE_LINK));
-    let in_local = fib.resolve_gateway(gateway, RT_TABLE_LOCAL, requested_oif, minimum_scope);
-    let in_requested = (table != RT_TABLE_MAIN)
-        .then(|| fib.resolve_gateway(gateway, table, requested_oif, minimum_scope))
-        .flatten();
-    let oif = in_local
-        .or(in_requested)
-        .or_else(|| fib.resolve_gateway(gateway, RT_TABLE_MAIN, requested_oif, minimum_scope))
+    let oif = fib
+        .resolve_gateway_with_builtin_rules(gateway, table, requested_oif, minimum_scope)
         .ok_or(if is_ipv4(gateway) {
             SystemError::ENETUNREACH
         } else {

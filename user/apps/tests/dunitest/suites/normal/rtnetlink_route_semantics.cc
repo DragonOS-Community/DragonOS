@@ -15,10 +15,16 @@ TEST(RtnetlinkRouteSemantics, Ipv4BuiltinRulesFallBackFromMainToDefaultTable) {
     ASSERT_GE(cleanup.Get(), 0);
     uint32_t cleanup_seq = 100;
     const uint32_t egress = if_nametoindex("veth1");
+    RouteSpec through_default = MakeIpv4Route("198.19.0.0", 24, egress);
+    through_default.gateway = Ipv4("198.18.240.1");
+    RouteSpec gateway_link = MakeIpv4Route("198.18.240.0", 24, egress);
+    gateway_link.table = RT_TABLE_DEFAULT;
     RouteSpec main = MakeIpv4Route("203.0.0.0", 16, egress);
     RouteSpec fallback = MakeIpv4Route("203.0.113.0", 24, egress);
     fallback.gateway = Ipv4("111.111.11.2");
     fallback.table = RT_TABLE_DEFAULT;
+    DeleteRouteIfPresent(cleanup.Get(), through_default, &cleanup_seq);
+    DeleteRouteIfPresent(cleanup.Get(), gateway_link, &cleanup_seq);
     DeleteRouteIfPresent(cleanup.Get(), main, &cleanup_seq);
     DeleteRouteIfPresent(cleanup.Get(), fallback, &cleanup_seq);
     ASSERT_TRUE(WIFEXITED(status));

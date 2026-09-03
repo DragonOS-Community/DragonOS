@@ -726,6 +726,32 @@ int RunIpv4BuiltinRuleChain() {
     if (egress == 0) return 2000 + errno;
     uint32_t seq = 1;
 
+    // Gateway validation must use the same IPv4 built-in rule fallback as
+    // packet lookup. Make the default table the only direct route to this
+    // gateway. Constrain the dependent route to this interface so an
+    // unrelated main-table default route in the shared guest cannot win.
+    RouteSpec gateway_link = MakeIpv4Route("198.18.240.0", 24, egress);
+    gateway_link.table = RT_TABLE_DEFAULT;
+    if (const int error = SendRouteRequest(
+                fd.Get(), RTM_NEWROUTE,
+                NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, gateway_link, seq++);
+        error != 0) {
+        return 2500 + error;
+    }
+    RouteSpec through_default = MakeIpv4Route("198.19.0.0", 24, egress);
+    through_default.gateway = Ipv4("198.18.240.1");
+    if (const int error = SendRouteRequest(
+                fd.Get(), RTM_NEWROUTE,
+                NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, through_default, seq++);
+        error != 0) {
+        return 2600 + error;
+    }
+    auto gateway_lookup = LookupIpv4Route(fd.Get(), "198.19.0.7", seq++);
+    if (!gateway_lookup.has_value() || gateway_lookup->oif != egress ||
+        gateway_lookup->gateway != through_default.gateway) {
+        return 2700;
+    }
+
     RouteSpec fallback = MakeIpv4Route("203.0.113.0", 24, egress);
     fallback.gateway = Ipv4("111.111.11.2");
     fallback.table = RT_TABLE_DEFAULT;

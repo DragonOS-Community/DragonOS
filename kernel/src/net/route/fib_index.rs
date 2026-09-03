@@ -105,6 +105,18 @@ impl ScopeWinners {
         self.0[requirement.index()]
     }
 
+    fn references(self, route_index: usize) -> bool {
+        self.0.contains(&Some(route_index))
+    }
+
+    fn replace_index(&mut self, old_index: usize, new_index: usize) {
+        for winner in &mut self.0 {
+            if *winner == Some(old_index) {
+                *winner = Some(new_index);
+            }
+        }
+    }
+
     fn consider(
         &mut self,
         route_index: usize,
@@ -136,6 +148,21 @@ impl CandidateWinners {
     fn clear(&mut self) {
         self.any_oif = ScopeWinners::default();
         self.by_oif.clear();
+    }
+
+    fn references(&self, route_index: usize) -> bool {
+        self.any_oif.references(route_index)
+            || self
+                .by_oif
+                .values()
+                .any(|winners| winners.references(route_index))
+    }
+
+    fn replace_index(&mut self, old_index: usize, new_index: usize) {
+        self.any_oif.replace_index(old_index, new_index);
+        for winners in self.by_oif.values_mut() {
+            winners.replace_index(old_index, new_index);
+        }
     }
 
     fn get(&self, oif: Option<u32>, requirement: ScopeRequirement) -> Option<usize> {
@@ -179,6 +206,15 @@ impl PrefixWinners {
             && self.standard.by_oif.is_empty()
             && self.broadcast.any_oif == ScopeWinners::default()
             && self.broadcast.by_oif.is_empty()
+    }
+
+    fn references(&self, route_index: usize) -> bool {
+        self.standard.references(route_index) || self.broadcast.references(route_index)
+    }
+
+    fn replace_index(&mut self, old_index: usize, new_index: usize) {
+        self.standard.replace_index(old_index, new_index);
+        self.broadcast.replace_index(old_index, new_index);
     }
 
     fn candidates_mut(&mut self, route: RouteEntry) -> &mut CandidateWinners {
@@ -333,10 +369,14 @@ impl FibIndex {
         let rank = before
             .map(|before| self.prefix_rank[before])
             .unwrap_or_else(|| self.all.get(&prefix).map_or(0, Vec::len));
-        if let Some(indices) = self.all.get(&prefix) {
-            for index in indices {
-                if self.prefix_rank[*index] >= rank {
-                    self.prefix_rank[*index] += 1;
+        // A tail insertion does not change any existing rank. Only an
+        // explicit insertion-before needs to shift the following aliases.
+        if before.is_some() {
+            if let Some(indices) = self.all.get(&prefix) {
+                for index in indices {
+                    if self.prefix_rank[*index] >= rank {
+                        self.prefix_rank[*index] += 1;
+                    }
                 }
             }
         }
@@ -345,7 +385,15 @@ impl FibIndex {
         insert_reserved_bucket(&mut self.all, prefix, route_index, before);
         if indexable(route) {
             update_prefix_count(&mut self.prefix_counts, route, true);
-            self.rebuild_winners(prefix, routes);
+            // Existing winners remain valid across insertion: relative order
+            // between existing aliases is unchanged, so only the new route
+            // can displace them. Deletion/replacement still rebuilds when a
+            // cached winner may disappear or change class.
+            self.winners
+                .get_mut(&prefix)
+                .expect("winner prefix must be reserved before commit")
+                .candidates_mut(route)
+                .consider(route_index, route, routes, &self.prefix_rank);
         }
         if let Some(key) = projection_key(route) {
             insert_reserved_bucket(&mut self.projection, key, route_index, None);
@@ -359,6 +407,11 @@ impl FibIndex {
         moved: Option<(usize, RouteEntry)>,
         routes: &[RouteEntry],
     ) {
+        let prefix = PrefixKey::new(route.table, route.destination);
+        let removed_was_winner = self
+            .winners
+            .get(&prefix)
+            .is_some_and(|winners| winners.references(route_index));
         let removed_rank = self.prefix_rank[route_index];
         remove_index(
             &mut self.all,
@@ -368,7 +421,6 @@ impl FibIndex {
         if let Some(key) = projection_key(route) {
             remove_index(&mut self.projection, &key, route_index);
         }
-        let prefix = PrefixKey::new(route.table, route.destination);
         if let Some(indices) = self.all.get(&prefix) {
             for index in indices {
                 if self.prefix_rank[*index] > removed_rank {
@@ -384,12 +436,8 @@ impl FibIndex {
         if let Some((old_index, moved_route)) = moved {
             self.replace_route_index(old_index, route_index, moved_route);
         }
-        self.rebuild_winners(prefix, routes);
-        if let Some((_, moved_route)) = moved {
-            let moved_prefix = PrefixKey::new(moved_route.table, moved_route.destination);
-            if moved_prefix != prefix {
-                self.rebuild_winners(moved_prefix, routes);
-            }
+        if removed_was_winner {
+            self.rebuild_winners(prefix, routes);
         }
     }
 
@@ -440,6 +488,10 @@ impl FibIndex {
 
         let old_indexable = indexable(old);
         let new_indexable = indexable(new);
+        let old_was_winner = self
+            .winners
+            .get(&old_prefix)
+            .is_some_and(|winners| winners.references(route_index));
         if old_indexable != new_indexable {
             update_prefix_count(
                 &mut self.prefix_counts,
@@ -459,7 +511,15 @@ impl FibIndex {
                 insert_reserved_bucket(&mut self.projection, key, route_index, None);
             }
         }
-        self.rebuild_winners(new_prefix, routes);
+        if old_was_winner {
+            self.rebuild_winners(new_prefix, routes);
+        } else if new_indexable {
+            self.winners
+                .get_mut(&new_prefix)
+                .expect("winner prefix must be reserved before replace")
+                .candidates_mut(new)
+                .consider(route_index, new, routes, &self.prefix_rank);
+        }
     }
 
     pub(super) fn prefix_candidates(&self, route: RouteEntry) -> &[usize] {
@@ -588,6 +648,12 @@ impl FibIndex {
         );
         if let Some(key) = projection_key(route) {
             replace_index(&mut self.projection, &key, old_index, new_index);
+        }
+        if let Some(winners) = self
+            .winners
+            .get_mut(&PrefixKey::new(route.table, route.destination))
+        {
+            winners.replace_index(old_index, new_index);
         }
     }
 
@@ -954,6 +1020,8 @@ fn indexable(route: RouteEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
     use super::{BroadcastLookup, FibIndex};
@@ -1034,6 +1102,40 @@ mod tests {
         let removed = routes.swap_remove(2);
         index.commit_remove(2, removed, None, &routes);
         assert_eq!(index, FibIndex::build(&routes).unwrap());
+    }
+
+    #[test]
+    fn incremental_insert_winners_match_full_rebuild() {
+        let mut routes = Vec::new();
+        let mut index = FibIndex::default();
+
+        for ordinal in 0..64 {
+            let mut added = route(
+                [192, 0, 2, 0],
+                24,
+                (63 - ordinal) % 11,
+                if ordinal % 5 == 0 {
+                    RTN_BROADCAST
+                } else {
+                    RTN_UNICAST
+                },
+            );
+            added.oif = ordinal % 4 + 1;
+            added.scope = if ordinal % 3 == 0 {
+                RT_SCOPE_HOST
+            } else {
+                RT_SCOPE_LINK
+            };
+
+            index.prepare_insert(added).unwrap();
+            let before = index.prefix_candidates(added).first().copied();
+            routes.push(added);
+            index.commit_insert(routes.len() - 1, added, before, &routes);
+
+            let mut rebuilt = index.try_clone().unwrap();
+            rebuilt.rebuild_all_winners(&routes);
+            assert_eq!(index, rebuilt);
+        }
     }
 
     #[test]

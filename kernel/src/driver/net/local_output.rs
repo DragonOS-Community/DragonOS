@@ -7,6 +7,30 @@ pub(crate) enum IfacePollScope {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum LocalOutputDrainState {
+    Quiescent,
+    BudgetExhausted,
+    Backpressured,
+    Contended,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) struct LocalOutputDrainResult {
+    pub(super) work_done: usize,
+    state: LocalOutputDrainState,
+}
+
+impl LocalOutputDrainResult {
+    pub(super) const fn new(work_done: usize, state: LocalOutputDrainState) -> Self {
+        Self { work_done, state }
+    }
+
+    pub(super) fn needs_immediate_poll(self) -> bool {
+        matches!(self.state, LocalOutputDrainState::BudgetExhausted)
+    }
+}
+
 /// A namespace-local view over the target interface's transport stack.
 /// Ingress retains the physical ifindex. Output is staged until the smoltcp
 /// locks are released: IPv4 may then select another device through the

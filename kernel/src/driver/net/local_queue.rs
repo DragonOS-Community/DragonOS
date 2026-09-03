@@ -670,6 +670,22 @@ impl LocalInputQueue {
             || !output.deferred_routes.is_empty()
     }
 
+    /// Whether an output packet can be claimed in the current poll round.
+    /// Future retry state still keeps the queue non-empty, but must not steal
+    /// NAPI budget from runnable ingress before its deadline.
+    pub(super) fn has_ready_output(&self, now: smoltcp::time::Instant) -> bool {
+        let output = self.output.lock();
+        !output.packets.is_empty()
+            || output
+                .backpressured
+                .front()
+                .is_some_and(|queued| queued.retry_at <= now)
+            || output
+                .deferred_routes
+                .iter()
+                .any(|bucket| !bucket.probe_in_flight && bucket.retry_at <= now)
+    }
+
     pub(super) fn release_backpressured_outputs(&self) -> bool {
         let mut output = self.output.lock();
         if output.backpressured.is_empty() {

@@ -636,6 +636,31 @@ impl FibTable {
         Some(winner.oif)
     }
 
+    /// Resolve a gateway using Linux's table-validation order: a non-main
+    /// route first consults its own table, then falls back to the built-in
+    /// family rule chain. The chain is shared with packet lookup so IPv4's
+    /// default-table fallback and IPv6's lack of one cannot diverge.
+    pub(super) fn resolve_gateway_with_builtin_rules(
+        &self,
+        destination: IpAddress,
+        route_table: u32,
+        required_oif: Option<u32>,
+        minimum_scope: Option<u8>,
+    ) -> Option<u32> {
+        let in_route_table = (route_table != super::RT_TABLE_MAIN)
+            .then(|| self.resolve_gateway(destination, route_table, required_oif, minimum_scope))
+            .flatten();
+        in_route_table.or_else(|| {
+            builtin_rule_tables(destination)
+                .iter()
+                .copied()
+                .filter(|table| route_table == super::RT_TABLE_MAIN || *table != route_table)
+                .find_map(|table| {
+                    self.resolve_gateway(destination, table, required_oif, minimum_scope)
+                })
+        })
+    }
+
     fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
         if self.entries.contains(&route) {
             return Ok(false);

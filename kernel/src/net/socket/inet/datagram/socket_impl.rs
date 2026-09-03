@@ -123,14 +123,14 @@ impl Socket for UdpSocket {
                     Some(_) => return Err(SystemError::ENOTCONN),
                     None => return Err(SystemError::EBADF),
                 };
-                let connected_source = output_flow::resolve_wildcard_ipv4(
+                let (required_oif, multicast_source) =
+                    output_flow::socket_constraints(self, remote.addr)?;
+                let connected_source = output_flow::resolve_ipv4_send_flow(
                     &self.netns,
                     local,
                     remote.addr,
-                    self.device_binding
-                        .resolve_iface(&self.netns)?
-                        .map(|iface| iface.nic_id() as u32),
-                    None,
+                    required_oif,
+                    multicast_source,
                     remote.addr.is_multicast(),
                     remote.addr.is_broadcast(),
                 )?

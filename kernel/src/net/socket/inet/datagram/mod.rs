@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
-use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion, Ipv4Address};
+use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
 
 use super::{
     common::{
@@ -581,8 +581,21 @@ impl UdpSocket {
     }
 
     pub fn bind_ephemeral(&self, remote: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
-        let mut inner_guard = self.inner.write();
+        let (required_oif, multicast_source) = output_flow::socket_constraints(self, remote)?;
+        let output_flow = output_flow::resolve_ipv4_send_flow(
+            &self.netns,
+            IpListenEndpoint::from(0),
+            remote,
+            required_oif,
+            multicast_source,
+            remote.is_multicast(),
+            remote.is_broadcast(),
+        )?;
+        let flow_target = output_flow
+            .map(|flow| output_flow::ephemeral_target(self, flow))
+            .transpose()?;
         let device_target = self.device_ephemeral_bind_target(remote)?;
+        let mut inner_guard = self.inner.write();
         let inner = inner_guard.take().ok_or(SystemError::EBADF)?;
         let mut newly_bound_iface = None;
         let bound = match inner {
@@ -599,16 +612,12 @@ impl UdpSocket {
                     UnboundUdp::new()
                 };
 
-                let bound_result = if let Some(target) = device_target {
+                let bound_result = if let Some(target) = flow_target.or(device_target) {
                     inner.bind_ephemeral_on_iface(
                         target.stack_owner,
                         target.local_addr,
                         self.bind_context(),
                     )
-                } else if let Some((iface, local_addr)) =
-                    self.ipv4_multicast_ephemeral_bind_target(remote)
-                {
-                    inner.bind_ephemeral_on_iface(iface, local_addr, self.bind_context())
                 } else {
                     inner.bind_ephemeral(remote, self.bind_context())
                 };
@@ -929,48 +938,6 @@ impl UdpSocket {
         }
     }
 
-    fn ipv4_multicast_ephemeral_bind_target(
-        &self,
-        dest: smoltcp::wire::IpAddress,
-    ) -> Option<(Arc<dyn Iface>, smoltcp::wire::IpAddress)> {
-        if !matches!(dest, Ipv4(addr) if addr.is_multicast()) {
-            return None;
-        }
-
-        let ifindex = self.ip_multicast_ifindex.load(Ordering::Relaxed);
-        let ifaddr = self.ip_multicast_addr.load(Ordering::Relaxed);
-        if ifindex == 0 && ifaddr == 0 {
-            return None;
-        }
-
-        let iface = if ifindex != 0 {
-            crate::net::socket::inet::common::multicast::find_iface_by_ifindex(&self.netns, ifindex)
-        } else {
-            crate::net::socket::inet::common::multicast::find_iface_by_ipv4(&self.netns, ifaddr)
-        }?;
-
-        if ifaddr != 0 {
-            let octets = ifaddr.to_ne_bytes();
-            return Some((
-                iface,
-                Ipv4(Ipv4Address::new(octets[0], octets[1], octets[2], octets[3])),
-            ));
-        }
-
-        let local_addr = {
-            let smol_iface = iface.smol_iface().lock();
-            smol_iface
-                .ip_addrs()
-                .iter()
-                .find_map(|cidr| match cidr.address() {
-                    Ipv4(addr) => Some(Ipv4(addr)),
-                    _ => None,
-                })
-        }?;
-
-        Some((iface, local_addr))
-    }
-
     fn device_ephemeral_bind_target(
         &self,
         remote: smoltcp::wire::IpAddress,
@@ -1065,11 +1032,18 @@ impl UdpSocket {
         }
 
         let placement = self.iface_placement.read();
-        let explicit = to.map(Endpoint::Ip);
-        let is_multicast = self
-            .connected_or_explicit_send_dest(explicit.as_ref())
-            .is_some_and(|dest| dest.addr.is_multicast());
-        if is_multicast {
+        let (is_multicast, is_unbound) = {
+            let inner = self.inner.read();
+            let destination = to.or_else(|| match inner.as_ref() {
+                Some(UdpInner::Bound(bound)) => bound.remote_endpoint().ok(),
+                _ => None,
+            });
+            (
+                destination.is_some_and(|dest| dest.addr.is_multicast()),
+                matches!(inner.as_ref(), Some(UdpInner::Unbound(_))),
+            )
+        };
+        if is_multicast || is_unbound {
             drop(placement);
             let _placement = self.iface_placement.write();
             return self.try_send_with_stable_iface(buf, to);
@@ -1087,30 +1061,48 @@ impl UdpSocket {
         // `inner` cannot remain locked because notifications may re-enter
         // socket event checks.
 
-        // Resolve wildcard unicast flow state before taking the send-side
+        // Resolve IPv4 flow state before taking the send-side
         // inner lock. The placement guard keeps endpoint/device state stable
         // across this lookup and the later enqueue.
-        let output_flow_request = {
+        let (output_flow_request, needs_ephemeral_bind) = {
             let inner = self.inner.read();
-            if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
-                to.or_else(|| bound.remote_endpoint().ok())
+            let request = match inner.as_ref() {
+                Some(UdpInner::Bound(bound)) => to
+                    .or_else(|| bound.remote_endpoint().ok())
                     .map(Self::normalize_unspecified_dest)
-                    .map(|dest| (bound.endpoint(), dest, bound.connected_source()))
-            } else {
-                None
-            }
+                    .map(|dest| (bound.endpoint(), dest, bound.connected_source())),
+                Some(UdpInner::Unbound(_)) => to
+                    .map(Self::normalize_unspecified_dest)
+                    .map(|dest| (IpListenEndpoint::from(0), dest, None)),
+                None => None,
+            };
+            (
+                request,
+                matches!(inner.as_ref(), Some(UdpInner::Unbound(_))),
+            )
         };
         let mut resolved_output_flow = match output_flow_request {
-            Some((local, dest, connected_source)) => output_flow::resolve_wildcard_ipv4(
-                &self.netns,
-                local,
-                dest.addr,
-                (self.bound_device_ifindex() != 0).then_some(self.bound_device_ifindex() as u32),
-                connected_source,
-                dest.addr.is_multicast(),
-                dest.addr.is_broadcast(),
-            )?,
+            Some((local, dest, connected_source)) => {
+                let (required_oif, multicast_source) =
+                    output_flow::socket_constraints(self, dest.addr)?;
+                output_flow::resolve_ipv4_send_flow(
+                    &self.netns,
+                    local,
+                    dest.addr,
+                    required_oif,
+                    connected_source.or(multicast_source),
+                    dest.addr.is_multicast(),
+                    dest.addr.is_broadcast(),
+                )?
+            }
             None => None,
+        };
+        let flow_target = if needs_ephemeral_bind {
+            resolved_output_flow
+                .map(|flow| output_flow::ephemeral_target(self, flow))
+                .transpose()?
+        } else {
+            None
         };
 
         // Send data and snapshot the delivery metadata before releasing inner.
@@ -1139,16 +1131,12 @@ impl UdpSocket {
                     UdpInner::Unbound(unbound) => unbound,
                     _ => unreachable!(),
                 };
-                let bound_result = if let Some(target) = device_target {
+                let bound_result = if let Some(target) = flow_target.or(device_target) {
                     unbound.bind_ephemeral_on_iface(
                         target.stack_owner,
                         target.local_addr,
                         self.bind_context(),
                     )
-                } else if let Some((iface, local_addr)) =
-                    self.ipv4_multicast_ephemeral_bind_target(to_addr)
-                {
-                    unbound.bind_ephemeral_on_iface(iface, local_addr, self.bind_context())
                 } else {
                     unbound.bind_ephemeral(to_addr, self.bind_context())
                 };
@@ -1188,6 +1176,10 @@ impl UdpSocket {
                         let ifindex = self.ip_multicast_ifindex.load(Ordering::Relaxed);
                         if ifindex != 0 {
                             ifindex
+                        } else if matches!(dest.addr, Ipv4(_)) {
+                            resolved_output_flow
+                                .map(|flow| flow.oif as i32)
+                                .unwrap_or(0)
                         } else {
                             bound_iface.nic_id() as i32
                         }
@@ -1222,7 +1214,7 @@ impl UdpSocket {
                         .inner
                         .is_broadcast(&dest.addr);
                     let is_broadcast = loopback_broadcast || bound_iface_is_broadcast;
-                    let output_flow = if is_multicast || is_broadcast {
+                    let output_flow = if is_broadcast {
                         None
                     } else {
                         resolved_output_flow.take()
@@ -1269,7 +1261,7 @@ impl UdpSocket {
                     } else {
                         let mut send_iface = bound_iface.clone();
                         let mut restore_iface = None;
-                        if is_multicast && mcast_ifindex != 0 {
+                        if is_multicast && !matches!(dest.addr, Ipv4(_)) && mcast_ifindex != 0 {
                             if let Some(target_iface) =
                                 crate::net::socket::inet::common::multicast::find_iface_by_ifindex(
                                     &self.netns,

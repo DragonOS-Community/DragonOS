@@ -214,6 +214,41 @@ TEST(RtnetlinkRouteSemantics, ConnectedRouteIsAnOrdinaryDeletableFibObject) {
               0);
 }
 
+TEST(RtnetlinkRouteSemantics, NonzeroPrefixInsideIpv4ZeroSlashEightGetsDerivedRoutes) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 4750;
+    const uint32_t veth = if_nametoindex("veth-host1");
+    ASSERT_NE(veth, 0u);
+    constexpr const char* kAddress = "0.1.2.3";
+
+    DeleteAddrIfPresent(fd.Get(), veth, kAddress, 24, &seq);
+    ASSERT_EQ(SendAddrRequest(fd.Get(), RTM_NEWADDR,
+                              NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, veth,
+                              kAddress, 24, ++seq),
+              0);
+
+    RouteSpec connected = MakeIpv4Route("0.1.2.0", 24, veth);
+    connected.protocol = RTPROT_KERNEL;
+    connected.scope = RT_SCOPE_LINK;
+    connected.preferred_source = Ipv4(kAddress);
+    EXPECT_TRUE(FindRoute(fd.Get(), connected, ++seq).has_value());
+
+    RouteSpec broadcast = MakeIpv4Route("0.1.2.255", 32, veth);
+    broadcast.table = RT_TABLE_LOCAL;
+    broadcast.protocol = RTPROT_KERNEL;
+    broadcast.scope = RT_SCOPE_LINK;
+    broadcast.kind = RTN_BROADCAST;
+    broadcast.preferred_source = Ipv4(kAddress);
+    EXPECT_TRUE(FindRoute(fd.Get(), broadcast, ++seq).has_value());
+
+    EXPECT_EQ(SendAddrRequest(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth, kAddress,
+                              24, ++seq),
+              0);
+    EXPECT_FALSE(FindRoute(fd.Get(), connected, ++seq).has_value());
+    EXPECT_FALSE(FindRoute(fd.Get(), broadcast, ++seq).has_value());
+}
+
 TEST(RtnetlinkRouteSemantics, LoopbackIpv4SubnetUsesLinuxLocalRouteIdentity) {
     FdGuard netlink_fd(OpenRouteSocket());
     ASSERT_GE(netlink_fd.Get(), 0) << "socket(AF_NETLINK, NETLINK_ROUTE) failed: "
@@ -321,6 +356,32 @@ TEST(RtnetlinkRouteSemantics, TransientBroadcastAndMulticastLookupsFollowLinuxFi
         EXPECT_EQ(lookup->oif, veth);
         EXPECT_EQ(lookup->gateway, multicast.gateway);
     }
+
+    // A wildcard multicast socket has no output-device constraint. Linux
+    // therefore selects both its interface and source through the FIB rather
+    // than inheriting the interface that owns the SocketSet.
+    FdGuard multicast_udp(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(multicast_udp.Get(), 0) << ErrnoString(errno);
+    sockaddr_in any = {};
+    any.sin_family = AF_INET;
+    any.sin_addr.s_addr = htonl(INADDR_ANY);
+    ASSERT_EQ(bind(multicast_udp.Get(), reinterpret_cast<sockaddr*>(&any), sizeof(any)), 0)
+            << ErrnoString(errno);
+    sockaddr_in multicast_remote = {};
+    multicast_remote.sin_family = AF_INET;
+    multicast_remote.sin_port = htons(9);
+    multicast_remote.sin_addr.s_addr = Ipv4("239.1.1.1");
+    ASSERT_EQ(connect(multicast_udp.Get(), reinterpret_cast<sockaddr*>(&multicast_remote),
+                      sizeof(multicast_remote)),
+              0)
+            << ErrnoString(errno);
+    sockaddr_in multicast_local = {};
+    socklen_t multicast_local_len = sizeof(multicast_local);
+    ASSERT_EQ(getsockname(multicast_udp.Get(), reinterpret_cast<sockaddr*>(&multicast_local),
+                          &multicast_local_len),
+              0)
+            << ErrnoString(errno);
+    EXPECT_EQ(multicast_local.sin_addr.s_addr, Ipv4("192.168.1.254"));
 
     EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, multicast,
                                ++seq),
@@ -628,11 +689,11 @@ TEST(RtnetlinkRouteSemantics, GatewaySelectsSourceFromItsInterfacePrefix) {
         << ErrnoString(errno);
     EXPECT_EQ(selected_local.sin_addr.s_addr, Ipv4(kSource));
 
-    FdGuard observer(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP)));
+    FdGuard observer(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
     ASSERT_GE(observer.Get(), 0) << ErrnoString(errno);
     sockaddr_ll packet_bind = {};
     packet_bind.sll_family = AF_PACKET;
-    packet_bind.sll_protocol = htons(ETH_P_ARP);
+    packet_bind.sll_protocol = htons(ETH_P_ALL);
     packet_bind.sll_ifindex = egress;
     ASSERT_EQ(bind(observer.Get(), reinterpret_cast<sockaddr*>(&packet_bind), sizeof(packet_bind)),
               0)
@@ -656,19 +717,31 @@ TEST(RtnetlinkRouteSemantics, GatewaySelectsSourceFromItsInterfacePrefix) {
               static_cast<ssize_t>(sizeof(payload)))
         << ErrnoString(errno);
 
-    bool saw_gateway_arp = false;
+    bool saw_valid_egress = false;
     char frame[2048] = {};
-    while (!saw_gateway_arp) {
+    while (!saw_valid_egress) {
         const ssize_t length = recv(observer.Get(), frame, sizeof(frame), 0);
         if (length < 0) break;
-        if (length < ETH_HLEN + 28) continue;
-        uint32_t sender = 0;
-        uint32_t target = 0;
-        std::memcpy(&sender, frame + ETH_HLEN + 14, sizeof(sender));
-        std::memcpy(&target, frame + ETH_HLEN + 24, sizeof(target));
-        saw_gateway_arp = sender == Ipv4(kSource) && target == Ipv4(kGateway);
+        if (length < ETH_HLEN) continue;
+        uint16_t ether_type = 0;
+        std::memcpy(&ether_type, frame + 12, sizeof(ether_type));
+        if (ntohs(ether_type) == ETH_P_ARP && length >= ETH_HLEN + 28) {
+            uint32_t sender = 0;
+            uint32_t target = 0;
+            std::memcpy(&sender, frame + ETH_HLEN + 14, sizeof(sender));
+            std::memcpy(&target, frame + ETH_HLEN + 24, sizeof(target));
+            saw_valid_egress = sender == Ipv4(kSource) && target == Ipv4(kGateway);
+        } else if (ntohs(ether_type) == ETH_P_IP && length >= ETH_HLEN + 20 &&
+                   (static_cast<uint8_t>(frame[ETH_HLEN]) >> 4) == 4) {
+            uint32_t source = 0;
+            uint32_t destination = 0;
+            std::memcpy(&source, frame + ETH_HLEN + 12, sizeof(source));
+            std::memcpy(&destination, frame + ETH_HLEN + 16, sizeof(destination));
+            saw_valid_egress =
+                source == Ipv4(kSource) && destination == remote.sin_addr.s_addr;
+        }
     }
-    EXPECT_TRUE(saw_gateway_arp);
+    EXPECT_TRUE(saw_valid_egress);
 
     EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq),
               0);

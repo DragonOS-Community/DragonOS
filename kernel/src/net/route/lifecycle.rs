@@ -331,6 +331,11 @@ fn derived_address_entries_for_link_state(
     Ok(result)
 }
 
+#[inline]
+fn ipv4_prefix_is_zeronet(cidr: smoltcp::wire::Ipv4Cidr) -> bool {
+    cidr.network().address().is_unspecified()
+}
+
 fn entries_for_address(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
@@ -373,8 +378,9 @@ fn entries_for_address(
     };
     let add_connected = match cidr {
         IpCidr::Ipv4(cidr) => {
-            let octets = cidr.network().address().octets();
-            (loopback || cidr.prefix_len() < 32) && octets[0] != 0 && (loopback || is_up)
+            (loopback || cidr.prefix_len() < 32)
+                && !ipv4_prefix_is_zeronet(cidr)
+                && (loopback || is_up)
         }
         // Linux keeps the address object and its host-local route while the
         // device is down, but defers the IPv6 prefix route until NETDEV_UP.
@@ -406,7 +412,7 @@ fn entries_for_address(
         result.push(local);
     }
     if let IpCidr::Ipv4(cidr) = cidr {
-        if cidr.prefix_len() < 31 && cidr.network().address().octets()[0] != 0 && is_up {
+        if cidr.prefix_len() < 31 && !ipv4_prefix_is_zeronet(cidr) && is_up {
             if let Some(broadcast) = cidr.broadcast() {
                 result.push(RouteEntry {
                     destination: IpCidr::Ipv4(Ipv4Cidr::new(broadcast, 32)),

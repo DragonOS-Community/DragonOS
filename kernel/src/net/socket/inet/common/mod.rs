@@ -523,7 +523,7 @@ fn get_ephemeral_bind_target(
 /// target a different interface from egress. Native IPv6 output is still
 /// interface-local, so IPv6 retains the egress stack until the routed-output
 /// backend supports that family as well.
-fn ephemeral_target_for_source(
+pub(crate) fn ephemeral_target_for_source(
     netns: &Arc<NetNamespace>,
     egress_iface: Arc<dyn Iface>,
     local_addr: smoltcp::wire::IpAddress,

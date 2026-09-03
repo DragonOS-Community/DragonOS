@@ -535,10 +535,11 @@ pub(crate) fn netns_has_address(
         .any(|iface| iface_has_address(iface, address))
 }
 
-/// Applies Linux's weak-host source-address ownership rule for the single L3
-/// domain represented by a DragonOS network namespace. IPv4 and global IPv6
-/// addresses may be selected across interfaces; interface-scoped IPv6
-/// addresses must belong to the egress interface.
+/// Applies source-address ownership supported by DragonOS's transport layout.
+/// IPv4 can use weak-host ownership because routed local delivery transfers
+/// packets to the address owner's SocketSet. IPv6 does not yet have that
+/// namespace-level delivery path, so every IPv6 source must belong to the
+/// egress interface.
 pub(crate) fn source_address_usable_on_iface(
     netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
     iface: &Arc<dyn Iface>,
@@ -601,11 +602,5 @@ impl<'a> CandidateAddressOwnership<'a> {
 }
 
 fn source_address_requires_iface(address: IpAddress) -> bool {
-    match address {
-        IpAddress::Ipv4(_) => false,
-        IpAddress::Ipv6(address) => {
-            let octets = address.octets();
-            address.is_loopback() || octets[0] == 0xfe && octets[1] & 0xc0 == 0x80
-        }
-    }
+    matches!(address, IpAddress::Ipv6(_))
 }

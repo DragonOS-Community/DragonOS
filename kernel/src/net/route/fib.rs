@@ -721,8 +721,9 @@ impl FibTable {
                         continue;
                     }
                     // Linux IPv6 keeps the route and silently drops a stale
-                    // preferred source. Global IPv6 preferred sources can be
-                    // cross-interface within the namespace's L3 domain.
+                    // preferred source. DragonOS additionally requires IPv6
+                    // preferred sources to stay on the route's egress iface
+                    // until namespace-level IPv6 local delivery exists.
                     let old = self.entries[index];
                     self.entries[index].preferred_source = None;
                     transitions

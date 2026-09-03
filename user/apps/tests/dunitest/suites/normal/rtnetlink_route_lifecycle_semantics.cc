@@ -864,7 +864,7 @@ TEST(RtnetlinkRouteSemantics, Ipv6PreferredSourceRemovalSilentlyUpdatesSurviving
               0);
 }
 
-TEST(RtnetlinkRouteSemantics, Ipv6PreferredSourceUsesCandidateL3Ownership) {
+TEST(RtnetlinkRouteSemantics, Ipv6PreferredSourceRequiresEgressOwnership) {
     FdGuard fd(OpenRouteSocket());
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
     uint32_t seq = 7475;
@@ -885,6 +885,14 @@ TEST(RtnetlinkRouteSemantics, Ipv6PreferredSourceUsesCandidateL3Ownership) {
                                   NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, first,
                                   kGlobal, 64, ++seq),
               0);
+    // Linux permits a global IPv6 preferred source from the same L3 domain,
+    // but DragonOS cannot safely expose that semantic until IPv6 local input
+    // can reach the source owner's per-interface SocketSet.
+    EXPECT_EQ(SendIpv6RouteRequest(fd.Get(), RTM_NEWROUTE,
+                                   NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                   kGlobalDestination, 64, egress, RT_SCOPE_UNIVERSE, ++seq,
+                                   nullptr, 0, kGlobal),
+              EINVAL);
     ASSERT_EQ(SendIpv6AddrRequest(fd.Get(), RTM_NEWADDR,
                                   NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, egress,
                                   kGlobal, 64, ++seq),

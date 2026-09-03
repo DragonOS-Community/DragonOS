@@ -1,5 +1,5 @@
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::filesystem::epoll::EPollEventType;
@@ -13,6 +13,10 @@ use alloc::vec::Vec;
 use smoltcp;
 use smoltcp::socket::tcp;
 use system_error::SystemError;
+
+use super::registration::{
+    ConnectingRegistration, ConnectingRegistrationLease, ConnectingRegistrationPublisher,
+};
 
 // pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;
@@ -198,6 +202,7 @@ impl Init {
         self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
         netns: Arc<NetNamespace>,
+        wrapper: Weak<dyn socket::inet::InetSocket>,
     ) -> Result<Connecting, (Self, SystemError)> {
         let (inner, local) = match self {
             Init::Unbound(_) => self.bind_to_ephemeral(remote_endpoint, netns)?,
@@ -206,6 +211,11 @@ impl Init {
         if local.addr.is_unspecified() {
             return Err((Init::Bound((inner, local)), SystemError::EINVAL));
         }
+        // Publish before taking the SocketSet lock and making the first SYN
+        // visible to poll. The RAII reservation survives until Connecting is
+        // replaced, while normal `bounds` registration covers the rest of the
+        // socket lifetime.
+        let registration = ConnectingRegistration::new(inner.iface().clone(), wrapper);
         let result = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket
                 .connect(
@@ -216,7 +226,7 @@ impl Init {
                 .map_err(|_| SystemError::ECONNREFUSED)
         });
         match result {
-            Ok(_) => Ok(Connecting::new(inner, local, remote_endpoint)),
+            Ok(_) => Ok(Connecting::new(inner, registration, local, remote_endpoint)),
             Err(err) => Err((Init::Bound((inner, local)), err)),
         }
     }
@@ -353,12 +363,17 @@ impl Init {
         });
     }
 
-    pub(super) fn close(&self) {
+    pub(super) fn close(self) -> Closed {
         match self {
-            Init::Unbound(_) => {}
+            Init::Unbound((_, version)) => Closed::new(version),
             Init::Bound((inner, endpoint)) => {
                 inner.port_manager().unbind_port(Types::Tcp, endpoint.port);
-                inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
+                let version = match endpoint.addr {
+                    smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpVersion::Ipv4,
+                    smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
+                };
+                let _ = inner.into_socket();
+                Closed::new(version)
             }
         }
     }
@@ -378,6 +393,7 @@ enum ConnectResult {
 #[derive(Debug)]
 pub struct Connecting {
     inner: socket::inet::BoundInner,
+    registration: ConnectingRegistration,
     result: RwSem<ConnectResult>,
     /// Track if the connection was ever in ESTABLISHED state.
     /// This is needed because for loopback, SYN+ACK and RST can be processed in the same poll,
@@ -391,11 +407,13 @@ pub struct Connecting {
 impl Connecting {
     fn new(
         inner: socket::inet::BoundInner,
+        registration: ConnectingRegistration,
         local: smoltcp::wire::IpEndpoint,
         remote: smoltcp::wire::IpEndpoint,
     ) -> Self {
         Connecting {
             inner,
+            registration,
             result: RwSem::new(ConnectResult::Connecting),
             was_established: AtomicBool::new(false),
             local,
@@ -418,17 +436,28 @@ impl Connecting {
         self.inner.iface()
     }
 
-    pub fn into_result(self) -> (Inner, Result<(), SystemError>) {
+    pub(super) fn registration_publisher(&self) -> ConnectingRegistrationPublisher {
+        self.registration.publisher()
+    }
+
+    pub fn into_result(mut self) -> (Inner, Result<(), SystemError>) {
         let result = *self.result.read();
         match result {
             ConnectResult::Connecting => (
                 Inner::Connecting(self),
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             ),
-            ConnectResult::Connected => (
-                Inner::Established(Established::new(self.inner, true)),
-                Ok(()),
-            ),
+            ConnectResult::Connected => {
+                let registration = self.registration.retain();
+                (
+                    Inner::Established(Established::new_with_connecting_registration(
+                        self.inner,
+                        true,
+                        registration,
+                    )),
+                    Ok(()),
+                )
+            }
             ConnectResult::Refused
             | ConnectResult::RefusedConsumed
             | ConnectResult::ShutdownReset
@@ -480,7 +509,19 @@ impl Connecting {
     /// This function is unsafe because it forces a state transition without verifying
     /// that the underlying socket is actually in the ESTABLISHED state.
     /// The caller must ensure that the socket handshake has completed successfully.
-    pub unsafe fn into_established(self) -> Established {
+    pub unsafe fn into_established(mut self) -> Established {
+        // Every live Connecting -> Established transition transfers the
+        // existing iface notification registration. Callers that are closing
+        // the socket have already unregistered it before reaching here.
+        let registration = self.registration.retain();
+        Established::new_with_connecting_registration(self.inner, true, registration)
+    }
+
+    /// Converts a Connecting socket after its iface registration was removed
+    /// by the close path. A delayed publisher observes cancellation and rolls
+    /// back any registration racing with close.
+    pub unsafe fn into_established_after_unbind(self) -> Established {
+        self.registration.cancel();
         Established::new(self.inner, true)
     }
 
@@ -804,6 +845,7 @@ pub struct Established {
     local: smoltcp::wire::IpEndpoint,
     peer: smoltcp::wire::IpEndpoint,
     owns_port: bool,
+    connecting_registration: Option<ConnectingRegistrationLease>,
 }
 
 impl Established {
@@ -825,6 +867,23 @@ impl Established {
             local,
             peer,
             owns_port,
+            connecting_registration: None,
+        }
+    }
+
+    fn new_with_connecting_registration(
+        inner: socket::inet::BoundInner,
+        owns_port: bool,
+        registration: ConnectingRegistrationLease,
+    ) -> Self {
+        let mut established = Self::new(inner, owns_port);
+        established.connecting_registration = Some(registration);
+        established
+    }
+
+    pub(super) fn cancel_connecting_registration(&self) {
+        if let Some(registration) = &self.connecting_registration {
+            registration.cancel();
         }
     }
 
@@ -1276,7 +1335,8 @@ impl Inner {
 
     pub fn iface(&self) -> Option<&alloc::sync::Arc<dyn crate::driver::net::Iface>> {
         match self {
-            Inner::Init(_) => None,
+            Inner::Init(Init::Bound((inner, _))) => Some(inner.iface()),
+            Inner::Init(Init::Unbound(_)) => None,
             Inner::Connecting(conn) => Some(conn.inner.iface()),
             Inner::Listening(listen) => Some(listen.inners[0].iface()),
             Inner::Established(est) => Some(est.inner.iface()),

@@ -14,6 +14,9 @@ pub struct IfaceCommon {
     /// Lock-free lifecycle summary for DOWN-owner protocol progress. The
     /// vector remains authoritative; this count only decides poll eligibility.
     pub(super) bound_socket_count: AtomicUsize,
+    /// Sockets that can already emit through smoltcp but have not yet been
+    /// published in `bounds`.
+    pending_routed_socket_count: AtomicUsize,
     /// The stack has accepted namespace-local ingress and must keep applying
     /// authoritative output routing until its socket/deferred work quiesces.
     pub(super) namespace_routed_stack: AtomicBool,
@@ -64,6 +67,13 @@ enum LocalOutputDrainResult {
     Contended,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PollModeRecheck {
+    Current,
+    Routed,
+    Authoritative,
+}
+
 impl LocalOutputDrainResult {
     fn needs_immediate_poll(self) -> bool {
         matches!(self, Self::BudgetExhausted)
@@ -112,6 +122,7 @@ impl IfaceCommon {
             sockets: Mutex::new(smoltcp::iface::SocketSet::new(Vec::new())),
             bounds: RwLock::new(Arc::new(Vec::new())),
             bound_socket_count: AtomicUsize::new(0),
+            pending_routed_socket_count: AtomicUsize::new(0),
             namespace_routed_stack: AtomicBool::new(false),
             port_manager: PortManager::default(),
             poll_deadline: PollDeadline::new(),
@@ -397,7 +408,51 @@ impl IfaceCommon {
     pub(super) fn needs_namespace_routing(&self) -> bool {
         self.has_local_work()
             || self.namespace_routed_stack.load(Ordering::Acquire)
+            || self.has_published_or_pending_sockets()
             || self.tcp_close_defer.has_pending()
+    }
+
+    /// Pairs with the publication handoff: a producer publishes `bounds`
+    /// before releasing its pending reservation. Reading pending first means
+    /// that observing zero synchronizes the following bound-count read with
+    /// the already completed publication; observing the old nonzero value is
+    /// itself sufficient to keep routed polling active.
+    fn has_published_or_pending_sockets(&self) -> bool {
+        let pending = self.pending_routed_socket_count.load(Ordering::Acquire);
+        let published = self.bound_socket_count.load(Ordering::Acquire);
+        pending != 0 || published != 0
+    }
+
+    /// Revalidates the lock-free routing-mode snapshot after both protocol
+    /// locks have been acquired. This is shared by direct and NAPI polling so
+    /// neither backend can process newly published output with a stale device.
+    fn recheck_poll_mode(
+        &self,
+        netns: Option<&Arc<NetNamespace>>,
+        needs_routed_poll: bool,
+        authoritative_ipv4_output: bool,
+    ) -> PollModeRecheck {
+        if !authoritative_ipv4_output
+            && netns.is_some_and(|netns| netns.router().requires_authoritative_ipv4_output())
+        {
+            PollModeRecheck::Authoritative
+        } else if !needs_routed_poll && self.needs_namespace_routing() {
+            PollModeRecheck::Routed
+        } else {
+            PollModeRecheck::Current
+        }
+    }
+
+    pub(crate) fn begin_routed_socket_publication(&self) {
+        self.pending_routed_socket_count
+            .fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn finish_routed_socket_publication(&self) {
+        let previous = self
+            .pending_routed_socket_count
+            .fetch_sub(1, Ordering::Release);
+        debug_assert!(previous != 0);
     }
 
     pub(super) fn clear_namespace_routing_if_idle(&self) {
@@ -429,9 +484,7 @@ impl IfaceCommon {
     pub(crate) fn poll_scope(&self) -> IfacePollScope {
         if self.flags().contains(InterfaceFlags::UP) {
             IfacePollScope::Full
-        } else if self.needs_namespace_routing()
-            || self.bound_socket_count.load(Ordering::Acquire) != 0
-        {
+        } else if self.needs_namespace_routing() {
             IfacePollScope::LocalOnly
         } else {
             IfacePollScope::None
@@ -490,20 +543,20 @@ impl IfaceCommon {
         let mut sockets = self.sockets.lock();
         let mut interface = self.smol_iface.lock();
 
-        // A route writer may publish the first default-table route after the
-        // initial mode snapshot. Recheck after serializing socket enqueue: if
-        // the mode changed, restart once with the authoritative path forced.
-        // Packets queued after the route commit cannot cross this lock point.
-        if !authoritative_ipv4_output
-            && netns
-                .as_ref()
-                .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output())
-        {
+        // Reservations and route-mode changes publish before SocketSet
+        // mutation. Recheck after serialization and restart before processing
+        // any packet if the initial backend snapshot became stale.
+        let restart =
+            self.recheck_poll_mode(netns.as_ref(), needs_routed_poll, authoritative_ipv4_output);
+        if restart != PollModeRecheck::Current {
             drop(interface);
             drop(sockets);
             drop(route_policy);
             drop(router);
-            return self.poll_with_authoritative_mode(device, true);
+            return self.poll_with_authoritative_mode(
+                device,
+                force_authoritative || restart == PollModeRecheck::Authoritative,
+            );
         }
 
         // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
@@ -668,16 +721,18 @@ impl IfaceCommon {
         let mut sockets = self.sockets.lock();
         let mut interface = self.smol_iface.lock();
 
-        if !authoritative_ipv4_output
-            && netns
-                .as_ref()
-                .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output())
-        {
+        let restart =
+            self.recheck_poll_mode(netns.as_ref(), needs_routed_poll, authoritative_ipv4_output);
+        if restart != PollModeRecheck::Current {
             drop(interface);
             drop(sockets);
             drop(route_policy);
             drop(router);
-            return self.poll_napi_with_authoritative_mode(device, budget, true);
+            return self.poll_napi_with_authoritative_mode(
+                device,
+                budget,
+                force_authoritative || restart == PollModeRecheck::Authoritative,
+            );
         }
 
         // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
@@ -1110,6 +1165,9 @@ impl IfaceCommon {
     pub fn bind_socket(&self, socket: Arc<dyn InetSocket>) {
         let mut bounds = self.bounds.write();
         let bounds = Arc::make_mut(&mut *bounds);
+        if bounds.iter().any(|bound| Arc::ptr_eq(bound, &socket)) {
+            return;
+        }
         bounds.push(socket);
         self.bound_socket_count
             .store(bounds.len(), Ordering::Release);

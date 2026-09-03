@@ -1,5 +1,157 @@
 #include "rtnetlink_route_test_support.h"
 
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
+
+namespace {
+
+uint16_t Ipv4HeaderChecksum(const uint8_t* data, size_t length) {
+    uint32_t sum = 0;
+    for (size_t offset = 0; offset + 1 < length; offset += 2) {
+        sum += (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+    }
+    if ((length & 1) != 0) sum += static_cast<uint16_t>(data[length - 1]) << 8;
+    while ((sum >> 16) != 0) sum = (sum & 0xffff) + (sum >> 16);
+    return static_cast<uint16_t>(~sum);
+}
+
+bool GetInterfaceMac(int fd, const char* name, uint8_t mac[ETH_ALEN]) {
+    ifreq request = {};
+    std::strncpy(request.ifr_name, name, IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFHWADDR, &request) != 0) return false;
+    std::memcpy(mac, request.ifr_hwaddr.sa_data, ETH_ALEN);
+    return true;
+}
+
+std::vector<uint8_t> BuildIpv4UdpPacket(uint32_t source, uint32_t destination,
+                                        uint16_t source_port, uint16_t destination_port,
+                                        const char* payload, size_t payload_length) {
+    constexpr size_t kIpv4HeaderLength = 20;
+    constexpr size_t kUdpHeaderLength = 8;
+    std::vector<uint8_t> packet(kIpv4HeaderLength + kUdpHeaderLength + payload_length, 0);
+    packet[0] = 0x45;
+    const uint16_t total_length = htons(static_cast<uint16_t>(packet.size()));
+    std::memcpy(packet.data() + 2, &total_length, sizeof(total_length));
+    packet[8] = 64;
+    packet[9] = IPPROTO_UDP;
+    std::memcpy(packet.data() + 12, &source, sizeof(source));
+    std::memcpy(packet.data() + 16, &destination, sizeof(destination));
+    const uint16_t checksum = Ipv4HeaderChecksum(packet.data(), kIpv4HeaderLength);
+    packet[10] = static_cast<uint8_t>(checksum >> 8);
+    packet[11] = static_cast<uint8_t>(checksum);
+
+    uint8_t* udp = packet.data() + kIpv4HeaderLength;
+    const uint16_t source_port_be = htons(source_port);
+    const uint16_t destination_port_be = htons(destination_port);
+    const uint16_t udp_length = htons(static_cast<uint16_t>(kUdpHeaderLength + payload_length));
+    std::memcpy(udp, &source_port_be, sizeof(source_port_be));
+    std::memcpy(udp + 2, &destination_port_be, sizeof(destination_port_be));
+    std::memcpy(udp + 4, &udp_length, sizeof(udp_length));
+    // An IPv4 UDP checksum of zero means "not provided" and is valid on Linux.
+    std::memcpy(udp + kUdpHeaderLength, payload, payload_length);
+    return packet;
+}
+
+enum class CrossOwnerBindMode {
+    kImplicit,
+    kDeviceThenImplicit,
+    kDeviceThenExplicit,
+    kExplicitThenDevice,
+};
+
+void ExpectCrossOwnerUdpReply(CrossOwnerBindMode mode, uint32_t egress, uint32_t injector,
+                              uint32_t remote, uint32_t local) {
+    FdGuard socket_fd(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(socket_fd.Get(), 0) << ErrnoString(errno);
+    const bool bind_to_device = mode != CrossOwnerBindMode::kImplicit;
+    const bool explicit_bind = mode == CrossOwnerBindMode::kDeviceThenExplicit ||
+                               mode == CrossOwnerBindMode::kExplicitThenDevice;
+    const bool device_after_bind = mode == CrossOwnerBindMode::kExplicitThenDevice;
+    if (bind_to_device && !device_after_bind) {
+        constexpr char device[] = "veth2";
+        ASSERT_EQ(setsockopt(socket_fd.Get(), SOL_SOCKET, SO_BINDTODEVICE, device,
+                             sizeof(device)),
+                  0)
+            << ErrnoString(errno);
+    }
+    timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    ASSERT_EQ(setsockopt(socket_fd.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+
+    if (explicit_bind) {
+        sockaddr_in requested_local = {};
+        requested_local.sin_family = AF_INET;
+        requested_local.sin_addr.s_addr = local;
+        ASSERT_EQ(bind(socket_fd.Get(), reinterpret_cast<sockaddr*>(&requested_local),
+                       sizeof(requested_local)),
+                  0)
+            << ErrnoString(errno);
+    }
+    if (bind_to_device && device_after_bind) {
+        constexpr char device[] = "veth2";
+        ASSERT_EQ(setsockopt(socket_fd.Get(), SOL_SOCKET, SO_BINDTODEVICE, device,
+                             sizeof(device)),
+                  0)
+            << ErrnoString(errno);
+    }
+
+    sockaddr_in peer = {};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(40123);
+    peer.sin_addr.s_addr = remote;
+    ASSERT_EQ(connect(socket_fd.Get(), reinterpret_cast<sockaddr*>(&peer), sizeof(peer)), 0)
+        << ErrnoString(errno);
+    sockaddr_in local_endpoint = {};
+    socklen_t endpoint_length = sizeof(local_endpoint);
+    ASSERT_EQ(getsockname(socket_fd.Get(), reinterpret_cast<sockaddr*>(&local_endpoint),
+                          &endpoint_length),
+              0);
+    ASSERT_EQ(local_endpoint.sin_addr.s_addr, local);
+
+    // Buffer resizing recreates the underlying smoltcp socket. Placement must
+    // remain on the local-address owner across that lifecycle operation.
+    int receive_buffer = 64 * 1024;
+    ASSERT_EQ(setsockopt(socket_fd.Get(), SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+                         sizeof(receive_buffer)),
+              0)
+        << ErrnoString(errno);
+
+    FdGuard injector_fd(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)));
+    ASSERT_GE(injector_fd.Get(), 0) << ErrnoString(errno);
+    sockaddr_ll packet_bind = {};
+    packet_bind.sll_family = AF_PACKET;
+    packet_bind.sll_protocol = htons(ETH_P_IP);
+    packet_bind.sll_ifindex = injector;
+    ASSERT_EQ(bind(injector_fd.Get(), reinterpret_cast<sockaddr*>(&packet_bind),
+                   sizeof(packet_bind)),
+              0)
+        << ErrnoString(errno);
+
+    uint8_t destination_mac[ETH_ALEN] = {};
+    ASSERT_TRUE(GetInterfaceMac(socket_fd.Get(), "veth2", destination_mac)) << ErrnoString(errno);
+    constexpr char reply[] = "cross-owner-reply";
+    const auto packet = BuildIpv4UdpPacket(remote, local, 40123,
+                                           ntohs(local_endpoint.sin_port), reply, sizeof(reply));
+    sockaddr_ll destination = {};
+    destination.sll_family = AF_PACKET;
+    destination.sll_protocol = htons(ETH_P_IP);
+    destination.sll_ifindex = injector;
+    destination.sll_halen = ETH_ALEN;
+    std::memcpy(destination.sll_addr, destination_mac, ETH_ALEN);
+    ASSERT_EQ(sendto(injector_fd.Get(), packet.data(), packet.size(), 0,
+                     reinterpret_cast<sockaddr*>(&destination), sizeof(destination)),
+              static_cast<ssize_t>(packet.size()))
+        << ErrnoString(errno);
+
+    char received[sizeof(reply)] = {};
+    ASSERT_EQ(recv(socket_fd.Get(), received, sizeof(received), 0),
+              static_cast<ssize_t>(sizeof(reply)))
+        << "reply injected through ifindex " << egress << " was not delivered to source owner: "
+        << ErrnoString(errno);
+    EXPECT_EQ(std::memcmp(received, reply, sizeof(reply)), 0);
+}
+
+}  // namespace
+
 TEST(RtnetlinkRouteSemantics, OnLinkRouteAllowsUdpSendWithoutNoRoute) {
     FdGuard netlink_fd(OpenRouteSocket());
     ASSERT_GE(netlink_fd.Get(), 0) << "socket(AF_NETLINK, NETLINK_ROUTE) failed: "
@@ -413,6 +565,92 @@ TEST(RtnetlinkRouteSemantics, CrossInterfacePreferredSourceDrivesOutputAndAddres
     EXPECT_FALSE(FindRoute(fd.Get(), route, ++seq).has_value());
     EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, fallback,
                                ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, CrossInterfacePreferredSourceOwnsTransportStack) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 6825;
+    const uint32_t source_owner = if_nametoindex("veth-host1");
+    const uint32_t egress = if_nametoindex("veth2");
+    const uint32_t injector = if_nametoindex("veth1");
+    ASSERT_NE(source_owner, 0u);
+    ASSERT_NE(egress, 0u);
+    ASSERT_NE(injector, 0u);
+    constexpr const char* kSource = "198.18.216.1";
+    constexpr const char* kRemote = "198.18.216.254";
+
+    RouteSpec route = MakeIpv4Route(kRemote, 32, egress);
+    route.priority = 6825;
+    route.preferred_source = Ipv4(kSource);
+    DeleteRouteIfPresent(fd.Get(), route, &seq);
+    DeleteAddrIfPresent(fd.Get(), source_owner, kSource, 32, &seq);
+    ASSERT_EQ(SendAddrRequest(fd.Get(), RTM_NEWADDR,
+                              NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                              source_owner, kSource, 32, ++seq),
+              0);
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              0);
+
+    // Cover the shared implicit-bind selector, the separate device-constrained
+    // selector, and both orderings of explicit bind versus SO_BINDTODEVICE.
+    ExpectCrossOwnerUdpReply(CrossOwnerBindMode::kImplicit, egress, injector, Ipv4(kRemote),
+                             Ipv4(kSource));
+    ExpectCrossOwnerUdpReply(CrossOwnerBindMode::kDeviceThenImplicit, egress, injector,
+                             Ipv4(kRemote), Ipv4(kSource));
+    ExpectCrossOwnerUdpReply(CrossOwnerBindMode::kDeviceThenExplicit, egress, injector,
+                             Ipv4(kRemote), Ipv4(kSource));
+    ExpectCrossOwnerUdpReply(CrossOwnerBindMode::kExplicitThenDevice, egress, injector,
+                             Ipv4(kRemote), Ipv4(kSource));
+
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq),
+              0);
+    EXPECT_EQ(SendAddrRequest(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, source_owner,
+                              kSource, 32, ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, SecondaryIpv4LocalRouteUsesPrimaryPreferredSource) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 6860;
+    const uint32_t iface = if_nametoindex("veth-host1");
+    ASSERT_NE(iface, 0u);
+    constexpr const char* kPrimary = "198.18.218.1";
+    constexpr const char* kSecondary = "198.18.218.2";
+    DeleteAddrIfPresent(fd.Get(), iface, kSecondary, 24, &seq);
+    DeleteAddrIfPresent(fd.Get(), iface, kPrimary, 24, &seq);
+    ASSERT_EQ(SendAddrRequest(fd.Get(), RTM_NEWADDR,
+                              NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, iface,
+                              kPrimary, 24, ++seq),
+              0);
+    ASSERT_EQ(SendAddrRequest(fd.Get(), RTM_NEWADDR,
+                              NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, iface,
+                              kSecondary, 24, ++seq),
+              0);
+
+    RouteSpec local = MakeIpv4Route(kSecondary, 32, iface);
+    local.table = RT_TABLE_LOCAL;
+    local.protocol = RTPROT_KERNEL;
+    local.scope = RT_SCOPE_HOST;
+    local.kind = RTN_LOCAL;
+    local.preferred_source = Ipv4(kPrimary);
+    auto dumped = FindRoute(fd.Get(), local, ++seq);
+    ASSERT_TRUE(dumped.has_value());
+    EXPECT_EQ(dumped->preferred_source, local.preferred_source);
+    auto lookup = LookupIpv4Route(fd.Get(), kSecondary, ++seq);
+    ASSERT_TRUE(lookup.has_value());
+    EXPECT_EQ(lookup->kind, RTN_LOCAL);
+    EXPECT_EQ(lookup->preferred_source, local.preferred_source);
+
+    EXPECT_EQ(SendAddrRequest(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, iface,
+                              kSecondary, 24, ++seq),
+              0);
+    EXPECT_EQ(SendAddrRequest(fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, iface, kPrimary,
+                              24, ++seq),
               0);
 }
 

@@ -128,6 +128,26 @@ pub(crate) fn lookup_on_iface(
     lookup_output_fib(&netns.router().fib.read(), destination, Some(oif))
 }
 
+/// Resolves the protocol-stack owner that receives packets for an exact local
+/// address.
+///
+/// DragonOS currently keeps one smoltcp `SocketSet` per interface, so socket
+/// placement must follow the winning local-table route rather than the output
+/// interface. This is the per-interface representation of Linux's netns-wide
+/// transport demultiplexing. The address check prevents a stale or synthetic
+/// local route from being used as a socket owner.
+pub(crate) fn local_address_owner(
+    netns: &Arc<NetNamespace>,
+    address: IpAddress,
+) -> Option<Arc<dyn Iface>> {
+    let decision = lookup(netns, address)?;
+    if decision.matched.kind != RTN_LOCAL {
+        return None;
+    }
+    let iface = netns.device_list().get(&(decision.oif as usize)).cloned()?;
+    crate::net::address::iface_has_address(&iface, address).then_some(iface)
+}
+
 /// Applies the destination-specific output classification shared by immediate
 /// socket lookup and deferred namespace-routed output. Keeping this policy at
 /// the FIB boundary prevents one output path from retaining a gateway for

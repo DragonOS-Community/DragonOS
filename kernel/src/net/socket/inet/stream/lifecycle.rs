@@ -297,7 +297,8 @@ impl TcpSocket {
                         )
                     }
                     other => {
-                        let conn_result = other.connect(remote_endpoint, self.netns());
+                        let conn_result =
+                            other.connect(remote_endpoint, self.netns(), self.self_ref.clone());
                         match conn_result {
                             Ok(connecting) => (
                                 inner::Inner::Connecting(connecting),
@@ -350,6 +351,10 @@ impl TcpSocket {
         // - connect: socket.inner.write -> bounds.write  (会与上面互锁)
         // SelfConnected 不依赖协议栈推进，不应触发 iface.poll()
         let need_poll_progress = matches!(init, inner::Inner::Connecting(_));
+        let registration_publisher = match &init {
+            inner::Inner::Connecting(connecting) => Some(connecting.registration_publisher()),
+            _ => None,
+        };
         let maybe_iface = init.iface().cloned();
         writer.replace(init);
         drop(writer);
@@ -362,13 +367,9 @@ impl TcpSocket {
                 //     iface.nic_id(),
                 //     self.is_nonblock()
                 // );
-                let me = self
-                    .self_ref
-                    .upgrade()
-                    .expect("TcpSocket::start_connect: self_ref upgrade failed");
-                // 去重绑定：防止重复注册导致重复 notify/epoll 唤醒。
-                iface.common().unbind_socket(me.clone());
-                iface.common().bind_socket(me);
+                registration_publisher
+                    .expect("Connecting state must own a registration publisher")
+                    .publish();
 
                 if let Some(netns) = iface.common().net_namespace() {
                     netns.wakeup_poll_thread();
@@ -632,6 +633,17 @@ impl TcpSocket {
         // For Listening sockets, unbind_socket must be done per-iface inside the
         // Listening match arm (INADDR_ANY spans multiple interfaces). For all other
         // states, inner.iface() returns the single owning iface.
+        // Keep routed output published from notification unregistration until
+        // close/abort output is either removed or owned by tcp_close_defer.
+        // This is the close-side counterpart of Connecting's first-SYN guard.
+        let _routing_publication = if !matches!(inner, inner::Inner::Listening(_)) {
+            inner
+                .iface()
+                .cloned()
+                .map(crate::net::socket::inet::common::RoutedSocketPublication::begin)
+        } else {
+            None
+        };
         if !matches!(inner, inner::Inner::Listening(_)) {
             if let Some(iface) = inner.iface() {
                 iface
@@ -654,7 +666,7 @@ impl TcpSocket {
                     let (new_inner, _) = conn.into_result();
                     writer.replace(new_inner);
                 } else {
-                    let conn = unsafe { conn.into_established() };
+                    let conn = unsafe { conn.into_established_after_unbind() };
                     let handle = conn.handle();
                     let local_port = conn.get_name().port;
                     let iface = conn.iface().clone();
@@ -680,6 +692,10 @@ impl TcpSocket {
                 }
             }
             inner::Inner::Established(es) => {
+                // A successful connect can still have a publisher racing from
+                // start_connect(). Cancel its transferable lease before this
+                // closed socket can be reinserted into iface bounds.
+                es.cancel_connecting_registration();
                 let handle = es.handle();
                 let local_port = es.get_name().port;
                 let iface = es.iface().clone();
@@ -717,6 +733,13 @@ impl TcpSocket {
                 writer.replace(inner::Inner::Closed(inner::Closed::new(ver)));
             }
             inner::Inner::Listening(mut ls) => {
+                // Each backlog slot can already be in a state that emits FIN
+                // when closed. Publish every owning stack before removing the
+                // listener from `bounds`; balanced counters avoid allocation
+                // in this infallible teardown path.
+                for bound in &ls.inners {
+                    bound.iface().common().begin_routed_socket_publication();
+                }
                 // close(listen_fd) should stop listening on the port.
                 let original_listen_sockets = ls.inners.len();
                 let port = ls.get_name().port;
@@ -746,6 +769,9 @@ impl TcpSocket {
                 // 因此这里必须在 release 后把状态切到显式 Closed，确保后续 update_events 不再触达 SocketSet，
                 // 同时语义上也更“优雅”。
                 ls.release();
+                for bound in &ls.inners {
+                    bound.iface().common().finish_routed_socket_publication();
+                }
                 let ver = match ls.get_name().addr {
                     smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
                     _ => smoltcp::wire::IpVersion::Ipv4,
@@ -759,8 +785,7 @@ impl TcpSocket {
                 post_poll_iface = post_close_iface;
             }
             inner::Inner::Init(init) => {
-                init.close();
-                writer.replace(inner::Inner::Init(init));
+                writer.replace(inner::Inner::Closed(init.close()));
             }
             inner::Inner::Closed(closed) => {
                 // Already closed: keep the Closed state.

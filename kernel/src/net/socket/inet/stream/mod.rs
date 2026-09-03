@@ -16,6 +16,7 @@ mod constants;
 mod info;
 mod inner;
 mod option;
+mod registration;
 pub use option::Options as TcpOption;
 use option::Options;
 

@@ -37,6 +37,8 @@ jobs:
     steps:
       - run: echo "Running in dragonos/dragonos-dev:v1.23"
       - uses: actions/checkout@v3
+        with:
+          submodules: recursive
 
       - name: Change source
         run: |
@@ -68,6 +70,8 @@ jobs:
       - run: echo "Running in dragonos/dragonos-dev:v1.23"
 
       - uses: actions/checkout@v3
+        with:
+          submodules: recursive
 
       - name: Change source
         run: |
@@ -90,20 +94,17 @@ jobs:
         include:
           - arch: x86_64
             make_target: all
-            checkout_params: {}
           - arch: riscv64
             make_target: all
-            checkout_params:
-              submodules: "recursive"
           - arch: loongarch64
             make_target: all
-            checkout_params: {}
 
     steps:
       - run: echo "Running in dragonos/dragonos-dev:v1.23"
 
       - uses: actions/checkout@v3
-        with: ${{ matrix.checkout_params }}
+        with:
+          submodules: recursive
 
       - name: Change source
         run: |

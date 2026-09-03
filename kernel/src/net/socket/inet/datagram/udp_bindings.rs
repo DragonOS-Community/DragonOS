@@ -23,11 +23,12 @@ pub(crate) struct NetnsUdpIngress {
 }
 
 impl NetnsUdpIngress {
-    pub fn new(netns: &Arc<NetNamespace>, ifindex: usize) -> Self {
-        Self {
+    pub fn try_new(netns: &Arc<NetNamespace>, ifindex: usize) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Self {
             netns: Arc::downgrade(netns),
             ifindex: ifindex as i32,
-        }
+        })
+        .map_err(|_| SystemError::ENOMEM)
     }
 }
 
@@ -48,10 +49,18 @@ impl smoltcp::iface::UdpIngressHandler for NetnsUdpIngress {
         };
         let src = IpEndpoint::new(IpAddress::Ipv4(ipv4.src_addr), udp_repr.src_port);
         let dest = IpEndpoint::new(IpAddress::Ipv4(ipv4.dst_addr), udp_repr.dst_port);
+        // Namespace-local handoff preserves Linux's skb_iif in PacketMeta.
+        // Physical ingress uses the handler owner's ifindex as the fallback.
+        // Socket device binding must match the original ingress device, not
+        // the smoltcp instance that performs transport demultiplexing.
+        let ingress_ifindex = i32::try_from(meta.id)
+            .ok()
+            .filter(|ifindex| *ifindex > 0)
+            .unwrap_or(self.ifindex);
         if netns.udp_bindings().deliver_ingress(
             dest,
             src,
-            self.ifindex,
+            ingress_ifindex,
             is_broadcast,
             meta,
             payload,

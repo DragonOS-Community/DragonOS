@@ -1231,19 +1231,27 @@ impl IfaceCommon {
         self.net_namespace.read().upgrade()
     }
 
-    pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
-        *self.net_namespace.write() = Arc::downgrade(&ns);
-        self.sockets.lock().set_udp_ingress_handler(Some(Arc::new(
-            crate::net::socket::inet::datagram::udp_bindings::NetnsUdpIngress::new(
-                &ns,
-                self.iface_id,
-            ),
-        )));
+    pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) -> Result<(), SystemError> {
+        // Prepare the only fallible publication input before changing either
+        // side of the interface's namespace association. Holding the namespace
+        // writer until the allocation-free SocketSet install completes means a
+        // poller that observes the namespace also observes its ingress handler.
+        let ingress = crate::net::socket::inet::datagram::udp_bindings::NetnsUdpIngress::try_new(
+            &ns,
+            self.iface_id,
+        )?;
+        let mut namespace = self.net_namespace.write();
+        let mut sockets = self.sockets.lock();
+        *namespace = Arc::downgrade(&ns);
+        sockets.set_udp_ingress_handler(Some(ingress));
+        Ok(())
     }
 
     pub fn clear_net_namespace(&self) {
-        *self.net_namespace.write() = Weak::new();
-        self.sockets.lock().set_udp_ingress_handler(None);
+        let mut namespace = self.net_namespace.write();
+        let mut sockets = self.sockets.lock();
+        *namespace = Weak::new();
+        sockets.set_udp_ingress_handler(None);
     }
 
     /// Runs a construction-time mutation while preventing namespace

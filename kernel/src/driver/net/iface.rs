@@ -391,8 +391,8 @@ pub trait Iface: crate::driver::base::device::Device {
         self.common().net_namespace()
     }
 
-    fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
-        self.common().set_net_namespace(ns);
+    fn set_net_namespace(&self, ns: Arc<NetNamespace>) -> Result<(), SystemError> {
+        self.common().set_net_namespace(ns)
     }
 
     fn clear_net_namespace(&self) {

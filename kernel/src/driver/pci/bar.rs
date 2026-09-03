@@ -330,6 +330,33 @@ pub fn pci_bar_init(
         }
     }
 
+    // Prepare every variable-size bookkeeping container before disabling PCI
+    // decode or publishing an MMIO mapping. The number of requested subranges
+    // is the upper bound for both interval merging and mapped-range metadata.
+    let mut consumed_mappings = Vec::new();
+    consumed_mappings
+        .try_reserve_exact(required_mappings.len())
+        .map_err(|_| PciError::CreateMmioError)?;
+    consumed_mappings.resize(required_mappings.len(), false);
+    let mut intervals_by_bar: [Vec<(usize, usize)>; 6] = core::array::from_fn(|_| Vec::new());
+    let mut merged_by_bar: [Vec<(usize, usize)>; 6] = core::array::from_fn(|_| Vec::new());
+    let mut mapped_by_bar: [Vec<PciBarMappedRange>; 6] = core::array::from_fn(|_| Vec::new());
+    for bar in 0..6u8 {
+        let count = required_mappings
+            .iter()
+            .filter(|request| request.bar == bar)
+            .count();
+        intervals_by_bar[bar as usize]
+            .try_reserve_exact(count)
+            .map_err(|_| PciError::CreateMmioError)?;
+        merged_by_bar[bar as usize]
+            .try_reserve_exact(count)
+            .map_err(|_| PciError::CreateMmioError)?;
+        mapped_by_bar[bar as usize]
+            .try_reserve_exact(count)
+            .map_err(|_| PciError::CreateMmioError)?;
+    }
+
     let command_status =
         pci_root_0().read_config(bus_device_function, STATUS_COMMAND_OFFSET.into());
     let command = command_status as u16;
@@ -343,7 +370,6 @@ pub fn pci_bar_init(
         command,
     };
     let mut device_bar: PciStandardDeviceBar = PciStandardDeviceBar::default();
-    let mut consumed_mappings = vec![false; required_mappings.len()];
     let mut bar_index_ignore: u8 = 255;
     for bar_index in 0..6 {
         if bar_index == bar_index_ignore {
@@ -411,7 +437,7 @@ pub fn pci_bar_init(
                 // unallocated BAR at physical address zero.
                 (None, Vec::new())
             } else if metadata_only_bars.contains(&bar_index) {
-                let mut intervals = Vec::new();
+                let intervals = &mut intervals_by_bar[bar_index as usize];
                 for (index, request) in required_mappings.iter().enumerate() {
                     if request.bar != bar_index {
                         continue;
@@ -435,8 +461,8 @@ pub fn pci_bar_init(
                     intervals.push((aligned_start, aligned_end));
                 }
                 intervals.sort_unstable_by_key(|interval| interval.0);
-                let mut merged: Vec<(usize, usize)> = Vec::new();
-                for (start, end) in intervals {
+                let merged = &mut merged_by_bar[bar_index as usize];
+                for &(start, end) in intervals.iter() {
                     if let Some(last) = merged.last_mut() {
                         if start <= last.1 {
                             last.1 = last.1.max(end);
@@ -446,8 +472,8 @@ pub fn pci_bar_init(
                     merged.push((start, end));
                 }
 
-                let mut mapped_ranges = Vec::new();
-                for (start, end) in merged {
+                let mapped_ranges = &mut mapped_by_bar[bar_index as usize];
+                for &(start, end) in merged.iter() {
                     let length = end.checked_sub(start).ok_or(PciError::InvalidBarRange)?;
                     let request_paddr = paddr
                         .data()
@@ -472,10 +498,10 @@ pub fn pci_bar_init(
                         offset: start as u64,
                         length: length as u64,
                         vaddr,
-                        _guard: Arc::new(guard),
+                        _guard: Arc::try_new(guard).map_err(|_| PciError::CreateMmioError)?,
                     });
                 }
-                (None, mapped_ranges)
+                (None, core::mem::take(mapped_ranges))
             } else {
                 for (index, request) in required_mappings.iter().enumerate() {
                     if request.bar != bar_index {
@@ -499,7 +525,10 @@ pub fn pci_bar_init(
                         .map_phys(paddr, size_want)
                         .map_err(|_| PciError::CreateMmioError)?;
                 }
-                (Some(Arc::new(guard)), Vec::new())
+                (
+                    Some(Arc::try_new(guard).map_err(|_| PciError::CreateMmioError)?),
+                    Vec::new(),
+                )
             };
             bar_info = BarInfo::Memory {
                 address_type,

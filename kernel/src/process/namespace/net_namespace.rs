@@ -1045,7 +1045,7 @@ impl NetNamespace {
         // interface is appended explicitly for projection preparation.
         let participants = try_snapshot_devices(&devices, Some(&device))?;
         let netns = self.self_ref.upgrade().unwrap();
-        device.set_net_namespace(netns.clone());
+        device.set_net_namespace(netns.clone())?;
         devices.insert(device.nic_id(), device.clone());
         let iface = device.clone();
         if let Err(error) = crate::net::route::register_iface(&rtnl, &netns, &iface, &participants)

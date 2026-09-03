@@ -1,3 +1,5 @@
+pub(super) use super::deferred_queue::DeferredRouteKey;
+use super::deferred_queue::{DeferredRouteLimits, DeferredRouteQueue, JoinDeferredResult};
 use super::*;
 
 pub(super) struct LocalInputRxToken {
@@ -70,19 +72,6 @@ pub(super) struct BackpressuredLocalOutput {
     pub(super) packet: LocalOutputPacket,
 }
 
-#[derive(Debug)]
-pub(super) struct DeferredRouteBucket {
-    pub(super) oif: u32,
-    pub(super) next_hop: smoltcp::wire::Ipv4Address,
-    pub(super) retry_at: smoltcp::time::Instant,
-    pub(super) probes: u8,
-    pub(super) probe_in_flight: bool,
-    pub(super) probe_bytes: usize,
-    pub(super) resolved: bool,
-    pub(super) packets: VecDeque<LocalOutputPacket>,
-    pub(super) bytes: usize,
-}
-
 /// Immutable output policy chosen before entering the smoltcp serialization
 /// locks. A queued packet is never reclassified against a later FIB snapshot.
 #[derive(Debug, Clone, Copy)]
@@ -147,7 +136,7 @@ impl LocalOutputDisposition {
 pub(super) struct LocalOutputQueueState {
     pub(super) packets: VecDeque<LocalOutputPacket>,
     pub(super) backpressured: VecDeque<BackpressuredLocalOutput>,
-    pub(super) deferred_routes: Vec<DeferredRouteBucket>,
+    pub(super) deferred_routes: DeferredRouteQueue,
     pub(super) frames: usize,
     pub(super) bytes: usize,
     pub(super) reserved_frames: usize,
@@ -205,12 +194,6 @@ pub(super) enum AdmittedRoutedOutput {
     Sent(LocalOutputPacket),
     Queued(smoltcp::time::Instant),
     Drop(LocalOutputPacket, SystemError),
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct DeferredRouteKey {
-    pub(super) oif: u32,
-    pub(super) next_hop: smoltcp::wire::Ipv4Address,
 }
 
 impl Drop for LocalOutputDrainGuard<'_> {
@@ -350,61 +333,18 @@ impl<'a> LocalOutputReservation<'a> {
         probe_sent: bool,
         advance_existing_probe: bool,
     ) -> Result<(), LocalOutputPacket> {
-        let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition else {
+        let LocalOutputDisposition::Routed { .. } = packet.disposition else {
             return Err(packet);
         };
         let mut output = self.output.lock();
-        let bucket_index = output
-            .deferred_routes
-            .iter()
-            .position(|bucket| bucket.oif == oif && bucket.next_hop == next_hop);
-        if let Some(index) = bucket_index {
-            let bucket = &mut output.deferred_routes[index];
-            if bucket.packets.len() + usize::from(bucket.probe_in_flight)
-                >= LocalInputQueue::MAX_DEFERRED_FRAMES_PER_NEIGHBOR
-                || bucket
-                    .bytes
-                    .saturating_add(bucket.probe_bytes)
-                    .saturating_add(self.bytes)
-                    > LocalInputQueue::MAX_DEFERRED_BYTES_PER_NEIGHBOR
-                || bucket.packets.try_reserve(1).is_err()
-            {
-                drop(output);
-                return Err(packet);
-            }
-            bucket.retry_at = if probe_sent || advance_existing_probe {
-                retry_at
-            } else {
-                bucket.retry_at.min(retry_at)
-            };
-            if probe_sent {
-                bucket.probes = bucket.probes.saturating_add(1);
-            }
-            bucket.bytes += self.bytes;
-            bucket.packets.push_back(packet);
-        } else {
-            if output.deferred_routes.try_reserve(1).is_err() {
-                drop(output);
-                return Err(packet);
-            }
-            let mut packets = VecDeque::new();
-            if packets.try_reserve(1).is_err() {
-                drop(output);
-                return Err(packet);
-            }
-            packets.push_back(packet);
-            output.deferred_routes.push(DeferredRouteBucket {
-                oif,
-                next_hop,
-                retry_at,
-                probes: u8::from(probe_sent),
-                probe_in_flight: false,
-                probe_bytes: 0,
-                resolved: false,
-                packets,
-                bytes: self.bytes,
-            });
-        }
+        output.deferred_routes.try_enqueue(
+            packet,
+            self.bytes,
+            retry_at,
+            probe_sent,
+            advance_existing_probe,
+            LocalInputQueue::DEFERRED_ROUTE_LIMITS,
+        )?;
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
         output.frames += 1;
@@ -419,35 +359,26 @@ impl<'a> LocalOutputReservation<'a> {
         mut self,
         packet: LocalOutputPacket,
     ) -> ExistingDeferredCommit<'a> {
-        let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition else {
+        let LocalOutputDisposition::Routed { .. } = packet.disposition else {
             return ExistingDeferredCommit::Missing(packet, self);
         };
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
         let mut output = self.output.lock();
-        let Some(index) = output
-            .deferred_routes
-            .iter()
-            .position(|bucket| bucket.oif == oif && bucket.next_hop == next_hop)
-        else {
-            drop(output);
-            return ExistingDeferredCommit::Missing(packet, self);
+        let retry_at = match output.deferred_routes.try_join(
+            packet,
+            self.bytes,
+            LocalInputQueue::DEFERRED_ROUTE_LIMITS,
+        ) {
+            JoinDeferredResult::Queued(retry_at) => retry_at,
+            JoinDeferredResult::Missing(packet) => {
+                drop(output);
+                return ExistingDeferredCommit::Missing(packet, self);
+            }
+            JoinDeferredResult::Full(packet) => {
+                drop(output);
+                return ExistingDeferredCommit::Full(packet, self);
+            }
         };
-        let bucket = &mut output.deferred_routes[index];
-        if bucket.packets.len() + usize::from(bucket.probe_in_flight)
-            >= LocalInputQueue::MAX_DEFERRED_FRAMES_PER_NEIGHBOR
-            || bucket
-                .bytes
-                .saturating_add(bucket.probe_bytes)
-                .saturating_add(self.bytes)
-                > LocalInputQueue::MAX_DEFERRED_BYTES_PER_NEIGHBOR
-            || bucket.packets.try_reserve(1).is_err()
-        {
-            drop(output);
-            return ExistingDeferredCommit::Full(packet, self);
-        }
-        let retry_at = bucket.retry_at;
-        bucket.bytes += self.bytes;
-        bucket.packets.push_back(packet);
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
         output.frames += 1;
@@ -465,37 +396,17 @@ impl<'a> LocalOutputReservation<'a> {
     ) -> Result<bool, LocalOutputPacket> {
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
         let mut output = self.output.lock();
-        let Some(index) = output.deferred_routes.iter().position(|bucket| {
-            bucket.oif == key.oif && bucket.next_hop == key.next_hop && bucket.probe_in_flight
-        }) else {
-            drop(output);
-            return Err(packet);
-        };
-
-        let resolved = output.deferred_routes[index].resolved;
-        {
-            let bucket = &mut output.deferred_routes[index];
-            debug_assert_eq!(bucket.probe_bytes, self.bytes);
-            bucket.probe_in_flight = false;
-            bucket.probe_bytes = 0;
-            bucket.bytes += self.bytes;
-            bucket.packets.push_front(packet);
-            if !resolved {
-                bucket.retry_at = retry_at;
-                if probe_sent {
-                    bucket.probes = bucket.probes.saturating_add(1);
-                }
-            }
-        }
-
+        let LocalOutputQueueState {
+            packets,
+            deferred_routes,
+            ..
+        } = &mut *output;
+        let resolved =
+            deferred_routes.finish_probe(packet, self.bytes, key, retry_at, probe_sent, packets)?;
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
         output.frames += 1;
         output.bytes += self.bytes;
-        if resolved {
-            let mut bucket = output.deferred_routes.swap_remove(index);
-            output.packets.append(&mut bucket.packets);
-        }
         self.active = false;
         Ok(resolved)
     }
@@ -517,6 +428,10 @@ impl LocalInputQueue {
     const MAX_BYTES: usize = 4 * 1024 * 1024;
     const MAX_DEFERRED_FRAMES_PER_NEIGHBOR: usize = 64;
     const MAX_DEFERRED_BYTES_PER_NEIGHBOR: usize = 256 * 1024;
+    const DEFERRED_ROUTE_LIMITS: DeferredRouteLimits = DeferredRouteLimits {
+        frames: Self::MAX_DEFERRED_FRAMES_PER_NEIGHBOR,
+        bytes: Self::MAX_DEFERRED_BYTES_PER_NEIGHBOR,
+    };
     const MAX_NEIGHBOR_PROBES: u8 = 3;
     const MAX_SCRATCH_FRAMES: usize = 64;
     const MAX_SCRATCH_BYTES: usize = 256 * 1024;
@@ -605,48 +520,20 @@ impl LocalInputQueue {
                 .expect("front was observed above");
             output.packets.push_back(queued.packet);
         }
-        let due_index = (prefer_deferred || output.packets.is_empty()).then(|| {
-            output
-                .deferred_routes
-                .iter()
-                .position(|bucket| !bucket.probe_in_flight && bucket.retry_at <= now)
-        });
-        let due_index = due_index.flatten();
         // Give one due neighbor bucket priority per drain round. The rest of
         // the round preserves FIFO service for ready output.
-        let take_deferred = due_index.is_some() && (prefer_deferred || output.packets.is_empty());
+        let take_deferred =
+            (prefer_deferred || output.packets.is_empty()) && output.deferred_routes.has_due(now);
         let (packet, probe_key) = if take_deferred {
-            let index = due_index.expect("take_deferred requires a due bucket");
-            if output.deferred_routes[index].resolved
-                || output.deferred_routes[index].probes >= Self::MAX_NEIGHBOR_PROBES
-            {
-                let mut bucket = output.deferred_routes.swap_remove(index);
-                if !bucket.resolved {
-                    for packet in bucket.packets.iter_mut() {
-                        packet.disposition = LocalOutputDisposition::Drop;
-                    }
-                }
-                let packet = bucket.packets.pop_front();
-                output.packets.append(&mut bucket.packets);
-                (packet, None)
-            } else {
-                let bucket = &mut output.deferred_routes[index];
-                let packet = bucket
-                    .packets
-                    .pop_front()
-                    .expect("a deferred route bucket is never empty");
-                let bytes = packet.frame.capacity();
-                bucket.bytes -= bytes;
-                bucket.probe_in_flight = true;
-                bucket.probe_bytes = bytes;
-                (
-                    Some(packet),
-                    Some(DeferredRouteKey {
-                        oif: bucket.oif,
-                        next_hop: bucket.next_hop,
-                    }),
-                )
-            }
+            let LocalOutputQueueState {
+                packets,
+                deferred_routes,
+                ..
+            } = &mut *output;
+            let (packet, key) = deferred_routes
+                .pop_due(now, Self::MAX_NEIGHBOR_PROBES, packets)
+                .expect("a due deferred bucket was observed");
+            (Some(packet), key)
         } else if let Some(packet) = output.packets.pop_front() {
             (Some(packet), None)
         } else {
@@ -670,9 +557,8 @@ impl LocalInputQueue {
         }
         match output
             .deferred_routes
-            .iter()
-            .filter(|bucket| !bucket.probe_in_flight)
-            .map(|bucket| bucket.retry_at)
+            .next_retry()
+            .into_iter()
             .chain(output.backpressured.front().map(|queued| queued.retry_at))
             .min()
         {
@@ -698,10 +584,7 @@ impl LocalInputQueue {
                 .backpressured
                 .front()
                 .is_some_and(|queued| queued.retry_at <= now)
-            || output
-                .deferred_routes
-                .iter()
-                .any(|bucket| !bucket.probe_in_flight && bucket.retry_at <= now)
+            || output.deferred_routes.has_due(now)
     }
 
     pub(super) fn release_backpressured_outputs(&self) -> bool {
@@ -724,66 +607,44 @@ impl LocalInputQueue {
         mut is_resolved: impl FnMut(smoltcp::wire::Ipv4Address) -> bool,
     ) {
         let mut output = self.output.lock();
-        let mut index = 0;
-        while index < output.deferred_routes.len() {
-            if is_resolved(output.deferred_routes[index].next_hop) {
-                if output.deferred_routes[index].probe_in_flight {
-                    output.deferred_routes[index].resolved = true;
-                    index += 1;
-                } else {
-                    let mut bucket = output.deferred_routes.swap_remove(index);
-                    output.packets.append(&mut bucket.packets);
-                }
-            } else {
-                index += 1;
-            }
-        }
+        let LocalOutputQueueState {
+            packets,
+            deferred_routes,
+            ..
+        } = &mut *output;
+        deferred_routes.release_resolved(&mut is_resolved, packets);
     }
 
     pub(super) fn release_neighbor(&self, oif: u32, next_hop: smoltcp::wire::Ipv4Address) -> bool {
         let mut output = self.output.lock();
-        let Some(index) = output
-            .deferred_routes
-            .iter()
-            .position(|bucket| bucket.oif == oif && bucket.next_hop == next_hop)
-        else {
-            return false;
-        };
-        if output.deferred_routes[index].probe_in_flight {
-            output.deferred_routes[index].resolved = true;
-        } else {
-            let mut bucket = output.deferred_routes.swap_remove(index);
-            output.packets.append(&mut bucket.packets);
-        }
-        true
+        let LocalOutputQueueState {
+            packets,
+            deferred_routes,
+            ..
+        } = &mut *output;
+        deferred_routes.release_neighbor(DeferredRouteKey { oif, next_hop }, packets)
     }
 
     pub(super) fn complete_deferred_probe_success(&self, key: DeferredRouteKey) {
         let mut output = self.output.lock();
-        let Some(index) = output.deferred_routes.iter().position(|bucket| {
-            bucket.oif == key.oif && bucket.next_hop == key.next_hop && bucket.probe_in_flight
-        }) else {
-            return;
-        };
-        let mut bucket = output.deferred_routes.swap_remove(index);
-        output.packets.append(&mut bucket.packets);
+        let LocalOutputQueueState {
+            packets,
+            deferred_routes,
+            ..
+        } = &mut *output;
+        deferred_routes.complete_probe_success(key, packets);
     }
 
     /// Fail only the in-flight representative. Other packets in this bucket
     /// may still be valid and remain eligible for independent processing.
     pub(super) fn complete_deferred_packet_failure(&self, key: DeferredRouteKey) {
         let mut output = self.output.lock();
-        let Some(index) = output.deferred_routes.iter().position(|bucket| {
-            bucket.oif == key.oif && bucket.next_hop == key.next_hop && bucket.probe_in_flight
-        }) else {
-            return;
-        };
-        let bucket = &mut output.deferred_routes[index];
-        bucket.probe_in_flight = false;
-        bucket.probe_bytes = 0;
-        if bucket.packets.is_empty() {
-            output.deferred_routes.swap_remove(index);
-        }
+        let LocalOutputQueueState {
+            packets,
+            deferred_routes,
+            ..
+        } = &mut *output;
+        deferred_routes.complete_packet_failure(key, packets);
     }
 
     pub(super) fn clear_routed_if_idle(

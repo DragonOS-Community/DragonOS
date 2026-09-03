@@ -36,6 +36,8 @@ pub mod types;
 pub mod veth;
 pub mod virtio_net;
 
+mod deferred_index;
+mod deferred_queue;
 mod iface;
 mod iface_common;
 mod local_output;

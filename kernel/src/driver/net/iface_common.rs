@@ -259,8 +259,7 @@ impl IfaceCommon {
             .output
             .lock()
             .deferred_routes
-            .iter()
-            .any(|bucket| bucket.oif == oif && bucket.next_hop == next_hop);
+            .contains(DeferredRouteKey { oif, next_hop });
         if !pending {
             return Ok(None);
         }

@@ -257,6 +257,7 @@ impl ParsedRouteRequest {
                 RouteAttr::Priority(metric) => parsed.priority = Some(*metric),
                 RouteAttr::Table(table) => parsed.table = Some(*table),
                 RouteAttr::Iif(index) => parsed.iif = Some(*index),
+                RouteAttr::Metrics | RouteAttr::Multipath => {}
             }
         }
         Ok(parsed)
@@ -264,6 +265,7 @@ impl ParsedRouteRequest {
 }
 
 fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
+    reject_unsupported_mutation_attrs(request)?;
     validate_mutation_family(request.body().family)?;
     validate_mutation_tos(request.body().family, request.body().tos)?;
     if request.body().raw_flags & !RouteFlags::ONLINK.bits() != 0 {
@@ -310,6 +312,7 @@ fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
 }
 
 fn validate_delete_request(request: &RouteSegment) -> Result<(), SystemError> {
+    reject_unsupported_mutation_attrs(request)?;
     validate_mutation_family(request.body().family)?;
     validate_mutation_tos(request.body().family, request.body().tos)?;
     if request.body().raw_flags != 0 {
@@ -327,6 +330,17 @@ fn validate_delete_request(request: &RouteSegment) -> Result<(), SystemError> {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     validate_prefix_lengths(request)
+}
+
+fn reject_unsupported_mutation_attrs(request: &RouteSegment) -> Result<(), SystemError> {
+    if request
+        .attrs()
+        .iter()
+        .any(|attr| matches!(attr, RouteAttr::Metrics | RouteAttr::Multipath))
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    Ok(())
 }
 
 fn validate_get_request(request: &RouteSegment) -> Result<(), SystemError> {

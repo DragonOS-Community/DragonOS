@@ -37,6 +37,7 @@ use super::{
 
 mod option;
 mod output_flow;
+mod rx_queue;
 mod socket_impl;
 
 pub mod inner;
@@ -166,27 +167,15 @@ pub struct UdpSocket {
     /// 3. Manually parsing/building UDP packets to bypass smoltcp's checksum handling
     no_check: AtomicBool,
     ip_version: IpVersion,
-    /// Queue for multicast loopback packets
-    /// This is separate from smoltcp's rx buffer because smoltcp doesn't support
-    /// multicast loopback delivery across different interface socket sets
-    multicast_loopback_rx: Mutex<VecDeque<LoopbackPacket>>,
-}
-
-/// A packet received via loopback delivery (multicast/unicast)
-#[derive(Clone, Debug)]
-struct LoopbackPacket {
-    src_endpoint: IpEndpoint,
-    dst_addr: smoltcp::wire::IpAddress,
-    dst_port: u16,
-    ifindex: i32,
-    payload: Vec<u8>,
+    /// One Linux-compatible receive queue shared by physical and local ingress.
+    receive_queue: rx_queue::UdpReceiveQueue,
 }
 
 impl UdpSocket {
     pub fn new(nonblock: bool, version: IpVersion) -> Arc<Self> {
         let netns = ProcessManager::current_netns();
         Arc::new_cyclic(|me| Self {
-            inner: RwSem::new(Some(UdpInner::Unbound(UnboundUdp::new()))),
+            inner: RwSem::new(Some(UdpInner::Unbound(UnboundUdp::new(version)))),
             iface_placement: RwSem::new(()),
             nonblock: AtomicBool::new(nonblock),
             shutdown: AtomicU8::new(0),
@@ -227,7 +216,7 @@ impl UdpSocket {
             recv_timeout_us: AtomicU64::new(u64::MAX),
             no_check: AtomicBool::new(false), // checksums enabled by default
             ip_version: version,
-            multicast_loopback_rx: Mutex::new(VecDeque::new()),
+            receive_queue: rx_queue::UdpReceiveQueue::new(inner::DEFAULT_RX_BUF_SIZE),
         })
     }
 
@@ -243,6 +232,7 @@ impl UdpSocket {
             reuseaddr: self.so_reuseaddr.load(Ordering::Relaxed),
             reuseport: self.so_reuseport.load(Ordering::Relaxed),
             bind_id: self.bind_id(),
+            generation: self.receive_queue.begin_binding(),
             bound_ifindex: self.bound_device_ifindex(),
         }
     }
@@ -250,11 +240,6 @@ impl UdpSocket {
     #[inline]
     pub(crate) fn bound_device_ifindex(&self) -> usize {
         self.device_binding.ifindex()
-    }
-
-    #[inline]
-    pub(crate) fn device_binding_allows(&self, ifindex: usize) -> bool {
-        self.device_binding.allows(ifindex)
     }
 
     #[inline]
@@ -445,68 +430,16 @@ impl UdpSocket {
         Ok(())
     }
 
-    fn loopback_accepts_with_preconnect(
-        &self,
-        pkt: &LoopbackPacket,
-        consume_preconnect: bool,
-    ) -> bool {
-        let inner = self.inner.read();
-        let bound = match inner.as_ref() {
-            Some(UdpInner::Bound(bound)) => bound,
-            _ => return false,
-        };
-        let local = bound.endpoint();
-        if local.port != pkt.dst_port {
-            return false;
-        }
-        if let Some(addr) = local.addr {
-            if addr != pkt.dst_addr {
-                if pkt.dst_addr.is_multicast() || pkt.dst_addr.is_broadcast() {
-                    return false;
-                }
-                if addr.is_multicast() || addr.is_broadcast() {
-                    return false;
-                }
-                return false;
-            }
-        }
-        if let Ok(remote) = bound.remote_endpoint() {
-            if remote != pkt.src_endpoint {
-                let allow = if consume_preconnect {
-                    bound.take_preconnect_data()
-                } else {
-                    bound.has_preconnect_data()
-                };
-                if !allow {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    fn try_recv_loopback(
+    fn try_recv_queued(
         &self,
         buf: &mut [u8],
         peek: bool,
     ) -> Option<(usize, IpEndpoint, usize, smoltcp::wire::IpAddress, i32)> {
-        let mut loopback_rx = self.multicast_loopback_rx.lock();
-        while let Some(pkt) = loopback_rx.pop_front() {
-            if !self.loopback_accepts_with_preconnect(&pkt, !peek) {
-                continue;
-            }
-            let copy_len = core::cmp::min(buf.len(), pkt.payload.len());
-            buf[..copy_len].copy_from_slice(&pkt.payload[..copy_len]);
-            let orig_len = pkt.payload.len();
-            let src = pkt.src_endpoint;
-            let dst = pkt.dst_addr;
-            let ifindex = pkt.ifindex;
-            if peek {
-                loopback_rx.push_front(pkt);
-            }
-            return Some((copy_len, src, orig_len, dst, ifindex));
-        }
-        None
+        self.receive_queue.recv(buf, peek).map(
+            |(copy_len, original_len, source, destination, ifindex, _)| {
+                (copy_len, source, original_len, destination, ifindex)
+            },
+        )
     }
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
@@ -555,10 +488,10 @@ impl UdpSocket {
             //     rx_size,
             //     tx_size
             // );
-            UnboundUdp::new_with_buf_size(rx_size, tx_size)
+            UnboundUdp::new_with_buf_size(self.ip_version, rx_size, tx_size)
         } else {
             // log::debug!("do_bind: creating socket with default buffer sizes");
-            UnboundUdp::new()
+            UnboundUdp::new(self.ip_version)
         };
 
         let result = self.bind_endpoint_on_owner(unbound, local_endpoint, bound_iface);
@@ -574,7 +507,7 @@ impl UdpSocket {
             }
             Err(e) => {
                 // Restore unbound state on error
-                *inner = Some(UdpInner::Unbound(UnboundUdp::new()));
+                *inner = Some(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
                 Err(e)
             }
         }
@@ -607,9 +540,9 @@ impl UdpSocket {
 
                 // Create new UnboundUdp with custom buffer sizes if they've been set
                 let inner = if rx_size > 0 || tx_size > 0 {
-                    UnboundUdp::new_with_buf_size(rx_size, tx_size)
+                    UnboundUdp::new_with_buf_size(self.ip_version, rx_size, tx_size)
                 } else {
-                    UnboundUdp::new()
+                    UnboundUdp::new(self.ip_version)
                 };
 
                 let bound_result = if let Some(target) = flow_target.or(device_target) {
@@ -627,7 +560,7 @@ impl UdpSocket {
                         bound
                     }
                     Err(e) => {
-                        inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
+                        inner_guard.replace(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
                         return Err(e);
                     }
                 }
@@ -693,9 +626,9 @@ impl UdpSocket {
         let rx_size = self.recv_buf_size.load(Ordering::Acquire);
         let tx_size = self.send_buf_size.load(Ordering::Acquire);
         let unbound = if rx_size > 0 || tx_size > 0 {
-            UnboundUdp::new_with_buf_size(rx_size, tx_size)
+            UnboundUdp::new_with_buf_size(self.ip_version, rx_size, tx_size)
         } else {
-            UnboundUdp::new()
+            UnboundUdp::new(self.ip_version)
         };
 
         // Rebind to the same endpoint
@@ -707,7 +640,7 @@ impl UdpSocket {
             Ok(b) => b,
             Err(e) => {
                 // Restore unbound state on error
-                *inner_guard = Some(UdpInner::Unbound(UnboundUdp::new()));
+                *inner_guard = Some(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
                 return Err(e);
             }
         };
@@ -732,6 +665,7 @@ impl UdpSocket {
 
     pub fn close(&self) {
         let _placement = self.iface_placement.write();
+        self.receive_queue.close();
         let mut inner = self.inner.write();
         if let Some(UdpInner::Bound(bound)) = &mut *inner {
             self.netns
@@ -759,6 +693,7 @@ impl UdpSocket {
         let should_unbind = match inner_guard.as_ref() {
             Some(UdpInner::Bound(bound)) => {
                 bound.disconnect();
+                self.receive_queue.disconnect();
                 bound.should_unbind_on_disconnect()
             }
             Some(UdpInner::Unbound(_)) => return Ok(()),
@@ -779,7 +714,8 @@ impl UdpSocket {
                 .common()
                 .unbind_socket(self.self_ref.upgrade().unwrap());
             bound.close();
-            inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
+            inner_guard.replace(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
+            self.receive_queue.invalidate_binding();
         }
         Ok(())
     }
@@ -808,7 +744,7 @@ impl UdpSocket {
         SystemError,
     > {
         if let Some((copy_len, endpoint, orig_len, dst_addr, ifindex)) =
-            self.try_recv_loopback(buf, peek)
+            self.try_recv_queued(buf, peek)
         {
             return Ok((copy_len, endpoint, orig_len, dst_addr, ifindex));
         }
@@ -907,9 +843,9 @@ impl UdpSocket {
 
     #[inline]
     pub fn can_recv(&self) -> bool {
-        // Can receive if there's data in multicast loopback queue or smoltcp queue
+        // Can receive if there's data in the socket-wide queue or smoltcp queue.
         // OR if read is shutdown (shutdown should wake up recv() to return 0/EOF)
-        if !self.multicast_loopback_rx.lock().is_empty() {
+        if !self.receive_queue.is_empty() {
             return true;
         }
         let has_data = self.check_io_event().contains(EP::EPOLLIN);
@@ -1152,7 +1088,7 @@ impl UdpSocket {
                     }
                     Err(e) => {
                         // Restore unbound state on error
-                        inner_guard.replace(UdpInner::Unbound(UnboundUdp::new()));
+                        inner_guard.replace(UdpInner::Unbound(UnboundUdp::new(self.ip_version)));
                         return Err(e);
                     }
                 }
@@ -1413,38 +1349,58 @@ impl UdpSocket {
     /// Returns true if the packet was successfully injected
     pub fn inject_loopback_packet(
         &self,
+        generation: u64,
         src_endpoint: IpEndpoint,
         dst_addr: smoltcp::wire::IpAddress,
-        dst_port: u16,
+        _dst_port: u16,
         ifindex: i32,
+        payload: &[u8],
+    ) -> bool {
+        self.inject_ingress_packet(
+            generation,
+            src_endpoint,
+            dst_addr,
+            ifindex,
+            smoltcp::phy::PacketMeta::default(),
+            payload,
+        )
+    }
+
+    pub(crate) fn ingress_match(
+        &self,
+        generation: u64,
+        source: IpEndpoint,
+        destination: smoltcp::wire::IpAddress,
+    ) -> Option<bool> {
+        self.receive_queue
+            .ingress_match(generation, source, destination)
+    }
+
+    pub(crate) fn inject_ingress_packet(
+        &self,
+        generation: u64,
+        source: IpEndpoint,
+        destination: smoltcp::wire::IpAddress,
+        ifindex: i32,
+        meta: smoltcp::phy::PacketMeta,
         payload: &[u8],
     ) -> bool {
         if ifindex <= 0 || !self.device_binding.allows(ifindex as usize) {
             return false;
         }
-        // Check if socket is bound
-        {
-            let inner = self.inner.read();
-            if !matches!(inner.as_ref(), Some(UdpInner::Bound(_))) {
-                return false;
-            }
-        }
-
-        // Add to multicast loopback queue
-        let packet = LoopbackPacket {
-            src_endpoint,
-            dst_addr,
-            dst_port,
-            ifindex,
-            payload: payload.to_vec(),
+        let Some(became_readable) =
+            self.receive_queue
+                .enqueue(generation, source, destination, ifindex, meta, payload)
+        else {
+            return false;
         };
-        self.multicast_loopback_rx.lock().push_back(packet);
-
-        // Wake up any waiting receivers
-        self.wait_queue.wakeup(None);
-        let pollflag = self.check_io_event();
-        let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), pollflag);
-
+        if became_readable {
+            self.wait_queue.wakeup_all(None);
+            let readable = EP::EPOLLIN | EP::EPOLLRDNORM;
+            let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), readable);
+            self.fasync_items
+                .send_sigio(crate::filesystem::vfs::fasync::FASYNC_POLL_IN);
+        }
         true
     }
 

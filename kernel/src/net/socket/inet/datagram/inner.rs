@@ -36,6 +36,7 @@ pub struct UdpBindContext {
     pub reuseaddr: bool,
     pub reuseport: bool,
     pub bind_id: usize,
+    pub generation: u64,
     pub bound_ifindex: usize,
 }
 
@@ -45,11 +46,15 @@ pub struct UnboundUdp {
 }
 
 impl UnboundUdp {
-    pub fn new() -> Self {
-        Self::new_with_buf_size(0, 0)
+    pub fn new(version: smoltcp::wire::IpVersion) -> Self {
+        Self::new_with_buf_size(version, 0, 0)
     }
 
-    pub fn new_with_buf_size(rx_size: usize, tx_size: usize) -> Self {
+    pub fn new_with_buf_size(
+        version: smoltcp::wire::IpVersion,
+        rx_size: usize,
+        tx_size: usize,
+    ) -> Self {
         // Buffer sizing strategy:
         // - setsockopt(SO_RCVBUF, X) stores X
         // - getsockopt(SO_RCVBUF) returns 2*X (Linux convention)
@@ -86,10 +91,18 @@ impl UnboundUdp {
         //     tx_buf_size
         // );
 
-        let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
-            vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; rx_buf_size],
-        );
+        // IPv4 ingress is demultiplexed into UdpSocket's namespace-wide queue
+        // before smoltcp socket lookup. Its SocketSet entry is TX-only; keeping
+        // another full RX ring would duplicate SO_RCVBUF without receiving data.
+        let (rx_metadata, rx_payload) = if version == smoltcp::wire::IpVersion::Ipv4 {
+            (alloc::vec::Vec::new(), alloc::vec::Vec::new())
+        } else {
+            (
+                vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
+                vec![0; rx_buf_size],
+            )
+        };
+        let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(rx_metadata, rx_payload);
         let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
             vec![0; tx_buf_size],
@@ -110,6 +123,7 @@ impl UnboundUdp {
             reuseaddr,
             reuseport,
             bind_id,
+            generation,
             bound_ifindex,
         } = context;
         let inner = BoundInner::bind(self.socket, &local_endpoint.addr, netns.clone())?;
@@ -121,6 +135,7 @@ impl UnboundUdp {
                 reuseaddr,
                 reuseport,
                 bind_id,
+                generation,
                 bound_ifindex,
                 netns.local_port_range(),
             )
@@ -134,6 +149,7 @@ impl UnboundUdp {
                     reuseaddr,
                     reuseport,
                     bind_id,
+                    generation,
                     bound_ifindex,
                 )
                 .map(|()| local_endpoint.port)
@@ -185,6 +201,7 @@ impl UnboundUdp {
             reuseaddr,
             reuseport,
             bind_id,
+            generation,
             bound_ifindex,
         } = context;
         let inner = BoundInner::bind_on_iface(self.socket, iface, netns.clone())?;
@@ -196,6 +213,7 @@ impl UnboundUdp {
                 reuseaddr,
                 reuseport,
                 bind_id,
+                generation,
                 bound_ifindex,
                 netns.local_port_range(),
             )
@@ -209,6 +227,7 @@ impl UnboundUdp {
                     reuseaddr,
                     reuseport,
                     bind_id,
+                    generation,
                     bound_ifindex,
                 )
                 .map(|()| local_endpoint.port)
@@ -256,6 +275,7 @@ impl UnboundUdp {
             reuseaddr,
             reuseport,
             bind_id,
+            generation,
             bound_ifindex,
         } = context;
         let (inner, local_addr) = BoundInner::bind_ephemeral(self.socket, remote, netns.clone())?;
@@ -265,6 +285,7 @@ impl UnboundUdp {
             reuseaddr,
             reuseport,
             bind_id,
+            generation,
             bound_ifindex,
             netns.local_port_range(),
         ) {
@@ -321,6 +342,7 @@ impl UnboundUdp {
             reuseaddr,
             reuseport,
             bind_id,
+            generation,
             bound_ifindex,
         } = context;
         let inner = BoundInner::bind_on_iface(self.socket, iface, netns.clone())?;
@@ -330,6 +352,7 @@ impl UnboundUdp {
             reuseaddr,
             reuseport,
             bind_id,
+            generation,
             bound_ifindex,
             netns.local_port_range(),
         ) {
@@ -432,23 +455,6 @@ impl BoundUdp {
 
     pub fn connected_source(&self) -> Option<smoltcp::wire::IpAddress> {
         (*self.connection.lock()).and_then(|connection| connection.source)
-    }
-
-    pub fn set_preconnect_data(&self, has_data: bool) {
-        *self.has_preconnect_data.lock() = has_data;
-    }
-
-    pub fn has_preconnect_data(&self) -> bool {
-        *self.has_preconnect_data.lock()
-    }
-
-    pub fn take_preconnect_data(&self) -> bool {
-        let mut guard = self.has_preconnect_data.lock();
-        let v = *guard;
-        if v {
-            *guard = false;
-        }
-        v
     }
 
     pub fn disconnect(&self) {

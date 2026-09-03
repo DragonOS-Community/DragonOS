@@ -55,9 +55,10 @@ impl UdpSocket {
                 let requested = byte_parser::read_u32(val)?;
                 let size = clamp_udp_buf(requested, SYSCTL_RMEM_MAX, SOCK_MIN_RCVBUF);
                 self.recv_buf_size.store(size, Ordering::Release);
-
-                // If socket is already bound, we need to recreate it with new buffer size
-                self.recreate_socket_if_bound()?;
+                self.receive_queue.set_capacity(size.saturating_mul(2));
+                if self.ip_version == smoltcp::wire::IpVersion::Ipv6 {
+                    self.recreate_socket_if_bound()?;
+                }
                 Ok(())
             }
             PSO::RCVLOWAT => {
@@ -101,7 +102,10 @@ impl UdpSocket {
                 let requested = byte_parser::read_i32(val)?;
                 let size = clamp_udp_buf_force(requested, SOCK_MIN_RCVBUF);
                 self.recv_buf_size.store(size, Ordering::Release);
-                self.recreate_socket_if_bound()?;
+                self.receive_queue.set_capacity(size.saturating_mul(2));
+                if self.ip_version == smoltcp::wire::IpVersion::Ipv6 {
+                    self.recreate_socket_if_bound()?;
+                }
                 Ok(())
             }
             PSO::REUSEADDR => {

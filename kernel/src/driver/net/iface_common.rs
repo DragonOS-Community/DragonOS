@@ -1232,12 +1232,18 @@ impl IfaceCommon {
     }
 
     pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) {
-        let mut guard = self.net_namespace.write();
-        *guard = Arc::downgrade(&ns);
+        *self.net_namespace.write() = Arc::downgrade(&ns);
+        self.sockets.lock().set_udp_ingress_handler(Some(Arc::new(
+            crate::net::socket::inet::datagram::udp_bindings::NetnsUdpIngress::new(
+                &ns,
+                self.iface_id,
+            ),
+        )));
     }
 
     pub fn clear_net_namespace(&self) {
         *self.net_namespace.write() = Weak::new();
+        self.sockets.lock().set_udp_ingress_handler(None);
     }
 
     /// Runs a construction-time mutation while preventing namespace

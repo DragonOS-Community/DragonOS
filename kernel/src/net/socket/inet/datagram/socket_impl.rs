@@ -66,6 +66,9 @@ impl Socket for UdpSocket {
         }
 
         // Otherwise return actual buffer capacity
+        if self.ip_version == IpVersion::Ipv4 {
+            return self.receive_queue.capacity();
+        }
         let size = match self.inner.read().as_ref() {
             Some(UdpInner::Bound(bound)) => {
                 bound.with_socket(|socket| socket.payload_recv_capacity())
@@ -77,20 +80,11 @@ impl Socket for UdpSocket {
     }
 
     fn recv_bytes_available(&self) -> usize {
+        if let Some(len) = self.receive_queue.first_len() {
+            return len;
+        }
         match self.inner.read().as_ref() {
             Some(UdpInner::Bound(bound)) => {
-                // 优先检查 loopback 队列，返回第一条可接收报文的长度。
-                let loopback_len = {
-                    let loopback_rx = self.multicast_loopback_rx.lock();
-                    loopback_rx
-                        .iter()
-                        .find(|pkt| self.loopback_accepts_with_preconnect(pkt, false))
-                        .map(|pkt| pkt.payload.len())
-                };
-                if let Some(len) = loopback_len {
-                    return len;
-                }
-
                 // For UDP, FIONREAD should return the size of the first packet,
                 // not the total bytes in the queue
                 bound.with_mut_socket(|socket| match socket.peek() {
@@ -138,9 +132,7 @@ impl Socket for UdpSocket {
                 match self.inner.read().as_ref() {
                     Some(UdpInner::Bound(inner)) => {
                         inner.connect(remote, connected_source);
-                        if !self.multicast_loopback_rx.lock().is_empty() {
-                            inner.set_preconnect_data(true);
-                        }
+                        self.receive_queue.connect(remote, connected_source);
                         Ok(())
                     }
                     Some(_) => Err(SystemError::ENOTCONN),
@@ -702,16 +694,19 @@ impl Socket for UdpSocket {
 
     fn check_io_event(&self) -> EPollEventType {
         let mut event = EPollEventType::empty();
-        let loopback_has_data = !self.multicast_loopback_rx.lock().is_empty();
+        let queued_data = !self.receive_queue.is_empty();
         match self.inner.read().as_ref() {
             Some(UdpInner::Unbound(_)) => {
                 event.insert(EP::EPOLLOUT | EP::EPOLLWRNORM | EP::EPOLLWRBAND);
+                if queued_data {
+                    event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
+                }
             }
             Some(UdpInner::Bound(bound)) => {
                 let (can_recv, can_send) =
                     bound.with_socket(|socket| (socket.can_recv(), socket.can_send()));
 
-                if can_recv || loopback_has_data {
+                if can_recv || queued_data {
                     event.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
                 }
 

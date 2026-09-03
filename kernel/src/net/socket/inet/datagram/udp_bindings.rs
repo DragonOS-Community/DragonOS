@@ -4,13 +4,64 @@ use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use hashbrown::HashMap;
 use jhash::jhash2;
-use smoltcp::wire::{IpAddress, IpEndpoint};
+use smoltcp::{
+    phy::PacketMeta,
+    wire::{IpAddress, IpEndpoint},
+};
 use system_error::SystemError;
 
 use crate::arch::rand::rand;
 use crate::libs::mutex::Mutex;
 
 use super::UdpSocket;
+use crate::process::namespace::net_namespace::NetNamespace;
+
+#[derive(Debug)]
+pub(crate) struct NetnsUdpIngress {
+    netns: Weak<NetNamespace>,
+    ifindex: i32,
+}
+
+impl NetnsUdpIngress {
+    pub fn new(netns: &Arc<NetNamespace>, ifindex: usize) -> Self {
+        Self {
+            netns: Arc::downgrade(netns),
+            ifindex: ifindex as i32,
+        }
+    }
+}
+
+impl smoltcp::iface::UdpIngressHandler for NetnsUdpIngress {
+    fn handle_udp_ingress(
+        &self,
+        meta: PacketMeta,
+        ip_repr: &smoltcp::wire::IpRepr,
+        udp_repr: &smoltcp::wire::UdpRepr,
+        is_broadcast: bool,
+        payload: &[u8],
+    ) -> smoltcp::iface::UdpIngressResult {
+        let smoltcp::wire::IpRepr::Ipv4(ipv4) = ip_repr else {
+            return smoltcp::iface::UdpIngressResult::NotHandled;
+        };
+        let Some(netns) = self.netns.upgrade() else {
+            return smoltcp::iface::UdpIngressResult::NotHandled;
+        };
+        let src = IpEndpoint::new(IpAddress::Ipv4(ipv4.src_addr), udp_repr.src_port);
+        let dest = IpEndpoint::new(IpAddress::Ipv4(ipv4.dst_addr), udp_repr.dst_port);
+        if netns.udp_bindings().deliver_ingress(
+            dest,
+            src,
+            self.ifindex,
+            is_broadcast,
+            meta,
+            payload,
+        ) {
+            smoltcp::iface::UdpIngressResult::Consumed
+        } else {
+            smoltcp::iface::UdpIngressResult::NotHandled
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct UdpBinding {
@@ -20,6 +71,7 @@ struct UdpBinding {
     /// checks, Linux reuseport delivery membership is not the live option bit.
     reuseport: bool,
     bind_id: usize,
+    generation: u64,
     bound_seq: u64,
 }
 
@@ -27,7 +79,22 @@ struct UdpBinding {
 struct UdpBindingMatch {
     socket: Arc<UdpSocket>,
     reuseport: bool,
+    generation: u64,
     bound_seq: u64,
+    score: UdpLookupScore,
+}
+
+/// The subset of Linux `compute_score()` that DragonOS currently models.
+///
+/// An exact local address is ordered first because Linux searches the
+/// destination-address hash before its wildcard hash. Within that class, a
+/// connected four-tuple outranks an unconnected socket and SO_BINDTODEVICE
+/// outranks an otherwise equivalent device-wildcard socket.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct UdpLookupScore {
+    local_exact: bool,
+    connected: bool,
+    device_bound: bool,
 }
 
 /// Per-network-namespace UDP port reservation and local-delivery table.
@@ -62,6 +129,7 @@ impl UdpBindingTable {
         reuseaddr: bool,
         reuseport: bool,
         bind_id: usize,
+        generation: u64,
         prospective_ifindex: usize,
     ) -> Result<(), SystemError> {
         if port == 0 {
@@ -85,6 +153,7 @@ impl UdpBindingTable {
             addr,
             reuseport,
             bind_id,
+            generation,
             bound_seq: self.bind_seq.fetch_add(1, Ordering::Relaxed),
         });
         Ok(())
@@ -98,6 +167,7 @@ impl UdpBindingTable {
         reuseaddr: bool,
         reuseport: bool,
         bind_id: usize,
+        generation: u64,
         prospective_ifindex: usize,
         range: (u16, u16),
     ) -> Result<u16, SystemError> {
@@ -143,6 +213,7 @@ impl UdpBindingTable {
                 addr,
                 reuseport,
                 bind_id,
+                generation,
                 bound_seq: self.bind_seq.fetch_add(1, Ordering::Relaxed),
             });
             return Ok(port);
@@ -171,15 +242,20 @@ impl UdpBindingTable {
         ifindex: i32,
         payload: &[u8],
     ) -> usize {
-        let candidates = self.match_bindings(dest.addr, dest.port, ifindex);
-        let chosen = if candidates.iter().any(|candidate| candidate.reuseport) {
-            choose_reuseport_socket(&candidates, dest, src)
-        } else {
-            choose_recent_socket(&candidates)
+        let Ok(candidates) = self.match_bindings(dest.addr, dest.port, src, ifindex) else {
+            return 0;
         };
+        let chosen = choose_unicast_socket(&candidates, dest, src);
         chosen
-            .filter(|socket| {
-                socket.inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
+            .filter(|candidate| {
+                candidate.socket.inject_loopback_packet(
+                    candidate.generation,
+                    src,
+                    dest.addr,
+                    dest.port,
+                    ifindex,
+                    payload,
+                )
             })
             .map_or(0, |_| 1)
     }
@@ -191,7 +267,9 @@ impl UdpBindingTable {
         ifindex: i32,
         payload: &[u8],
     ) -> usize {
-        let candidates = self.match_bindings(dest.addr, dest.port, ifindex);
+        let Ok(candidates) = self.match_bindings(dest.addr, dest.port, src, ifindex) else {
+            return 0;
+        };
         let multiaddr = match dest.addr {
             IpAddress::Ipv4(addr) => u32::from_ne_bytes(addr.octets()),
             _ => return 0,
@@ -205,9 +283,14 @@ impl UdpBindingTable {
                         .has_ipv4_multicast_membership(multiaddr, ifindex)
             })
             .filter(|candidate| {
-                candidate
-                    .socket
-                    .inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
+                candidate.socket.inject_loopback_packet(
+                    candidate.generation,
+                    src,
+                    dest.addr,
+                    dest.port,
+                    ifindex,
+                    payload,
+                )
             })
             .count()
     }
@@ -219,14 +302,91 @@ impl UdpBindingTable {
         ifindex: i32,
         payload: &[u8],
     ) -> usize {
-        self.match_bindings(dest.addr, dest.port, ifindex)
+        let Ok(candidates) = self.match_bindings(dest.addr, dest.port, src, ifindex) else {
+            return 0;
+        };
+        candidates
             .into_iter()
             .filter(|candidate| {
-                candidate
-                    .socket
-                    .inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
+                candidate.socket.inject_loopback_packet(
+                    candidate.generation,
+                    src,
+                    dest.addr,
+                    dest.port,
+                    ifindex,
+                    payload,
+                )
             })
             .count()
+    }
+
+    /// Delivers one UDP datagram after smoltcp has validated the IP/UDP packet.
+    /// `true` means a Linux UDP binding consumed the protocol lookup, including
+    /// the normal receive-buffer-full drop case, so smoltcp must not emit ICMP.
+    pub fn deliver_ingress(
+        &self,
+        dest: IpEndpoint,
+        src: IpEndpoint,
+        ifindex: i32,
+        is_broadcast: bool,
+        meta: PacketMeta,
+        payload: &[u8],
+    ) -> bool {
+        let candidates = match self.match_bindings(dest.addr, dest.port, src, ifindex) {
+            Ok(candidates) => candidates,
+            // A matching bucket exists but its fallible snapshot could not be
+            // allocated. UDP drops under receive-memory pressure without ICMP.
+            Err(()) => return true,
+        };
+        if candidates.is_empty() {
+            return false;
+        }
+        if dest.addr.is_multicast() {
+            let IpAddress::Ipv4(addr) = dest.addr else {
+                return false;
+            };
+            let multiaddr = u32::from_ne_bytes(addr.octets());
+            for candidate in candidates {
+                if candidate.socket.ip_multicast_all.load(Ordering::Relaxed)
+                    || candidate
+                        .socket
+                        .has_ipv4_multicast_membership(multiaddr, ifindex)
+                {
+                    candidate.socket.inject_ingress_packet(
+                        candidate.generation,
+                        src,
+                        dest.addr,
+                        ifindex,
+                        meta,
+                        payload,
+                    );
+                }
+            }
+        } else if is_broadcast {
+            for candidate in candidates {
+                candidate.socket.inject_ingress_packet(
+                    candidate.generation,
+                    src,
+                    dest.addr,
+                    ifindex,
+                    meta,
+                    payload,
+                );
+            }
+        } else {
+            let chosen = choose_unicast_socket(&candidates, dest, src);
+            if let Some(socket) = chosen {
+                socket.socket.inject_ingress_packet(
+                    socket.generation,
+                    src,
+                    dest.addr,
+                    ifindex,
+                    meta,
+                    payload,
+                );
+            }
+        }
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -261,28 +421,46 @@ impl UdpBindingTable {
         &self,
         dest_addr: IpAddress,
         dest_port: u16,
+        source: IpEndpoint,
         ingress_ifindex: i32,
-    ) -> Vec<UdpBindingMatch> {
+    ) -> Result<Vec<UdpBindingMatch>, ()> {
         let mut bindings = self.bindings.lock();
         let Some(bucket) = bindings.get_mut(&dest_port) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         Self::cleanup_bucket(bucket);
-        bucket
-            .iter()
-            .filter(|binding| udp_addr_match(binding.addr, dest_addr))
-            .filter_map(|binding| {
-                let socket = binding.socket.upgrade()?;
-                if ingress_ifindex <= 0 || !socket.device_binding_allows(ingress_ifindex as usize) {
-                    return None;
-                }
-                Some(UdpBindingMatch {
-                    socket,
-                    reuseport: binding.reuseport,
-                    bound_seq: binding.bound_seq,
-                })
-            })
-            .collect()
+        let mut matches = Vec::new();
+        for binding in bucket.iter() {
+            if !udp_addr_match(binding.addr, dest_addr) {
+                continue;
+            }
+            let Some(socket) = binding.socket.upgrade() else {
+                continue;
+            };
+            let bound_ifindex = socket.bound_device_ifindex();
+            if ingress_ifindex <= 0
+                || (bound_ifindex != 0 && bound_ifindex != ingress_ifindex as usize)
+            {
+                continue;
+            }
+            let Some(connected) = socket.ingress_match(binding.generation, source, dest_addr)
+            else {
+                continue;
+            };
+            matches.try_reserve(1).map_err(|_| ())?;
+            matches.push(UdpBindingMatch {
+                socket,
+                reuseport: binding.reuseport,
+                generation: binding.generation,
+                bound_seq: binding.bound_seq,
+                score: UdpLookupScore {
+                    local_exact: !binding.addr.is_unspecified(),
+                    connected,
+                    device_bound: bound_ifindex != 0,
+                },
+            });
+        }
+        Ok(matches)
     }
 
     fn cleanup_bucket(bindings: &mut Vec<UdpBinding>) {
@@ -300,35 +478,36 @@ fn udp_addr_match(bound_addr: IpAddress, dest_addr: IpAddress) -> bool {
     if bound_addr.version() != dest_addr.version() {
         return false;
     }
-    bound_addr.is_unspecified()
-        || dest_addr.is_multicast()
-        || dest_addr.is_broadcast()
-        || bound_addr == dest_addr
+    bound_addr.is_unspecified() || bound_addr == dest_addr
 }
 
-fn choose_recent_socket(candidates: &[UdpBindingMatch]) -> Option<Arc<UdpSocket>> {
-    candidates
-        .iter()
-        .max_by_key(|candidate| candidate.bound_seq)
-        .map(|candidate| candidate.socket.clone())
-}
-
-fn choose_reuseport_socket(
+fn choose_unicast_socket(
     candidates: &[UdpBindingMatch],
     dest: IpEndpoint,
     src: IpEndpoint,
-) -> Option<Arc<UdpSocket>> {
-    let reuseport: Vec<&UdpBindingMatch> = candidates
+) -> Option<&UdpBindingMatch> {
+    let best_score = candidates.iter().map(|candidate| candidate.score).max()?;
+    let primary = candidates
         .iter()
-        .filter(|candidate| candidate.reuseport)
-        .collect();
-    if reuseport.is_empty() {
-        return None;
+        .filter(|candidate| candidate.score == best_score)
+        .max_by_key(|candidate| candidate.bound_seq)
+        .unwrap();
+    if !primary.reuseport {
+        return Some(primary);
     }
-    let index = (udp_4tuple_hash(dest, src) as usize) % reuseport.len();
-    reuseport
-        .get(index)
-        .map(|candidate| candidate.socket.clone())
+
+    // Linux selects a best-scoring socket first and only then applies
+    // SO_REUSEPORT within that equivalent lookup class. In particular, a
+    // lower-specificity reuseport socket must never divert the datagram.
+    let count = candidates
+        .iter()
+        .filter(|candidate| candidate.score == best_score && candidate.reuseport)
+        .count();
+    let index = (udp_4tuple_hash(dest, src) as usize) % count;
+    candidates
+        .iter()
+        .filter(|candidate| candidate.score == best_score && candidate.reuseport)
+        .nth(index)
 }
 
 fn udp_4tuple_hash(dest: IpEndpoint, src: IpEndpoint) -> u32 {

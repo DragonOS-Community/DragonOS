@@ -50,6 +50,11 @@ pub enum RouteAttr {
     Priority(u32),
     Prefsrc(Vec<u8>),
     Table(u32),
+    /// Known nested attributes whose semantics are not implemented yet. The
+    /// operation layer only needs their presence, so do not duplicate an
+    /// attacker-sized payload that will be ignored or rejected.
+    Metrics,
+    Multipath,
 }
 
 impl RouteAttr {
@@ -63,6 +68,8 @@ impl RouteAttr {
             RouteAttr::Priority(_) => RouteAttrClass::PRIORITY,
             RouteAttr::Prefsrc(_) => RouteAttrClass::PREFSRC,
             RouteAttr::Table(_) => RouteAttrClass::TABLE,
+            RouteAttr::Metrics => RouteAttrClass::METRICS,
+            RouteAttr::Multipath => RouteAttrClass::MULTIPATH,
         }
     }
 }
@@ -78,6 +85,7 @@ impl Attribute for RouteAttr {
             | RouteAttr::Src(addr)
             | RouteAttr::Gateway(addr)
             | RouteAttr::Prefsrc(addr) => addr.as_slice(),
+            RouteAttr::Metrics | RouteAttr::Multipath => &[],
             RouteAttr::Oif(idx)
             | RouteAttr::Iif(idx)
             | RouteAttr::Priority(idx)
@@ -131,9 +139,9 @@ impl Attribute for RouteAttr {
             RouteAttrClass::TABLE if payload_len == 4 => {
                 RouteAttr::Table(*convert_one_from_raw_buf::<u32>(payload_buf)?)
             }
-            RouteAttrClass::METRICS | RouteAttrClass::MULTIPATH => {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
+            RouteAttrClass::METRICS if payload_len == 0 || payload_len >= 4 => RouteAttr::Metrics,
+            // struct rtnexthop is 8 bytes in Linux's UAPI.
+            RouteAttrClass::MULTIPATH if payload_len >= 8 => RouteAttr::Multipath,
             RouteAttrClass::UNSPEC => return Ok(None),
             _ => return Err(SystemError::EINVAL),
         };

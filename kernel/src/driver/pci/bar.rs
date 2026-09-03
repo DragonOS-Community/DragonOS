@@ -199,6 +199,9 @@ impl PciBarSubresourceGuard {
         }) {
             return Err(PciError::InvalidBarRange);
         }
+        resources
+            .try_reserve(1)
+            .map_err(|_| PciError::CreateMmioError)?;
         resources.push(resource);
         Ok(Self { resource })
     }

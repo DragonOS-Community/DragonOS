@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::libs::mutex::Mutex;
 use crate::net::{socket, Iface};
+use system_error::SystemError;
 
 #[derive(Debug)]
 pub(super) struct ConnectingRegistration {
@@ -32,18 +33,22 @@ impl ConnectingRegistration {
     const RETAINED: usize = 2;
     const CANCELLED: usize = 3;
 
-    pub(super) fn new(iface: Arc<dyn Iface>, wrapper: Weak<dyn socket::inet::InetSocket>) -> Self {
+    pub(super) fn try_new(
+        iface: Arc<dyn Iface>,
+        wrapper: Weak<dyn socket::inet::InetSocket>,
+    ) -> Result<Self, SystemError> {
         let routing_publication =
             socket::inet::common::RoutedSocketPublication::begin(iface.clone());
-        Self {
-            state: Arc::new(ConnectingRegistrationState {
+        Ok(Self {
+            state: Arc::try_new(ConnectingRegistrationState {
                 iface,
                 wrapper,
                 state: AtomicUsize::new(Self::PENDING),
                 routing_publication: Mutex::new(Some(routing_publication)),
-            }),
+            })
+            .map_err(|_| SystemError::ENOMEM)?,
             retained: false,
-        }
+        })
     }
 
     pub(super) fn publisher(&self) -> ConnectingRegistrationPublisher {

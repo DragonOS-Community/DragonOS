@@ -366,24 +366,32 @@ impl NetnsPoller {
                                 None => us,
                             });
                         }
-                        DueResult::Claimed(claimed_us) => match napi {
-                            Some(napi) => match napi_schedule(napi) {
-                                NapiScheduleResult::Accepted => {}
-                                NapiScheduleResult::Disabled | NapiScheduleResult::Detached => {
-                                    iface.common().restore_poll_deadline(claimed_us);
-                                }
-                            },
-                            None => direct_due.push((iface.clone(), claimed_us)),
-                        },
+                        DueResult::Claimed { claims, next } => {
+                            if let Some(us) = next {
+                                next_us = Some(match next_us {
+                                    Some(cur) => core::cmp::min(cur, us),
+                                    None => us,
+                                });
+                            }
+                            match napi {
+                                Some(napi) => match napi_schedule(napi) {
+                                    NapiScheduleResult::Accepted => {}
+                                    NapiScheduleResult::Disabled | NapiScheduleResult::Detached => {
+                                        iface.common().restore_poll_deadline(claims);
+                                    }
+                                },
+                                None => direct_due.push((iface.clone(), claims)),
+                            }
+                        }
                     }
                 }
             }
 
             if !direct_due.is_empty() {
                 drop(netns);
-                for (iface, claimed_us) in direct_due {
+                for (iface, claims) in direct_due {
                     if iface.common().poll_scope() == IfacePollScope::None {
-                        iface.common().restore_poll_deadline(claimed_us);
+                        iface.common().restore_poll_deadline(claims);
                         continue;
                     }
                     if Self::poll_direct_batch(&iface) {

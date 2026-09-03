@@ -22,9 +22,9 @@ pub struct IfaceCommon {
     pub(super) namespace_routed_stack: AtomicBool,
     /// 端口管理器
     pub(super) port_manager: PortManager,
-    /// Scheduler-owned future protocol deadline. Immediate work stays with
-    /// the current poll owner and is never armed here.
-    pub(super) poll_deadline: PollDeadline,
+    /// Scheduler-owned deadlines for independently published protocol and
+    /// local-output work. Immediate work stays with the current poll owner.
+    pub(super) poll_deadlines: PollDeadlines,
     /// Bounded fallback delay for local-output device backpressure. Individual
     /// packets retain their not-before deadline across unrelated poll wakes.
     pub(super) local_output_tx_backoff_us: AtomicU64,
@@ -70,7 +70,7 @@ impl fmt::Debug for IfaceCommon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IfaceCommon")
             .field("iface_id", &self.iface_id)
-            .field("poll_deadline", &self.poll_deadline)
+            .field("poll_deadlines", &self.poll_deadlines)
             .finish()
     }
 }
@@ -111,7 +111,7 @@ impl IfaceCommon {
             pending_routed_socket_count: AtomicUsize::new(0),
             namespace_routed_stack: AtomicBool::new(false),
             port_manager: PortManager::default(),
-            poll_deadline: PollDeadline::new(),
+            poll_deadlines: PollDeadlines::new(),
             local_output_tx_backoff_us: AtomicU64::new(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US),
             tx_completion_generation: AtomicU64::new(0),
             net_namespace: RwLock::new(Weak::new()),
@@ -642,20 +642,6 @@ impl IfaceCommon {
         has_events || poll_again || output_drain.needs_immediate_poll()
     }
 
-    /// Atomically classify and, when due, claim this interface's future
-    /// protocol deadline.
-    #[inline]
-    pub fn classify_poll_deadline(&self, now_us: u64) -> DueResult {
-        self.poll_deadline.classify_and_claim(now_us)
-    }
-
-    /// Restore a claimed deadline after a failed scheduler handoff, without
-    /// overwriting a concurrent publisher.
-    #[inline]
-    pub fn restore_poll_deadline(&self, claimed_us: u64) -> bool {
-        self.poll_deadline.restore_claimed_if_empty(claimed_us)
-    }
-
     /// NAPI 使用的 bounded poll：最多处理 `budget` 个 ingress 包，然后推进一次 egress。
     ///
     /// 返回值语义：是否仍有 ingress backlog 需要继续 poll（即 budget 用尽且仍在处理包）。
@@ -1117,55 +1103,6 @@ impl IfaceCommon {
     pub(super) fn reset_local_output_tx_backoff(&self) {
         self.local_output_tx_backoff_us
             .store(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US, Ordering::Release);
-    }
-
-    pub(super) fn defer_local_output_retry_at(&self, retry_at: smoltcp::time::Instant) {
-        let now_us = crate::time::Instant::now().total_micros().max(0) as u64;
-        let retry_us = (retry_at.total_micros().max(0) as u64).max(now_us.saturating_add(1));
-        self.publish_local_output_retry(now_us, retry_us);
-    }
-
-    pub(super) fn publish_local_output_retry(&self, now_us: u64, retry_us: u64) {
-        let rearm = self.poll_deadline.publish_earlier_future(now_us, retry_us)
-            == PublishResult::RearmRequired;
-        self.notify_deadline_rearm(rearm);
-    }
-
-    /// Publish smoltcp's next scheduling decision while both smoltcp
-    /// serialization locks are held.
-    ///
-    /// The returned boolean pair is `(poll_again, deadline_rearm)`.
-    pub(super) fn publish_poll_deadline(
-        &self,
-        now: smoltcp::time::Instant,
-        poll_at: Option<smoltcp::time::Instant>,
-    ) -> (bool, bool) {
-        match poll_at {
-            Some(instant) if instant <= now => {
-                self.poll_deadline.disarm();
-                (true, false)
-            }
-            Some(instant) => {
-                let now_us = now.total_micros() as u64;
-                let deadline_us = instant.total_micros() as u64;
-                let rearm = self.poll_deadline.publish_future(now_us, deadline_us)
-                    == PublishResult::RearmRequired;
-                (false, rearm)
-            }
-            None => {
-                self.poll_deadline.disarm();
-                (false, false)
-            }
-        }
-    }
-
-    pub(super) fn notify_deadline_rearm(&self, rearm: bool) {
-        if !rearm {
-            return;
-        }
-        if let Some(netns) = self.net_namespace() {
-            netns.notify_deadline_changed();
-        }
     }
 
     // 需要bounds储存具体的Inet Socket信息，以提供不同种类inet socket的事件分发

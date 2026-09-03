@@ -215,7 +215,10 @@ impl Init {
         // visible to poll. The RAII reservation survives until Connecting is
         // replaced, while normal `bounds` registration covers the rest of the
         // socket lifetime.
-        let registration = ConnectingRegistration::new(inner.iface().clone(), wrapper);
+        let registration = match ConnectingRegistration::try_new(inner.iface().clone(), wrapper) {
+            Ok(registration) => registration,
+            Err(err) => return Err((Init::Bound((inner, local)), err)),
+        };
         let result = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
             socket
                 .connect(

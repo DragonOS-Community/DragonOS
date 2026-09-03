@@ -6,7 +6,7 @@ use alloc::{string::String, sync::Arc};
 use core::cell::Cell;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use net_poll_state::{DueResult, PollDeadline, PublishResult};
+use net_poll_state::{DeadlineClaims, DueResult, PollDeadlines, PublishResult};
 use sysfs::{netdev_emit_uevent, netdev_register_kobject, netdev_unregister_kobject};
 
 use crate::driver::net::napi::NapiStruct;
@@ -40,6 +40,7 @@ mod deferred_index;
 mod deferred_queue;
 mod iface;
 mod iface_common;
+mod iface_deadline;
 mod local_output;
 mod local_queue;
 

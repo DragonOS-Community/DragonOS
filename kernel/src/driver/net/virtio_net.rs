@@ -725,6 +725,16 @@ impl VirtIoNetImpl {
         self.tx_free.pop()
     }
 
+    /// RX-path replies may consume the final buffer deliberately kept out of
+    /// the ordinary transmit path. A completely full ring still falls back to
+    /// the interface-owned software output queue.
+    fn reserve_response_tx(&mut self) -> Option<TxDmaBuffer> {
+        if self.poisoned || self.reap_tx_completions().is_err() || self.tx_free.is_empty() {
+            return None;
+        }
+        self.tx_free.pop()
+    }
+
     fn release_tx(&mut self, mut buffer: TxDmaBuffer) {
         buffer.used_len = 0;
         self.tx_free.push(buffer);
@@ -1001,6 +1011,19 @@ impl VirtIONicDeviceInner {
         let (_, result) = self.submit_frame(buffer, frame.len(), |buf| buf.copy_from_slice(frame));
         result
     }
+
+    fn try_response_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        if frame.len() > VIRTIO_NET_MAX_FRAME_SIZE {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let buffer = self
+            .inner
+            .lock_irqsave()
+            .reserve_response_tx()
+            .ok_or(SystemError::ENOBUFS)?;
+        let (_, result) = self.submit_frame(buffer, frame.len(), |buf| buf.copy_from_slice(frame));
+        result
+    }
 }
 
 pub struct VirtioNetRxToken {
@@ -1011,6 +1034,7 @@ pub struct VirtioNetRxToken {
 pub struct VirtioNetTxToken {
     driver: VirtIONicDeviceInner,
     tx_buffer: Option<TxDmaBuffer>,
+    meta: phy::PacketMeta,
 }
 
 impl VirtioNetRxToken {
@@ -1027,6 +1051,7 @@ impl VirtioNetTxToken {
         Self {
             driver,
             tx_buffer: None,
+            meta: phy::PacketMeta::default(),
         }
     }
 
@@ -1034,6 +1059,7 @@ impl VirtioNetTxToken {
         Self {
             driver,
             tx_buffer: Some(tx_buffer),
+            meta: phy::PacketMeta::default(),
         }
     }
 }
@@ -1086,6 +1112,10 @@ impl phy::Device for VirtIONicDeviceInner {
 }
 
 impl phy::TxToken for VirtioNetTxToken {
+    fn set_meta(&mut self, meta: phy::PacketMeta) {
+        self.meta = meta;
+    }
+
     fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -1097,11 +1127,33 @@ impl phy::TxToken for VirtioNetTxToken {
 
         // The token paired with an RX packet is intentionally lazy: RX must
         // continue to make progress even while the TX queue is saturated.
-        // Allocate response storage only if smoltcp actually emits a reply,
-        // then make a best-effort reservation after the RX packet is consumed.
+        // If immediate submission is backpressured, transfer ownership to the
+        // interface's bounded output queue; smoltcp cannot retry this token.
         let mut frame = alloc::vec![0; len];
         let result = f(&mut frame);
-        let _ = self.driver.try_raw_transmit(&frame);
+        let iface = self.driver.iface();
+        let tx_generation = iface
+            .as_ref()
+            .map(|iface| iface.common().tx_completion_generation());
+        match self.driver.try_response_transmit(&frame) {
+            Ok(()) => {}
+            Err(SystemError::ENOBUFS) | Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                let queued = iface.zip(tx_generation).is_some_and(|(iface, generation)| {
+                    super::defer_native_output_after_tx_backpressure(
+                        iface.as_ref(),
+                        phy::Medium::Ethernet,
+                        self.meta,
+                        frame,
+                        generation,
+                    )
+                    .is_ok()
+                });
+                if !queued {
+                    log::debug!("virtio-net dropped RX-path reply: deferred output is unavailable");
+                }
+            }
+            Err(err) => error!("virtio-net failed to transmit RX-path reply: {err:?}"),
+        }
         result
     }
 }

@@ -305,6 +305,24 @@ impl<'a> LocalOutputReservation<'a> {
         self.active = false;
     }
 
+    pub(super) fn requeue_native_backpressured(
+        self,
+        medium: smoltcp::phy::Medium,
+        meta: PacketMeta,
+        frame: Vec<u8>,
+        retry_at: smoltcp::time::Instant,
+    ) {
+        self.requeue_backpressured(
+            LocalOutputPacket {
+                medium,
+                meta,
+                disposition: LocalOutputDisposition::NativeOwner,
+                frame,
+            },
+            retry_at,
+        );
+    }
+
     pub(super) fn requeue_deferred(
         self,
         packet: LocalOutputPacket,

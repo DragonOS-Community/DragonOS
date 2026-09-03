@@ -24,12 +24,13 @@ use crate::{
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
-use log::info;
+use log::{error, info};
 use smoltcp::{phy, wire::HardwareAddress};
 use system_error::SystemError;
 
@@ -50,6 +51,7 @@ pub struct E1000ERxToken {
 pub struct E1000ETxToken {
     driver: E1000EDriver,
     tx_reserved: bool,
+    meta: phy::PacketMeta,
 }
 pub struct E1000EDriver {
     pub inner: Arc<SpinLock<E1000EDevice>>,
@@ -112,6 +114,10 @@ impl Drop for E1000ERxToken {
 }
 
 impl phy::TxToken for E1000ETxToken {
+    fn set_meta(&mut self, meta: phy::PacketMeta) {
+        self.meta = meta;
+    }
+
     fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -119,13 +125,43 @@ impl phy::TxToken for E1000ETxToken {
         let mut buffer = E1000EBuffer::new(len);
         let result = f(buffer.as_mut_slice());
         if !self.tx_reserved {
-            if self.driver.try_raw_transmit(buffer.as_slice()).is_ok() {
-                if let Some(iface) = self.driver.iface() {
-                    crate::net::socket::packet::deliver_to_packet_sockets(
-                        &iface,
-                        buffer.as_slice(),
-                        crate::net::socket::packet::PacketType::Outgoing,
-                    );
+            let iface = self.driver.iface();
+            let tx_generation = iface
+                .as_ref()
+                .map(|iface| iface.common().tx_completion_generation());
+            match self.driver.try_raw_transmit(buffer.as_slice()) {
+                Ok(()) => {
+                    if let Some(iface) = iface {
+                        crate::net::socket::packet::deliver_to_packet_sockets(
+                            &iface,
+                            buffer.as_slice(),
+                            crate::net::socket::packet::PacketType::Outgoing,
+                        );
+                    }
+                }
+                Err(SystemError::ENOBUFS) | Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    let mut frame = Vec::new();
+                    let copied = frame.try_reserve_exact(buffer.as_slice().len()).is_ok();
+                    if copied {
+                        frame.extend_from_slice(buffer.as_slice());
+                    }
+                    let queued = copied
+                        && iface.zip(tx_generation).is_some_and(|(iface, generation)| {
+                            super::super::defer_native_output_after_tx_backpressure(
+                                iface.as_ref(),
+                                phy::Medium::Ethernet,
+                                self.meta,
+                                frame,
+                                generation,
+                            )
+                            .is_ok()
+                        });
+                    if !queued {
+                        log::debug!("e1000e dropped RX-path reply: deferred output is unavailable");
+                    }
+                }
+                Err(err) => {
+                    error!("e1000e failed to transmit RX-path reply: {err:?}");
                 }
             }
             buffer.free_buffer();
@@ -202,7 +238,7 @@ impl E1000EDriver {
             return Err(SystemError::ENOBUFS);
         }
         let mut device = self.inner.lock();
-        if !device.e1000e_can_transmit() {
+        if !device.e1000e_can_transmit() && !device.arm_tx_completion_interrupt() {
             self.release_tx();
             return Err(SystemError::ENOBUFS);
         }
@@ -249,6 +285,7 @@ impl phy::Device for E1000EDriver {
                 E1000ETxToken {
                     driver: self.clone(),
                     tx_reserved: false,
+                    meta: phy::PacketMeta::default(),
                 },
             )),
             None => {
@@ -261,10 +298,12 @@ impl phy::Device for E1000EDriver {
         if !self.try_reserve_tx() {
             return None;
         }
-        match self.inner.lock().e1000e_can_transmit() {
+        let mut device = self.inner.lock();
+        match device.e1000e_can_transmit() || device.arm_tx_completion_interrupt() {
             true => Some(E1000ETxToken {
                 driver: self.clone(),
                 tx_reserved: true,
+                meta: phy::PacketMeta::default(),
             }),
             false => {
                 self.release_tx();
@@ -434,6 +473,10 @@ impl Iface for E1000EInterface {
 
     fn poll_napi(&self, budget: usize) -> crate::driver::net::napi::NapiPollResult {
         let mut driver = self.driver.clone();
+        let tx_available = driver.inner.lock().take_tx_completion_wakeup();
+        if tx_available {
+            self.common.release_tx_backpressure();
+        }
         self.common.poll_napi(&mut driver, budget)
     }
 

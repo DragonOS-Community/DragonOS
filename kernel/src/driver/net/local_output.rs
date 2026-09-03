@@ -31,6 +31,37 @@ impl LocalOutputDrainResult {
     }
 }
 
+/// Preserve a frame produced by a physical RX/TX token when the device queue
+/// cannot accept it immediately. smoltcp consumes such tokens without an
+/// error return, so ownership must move into the bounded interface output
+/// queue before `consume` returns.
+pub(super) fn defer_native_output_after_tx_backpressure(
+    iface: &dyn Iface,
+    medium: smoltcp::phy::Medium,
+    meta: PacketMeta,
+    frame: Vec<u8>,
+    observed_generation: u64,
+) -> Result<(), Vec<u8>> {
+    let common = iface.common();
+    let Some(mut reservation) = common.local_input_queue.reserve_output() else {
+        return Err(frame);
+    };
+    if !reservation.try_resize(frame.capacity()) {
+        return Err(frame);
+    }
+    let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+    let retry_at =
+        now + smoltcp::time::Duration::from_micros(common.next_local_output_tx_backoff_us());
+    reservation.requeue_native_backpressured(medium, meta, frame, retry_at);
+    let retry_at = if common.release_tx_backpressure_after(observed_generation) {
+        now
+    } else {
+        retry_at
+    };
+    common.schedule_registered_local_output(retry_at);
+    Ok(())
+}
+
 /// A namespace-local view over the target interface's transport stack.
 /// Ingress retains the physical ifindex. Output is staged until the smoltcp
 /// locks are released: IPv4 may then select another device through the

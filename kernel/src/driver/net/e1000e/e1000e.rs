@@ -183,6 +183,7 @@ pub struct E1000EDevice {
     trans_buffers: Vec<Option<E1000EBuffer>>,
     mac: [u8; 6],
     first_trans: bool,
+    tx_completion_interrupt_armed: bool,
     // napi队列，用于存放在中断关闭期间通过轮询收取的buffer
     // the napi queue is designed to save buffer/packet when the interrupt is close
     // NOTE: this feature is not completely implemented and not used in the current version
@@ -450,6 +451,7 @@ impl E1000EDevice {
             trans_buffers,
             mac,
             first_trans: true,
+            tx_completion_interrupt_armed: false,
             napi_buffers: (0..E1000E_RECV_NAPI).map(|_| None).collect(),
             napi_buffer_head: 0,
             napi_buffer_tail: 0,
@@ -520,6 +522,40 @@ impl E1000EDevice {
             return false;
         }
         true
+    }
+
+    /// Arm a one-shot TX completion wakeup and recheck the descriptor after
+    /// publishing the interrupt mask. This mirrors Linux's stop/recheck
+    /// pattern and closes the completion-before-arm race.
+    pub fn arm_tx_completion_interrupt(&mut self) -> bool {
+        if self.e1000e_can_transmit() {
+            return true;
+        }
+        if !self.tx_completion_interrupt_armed {
+            unsafe { volwrite!(self.interrupt_regs, ims, E1000E_IMS_TXDW) };
+            self.tx_completion_interrupt_armed = true;
+        }
+        if !self.e1000e_can_transmit() {
+            return false;
+        }
+        self.disarm_tx_completion_interrupt();
+        true
+    }
+
+    /// Consume an armed wakeup once descriptor capacity is observable. TXDW
+    /// remains masked during normal traffic, avoiding one interrupt per frame
+    /// even though every descriptor requests status write-back.
+    pub fn take_tx_completion_wakeup(&mut self) -> bool {
+        if !self.tx_completion_interrupt_armed || !self.e1000e_can_transmit() {
+            return false;
+        }
+        self.disarm_tx_completion_interrupt();
+        true
+    }
+
+    fn disarm_tx_completion_interrupt(&mut self) {
+        unsafe { volwrite!(self.interrupt_regs, imc, E1000E_IMS_TXDW) };
+        self.tx_completion_interrupt_armed = false;
     }
 
     pub fn e1000e_transmit(&mut self, packet: E1000EBuffer) -> Result<(), E1000EBuffer> {
@@ -833,6 +869,7 @@ const E1000E_CTRL_TFCE: u32 = 1 << 28;
 const E1000E_CTRL_PHY_RST: u32 = 1 << 31;
 
 // IMS
+const E1000E_IMS_TXDW: u32 = 1 << 0;
 const E1000E_IMS_LSC: u32 = 1 << 2;
 const E1000E_IMS_RXDMT0: u32 = 1 << 4;
 #[allow(dead_code)]

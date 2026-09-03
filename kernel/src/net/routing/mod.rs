@@ -40,18 +40,19 @@ pub struct Router {
     pub(in crate::net) fib: RwSem<crate::net::route::FibTable>,
     pub(self) nat_tracker: Arc<ConnTracker>,
     pub ns: RwSem<Weak<NetNamespace>>,
-    /// Derived execution mode for the IPv4 built-in default-table rule. A
-    /// flat per-interface smoltcp route cache cannot encode table-wide RPDB
-    /// priority, so affected namespaces route host output through the FIB.
+    /// Execution mode for IPv4 output. It is derived from the committed FIB
+    /// at rest and forced on while a writer publishes the FIB's per-interface
+    /// smoltcp projections, making the complete control-plane transaction the
+    /// only observable generation.
     authoritative_ipv4_output: AtomicBool,
 }
 
 /// Write access to the namespace FIB.
 ///
-/// The execution mode is derived from the committed FIB and therefore must
-/// be published after every mutation, including address-lifecycle updates.
-/// Keeping that invariant in the guard prevents individual writers from
-/// having to remember a second state update.
+/// The execution mode is forced before any projection changes and derived
+/// again from the committed FIB when the guard is dropped. Keeping both sides
+/// of that publication protocol in the guard prevents individual writers from
+/// having to remember a separate generation handoff.
 pub(in crate::net) struct RouterFibWriteGuard<'a> {
     fib: RwSemWriteGuard<'a, crate::net::route::FibTable>,
     authoritative_ipv4_output: &'a AtomicBool,
@@ -102,8 +103,17 @@ impl Router {
     }
 
     pub(in crate::net) fn fib_write(&self) -> RouterFibWriteGuard<'_> {
+        let fib = self.fib.write();
+        // The existing execution-mode handoff is also the projection
+        // publication gate. A poller that observes it takes the FIB read lock;
+        // a poller that raced the store rechecks after locking smoltcp and
+        // restarts. Consequently no data-plane reader can enter between two
+        // per-interface projection updates. Drop restores the mode derived
+        // from the newly committed FIB before releasing the write lock.
+        self.authoritative_ipv4_output
+            .store(true, Ordering::Release);
         RouterFibWriteGuard {
-            fib: self.fib.write(),
+            fib,
             authoritative_ipv4_output: &self.authoritative_ipv4_output,
         }
     }

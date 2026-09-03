@@ -376,7 +376,9 @@ fn entries_for_address(
             let octets = cidr.network().address().octets();
             (loopback || cidr.prefix_len() < 32) && octets[0] != 0 && (loopback || is_up)
         }
-        IpCidr::Ipv6(_) => true,
+        // Linux keeps the address object and its host-local route while the
+        // device is down, but defers the IPv6 prefix route until NETDEV_UP.
+        IpCidr::Ipv6(_) => is_up,
     };
     if add_connected {
         result.push(connected);
@@ -396,6 +398,10 @@ fn entries_for_address(
         kind: RTN_LOCAL,
         ..connected
     };
+    // DragonOS addresses are immediately usable (the IPv6 address path does
+    // not yet model DAD), matching Linux IFA_F_NODAD semantics. Keep the host
+    // route while down; unlike a connected route, it represents local
+    // delivery and does not select the device for external output.
     if !result.contains(&local) {
         result.push(local);
     }

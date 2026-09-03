@@ -395,6 +395,8 @@ TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
     constexpr const char* kDestination = "2001:db8:ffff:222::";
     constexpr const char* kAddress = "2001:db8:ffff:223::1";
     constexpr const char* kConnected = "2001:db8:ffff:223::";
+    constexpr const char* kDownAddress = "2001:db8:ffff:224::1";
+    constexpr const char* kDownConnected = "2001:db8:ffff:224::";
 
     ASSERT_EQ(SetLinkUp(sender.Get(), veth, true, ++seq), 0);
     (void)SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
@@ -419,11 +421,29 @@ TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
     EXPECT_FALSE(FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq).has_value());
     EXPECT_FALSE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
     EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kDestination, 64, RTM_DELROUTE));
+
+    // This request carries IFA_F_NODAD. Linux installs its host-local route
+    // immediately while the veth is down, but defers the connected prefix
+    // until NETDEV_UP.
+    (void)SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
+                              kDownAddress, 64, ++seq);
+    ASSERT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_NEWADDR,
+                                  NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, veth,
+                                  kDownAddress, 64, ++seq),
+              0);
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kDownConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownAddress, 128, veth, ++seq).has_value());
+
     ASSERT_EQ(SetLinkUp(sender.Get(), veth, true, ++seq), 0);
     EXPECT_TRUE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownAddress, 128, veth, ++seq).has_value());
     EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kConnected, 64, RTM_NEWROUTE));
     EXPECT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
                                   kAddress, 64, ++seq),
+              0);
+    EXPECT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
+                                  kDownAddress, 64, ++seq),
               0);
 }
 

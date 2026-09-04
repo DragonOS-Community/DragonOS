@@ -10,8 +10,9 @@ use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 use system_error::SystemError;
 
 use crate::{
-    driver::net::{AddressMetadata, Iface},
+    driver::net::{types::InterfaceFlags, AddressMetadata, Iface},
     net::rtnl::RtnlGuard,
+    process::namespace::net_namespace::NetNamespace,
 };
 
 const IPV4_MIN_MTU: usize = 68;
@@ -693,6 +694,63 @@ pub(crate) fn iface_has_address(iface: &Arc<dyn Iface>, address: IpAddress) -> b
         .any(|cidr| cidr.address() == address)
 }
 
+/// Returns whether Linux would treat `address` as local on `iface` for bind
+/// and fixed-source output validation.
+///
+/// Most addresses require an exact configured entry. IPv4 loopback devices
+/// additionally own every address in each configured prefix; this is the
+/// shared rule used by socket placement and route-source validation.
+pub(crate) fn iface_accepts_local_address(iface: &Arc<dyn Iface>, address: IpAddress) -> bool {
+    let addresses = iface.common().ip_addrs();
+    iface_accepts_local_address_from(iface, &addresses, address)
+}
+
+/// Returns whether `address` is an IPv4 broadcast address on `iface`.
+///
+/// This covers both the limited broadcast address and subnet-directed
+/// broadcasts derived from the interface's configured prefixes.
+pub(crate) fn iface_accepts_broadcast_address(iface: &Arc<dyn Iface>, address: IpAddress) -> bool {
+    let IpAddress::Ipv4(address) = address else {
+        return false;
+    };
+    address.is_broadcast()
+        || iface.common().ip_addrs().iter().any(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => cidr
+                .broadcast()
+                .is_some_and(|broadcast| broadcast == address),
+            IpCidr::Ipv6(_) => false,
+        })
+}
+
+pub(crate) fn netns_accepts_broadcast_address(
+    netns: &Arc<NetNamespace>,
+    address: IpAddress,
+) -> bool {
+    matches!(address, IpAddress::Ipv4(address) if address.is_broadcast())
+        || netns
+            .device_list()
+            .values()
+            .any(|iface| iface_accepts_broadcast_address(iface, address))
+}
+
+fn iface_accepts_local_address_from(
+    iface: &Arc<dyn Iface>,
+    addresses: &[IpCidr],
+    address: IpAddress,
+) -> bool {
+    if addresses.iter().any(|cidr| cidr.address() == address) {
+        return true;
+    }
+    let IpAddress::Ipv4(address) = address else {
+        return false;
+    };
+    iface.flags().contains(InterfaceFlags::LOOPBACK)
+        && addresses.iter().any(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => cidr.contains_addr(&address),
+            IpCidr::Ipv6(_) => false,
+        })
+}
+
 /// Selects the IPv4 source that Linux's `inet_select_addr()` would use for an
 /// output route on this interface.
 ///
@@ -747,7 +805,10 @@ pub(crate) fn source_address_usable_on_iface(
     if source_address_requires_iface(address) {
         iface_has_address(iface, address)
     } else {
-        netns_has_address(netns, address)
+        netns
+            .device_list()
+            .values()
+            .any(|iface| iface_accepts_local_address(iface, address))
     }
 }
 
@@ -776,14 +837,13 @@ impl<'a> CandidateAddressOwnership<'a> {
         }
     }
 
-    fn iface_has_address(&self, iface: &Arc<dyn Iface>, address: IpAddress) -> bool {
-        if Arc::ptr_eq(iface, self.changed_iface) {
+    fn iface_accepts_local_address(&self, iface: &Arc<dyn Iface>, address: IpAddress) -> bool {
+        let addresses = if Arc::ptr_eq(iface, self.changed_iface) {
             self.changed_addresses
-                .iter()
-                .any(|cidr| cidr.address() == address)
         } else {
-            iface_has_address(iface, address)
-        }
+            return iface_accepts_local_address(iface, address);
+        };
+        iface_accepts_local_address_from(iface, addresses, address)
     }
 
     pub(crate) fn source_usable_on_oif(&self, oif: u32, address: IpAddress) -> bool {
@@ -791,11 +851,11 @@ impl<'a> CandidateAddressOwnership<'a> {
             return false;
         };
         if source_address_requires_iface(address) {
-            self.iface_has_address(egress_iface, address)
+            self.iface_accepts_local_address(egress_iface, address)
         } else {
             self.devices
                 .values()
-                .any(|iface| self.iface_has_address(iface, address))
+                .any(|iface| self.iface_accepts_local_address(iface, address))
         }
     }
 }

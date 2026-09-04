@@ -62,6 +62,23 @@ fn needs_flow(destination: IpAddress) -> bool {
     matches!(destination, IpAddress::Ipv4(_))
 }
 
+/// Converts the receive-side bind address into an output source constraint.
+///
+/// Linux keeps separate receive and transmit addresses for IPv4 sockets:
+/// multicast and broadcast bind addresses select received traffic, while the
+/// transmit source remains route-selected. Keep that distinction here instead
+/// of teaching the FIB that non-unicast addresses are locally owned sources.
+fn bound_source_constraint(
+    netns: &Arc<NetNamespace>,
+    local: IpListenEndpoint,
+) -> Option<IpAddress> {
+    local.addr.filter(|address| {
+        !address.is_unspecified()
+            && !address.is_multicast()
+            && !crate::net::address::netns_accepts_broadcast_address(netns, *address)
+    })
+}
+
 pub(super) fn resolve_ipv4_send_flow(
     netns: &Arc<NetNamespace>,
     local: IpListenEndpoint,
@@ -72,10 +89,7 @@ pub(super) fn resolve_ipv4_send_flow(
     if !needs_flow(destination) {
         return Ok(None);
     }
-    let fixed_source = local
-        .addr
-        .filter(|address| !address.is_unspecified())
-        .or(fixed_source);
+    let fixed_source = bound_source_constraint(netns, local).or(fixed_source);
     crate::net::route::resolve_ipv4_output_flow(netns, destination, required_oif, fixed_source)
         .map(Some)
 }
@@ -88,9 +102,7 @@ pub(super) fn local_source_endpoint(
     output_flow: Option<Ipv4OutputFlow>,
     unspecified: IpAddress,
 ) -> IpEndpoint {
-    let address = local
-        .addr
-        .filter(|address| !address.is_unspecified())
+    let address = bound_source_constraint(netns, local)
         .or_else(|| output_flow.map(|flow| flow.source))
         .or_else(|| {
             let ifindex = usize::try_from(local_delivery_ifindex?).ok()?;

@@ -535,6 +535,125 @@ TEST(SocketIoctlNetdevMutation, PacketSendRejectsAdministrativelyDownInterface) 
     });
 }
 
+TEST(SocketIoctlNetdevMutation, PacketSendHonorsRuntimeMtu) {
+    ExpectIsolatedChild([] {
+        ChildResult isolated = EnterIsolatedNetwork();
+        if (isolated.stage != 0) return isolated;
+        FdGuard inet(OpenInetSocket());
+        if (inet.Get() < 0) return Failure(1, errno);
+
+        int ifindex = 0;
+        short flags = 0;
+        if (int error = QueryIfindex(inet.Get(), "lo", &ifindex)) return Failure(2, error);
+        if (int error = QueryIoctlFlags(inet.Get(), "lo", &flags)) return Failure(3, error);
+        if (int error = SetFlags(inet.Get(), "lo", static_cast<short>(flags | IFF_UP), false)) {
+            return Failure(4, error);
+        }
+        constexpr int kMtu = 1400;
+        if (int error = SetMtu(inet.Get(), "lo", kMtu, false)) return Failure(5, error);
+
+        sockaddr_ll destination{};
+        destination.sll_family = AF_PACKET;
+        destination.sll_protocol = htons(ETH_P_IP);
+        destination.sll_ifindex = ifindex;
+        destination.sll_halen = ETH_ALEN;
+
+        FdGuard raw(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
+        if (raw.Get() < 0) return Failure(6, errno);
+        std::array<uint8_t, kMtu + ETH_HLEN + 5> raw_frame{};
+        raw_frame[12] = 0x08;
+        raw_frame[13] = 0x00;
+        if (sendto(raw.Get(), raw_frame.data(), kMtu + ETH_HLEN, 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) !=
+            kMtu + ETH_HLEN) {
+            return Failure(7, errno);
+        }
+        errno = 0;
+        if (sendto(raw.Get(), raw_frame.data(), kMtu + ETH_HLEN + 1, 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != EMSGSIZE) {
+            return Failure(8, errno);
+        }
+
+        raw_frame[12] = 0x81;
+        raw_frame[13] = 0x00;
+        errno = 0;
+        if (sendto(raw.Get(), raw_frame.data(), kMtu + ETH_HLEN + 4, 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != EMSGSIZE) {
+            return Failure(9, errno);
+        }
+        raw_frame[12] = 0x88;
+        raw_frame[13] = 0xa8;
+        errno = 0;
+        if (sendto(raw.Get(), raw_frame.data(), kMtu + ETH_HLEN + 4, 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != EMSGSIZE) {
+            return Failure(10, errno);
+        }
+
+        FdGuard dgram(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)));
+        if (dgram.Get() < 0) return Failure(11, errno);
+        std::array<uint8_t, kMtu + 5> payload{};
+        if (sendto(dgram.Get(), payload.data(), kMtu, 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != kMtu) {
+            return Failure(12, errno);
+        }
+        errno = 0;
+        if (sendto(dgram.Get(), payload.data(), kMtu + 1, 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != EMSGSIZE) {
+            return Failure(13, errno);
+        }
+
+        destination.sll_protocol = htons(0x8100);
+        errno = 0;
+        if (sendto(dgram.Get(), payload.data(), kMtu + 4, 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != EMSGSIZE) {
+            return Failure(14, errno);
+        }
+        destination.sll_protocol = htons(0x88a8);
+        errno = 0;
+        if (sendto(dgram.Get(), payload.data(), kMtu + 4, 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != EMSGSIZE) {
+            return Failure(15, errno);
+        }
+
+        destination.sll_protocol = htons(ETH_P_IP);
+        std::array<iovec, 2> iov{};
+        iov[0].iov_base = payload.data();
+        iov[0].iov_len = kMtu / 2;
+        iov[1].iov_base = payload.data() + kMtu / 2;
+        iov[1].iov_len = kMtu / 2;
+        msghdr message{};
+        message.msg_name = &destination;
+        message.msg_namelen = sizeof(destination);
+        message.msg_iov = iov.data();
+        message.msg_iovlen = iov.size();
+        if (sendmsg(dgram.Get(), &message, 0) != kMtu) {
+            return Failure(16, errno);
+        }
+        ++iov[1].iov_len;
+        errno = 0;
+        if (sendmsg(dgram.Get(), &message, 0) != -1 || errno != EMSGSIZE) {
+            return Failure(17, errno);
+        }
+
+        if (int error = SetFlags(inet.Get(), "lo", static_cast<short>(flags & ~IFF_UP), false)) {
+            return Failure(18, error);
+        }
+        errno = 0;
+        if (sendto(raw.Get(), raw_frame.data(), raw_frame.size(), 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != ENETDOWN) {
+            return Failure(19, errno);
+        }
+        return Success();
+    });
+}
+
 TEST(SocketIoctlNetdevMutation, NeighborPurgeDependsOnLinkLifecycle) {
     ExpectIsolatedChild([] {
         const bool dragonos = IsDragonOS();

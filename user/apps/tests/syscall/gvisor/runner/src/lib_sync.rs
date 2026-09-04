@@ -19,6 +19,54 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[repr(C)]
+union IfReqData {
+    flags: libc::c_short,
+    align: [libc::c_ulong; 3],
+}
+
+#[repr(C)]
+struct IfReq {
+    name: [libc::c_char; libc::IFNAMSIZ],
+    data: IfReqData,
+}
+
+/// Create the isolated network environment expected by the network tests.
+/// Linux deliberately leaves loopback down in a fresh network namespace, so
+/// the runner must bring it up after unshare rather than changing kernel
+/// namespace-construction semantics.
+fn initialize_isolated_network() -> std::io::Result<()> {
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNET) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut request = IfReq {
+            name: [0; libc::IFNAMSIZ],
+            data: IfReqData { align: [0; 3] },
+        };
+        request.name[0] = b'l' as libc::c_char;
+        request.name[1] = b'o' as libc::c_char;
+        request.data.flags = libc::IFF_UP as libc::c_short;
+
+        // libc models ioctl's request argument as c_ulong for GNU targets and
+        // c_int for musl targets.  Use its UAPI constant and convert it to the
+        // target-specific request type inferred by ioctl.
+        let result = libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &request);
+        let error = std::io::Error::last_os_error();
+        libc::close(fd);
+        if result != 0 {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 // The pinned gVisor tests are executed directly rather than through gVisor's
 // Bazel runner, so publish the DragonOS capability that the Int3 test queries.
 // Keep this list conservative: an omitted capability does not claim support.
@@ -448,10 +496,7 @@ impl TestRunner {
                     return Err(std::io::Error::last_os_error());
                 }
                 if isolate_network {
-                    let ret = libc::unshare(libc::CLONE_NEWNET);
-                    if ret != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                    initialize_isolated_network()?;
                 }
                 Ok(())
             });

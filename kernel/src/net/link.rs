@@ -229,6 +229,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         }
 
         if link_down {
+            iface.common().close_tx_and_wait();
             iface.begin_admin_down();
             if let Some(napi) = iface.napi_struct() {
                 napi_pause_and_wait(&napi);
@@ -506,6 +507,7 @@ fn publish_link_flags_and_state(
         }
         iface.set_operstate(Operstate::IF_OPER_UP);
         iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+        iface.common().open_tx();
         if let Some(napi) = iface.napi_struct() {
             napi_resume(napi);
         }

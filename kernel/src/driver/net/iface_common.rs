@@ -6,6 +6,7 @@ pub struct IfaceCommon {
     pub(super) flags: AtomicU32,
     pub(super) mtu: AtomicUsize,
     pub(super) type_: InterfaceType,
+    tx_admission: tx_admission::TxAdmission,
     pub(super) smol_iface: Mutex<smoltcp::iface::Interface>,
     /// 存smoltcp网卡的套接字集
     pub(super) sockets: Mutex<smoltcp::iface::SocketSet<'static>>,
@@ -118,6 +119,7 @@ impl IfaceCommon {
             flags: AtomicU32::new(flags.bits()),
             mtu: AtomicUsize::new(mtu),
             type_,
+            tx_admission: tx_admission::TxAdmission::new(flags.contains(InterfaceFlags::UP)),
             napi_struct: RwLock::new(None),
             local_input_queue: LocalInputQueue::new(),
             address_metadata: Mutex::new(address_metadata),
@@ -1354,6 +1356,18 @@ impl IfaceCommon {
 
     pub fn mtu(&self) -> usize {
         self.mtu.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_acquire_tx(&self) -> Option<tx_admission::TxAdmissionGuard<'_>> {
+        self.tx_admission.try_enter()
+    }
+
+    pub(crate) fn close_tx_and_wait(&self) {
+        self.tx_admission.close_and_wait();
+    }
+
+    pub(crate) fn open_tx(&self) {
+        self.tx_admission.open();
     }
 
     pub fn set_mtu(&self, mtu: usize) {

@@ -651,6 +651,7 @@ pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
     iface.common.publish_configured_flags(prepared);
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
     iface.set_operstate(Operstate::IF_OPER_UP);
+    iface.common.open_tx();
 
     iface
 }

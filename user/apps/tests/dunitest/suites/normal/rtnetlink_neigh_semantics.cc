@@ -54,6 +54,15 @@ struct NeighborRequestOptions {
     bool include_state_mask = false;
 };
 
+struct NeighborDumpOptions {
+    int body_ifindex = 0;
+    std::optional<uint32_t> ifindex;
+    size_t ifindex_length = sizeof(uint32_t);
+    std::optional<uint32_t> master;
+    size_t master_length = sizeof(uint32_t);
+    uint8_t body_flags = 0;
+};
+
 NeighborAddress ParseNeighborAddress(int family, const char* text) {
     NeighborAddress address{};
     address.family = family;
@@ -131,11 +140,8 @@ int SendNeighborRequest(int fd, uint16_t type, uint16_t flags, const NeighborSpe
 }
 
 std::vector<DumpedNeighbor> DumpNeighbors(int fd, int family, uint32_t seq,
-                                          int body_ifindex = 0,
-                                          std::optional<uint32_t> filter_ifindex = std::nullopt,
-                                          int* dump_error = nullptr,
-                                          uint8_t body_flags = 0,
-                                          size_t filter_length = sizeof(uint32_t)) {
+                                          const NeighborDumpOptions& options = {},
+                                          int* dump_error = nullptr) {
     alignas(nlmsghdr) char request[256] = {};
     auto* header = reinterpret_cast<nlmsghdr*>(request);
     auto* message = reinterpret_cast<ndmsg*>(NLMSG_DATA(header));
@@ -144,10 +150,13 @@ std::vector<DumpedNeighbor> DumpNeighbors(int fd, int family, uint32_t seq,
     header->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
     header->nlmsg_seq = seq;
     message->ndm_family = static_cast<uint8_t>(family);
-    message->ndm_ifindex = body_ifindex;
-    message->ndm_flags = body_flags;
-    if (filter_ifindex.has_value()) {
-        AddAttr(header, sizeof(request), NDA_IFINDEX, &*filter_ifindex, filter_length);
+    message->ndm_ifindex = options.body_ifindex;
+    message->ndm_flags = options.body_flags;
+    if (options.ifindex.has_value()) {
+        AddAttr(header, sizeof(request), NDA_IFINDEX, &*options.ifindex, options.ifindex_length);
+    }
+    if (options.master.has_value()) {
+        AddAttr(header, sizeof(request), NDA_MASTER, &*options.master, options.master_length);
     }
     if (send(fd, header, header->nlmsg_len, 0) != static_cast<ssize_t>(header->nlmsg_len)) {
         if (dump_error != nullptr) *dump_error = errno;
@@ -614,12 +623,16 @@ TEST_F(RtnetlinkNeighborSemantics, DumpFamilyIfindexAndRawBodyFilters) {
         return SameAddress(item.spec.destination, ipv6.destination);
     }));
 
-    auto body_ignored = DumpNeighbors(fd_.Get(), AF_INET, ++seq_, static_cast<int>(veth2_));
+    NeighborDumpOptions body_options;
+    body_options.body_ifindex = static_cast<int>(veth2_);
+    auto body_ignored = DumpNeighbors(fd_.Get(), AF_INET, ++seq_, body_options);
     EXPECT_TRUE(std::any_of(body_ignored.begin(), body_ignored.end(), [&](const auto& item) {
         return SameAddress(item.spec.destination, first.destination);
     }));
 
-    auto filtered = DumpNeighbors(fd_.Get(), AF_INET, ++seq_, 0, veth2_);
+    NeighborDumpOptions ifindex_options;
+    ifindex_options.ifindex = veth2_;
+    auto filtered = DumpNeighbors(fd_.Get(), AF_INET, ++seq_, ifindex_options);
     ASSERT_TRUE(std::any_of(filtered.begin(), filtered.end(), [&](const auto& item) {
         return SameAddress(item.spec.destination, second.destination);
     }));
@@ -632,8 +645,11 @@ TEST_F(RtnetlinkNeighborSemantics, DumpFamilyIfindexAndRawBodyFilters) {
     }
 
     int dump_error = -1;
-    const auto malformed_filter = DumpNeighbors(fd_.Get(), AF_INET, ++seq_, 0, veth2_,
-                                                &dump_error, 0, sizeof(uint16_t));
+    NeighborDumpOptions malformed_ifindex_options;
+    malformed_ifindex_options.ifindex = veth2_;
+    malformed_ifindex_options.ifindex_length = sizeof(uint16_t);
+    const auto malformed_filter =
+            DumpNeighbors(fd_.Get(), AF_INET, ++seq_, malformed_ifindex_options, &dump_error);
     EXPECT_EQ(dump_error, 0);
     EXPECT_TRUE(std::any_of(malformed_filter.begin(), malformed_filter.end(),
                             [&](const auto& item) {
@@ -642,15 +658,74 @@ TEST_F(RtnetlinkNeighborSemantics, DumpFamilyIfindexAndRawBodyFilters) {
             << "a non-strict malformed filter must fall back to an unfiltered dump";
 
     dump_error = -1;
-    const auto unsupported = DumpNeighbors(fd_.Get(), AF_PACKET, ++seq_, 0, std::nullopt,
-                                           &dump_error);
+    const auto unsupported = DumpNeighbors(fd_.Get(), AF_PACKET, ++seq_, {}, &dump_error);
     EXPECT_EQ(dump_error, 0);
     EXPECT_TRUE(unsupported.empty());
 
-    const auto proxy = DumpNeighbors(fd_.Get(), AF_INET, ++seq_, 0, std::nullopt,
-                                     &dump_error, NTF_PROXY);
+    NeighborDumpOptions proxy_options;
+    proxy_options.body_flags = NTF_PROXY;
+    const auto proxy = DumpNeighbors(fd_.Get(), AF_INET, ++seq_, proxy_options, &dump_error);
     EXPECT_EQ(dump_error, EOPNOTSUPP);
     EXPECT_TRUE(proxy.empty());
+}
+
+TEST_F(RtnetlinkNeighborSemantics, DumpMasterFiltersFollowLinuxSemantics) {
+    NeighborSpec spec = MakeNeighbor(AF_INET, "198.18.230.43", veth1_);
+    NeighborCleanup cleanup(fd_.Get(), &seq_);
+    cleanup.Add(spec);
+    DeleteNeighborIfPresent(fd_.Get(), spec, &seq_);
+    ASSERT_EQ(SendNeighborRequest(fd_.Get(), RTM_NEWNEIGH,
+                                  NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                  spec, ++seq_),
+              0);
+
+    int dump_error = -1;
+    NeighborDumpOptions exact_master_options;
+    exact_master_options.master = veth2_;
+    const auto exact_master =
+            DumpNeighbors(fd_.Get(), AF_INET, ++seq_, exact_master_options, &dump_error);
+    EXPECT_EQ(dump_error, 0);
+    EXPECT_TRUE(exact_master.empty());
+
+    dump_error = -1;
+    NeighborDumpOptions no_master_options;
+    no_master_options.master = std::numeric_limits<uint32_t>::max();
+    const auto no_master =
+            DumpNeighbors(fd_.Get(), AF_INET, ++seq_, no_master_options, &dump_error);
+    EXPECT_EQ(dump_error, 0);
+    const auto no_master_entry =
+            std::find_if(no_master.begin(), no_master.end(), [&](const auto& item) {
+                return SameAddress(item.spec.destination, spec.destination);
+            });
+    ASSERT_NE(no_master_entry, no_master.end());
+    EXPECT_NE(no_master_entry->message_flags & NLM_F_DUMP_FILTERED, 0);
+
+    dump_error = -1;
+    NeighborDumpOptions zero_master_options;
+    zero_master_options.master = 0;
+    const auto zero_master =
+            DumpNeighbors(fd_.Get(), AF_INET, ++seq_, zero_master_options, &dump_error);
+    EXPECT_EQ(dump_error, 0);
+    const auto zero_master_entry =
+            std::find_if(zero_master.begin(), zero_master.end(), [&](const auto& item) {
+                return SameAddress(item.spec.destination, spec.destination);
+            });
+    ASSERT_NE(zero_master_entry, zero_master.end());
+    EXPECT_EQ(zero_master_entry->message_flags & NLM_F_DUMP_FILTERED, 0);
+
+    dump_error = -1;
+    NeighborDumpOptions malformed_master_options;
+    malformed_master_options.master = veth2_;
+    malformed_master_options.master_length = sizeof(uint16_t);
+    const auto malformed_master =
+            DumpNeighbors(fd_.Get(), AF_INET, ++seq_, malformed_master_options, &dump_error);
+    EXPECT_EQ(dump_error, 0);
+    const auto malformed_master_entry =
+            std::find_if(malformed_master.begin(), malformed_master.end(), [&](const auto& item) {
+                return SameAddress(item.spec.destination, spec.destination);
+            });
+    ASSERT_NE(malformed_master_entry, malformed_master.end());
+    EXPECT_EQ(malformed_master_entry->message_flags & NLM_F_DUMP_FILTERED, 0);
 }
 
 TEST_F(RtnetlinkNeighborSemantics, ForkedNetworkNamespaceHasIndependentNeighborTable) {

@@ -47,6 +47,54 @@ struct ParsedNeighborAttrs<'a> {
     protocol: Option<u8>,
 }
 
+#[derive(Clone, Copy, Default)]
+enum NeighborMasterFilter {
+    #[default]
+    Any,
+    NoMaster,
+    Exact(u32),
+}
+
+#[derive(Clone, Copy, Default)]
+struct NeighborDumpFilter {
+    ifindex: Option<u32>,
+    master: NeighborMasterFilter,
+}
+
+impl NeighborDumpFilter {
+    fn from_attrs(attrs: ParsedNeighborAttrs<'_>) -> Self {
+        let master = match attrs.master {
+            None | Some(0) => NeighborMasterFilter::Any,
+            Some(u32::MAX) => NeighborMasterFilter::NoMaster,
+            Some(ifindex) => NeighborMasterFilter::Exact(ifindex),
+        };
+        Self {
+            ifindex: attrs.ifindex.filter(|ifindex| *ifindex != 0),
+            master,
+        }
+    }
+
+    fn is_filtered(self) -> bool {
+        self.ifindex.is_some() || !matches!(self.master, NeighborMasterFilter::Any)
+    }
+
+    fn matches(self, entry: NeighborEntry) -> bool {
+        if self.ifindex.is_some_and(|ifindex| entry.ifindex != ifindex) {
+            return false;
+        }
+
+        // DragonOS does not yet expose a Linux-visible master/upper topology.
+        // Every registered interface therefore matches `nomaster`, while an
+        // exact master selector matches no configured neighbor. Keeping this
+        // decision in the filter object gives the future link implementation
+        // one place to replace the topology projection.
+        match self.master {
+            NeighborMasterFilter::Any | NeighborMasterFilter::NoMaster => true,
+            NeighborMasterFilter::Exact(_master_ifindex) => false,
+        }
+    }
+}
+
 impl<'a> ParsedNeighborAttrs<'a> {
     /// Apply Linux's `nda_policy` for operations which call
     /// nlmsg_parse_deprecated(), preserving last-attribute-wins semantics.
@@ -143,11 +191,8 @@ pub(super) fn do_get_neigh(
     // DragonOS does not expose NETLINK_GET_STRICT_CHK yet. Linux's non-strict
     // dump path discards filter-policy errors and continues unfiltered.
     let attrs = ParsedNeighborAttrs::from_policy_segment(request).unwrap_or_default();
-    let ifindex_filter = attrs.ifindex.filter(|ifindex| *ifindex != 0);
-    if attrs.master.is_some_and(|master| master != 0) {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-    let filtered = ifindex_filter.is_some();
+    let filter = NeighborDumpFilter::from_attrs(attrs);
+    let filtered = filter.is_filtered();
     let entries = if matches!(family, AF_UNSPEC | AF_INET | AF_INET6) {
         neighbor::snapshot(&netns)?
     } else {
@@ -159,9 +204,7 @@ pub(super) fn do_get_neigh(
         .map_err(|_| SystemError::ENOMEM)?;
 
     for entry in entries.iter().copied() {
-        if !family_matches(family, entry.destination)
-            || ifindex_filter.is_some_and(|ifindex| entry.ifindex != ifindex)
-        {
+        if !family_matches(family, entry.destination) || !filter.matches(entry) {
             continue;
         }
         response.push(RouteNlSegment::NewNeigh(neigh_to_segment(

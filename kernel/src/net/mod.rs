@@ -7,6 +7,7 @@ use core::sync::atomic::AtomicUsize;
 use crate::driver::net::Iface;
 
 pub(crate) mod address;
+pub(crate) mod link;
 pub mod neighbor;
 pub mod posix;
 pub(crate) mod route;

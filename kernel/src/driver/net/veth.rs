@@ -1,5 +1,5 @@
 use super::bridge::BridgeEnableDevice;
-use super::{BootstrapRoute, Iface, IfaceCommon, IfacePollScope};
+use super::{BootstrapRoute, Iface, IfaceCommon, IfacePollScope, MtuBounds};
 use super::{NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
@@ -42,9 +42,13 @@ pub struct Veth {
     /// Frames awaiting bridge/routing classification. Classification may
     /// consult the authoritative FIB and therefore must run outside smoltcp's
     /// interface lock.
-    pending_rx_queue: VecDeque<Vec<u8>>,
+    pending_rx_queue: VecDeque<PendingVethFrame>,
     /// Frames classified for local smoltcp delivery.
     local_rx_queue: VecDeque<Vec<u8>>,
+    /// Serialized with peer enqueue so DOWN both rejects new external ingress
+    /// and drains everything accepted before the transition.
+    peer_ingress_enabled: bool,
+    ingress_generation: u64,
     /// 对端的 `VethInterface`，在完成数据发送的时候会使用到
     peer: Weak<VethInterface>,
     self_iface_ref: Weak<VethInterface>,
@@ -56,6 +60,8 @@ impl Veth {
             name,
             pending_rx_queue: VecDeque::new(),
             local_rx_queue: VecDeque::new(),
+            peer_ingress_enabled: true,
+            ingress_generation: 0,
             peer: Weak::new(),
             self_iface_ref: Weak::new(),
         }
@@ -72,7 +78,13 @@ impl Veth {
     fn to_peer_owned(peer: &Arc<VethInterface>, data: Vec<u8>) -> Result<(), SystemError> {
         let napi = peer.napi_struct().ok_or(SystemError::ENOBUFS)?;
         let mut peer_veth = peer.driver.inner.lock();
-        peer_veth.pending_rx_queue.push_back(data);
+        if !peer_veth.peer_ingress_enabled {
+            return Ok(());
+        }
+        let generation = peer_veth.ingress_generation;
+        peer_veth
+            .pending_rx_queue
+            .push_back(PendingVethFrame { generation, data });
 
         // {
         //     let ether = EthernetFrame::new_checked(data).unwrap();
@@ -154,6 +166,11 @@ enum IngressDisposition {
     Local,
 }
 
+struct PendingVethFrame {
+    generation: u64,
+    data: Vec<u8>,
+}
+
 impl VethDriver {
     /// Classifies a bounded batch before smoltcp locks its interface. Routed
     /// and bridged frames are consumed here; local frames move to the queue
@@ -162,19 +179,22 @@ impl VethDriver {
         let _classification_guard = self.ingress_classification_lock.lock();
         let mut scanned = 0;
         for _ in 0..scan_budget {
-            let data = {
+            let frame = {
                 let mut veth = self.inner.lock();
                 veth.pending_rx_queue.pop_front()
             };
-            let Some(data) = data else {
+            let Some(frame) = frame else {
                 break;
             };
             scanned += 1;
 
-            match self.classify_and_consume(&data) {
+            match self.classify_and_consume(&frame.data) {
                 IngressDisposition::Consumed => {}
                 IngressDisposition::Local => {
-                    self.inner.lock().local_rx_queue.push_back(data);
+                    let mut inner = self.inner.lock();
+                    if inner.peer_ingress_enabled && inner.ingress_generation == frame.generation {
+                        inner.local_rx_queue.push_back(frame.data);
+                    }
                 }
             }
         }
@@ -685,6 +705,39 @@ impl Iface for VethInterface {
 
     fn mtu(&self) -> usize {
         self.common.mtu()
+    }
+
+    fn mtu_bounds(&self) -> MtuBounds {
+        MtuBounds {
+            min: 68,
+            max: VETH_IP_MTU,
+        }
+    }
+
+    fn begin_admin_down(&self) {
+        let mut driver = self.driver.inner.lock();
+        driver.peer_ingress_enabled = false;
+        driver.ingress_generation = driver.ingress_generation.wrapping_add(1);
+    }
+
+    fn quiesce_admin_down(&self) {
+        // Serialize with the complete dequeue/classify/commit section. Once
+        // this returns, no frame accepted in the old generation can still
+        // produce bridge, routing, packet-socket, or local-stack side effects.
+        let classification_guard = self.driver.ingress_classification_lock.lock();
+        let mut driver = self.driver.inner.lock();
+        let pending = core::mem::take(&mut driver.pending_rx_queue);
+        let local = core::mem::take(&mut driver.local_rx_queue);
+        drop(driver);
+        drop(classification_guard);
+        drop(pending);
+        drop(local);
+    }
+
+    fn publish_admin_state(&self, is_up: bool) {
+        if is_up {
+            self.driver.inner.lock().peer_ingress_enabled = true;
+        }
     }
 }
 

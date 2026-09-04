@@ -118,6 +118,38 @@ pub(crate) fn has_ipv4_entries(netns: &Arc<NetNamespace>) -> bool {
     netns.neighbor_table().has_ipv4_entries()
 }
 
+/// Allocation-complete removal of all configured neighbors owned by one
+/// interface. Holding the borrowed RTNL guard keeps the prepared table
+/// generation stable until publication.
+pub(crate) struct PreparedConfiguredNeighborPurge<'rtnl> {
+    rtnl: &'rtnl RtnlGuard,
+    netns: Arc<NetNamespace>,
+    prepared: table::PreparedNeighborPurge,
+}
+
+impl PreparedConfiguredNeighborPurge<'_> {
+    /// Publishes the purge without allocating and returns the removed entries
+    /// for post-commit rtnetlink notifications.
+    pub(crate) fn publish(self) -> Vec<NeighborEntry> {
+        self.netns
+            .neighbor_table()
+            .publish_iface_purge(self.rtnl, self.prepared)
+    }
+}
+
+pub(crate) fn prepare_configured_iface_purge<'rtnl>(
+    rtnl: &'rtnl RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    ifindex: u32,
+) -> Result<PreparedConfiguredNeighborPurge<'rtnl>, SystemError> {
+    let prepared = netns.neighbor_table().prepare_iface_purge(rtnl, ifindex)?;
+    Ok(PreparedConfiguredNeighborPurge {
+        rtnl,
+        netns: netns.clone(),
+        prepared,
+    })
+}
+
 pub(crate) fn remove_iface(rtnl: &RtnlGuard, netns: &Arc<NetNamespace>, ifindex: u32) {
     netns.neighbor_table().remove_iface(rtnl, ifindex);
 }

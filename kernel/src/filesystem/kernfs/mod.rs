@@ -27,6 +27,9 @@ use super::vfs::{
 };
 
 pub mod callback;
+mod rename;
+
+pub use rename::{KernFSRenameSpec, PreparedKernFSRename};
 
 #[derive(Debug)]
 pub struct KernFS {
@@ -106,8 +109,8 @@ impl KernFS {
             flags: InodeFlags::empty(),
         };
         let root_inode = Arc::new_cyclic(|self_ref| KernFSInode {
-            name: String::from(""),
             inner: RwSem::new(InnerKernFSInode {
+                name: String::from(""),
                 parent: Weak::new(),
                 metadata,
                 symlink_target: None,
@@ -118,6 +121,7 @@ impl KernFS {
             private_data: Mutex::new(None),
             callback: None,
             children: Mutex::new(HashMap::new()),
+            child_mutation: Mutex::new(()),
             inode_type: KernInodeType::Dir,
             lazy_list: Mutex::new(HashMap::new()),
             lazy_build_lock: Mutex::new(()),
@@ -140,10 +144,11 @@ pub struct KernFSInode {
     callback: Option<&'static dyn KernFSCallback>,
     /// 子Inode
     children: Mutex<HashMap<String, Arc<KernFSInode>>>,
+    /// Serializes every mutation of `children` and `lazy_list` for this
+    /// directory. Readers keep using the map locks directly.
+    child_mutation: Mutex<()>,
     /// Inode类型
     inode_type: KernInodeType,
-    /// Inode名称
-    name: String,
     /// lazy list
     lazy_list: Mutex<HashMap<String, fn() -> KernFSInodeArgs>>,
     /// Serializes lazy entry materialization without holding entry maps.
@@ -160,6 +165,9 @@ pub struct KernFSInodeArgs {
 
 #[derive(Debug)]
 pub struct InnerKernFSInode {
+    /// The name is changed together with its parent's map key by a prepared
+    /// kernfs rename transaction.
+    name: String,
     parent: Weak<KernFSInode>,
 
     /// 当前inode的元数据
@@ -363,7 +371,7 @@ impl IndexNode for KernFSInode {
     }
 
     fn dname(&self) -> Result<DName, SystemError> {
-        Ok(self.name.clone().into())
+        Ok(self.name().into())
     }
 
     fn read_at(
@@ -455,8 +463,8 @@ impl KernFSInode {
         metadata.file_type = inode_type.into();
 
         let inode = Arc::new_cyclic(|self_ref| KernFSInode {
-            name,
             inner: RwSem::new(InnerKernFSInode {
+                name,
                 parent: parent.as_ref().map_or(Weak::new(), Arc::downgrade),
                 metadata,
                 symlink_target: None,
@@ -467,6 +475,7 @@ impl KernFSInode {
             private_data: Mutex::new(private_data),
             callback,
             children: Mutex::new(HashMap::new()),
+            child_mutation: Mutex::new(()),
             inode_type,
             lazy_list: Mutex::new(HashMap::new()),
             lazy_build_lock: Mutex::new(()),
@@ -575,6 +584,7 @@ impl KernFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
+        let _mutation = self.child_mutation.lock();
         let children = self.children.lock();
         let mut lazy_list = self.lazy_list.lock();
         if children.contains_key(&name) || lazy_list.contains_key(&name) {
@@ -609,6 +619,7 @@ impl KernFSInode {
             args.callback,
         );
 
+        let _mutation = self.child_mutation.lock();
         let mut children = self.children.lock();
         if let Some(child) = children.get(name).cloned() {
             return Ok(child);
@@ -632,6 +643,7 @@ impl KernFSInode {
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
+        let _mutation = self.child_mutation.lock();
         let mut children = self.children.lock();
         let lazy_list = self.lazy_list.lock();
         if children.contains_key(&name) || lazy_list.contains_key(&name) {
@@ -709,6 +721,7 @@ impl KernFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
+        let _mutation = self.child_mutation.lock();
         let mut children = self.children.lock();
         let inode = children.get(name).ok_or(SystemError::ENOENT)?;
         if inode.children.lock().is_empty() {
@@ -751,8 +764,27 @@ impl KernFSInode {
         return Ok(inode);
     }
 
-    pub fn name(&self) -> &str {
-        return &self.name;
+    pub fn name(&self) -> String {
+        self.inner.read().name.clone()
+    }
+
+    /// Borrows the inode name while holding its read guard. This keeps
+    /// comparisons and fallible path construction allocation-free at the
+    /// call site without exposing the mutable inode internals.
+    pub(crate) fn with_name<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        let inner = self.inner.read();
+        f(&inner.name)
+    }
+
+    pub(crate) fn try_name(&self) -> Result<String, SystemError> {
+        self.with_name(|name| {
+            let mut result = String::new();
+            result
+                .try_reserve_exact(name.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            result.push_str(name);
+            Ok(result)
+        })
     }
 
     pub fn parent(&self) -> Option<Arc<KernFSInode>> {
@@ -770,9 +802,16 @@ impl KernFSInode {
 
     /// remove a kernfs_node recursively
     pub fn remove_recursive(&self) {
-        let mut children = self.children.lock().drain().collect::<Vec<_>>();
+        let mut children = {
+            let _mutation = self.child_mutation.lock();
+            self.children.lock().drain().collect::<Vec<_>>()
+        };
         while let Some((_, child)) = children.pop() {
-            children.append(&mut child.children.lock().drain().collect::<Vec<_>>());
+            let mut descendants = {
+                let _mutation = child.child_mutation.lock();
+                child.children.lock().drain().collect::<Vec<_>>()
+            };
+            children.append(&mut descendants);
         }
     }
 
@@ -781,7 +820,9 @@ impl KernFSInode {
     pub fn remove_inode_include_self(&self) {
         let parent = self.parent();
         if let Some(parent) = parent {
-            parent.children.lock().remove(self.name());
+            let name = self.name();
+            let _mutation = parent.child_mutation.lock();
+            parent.children.lock().remove(&name);
         }
         self.remove_recursive();
     }

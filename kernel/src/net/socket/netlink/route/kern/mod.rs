@@ -28,7 +28,7 @@ mod neigh;
 mod route;
 mod utils;
 
-pub(crate) use link::notify_link_change;
+pub(crate) use link::{notify_link_change, notify_link_commit};
 
 /// Per-send authorization and routing state for userspace rtnetlink requests.
 ///

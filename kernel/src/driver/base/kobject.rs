@@ -7,7 +7,6 @@ use core::{
 };
 
 use alloc::{
-    format,
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
@@ -31,7 +30,10 @@ use crate::{
         kobject::message::KobjectUeventMessage,
         table::{NetlinkKobjectUeventProtocol, SupportedNetlinkProtocol},
     },
-    process::{namespace::net_namespace::INIT_NET_NAMESPACE, ProcessManager},
+    process::{
+        namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
+        ProcessManager,
+    },
 };
 
 use system_error::SystemError;
@@ -93,29 +95,55 @@ impl dyn KObject {
         Self::emit_uevent(action, &devpath, extra_env)
     }
 
+    /// Emits a kobject event into an explicitly selected network namespace.
+    ///
+    /// Most kobjects are not namespace-aware and use [`Self::kobject_uevent`].
+    /// Namespaced object classes, such as network devices, must select the
+    /// namespace from the object rather than from the calling task.
+    pub fn kobject_uevent_in_netns(
+        kobj: &Arc<dyn KObject>,
+        action: &str,
+        extra_env: &[(&str, String)],
+        netns: Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        let devpath = Self::devpath(kobj)?;
+        Self::emit_uevent_in_netns(action, &devpath, extra_env, netns)
+    }
+
     pub fn emit_uevent(
         action: &str,
         devpath: &str,
         extra_env: &[(&str, String)],
     ) -> Result<(), SystemError> {
-        let mut payload = Vec::new();
-        push_env_field(&mut payload, &format!("{action}@{devpath}"));
-        push_env_field(&mut payload, &format!("ACTION={action}"));
-        push_env_field(&mut payload, &format!("DEVPATH={devpath}"));
-        for (key, value) in extra_env {
-            push_env_field(&mut payload, &format!("{key}={value}"));
-        }
-        let seqnum = UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed);
-        push_env_field(&mut payload, &format!("SEQNUM={seqnum}"));
-
         let netns = if ProcessManager::initialized() {
             ProcessManager::current_netns()
         } else {
             INIT_NET_NAMESPACE.clone()
         };
+        Self::emit_uevent_in_netns(action, devpath, extra_env, netns)
+    }
+
+    pub fn emit_uevent_in_netns(
+        action: &str,
+        devpath: &str,
+        extra_env: &[(&str, String)],
+        netns: Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        let mut payload = Vec::new();
+        try_push_env_components(&mut payload, &[action.as_bytes(), b"@", devpath.as_bytes()])?;
+        try_push_env_components(&mut payload, &[b"ACTION=", action.as_bytes()])?;
+        try_push_env_components(&mut payload, &[b"DEVPATH=", devpath.as_bytes()])?;
+        for (key, value) in extra_env {
+            try_push_env_components(&mut payload, &[key.as_bytes(), b"=", value.as_bytes()])?;
+        }
+        let seqnum = UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed);
+        let mut digits = [0u8; 20];
+        let seqnum = decimal_bytes(seqnum, &mut digits);
+        try_push_env_components(&mut payload, &[b"SEQNUM=", seqnum])?;
+
         NetlinkKobjectUeventProtocol::multicast(
             GroupIdSet::new(1),
-            KobjectUeventMessage::new(&payload),
+            KobjectUeventMessage::try_from_vec(payload)?,
             netns,
         )
     }
@@ -131,9 +159,30 @@ impl DowncastArc for dyn KObject {
     }
 }
 
-fn push_env_field(payload: &mut Vec<u8>, field: &str) {
-    payload.extend_from_slice(field.as_bytes());
+fn try_push_env_components(payload: &mut Vec<u8>, components: &[&[u8]]) -> Result<(), SystemError> {
+    let length = components.iter().try_fold(1usize, |length, component| {
+        length.checked_add(component.len())
+    });
+    payload
+        .try_reserve(length.ok_or(SystemError::ENOMEM)?)
+        .map_err(|_| SystemError::ENOMEM)?;
+    for component in components {
+        payload.extend_from_slice(component);
+    }
     payload.push(0);
+    Ok(())
+}
+
+fn decimal_bytes(mut value: u64, storage: &mut [u8; 20]) -> &[u8] {
+    let mut start = storage.len();
+    loop {
+        start -= 1;
+        storage[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return &storage[start..];
+        }
+    }
 }
 
 fn kobject_devpath(kobj: &Arc<dyn KObject>) -> Result<String, SystemError> {

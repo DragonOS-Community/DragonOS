@@ -5,13 +5,13 @@ use crate::net::socket::netlink::table::MulticastMessage;
 
 #[derive(Debug, Clone)]
 pub struct KobjectUeventMessage {
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl KobjectUeventMessage {
     pub fn new(payload: &[u8]) -> Self {
         Self {
-            bytes: Arc::from(payload),
+            bytes: Arc::new(payload.to_vec()),
         }
     }
 
@@ -21,15 +21,19 @@ impl KobjectUeventMessage {
             .try_reserve(payload.len())
             .map_err(|_| SystemError::ENOMEM)?;
         bytes.extend_from_slice(payload);
-        Ok(Self {
-            bytes: Arc::from(bytes),
-        })
+        Self::try_from_vec(bytes)
     }
 
     pub fn from_vec(bytes: Vec<u8>) -> Self {
         Self {
-            bytes: Arc::from(bytes),
+            bytes: Arc::new(bytes),
         }
+    }
+
+    pub fn try_from_vec(bytes: Vec<u8>) -> Result<Self, SystemError> {
+        Ok(Self {
+            bytes: Arc::try_new(bytes).map_err(|_| SystemError::ENOMEM)?,
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {

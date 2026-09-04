@@ -57,6 +57,7 @@ normal/udp_ipv6_send_semantics
 normal/socket_getsockopt_semantics
 normal/socket_readv_semantics
 normal/socket_ioctl_netdev_query
+normal/socket_ioctl_netdev_mutation
 normal/unix_socket_shutdown
 fuse/fuse_core
 fuse/fuse_extended

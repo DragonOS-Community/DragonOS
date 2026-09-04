@@ -18,7 +18,7 @@ use virtio_drivers::{
     PhysAddr,
 };
 
-use super::{Iface, NetDeivceState, NetDeviceCommonData, Operstate};
+use super::{Iface, MtuBounds, NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::{
     arch::rand::rand,
     driver::{
@@ -1295,7 +1295,15 @@ impl Iface for VirtioInterface {
         };
 
         match napi_complete_state(&napi) {
-            CompleteState::Disabled => {}
+            CompleteState::Disabled | CompleteState::Paused => {
+                // Administrative DOWN may race an in-flight poll after its
+                // completion path tentatively re-enabled callbacks.
+                self.device_inner
+                    .inner
+                    .lock_irqsave()
+                    .inner
+                    .disable_interrupts();
+            }
             CompleteState::Missed => {
                 self.device_inner
                     .inner
@@ -1386,6 +1394,21 @@ impl Iface for VirtioInterface {
 
     fn mtu(&self) -> usize {
         self.iface_common.mtu()
+    }
+
+    fn mtu_bounds(&self) -> MtuBounds {
+        MtuBounds {
+            min: 68,
+            max: VIRTIO_NET_IP_MTU,
+        }
+    }
+
+    fn begin_admin_down(&self) {
+        self.device_inner
+            .inner
+            .lock_irqsave()
+            .inner
+            .disable_interrupts();
     }
 }
 

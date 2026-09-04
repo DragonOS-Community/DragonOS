@@ -403,6 +403,10 @@ fn notify_entry(
     }
 }
 
+pub(super) fn notify_removed_entry(netns: &Arc<NetNamespace>, entry: NeighborEntry) {
+    notify_entry(netns, entry, CSegmentType::DELNEIGH, true);
+}
+
 fn neigh_to_segment(
     request_header: &CMsgSegHdr,
     entry: NeighborEntry,

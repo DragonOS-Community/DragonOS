@@ -12,8 +12,8 @@ use system_error::SystemError;
 
 use super::{
     ioctl::{
-        handle_netdev_query, handle_siocgifconf, SIOCGIFCONF, SIOCGIFFLAGS, SIOCGIFHWADDR,
-        SIOCGIFINDEX, SIOCGIFMTU,
+        handle_netdev_mutation, handle_netdev_query, handle_siocgifconf, SIOCGIFCONF, SIOCGIFFLAGS,
+        SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCSIFFLAGS, SIOCSIFMTU,
     },
     Socket,
 };
@@ -157,6 +157,7 @@ impl<T: Socket + 'static> IndexNode for T {
             SIOCGIFINDEX | SIOCGIFFLAGS | SIOCGIFMTU | SIOCGIFHWADDR => {
                 handle_netdev_query(self.netns(), cmd, data)
             }
+            SIOCSIFFLAGS | SIOCSIFMTU => handle_netdev_mutation(self.netns(), cmd, data),
             FIONREAD /* TIOCINQ */ => {
                 // Get number of bytes available to read
                 let bytes_available = self.recv_bytes_available();

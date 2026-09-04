@@ -10,7 +10,7 @@ use crate::{
         },
         net::{
             napi::NapiStruct, register_netdevice, types::InterfaceFlags, Iface, IfaceCommon,
-            NetDeivceState, NetDeviceCommonData, Operstate,
+            MtuBounds, NetDeivceState, NetDeviceCommonData, Operstate,
         },
     },
     libs::{
@@ -523,6 +523,33 @@ impl Iface for E1000EInterface {
 
     fn mtu(&self) -> usize {
         self.common.mtu()
+    }
+
+    fn mtu_bounds(&self) -> MtuBounds {
+        MtuBounds {
+            min: 68,
+            max: E1000E_IP_MTU,
+        }
+    }
+
+    fn begin_admin_down(&self) {
+        self.driver.inner.lock_irqsave().suspend_runtime_rx();
+    }
+
+    fn quiesce_admin_down(&self) {
+        // Intel documents a 10 ms drain interval after clearing RCTL.EN. Do
+        // not hold the device spinlock or FIB writer while hardware settles.
+        let deadline = Instant::now().total_micros().saturating_add(10_000);
+        while Instant::now().total_micros() < deadline {
+            crate::sched::sched_yield();
+        }
+        self.driver.inner.lock_irqsave().discard_rx_completions();
+    }
+
+    fn publish_admin_state(&self, is_up: bool) {
+        if is_up {
+            self.driver.inner.lock_irqsave().resume_runtime_rx();
+        }
     }
 }
 

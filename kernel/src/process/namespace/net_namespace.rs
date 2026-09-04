@@ -527,7 +527,6 @@ impl NetNamespace {
             crate::driver::net::loopback::LoopbackDriver::default(),
             crate::net::LOOPBACK_IFINDEX,
         );
-
         let inner = InnerNetNamespace {
             router: Router::new(format!("netns_router_{}", counter)),
         };
@@ -564,7 +563,11 @@ impl NetNamespace {
         // 否则像 lo 这样的设备在 Tx 后仅通过 wakeup_poll_thread() 触发下一次 poll，
         // 若此处不记录 pcb，后续将无法唤醒，从而导致 TCP connect/accept 等卡死。
         Self::create_polling_thread(netns.clone(), format!("netns_{}", counter));
-        netns.add_device(loopback)?;
+        // Per-netns loopback has no global sysfs projection. The shared
+        // registration lifecycle makes it PRESENT; as in Linux's
+        // loopback_net_init(), it remains administratively down until
+        // userspace opens the link.
+        crate::driver::net::register_netdevice_in_namespace(&netns, loopback)?;
 
         Ok(netns)
     }

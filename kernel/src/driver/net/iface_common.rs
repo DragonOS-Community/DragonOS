@@ -535,6 +535,13 @@ impl IfaceCommon {
         let timestamp = crate::time::Instant::now().into();
         let mut sockets = self.sockets.lock();
         let mut interface = self.smol_iface.lock();
+        if self.poll_scope() != scope {
+            drop(interface);
+            drop(sockets);
+            drop(route_policy);
+            drop(router);
+            return self.poll_with_authoritative_mode(device, force_authoritative);
+        }
         let configured_neighbors = netns.as_ref().and_then(|netns| {
             crate::net::neighbor::has_ipv4_entries(netns).then(|| crate::net::neighbor::read(netns))
         });
@@ -716,6 +723,13 @@ impl IfaceCommon {
         let timestamp = crate::time::Instant::now().into();
         let mut sockets = self.sockets.lock();
         let mut interface = self.smol_iface.lock();
+        if self.poll_scope() != scope {
+            drop(interface);
+            drop(sockets);
+            drop(route_policy);
+            drop(router);
+            return self.poll_napi_with_authoritative_mode(device, budget, force_authoritative);
+        }
         let configured_neighbors = netns.as_ref().and_then(|netns| {
             crate::net::neighbor::has_ipv4_entries(netns).then(|| crate::net::neighbor::read(netns))
         });
@@ -1339,11 +1353,11 @@ impl IfaceCommon {
     }
 
     pub fn mtu(&self) -> usize {
-        self.mtu.load(Ordering::Relaxed)
+        self.mtu.load(Ordering::Acquire)
     }
 
     pub fn set_mtu(&self, mtu: usize) {
-        self.mtu.store(mtu, Ordering::Relaxed);
+        self.mtu.store(mtu, Ordering::Release);
     }
 
     pub(crate) fn address_metadata(&self) -> &Mutex<Vec<AddressMetadata>> {

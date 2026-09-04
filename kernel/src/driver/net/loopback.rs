@@ -33,7 +33,7 @@ use crate::libs::once::Once;
 
 use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
 
-use super::{Iface, IfaceCommon};
+use super::{Iface, IfaceCommon, MtuBounds};
 
 const DEVICE_NAME: &str = "loopback";
 
@@ -367,10 +367,10 @@ impl LoopbackInterface {
             ip_addrs.push(cidr6).expect("Push ipCidr failed: full");
         });
 
-        let flags = InterfaceFlags::LOOPBACK
-            | InterfaceFlags::UP
-            | InterfaceFlags::RUNNING
-            | InterfaceFlags::LOWER_UP;
+        // Like Linux's gen_lo_setup(), construction records only the
+        // device-intrinsic flag. Registration owns PRESENT, administrative
+        // policy owns UP, and user_visible_flags() derives runtime flags.
+        let flags = InterfaceFlags::LOOPBACK;
         let mtu = driver.capabilities().max_transmission_unit;
 
         let iface = Arc::new(LoopbackInterface {
@@ -628,12 +628,29 @@ impl Iface for LoopbackInterface {
     fn mtu(&self) -> usize {
         self.common.mtu()
     }
+
+    fn mtu_bounds(&self) -> MtuBounds {
+        MtuBounds {
+            // smoltcp's IPv4/IPv6 TCP paths require room for their headers.
+            min: 68,
+            max: 65535,
+        }
+    }
 }
 
 pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
     let iface = LoopbackInterface::new(LoopbackDriver::default());
-    // 标识网络设备已经启动
+
+    // Preserve DragonOS's initial-netns bootstrap policy explicitly. Fresh
+    // network namespaces follow Linux and leave lo administratively down;
+    // neither policy belongs in the device constructor.
+    let prepared = iface
+        .common
+        .prepare_configured_flags(InterfaceFlags::UP, InterfaceFlags::UP)
+        .expect("initial loopback flags must be representable");
+    iface.common.publish_configured_flags(prepared);
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+    iface.set_operstate(Operstate::IF_OPER_UP);
 
     iface
 }

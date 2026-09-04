@@ -1,10 +1,9 @@
-//! Linux-compatible network-device query ioctls shared by all socket families.
+//! Linux-compatible network-device ioctls shared by all socket families.
 //!
 //! Query commands read the namespace captured by the socket at creation time,
-//! matching Linux `sock_net(sk)`. They intentionally do not acquire RTNL: each
-//! command returns one device property through the `ifreq` union. Mutation
-//! ioctls belong to the RTNL control core and must not be added here as direct
-//! `Iface` writes.
+//! matching Linux `sock_net(sk)`. Query commands return one device property
+//! through the `ifreq` union. Mutation commands only translate the ABI and
+//! delegate to the same RTNL-serialized link core as rtnetlink.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::mem::size_of;
@@ -12,15 +11,24 @@ use core::mem::size_of;
 use system_error::SystemError;
 
 use crate::{
-    driver::net::Iface,
-    net::{posix::SockAddrIn, socket::IFNAMSIZ},
-    process::namespace::net_namespace::NetNamespace,
+    driver::net::{types::InterfaceFlags, Iface},
+    net::{
+        link::{LinkFlagsUpdate, LinkMtuUpdate, LinkTarget, LinkUpdate},
+        posix::SockAddrIn,
+        socket::IFNAMSIZ,
+    },
+    process::{
+        cred::{ns_capable, CAPFlags},
+        namespace::net_namespace::NetNamespace,
+    },
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 pub(super) const SIOCGIFCONF: u32 = 0x8912;
 pub(super) const SIOCGIFFLAGS: u32 = 0x8913;
+pub(super) const SIOCSIFFLAGS: u32 = 0x8914;
 pub(super) const SIOCGIFMTU: u32 = 0x8921;
+pub(super) const SIOCSIFMTU: u32 = 0x8922;
 pub(super) const SIOCGIFHWADDR: u32 = 0x8927;
 pub(super) const SIOCGIFINDEX: u32 = 0x8933;
 
@@ -44,7 +52,7 @@ impl Default for IfReq {
 }
 
 impl IfReq {
-    fn lookup_name(&mut self) -> Result<&str, SystemError> {
+    fn canonical_name_bytes(&mut self) -> &[u8] {
         self.ifr_name[IFNAMSIZ - 1] = 0;
         let nul = self
             .ifr_name
@@ -53,7 +61,12 @@ impl IfReq {
             .unwrap_or(IFNAMSIZ);
         let name = &self.ifr_name[..nul];
         let alias = name.iter().position(|byte| *byte == b':').unwrap_or(nul);
-        let name = core::str::from_utf8(&name[..alias]).map_err(|_| SystemError::ENODEV)?;
+        &name[..alias]
+    }
+
+    fn lookup_name(&mut self) -> Result<&str, SystemError> {
+        let name =
+            core::str::from_utf8(self.canonical_name_bytes()).map_err(|_| SystemError::ENODEV)?;
         if name.is_empty() {
             return Err(SystemError::ENODEV);
         }
@@ -62,6 +75,23 @@ impl IfReq {
 
     fn set_i32(&mut self, value: i32) {
         self.ifr_ifru[..size_of::<i32>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn get_i32(&self) -> i32 {
+        i32::from_ne_bytes(
+            self.ifr_ifru[..size_of::<i32>()]
+                .try_into()
+                .expect("ifreq union contains an i32"),
+        )
+    }
+
+    fn get_flags(&self) -> InterfaceFlags {
+        let value = i16::from_ne_bytes(
+            self.ifr_ifru[..size_of::<i16>()]
+                .try_into()
+                .expect("ifreq union contains an i16"),
+        );
+        InterfaceFlags::from_bits_truncate((value as u16) as u32)
     }
 
     fn set_flags(&mut self, flags: u32) {
@@ -128,6 +158,46 @@ pub(super) fn handle_netdev_query(
     }
 
     write_ifreq(data, &ifreq)?;
+    Ok(0)
+}
+
+pub(super) fn handle_netdev_mutation(
+    netns: Arc<NetNamespace>,
+    cmd: u32,
+    data: usize,
+) -> Result<usize, SystemError> {
+    // Linux copies the whole ifreq before the capability check, so EFAULT has
+    // precedence over EPERM and device lookup errors.
+    let mut ifreq = read_ifreq(data)?;
+    let mut name_storage = [0u8; IFNAMSIZ];
+    let name_len = {
+        let name = ifreq.canonical_name_bytes();
+        name_storage[..name.len()].copy_from_slice(name);
+        name.len()
+    };
+    if !ns_capable(netns.user_ns(), CAPFlags::CAP_NET_ADMIN) {
+        return Err(SystemError::EPERM);
+    }
+    let name = core::str::from_utf8(&name_storage[..name_len]).map_err(|_| SystemError::ENODEV)?;
+    if name.is_empty() {
+        return Err(SystemError::ENODEV);
+    }
+
+    let update = match cmd {
+        SIOCSIFFLAGS => LinkUpdate {
+            flags: Some(LinkFlagsUpdate::Replace(ifreq.get_flags())),
+            ..Default::default()
+        },
+        SIOCSIFMTU => LinkUpdate {
+            mtu: Some(LinkMtuUpdate::Ioctl(ifreq.get_i32())),
+            ..Default::default()
+        },
+        _ => return Err(SystemError::ENOTTY),
+    };
+
+    let rtnl = crate::net::rtnl::lock();
+    let committed = crate::net::link::mutate_link(&rtnl, &netns, LinkTarget::Name(name), update)?;
+    super::netlink::notify_link_commit(&netns, committed);
     Ok(0)
 }
 

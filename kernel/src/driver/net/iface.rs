@@ -49,6 +49,16 @@ pub enum Operstate {
     IF_OPER_UP = 6,
 }
 
+/// Runtime IP-MTU limits supported by one interface implementation.
+///
+/// The control plane owns validation; drivers only describe the bounds that
+/// their current buffers and the smoltcp projection can safely represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MtuBounds {
+    pub min: usize,
+    pub max: usize,
+}
+
 /// Control-plane metadata attached to one configured interface address.
 ///
 /// `label == None` means the interface's current primary name. Keeping that
@@ -462,6 +472,26 @@ pub trait Iface: crate::driver::base::device::Device {
 
     fn mtu(&self) -> usize;
 
+    /// Inclusive runtime IP-MTU limits for this device.
+    fn mtu_bounds(&self) -> MtuBounds;
+
+    /// Stop new device notifications or software ingress admission before the
+    /// shared NAPI owner is paused. This must not fail, allocate, or block.
+    fn begin_admin_down(&self) {}
+
+    /// Wait for device-private ingress which started before administrative
+    /// DOWN to finish, then discard queued software ingress. The shared link
+    /// core invokes this after pausing NAPI and before taking the FIB writer,
+    /// so implementations may block but must not acquire RTNL.
+    fn quiesce_admin_down(&self) {}
+
+    /// Publishes device-private data-path state for a real administrative
+    /// UP/DOWN transition. Implementations must not allocate, fail, sleep, or
+    /// acquire RTNL/FIB/smoltcp locks: the caller holds RTNL and the FIB writer
+    /// after all preparation has succeeded. NAPI lifecycle is managed by the
+    /// shared link core rather than by this driver hook.
+    fn publish_admin_state(&self, _is_up: bool) {}
+
     /// # 获取当前iface的napi结构体
     /// 默认返回None，表示不支持napi
     fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
@@ -524,18 +554,31 @@ pub(super) fn register_netdevice(
     // Register driver-core/sysfs first. Until PRESENT and the namespace/FIB
     // transaction both commit, the object is provisional and unannounced.
     netdev_register_kobject(dev.clone())?;
-    dev.set_net_state(NetDeivceState::__LINK_STATE_PRESENT);
-
-    if let Err(error) = netns.add_device(dev.clone()) {
+    if let Err(error) = register_netdevice_in_namespace(netns, dev.clone()) {
         // No add uevent has been sent, so rollback is structural and must not
         // allocate notification state before removing the provisional object.
-        dev.clear_net_state(NetDeivceState::__LINK_STATE_PRESENT);
         netdev_unregister_kobject(dev);
         return Err(error);
     }
 
     netdev_emit_uevent(dev, "add");
 
+    Ok(())
+}
+
+/// Publishes a netdevice in one network namespace without creating a global
+/// sysfs projection. This is the common registration lifecycle used by
+/// per-netns devices: PRESENT is owned here and rolled back if topology/FIB
+/// insertion fails.
+pub(crate) fn register_netdevice_in_namespace(
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
+    dev.set_net_state(NetDeivceState::__LINK_STATE_PRESENT);
+    if let Err(error) = netns.add_device(dev.clone()) {
+        dev.clear_net_state(NetDeivceState::__LINK_STATE_PRESENT);
+        return Err(error);
+    }
     Ok(())
 }
 

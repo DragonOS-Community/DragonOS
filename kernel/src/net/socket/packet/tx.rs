@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-use crate::driver::net::Iface;
+use crate::driver::net::{types::InterfaceFlags, Iface};
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::net::posix::SockAddr;
 use crate::net::socket::endpoint::Endpoint;
@@ -36,6 +36,9 @@ impl PacketSocket {
     fn try_send(&self, buf: &[u8], dest: Option<SockAddrLl>) -> Result<usize, SystemError> {
         self.validate_packet_len(buf.len())?;
         let iface = self.destination_iface(dest.as_ref())?;
+        if !iface.user_visible_flags().contains(InterfaceFlags::UP) {
+            return Err(SystemError::ENETDOWN);
+        }
         match self.sock_type {
             PacketSocketType::Raw => {
                 if buf.len() < 14 {

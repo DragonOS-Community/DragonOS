@@ -25,7 +25,9 @@ impl<Message> MessageQueue<Message> {
 
     fn enqueue(&self, message: Message) -> Result<(), SystemError> {
         // FIXME: 确保消息队列不会超过最大长度
-        self.0.lock().push_back(message);
+        let mut queue = self.0.lock();
+        queue.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        queue.push_back(message);
         Ok(())
     }
 }

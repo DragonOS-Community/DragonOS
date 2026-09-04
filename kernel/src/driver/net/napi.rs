@@ -1,4 +1,4 @@
-use crate::driver::net::{types::InterfaceFlags, Iface};
+use crate::driver::net::{Iface, IfacePollScope};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
@@ -44,12 +44,20 @@ impl NapiStruct {
         })
     }
 
+    /// Creates a NAPI instance that cannot be scheduled until its device
+    /// registration transaction has committed.
+    pub fn new_disabled(net_device: Arc<dyn Iface>, weight: usize) -> Arc<Self> {
+        let napi = Self::new(net_device, weight);
+        napi_disable(&napi);
+        napi
+    }
+
     fn poll(&self, budget: usize) -> Option<(Arc<dyn Iface>, NapiPollResult)> {
         if let Some(iface) = self.net_device.upgrade() {
-            if !iface.flags().contains(InterfaceFlags::UP) {
-                return Some((iface, NapiPollResult::idle()));
-            }
-            let result = iface.poll_napi(budget);
+            let result = match iface.common().poll_scope() {
+                IfacePollScope::None => NapiPollResult::idle(),
+                IfacePollScope::LocalOnly | IfacePollScope::Full => iface.poll_napi(budget),
+            };
             return Some((iface, result));
         } else {
             log::error!(
@@ -148,7 +156,15 @@ fn net_rx_action() {
 
         while let Some(napi) = active.pop_front() {
             let elapsed = crate::time::Instant::now().total_micros() - started_at;
-            if polls_left == 0 || packets_left == 0 || elapsed >= NET_RX_TIME_BUDGET_US {
+            // The worker is preemptible. If it is descheduled after sampling
+            // `started_at` but before the first poll, the elapsed-time budget
+            // may already be exhausted when it resumes. Requeueing without
+            // one poll would permit a zero-progress yield/requeue livelock.
+            let attempted_poll = polls_left < NET_RX_POLL_BUDGET;
+            if polls_left == 0
+                || packets_left == 0
+                || (attempted_poll && elapsed >= NET_RX_TIME_BUDGET_US)
+            {
                 active.push_front(napi);
                 break;
             }
@@ -217,6 +233,14 @@ pub fn napi_complete(napi: Arc<NapiStruct>) {
 /// a scheduler and orphan its newly acquired owner.
 pub(crate) fn napi_disable(napi: &NapiStruct) {
     napi_state::disable(&napi.state);
+}
+
+/// Publishes a previously disabled NAPI instance after device registration.
+pub(crate) fn napi_enable(napi: &NapiStruct) {
+    napi.state.fetch_and(
+        !NapiState::DISABLE.bits(),
+        core::sync::atomic::Ordering::Release,
+    );
 }
 
 pub(crate) fn napi_schedule_prep(napi: &NapiStruct) -> ScheduleState {

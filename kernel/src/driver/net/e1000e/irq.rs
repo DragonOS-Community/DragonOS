@@ -56,6 +56,12 @@ impl E1000EIrqManager {
         let map = self.map.read_irqsave();
         map.get(dev_id).cloned()
     }
+
+    /// Undo a probe-time IRQ/NAPI publication when a later netdevice stage
+    /// fails. Removal is idempotent so error paths do not need shadow state.
+    pub fn unregister_napi(&self, dev_id: &Arc<DeviceId>) {
+        self.map.write_irqsave().remove(dev_id);
+    }
 }
 
 /// e1000e 的默认 IRQ handler：通过 PCI irq 子系统传入的 `DeviceId` 查表并 schedule NAPI。

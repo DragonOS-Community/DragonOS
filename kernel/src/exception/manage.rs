@@ -1220,7 +1220,7 @@ impl IrqManager {
     ///
     /// ## 返回
     ///
-    /// 返回传递给request_irq的devname参数
+    /// 成功时返回空结果
     ///
     /// ## 说明
     ///
@@ -1233,8 +1233,58 @@ impl IrqManager {
     /// 此函数不可以在中断上下文中调用。
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/irq/manage.c#2026
-    pub fn free_irq(&self, _irq: IrqNumber, _dev_id: Option<Arc<DeviceId>>) {
-        warn!("Unimplemented free_irq");
+    pub fn free_irq(
+        &self,
+        irq: IrqNumber,
+        dev_id: Option<&Arc<DeviceId>>,
+    ) -> Result<(), SystemError> {
+        let desc = irq_desc_manager().lookup(irq).ok_or(SystemError::EINVAL)?;
+        let _request_guard = desc.request_mutex_lock();
+        let mut desc_inner = desc.inner();
+        let position = desc_inner
+            .actions()
+            .iter()
+            .position(|action| {
+                let action = action.inner();
+                match (action.dev_id().as_ref(), dev_id) {
+                    (Some(actual), Some(expected)) => actual.as_ref() == expected.as_ref(),
+                    (None, None) => true,
+                    _ => false,
+                }
+            })
+            .ok_or(SystemError::ENOENT)?;
+        let action = desc_inner.remove_action_at(position);
+        let last_action = desc_inner.actions().is_empty();
+        if last_action {
+            self.mask_irq(desc_inner.irq_data());
+        }
+        drop(desc_inner);
+
+        // A hardirq may have cloned the action just before removal. The
+        // device source must already be masked by the caller; wait until that
+        // final snapshot and any threaded handler have retired before the
+        // registration token is released.
+        loop {
+            let in_progress = desc.inner().common_data().status().is_irq_in_progress();
+            if !in_progress && desc.threads_active() == 0 {
+                break;
+            }
+            crate::sched::sched_yield();
+        }
+        drop(action);
+        if last_action {
+            desc.chip_bus_lock();
+            let irq_data = desc.irq_data();
+            let chip = irq_data.chip_info_read_irqsave().chip();
+            if chip.irq_shutdown(&irq_data).is_err() {
+                chip.irq_disable(&irq_data);
+            }
+            irq_data.common_data().set_disabled();
+            irq_data.common_data().set_masked();
+            chip.irq_release_resources(&irq_data);
+            desc.chip_bus_sync_unlock();
+        }
+        Ok(())
     }
 }
 

@@ -13,6 +13,7 @@ use crate::net::socket::netlink::{
 };
 use crate::process::namespace::net_namespace::NetNamespace;
 use alloc::{sync::Arc, vec::Vec};
+use system_error::SystemError;
 
 pub const RTMGRP_LINK: u32 = 0x1;
 pub const RTMGRP_NEIGH: u32 = 0x4;
@@ -25,7 +26,7 @@ pub fn finish_response(
     request_header: &CMsgSegHdr,
     dump_all: bool,
     response_segments: &mut Vec<RouteNlSegment>,
-) {
+) -> Result<(), SystemError> {
     if !dump_all {
         if response_segments.len() != 1 {
             log::warn!(
@@ -33,16 +34,24 @@ pub fn finish_response(
                 response_segments.len()
             );
         }
-        return;
+        return Ok(());
     }
 
-    append_done_segment(request_header, response_segments);
+    append_done_segment(request_header, response_segments)?;
     add_multi_flag(response_segments);
+    Ok(())
 }
 
-fn append_done_segment(header: &CMsgSegHdr, response_segments: &mut Vec<RouteNlSegment>) {
+fn append_done_segment(
+    header: &CMsgSegHdr,
+    response_segments: &mut Vec<RouteNlSegment>,
+) -> Result<(), SystemError> {
+    response_segments
+        .try_reserve(1)
+        .map_err(|_| SystemError::ENOMEM)?;
     let done_segment = DoneSegment::new_from_request(header, None);
     response_segments.push(RouteNlSegment::Done(done_segment));
+    Ok(())
 }
 
 fn add_multi_flag(responce_segment: &mut [RouteNlSegment]) {

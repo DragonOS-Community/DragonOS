@@ -44,10 +44,14 @@ pub struct RouteSegmentBody {
     pub dst_len: u8,
     pub src_len: u8,
     pub tos: u8,
-    pub table: RouteTable,
-    pub protocol: RouteProtocol,
-    pub scope: RouteScope,
-    pub type_: RouteType,
+    /// Raw values are retained because Linux accepts user-defined table and
+    /// protocol identifiers that are not part of the well-known enums.
+    pub table: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub type_: u8,
+    /// Exact wire value retained for operation-specific policy checks.
+    pub raw_flags: u32,
     pub flags: RouteFlags,
 }
 
@@ -163,12 +167,16 @@ impl TryFrom<u8> for RouteType {
 
 bitflags::bitflags! {
     pub struct RouteFlags: u32 {
+        /// Single-path nexthop is explicitly on-link.
+        const ONLINK = 0x4;
         const NOTIFY = 0x100;
         const CLONED = 0x200;
         const EQUALIZE = 0x400;
         const PREFIX = 0x800;
         /// `RTM_F_LOOKUP_TABLE` — fib lookup (Linux 6.6).
         const LOOKUP_TABLE = 0x1000;
+        /// Return the matched FIB object instead of an output route.
+        const FIB_MATCH = 0x2000;
     }
 }
 
@@ -177,10 +185,10 @@ impl TryFrom<CRtMsg> for RouteSegmentBody {
 
     fn try_from(value: CRtMsg) -> Result<Self, Self::Error> {
         let family = AddressFamily::try_from(value.family as u16)?;
-        let table = RouteTable::try_from(value.table)?;
-        let protocol = RouteProtocol::try_from(value.protocol)?;
-        let scope = RouteScope::try_from(value.scope)?;
-        let type_ = RouteType::try_from(value.type_)?;
+        // The wire layer must preserve future flag bits. Whether a bit is
+        // accepted is operation-specific: Linux's non-strict dump ignores
+        // unknown bits, while mutation and lookup validators apply their own
+        // supported masks.
         let flags = RouteFlags::from_bits_truncate(value.flags);
 
         Ok(Self {
@@ -188,10 +196,11 @@ impl TryFrom<CRtMsg> for RouteSegmentBody {
             dst_len: value.dst_len,
             src_len: value.src_len,
             tos: value.tos,
-            table,
-            protocol,
-            scope,
-            type_,
+            table: value.table,
+            protocol: value.protocol,
+            scope: value.scope,
+            type_: value.type_,
+            raw_flags: value.flags,
             flags,
         })
     }
@@ -204,11 +213,11 @@ impl From<RouteSegmentBody> for CRtMsg {
             dst_len: body.dst_len,
             src_len: body.src_len,
             tos: body.tos,
-            table: body.table as u8,
-            protocol: body.protocol as u8,
-            scope: body.scope as u8,
-            type_: body.type_ as u8,
-            flags: body.flags.bits(),
+            table: body.table,
+            protocol: body.protocol,
+            scope: body.scope,
+            type_: body.type_,
+            flags: body.raw_flags,
         }
     }
 }

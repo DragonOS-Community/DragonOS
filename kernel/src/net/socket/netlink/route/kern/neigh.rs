@@ -62,7 +62,7 @@ pub(super) fn do_get_neigh(
         }
     }
 
-    finish_response(request_segment.header(), true, &mut response);
+    finish_response(request_segment.header(), true, &mut response)?;
     Ok(response)
 }
 

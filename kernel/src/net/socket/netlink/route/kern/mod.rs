@@ -176,8 +176,8 @@ fn dispatch_request(
             route::do_get_rule(request, netns)
         }
         RouteNlSegment::GetRoute(request) => route::do_get_route(request, netns),
-        RouteNlSegment::NewRoute(request) => route::do_new_route(request, netns),
-        RouteNlSegment::DelRoute(request) => route::do_del_route(request, netns),
+        RouteNlSegment::NewRoute(request) => route::do_new_route(rtnl, request, netns),
+        RouteNlSegment::DelRoute(request) => route::do_del_route(rtnl, request, netns),
         RouteNlSegment::NewNeigh(request) => neigh::do_new_neigh(request, netns),
         RouteNlSegment::GetNeigh(request) => neigh::do_get_neigh(request, netns),
         RouteNlSegment::DelNeigh(request) => neigh::do_del_neigh(request, netns),

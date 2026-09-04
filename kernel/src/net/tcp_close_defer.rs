@@ -82,6 +82,7 @@ struct ClosingTcpSocket {
 #[derive(Debug)]
 pub struct TcpCloseDefer {
     closing: Mutex<Vec<ClosingTcpSocket>>,
+    pending: AtomicUsize,
     reap_cursor: AtomicUsize,
     stats: Mutex<TcpCloseDeferStats>,
 }
@@ -90,6 +91,7 @@ impl TcpCloseDefer {
     pub fn new() -> Self {
         Self {
             closing: Mutex::new(Vec::new()),
+            pending: AtomicUsize::new(0),
             reap_cursor: AtomicUsize::new(0),
             stats: Mutex::new(TcpCloseDeferStats::default()),
         }
@@ -109,6 +111,7 @@ impl TcpCloseDefer {
             _reason: request.reason,
             abort_on_post_close_data: request.abort_on_post_close_data,
         });
+        self.pending.fetch_add(1, Ordering::Release);
         drop(guard);
 
         let mut stats = self.stats.lock();
@@ -122,6 +125,11 @@ impl TcpCloseDefer {
             DeferredTcpCloseReason::ZeroLinger => stats.zero_linger_abort += 1,
             _ => {}
         }
+    }
+
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) != 0
     }
 
     #[inline]
@@ -228,6 +236,7 @@ impl TcpCloseDefer {
                 }
                 sockets.remove(handle);
                 closing.swap_remove(i);
+                self.pending.fetch_sub(1, Ordering::Release);
                 let mut stats = self.stats.lock();
                 stats.closed_reaped += 1;
                 if rst_pending {

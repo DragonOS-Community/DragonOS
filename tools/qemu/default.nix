@@ -350,7 +350,7 @@ let
       EXTRA_CMDLINE="${qemuConfig.cmdlineExtra}"
 
       # FIXED: 补全缺失的默认内核参数 AUTO_TEST 和 SYSCALL_TEST_DIR
-      FINAL_CMDLINE="rw init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} DUNITEST_DIR=${testOpt.dunitest.testDir} $EXTRA_CMDLINE"
+      FINAL_CMDLINE="rw init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} DUNITEST_DIR=${testOpt.dunitest.testDir} ${lib.optionalString (testOpt.autotest == "dunit") "dragonos.net_test_fixtures"} $EXTRA_CMDLINE"
 
       ARCH_FLAGS=( ${lib.escapeShellArgs commonArchArgs} )
       ${archSpecificBash}

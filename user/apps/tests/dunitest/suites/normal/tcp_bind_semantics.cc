@@ -118,6 +118,26 @@ TEST(TcpBindSemantics, NonlocalAddressFailureDoesNotPoisonSocket) {
                                      << ErrnoString(errno);
 }
 
+TEST(TcpBindSemantics, CloseBoundSocketReleasesPort) {
+    uint16_t port = 0;
+    {
+        FdGuard first(socket(AF_INET, SOCK_STREAM, 0));
+        ASSERT_GE(first.Get(), 0) << "socket(first) failed: " << ErrnoString(errno);
+
+        sockaddr_in addr = LoopbackAddr(0);
+        ASSERT_EQ(bind(first.Get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0)
+                << "bind(first) failed: " << ErrnoString(errno);
+        port = BoundPort(first.Get());
+        ASSERT_NE(port, 0);
+    }
+
+    FdGuard second(socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_GE(second.Get(), 0) << "socket(second) failed: " << ErrnoString(errno);
+    sockaddr_in released = LoopbackAddr(port);
+    EXPECT_EQ(bind(second.Get(), reinterpret_cast<sockaddr*>(&released), sizeof(released)), 0)
+            << "bind(second) after close failed: " << ErrnoString(errno);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

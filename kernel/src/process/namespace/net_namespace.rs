@@ -1,6 +1,6 @@
 use crate::driver::net::bridge::BridgeDriver;
 use crate::driver::net::loopback::LoopbackInterface;
-use crate::driver::net::types::InterfaceFlags;
+use crate::driver::net::IfacePollScope;
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -53,14 +53,35 @@ pub static mut NETNS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const PACKET_SOCKET_CLEANUP_RETRY_MIN: Duration = Duration::from_millis(100);
 const PACKET_SOCKET_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(5);
 
+fn try_snapshot_devices(
+    devices: &BTreeMap<usize, Arc<dyn Iface>>,
+    additional: Option<&Arc<dyn Iface>>,
+) -> Result<Vec<Arc<dyn Iface>>, SystemError> {
+    let count = devices
+        .len()
+        .checked_add(usize::from(additional.is_some()))
+        .ok_or(SystemError::ENOMEM)?;
+    let mut participants = Vec::new();
+    participants
+        .try_reserve_exact(count)
+        .map_err(|_| SystemError::ENOMEM)?;
+    participants.extend(devices.values().cloned());
+    if let Some(device) = additional {
+        participants.push(device.clone());
+    }
+    Ok(participants)
+}
+
 #[unified_init(INITCALL_SUBSYS)]
 pub fn root_net_namespace_init() -> Result<(), SystemError> {
     // 创建root网络命名空间的轮询线程
     NetNamespace::create_polling_thread(INIT_NET_NAMESPACE.clone(), "root_netns".to_string());
 
-    // 创建 router
-    let router = Router::new("root_netns_router".to_string());
-    INIT_NET_NAMESPACE.inner_mut().router = router.clone();
+    // Router/FIB are constructed together with the namespace and remain
+    // stable for its entire lifetime. Initialization only attaches the weak
+    // namespace reference; replacing the Router here would discard routes
+    // imported by devices registered earlier in boot.
+    let router = INIT_NET_NAMESPACE.router();
     let mut guard = router.ns.write();
     *guard = INIT_NET_NAMESPACE.self_ref.clone();
 
@@ -265,11 +286,10 @@ impl NetnsPoller {
         const DIRECT_POLL_BATCH: usize = 64;
 
         for _ in 0..DIRECT_POLL_BATCH {
-            if !iface.flags().contains(InterfaceFlags::UP) {
-                return false;
-            }
-            if !iface.poll() {
-                return false;
+            match iface.common().poll_scope() {
+                IfacePollScope::None => return false,
+                IfacePollScope::LocalOnly | IfacePollScope::Full if !iface.poll() => return false,
+                IfacePollScope::LocalOnly | IfacePollScope::Full => {}
             }
         }
         true
@@ -329,7 +349,7 @@ impl NetnsPoller {
             {
                 let devices = netns.device_list.read();
                 for (_, iface) in devices.iter() {
-                    if !iface.flags().contains(InterfaceFlags::UP) {
+                    if iface.common().poll_scope() == IfacePollScope::None {
                         continue;
                     }
 
@@ -346,24 +366,32 @@ impl NetnsPoller {
                                 None => us,
                             });
                         }
-                        DueResult::Claimed(claimed_us) => match napi {
-                            Some(napi) => match napi_schedule(napi) {
-                                NapiScheduleResult::Accepted => {}
-                                NapiScheduleResult::Disabled | NapiScheduleResult::Detached => {
-                                    iface.common().restore_poll_deadline(claimed_us);
-                                }
-                            },
-                            None => direct_due.push((iface.clone(), claimed_us)),
-                        },
+                        DueResult::Claimed { claims, next } => {
+                            if let Some(us) = next {
+                                next_us = Some(match next_us {
+                                    Some(cur) => core::cmp::min(cur, us),
+                                    None => us,
+                                });
+                            }
+                            match napi {
+                                Some(napi) => match napi_schedule(napi) {
+                                    NapiScheduleResult::Accepted => {}
+                                    NapiScheduleResult::Disabled | NapiScheduleResult::Detached => {
+                                        iface.common().restore_poll_deadline(claims);
+                                    }
+                                },
+                                None => direct_due.push((iface.clone(), claims)),
+                            }
+                        }
                     }
                 }
             }
 
             if !direct_due.is_empty() {
                 drop(netns);
-                for (iface, claimed_us) in direct_due {
-                    if !iface.flags().contains(InterfaceFlags::UP) {
-                        iface.common().restore_poll_deadline(claimed_us);
+                for (iface, claims) in direct_due {
+                    if iface.common().poll_scope() == IfacePollScope::None {
+                        iface.common().restore_poll_deadline(claims);
                         continue;
                     }
                     if Self::poll_direct_batch(&iface) {
@@ -428,7 +456,7 @@ impl NetnsPoller {
                 // Event-driven work is scheduled once; NAPI performs bounded
                 // polling and records concurrent requests through MISSED.
                 for (_, iface) in devices.iter() {
-                    if !iface.flags().contains(InterfaceFlags::UP) {
+                    if iface.common().poll_scope() == IfacePollScope::None {
                         continue;
                     }
                     if let Some(napi) = iface.napi_struct() {
@@ -457,8 +485,7 @@ impl InnerNetNamespace {
 impl NetNamespace {
     pub fn new_root() -> Arc<Self> {
         let inner = InnerNetNamespace {
-            // 这里没有直接创建 router，而是留到 init 函数中创建
-            router: Router::new_empty(),
+            router: Router::new("root_netns_router".to_string()),
         };
 
         let ns_common = NsCommon::new(0, NamespaceType::Net);
@@ -526,11 +553,13 @@ impl NetNamespace {
             default_iface: RcuOptionArcSlot::new_none(),
         });
 
+        *netns.router().ns.write() = netns.self_ref.clone();
+
         // Linux 语义：每个 netns 都需要一个可被唤醒的轮询线程来推进协议栈。
         // 否则像 lo 这样的设备在 Tx 后仅通过 wakeup_poll_thread() 触发下一次 poll，
         // 若此处不记录 pcb，后续将无法唤醒，从而导致 TCP connect/accept 等卡死。
         Self::create_polling_thread(netns.clone(), format!("netns_{}", counter));
-        netns.add_device(loopback);
+        netns.add_device(loopback)?;
 
         Ok(netns)
     }
@@ -1008,26 +1037,80 @@ impl NetNamespace {
         self.netlink_kernel_socket.read().get(&protocol).cloned()
     }
 
-    pub fn add_device(&self, device: Arc<dyn Iface>) {
-        device.set_net_namespace(self.self_ref.upgrade().unwrap());
-
-        self.device_list_mut().insert(device.nic_id(), device);
+    pub fn add_device(&self, device: Arc<dyn Iface>) -> Result<(), SystemError> {
+        let rtnl = crate::net::rtnl::lock();
+        // Keep topology readers behind this write guard until both the map and
+        // the authoritative FIB/projections contain the new interface.
+        let mut devices = self.device_list_mut();
+        if devices.contains_key(&device.nic_id()) {
+            return Err(SystemError::EEXIST);
+        }
+        if device.net_namespace().is_some() {
+            return Err(SystemError::EBUSY);
+        }
+        // Build every fallible transaction input while the device is still
+        // unpublished. The write guard keeps the topology stable, and the new
+        // interface is appended explicitly for projection preparation.
+        let participants = try_snapshot_devices(&devices, Some(&device))?;
+        let netns = self.self_ref.upgrade().unwrap();
+        device.set_net_namespace(netns.clone())?;
+        devices.insert(device.nic_id(), device.clone());
+        let iface = device.clone();
+        if let Err(error) = crate::net::route::register_iface(&rtnl, &netns, &iface, &participants)
+        {
+            devices.remove(&device.nic_id());
+            device.clear_net_namespace();
+            return Err(error);
+        }
+        drop(devices);
         self.notify_deadline_changed();
 
         // log::info!(
         //     "Network device added to namespace count: {:?}",
         //     self.device_list().len()
         // );
+        Ok(())
     }
 
     pub fn remove_device(&self, nic_id: &usize) {
         // Teardown helper only: the caller must quiesce IRQ, DMA, and NAPI
         // before removing an active device. Runtime hot-remove is not provided
         // by this API.
-        let removed = self.device_list_mut().remove(nic_id);
-        if removed.is_none() {
+        let rtnl = crate::net::rtnl::lock();
+        // Readers cannot observe the interface after its FIB entries have
+        // disappeared but before topology removal completes.
+        let mut devices = self.device_list_mut();
+        if !devices.contains_key(nic_id) {
             return;
         }
+        let netns = self.self_ref.upgrade().unwrap();
+        let participants = match try_snapshot_devices(&devices, None) {
+            Ok(participants) => participants,
+            Err(error) => {
+                log::error!(
+                    "failed to snapshot interfaces before removing {}: {:?}",
+                    nic_id,
+                    error
+                );
+                return;
+            }
+        };
+        if let Err(error) =
+            crate::net::route::unregister_iface(&rtnl, &netns, *nic_id as u32, &participants)
+        {
+            log::error!(
+                "failed to purge routes for interface {}: {:?}",
+                nic_id,
+                error
+            );
+            return;
+        }
+        let Some(removed) = devices.remove(nic_id) else {
+            unreachable!("RTNL keeps the checked interface registered")
+        };
+
+        removed.clear_net_namespace();
+        drop(devices);
 
         self.default_iface
             .clear_if_deferred(|current| current.iface.nic_id() == *nic_id);

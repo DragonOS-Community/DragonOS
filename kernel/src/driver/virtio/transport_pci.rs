@@ -1,7 +1,7 @@
 //! PCI transport for VirtIO.
 
 use crate::arch::{
-    msi::{arch_pci_msi_vector_alloc, arch_pci_msi_vector_setup},
+    msi::{arch_pci_msi_vector_alloc, arch_pci_msi_vector_release, arch_pci_msi_vector_setup},
     PciArch, TraitPciArch,
 };
 use crate::driver::base::device::DeviceId;
@@ -376,7 +376,10 @@ impl PciTransport {
             return Err(VirtioPciError::IrqVectorAlreadyAssigned);
         }
         let irq = arch_pci_msi_vector_alloc().ok_or(VirtioPciError::IrqVectorUnavailable)?;
-        arch_pci_msi_vector_setup(irq).map_err(|_| VirtioPciError::IrqVectorUnavailable)?;
+        if arch_pci_msi_vector_setup(irq).is_err() {
+            arch_pci_msi_vector_release(irq);
+            return Err(VirtioPciError::IrqVectorUnavailable);
+        }
         irq_vector.push(irq);
         Ok(irq)
     }

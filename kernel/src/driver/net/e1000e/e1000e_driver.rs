@@ -24,14 +24,19 @@ use crate::{
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
-use log::info;
+use log::{error, info};
 use smoltcp::{phy, wire::HardwareAddress};
 use system_error::SystemError;
+
+const E1000E_IP_MTU: usize = 1500;
+const E1000E_STACK_FRAME_SIZE: usize = E1000E_IP_MTU + 14;
+const E1000E_HARDWARE_FRAME_LIMIT: usize = 1536;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
 use super::irq::e1000e_irq_manager;
@@ -46,6 +51,7 @@ pub struct E1000ERxToken {
 pub struct E1000ETxToken {
     driver: E1000EDriver,
     tx_reserved: bool,
+    meta: phy::PacketMeta,
 }
 pub struct E1000EDriver {
     pub inner: Arc<SpinLock<E1000EDevice>>,
@@ -108,6 +114,10 @@ impl Drop for E1000ERxToken {
 }
 
 impl phy::TxToken for E1000ETxToken {
+    fn set_meta(&mut self, meta: phy::PacketMeta) {
+        self.meta = meta;
+    }
+
     fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -115,13 +125,43 @@ impl phy::TxToken for E1000ETxToken {
         let mut buffer = E1000EBuffer::new(len);
         let result = f(buffer.as_mut_slice());
         if !self.tx_reserved {
-            if self.driver.try_raw_transmit(buffer.as_slice()).is_ok() {
-                if let Some(iface) = self.driver.iface() {
-                    crate::net::socket::packet::deliver_to_packet_sockets(
-                        &iface,
-                        buffer.as_slice(),
-                        crate::net::socket::packet::PacketType::Outgoing,
-                    );
+            let iface = self.driver.iface();
+            let tx_generation = iface
+                .as_ref()
+                .map(|iface| iface.common().tx_completion_generation());
+            match self.driver.try_raw_transmit(buffer.as_slice()) {
+                Ok(()) => {
+                    if let Some(iface) = iface {
+                        crate::net::socket::packet::deliver_to_packet_sockets(
+                            &iface,
+                            buffer.as_slice(),
+                            crate::net::socket::packet::PacketType::Outgoing,
+                        );
+                    }
+                }
+                Err(SystemError::ENOBUFS) | Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    let mut frame = Vec::new();
+                    let copied = frame.try_reserve_exact(buffer.as_slice().len()).is_ok();
+                    if copied {
+                        frame.extend_from_slice(buffer.as_slice());
+                    }
+                    let queued = copied
+                        && iface.zip(tx_generation).is_some_and(|(iface, generation)| {
+                            super::super::defer_native_output_after_tx_backpressure(
+                                iface.as_ref(),
+                                phy::Medium::Ethernet,
+                                self.meta,
+                                frame,
+                                generation,
+                            )
+                            .is_ok()
+                        });
+                    if !queued {
+                        log::debug!("e1000e dropped RX-path reply: deferred output is unavailable");
+                    }
+                }
+                Err(err) => {
+                    error!("e1000e failed to transmit RX-path reply: {err:?}");
                 }
             }
             buffer.free_buffer();
@@ -190,8 +230,7 @@ impl E1000EDriver {
     /// The submitted DMA buffer remains owned by the TX ring until DD is
     /// observed when that descriptor is reused.
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        const MAX_FRAME_LEN: usize = 1536;
-        if frame.len() > MAX_FRAME_LEN || frame.len() > u16::MAX as usize {
+        if frame.len() > E1000E_HARDWARE_FRAME_LIMIT || frame.len() > u16::MAX as usize {
             return Err(SystemError::EMSGSIZE);
         }
 
@@ -199,7 +238,7 @@ impl E1000EDriver {
             return Err(SystemError::ENOBUFS);
         }
         let mut device = self.inner.lock();
-        if !device.e1000e_can_transmit() {
+        if !device.e1000e_can_transmit() && !device.arm_tx_completion_interrupt() {
             self.release_tx();
             return Err(SystemError::ENOBUFS);
         }
@@ -246,6 +285,7 @@ impl phy::Device for E1000EDriver {
                 E1000ETxToken {
                     driver: self.clone(),
                     tx_reserved: false,
+                    meta: phy::PacketMeta::default(),
                 },
             )),
             None => {
@@ -258,10 +298,12 @@ impl phy::Device for E1000EDriver {
         if !self.try_reserve_tx() {
             return None;
         }
-        match self.inner.lock().e1000e_can_transmit() {
+        let mut device = self.inner.lock();
+        match device.e1000e_can_transmit() || device.arm_tx_completion_interrupt() {
             true => Some(E1000ETxToken {
                 driver: self.clone(),
                 tx_reserved: true,
+                meta: phy::PacketMeta::default(),
             }),
             false => {
                 self.release_tx();
@@ -275,7 +317,7 @@ impl phy::Device for E1000EDriver {
         // 网卡的最大传输单元. 请与IP层的MTU进行区分。这个值应当是网卡的最大传输单元，而不是IP层的MTU。
         // The maximum size of the received packet is limited by the 82574 hardware to 1536 bytes. Packets larger then 1536 bytes are silently discarded. Any packet smaller than 1536 bytes is processed by the 82574.
         // 82574l manual pp205
-        caps.max_transmission_unit = 1536;
+        caps.max_transmission_unit = E1000E_STACK_FRAME_SIZE;
         /*
            Maximum burst size, in terms of MTU.
            The network device is unable to send or receive bursts large than the value returned by this function.
@@ -288,8 +330,6 @@ impl phy::Device for E1000EDriver {
 
 impl E1000EInterface {
     pub fn new(mut driver: E1000EDriver) -> Arc<Self> {
-        use smoltcp::phy::Device;
-
         let iface_id = generate_iface_id();
         let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
             smoltcp::wire::EthernetAddress(driver.inner.lock().mac_address()),
@@ -305,7 +345,7 @@ impl E1000EInterface {
             | InterfaceFlags::MULTICAST
             | InterfaceFlags::LOWER_UP;
         let name = format!("eth{}", iface_id);
-        let mtu = driver.capabilities().max_transmission_unit;
+        let mtu = E1000E_IP_MTU;
 
         let iface = Arc::new(E1000EInterface {
             driver,
@@ -326,7 +366,7 @@ impl E1000EInterface {
         });
 
         // 设置 NAPI：让收包处理走 bounded poll（对齐 Linux NAPI/ksoftirqd）。
-        let napi_struct = NapiStruct::new(iface.clone(), 10);
+        let napi_struct = NapiStruct::new_disabled(iface.clone(), 10);
         *iface.common.napi_struct.write() = Some(napi_struct);
 
         // 设置 driver 对接口的弱引用，用于 packet socket 分发
@@ -433,6 +473,10 @@ impl Iface for E1000EInterface {
 
     fn poll_napi(&self, budget: usize) -> crate::driver::net::napi::NapiPollResult {
         let mut driver = self.driver.clone();
+        let tx_available = driver.inner.lock().take_tx_completion_wakeup();
+        if tx_available {
+            self.common.release_tx_backpressure();
+        }
         self.common.poll_napi(&mut driver, budget)
     }
 
@@ -540,31 +584,41 @@ impl KObject for E1000EInterface {
     }
 }
 
-pub fn e1000e_driver_init(device: E1000EDevice, dev_id: Arc<DeviceId>) {
+pub fn e1000e_driver_init(device: E1000EDevice, dev_id: Arc<DeviceId>) -> Result<(), SystemError> {
     let mac = smoltcp::wire::EthernetAddress::from_bytes(&device.mac_address());
     let driver = E1000EDriver::new(device);
     let iface = E1000EInterface::new(driver);
     // 标识网络设备已经启动
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
 
-    // 将网卡的接口信息注册到全局的网卡接口信息表中
-    // NET_DEVICES
-    //     .write_irqsave()
-    //     .insert(iface.nic_id(), iface.clone());
-    INIT_NET_NAMESPACE.add_device(iface.clone());
-    iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
-
-    info!("e1000e driver init successfully!\tMAC: [{}]", mac);
-
-    register_netdevice(iface.clone()).expect("register lo device failed");
-
     // 注册 IRQ -> NAPI 映射：使 e1000e IRQ handler 在 hardirq 内直接 napi_schedule，
     // 避免唤醒 netns 线程扫描 device_list（对齐 Linux NAPI 语义）。
+    let mut napi_registered = false;
     if let Some(napi) = iface.napi_struct() {
-        e1000e_irq_manager()
-            .register_napi(dev_id, napi)
-            .expect("register e1000e napi irq mapping failed");
+        e1000e_irq_manager().register_napi(dev_id.clone(), napi)?;
+        napi_registered = true;
     } else {
         log::warn!("e1000e iface has no napi_struct; irq mapping not registered");
     }
+
+    if let Err(error) = register_netdevice(&INIT_NET_NAMESPACE, iface.clone()) {
+        let teardown = iface.driver.inner.lock().prepare_quiesce();
+        if let Some(teardown) = teardown {
+            teardown.finish();
+        }
+        if napi_registered {
+            e1000e_irq_manager().unregister_napi(&dev_id);
+        }
+        return Err(error);
+    }
+
+    if let Some(napi) = iface.napi_struct() {
+        crate::driver::net::napi::napi_enable(&napi);
+        // Drain work which may have arrived while the provisional IRQ mapping
+        // was intentionally unable to schedule NAPI.
+        crate::driver::net::napi::napi_schedule(napi);
+    }
+
+    info!("e1000e driver init successfully!\tMAC: [{}]", mac);
+    Ok(())
 }

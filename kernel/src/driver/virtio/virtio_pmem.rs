@@ -130,16 +130,17 @@ impl VirtIOPmemDevice {
         mut transport: VirtIOTransport,
         dev_id: Arc<DeviceId>,
     ) -> Option<(Arc<Self>, Option<DeferredVirtioIrq>)> {
-        let (irq_ready, deferred_irq) = match transport.setup_irq(dev_id.clone()) {
-            Ok(setup) => (true, setup.into_deferred()),
+        let irq_setup = match transport.setup_irq(dev_id.clone()) {
+            Ok(setup) => Some(setup),
             Err(err) => {
                 warn!(
                     "VirtIOPmemDevice '{dev_id:?}' setup_irq failed, falling back to polling: {:?}",
                     err
                 );
-                (false, None)
+                None
             }
         };
+        let irq_ready = irq_setup.is_some();
 
         begin_pmem_init(&mut transport);
         let (start, size) = match read_config(&transport) {
@@ -193,6 +194,7 @@ impl VirtIOPmemDevice {
             flush_mutex: Mutex::new(()),
             flush_wait: WaitQueue::default(),
         });
+        let deferred_irq = irq_setup.and_then(|setup| setup.into_deferred());
         Some((device, deferred_irq))
     }
 

@@ -9,9 +9,12 @@ use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PCI_DEVICE_LINKEDLIST,
 };
-use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
+use crate::driver::pci::pci_irq::{
+    IrqCommonMsg, IrqSpecificMsg, IrqType, PciInterrupt, PciIrqError, PciIrqMsg, IRQ,
+};
 use crate::exception::IrqNumber;
-use alloc::string::ToString;
+use crate::time::Instant;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -19,6 +22,7 @@ use core::ptr::NonNull;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
 use log::{debug, info};
+use system_error::SystemError;
 
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
 
@@ -153,6 +157,9 @@ impl E1000EBuffer {
 
 #[allow(dead_code)]
 pub struct E1000EDevice {
+    pci_device: Arc<PciDeviceStructureGeneralDevice>,
+    irq_dev_id: Arc<DeviceId>,
+    active: bool,
     // 设备寄存器
     // device registers
     general_regs: NonNull<GeneralRegs>,
@@ -176,6 +183,7 @@ pub struct E1000EDevice {
     trans_buffers: Vec<Option<E1000EBuffer>>,
     mac: [u8; 6],
     first_trans: bool,
+    tx_completion_interrupt_armed: bool,
     // napi队列，用于存放在中断关闭期间通过轮询收取的buffer
     // the napi queue is designed to save buffer/packet when the interrupt is close
     // NOTE: this feature is not completely implemented and not used in the current version
@@ -183,6 +191,24 @@ pub struct E1000EDevice {
     napi_buffer_head: usize,
     napi_buffer_tail: usize,
     napi_buffer_empty: bool,
+}
+
+/// Owns the sleep-capable half of e1000e teardown.
+///
+/// Hardware producers are stopped while the device spinlock is held. IRQ
+/// synchronization is deliberately deferred until this token is consumed
+/// after that guard has been dropped.
+pub struct E1000EIrqTeardown {
+    pci_device: Arc<PciDeviceStructureGeneralDevice>,
+    irq_dev_id: Arc<DeviceId>,
+}
+
+impl E1000EIrqTeardown {
+    pub fn finish(self) {
+        if let Err(error) = self.pci_device.irq_uninstall(Some(&self.irq_dev_id)) {
+            log::error!("failed to uninstall e1000e IRQ during teardown: {error:?}");
+        }
+    }
 }
 
 impl E1000EDevice {
@@ -215,20 +241,33 @@ impl E1000EDevice {
 
         // 初始化msi中断
         // initialize msi interupt
+        let lifecycle_guard = device.common_header.irq_lifecycle.lock();
+        device.ensure_irq_unowned()?;
         let irq_vector = device.irq_vector_mut().unwrap();
         irq_vector.write().push(E1000E_RECV_VECTOR);
-        device.irq_init(IRQ::PCI_IRQ_MSI).expect("IRQ Init Failed");
+        if device.irq_init(IRQ::PCI_IRQ_MSI).is_none() {
+            irq_vector.write().clear();
+            return Err(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq).into());
+        }
         let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
                 0,
                 "E1000E_RECV_IRQ".to_string(),
                 &DefaultE1000EIrqHandler,
-                device_id,
+                device_id.clone(),
             ),
             irq_specific_message: IrqSpecificMsg::msi_default(),
         };
-        device.irq_install(msg)?;
-        device.irq_enable(true)?;
+        if let Err(error) = device.irq_install(msg) {
+            irq_vector.write().clear();
+            *device.irq_type.write() = IrqType::Unused;
+            return Err(error.into());
+        }
+        if let Err(error) = device.irq_enable(true) {
+            let _ = device.irq_uninstall_locked(Some(&device_id));
+            return Err(error.into());
+        }
+        drop(lifecycle_guard);
 
         let general_regs: NonNull<GeneralRegs> =
             get_register_ptr(vaddress, E1000E_GENERAL_REGS_OFFSET);
@@ -394,6 +433,9 @@ impl E1000EDevice {
             volwrite!(interrupt_regs, ims, ims);
         }
         return Ok(E1000EDevice {
+            pci_device: device.clone(),
+            irq_dev_id: device_id,
+            active: true,
             general_regs,
             interrupt_regs,
             rctl_regs,
@@ -409,11 +451,42 @@ impl E1000EDevice {
             trans_buffers,
             mac,
             first_trans: true,
+            tx_completion_interrupt_armed: false,
             napi_buffers: (0..E1000E_RECV_NAPI).map(|_| None).collect(),
             napi_buffer_head: 0,
             napi_buffer_tail: 0,
             napi_buffer_empty: true,
         });
+    }
+
+    /// Stops every hardware producer before descriptor ownership is released.
+    /// Idempotence lets probe rollback and `Drop` share one reverse-order path.
+    pub fn prepare_quiesce(&mut self) -> Option<E1000EIrqTeardown> {
+        if !self.active {
+            return None;
+        }
+        unsafe {
+            volwrite!(self.interrupt_regs, imc, E1000E_IMC_CLEAR);
+            let rctl = volread!(self.rctl_regs, rctl) & !E1000E_RCTL_EN;
+            volwrite!(self.rctl_regs, rctl, rctl);
+            let tctl = volread!(self.tctl_regs, tctl) & !E1000E_TCTL_EN;
+            volwrite!(self.tctl_regs, tctl, tctl);
+            // Flush posted PCI writes before waiting for outstanding DMA.
+            let _ = volread!(self.general_regs, status);
+        }
+        compiler_fence(Ordering::SeqCst);
+        // Intel e1000e requires a 10 ms drain interval after RX/TX disable.
+        // Teardown can run while the device's spinlock is owned, so this
+        // hardware barrier must not enter the scheduler.
+        let drain_deadline = Instant::now().total_micros().saturating_add(10_000);
+        while Instant::now().total_micros() < drain_deadline {
+            core::hint::spin_loop();
+        }
+        self.active = false;
+        Some(E1000EIrqTeardown {
+            pci_device: self.pci_device.clone(),
+            irq_dev_id: self.irq_dev_id.clone(),
+        })
     }
     pub fn e1000e_receive(&mut self) -> Option<E1000EBuffer> {
         self.e1000e_intr();
@@ -449,6 +522,40 @@ impl E1000EDevice {
             return false;
         }
         true
+    }
+
+    /// Arm a one-shot TX completion wakeup and recheck the descriptor after
+    /// publishing the interrupt mask. This mirrors Linux's stop/recheck
+    /// pattern and closes the completion-before-arm race.
+    pub fn arm_tx_completion_interrupt(&mut self) -> bool {
+        if self.e1000e_can_transmit() {
+            return true;
+        }
+        if !self.tx_completion_interrupt_armed {
+            unsafe { volwrite!(self.interrupt_regs, ims, E1000E_IMS_TXDW) };
+            self.tx_completion_interrupt_armed = true;
+        }
+        if !self.e1000e_can_transmit() {
+            return false;
+        }
+        self.disarm_tx_completion_interrupt();
+        true
+    }
+
+    /// Consume an armed wakeup once descriptor capacity is observable. TXDW
+    /// remains masked during normal traffic, avoiding one interrupt per frame
+    /// even though every descriptor requests status write-back.
+    pub fn take_tx_completion_wakeup(&mut self) -> bool {
+        if !self.tx_completion_interrupt_armed || !self.e1000e_can_transmit() {
+            return false;
+        }
+        self.disarm_tx_completion_interrupt();
+        true
+    }
+
+    fn disarm_tx_completion_interrupt(&mut self) {
+        unsafe { volwrite!(self.interrupt_regs, imc, E1000E_IMS_TXDW) };
+        self.tx_completion_interrupt_armed = false;
     }
 
     pub fn e1000e_transmit(&mut self, packet: E1000EBuffer) -> Result<(), E1000EBuffer> {
@@ -560,6 +667,9 @@ impl E1000EDevice {
 
 impl Drop for E1000EDevice {
     fn drop(&mut self) {
+        if let Some(teardown) = self.prepare_quiesce() {
+            teardown.finish();
+        }
         // 释放已分配的所有dma页
         // free all dma pages we have allocated
         debug!("droping...");
@@ -623,18 +733,18 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
                     standard_device.common_header.device_id
                 );
 
-                // todo: 根据pci的path来生成device id
+                let pci_function = String::from(standard_device.common_header.bus_device_function);
                 let dev_id = DeviceId::new(
                     None,
                     Some(format!(
-                        "e1000e_{}",
-                        standard_device.common_header.device_id
+                        "e1000e_{}_{pci_function}",
+                        standard_device.common_header.device_id,
                     )),
                 )
                 .unwrap();
 
                 let e1000e = E1000EDevice::new(standard_device.clone(), dev_id.clone())?;
-                e1000e_driver_init(e1000e, dev_id);
+                e1000e_driver_init(e1000e, dev_id)?;
                 initialized = true;
             }
         }
@@ -759,6 +869,7 @@ const E1000E_CTRL_TFCE: u32 = 1 << 28;
 const E1000E_CTRL_PHY_RST: u32 = 1 << 31;
 
 // IMS
+const E1000E_IMS_TXDW: u32 = 1 << 0;
 const E1000E_IMS_LSC: u32 = 1 << 2;
 const E1000E_IMS_RXDMT0: u32 = 1 << 4;
 #[allow(dead_code)]
@@ -818,12 +929,19 @@ pub enum E1000EPciError {
     // Size of BAR is not 128KB
     UnexpectedBarSize,
     Pci(PciError),
+    Netdevice(SystemError),
 }
 
 /// PCI error到VirtioPciError的转换，层层上报
 impl From<PciError> for E1000EPciError {
     fn from(error: PciError) -> Self {
         Self::Pci(error)
+    }
+}
+
+impl From<SystemError> for E1000EPciError {
+    fn from(error: SystemError) -> Self {
+        Self::Netdevice(error)
     }
 }
 

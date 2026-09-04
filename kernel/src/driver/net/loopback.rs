@@ -367,26 +367,6 @@ impl LoopbackInterface {
             ip_addrs.push(cidr6).expect("Push ipCidr failed: full");
         });
 
-        iface.routes_mut().update(|routes_map| {
-            routes_map
-                .push(smoltcp::iface::Route {
-                    cidr,
-                    via_router: None,
-                    preferred_until: None,
-                    expires_at: None,
-                })
-                .expect("Add default ipv4 route failed: full");
-
-            routes_map
-                .push(smoltcp::iface::Route {
-                    cidr: cidr6,
-                    via_router: None,
-                    preferred_until: None,
-                    expires_at: None,
-                })
-                .expect("Add default ipv6 route failed: full");
-        });
-
         let flags = InterfaceFlags::LOOPBACK
             | InterfaceFlags::UP
             | InterfaceFlags::RUNNING
@@ -603,6 +583,15 @@ impl Iface for LoopbackInterface {
         Ok(())
     }
 
+    fn route_and_send(
+        &self,
+        _next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+    ) -> Result<(), super::RouteSendError> {
+        self.inject_local_ipv4_packet(self.nic_id() as u32, self.mac(), ip_packet, false)
+            .map_err(Into::into)
+    }
+
     fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {
         self.common.should_drop_rx_packet(packet)
     }
@@ -646,8 +635,6 @@ pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
     // 标识网络设备已经启动
     iface.set_net_state(NetDeivceState::__LINK_STATE_START);
 
-    register_netdevice(iface.clone()).expect("register lo device failed");
-
     iface
 }
 
@@ -667,9 +654,9 @@ pub fn loopback_driver_init() {
 
         let iface = generate_loopback_iface_default();
 
-        INIT_NET_NAMESPACE.add_device(iface.clone());
+        register_netdevice(&INIT_NET_NAMESPACE, iface.clone())
+            .expect("register loopback in root netns");
         INIT_NET_NAMESPACE.set_loopback_iface(iface.clone());
-        iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
     });
 }
 

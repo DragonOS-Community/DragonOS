@@ -1,5 +1,7 @@
 use crate::{
-    driver::net::types::InterfaceFlags, net::Iface, process::namespace::net_namespace::NetNamespace,
+    driver::net::types::InterfaceFlags,
+    net::{address::source_address_usable_on_iface, Iface},
+    process::namespace::net_namespace::NetNamespace,
 };
 use alloc::sync::Arc;
 
@@ -33,6 +35,48 @@ pub struct BoundInner {
     netns: Arc<NetNamespace>,
     // inner: Vec<(smoltcp::iface::SocketHandle, Arc<dyn Iface>)>
     // address: smoltcp::wire::IpAddress,
+}
+
+/// The interface-local smoltcp stack and address selected for an implicit
+/// bind. `stack_owner` is deliberately not the route's output interface:
+/// incoming packets are delivered to the owner of `local_addr`, while output
+/// is independently routed through the namespace FIB.
+pub(crate) struct EphemeralBindTarget {
+    pub(crate) stack_owner: Arc<dyn Iface>,
+    pub(crate) local_addr: smoltcp::wire::IpAddress,
+}
+
+/// Keeps namespace-routed polling active across a protocol-state publication
+/// window. It is independent of the notification list so connect and close
+/// can preserve the same output invariant without changing their lock order.
+#[derive(Debug)]
+pub(crate) struct RoutedSocketPublication {
+    iface: Arc<dyn Iface>,
+}
+
+impl RoutedSocketPublication {
+    pub(crate) fn begin(iface: Arc<dyn Iface>) -> Self {
+        iface.common().begin_routed_socket_publication();
+        Self { iface }
+    }
+}
+
+impl Drop for RoutedSocketPublication {
+    fn drop(&mut self) {
+        self.iface.common().finish_routed_socket_publication();
+    }
+}
+
+/// Returns whether a concrete bind address has a unique local-delivery owner.
+/// Wildcard, multicast, and broadcast sockets remain interface-scoped and use
+/// the device-selection policy instead.
+#[inline]
+pub(crate) fn bind_address_uses_local_owner(address: smoltcp::wire::IpAddress) -> bool {
+    matches!(
+        address,
+        smoltcp::wire::IpAddress::Ipv4(address)
+            if !address.is_unspecified() && !address.is_multicast() && !address.is_broadcast()
+    )
 }
 
 impl BoundInner {
@@ -129,20 +173,20 @@ impl BoundInner {
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
-        let (iface, address) = match get_ephemeral_iface(&remote, netns.clone()) {
+        let target = match get_ephemeral_bind_target(&remote, netns.clone()) {
             Ok(result) => result,
             Err(err) => return Err((socket, err)),
         };
         // let bound_port = iface.port_manager().bind_ephemeral_port(socket_type)?;
-        let handle = iface.sockets().lock().add(socket);
+        let handle = target.stack_owner.sockets().lock().add(socket);
         // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
         Ok((
             Self {
                 handle,
-                iface,
+                iface: target.stack_owner,
                 netns,
             },
-            address,
+            target.local_addr,
         ))
     }
 
@@ -267,22 +311,17 @@ pub(crate) fn get_iface_for_local_bind(
     ip_addr: &smoltcp::wire::IpAddress,
     netns: &Arc<NetNamespace>,
 ) -> Option<Arc<dyn Iface>> {
-    let device_list = netns.device_list();
-
     // Preserve existing Linux-compatible bind behavior for multicast and
     // broadcast addresses, where the address is not configured as a unicast
     // address on an interface.
     if ip_addr.is_multicast() || ip_addr.is_broadcast() {
+        let device_list = netns.device_list();
         return netns
             .default_iface()
             .or_else(|| device_list.values().next().cloned());
     }
 
-    if let Some(iface) = device_list
-        .iter()
-        .find(|(_, iface)| iface.smol_iface().lock().has_ip_addr(*ip_addr))
-        .map(|(_, iface)| iface.clone())
-    {
+    if let Some(iface) = crate::net::route::local_address_owner(netns, *ip_addr) {
         return Some(iface);
     }
 
@@ -291,6 +330,7 @@ pub(crate) fn get_iface_for_local_bind(
     // binding to an unassigned IPv6 address in an on-link prefix fails with
     // EADDRNOTAVAIL.
     if let smoltcp::wire::IpAddress::Ipv4(v4_addr) = ip_addr {
+        let device_list = netns.device_list();
         return device_list.iter().find_map(|(_, iface)| {
             loopback_iface_contains_v4(iface, *v4_addr).then(|| iface.clone())
         });
@@ -396,18 +436,50 @@ fn loopback_iface_contains_v6(iface: &Arc<dyn Iface>, v6_addr: smoltcp::wire::Ip
 /// Get a suitable iface to deal with sendto/connect request if the socket is not bound to an iface.
 /// Linux-like behavior: for implicit bind on connect/sendto, the stack must be able to select a
 /// valid local source address for the given remote destination.
-fn get_ephemeral_iface(
+fn get_ephemeral_bind_target(
     remote_ip_addr: &smoltcp::wire::IpAddress,
     netns: Arc<NetNamespace>,
-) -> Result<(Arc<dyn Iface>, smoltcp::wire::IpAddress), SystemError> {
-    let default_iface = netns.default_iface();
+) -> Result<EphemeralBindTarget, SystemError> {
     let no_source_error = no_source_addr_error(remote_ip_addr);
     let loopback_dst = is_loopback_destination(remote_ip_addr);
+
+    // Unicast egress is decided exclusively by the authoritative per-netns
+    // FIB. A miss must not fall back to default_iface or device iteration,
+    // otherwise RTM_GETROUTE and the actual packet path disagree.
+    if !remote_ip_addr.is_unspecified()
+        && !remote_ip_addr.is_multicast()
+        && !remote_ip_addr.is_broadcast()
+    {
+        if matches!(remote_ip_addr, smoltcp::wire::IpAddress::Ipv4(_)) {
+            let resolved =
+                crate::net::route::resolve_ipv4_route(&netns, *remote_ip_addr, None, None)?;
+            let iface = netns
+                .device_list()
+                .get(&(resolved.decision.oif as usize))
+                .cloned()
+                .ok_or(SystemError::ENETUNREACH)?;
+            return ephemeral_target_for_source(&netns, iface, resolved.source, no_source_error);
+        }
+        let decision = crate::net::route::lookup(&netns, *remote_ip_addr)
+            .ok_or_else(|| no_source_error.clone())?;
+        let iface = netns
+            .device_list()
+            .get(&(decision.oif as usize))
+            .cloned()
+            .ok_or(SystemError::ENETUNREACH)?;
+        ensure_iface_up_for_route(&iface, decision.matched.kind)?;
+        // An explicit FIB decision is authoritative, including routes that
+        // deliberately send non-loopback destinations through `lo`.
+        let source = ipv6_route_source_from_decision(&netns, &iface, remote_ip_addr, decision)?;
+        return ephemeral_target_for_source(&netns, iface, source, no_source_error);
+    }
+
+    let default_iface = netns.default_iface();
 
     if let Some(iface) = get_iface_to_bind(remote_ip_addr, netns.clone()) {
         if iface_allowed_for_remote(&iface, loopback_dst) {
             if let Some(local_addr) = pick_configured_source_addr(&iface, remote_ip_addr) {
-                return Ok((iface, local_addr));
+                return ephemeral_target_for_source(&netns, iface, local_addr, no_source_error);
             }
         }
     }
@@ -415,30 +487,141 @@ fn get_ephemeral_iface(
     if let Some(iface) = default_iface {
         if iface_allowed_for_remote(&iface, loopback_dst) {
             if let Some(local_addr) = pick_configured_source_addr(&iface, remote_ip_addr) {
-                return Ok((iface, local_addr));
+                return ephemeral_target_for_source(&netns, iface, local_addr, no_source_error);
             }
         }
     }
 
-    for (_, iface) in netns.device_list().iter() {
-        if !iface_allowed_for_remote(iface, loopback_dst) {
-            continue;
-        }
-
-        if let Some(local_addr) = pick_configured_source_addr(iface, remote_ip_addr) {
-            return Ok((iface.clone(), local_addr));
-        }
+    // Clone the candidate before owner resolution: local_address_owner() also
+    // reads the topology, and RwSem writer preference forbids recursive reads
+    // once a writer is queued.
+    let (candidate, no_devices) = {
+        let devices = netns.device_list();
+        let candidate = devices.iter().find_map(|(_, iface)| {
+            if !iface_allowed_for_remote(iface, loopback_dst) {
+                return None;
+            }
+            pick_configured_source_addr(iface, remote_ip_addr)
+                .map(|local_addr| (iface.clone(), local_addr))
+        });
+        (candidate, devices.is_empty())
+    };
+    if let Some((iface, local_addr)) = candidate {
+        return ephemeral_target_for_source(&netns, iface, local_addr, no_source_error);
     }
 
-    if netns.device_list().is_empty() {
+    if no_devices {
         return Err(SystemError::ENODEV);
     }
 
     Err(no_source_error)
 }
 
+/// Selects the SocketSet owner for a source chosen on `egress_iface`.
+///
+/// IPv4 local delivery follows the namespace local FIB and may therefore
+/// target a different interface from egress. Native IPv6 output is still
+/// interface-local, so IPv6 retains the egress stack until the routed-output
+/// backend supports that family as well.
+pub(crate) fn ephemeral_target_for_source(
+    netns: &Arc<NetNamespace>,
+    egress_iface: Arc<dyn Iface>,
+    local_addr: smoltcp::wire::IpAddress,
+    no_source_error: SystemError,
+) -> Result<EphemeralBindTarget, SystemError> {
+    let stack_owner = match local_addr {
+        smoltcp::wire::IpAddress::Ipv4(address) if !address.is_unspecified() => {
+            crate::net::route::local_address_owner(netns, local_addr).ok_or(no_source_error)?
+        }
+        _ => egress_iface,
+    };
+    Ok(EphemeralBindTarget {
+        stack_owner,
+        local_addr,
+    })
+}
+
+pub(crate) fn ephemeral_bind_target_on_iface(
+    netns: &Arc<NetNamespace>,
+    egress_iface: Arc<dyn Iface>,
+    remote: &smoltcp::wire::IpAddress,
+) -> Result<EphemeralBindTarget, SystemError> {
+    let local_addr = route_source_on_iface(netns, &egress_iface, remote)?;
+    ephemeral_target_for_source(
+        netns,
+        egress_iface,
+        local_addr,
+        no_source_addr_error(remote),
+    )
+}
+
+pub(crate) fn route_source_on_iface(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    remote: &smoltcp::wire::IpAddress,
+) -> Result<smoltcp::wire::IpAddress, SystemError> {
+    if remote.is_unspecified() || remote.is_multicast() || remote.is_broadcast() {
+        ensure_iface_up(iface)?;
+        return pick_configured_source_addr(iface, remote).ok_or(no_source_addr_error(remote));
+    }
+    if matches!(remote, smoltcp::wire::IpAddress::Ipv4(_)) {
+        return crate::net::route::resolve_ipv4_route(
+            netns,
+            *remote,
+            Some(iface.nic_id() as u32),
+            None,
+        )
+        .map(|resolved| resolved.source);
+    }
+    let decision = crate::net::route::lookup_on_iface(netns, *remote, iface.nic_id() as u32)
+        .ok_or(SystemError::ENETUNREACH)?;
+    ensure_iface_up_for_route(iface, decision.matched.kind)?;
+    ipv6_route_source_from_decision(netns, iface, remote, decision)
+}
+
+fn ensure_iface_up_for_route(iface: &Arc<dyn Iface>, kind: u8) -> Result<(), SystemError> {
+    if kind == crate::net::route::RTN_LOCAL {
+        return Ok(());
+    }
+    ensure_iface_up(iface)
+}
+
+fn ipv6_route_source_from_decision(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    remote: &smoltcp::wire::IpAddress,
+    decision: crate::net::route::RouteLookupResult,
+) -> Result<smoltcp::wire::IpAddress, SystemError> {
+    debug_assert_eq!(decision.oif as usize, iface.nic_id());
+    debug_assert!(matches!(remote, smoltcp::wire::IpAddress::Ipv6(_)));
+    match decision.source {
+        crate::net::route::RouteSourcePolicy::Preferred(source)
+            if source_address_usable_on_iface(netns, iface, source) =>
+        {
+            Ok(source)
+        }
+        crate::net::route::RouteSourcePolicy::Preferred(_) => Err(no_source_addr_error(remote)),
+        crate::net::route::RouteSourcePolicy::SelectConfigured => {
+            pick_configured_source_addr(iface, remote).ok_or(no_source_addr_error(remote))
+        }
+        crate::net::route::RouteSourcePolicy::AllowUnspecified => {
+            Ok(pick_configured_source_addr(iface, remote)
+                .unwrap_or(smoltcp::wire::IpAddress::v4(0, 0, 0, 0)))
+        }
+    }
+}
+
+fn ensure_iface_up(iface: &Arc<dyn Iface>) -> Result<(), SystemError> {
+    if iface.flags().contains(InterfaceFlags::UP) {
+        Ok(())
+    } else {
+        Err(SystemError::ENETDOWN)
+    }
+}
+
 fn iface_allowed_for_remote(iface: &Arc<dyn Iface>, loopback_dst: bool) -> bool {
-    iface.flags().contains(InterfaceFlags::LOOPBACK) == loopback_dst
+    let flags = iface.flags();
+    flags.contains(InterfaceFlags::UP) && flags.contains(InterfaceFlags::LOOPBACK) == loopback_dst
 }
 
 fn no_source_addr_error(remote_ip_addr: &smoltcp::wire::IpAddress) -> SystemError {

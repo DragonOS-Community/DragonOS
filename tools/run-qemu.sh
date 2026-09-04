@@ -618,6 +618,14 @@ setup_kernel_cmdline_from_env() {
         echo "[INFO] Setting kernel loglevel to ${DRAGONOS_LOGLEVEL} from environment variable"
     fi
 
+    # Synthetic veth/bridge devices are test fixtures, not production boot
+    # devices. DUnit tests depend on them; manual test runs can opt in with
+    # DRAGONOS_NET_TEST_FIXTURES=1.
+    if [ "${DRAGONOS_NET_TEST_FIXTURES}" == "1" ] || [ "${AUTO_TEST}" == "dunit" ]; then
+        KERNEL_CMDLINE+=" dragonos.net_test_fixtures "
+        echo "[INFO] Enabling synthetic network test fixtures"
+    fi
+
     # 检测其他环境变量可以在这里添加
     # 例如：
     # if [ -n "${DRAGONOS_DEBUG}" ]; then

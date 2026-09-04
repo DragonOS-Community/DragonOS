@@ -1,280 +1,35 @@
-#include <gtest/gtest.h>
+#include "rtnetlink_route_test_support.h"
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <linux/if_addr.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
-
-#include <cstring>
-#include <optional>
-#include <string>
-#include <vector>
-
-namespace {
-
-class FdGuard {
-  public:
-    explicit FdGuard(int fd = -1) : fd_(fd) {}
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
-    ~FdGuard() { Reset(); }
-
-    int Get() const { return fd_; }
-
-    void Reset(int fd = -1) {
-        if (fd_ >= 0) {
-            close(fd_);
-        }
-        fd_ = fd;
+TEST(RtnetlinkRouteSemantics, Ipv4BuiltinRulesFallBackFromMainToDefaultTable) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << ErrnoString(errno);
+    if (child == 0) {
+        const int result = RunIpv4BuiltinRuleChain();
+        if (result != 0) dprintf(STDERR_FILENO, "builtin rule child failed: %d\n", result);
+        _exit(result == 0 ? 0 : 1);
     }
 
-  private:
-    int fd_;
-};
-
-std::string ErrnoString(int err) {
-    return std::to_string(err) + " (" + std::strerror(err) + ")";
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child) << ErrnoString(errno);
+    FdGuard cleanup(OpenRouteSocket());
+    ASSERT_GE(cleanup.Get(), 0);
+    uint32_t cleanup_seq = 100;
+    const uint32_t egress = if_nametoindex("veth1");
+    RouteSpec through_default = MakeIpv4Route("198.19.0.0", 24, egress);
+    through_default.gateway = Ipv4("198.18.240.1");
+    RouteSpec gateway_link = MakeIpv4Route("198.18.240.0", 24, egress);
+    gateway_link.table = RT_TABLE_DEFAULT;
+    RouteSpec main = MakeIpv4Route("203.0.0.0", 16, egress);
+    RouteSpec fallback = MakeIpv4Route("203.0.113.0", 24, egress);
+    fallback.gateway = Ipv4("111.111.11.2");
+    fallback.table = RT_TABLE_DEFAULT;
+    DeleteRouteIfPresent(cleanup.Get(), through_default, &cleanup_seq);
+    DeleteRouteIfPresent(cleanup.Get(), gateway_link, &cleanup_seq);
+    DeleteRouteIfPresent(cleanup.Get(), main, &cleanup_seq);
+    DeleteRouteIfPresent(cleanup.Get(), fallback, &cleanup_seq);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
-
-struct RouteSpec {
-    uint32_t dst = 0;
-    uint8_t prefix_len = 0;
-    uint8_t table = RT_TABLE_UNSPEC;
-    uint32_t oif = 0;
-    std::optional<uint32_t> gateway;
-};
-
-struct DumpedRoute {
-    uint32_t dst = 0;
-    uint8_t prefix_len = 0;
-    uint8_t table = RT_TABLE_UNSPEC;
-    uint32_t oif = 0;
-    bool has_gateway = false;
-};
-
-uint32_t Ipv4(const char* text);
-
-int OpenRouteSocket() {
-    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-    if (fd < 0) {
-        return -1;
-    }
-
-    sockaddr_nl addr = {};
-    addr.nl_family = AF_NETLINK;
-    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        int saved_errno = errno;
-        close(fd);
-        errno = saved_errno;
-        return -1;
-    }
-    return fd;
-}
-
-void AddAttr(nlmsghdr* nlh, size_t max_len, uint16_t type, const void* data, size_t len) {
-    size_t attr_len = RTA_LENGTH(len);
-    size_t aligned_len = RTA_ALIGN(attr_len);
-    ASSERT_LE(static_cast<size_t>(nlh->nlmsg_len) + aligned_len, max_len);
-
-    auto* rta = reinterpret_cast<rtattr*>(reinterpret_cast<char*>(nlh) + NLMSG_ALIGN(nlh->nlmsg_len));
-    rta->rta_type = type;
-    rta->rta_len = attr_len;
-    std::memcpy(RTA_DATA(rta), data, len);
-    std::memset(reinterpret_cast<char*>(rta) + attr_len, 0, aligned_len - attr_len);
-    nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + aligned_len;
-}
-
-int RecvAck(int fd, uint32_t seq) {
-    char buf[4096] = {};
-    for (;;) {
-        ssize_t len = recv(fd, buf, sizeof(buf), 0);
-        if (len < 0) {
-            return errno;
-        }
-
-        for (auto* nlh = reinterpret_cast<nlmsghdr*>(buf); NLMSG_OK(nlh, len);
-             nlh = NLMSG_NEXT(nlh, len)) {
-            if (nlh->nlmsg_seq != seq) {
-                continue;
-            }
-            if (nlh->nlmsg_type != NLMSG_ERROR) {
-                continue;
-            }
-
-            auto* err = reinterpret_cast<nlmsgerr*>(NLMSG_DATA(nlh));
-            return err->error == 0 ? 0 : -err->error;
-        }
-    }
-}
-
-int SendRouteRequest(int fd, uint16_t type, uint16_t flags, const RouteSpec& route, uint32_t seq) {
-    alignas(nlmsghdr) char buf[512] = {};
-    auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
-    auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
-
-    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
-    nlh->nlmsg_type = type;
-    nlh->nlmsg_flags = flags;
-    nlh->nlmsg_seq = seq;
-
-    rtm->rtm_family = AF_INET;
-    rtm->rtm_dst_len = route.prefix_len;
-    rtm->rtm_table = route.table;
-    rtm->rtm_protocol = RTPROT_STATIC;
-    rtm->rtm_scope = route.gateway.has_value() ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK;
-    rtm->rtm_type = RTN_UNICAST;
-
-    if (route.prefix_len != 0) {
-        AddAttr(nlh, sizeof(buf), RTA_DST, &route.dst, sizeof(route.dst));
-    }
-    AddAttr(nlh, sizeof(buf), RTA_OIF, &route.oif, sizeof(route.oif));
-    if (route.gateway.has_value()) {
-        uint32_t gw = *route.gateway;
-        AddAttr(nlh, sizeof(buf), RTA_GATEWAY, &gw, sizeof(gw));
-    }
-
-    if (send(fd, nlh, nlh->nlmsg_len, 0) != static_cast<ssize_t>(nlh->nlmsg_len)) {
-        return errno;
-    }
-    return RecvAck(fd, seq);
-}
-
-int SendAddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex, const char* addr,
-                    uint8_t prefix_len, uint32_t seq) {
-    alignas(nlmsghdr) char buf[512] = {};
-    auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
-    auto* ifa = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(nlh));
-
-    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(ifaddrmsg));
-    nlh->nlmsg_type = type;
-    nlh->nlmsg_flags = flags;
-    nlh->nlmsg_seq = seq;
-
-    ifa->ifa_family = AF_INET;
-    ifa->ifa_prefixlen = prefix_len;
-    ifa->ifa_scope = RT_SCOPE_HOST;
-    ifa->ifa_index = ifindex;
-
-    uint32_t ip = Ipv4(addr);
-    AddAttr(nlh, sizeof(buf), IFA_LOCAL, &ip, sizeof(ip));
-    AddAttr(nlh, sizeof(buf), IFA_ADDRESS, &ip, sizeof(ip));
-
-    if (send(fd, nlh, nlh->nlmsg_len, 0) != static_cast<ssize_t>(nlh->nlmsg_len)) {
-        return errno;
-    }
-    return RecvAck(fd, seq);
-}
-
-std::vector<DumpedRoute> DumpRoutes(int fd, uint32_t seq) {
-    alignas(nlmsghdr) char req_buf[NLMSG_LENGTH(sizeof(rtmsg))] = {};
-    auto* nlh = reinterpret_cast<nlmsghdr*>(req_buf);
-    auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
-
-    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
-    nlh->nlmsg_type = RTM_GETROUTE;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-    nlh->nlmsg_seq = seq;
-    rtm->rtm_family = AF_INET;
-
-    EXPECT_EQ(send(fd, nlh, nlh->nlmsg_len, 0), static_cast<ssize_t>(nlh->nlmsg_len))
-            << "send RTM_GETROUTE failed: " << ErrnoString(errno);
-
-    std::vector<DumpedRoute> routes;
-    char buf[8192] = {};
-    bool done = false;
-    while (!done) {
-        ssize_t len = recv(fd, buf, sizeof(buf), 0);
-        if (len < 0) {
-            ADD_FAILURE() << "recv RTM_GETROUTE failed: " << ErrnoString(errno);
-            break;
-        }
-
-        for (auto* msg = reinterpret_cast<nlmsghdr*>(buf); NLMSG_OK(msg, len);
-             msg = NLMSG_NEXT(msg, len)) {
-            if (msg->nlmsg_seq != seq) {
-                continue;
-            }
-            if (msg->nlmsg_type == NLMSG_DONE) {
-                done = true;
-                break;
-            }
-            if (msg->nlmsg_type != RTM_NEWROUTE) {
-                continue;
-            }
-
-            auto* route_msg = reinterpret_cast<rtmsg*>(NLMSG_DATA(msg));
-            DumpedRoute route = {};
-            route.prefix_len = route_msg->rtm_dst_len;
-            route.table = route_msg->rtm_table;
-
-            int attr_len = msg->nlmsg_len - NLMSG_LENGTH(sizeof(rtmsg));
-            for (auto* attr = RTM_RTA(route_msg); RTA_OK(attr, attr_len);
-                 attr = RTA_NEXT(attr, attr_len)) {
-                switch (attr->rta_type) {
-                    case RTA_DST:
-                        if (RTA_PAYLOAD(attr) >= sizeof(route.dst)) {
-                            std::memcpy(&route.dst, RTA_DATA(attr), sizeof(route.dst));
-                        }
-                        break;
-                    case RTA_OIF:
-                        if (RTA_PAYLOAD(attr) >= sizeof(route.oif)) {
-                            std::memcpy(&route.oif, RTA_DATA(attr), sizeof(route.oif));
-                        }
-                        break;
-                    case RTA_GATEWAY:
-                        route.has_gateway = true;
-                        break;
-                    default:
-                        break;
-                }
-            }
-            routes.push_back(route);
-        }
-    }
-    return routes;
-}
-
-std::optional<DumpedRoute> FindRoute(int fd, const RouteSpec& spec, uint32_t seq) {
-    for (const auto& route : DumpRoutes(fd, seq)) {
-        if (route.dst == spec.dst && route.prefix_len == spec.prefix_len &&
-            route.oif == spec.oif) {
-            return route;
-        }
-    }
-    return std::nullopt;
-}
-
-void DeleteRouteIfPresent(int fd, const RouteSpec& spec, uint32_t* seq) {
-    (void)SendRouteRequest(fd, RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, spec, ++(*seq));
-}
-
-void DeleteAddrIfPresent(int fd, uint32_t ifindex, const char* addr, uint8_t prefix_len,
-                         uint32_t* seq) {
-    (void)SendAddrRequest(fd, RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, ifindex, addr, prefix_len,
-                          ++(*seq));
-}
-
-uint32_t Ipv4(const char* text) {
-    in_addr addr = {};
-    EXPECT_EQ(inet_pton(AF_INET, text, &addr), 1) << text;
-    return addr.s_addr;
-}
-
-RouteSpec MakeIpv4Route(const char* dst, uint8_t prefix_len, uint32_t oif) {
-    RouteSpec route = {};
-    route.dst = Ipv4(dst);
-    route.prefix_len = prefix_len;
-    route.oif = oif;
-    return route;
-}
-
-}  // namespace
 
 TEST(RtnetlinkRouteSemantics, OnLinkRouteWithUnspecTableDumpsAsMainWithoutGateway) {
     FdGuard fd(OpenRouteSocket());
@@ -293,7 +48,7 @@ TEST(RtnetlinkRouteSemantics, OnLinkRouteWithUnspecTableDumpsAsMainWithoutGatewa
     auto dumped = FindRoute(fd.Get(), route, ++seq);
     ASSERT_TRUE(dumped.has_value());
     EXPECT_EQ(dumped->table, RT_TABLE_MAIN);
-    EXPECT_FALSE(dumped->has_gateway);
+    EXPECT_FALSE(dumped->gateway.has_value());
 
     EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq),
               0);
@@ -308,6 +63,8 @@ TEST(RtnetlinkRouteSemantics, DefaultDevRouteWithoutGatewaySucceeds) {
 
     RouteSpec route = {};
     route.oif = lo;
+    // Keep this test independent of a default route installed during boot.
+    route.priority = 4242;
     DeleteRouteIfPresent(fd.Get(), route, &seq);
 
     EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
@@ -318,7 +75,385 @@ TEST(RtnetlinkRouteSemantics, DefaultDevRouteWithoutGatewaySucceeds) {
               0);
 }
 
-TEST(RtnetlinkRouteSemantics, FailedDataPlaneSyncRollsBackNormalizedTableRoute) {
+TEST(RtnetlinkRouteSemantics, NonStrictRequestsIgnoreUnknownAttributes) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2250;
+    uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+
+    RouteSpec route = MakeIpv4Route("198.18.87.0", 24, lo);
+    DeleteRouteIfPresent(fd.Get(), route, &seq);
+    constexpr uint16_t kUnknownRouteAttribute = RTA_MAX + 1;
+
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq, kUnknownRouteAttribute),
+              0);
+    EXPECT_TRUE(FindRoute(fd.Get(), route, ++seq).has_value());
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq,
+                               kUnknownRouteAttribute),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, MetricAliasesUseLowestPriorityAndWildcardDeleteFirstMatch) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2500;
+    uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+
+    RouteSpec metric_200 = MakeIpv4Route("198.18.88.0", 24, lo);
+    metric_200.priority = 200;
+    RouteSpec metric_100 = metric_200;
+    metric_100.priority = 100;
+    DeleteRouteIfPresent(fd.Get(), metric_100, &seq);
+    DeleteRouteIfPresent(fd.Get(), metric_200, &seq);
+
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                               metric_200, ++seq),
+              0);
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                               metric_100, ++seq),
+              0);
+    EXPECT_TRUE(FindRoute(fd.Get(), metric_100, ++seq).has_value());
+    EXPECT_TRUE(FindRoute(fd.Get(), metric_200, ++seq).has_value());
+
+    RouteSpec wrong_metric = metric_100;
+    wrong_metric.priority = 300;
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, wrong_metric,
+                               ++seq),
+              ESRCH);
+
+    RouteSpec wildcard = metric_100;
+    wildcard.priority = 0;
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, wildcard,
+                               ++seq),
+              0);
+    EXPECT_FALSE(FindRoute(fd.Get(), metric_100, ++seq).has_value());
+    EXPECT_TRUE(FindRoute(fd.Get(), metric_200, ++seq).has_value());
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, metric_200,
+                               ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, ReplaceAndDeleteMatchGatewayPrecisely) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2700;
+    uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+
+    RouteSpec route = MakeIpv4Route("198.18.89.0", 24, lo);
+    route.priority = 100;
+    route.gateway = Ipv4("127.0.0.2");
+    DeleteRouteIfPresent(fd.Get(), route, &seq);
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              0);
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              EEXIST);
+
+    RouteSpec replacement = route;
+    replacement.gateway = Ipv4("127.0.0.3");
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE, replacement, ++seq),
+              0);
+    auto dumped = FindRoute(fd.Get(), replacement, ++seq);
+    ASSERT_TRUE(dumped.has_value());
+    EXPECT_EQ(dumped->gateway, replacement.gateway);
+    auto lookup = LookupIpv4Route(fd.Get(), "198.18.89.42", ++seq);
+    ASSERT_TRUE(lookup.has_value());
+    EXPECT_EQ(lookup->prefix_len, 32);
+    EXPECT_EQ(lookup->oif, lo);
+    EXPECT_EQ(lookup->gateway, replacement.gateway);
+
+    RouteSpec wrong_gateway = replacement;
+    wrong_gateway.gateway = Ipv4("127.0.0.4");
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, wrong_gateway,
+                               ++seq),
+              ESRCH);
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, replacement,
+                               ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, CreateFlagIsRequiredForNewIpv4Alias) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2850;
+    uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+
+    RouteSpec first = MakeIpv4Route("198.18.219.0", 24, lo);
+    first.priority = 2850;
+    first.gateway = Ipv4("127.0.0.2");
+    RouteSpec alias = first;
+    alias.gateway = Ipv4("127.0.0.3");
+    DeleteRouteIfPresent(fd.Get(), first, &seq);
+    DeleteRouteIfPresent(fd.Get(), alias, &seq);
+
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, first,
+                               ++seq),
+              0);
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_ACK, alias, ++seq),
+              ENOENT);
+    EXPECT_TRUE(FindRoute(fd.Get(), first, ++seq).has_value());
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, first, ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, ZeroOifDoesNotConstrainGatewayResolution) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2900;
+    uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+
+    RouteSpec route = MakeIpv4Route("198.18.220.0", 24, 0);
+    route.priority = 2900;
+    route.gateway = Ipv4("127.0.0.2");
+    RouteSpec committed = route;
+    committed.oif = lo;
+    DeleteRouteIfPresent(fd.Get(), committed, &seq);
+
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              0);
+    auto dumped = FindRoute(fd.Get(), committed, ++seq);
+    ASSERT_TRUE(dumped.has_value());
+    EXPECT_EQ(dumped->oif, lo);
+    EXPECT_EQ(dumped->gateway, route.gateway);
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, committed,
+                               ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, MissingAndCompactDestinationPayloadsKeepPrefixIdentity) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2950;
+    uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+
+    constexpr uint32_t kPriority = 2950;
+    (void)SendIpv4ZeroPrefixWithoutDst(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, 24, lo,
+                                       kPriority, ++seq);
+    ASSERT_EQ(SendIpv4ZeroPrefixWithoutDst(
+                      fd.Get(), RTM_NEWROUTE,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, 24, lo, kPriority,
+                      ++seq),
+              0);
+    RouteSpec zero_prefix = MakeIpv4Route("0.0.0.0", 24, lo);
+    zero_prefix.priority = kPriority;
+    EXPECT_TRUE(FindRoute(fd.Get(), zero_prefix, ++seq).has_value());
+    EXPECT_EQ(SendIpv4ZeroPrefixWithoutDst(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, 24,
+                                           lo, kPriority, ++seq),
+              0);
+
+    constexpr const char* kIpv6Prefix = "2001:db8:abcd:1234::";
+    (void)SendCompactIpv6PrefixRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
+                                       kIpv6Prefix, 64, lo, ++seq);
+    ASSERT_EQ(SendCompactIpv6PrefixRequest(
+                      fd.Get(), RTM_NEWROUTE,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, kIpv6Prefix, 64, lo,
+                      ++seq),
+              0);
+    EXPECT_TRUE(FindIpv6Route(fd.Get(), kIpv6Prefix, 64, lo, ++seq).has_value());
+    EXPECT_EQ(SendCompactIpv6PrefixRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
+                                           kIpv6Prefix, 64, lo, ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, Ipv4GatewayHonorsPrefixEndpointsAndRouteScope) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2975;
+    uint32_t veth = if_nametoindex("veth-host1");
+    ASSERT_NE(veth, 0u);
+
+    RouteSpec route = MakeIpv4Route("198.18.221.0", 24, veth);
+    route.priority = 2975;
+    route.gateway = Ipv4("192.168.1.0");
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              0);
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq),
+              0);
+    route.route_flags = RTNH_F_ONLINK;
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              0);
+    route.route_flags = 0;
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq),
+              0);
+
+    route.gateway = Ipv4("192.168.1.255");
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              EINVAL);
+
+    route.gateway = Ipv4("192.168.1.254");
+    route.route_flags = RTNH_F_ONLINK;
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              EINVAL);
+    route.route_flags = 0;
+
+    route.gateway = Ipv4("192.168.1.1");
+    route.scope = RT_SCOPE_LINK;
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              ENETUNREACH);
+    route.scope = RT_SCOPE_UNIVERSE;
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              0);
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2985;
+    uint32_t veth = if_nametoindex("veth-host1");
+    ASSERT_NE(veth, 0u);
+
+    RouteSpec route = MakeIpv4Route("198.18.222.0", 24, veth);
+    route.priority = 2985;
+    DeleteRouteIfPresent(fd.Get(), route, &seq);
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
+                               ++seq),
+              0);
+
+    FdGuard receiver(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(receiver.Get(), 0) << ErrnoString(errno);
+    timeval timeout = {};
+    timeout.tv_sec = 2;
+    ASSERT_EQ(setsockopt(receiver.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+    sockaddr_in local_endpoint = {};
+    local_endpoint.sin_family = AF_INET;
+    local_endpoint.sin_addr.s_addr = Ipv4("192.168.1.254");
+    ASSERT_EQ(bind(receiver.Get(), reinterpret_cast<sockaddr*>(&local_endpoint),
+                   sizeof(local_endpoint)),
+              0)
+        << ErrnoString(errno);
+    socklen_t endpoint_len = sizeof(local_endpoint);
+    ASSERT_EQ(getsockname(receiver.Get(), reinterpret_cast<sockaddr*>(&local_endpoint),
+                          &endpoint_len),
+              0);
+
+    ASSERT_EQ(SetLinkUp(fd.Get(), veth, false, ++seq), 0);
+
+    int add_error = SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                                     NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                     route, ++seq);
+    bool dumped_while_down = FindRoute(fd.Get(), route, ++seq).has_value();
+    auto lookup_while_down = LookupIpv4Route(fd.Get(), "198.18.222.1", ++seq);
+    auto local_while_down = LookupIpv4Route(fd.Get(), "192.168.1.254", ++seq);
+    FdGuard sender(socket(AF_INET, SOCK_DGRAM, 0));
+    ssize_t sent = sender.Get() < 0
+                       ? -1
+                       : sendto(sender.Get(), "x", 1, 0,
+                                reinterpret_cast<sockaddr*>(&local_endpoint),
+                                sizeof(local_endpoint));
+    int send_error = sent < 0 ? errno : 0;
+    char payload = 0;
+    ssize_t received = sent < 0 ? -1 : recv(receiver.Get(), &payload, sizeof(payload), 0);
+    int receive_error = received < 0 ? errno : 0;
+    int restore_error = SetLinkUp(fd.Get(), veth, true, ++seq);
+
+    EXPECT_EQ(add_error, ENETDOWN);
+    EXPECT_FALSE(dumped_while_down);
+    EXPECT_TRUE(!lookup_while_down.has_value() || lookup_while_down->oif != veth ||
+                lookup_while_down->prefix_len != route.prefix_len);
+    ASSERT_TRUE(local_while_down.has_value());
+    EXPECT_EQ(local_while_down->table, RT_TABLE_LOCAL);
+    EXPECT_EQ(local_while_down->kind, RTN_LOCAL);
+    EXPECT_EQ(local_while_down->oif, veth);
+    EXPECT_EQ(sent, 1) << ErrnoString(send_error);
+    EXPECT_EQ(received, 1) << ErrnoString(receive_error);
+    EXPECT_EQ(payload, 'x');
+    ASSERT_EQ(restore_error, 0);
+}
+
+TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
+    FdGuard sender(OpenRouteSocket());
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+    uint32_t seq = 2990;
+    uint32_t veth = if_nametoindex("veth-host1");
+    ASSERT_NE(veth, 0u);
+    constexpr const char* kDestination = "2001:db8:ffff:222::";
+    constexpr const char* kAddress = "2001:db8:ffff:223::1";
+    constexpr const char* kConnected = "2001:db8:ffff:223::";
+    constexpr const char* kDownAddress = "2001:db8:ffff:224::1";
+    constexpr const char* kDownConnected = "2001:db8:ffff:224::";
+
+    ASSERT_EQ(SetLinkUp(sender.Get(), veth, true, ++seq), 0);
+    (void)SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
+                              kAddress, 64, ++seq);
+    ASSERT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_NEWADDR,
+                                  NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, veth,
+                                  kAddress, 64, ++seq),
+              0);
+    ASSERT_TRUE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    (void)SendIpv6RouteRequest(sender.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
+                               kDestination, 64, veth, RT_SCOPE_NOWHERE, ++seq);
+    ASSERT_EQ(SendIpv6RouteRequest(sender.Get(), RTM_NEWROUTE,
+                                   NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                   kDestination, 64, veth, RT_SCOPE_LINK, ++seq),
+              0);
+    ASSERT_TRUE(FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq).has_value());
+
+    FdGuard listener(OpenRouteListener(RTMGRP_IPV6_ROUTE));
+    ASSERT_GE(listener.Get(), 0) << ErrnoString(errno);
+    ASSERT_EQ(SetLinkUp(sender.Get(), veth, false, ++seq), 0);
+
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq).has_value());
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kDestination, 64, RTM_DELROUTE));
+
+    // This request carries IFA_F_NODAD. Linux installs its host-local route
+    // immediately while the veth is down, but defers the connected prefix
+    // until NETDEV_UP.
+    (void)SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
+                              kDownAddress, 64, ++seq);
+    ASSERT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_NEWADDR,
+                                  NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, veth,
+                                  kDownAddress, 64, ++seq),
+              0);
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kDownConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownAddress, 128, veth, ++seq).has_value());
+
+    ASSERT_EQ(SetLinkUp(sender.Get(), veth, true, ++seq), 0);
+    EXPECT_TRUE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownConnected, 64, veth, ++seq).has_value());
+    EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownAddress, 128, veth, ++seq).has_value());
+    EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kConnected, 64, RTM_NEWROUTE));
+    EXPECT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
+                                  kAddress, 64, ++seq),
+              0);
+    EXPECT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
+                                  kDownAddress, 64, ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, RouteProjectionScalesBeyondFormerFixedCapacity) {
     FdGuard fd(OpenRouteSocket());
     ASSERT_GE(fd.Get(), 0) << "socket(AF_NETLINK, NETLINK_ROUTE) failed: " << ErrnoString(errno);
     uint32_t seq = 3000;
@@ -326,125 +461,26 @@ TEST(RtnetlinkRouteSemantics, FailedDataPlaneSyncRollsBackNormalizedTableRoute) 
     ASSERT_NE(lo, 0u);
 
     std::vector<RouteSpec> added;
-    std::optional<RouteSpec> failed;
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         std::string dst = std::string("198.18.") + std::to_string(100 + i) + ".0";
         RouteSpec route = MakeIpv4Route(dst.c_str(), 24, lo);
         DeleteRouteIfPresent(fd.Get(), route, &seq);
         int err = SendRouteRequest(fd.Get(), RTM_NEWROUTE,
                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
                                    ++seq);
-        if (err == 0) {
-            added.push_back(route);
-            continue;
-        }
-        if (err == ENOSPC) {
-            failed = route;
-            break;
-        }
-        FAIL() << "unexpected RTM_NEWROUTE error: " << ErrnoString(err);
+        ASSERT_EQ(err, 0) << "route " << i << " hit an artificial projection limit: "
+                          << ErrnoString(err);
+        added.push_back(route);
     }
 
-    ASSERT_TRUE(failed.has_value()) << "route table did not reach ENOSPC during rollback test";
-    EXPECT_FALSE(FindRoute(fd.Get(), *failed, ++seq).has_value())
-            << "failed add left a netlink control-plane route behind";
+    ASSERT_EQ(added.size(), 32u);
+    EXPECT_TRUE(FindRoute(fd.Get(), added.back(), ++seq).has_value());
 
     for (const auto& route : added) {
         EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route,
                                    ++seq),
                   0);
     }
-}
-
-TEST(RtnetlinkRouteSemantics, OnLinkRouteAllowsUdpSendWithoutNoRoute) {
-    FdGuard netlink_fd(OpenRouteSocket());
-    ASSERT_GE(netlink_fd.Get(), 0) << "socket(AF_NETLINK, NETLINK_ROUTE) failed: "
-                                   << ErrnoString(errno);
-    uint32_t seq = 4000;
-    uint32_t lo = if_nametoindex("lo");
-    ASSERT_NE(lo, 0u);
-
-    RouteSpec route = MakeIpv4Route("198.18.201.0", 24, lo);
-    DeleteRouteIfPresent(netlink_fd.Get(), route, &seq);
-    ASSERT_EQ(SendRouteRequest(netlink_fd.Get(), RTM_NEWROUTE,
-                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, route,
-                               ++seq),
-              0);
-
-    FdGuard udp_fd(socket(AF_INET, SOCK_DGRAM, 0));
-    ASSERT_GE(udp_fd.Get(), 0) << "socket(AF_INET, SOCK_DGRAM) failed: " << ErrnoString(errno);
-
-    sockaddr_in dst = {};
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(9);
-    dst.sin_addr.s_addr = Ipv4("198.18.201.42");
-
-    const char payload[] = "x";
-    errno = 0;
-    ssize_t sent = sendto(udp_fd.Get(), payload, sizeof(payload), 0,
-                          reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
-    EXPECT_GE(sent, 0) << "sendto failed: " << ErrnoString(errno);
-    EXPECT_NE(errno, ENETUNREACH);
-
-    EXPECT_EQ(SendRouteRequest(netlink_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route,
-                               ++seq),
-              0);
-}
-
-TEST(RtnetlinkRouteSemantics, LoopbackIpv4SubnetRoutesAreLocalForUdp) {
-    FdGuard netlink_fd(OpenRouteSocket());
-    ASSERT_GE(netlink_fd.Get(), 0) << "socket(AF_NETLINK, NETLINK_ROUTE) failed: "
-                                   << ErrnoString(errno);
-    uint32_t seq = 5000;
-    uint32_t lo = if_nametoindex("lo");
-    ASSERT_NE(lo, 0u);
-
-    DeleteAddrIfPresent(netlink_fd.Get(), lo, "192.0.2.1", 24, &seq);
-    ASSERT_EQ(SendAddrRequest(netlink_fd.Get(), RTM_NEWADDR,
-                              NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, lo,
-                              "192.0.2.1", 24, ++seq),
-              0);
-
-    FdGuard snd(socket(AF_INET, SOCK_DGRAM, 0));
-    ASSERT_GE(snd.Get(), 0) << "sender socket failed: " << ErrnoString(errno);
-    FdGuard rcv(socket(AF_INET, SOCK_DGRAM, 0));
-    ASSERT_GE(rcv.Get(), 0) << "receiver socket failed: " << ErrnoString(errno);
-
-    timeval timeout = {};
-    timeout.tv_sec = 2;
-    ASSERT_EQ(setsockopt(rcv.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0)
-            << "setsockopt(SO_RCVTIMEO) failed: " << ErrnoString(errno);
-
-    sockaddr_in sender = {};
-    sender.sin_family = AF_INET;
-    sender.sin_addr.s_addr = Ipv4("192.0.2.2");
-    ASSERT_EQ(bind(snd.Get(), reinterpret_cast<sockaddr*>(&sender), sizeof(sender)), 0)
-            << "bind sender failed: " << ErrnoString(errno);
-
-    sockaddr_in receiver = {};
-    receiver.sin_family = AF_INET;
-    receiver.sin_addr.s_addr = Ipv4("192.0.2.254");
-    ASSERT_EQ(bind(rcv.Get(), reinterpret_cast<sockaddr*>(&receiver), sizeof(receiver)), 0)
-            << "bind receiver failed: " << ErrnoString(errno);
-
-    socklen_t receiver_len = sizeof(receiver);
-    ASSERT_EQ(getsockname(rcv.Get(), reinterpret_cast<sockaddr*>(&receiver), &receiver_len), 0)
-            << "getsockname receiver failed: " << ErrnoString(errno);
-
-    const char payload[] = "loopback-subnet";
-    ASSERT_EQ(sendto(snd.Get(), payload, sizeof(payload), 0,
-                     reinterpret_cast<sockaddr*>(&receiver), receiver_len),
-              static_cast<ssize_t>(sizeof(payload)))
-            << "sendto failed: " << ErrnoString(errno);
-
-    char buf[sizeof(payload)] = {};
-    ASSERT_EQ(recv(rcv.Get(), buf, sizeof(buf), 0), static_cast<ssize_t>(sizeof(payload)))
-            << "recv failed: " << ErrnoString(errno);
-    EXPECT_EQ(std::memcmp(payload, buf, sizeof(payload)), 0);
-
-    EXPECT_EQ(SendAddrRequest(netlink_fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, lo,
-                              "192.0.2.1", 24, ++seq),
-              0);
 }
 
 int main(int argc, char** argv) {

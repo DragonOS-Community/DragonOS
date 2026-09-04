@@ -14,7 +14,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 use intertrait::cast::CastArc;
-use log::error;
+use log::{error, warn};
 use system_error::SystemError;
 
 use super::{class::sys_class_net_instance, Iface, NetDeivceState, Operstate};
@@ -22,8 +22,10 @@ use super::{class::sys_class_net_instance, Iface, NetDeivceState, Operstate};
 /// 将设备注册到`/sys/class/net`目录下
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/net-sysfs.c?fi=netdev_register_kobject#1311
 pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
+    let device = dev.clone() as Arc<dyn Device>;
+
     // 初始化设备
-    device_manager().device_default_initialize(&(dev.clone() as Arc<dyn Device>));
+    device_manager().device_default_initialize(&device);
 
     // 设置dev的class为net
     dev.set_class(Some(Arc::downgrade(
@@ -31,21 +33,52 @@ pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
     )));
 
     // 设置设备的kobject名
-    dev.set_name(dev.iface_name().clone());
+    dev.set_name(dev.iface_name());
 
-    device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
+    if let Err(error) = device_manager().add_device(device.clone()) {
+        // Driver-core currently exposes a fallible multi-stage add path. If a
+        // late stage fails after publishing IN_SYSFS, use its structural
+        // teardown path before returning the registration error. No uevent
+        // has been emitted by the net class at this point.
+        if device.is_registered() {
+            device_manager().remove(&device);
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+/// Remove the netdevice from driver-core/sysfs without allocating a uevent.
+///
+/// Registration rollback uses this path before the device has been announced,
+/// so emitting a synthetic remove event would be both unnecessary and unsafe:
+/// notification construction must never stand between a failed transaction
+/// and structural teardown.
+pub fn netdev_unregister_kobject(dev: Arc<dyn Iface>) {
+    device_manager().remove(&(dev as Arc<dyn Device>));
+}
+
+/// Emit a netdevice lifecycle event after the corresponding structural state
+/// has been committed. Notification delivery is best effort, like Linux
+/// kobject and rtnetlink multicast: listener backpressure must not roll back a
+/// registered device or prevent an unregistered device from being removed.
+pub fn netdev_emit_uevent(dev: Arc<dyn Iface>, action: &'static str) {
     let ifname = dev.iface_name();
-    <dyn KObject>::kobject_uevent(
+    if let Err(error) = <dyn KObject>::kobject_uevent(
         &(dev.clone() as Arc<dyn KObject>),
-        "add",
+        action,
         &[
             ("SUBSYSTEM", "net".into()),
             ("DEVNAME", ifname.clone()),
-            ("INTERFACE", ifname),
+            ("INTERFACE", ifname.clone()),
         ],
-    )?;
-
-    return Ok(());
+    ) {
+        warn!(
+            "failed to emit '{}' uevent for netdevice '{}': {:?}",
+            action, ifname, error
+        );
+    }
 }
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/net/core/net-sysfs.c

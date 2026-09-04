@@ -6,6 +6,8 @@ pub fn arch_pci_msi_vector_alloc() -> Option<IrqNumber> {
     None
 }
 
+pub fn arch_pci_msi_vector_release(_vector: IrqNumber) {}
+
 pub fn arch_pci_msi_vector_setup(_vector: IrqNumber) -> Result<(), SystemError> {
     Err(SystemError::ENOSYS)
 }

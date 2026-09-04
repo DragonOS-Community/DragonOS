@@ -248,10 +248,11 @@ fn read_short_getroute_segment(
         dst_len: 0,
         src_len: 0,
         tos: 0,
-        table: RouteTable::Unspec,
-        protocol: RouteProtocol::Unspec,
-        scope: RouteScope::Universe,
-        type_: RouteType::Unspec,
+        table: RouteTable::Unspec as u8,
+        protocol: RouteProtocol::Unspec as u8,
+        scope: RouteScope::Universe as u8,
+        type_: RouteType::Unspec as u8,
+        raw_flags: 0,
         flags: RouteFlags::empty(),
     };
     let mut segment = RouteSegment::new(header, body, Vec::<RouteAttr>::new());

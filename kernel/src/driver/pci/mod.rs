@@ -1,4 +1,5 @@
 pub mod attr;
+mod bar;
 pub mod dev_id;
 pub mod device;
 pub mod driver;

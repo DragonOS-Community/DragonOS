@@ -493,6 +493,7 @@ pub fn virtio_fs(
     let mut irq_wake_enabled = false;
     let mut irq_is_msix = false;
     let mut irq_ack = None;
+    let mut irq_setup = None;
     let cache_region = transport
         .shared_memory_region(VIRTIO_FS_SHMCAP_ID_CACHE)
         .filter(|region| region.length() != 0);
@@ -507,16 +508,20 @@ pub fn virtio_fs(
         }
     });
     if matches!(transport, VirtIOTransport::Pci(_)) {
-        if let Err(e) = transport.setup_irq(dev_id.clone()) {
-            warn!(
-                "virtio-fs: failed to setup irq for tag='{}' dev={:?}: {:?}; use polling fallback",
-                tag, dev_id, e
-            );
-        } else {
-            irq_wake_enabled = true;
-            irq_is_msix = transport.irq_is_msix();
-            if let VirtIOTransport::Pci(pci_transport) = &transport {
-                irq_ack = Some(pci_transport.interrupt_ack());
+        match transport.setup_irq(dev_id.clone()) {
+            Ok(setup) => {
+                irq_wake_enabled = true;
+                irq_is_msix = transport.irq_is_msix();
+                if let VirtIOTransport::Pci(pci_transport) = &transport {
+                    irq_ack = Some(pci_transport.interrupt_ack());
+                }
+                irq_setup = Some(setup);
+            }
+            Err(e) => {
+                warn!(
+                    "virtio-fs: failed to setup irq for tag='{}' dev={:?}: {:?}; use polling fallback",
+                    tag, dev_id, e
+                );
             }
         }
     } else {
@@ -550,6 +555,9 @@ pub fn virtio_fs(
     }
 
     map.insert(tag.clone(), instance);
+    if let Some(setup) = irq_setup {
+        let _deferred_irq = setup.into_deferred();
+    }
     info!(
         "virtio-fs: registered instance tag='{}' dev={:?} request_queues={} cache_region_len={:?}",
         tag, dev_id, nrqs, cache_region_len

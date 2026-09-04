@@ -62,7 +62,7 @@ linkme = "=0.3.27"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev = "1597c1c", default-features = false }
-smoltcp = { version = "=0.12.0", git = "https://github.com/DragonOS-Community/smoltcp", rev = "3933571", default-features = false, features = [
+smoltcp = { version = "=0.12.0", git = "https://github.com/DragonOS-Community/smoltcp", rev = "514ce28", default-features = false, features = [
     "alloc",
     "medium-ethernet",
     "socket-raw",
@@ -74,10 +74,12 @@ smoltcp = { version = "=0.12.0", git = "https://github.com/DragonOS-Community/sm
     "socket-dhcpv4",
     "socket-dns",
     "proto-ipv4",
+    "proto-ipv4-fragmentation",
     "proto-ipv6",
     "medium-ip",
     "log",
     "multicast",
+    "packetmeta-id",
     "iface-max-addr-count-8",
     "iface-max-route-count-8",
     "iface-max-multicast-group-count-8"

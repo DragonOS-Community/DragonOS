@@ -202,6 +202,91 @@ struct LinkSnapshot {
     std::string name;
 };
 
+struct RouteProbe {
+    uint8_t family;
+    uint8_t prefix_len;
+    uint8_t table;
+    uint8_t type;
+    uint32_t ifindex;
+    std::array<uint8_t, 16> destination;
+};
+
+int CountRoute(int fd, const RouteProbe& probe, uint32_t seq) {
+    struct {
+        nlmsghdr header;
+        rtmsg route;
+    } request {};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
+    request.header.nlmsg_type = RTM_GETROUTE;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    request.header.nlmsg_seq = seq;
+    request.route.rtm_family = probe.family;
+    if (send(fd, &request, request.header.nlmsg_len, 0) != request.header.nlmsg_len) {
+        return -errno;
+    }
+
+    const size_t address_length = probe.family == AF_INET ? 4 : 16;
+    int count = 0;
+    std::array<unsigned char, 16384> buffer {};
+    for (;;) {
+        const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
+        if (received < 0) return -errno;
+
+        int remaining = static_cast<int>(received);
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+            if (header->nlmsg_seq != seq) continue;
+            if (header->nlmsg_type == NLMSG_DONE) return count;
+            if (header->nlmsg_type == NLMSG_ERROR) {
+                const auto* error = reinterpret_cast<const nlmsgerr*>(NLMSG_DATA(header));
+                return error->error == 0 ? count : error->error;
+            }
+            if (header->nlmsg_type != RTM_NEWROUTE) continue;
+
+            const auto* route = reinterpret_cast<const rtmsg*>(NLMSG_DATA(header));
+            if (route->rtm_family != probe.family || route->rtm_dst_len != probe.prefix_len ||
+                route->rtm_table != probe.table || route->rtm_type != probe.type) {
+                continue;
+            }
+
+            uint32_t ifindex = 0;
+            std::array<uint8_t, 16> destination {};
+            bool has_destination = false;
+            int attr_length = RTM_PAYLOAD(header);
+            for (auto* attr = RTM_RTA(route); RTA_OK(attr, attr_length);
+                 attr = RTA_NEXT(attr, attr_length)) {
+                if (attr->rta_type == RTA_DST && RTA_PAYLOAD(attr) == address_length) {
+                    std::memcpy(destination.data(), RTA_DATA(attr), address_length);
+                    has_destination = true;
+                } else if (attr->rta_type == RTA_OIF &&
+                           RTA_PAYLOAD(attr) == sizeof(ifindex)) {
+                    std::memcpy(&ifindex, RTA_DATA(attr), sizeof(ifindex));
+                }
+            }
+            if (has_destination && ifindex == probe.ifindex &&
+                std::memcmp(destination.data(), probe.destination.data(), address_length) == 0) {
+                ++count;
+            }
+        }
+    }
+}
+
+int SendIpv4LoopbackDatagram() {
+    FdGuard fd(socket(AF_INET, SOCK_DGRAM, 0));
+    if (fd.Get() < 0) return errno;
+
+    sockaddr_in destination {};
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(9);
+    if (inet_pton(AF_INET, "127.0.0.1", &destination.sin_addr) != 1) return EINVAL;
+    const char payload = 'x';
+    if (sendto(fd.Get(), &payload, sizeof(payload), 0,
+               reinterpret_cast<const sockaddr*>(&destination), sizeof(destination)) < 0) {
+        return errno;
+    }
+    return 0;
+}
+
 bool AddAttribute(nlmsghdr* header, size_t capacity, uint16_t type, const void* data,
                   size_t length) {
     const size_t offset = NLMSG_ALIGN(header->nlmsg_len);
@@ -728,7 +813,8 @@ int RunFreshNetnsLoopbackLifecycleCase() {
     const auto ifindex = FindIfindex("lo");
     if (!ifindex.has_value()) return 11;
     const auto ioctl_flags = QueryIoctlFlags(ioctl_fd.Get(), "lo");
-    const auto rtnl_flags = QueryLinkFlags(route_fd.Get(), *ifindex, 1);
+    uint32_t seq = 1;
+    const auto rtnl_flags = QueryLinkFlags(route_fd.Get(), *ifindex, seq++);
     if (!ioctl_flags.has_value() || !rtnl_flags.has_value()) return 12;
 
     // Existence through both APIs proves that lo is registered. Linux creates
@@ -740,6 +826,55 @@ int RunFreshNetnsLoopbackLifecycleCase() {
     if ((static_cast<uint16_t>(*ioctl_flags) & IFF_LOOPBACK) == 0 ||
         (*rtnl_flags & IFF_LOOPBACK) == 0) {
         return 15;
+    }
+
+    RouteProbe connected_v4 {AF_INET, 8, RT_TABLE_LOCAL, RTN_LOCAL,
+                             static_cast<uint32_t>(*ifindex), {}};
+    RouteProbe local_v4 {AF_INET, 32, RT_TABLE_LOCAL, RTN_LOCAL,
+                         static_cast<uint32_t>(*ifindex), {}};
+    RouteProbe broadcast_v4 {AF_INET, 32, RT_TABLE_LOCAL, RTN_BROADCAST,
+                             static_cast<uint32_t>(*ifindex), {}};
+    RouteProbe local_v6 {AF_INET6, 128, RT_TABLE_LOCAL, RTN_LOCAL,
+                         static_cast<uint32_t>(*ifindex), {}};
+    if (inet_pton(AF_INET, "127.0.0.0", connected_v4.destination.data()) != 1 ||
+        inet_pton(AF_INET, "127.0.0.1", local_v4.destination.data()) != 1 ||
+        inet_pton(AF_INET, "127.255.255.255", broadcast_v4.destination.data()) != 1 ||
+        inet_pton(AF_INET6, "::1", local_v6.destination.data()) != 1) {
+        return 16;
+    }
+
+    if (CountRoute(route_fd.Get(), connected_v4, seq++) != 0 ||
+        CountRoute(route_fd.Get(), local_v4, seq++) != 0 ||
+        CountRoute(route_fd.Get(), broadcast_v4, seq++) != 0 ||
+        CountRoute(route_fd.Get(), local_v6, seq++) != 0) {
+        return 17;
+    }
+    if (SendIpv4LoopbackDatagram() != ENETUNREACH) return 18;
+
+    if (SetLinkUp(route_fd.Get(), *ifindex, true, seq++) != 0) return 19;
+    if (CountRoute(route_fd.Get(), connected_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), broadcast_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v6, seq++) != 1) {
+        return 20;
+    }
+    if (SendIpv4LoopbackDatagram() != 0) return 21;
+
+    if (SetLinkUp(route_fd.Get(), *ifindex, false, seq++) != 0) return 22;
+    if (CountRoute(route_fd.Get(), connected_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), broadcast_v4, seq++) != 0 ||
+        CountRoute(route_fd.Get(), local_v6, seq++) != 0) {
+        return 23;
+    }
+    if (SendIpv4LoopbackDatagram() != 0) return 24;
+
+    if (SetLinkUp(route_fd.Get(), *ifindex, true, seq++) != 0) return 25;
+    if (CountRoute(route_fd.Get(), connected_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), broadcast_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v6, seq++) != 1) {
+        return 26;
     }
     return 0;
 }

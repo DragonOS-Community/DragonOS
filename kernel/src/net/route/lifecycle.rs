@@ -28,13 +28,20 @@ pub(crate) fn register_iface(
 ) -> Result<(), SystemError> {
     let addresses = try_clone_slice(&iface.common().ip_addrs())?;
     let staged = iface.common().take_bootstrap_routes();
+    // Construction may preload addresses before the device is visible, but a
+    // DOWN device must not publish those addresses into the FIB merely by
+    // being registered. Explicit address changes after registration use the
+    // address transaction path and remain independent of this rule.
+    let defer_constructor_address_routes = !iface.flags().contains(InterfaceFlags::UP);
     iface
         .smol_iface()
         .lock()
         .set_route_table_includes_connected_prefixes(true);
     let result = transact_with_devices(rtnl, netns, devices, |candidate| {
-        for route in derived_address_entries(iface, &addresses)? {
-            candidate.insert_derived(route)?;
+        if !defer_constructor_address_routes {
+            for route in derived_address_entries(iface, &addresses)? {
+                candidate.insert_derived(route)?;
+            }
         }
         for route in staged.iter().copied() {
             let route = RouteEntry {
@@ -124,11 +131,11 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
             for entry in
                 derived_address_entries_for_link_state(iface, &iface.common().ip_addrs(), true)?
             {
-                if (!is_ipv4(entry.destination.address())
-                    || entry.table == RT_TABLE_MAIN
-                    || entry.kind == RTN_BROADCAST)
-                    && candidate.insert_derived(entry)?
-                {
+                // insert_derived() is the lifecycle authority here: the first
+                // UP publishes every deferred constructor address route,
+                // while later UP transitions only restore entries actually
+                // removed on DOWN.
+                if candidate.insert_derived(entry)? {
                     added.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
                     added.push(entry);
                 }

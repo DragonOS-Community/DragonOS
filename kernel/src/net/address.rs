@@ -14,6 +14,9 @@ use crate::{
     net::rtnl::RtnlGuard,
 };
 
+const IPV4_MIN_MTU: usize = 68;
+const IPV6_MIN_MTU: usize = 1280;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AddressMutation {
     Add(IpCidr),
@@ -31,6 +34,17 @@ pub(crate) enum AddressMutationOutcome {
 pub(in crate::net) struct AddressMutationCommit {
     pub outcome: AddressMutationOutcome,
     pub route_changes: crate::net::route::RouteNotifications,
+}
+
+pub(crate) struct RemovedAddress {
+    pub cidr: IpCidr,
+    pub label: CString,
+}
+
+pub(in crate::net) struct PreparedMtuAddressChange {
+    routes: crate::net::route::PreparedAddressRouteCommit,
+    removed: Vec<RemovedAddress>,
+    renamed_ipv4: Vec<IpCidr>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,59 +148,8 @@ impl PreparedAddressLabelRename {
         iface: &Arc<dyn Iface>,
         new_name: &str,
     ) -> Result<Self, SystemError> {
-        const IFNAME_MAX: usize = 15;
-
-        let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
-        let ipv4_count = metadata
-            .iter()
-            .filter(|entry| matches!(entry.cidr, IpCidr::Ipv4(_)))
-            .count();
-        let mut renamed_ipv4 = Vec::new();
-        renamed_ipv4
-            .try_reserve_exact(ipv4_count)
-            .map_err(|_| SystemError::ENOMEM)?;
-
-        // Interface names are bounded by IFNAMSIZ. Copy the old name to the
-        // stack so the name lock is never held across label allocation.
-        let mut old_name = [0u8; IFNAME_MAX + 1];
-        let old_name_len = iface.common().with_iface_name(|name| {
-            let copied = name.len().min(old_name.len());
-            old_name[..copied].copy_from_slice(&name.as_bytes()[..copied]);
-            copied
-        });
-        let old_name = &old_name[..old_name_len];
-
-        let mut ordinal = 0usize;
-        for entry in metadata
-            .iter_mut()
-            .filter(|entry| matches!(entry.cidr, IpCidr::Ipv4(_)))
-        {
-            ordinal += 1;
-            renamed_ipv4.push(entry.cidr);
-            if ordinal == 1 {
-                entry.label = None;
-                continue;
-            }
-
-            let old_label = entry
-                .label
-                .as_ref()
-                .map(|label| label.as_bytes())
-                .unwrap_or(old_name);
-            let mut generated_suffix = [0u8; 1 + 3 * core::mem::size_of::<usize>()];
-            let suffix = match old_label.iter().position(|byte| *byte == b':') {
-                Some(index) => &old_label[index..],
-                None => decimal_alias_suffix(ordinal, &mut generated_suffix),
-            };
-            let suffix = if suffix.len() > IFNAME_MAX {
-                &suffix[suffix.len() - IFNAME_MAX..]
-            } else {
-                suffix
-            };
-            let prefix_len = new_name.len().min(IFNAME_MAX - suffix.len());
-            entry.label = Some(try_build_label(&new_name.as_bytes()[..prefix_len], suffix)?);
-        }
-
+        let metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
+        let (metadata, renamed_ipv4) = prepare_renamed_metadata(iface, new_name, metadata)?;
         Ok(Self {
             metadata,
             renamed_ipv4,
@@ -200,6 +163,196 @@ impl PreparedAddressLabelRename {
             .publish_name_and_address_metadata(new_name, self.metadata);
         self.renamed_ipv4
     }
+}
+
+fn prepare_renamed_metadata(
+    iface: &Arc<dyn Iface>,
+    new_name: &str,
+    mut metadata: Vec<AddressMetadata>,
+) -> Result<(Vec<AddressMetadata>, Vec<IpCidr>), SystemError> {
+    const IFNAME_MAX: usize = 15;
+
+    let ipv4_count = metadata
+        .iter()
+        .filter(|entry| matches!(entry.cidr, IpCidr::Ipv4(_)))
+        .count();
+    let mut renamed_ipv4 = Vec::new();
+    renamed_ipv4
+        .try_reserve_exact(ipv4_count)
+        .map_err(|_| SystemError::ENOMEM)?;
+
+    // Interface names are bounded by IFNAMSIZ. Copy the old name to the
+    // stack so the name lock is never held across label allocation.
+    let mut old_name = [0u8; IFNAME_MAX + 1];
+    let old_name_len = iface.common().with_iface_name(|name| {
+        let copied = name.len().min(old_name.len());
+        old_name[..copied].copy_from_slice(&name.as_bytes()[..copied]);
+        copied
+    });
+    let old_name = &old_name[..old_name_len];
+
+    let mut ordinal = 0usize;
+    for entry in metadata
+        .iter_mut()
+        .filter(|entry| matches!(entry.cidr, IpCidr::Ipv4(_)))
+    {
+        ordinal += 1;
+        renamed_ipv4.push(entry.cidr);
+        if ordinal == 1 {
+            entry.label = None;
+            continue;
+        }
+
+        let old_label = entry
+            .label
+            .as_ref()
+            .map(|label| label.as_bytes())
+            .unwrap_or(old_name);
+        let mut generated_suffix = [0u8; 1 + 3 * core::mem::size_of::<usize>()];
+        let suffix = match old_label.iter().position(|byte| *byte == b':') {
+            Some(index) => &old_label[index..],
+            None => decimal_alias_suffix(ordinal, &mut generated_suffix),
+        };
+        let suffix = if suffix.len() > IFNAME_MAX {
+            &suffix[suffix.len() - IFNAME_MAX..]
+        } else {
+            suffix
+        };
+        let prefix_len = new_name.len().min(IFNAME_MAX - suffix.len());
+        entry.label = Some(try_build_label(&new_name.as_bytes()[..prefix_len], suffix)?);
+    }
+
+    Ok((metadata, renamed_ipv4))
+}
+
+pub(in crate::net) fn prepare_mtu_address_change(
+    _rtnl: &RtnlGuard,
+    netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    mtu: usize,
+    renamed_to: Option<&str>,
+    was_up: bool,
+    is_up: bool,
+) -> Result<Option<PreparedMtuAddressChange>, SystemError> {
+    let mirror = iface.router_common().ip_addrs.read();
+    let before = try_clone_copy_slice(&mirror, 0)?;
+    let mut after = try_clone_copy_slice(&mirror, 0)?;
+    drop(mirror);
+
+    let removal_count = after
+        .iter()
+        .filter(|cidr| match cidr {
+            IpCidr::Ipv4(_) => mtu < IPV4_MIN_MTU,
+            IpCidr::Ipv6(_) => mtu < IPV6_MIN_MTU,
+        })
+        .count();
+    if removal_count == 0 {
+        return Ok(None);
+    }
+
+    let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
+    let default_label = try_default_label(iface)?;
+    let mut removed = Vec::new();
+    removed
+        .try_reserve_exact(removal_count)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let mut deleted_addresses = Vec::new();
+    deleted_addresses
+        .try_reserve_exact(removal_count)
+        .map_err(|_| SystemError::ENOMEM)?;
+
+    let mut index = 0;
+    while index < after.len() {
+        let cidr = after[index];
+        let remove = match cidr {
+            IpCidr::Ipv4(_) => mtu < IPV4_MIN_MTU,
+            IpCidr::Ipv6(_) => mtu < IPV6_MIN_MTU,
+        };
+        if !remove {
+            index += 1;
+            continue;
+        }
+        after.remove(index);
+        deleted_addresses.push(cidr.address());
+        let label =
+            if let Some(metadata_index) = metadata.iter().position(|entry| entry.cidr == cidr) {
+                let entry = metadata.remove(metadata_index);
+                match entry.label {
+                    Some(label) => label,
+                    None => try_clone_cstring(&default_label)?,
+                }
+            } else {
+                try_clone_cstring(&default_label)?
+            };
+        removed.push(RemovedAddress { cidr, label });
+    }
+
+    let (metadata, renamed_ipv4) = if let Some(new_name) = renamed_to {
+        prepare_renamed_metadata(iface, new_name, metadata)?
+    } else {
+        (metadata, Vec::new())
+    };
+    let routes = crate::net::route::prepare_address_link_change(
+        netns,
+        iface,
+        crate::net::route::AddressLinkChange {
+            before: &before,
+            after: &after,
+            metadata,
+            deleted_addresses: &deleted_addresses,
+            was_up,
+            is_up,
+        },
+    )?;
+    Ok(Some(PreparedMtuAddressChange {
+        routes,
+        removed,
+        renamed_ipv4,
+    }))
+}
+
+impl PreparedMtuAddressChange {
+    pub(in crate::net) fn publish(
+        self,
+        netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
+        iface: &Arc<dyn Iface>,
+        renamed_to: Option<String>,
+        publish_mtu: impl FnOnce(),
+        is_up: bool,
+        publish_link_state: impl FnOnce(),
+    ) -> (
+        Vec<RemovedAddress>,
+        Vec<IpCidr>,
+        crate::net::route::RouteNotifications,
+    ) {
+        let Self {
+            routes,
+            removed,
+            renamed_ipv4,
+        } = self;
+        let route_changes = routes.publish_link_change(
+            netns,
+            iface,
+            renamed_to,
+            publish_mtu,
+            publish_link_state,
+            is_up,
+        );
+        (removed, renamed_ipv4, route_changes)
+    }
+}
+
+fn try_default_label(iface: &Arc<dyn Iface>) -> Result<CString, SystemError> {
+    iface.common().with_iface_name(|name| {
+        let allocation_len = name.len().checked_add(1).ok_or(SystemError::ENOMEM)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(allocation_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        CString::from_vec_with_nul(bytes).map_err(|_| SystemError::EINVAL)
+    })
 }
 
 fn decimal_alias_suffix(mut ordinal: usize, storage: &mut [u8]) -> &[u8] {
@@ -328,6 +481,7 @@ fn commit_published(
             if find_for_new_or_replace(&after, cidr).is_some() {
                 return Err(SystemError::EEXIST);
             }
+            validate_published_address_addition(iface, cidr)?;
             insert_address_candidate(&mut after, cidr);
             metadata.push(AddressMetadata {
                 cidr,
@@ -345,6 +499,7 @@ fn commit_published(
             if let Some(index) = find_for_new_or_replace(&after, cidr) {
                 AddressMutationOutcome::Replaced(after[index])
             } else {
+                validate_published_address_addition(iface, cidr)?;
                 insert_address_candidate(&mut after, cidr);
                 metadata.push(AddressMetadata {
                     cidr,
@@ -365,6 +520,20 @@ fn commit_published(
         outcome,
         route_changes,
     })
+}
+
+fn validate_published_address_addition(
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+) -> Result<(), SystemError> {
+    // Linux destroys the IPv4 in_device once MTU drops below the protocol
+    // minimum. A later address add cannot recreate it until the MTU is valid.
+    // IPv6 differs: Linux permits an explicit add below 1280, so keep this
+    // admission rule IPv4-specific.
+    if matches!(cidr, IpCidr::Ipv4(_)) && iface.mtu() < IPV4_MIN_MTU {
+        return Err(SystemError::ENOBUFS);
+    }
+    Ok(())
 }
 
 fn insert_address_candidate(addresses: &mut Vec<IpCidr>, cidr: IpCidr) {

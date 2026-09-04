@@ -197,6 +197,15 @@ int SetLinkUp(int fd, uint32_t ifindex, uint32_t sequence) {
     return SendAndReceiveAck(fd, request);
 }
 
+int SetLinkMtu(int fd, uint32_t ifindex, uint32_t mtu, uint32_t sequence) {
+    auto request = NewRequest<ifinfomsg>(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, sequence);
+    auto* message = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(request.data()));
+    message->ifi_family = AF_UNSPEC;
+    message->ifi_index = static_cast<int>(ifindex);
+    AddAttr(&request, IFLA_MTU, &mtu, sizeof(mtu));
+    return SendAndReceiveAck(fd, request);
+}
+
 int SetLinkName(int fd, uint32_t ifindex, const char* name, uint32_t sequence) {
     auto request = NewRequest<ifinfomsg>(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, sequence);
     auto* message = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(request.data()));
@@ -852,7 +861,7 @@ int RunCombinedRenameAndLinkState() {
 
     // A later invalid attribute must reject the whole combined request before
     // publishing either the requested name or administrative state.
-    if (SetLinkNameAndState(fd.Get(), ifindex, "bad0", false, ++sequence, 0) != EINVAL ||
+    if (SetLinkNameAndState(fd.Get(), ifindex, "bad0", false, ++sequence, UINT32_MAX) != EINVAL ||
         if_nametoindex("lo") != ifindex || if_nametoindex("bad0") != 0 ||
         LinkIsUp("lo") != std::optional<bool>(true)) {
         return 4420;
@@ -879,6 +888,35 @@ int RunCombinedRenameAndLinkState() {
         CountAddressNotifications(notifications.Get(), RTM_NEWADDR, generated, "txn1:3") != 1) {
         return 4440;
     }
+    return 0;
+}
+
+int RunLowMtuIpv4Admission() {
+    FdGuard fd;
+    uint32_t ifindex = 0;
+    uint32_t sequence = 1900;
+    if (const int error = PrepareNamespace(&fd, &ifindex, &sequence); error != 0) return error;
+
+    const AddressSpec address = MakeAddress(AF_INET, "192.0.2.61", 24, ifindex);
+    const RouteSpec connected{Ipv4("192.0.2.0"), 24, ifindex};
+    if (SetLinkMtu(fd.Get(), ifindex, 67, ++sequence) != 0 ||
+        ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, address, true,
+                      true, ++sequence) != ENOBUFS ||
+        CountAddress(fd.Get(), address, ++sequence) != 0 ||
+        CountRoute(fd.Get(), connected, ++sequence) != 0) {
+        return 4500;
+    }
+
+    if (SetLinkMtu(fd.Get(), ifindex, 68, ++sequence) != 0 ||
+        ChangeAddress(fd.Get(), RTM_NEWADDR,
+                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, address, true,
+                      true, ++sequence) != 0 ||
+        CountAddress(fd.Get(), address, ++sequence) != 1 ||
+        CountRoute(fd.Get(), connected, ++sequence) < 1) {
+        return 4510;
+    }
+    if (const int error = VerifyBoundUdpDelivery(address); error != 0) return 4520 + error;
     return 0;
 }
 
@@ -1290,6 +1328,11 @@ TEST(RtnetlinkAddressSemantics, DuplicateReplaceDeleteAndParserSemanticsMatchLin
 TEST(RtnetlinkAddressSemantics, CombinedRenameAndLinkStatePublishesOnePreparedGeneration) {
     ExpectSuccessfulChild(RunWithWatchdog(RunCombinedRenameAndLinkState),
                           "combined link rename/state transaction deadlocked");
+}
+
+TEST(RtnetlinkAddressSemantics, LowMtuRejectsIpv4UntilProtocolCanBeRecreated) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunLowMtuIpv4Admission),
+                          "low-MTU IPv4 admission or recovery deadlocked");
 }
 
 TEST(RtnetlinkAddressSemantics, InvalidAddressCannotPanicKernel) {

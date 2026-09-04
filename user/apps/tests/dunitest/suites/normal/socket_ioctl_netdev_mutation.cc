@@ -506,6 +506,89 @@ TEST(SocketIoctlNetdevMutation, LoopbackAcceptsLinuxStandardMtu) {
         if (ioctl_mtu != kLinuxLoopbackMtu || rtnl.mtu != kLinuxLoopbackMtu) {
             return Failure(15, ioctl_mtu);
         }
+
+        if (int error = SetMtu(inet.Get(), "lo", 67, true)) return Failure(16, error);
+        if (int error = QueryIoctlMtu(inet.Get(), "lo", &ioctl_mtu)) return Failure(17, error);
+        if (int error = QueryRtnlState(route.Get(), ifindex, 204, &rtnl)) {
+            return Failure(18, error);
+        }
+        if (ioctl_mtu != 67 || rtnl.mtu != 67) return Failure(19, ioctl_mtu);
+
+        if (int error = SetRtnlMtu(route.Get(), ifindex, 1, 205)) {
+            return Failure(20, error);
+        }
+        if (int error = QueryIoctlMtu(inet.Get(), "lo", &ioctl_mtu)) return Failure(21, error);
+        if (int error = QueryRtnlState(route.Get(), ifindex, 206, &rtnl)) {
+            return Failure(22, error);
+        }
+        if (ioctl_mtu != 1 || rtnl.mtu != 1) return Failure(23, ioctl_mtu);
+
+        if (int error = SetMtu(inet.Get(), "lo", 0, true)) return Failure(24, error);
+        if (int error = QueryIoctlMtu(inet.Get(), "lo", &ioctl_mtu)) return Failure(25, error);
+        if (int error = QueryRtnlState(route.Get(), ifindex, 207, &rtnl)) {
+            return Failure(26, error);
+        }
+        if (ioctl_mtu != 0 || rtnl.mtu != 0) return Failure(27, ioctl_mtu);
+
+        if (int error = SetRtnlMtu(route.Get(), ifindex, kLinuxLoopbackMtu, 208)) {
+            return Failure(28, error);
+        }
+        return Success();
+    });
+}
+
+TEST(SocketIoctlNetdevMutation, LowMtuWithdrawsLoopbackIpv4State) {
+    ExpectIsolatedChild([] {
+        ChildResult isolated = EnterIsolatedNetwork();
+        if (isolated.stage != 0) return isolated;
+        FdGuard inet(OpenInetSocket());
+        if (inet.Get() < 0) return Failure(1, errno);
+
+        short flags = 0;
+        if (int error = QueryIoctlFlags(inet.Get(), "lo", &flags)) return Failure(2, error);
+        if (int error = SetFlags(inet.Get(), "lo", static_cast<short>(flags | IFF_UP), false)) {
+            return Failure(3, error);
+        }
+
+        sockaddr_in destination{};
+        destination.sin_family = AF_INET;
+        destination.sin_port = htons(9);
+        destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        const uint8_t payload = 0;
+        const int enabled = 1;
+        if (setsockopt(inet.Get(), SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) != 0) {
+            return Failure(4, errno);
+        }
+        if (sendto(inet.Get(), &payload, sizeof(payload), 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != 1) {
+            return Failure(5, errno);
+        }
+
+        if (int error = SetMtu(inet.Get(), "lo", 67, true)) return Failure(6, error);
+        errno = 0;
+        if (sendto(inet.Get(), &payload, sizeof(payload), 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != ENETUNREACH) {
+            return Failure(7, errno);
+        }
+        destination.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        errno = 0;
+        if (sendto(inet.Get(), &payload, sizeof(payload), 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != ENETUNREACH) {
+            return Failure(8, errno);
+        }
+
+        // Linux destroys the IPv4 protocol state at this threshold. Raising
+        // the MTU alone therefore does not silently recreate the address.
+        if (int error = SetMtu(inet.Get(), "lo", 65536, true)) return Failure(9, error);
+        destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        errno = 0;
+        if (sendto(inet.Get(), &payload, sizeof(payload), 0,
+                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != -1 ||
+            errno != ENETUNREACH) {
+            return Failure(10, errno);
+        }
         return Success();
     });
 }

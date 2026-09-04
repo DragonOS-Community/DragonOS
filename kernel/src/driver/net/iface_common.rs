@@ -503,173 +503,176 @@ impl IfaceCommon {
     where
         D: smoltcp::phy::Device + ?Sized,
     {
-        let scope = self.poll_scope();
-        match scope {
-            IfacePollScope::None => return false,
-            IfacePollScope::LocalOnly | IfacePollScope::Full => {}
-        }
+        let mut force_authoritative = force_authoritative;
+        loop {
+            let scope = self.poll_scope();
+            match scope {
+                IfacePollScope::None => return false,
+                IfacePollScope::LocalOnly | IfacePollScope::Full => {}
+            }
 
-        let netns = self.net_namespace();
-        let authoritative_ipv4_output = force_authoritative
-            || netns
+            let netns = self.net_namespace();
+            let authoritative_ipv4_output = force_authoritative
+                || netns
+                    .as_ref()
+                    .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output());
+            let configured_ipv4_output = netns
                 .as_ref()
-                .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output());
-        let configured_ipv4_output = netns
-            .as_ref()
-            .is_some_and(crate::net::neighbor::has_ipv4_entries);
-        let needs_routed_poll = self.needs_namespace_routing()
-            || scope == IfacePollScope::LocalOnly
-            || authoritative_ipv4_output
-            || configured_ipv4_output;
-        let router = if needs_routed_poll {
-            netns.as_ref().map(|netns| netns.router())
-        } else {
-            None
-        };
-        let route_policy = router.as_ref().and_then(|router| {
-            netns
-                .as_ref()
-                .map(|netns| crate::net::route::lock_output_routes(router, netns.device_list()))
-        });
-        let routed_this_round = route_policy.is_some();
-        let owner_is_up = scope == IfacePollScope::Full;
+                .is_some_and(crate::net::neighbor::has_ipv4_entries);
+            let needs_routed_poll = self.needs_namespace_routing()
+                || scope == IfacePollScope::LocalOnly
+                || authoritative_ipv4_output
+                || configured_ipv4_output;
+            let router = if needs_routed_poll {
+                netns.as_ref().map(|netns| netns.router())
+            } else {
+                None
+            };
+            let route_policy = router.as_ref().and_then(|router| {
+                netns
+                    .as_ref()
+                    .map(|netns| crate::net::route::lock_output_routes(router, netns.device_list()))
+            });
+            let routed_this_round = route_policy.is_some();
+            let owner_is_up = scope == IfacePollScope::Full;
 
-        let timestamp = crate::time::Instant::now().into();
-        let mut sockets = self.sockets.lock();
-        let mut interface = self.smol_iface.lock();
-        if self.poll_scope() != scope {
-            drop(interface);
-            drop(sockets);
-            drop(route_policy);
-            drop(router);
-            return self.poll_with_authoritative_mode(device, force_authoritative);
-        }
-        let configured_neighbors = netns.as_ref().and_then(|netns| {
-            crate::net::neighbor::has_ipv4_entries(netns).then(|| crate::net::neighbor::read(netns))
-        });
+            let timestamp = crate::time::Instant::now().into();
+            let mut sockets = self.sockets.lock();
+            let mut interface = self.smol_iface.lock();
+            if self.poll_scope() != scope {
+                drop(interface);
+                drop(sockets);
+                drop(route_policy);
+                drop(router);
+                continue;
+            }
+            let configured_neighbors = netns.as_ref().and_then(|netns| {
+                crate::net::neighbor::has_ipv4_entries(netns)
+                    .then(|| crate::net::neighbor::read(netns))
+            });
 
-        // Reservations and route-mode changes publish before SocketSet
-        // mutation. Recheck after serialization and restart before processing
-        // any packet if the initial backend snapshot became stale.
-        let restart = self.recheck_poll_mode(
-            netns.as_ref(),
-            needs_routed_poll,
-            authoritative_ipv4_output,
-            configured_ipv4_output,
-        );
-        if restart != PollModeRecheck::Current {
+            // Reservations and route-mode changes publish before SocketSet
+            // mutation. Recheck after serialization and restart before processing
+            // any packet if the initial backend snapshot became stale.
+            let restart = self.recheck_poll_mode(
+                netns.as_ref(),
+                needs_routed_poll,
+                authoritative_ipv4_output,
+                configured_ipv4_output,
+            );
+            if restart != PollModeRecheck::Current {
+                drop(configured_neighbors);
+                drop(interface);
+                drop(sockets);
+                drop(route_policy);
+                drop(router);
+                force_authoritative |= restart == PollModeRecheck::Authoritative;
+                continue;
+            }
+            let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
+                routes,
+                configured_neighbors: configured_neighbors.as_ref(),
+                owner_ifindex: self.iface_id as u32,
+                owner_is_up,
+                authoritative_ipv4_output,
+            });
+
+            // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
+            self.tcp_listener_backlog
+                .refresh_listen_socket_present(&sockets);
+
+            let (has_events, poll_again, deadline_rearm) = {
+                let local_result = if routed_this_round
+                    && (self.has_local_input() || scope == IfacePollScope::LocalOnly)
+                {
+                    let mut local_device =
+                        LocalInputDevice::new(device, self, backend_policy.unwrap());
+                    Some(interface.poll(timestamp, &mut local_device, &mut sockets))
+                } else {
+                    None
+                };
+                let poll_result = if scope == IfacePollScope::Full {
+                    if routed_this_round {
+                        let mut routed_device = RoutedTxDevice {
+                            device,
+                            queue: &self.local_input_queue,
+                            backend_policy: backend_policy.unwrap(),
+                        };
+                        Some(interface.poll(timestamp, &mut routed_device, &mut sockets))
+                    } else {
+                        Some(interface.poll(timestamp, device, &mut sockets))
+                    }
+                } else {
+                    None
+                };
+
+                // Reclaim/advance orphaned TCP sockets after smoltcp has processed ingress.
+                // If this aborts an orphan, compute poll_at afterwards so the pending RST is
+                // scheduled immediately instead of waiting for an unrelated future poll.
+                self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
+
+                self.release_resolved_routed_outputs(
+                    &mut interface,
+                    timestamp,
+                    configured_neighbors.as_ref(),
+                );
+                self.retain_namespace_routing_for_pending_fragments(&interface);
+
+                let poll_at = interface.poll_at(timestamp, &sockets);
+                let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
+                (
+                    local_result.is_some_and(|result| {
+                        matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
+                    }) || poll_result.is_some_and(|result| {
+                        matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
+                    }),
+                    poll_again || self.has_local_input(),
+                    deadline_rearm,
+                )
+            };
+
+            // Publish the deadline while the smoltcp serialization locks are held,
+            // but notify the namespace only after dropping them.
+            // Lock order is smoltcp -> configured-neighbor read. Release in the
+            // reverse order before output draining may acquire another smoltcp
+            // lock; RTNL delete deliberately uses smoltcp -> table write.
             drop(configured_neighbors);
             drop(interface);
             drop(sockets);
             drop(route_policy);
             drop(router);
-            return self.poll_with_authoritative_mode(
-                device,
-                force_authoritative || restart == PollModeRecheck::Authoritative,
-            );
+            let output_drain = self.drain_local_outputs(device, Self::LOCAL_OUTPUT_POLL_BUDGET);
+            self.clear_namespace_routing_if_idle();
+            self.notify_deadline_rearm(deadline_rearm);
+
+            // 注意：不要在持有 bounds 读锁(且 irqsave)期间调用 socket.notify()。
+            // 否则会形成典型锁顺序反转死锁：
+            // - poll 路径：bounds.read_irqsave() -> socket.notify() -> socket.inner(RwLock)
+            // - connect/bind/close 路径：socket.inner(RwLock) -> bounds.write()
+            // 因此这里先快照一份 bound sockets，再逐个 notify。
+            //
+            // IMPORTANT: 对于 loopback 场景（如 gVisor BlockingLargeWrite 测试），始终需要唤醒所有
+            // 等待的 socket。原因：smoltcp 在处理 ACK 后可能不返回 SocketStateChanged，但发送端的
+            // can_send() 已经变为 true。如果只在 has_events 时唤醒，发送端会永远等待。
+            // 唤醒后 socket 会重新检查条件，如果条件不满足会继续等待，所以不会造成忙等待。
+            self.notify_all_bound_sockets();
+
+            // TODO: remove closed sockets
+            // let closed_sockets = self
+            //     .closing_sockets
+            //     .lock_irq_disabled()
+            //     .extract_if(|closing_socket| closing_socket.is_closed())
+            //     .collect::<Vec<_>>();
+            // drop(closed_sockets);
+            // `Iface::poll()` 的返回值不仅用于“这轮有没有状态变化”，还会被
+            // `poll_iface_until_quiescent()` 当作“是否还需要立刻再 poll 一轮”的判据。
+            //
+            // smoltcp 会通过 `poll_at() == Now` 表示还有立即可推进的工作
+            // （例如 loopback 二次往返、ACK/window update、仅 egress 前进等）。
+            // 如果这里只返回 `has_events`，快路径会过早停止，剩余工作只能等下一次外部事件，
+            // 在 blocking TCP 大包场景就会表现为 send/recv 偶发永久卡住。
+            return has_events || poll_again || output_drain.needs_immediate_poll();
         }
-        let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
-            routes,
-            configured_neighbors: configured_neighbors.as_ref(),
-            owner_ifindex: self.iface_id as u32,
-            owner_is_up,
-            authoritative_ipv4_output,
-        });
-
-        // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
-        self.tcp_listener_backlog
-            .refresh_listen_socket_present(&sockets);
-
-        let (has_events, poll_again, deadline_rearm) = {
-            let local_result = if routed_this_round
-                && (self.has_local_input() || scope == IfacePollScope::LocalOnly)
-            {
-                let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
-                Some(interface.poll(timestamp, &mut local_device, &mut sockets))
-            } else {
-                None
-            };
-            let poll_result = if scope == IfacePollScope::Full {
-                if routed_this_round {
-                    let mut routed_device = RoutedTxDevice {
-                        device,
-                        queue: &self.local_input_queue,
-                        backend_policy: backend_policy.unwrap(),
-                    };
-                    Some(interface.poll(timestamp, &mut routed_device, &mut sockets))
-                } else {
-                    Some(interface.poll(timestamp, device, &mut sockets))
-                }
-            } else {
-                None
-            };
-
-            // Reclaim/advance orphaned TCP sockets after smoltcp has processed ingress.
-            // If this aborts an orphan, compute poll_at afterwards so the pending RST is
-            // scheduled immediately instead of waiting for an unrelated future poll.
-            self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
-
-            self.release_resolved_routed_outputs(
-                &mut interface,
-                timestamp,
-                configured_neighbors.as_ref(),
-            );
-            self.retain_namespace_routing_for_pending_fragments(&interface);
-
-            let poll_at = interface.poll_at(timestamp, &sockets);
-            let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
-            (
-                local_result.is_some_and(|result| {
-                    matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
-                }) || poll_result.is_some_and(|result| {
-                    matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
-                }),
-                poll_again || self.has_local_input(),
-                deadline_rearm,
-            )
-        };
-
-        // Publish the deadline while the smoltcp serialization locks are held,
-        // but notify the namespace only after dropping them.
-        // Lock order is smoltcp -> configured-neighbor read. Release in the
-        // reverse order before output draining may acquire another smoltcp
-        // lock; RTNL delete deliberately uses smoltcp -> table write.
-        drop(configured_neighbors);
-        drop(interface);
-        drop(sockets);
-        drop(route_policy);
-        drop(router);
-        let output_drain = self.drain_local_outputs(device, Self::LOCAL_OUTPUT_POLL_BUDGET);
-        self.clear_namespace_routing_if_idle();
-        self.notify_deadline_rearm(deadline_rearm);
-
-        // 注意：不要在持有 bounds 读锁(且 irqsave)期间调用 socket.notify()。
-        // 否则会形成典型锁顺序反转死锁：
-        // - poll 路径：bounds.read_irqsave() -> socket.notify() -> socket.inner(RwLock)
-        // - connect/bind/close 路径：socket.inner(RwLock) -> bounds.write()
-        // 因此这里先快照一份 bound sockets，再逐个 notify。
-        //
-        // IMPORTANT: 对于 loopback 场景（如 gVisor BlockingLargeWrite 测试），始终需要唤醒所有
-        // 等待的 socket。原因：smoltcp 在处理 ACK 后可能不返回 SocketStateChanged，但发送端的
-        // can_send() 已经变为 true。如果只在 has_events 时唤醒，发送端会永远等待。
-        // 唤醒后 socket 会重新检查条件，如果条件不满足会继续等待，所以不会造成忙等待。
-        self.notify_all_bound_sockets();
-
-        // TODO: remove closed sockets
-        // let closed_sockets = self
-        //     .closing_sockets
-        //     .lock_irq_disabled()
-        //     .extract_if(|closing_socket| closing_socket.is_closed())
-        //     .collect::<Vec<_>>();
-        // drop(closed_sockets);
-        // `Iface::poll()` 的返回值不仅用于“这轮有没有状态变化”，还会被
-        // `poll_iface_until_quiescent()` 当作“是否还需要立刻再 poll 一轮”的判据。
-        //
-        // smoltcp 会通过 `poll_at() == Now` 表示还有立即可推进的工作
-        // （例如 loopback 二次往返、ACK/window update、仅 egress 前进等）。
-        // 如果这里只返回 `has_events`，快路径会过早停止，剩余工作只能等下一次外部事件，
-        // 在 blocking TCP 大包场景就会表现为 send/recv 偶发永久卡住。
-        has_events || poll_again || output_drain.needs_immediate_poll()
     }
 
     /// NAPI 使用的 bounded poll：最多处理 `budget` 个 ingress 包，然后推进一次 egress。
@@ -691,223 +694,227 @@ impl IfaceCommon {
     where
         D: smoltcp::phy::Device + ?Sized,
     {
-        let scope = self.poll_scope();
-        match scope {
-            IfacePollScope::None => return napi::NapiPollResult::idle(),
-            IfacePollScope::LocalOnly | IfacePollScope::Full => {}
-        }
+        let mut force_authoritative = force_authoritative;
+        loop {
+            let scope = self.poll_scope();
+            match scope {
+                IfacePollScope::None => return napi::NapiPollResult::idle(),
+                IfacePollScope::LocalOnly | IfacePollScope::Full => {}
+            }
 
-        let netns = self.net_namespace();
-        let authoritative_ipv4_output = force_authoritative
-            || netns
+            let netns = self.net_namespace();
+            let authoritative_ipv4_output = force_authoritative
+                || netns
+                    .as_ref()
+                    .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output());
+            let configured_ipv4_output = netns
                 .as_ref()
-                .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output());
-        let configured_ipv4_output = netns
-            .as_ref()
-            .is_some_and(crate::net::neighbor::has_ipv4_entries);
-        let needs_routed_poll = self.needs_namespace_routing()
-            || scope == IfacePollScope::LocalOnly
-            || authoritative_ipv4_output
-            || configured_ipv4_output;
-        let router = if needs_routed_poll {
-            netns.as_ref().map(|netns| netns.router())
-        } else {
-            None
-        };
-        let route_policy = router.as_ref().and_then(|router| {
-            netns
-                .as_ref()
-                .map(|netns| crate::net::route::lock_output_routes(router, netns.device_list()))
-        });
-        let routed_this_round = route_policy.is_some();
-        let owner_is_up = scope == IfacePollScope::Full;
+                .is_some_and(crate::net::neighbor::has_ipv4_entries);
+            let needs_routed_poll = self.needs_namespace_routing()
+                || scope == IfacePollScope::LocalOnly
+                || authoritative_ipv4_output
+                || configured_ipv4_output;
+            let router = if needs_routed_poll {
+                netns.as_ref().map(|netns| netns.router())
+            } else {
+                None
+            };
+            let route_policy = router.as_ref().and_then(|router| {
+                netns
+                    .as_ref()
+                    .map(|netns| crate::net::route::lock_output_routes(router, netns.device_list()))
+            });
+            let routed_this_round = route_policy.is_some();
+            let owner_is_up = scope == IfacePollScope::Full;
 
-        let timestamp = crate::time::Instant::now().into();
-        let mut sockets = self.sockets.lock();
-        let mut interface = self.smol_iface.lock();
-        if self.poll_scope() != scope {
-            drop(interface);
-            drop(sockets);
-            drop(route_policy);
-            drop(router);
-            return self.poll_napi_with_authoritative_mode(device, budget, force_authoritative);
-        }
-        let configured_neighbors = netns.as_ref().and_then(|netns| {
-            crate::net::neighbor::has_ipv4_entries(netns).then(|| crate::net::neighbor::read(netns))
-        });
+            let timestamp = crate::time::Instant::now().into();
+            let mut sockets = self.sockets.lock();
+            let mut interface = self.smol_iface.lock();
+            if self.poll_scope() != scope {
+                drop(interface);
+                drop(sockets);
+                drop(route_policy);
+                drop(router);
+                continue;
+            }
+            let configured_neighbors = netns.as_ref().and_then(|netns| {
+                crate::net::neighbor::has_ipv4_entries(netns)
+                    .then(|| crate::net::neighbor::read(netns))
+            });
 
-        let restart = self.recheck_poll_mode(
-            netns.as_ref(),
-            needs_routed_poll,
-            authoritative_ipv4_output,
-            configured_ipv4_output,
-        );
-        if restart != PollModeRecheck::Current {
+            let restart = self.recheck_poll_mode(
+                netns.as_ref(),
+                needs_routed_poll,
+                authoritative_ipv4_output,
+                configured_ipv4_output,
+            );
+            if restart != PollModeRecheck::Current {
+                drop(configured_neighbors);
+                drop(interface);
+                drop(sockets);
+                drop(route_policy);
+                drop(router);
+                force_authoritative |= restart == PollModeRecheck::Authoritative;
+                continue;
+            }
+            let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
+                routes,
+                configured_neighbors: configured_neighbors.as_ref(),
+                owner_ifindex: self.iface_id as u32,
+                owner_is_up,
+                authoritative_ipv4_output,
+            });
+
+            // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
+            self.tcp_listener_backlog
+                .refresh_listen_socket_present(&sockets);
+
+            let mut processed = 0usize;
+            let mut had_packet = false;
+
+            // Local output is packet work too: it performs route/neighbor
+            // classification and transmission rather than merely reaping TX
+            // completions. Reserve half the shared NAPI budget when it is already
+            // backlogged, then let either side consume unused capacity.
+            let ingress_budget = if self.local_input_queue.has_ready_output(timestamp) {
+                budget.div_ceil(2)
+            } else {
+                budget
+            };
+
+            // Reserve at most half of the first pass for namespace-local handoff,
+            // then poll the hardware/device queue. If the device has no work, use
+            // the remaining budget for local input. This keeps both sources
+            // progressing without reducing throughput when only one is active.
+            let local_first_budget = if scope == IfacePollScope::Full {
+                ingress_budget.div_ceil(2)
+            } else {
+                ingress_budget
+            };
+            if routed_this_round {
+                let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
+                for _ in 0..local_first_budget {
+                    match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets)
+                    {
+                        smoltcp::iface::PollIngressSingleResult::None => break,
+                        smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                        | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                            had_packet = true;
+                            processed += 1;
+                        }
+                    }
+                }
+            }
+
+            let device_budget = if scope == IfacePollScope::Full {
+                ingress_budget - processed
+            } else {
+                0
+            };
+            let mut device_processed = 0usize;
+            if routed_this_round {
+                let mut routed_device = RoutedTxDevice {
+                    device,
+                    queue: &self.local_input_queue,
+                    backend_policy: backend_policy.unwrap(),
+                };
+                for _ in 0..device_budget {
+                    match interface.poll_ingress_single(timestamp, &mut routed_device, &mut sockets)
+                    {
+                        smoltcp::iface::PollIngressSingleResult::None => break,
+                        smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                        | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                            had_packet = true;
+                            processed += 1;
+                            device_processed += 1;
+                        }
+                    }
+                }
+            } else {
+                for _ in 0..device_budget {
+                    match interface.poll_ingress_single(timestamp, device, &mut sockets) {
+                        smoltcp::iface::PollIngressSingleResult::None => break,
+                        smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                        | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                            had_packet = true;
+                            processed += 1;
+                            device_processed += 1;
+                        }
+                    }
+                }
+            }
+
+            let remaining = device_budget - device_processed;
+            if routed_this_round && remaining > 0 && self.has_local_input() {
+                let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
+                for _ in 0..remaining {
+                    match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets)
+                    {
+                        smoltcp::iface::PollIngressSingleResult::None => break,
+                        smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                        | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                            had_packet = true;
+                            processed += 1;
+                        }
+                    }
+                }
+            }
+
+            // 推进发送路径（smoltcp 保证 bounded work）。
+            if routed_this_round && owner_is_up {
+                let mut routed_device = RoutedTxDevice {
+                    device,
+                    queue: &self.local_input_queue,
+                    backend_policy: backend_policy.unwrap(),
+                };
+                let _ = interface.poll_egress(timestamp, &mut routed_device, &mut sockets);
+            } else if routed_this_round {
+                let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
+                let _ = interface.poll_egress(timestamp, &mut local_device, &mut sockets);
+            } else {
+                let _ = interface.poll_egress(timestamp, device, &mut sockets);
+            }
+
+            self.release_resolved_routed_outputs(
+                &mut interface,
+                timestamp,
+                configured_neighbors.as_ref(),
+            );
+            self.retain_namespace_routing_for_pending_fragments(&interface);
+
+            let poll_at = interface.poll_at(timestamp, &sockets);
+            let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
+
+            // 解锁后唤醒/通知 socket（沿用原 poll() 的 Linux-like 语义）。
+            // Preserve the same smoltcp -> neighbor lock order as the direct poll
+            // path before draining may enter a target interface.
             drop(configured_neighbors);
             drop(interface);
             drop(sockets);
             drop(route_policy);
             drop(router);
-            return self.poll_napi_with_authoritative_mode(
-                device,
-                budget,
-                force_authoritative || restart == PollModeRecheck::Authoritative,
+            let output_drain = self.drain_local_outputs(device, budget - processed);
+            self.clear_namespace_routing_if_idle();
+            self.notify_deadline_rearm(deadline_rearm);
+            self.notify_all_bound_sockets();
+
+            // NAPI 语义：只要“还有立即可推进的工作”，就应继续留在 poll_list。
+            //
+            // 除了 ingress backlog 超过 budget 之外，egress/ACK 路径也可能要求立刻再次 poll：
+            // smoltcp 会通过 `poll_at() == Now`（这里被 clamp 成 `Some(timestamp)`）表达这一点。
+            // 如果忽略这个条件，loopback/TCP 大流量场景可能出现：
+            // - 已处理完当前 ingress batch；
+            // - 但仍有 ACK / window update / 后续 egress 需要立即发送；
+            // - NAPI 线程却错误睡眠，直到下一次外部事件才继续推进，
+            //   导致 send done 后 recv 端偶发卡住。
+            return napi::NapiPollResult::new(
+                processed + output_drain.work_done,
+                (had_packet && processed == ingress_budget)
+                    || poll_again
+                    || self.has_local_input()
+                    || output_drain.needs_immediate_poll(),
             );
         }
-        let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
-            routes,
-            configured_neighbors: configured_neighbors.as_ref(),
-            owner_ifindex: self.iface_id as u32,
-            owner_is_up,
-            authoritative_ipv4_output,
-        });
-
-        // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
-        self.tcp_listener_backlog
-            .refresh_listen_socket_present(&sockets);
-
-        let mut processed = 0usize;
-        let mut had_packet = false;
-
-        // Local output is packet work too: it performs route/neighbor
-        // classification and transmission rather than merely reaping TX
-        // completions. Reserve half the shared NAPI budget when it is already
-        // backlogged, then let either side consume unused capacity.
-        let ingress_budget = if self.local_input_queue.has_ready_output(timestamp) {
-            budget.div_ceil(2)
-        } else {
-            budget
-        };
-
-        // Reserve at most half of the first pass for namespace-local handoff,
-        // then poll the hardware/device queue. If the device has no work, use
-        // the remaining budget for local input. This keeps both sources
-        // progressing without reducing throughput when only one is active.
-        let local_first_budget = if scope == IfacePollScope::Full {
-            ingress_budget.div_ceil(2)
-        } else {
-            ingress_budget
-        };
-        if routed_this_round {
-            let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
-            for _ in 0..local_first_budget {
-                match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets) {
-                    smoltcp::iface::PollIngressSingleResult::None => break,
-                    smoltcp::iface::PollIngressSingleResult::PacketProcessed
-                    | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                        had_packet = true;
-                        processed += 1;
-                    }
-                }
-            }
-        }
-
-        let device_budget = if scope == IfacePollScope::Full {
-            ingress_budget - processed
-        } else {
-            0
-        };
-        let mut device_processed = 0usize;
-        if routed_this_round {
-            let mut routed_device = RoutedTxDevice {
-                device,
-                queue: &self.local_input_queue,
-                backend_policy: backend_policy.unwrap(),
-            };
-            for _ in 0..device_budget {
-                match interface.poll_ingress_single(timestamp, &mut routed_device, &mut sockets) {
-                    smoltcp::iface::PollIngressSingleResult::None => break,
-                    smoltcp::iface::PollIngressSingleResult::PacketProcessed
-                    | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                        had_packet = true;
-                        processed += 1;
-                        device_processed += 1;
-                    }
-                }
-            }
-        } else {
-            for _ in 0..device_budget {
-                match interface.poll_ingress_single(timestamp, device, &mut sockets) {
-                    smoltcp::iface::PollIngressSingleResult::None => break,
-                    smoltcp::iface::PollIngressSingleResult::PacketProcessed
-                    | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                        had_packet = true;
-                        processed += 1;
-                        device_processed += 1;
-                    }
-                }
-            }
-        }
-
-        let remaining = device_budget - device_processed;
-        if routed_this_round && remaining > 0 && self.has_local_input() {
-            let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
-            for _ in 0..remaining {
-                match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets) {
-                    smoltcp::iface::PollIngressSingleResult::None => break,
-                    smoltcp::iface::PollIngressSingleResult::PacketProcessed
-                    | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                        had_packet = true;
-                        processed += 1;
-                    }
-                }
-            }
-        }
-
-        // 推进发送路径（smoltcp 保证 bounded work）。
-        if routed_this_round && owner_is_up {
-            let mut routed_device = RoutedTxDevice {
-                device,
-                queue: &self.local_input_queue,
-                backend_policy: backend_policy.unwrap(),
-            };
-            let _ = interface.poll_egress(timestamp, &mut routed_device, &mut sockets);
-        } else if routed_this_round {
-            let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
-            let _ = interface.poll_egress(timestamp, &mut local_device, &mut sockets);
-        } else {
-            let _ = interface.poll_egress(timestamp, device, &mut sockets);
-        }
-
-        self.release_resolved_routed_outputs(
-            &mut interface,
-            timestamp,
-            configured_neighbors.as_ref(),
-        );
-        self.retain_namespace_routing_for_pending_fragments(&interface);
-
-        let poll_at = interface.poll_at(timestamp, &sockets);
-        let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
-
-        // 解锁后唤醒/通知 socket（沿用原 poll() 的 Linux-like 语义）。
-        // Preserve the same smoltcp -> neighbor lock order as the direct poll
-        // path before draining may enter a target interface.
-        drop(configured_neighbors);
-        drop(interface);
-        drop(sockets);
-        drop(route_policy);
-        drop(router);
-        let output_drain = self.drain_local_outputs(device, budget - processed);
-        self.clear_namespace_routing_if_idle();
-        self.notify_deadline_rearm(deadline_rearm);
-        self.notify_all_bound_sockets();
-
-        // NAPI 语义：只要“还有立即可推进的工作”，就应继续留在 poll_list。
-        //
-        // 除了 ingress backlog 超过 budget 之外，egress/ACK 路径也可能要求立刻再次 poll：
-        // smoltcp 会通过 `poll_at() == Now`（这里被 clamp 成 `Some(timestamp)`）表达这一点。
-        // 如果忽略这个条件，loopback/TCP 大流量场景可能出现：
-        // - 已处理完当前 ingress batch；
-        // - 但仍有 ACK / window update / 后续 egress 需要立即发送；
-        // - NAPI 线程却错误睡眠，直到下一次外部事件才继续推进，
-        //   导致 send done 后 recv 端偶发卡住。
-        napi::NapiPollResult::new(
-            processed + output_drain.work_done,
-            (had_packet && processed == ingress_budget)
-                || poll_again
-                || self.has_local_input()
-                || output_drain.needs_immediate_poll(),
-        )
     }
 
     fn drain_local_outputs<D>(&self, device: &mut D, budget: usize) -> LocalOutputDrainResult

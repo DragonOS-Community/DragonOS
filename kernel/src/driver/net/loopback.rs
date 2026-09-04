@@ -38,6 +38,10 @@ use super::{Iface, IfaceCommon, MtuBounds};
 const DEVICE_NAME: &str = "loopback";
 /// Linux's userspace-visible loopback MTU and packet-buffer capacity.
 const LOOPBACK_MTU: usize = 64 * 1024;
+/// IPv4 requires room for its minimum header. smoltcp also uses this lower
+/// bound for its shared IPv4/IPv6 MTU, independently of Linux's administrative
+/// loopback MTU range.
+const LOOPBACK_STACK_MIN_MTU: usize = 68;
 /// smoltcp currently shares one MTU across IPv4 and IPv6. Keep its projection
 /// within IPv4's 16-bit total-length field while the device retains Linux's
 /// 64 KiB administrative MTU and packet-buffer capacity.
@@ -272,10 +276,21 @@ impl LoopbackDriver {
         !self.inner.lock().queue.is_empty()
     }
 
-    fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
-        if frame.len() > LOOPBACK_MTU {
+    fn packet_len_limit(&self) -> usize {
+        self.iface().map_or(LOOPBACK_MTU, |iface| iface.mtu())
+    }
+
+    fn validate_frame_len(&self, len: usize) -> Result<(), SystemError> {
+        if len > self.packet_len_limit() {
             return Err(SystemError::EMSGSIZE);
         }
+        Ok(())
+    }
+
+    fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
+        // Recheck immediately before enqueueing: the configured MTU can change
+        // after a caller's pre-allocation check.
+        self.validate_frame_len(frame.len())?;
         self.inner.lock().loopback_transmit(frame);
         if let Some(iface) = self.iface() {
             if let Some(napi) = iface.napi_struct() {
@@ -288,9 +303,7 @@ impl LoopbackDriver {
     }
 
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        if frame.len() > LOOPBACK_MTU {
-            return Err(SystemError::EMSGSIZE);
-        }
+        self.validate_frame_len(frame.len())?;
         self.submit_frame(frame.to_vec())
     }
 }
@@ -591,6 +604,9 @@ impl Iface for LoopbackInterface {
         _next_hop: &smoltcp::wire::IpAddress,
         ip_packet: &[u8],
     ) -> Result<(), super::RouteSendError> {
+        if ip_packet.len() > self.mtu() {
+            return Err(SystemError::EMSGSIZE.into());
+        }
         self.inject_local_ipv4_packet(self.nic_id() as u32, self.mac(), ip_packet, false)
             .map_err(Into::into)
     }
@@ -636,13 +652,13 @@ impl Iface for LoopbackInterface {
         MtuBounds {
             // Match Linux's standard loopback MTU while retaining the
             // protocol-safe smoltcp projection in stack_mtu().
-            min: 68,
+            min: 0,
             max: LOOPBACK_MTU,
         }
     }
 
     fn stack_mtu(&self, configured_mtu: usize) -> usize {
-        configured_mtu.min(LOOPBACK_STACK_MTU)
+        configured_mtu.clamp(LOOPBACK_STACK_MIN_MTU, LOOPBACK_STACK_MTU)
     }
 }
 

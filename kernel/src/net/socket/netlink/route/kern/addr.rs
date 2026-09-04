@@ -446,6 +446,15 @@ pub(super) fn notify_address_change(
     notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None);
 }
 
+pub(super) fn notify_removed_address(
+    netns: Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+    label: &CString,
+) {
+    notify_one(netns, iface, cidr, CSegmentType::DELADDR, Some(label));
+}
+
 fn notify_address_outcome_with_label(
     netns: Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,

@@ -257,6 +257,9 @@ pub trait Iface: crate::driver::base::device::Device {
         let smoltcp::wire::IpAddress::Ipv4(next_hop) = *next_hop else {
             return Err(SystemError::EAFNOSUPPORT);
         };
+        if ip_packet.len() > self.mtu() {
+            return Err(SystemError::EMSGSIZE);
+        }
         let napi = self.napi_struct();
         let owner_netns = self.net_namespace();
         let scheduler_netns = napi.is_none().then(|| owner_netns.clone()).flatten();

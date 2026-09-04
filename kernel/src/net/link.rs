@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    address::PreparedAddressLabelRename,
+    address::{PreparedAddressLabelRename, PreparedMtuAddressChange, RemovedAddress},
     neighbor::{self, NeighborEntry, PreparedConfiguredNeighborPurge},
     route::{self, PreparedLinkStateChange, RouteNotifications},
     rtnl::RtnlGuard,
@@ -83,6 +83,7 @@ pub(crate) struct LinkMutationCommit {
     pub iface: Arc<dyn Iface>,
     pub changes: LinkChanges,
     pub renamed_ipv4: Vec<smoltcp::wire::IpCidr>,
+    pub removed_addresses: Vec<RemovedAddress>,
     pub route_changes: Option<RouteNotifications>,
     pub removed_neighbors: Vec<NeighborEntry>,
     pub rename_old_devpath: Option<String>,
@@ -90,7 +91,7 @@ pub(crate) struct LinkMutationCommit {
 
 struct PreparedLinkRename {
     name: String,
-    labels: PreparedAddressLabelRename,
+    labels: Option<PreparedAddressLabelRename>,
     sysfs: PreparedDeviceSysfsRename,
 }
 
@@ -102,6 +103,7 @@ struct PreparedLinkMutation<'rtnl> {
     rename: Option<PreparedLinkRename>,
     flags: Option<PreparedConfiguredFlags>,
     routes: Option<PreparedLinkStateChange<'rtnl>>,
+    address_change: Option<PreparedMtuAddressChange>,
     neighbors: Option<PreparedConfiguredNeighborPurge<'rtnl>>,
     changes: LinkChanges,
     was_up: bool,
@@ -132,7 +134,27 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
 
         let (flags, was_up, is_up, noarp_changed) = prepare_flags(&iface, update.flags)?;
         let link_down = was_up && !is_up;
-        let routes = if was_up != is_up {
+        let address_change = mtu
+            .map(|mtu| {
+                super::address::prepare_mtu_address_change(
+                    rtnl,
+                    &netns,
+                    &iface,
+                    mtu,
+                    rename.as_ref().map(|rename| rename.name.as_str()),
+                    was_up,
+                    is_up,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let mut rename = rename;
+        if address_change.is_some() {
+            if let Some(rename) = rename.as_mut() {
+                rename.labels = None;
+            }
+        }
+        let routes = if address_change.is_none() && was_up != is_up {
             Some(route::prepare_link_state_change(
                 rtnl, &netns, &iface, is_up,
             )?)
@@ -168,6 +190,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             rename,
             flags,
             routes,
+            address_change,
             neighbors,
             changes,
             was_up,
@@ -185,6 +208,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             rename,
             flags,
             routes,
+            address_change,
             neighbors,
             changes,
             was_up,
@@ -201,7 +225,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             (None, None)
         };
 
-        if let Some(mtu) = mtu {
+        if let Some(mtu) = mtu.filter(|_| address_change.is_none()) {
             let stack_mtu = iface.stack_mtu(mtu);
             iface
                 .smol_iface()
@@ -211,11 +235,15 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             iface.common().set_mtu(mtu);
         }
 
-        let renamed_ipv4 = if let Some((name, labels)) = rename {
-            labels.publish(&iface, name)
-        } else {
-            Vec::new()
-        };
+        let mut rename = rename;
+        let mut renamed_ipv4 = Vec::new();
+        if address_change.is_none() {
+            if let Some((name, labels)) = rename.take() {
+                renamed_ipv4 = labels
+                    .expect("rename without an address transaction owns its label plan")
+                    .publish(&iface, name);
+            }
+        }
 
         if noarp_changed {
             iface
@@ -241,7 +269,42 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             iface.quiesce_admin_down();
         }
 
-        let route_changes = if let Some(routes) = routes {
+        let mut removed_addresses = Vec::new();
+        let route_changes = if let Some(address_change) = address_change {
+            let renamed_to = rename.take().map(|(name, labels)| {
+                debug_assert!(labels.is_none());
+                name
+            });
+            let (removed, renamed, route_changes) = address_change.publish(
+                &netns,
+                &iface,
+                renamed_to,
+                || {
+                    let mtu = mtu.expect("address teardown requires an MTU update");
+                    let stack_mtu = iface.stack_mtu(mtu);
+                    iface
+                        .smol_iface()
+                        .lock()
+                        .set_ip_mtu(stack_mtu)
+                        .expect("validated interface MTU must be representable by smoltcp");
+                    iface.common().set_mtu(mtu);
+                },
+                is_up,
+                || {
+                    if was_up != is_up {
+                        publish_link_flags_and_state(&iface, flags, is_up);
+                    } else if let Some(flags) = flags {
+                        iface.common().publish_configured_flags(flags);
+                    }
+                    if link_down {
+                        iface.smol_iface().lock().flush_neighbor_cache();
+                    }
+                },
+            );
+            removed_addresses = removed;
+            renamed_ipv4 = renamed;
+            Some(route_changes)
+        } else if let Some(routes) = routes {
             Some(routes.publish(&netns, is_up, || {
                 publish_link_flags_and_state(&iface, flags, is_up);
                 if link_down {
@@ -285,6 +348,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             iface,
             changes,
             renamed_ipv4,
+            removed_addresses,
             route_changes,
             removed_neighbors,
             rename_old_devpath,
@@ -359,7 +423,7 @@ fn prepare_rename(
     let sysfs = prepare_netdev_sysfs_rename(iface, try_copy_string(&name)?)?;
     Ok(Some(PreparedLinkRename {
         name,
-        labels,
+        labels: Some(labels),
         sysfs,
     }))
 }

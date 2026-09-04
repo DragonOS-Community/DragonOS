@@ -479,6 +479,7 @@ KERNEL_CMDLINE=" rw "
 # - none: 不进行自动测试
 # - syscall: 进行gvisor系统调用测试
 # - dunit: 进行dunitest测试
+# - benchmark: 进行lmbench性能基准测试
 AUTO_TEST=${AUTO_TEST:=none}
 # gvisor测试目录
 SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR:=/opt/tests/gvisor}
@@ -486,6 +487,8 @@ SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR:=/opt/tests/gvisor}
 DUNITEST_DIR=${DUNITEST_DIR:=/opt/tests/dunitest}
 # dunitest pattern过滤条件
 DUNITEST_PATTERN=${DUNITEST_PATTERN:=}
+# lmbench基准测试目录
+BENCHMARK_TEST_DIR=${BENCHMARK_TEST_DIR:=/opt/tests/benchmark/lmbench}
 
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
@@ -600,7 +603,7 @@ while true;do
 
 setup_kernel_init_program() {
     if [ ${ARCH} == "x86_64" ]; then
-        KERNEL_CMDLINE+=" init=/bin/busybox init AUTO_TEST=${AUTO_TEST} SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR} DUNITEST_DIR=${DUNITEST_DIR} DUNITEST_PATTERN=${DUNITEST_PATTERN} "
+        KERNEL_CMDLINE+=" init=/bin/busybox init AUTO_TEST=${AUTO_TEST} SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR} DUNITEST_DIR=${DUNITEST_DIR} DUNITEST_PATTERN=${DUNITEST_PATTERN} BENCHMARK_TEST_DIR=${BENCHMARK_TEST_DIR} "
         # KERNEL_CMDLINE+=" init=/bin/dragonreach "
     elif [ ${ARCH} == "riscv64" ]; then
         KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "

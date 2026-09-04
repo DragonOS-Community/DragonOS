@@ -1,0 +1,11 @@
+# Extraction/metadata for process_fork_lat
+CATEGORY=process
+BINARY=lat_proc
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_proc fork prints "Process fork+exit: <N> microseconds"; value is the field before the unit.
+SEARCH_PATTERN=Process fork
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=Process fork+exit latency via lat_proc fork

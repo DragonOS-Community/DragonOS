@@ -1,0 +1,12 @@
+# Extraction/metadata for tcp_virtio_bw_64k (KEY=VALUE; parsed by run.sh)
+CATEGORY=network
+BINARY=bw_tcp
+METRIC_TYPE=bandwidth
+UNIT=MB/s
+BIGGER_IS_BETTER=1
+# bw_tcp prints "<size MB> <MB/sec> MB/sec" e.g. "0.065536 8.88 MB/sec";
+# "socket connection" only appears in the perror on connect failure.
+SEARCH_PATTERN=^[0-9]
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=TCP virtio bandwidth via bw_tcp (64KB, 10.0.2.15)

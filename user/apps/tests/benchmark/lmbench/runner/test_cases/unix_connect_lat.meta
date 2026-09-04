@@ -1,0 +1,12 @@
+# Extraction/metadata for unix_connect_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=ipc
+BINARY=lat_unix_connect
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_unix_connect prints "UNIX connection cost: <N> microseconds" (prefix confirmed
+# via strings; tool did not run on host, to be confirmed in guest).
+SEARCH_PATTERN=UNIX connection cost
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=AF_UNIX connect latency via lat_unix_connect

@@ -1,0 +1,12 @@
+# Extraction/metadata for tcp_loopback_lat
+CATEGORY=network
+BINARY=lat_tcp
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_tcp prints "TCP latency using 127.0.0.1: <N> microseconds".
+# Anchor the result line so the wrapper banner "Running TCP latency test" cannot match.
+SEARCH_PATTERN=^TCP latency using
+RESULT_INDEX=NF-1
+NTH_OCCURRENCE=1
+DESCRIPTION=TCP loopback round-trip latency via lat_tcp

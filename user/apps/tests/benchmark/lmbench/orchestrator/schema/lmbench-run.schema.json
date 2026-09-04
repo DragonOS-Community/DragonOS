@@ -1,0 +1,180 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://dragonos.org/schema/lmbench-run.schema.json",
+  "title": "DragonOS LMbench Benchmark Run",
+  "description": "One benchmark run: environment metadata plus per-metric samples and statistics. Produced by the host-side collector from guest serial output.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "timestamp",
+    "arch",
+    "config",
+    "metrics",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Semantic version of THIS schema; bump on breaking shape changes.",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique id for the run, e.g. <UTC-compact-timestamp>-<short-commit>.",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Run start time, UTC, ISO-8601 (e.g. 2026-07-27T12:00:00Z)."
+    },
+    "arch": {
+      "type": "string",
+      "enum": ["x86_64", "riscv64", "aarch64", "loongarch64"]
+    },
+    "suite": {
+      "type": "string",
+      "description": "Benchmark suite identifier.",
+      "default": "lmbench"
+    },
+    "suite_version": {
+      "type": "string",
+      "description": "Version of the lmbench binaries under test (e.g. 3.0-a9)."
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Source revision of DragonOS under test.",
+      "properties": {
+        "commit": { "type": "string" },
+        "branch": { "type": "string" },
+        "dirty": { "type": "boolean" }
+      }
+    },
+    "kernel_version": {
+      "type": "string",
+      "description": "DragonOS kernel version/build string, if captured."
+    },
+    "host": {
+      "type": "object",
+      "description": "Host/QEMU environment that produced the numbers (affects comparability).",
+      "properties": {
+        "qemu": { "type": "string" },
+        "kvm": { "type": "boolean" },
+        "cpus": { "type": "integer", "minimum": 1 },
+        "mem_mb": { "type": "integer", "minimum": 1 },
+        "hostname": { "type": "string" }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Runner configuration in effect for this run.",
+      "required": ["samples", "timeout_sec"],
+      "properties": {
+        "samples": { "type": "integer", "minimum": 1, "description": "Repetitions per metric." },
+        "timeout_sec": { "type": "integer", "minimum": 1, "description": "Per-metric wall-clock timeout." },
+        "warmup": { "type": "integer", "minimum": 0, "description": "Warmup repetitions discarded before sampling." }
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/metric" }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "ok", "failed", "skipped"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "ok": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "definitions": {
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "metric_type", "unit", "bigger_is_better", "status"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Stable metric id, matches the test_cases/<name>.sh basename.",
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "category": {
+          "type": "string",
+          "description": "Grouping for charts, e.g. memory, process, ipc, vfs, network, signal, filesystem.",
+          "enum": ["memory", "process", "ipc", "vfs", "network", "signal", "filesystem", "other"]
+        },
+        "binary": { "type": "string", "description": "Underlying lmbench binary, e.g. bw_mem, lat_pipe." },
+        "command": { "type": "string", "description": "Exact command line executed inside the guest." },
+        "description": { "type": "string" },
+        "metric_type": {
+          "type": "string",
+          "enum": ["latency", "bandwidth", "ops", "other"]
+        },
+        "unit": {
+          "type": "string",
+          "description": "Human unit, e.g. microseconds, MB/s, ops/sec. May be empty for skipped/failed metrics that never resolved a unit."
+        },
+        "bigger_is_better": {
+          "type": "boolean",
+          "description": "Direction of goodness; drives regression alerts and chart legends."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ok", "failed", "skipped"]
+        },
+        "samples": {
+          "type": "array",
+          "description": "Raw per-repetition values, in run order.",
+          "items": { "type": "number" }
+        },
+        "stats": { "$ref": "#/definitions/stats" },
+        "error": {
+          "type": "string",
+          "description": "Present when status is failed/skipped: reason (timeout, non-zero exit, no-match, etc.)."
+        },
+        "raw_tail": {
+          "type": "string",
+          "description": "Tail of captured output; emitted on extraction failure to aid calibration."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "ok" } } },
+          "then": {
+            "required": ["samples", "stats"],
+            "properties": {
+              "unit": { "type": "string", "minLength": 1 },
+              "samples": { "minItems": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "mean", "median", "stddev", "min", "max"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 },
+        "mean": { "type": "number" },
+        "median": { "type": "number" },
+        "stddev": { "type": "number", "minimum": 0 },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "cv": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Coefficient of variation = stddev/mean; a stability indicator."
+        }
+      }
+    }
+  }
+}

@@ -1,56 +1,29 @@
-# README for AI Agents
+# AGENTS.md — DragonOS 文档 Harness 地图
 
-## 项目简介
+> DragonOS 是面向云计算轻量化场景、提供 Linux 二进制兼容性的 64 位自主内核操作系统，目标是为容器化工作负载提供轻量、高性能的运行环境。
 
-DragonOS是一个面向云计算轻量化场景的，完全自主内核的，提供Linux二进制兼容性的64位操作系统，旨在为容器化工作负载提供轻量级、高性能的解决方案。
+本文件只负责路由 Harness 文档。源码布局、工程约束和操作命令分别由下列文档维护，按任务需要读取：
 
-## 设计思想
+```text
+AGENTS.md                              ← Harness 文档总地图
+ARCHITECTURE.md                        ← 系统边界、目录职责与阅读路由
+FORCE_CONSTRAIN.md                     ← 交互、兼容性、安全与开发强约束
+KEY_INFO_REMINDER.md                   ← 构建、Nix 环境与 QEMU 关键命令
+docs/                                  ← 深层 Harness 文档
+├── constraints/                       ← 局部操作约束入口
+│   └── COMMIT.md                      ← 提交上下文与权威规范入口
+├── product-specs/                     ← 产品需求文档
+│   └── index.md                       ← 问题、价值、范围与需求索引
+├── design-docs/                       ← 设计意图文档
+│   └── index.md                       ← 技术方案与权衡索引
+├── exec-plans/                        ← 执行计划与债务跟踪
+│   ├── active/                        ← 进行中的实施计划
+│   ├── completed/                     ← 已完成的实施计划
+│   ├── tech-debt-tracker.md           ← 技术债跟踪
+│   └── product-debt-tracker.md        ← 产品债跟踪
+├── references/                        ← 可复用参考资料
+│   └── index.md                       ← 参考资料索引
+└── generated/                         ← 生成型文档预留目录
+```
 
-- Linux兼容性：系统调用接口/procfs/sysfs/devfs等的行为应当符合Linux语义。参考Linux 6.6的行为进行实现。
-- 轻量：简化复杂的抽象设计，保留合理的、简洁、符合Rust开发最佳实践的的抽象，提升系统性能。
-- 安全：注重内存安全、并发安全
-
-
-## 开发准则
-
-### 交互语言规范
-
-- 所有AI助手在回应DragonOS仓库内的请求时必须使用简体中文。
-- 即便用户使用其他语言输入，也需以中文回答，除非更高优先级的指令明确要求使用其他语言。
-
-### 项目目录结构：
-
-- 文档：在`docs/`目录下
-- 内核：在`kernel/`目录下
-- 自行编写的单元测试程序：在`user/apps/c_unitest`目录下
-- gvisor系统调用测试程序：根据用户给出的程序代码片段来读取测试代码。如果用户没有提供，就尝试寻找，如果找不到，则从 https://cnb.cool/DragonOS-Community/gvisor/-/tree/dragonos/release-20250616.0/test/syscalls/linux 下面获取（下载文件然后再尝试读取）
-
-
-### 开发最佳实践
-
-- 三思而后行！深度研究，掌握解决问题所必要的信息，然后再动手开发/修复。
-- 设计要具有合理抽象，避免过度抽象。并且要注意代码复用。
-- 实现代码的时候，多问问自己：这代码写在这里合理吗？（架构、正确性等方面）
-- 高内聚、低耦合
-- 符合Linux语义
-- 不得使用workaround的方法绕过问题。要从本质解决问题！
-
-
-**测试修复相关**
-
-- 符合Linux 6.6的语义
-- 结合测例报错、测例代码、DragonOS代码、Linux行为实现来深入分析
-
-### 开发时的一些常见命令
-
-- 编译内核：在项目根目录下运行`make kernel`. 当你想检查你编辑的代码有没有语法错误的时候，请执行这个命令
-- Nix开发环境（推荐）：`nix develop`激活环境后可使用上述命令；`nix run .#yolo-x86_64`一键编译+启动QEMU。详见`docs/introduction/develop_nix.md`
-
-
-## WHERE TO LOOK
-
-| 任务 | 位置 | 备注 |
-|------|------|------|
-| 运行 DragonOS | `docs/introduction/develop_nix.md` | Nix 一键启动流程 |
-| OOM Killer | `kernel/src/mm/oom.rs` | 全局状态机，缺页路径触发，详见代码注释 |
-| 进程管理重构后 | `kernel/src/process/state.rs`（ProcessFlags）、`kernel/src/process/manager/exit.rs`（exit路径） | mod.rs 已拆分为子模块 |
+以上路径均相对仓库根目录，按任务读取对应权威文档。

@@ -1,0 +1,12 @@
+# Extraction/metadata for process_ctx_lat (KEY=VALUE; parsed by run.sh)
+CATEGORY=process
+BINARY=lat_ctx
+METRIC_TYPE=latency
+UNIT=microseconds
+BIGGER_IS_BETTER=0
+# lat_ctx prints a header "size=0k ovr=..." then a data row "<nprocs> <ctx_us>".
+# The data row is the only one starting with a digit; take the last field.
+SEARCH_PATTERN=^[0-9]
+RESULT_INDEX=NF
+NTH_OCCURRENCE=1
+DESCRIPTION=Context switch latency via lat_ctx (18 procs)

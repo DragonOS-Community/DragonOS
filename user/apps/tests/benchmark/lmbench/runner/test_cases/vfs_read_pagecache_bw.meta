@@ -1,0 +1,11 @@
+# Extraction/metadata for vfs_read_pagecache_bw (KEY=VALUE; parsed by run.sh)
+CATEGORY=vfs
+BINARY=bw_file_rd
+METRIC_TYPE=bandwidth
+UNIT=MB/s
+BIGGER_IS_BETTER=1
+# bw_file_rd prints "<size_MB> <bandwidth_MB/s>"; take the bandwidth (last field).
+SEARCH_PATTERN=^[0-9]
+RESULT_INDEX=NF
+NTH_OCCURRENCE=1
+DESCRIPTION=File read pagecache bandwidth via bw_file_rd io_only (512MB)

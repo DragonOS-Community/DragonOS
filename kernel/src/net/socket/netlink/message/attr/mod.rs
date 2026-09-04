@@ -31,6 +31,10 @@ impl CAttrHeader {
         self.type_ & ATTRIBUTE_TYPE_MASK
     }
 
+    pub fn is_nested(&self) -> bool {
+        self.type_ & IS_NESTED_MASK != 0
+    }
+
     pub fn payload_len(&self) -> usize {
         self.len as usize - size_of::<Self>()
     }
@@ -50,6 +54,10 @@ impl CAttrHeader {
 
 /// Netlink Attribute
 pub trait Attribute: core::fmt::Debug + Send + Sync {
+    /// Deprecated netlink policies accept a malformed trailing remainder and
+    /// retain attributes parsed before it. Strict families keep the default.
+    const ALLOW_TRAILING: bool = false;
+
     fn type_(&self) -> u16;
 
     fn payload_as_bytes(&self) -> &[u8];
@@ -68,8 +76,14 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
     fn write_to_buf(&self, buf: &mut Vec<u8>) -> Result<usize, SystemError> {
         let type_: u16 = self.type_();
         let payload_bytes = self.payload_as_bytes();
+        if payload_bytes.len() > u16::MAX as usize - size_of::<CAttrHeader>() {
+            return Err(SystemError::EINVAL);
+        }
         let header = CAttrHeader::from_payload_len(type_, payload_bytes.len());
         let total_len = header.total_len_with_padding();
+
+        buf.try_reserve(total_len)
+            .map_err(|_| SystemError::ENOMEM)?;
 
         // let mut current_offset = offset;
 
@@ -92,8 +106,8 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
         // 添加对齐填充
         let padding_len = header.padding_len();
         if padding_len > 0 {
-            // buf[current_offset..current_offset + padding_len].fill(0);
-            buf.extend(vec![0u8; padding_len]);
+            let old_len = buf.len();
+            buf.resize(old_len + padding_len, 0);
         }
 
         Ok(total_len)
@@ -108,29 +122,39 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
 
         while total_len > 0 {
             if total_len < size_of::<CAttrHeader>() {
+                if Self::ALLOW_TRAILING {
+                    break;
+                }
                 return Err(SystemError::EINVAL);
             }
 
             // 检查是否有足够的字节读取属性头部
-            if buf.len() - offset < size_of::<CAttrHeader>() {
+            if buf.len().saturating_sub(offset) < size_of::<CAttrHeader>() {
                 return Err(SystemError::EINVAL);
             }
 
             // 读取属性头部
             let attr_header_bytes = &buf[offset..offset + size_of::<CAttrHeader>()];
-            let attr_header = unsafe { *(attr_header_bytes.as_ptr() as *const CAttrHeader) };
+            // Netlink attributes are aligned relative to the message, but the
+            // enclosing userspace buffer itself is not guaranteed to be.
+            let attr_header = unsafe {
+                core::ptr::read_unaligned(attr_header_bytes.as_ptr() as *const CAttrHeader)
+            };
 
             // 验证属性长度
             if attr_header.total_len() < size_of::<CAttrHeader>() {
+                if Self::ALLOW_TRAILING {
+                    break;
+                }
                 return Err(SystemError::EINVAL);
             }
 
+            let attr_total = attr_header.total_len();
             let attr_total_with_padding = attr_header.total_len_with_padding();
-            total_len = total_len
-                .checked_sub(attr_total_with_padding)
-                .ok_or(SystemError::EINVAL)?;
-
-            if buf.len() - offset < attr_header.total_len() {
+            if total_len < attr_total || buf.len().saturating_sub(offset) < attr_total {
+                if Self::ALLOW_TRAILING {
+                    break;
+                }
                 return Err(SystemError::EINVAL);
             }
 
@@ -141,10 +165,19 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
 
             // 解析属性
             if let Some(attr) = Self::read_from_buf(&attr_header, payload_buf)? {
+                attrs.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
                 attrs.push(attr);
             }
 
-            offset += attr_total_with_padding;
+            // nlmsg_len may end immediately after the last attribute payload;
+            // alignment bytes are required only between attributes.
+            if total_len < attr_total_with_padding {
+                offset += attr_total;
+                total_len = 0;
+            } else {
+                offset += attr_total_with_padding;
+                total_len -= attr_total_with_padding;
+            }
         }
 
         Ok(attrs)

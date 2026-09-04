@@ -17,7 +17,7 @@ use crate::net::socket::netlink::{
         segment::{
             addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, CIfaddrMsg, RtScope},
             link::{CIfinfoMsg, LinkMessageFlags, LinkSegment, LinkSegmentBody},
-            neigh::{CNdMsg, NeighSegment, NeighSegmentBody, NeighState},
+            neigh::{CNdMsg, NeighSegment, NeighSegmentBody},
             route::{
                 CRtMsg, RouteFlags, RouteProtocol, RouteScope, RouteSegment, RouteSegmentBody,
                 RouteTable, RouteType,
@@ -265,13 +265,13 @@ fn read_short_getneigh_segment(
     header: CMsgSegHdr,
     payload: &[u8],
 ) -> Result<NeighSegment, SystemError> {
-    let family = read_rtgen_family(payload)?;
+    let family = payload.first().copied().ok_or(SystemError::EINVAL)?;
     let body = NeighSegmentBody {
         family,
         ifindex: 0,
-        state: NeighState::empty(),
+        state: 0,
         flags: 0,
-        kind: RouteType::Unspec,
+        kind: RouteType::Unspec as u8,
     };
     let mut segment = NeighSegment::new(header, body, Vec::<NeighAttr>::new());
     segment.header_mut().len = header.len;

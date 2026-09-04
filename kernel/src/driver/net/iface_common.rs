@@ -49,7 +49,6 @@ pub struct IfaceCommon {
     /// Routes supplied by constructors before the interface joins a netns.
     /// Drained transactionally by netns registration; never authoritative.
     pub(super) bootstrap_routes: Mutex<Vec<BootstrapRoute>>,
-    pub(super) static_neighbors: RwSem<Vec<StaticNeighborEntry>>,
     /// TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket（Linux-like）。
     pub(super) tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer,
     /// TCP listener/backlog 语义辅助（Linux-like 丢 SYN 等）。
@@ -123,7 +122,6 @@ impl IfaceCommon {
             local_input_queue: LocalInputQueue::new(),
             address_metadata: Mutex::new(address_metadata),
             bootstrap_routes: Mutex::new(Vec::new()),
-            static_neighbors: RwSem::new(Vec::new()),
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
             tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
             ipv4_multicast_refcnt: Mutex::new(Vec::new()),
@@ -372,17 +370,19 @@ impl IfaceCommon {
         &self,
         interface: &mut smoltcp::iface::Interface,
         timestamp: smoltcp::time::Instant,
+        configured: Option<&crate::net::neighbor::NeighborReadGuard<'_>>,
     ) {
         if !self.local_input_queue.has_deferred_output() {
             return;
         }
-        let static_neighbors = self.static_neighbors.read();
+        let ifindex = self.iface_id as u32;
         self.local_input_queue.release_resolved_outputs(|next_hop| {
-            static_neighbors
-                .iter()
-                .any(|entry| entry.ip_addr == smoltcp::wire::IpAddress::Ipv4(next_hop))
-                || interface
-                    .is_neighbor_resolved(timestamp, smoltcp::wire::IpAddress::Ipv4(next_hop))
+            configured.is_some_and(|neighbors| {
+                neighbors
+                    .lookup(ifindex, smoltcp::wire::IpAddress::Ipv4(next_hop))
+                    .is_some()
+            }) || interface
+                .is_neighbor_resolved(timestamp, smoltcp::wire::IpAddress::Ipv4(next_hop))
         });
     }
 
@@ -416,12 +416,16 @@ impl IfaceCommon {
         netns: Option<&Arc<NetNamespace>>,
         needs_routed_poll: bool,
         authoritative_ipv4_output: bool,
+        configured_ipv4_output: bool,
     ) -> PollModeRecheck {
         if !authoritative_ipv4_output
             && netns.is_some_and(|netns| netns.router().requires_authoritative_ipv4_output())
         {
             PollModeRecheck::Authoritative
-        } else if !needs_routed_poll && self.needs_namespace_routing() {
+        } else if (!needs_routed_poll && self.needs_namespace_routing())
+            || (!configured_ipv4_output
+                && netns.is_some_and(crate::net::neighbor::has_ipv4_entries))
+        {
             PollModeRecheck::Routed
         } else {
             PollModeRecheck::Current
@@ -508,9 +512,13 @@ impl IfaceCommon {
             || netns
                 .as_ref()
                 .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output());
+        let configured_ipv4_output = netns
+            .as_ref()
+            .is_some_and(crate::net::neighbor::has_ipv4_entries);
         let needs_routed_poll = self.needs_namespace_routing()
             || scope == IfacePollScope::LocalOnly
-            || authoritative_ipv4_output;
+            || authoritative_ipv4_output
+            || configured_ipv4_output;
         let router = if needs_routed_poll {
             netns.as_ref().map(|netns| netns.router())
         } else {
@@ -527,13 +535,21 @@ impl IfaceCommon {
         let timestamp = crate::time::Instant::now().into();
         let mut sockets = self.sockets.lock();
         let mut interface = self.smol_iface.lock();
+        let configured_neighbors = netns.as_ref().and_then(|netns| {
+            crate::net::neighbor::has_ipv4_entries(netns).then(|| crate::net::neighbor::read(netns))
+        });
 
         // Reservations and route-mode changes publish before SocketSet
         // mutation. Recheck after serialization and restart before processing
         // any packet if the initial backend snapshot became stale.
-        let restart =
-            self.recheck_poll_mode(netns.as_ref(), needs_routed_poll, authoritative_ipv4_output);
+        let restart = self.recheck_poll_mode(
+            netns.as_ref(),
+            needs_routed_poll,
+            authoritative_ipv4_output,
+            configured_ipv4_output,
+        );
         if restart != PollModeRecheck::Current {
+            drop(configured_neighbors);
             drop(interface);
             drop(sockets);
             drop(route_policy);
@@ -543,6 +559,13 @@ impl IfaceCommon {
                 force_authoritative || restart == PollModeRecheck::Authoritative,
             );
         }
+        let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
+            routes,
+            configured_neighbors: configured_neighbors.as_ref(),
+            owner_ifindex: self.iface_id as u32,
+            owner_is_up,
+            authoritative_ipv4_output,
+        });
 
         // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
         self.tcp_listener_backlog
@@ -552,14 +575,7 @@ impl IfaceCommon {
             let local_result = if routed_this_round
                 && (self.has_local_input() || scope == IfacePollScope::LocalOnly)
             {
-                let mut local_device = LocalInputDevice::new(
-                    device,
-                    self,
-                    route_policy.as_ref().unwrap(),
-                    self.iface_id as u32,
-                    owner_is_up,
-                    authoritative_ipv4_output,
-                );
+                let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
                 Some(interface.poll(timestamp, &mut local_device, &mut sockets))
             } else {
                 None
@@ -569,10 +585,7 @@ impl IfaceCommon {
                     let mut routed_device = RoutedTxDevice {
                         device,
                         queue: &self.local_input_queue,
-                        route_policy: route_policy.as_ref().unwrap(),
-                        owner_ifindex: self.iface_id as u32,
-                        owner_is_up,
-                        authoritative_ipv4_output,
+                        backend_policy: backend_policy.unwrap(),
                     };
                     Some(interface.poll(timestamp, &mut routed_device, &mut sockets))
                 } else {
@@ -587,7 +600,11 @@ impl IfaceCommon {
             // scheduled immediately instead of waiting for an unrelated future poll.
             self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
 
-            self.release_resolved_routed_outputs(&mut interface, timestamp);
+            self.release_resolved_routed_outputs(
+                &mut interface,
+                timestamp,
+                configured_neighbors.as_ref(),
+            );
             self.retain_namespace_routing_for_pending_fragments(&interface);
 
             let poll_at = interface.poll_at(timestamp, &sockets);
@@ -605,6 +622,10 @@ impl IfaceCommon {
 
         // Publish the deadline while the smoltcp serialization locks are held,
         // but notify the namespace only after dropping them.
+        // Lock order is smoltcp -> configured-neighbor read. Release in the
+        // reverse order before output draining may acquire another smoltcp
+        // lock; RTNL delete deliberately uses smoltcp -> table write.
+        drop(configured_neighbors);
         drop(interface);
         drop(sockets);
         drop(route_policy);
@@ -672,9 +693,13 @@ impl IfaceCommon {
             || netns
                 .as_ref()
                 .is_some_and(|netns| netns.router().requires_authoritative_ipv4_output());
+        let configured_ipv4_output = netns
+            .as_ref()
+            .is_some_and(crate::net::neighbor::has_ipv4_entries);
         let needs_routed_poll = self.needs_namespace_routing()
             || scope == IfacePollScope::LocalOnly
-            || authoritative_ipv4_output;
+            || authoritative_ipv4_output
+            || configured_ipv4_output;
         let router = if needs_routed_poll {
             netns.as_ref().map(|netns| netns.router())
         } else {
@@ -691,10 +716,18 @@ impl IfaceCommon {
         let timestamp = crate::time::Instant::now().into();
         let mut sockets = self.sockets.lock();
         let mut interface = self.smol_iface.lock();
+        let configured_neighbors = netns.as_ref().and_then(|netns| {
+            crate::net::neighbor::has_ipv4_entries(netns).then(|| crate::net::neighbor::read(netns))
+        });
 
-        let restart =
-            self.recheck_poll_mode(netns.as_ref(), needs_routed_poll, authoritative_ipv4_output);
+        let restart = self.recheck_poll_mode(
+            netns.as_ref(),
+            needs_routed_poll,
+            authoritative_ipv4_output,
+            configured_ipv4_output,
+        );
         if restart != PollModeRecheck::Current {
+            drop(configured_neighbors);
             drop(interface);
             drop(sockets);
             drop(route_policy);
@@ -705,6 +738,13 @@ impl IfaceCommon {
                 force_authoritative || restart == PollModeRecheck::Authoritative,
             );
         }
+        let backend_policy = route_policy.as_ref().map(|routes| OutputBackendPolicy {
+            routes,
+            configured_neighbors: configured_neighbors.as_ref(),
+            owner_ifindex: self.iface_id as u32,
+            owner_is_up,
+            authoritative_ipv4_output,
+        });
 
         // 刷新 listener 缓存：必须在持有 sockets 锁的前提下进行，且不得额外分配。
         self.tcp_listener_backlog
@@ -733,14 +773,7 @@ impl IfaceCommon {
             ingress_budget
         };
         if routed_this_round {
-            let mut local_device = LocalInputDevice::new(
-                device,
-                self,
-                route_policy.as_ref().unwrap(),
-                self.iface_id as u32,
-                owner_is_up,
-                authoritative_ipv4_output,
-            );
+            let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
             for _ in 0..local_first_budget {
                 match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets) {
                     smoltcp::iface::PollIngressSingleResult::None => break,
@@ -763,10 +796,7 @@ impl IfaceCommon {
             let mut routed_device = RoutedTxDevice {
                 device,
                 queue: &self.local_input_queue,
-                route_policy: route_policy.as_ref().unwrap(),
-                owner_ifindex: self.iface_id as u32,
-                owner_is_up,
-                authoritative_ipv4_output,
+                backend_policy: backend_policy.unwrap(),
             };
             for _ in 0..device_budget {
                 match interface.poll_ingress_single(timestamp, &mut routed_device, &mut sockets) {
@@ -795,14 +825,7 @@ impl IfaceCommon {
 
         let remaining = device_budget - device_processed;
         if routed_this_round && remaining > 0 && self.has_local_input() {
-            let mut local_device = LocalInputDevice::new(
-                device,
-                self,
-                route_policy.as_ref().unwrap(),
-                self.iface_id as u32,
-                owner_is_up,
-                authoritative_ipv4_output,
-            );
+            let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
             for _ in 0..remaining {
                 match interface.poll_ingress_single(timestamp, &mut local_device, &mut sockets) {
                     smoltcp::iface::PollIngressSingleResult::None => break,
@@ -820,33 +843,30 @@ impl IfaceCommon {
             let mut routed_device = RoutedTxDevice {
                 device,
                 queue: &self.local_input_queue,
-                route_policy: route_policy.as_ref().unwrap(),
-                owner_ifindex: self.iface_id as u32,
-                owner_is_up,
-                authoritative_ipv4_output,
+                backend_policy: backend_policy.unwrap(),
             };
             let _ = interface.poll_egress(timestamp, &mut routed_device, &mut sockets);
         } else if routed_this_round {
-            let mut local_device = LocalInputDevice::new(
-                device,
-                self,
-                route_policy.as_ref().unwrap(),
-                self.iface_id as u32,
-                owner_is_up,
-                authoritative_ipv4_output,
-            );
+            let mut local_device = LocalInputDevice::new(device, self, backend_policy.unwrap());
             let _ = interface.poll_egress(timestamp, &mut local_device, &mut sockets);
         } else {
             let _ = interface.poll_egress(timestamp, device, &mut sockets);
         }
 
-        self.release_resolved_routed_outputs(&mut interface, timestamp);
+        self.release_resolved_routed_outputs(
+            &mut interface,
+            timestamp,
+            configured_neighbors.as_ref(),
+        );
         self.retain_namespace_routing_for_pending_fragments(&interface);
 
         let poll_at = interface.poll_at(timestamp, &sockets);
         let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
 
         // 解锁后唤醒/通知 socket（沿用原 poll() 的 Linux-like 语义）。
+        // Preserve the same smoltcp -> neighbor lock order as the direct poll
+        // path before draining may enter a target interface.
+        drop(configured_neighbors);
         drop(interface);
         drop(sockets);
         drop(route_policy);
@@ -1042,7 +1062,8 @@ impl IfaceCommon {
                     probe_sent,
                 } => {
                     self.reset_local_output_tx_backoff();
-                    let LocalOutputDisposition::Routed { oif, .. } = packet.disposition else {
+                    let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition
+                    else {
                         unreachable!("only routed output performs neighbor discovery");
                     };
                     if let Some(key) = deferred_probe {
@@ -1060,7 +1081,17 @@ impl IfaceCommon {
                         }
                     } else if oif == self.iface_id as u32 {
                         match in_flight.requeue_deferred(packet, retry_at, probe_sent) {
-                            Ok(()) => self.defer_local_output_retry_at(retry_at),
+                            Ok(()) => {
+                                let retry_at =
+                                    if crate::net::neighbor::release_deferred_after_enqueue(
+                                        &netns, self, oif, next_hop,
+                                    ) {
+                                        crate::time::Instant::now().into()
+                                    } else {
+                                        retry_at
+                                    };
+                                self.defer_local_output_retry_at(retry_at);
+                            }
                             Err(packet) => {
                                 log::debug!(
                                     "dropping deferred output on {}: per-neighbor queue full",
@@ -1350,38 +1381,25 @@ impl IfaceCommon {
         *staged = routes;
     }
 
-    pub fn static_neighbors(&self) -> RwSemReadGuard<'_, Vec<StaticNeighborEntry>> {
-        self.static_neighbors.read()
+    pub(crate) fn release_configured_neighbor(
+        &self,
+        ifindex: u32,
+        next_hop: smoltcp::wire::Ipv4Address,
+    ) -> bool {
+        self.local_input_queue.release_neighbor(ifindex, next_hop)
     }
 
-    pub fn set_static_neighbor(&self, entry: StaticNeighborEntry) {
-        let ip_addr = entry.ip_addr;
-        let mut neighbors = self.static_neighbors.write();
-        if let Some(existing) = neighbors
-            .iter_mut()
-            .find(|existing| existing.ip_addr == entry.ip_addr)
-        {
-            *existing = entry;
-        } else {
-            neighbors.push(entry);
-        }
-        drop(neighbors);
-        let smoltcp::wire::IpAddress::Ipv4(next_hop) = ip_addr else {
-            return;
-        };
-        if self
-            .local_input_queue
-            .release_neighbor(self.iface_id as u32, next_hop)
-        {
+    /// Publishes a configured-neighbor commit to the deferred output queue.
+    /// The authoritative table is already committed before this projection is
+    /// invoked, so waking output never exposes uncommitted control-plane data.
+    pub(crate) fn configured_neighbor_committed(
+        &self,
+        ifindex: u32,
+        next_hop: smoltcp::wire::Ipv4Address,
+    ) {
+        if self.release_configured_neighbor(ifindex, next_hop) {
             self.schedule_registered_local_output(crate::time::Instant::now().into());
         }
-    }
-
-    pub fn remove_static_neighbor(&self, ip_addr: smoltcp::wire::IpAddress) -> bool {
-        let mut neighbors = self.static_neighbors.write();
-        let before = neighbors.len();
-        neighbors.retain(|existing| existing.ip_addr != ip_addr);
-        neighbors.len() != before
     }
 
     pub fn adjust_promiscuity(&self, inc: i32) -> Result<(), SystemError> {

@@ -1,13 +1,8 @@
-use crate::net::socket::{
-    netlink::{
-        message::segment::{common::SegmentCommon, SegmentBody},
-        route::message::attr::neigh::NeighAttr,
-    },
-    AddressFamily,
+use crate::net::socket::netlink::{
+    message::segment::{common::SegmentCommon, SegmentBody},
+    route::message::attr::neigh::NeighAttr,
 };
 use system_error::SystemError;
-
-use super::route::RouteType;
 
 pub type NeighSegment = SegmentCommon<NeighSegmentBody, NeighAttr>;
 
@@ -29,11 +24,20 @@ pub struct CNdMsg {
 
 #[derive(Debug, Clone, Copy)]
 pub struct NeighSegmentBody {
-    pub family: AddressFamily,
+    /// Raw `AF_*` value supplied by userspace.
+    ///
+    /// Family support is operation-specific (for example, an unsupported
+    /// dump family yields an empty dump while a mutation fails).  Keeping the
+    /// wire value intact lets the rtnetlink operation layer apply that policy.
+    pub family: u8,
     pub ifindex: i32,
-    pub state: NeighState,
+    /// Raw `NUD_*` bit set.  Validation belongs to the operation layer; using
+    /// `from_bits_truncate` here would silently turn an invalid request into a
+    /// different valid request.
+    pub state: u16,
     pub flags: u8,
-    pub kind: RouteType,
+    /// Raw `RTN_*` value, for the same reason as `family` and `state`.
+    pub kind: u8,
 }
 
 impl TryFrom<CNdMsg> for NeighSegmentBody {
@@ -41,11 +45,11 @@ impl TryFrom<CNdMsg> for NeighSegmentBody {
 
     fn try_from(value: CNdMsg) -> Result<Self, Self::Error> {
         Ok(Self {
-            family: AddressFamily::try_from(value.family as u16)?,
+            family: value.family,
             ifindex: value.ifindex,
-            state: NeighState::from_bits_truncate(value.state),
+            state: value.state,
             flags: value.flags,
-            kind: RouteType::try_from(value.type_)?,
+            kind: value.type_,
         })
     }
 }
@@ -53,13 +57,13 @@ impl TryFrom<CNdMsg> for NeighSegmentBody {
 impl From<NeighSegmentBody> for CNdMsg {
     fn from(value: NeighSegmentBody) -> Self {
         Self {
-            family: value.family as u8,
+            family: value.family,
             pad1: 0,
             pad2: 0,
             ifindex: value.ifindex,
-            state: value.state.bits(),
+            state: value.state,
             flags: value.flags,
-            type_: value.kind as u8,
+            type_: value.kind,
         }
     }
 }

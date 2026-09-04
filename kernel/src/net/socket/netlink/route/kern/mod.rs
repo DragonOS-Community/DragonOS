@@ -178,9 +178,9 @@ fn dispatch_request(
         RouteNlSegment::GetRoute(request) => route::do_get_route(request, netns),
         RouteNlSegment::NewRoute(request) => route::do_new_route(rtnl, request, netns),
         RouteNlSegment::DelRoute(request) => route::do_del_route(rtnl, request, netns),
-        RouteNlSegment::NewNeigh(request) => neigh::do_new_neigh(request, netns),
+        RouteNlSegment::NewNeigh(request) => neigh::do_new_neigh(rtnl, request, netns),
         RouteNlSegment::GetNeigh(request) => neigh::do_get_neigh(request, netns),
-        RouteNlSegment::DelNeigh(request) => neigh::do_del_neigh(request, netns),
+        RouteNlSegment::DelNeigh(request) => neigh::do_del_neigh(rtnl, request, netns),
         _ => {
             log::warn!("Unsupported route request segment type: {:?}", seg_type);
             Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)

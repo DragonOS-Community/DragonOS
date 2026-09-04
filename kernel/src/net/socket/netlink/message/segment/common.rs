@@ -64,6 +64,19 @@ impl<Body: SegmentBody, Attr: Attribute> SegmentCommon<Body, Attr> {
             return Err(SystemError::EINVAL);
         }
 
+        let attrs_len = self.attrs.iter().try_fold(0usize, |length, attr| {
+            length.checked_add(attr.total_len_with_padding())
+        });
+        let payload_len = Body::total_len_with_padding()
+            .checked_add(attrs_len.ok_or(SystemError::EINVAL)?)
+            .ok_or(SystemError::EINVAL)?;
+        let required_len = Self::HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(SystemError::EINVAL)?;
+        if buf.len() < required_len {
+            return Err(SystemError::EINVAL);
+        }
+
         // Write header to the beginning of buf
         let header_bytes = unsafe {
             core::slice::from_raw_parts(
@@ -74,14 +87,17 @@ impl<Body: SegmentBody, Attr: Attribute> SegmentCommon<Body, Attr> {
         buf[..Self::HEADER_LEN].copy_from_slice(header_bytes);
 
         // 这里创建一个内核缓冲区，用来写入body和attribute，方便进行写入
-        let mut kernel_buf: Vec<u8> = vec![];
+        let mut kernel_buf: Vec<u8> = Vec::new();
+        kernel_buf
+            .try_reserve_exact(payload_len)
+            .map_err(|_| SystemError::ENOMEM)?;
 
         self.body.write_to_buf(&mut kernel_buf)?;
         for attr in self.attrs.iter() {
             attr.write_to_buf(&mut kernel_buf)?;
         }
 
-        let actual_len = kernel_buf.len().min(buf.len());
+        let actual_len = kernel_buf.len();
         let payload_copied = if !kernel_buf.is_empty() {
             buf[Self::HEADER_LEN..Self::HEADER_LEN + actual_len]
                 .copy_from_slice(&kernel_buf[..actual_len]);

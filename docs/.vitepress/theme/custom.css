@@ -1,0 +1,23 @@
+.VPNavBarTitle .title {
+  justify-content: center;
+}
+
+.VPNavBarTitle .title .logo {
+  margin-right: 0;
+}
+
+.dragonos-footer {
+  text-align: center;
+  padding: 1.5rem 1rem 2.5rem;
+  font-size: 0.875rem;
+  color: var(--vp-c-text-2);
+}
+
+.dragonos-footer a {
+  color: var(--vp-c-brand-1);
+}
+
+.dragonos-footer span {
+  margin: 0 0.5rem;
+  color: var(--vp-c-text-3);
+}

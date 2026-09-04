@@ -1,34 +1,27 @@
 # kprobe
 
-> 作者: 陈林峰
->
+> Author: Chen Linfeng  
 > Email: chenlinfeng25@outlook.com
 
-## 概述
+## Overview
 
-Linux kprobes调试技术是内核开发者们专门为了便于跟踪内核函数执行状态所设计的一种轻量级内核调试技术。利用kprobes技术，内核开发人员可以在内核的绝大多数指定函数中动态的插入探测点来收集所需的调试状态信息而基本不影响内核原有的执行流程。
+The Linux kprobes debugging technology is a lightweight kernel debugging technique specifically designed by kernel developers to facilitate tracking the execution status of kernel functions. Using kprobes technology, kernel developers can dynamically insert probe points in most specified functions of the kernel to collect the required debugging status information, with minimal impact on the original execution flow of the kernel.
 
-kprobes技术依赖硬件架构相关的支持，主要包括CPU的异常处理和单步调试机制，前者用于让程序的执行流程陷入到用户注册的回调函数中去，而后者则用于单步执行被探测点指令。需要注意的是，在一些架构上硬件并不支持单步调试机制，这可以通过一些软件模拟的方法解决(比如riscv)。
+The kprobes technology relies on hardware architecture support, mainly including CPU exception handling and single-step debugging mechanisms. The former is used to cause the program's execution flow to enter the user-registered callback function, while the latter is used for single-step execution of the probed instruction. It is worth noting that on some architectures, the hardware does not support the single-step debugging mechanism, which can be resolved through software simulation methods (such as RISC-V).
 
+## kprobe Workflow
 
+![kprobe workflow](/kernel/trace/kprobe_flow.png)
 
-## kprobe工作流程
+1. After registering a kprobe, each registered kprobe corresponds to a kprobe structure, which records the location of the probe point and the original instruction at that location.
+2. The location of the probe point is replaced with an exception instruction. When the CPU executes to this location, it will enter an exception state. On x86_64, the instruction is int3 (if the kprobe is optimized, the instruction is jmp).
+3. When the exception instruction is executed, the system checks whether it is an exception installed by kprobe. If it is, the pre_handler of the kprobe is executed. Then, using the CPU's single-step debugging (single-step) feature, the relevant registers are set, and the next instruction is set to the original instruction at the probe point, returning from the exception state.
+4. The system enters the exception state again. The previous step has set the single-step related registers, so the original instruction is executed and the system will enter the exception state again. At this point, the single-step is cleared, and the post_handler is executed, and the system safely returns from the exception state.
+5. When unloading the kprobe, the original instruction at the probe point is restored.
 
-<img src="/kernel/trace/kprobe_flow.png" style="zoom: 67%;"  alt="xxx"/>
+The kernel currently supports x86 and riscv64. Since riscv64 does not have a single-step execution mode, we use the break exception to simulate it. When saving the probe point instruction, we additionally fill in a break instruction, allowing the execution of the original instruction to trigger the break exception again on the riscv64 architecture.
 
-
-
-1. 注册kprobe后，注册的每一个kprobe对应一个kprobe结构体，该结构中记录着探测点的位置，以及该探测点本来对应的指令。
-2. 探测点的位置被替换成了一条异常的指令，这样当CPU执行到探测点位置时会陷入到异常态，在x86_64上指令是int3（如果kprobe经过优化后，指令是jmp）
-3. 当执行到异常指令时，系统换检查是否是kprobe 安装的异常，如果是，就执行kprobe的pre_handler,然后利用CPU提供的单步调试（single-step）功能，设置好相应的寄存器，将下一条指令设置为插入点处本来的指令，从异常态返回；
-4. 再次陷入异常态。上一步骤中设置了single-step相关的寄存器，所以原指令刚一执行，便会再次陷入异常态，此时将single-step清除，并且执行post_handler，然后从异常态安全返回.
-5. 当卸载kprobe时，探测点原来的指令会被恢复回去。
-
-
-
-内核目前对x86和riscv64都进行了支持，由于 riscv64 没有单步执行模式，因此我们使用 break 异常来进行模拟，在保存探测点指令时，我们会额外填充一条 break 指令，这样就可以使得在riscv64架构上，在执行完原指令后，会再次触发break陷入异常。
-
-## kprobe的接口
+## kprobe Interfaces
 
 ```rust
 pub fn register_kprobe(kprobe_info: KprobeInfo) -> Result<LockKprobe, SystemError>;
@@ -47,11 +40,10 @@ impl KprobeBasic {
 }
 ```
 
-- `call_pre_handler` 在探测点指令被执行前调用用户定义的回调函数
-- `call_post_handler` 在单步执行完探测点指令后调用用户定义的回调函数
-- `call_fault_handler` 在调用前两种回调函数发生失败时调用
-- `call_event_callback` 用于调用eBPF相关的回调函数，通常与`call_post_handler` 一样在单步执行探测点指令会调用
-- `update_event_callback`用于运行过程中更新回调函数
-- `disable` 和 `enable` 用于动态关闭kprobe，在`disable`调用后，kprobe被触发时不执行回调函数
-- `symbol` 返回探测点的函数名称
-
+- `call_pre_handler` Calls the user-defined callback function before the probe point instruction is executed.
+- `call_post_handler` Calls the user-defined callback function after the probe point instruction has been executed in single-step mode.
+- `call_fault_handler` Calls the user-defined callback function if the first two callback functions fail.
+- `call_event_callback` Used to call eBPF-related callback functions, usually called in the same way as `call_post_handler` after the probe point instruction is executed in single-step mode.
+- `update_event_callback` Used to update the callback function during runtime.
+- `disable` and `enable` are used to dynamically disable the kprobe. After calling `disable`, the kprobe will not execute the callback function when triggered.
+- `symbol` Returns the function name of the probe point.

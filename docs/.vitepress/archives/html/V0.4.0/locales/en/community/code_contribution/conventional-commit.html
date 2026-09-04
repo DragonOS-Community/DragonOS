@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Code Commit Guidelines &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="Get in Touch with the Community" href="../contact/index.html" />
+    <link rel="prev" title="Rust Language Code Style" href="rust-coding-style.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/device/index.html">设备</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Contributing to Development</a><ul class="current">
+<li class="toctree-l3"><a class="reference external" href="https://community.dragonos.org/contributors/">how-to-contribute</a></li>
+<li class="toctree-l3"><a class="reference internal" href="c-coding-style.html">C Language Code Style</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rust-coding-style.html">Rust Language Code Style</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">Code Commit Guidelines</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#conventional-commit-conventional-commit">Conventional Commit (Conventional Commit)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#dragonos-bot">DragonOS Bot</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">Contributing to Development</a></li>
+      <li class="breadcrumb-item active">Code Commit Guidelines</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/locales/en/community/code_contribution/conventional-commit.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: community/code_contribution/conventional-commit.md</p></li>
+<li><p>Translation time: 2025-05-19 01:41:57</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="code-commit-guidelines">
+<h1>Code Commit Guidelines<a class="headerlink" href="#code-commit-guidelines" title="Permalink to this heading"></a></h1>
+<p>  This document will briefly introduce the code commit guidelines for the DragonOS GitHub repository, mainly providing the naming conventions based on Conventional Commit, as well as a brief introduction to the DragonOS Bot.</p>
+<section id="conventional-commit-conventional-commit">
+<h2>Conventional Commit (Conventional Commit)<a class="headerlink" href="#conventional-commit-conventional-commit" title="Permalink to this heading"></a></h2>
+<p>  For detailed specifications on Conventional Commit, please refer to the website <a class="reference external" href="https://www.conventionalcommits.org/zh-hans/v1.0.0/">Conventional Commit/Conventional Commit</a>. At the end of this section, we will provide examples (taken from the <a class="reference external" href="https://www.conventionalcommits.org/zh-hans/v1.0.0/">Conventional Commit/Conventional Commit</a> website), which are optional to read. We make the following special notes:</p>
+<ol class="arabic simple">
+<li><p>Since the DragonOS kernel ensures external usability primarily through system call interfaces, and up to now (April 22, 2024), considering the software ecosystem, DragonOS has chosen to implement system calls consistent with Linux. Therefore, there is no special explanation for <code class="docutils literal notranslate"><span class="pre">破坏性变更(BREAKING</span> <span class="pre">CHANGES)</span></code>, or in the current development environment, there will not be any destructive changes that significantly affect users. Therefore, unless there is a special need, the DragonOS kernel should not use <code class="docutils literal notranslate"><span class="pre">feat!</span></code> to indicate destructive changes. (Outside the kernel, such as dadk, the guidelines still apply.)</p></li>
+<li><p>The DragonOS community strictly follows a squash-based workflow, so we do not require each individual commit in a PR to conform to <a class="reference external" href="https://www.conventionalcommits.org/zh-hans/v1.0.0/">Conventional Commit/Conventional Commit</a>. However, we still strongly recommend using it.</p></li>
+<li><p>Regarding scope: If not specified otherwise, the scope should be the name of the submodule/system/directory. For example, if the code change is adding a feature in <code class="docutils literal notranslate"><span class="pre">kernel/src/driver/net</span></code>, it should be named as <code class="docutils literal notranslate"><span class="pre">feat(driver/net):</span></code>; if it is in <code class="docutils literal notranslate"><span class="pre">kernel/src/mm/allocator</span></code>, it should be named as <code class="docutils literal notranslate"><span class="pre">feat(mm)</span></code>. In short, the scope should be as short as possible to indicate the module it belongs to. Most of the time, it should not use more than two levels of scope identifiers. For example, <code class="docutils literal notranslate"><span class="pre">fix(x86_64/driver/apic)</span></code> is incorrect and should be named as <code class="docutils literal notranslate"><span class="pre">fix(x86_64/apic)</span></code>.</p></li>
+<li><p>In the DragonOS kernel code repository, <code class="docutils literal notranslate"><span class="pre">issue</span> <span class="pre">checker</span></code> will perform a simple review of the title format. If it does not conform to the format, it will be marked as <code class="docutils literal notranslate"><span class="pre">ambiguous</span></code>. Contributors are advised to modify it as needed.</p></li>
+<li><p>Use lowercase.</p></li>
+</ol>
+<section id="examples">
+<h3>Examples<a class="headerlink" href="#examples" title="Permalink to this heading"></a></h3>
+<section id="commit-message-with-a-description-and-a-footnote-indicating-a-breaking-change">
+<h4>Commit message with a description and a footnote indicating a breaking change<a class="headerlink" href="#commit-message-with-a-description-and-a-footnote-indicating-a-breaking-change" title="Permalink to this heading"></a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>feat: allow provided config object to extend other configs
+
+BREAKING CHANGE: `extends` key in config file is now used for extending other config files
+</pre></div>
+</div>
+</section>
+<section id="commit-message-with-the-character-to-alert-about-a-breaking-change">
+<h4>Commit message with the ! character to alert about a breaking change<a class="headerlink" href="#commit-message-with-the-character-to-alert-about-a-breaking-change" title="Permalink to this heading"></a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>feat!: send an email to the customer when a product is shipped
+</pre></div>
+</div>
+</section>
+<section id="commit-message-with-scope-and-a-breaking-change">
+<h4>Commit message with scope and a breaking change !<a class="headerlink" href="#commit-message-with-scope-and-a-breaking-change" title="Permalink to this heading"></a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>feat(api)!: send an email to the customer when a product is shipped
+</pre></div>
+</div>
+</section>
+<section id="commit-message-with-and-breaking-change-footnote">
+<h4>Commit message with ! and BREAKING CHANGE footnote<a class="headerlink" href="#commit-message-with-and-breaking-change-footnote" title="Permalink to this heading"></a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>chore!: drop support for Node 6
+
+BREAKING CHANGE: use JavaScript features not available in Node 6.
+</pre></div>
+</div>
+</section>
+<section id="commit-message-without-a-body">
+<h4>Commit message without a body<a class="headerlink" href="#commit-message-without-a-body" title="Permalink to this heading"></a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">docs</span><span class="p">:</span> <span class="n">correct</span> <span class="n">spelling</span> <span class="n">of</span> <span class="n">CHANGELOG</span>
+</pre></div>
+</div>
+</section>
+<section id="commit-message-with-scope">
+<h4>Commit message with scope<a class="headerlink" href="#commit-message-with-scope" title="Permalink to this heading"></a></h4>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">feat</span><span class="p">(</span><span class="n">lang</span><span class="p">):</span> <span class="n">add</span> <span class="n">polish</span> <span class="n">language</span>
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+<section id="dragonos-bot">
+<h2>DragonOS Bot<a class="headerlink" href="#dragonos-bot" title="Permalink to this heading"></a></h2>
+<p>  DragonOS uses triagebot to implement automatic labeling and reviewer assignment. Contributors can also interact with triagebot through some commands. For more details, see <a class="reference external" href="https://forge.rust-lang.org/triagebot/index.html">triagebot</a></p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="rust-coding-style.html" class="btn btn-neutral float-left" title="Rust Language Code Style" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../contact/index.html" class="btn btn-neutral float-right" title="Get in Touch with the Community" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/locales/en/community/code_contribution/conventional-commit.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/locales/en/community/code_contribution/conventional-commit.html">V0.3.0</a></dd>
+      <dd><a href="conventional-commit.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/community/code_contribution/conventional-commit.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

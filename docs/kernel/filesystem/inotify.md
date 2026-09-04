@@ -1,26 +1,25 @@
-# DragonOS inotify：用户语义与架构设计
+# DragonOS inotify: User Semantics and Architecture
 
-> 对应 issue：[DragonOS-Community/DragonOS#2151](https://github.com/DragonOS-Community/DragonOS/issues/2151)
+> Related issue: [DragonOS-Community/DragonOS#2151](https://github.com/DragonOS-Community/DragonOS/issues/2151)
 >
-> 兼容基线：Linux 6.6.139
+> Compatibility baseline: Linux 6.6.139
 >
-> 状态：**已实现并持续维护**
+> Status: **Implemented and maintained**
 
+### 0. Design goals
 
-### 0. 设计目标
+DragonOS inotify uses Linux 6.6.139 as its compatibility baseline and follows four principles:
 
-DragonOS 的 inotify 以 Linux 6.6.139 为兼容基线，遵循四个原则：
+1. **Linux-visible semantics come first.** Syscalls, event layout, masks, errno values, ordering, and read/poll behavior should match Linux.
+2. **Notification must not change the original operation.** Delivery is best effort. Queue exhaustion or notification-side memory pressure cannot turn a successful filesystem operation into a failure.
+3. **Hot paths stay cheap.** The kernel exits immediately when there are no watches and, when watches exist, checks the relevant object instead of contending on a system-wide index.
+4. **Every state has an owner.** Watch publication, object deletion, unmount, and queue overflow use explicit transitions so cleanup is neither duplicated nor lost.
 
-1. **Linux 用户语义优先**：系统调用、事件布局、mask、错误码、事件顺序和 read/poll 行为应与 Linux 一致。
-2. **通知不能改变原操作结果**：事件投递是尽力而为的。文件操作一旦成功，通知侧的队列满或内存不足不能把它改成失败。
-3. **热路径低开销**：没有 watch 时直接跳过；有 watch 时也尽量只检查当前对象，而不是争用系统级全局锁。
-4. **状态有明确所有者**：watch、对象删除、卸载和队列溢出都有明确的状态转换，避免重复释放、漏通知或事后猜测。
+inotify is the userspace interface; fsnotify is the kernel event-routing layer. DragonOS currently provides an inotify backend without pre-implementing fanotify, mount marks, or Linux's full SRCU/connector machinery.
 
-inotify 是用户接口，fsnotify 是内核中的事件路由层。目前 DragonOS 只提供 inotify 后端，不预先实现 fanotify、mount mark 或 Linux 完整的 SRCU/connector 体系。
+### 1. The userspace model
 
-### 1. 用户看到的模型
-
-一个 inotify 实例就是一个只读文件描述符：
+An inotify instance is a read-only file descriptor:
 
 ```text
 inotify_init1()
@@ -28,290 +27,289 @@ inotify_init1()
        ▼
   inotify fd ── inotify_add_watch(path, mask) ──► wd
        │
-       ├── read() 读取若干 inotify_event
-       ├── poll()/epoll() 等待队列可读
-       ├── ioctl(FIONREAD) 查询当前可读字节数
-       └── close() 撤销该实例的全部 watch
+       ├── read() returns inotify_event records
+       ├── poll()/epoll() waits for a readable queue
+       ├── ioctl(FIONREAD) reports currently readable bytes
+       └── close() removes all watches owned by the instance
 ```
 
-- `fd` 表示一个独立事件消费者，拥有自己的事件队列。
-- `wd`（watch descriptor）只在该 inotify 实例内有意义。
-- 对同一实例中的同一文件重复 `inotify_add_watch()` 会更新原 watch，并返回原来的 `wd`。
-- 一个 watch 监听的是**文件系统对象**，不是一段永久不变的路径字符串。硬链接别名共享同一个对象 watch；目录 watch 收到的子项事件则带发生事件时的当前名称。
+- The `fd` represents one independent consumer with its own queue.
+- A `wd` is meaningful only within that inotify instance.
+- Adding the same object again to the same instance updates the existing watch and returns the existing `wd`.
+- A watch follows a **filesystem object**, not a permanently fixed pathname string. Hard-link aliases share the same object watch; child events on a directory watch carry the name that was current when the operation happened.
 
-#### 1.1 目录 watch 与对象自身 watch
+#### 1.1 Directory watches and direct object watches
 
-理解事件路由最重要的规则是区分“父目录中的子项事件”和“对象自身事件”：
+The most important routing rule is the distinction between child events in a parent directory and events on the object itself:
 
-| 操作 | 父目录 watch | 对象自身 watch |
+| Operation | Parent-directory watch | Direct object watch |
 |---|---|---|
-| 创建、删除、移入、移出子项 | 收到，带子项名 | 不以父目录事件形式收到 |
-| 打开、读取、写入、关闭、修改属性 | 收到，带当前子项名 | 收到，不带名称 |
-| 被监听对象自身移动 | 不适用 | `IN_MOVE_SELF` |
-| 被监听对象最终删除 | 父目录先收到删除事件 | `IN_DELETE_SELF`，随后 `IN_IGNORED` |
+| Create, delete, move in, or move out a child | Delivered with the child name | Not delivered as a parent event |
+| Open, read, write, close, or change attributes | Delivered with the current child name | Delivered without a name |
+| Move the watched object itself | Not applicable | `IN_MOVE_SELF` |
+| Finally delete the watched object | Parent deletion is delivered first | `IN_DELETE_SELF`, then `IN_IGNORED` |
 
-因此，监听一个目录可以观察其中子项的活动；监听文件本身可以跨 rename 或硬链接别名继续跟踪同一对象。
+A directory watch therefore observes activity below the directory, while a direct file watch continues to follow the same object across rename and hard-link aliases.
 
-### 2. 总体架构
+### 2. Architecture
 
-实现分为四层，每层只承担一种职责：
+The implementation has four layers, each with one responsibility:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ VFS 与文件操作                                               │
-│ 在 open/read/write/metadata/namespace 操作的提交边界产生事件 │
+│ VFS and file operations                                      │
+│ Produce events at committed open/I/O/metadata/namespace      │
+│ boundaries                                                   │
 └─────────────────────────────┬────────────────────────────────┘
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ fsnotify 路由层                                               │
-│ 识别父目录与对象、取得 mark 快照、过滤 mask、管理撤销         │
+│ fsnotify routing                                             │
+│ Resolve parent/object targets, snapshot marks, filter masks, │
+│ and manage retirement                                       │
 └─────────────────────────────┬────────────────────────────────┘
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ inotify 后端                                                  │
-│ 将内核事件转为 wd/mask/cookie/name，合并并写入实例队列        │
+│ inotify backend                                              │
+│ Convert events to wd/mask/cookie/name, merge, and enqueue    │
 └─────────────────────────────┬────────────────────────────────┘
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ inotify fd                                                    │
-│ read / poll / epoll / FIONREAD                               │
+│ inotify fd                                                   │
+│ read / poll / epoll / FIONREAD                              │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-| 层 | 主要职责 | 不负责什么 |
+| Layer | Owns | Does not own |
 |---|---|---|
-| VFS/File | 决定操作何时真正提交，以及事件顺序 | 不管理 watch 或用户队列 |
-| fsnotify | 对象身份、父/自身路由、mark 生命周期 | 不解释用户缓冲区 |
-| inotify 后端 | 用户 ABI、队列、合并、溢出、唤醒 | 不重新查询文件系统状态 |
-| inotify fd | 阻塞/非阻塞读取和 poll/epoll 接口 | 不参与文件系统变更 |
+| VFS/File | Commit point and event ordering | Watches or userspace queues |
+| fsnotify | Object identity, parent/self routing, mark lifetime | Userspace-buffer handling |
+| inotify backend | ABI, queueing, merging, overflow, wakeups | Filesystem-state revalidation |
+| inotify fd | Blocking/nonblocking reads and poll/epoll | Filesystem mutation |
 
-这种分层不是为了抽象而抽象。它确保文件系统操作不依赖某个具体通知消费者，同时让 inotify 的队列规则集中在一个位置。
+This separation is practical rather than speculative: filesystem operations do not depend on a particular consumer, and all inotify queue rules remain in one place.
 
-### 3. 事件如何产生
+### 3. Event production
 
-#### 3.1 以“已提交的事实”为准
+#### 3.1 Committed facts are authoritative
 
-普通事件在相应操作达到稳定提交点后产生。通知代码不会为了判断结果，再次读取可能已经变化的 metadata。
+Ordinary events are produced when an operation reaches a stable commit point. Notification code does not perform a later metadata read to reconstruct what happened.
 
-命名空间操作尤其需要准确的提交边界。DragonOS 的底层文件系统会返回带类型的结果，例如“删除后仍有其他硬链接”或“这是最后一个链接”。Mount/VFS 只消费这个权威结果，不使用操作后的 `nlink` 猜测。FUSE、OverlayFS、ext4、tmpfs、ramfs 等文件系统各自在拥有真实状态和串行锁的位置生成结果。
+Namespace operations are particularly sensitive to this boundary. A filesystem returns a typed outcome such as “other hard links remain” or “the last link was removed.” Mount/VFS consumes that authoritative result instead of guessing from a post-operation `nlink`. FUSE, OverlayFS, ext4, tmpfs, ramfs, and other filesystems produce the result where they own the real state and serialization.
 
-这带来两个好处：
+This avoids stale FUSE attribute-cache decisions and prevents notification bookkeeping from changing the result of an already successful syscall.
 
-- 不会因为缓存过期或额外的 FUSE `GETATTR` 得到陈旧链接数。
-- 不会在文件系统操作已经成功后，因为通知记账分配失败而改变 syscall 结果。
+#### 3.2 Event ordering
 
-#### 3.2 事件顺序
+Ordering is part of compatibility, not an accidental logging detail:
 
-事件顺序属于兼容语义，而不是日志上的偶然结果。关键顺序如下：
-
-| 操作 | 主要事件顺序 |
+| Operation | Main event order |
 |---|---|
-| 创建子项 | 提交创建 → 父目录 `IN_CREATE` |
-| 删除普通文件 | 文件 `IN_ATTRIB`（链接数变化）→ 父目录 `IN_DELETE` → 最终 detach 时对象 `IN_DELETE_SELF` / `IN_IGNORED` |
-| 删除目录 | 父目录 `IN_DELETE|IN_ISDIR` → 最终对象删除 |
-| 普通 rename | `IN_MOVED_FROM` → `IN_MOVED_TO` → 被覆盖目标的 `IN_ATTRIB`（若有）→ 源对象 `IN_MOVE_SELF` |
-| `RENAME_EXCHANGE` | 两组独立的 FROM/TO 配对事件，双方各有 `IN_MOVE_SELF` |
-| 写入时清除 set-id 位 | `IN_ATTRIB` → `IN_MODIFY` |
+| Create a child | Commit creation → parent `IN_CREATE` |
+| Unlink a regular file | file `IN_ATTRIB` (link-count change) → parent `IN_DELETE` → object `IN_DELETE_SELF` / `IN_IGNORED` at final detach |
+| Remove a directory | parent `IN_DELETE|IN_ISDIR` → final object deletion |
+| Ordinary rename | `IN_MOVED_FROM` → `IN_MOVED_TO` → displaced target `IN_ATTRIB` (if any) → source `IN_MOVE_SELF` |
+| `RENAME_EXCHANGE` | Two independent FROM/TO pairs; both objects receive `IN_MOVE_SELF` |
+| A write removes set-id bits | `IN_ATTRIB` → `IN_MODIFY` |
 
-同一次移动的 `IN_MOVED_FROM` 和 `IN_MOVED_TO` 使用相同的非零 cookie，便于用户态配对。交换 rename 使用两组 cookie。
+`IN_MOVED_FROM` and `IN_MOVED_TO` from one move share the same nonzero cookie. Exchange rename uses two cookie pairs.
 
-对于同一父目录中的并发创建、删除和重命名，通知在父目录的命名空间串行范围内发布，防止后提交操作的事件越过先提交操作。
+Concurrent create, remove, and rename operations in the same parent publish notifications within the parent's namespace serialization boundary, so an event for a later commit cannot overtake an earlier commit.
 
-#### 3.3 内容与属性事件
+#### 3.3 Data and attribute events
 
-当前实现覆盖常见 Linux 数据路径：
+The current implementation covers common Linux data paths:
 
-- 打开与执行：`IN_OPEN`
-- read/pread/readv/preadv 及文件传输源：`IN_ACCESS`
-- write/pwrite/writev、truncate、fallocate 及文件传输目标：`IN_MODIFY`
-- chmod/chown/timestamp/xattr、链接数变化和写入导致的权限位变化：`IN_ATTRIB`
-- 最后一个 open file description 关闭：`IN_CLOSE_WRITE` 或 `IN_CLOSE_NOWRITE`
+- open and exec: `IN_OPEN`
+- read/pread/readv/preadv and transfer sources: `IN_ACCESS`
+- write/pwrite/writev, truncate, fallocate, and transfer destinations: `IN_MODIFY`
+- chmod/chown/timestamps/xattrs, link-count changes, and write-side privilege-bit removal: `IN_ATTRIB`
+- final close of an open file description: `IN_CLOSE_WRITE` or `IN_CLOSE_NOWRITE`
 
-即使内核为了内存边界把一次大 I/O 分成多个内部块，用户可见的单次 syscall 也只产生一次对应的 ACCESS/MODIFY 通知。内核内部 I/O 和带 `FMODE_NONOTIFY` 的文件不会递归产生通知。
+Even when the kernel internally chunks a large I/O operation to bound memory use, one userspace syscall produces one corresponding ACCESS/MODIFY notification. Internal I/O and files marked `FMODE_NONOTIFY` do not recursively generate events.
 
-### 4. 对象身份与生命周期
+### 4. Object identity and lifetime
 
-#### 4.1 稳定对象身份
+#### 4.1 Stable object identity
 
-挂载文件系统中的通知身份由以下三部分组成：
+A mounted object is identified by:
 
 ```text
 (superblock identity, inode identity, inode generation)
 ```
 
-这可以区分不同挂载中相同的 inode 号，也能防止 inode 号复用后误投事件。硬链接别名在同一 superblock 中解析到同一对象状态，因此：
+This separates equal inode numbers in different mounts and prevents delivery to a reused inode identity. Hard-link aliases within one superblock resolve to the same object state, so:
 
-- 从任一别名建立的对象 watch 都能观察其他别名上的对象事件。
-- rename 不会让对象 watch 失效。
-- 父目录事件仍按实际发生操作的目录和名称路由。
+- A direct watch added through any alias observes object events through the other aliases.
+- Rename does not invalidate a direct object watch.
+- Parent events still use the directory and name on which the operation happened.
 
-watch 持有被监听对象的强引用，索引和事件快照只保存弱引用，避免引用环。
+The watch holds a strong reference to the watched object. Lookup indexes and dispatch snapshots contain weak references, avoiding ownership cycles.
 
-#### 4.2 最后链接删除状态机
+#### 4.2 Final-link deletion state machine
 
-`unlink()` 只删除一个目录项，不一定删除对象。DragonOS 将对象删除建模为三个阶段：
+`unlink()` removes one directory entry; it does not necessarily delete the object. DragonOS models deletion in three stages:
 
 ```text
-     删除一个非最后链接
+       remove a non-final link
 Linked ─────────────────────────► Linked
    │
-   │ 删除最后链接
+   │ remove the final link
    ▼
 Zero-link pending
-   │  最后一个断连 dentry/open fd 脱离对象
+   │  final disconnected dentry/open fd detaches
    ▼
 Delete committed ──► IN_DELETE_SELF ──► IN_IGNORED
 
-Zero-link pending ── 成功重新链接 ──► Linked
+Zero-link pending ── successful relink ──► Linked
 ```
 
-这解释了一个容易误解的现象：文件被 unlink 后，如果仍由打开的 fd 持有，直接对象 watch 不会立即收到 `IN_DELETE_SELF`；它在对象真正脱离最后一个 dentry/open-file 生命周期边界时才收到。若对象在此期间被合法重新链接，待删除状态会被取消。
+This explains an important behavior: if a file remains open after unlink, a direct watch does not immediately receive `IN_DELETE_SELF`. It arrives when the object crosses the final dentry/open-file lifetime boundary. A valid relink before that point cancels the pending deletion.
 
-链接变更由对象级协调器排序，add-watch 不持有该协调器跨文件系统或 FUSE I/O。这样既保证最后链接事实不会乱序，又避免用户态 FUSE daemon 重入时形成锁环。
+An object-local link-mutation coordinator orders link facts. Adding a watch does not hold that coordinator across filesystem or FUSE I/O, preserving both correctness and FUSE daemon reentrancy.
 
-#### 4.3 watch 生命周期
+#### 4.3 Watch lifetime
 
-每个 watch 的生命周期是显式的：
+Each watch follows an explicit lifecycle:
 
 ```text
 Allocated (inactive)
-      │  group/wd/index/quota 全部准备完成
+      │  group/wd/index/quota are fully prepared
       ▼
 Active
       │  rm_watch / one-shot / object delete / unmount / fd close
       ▼
-Retiring ── 唯一清理令牌 ──► Retired
+Retiring ── unique cleanup token ──► Retired
 ```
 
-`Active` 是最后发布的状态。事件分发只能看到完整初始化的 active watch；发布失败则按相反顺序回滚。撤销时只有一个执行者能取得清理责任，因此 wd、quota、对象计数和索引都只释放一次。
+`Active` is the final publication step. Dispatch can only observe a fully initialized active watch; failed publication unwinds in reverse order. Exactly one retirer owns cleanup, so the wd, quota, object counters, and indexes are released once.
 
-- 显式 `inotify_rm_watch()`、one-shot、对象删除和卸载会产生 `IN_IGNORED`。
-- 关闭 inotify fd 会撤销该实例的全部 watch，但队列已无消费者，因此不再排入 `IN_IGNORED`。
+- Explicit removal, one-shot retirement, object deletion, and unmount enqueue `IN_IGNORED`.
+- Closing the inotify fd removes all of that instance's watches, but no consumer remains, so it does not enqueue `IN_IGNORED`.
 
-#### 4.4 卸载
+#### 4.4 Unmount
 
-首次 add-watch 必须通过 superblock 的卸载准入检查。最终卸载进入关闭阶段后，不再允许新 watch 发布；已有对象的本地 mark 快照被逐一投递 `IN_UNMOUNT`，随后 watch 撤销并产生 `IN_IGNORED`。
+The first watch publication must pass superblock unmount admission. Once final unmount begins, no new watch may become active. Existing object-local snapshots receive `IN_UNMOUNT`; each watch is then retired and receives `IN_IGNORED`.
 
-`IN_UNMOUNT` 是每个 watch 的内建生命周期关注项，用户不需要显式把它加入订阅 mask。
+`IN_UNMOUNT` is an implicit lifecycle interest on every watch; users do not need to request it explicitly.
 
-### 5. 事件分发、队列与读取
+### 5. Dispatch, queues, and reads
 
-#### 5.1 分发与过滤
+#### 5.1 Dispatch and filtering
 
-fsnotify 先取得不可变的 mark 快照，然后释放索引锁，再逐个分发。后端入队、wake-up 和 watch 清理不会在对象索引锁内执行。
+fsnotify first takes an immutable mark snapshot, releases the index lock, and then dispatches. Backend queueing, wakeups, and mark cleanup never run under the object-index lock.
 
-分发时应用以下规则：
+Dispatch applies these rules:
 
-- 只保留 watch 订阅的事件位。
-- 目录子项事件带 `name`；对象自身事件不带名称。
-- 子项是目录时，适用的事件附加 `IN_ISDIR`；为兼容 Linux，`IN_DELETE_SELF` 和 `IN_MOVE_SELF` 不附加该位。
-- `IN_EXCL_UNLINK` 抑制已断连路径上的 ACCESS/MODIFY 等 path-data 事件；不应抑制 ftruncate 等 dentry 属性/数据事件。
-- `IN_ONESHOT` 在首个成功匹配的事件后撤销。队列已满导致事件丢失仍视为触发；事件对象分配失败则与 Linux 一样只记录 overflow，不消费 one-shot。
+- Only subscribed event bits are retained.
+- Directory-child events carry a name; direct object events do not.
+- Applicable directory events carry `IN_ISDIR`. For Linux compatibility, `IN_DELETE_SELF` and `IN_MOVE_SELF` do not.
+- `IN_EXCL_UNLINK` suppresses path-data ACCESS/MODIFY events on disconnected paths, but not dentry-data operations such as ftruncate.
+- `IN_ONESHOT` retires after the first successfully matched event. Queue-full loss still consumes it; event-allocation failure only records overflow and, like Linux, does not consume it.
 
-#### 5.2 合并与溢出
+#### 5.2 Merging and overflow
 
-连续、尚未被读取且具有相同 `wd`、mask 和 name 的事件会合并。`IN_IGNORED` 不合并，移动 cookie 不参与相等判断，这与 Linux 的 inotify 合并规则一致。
+Consecutive unread events with the same `wd`, mask, and name are merged. `IN_IGNORED` is never merged, and the move cookie is deliberately not part of the merge comparison, matching Linux inotify.
 
-队列最多保存 16384 个逻辑事件。队列满或事件分配失败时：
+Each instance holds at most 16384 logical queued events. If the queue is full or event allocation fails:
 
-1. 原文件系统操作保持成功。
-2. 内核记录一个逻辑 `IN_Q_OVERFLOW` 边界。
-3. 用户读取到 `wd = -1`、`cookie = 0` 的 overflow 事件。
+1. The original filesystem operation remains successful.
+2. The kernel records a logical `IN_Q_OVERFLOW` boundary.
+3. Userspace reads an overflow event with `wd = -1` and `cookie = 0`.
 
-overflow 状态不依赖再次分配队列节点，因此在低内存场景下仍能报告事件丢失。边界之前已接受的事件仍排在 overflow 前面，之后接受的事件排在它后面。
+The overflow state does not require allocating another queue node, so loss can still be reported under memory pressure. Events accepted before the boundary remain before it; later accepted events remain after it.
 
-#### 5.3 read、poll 与 epoll
+#### 5.3 read, poll, and epoll
 
-`inotify_event` 使用 Linux ABI：16 字节固定头，名称包含 NUL，并按 16 字节边界填充。
+`inotify_event` follows the Linux ABI: a 16-byte fixed header, a NUL-terminated name, and padding to a 16-byte boundary.
 
-- 缓冲区小于 16 字节，或放不下队首完整事件：`EINVAL`。
-- 非阻塞 fd 的空队列：`EAGAIN`。
-- 阻塞 fd 的空队列：可被信号中断，否则等待新事件。
-- 一次 read 只返回完整事件，不拆分记录。
-- 多个 reader 可以逐事件竞争消费；把事件复制到用户空间时不持队列锁。
-- 用户空间复制失败时，该事件已出队，并按 Linux inotify 的专用规则返回 `EFAULT`。
-- 队列从空变为可读时会唤醒 read 等待者，并通知 poll/epoll。
-- `ioctl(FIONREAD)` 返回当前完整逻辑队列可读的序列化字节数，包括待发的 overflow 记录。
-- inotify fd 是 stream-like、不可 seek 的对象；pread/pwrite/lseek 不适用。
+- A buffer smaller than 16 bytes, or one that cannot hold the first complete event, returns `EINVAL`.
+- An empty nonblocking instance returns `EAGAIN`.
+- An empty blocking instance waits for an event unless interrupted by a signal.
+- A read returns only whole records and never splits an event.
+- Multiple readers may compete one record at a time; user-memory copies happen without holding the queue lock.
+- If a userspace copy faults, the dequeued event is consumed and the Linux-specific inotify rule returns `EFAULT`.
+- Transitioning from empty to readable wakes read waiters and poll/epoll observers.
+- `ioctl(FIONREAD)` reports the serialized byte count of the complete logical queue, including a pending overflow record.
+- An inotify fd is stream-like and non-seekable; pread/pwrite/lseek do not apply.
 
-### 6. 性能与故障隔离
+### 6. Performance and failure isolation
 
-#### 6.1 多级快速路径
+#### 6.1 Layered fast paths
 
-事件生产是 open/read/write/close 的热路径，不能因为系统中存在一个无关 watch 就争用全局锁。当前实现依次使用以下短路：
+Event production sits on open/read/write/close hot paths. One unrelated watch must not force all I/O through a global lock. The implementation uses layered rejection:
 
 ```text
-系统无任何 watch？ ── 是 ──► 返回
-        │ 否
-当前 superblock 无 watch？ ── 是 ──► 返回
-        │ 否
-当前 dentry 的负缓存仍有效？ ── 是 ──► 返回
-        │ 否
-当前对象或父目录有 watch？ ── 否 ──► 更新负缓存并返回
-        │ 是
-        ▼
-克隆对象局部 mark 快照，锁外分发
+No watch in the system? ── yes ──► return
+          │ no
+No watch in this superblock? ── yes ──► return
+          │ no
+Valid negative-interest cache? ── yes ──► return
+          │ no
+No direct or parent watch? ── yes ──► update cache and return
+          │ no
+          ▼
+Clone an object-local mark snapshot and dispatch without the index lock
 ```
 
-具体设计包括：
+The main mechanisms are:
 
-- **全局 presence 计数**：系统完全没有 watch 时，热路径只有一次原子读取。
-- **per-superblock 计数**：无关挂载不会解析对象状态。
-- **目录 watch 计数**：没有目录 watch 时，不复制 parent/name。
-- **对象局部不可变快照**：mounted 对象命中事件时不扫描系统级全局索引。
-- **epoch 校验的负缓存**：确认某 dentry 的对象和父目录都无人监听后，后续 I/O 只做原子校验；watch 从 0↔1 变化或 rename/unlink 拓扑变化会使缓存失效。
-- **全局后备索引**：只用于没有 mounted object state 的匿名或特殊对象；支持对象自身计数提示的实现仍可提前短路。
+- **Global presence count:** when the system has no watches, the hot path performs one atomic read.
+- **Per-superblock counts:** unrelated mounts do not resolve object state.
+- **Directory-watch count:** parent/name are not copied when no directory is watched.
+- **Object-local immutable snapshots:** mounted-object hits do not scan the system-wide fallback index.
+- **Epoch-validated negative cache:** after confirming that neither object nor parent is watched, later I/O performs only an atomic validation. Watch 0↔1 transitions and rename/unlink topology changes invalidate the cache.
+- **Global fallback index:** used only for anonymous or special objects without mounted object state; inode-local presence hints can still reject early.
 
-watch 增删属于冷路径，允许构造新的不可变 mark 列表；事件分发只克隆 `Arc` 快照，不在锁内遍历和执行后端工作。这里没有引入 RCU、分片表或无锁状态字，因为当前互斥锁加不可变快照已能表达所需不变量。
+Watch addition/removal is a cold path and may build a new immutable mark list. Event dispatch clones an `Arc` snapshot and performs backend work outside the lock. RCU, sharded registries, and packed lock-free state machines are intentionally avoided because mutexes plus immutable snapshots already express the required invariants.
 
-#### 6.2 内存不足与回滚
+#### 6.2 Memory pressure and rollback
 
-- add-watch 在变为 active 前完成所有可能失败的分配和 quota 预留；任何失败都不会留下半发布 watch。
-- watch 撤销即使无法分配新的压缩快照，也会继续完成资源清理；失效的弱引用可稍后惰性清理。
-- 事件名称分配失败和队列满统一转为 `IN_Q_OVERFLOW`。
-- 命名空间 mutation 不会为了创建通知状态而分配；通知记账不能让原本可成功的 unlink/rename 变成 `ENOMEM`。
+- add-watch completes all fallible allocation and quota reservation before becoming active; failure cannot leave a half-published watch.
+- Retirement completes accounting even if a compact replacement snapshot cannot be allocated; dead weak entries are cleaned lazily.
+- Event-name allocation failure and queue exhaustion both become `IN_Q_OVERFLOW`.
+- Namespace mutation does not allocate notification state merely to proceed, so notification bookkeeping cannot turn an otherwise successful unlink/rename into `ENOMEM`.
 
-### 7. 用户 API 与支持范围
+### 7. Userspace API and supported scope
 
-#### 7.1 系统调用
+#### 7.1 Syscalls
 
-| 接口 | 行为 |
+| Interface | Behavior |
 |---|---|
-| `inotify_init()` | 创建阻塞实例；仅 x86_64 保留该旧 ABI |
-| `inotify_init1(flags)` | 支持 `IN_NONBLOCK`、`IN_CLOEXEC` |
-| `inotify_add_watch(fd, path, mask)` | 添加或更新 watch，检查目标读权限 |
-| `inotify_rm_watch(fd, wd)` | 显式撤销 watch |
+| `inotify_init()` | Create a blocking instance; this legacy ABI exists on x86_64 only |
+| `inotify_init1(flags)` | Supports `IN_NONBLOCK` and `IN_CLOEXEC` |
+| `inotify_add_watch(fd, path, mask)` | Add or update a watch; read permission is checked |
+| `inotify_rm_watch(fd, wd)` | Explicitly remove a watch |
 
-`IN_DONT_FOLLOW`、`IN_ONLYDIR`、`IN_EXCL_UNLINK`、`IN_MASK_ADD`、`IN_MASK_CREATE` 和 `IN_ONESHOT` 均受支持。未知位、空 mask，以及同时使用 `IN_MASK_ADD|IN_MASK_CREATE` 会按 Linux 语义返回错误。
+`IN_DONT_FOLLOW`, `IN_ONLYDIR`, `IN_EXCL_UNLINK`, `IN_MASK_ADD`, `IN_MASK_CREATE`, and `IN_ONESHOT` are supported. Unknown bits, an empty mask, or `IN_MASK_ADD|IN_MASK_CREATE` return Linux-compatible errors.
 
-#### 7.2 事件
+#### 7.2 Events
 
-实现支持标准事件位：
+The standard event bits are supported:
 
 ```text
-IN_ACCESS       IN_MODIFY       IN_ATTRIB
+IN_ACCESS       IN_MODIFY        IN_ATTRIB
 IN_CLOSE_WRITE  IN_CLOSE_NOWRITE IN_OPEN
-IN_MOVED_FROM   IN_MOVED_TO     IN_CREATE
-IN_DELETE       IN_DELETE_SELF  IN_MOVE_SELF
-IN_UNMOUNT      IN_Q_OVERFLOW   IN_IGNORED
+IN_MOVED_FROM   IN_MOVED_TO      IN_CREATE
+IN_DELETE       IN_DELETE_SELF   IN_MOVE_SELF
+IN_UNMOUNT      IN_Q_OVERFLOW    IN_IGNORED
 IN_ISDIR
 ```
 
-#### 7.3 资源限制
+#### 7.3 Resource limits
 
-当前限制为内核常量，尚未接入 `/proc/sys/fs/inotify/*`：
+The current limits are kernel constants and are not yet exposed through `/proc/sys/fs/inotify/*`:
 
-| 资源 | 限制 |
+| Resource | Limit |
 |---|---:|
-| 每个用户最多实例数 | 128 |
-| 每个用户最多 watch 数 | 8192 |
-| 每个实例最多排队事件数 | 16384 |
+| Instances per user | 128 |
+| Watches per user | 8192 |
+| Queued events per instance | 16384 |
 
-配额按当前 user namespace 与有效 UID 计费，并沿祖先 user namespace 计费，防止通过嵌套 namespace 重置限制。实例超限返回 `EMFILE`，watch 超限返回 `ENOSPC`。
+Accounting applies to the current user namespace and effective UID and to ancestor user namespaces, preventing nested namespaces from resetting the limits. Instance exhaustion returns `EMFILE`; watch exhaustion returns `ENOSPC`.
 
-### 8. 常见场景
+### 8. Common examples
 
-#### 8.1 监听目录中新文件
+#### 8.1 Watching a directory
 
 ```text
 watch(dir, IN_CREATE | IN_OPEN | IN_MODIFY)
@@ -321,7 +319,7 @@ open dir/a    → IN_OPEN(name="a")
 write dir/a   → IN_MODIFY(name="a")
 ```
 
-#### 8.2 配对 rename
+#### 8.2 Pairing rename events
 
 ```text
 dir/a ──rename──► dir/b
@@ -330,44 +328,44 @@ IN_MOVED_FROM(name="a", cookie=42)
 IN_MOVED_TO  (name="b", cookie=42)
 ```
 
-用户态应使用 cookie 配对，而不要假设队列中相邻的任意两个 move 事件必然属于同一次操作。
+Userspace should pair moves by cookie instead of assuming that any adjacent move records belong to the same operation.
 
-#### 8.3 unlink 后仍由 fd 持有
+#### 8.3 An unlinked file retained by an fd
 
 ```text
 open(file) → watch(file) → unlink(file)
 
-父目录：IN_DELETE
-对象自身：暂时没有 IN_DELETE_SELF
+parent: IN_DELETE
+object: no IN_DELETE_SELF yet
 
 close(last fd)
-对象自身：IN_DELETE_SELF → IN_IGNORED
+object: IN_DELETE_SELF → IN_IGNORED
 ```
 
-如果文件还有另一个硬链接，删除一个名称只产生链接数/父目录事件，不会结束对象 watch。
+If another hard link remains, removing one name only produces link-count and parent events; it does not terminate the object watch.
 
-### 9. 当前边界与非目标
+### 9. Current boundaries and non-goals
 
-- 当前后端是 inotify；fanotify、dnotify、mount mark 和 superblock mark 不在本实现范围内。
-- 资源上限是编译期常量，不提供 Linux 的 inotify sysctl 调节接口。
-- mounted 文件系统使用对象局部 mark 快照；匿名与部分特殊 inode 使用全局后备身份。两者对用户提供相同的 inotify ABI。
-- fsnotify 是异步观察机制，不是事务日志。发生 `IN_Q_OVERFLOW` 后，用户态必须重新扫描并重建状态。
+- inotify is the current backend. fanotify, dnotify, mount marks, and superblock marks are outside this implementation.
+- Resource limits are compile-time constants; Linux inotify sysctl tuning is not yet provided.
+- Mounted filesystems use object-local mark snapshots. Anonymous and some special inodes use a global fallback identity. Both expose the same inotify ABI.
+- fsnotify is an asynchronous observation mechanism, not a transaction log. After `IN_Q_OVERFLOW`, userspace must rescan and rebuild its state.
 
-### 10. 实现位置与验证
+### 10. Implementation map and validation
 
-主要实现边界：
+The main implementation boundaries are:
 
-| 位置 | 职责 |
+| Location | Responsibility |
 |---|---|
-| `kernel/src/filesystem/fsnotify/` | 事件路由、对象状态、mark/group 生命周期 |
-| `kernel/src/filesystem/inotify.rs` | syscall、队列、ABI、read/poll/epoll、quota |
-| `kernel/src/filesystem/vfs/mount/mod.rs` | mounted 对象身份、dentry 快照、删除与卸载生命周期、热路径缓存 |
-| `kernel/src/filesystem/vfs/file.rs` | open/read/write/close 等文件事件入口 |
-| `kernel/src/filesystem/vfs/syscall/` | rename、link、xattr、I/O transfer 等 syscall 级提交事件 |
-| 各具体文件系统 | 返回权威 link/rename/fallocate 结果，不管理 inotify 队列 |
+| `kernel/src/filesystem/fsnotify/` | Event routing, object state, mark/group lifetime |
+| `kernel/src/filesystem/inotify.rs` | Syscalls, queue, ABI, read/poll/epoll, quota |
+| `kernel/src/filesystem/vfs/mount/mod.rs` | Mounted identity, dentry snapshots, deletion/unmount lifetime, hot-path cache |
+| `kernel/src/filesystem/vfs/file.rs` | Open/read/write/close event entry points |
+| `kernel/src/filesystem/vfs/syscall/` | Rename, link, xattr, and I/O-transfer commit events |
+| Concrete filesystems | Authoritative link/rename/fallocate outcomes, not inotify queues |
 
-兼容语义参考 Linux 6.6.139 的 `fs/notify/`、`include/linux/fsnotify.h`、`include/linux/fsnotify_backend.h` 和 `include/uapi/linux/inotify.h`。DragonOS 的回归覆盖位于：
+Compatibility behavior is checked against Linux 6.6.139 `fs/notify/`, `include/linux/fsnotify.h`, `include/linux/fsnotify_backend.h`, and `include/uapi/linux/inotify.h`. DragonOS regression coverage lives in:
 
 - `user/apps/tests/dunitest/suites/normal/inotify_events.cc`
 - `user/apps/tests/dunitest/suites/normal/inotify_dir_watch.cc`
-- FUSE、OverlayFS、fallocate 与并发 namespace 的相关 dunitest
+- related FUSE, OverlayFS, fallocate, and concurrent-namespace dunitests

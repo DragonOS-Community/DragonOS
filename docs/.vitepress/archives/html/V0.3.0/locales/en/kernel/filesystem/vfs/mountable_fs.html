@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Design &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../../" id="documentation_options" src="../../../../../_static/documentation_options.js"></script>
+        <script src="../../../../../_static/jquery.js"></script>
+        <script src="../../../../../_static/underscore.js"></script>
+        <script src="../../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../../_static/doctools.js"></script>
+        <script src="../../../../../_static/translations.js"></script>
+    <script src="../../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../../search.html" />
+    <link rel="next" title="SysFS" href="../sysfs.html" />
+    <link rel="prev" title="VFS API Documentation" href="api.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html">File System</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l3 current"><a class="reference internal" href="index.html">VFS Virtual File System</a><ul class="current">
+<li class="toctree-l4"><a class="reference internal" href="design.html">Design</a></li>
+<li class="toctree-l4"><a class="reference internal" href="api.html">VFS API Documentation</a></li>
+<li class="toctree-l4 current"><a class="current reference internal" href="#">Design</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../sysfs.html">SysFS</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../kernfs.html">KernFS</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../unionfs/index.html">Union Filesystem</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="../index.html">File System</a></li>
+          <li class="breadcrumb-item"><a href="index.html">VFS Virtual File System</a></li>
+      <li class="breadcrumb-item active">Design</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/1c53c97/docs/locales/en/kernel/filesystem/vfs/mountable_fs.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/filesystem/vfs/mountable_fs.md</p></li>
+<li><p>Translation time: 2025-06-29 09:58:15</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>Author: Zhuang Kaiye</p>
+<p>Email: <a class="reference external" href="mailto:sparkhhhhhhhhhh&#37;&#52;&#48;outlook&#46;com">sparkhhhhhhhhhh<span>&#64;</span>outlook<span>&#46;</span>com</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="design">
+<h1>Design<a class="headerlink" href="#design" title="Permalink to this heading"></a></h1>
+<div class="highlight-mermaid notranslate"><div class="highlight"><pre><span></span>    graph TD
+    subgraph 用户层 / 系统调用
+        A[sys_mount] --&gt; B[produce_fs!]
+    end
+
+    subgraph 文件系统注册与创建
+        B --&gt; C{查找 FSMAKER}
+        C -- 找到匹配 --&gt; D[FileSystemMaker::builder &amp;&amp; FileSystemMaker::maker]
+        D --&gt; G[FileSystem 实例]
+        G --&gt; H[挂载成功]
+        C -- 未找到 --&gt; I[错误: EINVAL]
+    end
+
+    subgraph 文件系统实现者
+        J[RamFS / 其他文件系统] --&gt; K[实现 MountableFileSystem trait]
+        K --&gt; L[make_mount_data]
+        K --&gt; M[make_fs]
+        L --&gt; N[register_mountable_fs!宏]
+        M --&gt; N
+    end
+
+    N --&gt; O[分布式切片 FSMAKER ]
+    O --&gt; C
+
+    click J &quot;#&quot; &quot;RamFS - 文件系统示例&quot;
+    click B &quot;#&quot; &quot;produce_fs 函数&quot;
+    click O &quot;#&quot; &quot;FSMAKER - 文件系统工厂数组&quot;
+</pre></div>
+</div>
+<section id="process-description">
+<h2>Process Description:<a class="headerlink" href="#process-description" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>A specific file system (e.g., <code class="docutils literal notranslate"><span class="pre">RamFS</span></code>) registers its creation logic with <code class="docutils literal notranslate"><span class="pre">FSMAKER</span></code> by implementing <code class="docutils literal notranslate"><span class="pre">MountableFileSystem</span> <span class="pre">trait</span></code> and using the <code class="docutils literal notranslate"><span class="pre">register_mountable_fs!</span></code> macro.</p></li>
+<li><p>Users request to mount a file system via the <code class="docutils literal notranslate"><span class="pre">sys_mount</span></code> system call.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">sys_mount</span></code> calls the <code class="docutils literal notranslate"><span class="pre">produce_fs</span></code> function, passing the file system type, raw mount data, and source path.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">produce_fs</span></code> traverses the global <code class="docutils literal notranslate"><span class="pre">FSMAKER</span></code> array to find a FileSystemMaker matching the requested file system type name.</p></li>
+<li><p>If found, it first calls <code class="docutils literal notranslate"><span class="pre">maker.builder</span></code> (which internally invokes the specific file system’s <code class="docutils literal notranslate"><span class="pre">make_mount_data</span></code> method) to process the raw data and generate an optional <code class="docutils literal notranslate"><span class="pre">mount_data</span></code> object.</p></li>
+<li><p>Next, it calls <code class="docutils literal notranslate"><span class="pre">maker.build</span></code> (which internally invokes the specific file system’s <code class="docutils literal notranslate"><span class="pre">make_fs</span></code> method), passing the mount_data generated in the previous step, thereby creating the file system instance.</p></li>
+<li><p>The successfully created file system instance (<code class="docutils literal notranslate"><span class="pre">Arc&lt;dyn</span> <span class="pre">FileSystem&gt;</span></code>) is returned and used for subsequent mount operations.</p></li>
+<li><p>If no matching file system type is found, an error is returned.</p></li>
+</ul>
+</section>
+<section id="additional-notes">
+<h2>Additional Notes<a class="headerlink" href="#additional-notes" title="Permalink to this heading"></a></h2>
+<p>Currently, DragonOS supports mounting the following file systems: <code class="docutils literal notranslate"><span class="pre">ramfs</span></code>, <code class="docutils literal notranslate"><span class="pre">ext4</span></code>, and <code class="docutils literal notranslate"><span class="pre">vfat</span></code>. When mounting disk files in DragonOS, note the following:</p>
+<ul class="simple">
+<li><p>Since the system cannot directly determine the file system type of a disk, the target partition’s file system type must be explicitly known before mounting.</p></li>
+<li><p>The mount operation requires specifying the corresponding disk device name (located under /dev).</p></li>
+<li><p>These disk device files are generated by modifying the <code class="docutils literal notranslate"><span class="pre">tools/run-qemu.sh</span></code> startup script to load the prepared disk image files into the system. Examples of virtio disk device naming include <code class="docutils literal notranslate"><span class="pre">vda1</span></code> and <code class="docutils literal notranslate"><span class="pre">vdb1</span></code>. The device names of disks in DragonOS are automatically assigned based on the order in which images are loaded in <code class="docutils literal notranslate"><span class="pre">run-qemu.sh</span></code> (a, b, c, etc.), with numbers indicating partition numbers.</p></li>
+</ul>
+<p>Therefore, to mount a disk currently, you can modify the <code class="docutils literal notranslate"><span class="pre">test-mount-ext4</span></code> executable to mount the specified disk file with the corresponding file system format. Below is an example of the mount operation:</p>
+<div class="highlight-Rust notranslate"><div class="highlight"><pre><span></span><span class="k">use</span><span class="w"> </span><span class="n">core</span>::<span class="n">ffi</span>::<span class="p">{</span><span class="n">c_char</span><span class="p">,</span><span class="w"> </span><span class="n">c_void</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">libc</span>::<span class="p">{</span><span class="n">mount</span><span class="p">,</span><span class="w"> </span><span class="n">MS_BIND</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span>::<span class="n">fs</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span>::<span class="n">path</span>::<span class="n">Path</span><span class="p">;</span>
+
+<span class="k">fn</span> <span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">ext4_path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Path</span>::<span class="n">new</span><span class="p">(</span><span class="s">&quot;mnt/ext4&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">dir</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fs</span>::<span class="n">create_dir_all</span><span class="p">(</span><span class="n">ext4_path</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="n">dir</span><span class="p">.</span><span class="n">is_err</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="fm">panic!</span><span class="p">(</span><span class="s">&quot;mkdir /mnt/ext4 fail.&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 硬盘名称，由传入顺序决定</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">source</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">b&quot;/dev/vdb1</span><span class="se">\0</span><span class="s">&quot;</span><span class="p">.</span><span class="n">as_ptr</span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="n">c_char</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">target</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">b&quot;/mnt/ext4</span><span class="se">\0</span><span class="s">&quot;</span><span class="p">.</span><span class="n">as_ptr</span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="n">c_char</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// 文件系统类型</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">fstype</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">b&quot;ext4</span><span class="se">\0</span><span class="s">&quot;</span><span class="p">.</span><span class="n">as_ptr</span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="n">c_char</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MS_BIND</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span>::<span class="n">ptr</span>::<span class="n">null</span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="n">c_void</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">mount</span><span class="p">(</span><span class="n">source</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">,</span><span class="w"> </span><span class="n">fstype</span><span class="p">,</span><span class="w"> </span><span class="n">flags</span><span class="p">,</span><span class="w"> </span><span class="n">data</span><span class="p">)</span><span class="w"> </span><span class="p">};</span>
+
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Mount successfully!&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>As for disk image creation, you can run <code class="docutils literal notranslate"><span class="pre">sudo</span> <span class="pre">bash</span> <span class="pre">tools/make_fs_image.sh</span></code> to simultaneously create disk images for <code class="docutils literal notranslate"><span class="pre">ext4</span></code> and <code class="docutils literal notranslate"><span class="pre">fat</span></code>. After entering the system, two additional disk files (<code class="docutils literal notranslate"><span class="pre">vdb1</span></code> and <code class="docutils literal notranslate"><span class="pre">vdc1</span></code>) will appear in the dev directory. You can then execute the <code class="docutils literal notranslate"><span class="pre">test-mount-ext4</span></code> and <code class="docutils literal notranslate"><span class="pre">test-mount-fat</span></code> test programs to verify the setup.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="api.html" class="btn btn-neutral float-left" title="VFS API Documentation" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../sysfs.html" class="btn btn-neutral float-right" title="SysFS" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>1c53c97</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.3.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../../V0.2.0/locales/en/kernel/filesystem/vfs/mountable_fs.html">V0.2.0</a></dd>
+      <dd><a href="mountable_fs.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../../V0.4.0/locales/en/kernel/filesystem/vfs/mountable_fs.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../../master/locales/en/kernel/filesystem/vfs/mountable_fs.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

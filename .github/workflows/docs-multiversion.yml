@@ -25,24 +25,17 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '22.11.0'
-      
-    - name: install requirements
+        cache: npm
+        cache-dependency-path: docs/package-lock.json
+
+    - name: install and build
       working-directory: ./docs
       run: |
-        sudo apt-get update
-        sudo apt-get install -y python3-pip python3-setuptools
-        pip3 install -r requirements.txt
-
-    - name: build docs
-      working-directory: ./docs
-      shell: bash -ileo pipefail {0}
-
-      run: |
-        make html-multiversion
+        npm ci
+        npm run docs:build
 
     - name: deploy docs to EdgeOne
       env:
         EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
-      
       run: |
-        npx --yes edgeone makers deploy ./docs/_build/html -n dragonos-official-docs -t "${EDGEONE_API_TOKEN}" -e production
+        npx --yes edgeone makers deploy ./docs/.vitepress/dist -n dragonos-official-docs -t "${EDGEONE_API_TOKEN}" -e production

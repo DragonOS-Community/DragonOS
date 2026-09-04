@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>构建错误常见问题解答 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+        <script src="../_static/jquery.js"></script>
+        <script src="../_static/underscore.js"></script>
+        <script src="../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../_static/doctools.js"></script>
+        <script src="../_static/translations.js"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../genindex.html" />
+    <link rel="search" title="搜索" href="../search.html" />
+    <link rel="next" title="参与开发" href="../community/code_contribution/index.html" />
+    <link rel="prev" title="常见问题解答" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">常见问题解答</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">构建错误常见问题解答</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">1. 报错信息指示工具链缺失</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#question-detail">question detail</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#answer">Answer</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">2. 磁盘镜像写入失败了</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id4">question detail</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">Answer</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">常见问题解答</a></li>
+      <li class="breadcrumb-item active">构建错误常见问题解答</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/c0d0501/docs/questions/build_errors.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>构建错误常见问题解答<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<p>在构建DragonOS时遇到的常见问题及其解决方法。</p>
+<section id="id2">
+<h2>1. 报错信息指示工具链缺失<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<section id="question-detail">
+<h3>question detail<a class="headerlink" href="#question-detail" title="Permalink to this heading"></a></h3>
+<p>在构建中，如果出现比如<code class="docutils literal notranslate"><span class="pre">xxxx</span> <span class="pre">not</span> <span class="pre">found</span></code>这样的报错信息，通常是因为缺少必要的编译工具链。</p>
+</section>
+<section id="answer">
+<h3>Answer<a class="headerlink" href="#answer" title="Permalink to this heading"></a></h3>
+<p>如果你之前是可以编译的，但是在拉取最新的代码后，出现了这个错误,那么大概率是因为上游代码更新了对工具链的要求。你可以尝试以下步骤来解决这个问题：</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>tools
+bash<span class="w"> </span>bootstrap.sh
+</pre></div>
+</div>
+<p>接着，重启终端并重新运行构建命令。</p>
+<p><em>Note:</em> <code class="docutils literal notranslate"><span class="pre">bootstrap.sh</span></code>脚本被设计为：“可重复运行”的。他可以在任何时间点运行，把当前最新需要的工具链，安装到你的系统中。</p>
+</section>
+</section>
+<section id="id3">
+<h2>2. 磁盘镜像写入失败了<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<section id="id4">
+<h3>question detail<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>构建用户程序的时候，磁盘镜像里面的内容跟实际的不一致。</p></li>
+<li><p>报错符号链接相关的错误信息</p></li>
+<li><p>某些应用程序没有正确安装到镜像中</p></li>
+</ul>
+</section>
+<section id="id5">
+<h3>Answer<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>在构建过程中，如果遇到磁盘镜像写入失败的问题，可能是由于磁盘空间不足或者权限问题。或者是目录属性有些改变。</p>
+<p>一种典型的例子，<code class="docutils literal notranslate"><span class="pre">bin/sysroot/xxx</span></code>下面的某个文件夹是个实际的目录，但是新版的应用程序期望把目录<code class="docutils literal notranslate"><span class="pre">xxx</span></code>当作一个符号链接来使用。</p>
+<p>对于这种情形，你可以先检查自己的应用程序编译的脚本是否有问题。如果确认没有问题，那么可以尝试以下步骤：</p>
+<ul class="simple">
+<li><p>删掉<code class="docutils literal notranslate"><span class="pre">bin/</span></code>目录，然后重新构建。这能够解决大部分的问题。</p></li>
+</ul>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="常见问题解答" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../community/code_contribution/index.html" class="btn btn-neutral float-right" title="参与开发" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>c0d0501</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.2.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="build_errors.html">V0.2.0</a></dd>
+      <dd><a href="../../V0.3.0/questions/build_errors.html">V0.3.0</a></dd>
+      <dd><a href="../../V0.4.0/questions/build_errors.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../master/questions/build_errors.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

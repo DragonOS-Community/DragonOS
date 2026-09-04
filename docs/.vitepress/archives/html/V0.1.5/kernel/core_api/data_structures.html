@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>内核数据结构 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="内存分配指南" href="allocate-memory.html" />
+    <link rel="prev" title="原子变量" href="atomic.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">核心API文档</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="kernel_api.html">DragonOS内核核心API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atomic.html">原子变量</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">内核数据结构</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#kfifo">kfifo先进先出缓冲区</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-alloc">kfifo_alloc</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-init">kfifo_init</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-free-alloc">kfifo_free_alloc</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-in">kfifo_in</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-out">kfifo_out</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-out-peek">kfifo_out_peek</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-reset">kfifo_reset</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-reset-out">kfifo_reset_out</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-total-size">kfifo_total_size</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-size">kfifo_size</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-empty">kfifo_empty</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kfifo-full">kfifo_full</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id-allocation">ID Allocation</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#ida-init">ida_init</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ida-preload">ida_preload</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ida-alloc">ida_alloc</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ida-count">ida_count</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ida-remove">ida_remove</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ida-destroy">ida_destroy</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ida-empty">ida_empty</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#idr">IDR</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#idr-init">idr_init</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-preload">idr_preload</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-alloc">idr_alloc</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-remove">idr_remove</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-remove-all">idr_remove_all</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-destroy">idr_destroy</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-find">idr_find</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-find-next">idr_find_next</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-find-next-getid">idr_find_next_getid</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-replace">idr_replace</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-replace-get-old">idr_replace_get_old</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-empty">idr_empty</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#idr-count">idr_count</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#id1">内存管理</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">核心API文档</a></li>
+      <li class="breadcrumb-item active">内核数据结构</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/33270d0/docs/kernel/core_api/data_structures.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>内核数据结构<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<p>  内核中实现了常用的几种数据结构，这里是他们的api文档。</p>
+<hr class="docutils" />
+<section id="kfifo">
+<h2>kfifo先进先出缓冲区<a class="headerlink" href="#kfifo" title="Permalink to this heading"></a></h2>
+<p>  kfifo先进先出缓冲区定义于<code class="docutils literal notranslate"><span class="pre">common/kfifo.h</span></code>中。您可以使用它，创建指定大小的fifo缓冲区（最大大小为4GB）</p>
+<section id="kfifo-alloc">
+<h3>kfifo_alloc<a class="headerlink" href="#kfifo-alloc" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">kfifo_alloc(struct</span> <span class="pre">kfifo_t</span> <span class="pre">*fifo,</span> <span class="pre">uint32_t</span> <span class="pre">size,</span> <span class="pre">uint64_t</span> <span class="pre">reserved)</span></code></p>
+<section id="id2">
+<h4>描述<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h4>
+<p>  通过动态方式初始化kfifo缓冲队列。fifo缓冲区的buffer将由该函数进行申请。</p>
+</section>
+<section id="id3">
+<h4>参数<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+<p><strong>size</strong></p>
+<p>  缓冲区大小（单位：bytes）</p>
+<p><strong>reserved</strong></p>
+<p>  当前字段保留，请将其置为0</p>
+</section>
+<section id="id4">
+<h4>返回值<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h4>
+<p>  当返回值为0时，表示正常初始化成功，否则返回对应的errno</p>
+</section>
+</section>
+<section id="kfifo-init">
+<h3>kfifo_init<a class="headerlink" href="#kfifo-init" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">kfifo_init(struct</span> <span class="pre">kfifo_t</span> <span class="pre">*fifo,</span> <span class="pre">void</span> <span class="pre">*buffer,</span> <span class="pre">uint32_t</span> <span class="pre">size)</span></code></p>
+<section id="id5">
+<h4>描述<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h4>
+<p>  使用指定的缓冲区来初始化kfifo缓冲队列</p>
+</section>
+<section id="id6">
+<h4>参数<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+<p><strong>buffer</strong></p>
+<p>  缓冲区基地址指针</p>
+<p><strong>size</strong></p>
+<p>  缓冲区大小（单位：bytes）</p>
+</section>
+</section>
+<section id="kfifo-free-alloc">
+<h3>kfifo_free_alloc<a class="headerlink" href="#kfifo-free-alloc" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">kfifo_free_alloc(struct</span> <span class="pre">kfifo_t*</span> <span class="pre">fifo)</span></code></p>
+<section id="id7">
+<h4>描述<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h4>
+<p>  释放通过kfifo_alloc创建的fifo缓冲区. 请勿通过该函数释放其他方式创建的kfifo缓冲区。</p>
+</section>
+<section id="id8">
+<h4>参数<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+</section>
+</section>
+<section id="kfifo-in">
+<h3>kfifo_in<a class="headerlink" href="#kfifo-in" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">uint32_t</span> <span class="pre">kfifo_in(struct</span> <span class="pre">kfifo_t</span> <span class="pre">*fifo,</span> <span class="pre">const</span> <span class="pre">void</span> <span class="pre">*from,</span> <span class="pre">uint32_t</span> <span class="pre">size)</span></code></p>
+<section id="id9">
+<h4>描述<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h4>
+<p>  向kfifo缓冲区推入指定大小的数据。当队列中空间不足时，则不推入数据。</p>
+</section>
+<section id="id10">
+<h4>参数<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+<p><strong>from</strong></p>
+<p>  源数据基地址指针</p>
+<p><strong>size</strong></p>
+<p>  数据大小（单位：bytes）</p>
+</section>
+<section id="id11">
+<h4>返回值<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h4>
+<p>  返回成功被推入的数据的大小。</p>
+</section>
+</section>
+<section id="kfifo-out">
+<h3>kfifo_out<a class="headerlink" href="#kfifo-out" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">uint32_t</span> <span class="pre">kfifo_out(struct</span> <span class="pre">kfifo_t</span> <span class="pre">*fifo,</span> <span class="pre">void</span> <span class="pre">*to,</span> <span class="pre">uint32_t</span> <span class="pre">size)</span></code></p>
+<section id="id12">
+<h4>描述<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h4>
+<p>  从kfifo缓冲区取出数据，并从队列中删除数据。当队列中数据量不足时，则不取出。</p>
+</section>
+<section id="id13">
+<h4>参数<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+<p><strong>to</strong></p>
+<p>  目标缓冲区基地址指针</p>
+<p><strong>size</strong></p>
+<p>  数据大小（单位：bytes）</p>
+</section>
+<section id="id14">
+<h4>返回值<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h4>
+<p>  返回成功被取出的数据的大小。</p>
+</section>
+</section>
+<section id="kfifo-out-peek">
+<h3>kfifo_out_peek<a class="headerlink" href="#kfifo-out-peek" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">uint32_t</span> <span class="pre">kfifo_out_peek(struct</span> <span class="pre">kfifo_t</span> <span class="pre">*fifo,</span> <span class="pre">void</span> <span class="pre">*to,</span> <span class="pre">uint32_t</span> <span class="pre">size)</span></code></p>
+<section id="id15">
+<h4>描述<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h4>
+<p>  从kfifo缓冲区取出数据，但是不从队列中删除数据。当队列中数据量不足时，则不取出。</p>
+</section>
+<section id="id16">
+<h4>参数<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+<p><strong>to</strong></p>
+<p>  目标缓冲区基地址指针</p>
+<p><strong>size</strong></p>
+<p>  数据大小（单位：bytes）</p>
+</section>
+<section id="id17">
+<h4>返回值<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h4>
+<p>  返回成功被取出的数据的大小。</p>
+</section>
+</section>
+<section id="kfifo-reset">
+<h3>kfifo_reset<a class="headerlink" href="#kfifo-reset" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">kfifo_reset(fifo)</span></code></p>
+<section id="id18">
+<h4>描述<a class="headerlink" href="#id18" title="Permalink to this heading"></a></h4>
+<p>  忽略kfifo队列中的所有内容，并把输入和输出偏移量都归零</p>
+</section>
+<section id="id19">
+<h4>参数<a class="headerlink" href="#id19" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+</section>
+</section>
+<section id="kfifo-reset-out">
+<h3>kfifo_reset_out<a class="headerlink" href="#kfifo-reset-out" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">kfifo_reset_out(fifo)</span></code></p>
+<section id="id20">
+<h4>描述<a class="headerlink" href="#id20" title="Permalink to this heading"></a></h4>
+<p>  忽略kfifo队列中的所有内容，并将输入偏移量赋值给输出偏移量</p>
+</section>
+<section id="id21">
+<h4>参数<a class="headerlink" href="#id21" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+</section>
+</section>
+<section id="kfifo-total-size">
+<h3>kfifo_total_size<a class="headerlink" href="#kfifo-total-size" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">kfifo_total_size(fifo)</span></code></p>
+<section id="id22">
+<h4>描述<a class="headerlink" href="#id22" title="Permalink to this heading"></a></h4>
+<p>  获取kfifo缓冲区的最大大小</p>
+</section>
+<section id="id23">
+<h4>参数<a class="headerlink" href="#id23" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+</section>
+<section id="id24">
+<h4>返回值<a class="headerlink" href="#id24" title="Permalink to this heading"></a></h4>
+<p>  缓冲区最大大小</p>
+</section>
+</section>
+<section id="kfifo-size">
+<h3>kfifo_size<a class="headerlink" href="#kfifo-size" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">kfifo_size(fifo)</span></code></p>
+<section id="id25">
+<h4>描述<a class="headerlink" href="#id25" title="Permalink to this heading"></a></h4>
+<p>  获取kfifo缓冲区当前已使用的大小</p>
+</section>
+<section id="id26">
+<h4>参数<a class="headerlink" href="#id26" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+</section>
+<section id="id27">
+<h4>返回值<a class="headerlink" href="#id27" title="Permalink to this heading"></a></h4>
+<p>  缓冲区当前已使用的大小</p>
+</section>
+</section>
+<section id="kfifo-empty">
+<h3>kfifo_empty<a class="headerlink" href="#kfifo-empty" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">kfifo_empty(fifo)</span></code></p>
+<section id="id28">
+<h4>描述<a class="headerlink" href="#id28" title="Permalink to this heading"></a></h4>
+<p>  判断kfifo缓冲区当前是否为空</p>
+</section>
+<section id="id29">
+<h4>参数<a class="headerlink" href="#id29" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+</section>
+<section id="id30">
+<h4>返回值<a class="headerlink" href="#id30" title="Permalink to this heading"></a></h4>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>情况</p></th>
+<th class="head"><p>返回值</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>空</p></td>
+<td><p>1</p></td>
+</tr>
+<tr class="row-odd"><td><p>非空</p></td>
+<td><p>0</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="kfifo-full">
+<h3>kfifo_full<a class="headerlink" href="#kfifo-full" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">kfifo_full(fifo)</span></code></p>
+<section id="id31">
+<h4>描述<a class="headerlink" href="#id31" title="Permalink to this heading"></a></h4>
+<p>  判断kfifo缓冲区当前是否为满</p>
+</section>
+<section id="id32">
+<h4>参数<a class="headerlink" href="#id32" title="Permalink to this heading"></a></h4>
+<p><strong>fifo</strong></p>
+<p>  kfifo队列结构体的指针</p>
+</section>
+<section id="id33">
+<h4>返回值<a class="headerlink" href="#id33" title="Permalink to this heading"></a></h4>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>情况</p></th>
+<th class="head"><p>返回值</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>满</p></td>
+<td><p>1</p></td>
+</tr>
+<tr class="row-odd"><td><p>不满</p></td>
+<td><p>0</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+</section>
+<hr class="docutils" />
+<section id="id-allocation">
+<h2>ID Allocation<a class="headerlink" href="#id-allocation" title="Permalink to this heading"></a></h2>
+<p>   ida的主要作用是分配+管理id. 它能分配一个最小的, 未被分配出去的id. 当您需要管理某个数据结构时, 可能需要使用id来区分不同的目标. 这个时候, ida将会是很好的选择. 因为ida的十分高效, 运行常数相对数组更小, 而且提供了基本管理id需要用到的功能, 值得您试一试.</p>
+<p>  IDA定义于<code class="docutils literal notranslate"><span class="pre">idr.h</span></code>文件中. 您通过<code class="docutils literal notranslate"><span class="pre">DECLARE_IDA(my_ida)</span></code>来创建一个ida对象, 或者<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">ida</span> <span class="pre">my_ida;</span> <span class="pre">ida_init(&amp;my_ida);</span></code>来初始化一个ida.</p>
+<section id="ida-init">
+<h3>ida_init<a class="headerlink" href="#ida-init" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">ida_init(struct</span> <span class="pre">ida</span> <span class="pre">*ida_p)</span></code></p>
+<section id="id34">
+<h4>描述<a class="headerlink" href="#id34" title="Permalink to this heading"></a></h4>
+<p>  通初始化IDA, 你需要保证调用函数之前, ida的free_list为空, 否则会导致内存泄漏.</p>
+</section>
+<section id="id35">
+<h4>参数<a class="headerlink" href="#id35" title="Permalink to this heading"></a></h4>
+<p><strong>ida_p</strong></p>
+<p>   指向ida的指针</p>
+</section>
+<section id="id36">
+<h4>返回值<a class="headerlink" href="#id36" title="Permalink to this heading"></a></h4>
+<p>  无返回值</p>
+</section>
+</section>
+<section id="ida-preload">
+<h3>ida_preload<a class="headerlink" href="#ida-preload" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">ida_preload(struct</span> <span class="pre">ida</span> <span class="pre">*ida_p,</span> <span class="pre">gfp_t</span> <span class="pre">gfp_mask)</span></code></p>
+<section id="id37">
+<h4>描述<a class="headerlink" href="#id37" title="Permalink to this heading"></a></h4>
+<p>  为ida预分配空间.您可以不自行调用, 因为当ida需要空间的时候, 内部会自行使用<code class="docutils literal notranslate"><span class="pre">kmalloc</span></code>函数获取空间. 当然, 设计这个函数的目的是为了让您有更多的选择. 当您提前调用这个函数, 可以避免之后在开辟空间上的时间开销.</p>
+</section>
+<section id="id38">
+<h4>参数<a class="headerlink" href="#id38" title="Permalink to this heading"></a></h4>
+<p><strong>ida_p</strong></p>
+<p>   指向ida的指针</p>
+<p><strong>gfp_mask</strong></p>
+<p>   保留参数, 目前尚未使用.</p>
+</section>
+<section id="id39">
+<h4>返回值<a class="headerlink" href="#id39" title="Permalink to this heading"></a></h4>
+<p>  如果分配成功,将返回0; 否则返回负数错误码, 有可能是内存空间不够.</p>
+</section>
+</section>
+<section id="ida-alloc">
+<h3>ida_alloc<a class="headerlink" href="#ida-alloc" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">ida_alloc(struct</span> <span class="pre">ida</span> <span class="pre">*ida_p,</span> <span class="pre">int</span> <span class="pre">*p_id)</span></code></p>
+<section id="id40">
+<h4>描述<a class="headerlink" href="#id40" title="Permalink to this heading"></a></h4>
+<p>  获取一个空闲ID. 您需要注意, 返回值是成功/错误码.</p>
+</section>
+<section id="id41">
+<h4>参数<a class="headerlink" href="#id41" title="Permalink to this heading"></a></h4>
+<p><strong>ida_p</strong></p>
+<p>   指向ida的指针</p>
+<p><strong>p_id</strong></p>
+<p>   您需要传入一个int变量的指针, 如果成功分配ID, ID将会存储在该指针所指向的地址.</p>
+</section>
+<section id="id42">
+<h4>返回值<a class="headerlink" href="#id42" title="Permalink to this heading"></a></h4>
+<p>  如果分配成功,将返回0; 否则返回负数错误码, 有可能是内存空间不够.</p>
+</section>
+</section>
+<section id="ida-count">
+<h3>ida_count<a class="headerlink" href="#ida-count" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">ida_count(struct</span> <span class="pre">ida</span> <span class="pre">*ida_p,</span> <span class="pre">int</span> <span class="pre">id)</span></code></p>
+<section id="id43">
+<h4>描述<a class="headerlink" href="#id43" title="Permalink to this heading"></a></h4>
+<p>  查询一个ID是否被分配.</p>
+</section>
+<section id="id44">
+<h4>参数<a class="headerlink" href="#id44" title="Permalink to this heading"></a></h4>
+<p><strong>ida_p</strong></p>
+<p>   指向ida的指针</p>
+<p><strong>id</strong></p>
+<p>   您查询该ID是否被分配.</p>
+</section>
+<section id="id45">
+<h4>返回值<a class="headerlink" href="#id45" title="Permalink to this heading"></a></h4>
+<p>  如果分配,将返回true; 否则返回false.</p>
+</section>
+</section>
+<section id="ida-remove">
+<h3>ida_remove<a class="headerlink" href="#ida-remove" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">ida_remove(struct</span> <span class="pre">ida</span> <span class="pre">*ida_p,</span> <span class="pre">int</span> <span class="pre">id)</span></code></p>
+<section id="id46">
+<h4>描述<a class="headerlink" href="#id46" title="Permalink to this heading"></a></h4>
+<p>  删除一个已经分配的ID. 如果该ID不存在, 该函数不会产生异常错误, 因为在检测到该ID不存在的时候, 函数将会自动退出.</p>
+</section>
+<section id="id47">
+<h4>参数<a class="headerlink" href="#id47" title="Permalink to this heading"></a></h4>
+<p><strong>ida_p</strong></p>
+<p>   指向ida的指针</p>
+<p><strong>id</strong></p>
+<p>   您要删除的id.</p>
+</section>
+<section id="id48">
+<h4>返回值<a class="headerlink" href="#id48" title="Permalink to this heading"></a></h4>
+<p>  无返回值.</p>
+</section>
+</section>
+<section id="ida-destroy">
+<h3>ida_destroy<a class="headerlink" href="#ida-destroy" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">ida_destroy(struct</span> <span class="pre">ida</span> <span class="pre">*ida_p)</span></code></p>
+<section id="id49">
+<h4>描述<a class="headerlink" href="#id49" title="Permalink to this heading"></a></h4>
+<p>  释放一个IDA所有的空间, 同时删除ida的所有已经分配的id.(所以您不用担心删除id之后, ida还会占用大量空间.)</p>
+</section>
+<section id="id50">
+<h4>参数<a class="headerlink" href="#id50" title="Permalink to this heading"></a></h4>
+<p><strong>ida_p</strong></p>
+<p>   指向ida的指针</p>
+</section>
+<section id="id51">
+<h4>返回值<a class="headerlink" href="#id51" title="Permalink to this heading"></a></h4>
+<p>  无返回值</p>
+</section>
+</section>
+<section id="ida-empty">
+<h3>ida_empty<a class="headerlink" href="#ida-empty" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">ida_empty(struct</span> <span class="pre">ida</span> <span class="pre">*ida_p)</span></code></p>
+<section id="id52">
+<h4>描述<a class="headerlink" href="#id52" title="Permalink to this heading"></a></h4>
+<p>   查询一个ida是否为空</p>
+</section>
+<section id="id53">
+<h4>参数<a class="headerlink" href="#id53" title="Permalink to this heading"></a></h4>
+<p><strong>ida_p</strong></p>
+<p>   指向ida的指针</p>
+</section>
+<section id="id54">
+<h4>返回值<a class="headerlink" href="#id54" title="Permalink to this heading"></a></h4>
+<p>  ida为空则返回true，否则返回false。</p>
+</section>
+</section>
+</section>
+<hr class="docutils" />
+<section id="idr">
+<h2>IDR<a class="headerlink" href="#idr" title="Permalink to this heading"></a></h2>
+<p>   idr是一个基于radix-tree的ID-pointer的数据结构. 该数据结构提供了建id与数据指针绑定的功能, 它的主要功能有以下4个：</p>
+<ol class="arabic simple">
+<li><p>获取一个ID, 并且将该ID与一个指针绑定</p></li>
+<li><p>删除一个已分配的ID</p></li>
+<li><p>根据ID查找对应的指针</p></li>
+<li><p>根据ID使用新的ptr替换旧的ptr<br />
+   您可以使用<code class="docutils literal notranslate"><span class="pre">DECLARE_idr(my_idr)</span></code>来创建一个idr。或者您也可以使用<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">idr</span> <span class="pre">my_idr;</span> <span class="pre">idr_init(my_idr);</span></code>这两句话创建一个idr。
+   至于什么是radix-tree，您可以把他简单理解为一个向上生长的多叉树，在实现中，我们选取了64叉树。</p></li>
+</ol>
+<section id="idr-init">
+<h3>idr_init<a class="headerlink" href="#idr-init" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">idr_init(struct</span> <span class="pre">idr</span> <span class="pre">*idp)</span></code></p>
+<section id="id55">
+<h4>描述<a class="headerlink" href="#id55" title="Permalink to this heading"></a></h4>
+<p>  通初始化IDR, 你需要保证调用函数之前, idr的free_list为空, 否则会导致内存泄漏.</p>
+</section>
+<section id="id56">
+<h4>参数<a class="headerlink" href="#id56" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+</section>
+<section id="id57">
+<h4>返回值<a class="headerlink" href="#id57" title="Permalink to this heading"></a></h4>
+<p>  无返回值</p>
+</section>
+</section>
+<section id="idr-preload">
+<h3>idr_preload<a class="headerlink" href="#idr-preload" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">idr_preload(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">gfp_t</span> <span class="pre">gfp_mask)</span></code></p>
+<section id="id58">
+<h4>描述<a class="headerlink" href="#id58" title="Permalink to this heading"></a></h4>
+<p>  为idr预分配空间.您可以不自行调用, 因为当idr需要空间的时候, 内部会自行使用<code class="docutils literal notranslate"><span class="pre">kmalloc</span></code>函数获取空间. 当然, 设计这个函数的目的是为了让您有更多的选择. 当您提前调用这个函数, 可以避免之后在开辟空间上的时间开销.</p>
+</section>
+<section id="id59">
+<h4>参数<a class="headerlink" href="#id59" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+<p><strong>gfp_mask</strong></p>
+<p>   保留参数, 目前尚未使用.</p>
+</section>
+<section id="id60">
+<h4>返回值<a class="headerlink" href="#id60" title="Permalink to this heading"></a></h4>
+<p>  如果分配成功,将返回0; 否则返回负数错误码, 有可能是内存空间不够.</p>
+</section>
+</section>
+<section id="idr-alloc">
+<h3>idr_alloc<a class="headerlink" href="#idr-alloc" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">idr_alloc(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">void</span> <span class="pre">*ptr,</span> <span class="pre">int</span> <span class="pre">*id)</span></code></p>
+<section id="id61">
+<h4>描述<a class="headerlink" href="#id61" title="Permalink to this heading"></a></h4>
+<p>   获取一个空闲ID. 您需要注意, 返回值是成功/错误码.
+   调用这个函数，需要您保证ptr是非空的，即: <code class="docutils literal notranslate"><span class="pre">ptr</span> <span class="pre">!=</span> <span class="pre">NULL</span></code>, 否则将会影响 <code class="docutils literal notranslate"><span class="pre">idr_find/idr_find_next/idr_find_next_getid/...</span></code>等函数的使用。(具体请看这三个函数的说明，当然，只会影响到您的使用体验，并不会影响到idr内部函数的决策和逻辑)</p>
+</section>
+<section id="id62">
+<h4>参数<a class="headerlink" href="#id62" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向ida的指针</p>
+<p><strong>ptr</strong></p>
+<p>   指向数据的指针</p>
+<p><strong>id</strong></p>
+<p>   您需要传入一个int变量的指针, 如果成功分配ID, ID将会存储在该指针所指向的地址.</p>
+</section>
+<section id="id63">
+<h4>返回值<a class="headerlink" href="#id63" title="Permalink to this heading"></a></h4>
+<p>  如果分配成功,将返回0; 否则返回负数错误码, 有可能是内存空间不够.</p>
+</section>
+</section>
+<section id="idr-remove">
+<h3>idr_remove<a class="headerlink" href="#idr-remove" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void*</span> <span class="pre">idr_remove(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">int</span> <span class="pre">id)</span></code></p>
+<section id="id64">
+<h4>描述<a class="headerlink" href="#id64" title="Permalink to this heading"></a></h4>
+<p>  删除一个id, 但是不释放对应的ptr指向的空间, 同时返回这个被删除id所对应的ptr。
+   如果该ID不存在, 该函数不会产生异常错误, 因为在检测到该ID不存在的时候, 函数将会自动退出，并返回NULL。</p>
+</section>
+<section id="id65">
+<h4>参数<a class="headerlink" href="#id65" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+<p><strong>id</strong></p>
+<p>   您要删除的id.</p>
+</section>
+<section id="id66">
+<h4>返回值<a class="headerlink" href="#id66" title="Permalink to this heading"></a></h4>
+<p>  如果删除成功，就返回被删除id所对应的ptr；否则返回NULL。注意：如果这个id本来就和NULL绑定，那么也会返回NULL</p>
+</section>
+</section>
+<section id="idr-remove-all">
+<h3>idr_remove_all<a class="headerlink" href="#idr-remove-all" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">idr_remove_all(struct</span> <span class="pre">idr</span> <span class="pre">*idp)</span></code></p>
+<section id="id67">
+<h4>描述<a class="headerlink" href="#id67" title="Permalink to this heading"></a></h4>
+<p>  删除idr的所有已经分配的id.(所以您不用担心删除id之后, idr还会占用大量空间。)</p>
+<p>   但是你需要注意的是，调用这个函数是不会释放数据指针指向的空间的。 所以您调用该函数之前， 确保IDR内部的数据指针被保存。否则当IDR删除所有ID之后， 将会造成内存泄漏。</p>
+</section>
+<section id="id68">
+<h4>参数<a class="headerlink" href="#id68" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+</section>
+<section id="id69">
+<h4>返回值<a class="headerlink" href="#id69" title="Permalink to this heading"></a></h4>
+<p>  无返回值</p>
+</section>
+</section>
+<section id="idr-destroy">
+<h3>idr_destroy<a class="headerlink" href="#idr-destroy" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">idr_destroy(struct</span> <span class="pre">idr</span> <span class="pre">*idp)</span></code></p>
+<section id="id70">
+<h4>描述<a class="headerlink" href="#id70" title="Permalink to this heading"></a></h4>
+<p>  释放一个IDR所有的空间, 同时删除idr的所有已经分配的id.(所以您不用担心删除id之后, ida还会占用大量空间.) - 和<code class="docutils literal notranslate"><span class="pre">idr_remove_all</span></code>的区别是， 释放掉所有的空间(包括free_list的预分配空间)。</p>
+</section>
+<section id="id71">
+<h4>参数<a class="headerlink" href="#id71" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+</section>
+<section id="id72">
+<h4>返回值<a class="headerlink" href="#id72" title="Permalink to this heading"></a></h4>
+<p>  无返回值</p>
+</section>
+</section>
+<section id="idr-find">
+<h3>idr_find<a class="headerlink" href="#idr-find" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*idr_find(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">int</span> <span class="pre">id)</span></code></p>
+<section id="id73">
+<h4>描述<a class="headerlink" href="#id73" title="Permalink to this heading"></a></h4>
+<p>  查询一个ID所绑定的数据指针</p>
+</section>
+<section id="id74">
+<h4>参数<a class="headerlink" href="#id74" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+<p><strong>id</strong></p>
+<p>   您查询该ID的数据指针</p>
+</section>
+<section id="id75">
+<h4>返回值<a class="headerlink" href="#id75" title="Permalink to this heading"></a></h4>
+<p>   如果分配,将返回该ID对应的数据指针; 否则返回NULL.(注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
+   当然，我们也提供了<code class="docutils literal notranslate"><span class="pre">idr_count</span></code>函数来判断id是否被分配，具体请查看idr_count介绍。</p>
+</section>
+</section>
+<section id="idr-find-next">
+<h3>idr_find_next<a class="headerlink" href="#idr-find-next" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*idr_find_next(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">int</span> <span class="pre">start_id)</span></code></p>
+<section id="id76">
+<h4>描述<a class="headerlink" href="#id76" title="Permalink to this heading"></a></h4>
+<p>  传进一个start_id，返回满足 “id大于start_id的最小id” 所对应的数据指针。</p>
+</section>
+<section id="id77">
+<h4>参数<a class="headerlink" href="#id77" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+<p><strong>start_id</strong></p>
+<p>  您提供的ID限制</p>
+</section>
+<section id="id78">
+<h4>返回值<a class="headerlink" href="#id78" title="Permalink to this heading"></a></h4>
+<p>   如果分配,将返回该ID对应的数据指针; 否则返回NULL.(注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
+   当然，我们也提供了<code class="docutils literal notranslate"><span class="pre">idr_count</span></code>函数来判断id是否被分配，具体请查看idr_count介绍。</p>
+</section>
+</section>
+<section id="idr-find-next-getid">
+<h3>idr_find_next_getid<a class="headerlink" href="#idr-find-next-getid" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*idr_find_next_getid(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">int</span> <span class="pre">start_id,</span> <span class="pre">int</span> <span class="pre">*nextid)</span></code></p>
+<section id="id79">
+<h4>描述<a class="headerlink" href="#id79" title="Permalink to this heading"></a></h4>
+<p>  传进一个start_id，返回满足 “id大于start_id的最小id” 所对应的数据指针。同时，你获取到这个满足条件的最小id， 即参数中的 *nextid。</p>
+</section>
+<section id="id80">
+<h4>参数<a class="headerlink" href="#id80" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+<p><strong>start_id</strong></p>
+<p>   您提供的ID限制</p>
+</section>
+<section id="id81">
+<h4>返回值<a class="headerlink" href="#id81" title="Permalink to this heading"></a></h4>
+<p>   如果分配,将返回该ID对应的数据指针; 否则返回NULL.(注意， 返回NULL不一定代表这ID不存在，有可能该ID就是与空指针绑定。)
+   当然，我们也提供了<code class="docutils literal notranslate"><span class="pre">idr_count</span></code>函数来判断id是否被分配，具体请查看idr_count介绍。</p>
+</section>
+</section>
+<section id="idr-replace">
+<h3>idr_replace<a class="headerlink" href="#idr-replace" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">idr_replace(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">void</span> <span class="pre">*ptr,</span> <span class="pre">int</span> <span class="pre">id)</span></code></p>
+<section id="id82">
+<h4>描述<a class="headerlink" href="#id82" title="Permalink to this heading"></a></h4>
+<p>  传进一个ptr，使用该ptr替换掉id所对应的Old_ptr。</p>
+</section>
+<section id="id83">
+<h4>参数<a class="headerlink" href="#id83" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+<p><strong>ptr</strong></p>
+<p>  您要替换原来的old_ptr的新指针</p>
+<p><strong>id</strong></p>
+<p>   您要替换的指针所对应的id</p>
+</section>
+<section id="id84">
+<h4>返回值<a class="headerlink" href="#id84" title="Permalink to this heading"></a></h4>
+<p>   0代表成功，否则就是错误码 - 代表错误。</p>
+</section>
+</section>
+<section id="idr-replace-get-old">
+<h3>idr_replace_get_old<a class="headerlink" href="#idr-replace-get-old" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">idr_replace_get_old(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">void</span> <span class="pre">*ptr,</span> <span class="pre">int</span> <span class="pre">id,</span> <span class="pre">void</span> <span class="pre">**oldptr)</span></code></p>
+<section id="id85">
+<h4>描述<a class="headerlink" href="#id85" title="Permalink to this heading"></a></h4>
+<p>  传进一个ptr，使用该ptr替换掉id所对应的Old_ptr，同时你可以获取到old_ptr。</p>
+</section>
+<section id="id86">
+<h4>参数<a class="headerlink" href="#id86" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+<p><strong>ptr</strong></p>
+<p>  您要替换原来的old_ptr的新指针</p>
+<p><strong>id</strong></p>
+<p>   您要替换的指针所对应的id</p>
+<p><strong>old_ptr</strong></p>
+<p>   您需要传进该(void**)指针，old_ptr将会存放在该指针所指向的地址。</p>
+</section>
+<section id="id87">
+<h4>返回值<a class="headerlink" href="#id87" title="Permalink to this heading"></a></h4>
+<p>   0代表成功，否则就是错误码 - 代表错误。</p>
+</section>
+</section>
+<section id="idr-empty">
+<h3>idr_empty<a class="headerlink" href="#idr-empty" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">idr_empty(struct</span> <span class="pre">idr</span> <span class="pre">*idp)</span></code></p>
+<section id="id88">
+<h4>描述<a class="headerlink" href="#id88" title="Permalink to this heading"></a></h4>
+<p>   查询一个idr是否为空</p>
+</section>
+<section id="id89">
+<h4>参数<a class="headerlink" href="#id89" title="Permalink to this heading"></a></h4>
+<p><strong>idp</strong></p>
+<p>   指向idr的指针</p>
+</section>
+<section id="id90">
+<h4>返回值<a class="headerlink" href="#id90" title="Permalink to this heading"></a></h4>
+<p>  idr为空则返回true，否则返回false。</p>
+</section>
+</section>
+<section id="idr-count">
+<h3>idr_count<a class="headerlink" href="#idr-count" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">idr_count(struct</span> <span class="pre">idr</span> <span class="pre">*idp,</span> <span class="pre">int</span> <span class="pre">id)</span></code></p>
+<section id="id91">
+<h4>描述<a class="headerlink" href="#id91" title="Permalink to this heading"></a></h4>
+<p>  查询一个ID是否被分配.</p>
+</section>
+<section id="id92">
+<h4>参数<a class="headerlink" href="#id92" title="Permalink to this heading"></a></h4>
+<p><strong>ida_p</strong></p>
+<p>   指向idr的指针</p>
+<p><strong>id</strong></p>
+<p>   您查询该ID是否被分配.</p>
+</section>
+<section id="id93">
+<h4>返回值<a class="headerlink" href="#id93" title="Permalink to this heading"></a></h4>
+<p>  如果分配,将返回true; 否则返回false.</p>
+</section>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="atomic.html" class="btn btn-neutral float-left" title="原子变量" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="allocate-memory.html" class="btn btn-neutral float-right" title="内存分配指南" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>33270d0</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.5
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/kernel/core_api/data_structures.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/kernel/core_api/data_structures.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/kernel/core_api/data_structures.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/kernel/core_api/data_structures.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/core_api/data_structures.html">V0.1.4</a></dd>
+      <dd><a href="data_structures.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/core_api/data_structures.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/core_api/data_structures.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/core_api/data_structures.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/index.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/index.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

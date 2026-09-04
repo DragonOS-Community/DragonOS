@@ -1,228 +1,228 @@
-# DragonOS RCU 架构
+# DragonOS RCU Architecture
 
-## 1. RCU 解决什么问题
+## 1. What RCU Solves
 
-RCU（Read-Copy Update）的目标是在读多写少的共享数据上，让读者以很低的成本访问旧版本或新版本，同时保证旧版本只会在所有既有读者都不再使用它之后被回收。
+Read-Copy Update (RCU) lets readers access shared, read-mostly data at very low cost while an updater replaces an old version with a new one. The old version is reclaimed only after every reader that could still reference it has finished.
 
-一次典型更新分为三个阶段：
+A typical update has three phases:
 
-1. 更新者构造新版本，并以原子方式发布；
-2. 系统等待一个宽限期，确保发布前已经存在的读侧临界区全部结束；
-3. 宽限期结束后执行回调，回收旧版本或完成延迟操作。
+1. The updater constructs and atomically publishes a new version.
+2. The system waits for a grace period, ensuring that every read-side critical section that existed before publication has ended.
+3. After the grace period completes, callbacks reclaim the old version or perform other deferred work.
 
 ```mermaid
 flowchart LR
-    A[发布新版本] --> B[等待宽限期]
-    B --> C[确认既有读者均已离开]
-    C --> D[执行回调并回收旧版本]
+    A[Publish new version] --> B[Wait for a grace period]
+    B --> C[Confirm all pre-existing readers have left]
+    C --> D[Run callbacks and reclaim old version]
 ```
 
-RCU 不保证读者一定看到最新版本。它保证读者看到的版本在整个读侧临界区内仍然有效，并为更新者提供安全回收旧版本的时机。
+RCU does not guarantee that a reader observes the newest version. It guarantees that whichever version a reader observes remains valid throughout its read-side critical section, and it gives the updater a safe point at which to reclaim the old version.
 
-## 2. DragonOS RCU 的整体结构
+## 2. DragonOS RCU Structure
 
-DragonOS 当前采用适合非抢占式内核读侧临界区的轻量设计。系统由读侧保护、CPU 上下文跟踪、宽限期协调和回调处理四部分组成。
+DragonOS currently uses a lightweight design for non-preemptible kernel read-side critical sections. The system consists of four parts: read-side protection, CPU context tracking, grace-period coordination, and callback processing.
 
 ```mermaid
 flowchart TB
-    Reader[RCU 读侧临界区]
-    Arch[架构入口与退出边界]
-    Context[每 CPU 上下文跟踪]
-    Scheduler[调度器静止状态报告]
-    Coordinator[宽限期协调器]
-    GP[宽限期状态]
-    Callback[回调队列与执行器]
+    Reader[RCU read-side critical section]
+    Arch[Architecture entry and exit boundaries]
+    Context[Per-CPU context tracking]
+    Scheduler[Scheduler quiescent-state reports]
+    Coordinator[Grace-period coordinator]
+    GP[Grace-period state]
+    Callback[Callback queues and executor]
 
-    Reader -->|限制临界区内调度| Scheduler
-    Arch -->|User / Idle / IRQ / NMI 边界| Context
-    Context -->|当前状态与静止状态进展| Coordinator
-    Scheduler -->|上下文切换静止状态| Coordinator
+    Reader -->|Prevent scheduling in a critical section| Scheduler
+    Arch -->|User / Idle / IRQ / NMI boundaries| Context
+    Context -->|Current state and quiescent progress| Coordinator
+    Scheduler -->|Context-switch quiescent state| Coordinator
     Coordinator --> GP
-    GP -->|宽限期完成| Callback
+    GP -->|Grace period completed| Callback
 ```
 
-各层职责如下：
+Each layer has a distinct responsibility:
 
-- **读侧保护**：标识读侧临界区，并保证普通非抢占式读者不会在临界区中被调度走。
-- **上下文跟踪**：维护每个 CPU 当前是否可能运行普通 RCU 读者，以及该 CPU 是否穿过了静止状态。
-- **调度器集成**：把可靠的上下文切换作为静止状态来源之一。
-- **宽限期协调**：在宽限期开始时确定需要等待的 CPU，并收集它们后续的静止状态证据。
-- **回调处理**：按照宽限期世代组织回调，只在对应宽限期完成后执行。
+- **Read-side protection** marks read-side critical sections and ensures that an ordinary non-preemptible reader is not scheduled away while inside one.
+- **Context tracking** records whether each CPU can currently run ordinary RCU readers and whether that CPU has passed through a quiescent state.
+- **Scheduler integration** treats a reliable context switch as one source of quiescent-state evidence.
+- **Grace-period coordination** determines which CPUs must be waited for and collects their subsequent quiescent-state evidence.
+- **Callback processing** associates callbacks with grace-period generations and runs them only after their target grace period completes.
 
-上下文跟踪不管理回调，宽限期状态不理解架构入口细节，架构代码也不参与宽限期判定。这样的分层避免同一状态在多个子系统中重复维护。
+Context tracking does not manage callbacks, grace-period state does not interpret architecture entry details, and architecture code does not decide whether a grace period is complete. This separation avoids maintaining duplicate copies of the same state in different subsystems.
 
-## 3. Watching 与扩展静止状态
+## 3. Watching and Extended Quiescent States
 
-RCU 判断 CPU 是否需要被某个宽限期等待，关键不是 CPU 是否正在执行指令，而是它是否可能正在运行普通 RCU 读侧临界区。
+Whether a grace period must wait for a CPU does not depend on whether the CPU is executing instructions. It depends on whether the CPU could be running an ordinary RCU read-side critical section.
 
-DragonOS 将 CPU 上下文分为三种基础状态：
+DragonOS distinguishes three base CPU contexts:
 
-- **Kernel**：CPU 可能运行普通 RCU 读者，称为 RCU watching；
-- **User**：CPU 正在用户态，不能运行内核 RCU 读者，属于扩展静止状态；
-- **Idle**：CPU 正在空闲等待，不能运行普通 RCU 读者，属于扩展静止状态。
+- **Kernel**: the CPU may run ordinary RCU readers and is therefore RCU watching.
+- **User**: the CPU is in userspace and cannot run kernel RCU readers, so it is in an extended quiescent state.
+- **Idle**: the CPU is waiting while idle and cannot run ordinary RCU readers, so it is in an extended quiescent state.
 
-IRQ 和 NMI 是覆盖在基础状态上的临时执行层。它们执行内核代码，因此覆盖期间 CPU 必须视为 watching；只有最外层中断退出后，CPU 才能恢复被打断的 User 或 Idle 扩展静止状态。
+IRQ and NMI execution temporarily overlays the base context. Because an interrupt executes kernel code, the CPU must be watching while an overlay is active. The CPU may return to the interrupted User or Idle extended quiescent state only after the outermost interrupt exits.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Kernel
-    Kernel --> User: 返回用户态
-    User --> Kernel: 进入内核
-    Kernel --> Idle: 进入空闲等待
-    Idle --> Kernel: 离开空闲等待
+    Kernel --> User: Return to userspace
+    User --> Kernel: Enter the kernel
+    Kernel --> Idle: Enter idle wait
+    Idle --> Kernel: Leave idle wait
 
-    state "IRQ / NMI 覆盖层（watching）" as Overlay
-    Kernel --> Overlay: 中断进入
-    User --> Overlay: 中断进入
-    Idle --> Overlay: 中断进入
-    Overlay --> Overlay: 嵌套中断
-    Overlay --> Kernel: 返回内核执行
-    Overlay --> User: 恢复用户态
-    Overlay --> Idle: 恢复空闲等待
+    state "IRQ / NMI overlay (watching)" as Overlay
+    Kernel --> Overlay: Interrupt entry
+    User --> Overlay: Interrupt entry
+    Idle --> Overlay: Interrupt entry
+    Overlay --> Overlay: Nested interrupt
+    Overlay --> Kernel: Return to kernel execution
+    Overlay --> User: Resume userspace
+    Overlay --> Idle: Resume idle wait
 ```
 
-需要长期保持的状态不变量是：
+The persistent state invariants are:
 
-- Kernel 或任意 IRQ/NMI 覆盖层中，CPU 必须是 watching；
-- User 或 Idle 只有在不存在 IRQ/NMI 覆盖层时才属于扩展静止状态；
-- 进入和退出必须严格配对，只有最外层覆盖退出才允许改变 watching 状态；
-- 进入内核后必须先恢复 watching，之后才能运行普通内核逻辑；
-- 离开内核前必须先完成所有普通内核工作，最后才能停止 watching。
+- A CPU in Kernel or under any IRQ/NMI overlay must be watching.
+- User and Idle are extended quiescent states only when no IRQ/NMI overlay is active.
+- Entry and exit must be strictly paired, and only the outermost overlay exit may change the watching state.
+- Kernel entry must restore watching before any ordinary kernel logic runs.
+- Kernel exit must finish all ordinary kernel work before watching is stopped.
 
-## 4. 静止状态与进展世代
+## 4. Quiescent States and Progress Generations
 
-静止状态（Quiescent State，QS）表示某个 CPU 在该时刻不可能仍处于更早开始的普通 RCU 读侧临界区中。上下文切换、进入 User 和进入 Idle 都能提供这种证据。
+A quiescent state (QS) proves that a CPU cannot still be inside an older ordinary RCU read-side critical section at that point. Context switches, entry into User, and entry into Idle can all provide this evidence.
 
-每个 CPU 维护自己的静止状态进展世代。CPU 每次从 watching 穿过边界进入扩展静止状态时，世代都会向前推进。宽限期协调器只关心以下两个问题：
+Each CPU maintains its own quiescent-state progress generation. Whenever a CPU crosses from watching into an extended quiescent state, that generation advances. The grace-period coordinator needs to answer only two questions:
 
-1. 宽限期开始时，CPU 是否已经处于扩展静止状态；
-2. 如果当时仍然 watching，它的进展世代之后是否发生变化。
+1. Was the CPU already in an extended quiescent state when the grace period began?
+2. If it was still watching, did its progress generation change afterwards?
 
-这使宽限期不需要持续观察 CPU 的每次活动，也不需要把高频上下文转换都写入全局共享状态。
+This design avoids continuously observing every CPU action and avoids writing every high-frequency context transition into shared global state.
 
-## 5. 宽限期如何判断完成
+## 5. Grace-Period Completion
 
-宽限期开始时，协调器对在线 CPU 做一次一致性快照：
+At the beginning of a grace period, the coordinator takes a consistent snapshot of online CPUs:
 
-- 已经处于 User 或 Idle 的 CPU 不加入等待集合；
-- 仍然 watching 的 CPU 加入等待集合，同时记录其静止状态世代；
-- CPU 后续报告可靠的调度静止状态，或其上下文世代发生变化时，从等待集合移除；
-- 等待集合为空时，宽限期完成。
+- A CPU already in User or Idle is not added to the waiting set.
+- A CPU that is still watching is added to the waiting set together with its quiescent-state generation.
+- A CPU is removed from the waiting set after it reports a reliable scheduling quiescent state or its context generation changes.
+- The grace period completes when the waiting set becomes empty.
 
 ```mermaid
 flowchart TD
-    Start[开始宽限期] --> Snapshot[快照在线 CPU]
-    Snapshot --> Check{CPU 当前是否处于扩展静止状态}
-    Check -->|是| Skip[无需等待该 CPU]
-    Check -->|否| Wait[记录世代并加入等待集合]
-    Wait --> Evidence{获得静止状态证据}
-    Evidence -->|上下文切换| Credit[移出等待集合]
-    Evidence -->|世代已推进| Credit
-    Evidence -->|当前已在扩展静止状态| Credit
-    Skip --> Empty{等待集合为空}
+    Start[Start grace period] --> Snapshot[Snapshot online CPUs]
+    Snapshot --> Check{Is the CPU in an extended quiescent state?}
+    Check -->|Yes| Skip[Do not wait for this CPU]
+    Check -->|No| Wait[Record generation and add it to the waiting set]
+    Wait --> Evidence{Obtain quiescent-state evidence}
+    Evidence -->|Context switch| Credit[Remove it from the waiting set]
+    Evidence -->|Generation advanced| Credit
+    Evidence -->|Currently in an extended quiescent state| Credit
+    Skip --> Empty{Is the waiting set empty?}
     Credit --> Empty
-    Empty -->|否| Evidence
-    Empty -->|是| Done[完成宽限期]
+    Empty -->|No| Evidence
+    Empty -->|Yes| Done[Complete grace period]
 ```
 
-宽限期的正确性依赖两类证明：
+Grace-period correctness relies on two forms of proof:
 
-- **当前状态证明**：快照时 CPU 已在扩展静止状态，因此它不可能持有更早的普通 RCU 读侧临界区；
-- **状态进展证明**：快照时 CPU 仍然 watching，但之后穿过了静止状态，因此快照前存在的读侧临界区已经结束。
+- **Current-state proof**: the CPU was already in an extended quiescent state at the snapshot, so it could not hold an older ordinary RCU read-side critical section.
+- **State-progress proof**: the CPU was watching at the snapshot but later crossed a quiescent state, so any read-side critical section that existed at the snapshot has ended.
 
-两类证明缺一不可。只记录“返回过用户态”无法识别宽限期开始前已经处于用户态的 CPU；只观察当前状态又会遗漏已经穿过静止状态并重新进入内核的 CPU。
+Both proofs are necessary. Recording only that a CPU returned to userspace cannot identify a CPU that was already in userspace before the grace period started. Looking only at the current state misses a CPU that crossed a quiescent state and then re-entered the kernel.
 
-## 6. 快照与状态转换的并发闭环
+## 6. Closing the Snapshot-Transition Race
 
-CPU 进入扩展静止状态与宽限期开始可能同时发生。设计必须保证无论两者的先后顺序如何，协调器最终都能获得静止状态证据。
+A CPU may enter an extended quiescent state concurrently with grace-period startup. The design must guarantee that the coordinator eventually obtains quiescent-state evidence regardless of which operation happens first.
 
 ```mermaid
 sequenceDiagram
-    participant CPU as 目标 CPU
-    participant CT as 每 CPU 上下文状态
-    participant GP as 宽限期协调器
+    participant CPU as Target CPU
+    participant CT as Per-CPU context state
+    participant GP as Grace-period coordinator
 
-    GP->>GP: 发布“宽限期活动”
-    GP->>CT: 获取状态与进展世代快照
-    alt 快照看到扩展静止状态
-        GP->>GP: 不等待该 CPU
-    else 快照看到 watching
-        GP->>GP: 记录世代并等待
+    GP->>GP: Publish that a grace period is active
+    GP->>CT: Snapshot state and progress generation
+    alt Snapshot observes an extended quiescent state
+        GP->>GP: Do not wait for this CPU
+    else Snapshot observes watching
+        GP->>GP: Record generation and wait
     end
-    CPU->>CT: 进入扩展静止状态并推进世代
-    CPU->>GP: 活动宽限期存在时报告进展
-    GP->>CT: 复查状态或世代
-    GP->>GP: 确认证据后移出等待集合
+    CPU->>CT: Enter an extended quiescent state and advance generation
+    CPU->>GP: Report progress when a grace period is active
+    GP->>CT: Recheck state or generation
+    GP->>GP: Remove the CPU after confirming evidence
 ```
 
-并发协议满足以下闭环：
+The concurrent protocol closes the race in both directions:
 
-- CPU 先进入扩展静止状态时，后续宽限期快照必须能观察到新状态或新世代；
-- 宽限期先发布并记录 watching CPU 时，CPU 后续进入扩展静止状态必须触发进展检查；
-- 快照与转换重叠时，协调器只能看到转换前或转换后的完整状态，并通过复查消除临界窗口；
-- 用于减少无效报告的提示信息只能作为性能过滤，宽限期等待集合始终是正确性的唯一依据。
+- If the CPU enters an extended quiescent state first, the later grace-period snapshot must observe the new state or generation.
+- If the grace period first publishes its activity and records a watching CPU, the CPU must trigger a progress check when it subsequently enters an extended quiescent state.
+- If the snapshot overlaps the transition, the coordinator sees either the complete state before the transition or the complete state after it, and a recheck closes the boundary window.
+- Hints that suppress redundant reports are performance filters only; the grace-period waiting set remains the sole source of correctness.
 
-状态发布、快照和宽限期发布之间必须形成全序可证明的握手。若未来要放宽内存序，必须先给出覆盖所有架构的 happens-before 证明，不能仅凭单次压力测试判断安全。
+Publishing context state, taking snapshots, and publishing grace-period activity must form an ordered and provable handshake. Any future relaxation of memory ordering requires a complete cross-architecture happens-before proof; a passing stress test alone is not sufficient evidence.
 
-## 7. 回调生命周期
+## 7. Callback Lifecycle
 
-回调先进入当前 CPU 的局部队列，再由宽限期协调器按段归类。对应的宽限期完成后，回调进入可执行段，由回调执行器分批处理。
+A callback first enters the current CPU's local queue, where the grace-period coordinator classifies it by segment. After the required grace period completes, the callback moves to an executable segment and is processed in a bounded batch.
 
 ```mermaid
 flowchart LR
-    Admit[本 CPU 提交] --> Next[next: 尚未归类]
-    Next --> Wait[wait: 等待当前 GP]
-    Next --> NextReady[next-ready: 等待下一 GP]
+    Admit[Submit on this CPU] --> Next[next: unclassified]
+    Next --> Wait[wait: waiting for current GP]
+    Next --> NextReady[next-ready: waiting for next GP]
     NextReady --> Wait
-    Wait --> Done[done: GP 已完成]
-    Done --> Execute[有界批次执行]
+    Wait --> Done[done: GP completed]
+    Done --> Execute[Execute in bounded batches]
 ```
 
-这一过程遵循三个原则：
+This process follows three principles:
 
-- 回调不得早于目标宽限期完成；
-- 每个 CPU 的队列保持先入先出，CPU 之间不保证全局执行顺序；
-- 上下文转换只报告宽限期进展，不直接执行回调。
+- A callback must not run before its target grace period completes.
+- Each per-CPU queue preserves FIFO order; no global execution order is guaranteed across CPUs.
+- Context-transition paths report grace-period progress but do not execute callbacks directly.
 
-需要等待此前回调全部执行完毕时，应使用 `rcu_barrier()`；`synchronize_rcu()` 只等待宽限期结束。分段模型、屏障和 CPU 迁移的详细设计见 [RCU 分段回调队列](segmented-callback-queues.md)。
+Use `rcu_barrier()` when all previously submitted callbacks must finish; `synchronize_rcu()` waits only for a grace period to end. See [RCU Segmented Callback Queues](segmented-callback-queues.md) for the detailed segment, barrier, and CPU migration design.
 
-## 8. 架构接入原则
+## 8. Architecture Integration Principles
 
-各 CPU 架构只负责在可靠的入口和退出边界通知通用 RCU 层：
+Each CPU architecture reports reliable entry and exit boundaries to the common RCU layer:
 
-- 从用户态进入内核时，必须在任何可能使用普通 RCU 的内核逻辑之前恢复 watching；
-- 返回用户态时，必须在所有退出工作完成之后停止 watching；
-- 进入空闲等待时停止 watching，唤醒并恢复普通内核执行前恢复 watching；
-- IRQ/NMI 入口建立 watching 覆盖层，最外层退出按实际返回目标恢复基础状态；
-- 嵌套深度和返回目标必须来自真实入口上下文，不能根据当前任务类型或调度策略推测。
+- On entry from userspace, watching must be restored before any kernel logic that may use ordinary RCU executes.
+- On return to userspace, watching may stop only after all exit work has completed.
+- Entry into idle wait stops watching; waking and resuming ordinary kernel execution restores watching first.
+- IRQ/NMI entry establishes a watching overlay, and the outermost exit restores the base context according to the actual return target.
+- Nesting depth and return intent must come from the real entry context, not from task type or scheduler policy.
 
-架构层不保存第二份 RCU 上下文状态，也不解析通用状态的内部表示。这样可以让 x86_64、RISC-V 及未来架构共享同一套状态语义和宽限期算法。
+Architecture code does not keep a second copy of RCU context state and does not interpret the internal representation of the common state. This lets x86_64, RISC-V, and future architectures share the same state semantics and grace-period algorithm.
 
-## 9. 性能与安全约束
+## 9. Performance and Safety Constraints
 
-RCU 的价值依赖读侧和高频上下文路径足够轻量。DragonOS RCU 遵循以下约束：
+RCU is useful only when read-side and high-frequency context paths remain lightweight. DragonOS RCU follows these constraints:
 
-- 普通读侧临界区不获取全局锁；
-- 每 CPU 上下文转换优先只修改本 CPU 状态；
-- 普通 IRQ 嵌套和不产生静止状态的转换不进入宽限期全局慢路径；
-- 只有可能推进活动宽限期时才参与全局协调；
-- 高频状态按 CPU 隔离，避免不同 CPU 修改同一缓存行；
-- 上下文状态转换不分配内存，不执行回调；
-- 非法状态转换、嵌套计数错误和非 watching 读侧访问必须可诊断，不能通过静默修正状态掩盖调用错误。
+- Ordinary read-side critical sections do not acquire a global lock.
+- Per-CPU context transitions normally modify only local CPU state.
+- Ordinary IRQ nesting and transitions that do not produce a quiescent state do not enter the global grace-period slow path.
+- A CPU participates in global coordination only when it may advance an active grace period.
+- High-frequency state is isolated by CPU to avoid cross-CPU writes to the same cache line.
+- Context transitions do not allocate memory and do not execute callbacks.
+- Invalid transitions, nesting-count errors, and read-side access while not watching must be diagnosable; the implementation must not hide caller errors by silently repairing state.
 
-这些约束同时服务于性能和正确性：减少共享写入可以降低缓存争用，职责单一的状态机也更容易审计并发边界。
+These constraints serve both performance and correctness. Reducing shared writes lowers cache contention, while a state machine with narrow responsibilities is easier to audit at concurrent boundaries.
 
-## 10. 当前设计边界
+## 10. Current Design Boundaries
 
-DragonOS 当前 RCU 面向普通非抢占式内核读者。以下能力不属于这套基础架构：
+DragonOS RCU currently targets ordinary non-preemptible kernel readers. The following capabilities are outside this base architecture:
 
-- 抢占式 RCU 读者跟踪；
-- Tree RCU 的层级聚合结构；
-- 强制静止状态和 stall detector；
-- CPU hotplug 的完整 RCU 生命周期协议；
-- Tasks RCU、SRCU 等其他 RCU 类型；
-- tick/nohz、虚拟化时间记账等与上下文跟踪相邻但职责不同的功能。
+- tracking preemptible RCU readers;
+- Tree RCU hierarchical aggregation;
+- forced quiescent states and stall detection;
+- a complete RCU lifecycle protocol for CPU hotplug;
+- other RCU variants such as Tasks RCU and SRCU;
+- tick/nohz and virtualization time accounting, which are adjacent to context tracking but have different responsibilities.
 
-通用模型预留了可嵌套 NMI 的状态语义，但只有具备可返回 NMI 入口并完成延迟进展协议的架构，才能宣称完成 NMI 集成。尚未具备完整入口的架构应保持明确的未支持状态，不能用不可达 hook 代替真实实现。
+The common model reserves state semantics for nested NMI execution. An architecture may claim complete NMI integration only after it has a functional returning NMI entry path and a safe deferred-progress protocol. Architectures without complete entry support must report that limitation explicitly rather than using unreachable hooks as a substitute for integration.
 
-后续扩展应围绕明确需求增加能力，并继续保持“架构边界、上下文状态、宽限期协调、回调执行”四层职责分离，避免为了接近 Linux Tree RCU 的形态而引入当前没有消费者的复杂度。
+Future extensions should be driven by concrete requirements while preserving the separation between architecture boundaries, context state, grace-period coordination, and callback execution. DragonOS should not acquire the complexity of Linux Tree RCU merely to resemble its structure when that complexity has no current consumer.

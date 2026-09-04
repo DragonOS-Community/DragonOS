@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>eBPF &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="kprobe" href="kprobe.html" />
+    <link rel="prev" title="内核跟踪机制" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../net/index.html">网络子系统</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">内核跟踪机制</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">eBPF</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">概述</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#ebpf-in-dragonos">eBPF In DragonOS</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">eBPF的运行流程</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">用户态支持</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#tokio">Tokio</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ayaebpf">使用Aya创建eBPF程序</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">内核态支持</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#rbpf">rbpf</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">系统调用</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#helper">helper函数支持</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="kprobe.html">kprobe</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tracepoint.html">Tracepoints</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">内核跟踪机制</a></li>
+      <li class="breadcrumb-item active">eBPF</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/trace/eBPF.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="ebpf">
+<h1>eBPF<a class="headerlink" href="#ebpf" title="Permalink to this heading"></a></h1>
+<blockquote>
+<div><p>作者: 陈林峰</p>
+<p>Email: <a class="reference external" href="mailto:chenlinfeng25&#37;&#52;&#48;outlook&#46;com">chenlinfeng25<span>&#64;</span>outlook<span>&#46;</span>com</a></p>
+</div></blockquote>
+<section id="id1">
+<h2>概述<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>eBPF 是一项革命性的技术，起源于 Linux 内核，它可以在特权上下文中（如操作系统内核）运行沙盒程序。它用于安全有效地扩展内核的功能，而无需通过更改内核源代码或加载内核模块的方式来实现。</p>
+<p>从历史上看，由于内核具有监督和控制整个系统的特权，操作系统一直是实现可观测性、安全性和网络功能的理想场所。同时，由于操作系统内核的核心地位和对稳定性和安全性的高要求，操作系统内核很难快速迭代发展。因此在传统意义上，与在操作系统本身之外实现的功能相比，操作系统级别的创新速度要慢一些。</p>
+<p>eBPF 从根本上改变了这个方式。通过允许在操作系统中运行沙盒程序的方式，应用程序开发人员可以运行 eBPF 程序，以便在运行时向操作系统添加额外的功能。然后在 JIT 编译器和验证引擎的帮助下，操作系统确保它像本地编译的程序一样具备安全性和执行效率。这引发了一股基于 eBPF 的项目热潮，它们涵盖了广泛的用例，包括下一代网络实现、可观测性和安全功能等领域。</p>
+</section>
+<section id="ebpf-in-dragonos">
+<h2>eBPF In DragonOS<a class="headerlink" href="#ebpf-in-dragonos" title="Permalink to this heading"></a></h2>
+<p>在一个新的OS上添加eBPF的支持需要了解eBPF的运行过程，通常，eBPF需要用户态工具和内核相关基础设施配合才能发挥其功能。而新的OS通常会兼容Linux上的应用程序，这可以进一步简化对用户态工具的移植工作，只要内核实现相关的系统调用和功能，就可以配合已有的工具完成eBPF的支持。</p>
+</section>
+<section id="id2">
+<h2>eBPF的运行流程<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p><img alt="image-20240909165945192" src="../../_images/ebpf_flow.png" /></p>
+<p>如图所示，eBPF程序的运行过程分为三个主要步骤：</p>
+<ol class="arabic simple">
+<li><p>源代码-&gt;二进制</p>
+<ol class="arabic simple">
+<li><p>用户可以使用python/C/Rust编写eBPF程序，并使用相关的工具链编译源代码到二进制程序</p></li>
+<li><p>这个步骤中，用户需要合理使用helper函数丰富eBPF程序功能</p></li>
+</ol>
+</li>
+<li><p>加载eBPF程序</p>
+<ol class="arabic simple">
+<li><p>用户态的工具库会封装内核提供的系统调用接口，以简化用户的工作。用户态工具对eBPF程序经过预处理后发出系统调用，请求内核加载eBPF程序。</p></li>
+<li><p>内核首先会对eBPF程序进行验证，检查程序的正确性和合法性，同时也会对程序做进一步的处理</p></li>
+<li><p>内核会根据用户请求，将eBPF程序附加到内核的挂载点上(kprobe/uprobe/trace_point)</p></li>
+<li><p>在内核运行期间，当这些挂载点被特定的事件触发， eBPF程序就会被执行</p></li>
+</ol>
+</li>
+<li><p>数据交互</p>
+<ol class="arabic simple">
+<li><p>eBPF程序可以收集内核的信息，用户工具可以选择性的获取这些信息</p></li>
+<li><p>eBPF程序可以直接将信息输出到文件中，用户工具通过读取和解析文件中的内容拿到信息</p></li>
+<li><p>eBPF程序通过Map在内核和用户态之间共享和交换数据</p></li>
+</ol>
+</li>
+</ol>
+</section>
+<section id="id3">
+<h2>用户态支持<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<p>用户态的eBPF工具库有很多，比如C的libbpf，python的bcc, Rust的Aya，总体来说，这些工具的处理流程都大致相同。DragonOS当前支持<a class="reference external" href="https://github.com/aya-rs/aya">Aya</a>框架编写的eBPF程序，以Aya为例，用户态的工具的处理过程如下:</p>
+<ol class="arabic simple">
+<li><p>提供eBPF使用的helper函数和Map抽象，方便实现eBPF程序</p></li>
+<li><p>处理编译出来的eBPF程序，调用系统调用创建Map，获得对应的文件描述符</p></li>
+<li><p>根据需要，更新Map的值(.data)</p></li>
+<li><p>根据重定位信息，对eBPF程序的相关指令做修改</p></li>
+<li><p>根据内核版本，对eBPF程序中的bpf to bpf call进行处理</p></li>
+<li><p>加载eBPF程序到内核中</p></li>
+<li><p>对系统调用封装，提供大量的函数帮助访问eBPF的信息并与内核交互</p></li>
+</ol>
+<p>DragonOS对Aya 库的支持并不完整。通过对Aya库的删减，我们实现了一个较小的<a class="reference external" href="https://github.com/DragonOS-Community/tiny-aya">tiny-aya</a>。为了确保后期对Aya的兼容，tiny-aya只对Aya中的核心工具aya做了修改**，其中一些函数被禁用，因为这些函数的所需的系统调用或者文件在DragonOS中还未实现**。</p>
+<section id="tokio">
+<h3>Tokio<a class="headerlink" href="#tokio" title="Permalink to this heading"></a></h3>
+<p>Aya需要使用异步运行时，通过增加一些系统调用和修复一些错误DragonOS现在已经支持基本的tokio运行时。</p>
+</section>
+<section id="ayaebpf">
+<h3>使用Aya创建eBPF程序<a class="headerlink" href="#ayaebpf" title="Permalink to this heading"></a></h3>
+<p>与Aya官方提供的<a class="reference external" href="https://aya-rs.dev/book/start/development/">文档</a>所述，只需要根据其流程安装对应的Rust工具链，就可以按照模板创建eBPF项目。以当前实现的<code class="docutils literal notranslate"><span class="pre">syscall_ebf</span></code>为例，这个程序的功能是统计系统调用的次数，并将其存储在一个HashMap中。</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>├── Cargo.toml
+├── README.md
+├── syscall_ebpf
+├── syscall_ebpf-common
+├── syscall_ebpf-ebpf
+└── xtask
+</pre></div>
+</div>
+<p>在user/app目录中，项目结构如上所示：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">syscall_ebpf-ebpf</span></code>是 eBPF代码的实现目录，其会被编译到字节码</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">syscall_ebpf-common</span></code> 是公共库，方便内核和用户态进行信息交互</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">syscall_ebpf</span></code> 是用户态程序，其负责加载eBPF程序并获取eBPF程序产生的数据</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">xtask</span></code> 是一个命令行工具，方便用户编译和运行用户态程序</p></li>
+</ul>
+<p>为了在DragonOS中运行用户态程序，暂时还不能直接使用模板创建的项目：</p>
+<ol class="arabic simple">
+<li><p>这个项目不符合DragonOS对用户程序的项目结构要求，当然这可以通过稍加修改完成</p></li>
+<li><p>因为DragonOS对tokio运行时的支持还不是完整体，需要稍微修改一下使用方式</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="c1">#[tokio::main(flavor = &quot;current_thread&quot;)]</span>
+<span class="k">async</span> <span class="n">fn</span> <span class="n">main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Result</span><span class="o">&lt;</span><span class="p">(),</span> <span class="n">Box</span><span class="o">&lt;</span><span class="n">dyn</span> <span class="n">Error</span><span class="o">&gt;&gt;</span> <span class="p">{</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>因为对Aya支持不是完整体，因此项目依赖的aya和aya-log需要换成tiny-aya中的实现。</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">[</span><span class="n">dependencies</span><span class="p">]</span>
+<span class="n">aya</span> <span class="o">=</span> <span class="p">{</span> <span class="n">git</span> <span class="o">=</span> <span class="s2">&quot;https://github.com/DragonOS-Community/tiny-aya.git&quot;</span> <span class="p">}</span>
+<span class="n">aya</span><span class="o">-</span><span class="n">log</span> <span class="o">=</span> <span class="p">{</span> <span class="n">git</span> <span class="o">=</span> <span class="s2">&quot;https://github.com/DragonOS-Community/tiny-aya.git&quot;</span> <span class="p">}</span>
+</pre></div>
+</div>
+<p>只需要稍加修改，就可以利用Aya现有的工具完成eBPF程序的实现。</p>
+</section>
+</section>
+<section id="id4">
+<h2>内核态支持<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<p>内核态支持主要为三个部分：</p>
+<ol class="arabic simple">
+<li><p>kprobe实现：位于目录<code class="docutils literal notranslate"><span class="pre">kernel/crates/kprobe</span></code></p></li>
+<li><p>rbpf运行时：位于目录<code class="docutils literal notranslate"><span class="pre">kernel/crates/rbpf</span></code></p></li>
+<li><p>系统调用支持</p></li>
+<li><p>helper函数支持</p></li>
+</ol>
+<section id="rbpf">
+<h3>rbpf<a class="headerlink" href="#rbpf" title="Permalink to this heading"></a></h3>
+<p>由于rbpf之前只是用于运行一些简单的eBPF程序，其需要通过一些修改才能运行更复杂的程序。</p>
+<ol class="arabic simple">
+<li><p>增加bpf to bpf call 的支持：通过增加新的栈抽象和保存和恢复必要的寄存器数据</p></li>
+<li><p>关闭内部不必要的内存检查，这通常由内核的验证器完成</p></li>
+<li><p>增加带所有权的数据结构避免生命周期的限制</p></li>
+</ol>
+</section>
+<section id="id5">
+<h3>系统调用<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>eBPF相关的系统调用都集中在<code class="docutils literal notranslate"><span class="pre">bpf()</span></code> 上，通过参数cmd来进一步区分功能，目前对其支持如下:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">bpf</span><span class="p">(</span><span class="n">cmd</span>: <span class="nc">bpf_cmd</span><span class="p">,</span><span class="w"> </span><span class="n">attr</span>: <span class="kp">&amp;</span><span class="nc">bpf_attr</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">res</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">match</span><span class="w"> </span><span class="n">cmd</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// Map related commands</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_MAP_CREATE</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">map</span>::<span class="n">bpf_map_create</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_MAP_UPDATE_ELEM</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">map</span>::<span class="n">bpf_map_update_elem</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_MAP_LOOKUP_ELEM</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">map</span>::<span class="n">bpf_lookup_elem</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_MAP_GET_NEXT_KEY</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">map</span>::<span class="n">bpf_map_get_next_key</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_MAP_DELETE_ELEM</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">map</span>::<span class="n">bpf_map_delete_elem</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_MAP_LOOKUP_AND_DELETE_ELEM</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">map</span>::<span class="n">bpf_map_lookup_and_delete_elem</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_MAP_LOOKUP_BATCH</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">map</span>::<span class="n">bpf_map_lookup_batch</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_MAP_FREEZE</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">map</span>::<span class="n">bpf_map_freeze</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="c1">// Program related commands</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_PROG_LOAD</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">prog</span>::<span class="n">bpf_prog_load</span><span class="p">(</span><span class="n">attr</span><span class="p">),</span>
+<span class="w">        </span><span class="c1">// Object creation commands</span>
+<span class="w">        </span><span class="n">bpf_cmd</span>::<span class="n">BPF_BTF_LOAD</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">error</span><span class="o">!</span><span class="p">(</span><span class="s">&quot;bpf cmd {:?} not implemented&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span><span class="p">);</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">ty</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="fm">unimplemented!</span><span class="p">(</span><span class="s">&quot;bpf cmd {:?} not implemented&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">ty</span><span class="p">)</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">    </span><span class="n">res</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>其中对创建Map命令会再次细分，以确定具体的Map类型，目前我们对通用的Map基本添加了支持:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_ARRAY</span><span class="w"> </span>
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_PERCPU_ARRAY</span><span class="w"> </span>
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_PERF_EVENT_ARRAY</span>
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_HASH</span><span class="w"> </span>
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_PERCPU_HASH</span><span class="w"> </span>
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_QUEUE</span><span class="w"> </span>
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_STACK</span><span class="w"> </span>
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_LRU_HASH</span><span class="w"> </span>
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_LRU_PERCPU_HASH</span><span class="w"> </span>
+
+<span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_CPUMAP</span>
+<span class="o">|</span><span class="w"> </span><span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_DEVMAP</span>
+<span class="o">|</span><span class="w"> </span><span class="n">bpf_map_type</span>::<span class="n">BPF_MAP_TYPE_DEVMAP_HASH</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">error</span><span class="o">!</span><span class="p">(</span><span class="s">&quot;bpf map type {:?} not implemented&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">map_meta</span><span class="p">.</span><span class="n">map_type</span><span class="p">);</span>
+<span class="w">    </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">EINVAL</span><span class="p">)</span><span class="o">?</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>所有的Map都会实现定义好的接口，这个接口参考Linux的实现定义:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">BpfMapCommonOps</span>: <span class="nb">Send</span> <span class="o">+</span><span class="w"> </span><span class="nb">Sync</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Debug</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">CastFromSync</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// Lookup an element in the map.</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_lookup_elem/</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">lookup_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_key</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="nb">Option</span><span class="o">&lt;&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">]</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Update an element in the map.</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_update_elem/</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">update_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_key</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">],</span><span class="w"> </span><span class="n">_value</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">],</span><span class="w"> </span><span class="n">_flags</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Delete an element from the map.</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_delete_elem/</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">delete_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_key</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// For each element in map, call callback_fn function with map,</span>
+<span class="w">    </span><span class="sd">/// callback_ctx and other map-specific parameters.</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_for_each_map_elem/</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">for_each_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_cb</span>: <span class="nc">BpfCallBackFn</span><span class="p">,</span><span class="w"> </span><span class="n">_ctx</span>: <span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span><span class="w"> </span><span class="n">_flags</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="kt">u32</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Look up an element with the given key in the map referred to by the file descriptor fd,</span>
+<span class="w">    </span><span class="sd">/// and if found, delete the element.</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">lookup_and_delete_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_key</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">],</span><span class="w"> </span><span class="n">_value</span>: <span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// perform a lookup in percpu map for an entry associated to key on cpu.</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">lookup_percpu_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_key</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">],</span><span class="w"> </span><span class="n">cpu</span>: <span class="kt">u32</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="nb">Option</span><span class="o">&lt;&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">]</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Get the next key in the map. If key is None, get the first key.</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// Called from syscall</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">get_next_key</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_key</span>: <span class="nb">Option</span><span class="o">&lt;&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">]</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">_next_key</span>: <span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Push an element value in map.</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">push_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_value</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">],</span><span class="w"> </span><span class="n">_flags</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Pop an element value from map.</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">pop_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_value</span>: <span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Peek an element value from map.</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">peek_elem</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_value</span>: <span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Freeze the map.</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// It&#39;s useful for .rodata maps.</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">freeze</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">SystemError</span>::<span class="n">ENOSYS</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="sd">/// Get the first value pointer.</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">first_value_ptr</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="kt">u8</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="fm">panic!</span><span class="p">(</span><span class="s">&quot;value_ptr not implemented&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>联通eBPF和kprobe的系统调用是<a class="reference external" href="https://man7.org/linux/man-pages/man2/perf_event_open.2.html"><code class="docutils literal notranslate"><span class="pre">perf_event_open</span></code></a>，这个系统调用在Linux中非常复杂，因此Dragon中并没有按照Linux进行实现，目前只支持其中两个功能:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">match</span><span class="w"> </span><span class="n">args</span><span class="p">.</span><span class="n">type_</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Kprobe</span>
+<span class="w">    </span><span class="c1">// See /sys/bus/event_source/devices/kprobe/type</span>
+<span class="w">    </span><span class="n">perf_type_id</span>::<span class="n">PERF_TYPE_MAX</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">kprobe_event</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">kprobe</span>::<span class="n">perf_event_open_kprobe</span><span class="p">(</span><span class="n">args</span><span class="p">);</span>
+<span class="w">        </span><span class="nb">Box</span>::<span class="n">new</span><span class="p">(</span><span class="n">kprobe_event</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">perf_type_id</span>::<span class="n">PERF_TYPE_SOFTWARE</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// For bpf prog output</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">args</span><span class="p">.</span><span class="n">config</span><span class="p">,</span><span class="w"> </span><span class="n">perf_sw_ids</span>::<span class="n">PERF_COUNT_SW_BPF_OUTPUT</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span>
+<span class="w">            </span><span class="n">args</span><span class="p">.</span><span class="n">sample_type</span><span class="p">,</span>
+<span class="w">            </span><span class="nb">Some</span><span class="p">(</span><span class="n">perf_event_sample_format</span>::<span class="n">PERF_SAMPLE_RAW</span><span class="p">)</span>
+<span class="w">        </span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">bpf_event</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">bpf</span>::<span class="n">perf_event_open_bpf</span><span class="p">(</span><span class="n">args</span><span class="p">);</span>
+<span class="w">        </span><span class="nb">Box</span>::<span class="n">new</span><span class="p">(</span><span class="n">bpf_event</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>其中一个<code class="docutils literal notranslate"><span class="pre">PERF_TYPE_SOFTWARE</span></code>是用来创建软件定义的事件，<code class="docutils literal notranslate"><span class="pre">PERF_COUNT_SW_BPF_OUTPUT</span></code> 确保这个事件用来采集bpf的输出。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PERF_TYPE_MAX</span></code> 通常指示创建kprobe/uprobe事件，也就是用户程序使用kprobe的途径之一，用户程序可以将eBPF程序绑定在这个事件上</p></li>
+</ul>
+<p>同样的，perf不同的事件也实现定义的接口:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">PerfEventOps</span>: <span class="nb">Send</span> <span class="o">+</span><span class="w"> </span><span class="nb">Sync</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Debug</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">CastFromSync</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">CastFrom</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">mmap</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_start</span>: <span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">_len</span>: <span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">_offset</span>: <span class="kt">usize</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="fm">panic!</span><span class="p">(</span><span class="s">&quot;mmap not implemented for PerfEvent&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">set_bpf_prog</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">_bpf_prog</span>: <span class="nc">Arc</span><span class="o">&lt;</span><span class="n">File</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="fm">panic!</span><span class="p">(</span><span class="s">&quot;set_bpf_prog not implemented for PerfEvent&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">enable</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="fm">panic!</span><span class="p">(</span><span class="s">&quot;enable not implemented&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">disable</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="fm">panic!</span><span class="p">(</span><span class="s">&quot;disable not implemented&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">readable</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">bool</span> <span class="p">{</span>
+<span class="w">        </span><span class="fm">panic!</span><span class="p">(</span><span class="s">&quot;readable not implemented&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>这个接口目前并不稳定。</p>
+</section>
+<section id="helper">
+<h3>helper函数支持<a class="headerlink" href="#helper" title="Permalink to this heading"></a></h3>
+<p>用户态工具通过系统调用和内核进行通信，完成eBPF数据的设置、交换。在内核中，eBPF程序的运行也需要内核的帮助，单独的eBPF程序并没有什么太大的用处，因此其会调用内核提供的<code class="docutils literal notranslate"><span class="pre">helper</span></code> 函数完成对内核资源的访问。</p>
+<p>目前已经支持的大多数<code class="docutils literal notranslate"><span class="pre">helper</span></code> 函数是与Map操作相关:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// Initialize the helper functions.</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">init_helper_functions</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">map</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BTreeMap</span>::<span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// Map helpers::Generic map helpers</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_map_lookup_elem</span><span class="p">));</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_map_update_elem</span><span class="p">));</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_map_delete_elem</span><span class="p">));</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">164</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_map_for_each_elem</span><span class="p">));</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">195</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_map_lookup_percpu_elem</span><span class="p">));</span>
+<span class="w">        </span><span class="c1">// map.insert(93,define_func!(raw_bpf_spin_lock);</span>
+<span class="w">        </span><span class="c1">// map.insert(94,define_func!(raw_bpf_spin_unlock);</span>
+<span class="w">        </span><span class="c1">// Map helpers::Perf event array helpers</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">25</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_perf_event_output</span><span class="p">));</span>
+<span class="w">        </span><span class="c1">// Probe and trace helpers::Memory helpers</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_bpf_probe_read</span><span class="p">));</span>
+<span class="w">        </span><span class="c1">// Print helpers</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">trace_printf</span><span class="p">));</span>
+
+<span class="w">        </span><span class="c1">// Map helpers::Queue and stack helpers</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">87</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_map_push_elem</span><span class="p">));</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">88</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_map_pop_elem</span><span class="p">));</span>
+<span class="w">        </span><span class="n">map</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">89</span><span class="p">,</span><span class="w"> </span><span class="n">define_func</span><span class="o">!</span><span class="p">(</span><span class="n">raw_map_peek_elem</span><span class="p">));</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">BPF_HELPER_FUN_SET</span><span class="p">.</span><span class="n">init</span><span class="p">(</span><span class="n">map</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="内核跟踪机制" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="kprobe.html" class="btn btn-neutral float-right" title="kprobe" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/trace/eBPF.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/trace/eBPF.html">V0.3.0</a></dd>
+      <dd><a href="eBPF.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/trace/eBPF.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

@@ -1,28 +1,26 @@
-# Linux tty设备
+# Linux tty Devices
 
-`dev/tty` 是一个在 Linux 和其他 Unix-like 系统中非常特殊的设备文件。从本质上讲，**它是一个指向当前进程的控制终端（Controlling Terminal）的别名或快捷方式**。
+`dev/tty` is a very special device file in Linux and other Unix-like systems. Essentially, **it is an alias or shortcut pointing to the controlling terminal of the current process**.
 
-### 1. 核心概念：终端（Terminal）
+### 1. Core Concept: Terminal
 
-在计算机早期，用户通过物理设备与计算机交互，这些设备被称为“终端”。一个典型的物理终端包含一个键盘用于输入和一个屏幕（或打印机）用于输出。
+In the early days of computing, users interacted with computers through physical devices called "terminals." A typical physical terminal consisted of a keyboard for input and a screen (or printer) for output.
 
-在现代 Linux 系统中，物理终端已经不常见，取而代之的是**终端模拟器 (Terminal Emulator)**，例如 GNOME Terminal, Konsole, xterm, iTerm2 等。这些是图形界面下的软件程序，它们模拟了物理终端的行为。
+In modern Linux systems, physical terminals are uncommon, having been replaced by **terminal emulators (Terminal Emulator)** such as GNOME Terminal, Konsole, xterm, iTerm2, etc. These are software programs under graphical interfaces that simulate the behavior of physical terminals.
 
-此外，还有**控制台 (Console)**，这是直接连接到计算机硬件的终端，通常在没有图形界面或图形界面崩溃时使用。在 Linux 中，你可以通过 `Ctrl + Alt + F1-F6` 切换到虚拟控制台。
+Additionally, there are **consoles (Console)**, which are terminals directly connected to computer hardware, typically used when there is no graphical interface or when the graphical interface has crashed. In Linux, you can switch to a virtual console using `Ctrl + Alt + F1-F6`.
 
-无论是哪种形式，系统都通过一个名为 **TTY** 的驱动程序子系统来管理这些终端会话。TTY 这个名字来源于早期的“Teletypewriter”（电传打字机）。
+Regardless of the form, the system manages these terminal sessions through a driver subsystem called **TTY**, named after the early "Teletypewriter."
 
+### 2. TTY Device Files
 
+In Linux, "everything is a file." The system communicates with hardware devices through special files in the `/dev` directory. For terminals, there is also a series of device files, typically located in the `/dev/` directory, such as:
 
-### 2. TTY 设备文件
+- **/dev/ttyS0, /dev/ttyS1, ...**: Physical serial port devices.
+- **/dev/tty1, /dev/tty2, ...**: Virtual consoles.
+- **/dev/pts/0, /dev/pts/1, ...**: Pseudo-terminals. These are the most commonly used; when you open a terminal emulator window, the system creates a pseudo-terminal and assigns it a device file like `/dev/pts/0`.
 
-在 Linux 中，“一切皆文件”。系统通过 `/dev` 目录下的特殊文件与硬件设备进行通信。对于终端，也有一系列的设备文件，通常位于 `/dev/` 目录下，例如：
-
-- **/dev/ttyS0, /dev/ttyS1, ...**: 物理串口设备（Serial Ports）。
-- **/dev/tty1, /dev/tty2, ...**: 虚拟控制台（Virtual Consoles）。
-- **/dev/pts/0, /dev/pts/1, ...**: 伪终端（Pseudo-terminals）。这是我们最常用的，当你打开一个终端模拟器窗口时，系统就会创建一个伪终端，并为其分配一个像 `/dev/pts/0` 这样的设备文件。
-
-每个终端会话（比如你打开的一个终端窗口）都与一个特定的 TTY 设备文件相关联。你可以通过 `tty` 命令来查看当前终端对应的设备文件：
+Each terminal session (e.g., a terminal window you open) is associated with a specific TTY device file. You can use the `tty` command to view the device file corresponding to the current terminal:
 
 Bash
 
@@ -31,50 +29,44 @@ $ tty
 /dev/pts/0
 ```
 
-### 3. `/dev/tty` 的作用：一个动态的、指向“当前”的链接
+### 3. The Role of `/dev/tty`: A Dynamic Link to the "Current" Terminal
 
-现在我们回到主角 `/dev/tty`。
+Now let's return to the main subject, `/dev/tty`.
 
-想象一下你正在编写一个程序，这个程序需要与用户直接交互（读取用户的输入或向用户的屏幕显示信息），无论这个程序最终从哪里运行。
+Imagine you are writing a program that needs to interact directly with the user (read the user's input or display information on the user's screen), regardless of where the program ultimately runs.
 
-- 如果用户在虚拟控制台 `tty2` 上运行你的程序，程序应该向 `/dev/tty2` 读写。
-- 如果用户在 GNOME Terminal 的一个窗口里运行，程序可能需要向 `/dev/pts/5` 读写。
-- 如果用户通过 `ssh` 远程登录运行，程序又需要向另一个伪终端设备读写。
+- If the user runs your program on virtual console `tty2`, the program should read from and write to `/dev/tty2`.
+- If the user runs it in a GNOME Terminal window, the program may need to read from and write to `/dev/pts/5`.
+- If the user logs in remotely via `ssh`, the program needs to read from and write to another pseudo-terminal device.
 
-如果让程序自己去判断当前在哪个终端上运行，将会非常复杂和不可靠。
+Having the program determine which terminal it is running on would be very complex and unreliable.
 
-`/dev/tty` 就是为了解决这个问题而存在的。**无论一个进程的“控制终端”是哪一个具体的设备（`/dev/tty2` 或 `/dev/pts/5` 等），`/dev/tty` 始终是指向这个控制终端的链接。**
+`/dev/tty` exists to solve this problem. **No matter what the specific device (e.g., `/dev/tty2` or `/dev/pts/5`) of a process's "controlling terminal" is, `/dev/tty` is always a link pointing to this controlling terminal.**
 
-当一个程序打开 `/dev/tty` 文件时，内核会自动将这个文件描述符重定向到当前进程的实际控制终端。这样，程序开发者就不需要关心底层的具体 TTY 设备是什么，只需要统一地对 `/dev/tty` 进行读写，就能确保与当前用户进行交互。
+When a program opens the `/dev/tty` file, the kernel automatically redirects this file descriptor to the current process's actual controlling terminal. Thus, program developers do not need to worry about the underlying specific TTY device; they only need to uniformly read from and write to `/dev/tty`, ensuring interaction with the current user.
 
-**简单来说，`/dev/tty` 就是对程序说：“把信息发送给那个启动了你的用户，无论他在哪里。”**
+**In short, `/dev/tty` tells the program: "Send the information to the user who started you, no matter where they are."**
 
+### 4. The Difference Between `/dev/tty` and Standard Input/Output/Error (stdin, stdout, stderr)
 
+You might ask: This sounds similar to standard input (stdin) and standard output (stdout). What's the difference?
 
-### 4. `/dev/tty` 与标准输入/输出/错误 (stdin, stdout, stderr) 的区别
+In most cases, a process's standard input, output, and error streams are by default connected to its controlling terminal. For example, when you run the `ls` command, its `stdout` is your terminal by default, so you can see the file list on the screen.
 
+However, **redirection (Redirection)** changes this default behavior.
 
+- `ls > files.txt`: The `stdout` of the `ls` command is redirected to the `files.txt` file instead of the terminal.
+- `cat my_script.sh | bash`: The `stdin` of the `bash` process is redirected to a pipe (`|`), reading content from the output of the `cat` command instead of the keyboard.
 
-你可能会问：这听起来和标准输入（stdin）、标准输出（stdout）很像，有什么区别？
+In such cases, if the program still wants to forcibly interact with the user (for example, a script that requires the user to input a password), it can no longer rely on `stdin` or `stdout`, because they may have been redirected to a file or pipe, no longer the user's screen and keyboard.
 
-在大多数情况下，进程的标准输入、输出和错误流默认就是连接到其控制终端的。例如，当你运行 `ls` 命令时，它的 `stdout` 默认就是你的终端，所以你能在屏幕上看到文件列表。
+**This is where `/dev/tty` comes into play.**
 
-然而，**重定向 (Redirection)** 会改变这种默认行为。
+Reading from and writing to `/dev/tty` bypasses the redirection of standard input/output and directly accesses the controlling terminal.
 
-- `ls > files.txt`：`ls` 命令的 `stdout` 被重定向到了 `files.txt` 文件，而不是终端。
-- `cat my_script.sh | bash`：`bash` 进程的 `stdin` 被重定向到了管道 (`|`)，它从 `cat` 命令的输出中读取内容，而不是从键盘。
+#### Example:
 
-在这种情况下，如果程序内部仍然希望强制与用户交互（例如，一个需要用户输入密码的脚本），它就不能再依赖 `stdin` 或 `stdout` 了。因为它们可能已经被重定向到文件或管道，不再是用户的屏幕和键盘了。
-
-**这时，`/dev/tty` 就派上了用场。**
-
-对 `/dev/tty` 的读写操作会绕过标准输入/输出的重定向，直接访问控制终端。
-
-
-
-#### 示例：
-
-来看一个实际的例子。假设我们有一个脚本 `ask_password.sh`：
+Let's look at a practical example. Suppose we have a script `ask_password.sh`:
 
 Bash
 
@@ -93,7 +85,7 @@ echo "Password from stdin: $password_stdin"
 echo "Password from tty: $password_tty"
 ```
 
-现在，我们正常运行它：
+Now, we run it normally:
 
 Bash
 
@@ -107,7 +99,7 @@ Password from stdin: my_secret_pass
 Password from tty: my_secret_pass
 ```
 
-看起来没有区别。但是，现在我们尝试用重定向的方式运行它：
+There seems to be no difference. But now, let's try running it with redirection:
 
 Bash
 
@@ -120,112 +112,90 @@ Password from stdin: password_from_file
 Password from tty: my_real_secret
 ```
 
-**分析：**
+**Analysis:**
 
-1. 第一个 `read` 命令从 `stdin` 读取。由于我们通过管道将 `echo` 的输出重定向到了脚本的 `stdin`，所以它读到了 "password_from_file"。
-2. 第二个 `read` 命令被明确地重定向为从 `/dev/tty` 读取 (`< /dev/tty`)。这个操作绕过了 `stdin` 管道，直接访问了你的键盘和屏幕。因此，它会停下来等待你手动输入密码。
+1. The first `read` command reads from `stdin`. Since we redirected the output of `echo` to the script's `stdin` via a pipe, it reads "password_from_file".
+2. The second `read` command is explicitly redirected to read from `/dev/tty` (`< /dev/tty`). This operation bypasses the `stdin` pipe and directly accesses your keyboard and screen. Therefore, it will stop and wait for you to manually input the password.
 
-这就是 `/dev/tty` 的核心价值：**提供一个无论标准流如何重定向，都能保证与用户终端进行交互的可靠通道。** 像 `ssh`、`sudo` 等需要安全输入密码的程序，内部都会使用这种机制。
+This is the core value of `/dev/tty`: **providing a reliable channel to interact with the user's terminal, regardless of how standard streams are redirected.** Programs like `ssh` and `sudo` that require secure password input use this mechanism internally.
 
+### Summary
 
+| Feature                      | Description                                                  |
+| ---------------------------- | ------------------------------------------------------------ |
+| **Definition**               | A special device file that serves as an alias or shortcut for the current process's controlling terminal. |
+| **Function**                 | Provides a stable and reliable way for programs to interact with the user's terminal that launched them. |
+| **Dynamism**                 | It is not a specific device itself but a dynamically managed link by the kernel, pointing to the specific TTY device. |
+| **Difference from stdin/stdout** | When standard input/output/error streams are redirected to files, pipes, or other processes, `/dev/tty` can still be used to directly access the user's screen and keyboard. |
+| **Typical Uses**             | - Programs requiring user input of passwords or confirmations (e.g., `sudo`, `ssh`).<br>- Scripts needing explicit user interaction, even when run via pipes or redirection. |
 
-### 总结
+### How is /dev/tty Typically Used in User Programs?
 
+Well, the core goal of using `/dev/tty` in user programs is: **to bypass potentially redirected standard input/output streams and forcibly interact directly with the user's controlling terminal.**
 
+This is very common in the following scenarios:
 
-| 特性                       | 描述                                                         |
-| -------------------------- | ------------------------------------------------------------ |
-| **定义**                   | 一个特殊的设备文件，作为当前进程控制终端的别名或快捷方式。   |
-| **作用**                   | 为程序提供一个稳定、可靠的方式来与启动它的用户终端进行交互。 |
-| **动态性**                 | 它本身不是一个具体的设备，而是一个由内核管理的、动态指向具体 TTY 设备的链接。 |
-| **与 stdin/stdout 的区别** | 当标准输入/输出/错误流被重定向到文件、管道或其他进程时，`/dev/tty` 仍然可以用来直接访问用户的屏幕和键盘。 |
-| **典型用途**               | - 需要用户输入密码或确认的程序（如 `sudo`, `ssh`）。<br>- 需要在脚本中明确与用户交互，即使用户通过管道或重定向运行该脚本。 |
+1. **Requesting Sensitive Information**: Such as passwords, private key passwords, etc. Even if a script's output is redirected to a log file, you do not want the password prompt and input process to be recorded.
+2. **Interactive Confirmation**: In a script that may be automatically called, before performing dangerous operations (e.g., `rm -rf /`), it is necessary to force the user to manually confirm.
+3. **Diagnostics and Debugging**: Printing debugging information to the user's screen, even if the user has redirected the script's standard output elsewhere.
+4. **Fullscreen or Cursor-Based Applications**: Programs like `vim` and `top` need to directly control the terminal's screen, colors, and cursor positions, and they interact directly with the TTY device.
 
+#### Summary
 
+The pattern of using `/dev/tty` in user programs is very consistent:
 
-###  在用户程序中，通常是怎么使用/dev/tty的 
+1. **Open the File**: Open `/dev/tty` like a regular file, typically requiring read/write permissions (`r+`).
+2. **Error Handling**: Check if the open operation was successful. If a process does not have a controlling terminal (e.g., a background daemon process started by `systemd`), opening `/dev/tty` will fail. The program needs to handle this situation properly.
+3. **Writing (Output)**: Use standard file writing functions (e.g., `fprintf`, `write`) to write data to the opened `/dev/tty` file descriptor, which will display prompt information on the user's screen.
+4. **Reading (Input)**: Use standard file reading functions (e.g., `fgets`, `read`) to read data from `/dev/tty`, obtaining the user's keyboard input.
+5. **Close the File**: After completing the interaction, close the file descriptor.
 
-好的，在用户程序中使用 `/dev/tty` 的核心目标是：**绕过可能被重定向的标准输入/输出流，强制与用户的控制终端进行直接交互。**
+## What is the Role of /dev/ptmx and Files Under /dev/pts/?
 
-这在以下几个场景中非常常见：
+Well, let's delve into the files under `/dev/ptmx` and `/dev/pts/`. These two components are the core of the **pseudo-terminal (PTY)** mechanism in modern Linux systems, crucial for terminal emulators and SSH remote login functions we use daily.
 
-1. **请求敏感信息**：比如密码、私钥密码等。即使脚本的输出被重定向到日志文件，你也不希望密码提示和输入过程被记录下来。
-2. **交互式确认**：在一个可能被自动化调用的脚本中，执行危险操作前（如 `rm -rf /`），需要强制用户手动确认。
-3. **诊断和调试**：向用户的屏幕打印调试信息，即使用户已经将脚本的标准输出重定向到了别处。
-4. **全屏或基于光标的应用程序**：像 `vim`, `top` 这样的程序需要直接控制终端的屏幕、颜色和光标位置，它们会直接与 TTY 设备打交道。
+Simply put, they together create a "fake" terminal device, making programs (e.g., `bash`) think they are communicating with a physical terminal, when in fact they are interacting with software (e.g., GNOME Terminal or `sshd`).
 
-#### 总结
+This mechanism consists of two parts:
 
-在用户程序中使用 `/dev/tty` 的模式非常一致：
+- **Master Device**: Represented by `/dev/ptmx`.
+- **Slave Device**: Located in the `/dev/pts/` directory, such as `/dev/pts/0`, `/dev/pts/1`, etc.
 
-1. **打开文件**：像打开普通文件一样打开 `/dev/tty`，通常需要读写权限 (`r+`)。
-2. **错误处理**：检查打开操作是否成功。如果一个进程没有控制终端（例如，一个由 `systemd` 启动的后台守护进程），打开 `/dev/tty` 将会失败。程序需要妥善处理这种情况。
-3. **写入（输出）**：使用标准的文件写入函数（如 `fprintf`, `write`）向打开的 `/dev/tty` 文件描述符写入数据，这将会在用户的屏幕上显示提示信息。
-4. **读取（输入）**：使用标准的文件读取函数（如 `fgets`, `read`）从 `/dev/tty` 读取数据，这将获取用户的键盘输入。
-5. **关闭文件**：完成交互后，关闭文件描述符。
+Let's delve deeper into their respective roles and how they work together.
 
+### 1. The Concept of Pseudo-Terminals (PTY)
 
+First, understand why pseudo-terminals are needed. In early Unix systems, users interacted with computers through physical serial ports (e.g., `/dev/ttyS0`) connected to physical terminals. Later, with the development of graphical interfaces and networks, we needed a way to simulate this hardware terminal at the software level.
 
-##  /dev/ptmx和 /dev/pts/下文件有什么作用？ 
+Pseudo-terminals are this software simulation of terminals. They act like a pipe, with a "device" at each end:
 
+- **Master Side**: Held and controlled by terminal emulators (e.g., xterm, GNOME Terminal) or remote login services (e.g., `sshd`).
+- **Slave Side**: Provided for applications (e.g., `shell`, `vim`, `top`) to use. This slave device looks and behaves exactly like a true physical terminal device.
 
+When you type on the keyboard in a terminal emulator, the terminal emulator program writes data from the master side; the kernel forwards this data to the slave side, and the `shell` program can read your input from the slave side. Conversely, when the `shell` program produces output (e.g., the result of `ls`), it writes data to the slave side; the kernel forwards it to the master side, and the terminal emulator reads this data and displays it in the window.
 
-好的，我们来详细讲解 `/dev/ptmx` 和 `/dev/pts/` 目录下的文件。这两个组件是现代 Linux 系统中实现**伪终端（Pseudo-terminals, PTY）**机制的核心，对于我们日常使用的终端模拟器、SSH 远程登录等功能至关重要。
+### 2. `/dev/ptmx`: The Pseudo-Terminal Master Multiplexer
 
-简单来说，它们共同创建了一个“假的”终端设备，让程序（如 `bash`）以为自己正在和一个物理终端对话，而实际上它是在和一个软件（如 GNOME Terminal 或 `sshd`）对话。
+`/dev/ptmx` is a special character device file, whose name is an abbreviation for "pseudo-terminal multiplexer." You can think of it as a **factory for creating pseudo-terminal master/slave device pairs**.
 
-这个机制包含两个部分：
+Its core functions are:
 
-- **主设备 (Master)**：由 `/dev/ptmx` 代表。
-- **从设备 (Slave)**：位于 `/dev/pts/` 目录下，例如 `/dev/pts/0`, `/dev/pts/1` 等。
+1. **Creating New PTY Pairs**: When a program (e.g., a terminal emulator) needs a new pseudo-terminal, it opens the `/dev/ptmx` file.
+2. **Returning the Master Device File Descriptor**: This `open` operation successfully returns a file descriptor. This file descriptor represents the **master side** of the newly created PTY pair.
+3. **Dynamically Creating the Slave Device**: While opening `/dev/ptmx`, the kernel dynamically creates a corresponding **slave device (Slave)** file in the `/dev/pts/` directory, such as `/dev/pts/0`.
+4. **Providing a Control Interface**: The program can perform `ioctl()` system calls on the file descriptor returned by `/dev/ptmx` to configure the PTY, such as obtaining the name of the slave device, unlocking the slave device, etc.
 
-下面我们来深入了解它们各自的作用以及如何协同工作。
+**Key Point**: You cannot directly perform extensive read/write operations on `/dev/ptmx`. Its primary purpose is to request and create a new PTY pair through `open()` calls. Subsequent read/write operations are performed through the file descriptor returned by `open()`. Each opening of `/dev/ptmx` creates a brand new, independent PTY master/slave device pair.
 
+### 3. The `/dev/pts/` Directory and Its Files
 
+`/dev/pts` is a special file system of type `devpts`. This directory is specifically used to store pseudo-terminal **slave device** files.
 
-### 1. 伪终端 (PTY) 的概念
+- **Dynamically Created**: The files in this directory (e.g., `/dev/pts/0`, `/dev/pts/1`, ...) are not permanently present. They are dynamically created by the kernel when the corresponding PTY master device is created (i.e., when `/dev/ptmx` is opened).
+- **Role of Slave Devices**: Each `/dev/pts/N` file acts as the slave side of a PTY pair. It is a standard TTY device, and applications (e.g., `bash`) can open it, read user input, and write program output just like any other terminal device.
+- **Assigned to Shell**: After creating a PTY pair, the terminal emulator will `fork` a child process and redirect the standard input, output, and error of the child process to this newly created slave device (e.g., `/dev/pts/0`), then execute `bash` or another shell. Thus, `bash` "owns" this pseudo-terminal as its controlling terminal.
 
-
-
-首先，理解为什么需要伪终端。在早期的 Unix 系统中，用户通过物理串口（如 `/dev/ttyS0`）连接的物理终端与计算机交互。后来，随着图形界面和网络的发展，我们需要一种在软件层面模拟这种硬件终端的方法。
-
-伪终端就是这种软件模拟的终端。它像一个管道一样，在两端各有一个“设备”：
-
-- **主端 (Master Side)**：由终端模拟器（如 xterm, GNOME Terminal）或远程登录服务（如 `sshd`）持有和控制。
-- **从端 (Slave Side)**：提供给应用程序（如 `shell`, `vim`, `top`）使用。这个从设备看起来和行为上都与一个真正的物理终端设备一模一样。
-
-当你在终端模拟器里敲击键盘时，终端模拟器程序从主端写入数据；内核将这些数据转发到从端，`shell` 程序就能从从端读到你的输入。反之，当 `shell` 程序产生输出时（例如 `ls` 的结果），它向从端写入数据；内核将其转发到主端，终端模拟器读取这些数据并在窗口中显示出来。
-
-
-
-### 2. `/dev/ptmx`：伪终端的主设备复用器 (Master Multiplexer)
-
-
-
-`/dev/ptmx` 是一个特殊的字符设备文件，它的名字是 "pseudo-terminal multiplexer" 的缩写。可以把它理解为**创建伪终端主/从设备对的工厂**。
-
-它的核心作用是：
-
-1. **创建新的 PTY 对**：当一个程序（如终端模拟器）需要一个新的伪终端时，它会打开 `/dev/ptmx` 文件。
-2. **返回主设备的文件描述符**：这个 `open` 操作会成功返回一个文件描述符。这个文件描述符就代表了新创建的 PTY 对的**主端 (Master)**。
-3. **动态创建从设备**：在打开 `/dev/ptmx` 的同时，内核会在 `/dev/pts/` 目录下动态地创建一个对应的**从设备 (Slave)** 文件，比如 `/dev/pts/0`。
-4. **提供控制接口**：程序可以通过对 `/dev/ptmx` 返回的文件描述符执行 `ioctl()` 系统调用，来对 PTY 进行配置，例如获取从设备的名称、解锁从设备等。
-
-**关键点**：你不能直接对 `/dev/ptmx` 进行大量的读写。它的主要目的是通过 `open()` 调用来请求和创建一个新的 PTY 对。之后所有的读写操作都通过 `open()` 返回的那个文件描述符来进行。每次打开 `/dev/ptmx` 都会创建一个全新的、独立的 PTY 主/从设备对。
-
-
-
-### 3. `/dev/pts/` 目录和其下的文件
-
-
-
-`/dev/pts` 是一个特殊的文件系统，类型是 `devpts`。这个目录专门用来存放伪终端的**从设备 (Slave)** 文件。
-
-- **动态创建**：这个目录下的文件（如 `/dev/pts/0`, `/dev/pts/1`, ...）不是永久存在的。它们是在对应的 PTY 主设备被创建时（即 `/dev/ptmx` 被打开时）由内核动态创建的。
-- **从设备的角色**：每个 `/dev/pts/N` 文件都扮演着 PTY 对中从端的角色。它是一个标准的 TTY 设备，应用程序（如 `bash`）可以像对待任何其他终端设备一样打开它、读取用户输入、写入程序输出。
-- **分配给 Shell**：终端模拟器在创建了 PTY 对之后，会 `fork` 一个子进程，并在子进程中将标准输入、标准输出和标准错误都重定向到这个新创建的从设备（例如 `/dev/pts/0`）上，然后执行 `bash` 或其他 shell。这样，`bash` 就“拥有”了这个伪终端作为它的控制终端。
-
-你可以通过 `tty` 命令查看当前 shell 关联的从设备：
+You can use the `tty` command to view the slave device associated with the current shell:
 
 Bash
 
@@ -234,7 +204,7 @@ $ tty
 /dev/pts/0
 ```
 
-如果你再打开一个新的终端窗口，在新窗口里执行 `tty`，你可能会看到：
+If you open a new terminal window and run `tty` in the new window, you might see:
 
 Bash
 
@@ -243,76 +213,54 @@ $ tty
 /dev/pts/1
 ```
 
+### 4. Complete Creation Process
 
+Let's string the entire process together to see what happens in the background when you open a new terminal window:
 
-### 4. 完整的创建流程
+1. **Open ptmx**: The GNOME Terminal program calls `open("/dev/ptmx", O_RDWR)`.
+2. **Create PTY Pair**: The kernel receives the request and creates a new pseudo-terminal master/slave device pair.
+3. **Return Master Device FD**: The `open` call returns a file descriptor (e.g., `fd=3`) to GNOME Terminal. This `fd` is the master side of the PTY.
+4. **Create Slave Device File**: Simultaneously, the kernel creates a new slave device file in the `/dev/pts/` directory, such as `/dev/pts/5`.
+5. **Unlock and Authorize**: The GNOME Terminal program performs a series of `ioctl` calls (e.g., `grantpt` and `unlockpt`) on the file descriptor of the master device to set the permissions and status of the slave device `/dev/pts/5`, making it usable.
+6. **Get Slave Device Name**: The GNOME Terminal queries the name of the slave device associated with the master device of `fd=3` through an `ioctl` call to `ptsname`, obtaining the string "/dev/pts/5".
+7. **Create Child Process**: The GNOME Terminal calls `fork()` to create a child process.
+8. **Set Session and Redirect**: In the child process:
+   - A new session is created (`setsid()`), and `/dev/pts/5` is set as the controlling terminal of the session.
+   - The standard input, output, and error (file descriptors 0, 1, 2) are closed.
+   - `/dev/pts/5` is opened and duplicated to file descriptors 0, 1, 2. Now, the child process's `stdin`, `stdout`, and `stderr` all point to this pseudo-terminal slave device.
+9. **Execute Shell**: The child process calls `execve("/bin/bash", ...)` to start `bash`. `bash` inherits the already set file descriptors, naturally reading commands from `/dev/pts/5` and writing results to it.
+10. **Data Forwarding**:
+    - You type `ls` in the GNOME Terminal window.
+    - The GNOME Terminal program reads the input from keyboard events and **writes** "ls\n" through the file descriptor of the master device `fd=3`.
+    - The kernel forwards the data from the master side to the slave side `/dev/pts/5`.
+    - `bash` reads "ls\n" from its standard input (`/dev/pts/5`) and executes the command.
+    - The output of `ls` is **written** by `bash` to its standard output (`/dev/pts/5`).
+    - The kernel forwards the data from the slave side to the master side.
+    - The GNOME Terminal program **reads** the output result of `ls` through the file descriptor of the master device `fd=3` and renders it in the window.
 
+### Summary
 
+| Component                     | Role                            | Function                                                     |
+| ---------------------------- | ------------------------------- | ------------------------------------------------------------ |
+| **`/dev/ptmx`**          | **Master Device Factory**       | As a single entry point, when opened, it creates a new pseudo-terminal master/slave device pair and returns the file descriptor representing the **master device**. |
+| **Files Under `/dev/pts/`** | **Slave Devices**               | These are dynamically created device files, each representing the **slave device** of a pseudo-terminal. They provide a standard TTY interface for applications (e.g., shells) to interact as if with a physical terminal. |
 
-让我们把整个过程串起来，看看当你打开一个新的终端窗口时，后台发生了什么：
+### A Simple User Program Demonstrating the Use of /dev/ptmx
 
-1. **打开 ptmx**：GNOME Terminal 程序调用 `open("/dev/ptmx", O_RDWR)`。
-2. **创建 PTY 对**：内核接收到请求，创建一个新的伪终端主/从设备对。
-3. **返回主设备FD**：`open` 调用返回一个文件描述符（比如 `fd=3`）给 GNOME Terminal。这个 `fd` 就是 PTY 的主端。
-4. **创建从设备文件**：同时，内核在 `/dev/pts/` 目录下创建一个新的从设备文件，比如 `/dev/pts/5`。
-5. **解锁和授权**：GNOME Terminal 程序通过对主设备的文件描述符 `fd=3` 执行一系列 `ioctl` 调用（如 `grantpt` 和 `unlockpt`），来设置从设备 `/dev/pts/5` 的权限和状态，使其可用。
-6. **获取从设备名**：GNOME Terminal 通过 `ioctl` 调用 `ptsname` 来查询与 `fd=3` 对应的主设备关联的从设备名称，得到字符串 "/dev/pts/5"。
-7. **创建子进程**：GNOME Terminal 调用 `fork()` 创建一个子进程。
-8. **设置会话和重定向**：在子进程中：
-   - 创建一个新的会话 (`setsid()`)，并将 `/dev/pts/5` 设置为该会话的控制终端。
-   - 关闭标准输入、输出、错误（文件描述符 0, 1, 2）。
-   - 打开 `/dev/pts/5` 并将其复制到文件描述符 0, 1, 2。现在，子进程的 `stdin`, `stdout`, `stderr` 都指向了这个伪终端从设备。
-9. **执行 Shell**：子进程调用 `execve("/bin/bash", ...)` 来启动 `bash`。`bash` 继承了已经设置好的文件描述符，所以它自然地从 `/dev/pts/5` 读取命令并向其写入结果。
-10. **数据转发**：
-    - 你在 GNOME Terminal 窗口输入 `ls`。
-    - GNOME Terminal 程序从键盘事件中读取输入，并通过主设备的文件描述符 `fd=3` **写入** "ls\n"。
-    - 内核将数据从主端转发到从端 `/dev/pts/5`。
-    - `bash` 从它的标准输入（即 `/dev/pts/5`）**读取** "ls\n"，执行命令。
-    - `ls` 的输出被 `bash` **写入** 到它的标准输出（即 `/dev/pts/5`）。
-    - 内核将数据从从端转发到主端。
-    - GNOME Terminal 程序通过主设备的文件描述符 `fd=3` **读取** `ls` 的输出结果，并将其渲染显示在窗口中。
+Well, here is a simple C language user program that clearly demonstrates how to use `/dev/ptmx` to create a pseudo-terminal and start a shell (`/bin/bash`) within this pseudo-terminal.
 
+This program will act as the most basic "terminal emulator." It handles the master side, while the `bash` shell runs on the slave side it creates.
 
+#### Program Function Breakdown
 
-### 总结
+1. **Open `/dev/ptmx`**: Obtain a file descriptor for the pseudo-terminal master device.
+2. **Initialize the Slave Device**: Call `grantpt()` and `unlockpt()` to set the permissions and status of the slave device (slave PTY).
+3. **Get the Slave Device Name**: Call `ptsname()` to obtain the path of the corresponding slave device (e.g., `/dev/pts/3`).
+4. **Create a Child Process**: Use `fork()` to create a child process, which will run the shell.
+5. **Child Process Setup**: In the child process, associate its session with the slave device, redirect standard input, output, and error to the slave device, and then execute `/bin/bash`.
+6. **Parent Process Communication**: In the parent process, listen to input from the user's current terminal and output from `bash`, transferring data back and forth between them to achieve interaction.
 
-| 组件                     | 角色                            | 作用                                                         |
-| ------------------------ | ------------------------------- | ------------------------------------------------------------ |
-| **`/dev/ptmx`**          | **主设备工厂 (Master Factory)** | 作为一个单一的入口点，当被打开时，它会创建一个新的伪终端主/从设备对，并返回代表**主设备**的文件描述符。 |
-| **`/dev/pts/` 下的文件** | **从设备 (Slave Devices)**      | 这些是动态创建的设备文件，每一个都代表一个伪终端的**从设备**。它们为应用程序（如 shell）提供了一个标准的 TTY 接口，使其可以像与物理终端一样进行交互。 |
-
-
-
-
-
-### 简单的用户程序展示/dev/ptmx的使用 
-
-
-
-
-
-好的，下面是一个简单的 C 语言用户程序，它清晰地展示了如何使用 `/dev/ptmx` 来创建一个伪终端，并在这个伪终端中启动一个 shell (`/bin/bash`)。
-
-这个程序将扮演一个最基础的“终端模拟器”的角色。它会处理主设备（master）端，而 `bash` shell 会在它创建的从设备（slave）端运行。
-
-
-
-#### 程序功能分解
-
-
-
-1. **打开 `/dev/ptmx`**：获取一个伪终端主设备（master PTY）的文件描述符。
-2. **初始化从设备**：调用 `grantpt()` 和 `unlockpt()` 来设置从设备（slave PTY）的权限和状态。
-3. **获取从设备名**：调用 `ptsname()` 来得到对应的从设备路径（例如 `/dev/pts/3`）。
-4. **创建子进程**：使用 `fork()` 创建一个子进程，这个子进程将用来运行 shell。
-5. **子进程设置**：在子进程中，将其会话（session）与从设备关联，并将标准输入、输出、错误重定向到从设备，然后执行 `/bin/bash`。
-6. **父进程通信**：在父进程中，监听用户在当前终端的输入和来自 `bash` 的输出，并在它们之间来回传递数据，实现交互。
-
-
-
-#### 源代码 (`ptmx_demo.c`)
-
-
+#### Source Code (`ptmx_demo.c`)
 
 C
 
@@ -472,33 +420,29 @@ int main() {
 }
 ```
 
+#### How to Compile and Run
 
+1. **Save the Code**: Save the above code as `ptmx_demo.c`.
 
-#### 如何编译和运行
-
-1. **保存代码**：将上面的代码保存为 `ptmx_demo.c`。
-
-2. **编译**：使用 gcc 进行编译。
+2. **Compile**: Compile using gcc.
 
    Bash
 
    ```
    gcc -o ptmx_demo ptmx_demo.c
-   ```
+   _en```
 
-3. **运行**：执行生成的可执行文件。
+3. **Run**: Execute the generated executable file.
 
    Bash
 
-   ```
+   _en```
    ./ptmx_demo
-   ```
+   _en```
 
+#### Runtime Output and Interaction
 
-
-#### 运行时的输出和交互
-
-当你运行程序时，你会看到类似下面的输出：
+When you run the program, you will see output similar to the following:
 
 ```
 1. Master PTY opened with fd: 3
@@ -511,20 +455,20 @@ int main() {
 bash-5.1$
 ```
 
-**发生了什么？**
+**What Happened?**
 
-- 你的 `./ptmx_demo` 程序创建了一个新的伪终端 `/dev/pts/2`。
-- 它启动了一个新的 `bash` 进程，这个 `bash` 的“世界”就是 `/dev/pts/2`。
-- 你的 `./ptmx_demo` 程序正在作为中间人：
-  - 它读取你在当前终端（比如 `/dev/pts/1`）的键盘输入。
-  - 将你的输入（如 `ls -l`）写入到主设备（`master_fd`）。
-  - 内核将数据转发给从设备 `/dev/pts/2`。
-  - `bash` 从它的标准输入（`/dev/pts/2`）读取到 `ls -l` 并执行。
-  - `bash` 将 `ls -l` 的结果写入到它的标准输出（`/dev/pts/2`）。
-  - 内核将数据转发给主设备。
-  - 你的 `./ptmx_demo` 程序从主设备（`master_fd`）读取到结果，并将其打印到自己的标准输出，所以你就在屏幕上看到了 `ls -l` 的结果。
+- Your `./ptmx_demo` program created a new pseudo-terminal `/dev/pts/2`.
+- It started a new `bash` process, whose "world" is `/dev/pts/2`.
+- Your `./ptmx_demo` program acts as an intermediary:
+  - It reads keyboard input from your current terminal (e.g., `/dev/pts/1`).
+  - Writes your input (e.g., `ls -l`) to the master device (`master_fd`).
+  - The kernel forwards the data to the slave device `/dev/pts/2`.
+  - `bash` reads `ls -l` from its standard input (`/dev/pts/2`) and executes it.
+  - `ls`'s output is **written** by `bash` to its standard output (`/dev/pts/2`).
+  - The kernel forwards the data to the master device.
+  - Your `./ptmx_demo` program reads the result from the master device (`master_fd`) and prints it to its standard output, so you see the result of `ls -l` on the screen.
 
-你可以像在普通 shell 中一样执行命令：
+You can execute commands as in a normal shell:
 
 ```
 bash-5.1$ pwd
@@ -538,8 +482,8 @@ user       12345  12344  0 10:30 pts/2    00:00:00 bash
 user       12350  12345  0 10:31 pts/2    00:00:00 ps -f
 ```
 
-注意 `ps` 命令的输出！我们的 `ptmx_demo` 程序运行在 `pts/1`（你原来的终端），而它创建的 `bash` 进程则运行在一个全新的终端 `pts/2` 上。
+Note the output of the `ps` command! Our `ptmx_demo` program runs on `pts/1` (your original terminal), while the `bash` process it creates runs in a completely new terminal `pts/2`.
 
-当你输入 `exit` 并回车时，`bash` 进程会终止，这会导致伪终端连接关闭。父进程中的 `read(master_fd, ...)` 会返回 0，循环中断，程序优雅地退出。
+When you type `exit` and press Enter, the `bash` process terminates, causing the pseudo-terminal connection to close. The `read(master_fd, ...)` in the parent process returns 0, the loop breaks, and the program exits gracefully.
 
-这个例子完整地展示了 `/dev/ptmx` 的核心用途：创建一个隔离的终端会话环境，并允许一个程序（父进程）完全控制另一个程序（子进程）的输入和输出。这也是所有终端模拟器、`ssh` 服务和 `tmux`/`screen` 等工具的基础工作原理。
+This example fully demonstrates the core use of `/dev/ptmx`: creating an isolated terminal session environment and allowing a program (parent process) to fully control the input and output of another program (child process). This is also the foundational working principle of all terminal emulators, `ssh` services, and `tmux`/`screen` tools.

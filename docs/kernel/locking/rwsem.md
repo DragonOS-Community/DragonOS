@@ -1,25 +1,25 @@
-# RwSem 读写信号量
+# RwSem Read-Write Semaphore
 
-## 1. 简介
+## 1. Introduction
 
-RwSem (Read-Write Semaphore) 是一种可睡眠的读写锁，用于保护进程上下文中的共享数据。与自旋锁实现的 RwLock 不同，RwSem 在无法获取锁时会**让出 CPU 并进入睡眠状态**，而不是忙等待。
+RwSem (Read-Write Semaphore) is a sleepable read-write lock used to protect shared data in process context. Unlike the spinlock-based RwLock, RwSem will **yield the CPU and enter sleep state** when it fails to acquire the lock, rather than busy-waiting.
 
-### 1.1 适用场景
+### 1.1 Applicable Scenarios
 
-| 特性 | RwLock (spinlock) | RwSem (semaphore) |
-|------|-------------------|-------------------|
-| 上下文 | 进程 / 中断 | 仅进程上下文 |
-| 等待方式 | 忙等待 (自旋) | 睡眠 (调度) |
-| 适用场景 | 短时间临界区 | 长时间临界区 |
-| 中断上下文 | 可用 | **不可用** |
+| Feature | RwLock (spinlock) | RwSem (semaphore) |
+|---------|-------------------|-------------------|
+| Context | Process / Interrupt | Process context only |
+| Waiting Method | Busy-waiting (spinning) | Sleeping (scheduling) |
+| Applicable Scenario | Short critical sections | Long critical sections |
+| Interrupt Context | Available | **Not available** |
 
-**重要**: RwSem **不能在中断上下文中使用**，因为它可能会睡眠。
+**Important**: RwSem **cannot be used in interrupt context** as it may sleep.
 
-## 2. 核心设计
+## 2. Core Design
 
-### 2.1 锁状态表示
+### 2.1 Lock State Representation
 
-RwSem 使用一个原子整数 (`AtomicUsize`) 维护锁状态，通过位域编码实现高效的状态管理：
+RwSem uses an atomic integer (`AtomicUsize`) to maintain the lock state, with efficient state management through bitfield encoding:
 
 ```
 64位系统状态位布局:
@@ -31,13 +31,13 @@ RwSem 使用一个原子整数 (`AtomicUsize`) 维护锁状态，通过位域编
 +--------+--------------+------------+----------+------------------+
 ```
 
-| 字段 | 位置 | 说明 |
-|------|------|------|
-| `WRITER` | Bit 63 | 写者锁，1 表示有写者持有锁 |
-| `UPGRADEABLE_READER` | Bit 62 | 可升级读者锁，1 表示有可升级读者持有锁 |
-| `BEING_UPGRADED` | Bit 61 | 升级进行中标志，1 表示正在从可升级读者升级到写者 |
-| `MAX_READER` | Bit 60 | 读者溢出检测位，当读者数量达到 2^60 时置位 |
-| `READER_COUNT` | Bits 59..0 | 当前激活的读者数量 |
+| Field | Position | Description |
+|-------|----------|-------------|
+| `WRITER` | Bit 63 | Writer lock, 1 indicates a writer holds the lock |
+| `UPGRADEABLE_READER` | Bit 62 | Upgradeable reader lock, 1 indicates an upgradeable reader holds the lock |
+| `BEING_UPGRADED` | Bit 61 | Upgrade-in-progress flag, 1 indicates upgrading from upgradeable reader to writer |
+| `MAX_READER` | Bit 60 | Reader overflow detection bit, set when reader count reaches 2^60 |
+| `READER_COUNT` | Bits 59..0 | Current number of active readers |
 
 ```rust
 const READER: usize = 1;
@@ -47,27 +47,27 @@ const BEING_UPGRADED: usize = 1 << (usize::BITS - 3);      // Bit 61
 const MAX_READER: usize = 1 << (usize::BITS - 4);          // Bit 60
 ```
 
-### 2.2 三种锁模式
+### 2.2 Three Lock Modes
 
-RwSem 支持三种锁模式，提供不同级别的访问权限：
+RwSem supports three lock modes, providing different levels of access permissions:
 
-1. **读锁（Read Lock）**
-   - 多个读者可以并发持有读锁
-   - 提供对数据的只读访问（`&T`）
-   - 与写者和正在升级的可升级读者互斥
+1. **Read Lock**
+   - Multiple readers can hold the read lock concurrently
+   - Provides read-only access to data (`&T`)
+   - Mutually exclusive with writers and upgrade-in-progress readers
 
-2. **写锁（Write Lock）**
-   - 只有一个写者可以持有写锁
-   - 提供对数据的可变访问（`&mut T`）
-   - 与所有其他锁模式互斥
+2. **Write Lock**
+   - Only one writer can hold the write lock
+   - Provides mutable access to data (`&mut T`)
+   - Mutually exclusive with all other lock modes
 
-3. **可升级读锁（Upgradeable Read Lock）**
-   - 只有一个可升级读者可以持有可升级读锁
-   - 初始提供只读访问（`&T`）
-   - 可以原子地升级到写锁
-   - 与写者和其他可升级读者互斥，但可与普通读者共存
+3. **Upgradeable Read Lock**
+   - Only one upgradeable reader can hold this lock
+   - Initially provides read-only access (`&T`)
+   - Can be atomically upgraded to a write lock
+   - Mutually exclusive with writers and other upgradeable readers, but can coexist with regular readers
 
-### 2.3 等待队列设计
+### 2.3 Wait Queue Design
 
 ```rust
 pub struct RwSem<T: ?Sized> {
@@ -77,14 +77,14 @@ pub struct RwSem<T: ?Sized> {
 }
 ```
 
-**设计特点**：
-- 使用单一 `WaitQueue` 管理所有等待者（读者、写者、可升级读者）
-- 利用 `WaitQueue.wait_until()` 的原子语义确保正确性
-- 通过不同的唤醒策略实现公平性和性能平衡
+**Design Features**:
+- Uses a single `WaitQueue` to manage all waiters (readers, writers, upgradeable readers)
+- Leverages the atomic semantics of `WaitQueue.wait_until()` to ensure correctness
+- Balances fairness and performance through different wake-up strategies
 
-## 3. 锁获取机制
+## 3. Lock Acquisition Mechanism
 
-### 3.1 读锁获取
+### 3.1 Read Lock Acquisition
 
 ```rust
 pub fn read(&self) -> RwSemReadGuard<'_, T> {
@@ -107,18 +107,18 @@ pub fn try_read(&self) -> Option<RwSemReadGuard<'_, T>> {
 }
 ```
 
-**获取条件**：
-- 无写者（`WRITER` 位为 0）
-- 无正在升级的可升级读者（`BEING_UPGRADED` 位为 0）
-- 读者数量未溢出（`MAX_READER` 位为 0）
+**Acquisition Conditions**:
+- No writer (`WRITER` bit is 0)
+- No upgrade-in-progress reader (`BEING_UPGRADED` bit is 0)
+- Reader count not overflowed (`MAX_READER` bit is 0)
 
-**关键设计**：
-- 先乐观地递增读者计数（`fetch_add`）
-- 再检查阻塞条件
-- 失败则回滚计数（`fetch_sub`）
-- 这种"先递增后检查"的方式在无竞争场景下性能更优
+**Key Design**:
+- Optimistically increments reader count first (`fetch_add`)
+- Then checks blocking conditions
+- Rolls back count if failed (`fetch_sub`)
+- This "increment then check" approach performs better in non-contention scenarios
 
-### 3.2 写锁获取
+### 3.2 Write Lock Acquisition
 
 ```rust
 pub fn write(&self) -> RwSemWriteGuard<'_, T> {
@@ -137,11 +137,11 @@ pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, T>> {
 }
 ```
 
-**获取条件**：
-- 锁状态必须为 0（无读者、无写者、无可升级读者）
-- 使用 CAS 操作保证原子性
+**Acquisition Conditions**:
+- Lock state must be 0 (no readers, no writers, no upgradeable readers)
+- Uses CAS operation to ensure atomicity
 
-### 3.3 可升级读锁获取
+### 3.3 Upgradeable Read Lock Acquisition
 
 ```rust
 pub fn upread(&self) -> RwSemUpgradeableGuard<'_, T> {
@@ -167,19 +167,19 @@ pub fn try_upread(&self) -> Option<RwSemUpgradeableGuard<'_, T>> {
 }
 ```
 
-**获取条件**：
-- 无写者（`WRITER` 位为 0）
-- 无其他可升级读者（`UPGRADEABLE_READER` 位为 0）
-- 可与普通读者共存
+**Acquisition Conditions**:
+- No writer (`WRITER` bit is 0)
+- No other upgradeable readers (`UPGRADEABLE_READER` bit is 0)
+- Can coexist with regular readers
 
-**关键设计**：
-- 使用 `fetch_or` 原子设置可升级读者位
-- 通过检查返回的旧值判断是否成功
-- 只在设置了 `WRITER` 位但失败时才需要回滚
+**Key Design**:
+- Uses `fetch_or` to atomically set the upgradeable reader bit
+- Determines success by checking the returned old value
+- Only needs to roll back if `WRITER` bit was set but failed
 
-### 3.4 wait_until 核心机制
+### 3.4 wait_until Core Mechanism
 
-所有阻塞式的锁获取都依赖 `WaitQueue.wait_until()` 方法：
+All blocking lock acquisitions rely on the `WaitQueue.wait_until()` method:
 
 ```rust
 pub fn wait_until<F, R>(&self, cond: F) -> R
@@ -212,14 +212,14 @@ where
 }
 ```
 
-**关键点**：
-- 先注册 waker，再检查条件，确保不会错过任何唤醒信号
-- 即使被唤醒，也可能获取锁失败（公平竞争），需要继续循环
-- 这种设计避免了复杂的唤醒丢失问题
+**Key Points**:
+- Registers waker before checking conditions to avoid missing wake signals
+- May fail to acquire the lock even after being woken (fair competition), requiring continued looping
+- This design avoids complex wake-loss issues
 
-## 4. 锁释放与唤醒策略
+## 4. Lock Release and Wake-up Strategies
 
-### 4.1 读锁释放
+### 4.1 Read Lock Release
 
 ```rust
 impl<T: ?Sized> Drop for RwSemReadGuard<'_, T> {
@@ -233,12 +233,12 @@ impl<T: ?Sized> Drop for RwSemReadGuard<'_, T> {
 }
 ```
 
-**唤醒策略**：
-- 只有最后一个读者释放时才唤醒
-- 唤醒一个等待者（可能是写者或可升级读者）
-- 避免不必要的唤醒开销
+**Wake-up Strategy**:
+- Only wakes when the last reader releases
+- Wakes one waiter (may be a writer or upgradeable reader)
+- Avoids unnecessary wake-up overhead
 
-### 4.2 写锁释放
+### 4.2 Write Lock Release
 
 ```rust
 impl<T: ?Sized> Drop for RwSemWriteGuard<'_, T> {
@@ -252,12 +252,12 @@ impl<T: ?Sized> Drop for RwSemWriteGuard<'_, T> {
 }
 ```
 
-**唤醒策略**：
-- 唤醒所有等待者
-- 允许多个读者并发获取锁
-- 只有一个写者能成功（通过 CAS 竞争）
+**Wake-up Strategy**:
+- Wakes all waiters
+- Allows multiple readers to acquire the lock concurrently
+- Only one writer can succeed (through CAS competition)
 
-### 4.3 可升级读锁释放
+### 4.3 Upgradeable Read Lock Release
 
 ```rust
 impl<T: ?Sized> Drop for RwSemUpgradeableGuard<'_, T> {
@@ -271,15 +271,15 @@ impl<T: ?Sized> Drop for RwSemUpgradeableGuard<'_, T> {
 }
 ```
 
-**唤醒策略**：
-- 如果没有其他读者（`res == UPGRADEABLE_READER`），唤醒所有等待者
-- 如果还有其他读者，不唤醒（等待最后一个读者唤醒）
+**Wake-up Strategy**:
+- If no other readers (`res == UPGRADEABLE_READER`), wakes all waiters
+- If other readers remain, doesn't wake (waits for last reader to wake)
 
-## 5. 高级特性
+## 5. Advanced Features
 
-### 5.1 写锁降级
+### 5.1 Write Lock Downgrade
 
-将写锁原子地降级为可升级读锁，允许其他读者并发访问：
+Atomically downgrades a write lock to an upgradeable read lock, allowing concurrent reader access:
 
 ```rust
 impl<'a, T> RwSemWriteGuard<'a, T> {
@@ -313,18 +313,18 @@ impl<'a, T> RwSemWriteGuard<'a, T> {
 }
 ```
 
-**使用场景**：
-- 写入数据后，需要长时间持有锁进行只读操作
-- 通过降级允许其他读者并发访问，提高并发性
+**Use Cases**:
+- After writing data, needing to hold the lock for prolonged read operations
+- Downgrading allows concurrent reader access, improving concurrency
 
-**注意事项**：
-- 降级过程中使用 CAS 操作保证原子性
-- 使用循环重试处理 CAS 失败（通常是由于 ABA 问题）
-- 降级后不会唤醒等待者（由可升级读锁释放时处理）
+**Notes**:
+- Uses CAS operations to ensure atomicity during downgrade
+- Uses loop retries to handle CAS failures (typically due to ABA issues)
+- Doesn't wake waiters after downgrade (handled during upgradeable read release)
 
-### 5.2 可升级读锁升级
+### 5.2 Upgradeable Read Lock Upgrade
 
-将可升级读锁原子地升级为写锁：
+Atomically upgrades an upgradeable read lock to a write lock:
 
 ```rust
 impl<'a, T> RwSemUpgradeableGuard<'a, T> {
@@ -360,19 +360,19 @@ impl<'a, T> RwSemUpgradeableGuard<'a, T> {
 }
 ```
 
-**升级机制**：
-1. 先设置 `BEING_UPGRADED` 标志，阻塞新的读者
-2. 自旋等待现有读者全部释放（读者计数降为 0）
-3. 使用 CAS 将状态从"可升级读者+升级中"转换为"写者"
+**Upgrade Mechanism**:
+1. First sets `BEING_UPGRADED` flag to block new readers
+2. Spins waiting for existing readers to release (reader count drops to 0)
+3. Uses CAS to transition state from "upgradeable reader + upgrading" to "writer"
 
-**关键设计**：
-- 升级过程中不会睡眠，而是自旋等待
-- `BEING_UPGRADED` 标志确保不会有新的读者进入
-- 保持 `UPGRADEABLE_READER` 位直到升级完成，防止其他线程获取可升级读锁
+**Key Design**:
+- Doesn't sleep during upgrade, instead spins
+- `BEING_UPGRADED` flag ensures no new readers enter
+- Maintains `UPGRADEABLE_READER` bit until upgrade completes to prevent other threads from acquiring upgradeable read locks
 
-### 5.3 可中断的锁获取
+### 5.3 Interruptible Lock Acquisition
 
-支持被信号中断的锁获取操作：
+Supports lock acquisition operations that can be interrupted by signals:
 
 ```rust
 // 可中断的读锁获取
@@ -386,17 +386,17 @@ pub fn write_interruptible(&self) -> Result<RwSemWriteGuard<'_, T>, SystemError>
 }
 ```
 
-**使用场景**：
-- 用户态进程获取锁时，需要响应信号（如 Ctrl+C）
-- 避免进程无限期阻塞
+**Use Cases**:
+- User-space processes acquiring locks need to respond to signals (e.g., Ctrl+C)
+- Prevents indefinite process blocking
 
-**错误处理**：
-- 返回 `Err(SystemError::ERESTARTSYS)` 表示被信号中断
-- 调用者需要适当处理错误（通常是返回到用户态）
+**Error Handling**:
+- Returns `Err(SystemError::ERESTARTSYS)` to indicate signal interruption
+- Callers need to handle errors appropriately (typically returning to user-space)
 
-## 6. API 参考
+## 6. API Reference
 
-### 6.1 创建
+### 6.1 Creation
 
 ```rust
 // 编译期常量初始化
@@ -406,7 +406,7 @@ pub const fn new(value: T) -> Self
 let rwsem = RwSem::new(data);
 ```
 
-### 6.2 读锁操作
+### 6.2 Read Lock Operations
 
 ```rust
 // 阻塞获取（不可中断）
@@ -419,7 +419,7 @@ pub fn read_interruptible(&self) -> Result<RwSemReadGuard<'_, T>, SystemError>
 pub fn try_read(&self) -> Option<RwSemReadGuard<'_, T>>
 ```
 
-### 6.3 写锁操作
+### 6.3 Write Lock Operations
 
 ```rust
 // 阻塞获取（不可中断）
@@ -432,7 +432,7 @@ pub fn write_interruptible(&self) -> Result<RwSemWriteGuard<'_, T>, SystemError>
 pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, T>>
 ```
 
-### 6.4 可升级读锁操作
+### 6.4 Upgradeable Read Lock Operations
 
 ```rust
 // 阻塞获取（不可中断）
@@ -442,7 +442,7 @@ pub fn upread(&self) -> RwSemUpgradeableGuard<'_, T>
 pub fn try_upread(&self) -> Option<RwSemUpgradeableGuard<'_, T>>
 ```
 
-### 6.5 锁转换操作
+### 6.5 Lock Conversion Operations
 
 ```rust
 impl<'a, T> RwSemWriteGuard<'a, T> {
@@ -459,16 +459,16 @@ impl<'a, T> RwSemUpgradeableGuard<'a, T> {
 }
 ```
 
-### 6.6 直接访问
+### 6.6 Direct Access
 
 ```rust
 // 获取可变引用（需要独占的 &mut self）
 pub fn get_mut(&mut self) -> &mut T
 ```
 
-## 7. 使用示例
+## 7. Usage Examples
 
-### 7.1 基本读写
+### 7.1 Basic Read-Write
 
 ```rust
 use crate::libs::rwsem::RwSem;
@@ -490,7 +490,7 @@ fn writer() {
 }
 ```
 
-### 7.2 可升级读锁
+### 7.2 Upgradeable Read Lock
 
 ```rust
 fn reader_that_may_write() {
@@ -507,7 +507,7 @@ fn reader_that_may_write() {
 }
 ```
 
-### 7.3 写锁降级
+### 7.3 Write Lock Downgrade
 
 ```rust
 fn writer_with_downgrade() {
@@ -524,7 +524,7 @@ fn writer_with_downgrade() {
 }
 ```
 
-### 7.4 可中断的获取
+### 7.4 Interruptible Acquisition
 
 ```rust
 fn interruptible_reader() -> Result<(), SystemError> {
@@ -535,7 +535,7 @@ fn interruptible_reader() -> Result<(), SystemError> {
 }
 ```
 
-### 7.5 非阻塞尝试
+### 7.5 Non-blocking Attempt
 
 ```rust
 fn try_reader() -> Option<()> {
@@ -546,18 +546,18 @@ fn try_reader() -> Option<()> {
 }
 ```
 
-## 8. 内存序与正确性
+## 8. Memory Ordering and Correctness
 
-### 8.1 内存序保证
+### 8.1 Memory Ordering Guarantees
 
-RwSem 使用以下内存序保证正确性：
+RwSem uses the following memory orderings to ensure correctness:
 
-- **Acquire**：获取锁时使用，确保锁保护的数据可见
-- **Release**：释放锁时使用，确保临界区内的修改对后续获取者可见
-- **AcqRel**：同时需要 Acquire 和 Release 语义的操作（如降级、升级）
-- **Relaxed**：CAS 失败路径，不需要同步
+- **Acquire**: Used when acquiring locks, ensures visibility of protected data
+- **Release**: Used when releasing locks, ensures modifications in critical sections are visible to subsequent acquirers
+- **AcqRel**: Operations requiring both Acquire and Release semantics (e.g., downgrades, upgrades)
+- **Relaxed**: CAS failure paths, no synchronization needed
 
-### 8.2 happens-before 关系
+### 8.2 Happens-Before Relationships
 
 ```
 写者释放 (Release) ────┐
@@ -565,52 +565,52 @@ RwSem 使用以下内存序保证正确性：
 读者获取 (Acquire) ←──┘
 ```
 
-**保证**：
-- 写者在释放前的所有修改，对后续读者可见
-- 多个读者之间没有 happens-before 关系（并发读）
+**Guarantees**:
+- All modifications by a writer before release are visible to subsequent readers
+- No happens-before relationships between multiple readers (concurrent reads)
 
-## 9. 与其他实现的对比
+## 9. Comparison with Other Implementations
 
-| 特性 | Linux rw_semaphore | Rust parking_lot::RwLock | DragonOS RwSem |
-|------|-------------------|--------------------------|----------------|
-| 状态存储 | atomic_long_t | AtomicUsize | AtomicUsize |
-| 等待队列 | 单队列 + 类型标记 | 单队列 + parking | 单队列 + WaitQueue |
-| 可升级锁 | 不支持 | 支持 | **支持** |
-| 锁降级 | 支持（down_write_to_read） | 支持 | **支持** |
-| 公平策略 | 写者优先 + HANDOFF | FIFO + 反饥饿 | FIFO 公平竞争 |
-| 可中断等待 | 支持 | 不支持 | **支持** |
-| 中断上下文 | 不支持 | 不支持 | 不支持 |
+| Feature | Linux rw_semaphore | Rust parking_lot::RwLock | DragonOS RwSem |
+|---------|-------------------|--------------------------|----------------|
+| State Storage | atomic_long_t | AtomicUsize | AtomicUsize |
+| Wait Queue | Single queue + type tagging | Single queue + parking | Single queue + WaitQueue |
+| Upgradeable Locks | Not supported | Supported | **Supported** |
+| Lock Downgrade | Supported (down_write_to_read) | Supported | **Supported** |
+| Fairness Policy | Writer priority + HANDOFF | FIFO + anti-starvation | FIFO fair competition |
+| Interruptible Waits | Supported | Not supported | **Supported** |
+| Interrupt Context | Not supported | Not supported | Not supported |
 
-## 10. 性能特性
+## 10. Performance Characteristics
 
-### 10.1 快速路径优化
+### 10.1 Fast Path Optimizations
 
-- **无竞争读取**：单次原子操作（`fetch_add`）
-- **无竞争写入**：单次 CAS 操作
-- **读者释放**：单次原子操作，只有最后一个读者才唤醒
+- **Uncontended Reads**: Single atomic operation (`fetch_add`)
+- **Uncontended Writes**: Single CAS operation
+- **Reader Release**: Single atomic operation, only last reader wakes
 
-### 10.2 可扩展性
+### 10.2 Scalability
 
-- **并发读**：读者之间完全并发，无额外同步开销
-- **写者唤醒**：`wake_all()` 允许多个读者并发唤醒
-- **队列开销**：只在有等待者时才操作队列
+- **Concurrent Reads**: Fully concurrent among readers, no additional synchronization overhead
+- **Writer Wake-up**: `wake_all()` allows concurrent reader wake-ups
+- **Queue Overhead**: Only operates on the queue when waiters exist
 
-### 10.3 性能建议
+### 10.3 Performance Recommendations
 
-- 优先使用 `try_*` 方法避免睡眠（在能够快速重试的场景下）
-- 使用可升级读锁避免读锁升级导致的死锁
-- 读密集场景下性能优于写密集场景
+- Prefer `try_*` methods to avoid sleeping (in scenarios where quick retries are possible)
+- Use upgradeable read locks to avoid deadlocks from read-to-write upgrades
+- Outperforms in read-heavy scenarios compared to write-heavy scenarios
 
-## 11. 注意事项
+## 11. Notes
 
-### 11.1 使用限制
+### 11.1 Usage Restrictions
 
-1. **不可在中断上下文使用** - RwSem 可能会睡眠
-2. **避免嵌套锁** - 同一线程递归获取同一 RwSem 会导致死锁
-3. **避免读锁升级** - 不支持将普通读锁升级为写锁（会导致死锁）
-4. **Guard 不可跨线程** - Guard 类型标记为 `!Send`，不能跨线程传递
+1. **Not for Interrupt Context** - RwSem may sleep
+2. **Avoid Nested Locks** - Recursive acquisition by the same thread leads to deadlocks
+3. **Avoid Read-to-Write Upgrades** - Doesn't support upgrading regular read locks to write locks (causes deadlocks)
+4. **Guards Not Thread-Safe** - Guard types are marked as `!Send`, cannot be passed across threads
 
-### 11.2 死锁场景
+### 11.2 Deadlock Scenarios
 
 ```rust
 // ❌ 错误：嵌套获取同一锁
@@ -627,14 +627,14 @@ let guard = rwsem.upread();
 let guard = guard.upgrade();  // 原子升级
 ```
 
-### 11.3 最佳实践
+### 11.3 Best Practices
 
-1. 优先使用可升级读锁而非普通读锁（当可能需要写入时）
-2. 使用降级而非释放+重新获取（保持原子性）
-3. 在用户态进程中使用 `*_interruptible` 变体
-4. 尽量减少临界区大小，避免长时间持有锁
+1. Prefer upgradeable read locks over regular read locks when writes might be needed
+2. Use downgrades instead of release-and-reacquire (maintains atomicity)
+3. Use `*_interruptible` variants in user-space processes
+4. Minimize critical section sizes to avoid prolonged lock holding
 
-## 12. 实现原理总结
+## 12. Implementation Summary
 
 ```
                     ┌─────────────────────────────────────┐
@@ -684,4 +684,4 @@ let guard = guard.upgrade();  // 原子升级
     可升级读锁: 无其他读者时 → wake_all()
 ```
 
-这个设计通过巧妙利用位域编码、wait_until 原子等待机制和差异化的唤醒策略，实现了一个高效、正确且功能丰富的读写信号量。
+This design achieves an efficient, correct, and feature-rich read-write semaphore through clever use of bitfield encoding, the wait_until atomic waiting mechanism, and differentiated wake-up strategies.

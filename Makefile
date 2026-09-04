@@ -115,10 +115,10 @@ ECHO:
 
 
 docs: ECHO
-	bash -c "cd docs && make html && cd .."
+	bash -c "cd docs && npm run docs:build && cd .."
 
 clean-docs:
-	bash -c "cd docs && make clean && cd .."
+	bash -c "cd docs && rm -rf .vitepress/dist .vitepress/cache && cd .."
 
 gdb: check_arch
 	@if [ -f "$(VMSTATE_DIR)/gdb" ]; then \

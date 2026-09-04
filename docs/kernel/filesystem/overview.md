@@ -1,22 +1,23 @@
-:::{note}
-本文作者: 龙进
+::: info Author
+Long Jin
 
-Email: <longjin@DragonOS.org>
+Email: `<longjin@DragonOS.org>`
 :::
 
-# 概述
 
-&emsp;&emsp;在本文中，我们将介绍DragonOS文件系统的架构设计。
+# Overview
 
-## 总览
+In this document, we will introduce the architectural design of the DragonOS file system.
 
-&emsp;&emsp;如下图所示，DragonOS的文件系统相关的机制主要包括以下几个部分：
+## Summary
 
-- 系统调用接口
-- 虚拟文件系统
-    - 文件抽象（File）
-    - 挂载文件系统（MountFS）
-- 具体的文件系统
+As shown in the following diagram, the file system-related mechanisms in DragonOS mainly consist of the following components:
+
+- System call interface
+- Virtual file system
+    - File abstraction (File)
+    - Mounted file system (MountFS)
+- Specific file systems
 
 ```text
             ┌─────────────────────────────────────────────────┐
@@ -49,30 +50,28 @@ Syscall:    │   sys_open, sys_read, sys_write, sys_close,     │
             └───────────┘ └───────────┘ └──────────┘ └───────────┘
 ```
 
-## 系统调用接口
+## System Call Interface
 
+For the specific meanings of the interfaces, please refer to the relevant Linux documentation.
 
-&emsp;&emsp;关于接口的具体含义，可以参考Linux的相关文档。
+## Virtual File System (VFS)
 
-## 虚拟文件系统（VFS）
+VFS is the core of the DragonOS file system. It provides a unified file system interface, enabling DragonOS to support multiple different file systems. The main functions of VFS include:
 
-&emsp;&emsp;VFS是DragonOS文件系统的核心，它提供了一套统一的文件系统接口，使得DragonOS可以支持多种不同的文件系统。VFS的主要功能包括：
+- Providing a unified file system interface
+- Providing file system mounting and unmounting mechanisms (MountFS)
+- Providing file abstraction (File)
+- Providing file system abstraction (FileSystem)
+- Providing IndexNode abstraction
+- Providing file system caching and synchronization mechanisms
 
-- 提供统一的文件系统接口
-- 提供文件系统的挂载和卸载机制（MountFS）
-- 提供文件抽象（File）
-- 提供文件系统的抽象（FileSystem）
-- 提供IndexNode抽象
-- 提供文件系统的缓存、同步机制
+For a detailed introduction to VFS, please see [DragonOS Virtual File System](/kernel/filesystem/vfs/).
 
+## Specific File Systems
 
-&emsp;&emsp;关于VFS的详细介绍，请见[DragonOS虚拟文件系统](vfs/index.rst)。
+The file systems currently supported by DragonOS include:
 
-## 具体的文件系统
-
-&emsp;&emsp;DragonOS目前支持的文件系统包括：
-
-- FAT文件系统（FAT12、FAT16、FAT32）
+- FAT file systems (FAT12, FAT16, FAT32)
 - ext4
 - DevFS
 - ProcFS

@@ -1,27 +1,25 @@
 # Tracepoints
 
-> 作者: 陈林峰
+> Author: Chen Linfeng  
 >
 > Email: chenlinfeng25@outlook.com
 
+## Overview
+Tracepoints are a tracing mechanism provided by the Linux kernel. They let developers define probe points at specific locations in kernel code to collect runtime information. Unlike kprobes, tracepoints do not require users to inject probes into arbitrary locations at runtime. DragonOS controls these predefined paths with static keys and uses [runtime text patching](text_patching.md) to switch them safely on multiprocessor systems.
 
-## 概述
-Tracepoints 是 Linux 内核提供的一种跟踪机制，允许开发者在内核代码的特定位置预先定义探测点，以便收集运行时信息。与 kprobes 不同，tracepoints 不需要用户在运行时向任意位置注入探针。DragonOS 使用 static key 控制这些预定义路径，并通过[运行时文本修补](text_patching.md)在多核系统中安全地切换启用状态。
+## Workflow
+1. **Define Tracepoint**: Kernel developers define tracepoints in the code using the macro `define_event_trace`.
+2. **Trigger Tracepoint**: Developers can trigger the defined tracepoints from other parts of the code by using the functions defined with `define_event_trace`, and pass relevant context information. For example, if the defined tracepoint is named `my_tracepoint`, it can be triggered using `trace_my_tracepoint()`.
+3. **Collect Data**: When a tracepoint is triggered, the kernel records the related data. This data can be analyzed using user-space tools (such as `trace-cmd` or `perf`). Currently, DragonOS only supports viewing the data files created by the kernel for these data.
+    1. Reading the `/sys/kernel/debug/tracing/trace` file can view the tracepoint collected data. The buffer content will not be cleared.
+    2. Reading the `/sys/kernel/debug/tracing/trace_pipe` file can view the tracepoint collected data. The buffer content will be cleared. If there is no content in the buffer, it will block until new data is available.
+    3. Reading the `/sys/kernel/debug/tracing/events/` directory can view all available tracepoints.
+    4. Reading the `/sys/kernel/debug/tracing/events/``<event_name>``/format` file can view the data format of a specific tracepoint.
+    5. Writing to the `/sys/kernel/debug/tracing/events/``<event_name>``/enable` file can enable a specific tracepoint.
+    6. Writing an empty value to `/sys/kernel/debug/tracing/trace` can clear the current trace data.
+4. **Analyze Data**: User-space tools can read the data collected by tracepoints and generate reports or charts to help developers understand kernel behavior.
 
-## 工作流程
-1. **定义 Tracepoint**: 内核开发者在代码中定义 tracepoint，使用宏 `define_event_trace`。
-2. **触发 Tracepoint**: 在代码的其他部分，开发者可以使用 `define_event_trace` 定义的函数来触发已定义的 tracepoint，并传递相关的上下文信息。比如定义的tracepoint名称为`my_tracepoint`,则可以使用 `trace_my_tracepoint()` 来触发它。
-3.  **收集数据**: 当 tracepoint 被触发时，内核会记录相关的数据，这些数据可以通过用户空间工具（如 `trace-cmd` 或 `perf`）进行分析。现在DragonOS中还只能支持查看内核为这些数据创建的文件。
-    1.  读取`/sys/kernel/debug/tracing/trace`文件可以查看tracepoint收集的数据。缓冲区的内容不会被清除。
-    2.  读取`/sys/kernel/debug/tracing/trace_pipe`文件可以查看tracepoint收集的数据。缓冲区的内容会被清除。如果缓冲区没有内容，则会阻塞等待新的数据。
-    3.  读取`/sys/kernel/debug/tracing/events/`目录可以查看所有可用的 tracepoints。
-    4.  读取`/sys/kernel/debug/tracing/events/<event_name>/format`文件可以查看特定 tracepoint 的数据格式。
-    5.  写入`/sys/kernel/debug/tracing/events/<event_name>/enable` 文件可以启用特定的 tracepoint。
-    6.  写入空值到 `/sys/kernel/debug/tracing/trace` 可以清空当前的 trace 数据。
-4. **分析数据**: 用户空间工具可以读取 tracepoint 收集的数据，并生成报告或图表，以帮助开发者理解内核行为。
-
-
-## 接口
+## Interface
 ```rust
 define_event_trace!() // 定义一个 tracepoint
 ```
@@ -56,5 +54,6 @@ define_event_trace!(
     })
 );
 ```
+
 ## Tracepoints For eBPF
-在 DragonOS 中，tracepoints 也可以与 eBPF 结合使用，以便在内核中收集更丰富的数据。eBPF 程序可以附加到 tracepoints 上，以便在 tracepoint 被触发时执行自定义的逻辑。
+In DragonOS, tracepoints can also be used in conjunction with eBPF to collect richer data within the kernel. eBPF programs can be attached to tracepoints to execute custom logic when a tracepoint is triggered.

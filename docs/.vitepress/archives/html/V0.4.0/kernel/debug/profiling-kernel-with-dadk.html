@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>使用DADK对内核进行性能分析 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="内核测试" href="../ktest/index.html" />
+    <link rel="prev" title="如何使用GDB调试内核" href="debug-kernel-with-gdb.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">内核调试模块</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="traceback.html">内核栈traceback</a></li>
+<li class="toctree-l2"><a class="reference internal" href="debug-kernel-with-gdb.html">如何使用GDB调试内核</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">使用DADK对内核进行性能分析</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">1. 概述</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id2">1.1 准备工作</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">1.2 什么是火焰图？</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#dragonos">2. 配置DragonOS内核</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">3. 使用DADK进行性能分析</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id5">3.1 启动内核</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">3.2 运行你的工作负载</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">3.3 启动DADK进行性能分析</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">3.4 分析火焰图</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">内核调试模块</a></li>
+      <li class="breadcrumb-item active">使用DADK对内核进行性能分析</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/debug/profiling-kernel-with-dadk.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="dadk">
+<h1>使用DADK对内核进行性能分析<a class="headerlink" href="#dadk" title="Permalink to this heading"></a></h1>
+<section id="id1">
+<h2>1. 概述<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>本文将教你使用DADK，对DragonOS内核进行性能分析，以识别和解决潜在的性能瓶颈。</p>
+<section id="id2">
+<h3>1.1 准备工作<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>在开始之前，请确保你已经安装了DADK，并且已经配置好了DragonOS内核的编译环境。</p>
+</div>
+</section>
+<section id="id3">
+<h3>1.2 什么是火焰图？<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>如果你没有听说过火焰图，可以先阅读这篇文章：<a class="reference external" href="https://www.ruanyifeng.com/blog/2017/09/flame-graph.html">《如何读懂火焰图？- 阮一峰》</a></p>
+<p>简单的说，火焰图是基于性能采样结果产生的 SVG 图片，用来展示 CPU 的调用栈。</p>
+<p><img alt="" src="https://web-static2.dragonos.org.cn//longjin/flame2.svg?imageSlim" /></p>
+<p>x 轴表示抽样数，如果一个函数在 x 轴占据的宽度越宽，就表示它被抽到的次数多，即执行的时间长。注意，x 轴不代表时间，而是所有的调用栈合并后，按字母顺序排列的。</p>
+<p>火焰图就是看顶层的哪个函数占据的宽度最大。只要有”平顶”（plateaus），就表示该函数可能存在性能问题。</p>
+<p>颜色没有特殊含义，因为火焰图表示的是 CPU 的繁忙程度，所以一般选择暖色调。</p>
+</section>
+</section>
+<section id="dragonos">
+<h2>2. 配置DragonOS内核<a class="headerlink" href="#dragonos" title="Permalink to this heading"></a></h2>
+<p>由于性能分析需要详尽的符号表数据，因此我们需要在编译内核时，需要进行以下配置：</p>
+<p>在<code class="docutils literal notranslate"><span class="pre">kernel/Cargo.toml</span></code>中的<code class="docutils literal notranslate"><span class="pre">[profile.release]</span></code>部分，设置以下两项：</p>
+<div class="highlight-toml notranslate"><div class="highlight"><pre><span></span><span class="k">[profile.release]</span>
+<span class="n">debug</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<span class="n">opt-level</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
+</pre></div>
+</div>
+<p>这样，编译出来的内核就会包含符号表数据，方便我们进行性能分析。</p>
+</section>
+<section id="id4">
+<h2>3. 使用DADK进行性能分析<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<section id="id5">
+<h3>3.1 启动内核<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>首先，我们需要启动DragonOS内核。</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 使用你喜欢的方式启动内核，例如：</span>
+make<span class="w"> </span>run
+<span class="c1"># 或者</span>
+make<span class="w"> </span>build<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>make<span class="w"> </span>qemu-nographic
+</pre></div>
+</div>
+</section>
+<section id="id6">
+<h3>3.2 运行你的工作负载<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<p>在启动内核后，我们需要运行一些工作负载，以便进行性能分析。</p>
+<p>这可以是一个应用程序，也可以是别的东西。甚至你可以什么都不运行，只是单纯看看DragonOS内核在空闲时的调用栈情况。</p>
+</section>
+<section id="id7">
+<h3>3.3 启动DADK进行性能分析<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<p>在DragonOS项目目录下，运行以下命令：</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>dadk<span class="w"> </span>profile<span class="w"> </span>sample<span class="w"> </span>--format<span class="w"> </span>flamegraph<span class="w">  </span>--output<span class="w"> </span>flame.svg<span class="w"> </span>--interval<span class="w"> </span>200ms<span class="w"> </span>--duration<span class="w"> </span>20s<span class="w">  </span>--cpu-mask<span class="w"> </span>0x1
+</pre></div>
+</div>
+<p>上面的命令，将会对DragonOS内核进行性能分析，并生成一个火焰图。</p>
+<p>详细解释：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">--format</span> <span class="pre">flamegraph</span></code>：指定输出格式为火焰图。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--output</span> <span class="pre">flame.svg</span></code>：指定输出文件名为<code class="docutils literal notranslate"><span class="pre">flame.svg</span></code>。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--interval</span> <span class="pre">200ms</span></code>：指定采样间隔为200ms。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--duration</span> <span class="pre">20s</span></code>：指定采样时间为20s。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--cpu-mask</span> <span class="pre">0x1</span></code>：指定采样的CPU为0号CPU。（这是个按位掩码，也就是说，如果要采样0和1号CPU，那么cpu-mask为0x3）</p></li>
+</ul>
+<p><em>更多参数请参考<code class="docutils literal notranslate"><span class="pre">dadk</span> <span class="pre">profile</span> <span class="pre">sample</span> <span class="pre">--help</span></code>.</em></p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>由于采样时会暂停vCPU，因此采样时间不宜过短，否则会影响系统的正常运行。</p>
+</div>
+<p>经过一段时间的等待，你将会得到一个<code class="docutils literal notranslate"><span class="pre">flame.svg</span></code>文件。</p>
+</section>
+<section id="id8">
+<h3>3.4 分析火焰图<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<p>使用浏览器打开<code class="docutils literal notranslate"><span class="pre">flame.svg</span></code>文件，你将会看到一个火焰图。</p>
+<p>你可以通过点击火焰图中的某个函数，来查看它的调用栈。</p>
+<p><strong>你可以右键下面的图片，在新的标签页打开，体验交互效果。</strong></p>
+<p><img alt="" src="https://web-static2.dragonos.org.cn//longjin/flame2.svg?imageSlim" /></p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="debug-kernel-with-gdb.html" class="btn btn-neutral float-left" title="如何使用GDB调试内核" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../ktest/index.html" class="btn btn-neutral float-right" title="内核测试" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/debug/profiling-kernel-with-dadk.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/debug/profiling-kernel-with-dadk.html">V0.3.0</a></dd>
+      <dd><a href="profiling-kernel-with-dadk.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/debug/profiling-kernel-with-dadk.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

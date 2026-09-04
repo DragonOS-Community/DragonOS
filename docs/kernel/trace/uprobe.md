@@ -1,202 +1,205 @@
-# Uprobe：用户态动态探针
+# Uprobe: Dynamic Probes for User Space
 
-Uprobe 允许观察一个用户态 ELF 文件或共享库中的指令。用户通过 perf event 指定文件和偏移；当目标进程执行到该位置时，DragonOS 可以累计命中次数，或运行附着的 eBPF 程序。
+Uprobes observe instructions in user-space ELF files and shared libraries. A user selects a file and offset through a perf event; when a target process reaches that instruction, DragonOS can count the hit or run an attached eBPF program.
 
-:::{important}
-理解 DragonOS uprobe，只需要先记住四件事：
+::: warning
+Four ideas form the core mental model:
 
-1. 探针由**文件身份和文件偏移**定义，而不是由某个进程里的虚拟地址定义。
-2. 断点只写入目标地址空间的**私有副本页**，绝不修改文件页缓存。
-3. 被替换的原指令在 **XOL（Execute Out of Line）** 区域执行，因此程序能够继续运行。
-4. 探针的发布、撤销以及 VMA 变化都遵循严格的并发顺序，避免出现“有断点、无元数据”的孤立状态。
+1. A probe is defined by **file identity and file offset**, not by one process's virtual address.
+2. The breakpoint is written only to a **private page in the target address space**. The page cache is never patched.
+3. The replaced instruction runs from an **XOL (execute out of line)** area so that the program can continue normally.
+4. Publication, withdrawal, and VMA changes follow strict concurrency ordering, preventing an orphan breakpoint with no matching metadata.
 :::
 
-## 当前支持范围
 
-| 能力 | 状态 |
+## Current scope
+
+| Capability | Status |
 | --- | --- |
-| ELF/共享库入口探针 | 支持 |
-| task-scoped 与 system-wide perf event | 支持 |
-| 命中计数与 eBPF 回调 | 支持 |
-| x86_64 用户态执行 | 支持 |
-| uretprobe（函数返回探针） | 暂不支持 |
-| perf sampling/ring buffer | 暂不支持 |
+| Entry probes in ELF files and shared libraries | Supported |
+| Task-scoped and system-wide perf events | Supported |
+| Hit counting and eBPF callbacks | Supported |
+| User-space execution on x86_64 | Supported |
+| Uretprobes (return probes) | Not yet supported |
+| Perf sampling and ring buffers | Not yet supported |
 
-本文重点说明架构和正确性原理。perf event 的通用 ABI、eBPF 指令集及用户工具用法不在这里展开。
+This document focuses on architecture and correctness principles. It does not repeat the generic perf ABI, the eBPF instruction set, or user-tool documentation.
 
-## 整体架构
+## Architecture at a glance
 
 ```mermaid
 flowchart LR
-    Tool[用户工具] --> Perf[perf event 适配层]
-    Perf --> Consumer[Consumer<br/>订阅与生命周期]
-    Consumer --> Definition[Definition<br/>文件身份 + 偏移]
-    Definition --> Reconcile[VMA 协调]
-    Reconcile --> Site[每个 mm 的 Site]
-    Site --> Page[私有断点页]
-    Site --> XOL[每个 mm 的 XOL 池]
-    Site --> Hit[RCU 命中快照]
-    Hit --> Trap[#BP / #DB 处理]
-    Trap --> Task[每任务 XOL 状态]
-    Perf -. 计数 / eBPF .-> Hit
+    Tool[User tool] --> Perf[perf event adapter]
+    Perf --> Consumer[Consumer<br/>subscription and lifetime]
+    Consumer --> Definition[Definition<br/>file identity + offset]
+    Definition --> Reconcile[VMA reconciliation]
+    Reconcile --> Site[Per-mm site]
+    Site --> Page[Private breakpoint page]
+    Site --> XOL[Per-mm XOL pool]
+    Site --> Hit[RCU hit snapshot]
+    Hit --> Trap[#BP / #DB handling]
+    Trap --> Task[Per-task XOL state]
+    Perf -. count / eBPF .-> Hit
 ```
 
-这套设计把不同职责分开：
+The architecture separates five ownership domains:
 
-- **Definition（定义）**描述“文件中的哪条指令”。它使用规范化的文件身份和偏移，并保存一次经过分析的指令快照。
-- **Consumer（订阅者）**描述“谁想观察它”。一个定义可以有多个 task-scoped 或 system-wide consumer。
-- **Site（站点）**描述“这个地址空间中的哪个虚拟地址已经布置断点”。同一地址的多个 consumer 共享一个 site。
-- **XOL 池**保存原指令的可执行副本。每个活动执行都持有租约，保证槽位在退出单步执行前不会被回收。
-- **命中快照与任务状态**服务异常热路径，使 `#BP`/`#DB` 处理无需分配内存，也无需获取地址空间写锁。
+- A **definition** identifies and analyzes an instruction by canonical file identity and offset.
+- A **consumer** represents an observer. One definition may have task-scoped and system-wide consumers.
+- A **site** represents an armed virtual address in one address space. Multiple consumers at the same address share the site.
+- The **XOL pool** stores executable copies of original instructions. A lease pins a slot and its page until execution has completed.
+- The **hit snapshot and task state** serve the exception hot path without allocation or an address-space write lock.
 
-:::{note}
-Consumer 与 site 不是同一个对象。一个 system-wide consumer 可能对应很多进程中的 site；同一个 site 也可能服务多个 consumer。这个区分是理解 fork、exec、关闭和并发注册的关键。
+::: info
+A consumer is not a site. One system-wide consumer can create sites in many processes, while one site can serve many consumers. This distinction is essential when reasoning about fork, exec, close, and concurrent registration.
 :::
 
-## 从注册请求到可命中的断点
+
+## From registration to an armed breakpoint
 
 ```mermaid
 flowchart TD
-    A[perf 注册请求] --> B[解析 ELF 文件身份和偏移]
-    B --> C[创建或复用 Definition]
-    C --> D[寻找符合条件的文件 VMA]
-    D --> E[验证映射连续性和完整指令]
-    E --> F[准备 XOL 槽位和私有候选页]
-    F --> G[先发布 site 与命中元数据]
-    G --> H[在私有页写入 INT3]
-    H --> I[原子替换 PTE]
-    I --> J[同步 TLB]
-    J --> K[探针已就绪]
+    A[perf registration] --> B[Resolve ELF identity and offset]
+    B --> C[Create or reuse a definition]
+    C --> D[Find eligible file VMAs]
+    D --> E[Validate mapping continuity and full instruction]
+    E --> F[Prepare an XOL slot and private candidate page]
+    F --> G[Publish site and hit metadata first]
+    G --> H[Write INT3 into the private page]
+    H --> I[Atomically replace the PTE]
+    I --> J[Synchronize TLBs]
+    J --> K[Probe armed]
 ```
 
-### 1. 用文件坐标定位指令
+### 1. Locate instructions in file coordinates
 
-同一个共享库可以映射到不同虚拟地址。Definition 因此不保存某个进程的地址，而是保存规范化 inode 身份和文件偏移。协调层再根据每个 VMA 的文件偏移，计算该地址空间中的实际探针地址。
+The same shared object may be mapped at different virtual addresses. A definition therefore stores a canonical inode identity and file offset, not a process address. Reconciliation combines that coordinate with each VMA's file offset to derive the actual probe address.
 
-这样既支持 ASLR，也能让一个 system-wide 探针复用于多个地址空间。
+This supports ASLR and lets one system-wide probe apply to multiple address spaces.
 
-### 2. 只在合格映射中安装
+### 2. Install only in eligible mappings
 
-新安装只考虑可执行、私有、文件支持且不可写的映射。共享或可写映射允许用户在没有内核协调的情况下直接修改指令，不适合作为新断点的稳定基础。
+New installation requires a private, executable-capable, file-backed, non-writable mapping. Shared or writable mappings allow instruction bytes to change without kernel mediation and are not a stable basis for a new breakpoint.
 
-跨页或跨相邻 VMA 的指令也可以被探测，但安装时必须确认所有指令字节来自同一文件的连续区间，并且映射身份在准备期间没有变化。
+Instructions may cross a page or an adjacent VMA. Installation then verifies that every byte belongs to a continuous range of the same file and that the mapping identity remains stable throughout preparation.
 
-### 3. 私有化断点页
+### 3. Privatize the breakpoint page
 
-DragonOS 不会把 `INT3` 写入页缓存，否则所有映射该文件的进程都会被意外修改。内核为目标地址空间准备一个私有页面副本，只替换探针位置的第一个字节，然后原子地替换该地址空间的 PTE。
+DragonOS never writes `INT3` into the page cache, which would unexpectedly modify every process mapping the file. Instead, it prepares a private page for the target address space, replaces only the first byte at the probe address, and atomically swaps that address space's PTE.
 
-### 4. 元数据先于断点可见
+### 4. Publish metadata before exposing INT3
 
-这是最重要的发布顺序：
+The most important ordering rule is:
 
-> 在任何 CPU 能看到 `INT3` 之前，异常处理所需的 site、参与者和 XOL 元数据必须已经可见。
+> Before any CPU can observe `INT3`, all site, participant, and XOL metadata required by the exception handler must already be visible.
 
-发布完成后才替换 PTE，并进行同步 TLB 刷新。失败操作尽量放在此边界之前；越过边界后只执行已经准备好的、不可失败的提交步骤。
+Only after publication does DragonOS replace the PTE and perform a synchronous TLB flush. Fallible work is kept before this boundary; after it, the commit consists only of operations prepared to succeed.
 
-## 一次命中如何执行
+## How one hit executes
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户线程
-    participant BP as 断点异常处理器
-    participant S as RCU Site 快照
-    participant X as XOL 槽位
-    participant DB as 单步异常处理器
+    participant U as User thread
+    participant BP as Breakpoint handler
+    participant S as RCU site snapshot
+    participant X as XOL slot
+    participant DB as Single-step handler
 
-    U->>BP: 执行 INT3
-    BP->>S: 按 mm + 原地址查找
-    S-->>BP: pin site、consumer 与 XOL 租约
-    BP->>BP: 计数 / 运行 eBPF
-    BP->>X: RIP 重定向并设置单步标志
-    X->>X: 执行原指令
-    X->>DB: 单步完成
-    DB->>U: 恢复原返回地址和用户 TF
+    U->>BP: Execute INT3
+    BP->>S: Look up mm + original address
+    S-->>BP: Pin site, consumers, and XOL lease
+    BP->>BP: Count / run eBPF
+    BP->>X: Redirect RIP and enable single-step
+    X->>X: Execute original instruction
+    X->>DB: Single-step completes
+    DB->>U: Restore return address and user TF
 ```
 
-### 为什么需要 XOL
+### Why XOL is necessary
 
-命中断点后，不能简单地在原地址临时恢复指令再执行：同一进程的其他 CPU 可能同时经过该地址，看到的内容会随时变化。
+Temporarily restoring the instruction in place is unsafe: another CPU in the same process may reach the address while its contents are changing.
 
-XOL 把原指令复制到地址空间中的专用可执行槽位。异常处理器把用户 RIP 重定向到槽位，并借助 x86 单步异常在指令完成后恢复到原指令的下一地址。对于 RIP-relative 指令，分配器会选择可重定位的槽位；无法安全搬运的控制流或系统指令会在注册阶段被拒绝。
+XOL copies the original instruction into a dedicated executable slot. The exception handler redirects the user RIP there and uses x86 single-step completion to resume at the address after the original instruction. RIP-relative instructions receive a reachable relocation slot. Control-flow and system instructions that cannot be moved safely are rejected during registration.
 
-### 用户看到的仍是原始执行上下文
+### User-visible context remains original
 
-XOL 地址是内核实现细节。eBPF、信号和 rseq 等需要用户逻辑指令地址的机制，应观察原探针地址，而不是槽位地址。如果 rseq 要求跳转到 abort handler，内核会先终止当前 XOL 状态，再发布新的用户 RIP，避免后续 `#DB` 覆盖该跳转。
+The XOL address is an implementation detail. eBPF, signals, and rseq must observe the logical probe address rather than the slot. If rseq needs to redirect execution to an abort handler, DragonOS first terminates the active XOL state and then publishes the new user RIP, so a later `#DB` cannot overwrite the redirect.
 
-## VMA 变化与事务边界
+## VMA changes and transaction boundaries
 
-`mmap`、`munmap`、`mprotect`、`mremap`、`madvise`、fork 和 exec 都可能改变探针所依赖的映射。单纯持有地址空间写锁并不能阻止同一进程中其他 CPU 取指，因此协调不能只依靠锁。
+`mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, fork, and exec can all change mappings on which probes depend. An address-space write lock alone does not stop another CPU in the same process from fetching instructions, so reconciliation cannot rely on locking alone.
 
-DragonOS 将关键变化组织为以下阶段：
+DragonOS organizes sensitive changes into these conceptual phases:
 
 ```mermaid
 stateDiagram-v2
     [*] --> Stable
-    Stable --> Prepare: 验证语义、配额和映射
-    Prepare --> Barrier: 必要时临时禁止执行/写入并刷新 TLB
-    Barrier --> Withdraw: 撤销受影响的 site
-    Withdraw --> Commit: 提交 VMA/PTE 变化
-    Commit --> Reconcile: 安装最终映射所需的 site
-    Reconcile --> Publish: 发布最终权限并刷新 TLB
+    Stable --> Prepare: Validate semantics, accounting, and mappings
+    Prepare --> Barrier: Temporarily remove execute/write and flush if needed
+    Barrier --> Withdraw: Withdraw affected sites
+    Withdraw --> Commit: Commit VMA/PTE changes
+    Commit --> Reconcile: Install sites for the final mapping
+    Reconcile --> Publish: Publish final permissions and flush
     Publish --> Stable
 ```
 
-不同系统调用不一定需要每个阶段，但必须保持以下不变量：
+Not every operation needs every phase, but all operations preserve these invariants:
 
-:::{important}
-- **绝不出现孤立断点：** 用户能执行 `INT3` 时，命中元数据和 XOL 租约一定存在。
-- **页缓存不被修改：** 断点只存在于每个地址空间的私有页中。
-- **撤销有完成屏障：** 恢复原字节并完成 TLB rendezvous 后，才从命中索引撤除 site。
-- **资源释放晚于读者：** 已进入的回调、RCU 读者和活动 XOL 完成后，才能释放 consumer、BPF 和槽位。
+::: warning
+- **No orphan breakpoint:** if user space can execute `INT3`, matching hit metadata and an XOL lease exist.
+- **The page cache stays clean:** breakpoints exist only in private per-mm pages.
+- **Withdrawal has a completion barrier:** the original byte and TLB rendezvous complete before the site leaves the hit index.
+- **Readers outlive resources:** admitted callbacks, RCU readers, and active XOL execution finish before consumer, BPF, or slot storage is freed.
 :::
 
-### fork
 
-私有 COW 页可能让子进程继承父进程的 `INT3`，但 task-scoped perf event 默认不继承。DragonOS 会先严格清除子地址空间中继承的断点，再以 best-effort 方式为 system-wide consumer 重放探针。这样子进程不会遇到没有命中元数据的断点。
+### Fork
 
-### exec
+A private COW page can make a child inherit a parent's `INT3`, even though task-scoped perf events do not inherit. DragonOS first performs strict child sanitization to remove inherited breakpoints, then replays system-wide consumers on a best-effort basis. The child therefore never executes a breakpoint for which it has no hit metadata.
 
-exec 会替换整个地址空间。属于当前任务且仍活动的 consumer 可以应用到新映像；其他任务的 consumer 不应导致无关 exec 扫描全部 VMA。成功提交前后通过 epoch、任务索引和文件反向映射形成握手，保证并发 enable 不会漏掉新映像。
+### Exec
 
-### 关闭与撤销
+Exec replaces the address space. Active consumers owned by the current task can be replayed into the new image; consumers owned by unrelated tasks must not force a full VMA scan. Epoch publication, the task index, and file reverse mappings form a handshake with concurrent enable, ensuring that the new image is not missed.
 
-最后一个 perf 文件引用关闭时，DragonOS 先同步关闭“新安装”和“新回调”的准入门，再由可睡眠的控制路径等待已有读者退出并撤销 site。恢复原字节是条件性的：只有当前位置仍是 `INT3` 时才写回，避免覆盖用户在映射变为可写后自行写入的新字节。
+### Close and withdrawal
 
-## 生命周期一览
+When the last perf file reference closes, DragonOS synchronously closes admission for new installation and new callbacks. A sleepable control path then drains existing readers and withdraws sites. Byte restoration is conditional: the old byte is written only if the location still contains `INT3`, so closing an event does not overwrite a byte that user space wrote after making the mapping writable.
 
-| 对象 | 所属范围 | 主要职责 | 何时可以释放 |
+## Lifetime summary
+
+| Object | Scope | Main responsibility | Safe release point |
 | --- | --- | --- | --- |
-| Definition | 文件身份 + 偏移 | 保存并分析规范指令 | 没有 consumer 引用时 |
-| Consumer | perf event | scope、epoch、计数与 eBPF | 关闭准入并排空读者后 |
-| Site | 单个 mm + 虚拟地址 | 共享断点及参与者集合 | 恢复字节、TLB 同步并撤索引后 |
-| XOL lease | site/活动命中 | 固定槽位和页面生命周期 | `#DB`、中止或任务退出后 |
-| Task XOL state | 当前任务 | 连接 `#BP`、XOL、`#DB` 与信号/rseq | 回到 Idle 后 |
+| Definition | File identity + offset | Store and analyze the canonical instruction | No consumer references remain |
+| Consumer | Perf event | Scope, epoch, count, and eBPF | Admission is closed and readers are drained |
+| Site | One mm + virtual address | Shared breakpoint and participant set | Byte restored, TLB synchronized, and hit index withdrawn |
+| XOL lease | Site or active hit | Pin slot and page lifetime | After `#DB`, abort, or task exit |
+| Task XOL state | Current task | Connect `#BP`, XOL, `#DB`, signals, and rseq | State returns to Idle |
 
-## 性能模型
+## Performance model
 
-| 路径 | 设计重点 |
+| Path | Design priority |
 | --- | --- |
-| `#BP` / `#DB` 命中热路径 | 无内存分配、无睡眠、无地址空间写锁；使用 RCU 快照和任务本地状态 |
-| 注册、enable、disable、close | 允许分配、锁和 TLB 同步；按文件/VMA/site 精确协调 |
-| VMA 系统调用 | 无相关 consumer 时快速跳过；有探针时才建立事务和发布屏障 |
+| `#BP` / `#DB` hit path | No allocation, sleeping, or address-space write lock; use RCU snapshots and task-local state |
+| Register, enable, disable, close | Allocation, locking, and TLB synchronization are allowed; coordinate by file, VMA, and site |
+| VMA system calls | Fast rejection when no relevant consumer exists; build transactions and barriers only when required |
 
-命中路径必须遍历该 site 的活动参与者，因为每个 consumer 都需要收到事件。控制路径使用结构共享快照和精确索引，避免在大量同址 consumer 或大量文件偏移下出现二次复杂度。
+The hit path necessarily visits every active participant at a site because each consumer must receive the event. Control-path snapshots use structural sharing and exact indexes to avoid quadratic behavior with many consumers at one address or many offsets in one file.
 
-## Linux 兼容边界与限制
+## Linux-compatible boundaries and limitations
 
-- 普通映射上的探针安装是 **best-effort**。资源不足、映射变化或指令不匹配不会把原本成功的 `mmap`/fork 变成失败；显式创建或启用 perf event 时仍会报告相应错误。
-- 新安装拒绝可写或共享映射。已安装的私有 site 在纯 `mprotect` 增加写权限后可以保留；用户若覆盖 `INT3`，后续自然不再命中，关闭时也不会覆盖用户的新字节。
-- 指令定义在首次分析时形成稳定快照。与 Linux 一样，探针活动期间的自修改代码或外部文件修改不保证让 XOL 实时重新分析；映射身份发生变化时则会撤销或重新协调。
-- 当前只在 x86_64 上执行用户态 uprobe，并拒绝无法安全进行 XOL 的指令。uretprobe 尚未实现。
+- Installation during ordinary mapping reconciliation is **best effort**. Resource pressure, mapping changes, or instruction mismatch do not turn an otherwise successful `mmap` or fork into a failure. Explicit perf event creation or enable still reports relevant errors.
+- New installation rejects writable and shared mappings. A private existing site may survive a pure `mprotect` transition that adds write permission. If user space overwrites `INT3`, the probe naturally stops hitting, and close will not overwrite the new byte.
+- A definition is a stable snapshot taken during initial analysis. As on Linux, self-modifying code or external file modification while a probe is active does not guarantee live XOL re-analysis. Mapping-identity changes do trigger withdrawal or reconciliation.
+- User-space uprobes currently execute only on x86_64 and reject instructions that cannot safely use XOL. Uretprobes are not implemented yet.
 
-## 建议的阅读顺序
+## Suggested source-reading order
 
-若要继续阅读源码，建议按职责而不是按调用栈展开：
+When continuing into the source, follow responsibilities rather than the raw call graph:
 
-1. perf 层：理解文件描述符、事件状态、计数与 eBPF 的边界；
-2. consumer/definition：理解文件坐标、scope 和 epoch；
-3. reconcile/site：理解 VMA 如何变成每个 mm 的断点；
-4. XOL 与异常处理：理解一次命中的透明执行；
-5. fork/exec/VMA 事务：理解并发和生命周期闭环。
+1. the perf layer for file descriptors, event state, counting, and eBPF;
+2. consumers and definitions for file coordinates, scope, and epochs;
+3. reconciliation and sites for mapping definitions into each mm;
+4. XOL and exception handling for transparent hit execution;
+5. fork, exec, and VMA transactions for concurrency and lifetime closure.
 
-这种顺序能先建立所有权模型，再进入异常和页表细节。
+This order establishes the ownership model before introducing exception and page-table details.

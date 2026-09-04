@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MMIO &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+        <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+        <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="文件系统" href="../filesystem/index.html" />
+    <link rel="prev" title="内存分配指南" href="allocate-memory.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">内存管理</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="intro.html">内存管理模块简介</a></li>
+<li class="toctree-l2"><a class="reference internal" href="allocate-memory.html">内存分配指南</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">MMIO</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">地址空间管理</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id2">为什么需要MMIO地址空间自动分配？</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">这套机制提供了什么功能？</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">这套机制是如何实现的？</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">地址空间分配过程</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">MMIO的映射过程</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">MMIO虚拟地址空间的释放</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id8">MMIO的伙伴算法</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id9">伙伴的定义</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id10">伙伴算法</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id11">伙伴算法的数据结构</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id12">设计思路</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#api">伙伴算法内部api</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id13">伙伴算法对外api</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">内存管理</a></li>
+      <li class="breadcrumb-item active">MMIO</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/5db5a56/docs/kernel/memory_management/mmio.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="mmio">
+<h1>MMIO<a class="headerlink" href="#mmio" title="Permalink to this heading"></a></h1>
+<p>MMIO是“内存映射IO”的缩写，它被广泛应用于与硬件设备的交互之中。</p>
+<section id="id1">
+<h2>地址空间管理<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>DragonOS中实现了MMIO地址空间的管理机制，本节将介绍它们。</p>
+<section id="id2">
+<h3>为什么需要MMIO地址空间自动分配？<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<p>  由于计算机上的很多设备都需要MMIO的地址空间，而每台计算机上所连接的各种设备的对MMIO地址空间的需求是不一样的。如果我们为每个类型的设备都手动指定一个MMIO地址，会使得虚拟地址空间被大大浪费，也会增加系统的复杂性。并且，我们在将来还需要为不同的虚拟内存区域做异常处理函数。因此，我们需要一套能够自动分配MMIO地址空间的机制。</p>
+</section>
+<section id="id3">
+<h3>这套机制提供了什么功能？<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>为驱动程序分配4K到1GB的MMIO虚拟地址空间</p></li>
+<li><p>对于这些虚拟地址空间，添加到VMA中进行统一管理</p></li>
+<li><p>可以批量释放这些地址空间</p></li>
+</ul>
+</section>
+<section id="id4">
+<h3>这套机制是如何实现的？<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>  这套机制本质上是使用了伙伴系统来对MMIO虚拟地址空间进行维护。在<code class="docutils literal notranslate"><span class="pre">mm/mm.h</span></code>中指定了MMIO的虚拟地址空间范围，这个范围是<code class="docutils literal notranslate"><span class="pre">0xffffa10000000000</span></code>开始的1TB的空间。也就是说，这个伙伴系统为MMIO维护了这1TB的虚拟地址空间。</p>
+</section>
+<section id="id5">
+<h3>地址空间分配过程<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>初始化MMIO-mapping模块，在mmio的伙伴系统中创建512个1GB的<code class="docutils literal notranslate"><span class="pre">__mmio_buddy_addr_region</span></code></p></li>
+<li><p>驱动程序使用<code class="docutils literal notranslate"><span class="pre">mmio_create</span></code>请求分配地址空间。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mmio_create</span></code>对申请的地址空间大小按照2的n次幂进行对齐，然后从buddy中申请内存地址空间</p></li>
+<li><p>创建VMA，并将VMA标记为<code class="docutils literal notranslate"><span class="pre">VM_IO|VM_DONTCOPY</span></code>。MMIO的vma只绑定在<code class="docutils literal notranslate"><span class="pre">initial_mm</span></code>下，且不会被拷贝。</p></li>
+<li><p>分配完成</p></li>
+</ol>
+<p>一旦MMIO地址空间分配完成，它就像普通的vma一样，可以使用mmap系列函数进行操作。</p>
+</section>
+<section id="id6">
+<h3>MMIO的映射过程<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<p>  在得到了虚拟地址空间之后，当我们尝试往这块地址空间内映射内存时，我们可以调用<code class="docutils literal notranslate"><span class="pre">mm_map</span></code>函数，对这块区域进行映射。</p>
+<p>  该函数会对MMIO的VMA的映射做出特殊处理。即：创建<code class="docutils literal notranslate"><span class="pre">Page</span></code>结构体以及对应的<code class="docutils literal notranslate"><span class="pre">anon_vma</span></code>. 然后会将对应的物理地址，填写到页表之中。</p>
+</section>
+<section id="id7">
+<h3>MMIO虚拟地址空间的释放<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<p>  当设备被卸载时，驱动程序可以调用<code class="docutils literal notranslate"><span class="pre">mmio_release</span></code>函数对指定的mmio地址空间进行释放。</p>
+<p>  释放的过程中，<code class="docutils literal notranslate"><span class="pre">mmio_release</span></code>将执行以下流程：</p>
+<ol class="arabic simple">
+<li><p>取消mmio区域在页表中的映射。</p></li>
+<li><p>将释放MMIO区域的VMA</p></li>
+<li><p>将地址空间归还给mmio的伙伴系统。</p></li>
+</ol>
+</section>
+</section>
+<section id="id8">
+<h2>MMIO的伙伴算法<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h2>
+<section id="id9">
+<h3>伙伴的定义<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h3>
+<p>  同时满足以下三个条件的两个内存块被称为伙伴内存块：</p>
+<ol class="arabic simple">
+<li><p>两个内存块的大小相同</p></li>
+<li><p>两个内存块的内存地址连续</p></li>
+<li><p>两个内存块由同一个大块内存分裂得到</p></li>
+</ol>
+</section>
+<section id="id10">
+<h3>伙伴算法<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h3>
+<p>  伙伴（buddy）算法的作用是维护以及组织大块连续内存块的分配和回收，以减少系统时运行产生的外部碎片。伙伴系统中的每个内存块的大小均为<span class="math notranslate nohighlight">\(2^n\)</span>。 在DragonOS中，伙伴系统内存池共维护了1TB的连续存储空间，最大的内存块大小为<span class="math notranslate nohighlight">\(1G\)</span>，即<span class="math notranslate nohighlight">\(2^{30}B\)</span>，最小的内存块大小为<span class="math notranslate nohighlight">\(4K\)</span>，即 <span class="math notranslate nohighlight">\(2^{12}B\)</span>。</p>
+<p>  伙伴算法的核心思想是当应用申请内存时，每次都分配比申请的内存大小更大的最小内存块，同时分配出去的内存块大小为<span class="math notranslate nohighlight">\(2^nB\)</span>。（e.g. 假设某应用申请了<span class="math notranslate nohighlight">\(3B\)</span>内存，显然并没有整数值n，使<span class="math notranslate nohighlight">\(2^n = 3\)</span> ，且<span class="math notranslate nohighlight">\(3 \in [2^1,2^2]\)</span>，所以系统会去取一块大小为<span class="math notranslate nohighlight">\(2^2B\)</span>的内存块，将它分配给申请的应用，本次申请内存操作顺利完成。）</p>
+<p>  那么当伙伴系统中没有如此“合适”的内存块时该怎么办呢？系统先会去寻找更大的内存块，如果找到了，则会将大内存块分裂成合适的内存块分配给应用。（e.g. 假设申请<span class="math notranslate nohighlight">\(3B\)</span>内存，此时系统中比<span class="math notranslate nohighlight">\(3B\)</span>大的最小内存块的大小为<span class="math notranslate nohighlight">\(16B\)</span>，那么<span class="math notranslate nohighlight">\(16B\)</span>会被分裂成两块<span class="math notranslate nohighlight">\(8B\)</span>的内存块，一块放入内存池中，一块继续分裂成两块<span class="math notranslate nohighlight">\(4B\)</span>的内存块。两块<span class="math notranslate nohighlight">\(4B\)</span>的内存块，一块放入内存池中，一块分配给应用。至此，本次申请内存操作顺利完成。）</p>
+<p>  如果系统没有找到更大的内存块，系统将会尝试合并较小的内存块，直到符合申请空间的大小。（e.g. 假设申请<span class="math notranslate nohighlight">\(3B\)</span>内存，系统检查内存池发现只有两个<span class="math notranslate nohighlight">\(2B\)</span>的内存块，那么系统将会把这两个<span class="math notranslate nohighlight">\(2B\)</span>的内存块合并成一块<span class="math notranslate nohighlight">\(4B\)</span>的内存块，并分配给应用。至此，本次申请内存操作顺利完成。）</p>
+<p>  最后，当系统既没有找到大块内存，又无法成功合并小块内存时，就会通知应用内存不够，无法分配内存。</p>
+</section>
+<section id="id11">
+<h3>伙伴算法的数据结构<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>
+                                  MmioBuddyMemPool
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                     │
+│                                 pool_start_addr                                     │
+│                                                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                                    pool_size                                        │
+│                                                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                                                                                     │
+│                                   free_regions                                      │
+│                                                                                     │
+│                                  ┌────────────┐                                     │
+│                                  │            │     ┌───────┐     ┌────────┐        │
+│                                  │ ┌────────┬─┼────►│       ├────►│        │        │
+│                                  │ │  list  │ │     │ vaddr │     │ vaddr  │        │
+│                                  │ │        │◄├─────┤       │◄────┤        │        │
+│                  MmioFreeRegionList├────────┤ │     └───────┘     └────────┘        │
+│                                  │ │num_free│ │                                     │
+│                                  │ └────────┘ │  MmioBuddyAddrRegion                │
+│          MMIO_BUDDY_MIN_EXP - 12 │      0     │                                     │
+│                                  ├────────────┤                                     │
+│                                  │      1     │                                     │
+│                                  ├────────────┤                                     │
+│                                  │      2     │                                     │
+│                                  ├────────────┤                                     │
+│                                  │      3     │                                     │
+│                                  ├────────────┤                                     │
+│                                  │     ...    │                                     │
+│                                  ├────────────┤                                     │
+│                                  │     ...    │                                     │
+│                                  ├────────────┤                                     │
+│          MMIO_BUDDY_MAX_EXP - 12 │     18     │                                     │
+│                                  └────────────┘                                     │
+│                                                                                     │
+│                                                                                     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+</pre></div>
+</div>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// 最大的内存块为1G，其幂为30</span>
+<span class="k">const</span><span class="w"> </span><span class="n">MMIO_BUDDY_MAX_EXP</span>: <span class="kt">u32</span> <span class="o">=</span><span class="w"> </span><span class="n">PAGE_1G_SHIFT</span><span class="p">;</span>
+<span class="sd">/// 最小的内存块为4K，其幂为12                                  </span>
+<span class="k">const</span><span class="w"> </span><span class="n">MMIO_BUDDY_MIN_EXP</span>: <span class="kt">u32</span> <span class="o">=</span><span class="w"> </span><span class="n">PAGE_4K_SHIFT</span><span class="p">;</span>
+<span class="sd">/// 内存池数组的大小为18</span>
+<span class="k">const</span><span class="w"> </span><span class="n">MMIO_BUDDY_REGION_COUNT</span>: <span class="kt">u32</span> <span class="o">=</span><span class="w"> </span><span class="n">MMIO_BUDDY_MAX_EXP</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">MMIO_BUDDY_MIN_EXP</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+
+<span class="sd">/// buddy内存池</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">MmioBuddyMemPool</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// 内存池的起始地址</span>
+<span class="w">    </span><span class="n">pool_start_addr</span>: <span class="kt">u64</span><span class="p">,</span><span class="w"> </span>
+<span class="w">    </span><span class="sd">/// 内存池大小：初始化为1TB</span>
+<span class="w">    </span><span class="n">pool_size</span>: <span class="kt">u64</span><span class="p">,</span>
+<span class="w">    </span><span class="sd">/// 空闲内存块链表数组</span>
+<span class="w">    </span><span class="sd">/// MMIO_BUDDY_REGION_COUNT = MMIO_BUDDY_MAX_EXP - MMIO_BUDDY_MIN_EXP + 1</span>
+<span class="w">    </span><span class="n">free_regions</span>: <span class="p">[</span><span class="n">SpinLock</span><span class="o">&lt;</span><span class="n">MmioFreeRegionList</span><span class="o">&gt;</span><span class="p">;</span><span class="w"> </span><span class="n">MMIO_BUDDY_REGION_COUNT</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">usize</span><span class="p">],</span>
+<span class="p">}</span>
+
+<span class="sd">/// 空闲内存块链表结构体</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">MmioFreeRegionList</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// 存储了空闲内存块信息的结构体的链表</span>
+<span class="w">    </span><span class="n">list</span>: <span class="nc">LinkedList</span><span class="o">&lt;</span><span class="nb">Box</span><span class="o">&lt;</span><span class="n">MmioBuddyAddrRegion</span><span class="o">&gt;&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="sd">/// 当前链表空闲块的数量</span>
+<span class="w">    </span><span class="n">num_free</span>: <span class="kt">i64</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="sd">/// mmio伙伴系统内部的地址区域结构体</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">MmioBuddyAddrRegion</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// 内存块的起始地址</span>
+<span class="w">    </span><span class="n">vaddr</span>: <span class="kt">u64</span><span class="p">,</span>
+<span class="p">}</span><span class="w">                                  </span>
+<span class="w">                  </span>
+</pre></div>
+</div>
+</section>
+<section id="id12">
+<h3>设计思路<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h3>
+<p>  DragonOS中，使用<code class="docutils literal notranslate"><span class="pre">MmioBuddyMemPool</span></code>结构体作为buddy（为表述方便，以下将伙伴算法简称为buddy）内存池的数据结构，其记录了内存池的起始地址（pool_start_addr）以及内存池中内存块的总大小（pool_size），同时其维护了大小为<code class="docutils literal notranslate"><span class="pre">MMIO_BUDDY_REGION_COUNT</span></code>的双向链表数组（free_regions）。<code class="docutils literal notranslate"><span class="pre">free_regions</span></code>中的各个链表维护了若干空闲内存块（MmioBuddyAddrRegion）。</p>
+<p>  <code class="docutils literal notranslate"><span class="pre">free_regions</span></code>的下标（index）与内存块的大小有关。由于每个内存块大小都为<span class="math notranslate nohighlight">\(2^{n}\)</span> bytes，那么可以令<span class="math notranslate nohighlight">\(exp = n\)</span>。index与exp的换算公式如下：<span class="math notranslate nohighlight">\(index = exp - 12\)</span>。e.g. 一个大小为<span class="math notranslate nohighlight">\(2^{12}\)</span> bytes的内存块，其<span class="math notranslate nohighlight">\(exp = 12\)</span>，使用上述公式计算得<span class="math notranslate nohighlight">\(index = 12 -12 = 0\)</span>，所以该内存块会被存入<code class="docutils literal notranslate"><span class="pre">free_regions[0].list</span></code>中。通过上述换算公式，每次取出或释放<span class="math notranslate nohighlight">\(2^n\)</span>大小的内存块，只需要操作<code class="docutils literal notranslate"><span class="pre">free_regions[n</span> <span class="pre">-12]</span></code>即可。DragonOS中，buddy内存池最大的内存块大小为<span class="math notranslate nohighlight">\(1G =  2^{30}bytes\)</span>，最小的内存块大小为 <span class="math notranslate nohighlight">\(4K =  2^{12} bytes\)</span>，所以<span class="math notranslate nohighlight">\(index\in[0,18]\)</span>。</p>
+<p>  作为内存分配机制，buddy服务于所有进程，为了解决在各个进程之间实现free_regions中的链表数据同步的问题，<code class="docutils literal notranslate"><span class="pre">free_regions</span></code>中的链表类型采用加了 <a class="reference internal" href="../locking/spinlock.html#spinlock-doc-spinlock"><span class="std std-ref">自旋锁</span></a>（SpinLock）的空闲内存块链表（MmioFreeRegionList），<code class="docutils literal notranslate"><span class="pre">MmioFreeRegionList</span></code>中封装有真正的存储了空闲内存块信息的结构体的链表（list）和对应链表长度（num_free）。有了自选锁后，同一时刻只允许一个进程修改某个链表，如取出链表元素（申请内存）或者向链表中插入元素（释放内存）。</p>
+<p>  <code class="docutils literal notranslate"><span class="pre">MmioFreeRegionList</span></code>中的元素类型为<code class="docutils literal notranslate"><span class="pre">MmioBuddyAddrRegion</span></code>结构体，<code class="docutils literal notranslate"><span class="pre">MmioBuddyAddrRegion</span></code>记录了内存块的起始地址（vaddr）。</p>
+</section>
+<section id="api">
+<h3>伙伴算法内部api<a class="headerlink" href="#api" title="Permalink to this heading"></a></h3>
+<p><strong>P.S 以下函数均为MmioBuddyMemPool的成员函数。系统中已经创建了一个MmioBuddyMemPool类型的全局引用<code class="docutils literal notranslate"><span class="pre">MMIO_POOL</span></code>，如要使用以下函数，请以<code class="docutils literal notranslate"><span class="pre">MMIO_POOL.xxx()</span></code>形式使用，以此形式使用则不需要传入self。</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p><strong>函数名</strong></p></th>
+<th class="head text-left"><p><strong>描述</strong></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>__create_region(&amp;self, vaddr)</p></td>
+<td class="text-left"><p>将虚拟地址传入，创建新的内存块地址结构体</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>__give_back_block(&amp;self, vaddr, exp)</p></td>
+<td class="text-left"><p>将地址为vaddr，幂为exp的内存块归还给buddy</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>__buddy_split(&amp;self,region,exp,list_guard)</p></td>
+<td class="text-left"><p>将给定大小为<span class="math notranslate nohighlight">\(2^{exp}\)</span>的内存块一分为二，并插入内存块大小为<span class="math notranslate nohighlight">\(2^{exp-1}\)</span>的链表中</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>__query_addr_region(&amp;self,exp,list_guard)</p></td>
+<td class="text-left"><p>从buddy中申请一块大小为<span class="math notranslate nohighlight">\(2^{exp}\)</span>的内存块</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>mmio_buddy_query_addr_region(&amp;self,exp)</p></td>
+<td class="text-left"><p>对query_addr_region进行封装，<strong>请使用这个函数，而不是__query_addr_region</strong></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>__buddy_add_region_obj(&amp;self,region,list_guard)</p></td>
+<td class="text-left"><p>往指定的地址空间链表中添加一个内存块</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>__buddy_block_vaddr(&amp;self, vaddr, exp)</p></td>
+<td class="text-left"><p>根据地址和内存块大小，计算伙伴块虚拟内存的地址</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>__pop_buddy_block( &amp;self, vaddr,exp,list_guard)</p></td>
+<td class="text-left"><p>寻找并弹出指定内存块的伙伴块</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>__buddy_pop_region( &amp;self,        list_guard)</p></td>
+<td class="text-left"><p>从指定空闲链表中取出内存区域</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>__buddy_merge(&amp;self,exp,list_guard,high_list_guard)</p></td>
+<td class="text-left"><p>合并所有<span class="math notranslate nohighlight">\(2^{exp}\)</span>大小的内存块</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>__buddy_merge_blocks(&amp;self,region_1,region_2,exp,high_list_guard)</p></td>
+<td class="text-left"><p>合并两个<strong>已经从链表中取出的</strong>内存块</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id13">
+<h3>伙伴算法对外api<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p><strong>函数名</strong></p></th>
+<th class="head"><p><strong>描述</strong></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>__mmio_buddy_init()</p></td>
+<td><p>初始化buddy系统，<strong>在mmio_init()中调用，请勿随意调用</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p>__exp2index(exp)</p></td>
+<td><p>将<span class="math notranslate nohighlight">\(2^{exp}\)</span>的exp转换成内存池中的数组的下标（index）</p></td>
+</tr>
+<tr class="row-even"><td><p>mmio_create(size,vm_flags,res_vaddr,res_length)</p></td>
+<td><p>创建一块根据size对齐后的大小的mmio区域，并将其vma绑定到initial_mm</p></td>
+</tr>
+<tr class="row-odd"><td><p>mmio_release(vaddr, length)</p></td>
+<td><p>取消地址为vaddr，大小为length的mmio的映射并将其归还到buddy中</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="allocate-memory.html" class="btn btn-neutral float-left" title="内存分配指南" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../filesystem/index.html" class="btn btn-neutral float-right" title="文件系统" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>5db5a56</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.8
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/kernel/memory_management/mmio.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/kernel/memory_management/mmio.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/memory_management/mmio.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/kernel/memory_management/mmio.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/kernel/memory_management/mmio.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/memory_management/mmio.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/memory_management/mmio.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/memory_management/mmio.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/memory_management/mmio.html">V0.1.7</a></dd>
+      <dd><a href="mmio.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/memory_management/mmio.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/memory_management/mmio.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/memory_management/mmio.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/memory_management/mmio.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/memory_management/mmio.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>C Language Code Style &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="Rust Language Code Style" href="rust-coding-style.html" />
+    <link rel="prev" title="Contributing to Development" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../kernel/device/index.html">设备</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Contributing to Development</a><ul class="current">
+<li class="toctree-l3"><a class="reference external" href="https://community.dragonos.org/contributors/">how-to-contribute</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">C Language Code Style</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#code-formatter">0. Code Formatter</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#indentation">1. Indentation</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#line-breaks">2. Line Breaks</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#braces-and-spaces">3. Braces and Spaces</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#naming">4. Naming</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="rust-coding-style.html">Rust Language Code Style</a></li>
+<li class="toctree-l3"><a class="reference internal" href="conventional-commit.html">Code Commit Guidelines</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">Contributing to Development</a></li>
+      <li class="breadcrumb-item active">C Language Code Style</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/locales/en/community/code_contribution/c-coding-style.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: community/code_contribution/c-coding-style.md</p></li>
+<li><p>Translation time: 2025-05-19 01:42:01</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="c-language-code-style">
+<h1>C Language Code Style<a class="headerlink" href="#c-language-code-style" title="Permalink to this heading"></a></h1>
+<p>  This document will briefly introduce the C language code style used in DragonOS. It is completely normal for each person to have their own code style. However, for the maintainability of an open-source project, we hope to establish some code standards so that every developer, including you, can feel more comfortable when reading the code. A project filled with various code styles is difficult to maintain.</p>
+<p>  We propose some recommendations here, and we hope you will follow them as much as possible. These recommendations are similar to those of Linux, but with some differences. DragonOS uses Linux’s style for variable naming; for indentation, DragonOS uses Microsoft’s style.</p>
+<section id="code-formatter">
+<h2>0. Code Formatter<a class="headerlink" href="#code-formatter" title="Permalink to this heading"></a></h2>
+<p>  Before we present the following recommendations, we recommend that you use the <code class="docutils literal notranslate"><span class="pre">C/C++</span> <span class="pre">Extension</span> <span class="pre">Pack</span></code> plugin in Visual Studio Code as a code formatter during development. These plugins provide good auto-formatting functionality, ensuring that your code’s basic format meets DragonOS’s requirements.</p>
+<p>  Pressing <code class="docutils literal notranslate"><span class="pre">Ctrl+shift+I</span></code> or your set code formatting shortcut frequently while coding can help you maintain good code formatting consistently.</p>
+</section>
+<section id="indentation">
+<h2>1. Indentation<a class="headerlink" href="#indentation" title="Permalink to this heading"></a></h2>
+<p>  The width of a tab is equal to 4 spaces. Code indentation is based on the tab width (usually 4 characters in most editors).</p>
+<p>  This makes your code more readable and helps better identify the control structures in the code. This can avoid many unnecessary troubles!</p>
+<p>For example: In a switch statement, place the switch and case on the same indentation level. And indent each case’s code by one tab to the right. This improves code readability.</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">switch</span><span class="w"> </span><span class="p">(</span><span class="n">cmd</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="k">case</span><span class="w"> </span><span class="no">AHCI_CMD_READ_DMA_EXT</span><span class="p">:</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">end_handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AHCI_CMD_READ_DMA_EXT</span><span class="p">;</span>
+<span class="w">    </span><span class="k">break</span><span class="p">;</span>
+<span class="k">case</span><span class="w"> </span><span class="no">AHCI_CMD_WRITE_DMA_EXT</span><span class="p">:</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">end_handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AHCI_CMD_WRITE_DMA_EXT</span><span class="p">;</span>
+<span class="w">    </span><span class="k">break</span><span class="p">;</span>
+<span class="k">default</span><span class="o">:</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">end_handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cmd</span><span class="p">;</span>
+<span class="w">    </span><span class="k">break</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="line-breaks">
+<h2>2. Line Breaks<a class="headerlink" href="#line-breaks" title="Permalink to this heading"></a></h2>
+<p>  We recommend that each line should not exceed 120 characters. If it does, unless there is a necessary reason, it should be split into two lines.</p>
+<p>  When breaking lines, we need to indent the second line by one level from the first line’s starting part to indicate that it is a sub-line. Using the code formatting shortcut can quickly accomplish this.</p>
+<p>  For log strings, we do not recommend breaking them into multiple lines for easier retrieval.</p>
+<p>  For code line breaks, do not try to place several statements on the same line, as this provides no benefit to code readability:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="c1">// 错误示范(1)</span>
+<span class="k">if</span><span class="p">(</span><span class="n">a</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+
+<span class="c1">// 错误示范(2)</span>
+<span class="k">if</span><span class="p">(</span><span class="n">b</span><span class="p">)</span>
+<span class="w">    </span><span class="n">do_a</span><span class="p">(),</span><span class="n">do_b</span><span class="p">();</span>
+</pre></div>
+</div>
+</section>
+<section id="braces-and-spaces">
+<h2>3. Braces and Spaces<a class="headerlink" href="#braces-and-spaces" title="Permalink to this heading"></a></h2>
+<section id="braces">
+<h3>3.1 Braces<a class="headerlink" href="#braces" title="Permalink to this heading"></a></h3>
+<p>  The placement of braces is a matter of personal preference, mainly due to habit rather than technical reasons. We recommend placing the opening and closing braces on new lines, as shown below:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">while</span><span class="p">(</span><span class="n">i</span><span class="o">&lt;</span><span class="mi">10</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="o">++</span><span class="n">i</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  This rule applies to all code blocks.</p>
+<p>  The reason for this choice is that, in some editors, placing the braces in this way will result in <strong>a semi-transparent vertical line appearing in the editor, with the line ends being the braces</strong>. This helps developers better understand the hierarchical relationships of the code blocks.</p>
+<p>Let’s demonstrate this with some examples:</p>
+<p>  In the following code block, we need to note that the <code class="docutils literal notranslate"><span class="pre">else</span> <span class="pre">if</span></code> statement should be on a new line, not after the previous <code class="docutils literal notranslate"><span class="pre">}</span></code>. This is because we require <code class="docutils literal notranslate"><span class="pre">{</span></code> to be at the start of each line and maintain the indentation level.</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">fmt</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="sc">&#39;*&#39;</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="o">++</span><span class="n">fmt</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">is_digit</span><span class="p">(</span><span class="o">*</span><span class="n">fmt</span><span class="p">))</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">field_width</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">skip_and_atoi</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmt</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  When there are multiple simple statements in a loop, braces should be used.</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">condition</span><span class="p">)</span><span class="w"> </span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">test</span><span class="p">)</span>
+<span class="w">        </span><span class="n">do_something</span><span class="p">();</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  When there is only one simple statement, we do not need to use braces.</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">if</span><span class="p">(</span><span class="n">a</span><span class="p">)</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</pre></div>
+</div>
+</section>
+<section id="spaces">
+<h3>3.2 Spaces<a class="headerlink" href="#spaces" title="Permalink to this heading"></a></h3>
+<p>  For most keywords, we need to add a space after them to improve code readability.</p>
+<p>  Please add a space after all of these keywords:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">if</span><span class="p">,</span><span class="w"> </span><span class="k">switch</span><span class="p">,</span><span class="w"> </span><span class="k">case</span><span class="p">,</span><span class="w"> </span><span class="no">for</span><span class="p">,</span><span class="w"> </span><span class="no">do</span><span class="p">,</span><span class="w"> </span><span class="no">while</span>
+</pre></div>
+</div>
+<p>  Keywords such as sizeof, typeof, alignof, and <strong>attribute</strong> do not require a space after them, as they are used like functions.</p>
+<p>  For pointer-type variables, the asterisk should be close to the variable name rather than the type name. As shown below:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">a</span><span class="p">;</span>
+<span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="nf">func</span><span class="p">(</span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">**</span><span class="n">p</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>  Use a space on both sides of most binary and ternary operators, as shown below:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="o">=</span><span class="w">  </span><span class="o">+</span><span class="w">  </span><span class="o">-</span><span class="w">  </span><span class="o">&lt;</span><span class="w">  </span><span class="o">&gt;</span><span class="w">  </span><span class="o">*</span><span class="w">  </span><span class="o">/</span><span class="w">  </span><span class="o">%</span><span class="w">  </span><span class="o">|</span><span class="w">  </span><span class="o">&amp;</span><span class="w">  </span><span class="o">^</span><span class="w">  </span><span class="o">&lt;=</span><span class="w">  </span><span class="o">&gt;=</span><span class="w">  </span><span class="o">==</span><span class="w">  </span><span class="o">!=</span><span class="w">  </span><span class="o">?</span><span class="w">  </span><span class="o">:</span>
+</pre></div>
+</div>
+<p>  There is no space after these unary operators:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="o">&amp;</span><span class="w">  </span><span class="o">*</span><span class="w">  </span><span class="o">+</span><span class="w">  </span><span class="o">-</span><span class="w">  </span><span class="o">~</span><span class="w">  </span><span class="o">!</span><span class="w">  </span><span class="k">sizeof</span><span class="w">  </span><span class="n">typeof</span><span class="w">  </span><span class="k">alignof</span><span class="w">  </span><span class="n">__attribute__</span><span class="w">  </span><span class="n">defined</span>
+</pre></div>
+</div>
+<p>  Special cases: no space is needed before or after the following operators:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="o">++</span><span class="w">  </span><span class="o">--</span><span class="w"> </span><span class="p">.</span><span class="w"> </span><span class="o">-&gt;</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="naming">
+<h2>4. Naming<a class="headerlink" href="#naming" title="Permalink to this heading"></a></h2>
+<p>  DragonOS does not use the camelCase naming convention for function names, but instead uses concise and clear names like <code class="docutils literal notranslate"><span class="pre">tmp</span></code>.</p>
+<p>  Note that this refers to our entire project not using the camelCase naming convention. It does not mean that programmers can use obscure abbreviations for variable names.</p>
+<p>  For global variables or globally visible functions and structures, we need to follow the following naming conventions:</p>
+<ul class="simple">
+<li><p>The name should be easy to understand and not ambiguous. For example, for a function that calculates folder size, we recommend using <code class="docutils literal notranslate"><span class="pre">count_folder_size()</span></code> instead of <code class="docutils literal notranslate"><span class="pre">cntfs()</span></code>, which can confuse others.</p></li>
+<li><p>For global, non-static names, unless there is a special need, the naming should follow the format: <code class="docutils literal notranslate"><span class="pre">模块名缩写前缀_函数/变量名</span></code>. This naming convention helps others distinguish which module the name belongs to and reduces the risk of naming conflicts.</p></li>
+<li><p>Global names that do not need to be visible to other code files must be prefixed with the <code class="docutils literal notranslate"><span class="pre">static</span></code> modifier.</p></li>
+</ul>
+<p>  For local variables within functions, the naming convention should be concise. Long names for local variables have little significance.</p>
+<p>[Document not completed, to be continued]</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="Contributing to Development" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="rust-coding-style.html" class="btn btn-neutral float-right" title="Rust Language Code Style" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/locales/en/community/code_contribution/c-coding-style.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/locales/en/community/code_contribution/c-coding-style.html">V0.3.0</a></dd>
+      <dd><a href="c-coding-style.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/community/code_contribution/c-coding-style.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

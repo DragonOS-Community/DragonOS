@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>kthread 内核线程 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="PCB 进程控制块" href="pcb.html" />
+    <link rel="prev" title="进程管理模块" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">进程管理模块</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">kthread 内核线程</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">原理</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">创建内核线程</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#kthread-create">kthread_create()</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kthread-run">kthread_run()</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kthread-run-rt">kthread_run_rt()</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id11">停止内核线程</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#kthread-stop">kthread_stop()</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kthread-should-stop">kthread_should_stop()</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kthread-exit">kthread_exit()</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="pcb.html">PCB 进程控制块</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">进程管理模块</a></li>
+      <li class="breadcrumb-item active">kthread 内核线程</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/33270d0/docs/kernel/process_management/kthread.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="kthread">
+<h1>kthread 内核线程<a class="headerlink" href="#kthread" title="Permalink to this heading"></a></h1>
+<p>  内核线程模块定义在<code class="docutils literal notranslate"><span class="pre">common/kthread.h</span></code>中，提供对内核线程的及支持功能。内核线程作为内核的“分身”，能够提升系统的并行化程度以及故障容错能力。</p>
+<section id="id1">
+<h2>原理<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>  每个内核线程都运行在内核态，执行其特定的任务。</p>
+<p>  内核线程的创建是通过调用<code class="docutils literal notranslate"><span class="pre">kthread_create()</span></code>或者<code class="docutils literal notranslate"><span class="pre">kthread_run()</span></code>宏，向<code class="docutils literal notranslate"><span class="pre">kthreadd</span></code>守护线程发送创建任务来实现的。也就是说，内核线程的创建，最终是由<code class="docutils literal notranslate"><span class="pre">kthreadd</span></code>来完成。</p>
+<p>  当内核线程被创建后，虽然会加入调度队列，但是当其被第一次调度，执行引导程序<code class="docutils literal notranslate"><span class="pre">kthread()</span></code>后，将进入休眠状态。直到其他模块使用<code class="docutils literal notranslate"><span class="pre">process_wakeup()</span></code>，它才会真正开始运行。</p>
+<p>  当内核其他模块想要停止一个内核线程的时候，可以调用<code class="docutils literal notranslate"><span class="pre">kthread_stop()</span></code>函数。该函数将会置位内核线程的<code class="docutils literal notranslate"><span class="pre">worker_private</span></code>中的<code class="docutils literal notranslate"><span class="pre">KTHREAD_SHOULD_STOP</span></code>标志位，并等待内核线程的退出，然后获得返回值并清理内核线程的pcb。</p>
+<p>  内核线程应当经常检查<code class="docutils literal notranslate"><span class="pre">KTHREAD_SHOULD_STOP</span></code>标志位，以确定其是否要退出。当检测到该标志位被置位时，内核线程应当完成数据清理工作，并调用<code class="docutils literal notranslate"><span class="pre">kthread_exit()</span></code>或直接返回一个返回码，以退出内核线程。</p>
+</section>
+<section id="id2">
+<h2>创建内核线程<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<section id="kthread-create">
+<h3>kthread_create()<a class="headerlink" href="#kthread-create" title="Permalink to this heading"></a></h3>
+<section id="id3">
+<h4>原型<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h4>
+<p>  <code class="docutils literal notranslate"><span class="pre">kthread_create(thread_fn,</span> <span class="pre">data,</span> <span class="pre">name_fmt,</span> <span class="pre">arg...)</span></code></p>
+</section>
+<section id="id4">
+<h4>简介<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h4>
+<p>  在当前NUMA结点上创建一个内核线程（DragonOS目前暂不支持NUMA，因此node可忽略。）</p>
+<p>  请注意，该宏会创建一个内核线程，并将其设置为停止状态.</p>
+</section>
+<section id="id5">
+<h4>参数<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h4>
+<p><strong>thread_fn</strong></p>
+<p>  该内核线程要执行的函数</p>
+<p><strong>data</strong></p>
+<p>  传递给 <em>thread_fn</em> 的参数数据</p>
+<p><strong>name_fmt</strong></p>
+<p>  printf-style format string for the thread name</p>
+<p><strong>arg</strong></p>
+<p>  name_fmt的参数</p>
+</section>
+<section id="id6">
+<h4>返回值<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h4>
+<p>  创建好的内核线程的pcb</p>
+</section>
+</section>
+<section id="kthread-run">
+<h3>kthread_run()<a class="headerlink" href="#kthread-run" title="Permalink to this heading"></a></h3>
+<section id="id7">
+<h4>原型<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h4>
+<p>  <code class="docutils literal notranslate"><span class="pre">kthread_run(thread_fn,</span> <span class="pre">data,</span> <span class="pre">name_fmt,</span> <span class="pre">...)</span></code></p>
+</section>
+<section id="id8">
+<h4>简介<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h4>
+<p>  创建内核线程并加入调度队列。</p>
+<p>  该宏定义是<code class="docutils literal notranslate"><span class="pre">kthread_create()</span></code>的简单封装，提供创建了内核线程后，立即运行的功能。</p>
+</section>
+</section>
+<section id="kthread-run-rt">
+<h3>kthread_run_rt()<a class="headerlink" href="#kthread-run-rt" title="Permalink to this heading"></a></h3>
+<section id="id9">
+<h4>原型<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h4>
+<p>  <code class="docutils literal notranslate"><span class="pre">kthread_run_rt(thread_fn,</span> <span class="pre">data,</span> <span class="pre">name_fmt,</span> <span class="pre">...)</span></code></p>
+</section>
+<section id="id10">
+<h4>简介<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h4>
+<p>  创建内核实时线程并加入调度队列。</p>
+<p>  类似<code class="docutils literal notranslate"><span class="pre">kthread_run()</span></code>，该宏定义也是<code class="docutils literal notranslate"><span class="pre">kthread_create()</span></code>的简单封装，提供创建了内核实时线程后，在设置实时进程的参数后，立即运行的功能。</p>
+</section>
+</section>
+</section>
+<section id="id11">
+<h2>停止内核线程<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h2>
+<section id="kthread-stop">
+<h3>kthread_stop()<a class="headerlink" href="#kthread-stop" title="Permalink to this heading"></a></h3>
+<section id="id12">
+<h4>原型<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h4>
+<p>  <code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">kthread_stop(struct</span> <span class="pre">process_control_block</span> <span class="pre">*</span> <span class="pre">pcb)</span></code></p>
+</section>
+<section id="id13">
+<h4>简介<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h4>
+<p>  当外部模块希望停止一个内核线程时，调用该函数，向kthread发送停止消息，请求其结束。并等待其退出，返回内核线程的退出返回值。</p>
+</section>
+<section id="id14">
+<h4>参数<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h4>
+<p><strong>pcb</strong></p>
+<p>  内核线程的pcb</p>
+</section>
+<section id="id15">
+<h4>返回值<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h4>
+<p>  内核线程的退出返回码。</p>
+</section>
+</section>
+<section id="kthread-should-stop">
+<h3>kthread_should_stop()<a class="headerlink" href="#kthread-should-stop" title="Permalink to this heading"></a></h3>
+<section id="id16">
+<h4>原型<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h4>
+<p>  <code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">kthread_should_stop(void)</span></code></p>
+</section>
+<section id="id17">
+<h4>简介<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h4>
+<p>  内核线程可以调用该函数得知是否有其他进程请求结束当前内核线程。</p>
+</section>
+<section id="id18">
+<h4>返回值<a class="headerlink" href="#id18" title="Permalink to this heading"></a></h4>
+<p>  一个bool变量</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>值</p></th>
+<th class="head"><p>解释</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>true</p></td>
+<td><p>有其他进程请求结束该内核线程</p></td>
+</tr>
+<tr class="row-odd"><td><p>false</p></td>
+<td><p>该内核线程没有收到停止消息</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="kthread-exit">
+<h3>kthread_exit()<a class="headerlink" href="#kthread-exit" title="Permalink to this heading"></a></h3>
+<section id="id19">
+<h4>原型<a class="headerlink" href="#id19" title="Permalink to this heading"></a></h4>
+<p>  <code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">kthread_exit(long</span> <span class="pre">result)</span></code></p>
+</section>
+<section id="id20">
+<h4>简介<a class="headerlink" href="#id20" title="Permalink to this heading"></a></h4>
+<p>  让当前内核线程退出，并返回result参数给kthread_stop()函数。</p>
+</section>
+<section id="id21">
+<h4>参数<a class="headerlink" href="#id21" title="Permalink to this heading"></a></h4>
+<p><strong>result</strong></p>
+<p>  内核线程的退出返回码</p>
+</section>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="进程管理模块" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="pcb.html" class="btn btn-neutral float-right" title="PCB 进程控制块" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>33270d0</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.5
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/kernel/process_management/kthread.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/kernel/process_management/kthread.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/process_management/kthread.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/kernel/process_management/kthread.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/kernel/process_management/kthread.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/process_management/kthread.html">V0.1.4</a></dd>
+      <dd><a href="kthread.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/process_management/kthread.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/process_management/kthread.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/process_management/kthread.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/process_management/kthread.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/process_management/kthread.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/process_management/kthread.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/process_management/kthread.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/process_management/kthread.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

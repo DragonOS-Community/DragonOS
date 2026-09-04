@@ -1,20 +1,20 @@
-# Rust语言代码风格
+# Rust Language Code Style
 
-&emsp;&emsp;这篇文档将会介绍DragonOS中的Rust语言代码风格。随着开发的进行，这些风格可能会发生变化，但是我们会尽量保持风格的一致性。
+This document will introduce the Rust language code style used in DragonOS. As development progresses, these styles may change, but we will strive to maintain consistency in the style.
 
-## 1. 命名
+## 1. Naming
 
-&emsp;&emsp;这部分基于Rust语言圣经中的[命名规范](https://course.rs/practice/naming.html)进行修改，本文未提及的部分，请参考Rust语言圣经中的[命名规范](https://course.rs/practice/naming.html)。
+This section is based on the naming conventions from the Rust language bible, [Naming Guide](https://course.rs/practice/naming.html). For parts not mentioned in this document, please refer to the [Naming Guide](https://course.rs/practice/naming.html) in the Rust language bible.
 
-## 2. 格式
+## 2. Formatting
 
-### 2.1 缩进
+### 2.1 Indentation
 
-&emsp;&emsp;请在提交代码之前，使用`cargo fmt`命令对代码进行格式化。
+Please use the `cargo fmt` command to format the code before submitting it.
 
-### 2.2 函数返回值
+### 2.2 Function Return Values
 
-&emsp;&emsp;尽管Rust可以返回函数的最后一行的语句的值，但是，这种方式会使代码的可读性变差。因此，我们推荐您在函数的最后一行使用`return`语句，而不是直接返回值。
+Although Rust allows returning the value of the last line of a function, this approach can reduce code readability. Therefore, we recommend using the `return` statement as the last line of the function, rather than directly returning the value.
 
 ```rust
 // 不推荐
@@ -27,9 +27,9 @@ fn foo() -> i32 {
     return 1 + 2;
 }
 ```
-### 2.3 错误处理
+### 2.3 Error Handling
 
-&emsp;&emsp;DragonOS采用返回Posix错误码作为**模块间错误处理**的方式。为了确保在模块之间，错误处理代码的一致性，我们推荐在发生错误的时候，返回`SystemError`类型，该类型表示posix错误码。这样做的优点尤其体现在跨模块调用函数时，可以直接返回通用的错误码，从而降低错误处理代码的耦合度。
+DragonOS uses returning POSIX error codes as the **inter-module error handling** method. To ensure consistency in error handling code across modules, we recommend returning the `SystemError` type when an error occurs. This approach is especially beneficial when calling functions across modules, as it allows direct return of a generic error code, thereby reducing the coupling of error handling code.
 
 ```rust
 // 函数跨越模块边界时（由其他模块调用当前函数），不推荐
@@ -51,25 +51,25 @@ fn foo() -> Result<(), SystemError> {
 }
 ```
 
-&emsp;&emsp;在**模块内部**，您既可以采用返回自定义错误enum的方式，也可以采用返回`SystemError`的方式。但是，我们推荐您在模块内部，采用返回自定义错误enum的方式，这样可以使错误处理代码更加清晰。
+Within **modules**, you can either use a custom error enum or return the `SystemError` type. However, we recommend using a custom error enum for error handling within modules, as it makes the error handling code clearer.
 
-&emsp;&emsp;**TODO**: 将原有的使用i32作为错误码的代码，改为使用`SystemError`。
+**TODO**: Convert existing code that uses i32 as an error code to use `SystemError`.
 
-## 3. 注释
+## 3. Comments
 
-&emsp;&emsp;DragonOS的注释风格与Rust官方的保持一致。同时，我们推荐您在代码中加入尽可能多的有效注释，以便于其他人理解您的代码。并且，变量、函数等声明，遵守第一节中提到的命名规范，使其能够“自注释”。
+The commenting style in DragonOS is consistent with the official Rust style. We also recommend adding as many meaningful comments as possible in your code to help others understand your code. Additionally, variable and function declarations should follow the naming conventions mentioned in Section 1, making them "self-documenting."
 
-### 3.1 函数注释
+### 3.1 Function Comments
 
-&emsp;&emsp;函数注释应该包含以下内容：
+Function comments should include the following:
 
-- 函数的功能
-- 函数的参数
-- 函数的返回值
-- 函数的错误处理
-- 函数的副作用或者其他的需要说明的内容
+- The function's purpose
+- The function's parameters
+- The function's return value
+- The function's error handling
+- Any side effects or other information that needs to be explained
 
-&emsp;&emsp;函数注释的格式如下：
+The format for function comments is as follows:
 
 ```rust
 /// # 函数的功能

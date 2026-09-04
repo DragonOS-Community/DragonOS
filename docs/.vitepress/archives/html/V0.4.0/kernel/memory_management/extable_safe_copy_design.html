@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>异常表安全内存拷贝方案设计 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="文件系统" href="../filesystem/index.html" />
+    <link rel="prev" title="MMIO" href="mmio.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">内存管理</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="intro.html">内存管理模块简介</a></li>
+<li class="toctree-l2"><a class="reference internal" href="allocate-memory.html">内存分配指南</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mmio.html">MMIO</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">异常表安全内存拷贝方案设计</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">概述</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">设计背景与动机</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id4">问题定义</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">传统方案的局限</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id6">异常表机制原理</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id7">核心思想</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">架构示意图</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id9">核心数据结构</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id10">工作流程</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id11">典型执行场景</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id12">场景: 系统调用传入无效地址</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id13">使用场景分析</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id14">✅ 适合使用异常表保护的场景</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id17">❌ 不适合使用异常表保护的场景</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id20">决策矩阵</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id21">安全性分析</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id22">防御能力</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id23">安全边界</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id24">多层防御</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id25">实现要点</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id26">关键技术</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id27">架构移植</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">内存管理</a></li>
+      <li class="breadcrumb-item active">异常表安全内存拷贝方案设计</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/memory_management/extable_safe_copy_design.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>异常表安全内存拷贝方案设计<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>本文作者：龙进 <a class="reference external" href="mailto:longjin&#37;&#52;&#48;dragonos&#46;org">longjin<span>&#64;</span>dragonos<span>&#46;</span>org</a></p>
+</div>
+<section id="id2">
+<h2>概述<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>本文档描述DragonOS中基于异常表(Exception Table)机制的安全内存拷贝方案的核心设计思想。该方案解决内核在系统调用上下文中安全访问用户空间内存的问题,防止因访问无效用户地址而导致的内核panic。</p>
+</section>
+<section id="id3">
+<h2>设计背景与动机<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<section id="id4">
+<h3>问题定义<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>在系统调用处理中,内核需要访问用户空间传入的指针(如路径字符串、参数结构体等)。这些访问可能失败:</p>
+<ol class="arabic simple">
+<li><p><strong>地址未映射</strong>: 用户传入的地址没有对应的VMA(Virtual Memory Area)</p></li>
+<li><p><strong>权限不足</strong>: 页面存在但缺少所需权限</p></li>
+<li><p><strong>恶意输入</strong>: 用户故意传入非法地址</p></li>
+</ol>
+</section>
+<section id="id5">
+<h3>传统方案的局限<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p><strong>预检查方案的TOCTTOU问题:</strong></p>
+<ul class="simple">
+<li><p>检查时地址有效,使用时可能已被其他线程修改</p></li>
+<li><p>存在竞态窗口</p></li>
+</ul>
+<p><strong>直接访问的困境:</strong></p>
+<ul class="simple">
+<li><p>无法区分”正常缺页”和”非法访问”</p></li>
+<li><p>页错误处理器无法判断是内核bug还是用户错误</p></li>
+</ul>
+</section>
+</section>
+<section id="id6">
+<h2>异常表机制原理<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h2>
+<section id="id7">
+<h3>核心思想<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<p>异常表机制通过<strong>编译期标记 + 运行时查找</strong>实现安全的用户空间访问:</p>
+<ol class="arabic simple">
+<li><p><strong>编译期</strong>: 在可能触发页错误的指令处生成异常表条目</p></li>
+<li><p><strong>运行时</strong>: 页错误发生时,查找异常表并跳转到修复代码</p></li>
+<li><p><strong>零开销</strong>: 正常路径无性能损失</p></li>
+</ol>
+</section>
+<section id="id8">
+<h3>架构示意图<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────────────────────────────────────────────────────┐
+│                      系统调用执行流程                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   用户空间                  内核空间                           │
+│  ┌──────┐         ┌──────────────────────────────┐          │
+│  │0x1000│         │ 1. 系统调用入口                │          │
+│  │(未映射)─────────→ 2. 拷贝用户数据(带标记)         │          │
+│  └──────┘         │    ├─ 正常完成 ──→ 返回成功     │          │
+│                   │    └─ 触发#PF                 │          │
+│                   │         ↓                    │          │
+│                   │ 3. 页错误处理器                │          │
+│                   │    ├─ 查找异常表               │          │
+│                   │    └─ 找到修复代码地址          │          │
+│                   │         ↓                    │          │
+│                   │ 4. 修改指令指针(RIP)           │          │
+│                   │         ↓                    │          │
+│                   │ 5. 执行修复代码                │          │
+│                   │    └─ 返回剩余未拷贝字节数      │          │
+│                   │         ↓                    │          │
+│                   │ 6. 返回EFAULT给用户            │          │
+│                   └──────────────────────────────┘          │
+└─────────────────────────────────────────────────────────────┘
+</pre></div>
+</div>
+</section>
+<section id="id9">
+<h3>核心数据结构<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h3>
+<p><strong>异常表条目 (8字节对齐):</strong></p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────────┬──────────────────┐
+│  指令相对偏移     │  修复代码相对偏移   │
+│    (4 bytes)    │    (4 bytes)     │
+└─────────────────┴──────────────────┘
+</pre></div>
+</div>
+<p><strong>设计要点:</strong></p>
+<ul class="simple">
+<li><p>使用相对偏移支持ASLR(地址空间布局随机化)</p></li>
+<li><p>8字节对齐提高缓存性能</p></li>
+<li><p>存储于只读段防止篡改</p></li>
+</ul>
+</section>
+<section id="id10">
+<h3>工作流程<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>编译期:
+    源码 ──→ 带标记的指令 ──→ 生成异常表条目 ──→ 链接到内核镜像
+              (rep movsb)       (insn→fixup)
+
+运行期:
+    执行拷贝 ──→ 触发页错误? ─否→ 正常返回
+                     │
+                    是
+                     ↓
+              查找异常表 ──→ 找到? ─否→ 内核panic
+                              │
+                             是
+                              ↓
+                    修改RIP到修复代码 ──→ 返回剩余未拷贝字节数
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id11">
+<h2>典型执行场景<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h2>
+<section id="id12">
+<h3>场景: 系统调用传入无效地址<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h3>
+<p>以<code class="docutils literal notranslate"><span class="pre">open()</span></code>系统调用为例,展示异常表的工作过程:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>用户程序: open(0x1000, O_RDONLY)  // 0x1000未映射
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 1. 进入系统调用                  │
+    │    ├─ 解析路径字符串             │
+    │    └─ 逐字节拷贝直到&#39;\0&#39;         │
+    └────────────────────────────────┘
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 2. 拷贝第一个字节时触发页错误      │
+    │    (地址0x1000不在VMA中)         │
+    └────────────────────────────────┘
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 3. 页错误处理器                  │
+    │    ├─ 检测到访问用户地址          │
+    │    ├─ 查找异常表                 │
+    │    └─ 找到对应的修复代码          │
+    └────────────────────────────────┘
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 4. 修改指令指针到修复代码          │
+    │    └─ 设置返回值为剩余未拷贝字节数  │
+    └────────────────────────────────┘
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 5. 系统调用返回EFAULT            │
+    └────────────────────────────────┘
+         │
+         ↓
+用户程序: fd = -1, errno = EFAULT
+</pre></div>
+</div>
+<p><strong>关键点:</strong></p>
+<ul class="simple">
+<li><p>无需预检查地址有效性</p></li>
+<li><p>页错误自动转换为返回剩余未拷贝字节数</p></li>
+<li><p>内核不会panic,用户程序收到明确的错误信息</p></li>
+</ul>
+</section>
+</section>
+<section id="id13">
+<h2>使用场景分析<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h2>
+<section id="id14">
+<h3>✅ 适合使用异常表保护的场景<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h3>
+<section id="id15">
+<h4>1. 小数据的系统调用参数<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h4>
+<p><strong>特征:</strong></p>
+<ul class="simple">
+<li><p>数据量小 (通常 &lt; 4KB)</p></li>
+<li><p>一次性拷贝</p></li>
+<li><p>无法预知数据长度(如字符串)</p></li>
+</ul>
+<p><strong>典型应用:</strong></p>
+<ul class="simple">
+<li><p>路径字符串: <code class="docutils literal notranslate"><span class="pre">open()</span></code>, <code class="docutils literal notranslate"><span class="pre">stat()</span></code>, <code class="docutils literal notranslate"><span class="pre">execve()</span></code>等</p></li>
+<li><p>固定大小结构体: <code class="docutils literal notranslate"><span class="pre">sigaction</span></code>, <code class="docutils literal notranslate"><span class="pre">timespec</span></code>, <code class="docutils literal notranslate"><span class="pre">stat</span></code>等</p></li>
+<li><p>小型数组: <code class="docutils literal notranslate"><span class="pre">iovec[]</span></code>, <code class="docutils literal notranslate"><span class="pre">pollfd[]</span></code>等</p></li>
+</ul>
+<p><strong>优势:</strong></p>
+<ul class="simple">
+<li><p><strong>避免TOCTTOU竞态</strong>: 无需预检查</p></li>
+<li><p><strong>高鲁棒性</strong>: 用户错误不会导致内核panic</p></li>
+<li><p><strong>性能可接受</strong>: 数据量小,即使多拷贝一次也影响不大</p></li>
+</ul>
+</section>
+<section id="id16">
+<h4>2. 不确定地址有效性的场景<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h4>
+<p>当无法通过其他方式验证地址时,异常表是最安全的选择:</p>
+<ul class="simple">
+<li><p>用户直接传入的原始指针</p></li>
+<li><p>多线程环境下可能被并发修改的地址</p></li>
+<li><p>需要原子性保证的操作</p></li>
+</ul>
+</section>
+</section>
+<section id="id17">
+<h3>❌ 不适合使用异常表保护的场景<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h3>
+<section id="id18">
+<h4>1. 大数据传输<a class="headerlink" href="#id18" title="Permalink to this heading"></a></h4>
+<p><strong>反模式: read/write系统调用中双重缓冲</strong></p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>用户缓冲区 → 内核临时缓冲区 → 用户缓冲区  ❌
+</pre></div>
+</div>
+<p><strong>问题:</strong></p>
+<ul class="simple">
+<li><p>内存浪费: 需要额外的内核缓冲区</p></li>
+<li><p>双重拷贝: 数据被拷贝两次</p></li>
+<li><p>OOM风险: 大量并发读写耗尽内存</p></li>
+</ul>
+<p><strong>正确方案: 零拷贝</strong></p>
+<ul class="simple">
+<li><p>预先验证地址在有效VMA中</p></li>
+<li><p>直接在用户缓冲区上操作</p></li>
+<li><p>页错误触发正常的缺页处理(非错误)</p></li>
+</ul>
+</section>
+<section id="vma">
+<h4>2. 已验证的VMA内地址<a class="headerlink" href="#vma" title="Permalink to this heading"></a></h4>
+<p>如果地址已通过VMA检查,异常表是多余的:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mmap()</span></code>后的立即访问</p></li>
+<li><p>DMA缓冲区</p></li>
+<li><p>共享内存区域</p></li>
+</ul>
+<p>在这些场景下,页错误是<strong>正常的缺页处理</strong>(如COW),不是错误。</p>
+</section>
+<section id="id19">
+<h4>3. 性能敏感的热路径<a class="headerlink" href="#id19" title="Permalink to this heading"></a></h4>
+<p>避免在循环中频繁调用带异常表保护的函数:</p>
+<ul class="simple">
+<li><p><strong>批量处理</strong>: 一次拷贝整个数组,而非逐元素拷贝</p></li>
+<li><p><strong>提前验证</strong>: 在循环外验证地址,循环内直接访问</p></li>
+</ul>
+</section>
+</section>
+<section id="id20">
+<h3>决策矩阵<a class="headerlink" href="#id20" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>场景特征</p></th>
+<th class="head"><p>数据量</p></th>
+<th class="head"><p>推荐方案</p></th>
+<th class="head"><p>核心考虑</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>系统调用小参数</p></td>
+<td><p>&lt; 4KB</p></td>
+<td><p>异常表保护</p></td>
+<td><p>避免TOCTTOU,提高鲁棒性</p></td>
+</tr>
+<tr class="row-odd"><td><p>文件读写</p></td>
+<td><p>可变(MB级)</p></td>
+<td><p>零拷贝</p></td>
+<td><p>性能优先,避免双重缓冲</p></td>
+</tr>
+<tr class="row-even"><td><p>mmap后访问</p></td>
+<td><p>任意</p></td>
+<td><p>直接访问</p></td>
+<td><p>VMA已验证,正常缺页</p></td>
+</tr>
+<tr class="row-odd"><td><p>批量小数据</p></td>
+<td><p>累计KB级</p></td>
+<td><p>批量拷贝</p></td>
+<td><p>减少系统调用次数</p></td>
+</tr>
+<tr class="row-even"><td><p>字符串解析</p></td>
+<td><p>未知</p></td>
+<td><p>异常表保护</p></td>
+<td><p>逐字节扫描,需要健壮性</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="id21">
+<h2>安全性分析<a class="headerlink" href="#id21" title="Permalink to this heading"></a></h2>
+<section id="id22">
+<h3>防御能力<a class="headerlink" href="#id22" title="Permalink to this heading"></a></h3>
+<p>异常表机制可以防御:</p>
+<ol class="arabic simple">
+<li><p><strong>空指针解引用</strong>: 返回EFAULT而非段错误</p></li>
+<li><p><strong>内核地址注入</strong>: 用户传入内核地址被安全拒绝</p></li>
+<li><p><strong>竞态攻击</strong>: TOCTTOU窗口被消除</p></li>
+<li><p><strong>越界访问</strong>: 访问VMA外地址被捕获</p></li>
+</ol>
+</section>
+<section id="id23">
+<h3>安全边界<a class="headerlink" href="#id23" title="Permalink to this heading"></a></h3>
+<p>异常表<strong>不能</strong>防御:</p>
+<ol class="arabic simple">
+<li><p><strong>内核自身bug</strong>: 如野指针解引用</p></li>
+<li><p><strong>硬件故障</strong>: 内存物理损坏</p></li>
+<li><p><strong>其他异常类型</strong>: 仅处理页错误</p></li>
+</ol>
+</section>
+<section id="id24">
+<h3>多层防御<a class="headerlink" href="#id24" title="Permalink to this heading"></a></h3>
+<p>异常表是纵深防御的一部分:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────────────────────────────┐
+│  用户空间权限检查 (SELinux/AppArmor)   │  ← 权限层
+├─────────────────────────────────────┤
+│  系统调用参数验证                      │  ← 逻辑层
+├─────────────────────────────────────┤
+│  异常表机制                           │  ← 内存安全层
+├─────────────────────────────────────┤
+│  硬件页保护 (MMU)                     │  ← 硬件层
+└─────────────────────────────────────┘
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id25">
+<h2>实现要点<a class="headerlink" href="#id25" title="Permalink to this heading"></a></h2>
+<section id="id26">
+<h3>关键技术<a class="headerlink" href="#id26" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p><strong>相对偏移编码</strong>: 支持地址随机化(ASLR)</p></li>
+<li><p><strong>二分查找</strong>: O(log n)时间复杂度快速定位</p></li>
+<li><p><strong>内联汇编</strong>: 精确控制指令和异常表生成</p></li>
+<li><p><strong>零开销抽象</strong>: 正常路径无性能损失</p></li>
+</ol>
+</section>
+<section id="id27">
+<h3>架构移植<a class="headerlink" href="#id27" title="Permalink to this heading"></a></h3>
+<p>异常表机制可移植到其他架构:</p>
+<ul class="simple">
+<li><p><strong>x86_64</strong>: 使用<code class="docutils literal notranslate"><span class="pre">rep</span> <span class="pre">movsb</span></code>指令</p></li>
+<li><p><strong>ARM64</strong>: 使用<code class="docutils literal notranslate"><span class="pre">ldp/stp</span></code>指令序列</p></li>
+<li><p><strong>RISC-V</strong>: 使用<code class="docutils literal notranslate"><span class="pre">ld/sd</span></code>指令序列</p></li>
+</ul>
+<p>核心思想保持不变,只需调整汇编语法。</p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="mmio.html" class="btn btn-neutral float-left" title="MMIO" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../filesystem/index.html" class="btn btn-neutral float-right" title="文件系统" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/memory_management/extable_safe_copy_design.html">V0.3.0</a></dd>
+      <dd><a href="extable_safe_copy_design.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/memory_management/extable_safe_copy_design.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

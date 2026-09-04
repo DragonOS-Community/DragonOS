@@ -1,615 +1,608 @@
-# DragonOS内核核心API
+# DragonOS Kernel Core API
 
-## 循环链表管理函数
+## Circular Linked List Management Functions
 
-&emsp;&emsp;循环链表是内核的重要的数据结构之一。包含在`kernel/common/list.h`中。
+Circular linked list is one of the important data structures in the kernel. It is included in `kernel/common/list.h`.
 
 ### `void list_init(struct List *list)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;初始化一个List结构体，使其prev和next指针指向自身
+Initialize a List structure so that its prev and next pointers point to itself.
 
-#### 参数
+#### Parameters
 
 **list**
 
-&emsp;&emsp;要被初始化的List结构体
+The List structure to be initialized.
 
 ### `void list_add(struct List *entry, struct List *node)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;将node插入到entry的后方
+Insert the node after the entry.
 
-#### 参数
+#### Parameters
 
 **entry**
 
-&emsp;&emsp;已存在于循环链表中的一个结点
+An existing node in the circular linked list.
 
 **node**
 
-&emsp;&emsp;待插入的结点
+The node to be inserted.
 
 ### `void list_append(struct List *entry, struct List *node)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;将node插入到entry的前方
+Insert the node before the entry.
 
-#### 参数
+#### Parameters
 
 **entry**
 
-&emsp;&emsp;已存在于循环链表中的一个结点
+An existing node in the circular linked list.
 
 **node**
 
-&emsp;&emsp;待插入的结点
+The node to be inserted.
 
 ### `void list_del(struct List *entry)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从链表中删除结点entry
+Remove the node from the list.
 
-#### 参数
+#### Parameters
 
 **entry**
 
-&emsp;&emsp;待删除的结点
+The node to be removed.
 
 ### `list_del_init(struct List *entry)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从链表中删除结点entry，并将这个entry使用list_init()进行重新初始化。
+Remove the node from the list and re-initialize the entry using list_init().
 
-#### 参数
+#### Parameters
 
 **entry**
 
-&emsp;&emsp;待删除的结点
+The node to be removed.
 
 ### `bool list_empty(struct List *entry)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;判断链表是否为空
+Check if the list is empty.
 
-#### 参数
+#### Parameters
 
 **entry**
 
-&emsp;&emsp;链表中的一个结点
+A node in the list.
 
 ### `struct List *list_prev(struct List *entry)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;获取entry的前一个结点
+Get the previous node of the entry.
 
-#### 参数
+#### Parameters
 
 **entry**
 
-&emsp;&emsp;链表中的一个结点
+A node in the list.
 
 ### `struct List *list_next(struct List *entry)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;获取entry的后一个结点
+Get the next node of the entry.
 
-#### 参数
+#### Parameters
 
 **entry**
 
-&emsp;&emsp;链表中的一个结点
+A node in the list.
 
 ### `void list_replace(struct List *old, struct List *new)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;将链表中的old结点替换成new结点
+Replace the old node in the list with the new node.
 
-#### 参数
+#### Parameters
 
 **old**
 
-&emsp;&emsp;要被换下来的结点
+The node to be removed.
 
 **new**
 
-&emsp;&emsp;要被换入链表的新的结点
+The new node to be inserted into the list.
 
-(_list_entry)=
 
-### `list_entry(ptr, type, member)`
+### `list_entry(ptr, type, member)` {#_list_entry}
 
-#### 描述
+#### Description
 
-&emsp;&emsp;该宏能通过ptr指向的List获取到List所处的结构体的地址
+This macro can get the address of the structure that contains the List pointed to by ptr.
 
-#### 参数
+#### Parameters
 
 **ptr**
 
-&emsp;&emsp;指向List结构体的指针
+Pointer to the List structure.
 
 **type**
 
-&emsp;&emsp;要被换入链表的新的结点
+The type of the structure that contains the List.
 
 **member**
 
-&emsp;&emsp;List结构体在上述的“包裹list结构体的结构体”中的变量名
+The name of the List structure member in the structure that contains the List.
 
 ### `list_first_entry(ptr, type, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;获取链表中的第一个元素。请注意，该宏要求链表非空，否则会出错。
+Get the first element in the list. Please note that this macro requires the list to be non-empty, otherwise it will cause an error.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_entry() <_list_entry>`相同
+Same as [list_entry() ](/kernel/core_api/kernel_api.html#_list_entry)
 
 ### `list_first_entry_or_null(ptr, type, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;获取链表中的第一个元素。若链表为空，则返回NULL。
+Get the first element in the list. If the list is empty, return NULL.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_entry() <_list_entry>`相同
+Same as [list_entry() ](/kernel/core_api/kernel_api.html#_list_entry)
 
 ### `list_last_entry(ptr, type, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;获取链表中的最后一个元素。请注意，该宏要求链表非空，否则会出错。
+Get the last element in the list. Please note that this macro requires the list to be non-empty, otherwise it will cause an error.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_entry() <_list_entry>`相同
+Same as [list_entry() ](/kernel/core_api/kernel_api.html#_list_entry)
 
 ### `list_last_entry_or_full(ptr, type, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;获取链表中的最后一个元素。若链表为空，则返回NULL。
+Get the last element in the list. If the list is empty, return NULL.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_entry() <_list_entry>`相同
+Same as [list_entry() ](/kernel/core_api/kernel_api.html#_list_entry)
 
-(_list_next_entry)=
-### `list_next_entry(pos, member)`
+### `list_next_entry(pos, member)` {#_list_next_entry}
 
-#### 描述
+#### Description
 
-&emsp;&emsp;获取链表中的下一个元素
+Get the next element in the list.
 
-#### 参数
+#### Parameters
 
 **pos**
 
-&emsp;&emsp;指向当前的外层结构体的指针
+Pointer to the outer structure.
 
 **member**
 
-&emsp;&emsp;链表结构体在外层结构体内的变量名
+The name of the List structure member in the outer structure.
 
 ### `list_prev_entry(pos, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;获取链表中的上一个元素
+Get the previous element in the list.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_next_entry() <_list_next_entry>`相同
+Same as [list_next_entry() ](/kernel/core_api/kernel_api.html#_list_next_entry)
 
-(_list_for_each)=
-### `list_for_each(ptr, head)`
+### `list_for_each(ptr, head)` {#_list_for_each}
 
-#### 描述
+#### Description
 
-&emsp;&emsp;遍历整个链表（从前往后）
+Traverse the entire list (from front to back).
 
-#### 参数
+#### Parameters
 
 **ptr**
 
-&emsp;&emsp;指向List结构体的指针
+Pointer to the List structure.
 
 **head**
 
-&emsp;&emsp;指向链表头结点的指针(struct List*)
+Pointer to the head node of the list (struct List*).
 
 ### `list_for_each_prev(ptr, head)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;遍历整个链表（从后往前）
+Traverse the entire list (from back to front).
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_for_each() <_list_for_each>`相同
+Same as [list_for_each() ](/kernel/core_api/kernel_api.html#_list_for_each)
 
-(_list_for_each_safe)=
-### `list_for_each_safe(ptr, n, head)`
+### `list_for_each_safe(ptr, n, head)` {#_list_for_each_safe}
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从前往后遍历整个链表（支持删除当前链表结点）
+Traverse the entire list from front to back (supports deletion of the current list node).
 
-&emsp;&emsp;该宏通过暂存中间变量，防止在迭代链表的过程中，由于删除了当前ptr所指向的链表结点从而造成错误.
+This macro uses a temporary variable to prevent errors that may occur during iteration if the current ptr node is deleted.
 
-#### 参数
+#### Parameters
 
 **ptr**
 
-&emsp;&emsp;指向List结构体的指针
+Pointer to the List structure.
 
 **n**
 
-&emsp;&emsp;用于存储临时值的List类型的指针
+Pointer to store the temporary value (List type).
 
 **head**
 
-&emsp;&emsp;指向链表头结点的指针(struct List*)
+Pointer to the head node of the list (struct List*).
 
 ### `list_for_each_prev_safe(ptr, n, head)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从后往前遍历整个链表.（支持删除当前链表结点）
+Traverse the entire list from back to front (supports deletion of the current list node).
 
-&emsp;&emsp;该宏通过暂存中间变量，防止在迭代链表的过程中，由于删除了当前ptr所指向的链表结点从而造成错误.
+This macro uses a temporary variable to prevent errors that may occur during iteration if the current ptr node is deleted.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_for_each_safe() <_list_for_each_safe>`相同
+Same as [list_for_each_safe() ](/kernel/core_api/kernel_api.html#_list_for_each_safe)
 
-(_list_for_each_entry)=
-### `list_for_each_entry(pos, head, member)`
+### `list_for_each_entry(pos, head, member)` {#_list_for_each_entry}
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从头开始迭代给定类型的链表
+Iterate through the list of a given type from the beginning.
 
-#### 参数
+#### Parameters
 
 **pos**
 
-&emsp;&emsp;指向特定类型的结构体的指针
+Pointer to a structure of the specific type.
 
 **head**
 
-&emsp;&emsp;指向链表头结点的指针(struct List*)
+Pointer to the head node of the list (struct List*).
 
 **member**
 
-&emsp;&emsp;struct List在pos的结构体中的成员变量名
+The name of the List member in the structure pointed to by pos.
 
 ### `list_for_each_entry_reverse(pos, head, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;逆序迭代给定类型的链表
+Iterate through the list of a given type in reverse order.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_for_each_entry() <_list_for_each_entry>`相同
+Same as [list_for_each_entry() ](/kernel/core_api/kernel_api.html#_list_for_each_entry)
 
 ### `list_for_each_entry_safe(pos, n, head, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从头开始迭代给定类型的链表（支持删除当前链表结点）
+Iterate through the list of a given type from the beginning (supports deletion of the current list node).
 
-#### 参数
+#### Parameters
 
 **pos**
 
-&emsp;&emsp;指向特定类型的结构体的指针
+Pointer to a structure of the specific type.
 
 **n**
 
-&emsp;&emsp;用于存储临时值的，和pos相同类型的指针
+Pointer to store the temporary value (same type as pos).
 
 **head**
 
-&emsp;&emsp;指向链表头结点的指针(struct List*)
+Pointer to the head node of the list (struct List*).
 
 **member**
 
-&emsp;&emsp;struct List在pos的结构体中的成员变量名
+The name of the List member in the structure pointed to by pos.
 
 ### `list_prepare_entry(pos, head, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;为{ref}`list_for_each_entry_continue() <_list_for_each_entry_continue>`准备一个'pos'结构体
+Prepare a 'pos' structure for [list_for_each_entry_continue() ](/kernel/core_api/kernel_api.html#_list_for_each_entry_continue).
 
-#### 参数
-
-**pos**
-
-&emsp;&emsp;指向特定类型的结构体的，用作迭代起点的指针
-
-**head**
-
-&emsp;&emsp;指向要开始迭代的struct List结构体的指针
-
-**member**
-
-&emsp;&emsp;struct List在pos的结构体中的成员变量名
-
-(_list_for_each_entry_continue)=
-### `list_for_each_entry_continue(pos, head, member)`
-
-#### 描述
-
-&emsp;&emsp;从指定的位置的【下一个元素开始】,继续迭代给定的链表
-
-#### 参数
+#### Parameters
 
 **pos**
 
-&emsp;&emsp;指向特定类型的结构体的指针。该指针用作迭代的指针。
+Pointer to a structure of the specific type, used as the starting point for iteration.
 
 **head**
 
-&emsp;&emsp;指向要开始迭代的struct List结构体的指针
+Pointer to the struct List structure to start iteration from.
 
 **member**
 
-&emsp;&emsp;struct List在pos的结构体中的成员变量名
+The name of the List member in the structure pointed to by pos.
+
+### `list_for_each_entry_continue(pos, head, member)` {#_list_for_each_entry_continue}
+
+#### Description
+
+Continue iterating through the list from the next element of the specified position.
+
+#### Parameters
+
+**pos**
+
+Pointer to a structure of the specific type. This pointer is used as the iteration pointer.
+
+**head**
+
+Pointer to the struct List structure to start iteration from.
+
+**member**
+
+The name of the List member in the structure pointed to by pos.
 
 ### `list_for_each_entry_continue_reverse(pos, head, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从指定的位置的【上一个元素开始】,【逆序】迭代给定的链表
+Iterate through the list in reverse order, starting from the previous element of the specified position.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_for_each_entry_continue() <_list_for_each_entry_continue>`的相同
+Same as [list_for_each_entry_continue() ](/kernel/core_api/kernel_api.html#_list_for_each_entry_continue)
 
 ### `list_for_each_entry_from(pos, head, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从指定的位置开始,继续迭代给定的链表
+Continue iterating through the list from the specified position.
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_for_each_entry_continue() <_list_for_each_entry_continue>`的相同
+Same as [list_for_each_entry_continue() ](/kernel/core_api/kernel_api.html#_list_for_each_entry_continue)
 
-(_list_for_each_entry_safe_continue)=
-### `list_for_each_entry_safe_continue(pos, n, head, member)`
+### `list_for_each_entry_safe_continue(pos, n, head, member)` {#_list_for_each_entry_safe_continue}
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从指定的位置的【下一个元素开始】,继续迭代给定的链表.（支持删除当前链表结点）
+Continue iterating through the list from the next element of the specified position (supports deletion of the current list node).
 
-#### 参数
+#### Parameters
 
 **pos**
 
-&emsp;&emsp;指向特定类型的结构体的指针。该指针用作迭代的指针。
+Pointer to a structure of the specific type. This pointer is used as the iteration pointer.
 
 **n**
 
-&emsp;&emsp;用于存储临时值的，和pos相同类型的指针
+Pointer to store the temporary value (same type as pos).
 
 **head**
 
-&emsp;&emsp;指向要开始迭代的struct List结构体的指针
+Pointer to the struct List structure to start iteration from.
 
 **member**
 
-&emsp;&emsp;struct List在pos的结构体中的成员变量名
+The name of the List member in the structure pointed to by pos.
 
 ### `list_for_each_entry_safe_continue_reverse(pos, n, head, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从指定的位置的【上一个元素开始】,【逆序】迭代给定的链表。（支持删除当前链表结点）
+Iterate through the list in reverse order, starting from the previous element of the specified position (supports deletion of the current list node).
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_for_each_entry_safe_continue() <_list_for_each_entry_safe_continue>`的相同
+Same as [list_for_each_entry_safe_continue() ](/kernel/core_api/kernel_api.html#_list_for_each_entry_safe_continue)
 
 ### `list_for_each_entry_safe_from(pos, n, head, member)`
 
-#### 描述
+#### Description
 
-&emsp;&emsp;从指定的位置开始,继续迭代给定的链表.（支持删除当前链表结点）
+Continue iterating through the list from the specified position (supports deletion of the current list node).
 
-#### 参数
+#### Parameters
 
-&emsp;&emsp;与{ref}`list_for_each_entry_safe_continue() <_list_for_each_entry_safe_continue>`的相同
+Same as [list_for_each_entry_safe_continue() ](/kernel/core_api/kernel_api.html#_list_for_each_entry_safe_continue)
 
 ---
 
-## 基础C函数库
+## Basic C Function Library
 
-&emsp;&emsp;内核编程与应用层编程不同，你将无法使用LibC中的函数来进行编程。为此，内核实现了一些常用的C语言函数，并尽量使其与标准C库中的函数行为相近。值得注意的是，这些函数的行为可能与标准C库函数不同，请在使用时仔细阅读以下文档，这将会为你带来帮助。
+Kernel programming differs from application layer programming; you will not be able to use functions from LibC. To address this, the kernel implements some commonly used C language functions, trying to make their behavior as close as possible to standard C library functions. It is important to note that the behavior of these functions may differ from standard C library functions, so it is recommended to carefully read the following documentation, which will be helpful to you.
 
-### 字符串操作
+### String Operations
 
 #### `int strlen(const char *s)`
 
-##### 描述
+##### Description
 
-&emsp;&emsp;测量并返回字符串长度。
+Measure and return the length of the string.
 
-##### 参数
+##### Parameters
 
 **src**
 
-&emsp;&emsp;源字符串
+Source string.
 
 #### `long strnlen(const char *src, unsigned long maxlen)`
 
-##### 描述
+##### Description
 
-&emsp;&emsp;测量并返回字符串长度。当字符串长度大于maxlen时，返回maxlen
+Measure and return the length of the string. If the string length is greater than maxlen, return maxlen.
 
-##### 参数
+##### Parameters
 
 **src**
 
-&emsp;&emsp;源字符串
+Source string.
 
 **maxlen**
 
-&emsp;&emsp;最大长度
+Maximum length.
 
 #### `long strnlen_user(const char *src, unsigned long maxlen)`
 
-##### 描述
+##### Description
 
-&emsp;&emsp;测量并返回字符串长度。当字符串长度大于maxlen时，返回maxlen。
+Measure and return the length of the string. If the string length is greater than maxlen, return maxlen.
 
-&emsp;&emsp;该函数会进行地址空间校验，要求src字符串必须来自用户空间。当源字符串来自内核空间时，将返回0.
+This function performs address space validation, requiring the src string to be from user space. If the source string is from kernel space, it will return 0.
 
-##### 参数
+##### Parameters
 
 **src**
 
-&emsp;&emsp;源字符串，地址位于用户空间
+Source string, located in user space.
 
 **maxlen**
 
-&emsp;&emsp;最大长度
+Maximum length.
 
 #### `char *strncpy(char *dst, const char *src, long count)`
 
-##### 描述
+##### Description
 
-&emsp;&emsp;拷贝长度为count个字节的字符串，返回dst字符串
+Copy a string of count bytes and return the dst string.
 
-##### 参数
+##### Parameters
 
 **src**
 
-&emsp;&emsp;源字符串
+Source string.
 
 **dst**
 
-&emsp;&emsp;目标字符串
+Destination string.
 
 **count**
 
-&emsp;&emsp;要拷贝的源字符串的长度
+Length of the source string to copy.
 
 #### `char *strcpy(char *dst, const char *src)`
 
-##### 描述
+##### Description
 
-&emsp;&emsp;拷贝源字符串，返回dst字符串
+Copy the source string and return the dst string.
 
-##### 参数
+##### Parameters
 
 **src**
 
-&emsp;&emsp;源字符串
+Source string.
 
 **dst**
 
-&emsp;&emsp;目标字符串
+Destination string.
 
 #### `long strncpy_from_user(char *dst, const char *src, unsigned long size)`
 
-##### 描述
+##### Description
 
-&emsp;&emsp;从用户空间拷贝长度为count个字节的字符串到内核空间，返回拷贝的字符串的大小
+Copy a string of count bytes from user space to kernel space, and return the size of the copied string.
 
-&emsp;&emsp;该函数会对字符串的地址空间进行校验，防止出现地址空间越界的问题。
+This function performs address space validation to prevent address space overflow issues.
 
-##### 参数
+##### Parameters
 
 **src**
 
-&emsp;&emsp;源字符串
+Source string.
 
 **dst**
 
-&emsp;&emsp;目标字符串
+Destination string.
 
 **size**
 
-&emsp;&emsp;要拷贝的源字符串的长度
+Length of the source string to copy.
 
 #### `int strcmp(char *FirstPart, char *SecondPart)`
 
-##### 描述
+##### Description
 
-  比较两个字符串的大小。
+  Compare the sizes of two strings.
 
-***返回值***
+***Return Value***
 
-| 情况                      | 返回值 |
+| Situation                      | Return Value |
 | ----------------------- | --- |
 | FirstPart == SecondPart | 0   |
 | FirstPart > SecondPart  | 1   |
 | FirstPart < SecondPart  | -1  |
 
-##### 参数
+##### Parameters
 
 **FirstPart**
 
-&emsp;&emsp;第一个字符串
+First string.
 
 **SecondPart**
 
-&emsp;&emsp;第二个字符串
+Second string.
 
-### 内存操作
+### Memory Operations
 
 #### `void *memcpy(void *dst, const void *src, uint64_t size)`
 
-##### 描述
+##### Description
 
-&emsp;&emsp;将内存从src处拷贝到dst处。
+Copy memory from src to dst.
 
-##### 参数
+##### Parameters
 
 **dst**
 
-&emsp;&emsp;指向目标地址的指针
+Pointer to the destination address.
 
 **src**
 
-&emsp;&emsp;指向源地址的指针
+Pointer to the source address.
 
 **size**
 
-&emsp;&emsp;待拷贝的数据大小
+Size of data to be copied.
 
 #### `void *memmove(void *dst, const void *src, uint64_t size)`
 
-##### 描述
+##### Description
 
-&emsp;&emsp;与`memcpy()`类似，但是在源数据区域与目标数据区域之间存在重合时，该函数能防止数据被错误的覆盖。
+Similar to `memcpy()`, but this function prevents data from being incorrectly overwritten when the source and destination memory regions overlap.
 
-##### 参数
+##### Parameters
 
 **dst**
 
-&emsp;&emsp;指向目标地址的指针
+Pointer to the destination address.
 
 **src**
 
-&emsp;&emsp;指向源地址的指针
+Pointer to the source address.
 
 **size**
 
-&emsp;&emsp;待拷贝的数据大小
+Size of data to be copied.

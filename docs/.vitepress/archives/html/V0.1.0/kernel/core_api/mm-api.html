@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>内存管理API &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="锁" href="../locking/index.html" />
+    <link rel="prev" title="内存分配指南" href="allocate-memory.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">核心API文档</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="kernel_api.html">DragonOS内核核心API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="atomic.html">原子变量</a></li>
+<li class="toctree-l2"><a class="reference internal" href="data_structures.html">内核数据结构</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html#id1">内存管理</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="allocate-memory.html">内存分配指南</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">内存管理API</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#slab">SLAB内存池</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">物理页管理</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id15">页表管理</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id25">内存信息获取</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">核心API文档</a></li>
+      <li class="breadcrumb-item active">内存管理API</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/325c103/docs/kernel/core_api/mm-api.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="api">
+<span id="core-mm-api"></span><h1>内存管理API<a class="headerlink" href="#api" title="Permalink to this heading"></a></h1>
+<section id="slab">
+<h2>SLAB内存池<a class="headerlink" href="#slab" title="Permalink to this heading"></a></h2>
+<p>SLAB内存池提供小内存对象的分配功能。</p>
+<section id="void-kmalloc-unsigned-long-size-gfp-t-gfp">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*kmalloc(unsigned</span> <span class="pre">long</span> <span class="pre">size,</span> <span class="pre">gfp_t</span> <span class="pre">gfp)</span></code><a class="headerlink" href="#void-kmalloc-unsigned-long-size-gfp-t-gfp" title="Permalink to this heading"></a></h3>
+<p>  获取小块的内存。</p>
+<section id="id1">
+<h4>描述<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h4>
+<p>  kmalloc用于获取那些小于2M内存页大小的内存对象。可分配的内存对象大小为32bytes~1MBytes. 且分配的内存块大小、起始地址按照2的n次幂进行对齐。（比如，申请的是80bytes的内存空间，那么获得的内存对象大小为128bytes且内存地址按照128bytes对齐）</p>
+<section id="id2">
+<h5>参数<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h5>
+<p><strong>size</strong></p>
+<p>  内存对象的大小</p>
+<p><strong>gfp</strong></p>
+<p>  标志位</p>
+</section>
+</section>
+</section>
+<section id="void-kzalloc-unsigned-long-size-gfp-t-gfp">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*kzalloc(unsigned</span> <span class="pre">long</span> <span class="pre">size,</span> <span class="pre">gfp_t</span> <span class="pre">gfp)</span></code><a class="headerlink" href="#void-kzalloc-unsigned-long-size-gfp-t-gfp" title="Permalink to this heading"></a></h3>
+<section id="id3">
+<h4>描述<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h4>
+<p>  获取小块的内存，并将其清零。其余功能与kmalloc相同。</p>
+<section id="id4">
+<h5>参数<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h5>
+<p><strong>size</strong></p>
+<p>  内存对象的大小</p>
+<p><strong>gfp</strong></p>
+<p>  标志位</p>
+</section>
+</section>
+</section>
+<section id="unsigned-long-kfree-void-address">
+<h3><code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">kfree(void</span> <span class="pre">*address)</span></code><a class="headerlink" href="#unsigned-long-kfree-void-address" title="Permalink to this heading"></a></h3>
+<p>  释放从slab分配的内存。</p>
+<section id="id5">
+<h4>描述<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h4>
+<p>  该函数用于释放通过kmalloc申请的内存。如果<code class="docutils literal notranslate"><span class="pre">address</span></code>为NULL，则函数被调用后，无事发生。</p>
+<p>  请不要通过这个函数释放那些不是从<code class="docutils literal notranslate"><span class="pre">kmalloc()</span></code>或<code class="docutils literal notranslate"><span class="pre">kzalloc()</span></code>申请的内存，否则将会导致系统崩溃。</p>
+<section id="id6">
+<h5>参数<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h5>
+<p><strong>address</strong></p>
+<p>  指向内存对象的起始地址的指针</p>
+</section>
+</section>
+</section>
+</section>
+<section id="id7">
+<h2>物理页管理<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h2>
+<p>DragonOS支持对物理页的直接操作</p>
+<section id="struct-page-alloc-pages-unsigned-int-zone-select-int-num-ul-flags">
+<h3><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">Page</span> <span class="pre">*alloc_pages(unsigned</span> <span class="pre">int</span> <span class="pre">zone_select,</span> <span class="pre">int</span> <span class="pre">num,</span> <span class="pre">ul</span> <span class="pre">flags)</span></code><a class="headerlink" href="#struct-page-alloc-pages-unsigned-int-zone-select-int-num-ul-flags" title="Permalink to this heading"></a></h3>
+<section id="id8">
+<h4>描述<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h4>
+<p>  从物理页管理单元中申请一段连续的物理页</p>
+</section>
+<section id="id9">
+<h4>参数<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h4>
+<p><strong>zone_select</strong></p>
+<p>  要申请的物理页所位于的内存区域</p>
+<p>可选值：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">ZONE_DMA</span></code> DMA映射专用区域</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ZONE_NORMAL</span></code> 正常的物理内存区域，已在页表高地址处映射</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ZONE_UNMAPPED_IN_PGT</span></code> 尚未在页表中映射的区域</p></li>
+</ul>
+<p><strong>num</strong></p>
+<p>  要申请的连续物理页的数目，该值应当小于64</p>
+<p><strong>flags</strong></p>
+<p>  分配的页面要被设置成的属性</p>
+<p>可选值：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">PAGE_PGT_MAPPED</span></code> 页面在页表中已被映射</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PAGE_KERNEL_INIT</span></code> 内核初始化所占用的页</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PAGE_DEVICE</span></code> 设备MMIO映射的内存</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PAGE_KERNEL</span></code> 内核层页</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PAGE_SHARED</span></code> 共享页</p></li>
+</ul>
+</section>
+<section id="id10">
+<h4>返回值<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h4>
+<section id="id11">
+<h5>成功<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h5>
+<p>  成功申请则返回指向起始页面的Page结构体的指针</p>
+</section>
+<section id="id12">
+<h5>失败<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h5>
+<p>  当ZONE错误或内存不足时，返回<code class="docutils literal notranslate"><span class="pre">NULL</span></code></p>
+</section>
+</section>
+</section>
+<section id="void-free-pages-struct-page-page-int-number">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">free_pages(struct</span> <span class="pre">Page</span> <span class="pre">*page,</span> <span class="pre">int</span> <span class="pre">number)</span></code><a class="headerlink" href="#void-free-pages-struct-page-page-int-number" title="Permalink to this heading"></a></h3>
+<section id="id13">
+<h4>描述<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h4>
+<p>  从物理页管理单元中释放一段连续的物理页。</p>
+</section>
+<section id="id14">
+<h4>参数<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h4>
+<p><strong>page</strong></p>
+<p>  要释放的第一个物理页的Page结构体</p>
+<p><strong>number</strong></p>
+<p>  要释放的连续内存页的数量。该值应小于64</p>
+</section>
+</section>
+</section>
+<section id="id15">
+<h2>页表管理<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h2>
+<section id="int-mm-map-phys-addr-ul-virt-addr-start-ul-phys-addr-start-ul-length-ul-flags-bool-use4k">
+<h3><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">mm_map_phys_addr(ul</span> <span class="pre">virt_addr_start,</span> <span class="pre">ul</span> <span class="pre">phys_addr_start,</span> <span class="pre">ul</span> <span class="pre">length,</span> <span class="pre">ul</span> <span class="pre">flags,</span> <span class="pre">bool</span> <span class="pre">use4k)</span></code><a class="headerlink" href="#int-mm-map-phys-addr-ul-virt-addr-start-ul-phys-addr-start-ul-length-ul-flags-bool-use4k" title="Permalink to this heading"></a></h3>
+<section id="id16">
+<h4>描述<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h4>
+<p>  将一段物理地址映射到当前页表的指定虚拟地址处</p>
+</section>
+<section id="id17">
+<h4>参数<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h4>
+<p><strong>virt_addr_start</strong></p>
+<p>  虚拟地址的起始地址</p>
+<p><strong>phys_addr_start</strong></p>
+<p>  物理地址的起始地址</p>
+<p><strong>length</strong></p>
+<p>  要映射的地址空间的长度</p>
+<p><strong>flags</strong></p>
+<p>  页表项的属性</p>
+<p><strong>use4k</strong></p>
+<p>  使用4级页表，将地址区域映射为若干4K页</p>
+</section>
+</section>
+<section id="int-mm-map-proc-page-table-ul-proc-page-table-addr-bool-is-phys-ul-virt-addr-start-ul-phys-addr-start-ul-length-ul-flags-bool-user-bool-flush-bool-use4k">
+<h3><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">mm_map_proc_page_table(ul</span> <span class="pre">proc_page_table_addr,</span> <span class="pre">bool</span> <span class="pre">is_phys,</span> <span class="pre">ul</span> <span class="pre">virt_addr_start,</span> <span class="pre">ul</span> <span class="pre">phys_addr_start,</span> <span class="pre">ul</span> <span class="pre">length,</span> <span class="pre">ul</span> <span class="pre">flags,</span> <span class="pre">bool</span> <span class="pre">user,</span> <span class="pre">bool</span> <span class="pre">flush,</span> <span class="pre">bool</span> <span class="pre">use4k)</span></code><a class="headerlink" href="#int-mm-map-proc-page-table-ul-proc-page-table-addr-bool-is-phys-ul-virt-addr-start-ul-phys-addr-start-ul-length-ul-flags-bool-user-bool-flush-bool-use4k" title="Permalink to this heading"></a></h3>
+<section id="id18">
+<h4>描述<a class="headerlink" href="#id18" title="Permalink to this heading"></a></h4>
+<p>  将一段物理地址映射到指定页表的指定虚拟地址处</p>
+</section>
+<section id="id19">
+<h4>参数<a class="headerlink" href="#id19" title="Permalink to this heading"></a></h4>
+<p><strong>proc_page_table_addr</strong></p>
+<p>  指定的顶层页表的起始地址</p>
+<p><strong>is_phys</strong></p>
+<p>  该顶层页表地址是否为物理地址</p>
+<p><strong>virt_addr_start</strong></p>
+<p>  虚拟地址的起始地址</p>
+<p><strong>phys_addr_start</strong></p>
+<p>  物理地址的起始地址</p>
+<p><strong>length</strong></p>
+<p>  要映射的地址空间的长度</p>
+<p><strong>flags</strong></p>
+<p>  页表项的属性</p>
+<p><strong>user</strong></p>
+<p>  页面是否为用户态可访问</p>
+<p><strong>flush</strong></p>
+<p>  完成映射后，是否刷新TLB</p>
+<p><strong>use4k</strong></p>
+<p>  使用4级页表，将地址区域映射为若干4K页</p>
+</section>
+<section id="id20">
+<h4>返回值<a class="headerlink" href="#id20" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>映射成功：0</p></li>
+<li><p>映射失败：-EFAULT</p></li>
+</ul>
+</section>
+</section>
+<section id="void-mm-unmap-proc-table-ul-proc-page-table-addr-bool-is-phys-ul-virt-addr-start-ul-length">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">mm_unmap_proc_table(ul</span> <span class="pre">proc_page_table_addr,</span> <span class="pre">bool</span> <span class="pre">is_phys,</span> <span class="pre">ul</span> <span class="pre">virt_addr_start,</span> <span class="pre">ul</span> <span class="pre">length)</span></code><a class="headerlink" href="#void-mm-unmap-proc-table-ul-proc-page-table-addr-bool-is-phys-ul-virt-addr-start-ul-length" title="Permalink to this heading"></a></h3>
+<section id="id21">
+<h4>描述<a class="headerlink" href="#id21" title="Permalink to this heading"></a></h4>
+<p>  取消给定页表中的指定地址空间的页表项映射。</p>
+</section>
+<section id="id22">
+<h4>参数<a class="headerlink" href="#id22" title="Permalink to this heading"></a></h4>
+<p><strong>proc_page_table_addr</strong></p>
+<p>  指定的顶层页表的基地址</p>
+<p><strong>is_phys</strong></p>
+<p>  该顶层页表地址是否为物理地址</p>
+<p><strong>virt_addr_start</strong></p>
+<p>  虚拟地址的起始地址</p>
+<p><strong>length</strong></p>
+<p>  要取消映射的地址空间的长度</p>
+</section>
+</section>
+<section id="mm-unmap-addr-virt-addr-length">
+<h3><code class="docutils literal notranslate"><span class="pre">mm_unmap_addr(virt_addr,</span> <span class="pre">length)</span></code><a class="headerlink" href="#mm-unmap-addr-virt-addr-length" title="Permalink to this heading"></a></h3>
+<section id="id23">
+<h4>描述<a class="headerlink" href="#id23" title="Permalink to this heading"></a></h4>
+<p>  该宏定义用于取消当前进程的页表中的指定地址空间的页表项映射。</p>
+</section>
+<section id="id24">
+<h4>参数<a class="headerlink" href="#id24" title="Permalink to this heading"></a></h4>
+<p><strong>virt_addr</strong></p>
+<p>  虚拟地址的起始地址</p>
+<p><strong>length</strong></p>
+<p>  要取消映射的地址空间的长度</p>
+</section>
+</section>
+</section>
+<section id="id25">
+<h2>内存信息获取<a class="headerlink" href="#id25" title="Permalink to this heading"></a></h2>
+<section id="struct-mm-stat-t-mm-stat">
+<h3><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">mm_stat_t</span> <span class="pre">mm_stat()</span></code><a class="headerlink" href="#struct-mm-stat-t-mm-stat" title="Permalink to this heading"></a></h3>
+<section id="id26">
+<h4>描述<a class="headerlink" href="#id26" title="Permalink to this heading"></a></h4>
+<p>  获取计算机目前的内存空间使用情况</p>
+</section>
+<section id="id27">
+<h4>参数<a class="headerlink" href="#id27" title="Permalink to this heading"></a></h4>
+<p>无</p>
+</section>
+<section id="id28">
+<h4>返回值<a class="headerlink" href="#id28" title="Permalink to this heading"></a></h4>
+<p>  返回值是一个<code class="docutils literal notranslate"><span class="pre">mm_mstat_t</span></code>结构体，该结构体定义于<code class="docutils literal notranslate"><span class="pre">mm/mm.h</span></code>中。其中包含了以下信息（单位均为字节）：</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>参数名</p></th>
+<th class="head"><p>解释</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>total</p></td>
+<td><p>计算机的总内存数量大小</p></td>
+</tr>
+<tr class="row-odd"><td><p>used</p></td>
+<td><p>已使用的内存大小</p></td>
+</tr>
+<tr class="row-even"><td><p>free</p></td>
+<td><p>空闲物理页所占的内存大小</p></td>
+</tr>
+<tr class="row-odd"><td><p>shared</p></td>
+<td><p>共享的内存大小</p></td>
+</tr>
+<tr class="row-even"><td><p>cache_used</p></td>
+<td><p>位于slab缓冲区中的已使用的内存大小</p></td>
+</tr>
+<tr class="row-odd"><td><p>cache_free</p></td>
+<td><p>位于slab缓冲区中的空闲的内存大小</p></td>
+</tr>
+<tr class="row-even"><td><p>available</p></td>
+<td><p>系统总空闲内存大小（包括kmalloc缓冲区）</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="allocate-memory.html" class="btn btn-neutral float-left" title="内存分配指南" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../locking/index.html" class="btn btn-neutral float-right" title="锁" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>325c103</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="mm-api.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/kernel/core_api/mm-api.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/kernel/core_api/mm-api.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/kernel/core_api/mm-api.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/core_api/mm-api.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/core_api/mm-api.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/core_api/mm-api.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/core_api/mm-api.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/index.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/index.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

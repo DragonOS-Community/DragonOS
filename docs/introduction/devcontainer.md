@@ -1,31 +1,31 @@
-# 使用 devcontainer 开发 DragonOS
+# Developing DragonOS with devcontainer
 
-本教程以 VSCode 为例，需要装有 Docker 的 Linux。
+This tutorial uses VSCode as an example and requires a Linux system with Docker installed.
 
-## 克隆仓库
+## Clone the Repository
 
 ```shell
 git clone https://github.com/DragonOS-Community/DragonOS.git
 code DragonOS
 ```
 
-## 进入 devcontainer 环境
+## Enter the devcontainer Environment
 
-在 VSCode 右下角会有弹窗，选择 `Reopen in Container`。如果不可见，请根据下列步骤来进入：
-- 下载 devcontainer 插件
-- `ctrl+shift+p` 打开 VSCode 命令面板
-- 输入 `devcontainer` 字样，会有 `Reopen in Container` 的选项，点击即会构建 devcontainer 环境
+A popup will appear in the bottom right corner of VSCode. Select `Reopen in Container`. If it's not visible, follow these steps to enter:
+- Download the devcontainer plugin
+- `ctrl+shift+p` Open the VSCode command palette
+- Type `devcontainer`, and you'll see an option for `Reopen in Container`. Click it to build the devcontainer environment
 
-构建可能需要一些时间，尤其 msr 的插件在网络环境不好的情况下容易安装失败。
+The build may take some time, especially as the msr plugin is prone to installation failures under poor network conditions.
 
-## 构建 DragonOS！
+## Build DragonOS!
 
-直接输入
+Simply enter
 
 ```shell
 make run-nographic
 ```
 
-等待构建，最后会自动进入 DragonOS qemu 环境。
+Wait for the build to complete, and you will automatically enter the DragonOS QEMU environment.
 
-需要退出qemu环境，请输入 `ctrl+a` 然后按 `x`。
+To exit the QEMU environment, type `ctrl+a` and then press `x`.

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SysFS &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="KernFS" href="kernfs.html" />
+    <link rel="prev" title="Design" href="vfs/mountable_fs.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Inter-Process Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">File System</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="overview.html">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vfs/index.html">VFS Virtual File System</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">SysFS</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#sysfs-and-device-driver-model">1. SysFS and Device Driver Model</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#device-driver-model-in-dragonos">2. Device Driver Model in DragonOS</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#how-to-develop-drivers">3. How to Develop Drivers</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="kernfs.html">KernFS</a></li>
+<li class="toctree-l3"><a class="reference internal" href="unionfs/index.html">Union Filesystem</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">File System</a></li>
+      <li class="breadcrumb-item active">SysFS</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/c0d0501/docs/locales/en/kernel/filesystem/sysfs.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/filesystem/sysfs.md</p></li>
+<li><p>Translation time: 2025-05-19 01:41:50</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="sysfs">
+<h1>SysFS<a class="headerlink" href="#sysfs" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>Author: Huang Ting</p>
+<p>Email: <a class="reference external" href="mailto:huangting&#37;&#52;&#48;DragonOS&#46;org">huangting<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p>
+</div>
+<section id="sysfs-and-device-driver-model">
+<h2>1. SysFS and Device Driver Model<a class="headerlink" href="#sysfs-and-device-driver-model" title="Permalink to this heading"></a></h2>
+<section id="the-relationship-between-devices-drivers-buses-etc-is-complex">
+<h3>1.1. The relationship between devices, drivers, buses, etc., is complex<a class="headerlink" href="#the-relationship-between-devices-drivers-buses-etc-is-complex" title="Permalink to this heading"></a></h3>
+<p>  If you want the kernel to run smoothly, you must code these functionalities for each module. This will make the kernel very bloated and redundant. The idea of the device model is to abstract these codes into a shared framework for all modules. This not only makes the code concise, but also allows device driver developers to avoid the headache of this essential but burdensome task, and focus their limited energy on implementing the differences of the devices.</p>
+<p>  The device model provides a template, an optimal approach and process that has been proven. This reduces unnecessary errors during the development process and clears the way for future maintenance.</p>
+</section>
+<section id="sysfs-is-a-memory-based-file-system-its-role-is-to-provide-kernel-information-in-the-form-of-files-for-user-programs-to-use">
+<h3>1.2. sysfs is a memory-based file system, its role is to provide kernel information in the form of files for user programs to use.<a class="headerlink" href="#sysfs-is-a-memory-based-file-system-its-role-is-to-provide-kernel-information-in-the-form-of-files-for-user-programs-to-use" title="Permalink to this heading"></a></h3>
+<p>  sysfs can be seen as a file system similar to proc, devfs, and devpty. This file system is virtual and can make it easier to manage system devices. It can generate a hierarchical view of all system hardware, similar to the proc file system that provides process and status information. sysfs organizes the devices and buses connected to the system into a hierarchical file structure, which can be accessed from user space, exporting kernel data structures and their attributes to user space.</p>
+</section>
+</section>
+<section id="device-driver-model-in-dragonos">
+<h2>2. Device Driver Model in DragonOS<a class="headerlink" href="#device-driver-model-in-dragonos" title="Permalink to this heading"></a></h2>
+<section id="the-basic-elements-are-composed-of-devices-and-drivers">
+<h3>2.1. The basic elements are composed of devices and drivers<a class="headerlink" href="#the-basic-elements-are-composed-of-devices-and-drivers" title="Permalink to this heading"></a></h3>
+<section id="device">
+<h4>2.1.1. Device<a class="headerlink" href="#device" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// @brief: 所有设备都应该实现该trait</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">Device</span>: <span class="nc">Any</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Sync</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Debug</span><span class="w"> </span><span class="p">{}</span>
+</pre></div>
+</div>
+<p>  DragonOS uses a global device manager to manage all devices in the system.</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// @brief Device管理器</span>
+<span class="cp">#[derive(Debug, Clone)]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">DeviceManager</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">devices</span>: <span class="nc">BTreeMap</span><span class="o">&lt;</span><span class="n">IdTable</span><span class="p">,</span><span class="w"> </span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">Device</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// 所有设备</span>
+<span class="w">    </span><span class="n">sys_info</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">IndexNode</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w">  </span><span class="c1">// sys information</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="driver">
+<h4>2.1.2. Driver<a class="headerlink" href="#driver" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// @brief: 所有驱动驱动都应该实现该trait</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">Driver</span>: <span class="nc">Any</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Sync</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Debug</span><span class="w"> </span><span class="p">{}</span>
+</pre></div>
+</div>
+<p>  Similarly, drivers also use a global driver manager for management.</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// @brief: 驱动管理器</span>
+<span class="cp">#[derive(Debug, Clone)]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">DriverManager</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">drivers</span>: <span class="nc">BTreeMap</span><span class="o">&lt;</span><span class="n">IdTable</span><span class="p">,</span><span class="w"> </span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">Driver</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// 所有驱动</span>
+<span class="w">    </span><span class="n">sys_info</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">IndexNode</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// sys information</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="bus">
+<h3>2.2. Bus<a class="headerlink" href="#bus" title="Permalink to this heading"></a></h3>
+<p>  Bus is a type of device, and it also needs a driver to initialize. Due to the special nature of buses, a global bus manager is used for management.</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// @brief: 总线驱动trait，所有总线驱动都应实现该trait</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">BusDriver</span>: <span class="nc">Driver</span><span class="w"> </span><span class="p">{}</span>
+
+<span class="sd">/// @brief: 总线设备trait，所有总线都应实现该trait</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">Bus</span>: <span class="nc">Device</span><span class="w"> </span><span class="p">{}</span>
+
+<span class="sd">/// @brief: 总线管理结构体</span>
+<span class="cp">#[derive(Debug, Clone)]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">BusManager</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">buses</span>: <span class="nc">BTreeMap</span><span class="o">&lt;</span><span class="n">IdTable</span><span class="p">,</span><span class="w"> </span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">Bus</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w">          </span><span class="c1">// 总线设备表</span>
+<span class="w">    </span><span class="n">bus_drvs</span>: <span class="nc">BTreeMap</span><span class="o">&lt;</span><span class="n">IdTable</span><span class="p">,</span><span class="w"> </span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">BusDriver</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// 总线驱动表</span>
+<span class="w">    </span><span class="n">sys_info</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">IndexNode</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w">            </span><span class="c1">// 总线inode</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  As can be seen, each manager contains a sys_info. The device model establishes a connection with sysfs through this member, and sys_info points to the unique inode in sysfs. For a device, it corresponds to the devices folder under sysfs, and the same applies to other components.</p>
+</section>
+</section>
+<section id="how-to-develop-drivers">
+<h2>3. How to Develop Drivers<a class="headerlink" href="#how-to-develop-drivers" title="Permalink to this heading"></a></h2>
+<p>  Taking the platform bus as an example, the platform bus is a virtual bus that can match devices and drivers mounted on it and drive the devices. This bus is a type of device and also a type of bus. When programming, you need to create an instance of this device and implement the Device trait and Bus trait for the device instance to indicate that this structure is a bus device. At the same time, the matching rules on the bus should be implemented. Different buses have different matching rules. This bus uses a matching table for matching, and both devices and drivers should have a matching table, indicating the devices supported by the driver and the drivers supported by the device.</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">CompatibleTable</span><span class="p">(</span><span class="n">BTreeSet</span><span class="o">&lt;&amp;&#39;</span><span class="nb">static</span><span class="w"> </span><span class="kt">str</span><span class="o">&gt;</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>  For a bus device, you need to call bus_register to register the bus into the system and visualize it in sysfs.</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// @brief: 总线注册，将总线加入全局总线管理器中，并根据id table在sys/bus和sys/devices下生成文件夹</span>
+<span class="sd">/// @parameter bus: Bus设备实体</span>
+<span class="sd">/// @return: 成功:()   失败:DeviceError</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">bus_register</span><span class="o">&lt;</span><span class="n">T</span>: <span class="nc">Bus</span><span class="o">&gt;</span><span class="p">(</span><span class="n">bus</span>: <span class="nc">Arc</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">DeviceError</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">BUS_MANAGER</span><span class="p">.</span><span class="n">add_bus</span><span class="p">(</span><span class="n">bus</span><span class="p">.</span><span class="n">get_id_table</span><span class="p">(),</span><span class="w"> </span><span class="n">bus</span><span class="p">.</span><span class="n">clone</span><span class="p">());</span>
+<span class="w">    </span><span class="k">match</span><span class="w"> </span><span class="n">sys_bus_register</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bus</span><span class="p">.</span><span class="n">get_id_table</span><span class="p">().</span><span class="n">to_name</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="n">inode</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sys_bus_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">inode</span><span class="p">);</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="n">device_register</span><span class="p">(</span><span class="n">bus</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="nb">Err</span><span class="p">(</span><span class="n">_</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">DeviceError</span>::<span class="n">RegisterError</span><span class="p">),</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  From the source code of bus_register, we can see that this function not only generates a bus folder under sysfs/bus, but also internally calls device_register. This function adds the bus to the device manager and generates a device folder under sys/devices.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="vfs/mountable_fs.html" class="btn btn-neutral float-left" title="Design" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="kernfs.html" class="btn btn-neutral float-right" title="KernFS" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>c0d0501</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.2.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="sysfs.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/locales/en/kernel/filesystem/sysfs.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/locales/en/kernel/filesystem/sysfs.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/filesystem/sysfs.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

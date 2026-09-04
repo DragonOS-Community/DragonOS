@@ -1,58 +1,58 @@
-# DragonOS NAPI 与 NetNamespace Poll 机制设计说明
+# Design Documentation of NAPI and NetNamespace Polling Mechanism in DragonOS
 
-本文档对 DragonOS 当前网络子系统中的 NAPI（New API）机制与 NetNamespace 轮询调度机制的设计与实现进行说明。
+This document explains the design and implementation of the NAPI (New API) mechanism and NetNamespace polling scheduling mechanism in the current network subsystem of DragonOS.
 
-## 1. 机制概览
+## 1. Mechanism Overview
 
-DragonOS 的网络包处理采用 **"事件驱动 (Event-Driven) + 精确定时 (Precise Timing)"** 的混合驱动模型。系统通过独立的内核线程来分别处理"硬件中断触发的收包任务"和"协议栈定时任务"，实现了对网络流量的高效响应与 CPU 资源的合理调度。
+DragonOS adopts a **"Event-Driven + Precise Timing"** hybrid driving model for network packet processing. The system uses separate kernel threads to handle "packet reception tasks triggered by hardware interrupts" and "protocol stack timing tasks," achieving efficient response to network traffic and rational scheduling of CPU resources.
 
-核心设计包含两个主要部分：
-1.  **NAPI 子系统**：负责高吞吐量的网络包收发处理，采用"有界轮询 (Bounded Polling)" 机制。
-2.  **NetNamespace 调度器**：负责管理协议栈的时间事件（如 TCP 重传），充当精确定时器。
+The core design consists of two main parts:
+1. **NAPI Subsystem**: Responsible for high-throughput network packet reception and transmission processing, using a "Bounded Polling" mechanism.
+2. **NetNamespace Scheduler**: Responsible for managing the protocol stack's time events (such as TCP retransmission), acting as a precise timer.
 
-## 2. 核心组件设计
+## 2. Core Component Design
 
-### 2.1 NAPI 子系统 (`kernel/src/driver/net/napi.rs`)
+### 2.1 NAPI Subsystem (`kernel/src/driver/net/napi.rs`)
 
-NAPI 是 DragonOS 网络驱动层的核心收包机制。
+NAPI is the core packet reception mechanism in the DragonOS network driver layer.
 
 *   **NapiStruct**:
-    每个支持 NAPI 的网卡接口（`Iface`）都绑定一个 `NapiStruct` 结构体。它维护了 NAPI 实例的状态（如 `SCHED` 调度位）和权重（`weight`）。
-    *   **Weight (权重)**: 定义了单次调度周期内该接口允许处理的最大数据包数量（Budget），防止单网卡独占 CPU。
+    Each network interface card (NIC) that supports NAPI (`Iface`) is bound to an `NapiStruct` structure. It maintains the state of the NAPI instance (such as the `SCHED` scheduling bit) and weight (`weight`).
+    *   **Weight (Weight)**: Defines the maximum number of data packets allowed to be processed within a single scheduling cycle (Budget) for this interface, preventing a single NIC from monopolizing the CPU.
 
-*   **全局 NAPI 管理器 (Global NapiManager)**:
-    *   目前实现为单例（`GLOBAL_NAPI_MANAGER`）。
-    *   维护一个全局的 `napi_list` 待处理队列。
-    *   提供 `napi_schedule()` 接口：供网卡中断处理函数调用，将 NAPI 实例加入队列并唤醒处理线程。
+*   **Global NAPI Manager (Global NapiManager)**:
+    *   Currently implemented as a singleton (`GLOBAL_NAPI_MANAGER`).
+    *   Maintains a global `napi_list` pending queue.
+    *   Provides the `napi_schedule()` interface: called by the NIC interrupt handling function to add the NAPI instance to the queue and wake up the processing thread.
 
-*   **NAPI 处理线程 (`napi_handler`)**:
-    *   这是一个专用的内核线程，并在系统启动时初始化。
-    *   **工作逻辑**：不断从 `napi_list` 取出被调度的 NAPI 实例，调用其 `poll()` 方法。
-    *   **循环调度**：如果 `poll()` 返回 `true`（表示 Budget 用尽但仍有数据），线程会将该实例重新放回队列尾部，等待下一轮调度。
+*   **NAPI Processing Thread (`napi_handler`)**:
+    *   This is a dedicated kernel thread, initialized during system startup.
+    *   **Working Logic**: Continuously retrieves scheduled NAPI instances from `napi_list`, and calls their `poll()` method.
+    *   **Cyclic Scheduling**: If `poll()` returns `true` (indicating the Budget is exhausted but there are still packets), the thread will put the instance back at the end of the queue, waiting for the next round of scheduling.
 
-### 2.2 NetNamespace 调度器 (`kernel/src/process/namespace/net_namespace.rs`)
+### 2.2 NetNamespace Scheduler (`kernel/src/process/namespace/net_namespace.rs`)
 
-每个网络命名空间（NetNamespace）拥有一个独立的轮询线程（`netns_poll`），在当前设计中，它主要承担 **"定时器"** 和 **"兜底调度器"** 的角色。
+Each network namespace (NetNamespace) has an independent polling thread (`netns_poll`), which in the current design mainly serves as a **"Timer"** and **"Fallback Scheduler"**.
 
-*   **精确定时**:
-    该线程维护了命名空间内所有网卡的 `poll_at_us`（下一次需要处理的时间点）。它会计算出最近的截止时间（Deadline）并进行精确休眠（`wait_event_timeout`）。
+*   **Precise Timing**:
+    This thread maintains the `poll_at_us` (next time point that needs to be processed) of all NICs within the namespace. It calculates the nearest deadline (Deadline) and performs precise sleep (`wait_event_timeout`).
 
-*   **超时触发**:
-    当休眠超时（即协议栈定时事件到达，如 TCP RTO）时，该线程**不会**直接处理数据包，而是调用 `napi_schedule()`，将任务分发给 NAPI 线程执行。这保证了繁重的协议栈处理逻辑统一由 NAPI 线程承担。
+*   **Timeout Trigger**:
+    When the sleep times out (i.e., the protocol stack timing event arrives, such as TCP RTO), this thread **does not** directly process the packets but calls `napi_schedule()`, distributing the tasks to the NAPI thread for execution. This ensures that the heavy protocol stack processing logic is uniformly handled by the NAPI thread.
 
-### 2.3 有界轮询 (Bounded Polling)
+### 2.3 Bounded Polling (Bounded Polling)
 
-在 `kernel/src/driver/net/mod.rs` 中实现了适配 NAPI 的轮询接口 `poll_napi(budget)`。
+The polling interface `poll_napi(budget)` adapted for NAPI is implemented in `kernel/src/driver/net/mod.rs`.
 
-*   **逻辑**：
-    1.  调用 `smoltcp` 的 `poll_ingress_single` 处理接收队列，循环次数受 `budget` 限制。
-    2.  执行一次 `poll_egress` 推进发送队列。
-    3.  更新 `poll_at_us` 时间戳，供 NetNamespace 调度器参考。
-*   **特性**：保证了每次调度的执行时间是可控的，避免了长时关中断或线程饿死。
+*   **Logic**:
+    1.  Calls the `poll_ingress_single` of `smoltcp` to process the receive queue, with the number of loops limited by `budget`.
+    2.  Executes a `poll_egress` to advance the send queue.
+    3.  Updates the `poll_at_us` timestamp for reference by the NetNamespace scheduler.
+*   **Features**: Ensures that the execution time of each scheduling is controllable, avoiding long interrupt closures or thread starvation.
 
-## 3. 工作流程图解
+## 3. Workflow Illustration
 
-当前系统的网络处理数据流与控制流如下：
+The current system's network processing data flow and control flow are as follows:
 
 ```mermaid
 flowchart TD
@@ -91,20 +91,20 @@ flowchart TD
 
 ```
 
-## 4. 当前实现现状
+## 4. Current Implementation Status
 
-截至当前版本，DragonOS 的网络机制具有以下实现特征：
+As of the current version, the network mechanism of DragonOS has the following implementation characteristics:
 
-1.  **单队列 NAPI 管理**：
-    *   目前的 `NapiManager` 是全局唯一的，所有 CPU 共享同一个待处理队列。
-    *   尚未实现 Linux 风格的 Per-CPU NAPI 队列（代码中留有 TODO）。
+1.  **Single-Queue NAPI Management**:
+    *   The current `NapiManager` is globally unique, and all CPUs share the same pending queue.
+    *   The Linux-style Per-CPU NAPI queue has not been implemented yet (TODO is left in the code).
 
-2.  **线程模型**：
-    *   `napi_handler`：负责具体的包处理和协议栈推进，是计算密集型线程。
-    *   `netns_poll`：负责时间管理和事件分发，是 IO/Sleep 密集型线程。
+2.  **Thread Model**:
+    *   `napi_handler`: Responsible for specific packet processing and protocol stack advancement, is a compute-intensive thread.
+    *   `netns_poll`: Responsible for time management and event distribution, is an IO/Sleep-intensive thread.
 
-3.  **驱动支持**：
-    *   Virtio-Net、Veth、Loopback 等驱动已接入此机制，在中断或发包时主动调用 `napi_schedule`。
+3.  **Driver Support**:
+    *   Drivers such as Virtio-Net, Veth, and Loopback have been integrated into this mechanism, actively calling `napi_schedule` during interrupts or packet sending.
 
-4.  **Smoltcp 适配**：
-    *   通过 `IfaceCommon` 对 `smoltcp` 进行了封装，将无界的 `poll()` 转化为适配 NAPI 的有界 `poll_napi()`。
+4.  **Smoltcp Adaptation**:
+    *   Through `IfaceCommon`, `smoltcp` is encapsulated, converting the unbounded `poll()` into a bounded `poll_napi()` adapted for NAPI.

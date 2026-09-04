@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>APIs Related to Process Scheduler &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="APIs Related to the Completely Fair Scheduler" href="cfs.html" />
+    <link rel="prev" title="APIs Related to “Waiting” (Rust Language)" href="rust_waiting.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">DragonOS Scheduling</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="c_waiting.html">APIs Related to “Waiting” (C Language)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rust_waiting.html">APIs Related to “Waiting” (Rust Language)</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">APIs Related to Process Scheduler</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#introduction-to-scheduler">Introduction to Scheduler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#overall-architecture">Overall Architecture</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id1">重要结构</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id2">调度流程</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="cfs.html">APIs Related to the Completely Fair Scheduler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rt.html">APIs Related to Real-Time Process Scheduler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="kernel_timer.html">Kernel Timer</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Inter-Process Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">DragonOS Scheduling</a></li>
+      <li class="breadcrumb-item active">APIs Related to Process Scheduler</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/c0d0501/docs/locales/en/kernel/sched/core.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/sched/core.md</p></li>
+<li><p>Translation time: 2025-05-19 01:41:31</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="apis-related-to-process-scheduler">
+<h1>APIs Related to Process Scheduler<a class="headerlink" href="#apis-related-to-process-scheduler" title="Permalink to this heading"></a></h1>
+<p>   This section defines the APIs related to process scheduling in DragonOS, which are the interfaces for the system to perform process scheduling. It also abstracts the Scheduler trait to allow specific scheduler implementations.</p>
+<section id="introduction-to-scheduler">
+<h2>Introduction to Scheduler<a class="headerlink" href="#introduction-to-scheduler" title="Permalink to this heading"></a></h2>
+<p>   Generally, a system handles multiple requests at the same time, but its resources are limited and prioritized. Scheduling is the method used to coordinate each request’s usage of these resources.</p>
+</section>
+<section id="overall-architecture">
+<h2>Overall Architecture<a class="headerlink" href="#overall-architecture" title="Permalink to this heading"></a></h2>
+<p>   The entire scheduling subsystem is organized in a <strong>tree structure</strong>, with each CPU managing such a tree. Each CPU’s <code class="docutils literal notranslate"><span class="pre">CpuRunQueue</span></code>即可以理解为树的根节点。每个<code class="docutils literal notranslate"><span class="pre">CpuRunQueue</span></code>下会管理着不同调度策略的子树，根据不同的调度策略深入到对应子树中实施调度。大体结构如下：</p>
+<ul class="simple">
+<li><p>CpuRunQueue</p>
+<ul>
+<li><p>Cfs</p>
+<ul>
+<li><p>CfsRunQueue</p>
+<ul>
+<li><p>FairSchedEntity</p>
+<ul>
+<li><p>CfsRunQueue</p>
+<ul>
+<li><p>…（嵌套）</p></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p>Rt</p>
+<ul>
+<li><p>…</p></li>
+</ul>
+</li>
+<li><p>Idle</p>
+<ul>
+<li><p>…</p></li>
+</ul>
+</li>
+<li><p>RR</p>
+<ul>
+<li><p>…</p></li>
+</ul>
+</li>
+<li><p>…</p></li>
+</ul>
+</li>
+</ul>
+<p>  基于这个结构，调度子系统能够更轻松地解耦以及添加其他调度策略。
+  </p>
+</section>
+<section id="id1">
+<h2>重要结构<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Scheduler:</span></code>
+  <code class="docutils literal notranslate"><span class="pre">Scheduler</span></code>是各个调度算法提供给上层的接口，实现不同的调度算法，只需要向外提供这样一组接口即可。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">CpuRunQueue:</span></code>
+  <code class="docutils literal notranslate"><span class="pre">CpuRunQueue</span></code>为总的CPU运行队列，他会根据不同的调度策略来进行调度。他作为调度子系统的根节点来组织调度。</p>
+<ul>
+<li><p><strong>重要字段</strong></p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">lock</span></code>: 过程锁，因为在深入到具体调度策略后的调度过程中还会需要访问<code class="docutils literal notranslate"><span class="pre">CpuRunQueue</span></code>中的信息，在cfs中保存了<code class="docutils literal notranslate"><span class="pre">CpuRunQueue</span></code>对象，我们需要确保在整体过程上锁后，子对象中不需要二次加锁即可访问，所以过程锁比较适合这个场景，若使用对象锁，则在对应调度策略中想要访问<code class="docutils literal notranslate"><span class="pre">CpuRunQueue</span></code>中的信息时需要加锁，但是最外层已经将<code class="docutils literal notranslate"><span class="pre">CpuRunQueue</span></code>对象上锁，会导致内层永远拿不到锁。对于该字段，详见<a class="reference external" href="https://code.dragonos.org.cn/xref/DragonOS/kernel/src/sched/mod.rs?r=dd8e74ef0d7f91a141bd217736bef4fe7dc6df3d#360">CpuRunQueue的self_lock方法及其注释</a>。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cfs</span></code>: Cfs调度器的根节点，往下伸展为一棵子树，详见完全公平调度文档。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">current</span></code>: 当前在CPU上运行的进程。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">idle</span></code>: 当前CPU的Idle进程。</p></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="id2">
+<h2>调度流程<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>  一次有效的调度分两种情况，第一是主动调用<code class="docutils literal notranslate"><span class="pre">__schedule</span></code>或者<code class="docutils literal notranslate"><span class="pre">schedule</span></code>函数进行调度，第二是通过时钟中断，判断当前运行的任务时间是否到期。</p>
+<ul class="simple">
+<li><p><strong>主动调度</strong></p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">__schedule</span></code>和<code class="docutils literal notranslate"><span class="pre">schedule</span></code>函数：</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">__schedule</span></code>:真正执行调度。会按照当前调度策略来选择下一个任务执行。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">schedule</span></code>: <code class="docutils literal notranslate"><span class="pre">__schedule</span></code>的上层封装，它需要该任务在内核中的所有资源释放干净才能进行调度，即判断当前进程的<code class="docutils literal notranslate"><span class="pre">preempt_count</span></code>是否为0，若不为0则会<strong>panic</strong>。</p></li>
+<li><p>参数：这两个函数都需要提供一个参数：<code class="docutils literal notranslate"><span class="pre">SchedMode</span></code>。用于控制此次调度的行为,可选参数主要有以下两个：</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">SchedMode::SM_NONE</span></code>: 标志当前进程没有被抢占而是主动让出，他<strong>不会</strong>被再次加入队列，直到有其他进程主动唤醒它，这个标志位主要用于信号量、等待队列以及一些主动唤醒场景的实现。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">SchedMode::SM_PREEMPT</span></code>:标志当前是被<strong>抢占</strong>运行的，他<strong>会</strong>再次被加入调度队列等待下次调度，通俗来说：它是被别的进程抢占了运行时间，有机会运行时他会继续执行。</p></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><strong>时钟调度</strong>
+  时钟中断到来的时候，调度系统会进行更新，包括判断是否需要下一次调度。以下为主要的函数调用栈：</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">LocalApicTimer::handle_irq</span></code>: 中断处理函数</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">ProcessManager::update_process_times</span></code>: 更新当前进程的时钟信息（统计运行时等）</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">scheduler_tick</span></code>: 调度子系统tick入口</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">CompletelyFairScheduler::tick</span></code>: 以cfs为例，此为cfs调度算法的tick入口</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">CfsRunQueue::entity_tick</span></code>: 对所有调度实体进行tick</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">CfsRunQueue::update_current</span></code>: 更新当前运行任务的运行时间及判断是否到期</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">CfsRunQueue::account_cfs_rq_runtime</span></code>: 计算当前队列的运行时间</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">CpuRunQueue::resched_current</span></code>: 若上一步计算的时间超时则到这一步，这里会设置进程标志为<code class="docutils literal notranslate"><span class="pre">NEED_SCHEDULE</span></code>.</p></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p>退出中断：退出中断时检查当前进程是否存在标志位<code class="docutils literal notranslate"><span class="pre">NEED_SCHEDULE</span></code>，若存在则调用<code class="docutils literal notranslate"><span class="pre">__schedule</span></code> performs scheduling.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="rust_waiting.html" class="btn btn-neutral float-left" title="APIs Related to “Waiting” (Rust Language)" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="cfs.html" class="btn btn-neutral float-right" title="APIs Related to the Completely Fair Scheduler" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>c0d0501</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.2.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="core.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/locales/en/kernel/sched/core.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/locales/en/kernel/sched/core.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/sched/core.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

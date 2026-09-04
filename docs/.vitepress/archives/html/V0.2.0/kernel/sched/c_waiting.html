@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>与“等待”相关的api（C语言） &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="与“等待”相关的api（rust语言）" href="rust_waiting.html" />
+    <link rel="prev" title="DragonOS调度" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">DragonOS调度</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">与“等待”相关的api（C语言）</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#wait-queue">一. wait_queue等待队列</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id1">简单用法</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id2">初始化等待队列</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">将结点插入等待队列</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">从等待队列唤醒一个进程</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#wait-queue-head">二. wait_queue_head等待队列头</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id5">提供的宏</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">创建等待队列头</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">将结点插入等待队列</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">从等待队列唤醒一个进程</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#completion">三. completion完成量</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id9">简单用法</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id10">更多用法</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id11">初始化完成量</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#wait">关于完成量的wait系列函数</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#complete">关于完成量的complete系列函数</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id12">其他用于查询信息的函数</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rust_waiting.html">与“等待”相关的api（rust语言）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="core.html">进程调度器相关的api</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cfs.html">完全公平调度器相关的api</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt.html">实时进程调度器相关的api</a></li>
+<li class="toctree-l2"><a class="reference internal" href="kernel_timer.html">内核定时器</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">DragonOS调度</a></li>
+      <li class="breadcrumb-item active">与“等待”相关的api（C语言）</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/c0d0501/docs/kernel/sched/c_waiting.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="api-c">
+<h1>与“等待”相关的api（C语言）<a class="headerlink" href="#api-c" title="Permalink to this heading"></a></h1>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p>随着内核的发展，我们将会逐步将C语言的等待机制替换为Rust语言的等待机制。在这个过程中，我们将会同时保留C语言和Rust语言的等待机制，以便于我们在开发过程中进行对比。
+待时机成熟，我们将会逐步将C语言的等待机制移除。</p>
+</div>
+<p>  如果几个进程需要等待某个事件发生，才能被运行，那么就需要一种“等待”的机制，以实现进程同步。</p>
+<section id="wait-queue">
+<h2>一. wait_queue等待队列<a class="headerlink" href="#wait-queue" title="Permalink to this heading"></a></h2>
+<p>  wait_queue是一种进程同步机制，中文名为“等待队列”。它可以将当前进程挂起，并在时机成熟时，由另一个进程唤醒他们。</p>
+<p>  当您需要等待一个事件完成时，使用wait_queue机制能减少进程同步的开销。相比于滥用自旋锁以及信号量，或者是循环使用usleep(1000)这样的函数来完成同步，wait_queue是一个高效的解决方案。</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p><code class="docutils literal notranslate"><span class="pre">wait_queue.h</span></code>中的等待队列的实现并没有把队列头独立出来，同时没有考虑为等待队列加锁。所以在后来的开发中加入了<code class="docutils literal notranslate"><span class="pre">wait_queue_head_t</span></code>的队列头实现，实质上就是链表+自旋锁。它与<code class="docutils literal notranslate"><span class="pre">wait_queue.h</span></code>中的队列<code class="docutils literal notranslate"><span class="pre">wait_queue_node_t</span></code>是兼容的，当你使用<code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">wait_queue_head</span></code>作为队列头时，你同样可以使用等待队列添加节点的函数。</p>
+</div>
+<section id="id1">
+<h3>简单用法<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h3>
+<p>  等待队列的使用方法主要分为以下几部分：</p>
+<ul class="simple">
+<li><p>创建并初始化一个等待队列</p></li>
+<li><p>使用<code class="docutils literal notranslate"><span class="pre">wait_queue_sleep_on_</span></code>系列的函数，将当前进程挂起。晚挂起的进程将排在队列的尾部。</p></li>
+<li><p>通过<code class="docutils literal notranslate"><span class="pre">wait_queue_wakeup()</span></code>函数，依次唤醒在等待队列上的进程，将其加入调度队列</p></li>
+</ul>
+<p>  要使用wait_queue，您需要<code class="docutils literal notranslate"><span class="pre">#include&lt;common/wait_queue.h&gt;</span></code>，并创建一个<code class="docutils literal notranslate"><span class="pre">wait_queue_node_t</span></code>类型的变量，作为等待队列的头部。这个结构体只包含两个成员变量：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">typedef</span><span class="w"> </span><span class="k">struct</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">List</span><span class="w"> </span><span class="n">wait_list</span><span class="p">;</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">process_control_block</span><span class="w"> </span><span class="o">*</span><span class="n">pcb</span><span class="p">;</span>
+<span class="p">}</span><span class="w"> </span><span class="n">wait_queue_node_t</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>  对于等待队列，这里有一个好的命名方法：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">wait_queue_node_t</span><span class="w"> </span><span class="n">wq_keyboard_interrupt_received</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>  这样的命名方式能增加代码的可读性，更容易让人明白这里到底在等待什么。</p>
+</section>
+<section id="id2">
+<h3>初始化等待队列<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<p>  函数<code class="docutils literal notranslate"><span class="pre">wait_queue_init(wait_queue_node_t</span> <span class="pre">*wait_queue,</span> <span class="pre">struct</span> <span class="pre">process_control_block</span> <span class="pre">*pcb)</span></code>提供了初始化wait_queue结点的功能。</p>
+<p>  当您初始化队列头部时，您仅需要将wait_queue首部的结点指针传入，第二个参数请设置为NULL</p>
+</section>
+<section id="id3">
+<h3>将结点插入等待队列<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>  您可以使用以下函数，将当前进程挂起，并插入到指定的等待队列。这些函数大体功能相同，只是在一些细节上有所不同。</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>函数名</p></th>
+<th class="head"><p>解释</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>wait_queue_sleep_on()</p></td>
+<td><p>将当前进程挂起，并设置挂起状态为PROC_UNINTERRUPTIBLE</p></td>
+</tr>
+<tr class="row-odd"><td><p>wait_queue_sleep_on_unlock()</p></td>
+<td><p>将当前进程挂起，并设置挂起状态为PROC_UNINTERRUPTIBLE。待当前进程被插入等待队列后，解锁给定的自旋锁</p></td>
+</tr>
+<tr class="row-even"><td><p>wait_queue_sleep_on_interriptible()</p></td>
+<td><p>将当前进程挂起，并设置挂起状态为PROC_INTERRUPTIBLE</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id4">
+<h3>从等待队列唤醒一个进程<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>  您可以使用<code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">wait_queue_wakeup(wait_queue_node_t</span> <span class="pre">*</span> <span class="pre">wait_queue_head,</span> <span class="pre">int64_t</span> <span class="pre">state);</span></code>函数，从指定的等待队列中，唤醒第一个挂起时的状态与指定的<code class="docutils literal notranslate"><span class="pre">state</span></code>相同的进程。</p>
+<p>  当没有符合条件的进程时，将不会唤醒任何进程，仿佛无事发生。</p>
+<hr class="docutils" />
+<p>  
+  
+  </p>
+</section>
+</section>
+<section id="wait-queue-head">
+<h2>二. wait_queue_head等待队列头<a class="headerlink" href="#wait-queue-head" title="Permalink to this heading"></a></h2>
+<p>   数据结构定义如下：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">typedef</span><span class="w"> </span><span class="k">struct</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">List</span><span class="w"> </span><span class="n">wait_list</span><span class="p">;</span>
+<span class="w">    </span><span class="n">spinlock_t</span><span class="w"> </span><span class="n">lock</span><span class="p">;</span><span class="w">  </span><span class="c1">// 队列需要有一个自旋锁,虽然目前内部并没有使用,但是以后可能会用.</span>
+<span class="p">}</span><span class="w"> </span><span class="n">wait_queue_head_t</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>   等待队列头的使用逻辑与等待队列实际是一样的，因为他同样也是等待队列的节点(仅仅多了一把锁)。且wait_queue_head的函数基本上与wait_queue一致，只不过多了***_with_node_***的字符串。</p>
+<p>   同时，wait_queue.h文件中提供了很多的宏，可以方便您的工作。</p>
+<section id="id5">
+<h3>提供的宏<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>宏</p></th>
+<th class="head"><p>解释</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>DECLARE_WAIT_ON_STACK(name, pcb)</p></td>
+<td><p>在栈上声明一个wait_queue节点，同时把pcb所代表的进程与该节点绑定</p></td>
+</tr>
+<tr class="row-odd"><td><p>DECLARE_WAIT_ON_STACK_SELF(name)</p></td>
+<td><p>传在栈上声明一个wait_queue节点，同时当前进程(即自身进程)与该节点绑定</p></td>
+</tr>
+<tr class="row-even"><td><p>DECLARE_WAIT_ALLOC(name, pcb)</p></td>
+<td><p>使用<code class="docutils literal notranslate"><span class="pre">kzalloc</span></code>声明一个wait_queue节点，同时把pcb所代表的进程与该节点绑定，请记得使用kfree释放空间</p></td>
+</tr>
+<tr class="row-odd"><td><p>DECLARE_WAIT_ALLOC_SELF(name)</p></td>
+<td><p>使用<code class="docutils literal notranslate"><span class="pre">kzalloc</span></code>声明一个wait_queue节点，同时当前进程(即自身进程)与该节点绑定，请记得使用kfree释放空间</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id6">
+<h3>创建等待队列头<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<p>   您可以直接调用宏</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">DECLARE_WAIT_QUEUE_HEAD</span><span class="p">(</span><span class="n">m_wait_queue_head</span><span class="p">);</span><span class="w">  </span><span class="c1">// 在栈上声明一个队列头变量</span>
+</pre></div>
+</div>
+<p>   也可以手动声明</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">wait_queue_head_t</span><span class="w"> </span><span class="n">m_wait_queue_head</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span><span class="w"> </span>
+<span class="n">wait_queue_head_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">m_wait_queue_head</span><span class="p">);</span>
+</pre></div>
+</div>
+</section>
+<section id="id7">
+<h3>将结点插入等待队列<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>函数名</p></th>
+<th class="head"><p>解释</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>wait_queue_sleep_with_node(wait_queue_head_t *head, wait_queue_node_t *wait_node)</p></td>
+<td><p>传入一个等待队列节点，并设置该节点的挂起状态为PROC_UNINTERRUPTIBLE</p></td>
+</tr>
+<tr class="row-odd"><td><p>wait_queue_sleep_with_node_unlock(wait_queue_head_t *q, wait_queue_node_t *wait, void *lock)</p></td>
+<td><p>传入一个等待队列节点，将该节点的pcb指向的进程挂起，并设置挂起状态为PROC_UNINTERRUPTIBLE。待当前进程被插入等待队列后，解锁给定的自旋锁</p></td>
+</tr>
+<tr class="row-even"><td><p>wait_queue_sleep_with_node_interriptible(wait_queue_head_t *q, wait_queue_node_t *wait)</p></td>
+<td><p>传入一个等待队列节点，将该节点的pcb指向的进程挂起，并设置挂起状态为PROC_INTERRUPTIBLE</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id8">
+<h3>从等待队列唤醒一个进程<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<p>   在<code class="docutils literal notranslate"><span class="pre">wait_queue.h</span></code>中的<code class="docutils literal notranslate"><span class="pre">wait_queue_wakeup</span></code>函数直接kfree掉了wait_node节点。对于在栈上的wait_node,您可以选择<code class="docutils literal notranslate"><span class="pre">wait_queue_wakeup_on_stack(wait_queue_head_t</span> <span class="pre">*q,</span> <span class="pre">int64_t</span> <span class="pre">state)</span></code>来唤醒队列里面的队列头节点。</p>
+<hr class="docutils" />
+<p>  
+  
+  </p>
+</section>
+</section>
+<section id="completion">
+<h2>三. completion完成量<a class="headerlink" href="#completion" title="Permalink to this heading"></a></h2>
+<section id="id9">
+<h3>简单用法<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h3>
+<p>  完成量的使用方法主要分为以下几部分：</p>
+<ul class="simple">
+<li><p>声明一个完成量(可以在栈中/使用kmalloc/使用数组)</p></li>
+<li><p>使用wait_for_completion等待事件完成</p></li>
+<li><p>使用complete唤醒等待的进程</p></li>
+</ul>
+<p>   等待操作</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">void</span><span class="w"> </span><span class="nf">wait_fun</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">DECLARE_COMPLETION_ON_STACK</span><span class="p">(</span><span class="n">comp</span><span class="p">);</span><span class="w">  </span><span class="c1">// 声明一个completion </span>
+
+<span class="w">    </span><span class="c1">// .... do somethind here </span>
+<span class="w">    </span><span class="c1">// 大部分情况是你使用kthread_run()创建了另一个线程</span>
+<span class="w">    </span><span class="c1">// 你需要把comp变量传给这个线程, 然后当前线程就会等待他的完成</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">try_wait_for_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">comp</span><span class="p">))</span><span class="w">  </span><span class="c1">// 进入等待</span>
+<span class="w">        </span><span class="n">wait_for_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">comp</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>   完成操作</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">void</span><span class="w"> </span><span class="nf">kthread_fun</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">completion</span><span class="w"> </span><span class="o">*</span><span class="n">comp</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ...... 做一些事  .......</span>
+<span class="w">    </span><span class="c1">// 这里你确定你完成了目标事件</span>
+
+<span class="w">    </span><span class="n">complete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">comp</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 或者你使用complete_all</span>
+<span class="w">    </span><span class="n">complete_all</span><span class="p">(</span><span class="o">&amp;</span><span class="n">comp</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="id10">
+<h3>更多用法<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h3>
+<p>   kernel/sched/completion.c文件夹中,你可以看到 __test 开头的几个函数,他们是completion模块的测试代码,基本覆盖了completion的大部分函数.你可以在这里查询函数使用方法.</p>
+</section>
+<section id="id11">
+<h3>初始化完成量<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h3>
+<p>   函数<code class="docutils literal notranslate"><span class="pre">completion_init(struct</span> <span class="pre">completion</span> <span class="pre">*x)</span></code>提供了初始化completion的功能。当你使用<code class="docutils literal notranslate"><span class="pre">DECLARE_COMPLETION_ON_STACK</span></code>来创建(在栈上创建)的时候,会自动初始化.</p>
+</section>
+<section id="wait">
+<h3>关于完成量的wait系列函数<a class="headerlink" href="#wait" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>函数名</p></th>
+<th class="head"><p>解释</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>wait_for_completion(struct completion *x)</p></td>
+<td><p>将当前进程挂起，并设置挂起状态为PROC_UNINTERRUPTIBLE。</p></td>
+</tr>
+<tr class="row-odd"><td><p>wait_for_completion_timeout(struct completion *x, long timeout)</p></td>
+<td><p>将当前进程挂起，并设置挂起状态为PROC_UNINTERRUPTIBLE。当等待timeout时间(jiffies时间片)之后,自动唤醒进程。</p></td>
+</tr>
+<tr class="row-even"><td><p>wait_for_completion_interruptible(struct completion *x)</p></td>
+<td><p>将当前进程挂起，并设置挂起状态为PROC_INTERRUPTIBLE。</p></td>
+</tr>
+<tr class="row-odd"><td><p>wait_for_completion_interruptible_timeout(struct completion *x, long timeout)</p></td>
+<td><p>将当前进程挂起，并设置挂起状态为PROC_INTERRUPTIBLE。当等待timeout时间(jiffies时间片)之后,自动唤醒进程。</p></td>
+</tr>
+<tr class="row-even"><td><p>wait_for_multicompletion(struct completion x[], int n)</p></td>
+<td><p>将当前进程挂起，并设置挂起状态为PROC_UNINTERRUPTIBLE。(等待数组里面的completion的完成)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="complete">
+<h3>关于完成量的complete系列函数<a class="headerlink" href="#complete" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>函数名</p></th>
+<th class="head"><p>解释</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>complete(struct completion *x)</p></td>
+<td><p>表明一个事件被完成,从等待队列中唤醒一个进程</p></td>
+</tr>
+<tr class="row-odd"><td><p>complete_all(struct completion *x)</p></td>
+<td><p>表明与该completion有关的事件被标记为永久完成,并唤醒等待队列中的所有进程</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id12">
+<h3>其他用于查询信息的函数<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>函数名</p></th>
+<th class="head"><p>解释</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>completion_done(struct completion *x)</p></td>
+<td><p>查询completion的done变量是不是大于0，如果大于0，返回true；否则返回false。在等待前加上这个函数有可能加速？(暂未经过实验测试，有待证明)</p></td>
+</tr>
+<tr class="row-odd"><td><p>try_wait_for_completion(struct completion *x)</p></td>
+<td><p>查询completion的done变量是不是大于0，如果大于0，返回true(同时令done-=1)；否则返回false。在等待前加上这个函数有可能加速？（该函数和<code class="docutils literal notranslate"><span class="pre">completion_done</span></code>代码逻辑基本一致，但是会主动令completion的done变量减1）</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="DragonOS调度" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="rust_waiting.html" class="btn btn-neutral float-right" title="与“等待”相关的api（rust语言）" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>c0d0501</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.2.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/sched/c_waiting.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/sched/c_waiting.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/sched/c_waiting.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/sched/c_waiting.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/sched/c_waiting.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/sched/c_waiting.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/sched/c_waiting.html">V0.1.9</a></dd>
+      <dd><a href="c_waiting.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/sched/c_waiting.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/index.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/index.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

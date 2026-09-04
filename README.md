@@ -45,7 +45,7 @@
 
 &emsp;&emsp;If you prefer to build and run DragonOS locally, you can refer to the following documentation:
 
-- [Building DragonOS — DragonOS dev documentation](https://docs.dragonos.org.cn/locales/en/introduction/build_system.html)
+- [Building DragonOS — DragonOS documentation](https://docs.dragonos.org.cn/introduction/build_system.html)
 
 ## Want to Contribute?
 

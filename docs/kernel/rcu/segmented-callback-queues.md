@@ -1,62 +1,62 @@
-# RCU 分段回调队列
+# RCU Segmented Callback Queues
 
-## 1. 设计目标
+## 1. Design Goals
 
-RCU 回调用于把资源释放等延迟操作安排到宽限期之后执行。一个可扩展的回调系统需要同时满足两类要求：
+RCU callbacks schedule deferred operations, such as resource reclamation, to run after a grace period. A scalable callback system must satisfy two requirements:
 
-- 提交回调是高频操作，不应让所有 CPU 持续争用同一把全局锁；
-- 回调只有在它所依赖的宽限期结束后才能执行，屏障和 CPU 生命周期变化也不能破坏这一语义。
+- callback submission is frequent and should not make every CPU contend for one global lock;
+- a callback may run only after its required grace period has ended, including during barriers and CPU lifecycle changes.
 
-DragonOS 使用每 CPU 分段队列组织回调。每个 CPU 在自己的局部队列中提交工作，宽限期协调器以“段”为单位推进回调状态，执行器则以有界批次消费已经就绪的回调。
+DragonOS organizes callbacks in per-CPU segmented queues. Each CPU submits work to its local queue, the grace-period coordinator advances callback state one segment at a time, and the executor consumes ready callbacks in bounded batches.
 
-这套设计借鉴 Linux RCU 分段回调链表的核心思想，但与 DragonOS 当前的宽限期模型相匹配：保留单一宽限期协调器和单一回调执行器，不引入多级 RCU 层级、回调卸载或额外执行通道。
+This design adopts the central idea of Linux RCU segmented callback lists while matching the current DragonOS grace-period model. It retains one grace-period coordinator and one callback executor without introducing a multilevel RCU hierarchy, callback offloading, or additional execution paths.
 
-## 2. 为什么需要分段
+## 2. Why Segmentation Is Needed
 
-最直接的回调队列是一条全局链表：提交者把回调加入链表，宽限期结束后再扫描链表，找出可以执行的节点。这种模型简单，但存在两个问题：
+The simplest callback queue is a single global list: producers append callbacks, and the system scans the list after a grace period to find callbacks that may run. Although straightforward, this model has two problems:
 
-1. 所有 CPU 的提交都会竞争全局队列；
-2. 宽限期变化时，需要逐个检查或更新回调的目标世代。
+1. callback submission from every CPU contends for the global queue;
+2. a grace-period transition requires examining or updating callbacks individually.
 
-分段队列将“等待相同宽限期进展的回调”组织在一起。段的边界本身表示回调状态，因此宽限期推进时只需移动链表边界，不需要遍历其中的每个回调。
+A segmented queue groups callbacks that are waiting for the same grace-period progress. Segment boundaries represent callback state, so a grace-period transition moves list boundaries instead of traversing every callback in the segment.
 
 ```mermaid
 flowchart LR
-    Submit[提交回调] --> Next[next<br/>尚未归类]
-    Next --> Wait[wait<br/>等待当前宽限期]
-    Next --> NextReady[next-ready<br/>等待下一宽限期]
+    Submit[Submit callback] --> Next[next<br/>unclassified]
+    Next --> Wait[wait<br/>waiting for current grace period]
+    Next --> NextReady[next-ready<br/>waiting for next grace period]
     NextReady --> Wait
-    Wait --> Done[done<br/>可以执行]
-    Done --> Run[执行回调]
+    Wait --> Done[done<br/>ready to execute]
+    Done --> Run[Execute callback]
 ```
 
-分段带来的关键收益是：
+Segmentation provides several important properties:
 
-- 提交操作主要访问本 CPU 数据；
-- 宽限期推进的成本与 CPU 数量相关，而不是与积压回调数量相关；
-- 回调所处的生命周期阶段可以直接从段位置判断；
-- 屏障、迁移和调试都可以围绕同一状态模型实现。
+- submission primarily accesses data local to the current CPU;
+- grace-period advancement costs scale with the number of CPUs rather than the callback backlog;
+- a callback's lifecycle stage follows directly from its segment;
+- barriers, migration, and observability use the same state model.
 
-## 3. 整体架构
+## 3. Overall Architecture
 
-回调处理分为提交、协调和执行三部分。
+Callback processing consists of submission, coordination, and execution.
 
 ```mermaid
 flowchart TB
-    subgraph Producers[回调提交者]
+    subgraph Producers[Callback producers]
         C0[CPU 0]
         C1[CPU 1]
         CN[CPU N]
     end
 
-    subgraph Queues[每 CPU 分段队列]
+    subgraph Queues[Per-CPU segmented queues]
         Q0[CPU 0<br/>done / wait / next-ready / next]
         Q1[CPU 1<br/>done / wait / next-ready / next]
         QN[CPU N<br/>done / wait / next-ready / next]
     end
 
-    GP[宽限期协调器]
-    Worker[回调执行器]
+    GP[Grace-period coordinator]
+    Worker[Callback executor]
 
     C0 --> Q0
     C1 --> Q1
@@ -69,232 +69,232 @@ flowchart TB
     QN --> Worker
 ```
 
-各部分职责如下：
+Each part has a distinct responsibility:
 
-- **提交者**只负责把回调放入当前 CPU 的 `next` 段，并通知系统存在新工作；
-- **每 CPU 队列**保存回调及其宽限期阶段，不负责决定宽限期何时开始或结束；
-- **宽限期协调器**维护全局宽限期状态，并在状态变化时推进各 CPU 的队列段；
-- **回调执行器**只消费 `done` 段，在不持有 RCU 内部锁的情况下调用回调函数。
+- **Producers** append callbacks to the current CPU's `next` segment and announce that work is available.
+- **Per-CPU queues** retain callbacks and their grace-period stage, but do not decide when a grace period starts or ends.
+- **The grace-period coordinator** maintains global grace-period state and advances per-CPU segments when that state changes.
+- **The callback executor** consumes only the `done` segments and invokes callbacks without holding internal RCU locks.
 
-每 CPU 队列隔离了高频写入，而宽限期状态仍由唯一协调器维护。这样既避免复制全局状态，也不会为了优化提交路径而引入多套相互竞争的宽限期判断。
+Per-CPU queues isolate frequent writes while the single coordinator remains the authority for grace-period state. This avoids duplicating global state or introducing competing grace-period decisions merely to optimize submission.
 
-## 4. 四段状态模型
+## 4. The Four-Segment State Model
 
-每个 CPU 的回调队列由四个保持 FIFO 顺序的逻辑段组成。
+Each per-CPU callback queue contains four logical FIFO segments.
 
-| 段 | 含义 | 是否可以执行 |
+| Segment | Meaning | Executable |
 |---|---|---|
-| `next` | 新提交、尚未绑定到某次宽限期 | 否 |
-| `next-ready` | 已确定需要等待下一次宽限期 | 否 |
-| `wait` | 正在等待当前宽限期完成 | 否 |
-| `done` | 所依赖的宽限期已经完成 | 是 |
+| `next` | Newly submitted and not yet associated with a grace period | No |
+| `next-ready` | Known to require the next grace period | No |
+| `wait` | Waiting for the current grace period to complete | No |
+| `done` | Its required grace period has completed | Yes |
 
-段之间的转换由宽限期事件驱动：
+Grace-period events drive transitions between segments:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Next: 提交
-    Next --> Wait: 绑定当前或新启动的宽限期
-    Next --> NextReady: 当前宽限期已开始
-    NextReady --> Wait: 下一宽限期开始
-    Wait --> Done: 对应宽限期完成
-    Done --> Executing: 执行器取出
-    Executing --> [*]: 回调返回
-    Executing --> Next: 回调重新提交自身
+    [*] --> Next: Submit
+    Next --> Wait: Associate with current or newly started grace period
+    Next --> NextReady: Current grace period has already started
+    NextReady --> Wait: Next grace period starts
+    Wait --> Done: Required grace period completes
+    Done --> Executing: Executor removes callback
+    Executing --> [*]: Callback returns
+    Executing --> Next: Callback resubmits itself
 ```
 
-需要始终成立的不变量是：
+The following invariants must always hold:
 
-- 一个已提交回调只能位于一个段中，或正由执行器执行；
-- 只有 `done` 段中的回调可以被执行；
-- 同一段内保持提交顺序；
-- 段的宽限期含义一致，不能把等待不同世代的回调混入同一等待段；
-- 跨 CPU 不提供全局回调执行顺序保证；
-- 回调函数运行期间不持有队列锁或宽限期锁。
+- a submitted callback is in exactly one segment or is being executed;
+- only callbacks in `done` may be executed;
+- submission order is preserved within a segment;
+- callbacks waiting for different grace-period generations are not mixed in one waiting segment;
+- no global callback execution order is guaranteed across CPUs;
+- callback functions run without queue or grace-period locks held.
 
-这里的四段不是四份独立工作流，而是同一条回调生命周期的四个阶段。实现可以用多条局部链表表达这些段，只要段合并和移动保持常数时间，并维持上述语义。
+The four segments are four stages of one callback lifecycle, not four independent workflows. An implementation may represent them with separate local lists as long as segment movement and merging remain constant-time operations and preserve these semantics.
 
-## 5. 提交与宽限期推进
+## 5. Submission and Grace-Period Advancement
 
-### 5.1 局部提交
+### 5.1 Local Submission
 
-提交回调时，CPU 先稳定自己的执行位置，再把回调追加到本地 `next` 段。提交完成后发布一个持久的“需要扫描”条件，并在必要时唤醒回调执行器。
+To submit a callback, a CPU first stabilizes its execution location and then appends the callback to its local `next` segment. It subsequently publishes a persistent “scan needed” condition and wakes the callback executor when necessary.
 
 ```mermaid
 sequenceDiagram
-    participant Caller as 提交者
-    participant Local as 本 CPU 队列
-    participant Signal as 工作通知
-    participant Worker as 回调执行器
+    participant Caller as Producer
+    participant Local as Local CPU queue
+    participant Signal as Work notification
+    participant Worker as Callback executor
 
-    Caller->>Caller: 稳定当前 CPU
-    Caller->>Local: 追加到 next
-    Caller->>Signal: 发布需要扫描
-    Signal-->>Worker: 必要时唤醒
+    Caller->>Caller: Stabilize current CPU
+    Caller->>Local: Append to next
+    Caller->>Signal: Publish scan-needed state
+    Signal-->>Worker: Wake if necessary
 ```
 
-本地提交不负责启动或推进宽限期。这样可以让高频路径保持短小，并避免所有 CPU 在每次提交时访问全局宽限期状态。
+Local submission neither starts nor advances a grace period. This keeps the frequent path short and avoids accessing global grace-period state for every callback.
 
-工作通知只是减少无效扫描和唤醒的性能机制。队列状态和宽限期状态才是正确性的依据；即使通知被合并，执行器也必须能通过持久状态重新发现尚未处理的工作。
+Work notification is a performance mechanism that reduces unnecessary scans and wakeups. Queue and grace-period state remain the source of correctness. Even when notifications are coalesced, the executor must be able to rediscover outstanding work from persistent state.
 
-### 5.2 整段推进
+### 5.2 Whole-Segment Advancement
 
-宽限期协调器观察到新回调后，将 `next` 段绑定到合适的宽限期：
+After the grace-period coordinator observes new callbacks, it associates the `next` segment with an appropriate grace period:
 
-- 没有活动宽限期时，回调进入 `wait`，并请求一次新的宽限期；
-- 已有活动宽限期且回调来不及被其覆盖时，回调进入 `next-ready`，等待下一次宽限期；
-- 宽限期完成时，对应的 `wait` 整段进入 `done`；
-- 后续宽限期开始时，`next-ready` 整段进入 `wait`。
+- if no grace period is active, callbacks move to `wait` and a new grace period is requested;
+- if an active grace period can no longer cover the callbacks, they move to `next-ready` for the following grace period;
+- when a grace period completes, its `wait` segment moves as a whole to `done`;
+- when the following grace period starts, `next-ready` moves as a whole to `wait`.
 
-协调器必须先明确宽限期事件，再据此移动各队列的段。并发提交到达扫描边界时，可以保守地归入后一宽限期，但绝不能被错误地归入已经无法覆盖它的宽限期。
+The coordinator must establish the grace-period event before moving queue segments according to that event. A callback racing with a scan boundary may conservatively wait for a later grace period, but it must never be associated with a grace period that cannot cover it.
 
-这种“允许多等、禁止少等”的边界规则保持了 RCU 安全性，同时不要求提交者与全局协调器进行昂贵同步。
+This rule—waiting longer is safe, waiting too little is not—preserves RCU safety without expensive synchronization between every producer and the global coordinator.
 
-## 6. 回调执行与公平性
+## 6. Callback Execution and Fairness
 
-DragonOS 使用单一逻辑执行权消费所有 CPU 的 `done` 段。单一执行权使回调之间不会因多个执行通道而产生新的并行语义，也简化了屏障对“正在执行的回调”的判断。
+DragonOS uses one logical execution owner to consume the `done` segments of all CPUs. A single execution owner avoids introducing parallel callback semantics and simplifies the barrier's treatment of callbacks that are already executing.
 
-执行器采用轮转和有界批次：
+The executor combines round-robin selection with bounded batches:
 
-1. 从上一次停止位置之后的 CPU 开始扫描；
-2. 从某个 `done` 段取出一个回调，并记录该队列有回调正在执行；
-3. 释放所有 RCU 内部锁后调用回调；
-4. 回调返回后发布执行完成状态；
-5. 达到批次上限时提供调度机会，再继续处理剩余工作。
+1. begin scanning after the CPU at which the previous scan stopped;
+2. remove one callback from a `done` segment and record that the queue has a callback in progress;
+3. release all internal RCU locks before invoking the callback;
+4. publish completion after the callback returns;
+5. provide a scheduling opportunity after reaching the batch limit, then continue with remaining work.
 
 ```mermaid
 flowchart TD
-    Scan[轮转扫描每 CPU 队列] --> Ready{存在 done 回调?}
-    Ready -->|否| NextCPU[检查下一个 CPU]
-    Ready -->|是| Pop[摘取一个回调]
-    Pop --> Unlock[释放 RCU 内部锁]
-    Unlock --> Invoke[执行回调]
-    Invoke --> Complete[发布执行完成]
-    Complete --> Limit{达到批次上限?}
-    Limit -->|否| Scan
-    Limit -->|是| Yield[提供调度机会]
+    Scan[Scan per-CPU queues round-robin] --> Ready{A done callback exists?}
+    Ready -->|No| NextCPU[Check the next CPU]
+    Ready -->|Yes| Pop[Remove one callback]
+    Pop --> Unlock[Release internal RCU locks]
+    Unlock --> Invoke[Invoke callback]
+    Invoke --> Complete[Publish completion]
+    Complete --> Limit{Batch limit reached?}
+    Limit -->|No| Scan
+    Limit -->|Yes| Yield[Provide a scheduling opportunity]
     Yield --> Scan
 ```
 
-轮转避免某个持续产生回调的 CPU 长期占用执行器；批次上限避免大量回调让内核任务长时间失去调度机会。回调本身仍应遵守其执行上下文约束，分批机制不能消除单个慢回调造成的延迟。
+Round-robin selection prevents a CPU with a continuous callback stream from monopolizing the executor. Bounded batches prevent large backlogs from denying other kernel tasks a scheduling opportunity. A callback must still obey the constraints of its execution context; batching cannot eliminate latency caused by one slow callback.
 
-## 7. RCU 屏障
+## 7. RCU Barriers
 
-等待一个宽限期结束，与等待此前提交的回调全部执行完成，是两个不同的操作。前者只证明旧读者已经离开；回调可能仍停留在 `done` 段中。RCU 屏障必须额外等待回调执行。
+Waiting for a grace period to end is different from waiting for all previously submitted callbacks to finish. A completed grace period proves that old readers have left, but callbacks may still remain in `done`. An RCU barrier must additionally wait for callback execution.
 
-分段队列使用每队列尾标记实现屏障：屏障在每个包含未完成工作的队列中追加一个特殊回调，然后等待所有标记被执行。标记之前的队列前缀因此必然已经执行完毕。
+Segmented queues implement a barrier with a tail marker for each queue. The barrier appends a special callback after the unfinished work in every relevant queue, then waits until all markers execute. The queue prefix before each marker must therefore have finished.
 
 ```mermaid
 sequenceDiagram
-    participant Barrier as 屏障调用者
-    participant Queues as 每 CPU 队列
-    participant Worker as 回调执行器
+    participant Barrier as Barrier caller
+    participant Queues as Per-CPU queues
+    participant Worker as Callback executor
 
-    Barrier->>Queues: 稳定回调所有权
-    loop 每个队列
-        Barrier->>Queues: 在已有工作之后追加尾标记
+    Barrier->>Queues: Stabilize callback ownership
+    loop Each queue
+        Barrier->>Queues: Append a tail marker after existing work
     end
-    Barrier->>Worker: 唤醒执行器
-    Worker->>Queues: 按正常宽限期规则推进和执行
-    Worker-->>Barrier: 每个尾标记完成一次计数
-    Barrier->>Barrier: 所有标记完成后返回
+    Barrier->>Worker: Wake the executor
+    Worker->>Queues: Advance and execute using normal grace-period rules
+    Worker-->>Barrier: Account for each completed marker
+    Barrier->>Barrier: Return after every marker completes
 ```
 
-屏障快照的边界，是它在各队列锁保护下插入标记或确认队列无未完成工作的时刻：
+The barrier snapshot boundary for a queue is the instant, under that queue's synchronization, at which the barrier inserts a marker or confirms that no unfinished work exists:
 
-- 标记之前的回调属于本次屏障，标记之后的新提交不属于本次屏障；
-- 已经从队列摘取但尚未返回的回调也属于未完成工作，不能因为链表暂时为空而漏掉；
-- 标记跟随普通回调经历相同的分段推进，因此不会绕过宽限期；
-- 标记应接在已有工作的最后，而不是无条件等待一次额外宽限期。
+- callbacks before the marker belong to the barrier; new submissions after it do not;
+- a callback already removed from a queue but not yet returned is still unfinished and cannot be ignored merely because the list is empty;
+- markers follow the same segment transitions as ordinary callbacks and cannot bypass a grace period;
+- a marker is placed after existing work instead of unconditionally requiring an extra grace period.
 
-多个屏障调用需要串行化其快照和标记生命周期。屏障扫描还必须与 CPU 队列迁移互斥，否则旧回调可能从尚未扫描的源队列移动到已经扫描过的目标队列，造成漏等待。
+Concurrent barrier calls must serialize their snapshots and marker lifetimes. Barrier scanning must also exclude CPU queue migration. Otherwise, old callbacks could move from an unscanned source queue to a destination queue that the barrier has already scanned, causing the barrier to miss them.
 
-## 8. CPU 生命周期与队列迁移
+## 8. CPU Lifecycle and Queue Migration
 
-CPU 下线会改变回调队列的所有权，但不能改变回调原有的宽限期含义。下线流程应先阻止目标 CPU 接收新的普通工作，再把它从后续宽限期参与集合中移除，最后把尚未执行的回调迁移到仍参与 RCU 的 CPU。
+Taking a CPU offline changes callback queue ownership but must not change the grace-period requirements of its callbacks. The offline sequence first prevents the CPU from accepting new ordinary work, removes its responsibility from future grace periods, and then migrates its unexecuted callbacks to a CPU that still participates in RCU.
 
 ```mermaid
 flowchart TD
-    Dying[CPU 进入下线阶段] --> Stop[停止接收新的普通提交]
-    Stop --> GP[结清该 CPU 的宽限期责任]
-    GP --> Owner[稳定回调队列所有权]
-    Owner --> Align[按同一宽限期状态对齐源和目标队列]
-    Align --> Merge[分别合并四个同名段]
-    Merge --> Wake[通知回调执行器]
-    Wake --> Dead[完成 CPU 下线]
+    Dying[CPU enters offline transition] --> Stop[Stop accepting ordinary submissions]
+    Stop --> GP[Settle the CPU's grace-period responsibility]
+    GP --> Owner[Stabilize callback queue ownership]
+    Owner --> Align[Align source and destination to one grace-period state]
+    Align --> Merge[Merge the four corresponding segments]
+    Merge --> Wake[Notify the callback executor]
+    Wake --> Dead[Complete CPU offline transition]
 ```
 
-迁移遵循以下原则：
+Migration follows these principles:
 
-- `done`、`wait`、`next-ready` 和 `next` 分别合并，不能把待完成回调直接变为可执行；
-- 源队列和目标队列必须基于同一个宽限期状态完成对齐；
-- 队列迁移与屏障扫描共享同一所有权同步域；
-- 正在执行的回调无需迁移，其完成状态仍由原队列记录；
-- 队列存储的生命周期必须长于 CPU 在线周期，使下线后仍可安全完成记账；
-- 迁移目标必须来自 RCU 自己的参与 CPU 集合，不能使用语义更宽泛、更新时序不同的在线状态替代。
+- `done`, `wait`, `next-ready`, and `next` are merged with their corresponding segments; a pending callback never becomes executable merely because it moved;
+- source and destination queues are aligned against the same grace-period state;
+- queue migration and barrier scanning share one callback-ownership synchronization domain;
+- a callback already executing does not migrate, and its source queue continues to record its completion;
+- queue storage outlives the CPU's online lifetime, so completion bookkeeping remains safe after the CPU goes offline;
+- the migration destination comes from RCU's participating CPU set, not from a broader online state with different semantics or update timing.
 
-CPU 生命周期状态是队列归属的唯一事实来源。回调子系统不维护第二套 online/offline 状态，以免两套状态在并发下线时产生分歧。
+CPU lifecycle state is the sole source of truth for queue ownership. The callback subsystem does not maintain a second online/offline state that could diverge during a concurrent offline transition.
 
-## 9. 并发模型
+## 9. Concurrency Model
 
-分段队列包含三类同步域：
+Segmented callback queues use three synchronization domains:
 
-- **宽限期状态**：保护全局宽限期的开始、完成和参与 CPU 集合；
-- **回调所有权**：协调屏障全局快照与 CPU 队列迁移；
-- **局部队列**：保护单个 CPU 的分段链表和执行状态。
+- **Grace-period state** protects grace-period start, completion, and the participating CPU set.
+- **Callback ownership** coordinates barrier-wide snapshots with CPU queue migration.
+- **Local queues** protect each CPU's segmented lists and execution state.
 
-需要同时进入多个同步域的控制路径采用统一方向：先稳定宽限期和所有权，再按确定顺序访问局部队列。普通提交只访问一个局部队列，不反向进入全局同步域。
+A control path that enters multiple domains follows one direction: stabilize grace-period state and callback ownership before accessing local queues in a deterministic order. Ordinary submission accesses only one local queue and never reverses into a global domain.
 
 ```mermaid
 flowchart LR
-    GP[宽限期状态] --> Ownership[回调所有权]
-    Ownership --> Q0[较小 CPU 编号队列]
-    Q0 --> Q1[较大 CPU 编号队列]
+    GP[Grace-period state] --> Ownership[Callback ownership]
+    Ownership --> Q0[Lower-numbered CPU queue]
+    Q0 --> Q1[Higher-numbered CPU queue]
 
-    Submit[普通提交] --> Local[单个本地队列]
+    Submit[Ordinary submission] --> Local[One local queue]
 ```
 
-这一方向约束同时服务于正确性和可维护性：新增控制路径时，只要遵守相同的层次，就不会与已有路径形成反向加锁。
+This ordering serves both correctness and maintainability. A new control path that follows the same hierarchy cannot create a reverse lock dependency with an existing path.
 
-工作发布还必须遵循“先发布持久条件，后发送唤醒”的原则。唤醒可以合并，也可能发生在执行器检查睡眠条件附近；执行器因此必须在睡眠前复查队列和宽限期是否仍有可推进工作，闭合丢唤醒窗口。尚被活动宽限期阻塞的等待段不属于当前可运行工作，不能让执行器空转。
+Work publication also follows the rule “publish a persistent condition before sending a wakeup.” Wakeups may be coalesced or race with the executor's sleep check. The executor therefore rechecks queue and grace-period state before sleeping to close the lost-wakeup window. Waiting segments blocked by an active grace period are not currently runnable work and must not make the executor spin.
 
-## 10. 正确性边界
+## 10. Correctness Boundaries
 
-### 10.1 回调重复提交
+### 10.1 Duplicate Submission
 
-同一个回调节点在入队期间不能再次提交。执行器应在调用回调函数之前解除节点的入队状态，因此回调可以在自身执行过程中再次提交同一节点；新的提交属于新的队列位置和宽限期判断。
+The same callback node cannot be submitted again while it is queued. The executor clears the queued state before invoking the callback, allowing a callback to resubmit its own node while it runs. The new submission receives a new queue position and grace-period classification.
 
-### 10.2 顺序保证
+### 10.2 Ordering Guarantees
 
-同一局部段保持 FIFO 顺序，段的推进也保持段内顺序。不同 CPU 的回调没有全局提交或完成顺序。需要全局完成边界的调用者应使用 RCU 屏障，而不是依赖偶然的执行次序。
+FIFO order is retained within each local segment, and segment advancement preserves that order. Callbacks on different CPUs have no global submission or completion order. A caller that requires a global completion boundary uses an RCU barrier rather than relying on incidental execution order.
 
-### 10.3 内存可见性
+### 10.3 Memory Visibility
 
-队列锁负责发布回调节点内容和链表关系；宽限期协议负责建立读侧临界区结束与回调可执行之间的顺序；屏障标记的完成发布则保证屏障返回发生在其覆盖的回调返回之后。
+Queue synchronization publishes callback contents and list relationships. The grace-period protocol orders the end of read-side critical sections before callback eligibility. Completion of barrier markers ensures that a barrier returns after the callbacks it covers have returned.
 
-用于唤醒或减少扫描的原子标志只是提示，不能单独承担节点生命周期、宽限期完成或屏障完成的证明。
+Atomic state used to reduce scans or wakeups is only a hint. It cannot by itself prove callback lifetime, grace-period completion, or barrier completion.
 
-### 10.4 失败与退化
+### 10.4 Failure and Degradation
 
-回调提交路径不依赖动态分配，因此内存压力不会使已经准备好的回调无法入队。大量回调会增加排队延迟，但有界批次和轮转保证系统仍有调度机会。CPU 下线和执行器启动阶段也必须沿用相同的状态机，不能通过提前完成回调来绕过正常宽限期。
+Callback submission does not require dynamic allocation, so memory pressure cannot prevent a prepared callback from entering a queue. A large backlog increases queueing latency, but bounded batches and round-robin selection preserve scheduling opportunities. CPU offline and executor startup paths follow the same state machine and must not bypass normal grace-period rules by marking pending callbacks complete early.
 
-## 11. 可观测性
+## 11. Observability
 
-调试接口可以按 CPU 展示四个段的长度和是否存在正在执行的回调，并提供聚合视图。这样的快照用于回答两类问题：
+Debugging facilities can expose the lengths of all four segments and whether a callback is currently executing for each CPU, together with an aggregate view. Such a snapshot answers two questions:
 
-- 回调积压集中在哪些 CPU；
-- 积压发生在等待宽限期、尚未归类，还是已经可执行的阶段。
+- which CPUs hold most of the callback backlog;
+- whether the backlog is waiting for a grace period, unclassified, or already executable.
 
-调试快照不参与正确性判断，也不要求全系统线性一致。读取时逐个短暂观察局部队列，可以避免为了诊断而在所有 CPU 之间建立新的全局停顿。一次打开操作应看到稳定文本，避免分段读取时把不同时间点的数据拼接在一起。
+Debug snapshots do not participate in correctness and need not be globally linearizable. Observing one local queue at a time avoids introducing a system-wide pause solely for diagnostics. A single open operation should present stable text so that partial reads do not combine data from different points in time.
 
-## 12. 设计取舍
+## 12. Design Trade-offs
 
-当前设计有意保持以下边界：
+The current design deliberately retains the following boundaries:
 
-- 使用每 CPU 队列减少提交争用，但保留单一宽限期协调器；
-- 使用单一逻辑回调执行权，避免引入回调并行执行语义；
-- 使用固定的有界批次和轮转公平性，不额外引入时间预算调度器；
-- 不实现多级 RCU 节点层次、回调卸载、延迟回调或多执行器；
-- 不维护全局回调序号，跨队列完成边界由尾标记屏障表达。
+- per-CPU queues reduce submission contention, while one grace-period coordinator remains authoritative;
+- one logical callback execution owner avoids parallel callback semantics;
+- fixed bounded batches and round-robin fairness are used without an additional time-budget scheduler;
+- multilevel RCU nodes, callback offloading, lazy callbacks, and multiple executors are not introduced;
+- no global callback sequence is maintained; tail-marker barriers express cross-queue completion boundaries.
 
-这些边界让回调提交成本随 CPU 局部化，同时把跨 CPU 协调限制在宽限期变化、屏障和 CPU 生命周期等低频路径。若未来工作负载证明单一协调器或执行器成为瓶颈，应基于测量结果扩展对应层次，而不是预先引入 Linux Tree RCU 的全部复杂度。
+These boundaries localize callback submission costs while restricting cross-CPU coordination to lower-frequency grace-period transitions, barriers, and CPU lifecycle events. If measurements later show that the single coordinator or executor is a bottleneck, the corresponding layer can be extended based on evidence rather than adopting the full complexity of Linux Tree RCU in advance.

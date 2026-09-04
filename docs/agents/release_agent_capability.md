@@ -16,15 +16,13 @@
 ## 输出
 - 提交快照：`dragonos_<VER>_commits_formatted.txt`、`dragonos_<VER>_commits_oneline.txt`
 - 发行日志：`docs/community/ChangeLog/V0.<X>.x/V0.<X>.0.md`
-- ChangeLog 索引更新：`docs/community/ChangeLog/index.rst`
+- ChangeLog 索引更新：`docs/zh/community/ChangeLog/index.md` 与 `docs/.vitepress/sidebars/zh.ts` / `en.ts`
 - （可选）推文要点草稿
 
 ## 路径约定
-- 发行日志目录：`docs/community/ChangeLog/V0.<X>.x/`
-- 新增条目在 `index.rst` 的 toctree 中追加：
-  ```
-  V0.<X>.x/V0.<X>.0
-  ```
+- 中文发行日志目录：`docs/zh/community/ChangeLog/V0.<X>.x/`
+- 英文发行日志目录：`docs/community/ChangeLog/V0.<X>.x/`
+- 新增条目写入对应 `index.md`，并在 VitePress sidebar 中追加链接
 
 ## 工作流步骤
 1) 确定基线  

@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kernel Boot Command Line Parameters &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="Core API Documentation" href="../core_api/index.html" />
+    <link rel="prev" title="Bootloader" href="bootloader.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Bootloader</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="bootloader.html">Bootloader</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">Kernel Boot Command Line Parameters</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#overview">Overview</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#design">Design</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#macros-for-declaring-kernel-boot-command-line-parameters">Macros for Declaring Kernel Boot Command Line Parameters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#example">Example</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#todo">TODO</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">Bootloader</a></li>
+      <li class="breadcrumb-item active">Kernel Boot Command Line Parameters</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/1c53c97/docs/locales/en/kernel/boot/cmdline.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/boot/cmdline.md</p></li>
+<li><p>Translation time: 2025-05-19 01:41:48</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="kernel-boot-command-line-parameters">
+<h1>Kernel Boot Command Line Parameters<a class="headerlink" href="#kernel-boot-command-line-parameters" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>Author:</p>
+<ul class="simple">
+<li><p>Longjin <a class="reference external" href="mailto:longjin&#37;&#52;&#48;DragonOS&#46;org">longjin<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+</ul>
+</div>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Permalink to this heading"></a></h2>
+<p>  The DragonOS kernel boot command line parameter parsing module aims to provide support for parsing kernel boot command line parameters similar to Linux, enabling more flexible behavior for the kernel. This module allows the kernel to receive and parse command line parameters at boot time, and execute corresponding callback functions or set environment variables based on the type of parameters.</p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>Callback functions are not supported temporarily.</p>
+</div>
+</section>
+<section id="design">
+<h2>Design<a class="headerlink" href="#design" title="Permalink to this heading"></a></h2>
+<section id="parameter-types">
+<h3>Parameter Types<a class="headerlink" href="#parameter-types" title="Permalink to this heading"></a></h3>
+<p>Kernel boot command line parameters are divided into three types:</p>
+<ul class="simple">
+<li><p>Arg type</p></li>
+<li><p>KV type</p></li>
+<li><p>EarlyKV type</p></li>
+</ul>
+<section id="arg-type">
+<h4>Arg Type<a class="headerlink" href="#arg-type" title="Permalink to this heading"></a></h4>
+<p>Arg type parameters have only a name and no value. They are divided into the following two types:</p>
+<ul class="simple">
+<li><p>ArgNormal: The default value is <code class="docutils literal notranslate"><span class="pre">false</span></code>. If the parameter is present in the command line, it will be set to <code class="docutils literal notranslate"><span class="pre">true</span></code>.</p></li>
+<li><p>ArgInv: The default value is <code class="docutils literal notranslate"><span class="pre">true</span></code>. If the parameter is present in the command line, it will be set to <code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></li>
+</ul>
+</section>
+<section id="kv-type">
+<h4>KV Type<a class="headerlink" href="#kv-type" title="Permalink to this heading"></a></h4>
+<p>KV type parameters are represented in the command line as <code class="docutils literal notranslate"><span class="pre">name=value</span></code>, <code class="docutils literal notranslate"><span class="pre">value</span></code> separated by commas. Kernel modules can provide default values for these parameters.</p>
+</section>
+<section id="earlykv-type">
+<h4>EarlyKV Type<a class="headerlink" href="#earlykv-type" title="Permalink to this heading"></a></h4>
+<p>EarlyKV type parameters are similar to KV type parameters, but they are parsed before memory management initialization.</p>
+</section>
+</section>
+<section id="module-flags">
+<h3>Module Flags<a class="headerlink" href="#module-flags" title="Permalink to this heading"></a></h3>
+<p>Module flags are similar to <code class="docutils literal notranslate"><span class="pre">usbprobe.xxxx</span></code>.</p>
+</section>
+<section id="parameter-declaration">
+<h3>Parameter Declaration<a class="headerlink" href="#parameter-declaration" title="Permalink to this heading"></a></h3>
+<p>Provides macros to declare kernel command line parameters.</p>
+</section>
+<section id="procfs-support">
+<h3>procfs Support<a class="headerlink" href="#procfs-support" title="Permalink to this heading"></a></h3>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>TODO: Display the current kernel’s boot command line parameters under <code class="docutils literal notranslate"><span class="pre">/proc/cmdline</span></code>.</p>
+</div>
+</section>
+</section>
+<section id="macros-for-declaring-kernel-boot-command-line-parameters">
+<h2>Macros for Declaring Kernel Boot Command Line Parameters<a class="headerlink" href="#macros-for-declaring-kernel-boot-command-line-parameters" title="Permalink to this heading"></a></h2>
+<section id="arg-type-parameter-declaration">
+<h3>Arg Type Parameter Declaration<a class="headerlink" href="#arg-type-parameter-declaration" title="Permalink to this heading"></a></h3>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="n">kernel_cmdline_param_arg</span><span class="o">!</span><span class="p">(</span><span class="n">varname</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">default_bool</span><span class="p">,</span><span class="w"> </span><span class="n">inv</span><span class="p">);</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">varname</span></code>: The variable name of the parameter</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">name</span></code>: The name of the parameter</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">default_bool</span></code>: The default value</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inv</span></code>: Whether to invert</p></li>
+</ul>
+</section>
+<section id="kv-type-parameter-declaration">
+<h3>KV Type Parameter Declaration<a class="headerlink" href="#kv-type-parameter-declaration" title="Permalink to this heading"></a></h3>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="n">kernel_cmdline_param_kv</span><span class="o">!</span><span class="p">(</span><span class="n">varname</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">default_str</span><span class="p">);</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">varname</span></code>: The variable name of the parameter</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">name</span></code>: The name of the parameter</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">default_str</span></code>: The default value</p></li>
+</ul>
+</section>
+<section id="kv-type-parameter-declaration-before-memory-management-initialization">
+<h3>KV Type Parameter Declaration Before Memory Management Initialization<a class="headerlink" href="#kv-type-parameter-declaration-before-memory-management-initialization" title="Permalink to this heading"></a></h3>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="n">kernel_cmdline_param_early_kv</span><span class="o">!</span><span class="p">(</span><span class="n">varname</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">default_str</span><span class="p">);</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">varname</span></code>: The variable name of the parameter</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">name</span></code>: The name of the parameter</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">default_str</span></code>: The default value</p></li>
+</ul>
+</section>
+</section>
+<section id="example">
+<h2>Example<a class="headerlink" href="#example" title="Permalink to this heading"></a></h2>
+<p>The following example demonstrates how to declare and use KV type parameters:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="n">kernel_cmdline_param_kv</span><span class="o">!</span><span class="p">(</span><span class="n">ROOTFS_PATH_PARAM</span><span class="p">,</span><span class="w"> </span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">rootfs_dev_path</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ROOTFS_PATH_PARAM</span><span class="p">.</span><span class="n">value_str</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="o">......</span><span class="p">.</span>
+<span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="o">......</span><span class="p">.</span>
+<span class="p">};</span>
+</pre></div>
+</div>
+<section id="usage">
+<h3>Usage<a class="headerlink" href="#usage" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>In the kernel code, use the <code class="docutils literal notranslate"><span class="pre">kernel_cmdline_param_kv!</span></code> macro to declare the required KV type parameters.</p></li>
+<li><p>During kernel initialization, retrieve the parameter value through the <code class="docutils literal notranslate"><span class="pre">value_str()</span></code> or <code class="docutils literal notranslate"><span class="pre">value_bool()</span></code> method of the parameter.</p></li>
+<li><p>Execute corresponding operations based on the parameter value.</p></li>
+</ol>
+<p>By following these steps, developers can flexibly use kernel boot command line parameters to control kernel behavior.</p>
+</section>
+</section>
+<section id="todo">
+<h2>TODO<a class="headerlink" href="#todo" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>Support displaying the current kernel’s boot command line parameters under <code class="docutils literal notranslate"><span class="pre">/proc/cmdline</span></code> (requires procfs refactoring)</p></li>
+<li><p>Support setting callback functions to set parameter values</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="bootloader.html" class="btn btn-neutral float-left" title="Bootloader" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../core_api/index.html" class="btn btn-neutral float-right" title="Core API Documentation" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>1c53c97</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.3.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/locales/en/kernel/boot/cmdline.html">V0.2.0</a></dd>
+      <dd><a href="cmdline.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/locales/en/kernel/boot/cmdline.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/boot/cmdline.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

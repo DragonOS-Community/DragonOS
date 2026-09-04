@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V0.1.8 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+        <script src="../../../_static/jquery.js"></script>
+        <script src="../../../_static/underscore.js"></script>
+        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../_static/doctools.js"></script>
+        <script src="../../../_static/translations.js"></script>
+    <script src="../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../search.html" />
+    <link rel="next" title="V0.1.7" href="V0.1.7.html" />
+    <link rel="prev" title="V0.1.9" href="V0.1.9.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/libs/index.html">其他内核库</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">发行日志</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="V0.1.10.html">V0.1.10</a></li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.9.html">V0.1.9</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">V0.1.8</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">贡献者名单</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">赞助者名单</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">更新内容-内核</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id4">新特性</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#bugfix">bugfix</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id5">更新内容-用户环境</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id6">新特性</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">bugfix</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id8">更新内容-其他</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id9">更新内容-软件移植</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id10">源码、发布版镜像下载</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#git">通过Git获取</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#dragonos">通过DragonOS软件镜像站获取</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id11">开放源代码声明</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id12">开源软件使用情况</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id13">当前版本的所有提交记录</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.7.html">V0.1.7</a></li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.6.html">V0.1.6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.5.html">V0.1.5</a></li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.4.html">V0.1.4</a></li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.3.html">V0.1.3</a></li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.2.html">V0.1.2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.1.html">V0.1.1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="V0.1.0.html">V0.1.0</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../index.html">发行日志</a></li>
+      <li class="breadcrumb-item active">V0.1.8</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ce48b93/docs/community/ChangeLog/V0.1.x/V0.1.8.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="v0-1-8">
+<h1>V0.1.8<a class="headerlink" href="#v0-1-8" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>本文作者：龙进 <a class="reference external" href="mailto:longjin&#37;&#52;&#48;DragonOS&#46;org">longjin<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p>
+<p>2023年8月16日</p>
+</div>
+<section id="id1">
+<h2>贡献者名单<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>DragonOS V0.1.8版本由以下小伙伴贡献代码：</p>
+<ul class="simple">
+<li><p>龙进 <a class="reference external" href="mailto:longjin&#37;&#52;&#48;DragonOS&#46;org">longjin<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>侯嘉滢 <a class="reference external" href="mailto:houjiaying&#37;&#52;&#48;DragonOS&#46;org">houjiaying<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>吴宇健 <a class="reference external" href="mailto:wuyujian&#37;&#52;&#48;DragonOS&#46;org">wuyujian<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>黄厅 <a class="reference external" href="mailto:huangting&#37;&#52;&#48;DragonOS&#46;org">huangting<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>孔维超 <a class="reference external" href="mailto:kongweichao&#37;&#52;&#48;DragonOS&#46;org">kongweichao<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>蔡嘉鑫 <a class="reference external" href="mailto:caijiaxin&#37;&#52;&#48;DragonOS&#46;org">caijiaxin<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>池克俭 <a class="reference external" href="mailto:chikejhian&#37;&#52;&#48;DragonOS&#46;org">chikejhian<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>zhaoyao73 <a class="reference external" href="mailto:dragonlinux&#37;&#52;&#48;gmail&#46;com">dragonlinux<span>&#64;</span>gmail<span>&#46;</span>com</a></p></li>
+<li><p>周瀚杰 <a class="reference external" href="mailto:zhouhanjie&#37;&#52;&#48;DragonOS&#46;org">zhouhanjie<span>&#64;</span>DragonOS<span>&#46;</span>org</a></p></li>
+<li><p>Bullet <a class="reference external" href="mailto:93781792+GP-Bullet&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">93781792+GP-Bullet<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a></p></li>
+<li><p>櫻井桃華 <a class="reference external" href="mailto:89176634+TihayaKousaka&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">89176634+TihayaKousaka<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a></p></li>
+<li><p>Tptogiar <a class="reference external" href="mailto:2528891112&#37;&#52;&#48;qq&#46;com">2528891112<span>&#64;</span>qq<span>&#46;</span>com</a></p></li>
+</ul>
+</section>
+<section id="id2">
+<h2>赞助者名单<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>感谢以下同学的赞赏，我们将不断努力！</p>
+<ul class="simple">
+<li><p>万晓兰</p></li>
+<li><p>David Wen</p></li>
+<li><p><a class="reference external" href="https://github.com/seeleclover">Seele.Clover</a></p></li>
+<li><p><a class="reference external" href="https://github.com/FindWangHao">FindWangHao</a></p></li>
+<li><p><a class="reference external" href="https://github.com/ferchiel">ferchiel</a></p></li>
+<li><p>叶锦毅</p></li>
+<li><p>林</p></li>
+<li><p>Albert</p></li>
+<li><p><a class="reference external" href="https://github.com/TerryLeeSCUT">TerryLeeSCUT · GitHub</a></p></li>
+<li><p>slientbard</p></li>
+<li><p>悟</p></li>
+<li><p>匿名热心人士</p></li>
+</ul>
+</section>
+<section id="id3">
+<h2>更新内容-内核<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<section id="id4">
+<h3>新特性<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>refactor: 重构系统调用模块 (#267)</p></li>
+<li><p>feature: 添加AlignBox和int_like宏 (#272)</p></li>
+<li><p>refactor: 新的ipi功能&amp;kick_cpu功能的重写 (#274)</p></li>
+<li><p>feature: 实现gettimeofday()系统调用和clocksource+timekeeping子模块 (#278)</p></li>
+<li><p>refactor: PCI设备中断重构，并删去USB相关代码 (#285)</p></li>
+<li><p>feature: 注册串口设备，创建字符设备框架(#290)</p></li>
+<li><p>refactor: 新的内存管理模块 (#303)</p></li>
+<li><p>feature: 新的二进制加载器、elf解析器 (#303)</p></li>
+<li><p>feature: 增加 ListenTable 来检测端口占用 (#291)</p></li>
+<li><p>feature: 替换 local_irq_save 为 IrqFlagsGuard 实现 (#317)</p></li>
+<li><p>feature: 实现系统调用Fstat (#295)</p></li>
+<li><p>feature: 实现内核通知链 notifier chain (#316)</p></li>
+<li><p>feature: 增加fcntl系统调用 (#323)</p></li>
+<li><p>feature: 添加per cpu变量支持 (#327)</p></li>
+<li><p>feature: spinlock守卫新增leak,spinlock新增force unlock功能.(#329)</p></li>
+</ul>
+</section>
+<section id="bugfix">
+<h3>bugfix<a class="headerlink" href="#bugfix" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>bugfix: 修复无法正常读取stdin的问题 (#264)</p></li>
+<li><p>bugfix: 修复了当传入ahci驱动的缓冲区地址为用户缓冲区时,产生的内存越界问题.(采用分配内核缓冲区的方式临时解决) (#265)</p></li>
+<li><p>bugfix: 解决由于local_irq_save、local_irq_restore函数的汇编不规范导致影响栈行为的bug。 (#303)</p></li>
+<li><p>bugfix: 解决local_irq_save未关中断的错误 (#303)</p></li>
+<li><p>bugfix: 解决arch_try_cmpxchg对于指针处理的错误 (#307)</p></li>
+<li><p>bugfix: 修复了wait4的异常报错 (#312)</p></li>
+<li><p>bugfix: 修正null设备以及zero设备无法open、行为不符合预期的问题 (#314)</p></li>
+<li><p>bugfix: 修正fat文件系统未能正确的扩展文件大小的bug (#323)</p></li>
+<li><p>bugfix: 修正rwlock有的地方由于未使用ManuallyDrop导致的use after free问题 (#329)</p></li>
+</ul>
+</section>
+</section>
+<section id="id5">
+<h2>更新内容-用户环境<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h2>
+<section id="id6">
+<h3>新特性<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>feature: 新增http server (#265)</p></li>
+</ul>
+</section>
+<section id="id7">
+<h3>bugfix<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>bugfix: 解决链接时，由于crt*.o未按照升序排列导致init段链接错误的问题 (#265)</p></li>
+</ul>
+</section>
+</section>
+<section id="id8">
+<h2>更新内容-其他<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>bugfix: 固定编译工具链、修复由于新版rust编译器问题导致的报错。 (#258)</p></li>
+<li><p>feature: Makefile: 根目录下添加make help命令 (#271)</p></li>
+<li><p>doc: 更新github issue模板 (#277)</p></li>
+<li><p>bugfix: 解决relibc的头文件没能识别__dragonos__定义的问题 (#315)</p></li>
+<li><p>feature: 设置内核、relibc的远程为dragonos的git镜像站，防止国内网络问题导致编译失败 (#318)</p></li>
+<li><p>feature: 自动安装、更新dadk (#319)</p></li>
+</ul>
+</section>
+<section id="id9">
+<h2>更新内容-软件移植<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>feature: 移植了sqlite3 (#323)</p></li>
+</ul>
+</section>
+<section id="id10">
+<h2>源码、发布版镜像下载<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h2>
+<p>  您可以通过以下方式获得源代码:</p>
+<section id="git">
+<h3>通过Git获取<a class="headerlink" href="#git" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>您可以访问<a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/releases">https://github.com/DragonOS-Community/DragonOS/releases</a>下载发布版的代码，以及编译好的，可运行的磁盘镜像。</p></li>
+<li><p>我们在gitee上也有镜像仓库可供下载：<a class="reference external" href="https://gitee.com/DragonOS/DragonOS">https://gitee.com/DragonOS/DragonOS</a></p></li>
+</ul>
+</section>
+<section id="dragonos">
+<h3>通过DragonOS软件镜像站获取<a class="headerlink" href="#dragonos" title="Permalink to this heading"></a></h3>
+<p>  为解决国内访问GitHub慢、不稳定的问题，同时为了方便开发者们下载DragonOS的每个版本的代码，我们特意搭建了镜像站，您可以通过以下地址访问镜像站：</p>
+<p>  您可以通过镜像站获取到DragonOS的代码压缩包，以及编译好的可运行的磁盘镜像。</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://mirrors.DragonOS.org">https://mirrors.DragonOS.org</a></p></li>
+<li><p><a class="reference external" href="https://git.mirrors.DragonOS.org">https://git.mirrors.DragonOS.org</a></p></li>
+<li><p>国内镜像加速： <a class="reference external" href="https://mirrors.ringotek.cn/">https://mirrors.ringotek.cn/</a></p></li>
+</ul>
+</section>
+</section>
+<section id="id11">
+<h2>开放源代码声明<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h2>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>为促进DragonOS项目的健康发展，DragonOS以GPLv2开源协议进行发布。所有能获得到DragonOS源代码以及相应的软件制品（包括但不限于二进制副本、文档）的人，都能享有我们通过GPLv2协议授予您的权利，同时您也需要遵守协议中规定的义务。</p>
+<p>这是一个相当严格的，保护开源软件健康发展，不被侵占的协议。</p>
+<p>对于大部分的善意的人们而言，您不会违反我们的开源协议。</p>
+<p>我们鼓励DragonOS的自由传播、推广，但是请确保所有行为没有侵犯他人的合法权益，也没有违反GPLv2协议。</p>
+<p>请特别注意，对于违反开源协议的，尤其是<strong>商业闭源使用以及任何剽窃、学术不端行为将会受到严肃的追责</strong>。（这是最容易违反我们的开源协议的场景）。</p>
+<p>并且，请注意，按照GPLv2协议的要求，基于DragonOS修改或二次开发的软件，必须同样采用GPLv2协议开源，并标明其基于DragonOS进行了修改。亦需保证这些修改版本的用户能方便的获取到DragonOS的原始版本。</p>
+<p>您必须使得DragonOS的开发者们，能够以同样的方式，从公开渠道获取到您二次开发的版本的源代码，否则您将违反GPLv2协议。</p>
+<p>关于协议详细内容，还敬请您请阅读项目根目录下的<strong>LICENSE</strong>文件。请注意，按照GPLv2协议的要求，<strong>只有英文原版才具有法律效力</strong>。任何翻译版本都仅供参考。</p>
+</div>
+<section id="id12">
+<h3>开源软件使用情况<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h3>
+<p>  DragonOS在开发的过程中，参考了一些开源项目的设计，或者引入了他们的部分代码，亦或是受到了他们的启发。现将他们列在下面。我们对这些开源项目的贡献者们致以最衷心的感谢！</p>
+<p>格式：&lt;项目名&gt; - &lt;链接&gt; - &lt;开源协议&gt;</p>
+<ul class="simple">
+<li><p>Linux - 	<a class="reference external" href="https://git.kernel.org/">https://git.kernel.org/</a> - GPLv2</p></li>
+<li><p>skiftOS - <a class="reference external" href="https://github.com/skiftOS/skift">https://github.com/skiftOS/skift</a> - MIT</p></li>
+<li><p>FYSOS - <a class="reference external" href="https://github.com/fysnet/FYSOS">https://github.com/fysnet/FYSOS</a> - <a class="reference external" href="https://github.com/fysnet/FYSOS/blob/9a8968e3d6600de34539c028c843f4c06d134039/license.txt">FYSOS’ License</a></p></li>
+<li><p>LemonOS - <a class="reference external" href="https://github.com/LemonOSProject/LemonOS.git">https://github.com/LemonOSProject/LemonOS.git</a> - BSD 2-Clause License</p></li>
+<li><p>LZ4 - <a class="reference external" href="https://github.com/lz4/lz4">https://github.com/lz4/lz4</a> - BSD 2-Clause license</p></li>
+<li><p>SerenityOS - <a class="reference external" href="https://github.com/SerenityOS/serenity.git">https://github.com/SerenityOS/serenity.git</a> - BSD 2-Clause license</p></li>
+<li><p>MINE - 《一个64位操作系统的设计与实现》田宇; 人民邮电出版社</p></li>
+<li><p>chcore - 《现代操作系统：设计与实现》陈海波，夏虞斌; 机械工业出版社</p></li>
+<li><p>SimpleKernel - <a class="reference external" href="https://github.com/Simple-XX/SimpleKernel">https://github.com/Simple-XX/SimpleKernel</a> - MIT</p></li>
+<li><p>rcore-fs - <a class="reference external" href="https://github.com/rcore-os/rcore-fs.git">https://github.com/rcore-os/rcore-fs.git</a> - MIT</p></li>
+<li><p>redox - <a class="reference external" href="https://gitlab.redox-os.org/redox-os/redox">https://gitlab.redox-os.org/redox-os/redox</a> - MIT</p></li>
+</ul>
+</section>
+</section>
+<section id="id13">
+<h2>当前版本的所有提交记录<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h2>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>commit 40176b1c6603d487b7eb66fb81e641f0932ab90a
+Author: longjin &lt;longjin@RinGoTek.cn&gt;
+Date:   Tue Aug 15 15:06:57 2023 +0000
+
+    删除无用代码,并把about app的版本号更新为0.1.8
+
+commit 67b481888770c6469f572f244a4f97e42da77d1f
+Author: houmkh &lt;1119644616@qq.com&gt;
+Date:   Mon Aug 14 12:18:46 2023 +0800
+
+    移动fstat (#330)
+    
+    * 移动fstat
+
+commit 90a0a49048fdaf5e31320d0c87f8bed8db1bd882
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Mon Aug 14 01:24:49 2023 +0800
+
+    修正rwlock有的地方由于未使用ManuallyDrop导致的use after free &amp;&amp; spinlock守卫新增leak,spinlock新增force unlock功能.(#329)
+    
+    1.修正rwlock有的地方由于未使用ManuallyDrop导致的use after free
+    2. spinlock守卫新增leak,spinlock新增force unlock功能.
+
+commit c3dad0011d331d782670e14723aa48e98fbac787
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Sun Aug 13 16:28:24 2023 +0800
+
+    添加per cpu变量支持 (#327)
+
+commit 42c97fa7f4fee7eeefeda5d2b7ed14f598a58493
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Tue Aug 8 23:45:04 2023 +0800
+
+    删除旧的libELF (#324)
+
+commit 6d81180b3b7328466b976b69c5f7782aa66d8a89
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Tue Aug 8 23:39:22 2023 +0800
+
+    移植sqlite3,并修复一些bug (#323)
+    
+    * bugfix: 程序加载器映射内存时，计算要映射的大小不正确的问题。
+    
+    * 修正brk系统调用不符合规范的地方
+    
+    * bugfix: 修正fat文件系统未能正确的扩展文件大小的bug
+    
+    * 增加fcntl系统调用
+    
+    * 移植sqlite3
+
+commit 26887c6334cdca2d13ad71dec27fb69faa0a57be
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Mon Aug 7 01:38:52 2023 +0800
+
+    bugfix: 解决取消低地址映射时，错误的把重映射的物理页释放，从而导致的use after free问题。 (#321)
+
+commit 729a96ef47f473d535d8317a2ace5ba141fd282a
+Author: Xshine &lt;gshine@m.scnu.edu.cn&gt;
+Date:   Sun Aug 6 12:53:47 2023 +0800
+
+    实现内核通知链 notifier chain (#316)
+    
+    * 实现通知链块结构
+    
+    * 实现通知链的基本功能
+    
+    * 实现 atomic notifier chain
+    
+    * 实现 blocking notifier chain
+    
+    * 使用 rust 范式完成功能
+    
+    * 支持回调次数 nr_to_call
+    
+    * 移动至 libs 目录
+    
+    * 完善通知链相关方法
+    
+    * 修正相关格式
+    
+    * 文档编写
+    
+    * 更改文档路径
+
+commit be63f3b2b6b472daa3ee17180aa607409cb9d182
+Author: houmkh &lt;1119644616@qq.com&gt;
+Date:   Sat Aug 5 18:52:46 2023 +0800
+
+    实现系统调用Fstat (#295)
+    
+    * fstat
+    
+    * 修改syscall.rs中的verify_area
+
+commit 9550910ae1de900e0291a84d268e8873fa142902
+Author: Chiichen &lt;39649411+Chiichen@users.noreply.github.com&gt;
+Date:   Sat Aug 5 18:30:55 2023 +0800
+
+     替换 local_irq_save 为 IrqFlagsGuard 实现 (#317)
+
+commit abf3f634bf7e13e829556e962e7c73a85d163335
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Sat Aug 5 15:30:06 2023 +0800
+
+    自动安装、更新dadk (#319)
+    
+    * auto install/auto update dadk
+
+commit d6fd9c1e8025dd679339f9156477cb7d26d3db0d
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Sat Aug 5 15:04:08 2023 +0800
+
+    设置内核、relibc的远程为dragonos的git镜像站，防止国内网络问题导致编译失败 (#318)
+
+commit 1a62e7767c1215f9668915b42de770e7993711bf
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Wed Aug 2 18:11:05 2023 +0800
+
+    解决relibc的头文件没能识别__dragonos__定义的问题 (#315)
+
+commit 06500303303ec14711b4f995e2058e12703f0f2c
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Wed Aug 2 17:33:16 2023 +0800
+
+    修正null设备以及zero设备无法open、行为不符合预期的问题 (#314)
+
+commit 4da3758acf0327d429dfce3d313b50c2e0fc7723
+Author: Chiichen &lt;39649411+Chiichen@users.noreply.github.com&gt;
+Date:   Wed Aug 2 14:29:59 2023 +0800
+
+    修复了wait4的异常报错 (#312)
+    
+    * 修复了wait4的异常报错
+
+commit 821bb9a2dcfd28f9878d53ba722bdf164cf00f69
+Author: Xshine &lt;caijiaxin@dragonos.org&gt;
+Date:   Fri Jul 28 17:51:05 2023 +0800
+
+    增加 ListenTable 来检测端口占用 (#291)
+    
+    * 增加 ListenTable 来检测端口占用
+    
+    
+    * 使用Arc封装GlobalSocketHandle
+    
+    * 删除 listen 处的端口检测逻辑，延至实现端口复用时完成
+    
+    * 设立两张表，分别记录TCP和UDP的端口占用
+    
+    * 实现 meatadata 相关逻辑
+    
+    * 实现socket关闭时，端口在表中移除
+    
+    * 使用端口管理器重构端口记录表
+    
+    * 修正与RawSocket相关的端口管理逻辑
+    
+    * 补充测试文件
+    
+    * 修正 unbind_port 在逻辑错误
+    
+    * 修正格式问题
+    
+    ---------
+    
+    Co-authored-by: longjin &lt;longjin@RinGoTek.cn&gt;
+
+commit 7cc4a02c7ff7bafd798b185beb7b0c2986b9f32f
+Author: zhaoyao73 &lt;zhaoyao73@users.noreply.github.com&gt;
+Date:   Fri Jul 28 03:44:45 2023 -0400
+
+    fix arch_try_cmpxchg macro declaration (#307)
+    
+    fix arch_try_cmpxchg in atomic_cmpxchg
+    
+    Co-authored-by: Yao Zhao &lt;dragonlinux@gmail.com&gt;
+
+commit a30434f5201ca4c60b9515c8c23444fea3b5a8c6
+Author: zhaoyao73 &lt;zhaoyao73@users.noreply.github.com&gt;
+Date:   Tue Jul 25 10:02:42 2023 -0400
+
+    fix some script bugs (#304)
+    
+    add arch linux prerequisited packages
+    
+    Co-authored-by: Yao Zhao &lt;dragonlinux@gmail.com&gt;
+
+commit 40fe15e0953f989ccfeb74826d61621d43dea6bb
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Sat Jul 22 16:27:02 2023 +0800
+
+    新的内存管理模块 (#303)
+    
+    &amp;emsp;&amp;emsp;实现了具有优秀架构设计的新的内存管理模块，对内核空间和用户空间的内存映射、分配、释放、管理等操作进行了封装，使得内核开发者可以更加方便地进行内存管理。
+    
+    &amp;emsp;&amp;emsp;内存管理模块主要由以下类型的组件组成：
+    
+    - **硬件抽象层（MemoryManagementArch）** - 提供对具体处理器架构的抽象，使得内存管理模块可以在不同的处理器架构上运行
+    - **页面映射器（PageMapper）**- 提供对虚拟地址和物理地址的映射，以及页表的创建、填写、销毁、权限管理等操作。分为两种类型：内核页表映射器（KernelMapper）和用户页表映射器（位于具体的用户地址空间结构中）
+    - **页面刷新器（PageFlusher）** - 提供对页表的刷新操作（整表刷新、单页刷新、跨核心刷新）
+    - **页帧分配器（FrameAllocator）** - 提供对页帧的分配、释放、管理等操作。具体来说，包括BumpAllocator、BuddyAllocator
+    - **小对象分配器** - 提供对小内存对象的分配、释放、管理等操作。指的是内核里面的SlabAllocator （SlabAllocator的实现目前还没有完成）
+    - **MMIO空间管理器** - 提供对MMIO地址空间的分配、管理操作。（目前这个模块待进一步重构）
+    - **用户地址空间管理机制** - 提供对用户地址空间的管理。
+        - VMA机制 - 提供对用户地址空间的管理，包括VMA的创建、销毁、权限管理等操作
+        - 用户映射管理 - 与VMA机制共同作用，管理用户地址空间的映射
+    - **系统调用层** - 提供对用户空间的内存管理系统调用，包括mmap、munmap、mprotect、mremap等
+    - **C接口兼容层** - 提供对原有的C代码的接口，是的C代码能够正常运行。
+    
+    
+    除上面的新增内容以外，其它的更改内容：
+    - 新增二进制加载器，以及elf的解析器
+    - 解决由于local_irq_save、local_irq_restore函数的汇编不规范导致影响栈行为的bug。
+    - 解决local_irq_save未关中断的错误。
+    - 修复sys_gettimeofday对timezone参数的处理的bug
+    
+    ---------
+    
+    Co-authored-by: kong &lt;kongweichao@dragonos.org&gt;
+
+commit bb5f098a864cee36b7d2c1ab9c029c0280d94a8a
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Sat Jul 22 16:24:55 2023 +0800
+
+    Revert &quot;新的内存管理模块 (#301)&quot; (#302)
+    
+    This reverts commit d8ad0a5e7724469abd5cc3cf271993538878033e.
+
+commit d8ad0a5e7724469abd5cc3cf271993538878033e
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Sat Jul 22 16:22:17 2023 +0800
+
+    新的内存管理模块 (#301)
+    
+    &amp;emsp;&amp;emsp;实现了具有优秀架构设计的新的内存管理模块，对内核空间和用户空间的内存映射、分配、释放、管理等操作进行了封装，使得内核开发者可以更加方便地进行内存管理。
+    
+    &amp;emsp;&amp;emsp;内存管理模块主要由以下类型的组件组成：
+    
+    - **硬件抽象层（MemoryManagementArch）** - 提供对具体处理器架构的抽象，使得内存管理模块可以在不同的处理器架构上运行
+    - **页面映射器（PageMapper）**- 提供对虚拟地址和物理地址的映射，以及页表的创建、填写、销毁、权限管理等操作。分为两种类型：内核页表映射器（KernelMapper）和用户页表映射器（位于具体的用户地址空间结构中）
+    - **页面刷新器（PageFlusher）** - 提供对页表的刷新操作（整表刷新、单页刷新、跨核心刷新）
+    - **页帧分配器（FrameAllocator）** - 提供对页帧的分配、释放、管理等操作。具体来说，包括BumpAllocator、BuddyAllocator
+    - **小对象分配器** - 提供对小内存对象的分配、释放、管理等操作。指的是内核里面的SlabAllocator （SlabAllocator的实现目前还没有完成）
+    - **MMIO空间管理器** - 提供对MMIO地址空间的分配、管理操作。（目前这个模块待进一步重构）
+    - **用户地址空间管理机制** - 提供对用户地址空间的管理。
+        - VMA机制 - 提供对用户地址空间的管理，包括VMA的创建、销毁、权限管理等操作
+        - 用户映射管理 - 与VMA机制共同作用，管理用户地址空间的映射
+    - **系统调用层** - 提供对用户空间的内存管理系统调用，包括mmap、munmap、mprotect、mremap等
+    - **C接口兼容层** - 提供对原有的C代码的接口，是的C代码能够正常运行。
+    
+    
+    除上面的新增内容以外，其它的更改内容：
+    - 新增二进制加载器，以及elf的解析器
+    - 解决由于local_irq_save、local_irq_restore函数的汇编不规范导致影响栈行为的bug。
+    - 解决local_irq_save未关中断的错误。
+    - 修复sys_gettimeofday对timezone参数的处理的bug
+
+commit 0663027b111ffb6ff93becd60ffef1e2b8fbd4c6
+Author: TingHuang &lt;92705854+TingSHub@users.noreply.github.com&gt;
+Date:   Wed Jul 12 12:49:45 2023 +0800
+
+    注册串口设备，创建字符设备框架(#290)
+    
+    * 按照rust规范修改两个函数名称
+    
+    * 修改一些函数句柄以符合rust规范
+    
+    * 添加字符设备相关
+    
+    * 添加字符设备相关文件
+    
+    * 添加字符设备驱动框架代码
+    
+    * 将串口注册
+    
+    * 规范代码
+
+commit cc36cf4a186be834e6c2ab857b9b9501ddb8b1eb
+Author: YJwu2023 &lt;yujianwu2019@gmail.com&gt;
+Date:   Sat Jul 8 17:22:42 2023 +0800
+
+    PCI设备中断重构，删去USB相关代码 (#285)
+    
+    * 修复ecam无法获取MCFG table的问题
+    
+    * 完善pcie
+    
+    * 完善irq的错误检测机制
+
+commit 2311e2f30048d09250afc3e2e4e7029627996655
+Author: 櫻井桃華 &lt;89176634+TihayaKousaka@users.noreply.github.com&gt;
+Date:   Fri Jul 7 22:50:46 2023 +0800
+
+    修改makefile通过编译 (#287)
+
+commit 36fd013004ee0bd5fc7cfb452ba22531a83a859c
+Author: houmkh &lt;1119644616@qq.com&gt;
+Date:   Sat Jun 17 22:48:15 2023 +0800
+
+    实现gettimeofday()系统调用和clocksource+timekeeping子模块 (#278)
+    
+    - 实现gettimeofday()系统调用
+    - 实现clocksource+timekeeping子模块部分功能
+    - 实现了timespec转换成日期时间
+
+commit a55ac7b928a6ca08483bbb3355bea55f1446ccab
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Tue Jun 6 17:44:54 2023 +0800
+
+    Update issue templates (#277)
+
+commit 5f57834372f6cb720ba14103effa4799e195a963
+Author: Tptogiar &lt;2528891112@qq.com&gt;
+Date:   Tue Jun 6 16:41:02 2023 +0800
+
+    Makefile: 根目录下添加make help命令 (#271)
+    
+    * Makefile: 根目录下添加make help命令
+    
+    * Makefile: 补充根目录Makefile的help命令
+
+commit aa0367d69e15989684109c5b454e85da9ecb1975
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Tue May 30 10:21:11 2023 +0800
+
+    新的ipi功能&amp;kick_cpu功能的重写 (#274)
+
+commit bb24249faabc5006784aa98ca17b4cbdcb788c65
+Author: LoGin &lt;longjin@DragonOS.org&gt;
+Date:   Sun May 28 23:00:37 2023 +0800
+
+    添加AlignBox和int_like宏 (#272)
+
+commit ab5c8ca46db8e7d4793a9791292122b0b9684274
+Author: login &lt;longjin@DragonOS.org&gt;
+Date:   Wed May 24 17:05:33 2023 +0800
+
+    重构系统调用模块 (#267)
+    
+    * 完成系统调用模块重构
+    
+    * 更新github workflow
+
+commit 660a04cef803fd73e9b294b30a96421b021a4b9b
+Author: login &lt;longjin@DragonOS.org&gt;
+Date:   Sat May 13 21:17:12 2023 +0800
+
+    新增http server (#265)
+    
+    * 1.修复了当传入ahci驱动的缓冲区地址为用户缓冲区时,产生的内存越界问题.(采用分配内核缓冲区的方式临时解决)
+    2.新增http server
+    
+    * 把libssl-dev添加到bootstrap.sh
+    
+    * http_server增加对父级相对路径的安全检查，防止访问系统内的其他文件
+    
+    * 检查空指针情况
+    
+    * 解决由于链接时，crt*.o未按照升序排列导致init段链接错误的问题
+
+commit 49249f4ec94fad7baf923aed68d9a7b2da3de3d4
+Author: Bullet &lt;93781792+GP-Bullet@users.noreply.github.com&gt;
+Date:   Sat May 13 09:55:24 2023 +0800
+
+    把调度器实例的裸指针改为Option (#262)
+
+commit bfafc102798ab1968ccf6b04315d8d3359a70ca8
+Author: login &lt;longjin@DragonOS.org&gt;
+Date:   Thu May 11 17:41:42 2023 +0800
+
+    修复读取stdin时，无法正常读取的问题。 (#264)
+
+commit 7285c927d95bb4b5c692c51a8f86c47009d07667
+Author: login &lt;longjin@DragonOS.org&gt;
+Date:   Thu May 11 16:17:58 2023 +0800
+
+    添加dadk支持 (#263)
+    
+    * 引入dadk，使用dadk0.1.1来编译test-relibc程序
+    
+    * 由于gitee仓库体积限制导致无法继续使用gitee上的rust索引，因此更换为清华源
+    
+    * github workflow的环境中，安装dadk
+    
+    * Auto configure dragonos rust toolchain
+
+commit b11bb1b25676f528ec1b0e1da0af82b4652f70c4
+Author: login &lt;longjin@DragonOS.org&gt;
+Date:   Sun May 7 22:20:33 2023 +0800
+
+    固定编译工具链、修复由于新版rust编译器问题导致的报错。 (#258)
+    
+    * 固定编译工具链、修复由于新版rust编译器问题导致的报错。
+    
+    * 完善github workflow环境配置
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="V0.1.9.html" class="btn btn-neutral float-left" title="V0.1.9" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="V0.1.7.html" class="btn btn-neutral float-right" title="V0.1.7" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ce48b93</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.10
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="V0.1.8.html">V0.1.10</a></dd>
+      <dd><a href="../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../V0.1.8/community/ChangeLog/V0.1.x/V0.1.8.html">V0.1.8</a></dd>
+      <dd><a href="../../../../V0.1.9/community/ChangeLog/V0.1.x/V0.1.8.html">V0.1.9</a></dd>
+      <dd><a href="../../../../V0.2.0/community/ChangeLog/V0.1.x/V0.1.8.html">V0.2.0</a></dd>
+      <dd><a href="../../../../V0.3.0/community/ChangeLog/V0.1.x/V0.1.8.html">V0.3.0</a></dd>
+      <dd><a href="../../../../V0.4.0/community/ChangeLog/V0.1.x/V0.1.8.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../master/community/ChangeLog/V0.1.x/V0.1.8.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

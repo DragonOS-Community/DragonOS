@@ -1,13 +1,13 @@
-:::{note}
-本文作者: 龙进
+::: info Author
+Long Jin
 
-Email: <longjin@DragonOS.org>
+Email: `<longjin@DragonOS.org>`
 :::
 
-# 设计
 
+# Design
 
-&emsp;&emsp;VFS的架构设计如下图所示：
+The architecture design of VFS is shown in the following diagram:
 
 ```text
                       ┌─────────┐
@@ -39,20 +39,20 @@ Filesystems:   │
 ```
 
 ## 1. File
-&emsp;&emsp;File结构体是VFS中最基本的抽象，它代表了一个打开的文件。每当进程打开了一个文件，就会创建一个File结构体，用于维护该文件的状态信息。
+The File structure is the most basic abstraction in VFS, representing an opened file. Whenever a process opens a file, a File structure is created to maintain the state information of that file.
 
 ## 2. Traits
 
-&emsp;&emsp;对于每个具体文件系统，都需要实现以下的trait：
+For each specific file system, the following traits must be implemented:
 
-- FileSystem：表明某个struct是一个文件系统
-- IndexNode： 表明某个struct是一个索引节点
+- FileSystem: Indicates that a struct is a file system
+- IndexNode: Indicates that a struct is an index node
 
-&emsp;&emsp;一般情况下，FileSystem和IndexNode是一对一的关系，也就是，一个文件系统对应一种IndexNode。但是，对于某些特殊的文件系统，比如DevFS，根据不同的设备类型，会有不同的IndexNode，因此，FileSystem和IndexNode是一对多的关系。
+Generally, there is a one-to-one relationship between FileSystem and IndexNode, meaning that one file system corresponds to one type of IndexNode. However, for some special file systems, such as DevFS, different IndexNodes may exist based on different device types. Therefore, there is a one-to-many relationship between FileSystem and IndexNode.
 
 ## 3. MountFS
 
-&emsp;&emsp;挂载文件系统虽然实现了FileSystem和IndexNode这两个trait，但它并不是一个“文件系统”，而是一种机制，用于将不同的文件系统挂载到同一个文件系统树上.
-所有的文件系统要挂载到文件系统树上，都需要通过MountFS来完成。也就是说，挂载树上的每个文件系统结构体的外面，都套了一层MountFS结构体。
+Although MountFS implements the FileSystem and IndexNode traits, it is not itself a "file system," but rather a mechanism used to mount different file systems onto the same file system tree.
+All file systems that need to be mounted onto the file system tree must go through MountFS to complete the mounting process. In other words, each file system structure in the mount tree is wrapped with a MountFS structure.
 
-&emsp;&emsp;对于大部分的操作，MountFS都是直接转发给具体的文件系统，而不做任何处理。同时，为了支持跨文件系统的操作，比如在目录树上查找，每次lookup操作或者是find操作，都会通过MountFSInode的对应方法，判断当前inode是否为挂载点，并对挂载点进行特殊处理。如果发现操作跨越了具体文件系统的边界，MountFS就会将操作转发给下一个文件系统，并执行Inode替换。这个功能的实现，也是通过在普通的Inode结构体外面，套一层MountFSInode结构体来实现的。
+For most operations, MountFS simply forwards the operation to the specific file system without any processing. At the same time, to support cross-file system operations, such as searching in a directory tree, each lookup or find operation will go through the corresponding method of MountFSInode to determine whether the current inode is a mount point and handle it specially. If the operation is found to cross the boundary of a specific file system, MountFS will forward the operation to the next file system and perform an inode replacement. This functionality is implemented by wrapping a regular Inode structure with a MountFSInode structure.

@@ -475,6 +475,17 @@ pub trait Iface: crate::driver::base::device::Device {
     /// Inclusive runtime IP-MTU limits for this device.
     fn mtu_bounds(&self) -> MtuBounds;
 
+    /// Project a userspace-visible device MTU into the shared network stack.
+    ///
+    /// Most devices have an identity projection. Implementations whose ABI
+    /// MTU exceeds a protocol limit supported by the stack may derive a
+    /// smaller value here; the configured MTU remains the sole stored state.
+    /// Every value accepted by `mtu_bounds()` must project to a value accepted
+    /// by this interface's smoltcp device capabilities.
+    fn stack_mtu(&self, configured_mtu: usize) -> usize {
+        configured_mtu
+    }
+
     /// Stop new device notifications or software ingress admission before the
     /// shared NAPI owner is paused. This must not fail, allocate, or block.
     fn begin_admin_down(&self) {}

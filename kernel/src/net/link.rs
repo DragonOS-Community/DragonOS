@@ -202,10 +202,11 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         };
 
         if let Some(mtu) = mtu {
+            let stack_mtu = iface.stack_mtu(mtu);
             iface
                 .smol_iface()
                 .lock()
-                .set_ip_mtu(mtu)
+                .set_ip_mtu(stack_mtu)
                 .expect("validated interface MTU must be representable by smoltcp");
             iface.common().set_mtu(mtu);
         }

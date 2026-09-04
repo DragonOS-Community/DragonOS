@@ -265,6 +265,21 @@ int RecvAck(int fd, uint32_t seq) {
     }
 }
 
+int SetRtnlMtu(int fd, int ifindex, uint32_t mtu, uint32_t seq) {
+    std::array<unsigned char, 256> request{};
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    auto* link = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(header));
+    header->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    header->nlmsg_type = RTM_SETLINK;
+    header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    header->nlmsg_seq = seq;
+    link->ifi_family = AF_UNSPEC;
+    link->ifi_index = ifindex;
+    AddAttr(header, request.size(), IFLA_MTU, &mtu, sizeof(mtu));
+    if (send(fd, request.data(), header->nlmsg_len, 0) != header->nlmsg_len) return errno;
+    return RecvAck(fd, seq);
+}
+
 int MutatePermanentNeighbor(int fd, uint16_t type, uint16_t flags, int ifindex,
                             uint32_t destination, const std::array<uint8_t, 6>* mac,
                             uint32_t seq) {
@@ -437,6 +452,59 @@ TEST(SocketIoctlNetdevMutation, FlagsAndMtuAreSharedWithRtnetlinkAndRestored) {
         if (rtnl.mtu != static_cast<uint32_t>(original_mtu) ||
             (rtnl.flags & IFF_UP) != (static_cast<uint32_t>(original_flags) & IFF_UP)) {
             return Failure(25, static_cast<int>(rtnl.mtu));
+        }
+        return Success();
+    });
+}
+
+TEST(SocketIoctlNetdevMutation, LoopbackAcceptsLinuxStandardMtu) {
+    ExpectIsolatedChild([] {
+        ChildResult isolated = EnterIsolatedNetwork();
+        if (isolated.stage != 0) return isolated;
+        FdGuard inet(OpenInetSocket());
+        FdGuard route(OpenRouteSocket());
+        if (inet.Get() < 0 || route.Get() < 0) return Failure(1, errno);
+
+        int ifindex = 0;
+        if (int error = QueryIfindex(inet.Get(), "lo", &ifindex)) return Failure(2, error);
+        constexpr int kLinuxLoopbackMtu = 65536;
+        int ioctl_mtu = 0;
+        LinkState rtnl{};
+        if (int error = QueryIoctlMtu(inet.Get(), "lo", &ioctl_mtu)) return Failure(3, error);
+        if (int error = QueryRtnlState(route.Get(), ifindex, 199, &rtnl)) {
+            return Failure(4, error);
+        }
+        if (ioctl_mtu != kLinuxLoopbackMtu || rtnl.mtu != kLinuxLoopbackMtu) {
+            return Failure(5, ioctl_mtu);
+        }
+
+        constexpr int kAlternateMtu = kLinuxLoopbackMtu - 1;
+        if (int error = SetMtu(inet.Get(), "lo", kAlternateMtu, true)) {
+            return Failure(6, error);
+        }
+        if (int error = SetMtu(inet.Get(), "lo", kLinuxLoopbackMtu, true)) {
+            return Failure(7, error);
+        }
+        if (int error = QueryIoctlMtu(inet.Get(), "lo", &ioctl_mtu)) return Failure(8, error);
+        if (int error = QueryRtnlState(route.Get(), ifindex, 200, &rtnl)) {
+            return Failure(9, error);
+        }
+        if (ioctl_mtu != kLinuxLoopbackMtu || rtnl.mtu != kLinuxLoopbackMtu) {
+            return Failure(10, ioctl_mtu);
+        }
+
+        if (int error = SetRtnlMtu(route.Get(), ifindex, kAlternateMtu, 201)) {
+            return Failure(11, error);
+        }
+        if (int error = SetRtnlMtu(route.Get(), ifindex, kLinuxLoopbackMtu, 202)) {
+            return Failure(12, error);
+        }
+        if (int error = QueryIoctlMtu(inet.Get(), "lo", &ioctl_mtu)) return Failure(13, error);
+        if (int error = QueryRtnlState(route.Get(), ifindex, 203, &rtnl)) {
+            return Failure(14, error);
+        }
+        if (ioctl_mtu != kLinuxLoopbackMtu || rtnl.mtu != kLinuxLoopbackMtu) {
+            return Failure(15, ioctl_mtu);
         }
         return Success();
     });

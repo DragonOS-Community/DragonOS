@@ -36,6 +36,12 @@ use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
 use super::{Iface, IfaceCommon, MtuBounds};
 
 const DEVICE_NAME: &str = "loopback";
+/// Linux's userspace-visible loopback MTU and packet-buffer capacity.
+const LOOPBACK_MTU: usize = 64 * 1024;
+/// smoltcp currently shares one MTU across IPv4 and IPv6. Keep its projection
+/// within IPv4's 16-bit total-length field while the device retains Linux's
+/// 64 KiB administrative MTU and packet-buffer capacity.
+const LOOPBACK_STACK_MTU: usize = u16::MAX as usize;
 
 /// ## 环回接收令牌
 /// 用于储存lo网卡接收到的数据
@@ -190,10 +196,11 @@ impl phy::Device for LoopbackDriver {
     where
         Self: 'a;
     /// ## 返回设备的物理层特性。
-    /// lo设备的最大传输单元为65535，最大突发大小为1，传输介质默认为Ethernet
+    /// smoltcp 的共享 IPv4/IPv6 MTU 能力使用 IPv4 可表示上限；
+    /// Linux 可见的 64 KiB loopback MTU 由 `LoopbackInterface` 单独公布。
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut result = phy::DeviceCapabilities::default();
-        result.max_transmission_unit = 65535;
+        result.max_transmission_unit = LOOPBACK_STACK_MTU;
         result.max_burst_size = Some(1);
         result.medium = smoltcp::phy::Medium::Ip;
         return result;
@@ -253,8 +260,6 @@ impl phy::Device for LoopbackDriver {
 }
 
 impl LoopbackDriver {
-    const MAX_PACKET_LEN: usize = 65535;
-
     pub fn set_iface(&self, iface: Weak<dyn Iface>) {
         *self.iface.lock() = Some(iface);
     }
@@ -268,7 +273,7 @@ impl LoopbackDriver {
     }
 
     fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
-        if frame.len() > Self::MAX_PACKET_LEN {
+        if frame.len() > LOOPBACK_MTU {
             return Err(SystemError::EMSGSIZE);
         }
         self.inner.lock().loopback_transmit(frame);
@@ -283,7 +288,7 @@ impl LoopbackDriver {
     }
 
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        if frame.len() > Self::MAX_PACKET_LEN {
+        if frame.len() > LOOPBACK_MTU {
             return Err(SystemError::EMSGSIZE);
         }
         self.submit_frame(frame.to_vec())
@@ -335,8 +340,6 @@ impl LoopbackInterface {
 
     /// 在指定网络命名空间中创建 loopback，使用给定的 per-netns ifindex（Linux 新 netns 中 lo 通常为 1）。
     pub fn new_with_ifindex(mut driver: LoopbackDriver, ifindex: usize) -> Arc<Self> {
-        use smoltcp::phy::Device;
-
         let iface_id = ifindex;
 
         // let hardware_addr = HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([
@@ -371,7 +374,7 @@ impl LoopbackInterface {
         // device-intrinsic flag. Registration owns PRESENT, administrative
         // policy owns UP, and user_visible_flags() derives runtime flags.
         let flags = InterfaceFlags::LOOPBACK;
-        let mtu = driver.capabilities().max_transmission_unit;
+        let mtu = LOOPBACK_MTU;
 
         let iface = Arc::new(LoopbackInterface {
             driver,
@@ -631,10 +634,15 @@ impl Iface for LoopbackInterface {
 
     fn mtu_bounds(&self) -> MtuBounds {
         MtuBounds {
-            // smoltcp's IPv4/IPv6 TCP paths require room for their headers.
+            // Match Linux's standard loopback MTU while retaining the
+            // protocol-safe smoltcp projection in stack_mtu().
             min: 68,
-            max: 65535,
+            max: LOOPBACK_MTU,
         }
+    }
+
+    fn stack_mtu(&self, configured_mtu: usize) -> usize {
+        configured_mtu.min(LOOPBACK_STACK_MTU)
     }
 }
 

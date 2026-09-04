@@ -13,6 +13,12 @@ namespace {
 constexpr std::array<uint8_t, ETH_ALEN> kMacA = {0x02, 0x22, 0x33, 0x44, 0x55, 0x61};
 constexpr std::array<uint8_t, ETH_ALEN> kMacB = {0x02, 0x22, 0x33, 0x44, 0x55, 0x62};
 
+// Stable Linux 6.6 netlink wire ABI values. Keep these test-local so building
+// the target test does not depend on the host's <linux/neighbour.h> version.
+constexpr uint16_t kNdaFlagsExt = 15;
+constexpr uint16_t kNdaNdmStateMask = 16;
+constexpr uint32_t kNtfExtManaged = 1U << 0;
+
 struct NeighborAddress {
     int family = AF_UNSPEC;
     std::array<uint8_t, sizeof(in6_addr)> bytes{};
@@ -103,7 +109,7 @@ int SendNeighborRequest(int fd, uint16_t type, uint16_t flags, const NeighborSpe
     }
     if (options.flags_ext.has_value()) {
         const std::array<uint32_t, 2> values = {*options.flags_ext, 0};
-        AddAttr(header, sizeof(buffer), NDA_FLAGS_EXT, values.data(),
+        AddAttr(header, sizeof(buffer), kNdaFlagsExt, values.data(),
                 options.flags_ext_length.value_or(sizeof(*options.flags_ext)));
     }
     if (options.protocol.has_value()) {
@@ -116,7 +122,7 @@ int SendNeighborRequest(int fd, uint16_t type, uint16_t flags, const NeighborSpe
     }
     if (options.include_state_mask) {
         const uint16_t state_mask = NUD_PERMANENT;
-        AddAttr(header, sizeof(buffer), NDA_NDM_STATE_MASK, &state_mask, sizeof(state_mask));
+        AddAttr(header, sizeof(buffer), kNdaNdmStateMask, &state_mask, sizeof(state_mask));
     }
     if (send(fd, header, header->nlmsg_len, 0) != static_cast<ssize_t>(header->nlmsg_len)) {
         return errno;
@@ -279,6 +285,26 @@ TEST_F(RtnetlinkNeighborSemantics, HeaderlessDeviceKeepsControlPlaneEntryWithout
                                   spec, ++seq_),
               0);
     EXPECT_FALSE(FindNeighbor(fd_.Get(), spec, ++seq_).has_value());
+}
+
+TEST_F(RtnetlinkNeighborSemantics, EthernetValidStateRequiresLinkLayerAddress) {
+    constexpr std::array<uint16_t, 2> states = {NUD_PERMANENT, NUD_NOARP};
+    constexpr std::array<const char*, 2> destinations = {"198.18.230.41", "198.18.230.42"};
+    NeighborCleanup cleanup(fd_.Get(), &seq_);
+
+    for (size_t index = 0; index < states.size(); ++index) {
+        SCOPED_TRACE(testing::Message() << "state=" << states[index]);
+        NeighborSpec spec = MakeNeighbor(AF_INET, destinations[index], veth1_);
+        spec.state = states[index];
+        spec.lladdr.reset();
+        cleanup.Add(spec);
+        DeleteNeighborIfPresent(fd_.Get(), spec, &seq_);
+
+        EXPECT_EQ(SendNeighborRequest(fd_.Get(), RTM_NEWNEIGH,
+                                      NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                      spec, ++seq_),
+                  EINVAL);
+    }
 }
 
 TEST_F(RtnetlinkNeighborSemantics, Ipv4AndIpv6CreateDumpDelete) {
@@ -444,7 +470,7 @@ TEST_F(RtnetlinkNeighborSemantics, MutationErrorsAndDuplicateAttributesMatchLinu
                                   ++seq_),
               EOPNOTSUPP);
     NeighborRequestOptions managed;
-    managed.flags_ext = NTF_EXT_MANAGED;
+    managed.flags_ext = kNtfExtManaged;
     EXPECT_EQ(SendNeighborRequest(fd_.Get(), RTM_NEWNEIGH,
                                   NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE, spec, ++seq_,
                                   managed),

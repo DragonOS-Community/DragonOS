@@ -332,7 +332,9 @@ pub(crate) fn get_iface_for_local_bind(
     if let smoltcp::wire::IpAddress::Ipv4(v4_addr) = ip_addr {
         let device_list = netns.device_list();
         return device_list.iter().find_map(|(_, iface)| {
-            loopback_iface_contains_v4(iface, *v4_addr).then(|| iface.clone())
+            (iface.flags().contains(InterfaceFlags::LOOPBACK)
+                && crate::net::address::iface_accepts_local_address(iface, (*v4_addr).into()))
+            .then(|| iface.clone())
         });
     }
 
@@ -347,13 +349,12 @@ pub fn get_iface_to_bind(
     let device_list = netns.device_list();
 
     // Subnet-directed broadcast should prefer the iface whose configured subnet matches.
-    if let smoltcp::wire::IpAddress::Ipv4(target_broadcast) = ip_addr {
-        if target_broadcast.is_broadcast() {
-            if let Some(iface) = device_list.iter().find_map(|(_, iface)| {
-                iface_matches_directed_broadcast(iface, *target_broadcast).then(|| iface.clone())
-            }) {
-                return Some(iface);
-            }
+    if matches!(ip_addr, smoltcp::wire::IpAddress::Ipv4(_)) {
+        if let Some(iface) = device_list.iter().find_map(|(_, iface)| {
+            crate::net::address::iface_accepts_broadcast_address(iface, *ip_addr)
+                .then(|| iface.clone())
+        }) {
+            return Some(iface);
         }
     }
 
@@ -365,18 +366,11 @@ pub fn get_iface_to_bind(
     }
 
     if let Some(iface) = device_list
-        .iter()
-        .find(|(_, iface)| iface.smol_iface().lock().has_ip_addr(*ip_addr))
-        .map(|(_, iface)| iface.clone())
+        .values()
+        .find(|iface| crate::net::address::iface_accepts_local_address(iface, *ip_addr))
+        .cloned()
     {
         return Some(iface);
-    }
-
-    // Linux-like loopback behavior for IPv4: lo considers the whole configured subnet local.
-    if let smoltcp::wire::IpAddress::Ipv4(v4_addr) = ip_addr {
-        return device_list.iter().find_map(|(_, iface)| {
-            loopback_iface_contains_v4(iface, *v4_addr).then(|| iface.clone())
-        });
     }
 
     // IPv6 loopback destinations (::1 etc.) are delivered via the loopback interface.
@@ -387,35 +381,6 @@ pub fn get_iface_to_bind(
     }
 
     None
-}
-
-#[inline]
-fn iface_matches_directed_broadcast(
-    iface: &Arc<dyn Iface>,
-    target_broadcast: smoltcp::wire::Ipv4Address,
-) -> bool {
-    let smol_iface = iface.smol_iface().lock();
-    smol_iface.ip_addrs().iter().any(|cidr| match cidr {
-        smoltcp::wire::IpCidr::Ipv4(v4_cidr) => {
-            v4_cidr.broadcast().is_some_and(|b| b == target_broadcast)
-        }
-        _ => false,
-    })
-}
-
-#[inline]
-pub(super) fn loopback_iface_contains_v4(
-    iface: &Arc<dyn Iface>,
-    v4_addr: smoltcp::wire::Ipv4Address,
-) -> bool {
-    if !iface.flags().contains(InterfaceFlags::LOOPBACK) {
-        return false;
-    }
-    let smol_iface = iface.smol_iface().lock();
-    smol_iface.ip_addrs().iter().any(|cidr| match cidr {
-        smoltcp::wire::IpCidr::Ipv4(v4_cidr) => v4_cidr.contains_addr(&v4_addr),
-        _ => false,
-    })
 }
 
 #[inline]

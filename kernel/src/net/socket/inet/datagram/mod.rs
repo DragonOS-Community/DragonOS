@@ -521,8 +521,6 @@ impl UdpSocket {
             remote,
             required_oif,
             multicast_source,
-            remote.is_multicast(),
-            remote.is_broadcast(),
         )?;
         let flow_target = output_flow
             .map(|flow| output_flow::ephemeral_target(self, flow))
@@ -1027,8 +1025,6 @@ impl UdpSocket {
                     dest.addr,
                     required_oif,
                     connected_source.or(multicast_source),
-                    dest.addr.is_multicast(),
-                    dest.addr.is_broadcast(),
                 )?
             }
             None => None,

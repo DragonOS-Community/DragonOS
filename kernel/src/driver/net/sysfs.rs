@@ -1,7 +1,9 @@
+pub(crate) use crate::driver::base::device_rename::PreparedDeviceSysfsRename;
 use crate::{
     driver::base::{
         class::Class,
         device::{device_manager, Device},
+        device_rename::prepare_class_device_sysfs_rename,
         kobject::KObject,
     },
     filesystem::{
@@ -13,6 +15,7 @@ use crate::{
     },
 };
 use alloc::sync::Arc;
+use alloc::{string::String, vec::Vec};
 use intertrait::cast::CastArc;
 use log::{error, warn};
 use system_error::SystemError;
@@ -59,26 +62,90 @@ pub fn netdev_unregister_kobject(dev: Arc<dyn Iface>) {
     device_manager().remove(&(dev as Arc<dyn Device>));
 }
 
+/// Prepares the sysfs half of a netdevice rename without changing the logical
+/// interface name. Non-initial namespaces deliberately have no sysfs object.
+pub(crate) fn prepare_netdev_sysfs_rename(
+    dev: &Arc<dyn Iface>,
+    new_name: String,
+) -> Result<PreparedDeviceSysfsRename, SystemError> {
+    prepare_class_device_sysfs_rename(&(dev.clone() as Arc<dyn Device>), new_name)
+}
+
+/// Emits the best-effort kobject move notification after the sysfs and logical
+/// netdevice names have committed.
+pub(crate) fn netdev_emit_move_uevent(dev: Arc<dyn Iface>, old_devpath: String) {
+    netdev_emit_uevent_with_env(dev, "move", Some(("DEVPATH_OLD", old_devpath)));
+}
+
 /// Emit a netdevice lifecycle event after the corresponding structural state
 /// has been committed. Notification delivery is best effort, like Linux
 /// kobject and rtnetlink multicast: listener backpressure must not roll back a
 /// registered device or prevent an unregistered device from being removed.
 pub fn netdev_emit_uevent(dev: Arc<dyn Iface>, action: &'static str) {
-    let ifname = dev.iface_name();
-    if let Err(error) = <dyn KObject>::kobject_uevent(
-        &(dev.clone() as Arc<dyn KObject>),
-        action,
-        &[
-            ("SUBSYSTEM", "net".into()),
-            ("DEVNAME", ifname.clone()),
-            ("INTERFACE", ifname.clone()),
-        ],
-    ) {
-        warn!(
-            "failed to emit '{}' uevent for netdevice '{}': {:?}",
-            action, ifname, error
-        );
+    netdev_emit_uevent_with_env(dev, action, None);
+}
+
+/// Builds the Linux netdevice-specific environment in one place and routes
+/// the event according to the device's namespace ownership. Event-specific
+/// fields are appended without duplicating the stable identity fields.
+fn netdev_emit_uevent_with_env(
+    dev: Arc<dyn Iface>,
+    action: &'static str,
+    action_env: Option<(&'static str, String)>,
+) {
+    let result = try_emit_netdev_uevent(&dev, action, action_env);
+    if let Err(error) = result {
+        warn!("failed to emit '{}' netdevice uevent: {:?}", action, error);
     }
+}
+
+fn try_emit_netdev_uevent(
+    dev: &Arc<dyn Iface>,
+    action: &'static str,
+    action_env: Option<(&'static str, String)>,
+) -> Result<(), SystemError> {
+    let ifname = dev.common().with_iface_name(try_copy_string)?;
+    let Some(netns) = dev.net_namespace() else {
+        return Err(SystemError::ENODEV);
+    };
+    let inode = dev.inode().ok_or(SystemError::ENOENT)?;
+    let devpath = crate::filesystem::sysfs::sysfs_instance().try_kernfs_path(&inode)?;
+    let mut env = Vec::new();
+    env.try_reserve_exact(4 + usize::from(action_env.is_some()))
+        .map_err(|_| SystemError::ENOMEM)?;
+    env.push(("SUBSYSTEM", try_copy_string("net")?));
+    env.push(("DEVNAME", try_copy_string(&ifname)?));
+    env.push(("INTERFACE", ifname));
+    env.push(("IFINDEX", try_decimal_string(dev.nic_id())?));
+    if let Some(field) = action_env {
+        env.push(field);
+    }
+
+    <dyn KObject>::emit_uevent_in_netns(action, &devpath, &env, netns)
+}
+
+fn try_copy_string(source: &str) -> Result<String, SystemError> {
+    let mut result = String::new();
+    result
+        .try_reserve_exact(source.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    result.push_str(source);
+    Ok(result)
+}
+
+fn try_decimal_string(mut value: usize) -> Result<String, SystemError> {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let value = core::str::from_utf8(&digits[start..]).map_err(|_| SystemError::EINVAL)?;
+    try_copy_string(value)
 }
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/net/core/net-sysfs.c

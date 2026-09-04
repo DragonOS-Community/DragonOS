@@ -161,7 +161,7 @@ impl<'a> FibEditor<'a> {
         before_routes: &[RouteEntry],
         after_routes: &[RouteEntry],
         ifindex: u32,
-        deleted_address: Option<IpAddress>,
+        deleted_addresses: &[IpAddress],
         preferred_source_remains_usable: F,
     ) -> Result<PreferredSourceTransitions, SystemError>
     where
@@ -171,15 +171,18 @@ impl<'a> FibEditor<'a> {
         // still untouched; subsequent edits keep the candidate's index in
         // lockstep with its authoritative route vector.
         self.record(ifindex)?;
-        if let Some(deleted) = deleted_address {
+        if !deleted_addresses.is_empty() {
             let mut affected_oifs = Vec::new();
             affected_oifs
                 .try_reserve_exact(self.fib.entries.len())
                 .map_err(|_| SystemError::ENOMEM)?;
             for entry in self.fib.entries.iter().copied() {
-                if entry.preferred_source == Some(deleted)
+                if entry
+                    .preferred_source
+                    .is_some_and(|source| deleted_addresses.contains(&source))
                     && !preferred_source_remains_usable(entry)
-                    && (!is_ipv4(deleted) || entry.table == super::RT_TABLE_MAIN)
+                    && (!entry.preferred_source.is_some_and(is_ipv4)
+                        || entry.table == super::RT_TABLE_MAIN)
                     && !affected_oifs.contains(&entry.oif)
                 {
                     affected_oifs.push(entry.oif);
@@ -192,7 +195,7 @@ impl<'a> FibEditor<'a> {
         self.fib.reconcile_address_routes(
             before_routes,
             after_routes,
-            deleted_address,
+            deleted_addresses,
             preferred_source_remains_usable,
         )
     }
@@ -700,7 +703,7 @@ impl FibTable {
         &mut self,
         before_routes: &[RouteEntry],
         after_routes: &[RouteEntry],
-        deleted_address: Option<IpAddress>,
+        deleted_addresses: &[IpAddress],
         preferred_source_remains_usable: F,
     ) -> Result<PreferredSourceTransitions, SystemError>
     where
@@ -734,13 +737,18 @@ impl FibTable {
         }
 
         let mut transitions = PreferredSourceTransitions::default();
-        if let Some(deleted) = deleted_address {
+        if !deleted_addresses.is_empty() {
             let mut index = 0;
             while index < self.entries.len() {
                 let entry = self.entries[index];
-                if entry.preferred_source == Some(deleted)
-                    && !preferred_source_remains_usable(entry)
-                {
+                let Some(deleted) = entry
+                    .preferred_source
+                    .filter(|source| deleted_addresses.contains(source))
+                else {
+                    index += 1;
+                    continue;
+                };
+                if !preferred_source_remains_usable(entry) {
                     if is_ipv4(deleted) {
                         // fib_sync_down_addr() only invalidates the L3
                         // domain's forwarding table. DragonOS has no VRF/L3

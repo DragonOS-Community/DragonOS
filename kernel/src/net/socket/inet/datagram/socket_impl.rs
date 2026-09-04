@@ -125,8 +125,6 @@ impl Socket for UdpSocket {
                     remote.addr,
                     required_oif,
                     multicast_source,
-                    remote.addr.is_multicast(),
-                    remote.addr.is_broadcast(),
                 )?
                 .map(|flow| flow.source);
                 match self.inner.read().as_ref() {

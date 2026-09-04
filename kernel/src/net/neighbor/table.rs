@@ -43,6 +43,19 @@ pub(crate) struct NeighborSnapshot {
     entries: Vec<NeighborEntry>,
 }
 
+/// An RTNL-serialized, allocation-complete purge of one interface's configured
+/// neighbors.
+///
+/// The copied entries are both the eventual notification payload and proof of
+/// the table generation prepared for publication. Configured-neighbor writers
+/// all require RTNL, so the matching table range cannot change between
+/// `prepare_iface_purge` and `publish_iface_purge` while the caller retains the
+/// same guard.
+pub(super) struct PreparedNeighborPurge {
+    ifindex: u32,
+    removed: Vec<NeighborEntry>,
+}
+
 impl NeighborSnapshot {
     pub(crate) fn empty() -> Self {
         Self {
@@ -63,13 +76,7 @@ impl NeighborSnapshot {
     }
 
     pub(crate) fn for_iface(&self, ifindex: u32) -> &[NeighborEntry] {
-        let start = self
-            .entries
-            .partition_point(|entry| entry.ifindex < ifindex);
-        let end = self
-            .entries
-            .partition_point(|entry| entry.ifindex <= ifindex);
-        &self.entries[start..end]
+        &self.entries[iface_range(&self.entries, ifindex)]
     }
 }
 
@@ -205,21 +212,63 @@ impl NeighborTable {
         self.ipv4_entries.load(AtomicOrdering::Acquire) != 0
     }
 
+    pub(super) fn prepare_iface_purge(
+        &self,
+        _rtnl: &RtnlGuard,
+        ifindex: u32,
+    ) -> Result<PreparedNeighborPurge, SystemError> {
+        let entries = self.entries.read();
+        let range = iface_range(&entries, ifindex);
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(range.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        removed.extend_from_slice(&entries[range]);
+        Ok(PreparedNeighborPurge { ifindex, removed })
+    }
+
+    pub(super) fn publish_iface_purge(
+        &self,
+        _rtnl: &RtnlGuard,
+        prepared: PreparedNeighborPurge,
+    ) -> Vec<NeighborEntry> {
+        let PreparedNeighborPurge { ifindex, removed } = prepared;
+        if removed.is_empty() {
+            return removed;
+        }
+
+        let mut entries = self.entries.write();
+        let range = iface_range(&entries, ifindex);
+        debug_assert_eq!(&entries[range.clone()], removed.as_slice());
+        self.remove_iface_entries(&mut entries, range);
+        removed
+    }
+
     /// Purges device-owned entries during an RTNL-serialized topology removal.
     /// Shrinking a vector is non-fallible, which lets device teardown finish
     /// after its fallible route preparation has succeeded.
     pub(super) fn remove_iface(&self, _rtnl: &RtnlGuard, ifindex: u32) {
         let mut entries = self.entries.write();
-        let removed_ipv4 = entries
+        let range = iface_range(&entries, ifindex);
+        self.remove_iface_entries(&mut entries, range);
+    }
+
+    fn remove_iface_entries(
+        &self,
+        entries: &mut Vec<NeighborEntry>,
+        range: core::ops::Range<usize>,
+    ) {
+        let removed_ipv4 = entries[range.clone()]
             .iter()
             .filter(|entry| {
-                entry.ifindex == ifindex
-                    && entry.ethernet_output
-                    && matches!(entry.destination, IpAddress::Ipv4(_))
+                entry.ethernet_output && matches!(entry.destination, IpAddress::Ipv4(_))
             })
             .count();
-        entries.retain(|entry| entry.ifindex != ifindex);
+        entries.drain(range);
         if removed_ipv4 != 0 {
+            // Keep a stale-positive gate until the mappings are gone. A packet
+            // may take the slow path unnecessarily, but can never miss a
+            // configured mapping that is still published.
             self.ipv4_entries
                 .fetch_sub(removed_ipv4, AtomicOrdering::Release);
         }
@@ -240,6 +289,12 @@ fn validate_supported_capabilities(update: NeighborUpdate) -> Result<(), SystemE
 
 fn find(entries: &[NeighborEntry], ifindex: u32, destination: IpAddress) -> Result<usize, usize> {
     entries.binary_search_by(|entry| compare_key(entry, ifindex, destination))
+}
+
+fn iface_range(entries: &[NeighborEntry], ifindex: u32) -> core::ops::Range<usize> {
+    let start = entries.partition_point(|entry| entry.ifindex < ifindex);
+    let end = entries.partition_point(|entry| entry.ifindex <= ifindex);
+    start..end
 }
 
 fn compare_key(entry: &NeighborEntry, ifindex: u32, destination: IpAddress) -> Ordering {

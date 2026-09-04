@@ -65,6 +65,7 @@ const E1000E_RECV_VECTOR: IrqNumber = IrqNumber::new(57);
 
 // napi队列中暂时存储的buffer个数
 const E1000E_RECV_NAPI: usize = 1024;
+const E1000E_RUNTIME_RX_INTERRUPTS: u32 = E1000E_IMS_RXT0 | E1000E_IMS_RXDMT0 | E1000E_IMS_OTHER;
 
 // 收/发包的描述符结构 pp.24 Table 3-1
 #[repr(C)]
@@ -512,6 +513,49 @@ impl E1000EDevice {
         buffer.set_length(packet_len);
         // debug!("e1000e: receive packet");
         return Some(buffer);
+    }
+
+    /// Stop runtime RX production before NAPI is quiesced. Descriptor memory
+    /// remains owned by the driver throughout the administrative transition.
+    pub fn suspend_runtime_rx(&mut self) {
+        unsafe {
+            volwrite!(self.interrupt_regs, imc, E1000E_IMC_CLEAR);
+            let rctl = volread!(self.rctl_regs, rctl) & !E1000E_RCTL_EN;
+            volwrite!(self.rctl_regs, rctl, rctl);
+            let _ = volread!(self.general_regs, status);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Return completions from the stopped receiver without allocating new
+    /// DMA buffers.
+    pub fn discard_rx_completions(&mut self) {
+        for _ in 0..self.recv_desc_ring.len() {
+            let mut rdt = unsafe { volread!(self.receive_regs, rdt0) } as usize;
+            let index = (rdt + 1) % self.recv_desc_ring.len();
+            let desc = &mut self.recv_desc_ring[index];
+            if (desc.status & E1000E_RXD_STATUS_DD) == 0 {
+                break;
+            }
+            desc.status = 0;
+            desc.len = 0;
+            rdt = index;
+            unsafe { volwrite!(self.receive_regs, rdt0, rdt as u32) };
+        }
+        self.e1000e_intr();
+    }
+
+    pub fn resume_runtime_rx(&mut self) {
+        unsafe {
+            let rctl = volread!(self.rctl_regs, rctl) | E1000E_RCTL_EN;
+            volwrite!(self.rctl_regs, rctl, rctl);
+            let _ = volread!(self.general_regs, status);
+            let mut interrupts = E1000E_IMS_LSC | E1000E_RUNTIME_RX_INTERRUPTS;
+            if self.tx_completion_interrupt_armed {
+                interrupts |= E1000E_IMS_TXDW;
+            }
+            volwrite!(self.interrupt_regs, ims, interrupts);
+        }
     }
 
     pub fn e1000e_can_transmit(&self) -> bool {

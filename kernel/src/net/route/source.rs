@@ -54,12 +54,7 @@ pub(crate) fn resolve_ipv4_route(
         fixed_source.and_then(|source| {
             (!source.is_unspecified()).then_some(())?;
             devices.iter().find_map(|(ifindex, candidate)| {
-                candidate
-                    .router_common()
-                    .ip_addrs
-                    .read()
-                    .iter()
-                    .any(|cidr| cidr.address() == source)
+                crate::net::address::iface_accepts_local_address(candidate, source)
                     .then(|| u32::try_from(*ifindex).ok())
                     .flatten()
             })
@@ -77,14 +72,9 @@ pub(crate) fn resolve_ipv4_route(
     }
 
     let source_is_local = |source: IpAddress| {
-        devices.values().any(|candidate| {
-            candidate
-                .router_common()
-                .ip_addrs
-                .read()
-                .iter()
-                .any(|cidr| cidr.address() == source)
-        })
+        devices
+            .values()
+            .any(|candidate| crate::net::address::iface_accepts_local_address(candidate, source))
     };
     let source = if let Some(source) = fixed_source {
         if !matches!(source, IpAddress::Ipv4(_)) || !source_is_local(source) {

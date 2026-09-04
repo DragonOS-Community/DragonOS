@@ -318,8 +318,21 @@ impl Socket for PacketSocket {
     fn send_to(&self, b: &[u8], f: PMSG, a: Endpoint) -> Result<usize, SystemError> {
         self.send_endpoint(b, f, a)
     }
-    fn validate_send_buffer_len(&self, l: usize, _: Option<&Endpoint>) -> Result<(), SystemError> {
-        self.validate_packet_len(l)
+    fn validate_send_buffer_len(
+        &self,
+        len: usize,
+        address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        self.validate_packet_send_len(len, address)
+    }
+    fn send_user_buffer(
+        &self,
+        reader: &crate::syscall::user_access::UserBufferReader<'_>,
+        len: usize,
+        flags: PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<usize, SystemError> {
+        self.send_packet_user_buffer(reader, len, flags, address)
     }
     fn recv(&self, b: &mut [u8], f: PMSG) -> Result<usize, SystemError> {
         self.recv_packet(b, f)

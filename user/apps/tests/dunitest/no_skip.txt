@@ -18,5 +18,6 @@ normal/rtnetlink_serialization_semantics
 normal/rtnetlink_neigh_semantics
 normal/socket_getsockopt_semantics
 normal/socket_ioctl_netdev_query
+normal/socket_ioctl_netdev_mutation
 normal/tcp_self_connect_semantics
 normal/poll_timeout_semantics

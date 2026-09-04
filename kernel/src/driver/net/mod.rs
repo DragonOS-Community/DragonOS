@@ -43,6 +43,7 @@ mod iface_common;
 mod iface_deadline;
 mod local_output;
 mod local_queue;
+mod tx_admission;
 
 pub use iface::*;
 pub use iface_common::IfaceCommon;

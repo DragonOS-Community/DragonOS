@@ -1,9 +1,9 @@
 use crate::{
     driver::net::{
-        napi::napi_schedule,
         types::{InterfaceFlags, InterfaceType},
-        Iface, Operstate,
+        Iface,
     },
+    net::link::{LinkFlagsUpdate, LinkMtuUpdate, LinkMutationCommit, LinkTarget, LinkUpdate},
     net::socket::{
         netlink::{
             message::segment::{
@@ -185,11 +185,35 @@ pub(super) fn do_del_link(
     request_segment: &LinkSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let iface = find_iface_for_setlink(request_segment, netns)?;
+    let iface = find_iface_for_link(request_segment, &netns)?;
     if iface.type_() == InterfaceType::LOOPBACK {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+}
+
+fn find_iface_for_link(
+    request_segment: &LinkSegment,
+    netns: &Arc<NetNamespace>,
+) -> Result<Arc<dyn Iface>, SystemError> {
+    if let Some(index) = request_segment.body().index {
+        return netns
+            .device_list()
+            .get(&(index.get() as usize))
+            .cloned()
+            .ok_or(SystemError::ENODEV);
+    }
+    let name = request_segment.attrs().iter().find_map(|attr| match attr {
+        LinkAttr::Name(name) => name.to_str().ok(),
+        _ => None,
+    });
+    let name = name.ok_or(SystemError::EINVAL)?;
+    netns
+        .device_list()
+        .values()
+        .find(|iface| iface.common().with_iface_name(|current| current == name))
+        .cloned()
+        .ok_or(SystemError::ENODEV)
 }
 
 pub(super) fn do_set_link(
@@ -197,178 +221,39 @@ pub(super) fn do_set_link(
     request_segment: &LinkSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let iface = find_iface_for_setlink(request_segment, netns.clone())?;
-    let updates = validate_setlink_request(request_segment, iface.as_ref())?;
-    let committed =
-        PreparedSetLink::prepare(rtnl, request_segment, netns.clone(), iface.clone(), updates)?
-            .commit();
-
-    notify_link_change(&iface);
-    for cidr in committed.renamed_ipv4 {
-        super::addr::notify_address_change(netns.clone(), &iface, cidr);
-    }
-    if let Some(changes) = committed.route_changes {
-        notify_link_route_changes(&netns, changes);
-    }
-
+    let (target, update) = parse_setlink_request(request_segment)?;
+    let committed = crate::net::link::mutate_link(rtnl, &netns, target, update)?;
+    notify_link_commit(&netns, committed);
     Ok(Vec::new())
 }
 
-struct PreparedLinkRename {
-    name: String,
-    labels: crate::net::address::PreparedAddressLabelRename,
-}
-
-/// A SETLINK mutation whose validation and allocations have completed.
-///
-/// This statically composes the concrete name/address, flag, and route plans;
-/// a generic transaction framework would obscure their different publication
-/// ordering without improving the single SETLINK call site.
-struct PreparedSetLink<'rtnl> {
-    _rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
-    iface: Arc<dyn Iface>,
-    netns: Arc<NetNamespace>,
-    mtu: Option<u32>,
-    rename: Option<PreparedLinkRename>,
-    flags: crate::driver::net::PreparedConfiguredFlags,
-    routes: Option<crate::net::route::PreparedLinkStateChange<'rtnl>>,
-    changes_up: bool,
-    was_up: bool,
-    is_up: bool,
-}
-
-struct CommittedSetLink {
-    renamed_ipv4: Vec<smoltcp::wire::IpCidr>,
-    route_changes: Option<crate::net::route::RouteNotifications>,
-}
-
-impl<'rtnl> PreparedSetLink<'rtnl> {
-    fn prepare(
-        rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
-        request_segment: &LinkSegment,
-        netns: Arc<NetNamespace>,
-        iface: Arc<dyn Iface>,
-        updates: SetLinkUpdates,
-    ) -> Result<Self, SystemError> {
-        let rename = if let Some(name) = updates.name {
-            let duplicate = netns.device_list().values().any(|other| {
-                !Arc::ptr_eq(other, &iface)
-                    && other
-                        .common()
-                        .with_iface_name(|current| current == name.as_str())
-            });
-            if duplicate {
-                return Err(SystemError::EEXIST);
-            }
-            let labels =
-                crate::net::address::PreparedAddressLabelRename::prepare(rtnl, &iface, &name)?;
-            Some(PreparedLinkRename { name, labels })
-        } else {
-            None
-        };
-
-        let change_mask = InterfaceFlags::from_bits_truncate(request_segment.body().change.bits());
-        let requested_flags =
-            InterfaceFlags::from_bits_truncate(request_segment.body().flags.bits());
-        let flags = iface
-            .common()
-            .prepare_configured_flags(requested_flags, change_mask)?;
-        let was_up = flags.old_flags().contains(InterfaceFlags::UP);
-        let is_up = flags.new_flags().contains(InterfaceFlags::UP);
-        let changes_up = change_mask.contains(InterfaceFlags::UP);
-        let routes = if changes_up && was_up != is_up {
-            Some(crate::net::route::prepare_link_state_change(
-                rtnl, &netns, &iface, is_up,
-            )?)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            _rtnl: rtnl,
-            iface,
-            netns,
-            mtu: updates.mtu,
-            rename,
-            flags,
-            routes,
-            changes_up,
-            was_up,
-            is_up,
-        })
+pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutationCommit) {
+    let LinkMutationCommit {
+        iface,
+        changes,
+        renamed_ipv4,
+        removed_addresses,
+        route_changes,
+        removed_neighbors,
+        rename_old_devpath,
+    } = committed;
+    if let Some(old_devpath) = rename_old_devpath {
+        crate::driver::net::sysfs::netdev_emit_move_uevent(iface.clone(), old_devpath);
     }
-
-    fn commit(self) -> CommittedSetLink {
-        let Self {
-            _rtnl: _,
-            iface,
-            netns,
-            mtu,
-            rename,
-            flags,
-            routes,
-            changes_up,
-            was_up,
-            is_up,
-        } = self;
-
-        // Linux applies MTU and rename before dev_change_flags(). All
-        // fallible work is already owned by this plan, so publication cannot
-        // strand a half-prepared SETLINK request.
-        if let Some(mtu) = mtu {
-            iface.common().set_mtu(mtu as usize);
-        }
-        let renamed_ipv4 = if let Some(rename) = rename {
-            rename.labels.publish(&iface, rename.name)
-        } else {
-            Vec::new()
-        };
-
-        let route_changes = if let Some(routes) = routes {
-            Some(routes.publish(&netns, is_up, || {
-                publish_link_flags_and_state(&iface, flags, is_up);
-            }))
-        } else {
-            // Linux applies an idempotent IFF_UP request to the runtime
-            // lifecycle too; only FIB publication requires a transition.
-            if changes_up {
-                publish_link_flags_and_state(&iface, flags, is_up);
-            } else {
-                iface.common().publish_configured_flags(flags);
-            }
-            None
-        };
-
-        if changes_up && was_up != is_up {
-            if is_up {
-                if let Some(napi) = iface.napi_struct() {
-                    napi_schedule(napi);
-                } else {
-                    netns.wakeup_poll_thread();
-                }
-            }
-            netns.notify_deadline_changed();
-        }
-
-        CommittedSetLink {
-            renamed_ipv4,
-            route_changes,
-        }
+    if !changes.is_empty() {
+        notify_link_change(&iface);
     }
-}
-
-fn publish_link_flags_and_state(
-    iface: &Arc<dyn Iface>,
-    prepared_flags: crate::driver::net::PreparedConfiguredFlags,
-    is_up: bool,
-) {
-    iface.common().publish_configured_flags(prepared_flags);
-    if is_up {
-        iface.set_operstate(Operstate::IF_OPER_UP);
-        iface.set_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
-    } else {
-        iface.clear_net_state(crate::driver::net::NetDeivceState::__LINK_STATE_START);
-        iface.set_operstate(Operstate::IF_OPER_DOWN);
+    for removed in removed_addresses {
+        super::addr::notify_removed_address(netns.clone(), &iface, removed.cidr, &removed.label);
+    }
+    for cidr in renamed_ipv4 {
+        super::addr::notify_address_change(netns.clone(), &iface, cidr);
+    }
+    if let Some(changes) = route_changes {
+        notify_link_route_changes(netns, changes);
+    }
+    for entry in removed_neighbors {
+        super::neigh::notify_removed_entry(netns, entry);
     }
 }
 
@@ -388,78 +273,54 @@ fn notify_link_route_changes(
     }
 }
 
-fn find_iface_for_setlink(
+fn parse_setlink_request(
     request_segment: &LinkSegment,
-    netns: Arc<NetNamespace>,
-) -> Result<Arc<dyn Iface>, SystemError> {
-    if let Some(index) = request_segment.body().index {
-        return netns
-            .device_list()
-            .get(&(index.get() as usize))
-            .cloned()
-            .ok_or(SystemError::ENODEV);
-    }
-
-    let requested_name = request_segment.attrs().iter().find_map(|attr| {
-        if let LinkAttr::Name(name) = attr {
-            name.to_str().ok()
-        } else {
-            None
-        }
-    });
-
-    if let Some(name) = requested_name {
-        return netns
-            .device_list()
-            .iter()
-            .find(|(_, iface)| iface.common().with_iface_name(|current| current == name))
-            .map(|(_, iface)| iface.clone())
-            .ok_or(SystemError::ENODEV);
-    }
-
-    Err(SystemError::EINVAL)
-}
-
-struct SetLinkUpdates {
-    name: Option<String>,
-    mtu: Option<u32>,
-}
-
-fn validate_setlink_request(
-    request_segment: &LinkSegment,
-    iface: &dyn Iface,
-) -> Result<SetLinkUpdates, SystemError> {
-    let body = request_segment.body();
-    if body.pad.is_some() {
+) -> Result<(LinkTarget<'_>, LinkUpdate), SystemError> {
+    if request_segment.body().pad.is_some() {
         return Err(SystemError::EINVAL);
     }
+    // nla_parse() keeps the last attribute of a given type.
+    let requested_name = request_segment
+        .attrs()
+        .iter()
+        .filter_map(|attr| {
+            if let LinkAttr::Name(name) = attr {
+                name.to_str().ok()
+            } else {
+                None
+            }
+        })
+        .next_back();
+    if let Some(index) = request_segment.body().index {
+        let mut update = LinkUpdate::default();
+        if let Some(name) = requested_name {
+            update.new_name = Some(try_string_from_str(name)?);
+        }
+        parse_setlink_attrs(request_segment, &mut update, true)?;
+        update.flags = parse_flags(request_segment);
+        return Ok((LinkTarget::Index(index.get()), update));
+    }
+    let name = requested_name.ok_or(SystemError::EINVAL)?;
+    let mut update = LinkUpdate::default();
+    parse_setlink_attrs(request_segment, &mut update, false)?;
+    update.flags = parse_flags(request_segment);
+    Ok((LinkTarget::Name(name), update))
+}
 
-    let mut updates = SetLinkUpdates {
-        name: None,
-        mtu: None,
-    };
+fn parse_setlink_attrs(
+    request_segment: &LinkSegment,
+    update: &mut LinkUpdate,
+    name_is_mutation: bool,
+) -> Result<(), SystemError> {
     for attr in request_segment.attrs() {
         match attr {
             LinkAttr::Name(name) => {
-                let name = try_string_from_str(name.to_str().map_err(|_| SystemError::EINVAL)?)?;
-                if name.is_empty() {
-                    return Err(SystemError::EINVAL);
-                }
-                if !iface
-                    .common()
-                    .with_iface_name(|current| current == name.as_str())
-                {
-                    updates.name = Some(name);
+                name.to_str().map_err(|_| SystemError::EINVAL)?;
+                if name_is_mutation {
+                    // Already copied above; keep parsing focused on policy.
                 }
             }
-            LinkAttr::Mtu(mtu) => {
-                if *mtu == 0 {
-                    return Err(SystemError::EINVAL);
-                }
-                if *mtu != iface.mtu() as u32 {
-                    updates.mtu = Some(*mtu);
-                }
-            }
+            LinkAttr::Mtu(mtu) => update.mtu = Some(LinkMtuUpdate::Rtnetlink(*mtu)),
             LinkAttr::Allmulti(_) => return Err(SystemError::EINVAL),
             LinkAttr::Promiscuity(_)
             | LinkAttr::TxqLen(_)
@@ -468,8 +329,18 @@ fn validate_setlink_request(
             _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
         }
     }
+    Ok(())
+}
 
-    Ok(updates)
+fn parse_flags(request_segment: &LinkSegment) -> Option<LinkFlagsUpdate> {
+    let body = request_segment.body();
+    if body.flags.is_empty() && body.change.is_empty() {
+        return None;
+    }
+    Some(LinkFlagsUpdate::Masked {
+        requested: InterfaceFlags::from_bits_truncate(body.flags.bits()),
+        change: InterfaceFlags::from_bits_truncate(body.change.bits()),
+    })
 }
 
 fn try_string_from_str(source: &str) -> Result<String, SystemError> {

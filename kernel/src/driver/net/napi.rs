@@ -9,8 +9,8 @@ use alloc::collections::VecDeque;
 use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicU32;
-use napi_state::CompleteState;
 pub(crate) use napi_state::ScheduleState;
+use napi_state::{CompleteState, ResumeState};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -110,6 +110,8 @@ bitflags! {
         /// 一个可选的高级功能，表示此NAPI由专用内核线程处理。
         const THREADED          = 1 << 8;
         const SCHED_THREADED    = 1 << 9;
+        /// Reversible administrative pause, separate from teardown DISABLE.
+        const PAUSED            = 1 << 10;
     }
 }
 
@@ -175,6 +177,9 @@ fn net_rx_action() {
             if napi_is_disabled(&napi) {
                 continue;
             }
+            if napi_state::complete_paused(&napi.state) {
+                continue;
+            }
 
             let Some((iface, result)) = napi.poll(budget) else {
                 // A registered NAPI must not outlive its interface. Clear the state to avoid
@@ -224,6 +229,27 @@ pub(crate) fn napi_complete_state(napi: &NapiStruct) -> CompleteState {
 /// Complete a NAPI instance which has no device-specific callback handshake.
 pub fn napi_complete(napi: Arc<NapiStruct>) {
     if napi_complete_state(&napi) == CompleteState::Missed {
+        __napi_schedule(napi);
+    }
+}
+
+/// Reversibly pause polling for an administratively down interface.
+fn napi_pause(napi: &NapiStruct) {
+    napi_state::pause(&napi.state);
+}
+
+/// Pause new scheduling and wait until the queued or active owner observes it.
+/// Callers must not hold a lock needed by the poll path.
+pub(crate) fn napi_pause_and_wait(napi: &NapiStruct) {
+    napi_pause(napi);
+    while napi.state.load(core::sync::atomic::Ordering::Acquire) & napi_state::SCHED != 0 {
+        crate::sched::sched_yield();
+    }
+}
+
+/// Resume polling while preserving the unique queued/active owner.
+pub(crate) fn napi_resume(napi: Arc<NapiStruct>) {
+    if napi_state::resume(&napi.state) == ResumeState::Acquired {
         __napi_schedule(napi);
     }
 }
@@ -292,7 +318,7 @@ pub fn napi_schedule(napi: Arc<NapiStruct>) -> NapiScheduleResult {
         return NapiScheduleResult::Detached;
     };
     iface.napi_poll_begin();
-    if napi_is_disabled(&napi) {
+    if napi_is_disabled(&napi) || napi_state::complete_paused(&napi.state) {
         return NapiScheduleResult::Disabled;
     }
     __napi_schedule(napi);

@@ -166,6 +166,68 @@ impl SysFS {
         return path;
     }
 
+    /// Builds the absolute path cached by a sysfs symlink before a child is
+    /// renamed. All fallible allocation belongs to the prepare phase.
+    pub(crate) fn child_absolute_path(
+        &self,
+        parent: &Arc<KernFSInode>,
+        child_name: &str,
+    ) -> Result<String, SystemError> {
+        let parent_path = self.try_kernfs_path(parent)?;
+        let mut path = String::new();
+        let capacity = "/sys"
+            .len()
+            .checked_add(parent_path.len())
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(child_name.len()))
+            .ok_or(SystemError::ENOMEM)?;
+        path.try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        path.push_str("/sys");
+        path.push_str(&parent_path);
+        path.push('/');
+        path.push_str(child_name);
+        Ok(path)
+    }
+
+    /// Fallible counterpart used by prepared control-plane transactions.
+    /// Existing display-only callers retain `kernfs_path`; mutation prepare
+    /// must be able to report ENOMEM rather than enter the allocator handler.
+    pub(crate) fn try_kernfs_path(&self, inode: &Arc<KernFSInode>) -> Result<String, SystemError> {
+        let mut current = inode.clone();
+        let mut names = Vec::new();
+        let root = self.root_inode();
+        let mut detached = false;
+        while !Arc::ptr_eq(&current, root) {
+            names.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            names.push(current.try_name()?);
+            let Some(parent) = current.parent() else {
+                detached = true;
+                break;
+            };
+            current = parent;
+        }
+
+        let mut length = if detached { "(null)".len() } else { 0 };
+        for name in &names {
+            length = length
+                .checked_add(1)
+                .and_then(|value| value.checked_add(name.len()))
+                .ok_or(SystemError::ENOMEM)?;
+        }
+        let mut path = String::new();
+        path.try_reserve_exact(length)
+            .map_err(|_| SystemError::ENOMEM)?;
+        if detached {
+            path.push_str("(null)");
+        }
+        for name in names.iter().rev() {
+            path.push('/');
+            path.push_str(name);
+        }
+        Ok(path)
+    }
+
     /// 从sysfs中删除一个kobject对应的目录（包括目录自身以及目录下的所有文件、文件夹）
     pub fn remove_dir(&self, kobj: &Arc<dyn KObject>) {
         let kobj_inode = kobj.inode();

@@ -54,6 +54,13 @@ pub fn create_netlink_socket(
     Ok(inode)
 }
 
+pub(crate) fn notify_link_commit(
+    netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    committed: crate::net::link::LinkMutationCommit,
+) {
+    route::kern::notify_link_commit(netns, committed);
+}
+
 pub(crate) fn notify_link_change(iface: &Arc<dyn crate::driver::net::Iface>) {
     route::kern::notify_link_change(iface);
 }

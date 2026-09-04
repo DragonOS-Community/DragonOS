@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use smoltcp::{
     iface::Route as SmolRoute,
@@ -28,13 +28,20 @@ pub(crate) fn register_iface(
 ) -> Result<(), SystemError> {
     let addresses = try_clone_slice(&iface.common().ip_addrs())?;
     let staged = iface.common().take_bootstrap_routes();
+    // Construction may preload addresses before the device is visible, but a
+    // DOWN device must not publish those addresses into the FIB merely by
+    // being registered. Explicit address changes after registration use the
+    // address transaction path and remain independent of this rule.
+    let defer_constructor_address_routes = !iface.flags().contains(InterfaceFlags::UP);
     iface
         .smol_iface()
         .lock()
         .set_route_table_includes_connected_prefixes(true);
     let result = transact_with_devices(rtnl, netns, devices, |candidate| {
-        for route in derived_address_entries(iface, &addresses)? {
-            candidate.insert_derived(route)?;
+        if !defer_constructor_address_routes {
+            for route in derived_address_entries(iface, &addresses)? {
+                candidate.insert_derived(route)?;
+            }
         }
         for route in staged.iter().copied() {
             let route = RouteEntry {
@@ -124,11 +131,11 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
             for entry in
                 derived_address_entries_for_link_state(iface, &iface.common().ip_addrs(), true)?
             {
-                if (!is_ipv4(entry.destination.address())
-                    || entry.table == RT_TABLE_MAIN
-                    || entry.kind == RTN_BROADCAST)
-                    && candidate.insert_derived(entry)?
-                {
+                // insert_derived() is the lifecycle authority here: the first
+                // UP publishes every deferred constructor address route,
+                // while later UP transitions only restore entries actually
+                // removed on DOWN.
+                if candidate.insert_derived(entry)? {
                     added.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
                     added.push(entry);
                 }
@@ -160,7 +167,7 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
 /// A fully prepared address/FIB commit. Construction may fail; publication is
 /// intentionally non-fallible and keeps addresses, projection and FIB atomic
 /// under the established RTNL -> FIB -> smoltcp lock order.
-struct PreparedAddressRouteCommit {
+pub(crate) struct PreparedAddressRouteCommit {
     before: FibTable,
     candidate: FibTable,
     projection: Vec<SmolRoute>,
@@ -170,6 +177,15 @@ struct PreparedAddressRouteCommit {
     metadata: Vec<AddressMetadata>,
 }
 
+pub(crate) struct AddressLinkChange<'a> {
+    pub before: &'a [IpCidr],
+    pub after: &'a [IpCidr],
+    pub metadata: Vec<AddressMetadata>,
+    pub deleted_addresses: &'a [IpAddress],
+    pub was_up: bool,
+    pub is_up: bool,
+}
+
 impl PreparedAddressRouteCommit {
     fn prepare(
         netns: &Arc<NetNamespace>,
@@ -177,13 +193,43 @@ impl PreparedAddressRouteCommit {
         before_addresses: &[IpCidr],
         after_addresses: &[IpCidr],
         metadata: Vec<AddressMetadata>,
-        deleted_address: Option<IpAddress>,
+        deleted_addresses: &[IpAddress],
     ) -> Result<Self, SystemError> {
+        let is_up = iface.flags().contains(InterfaceFlags::UP);
+        Self::prepare_for_link(
+            netns,
+            iface,
+            AddressLinkChange {
+                before: before_addresses,
+                after: after_addresses,
+                metadata,
+                deleted_addresses,
+                was_up: is_up,
+                is_up,
+            },
+        )
+    }
+
+    fn prepare_for_link(
+        netns: &Arc<NetNamespace>,
+        iface: &Arc<dyn Iface>,
+        change: AddressLinkChange<'_>,
+    ) -> Result<Self, SystemError> {
+        let AddressLinkChange {
+            before: before_addresses,
+            after: after_addresses,
+            metadata,
+            deleted_addresses,
+            was_up,
+            is_up,
+        } = change;
         let ifindex = iface.nic_id() as u32;
         let before = netns.router().fib.read().try_clone()?;
         let mut candidate = before.try_clone()?;
-        let before_routes = derived_address_entries(iface, before_addresses)?;
-        let after_routes = derived_address_entries(iface, after_addresses)?;
+        let before_routes =
+            derived_address_entries_for_link_state(iface, before_addresses, was_up)?;
+        let after_address_routes =
+            derived_address_entries_for_link_state(iface, after_addresses, was_up)?;
         let device_list = netns.device_list();
         let mut devices = Vec::new();
         devices
@@ -195,9 +241,9 @@ impl PreparedAddressRouteCommit {
             let ownership = CandidateAddressOwnership::new(&device_list, iface, after_addresses);
             editor.reconcile_address_routes(
                 &before_routes,
-                &after_routes,
+                &after_address_routes,
                 ifindex,
-                deleted_address,
+                deleted_addresses,
                 |entry| {
                     ownership.source_usable_on_oif(
                         entry.oif,
@@ -208,8 +254,44 @@ impl PreparedAddressRouteCommit {
                 },
             )
         }?;
+        let mut affected_oifs = editor.finish()?;
+        let address_removed = if was_up && !is_up {
+            candidate.delta_from(&before)?.removed
+        } else {
+            Vec::new()
+        };
+        if was_up && !is_up {
+            let mut state_editor = FibEditor::new(&mut candidate);
+            state_editor.remove_where(|entry| {
+                entry.oif == ifindex
+                    && !(is_ipv4(entry.destination.address())
+                        && entry.table == RT_TABLE_LOCAL
+                        && entry.kind == RTN_LOCAL
+                        && entry.scope == RT_SCOPE_HOST)
+            })?;
+            for oif in state_editor.finish()? {
+                if !affected_oifs.contains(&oif) {
+                    affected_oifs
+                        .try_reserve(1)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    affected_oifs.push(oif);
+                }
+            }
+        } else if !was_up && is_up {
+            let mut state_editor = FibEditor::new(&mut candidate);
+            for entry in derived_address_entries_for_link_state(iface, after_addresses, true)? {
+                state_editor.insert_derived(entry)?;
+            }
+            for oif in state_editor.finish()? {
+                if !affected_oifs.contains(&oif) {
+                    affected_oifs
+                        .try_reserve(1)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    affected_oifs.push(oif);
+                }
+            }
+        }
         drop(device_list);
-        let affected_oifs = editor.finish()?;
 
         let mut address_capacity = 0;
         iface
@@ -229,6 +311,14 @@ impl PreparedAddressRouteCommit {
         let other_projections =
             ProjectionPlan::prepare(&before, &candidate, &other_oifs, &devices)?;
         let mut notifications = candidate.delta_from(&before)?.into_notifications();
+        if was_up && !is_up {
+            // NETDEV_DOWN silently flushes ordinary IPv4 routes. Routes
+            // removed by the preceding MTU address teardown retain their
+            // normal address-lifecycle notifications.
+            notifications.removed.retain(|entry| {
+                !is_ipv4(entry.destination.address()) || address_removed.contains(entry)
+            });
+        }
         silent.removed.sort_unstable();
         silent.added.sort_unstable();
         notifications
@@ -249,6 +339,18 @@ impl PreparedAddressRouteCommit {
     }
 
     fn publish(self, netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>) -> RouteNotifications {
+        self.publish_link_change(netns, iface, None, || {}, || {}, false)
+    }
+
+    pub(crate) fn publish_link_change(
+        self,
+        netns: &Arc<NetNamespace>,
+        iface: &Arc<dyn Iface>,
+        renamed_to: Option<String>,
+        publish_mtu: impl FnOnce(),
+        publish_link_state: impl FnOnce(),
+        is_up: bool,
+    ) -> RouteNotifications {
         let Self {
             before,
             candidate,
@@ -260,6 +362,13 @@ impl PreparedAddressRouteCommit {
         } = self;
         let router = netns.router();
         let mut current = router.fib_write();
+        publish_mtu();
+        let mut publish_link_state = Some(publish_link_state);
+        if !is_up {
+            publish_link_state
+                .take()
+                .expect("link state publisher runs once")();
+        }
         debug_assert_eq!(*current, before);
         let mut smol_iface = iface.smol_iface().lock();
         smol_iface.update_ip_addrs(|addresses| {
@@ -275,12 +384,31 @@ impl PreparedAddressRouteCommit {
         });
         drop(smol_iface);
         other_projections.publish();
-        *iface.common().address_metadata().lock() = metadata;
+        if let Some(name) = renamed_to {
+            iface
+                .common()
+                .publish_name_and_address_metadata(name, metadata);
+        } else {
+            *iface.common().address_metadata().lock() = metadata;
+        }
         let mut mirror = iface.router_common().ip_addrs.write();
         *mirror = after_addresses;
         *current = candidate;
+        if is_up {
+            publish_link_state
+                .take()
+                .expect("link state publisher runs once")();
+        }
         notifications
     }
+}
+
+pub(crate) fn prepare_address_link_change(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    change: AddressLinkChange<'_>,
+) -> Result<PreparedAddressRouteCommit, SystemError> {
+    PreparedAddressRouteCommit::prepare_for_link(netns, iface, change)
 }
 
 pub(crate) fn commit_addresses(
@@ -292,13 +420,14 @@ pub(crate) fn commit_addresses(
     metadata: Vec<AddressMetadata>,
     deleted_address: Option<IpAddress>,
 ) -> Result<RouteNotifications, SystemError> {
+    let deleted_addresses = deleted_address.as_slice();
     let prepared = PreparedAddressRouteCommit::prepare(
         netns,
         iface,
         before,
         after,
         metadata,
-        deleted_address,
+        deleted_addresses,
     )?;
     Ok(prepared.publish(netns, iface))
 }

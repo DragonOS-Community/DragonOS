@@ -9,11 +9,11 @@ use crate::{
         fork::CloneFlags,
         lock_fs_refs_copy,
         pid::PidType,
-        ProcessManager,
+        FsRefsReadGuard, ProcessControlBlock, ProcessManager,
     },
 };
 
-use super::nsproxy::{switch_task_namespaces, NsProxy};
+use super::nsproxy::{NsProxy, PreparedNamespaceInstall};
 
 fn can_setns_cgroup(target: &crate::process::namespace::cgroup_namespace::CgroupNamespace) -> bool {
     let current = ProcessManager::current_pcb();
@@ -29,6 +29,33 @@ fn can_setns_cgroup(target: &crate::process::namespace::cgroup_namespace::Cgroup
 
 fn flags_match(flags: CloneFlags, expected: CloneFlags) -> bool {
     flags.is_empty() || flags == expected
+}
+
+fn validate_namespace_fd_flags(
+    flags: CloneFlags,
+    expected: CloneFlags,
+) -> Result<CloneFlags, SystemError> {
+    if flags_match(flags, expected) {
+        Ok(expected)
+    } else {
+        Err(SystemError::EINVAL)
+    }
+}
+
+fn prepare_setns_install(
+    current: &Arc<ProcessControlBlock>,
+    new_nsproxy: Arc<NsProxy>,
+    new_cred: Option<Arc<Cred>>,
+    installation_flags: CloneFlags,
+    fs_refs: &FsRefsReadGuard,
+) -> Result<PreparedNamespaceInstall, SystemError> {
+    PreparedNamespaceInstall::prepare_for_setns(
+        current,
+        new_nsproxy,
+        new_cred,
+        installation_flags.contains(CloneFlags::CLONE_NEWIPC),
+        fs_refs,
+    )
 }
 
 fn can_setns_target_userns(
@@ -185,7 +212,8 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
         let new_nsproxy = Arc::new(new_inner);
         let fs_refs = lock_fs_refs_copy();
-        switch_task_namespaces(&current, new_nsproxy, &fs_refs)?;
+        let prepared = prepare_setns_install(&current, new_nsproxy, None, flags, &fs_refs)?;
+        prepared.commit(&current, &fs_refs)?;
         return Ok(());
     }
 
@@ -205,11 +233,14 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         }
     }
 
+    let installation_flags;
+    let mut new_cred = None;
     match ns_fd {
         NamespaceFilePrivateData::Ipc(ns) => {
             if !flags_match(flags, CloneFlags::CLONE_NEWIPC) {
                 return Err(SystemError::EINVAL);
             }
+            installation_flags = CloneFlags::CLONE_NEWIPC;
             new_inner.ipc_ns = ns;
         }
         NamespaceFilePrivateData::Uts(ns) => {
@@ -219,33 +250,34 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             if !can_setns_uts(&ns) {
                 return Err(SystemError::EPERM);
             }
+            installation_flags = CloneFlags::CLONE_NEWUTS;
             new_inner.uts_ns = ns;
         }
         NamespaceFilePrivateData::Mnt(ns) => {
             if !flags_match(flags, CloneFlags::CLONE_NEWNS) {
                 return Err(SystemError::EINVAL);
             }
+            installation_flags = CloneFlags::CLONE_NEWNS;
             new_inner.mnt_ns = ns;
         }
         NamespaceFilePrivateData::Net(ns) => {
             if !flags_match(flags, CloneFlags::CLONE_NEWNET) {
                 return Err(SystemError::EINVAL);
             }
+            installation_flags = CloneFlags::CLONE_NEWNET;
             new_inner.net_ns = ns;
         }
         NamespaceFilePrivateData::Pid(ns) | NamespaceFilePrivateData::PidForChildren(ns) => {
             if !flags_match(flags, CloneFlags::CLONE_NEWPID) {
                 return Err(SystemError::EINVAL);
             }
+            installation_flags = CloneFlags::CLONE_NEWPID;
             // 仅影响子进程 PID namespace，保持与 Linux 语义一致
             new_inner.pid_ns_for_children = ns;
         }
         NamespaceFilePrivateData::User(ns) => {
-            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWUSER) {
-                return Err(SystemError::EINVAL);
-            }
-            userns_install(&current, ns)?;
-            return Ok(());
+            installation_flags = validate_namespace_fd_flags(flags, CloneFlags::CLONE_NEWUSER)?;
+            new_cred = Some(prepare_userns_cred(&current, ns)?);
         }
         NamespaceFilePrivateData::Cgroup(ns) => {
             if !flags_match(flags, CloneFlags::CLONE_NEWCGROUP) {
@@ -254,6 +286,7 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             if !can_setns_cgroup(&ns) {
                 return Err(SystemError::EPERM);
             }
+            installation_flags = CloneFlags::CLONE_NEWCGROUP;
             new_inner.cgroup_ns = ns;
         }
     }
@@ -262,16 +295,23 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
     // 5. 原子切换当前任务的 namespace 代理
     let fs_refs = lock_fs_refs_copy();
-    switch_task_namespaces(&current, new_nsproxy, &fs_refs)?;
+    let prepared = prepare_setns_install(
+        &current,
+        new_nsproxy,
+        new_cred,
+        installation_flags,
+        &fs_refs,
+    )?;
+    prepared.commit(&current, &fs_refs)?;
 
     Ok(())
 }
 
 /// 安装（切换）user namespace（对应 Linux userns_install）
-fn userns_install(
+fn prepare_userns_cred(
     current: &Arc<crate::process::ProcessControlBlock>,
     user_ns: Arc<super::user_namespace::UserNamespace>,
-) -> Result<(), SystemError> {
+) -> Result<Arc<Cred>, SystemError> {
     // 1. 不能与当前 ns 相同（防止重复获得能力）
     if Arc::ptr_eq(&current.cred().user_ns, &user_ns) {
         return Err(SystemError::EINVAL);
@@ -292,10 +332,50 @@ fn userns_install(
         return Err(SystemError::EPERM);
     }
 
-    // 5. 先准备新的 cred，全部校验通过后再提交
+    // 5. Prepare new credentials after every validation has passed.
     let mut new_cred = (*current.cred()).clone();
     crate::process::cred::set_cred_user_ns(&mut new_cred, user_ns);
-    current.commit_cred(Cred::new_arc(new_cred))?;
+    Ok(Cred::new_arc(new_cred))
+}
 
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::{KernelStack, ProcessControlBlock};
+
+    #[test]
+    fn setns_newipc_detaches_even_for_same_arc_target() {
+        let pcb = ProcessControlBlock::new_idle(0, KernelStack::new().unwrap());
+        let old_nsproxy = pcb.nsproxy();
+        let old_group = pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
+        let fs_refs = lock_fs_refs_copy();
+
+        let prepared = prepare_setns_install(
+            &pcb,
+            old_nsproxy.clone(),
+            None,
+            CloneFlags::CLONE_NEWIPC,
+            &fs_refs,
+        )
+        .unwrap();
+        prepared.commit(&pcb, &fs_refs).unwrap();
+
+        assert!(Arc::ptr_eq(&pcb.nsproxy(), &old_nsproxy));
+        assert!(pcb.sem_undo_group().is_none());
+        let replacement = pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
+        assert!(!Arc::ptr_eq(&replacement, &old_group));
+        assert_eq!(old_group.task_owners_for_test(), 0);
+        assert_eq!(old_group.replay_count_for_test(), 1);
+    }
+
+    #[test]
+    fn user_namespace_fd_rejects_combined_newuser_newipc() {
+        assert_eq!(
+            validate_namespace_fd_flags(
+                CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWIPC,
+                CloneFlags::CLONE_NEWUSER,
+            ),
+            Err(SystemError::EINVAL)
+        );
+    }
 }

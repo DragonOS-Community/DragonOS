@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // System V semaphore subsystem, tracking Linux 6.6 `ipc/sem.c` observable
-// behavior. SEM_UNDO is intentionally unsupported and rejected with ENOSYS.
+// behavior, including SEM_UNDO lifecycle accounting.
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::fmt;
 
 use hashbrown::HashMap;
@@ -13,6 +17,7 @@ use crate::{
     ipc::{
         id::IpcIdAllocator,
         ipc_perm::{self, IpcPerm, IpcPermView, PosixIpcPerm},
+        sem_undo::{PreparedSemUndoRecordAction, SemUndoGroup, SemUndoRecord},
     },
     libs::{
         spinlock::SpinLock,
@@ -256,23 +261,71 @@ enum SemQueueStatus {
 struct SemQueueEntry {
     sops: Vec<PosixSemBuf>,
     pid: Option<Arc<Pid>>,
+    undo_group: Option<Arc<SemUndoGroup>>,
+    undo_record: SpinLock<Option<SemUndoRecord>>,
     waker: Arc<Waker>,
+    scratch: SpinLock<SemopScratch>,
     status: SpinLock<SemQueueStatus>,
 }
 
 impl SemQueueEntry {
+    fn new_prepared(
+        sops: Vec<PosixSemBuf>,
+        pid: Option<Arc<Pid>>,
+        undo_group: Option<Arc<SemUndoGroup>>,
+        undo_record: Option<SemUndoRecord>,
+        waker: Arc<Waker>,
+        scratch: SemopScratch,
+        blocker: SemBlockedOp,
+    ) -> Self {
+        debug_assert_eq!(
+            undo_group.is_some(),
+            undo_record.is_some(),
+            "queued SEM_UNDO group and prepared record must be captured together"
+        );
+        debug_assert!(
+            undo_group.is_some()
+                || sops
+                    .iter()
+                    .all(|op| (op.sem_flg as u32) & SemFlags::SEM_UNDO.bits() == 0),
+            "queued SEM_UNDO entry requires a captured undo group"
+        );
+        Self {
+            scratch: SpinLock::new(scratch),
+            sops,
+            pid,
+            undo_group,
+            undo_record: SpinLock::new(undo_record),
+            waker,
+            status: SpinLock::new(SemQueueStatus::Queued(blocker)),
+        }
+    }
+
+    fn prepare_sops(sops: &[PosixSemBuf]) -> Result<Vec<PosixSemBuf>, SystemError> {
+        let mut owned_sops = Vec::new();
+        owned_sops
+            .try_reserve_exact(sops.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        owned_sops.extend_from_slice(sops);
+        Ok(owned_sops)
+    }
+
+    #[cfg(test)]
     fn new(
         sops: &[PosixSemBuf],
         pid: Option<Arc<Pid>>,
         waker: Arc<Waker>,
         blocker: SemBlockedOp,
     ) -> Self {
-        Self {
-            sops: sops.to_vec(),
+        Self::new_prepared(
+            Self::prepare_sops(sops).unwrap(),
             pid,
+            None,
+            None,
             waker,
-            status: SpinLock::new(SemQueueStatus::Queued(blocker)),
-        }
+            SemopScratch::try_new(sops.len()).unwrap(),
+            blocker,
+        )
     }
 
     fn completed_result(&self) -> Option<Result<usize, SystemError>> {
@@ -373,8 +426,75 @@ impl KernelSemSet {
 }
 
 #[derive(Debug)]
+struct SemopScratchEntry {
+    semnum: usize,
+    initial_val: i32,
+    virtual_val: i32,
+    initial_adj: i16,
+    virtual_adj: i16,
+}
+
+#[derive(Debug)]
+struct SemopScratch {
+    entries: Vec<SemopScratchEntry>,
+}
+
+impl SemopScratch {
+    fn try_new(capacity: usize) -> Result<Self, SystemError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self { entries })
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn entry_for(
+        &mut self,
+        set: &KernelSemSet,
+        semnum: usize,
+        undo: Option<&SemUndoRecord>,
+    ) -> Result<&mut SemopScratchEntry, SystemError> {
+        if let Some(index) = self.entries.iter().position(|entry| entry.semnum == semnum) {
+            return Ok(&mut self.entries[index]);
+        }
+
+        if self.entries.len() == self.entries.capacity() {
+            return Err(SystemError::ENOMEM);
+        }
+
+        let initial_val = set.sems[semnum].val;
+        let initial_adj = undo
+            .map(|record| record.adjustment(semnum))
+            .unwrap_or_default();
+        self.entries.push(SemopScratchEntry {
+            semnum,
+            initial_val,
+            virtual_val: initial_val,
+            initial_adj,
+            virtual_adj: initial_adj,
+        });
+        Ok(self
+            .entries
+            .last_mut()
+            .expect("SEM_UNDO scratch entry was just inserted"))
+    }
+}
+
+/// Fixed-capacity virtual semaphore state produced by `SemopScratch`.
+#[derive(Debug)]
 struct SemopSimulation {
-    values: HashMap<usize, i32>,
+    entry_count: usize,
+}
+
+impl SemopSimulation {
+    #[cfg(test)]
+    fn empty_for_test() -> Self {
+        Self { entry_count: 0 }
+    }
 }
 
 /// Result of an attempted `semop` execution
@@ -382,6 +502,16 @@ struct SemopSimulation {
 enum SemopOutcome {
     Ready(SemopSimulation),
     Blocked(SemBlockedOp),
+}
+
+impl SemopOutcome {
+    #[cfg(test)]
+    fn ready_for_test(self) -> SemopSimulation {
+        match self {
+            Self::Ready(simulation) => simulation,
+            Self::Blocked(_) => panic!("expected ready semop outcome"),
+        }
+    }
 }
 
 /// Semaphore manager
@@ -395,6 +525,8 @@ pub struct SemManager {
     key2id: HashMap<SemKey, SemId>,
     /// Total semaphores in the namespace (Linux semmns accounting)
     total_sems: usize,
+    #[allow(dead_code)]
+    undo_groups: Arc<Vec<Weak<SemUndoGroup>>>,
 }
 
 impl Default for SemManager {
@@ -413,6 +545,7 @@ impl SemManager {
             id2sem: HashMap::new(),
             key2id: HashMap::new(),
             total_sems: 0,
+            undo_groups: Arc::new(Vec::new()),
         }
     }
 
@@ -440,6 +573,208 @@ impl SemManager {
     fn get_by_index(&self, id: usize) -> Result<&KernelSemSet, SystemError> {
         let idx = id & IpcIdAllocator::IPC_ID_IDX_MASK;
         self.id2sem.get(&idx).ok_or(SystemError::EINVAL)
+    }
+
+    #[allow(dead_code)]
+    fn validate_semid_nsems(&self, semid: SemId) -> Result<usize, SystemError> {
+        Ok(self.get_by_semid_checked(semid)?.sems.len())
+    }
+
+    #[allow(dead_code)]
+    fn build_undo_registry_replacement(
+        snapshot: &Arc<Vec<Weak<SemUndoGroup>>>,
+        group: &Arc<SemUndoGroup>,
+    ) -> Result<Arc<Vec<Weak<SemUndoGroup>>>, SystemError> {
+        let mut live = Vec::new();
+        live.try_reserve_exact(snapshot.len().saturating_add(1))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut contains_group = false;
+
+        for weak in snapshot.iter() {
+            let Some(existing) = weak.upgrade() else {
+                continue;
+            };
+            contains_group |= Arc::ptr_eq(&existing, group);
+            if !live
+                .iter()
+                .any(|item: &Weak<SemUndoGroup>| item.ptr_eq(weak))
+            {
+                live.push(Arc::downgrade(&existing));
+            }
+        }
+
+        if !contains_group {
+            live.push(Arc::downgrade(group));
+        }
+
+        Arc::try_new(live).map_err(|_| SystemError::ENOMEM)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prepare_undo_record_and_registry(
+        ipcns: &Arc<IpcNamespace>,
+        group: &Arc<SemUndoGroup>,
+        semid: SemId,
+    ) -> Result<(), SystemError> {
+        loop {
+            let (nsems, snapshot) = {
+                let guard = ipcns.sem.lock();
+                (
+                    guard.validate_semid_nsems(semid)?,
+                    guard.undo_groups.clone(),
+                )
+            };
+
+            let replacement = Self::build_undo_registry_replacement(&snapshot, group)?;
+            let record = group.prepare_record(semid, nsems)?;
+
+            let mut guard = ipcns.sem.lock();
+            if !Arc::ptr_eq(&guard.undo_groups, &snapshot) {
+                drop(record);
+                continue;
+            }
+
+            let current_nsems = guard.validate_semid_nsems(semid)?;
+            if current_nsems != nsems || record.adjustment_count() != current_nsems {
+                drop(record);
+                continue;
+            }
+
+            guard.undo_groups = replacement;
+            match group.commit_prepared_record_noalloc(record) {
+                Ok(()) => return Ok(()),
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn with_undo_record_mut<R>(
+        group: &Arc<SemUndoGroup>,
+        semid: SemId,
+        f: impl FnOnce(&mut SemUndoRecord) -> R,
+    ) -> Option<R> {
+        group.with_record_mut(semid, f)
+    }
+
+    fn compact_undo_registry(&mut self) {
+        if let Some(groups) = Arc::get_mut(&mut self.undo_groups) {
+            groups.retain(|weak| weak.strong_count() != 0);
+        }
+    }
+
+    pub(crate) fn clear_undo_for_setval(&mut self, semid: SemId, semnum: usize) {
+        let mut saw_stale = false;
+        for weak in self.undo_groups.iter() {
+            let Some(group) = weak.upgrade() else {
+                saw_stale = true;
+                continue;
+            };
+            Self::with_undo_record_mut(&group, semid, |record| {
+                if semnum < record.adjustment_count() {
+                    record.clear_adjustment(semnum);
+                }
+            });
+        }
+        if saw_stale {
+            self.compact_undo_registry();
+        }
+    }
+
+    pub(crate) fn clear_undo_for_setall(&mut self, semid: SemId) {
+        let mut saw_stale = false;
+        for weak in self.undo_groups.iter() {
+            let Some(group) = weak.upgrade() else {
+                saw_stale = true;
+                continue;
+            };
+            Self::with_undo_record_mut(&group, semid, |record| record.clear_all_adjustments());
+        }
+        if saw_stale {
+            self.compact_undo_registry();
+        }
+    }
+
+    pub(crate) fn discard_undo_for_rmid(&mut self, semid: SemId) {
+        let mut saw_stale = false;
+        for weak in self.undo_groups.iter() {
+            let Some(group) = weak.upgrade() else {
+                saw_stale = true;
+                continue;
+            };
+            group.remove_record(semid);
+        }
+        if saw_stale {
+            self.compact_undo_registry();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prune_and_apply_setval_undo(&mut self, semid: SemId, semnum: usize) {
+        self.clear_undo_for_setval(semid, semnum);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prune_and_apply_setall_undo(&mut self, semid: SemId) {
+        self.clear_undo_for_setall(semid);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn remove_undo_records_for_rmid(&mut self, semid: SemId) {
+        self.discard_undo_for_rmid(semid);
+    }
+
+    #[cfg(test)]
+    fn update_queue_for_test(&mut self, semid: SemId) {
+        let Ok(set) = self.get_by_semid_checked_mut(semid) else {
+            return;
+        };
+        Self::update_queue(set, semid);
+    }
+
+    #[cfg(test)]
+    fn live_undo_group_count_for_test(&self) -> usize {
+        self.undo_groups
+            .iter()
+            .filter(|weak| weak.upgrade().is_some())
+            .count()
+    }
+
+    #[cfg(test)]
+    fn undo_registry_contains_for_test(&self, group: &Arc<SemUndoGroup>) -> bool {
+        self.undo_groups
+            .iter()
+            .any(|weak| weak.ptr_eq(&Arc::downgrade(group)))
+    }
+
+    #[cfg(test)]
+    fn namespace_lifecycle_invariant_for_test(&self) -> bool {
+        self.undo_groups.iter().all(|weak| {
+            weak.upgrade()
+                .is_none_or(|group| group.record_count_for_test() == 0)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_undo_record_and_registry_for_test(
+        &mut self,
+        group: &Arc<SemUndoGroup>,
+        semid: SemId,
+    ) -> Result<(), SystemError> {
+        let nsems = self.validate_semid_nsems(semid)?;
+        let snapshot = self.undo_groups.clone();
+        let replacement = Self::build_undo_registry_replacement(&snapshot, group)?;
+        let record = group.prepare_record(semid, nsems)?;
+        if !Arc::ptr_eq(&self.undo_groups, &snapshot) {
+            drop(record);
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        if self.validate_semid_nsems(semid)? != nsems {
+            drop(record);
+            return Err(SystemError::EINVAL);
+        }
+        self.undo_groups = replacement;
+        group.commit_prepared_record_noalloc(record)
     }
 
     fn current_max_index(&self) -> usize {
@@ -535,12 +870,14 @@ impl SemManager {
         Ok(sem_id.data())
     }
 
-    /// Simulate sops in order without changing the real semaphore values.
+    /// Simulate sops in order without changing shared semaphore values or undo records.
     fn simulate_semop(
         set: &KernelSemSet,
         sops: &[PosixSemBuf],
+        undo: Option<&mut SemUndoRecord>,
+        scratch: &mut SemopScratch,
     ) -> Result<SemopOutcome, SystemError> {
-        let mut values = HashMap::with_capacity(sops.len());
+        scratch.clear();
 
         for op in sops {
             let idx = op.sem_num as usize;
@@ -548,8 +885,9 @@ impl SemManager {
                 return Err(SystemError::EFBIG);
             }
 
-            let value = values.entry(idx).or_insert(set.sems[idx].val);
-            let current = *value;
+            let has_undo = (op.sem_flg as u32) & SemFlags::SEM_UNDO.bits() != 0;
+            let entry = scratch.entry_for(set, idx, undo.as_deref())?;
+            let current = entry.virtual_val;
             if op.sem_op == 0 {
                 if current != 0 {
                     return Ok(SemopOutcome::Blocked(SemBlockedOp {
@@ -572,40 +910,106 @@ impl SemManager {
                     nowait: (op.sem_flg as u32) & SemFlags::IPC_NOWAIT.bits() != 0,
                 }));
             }
-            *value = result as i32;
+
+            if has_undo {
+                let next_adj = entry.virtual_adj as i32 - op.sem_op as i32;
+                if !(i16::MIN as i32..=i16::MAX as i32).contains(&next_adj) {
+                    return Err(SystemError::ERANGE);
+                }
+                entry.virtual_adj = next_adj as i16;
+            }
+            entry.virtual_val = result as i32;
         }
 
-        Ok(SemopOutcome::Ready(SemopSimulation { values }))
+        Ok(SemopOutcome::Ready(SemopSimulation {
+            entry_count: scratch.entries.len(),
+        }))
     }
 
     /// Commit a successful simulation while the manager lock is held.
     fn commit_semop(
         set: &mut KernelSemSet,
         simulation: SemopSimulation,
+        scratch: &SemopScratch,
         pid: Option<Arc<Pid>>,
+        mut undo: Option<&mut SemUndoRecord>,
     ) -> bool {
         let mut values_changed = false;
-        for (idx, value) in simulation.values {
-            let sem = &mut set.sems[idx];
-            values_changed |= sem.val != value;
-            sem.val = value;
+        for entry in scratch.entries.iter().take(simulation.entry_count) {
+            let sem = &mut set.sems[entry.semnum];
+            values_changed |= entry.initial_val != entry.virtual_val;
+            sem.val = entry.virtual_val;
             sem.pid = pid.clone();
+            if entry.virtual_adj != entry.initial_adj {
+                if let Some(record) = undo.as_deref_mut() {
+                    record.set_adjustment(entry.semnum, entry.virtual_adj);
+                }
+            }
         }
         set.sem_otime = PosixTimeSpec::now().tv_sec;
         values_changed
     }
 
     /// Complete every executable queue entry without head-of-line blocking.
-    fn update_queue(set: &mut KernelSemSet) {
+    fn update_queue(set: &mut KernelSemSet, _semid: SemId) {
         loop {
             let mut values_changed = false;
             let mut index = 0;
 
             while index < set.waiters.len() {
                 let entry = set.waiters[index].clone();
-                match Self::simulate_semop(set, &entry.sops) {
+
+                if let Some(group) = entry.undo_group.as_ref() {
+                    let result = {
+                        let mut record_slot = entry.undo_record.lock_irqsave();
+                        let Some(record) = record_slot.take() else {
+                            set.waiters.remove(index);
+                            entry.complete(Err(SystemError::EINVAL));
+                            entry.waker.wake();
+                            continue;
+                        };
+                        match group.with_prepared_record_noalloc(record, |record| {
+                            match Self::retry_queued_undo_entry(set, &entry, record) {
+                                Ok(Some(changed)) => {
+                                    PreparedSemUndoRecordAction::Publish(Ok(Some(changed)))
+                                }
+                                Ok(None) => PreparedSemUndoRecordAction::Keep(Ok(None)),
+                                Err(error) => PreparedSemUndoRecordAction::Keep(Err(error)),
+                            }
+                        }) {
+                            Ok((result, kept_record)) => {
+                                *record_slot = kept_record;
+                                result
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+
+                    match result {
+                        Ok(Some(changed)) => {
+                            values_changed |= changed;
+                            set.waiters.remove(index);
+                            entry.complete(Ok(0));
+                            entry.waker.wake();
+                            if changed {
+                                break;
+                            }
+                        }
+                        Ok(None) => index += 1,
+                        Err(error) => {
+                            set.waiters.remove(index);
+                            entry.complete(Err(error));
+                            entry.waker.wake();
+                        }
+                    }
+                    continue;
+                }
+
+                let mut scratch = entry.scratch.lock();
+                match Self::simulate_semop(set, &entry.sops, None, &mut scratch) {
                     Ok(SemopOutcome::Ready(simulation)) => {
-                        let changed = Self::commit_semop(set, simulation, entry.pid.clone());
+                        let changed =
+                            Self::commit_semop(set, simulation, &scratch, entry.pid.clone(), None);
                         values_changed |= changed;
                         set.waiters.remove(index);
                         entry.complete(Ok(0));
@@ -637,6 +1041,59 @@ impl SemManager {
         }
     }
 
+    fn retry_queued_undo_entry(
+        set: &mut KernelSemSet,
+        entry: &Arc<SemQueueEntry>,
+        record: &mut SemUndoRecord,
+    ) -> Result<Option<bool>, SystemError> {
+        if record.adjustment_count() != set.sems.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let mut scratch = entry.scratch.lock();
+        match Self::simulate_semop(set, &entry.sops, Some(record), &mut scratch) {
+            Ok(SemopOutcome::Ready(simulation)) => Ok(Some(Self::commit_semop(
+                set,
+                simulation,
+                &scratch,
+                entry.pid.clone(),
+                Some(record),
+            ))),
+            Ok(SemopOutcome::Blocked(blocker)) => {
+                if blocker.nowait {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                } else {
+                    entry.update_blocker(blocker);
+                    Ok(None)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn replay_sem_undo_adjustments(
+        &mut self,
+        semid: SemId,
+        adjustments: &[i16],
+        exiting_tgid: Option<Arc<Pid>>,
+    ) {
+        let Ok(set) = self.get_by_semid_checked_mut(semid) else {
+            return;
+        };
+
+        for (sem, adjustment) in set.sems.iter_mut().zip(adjustments.iter().copied()) {
+            if adjustment == 0 {
+                continue;
+            }
+
+            let next = (sem.val as i64 + adjustment as i64).clamp(0, SEMVMX as i64) as i32;
+            sem.val = next;
+            sem.pid = exiting_tgid.clone();
+        }
+
+        set.sem_otime = PosixTimeSpec::now().tv_sec;
+        Self::update_queue(set, semid);
+    }
+
     fn cancel_queued_entry(
         &mut self,
         semid: SemId,
@@ -647,16 +1104,28 @@ impl SemManager {
             return result;
         }
 
-        let set = match self.get_by_semid_checked_mut(semid) {
-            Ok(set) => set,
-            Err(_) => {
-                entry.complete(Err(SystemError::EIDRM));
-                return Err(SystemError::EIDRM);
+        if let Ok(set) = self.get_by_semid_checked_mut(semid) {
+            if let Some(result) = entry.completed_result() {
+                return result;
             }
-        };
-        set.remove_waiter(entry);
-        entry.complete(Err(error.clone()));
-        Err(error)
+            set.remove_waiter(entry);
+            if entry.complete(Err(error.clone())) {
+                return Err(error);
+            }
+            return entry
+                .completed_result()
+                .expect("completed semaphore queue entry lost its terminal result");
+        }
+
+        if let Some(result) = entry.completed_result() {
+            return result;
+        }
+        if entry.complete(Err(SystemError::EIDRM)) {
+            return Err(SystemError::EIDRM);
+        }
+        entry
+            .completed_result()
+            .expect("completed semaphore queue entry lost its terminal result")
     }
 
     /// # semtimedop: execute `sops` atomically, blocking if necessary
@@ -679,28 +1148,19 @@ impl SemManager {
         if sops.len() > SEMOPM {
             return Err(SystemError::E2BIG);
         }
-        if sops
-            .iter()
-            .any(|op| (op.sem_flg as u32) & SemFlags::SEM_UNDO.bits() != 0)
-        {
-            return Err(SystemError::ENOSYS);
-        }
+
         let non_blocking = timeout == Some(Duration::ZERO);
+        let has_undo = sops
+            .iter()
+            .any(|op| (op.sem_flg as u32) & SemFlags::SEM_UNDO.bits() != 0);
         // Check read permission only for all-zero waits; otherwise check write permission
         // to match Linux semantics.
         let alter = sops.iter().any(|op| op.sem_op != 0);
 
         let target_user_ns = ipcns.user_ns.clone();
-        let deadline_ticks = timeout.map(|d| next_n_us_timer_jiffies(d.total_micros()));
-
-        let (waiter, waker) = Waiter::new_pair();
-        let timer =
-            deadline_ticks.map(|deadline| Timer::new(TimeoutWaker::new(waker.clone()), deadline));
-        let pid = ProcessManager::current_pcb().task_pid_ptr(PidType::TGID);
-
-        let entry = {
-            let mut guard = ipcns.sem.lock();
-            let set = guard.get_by_semid_checked_mut(semid)?;
+        {
+            let guard = ipcns.sem.lock();
+            let set = guard.get_by_semid_checked(semid)?;
             // Match Linux: check semnum bounds (EFBIG) before permissions (EACCES).
             if sops.iter().any(|op| op.sem_num as usize >= set.sems.len()) {
                 return Err(SystemError::EFBIG);
@@ -714,23 +1174,167 @@ impl SemManager {
                 },
                 &target_user_ns,
             )?;
+        }
 
-            match Self::simulate_semop(set, sops)? {
-                SemopOutcome::Ready(simulation) => {
-                    Self::commit_semop(set, simulation, pid);
-                    Self::update_queue(set);
-                    return Ok(0);
+        let deadline_ticks = timeout.map(|d| next_n_us_timer_jiffies(d.total_micros()));
+        let (waiter, waker) = Waiter::new_pair();
+        let timer =
+            deadline_ticks.map(|deadline| Timer::new(TimeoutWaker::new(waker.clone()), deadline));
+
+        let current = ProcessManager::current_pcb();
+        let pid = current.task_pid_ptr(PidType::TGID);
+        let undo_group = if has_undo {
+            Some(current.ensure_sem_undo_group(ipcns)?)
+        } else {
+            None
+        };
+        let mut immediate_scratch = SemopScratch::try_new(sops.len())?;
+        let plain_prepared_entry = if has_undo {
+            None
+        } else {
+            Some(
+                Arc::try_new(SemQueueEntry::new_prepared(
+                    SemQueueEntry::prepare_sops(sops)?,
+                    pid.clone(),
+                    None,
+                    None,
+                    waker.clone(),
+                    SemopScratch::try_new(sops.len())?,
+                    SemBlockedOp {
+                        semnum: 0,
+                        wait_type: SemWaitType::Zero,
+                        nowait: false,
+                    },
+                ))
+                .map_err(|_| SystemError::ENOMEM)?,
+            )
+        };
+
+        let entry = loop {
+            let (nsems, snapshot) = {
+                let guard = ipcns.sem.lock();
+                let set = guard.get_by_semid_checked(semid)?;
+                // Match Linux: check semnum bounds (EFBIG) before permissions (EACCES).
+                if sops.iter().any(|op| op.sem_num as usize >= set.sems.len()) {
+                    return Err(SystemError::EFBIG);
                 }
-                SemopOutcome::Blocked(blocker) => {
-                    if blocker.nowait || non_blocking {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                ipc_perm::ipc_permission(
+                    &set.kern_ipc_perm,
+                    if alter {
+                        Self::IPC_WRITE
+                    } else {
+                        Self::IPC_READ
+                    },
+                    &target_user_ns,
+                )?;
+                (set.sems.len(), guard.undo_groups.clone())
+            };
+
+            let prepared_undo = if let Some(group) = undo_group.as_ref() {
+                let replacement = Self::build_undo_registry_replacement(&snapshot, group)?;
+                let record = group.prepare_record(semid, nsems)?;
+                let entry = Arc::try_new(SemQueueEntry::new_prepared(
+                    SemQueueEntry::prepare_sops(sops)?,
+                    pid.clone(),
+                    Some(group.clone()),
+                    Some(record),
+                    waker.clone(),
+                    SemopScratch::try_new(sops.len())?,
+                    SemBlockedOp {
+                        semnum: 0,
+                        wait_type: SemWaitType::Zero,
+                        nowait: false,
+                    },
+                ))
+                .map_err(|_| SystemError::ENOMEM)?;
+                Some((replacement, entry))
+            } else {
+                None
+            };
+
+            let mut guard = ipcns.sem.lock();
+            if !Arc::ptr_eq(&guard.undo_groups, &snapshot) {
+                continue;
+            }
+            if guard.validate_semid_nsems(semid)? != nsems {
+                continue;
+            }
+            if let Some((replacement, prepared_entry)) = prepared_undo {
+                let mut record_slot = prepared_entry.undo_record.lock_irqsave();
+                let prepared_record = record_slot
+                    .take()
+                    .expect("prepared SEM_UNDO entry owns its record");
+                if prepared_record.adjustment_count() != nsems {
+                    *record_slot = Some(prepared_record);
+                    continue;
+                }
+                guard.undo_groups = replacement;
+                let set = guard.get_by_semid_checked_mut(semid)?;
+                let (outcome, kept_record) = undo_group
+                    .as_ref()
+                    .expect("SEM_UNDO operation has a current group")
+                    .with_prepared_record_noalloc(prepared_record, |record| {
+                        let outcome =
+                            Self::simulate_semop(set, sops, Some(record), &mut immediate_scratch);
+                        match outcome {
+                            Ok(SemopOutcome::Ready(simulation)) => {
+                                Self::commit_semop(
+                                    set,
+                                    simulation,
+                                    &immediate_scratch,
+                                    pid.clone(),
+                                    Some(record),
+                                );
+                                PreparedSemUndoRecordAction::Publish(Ok(None))
+                            }
+                            Ok(SemopOutcome::Blocked(blocker)) => {
+                                PreparedSemUndoRecordAction::Keep(Ok(Some(blocker)))
+                            }
+                            Err(error) => PreparedSemUndoRecordAction::Keep(Err(error)),
+                        }
+                    })?;
+                *record_slot = kept_record;
+                match outcome? {
+                    None => {
+                        drop(record_slot);
+                        Self::update_queue(set, semid);
+                        return Ok(0);
                     }
-                    if deadline_ticks.is_some_and(|deadline| clock() >= deadline) {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    Some(blocker) => {
+                        if blocker.nowait || non_blocking {
+                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        }
+                        if deadline_ticks.is_some_and(|deadline| clock() >= deadline) {
+                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        }
+                        drop(record_slot);
+                        prepared_entry.update_blocker(blocker);
+                        set.enqueue_waiter(prepared_entry.clone());
+                        break prepared_entry;
                     }
-                    let entry = Arc::new(SemQueueEntry::new(sops, pid, waker.clone(), blocker));
-                    set.enqueue_waiter(entry.clone());
-                    entry
+                }
+            } else {
+                let set = guard.get_by_semid_checked_mut(semid)?;
+                match Self::simulate_semop(set, sops, None, &mut immediate_scratch)? {
+                    SemopOutcome::Ready(simulation) => {
+                        Self::commit_semop(set, simulation, &immediate_scratch, pid, None);
+                        Self::update_queue(set, semid);
+                        return Ok(0);
+                    }
+                    SemopOutcome::Blocked(blocker) => {
+                        if blocker.nowait || non_blocking {
+                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        }
+                        if deadline_ticks.is_some_and(|deadline| clock() >= deadline) {
+                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        }
+                        let prepared_entry = plain_prepared_entry
+                            .as_ref()
+                            .expect("plain queued semop entry is preallocated");
+                        prepared_entry.update_blocker(blocker);
+                        set.enqueue_waiter(prepared_entry.clone());
+                        break prepared_entry.clone();
+                    }
                 }
             }
         };
@@ -768,14 +1372,15 @@ impl SemManager {
             ipc_perm::check_control_permission(&set.kern_ipc_perm, &target_user_ns)?;
             set.kern_ipc_perm.key
         };
+        self.discard_undo_for_rmid(id);
         let mut set = self
             .id2sem
             .remove(&decoded.idx)
             .ok_or(SystemError::EINVAL)?;
         self.key2id.remove(&SemKey::new(key));
-        self.id_allocator.free_idx(decoded.idx);
         self.total_sems = self.total_sems.saturating_sub(set.sems.len());
         set.complete_all_removed();
+        self.id_allocator.free_idx(decoded.idx);
         Ok(())
     }
 
@@ -871,33 +1476,45 @@ impl SemManager {
         if !(0..=SEMVMX).contains(&val) {
             return Err(SystemError::ERANGE);
         }
-        let set = self.get_by_semid_checked_mut(id)?;
-        if semnum >= set.sems.len() {
-            return Err(SystemError::EINVAL);
-        }
-        let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
-        ipc_perm::ipc_permission(&set.kern_ipc_perm, Self::IPC_WRITE, &target_user_ns)?;
+        let nsems = {
+            let set = self.get_by_semid_checked(id)?;
+            if semnum >= set.sems.len() {
+                return Err(SystemError::EINVAL);
+            }
+            let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
+            ipc_perm::ipc_permission(&set.kern_ipc_perm, Self::IPC_WRITE, &target_user_ns)?;
+            set.sems.len()
+        };
+        debug_assert!(semnum < nsems);
 
+        self.clear_undo_for_setval(id, semnum);
+        let set = self.get_by_semid_checked_mut(id)?;
         let sem = &mut set.sems[semnum];
         sem.val = val;
         sem.pid = ProcessManager::current_pcb().task_pid_ptr(PidType::TGID);
         set.sem_ctime = PosixTimeSpec::now().tv_sec;
-        Self::update_queue(set);
+        Self::update_queue(set, id);
         Ok(())
     }
 
     /// # SETALL: set values of all semaphores in the set without changes on validation failure
     pub fn setall(&mut self, token: SemSetAllToken, vals: &[u16]) -> Result<(), SystemError> {
-        let set = self
-            .get_by_semid_checked_mut(token.id)
-            .map_err(|_| SystemError::EIDRM)?;
-        if vals.len() != token.nsems || vals.len() != set.sems.len() {
+        let set_nsems = self
+            .get_by_semid_checked(token.id)
+            .map_err(|_| SystemError::EIDRM)?
+            .sems
+            .len();
+        if vals.len() != token.nsems || vals.len() != set_nsems {
             return Err(SystemError::EINVAL);
         }
         if vals.iter().any(|&v| v as i32 > SEMVMX) {
             return Err(SystemError::ERANGE);
         }
 
+        self.clear_undo_for_setall(token.id);
+        let set = self
+            .get_by_semid_checked_mut(token.id)
+            .map_err(|_| SystemError::EIDRM)?;
         let pid = ProcessManager::current_pcb().task_pid_ptr(PidType::TGID);
         for (i, &v) in vals.iter().enumerate() {
             let sem = &mut set.sems[i];
@@ -905,7 +1522,7 @@ impl SemManager {
             sem.pid = pid.clone();
         }
         set.sem_ctime = PosixTimeSpec::now().tv_sec;
-        Self::update_queue(set);
+        Self::update_queue(set, token.id);
         Ok(())
     }
 
@@ -929,7 +1546,16 @@ impl SemManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::cred::{Kgid, Kuid};
+    use crate::{
+        ipc::sem_undo::detach_sem_undo,
+        process::{
+            cred::{Kgid, Kuid},
+            fork::CloneFlags,
+            namespace::ipc_namespace::INIT_IPC_NAMESPACE,
+            namespace::pid_namespace::INIT_PID_NAMESPACE,
+            KernelStack, ProcessControlBlock, RawPid,
+        },
+    };
 
     fn test_perm(id: SemId, key: SemKey, seq: usize) -> IpcPerm {
         IpcPerm {
@@ -974,6 +1600,850 @@ mod tests {
             .iter()
             .map(|sem| sem.val)
             .collect()
+    }
+
+    fn test_ipc_ns() -> Arc<IpcNamespace> {
+        INIT_IPC_NAMESPACE.copy_ipc_ns(
+            &CloneFlags::CLONE_NEWIPC,
+            INIT_IPC_NAMESPACE.user_ns.clone(),
+        )
+    }
+
+    fn test_pcb_with_group(
+        ipc_ns: &Arc<IpcNamespace>,
+    ) -> (Arc<ProcessControlBlock>, Arc<SemUndoGroup>) {
+        let pcb = ProcessControlBlock::new_idle(0, KernelStack::new().unwrap());
+        let group = pcb.ensure_sem_undo_group(ipc_ns).unwrap();
+        (pcb, group)
+    }
+
+    fn enqueue_test_waiter(
+        set: &mut KernelSemSet,
+        sops: &[PosixSemBuf],
+        blocker: SemBlockedOp,
+    ) -> Arc<SemQueueEntry> {
+        let (_waiter, waker) = Waiter::new_pair();
+        let entry = Arc::new(SemQueueEntry::new(sops, None, waker, blocker));
+        set.enqueue_waiter(entry.clone());
+        entry
+    }
+
+    #[test]
+    fn last_owner_replays_adjustment_with_clamp_and_removes_record() {
+        let ipc_ns = test_ipc_ns();
+        let semid = {
+            let mut manager = ipc_ns.sem.lock();
+            insert_test_set(&mut manager, SemKey::new(31), &[32766])
+        };
+        let (pcb, group) = test_pcb_with_group(&ipc_ns);
+        group.insert_test_record(semid, &[4]);
+
+        detach_sem_undo(&pcb);
+
+        let manager = ipc_ns.sem.lock();
+        assert_eq!(sem_values(&manager, semid), vec![SEMVMX]);
+        assert_eq!(group.record_count_for_test(), 0);
+        assert!(pcb.sem_undo_group().is_none());
+    }
+
+    #[test]
+    fn non_last_owner_does_not_replay() {
+        let ipc_ns = test_ipc_ns();
+        let semid = {
+            let mut manager = ipc_ns.sem.lock();
+            insert_test_set(&mut manager, SemKey::new(32), &[10])
+        };
+        let (owner_one, group) = test_pcb_with_group(&ipc_ns);
+        let owner_two = ProcessControlBlock::new_idle(0, KernelStack::new().unwrap());
+        let mut guard = owner_one
+            .prepare_shared_sem_undo_attachment(&ipc_ns)
+            .unwrap();
+        guard.install_into(&owner_two);
+        guard.disarm();
+        group.insert_test_record(semid, &[4]);
+
+        detach_sem_undo(&owner_one);
+
+        assert_eq!(sem_values(&ipc_ns.sem.lock(), semid), vec![10]);
+        assert_eq!(group.record_count_for_test(), 1);
+
+        detach_sem_undo(&owner_two);
+
+        assert_eq!(sem_values(&ipc_ns.sem.lock(), semid), vec![14]);
+        assert_eq!(group.record_count_for_test(), 0);
+    }
+
+    #[test]
+    fn stale_full_semid_does_not_touch_reused_index() {
+        let ipc_ns = test_ipc_ns();
+        let old_semid = {
+            let mut manager = ipc_ns.sem.lock();
+            manager.id_allocator = IpcIdAllocator::new(2).unwrap();
+            insert_test_set(&mut manager, SemKey::new(33), &[7])
+        };
+        let (pcb, group) = test_pcb_with_group(&ipc_ns);
+        group.insert_test_record(old_semid, &[9]);
+
+        let new_semid = {
+            let mut manager = ipc_ns.sem.lock();
+            insert_test_set(&mut manager, SemKey::new(34), &[5]);
+            remove_test_set(&mut manager, old_semid);
+            insert_test_set(&mut manager, SemKey::new(35), &[21])
+        };
+        assert_ne!(old_semid, new_semid);
+        assert_eq!(
+            old_semid.data() & IpcIdAllocator::IPC_ID_IDX_MASK,
+            new_semid.data() & IpcIdAllocator::IPC_ID_IDX_MASK
+        );
+
+        detach_sem_undo(&pcb);
+
+        assert_eq!(sem_values(&ipc_ns.sem.lock(), new_semid), vec![21]);
+        assert_eq!(group.record_count_for_test(), 0);
+    }
+
+    #[test]
+    fn replay_updates_otime_and_rescans_waiter() {
+        let ipc_ns = test_ipc_ns();
+        let (semid, entry) = {
+            let mut manager = ipc_ns.sem.lock();
+            let semid = insert_test_set(&mut manager, SemKey::new(35), &[1, 2]);
+            let set = manager.get_by_semid_checked_mut(semid).unwrap();
+            set.sem_otime = -1;
+
+            let (_waiter, waker) = Waiter::new_pair();
+            let blocker = SemBlockedOp {
+                semnum: 0,
+                wait_type: SemWaitType::Zero,
+                nowait: false,
+            };
+            let entry = Arc::new(SemQueueEntry::new(
+                &[PosixSemBuf {
+                    sem_num: 0,
+                    sem_op: 0,
+                    sem_flg: 0,
+                }],
+                None,
+                waker,
+                blocker,
+            ));
+            set.enqueue_waiter(entry.clone());
+            (semid, entry)
+        };
+        let (pcb, group) = test_pcb_with_group(&ipc_ns);
+        let exiting_tgid = Pid::new_for_test(RawPid::new(4242), INIT_PID_NAMESPACE.clone());
+        pcb.install_pid_identity_for_test(exiting_tgid.clone());
+        group.insert_test_record(semid, &[-1, 1]);
+
+        detach_sem_undo(&pcb);
+
+        let mut manager = ipc_ns.sem.lock();
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        let values = [set.sems[0].val, set.sems[1].val];
+        let waiter_pid_was_applied = set.sems[0].pid.is_none();
+        let replay_pid_was_applied = set.sems[1]
+            .pid
+            .as_ref()
+            .is_some_and(|pid| Arc::ptr_eq(pid, &exiting_tgid));
+        let replay_pid_vnr = set.sems[1]
+            .pid
+            .as_ref()
+            .map(|pid| pid.pid_nr_ns(&INIT_PID_NAMESPACE));
+        let sem_otime = set.sem_otime;
+        let waiters_are_empty = set.waiters.is_empty();
+        let completed_result = entry.completed_result();
+        let record_count = group.record_count_for_test();
+
+        for sem in &mut set.sems {
+            sem.pid = None;
+        }
+        drop(manager);
+        pcb.clear_pid_identity_for_test();
+        exiting_tgid.clear_numbers_for_test();
+
+        assert_eq!(values, [0, 3]);
+        assert!(waiter_pid_was_applied);
+        assert!(replay_pid_was_applied);
+        assert_eq!(replay_pid_vnr, Some(RawPid::new(4242)));
+        assert_ne!(sem_otime, -1);
+        assert!(waiters_are_empty);
+        assert_eq!(completed_result, Some(Ok(0)));
+        assert_eq!(record_count, 0);
+    }
+
+    #[test]
+    fn replay_rescans_and_updates_otime_when_clamp_does_not_change_value() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(36), &[SEMVMX, SEMVMX]);
+        let entry = {
+            let set = manager.get_by_semid_checked_mut(semid).unwrap();
+            set.sem_otime = -1;
+            enqueue_test_waiter(
+                set,
+                &[PosixSemBuf {
+                    sem_num: 0,
+                    sem_op: -1,
+                    sem_flg: 0,
+                }],
+                SemBlockedOp {
+                    semnum: 0,
+                    wait_type: SemWaitType::Increase,
+                    nowait: false,
+                },
+            )
+        };
+        let exiting_tgid = Pid::new_for_test(RawPid::new(4243), INIT_PID_NAMESPACE.clone());
+
+        manager.replay_sem_undo_adjustments(semid, &[1, 1], Some(exiting_tgid.clone()));
+
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        let values = [set.sems[0].val, set.sems[1].val];
+        let replay_pid_was_applied = set.sems[1]
+            .pid
+            .as_ref()
+            .is_some_and(|pid| Arc::ptr_eq(pid, &exiting_tgid));
+        let sem_otime = set.sem_otime;
+        let waiters_are_empty = set.waiters.is_empty();
+        let completed_result = entry.completed_result();
+        for sem in &mut set.sems {
+            sem.pid = None;
+        }
+        exiting_tgid.clear_numbers_for_test();
+
+        assert_eq!(values, [SEMVMX - 1, SEMVMX]);
+        assert!(replay_pid_was_applied);
+        assert_ne!(sem_otime, -1);
+        assert!(waiters_are_empty);
+        assert_eq!(completed_result, Some(Ok(0)));
+    }
+
+    #[test]
+    fn valid_all_zero_record_still_updates_otime_and_rescans_queue() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(37), &[0, 5]);
+        let entry = {
+            let set = manager.get_by_semid_checked_mut(semid).unwrap();
+            set.sem_otime = -1;
+            enqueue_test_waiter(
+                set,
+                &[PosixSemBuf {
+                    sem_num: 0,
+                    sem_op: 0,
+                    sem_flg: 0,
+                }],
+                SemBlockedOp {
+                    semnum: 0,
+                    wait_type: SemWaitType::Zero,
+                    nowait: false,
+                },
+            )
+        };
+        let exiting_tgid = Pid::new_for_test(RawPid::new(4244), INIT_PID_NAMESPACE.clone());
+
+        manager.replay_sem_undo_adjustments(semid, &[0, 0], Some(exiting_tgid.clone()));
+
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        let values = [set.sems[0].val, set.sems[1].val];
+        let untouched_pid = set.sems[1].pid.is_none();
+        let sem_otime = set.sem_otime;
+        let waiters_are_empty = set.waiters.is_empty();
+        let completed_result = entry.completed_result();
+        for sem in &mut set.sems {
+            sem.pid = None;
+        }
+        exiting_tgid.clear_numbers_for_test();
+
+        assert_eq!(values, [0, 5]);
+        assert!(untouched_pid);
+        assert_ne!(sem_otime, -1);
+        assert!(waiters_are_empty);
+        assert_eq!(completed_result, Some(Ok(0)));
+    }
+
+    #[test]
+    fn new_manager_starts_with_empty_undo_registry() {
+        assert!(SemManager::new().undo_groups.is_empty());
+    }
+
+    #[test]
+    fn queued_undo_commits_to_captured_group_not_waker_current_task() {
+        let ipc_ns = test_ipc_ns();
+        let group_a = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+        let group_b = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+        let mut manager = ipc_ns.sem.lock();
+        let semid = insert_test_set(&mut manager, SemKey::new(46), &[0]);
+        manager
+            .prepare_undo_record_and_registry_for_test(&group_a, semid)
+            .unwrap();
+        manager
+            .prepare_undo_record_and_registry_for_test(&group_b, semid)
+            .unwrap();
+
+        let (_waiter, waker) = Waiter::new_pair();
+        let entry = Arc::new(SemQueueEntry::new_prepared(
+            SemQueueEntry::prepare_sops(&[undo_sop(0, -1)]).unwrap(),
+            None,
+            Some(group_a.clone()),
+            Some(group_a.prepare_record_for_test(semid, 1).unwrap()),
+            waker,
+            SemopScratch::try_new(1).unwrap(),
+            SemBlockedOp {
+                semnum: 0,
+                wait_type: SemWaitType::Increase,
+                nowait: false,
+            },
+        ));
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        set.enqueue_waiter(entry.clone());
+        set.sems[0].val = 1;
+
+        manager.update_queue_for_test(semid);
+
+        assert_eq!(entry.completed_result(), Some(Ok(0)));
+        assert_eq!(sem_values(&manager, semid), vec![0]);
+        assert_eq!(group_a.adjustment_for_test(semid, 0), 1);
+        assert_eq!(group_b.adjustment_for_test(semid, 0), 0);
+    }
+
+    #[test]
+    fn queued_timeout_signal_and_rmid_never_commit_adjustment() {
+        let ipc_ns = test_ipc_ns();
+        let group = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+        let mut manager = ipc_ns.sem.lock();
+        let timeout_semid = insert_test_set(&mut manager, SemKey::new(47), &[0]);
+        let signal_semid = insert_test_set(&mut manager, SemKey::new(48), &[0]);
+        let rmid_semid = insert_test_set(&mut manager, SemKey::new(49), &[0]);
+        for semid in [timeout_semid, signal_semid, rmid_semid] {
+            manager
+                .prepare_undo_record_and_registry_for_test(&group, semid)
+                .unwrap();
+        }
+
+        let timeout_entry = enqueue_undo_waiter_for_test(&mut manager, timeout_semid, &group);
+        assert_eq!(
+            manager.cancel_queued_entry(
+                timeout_semid,
+                &timeout_entry,
+                SystemError::EAGAIN_OR_EWOULDBLOCK,
+            ),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        );
+        assert_eq!(group.adjustment_for_test(timeout_semid, 0), 0);
+
+        let signal_entry = enqueue_undo_waiter_for_test(&mut manager, signal_semid, &group);
+        assert_eq!(
+            manager.cancel_queued_entry(signal_semid, &signal_entry, SystemError::EINTR),
+            Err(SystemError::EINTR)
+        );
+        assert_eq!(group.adjustment_for_test(signal_semid, 0), 0);
+
+        let rmid_entry = enqueue_undo_waiter_for_test(&mut manager, rmid_semid, &group);
+        manager.ipc_rmid(rmid_semid).unwrap();
+        assert_eq!(rmid_entry.completed_result(), Some(Err(SystemError::EIDRM)));
+        assert_eq!(group.adjustment_for_test(rmid_semid, 0), 0);
+    }
+
+    #[test]
+    fn first_record_is_registry_visible_before_future_cleanup() {
+        let ipc_ns = test_ipc_ns();
+        let group = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+        let mut manager = ipc_ns.sem.lock();
+        let semid = insert_test_set(&mut manager, SemKey::new(50), &[3]);
+
+        manager
+            .prepare_undo_record_and_registry_for_test(&group, semid)
+            .unwrap();
+
+        assert_eq!(manager.live_undo_group_count_for_test(), 1);
+        assert!(manager.undo_registry_contains_for_test(&group));
+        assert_eq!(group.adjustment_for_test(semid, 0), 0);
+    }
+
+    #[test]
+    fn stale_weak_entries_are_compacted_without_losing_live_group() {
+        let ipc_ns = test_ipc_ns();
+        let live = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+        let candidate = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+        let stale = SemUndoGroup::new_for_test_bound_to(&ipc_ns).unwrap();
+        let stale_weak = Arc::downgrade(&stale);
+        drop(stale);
+
+        let mut manager = ipc_ns.sem.lock();
+        let semid = insert_test_set(&mut manager, SemKey::new(51), &[1]);
+        manager.undo_groups = Arc::new(vec![stale_weak, Arc::downgrade(&live)]);
+
+        manager
+            .prepare_undo_record_and_registry_for_test(&candidate, semid)
+            .unwrap();
+
+        assert_eq!(manager.live_undo_group_count_for_test(), 2);
+        assert!(manager.undo_registry_contains_for_test(&live));
+        assert!(manager.undo_registry_contains_for_test(&candidate));
+    }
+
+    #[test]
+    fn queued_undo_entry_retains_group_after_external_owner_drops() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(52), &[1]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        manager
+            .prepare_undo_record_and_registry_for_test(&group, semid)
+            .unwrap();
+        let entry = enqueue_undo_waiter_for_test(&mut manager, semid, &group);
+        let group_weak = Arc::downgrade(&group);
+        drop(group);
+        assert!(group_weak.upgrade().is_some());
+        manager.get_by_semid_checked_mut(semid).unwrap().sems[0].val = 1;
+
+        manager.update_queue_for_test(semid);
+
+        assert_eq!(entry.completed_result(), Some(Ok(0)));
+        assert_eq!(sem_values(&manager, semid), vec![0]);
+    }
+
+    #[test]
+    fn queued_undo_record_length_mismatch_completes_with_internal_error() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(53), &[1, 1]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(semid, &[0]);
+        let entry = enqueue_undo_waiter_for_test(&mut manager, semid, &group);
+        manager.get_by_semid_checked_mut(semid).unwrap().sems[0].val = 1;
+
+        manager.update_queue_for_test(semid);
+
+        assert_eq!(entry.completed_result(), Some(Err(SystemError::EINVAL)));
+        assert_eq!(sem_values(&manager, semid), vec![1, 1]);
+        assert_eq!(group.adjustment_for_test(semid, 0), 0);
+    }
+
+    #[test]
+    fn final_owner_detach_replays_against_setval_as_a_single_serial_order() {
+        let ipc_ns = test_ipc_ns();
+        let semid = {
+            let mut manager = ipc_ns.sem.lock();
+            insert_test_set(&mut manager, SemKey::new(62), &[2])
+        };
+        let (pcb, group) = test_pcb_with_group(&ipc_ns);
+        group.insert_test_record(semid, &[3]);
+        drop(pcb.take_sem_undo_attachment().unwrap());
+        assert!(group.detach_last_owner_for_test());
+
+        {
+            let mut manager = ipc_ns.sem.lock();
+            manager.setval(semid, 0, 7).unwrap();
+        }
+        group.replay_marked_records_for_test(&pcb);
+
+        let manager = ipc_ns.sem.lock();
+        assert_eq!(sem_values(&manager, semid), vec![7]);
+        assert_eq!(group.record_count_for_test(), 0);
+        assert_eq!(group.replay_count_for_test(), 1);
+        assert!(pcb.sem_undo_group().is_none());
+    }
+
+    #[test]
+    fn rmid_before_final_owner_replay_skips_detached_record_once() {
+        let ipc_ns = test_ipc_ns();
+        let semid = {
+            let mut manager = ipc_ns.sem.lock();
+            insert_test_set(&mut manager, SemKey::new(63), &[2])
+        };
+        let (pcb, group) = test_pcb_with_group(&ipc_ns);
+        group.insert_test_record(semid, &[3]);
+        drop(pcb.take_sem_undo_attachment().unwrap());
+        assert!(group.detach_last_owner_for_test());
+
+        {
+            let mut manager = ipc_ns.sem.lock();
+            manager.ipc_rmid(semid).unwrap();
+        }
+        group.replay_marked_records_for_test(&pcb);
+
+        let manager = ipc_ns.sem.lock();
+        assert_eq!(
+            manager.get_by_semid_checked(semid),
+            Err(SystemError::EINVAL)
+        );
+        assert_eq!(group.record_count_for_test(), 0);
+        assert_eq!(group.replay_count_for_test(), 1);
+        assert!(pcb.sem_undo_group().is_none());
+    }
+
+    #[test]
+    fn prepare_existing_undo_record_length_mismatch_returns_einval_without_mutation() {
+        let semid = SemId::new(64);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(semid, &[5]);
+
+        let err = group.prepare_record_for_test(semid, 2).unwrap_err();
+
+        assert_eq!(err, SystemError::EINVAL);
+        assert_eq!(group.adjustment_for_test(semid, 0), 5);
+        assert_eq!(group.record_count_for_test(), 1);
+        assert_eq!(group.pending_record_reservations_for_test(), 0);
+    }
+
+    #[test]
+    fn setval_clears_only_target_sem_adjustment_across_all_groups() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(54), &[4, 5]);
+        let other_semid = insert_test_set(&mut manager, SemKey::new(55), &[6, 7]);
+        let group_a = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        let group_b = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group_a.insert_test_record(semid, &[11, 12]);
+        group_b.insert_test_record(semid, &[21, 22]);
+        group_a.insert_test_record(other_semid, &[31, 32]);
+        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group_a), Arc::downgrade(&group_b)]);
+
+        manager.setval(semid, 0, 9).unwrap();
+
+        assert_eq!(sem_values(&manager, semid), vec![9, 5]);
+        assert_eq!(group_a.adjustment_for_test(semid, 0), 0);
+        assert_eq!(group_a.adjustment_for_test(semid, 1), 12);
+        assert_eq!(group_b.adjustment_for_test(semid, 0), 0);
+        assert_eq!(group_b.adjustment_for_test(semid, 1), 22);
+        assert_eq!(group_a.adjustment_for_test(other_semid, 0), 31);
+    }
+
+    #[test]
+    fn setall_clears_entire_full_semid_record_across_all_groups() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(56), &[1, 2, 3]);
+        let other_semid = insert_test_set(&mut manager, SemKey::new(57), &[4, 5, 6]);
+        let group_a = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        let group_b = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group_a.insert_test_record(semid, &[1, 2, 3]);
+        group_b.insert_test_record(semid, &[4, 5, 6]);
+        group_b.insert_test_record(other_semid, &[7, 8, 9]);
+        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group_a), Arc::downgrade(&group_b)]);
+        let token = SemSetAllToken::new(semid, 3);
+
+        manager.setall(token, &[10, 11, 12]).unwrap();
+
+        assert_eq!(sem_values(&manager, semid), vec![10, 11, 12]);
+        assert_eq!(group_a.adjustment_for_test(semid, 0), 0);
+        assert_eq!(group_a.adjustment_for_test(semid, 1), 0);
+        assert_eq!(group_a.adjustment_for_test(semid, 2), 0);
+        assert_eq!(group_b.adjustment_for_test(semid, 0), 0);
+        assert_eq!(group_b.adjustment_for_test(semid, 1), 0);
+        assert_eq!(group_b.adjustment_for_test(semid, 2), 0);
+        assert_eq!(group_b.adjustment_for_test(other_semid, 1), 8);
+    }
+
+    #[test]
+    fn setval_cleanup_precedes_value_write_and_queue_rescan() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(58), &[0]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(semid, &[7]);
+        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        let entry = enqueue_undo_waiter_for_test(&mut manager, semid, &group);
+
+        manager.setval(semid, 0, 1).unwrap();
+
+        assert_eq!(entry.completed_result(), Some(Ok(0)));
+        assert_eq!(sem_values(&manager, semid), vec![0]);
+        assert_eq!(group.adjustment_for_test(semid, 0), 1);
+    }
+
+    #[test]
+    fn rmid_discards_record_before_index_can_be_reused() {
+        let mut manager = SemManager::new();
+        manager.id_allocator = IpcIdAllocator::new(2).unwrap();
+        let old_semid = insert_test_set(&mut manager, SemKey::new(59), &[3]);
+        let filler_semid = insert_test_set(&mut manager, SemKey::new(60), &[4]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(old_semid, &[9]);
+        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        manager.ipc_rmid(old_semid).unwrap();
+
+        let new_semid = insert_test_set(&mut manager, SemKey::new(61), &[5]);
+
+        assert_ne!(old_semid, new_semid);
+        assert_eq!(
+            old_semid.data() & IpcIdAllocator::IPC_ID_IDX_MASK,
+            new_semid.data() & IpcIdAllocator::IPC_ID_IDX_MASK
+        );
+        assert_eq!(sem_values(&manager, new_semid), vec![5]);
+        assert_eq!(group.record_count_for_test(), 0);
+        assert_eq!(sem_values(&manager, filler_semid), vec![4]);
+    }
+
+    #[test]
+    fn setval_clear_between_prepare_and_commit_refreshes_stale_existing_record() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(62), &[4]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(semid, &[7]);
+        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+
+        let record = group.prepare_record_for_test(semid, 1).unwrap();
+        manager.clear_undo_for_setval(semid, 0);
+        let mut scratch = SemopScratch::try_new(1).unwrap();
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+
+        let result = group.with_prepared_record_noalloc(record, |record| {
+            let outcome =
+                SemManager::simulate_semop(set, &[undo_sop(0, -1)], Some(record), &mut scratch)
+                    .unwrap()
+                    .ready_for_test();
+            SemManager::commit_semop(set, outcome, &scratch, None, Some(record));
+            PreparedSemUndoRecordAction::Publish(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(sem_values(&manager, semid), vec![3]);
+        assert_eq!(group.adjustment_for_test(semid, 0), 1);
+    }
+
+    #[test]
+    fn setall_clear_between_prepare_and_commit_refreshes_stale_existing_record() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(63), &[4, 5]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(semid, &[7, -3]);
+        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+
+        let record = group.prepare_record_for_test(semid, 2).unwrap();
+        manager.clear_undo_for_setall(semid);
+        let mut scratch = SemopScratch::try_new(1).unwrap();
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+
+        let result = group.with_prepared_record_noalloc(record, |record| {
+            let outcome =
+                SemManager::simulate_semop(set, &[undo_sop(0, -1)], Some(record), &mut scratch)
+                    .unwrap()
+                    .ready_for_test();
+            SemManager::commit_semop(set, outcome, &scratch, None, Some(record));
+            PreparedSemUndoRecordAction::Publish(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(sem_values(&manager, semid), vec![3, 5]);
+        assert_eq!(group.adjustment_for_test(semid, 0), 1);
+        assert_eq!(group.adjustment_for_test(semid, 1), 0);
+    }
+
+    #[test]
+    fn stale_existing_prepared_record_refreshes_before_immediate_commit() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(65), &[4]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(semid, &[7]);
+        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+
+        let record = group.prepare_record_for_test(semid, 1).unwrap();
+        manager.clear_undo_for_setval(semid, 0);
+        let mut scratch = SemopScratch::try_new(1).unwrap();
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+
+        let result = group.with_prepared_record_noalloc(record, |record| {
+            let outcome =
+                SemManager::simulate_semop(set, &[undo_sop(0, -1)], Some(record), &mut scratch)
+                    .unwrap()
+                    .ready_for_test();
+            SemManager::commit_semop(set, outcome, &scratch, None, Some(record));
+            PreparedSemUndoRecordAction::Publish(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(sem_values(&manager, semid), vec![3]);
+        assert_eq!(group.adjustment_for_test(semid, 0), 1);
+    }
+
+    #[test]
+    fn queued_stale_existing_record_retries_and_completes_without_error() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(66), &[0]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(semid, &[7]);
+        manager.undo_groups = Arc::new(vec![Arc::downgrade(&group)]);
+        let entry = enqueue_undo_waiter_for_test(&mut manager, semid, &group);
+
+        manager.clear_undo_for_setval(semid, 0);
+        manager.get_by_semid_checked_mut(semid).unwrap().sems[0].val = 2;
+        manager.update_queue_for_test(semid);
+
+        assert_eq!(entry.completed_result(), Some(Ok(0)));
+        assert_eq!(sem_values(&manager, semid), vec![1]);
+        assert_eq!(group.adjustment_for_test(semid, 0), 1);
+    }
+
+    #[test]
+    fn consecutive_sem_undo_on_unchanged_existing_record_still_accumulates() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(64), &[5]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        group.insert_test_record(semid, &[2]);
+
+        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        let mut scratch = SemopScratch::try_new(1).unwrap();
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        let outcome =
+            SemManager::simulate_semop(set, &[undo_sop(0, -2)], Some(&mut record), &mut scratch)
+                .unwrap()
+                .ready_for_test();
+        SemManager::commit_semop(set, outcome, &scratch, None, Some(&mut record));
+        group.commit_prepared_record_noalloc(record).unwrap();
+
+        assert_eq!(group.adjustment_for_test(semid, 0), 4);
+    }
+
+    fn enqueue_undo_waiter_for_test(
+        manager: &mut SemManager,
+        semid: SemId,
+        group: &Arc<SemUndoGroup>,
+    ) -> Arc<SemQueueEntry> {
+        let (_waiter, waker) = Waiter::new_pair();
+        let entry = Arc::new(SemQueueEntry::new_prepared(
+            SemQueueEntry::prepare_sops(&[undo_sop(0, -1)]).unwrap(),
+            None,
+            Some(Arc::clone(group)),
+            Some(group.prepare_record_for_test(semid, 1).unwrap()),
+            waker,
+            SemopScratch::try_new(1).unwrap(),
+            SemBlockedOp {
+                semnum: 0,
+                wait_type: SemWaitType::Increase,
+                nowait: false,
+            },
+        ));
+        manager
+            .get_by_semid_checked_mut(semid)
+            .unwrap()
+            .enqueue_waiter(entry.clone());
+        entry
+    }
+
+    fn undo_sop(sem_num: u16, sem_op: i16) -> PosixSemBuf {
+        PosixSemBuf {
+            sem_num,
+            sem_op,
+            sem_flg: SemFlags::SEM_UNDO.bits() as i16,
+        }
+    }
+
+    fn plain_sop(sem_num: u16, sem_op: i16) -> PosixSemBuf {
+        PosixSemBuf {
+            sem_num,
+            sem_op,
+            sem_flg: 0,
+        }
+    }
+
+    fn nowait_sop(sem_num: u16, sem_op: i16) -> PosixSemBuf {
+        PosixSemBuf {
+            sem_num,
+            sem_op,
+            sem_flg: SemFlags::IPC_NOWAIT.bits() as i16,
+        }
+    }
+
+    #[test]
+    fn ordered_mixed_undo_ops_apply_each_adjustment_step() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(41), &[4]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        let mut scratch = SemopScratch::try_new(3).unwrap();
+        let sops = [undo_sop(0, 3), plain_sop(0, -1), undo_sop(0, -2)];
+
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        let outcome = SemManager::simulate_semop(set, &sops, Some(&mut record), &mut scratch);
+        assert!(matches!(outcome, Ok(SemopOutcome::Ready(_))));
+        SemManager::commit_semop(
+            set,
+            outcome.unwrap().ready_for_test(),
+            &scratch,
+            None,
+            Some(&mut record),
+        );
+
+        assert_eq!(set.sems[0].val, 4);
+        assert_eq!(record.adjustment_for_test(0), -1);
+    }
+
+    #[test]
+    fn intermediate_adjustment_overflow_is_erange_even_if_later_op_cancels_it() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(42), &[10]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        record.set_adjustment_for_test(0, i16::MAX);
+        let mut scratch = SemopScratch::try_new(2).unwrap();
+        let sops = [undo_sop(0, -1), undo_sop(0, 1)];
+
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        assert!(matches!(
+            SemManager::simulate_semop(set, &sops, Some(&mut record), &mut scratch),
+            Err(SystemError::ERANGE)
+        ));
+
+        assert_eq!(set.sems[0].val, 10);
+        assert_eq!(record.adjustment_for_test(0), i16::MAX);
+    }
+
+    #[test]
+    fn blocked_or_nowait_failure_does_not_commit_semval_or_semadj_prefix() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(43), &[2]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        let mut scratch = SemopScratch::try_new(2).unwrap();
+        let sops = [undo_sop(0, -1), nowait_sop(0, -2)];
+
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        assert!(matches!(
+            SemManager::simulate_semop(set, &sops, Some(&mut record), &mut scratch),
+            Ok(SemopOutcome::Blocked(SemBlockedOp {
+                semnum: 0,
+                wait_type: SemWaitType::Increase,
+                nowait: true,
+            }))
+        ));
+
+        assert_eq!(set.sems[0].val, 2);
+        assert_eq!(record.adjustment_for_test(0), 0);
+    }
+
+    #[test]
+    fn zero_undo_op_can_prepare_zero_record_without_adjustment() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(44), &[0]);
+        let group = SemUndoGroup::new_for_test_bound_to(&INIT_IPC_NAMESPACE).unwrap();
+        let mut record = group.prepare_record_for_test(semid, 1).unwrap();
+        let mut scratch = SemopScratch::try_new(1).unwrap();
+        let sops = [undo_sop(0, 0)];
+
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        let outcome = SemManager::simulate_semop(set, &sops, Some(&mut record), &mut scratch);
+        assert!(matches!(outcome, Ok(SemopOutcome::Ready(_))));
+        SemManager::commit_semop(
+            set,
+            outcome.unwrap().ready_for_test(),
+            &scratch,
+            None,
+            Some(&mut record),
+        );
+        group.commit_record(record).unwrap();
+
+        assert_eq!(set.sems[0].val, 0);
+        assert_eq!(group.record_count_for_test(), 1);
+    }
+
+    #[test]
+    fn scratch_entry_for_returns_enomem_instead_of_extending_past_capacity() {
+        let mut manager = SemManager::new();
+        let semid = insert_test_set(&mut manager, SemKey::new(45), &[1, 1]);
+        let set = manager.get_by_semid_checked_mut(semid).unwrap();
+        let mut scratch = SemopScratch::try_new(1).unwrap();
+        let sops = [plain_sop(0, -1), plain_sop(1, -1)];
+
+        assert!(matches!(
+            SemManager::simulate_semop(set, &sops, None, &mut scratch),
+            Err(SystemError::ENOMEM)
+        ));
     }
 
     #[test]

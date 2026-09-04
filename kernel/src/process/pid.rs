@@ -100,6 +100,20 @@ impl Pid {
         pid
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(nr: RawPid, ns: Arc<PidNamespace>) -> Arc<Self> {
+        let pid = Self::new(ns.level());
+        pid.numbers.lock()[ns.level() as usize] = Some(UPid::new(nr, ns));
+        pid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_numbers_for_test(&self) {
+        for number in self.numbers.lock().iter_mut() {
+            number.take();
+        }
+    }
+
     pub fn dead(&self) -> bool {
         self.dead.load(core::sync::atomic::Ordering::Relaxed)
     }
@@ -300,6 +314,24 @@ impl Debug for UPid {
 impl ProcessControlBlock {
     pub fn pid(&self) -> Arc<Pid> {
         self.thread_pid.read().clone().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_pid_identity_for_test(&self, pid: Arc<Pid>) {
+        let raw_pid = pid
+            .first_upid()
+            .expect("test PID identity must have a namespace number")
+            .nr;
+        self.pid.store(raw_pid, Ordering::Release);
+        self.thread_pid.write().replace(pid.clone());
+        self.sighand().set_pid(PidType::TGID, Some(pid));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_pid_identity_for_test(&self) {
+        self.sighand().set_pid(PidType::TGID, None);
+        self.thread_pid.write().take();
+        self.pid.store(RawPid::new(0), Ordering::Release);
     }
 
     /// 强制设置当前进程的raw_pid
@@ -646,7 +678,7 @@ impl ProcessControlBlock {
     /// # 特殊情况
     /// * 如果进程的raw_pid为0（通常是空闲进程），则直接返回raw_pid
     #[allow(dead_code)]
-    pub(super) fn task_pid_nr_ns(
+    pub(crate) fn task_pid_nr_ns(
         &self,
         pid_type: PidType,
         ns: Option<Arc<PidNamespace>>,

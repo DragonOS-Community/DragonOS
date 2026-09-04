@@ -107,6 +107,84 @@ impl Drop for RcuReadGuard {
     }
 }
 
+/// Preallocate an intrusive callback before an irreversible publication.
+/// Enqueueing uses the existing per-CPU raw callback queue without allocation.
+pub(crate) struct PreparedRcuArcRetire<T: Send + Sync + 'static> {
+    call: Box<RetiredArc<T>>,
+}
+
+pub(crate) struct RcuArcRetirement<T: Send + Sync + 'static> {
+    call: Option<Box<RetiredArc<T>>>,
+}
+
+#[repr(C)]
+struct RetiredArc<T: Send + Sync + 'static> {
+    head: RcuHead,
+    value: Option<Arc<T>>,
+}
+
+#[cfg(test)]
+static FAIL_NEXT_PREPARED_ARC_RETIRE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_prepared_arc_retire_for_test() {
+    FAIL_NEXT_PREPARED_ARC_RETIRE.store(true, Ordering::Release);
+}
+
+impl<T: Send + Sync + 'static> PreparedRcuArcRetire<T> {
+    pub(crate) fn prepare() -> Result<Self, ()> {
+        #[cfg(test)]
+        if FAIL_NEXT_PREPARED_ARC_RETIRE.swap(false, Ordering::AcqRel) {
+            return Err(());
+        }
+        Ok(Self {
+            call: Box::try_new(RetiredArc {
+                head: RcuHead::new(),
+                value: None,
+            })
+            .map_err(|_| ())?,
+        })
+    }
+
+    fn bind_removed(mut self, old: Arc<T>) -> RcuArcRetirement<T> {
+        self.call.value = Some(old);
+        RcuArcRetirement {
+            call: Some(self.call),
+        }
+    }
+}
+
+unsafe fn reclaim_retired_arc<T: Send + Sync + 'static>(head: NonNull<RcuHead>) {
+    // SAFETY: RetiredArc is repr(C), head is first, and enqueue transfers its Box.
+    drop(unsafe { Box::from_raw(head.as_ptr().cast::<RetiredArc<T>>()) });
+}
+
+impl<T: Send + Sync + 'static> RcuArcRetirement<T> {
+    pub(crate) fn enqueue(mut self) {
+        self.submit();
+    }
+
+    fn submit(&mut self) {
+        if let Some(call) = self.call.take() {
+            let raw = Box::into_raw(call);
+            // SAFETY: callback owns the allocation until the grace period ends.
+            unsafe {
+                call_rcu_raw(
+                    NonNull::new_unchecked(core::ptr::addr_of_mut!((*raw).head)),
+                    reclaim_retired_arc::<T>,
+                );
+            }
+        }
+    }
+}
+
+impl<T: Send + Sync + 'static> Drop for RcuArcRetirement<T> {
+    fn drop(&mut self) {
+        // An accidentally dropped publication token must still honor RCU readers.
+        self.submit();
+    }
+}
+
 #[derive(Debug)]
 /// An RCU-published non-null `Arc` slot.
 ///
@@ -118,6 +196,8 @@ where
     T: Send + Sync + 'static,
 {
     ptr: AtomicPtr<T>,
+    #[cfg(test)]
+    unprepared_stores: AtomicUsize,
 }
 
 unsafe fn defer_drop_slot_arc_raw<T>(raw: *mut T)
@@ -143,6 +223,8 @@ where
     pub fn new(initial: Arc<T>) -> Self {
         Self {
             ptr: AtomicPtr::new(Arc::into_raw(initial) as *mut T),
+            #[cfg(test)]
+            unprepared_stores: AtomicUsize::new(0),
         }
     }
 
@@ -200,10 +282,29 @@ where
     }
 
     pub fn store_deferred(&self, new: Arc<T>) {
+        #[cfg(test)]
+        self.unprepared_stores.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the removed slot reference is immediately transferred to
         // the RCU deferred-drop queue.
         let old = unsafe { self.swap(new) };
         rcu_defer_drop(old);
+    }
+
+    pub(crate) fn swap_prepared(
+        &self,
+        new: Arc<T>,
+        prepared: PreparedRcuArcRetire<T>,
+    ) -> RcuArcRetirement<T> {
+        // SAFETY: the prepared retirement retains the removed slot reference
+        // until its preallocated callback is enqueued after the publication
+        // lock is released.
+        let old = unsafe { self.swap(new) };
+        prepared.bind_removed(old)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unprepared_store_count_for_test(&self) -> usize {
+        self.unprepared_stores.load(Ordering::Relaxed)
     }
 
     pub fn swap_deferred(&self, new: Arc<T>) -> Arc<T> {

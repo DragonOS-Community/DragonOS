@@ -84,9 +84,23 @@ impl Syscall for SysSemtimedopHandle {
         let semid = Self::semid(args);
         let nsops = Self::nsops(args);
         let sops_ptr = Self::sops(args);
+        let timeout_ptr = Self::timeout(args);
         let from_user = frame.is_from_user();
 
-        // Match Linux: validate nsops before making any allocation.
+        let timeout = if timeout_ptr.is_null() {
+            None
+        } else {
+            let mut ts = PosixTimeSpec::new(0, 0);
+            let ts_reader = UserBufferReader::new(
+                timeout_ptr,
+                core::mem::size_of::<PosixTimeSpec>(),
+                from_user,
+            )?;
+            ts_reader.copy_one_from_user(&mut ts, 0)?;
+            Some(ts)
+        };
+
+        // Match Linux: after copying a non-null timeout, validate nsops before allocating sops.
         if nsops == 0 {
             return Err(SystemError::EINVAL);
         }
@@ -110,20 +124,6 @@ impl Syscall for SysSemtimedopHandle {
         for (i, op) in sops.iter_mut().enumerate() {
             sops_reader.copy_one_from_user(op, i * core::mem::size_of::<PosixSemBuf>())?;
         }
-
-        let timeout_ptr = Self::timeout(args);
-        let timeout = if timeout_ptr.is_null() {
-            None
-        } else {
-            let mut ts = PosixTimeSpec::new(0, 0);
-            let ts_reader = UserBufferReader::new(
-                timeout_ptr,
-                core::mem::size_of::<PosixTimeSpec>(),
-                from_user,
-            )?;
-            ts_reader.copy_one_from_user(&mut ts, 0)?;
-            Some(ts)
-        };
 
         do_kernel_semtimedop(semid, &sops, timeout)
     }

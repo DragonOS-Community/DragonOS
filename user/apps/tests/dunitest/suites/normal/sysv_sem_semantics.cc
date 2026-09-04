@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sched.h>
 #include <signal.h>
@@ -16,6 +17,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef SYS_semget
@@ -30,12 +32,27 @@
 #ifndef SYS_semtimedop
 #define SYS_semtimedop 220
 #endif
+#ifndef SYS_unshare
+#define SYS_unshare 272
+#endif
+#ifndef SYS_setns
+#define SYS_setns 308
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
 
 #ifndef SEM_STAT
 #define SEM_STAT 18
 #endif
 #ifndef SEM_STAT_ANY
 #define SEM_STAT_ANY 20
+#endif
+#ifndef CLONE_SYSVSEM
+#define CLONE_SYSVSEM 0x00040000
+#endif
+#ifndef CLONE_NEWIPC
+#define CLONE_NEWIPC 0x08000000
 #endif
 
 // ============ helpers ============
@@ -212,18 +229,106 @@ void WaitChildOk(ChildGuard* child) {
 }
 
 // Wait until the target semaphore has the expected number of waiters, confirming that
-// child processes have blocked.
+// child processes have blocked. GETNCNT and GETZCNT are the semaphore ABI handshake.
+// A bounded exponential pause prevents a tight spin; correctness depends only on the
+// observed counter and a monotonic deadline, never on a guessed child run interval.
 bool WaitForWaiters(int semid, int semnum, int expected, int timeout_ms = 5000) {
-    const int deadline = timeout_ms * 1000;
-    for (int elapsed = 0; elapsed < deadline; elapsed += 10000) {
+    struct timespec start = {};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    long pause_ns = 1000;
+    for (;;) {
         int ncnt = SemCtl(semid, semnum, GETNCNT, 0);
         int zcnt = SemCtl(semid, semnum, GETZCNT, 0);
         if (ncnt >= 0 && ncnt + zcnt >= expected) {
             return true;
         }
-        usleep(10000);
+        struct timespec now = {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
+                                (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (elapsed_ms >= timeout_ms) {
+            return false;
+        }
+        const struct timespec pause = {0, pause_ns};
+        nanosleep(&pause, nullptr);
+        if (pause_ns < 1000000) {
+            pause_ns *= 2;
+        }
     }
-    return false;
+}
+
+bool ReadExact(int fd, void* buffer, size_t size) {
+    char* cursor = static_cast<char*>(buffer);
+    while (size != 0) {
+        ssize_t received = read(fd, cursor, size);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            return false;
+        }
+        cursor += received;
+        size -= static_cast<size_t>(received);
+    }
+    return true;
+}
+
+bool WriteExact(int fd, const void* buffer, size_t size) {
+    const char* cursor = static_cast<const char*>(buffer);
+    while (size != 0) {
+        ssize_t written = write(fd, cursor, size);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return false;
+        }
+        cursor += written;
+        size -= static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool WaitForNcnt(int semid, int semnum, int expected) {
+    return WaitForWaiters(semid, semnum, expected) &&
+           SemCtl(semid, semnum, GETNCNT, 0) >= expected;
+}
+
+bool WaitForZcnt(int semid, int semnum, int expected) {
+    return WaitForWaiters(semid, semnum, expected) &&
+           SemCtl(semid, semnum, GETZCNT, 0) >= expected;
+}
+
+bool WaitForSemValue(int semid, int semnum, int expected, int timeout_ms = 5000) {
+    struct timespec start = {};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    long pause_ns = 1000;
+    for (;;) {
+        if (SemCtl(semid, semnum, GETVAL, 0) == expected) {
+            return true;
+        }
+        struct timespec now = {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
+                                (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (elapsed_ms >= timeout_ms) {
+            return false;
+        }
+        const struct timespec pause = {0, pause_ns};
+        nanosleep(&pause, nullptr);
+        if (pause_ns < 1000000) {
+            pause_ns *= 2;
+        }
+    }
+}
+
+bool SemOpMustSucceed(int semid, struct sembuf* ops, size_t count) {
+    return SemOp(semid, ops, count) == 0;
+}
+
+bool SemUndoOpMustSucceed(int semid, unsigned short semnum, short delta) {
+    struct sembuf op = {semnum, delta, SEM_UNDO};
+    return SemOpMustSucceed(semid, &op, 1);
 }
 
 // ============ creation & lookup ============
@@ -703,14 +808,905 @@ TEST(SysVSem, InvalidSemid) {
     EXPECT_EQ(EINVAL, errno);
 }
 
-TEST(SysVSem, SemUndoRejected) {
+// ============ SEM_UNDO ABI conformance ============
+//
+// Every case starts with an immediately-completing undo operation.  Until the
+// kernel gate is enabled this is deliberately the first assertion to fail with
+// ENOSYS, rather than allowing a later queue rendezvous to time out.
+void RequireSemUndoAvailable(const SemSet& sem) {
+    struct sembuf probe = {0, 1, SEM_UNDO};
+    ASSERT_EQ(0, SemOp(sem.id(), &probe, 1))
+        << "SEM_UNDO must be published only after all lifecycle prerequisites; errno=" << errno;
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 0)) << "SETVAL must clear probe debt";
+}
+
+TEST(SysVSem, SemUndoBasicAccumulationAndSign) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    int ready[2];
+    int release[2];
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    FdGuard ready_read(ready[0]);
+    FdGuard ready_write(ready[1]);
+    FdGuard release_read(release[0]);
+    FdGuard release_write(release[1]);
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ready_read.Close();
+        release_write.Close();
+        struct sembuf ops[] = {{0, 3, SEM_UNDO}, {0, -1, SEM_UNDO}};
+        const int result = SemOp(sem.id(), ops, 2);
+        const int saved_errno = errno;
+        if (!WriteExact(ready_write.get(), &result, sizeof(result)) ||
+            !WriteExact(ready_write.get(), &saved_errno, sizeof(saved_errno))) {
+            _exit(10);
+        }
+        char token;
+        _exit(result == 0 && ReadExact(release_read.get(), &token, sizeof(token)) ? 0 : 11);
+    }
+    ready_write.Close();
+    release_read.Close();
+    int result;
+    int child_errno;
+    ASSERT_TRUE(ReadExact(ready_read.get(), &result, sizeof(result)));
+    ASSERT_TRUE(ReadExact(ready_read.get(), &child_errno, sizeof(child_errno)));
+    ASSERT_EQ(0, result) << "child SEM_UNDO ops failed: errno=" << child_errno;
+    EXPECT_EQ(2, SemCtl(sem.id(), 0, GETVAL, 0));
+    const char token = 1;
+    ASSERT_TRUE(WriteExact(release_write.get(), &token, sizeof(token)));
+    WaitChildOk(child);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 3));
+    child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        _exit(SemUndoOpMustSucceed(sem.id(), 0, -2) ? 0 : 12);
+    }
+    WaitChildOk(child);
+    EXPECT_EQ(3, SemCtl(sem.id(), 0, GETVAL, 0));
+}
+
+TEST(SysVSem, SemUndoArrayOrderAndRollback) {
+    SemSet sem(2, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    struct sembuf blocked[] = {{0, 1, SEM_UNDO}, {1, -1, SEM_UNDO | IPC_NOWAIT}};
+    errno = 0;
+    EXPECT_EQ(-1, SemOp(sem.id(), blocked, 2));
+    EXPECT_EQ(EAGAIN, errno);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 32767));
+    struct sembuf overflow[] = {{0, -1, SEM_UNDO}, {0, 1, SEM_UNDO}, {0, 1, SEM_UNDO}};
+    errno = 0;
+    EXPECT_EQ(-1, SemOp(sem.id(), overflow, 3));
+    EXPECT_EQ(ERANGE, errno);
+    EXPECT_EQ(32767, SemCtl(sem.id(), 0, GETVAL, 0));
+}
+
+TEST(SysVSem, SemUndoAdjustmentBounds) {
+    SemSet negative(1, IPC_CREAT | 0600);
+    SemSet positive(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(negative.valid());
+    ASSERT_TRUE(positive.valid());
+    RequireSemUndoAvailable(negative);
+    RequireSemUndoAvailable(positive);
+
+    // semadj is the inverse of sem_op. One max-sized undo operation plus a
+    // one-unit undo operation reaches -32768 while the plain reverse keeps
+    // semval at zero. The following operation must exceed the signed bound.
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard negative_child(child);
+    if (child == 0) {
+        struct sembuf to_minus_32767[] = {{0, 32767, SEM_UNDO}, {0, -32767, 0}};
+        struct sembuf reach_minus_32768[] = {{0, 1, SEM_UNDO}, {0, -1, 0}};
+        struct sembuf below_min[] = {{0, 1, SEM_UNDO}, {0, -1, 0}};
+        if (SemOp(negative.id(), to_minus_32767, 2) != 0 ||
+            SemOp(negative.id(), reach_minus_32768, 2) != 0) {
+            _exit(40);
+        }
+        errno = 0;
+        _exit(SemOp(negative.id(), below_min, 2) == -1 && errno == ERANGE ? 0 : 41);
+    }
+    WaitChildOk(&negative_child);
+    EXPECT_EQ(0, SemCtl(negative.id(), 0, GETVAL, 0));
+
+    // Start at SEMVMX. A max-sized negative undo plus a plain reverse reaches
+    // +32767 semadj without blocking; the following IPC_NOWAIT decrement must
+    // fail for semadj overflow rather than queueing.
+    ASSERT_EQ(0, SemCtl(positive.id(), 0, SETVAL, 32767));
+    child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard positive_child(child);
+    if (child == 0) {
+        struct sembuf to_plus_32767[] = {{0, -32767, SEM_UNDO | IPC_NOWAIT}, {0, 32767, 0}};
+        struct sembuf above_max[] = {{0, -1, SEM_UNDO | IPC_NOWAIT}, {0, 1, 0}};
+        if (SemOp(positive.id(), to_plus_32767, 2) != 0) {
+            _exit(42);
+        }
+        errno = 0;
+        _exit(SemOp(positive.id(), above_max, 2) == -1 && errno == ERANGE ? 0 : 43);
+    }
+    WaitChildOk(&positive_child);
+    EXPECT_EQ(32767, SemCtl(positive.id(), 0, GETVAL, 0));
+}
+
+TEST(SysVSem, SemUndoQueueCapturedOwner) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    int ready[2];
+    int release[2];
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    pid_t owner = fork();
+    ASSERT_GE(owner, 0);
+    if (owner == 0) {
+        close(ready[0]);
+        close(release[1]);
+        struct sembuf dec = {0, -1, SEM_UNDO};
+        int result = SemOp(sem.id(), &dec, 1);
+        if (!WriteExact(ready[1], &result, sizeof(result))) {
+            _exit(20);
+        }
+        char token;
+        _exit(result == 0 && ReadExact(release[0], &token, sizeof(token)) ? 0 : 21);
+    }
+    FdGuard ready_read(ready[0]);
+    FdGuard ready_write(ready[1]);
+    FdGuard release_read(release[0]);
+    FdGuard release_write(release[1]);
+    ready_write.Close();
+    release_read.Close();
+    ASSERT_TRUE(WaitForNcnt(sem.id(), 0, 1));
+    pid_t waker = fork();
+    ASSERT_GE(waker, 0);
+    if (waker == 0) {
+        struct sembuf inc = {0, 1, 0};
+        _exit(SemOp(sem.id(), &inc, 1) == 0 ? 0 : 22);
+    }
+    WaitChildOk(waker);
+    int result;
+    ASSERT_TRUE(ReadExact(ready_read.get(), &result, sizeof(result)));
+    ASSERT_EQ(0, result);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0)) << "ordinary waker exit must not replay A debt";
+    char token = 1;
+    ASSERT_TRUE(WriteExact(release_write.get(), &token, sizeof(token)));
+    WaitChildOk(owner);
+    EXPECT_EQ(1, SemCtl(sem.id(), 0, GETVAL, 0));
+}
+
+TEST(SysVSem, SemUndoUncommittedPaths) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    struct sembuf nowait = {0, -1, SEM_UNDO | IPC_NOWAIT};
+    errno = 0;
+    EXPECT_EQ(-1, SemOp(sem.id(), &nowait, 1));
+    EXPECT_EQ(EAGAIN, errno);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+
+    // A real blocking semtimedop must time out and leave no queued debt.
+    struct sembuf timed = {0, -1, SEM_UNDO};
+    const struct timespec timeout = {0, 20 * 1000 * 1000};
+    errno = 0;
+    EXPECT_EQ(-1, SemTimedOp(sem.id(), &timed, 1, &timeout));
+    EXPECT_EQ(EAGAIN, errno);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETNCNT, 0));
+
+    int ready[2];
+    ASSERT_EQ(0, pipe(ready));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard signal_child(child);
+    if (child == 0) {
+        close(ready[0]);
+        struct sigaction sa = {};
+        sa.sa_handler = [](int) {};
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGUSR1, &sa, nullptr) != 0) {
+            _exit(30);
+        }
+        struct sembuf dec = {0, -1, SEM_UNDO};
+        const char entered = 1;
+        if (!WriteExact(ready[1], &entered, sizeof(entered))) {
+            _exit(31);
+        }
+        int result = SemOp(sem.id(), &dec, 1);
+        _exit(result == -1 && errno == EINTR ? 0 : 32);
+    }
+    FdGuard ready_read(ready[0]);
+    FdGuard ready_write(ready[1]);
+    ready_write.Close();
+    char entered;
+    ASSERT_TRUE(ReadExact(ready_read.get(), &entered, sizeof(entered)));
+    ASSERT_TRUE(WaitForNcnt(sem.id(), 0, 1));
+    ASSERT_EQ(0, kill(signal_child.pid(), SIGUSR1));
+    WaitChildOk(&signal_child);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+
+    // RMID must wake an uncommitted SEM_UNDO waiter with EIDRM and cannot replay debt.
+    SemSet removed(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(removed.valid());
+    int rmid_ready[2];
+    ASSERT_EQ(0, pipe(rmid_ready));
+    child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard rmid_child(child);
+    if (child == 0) {
+        close(rmid_ready[0]);
+        struct sembuf dec = {0, -1, SEM_UNDO};
+        const char queued = 1;
+        if (!WriteExact(rmid_ready[1], &queued, sizeof(queued))) {
+            _exit(33);
+        }
+        const int result = SemOp(removed.id(), &dec, 1);
+        _exit(result == -1 && errno == EIDRM ? 0 : 34);
+    }
+    FdGuard rmid_ready_read(rmid_ready[0]);
+    FdGuard rmid_ready_write(rmid_ready[1]);
+    rmid_ready_write.Close();
+    ASSERT_TRUE(ReadExact(rmid_ready_read.get(), &entered, sizeof(entered)));
+    ASSERT_TRUE(WaitForNcnt(removed.id(), 0, 1));
+    ASSERT_EQ(0, SemCtl(removed.id(), 0, IPC_RMID, 0));
+    removed.release();
+    WaitChildOk(&rmid_child);
+}
+
+TEST(SysVSem, SemUndoSetvalSetallClearDebt) {
+    SemSet sem(2, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    int ready[2];
+    int release[2];
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        struct sembuf ops[] = {{0, 1, SEM_UNDO}, {1, 2, SEM_UNDO}};
+        const int result = SemOp(sem.id(), ops, 2);
+        if (!WriteExact(ready[1], &result, sizeof(result))) {
+            _exit(40);
+        }
+        char token;
+        _exit(result == 0 && ReadExact(release[0], &token, sizeof(token)) ? 0 : 41);
+    }
+    FdGuard ready_read(ready[0]);
+    FdGuard ready_write(ready[1]);
+    FdGuard release_read(release[0]);
+    FdGuard release_write(release[1]);
+    ready_write.Close();
+    release_read.Close();
+    int result;
+    ASSERT_TRUE(ReadExact(ready_read.get(), &result, sizeof(result)));
+    ASSERT_EQ(0, result);
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 7));
+    char token = 1;
+    ASSERT_TRUE(WriteExact(release_write.get(), &token, sizeof(token)));
+    WaitChildOk(child);
+    EXPECT_EQ(7, SemCtl(sem.id(), 0, GETVAL, 0)) << "SETVAL clears only target debt";
+    EXPECT_EQ(0, SemCtl(sem.id(), 1, GETVAL, 0)) << "un-cleared sem debt replays";
+
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        struct sembuf ops[] = {{0, 1, SEM_UNDO}, {1, 1, SEM_UNDO}};
+        const int child_result = SemOp(sem.id(), ops, 2);
+        if (!WriteExact(ready[1], &child_result, sizeof(child_result))) {
+            _exit(42);
+        }
+        char child_token;
+        _exit(child_result == 0 && ReadExact(release[0], &child_token, sizeof(child_token)) ? 0 : 43);
+    }
+    FdGuard all_ready_read(ready[0]);
+    FdGuard all_ready_write(ready[1]);
+    FdGuard all_release_read(release[0]);
+    FdGuard all_release_write(release[1]);
+    all_ready_write.Close();
+    all_release_read.Close();
+    ASSERT_TRUE(ReadExact(all_ready_read.get(), &result, sizeof(result)));
+    ASSERT_EQ(0, result);
+    unsigned short vals[] = {4, 5};
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETALL, reinterpret_cast<unsigned long>(vals)));
+    token = 1;
+    ASSERT_TRUE(WriteExact(all_release_write.get(), &token, sizeof(token)));
+    WaitChildOk(child);
+    EXPECT_EQ(4, SemCtl(sem.id(), 0, GETVAL, 0)) << "SETALL clears first adjustment";
+    EXPECT_EQ(5, SemCtl(sem.id(), 1, GETVAL, 0)) << "SETALL clears complete set slice";
+    // SETVAL wakes a queued UNDO request. Its undo debt is committed only when
+    // dequeued, so it must still replay when the waiter exits.
+    SemSet queued(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(queued.valid());
+    int queued_ready[2];
+    int queued_release[2];
+    ASSERT_EQ(0, pipe(queued_ready));
+    ASSERT_EQ(0, pipe(queued_release));
+    child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard queued_child(child);
+    if (child == 0) {
+        close(queued_ready[0]);
+        close(queued_release[1]);
+        struct sembuf dec = {0, -1, SEM_UNDO};
+        const char entered = 1;
+        if (!WriteExact(queued_ready[1], &entered, sizeof(entered)) || SemOp(queued.id(), &dec, 1) != 0) {
+            _exit(44);
+        }
+        char release_token;
+        _exit(ReadExact(queued_release[0], &release_token, sizeof(release_token)) ? 0 : 45);
+    }
+    FdGuard queued_ready_read(queued_ready[0]);
+    FdGuard queued_ready_write(queued_ready[1]);
+    FdGuard queued_release_read(queued_release[0]);
+    FdGuard queued_release_write(queued_release[1]);
+    queued_ready_write.Close();
+    queued_release_read.Close();
+    char queued_token;
+    ASSERT_TRUE(ReadExact(queued_ready_read.get(), &queued_token, sizeof(queued_token)));
+    ASSERT_TRUE(WaitForNcnt(queued.id(), 0, 1));
+    ASSERT_EQ(0, SemCtl(queued.id(), 0, SETVAL, 1));
+    EXPECT_EQ(0, SemCtl(queued.id(), 0, GETVAL, 0));
+    queued_token = 1;
+    ASSERT_TRUE(WriteExact(queued_release_write.get(), &queued_token, sizeof(queued_token)));
+    WaitChildOk(&queued_child);
+    EXPECT_EQ(1, SemCtl(queued.id(), 0, GETVAL, 0))
+        << "debt committed after SETVAL wake must replay at owner exit";
+}
+
+TEST(SysVSem, SemUndoRmidDiscardsDebt) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+    int ready[2];
+    int release[2];
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        const int result = SemUndoOpMustSucceed(sem.id(), 0, 1) ? 0 : -1;
+        if (!WriteExact(ready[1], &result, sizeof(result))) {
+            _exit(50);
+        }
+        char token;
+        _exit(result == 0 && ReadExact(release[0], &token, sizeof(token)) ? 0 : 51);
+    }
+    FdGuard ready_read(ready[0]);
+    FdGuard ready_write(ready[1]);
+    FdGuard release_read(release[0]);
+    FdGuard release_write(release[1]);
+    ready_write.Close();
+    release_read.Close();
+    int result;
+    ASSERT_TRUE(ReadExact(ready_read.get(), &result, sizeof(result)));
+    ASSERT_EQ(0, result);
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, IPC_RMID, 0));
+    sem.release();
+    char token = 1;
+    ASSERT_TRUE(WriteExact(release_write.get(), &token, sizeof(token)));
+    WaitChildOk(child);
+}
+
+struct CloneUndoArgs {
+    int semid;
+    int ready_fd;
+    int release_fd;
+};
+
+int CloneSysvsemUndoChild(void* opaque) {
+    CloneUndoArgs* args = static_cast<CloneUndoArgs*>(opaque);
+    if (!SemUndoOpMustSucceed(args->semid, 0, 1)) {
+        return 1;
+    }
+    if (args->ready_fd >= 0) {
+        const char ready = 1;
+        if (!WriteExact(args->ready_fd, &ready, sizeof(ready))) {
+            return 2;
+        }
+    }
+    if (args->release_fd >= 0) {
+        char release;
+        if (!ReadExact(args->release_fd, &release, sizeof(release))) {
+            return 3;
+        }
+    }
+    return 0;
+}
+
+TEST(SysVSem, SemUndoForkAndCloneOwners) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    pid_t supervisor = fork();
+    ASSERT_GE(supervisor, 0);
+    ChildGuard supervisor_guard(supervisor);
+    if (supervisor == 0) {
+        if (!SemUndoOpMustSucceed(sem.id(), 0, 1)) {
+            _exit(60);
+        }
+        pid_t ordinary = fork();
+        if (ordinary < 0) {
+            _exit(61);
+        }
+        if (ordinary == 0) {
+            _exit(0);
+        }
+        int status;
+        if (waitpid(ordinary, &status, 0) != ordinary || !WIFEXITED(status) || WEXITSTATUS(status) ||
+            SemCtl(sem.id(), 0, GETVAL, 0) != 1) {
+            _exit(62);
+        }
+
+        alignas(16) char shared_stack[16384];
+        CloneUndoArgs shared_args = {sem.id(), -1, -1};
+        pid_t shared = clone(CloneSysvsemUndoChild, shared_stack + sizeof(shared_stack),
+                             CLONE_SYSVSEM | SIGCHLD, &shared_args);
+        if (shared < 0 || waitpid(shared, &status, 0) != shared || !WIFEXITED(status) || WEXITSTATUS(status) ||
+            SemCtl(sem.id(), 0, GETVAL, 0) != 2) {
+            _exit(63);
+        }
+
+        int ready[2];
+        int release[2];
+        if (pipe(ready) != 0 || pipe(release) != 0) {
+            _exit(64);
+        }
+        alignas(16) char thread_stack[16384];
+        CloneUndoArgs thread_args = {sem.id(), ready[1], release[0]};
+        const int thread_flags = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
+        if (clone(CloneSysvsemUndoChild, thread_stack + sizeof(thread_stack), thread_flags, &thread_args) < 0) {
+            _exit(65);
+        }
+        close(ready[1]);
+        close(release[0]);
+        char token;
+        if (!ReadExact(ready[0], &token, sizeof(token)) || SemCtl(sem.id(), 0, GETVAL, 0) != 3) {
+            _exit(66);
+        }
+        token = 1;
+        if (!WriteExact(release[1], &token, sizeof(token))) {
+            _exit(67);
+        }
+        close(release[1]);
+        // EOF is the explicit thread-exit handshake. The thread is the last
+        // writer, so EOF and the value together prove independent replay.
+        if (ReadExact(ready[0], &token, sizeof(token)) || SemCtl(sem.id(), 0, GETVAL, 0) != 2) {
+            _exit(68);
+        }
+        close(ready[0]);
+        _exit(0);
+    }
+    WaitChildOk(&supervisor_guard);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0))
+        << "only final CLONE_SYSVSEM owner replays its shared debt";
+
+    alignas(16) char invalid_stack[16384];
+    CloneUndoArgs invalid_args = {sem.id(), -1, -1};
+    errno = 0;
+    EXPECT_EQ(-1, clone(CloneSysvsemUndoChild, invalid_stack + sizeof(invalid_stack),
+                        CLONE_NEWIPC | CLONE_SYSVSEM | SIGCHLD, &invalid_args));
+    EXPECT_EQ(EINVAL, errno);
+}
+
+const char* g_program_path = nullptr;
+
+TEST(SysVSem, SemUndoExecPreservesAttachment) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+    ASSERT_NE(nullptr, g_program_path);
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (!SemUndoOpMustSucceed(sem.id(), 0, 1)) {
+            _exit(70);
+        }
+        char* const argv[] = {const_cast<char*>(g_program_path), const_cast<char*>("--sem-undo-exec-helper"), nullptr};
+        execv(g_program_path, argv);
+        _exit(71);
+    }
+    WaitChildOk(child);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+
+    child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (!SemUndoOpMustSucceed(sem.id(), 0, 1)) {
+            _exit(72);
+        }
+        char* const argv[] = {const_cast<char*>("/missing-sem-undo-helper"), nullptr};
+        execv(argv[0], argv);
+        _exit(errno == ENOENT ? 0 : 73);
+    }
+    WaitChildOk(child);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+}
+
+TEST(SysVSem, SemUndoExitClampAndWake) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    // Exit replay is saturating at SEMVMX: +1 debt meets a concurrently raised value.
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 32766));
+    int ready[2];
+    int release[2];
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard upper_child(child);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        if (!SemUndoOpMustSucceed(sem.id(), 0, -1)) {
+            _exit(80);
+        }
+        const char token = 1;
+        if (!WriteExact(ready[1], &token, sizeof(token))) {
+            _exit(81);
+        }
+        char release_token;
+        _exit(ReadExact(release[0], &release_token, sizeof(release_token)) ? 0 : 82);
+    }
+    FdGuard upper_ready_read(ready[0]);
+    FdGuard upper_ready_write(ready[1]);
+    FdGuard upper_release_read(release[0]);
+    FdGuard upper_release_write(release[1]);
+    upper_ready_write.Close();
+    upper_release_read.Close();
+    char token;
+    ASSERT_TRUE(ReadExact(upper_ready_read.get(), &token, sizeof(token)));
+    struct sembuf raise_to_max = {0, 2, 0};
+    ASSERT_EQ(0, SemOp(sem.id(), &raise_to_max, 1));
+    ASSERT_TRUE(WriteExact(upper_release_write.get(), &token, sizeof(token)));
+    WaitChildOk(&upper_child);
+    EXPECT_EQ(32767, SemCtl(sem.id(), 0, GETVAL, 0));
+
+    // Negative replay also saturates at zero: +1 debt meets a forced zero value.
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 1));
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard lower_child(child);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        if (!SemUndoOpMustSucceed(sem.id(), 0, 1)) {
+            _exit(83);
+        }
+        const char child_token = 1;
+        if (!WriteExact(ready[1], &child_token, sizeof(child_token))) {
+            _exit(84);
+        }
+        char release_token;
+        _exit(ReadExact(release[0], &release_token, sizeof(release_token)) ? 0 : 85);
+    }
+    FdGuard lower_ready_read(ready[0]);
+    FdGuard lower_ready_write(ready[1]);
+    FdGuard lower_release_read(release[0]);
+    FdGuard lower_release_write(release[1]);
+    lower_ready_write.Close();
+    lower_release_read.Close();
+    ASSERT_TRUE(ReadExact(lower_ready_read.get(), &token, sizeof(token)));
+    struct sembuf lower_to_zero = {0, -2, 0};
+    ASSERT_EQ(0, SemOp(sem.id(), &lower_to_zero, 1));
+    ASSERT_TRUE(WriteExact(lower_release_write.get(), &token, sizeof(token)));
+    WaitChildOk(&lower_child);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+
+    // Final-owner replay must wake a zero waiter, validated by GETZCNT rather than timing.
+    ASSERT_EQ(0, SemCtl(sem.id(), 0, SETVAL, 0));
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release));
+    child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard wake_owner(child);
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        if (!SemUndoOpMustSucceed(sem.id(), 0, 1)) {
+            _exit(86);
+        }
+        const char child_token = 1;
+        if (!WriteExact(ready[1], &child_token, sizeof(child_token))) {
+            _exit(87);
+        }
+        char release_token;
+        _exit(ReadExact(release[0], &release_token, sizeof(release_token)) ? 0 : 88);
+    }
+    FdGuard wake_ready_read(ready[0]);
+    FdGuard wake_ready_write(ready[1]);
+    FdGuard wake_release_read(release[0]);
+    FdGuard wake_release_write(release[1]);
+    wake_ready_write.Close();
+    wake_release_read.Close();
+    ASSERT_TRUE(ReadExact(wake_ready_read.get(), &token, sizeof(token)));
+    pid_t waiter = fork();
+    ASSERT_GE(waiter, 0);
+    ChildGuard wake_waiter(waiter);
+    if (waiter == 0) {
+        struct sembuf zero = {0, 0, 0};
+        _exit(SemOp(sem.id(), &zero, 1) == 0 ? 0 : 89);
+    }
+    ASSERT_TRUE(WaitForZcnt(sem.id(), 0, 1));
+    ASSERT_TRUE(WriteExact(wake_release_write.get(), &token, sizeof(token)));
+    WaitChildOk(&wake_owner);
+    WaitChildOk(&wake_waiter);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0));
+}
+
+TEST(SysVSem, SemUndoUnshareSysvsem) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    int phase[2];
+    int supervisor_release[2];
+    int old_owner_release[2];
+    ASSERT_EQ(0, pipe(phase));
+    ASSERT_EQ(0, pipe(supervisor_release));
+    ASSERT_EQ(0, pipe(old_owner_release));
+    pid_t supervisor = fork();
+    ASSERT_GE(supervisor, 0);
+    ChildGuard supervisor_guard(supervisor);
+    if (supervisor == 0) {
+        close(phase[0]);
+        close(supervisor_release[1]);
+        close(old_owner_release[1]);
+        if (!SemUndoOpMustSucceed(sem.id(), 0, 1)) {
+            _exit(90);
+        }
+        alignas(16) char stack[16384];
+        CloneUndoArgs args = {sem.id(), -1, old_owner_release[0]};
+        pid_t old_owner = clone(CloneSysvsemUndoChild, stack + sizeof(stack),
+                                CLONE_SYSVSEM | SIGCHLD, &args);
+        if (old_owner < 0 || unshare(CLONE_SYSVSEM) != 0 ||
+            !SemUndoOpMustSucceed(sem.id(), 0, 1)) {
+            _exit(91);
+        }
+        const char detached = 1;
+        if (!WriteExact(phase[1], &detached, sizeof(detached))) {
+            _exit(92);
+        }
+        char release_supervisor;
+        if (!ReadExact(supervisor_release[0], &release_supervisor, sizeof(release_supervisor))) {
+            _exit(93);
+        }
+        // Do not wait for old_owner here: it is intentionally held by the parent
+        // until this process exits and replays the new group's debt.
+        _exit(0);
+    }
+    FdGuard phase_read(phase[0]);
+    FdGuard phase_write(phase[1]);
+    FdGuard supervisor_read(supervisor_release[0]);
+    FdGuard supervisor_write(supervisor_release[1]);
+    FdGuard old_owner_read(old_owner_release[0]);
+    FdGuard old_owner_write(old_owner_release[1]);
+    phase_write.Close();
+    supervisor_read.Close();
+    old_owner_read.Close();
+    char token;
+    ASSERT_TRUE(ReadExact(phase_read.get(), &token, sizeof(token)));
+    EXPECT_EQ(3, SemCtl(sem.id(), 0, GETVAL, 0))
+        << "new group debt must coexist with the still-live old shared group";
+    ASSERT_TRUE(WriteExact(supervisor_write.get(), &token, sizeof(token)));
+    WaitChildOk(&supervisor_guard);
+    EXPECT_EQ(2, SemCtl(sem.id(), 0, GETVAL, 0))
+        << "unshared owner exit replays only its new group debt";
+    ASSERT_TRUE(WriteExact(old_owner_write.get(), &token, sizeof(token)));
+    ASSERT_TRUE(WaitForSemValue(sem.id(), 0, 0));
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0))
+        << "last old shared owner replays old-group debt after its release";
+}
+
+struct NamespaceUndoReport {
+    int setns_result;
+    int setns_errno;
+    int value_before_exit;
+    int inaccessible_sem_errno;
+    int precondition_errno;
+};
+
+int RunNamespaceSetnsChild(int semid, int setns_fd, int flags, int report_fd) {
+    NamespaceUndoReport report = {-1, 0, -1, 0, 0};
+    if (!SemUndoOpMustSucceed(semid, 0, 1)) {
+        return 101;
+    }
+    errno = 0;
+    report.setns_result = static_cast<int>(syscall(SYS_setns, setns_fd, flags));
+    report.setns_errno = errno;
+    report.value_before_exit = SemCtl(semid, 0, GETVAL, 0);
+    return WriteExact(report_fd, &report, sizeof(report)) ? 0 : 102;
+}
+
+bool ReadNamespaceReportAndReap(int report_fd, ChildGuard* child, NamespaceUndoReport* report) {
+    if (!ReadExact(report_fd, report, sizeof(*report))) {
+        return false;
+    }
+    WaitChildOk(child);
+    return true;
+}
+
+TEST(SysVSem, SemtimedopCopiesNonNullTimeoutBeforeNsopsValidation) {
     SemSet sem(1, IPC_CREAT | 0600);
     ASSERT_TRUE(sem.valid());
 
-    struct sembuf op = {0, 1, SEM_UNDO};
+    struct sembuf op = {0, 0, 0};
+    const struct timespec* invalid_timeout = reinterpret_cast<const struct timespec*>(
+        static_cast<uintptr_t>(1));
+
     errno = 0;
-    EXPECT_EQ(-1, SemOp(sem.id(), &op, 1));
-    EXPECT_EQ(ENOSYS, errno) << "SEM_UNDO unsupported";
+    EXPECT_EQ(-1, SemTimedOp(sem.id(), &op, 0, invalid_timeout));
+    EXPECT_EQ(EFAULT, errno)
+        << "non-null timeout must be copied before nsops == 0 is rejected";
+}
+
+TEST(SysVSem, SemUndoIpcNamespaceAndErrnos) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    struct sembuf invalid_semnum = {1, 1, SEM_UNDO};
+    errno = 0;
+    EXPECT_EQ(-1, SemOp(sem.id(), &invalid_semnum, 1));
+    EXPECT_EQ(EFBIG, errno);
+    errno = 0;
+    EXPECT_EQ(-1, SemOp(sem.id(), nullptr, 1));
+    EXPECT_EQ(EFAULT, errno);
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_semop, sem.id(), &invalid_semnum, 501));
+    EXPECT_EQ(E2BIG, errno);
+
+    int report_pipe[2];
+    ASSERT_EQ(0, pipe(report_pipe));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard invalid_child(child);
+    if (child == 0) {
+        close(report_pipe[0]);
+        _exit(RunNamespaceSetnsChild(sem.id(), -1, CLONE_NEWIPC | CLONE_SYSVSEM, report_pipe[1]));
+    }
+    FdGuard report_read(report_pipe[0]);
+    FdGuard report_write(report_pipe[1]);
+    report_write.Close();
+    NamespaceUndoReport report = {};
+    ASSERT_TRUE(ReadNamespaceReportAndReap(report_read.get(), &invalid_child, &report));
+    EXPECT_EQ(-1, report.setns_result);
+    EXPECT_EQ(EINVAL, report.setns_errno);
+    EXPECT_EQ(1, report.value_before_exit);
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0))
+        << "failed setns prepare must preserve old debt until child exit";
+}
+
+TEST(SysVSem, SemUndoNamespaceFdDetachesAttachment) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    int nsfd = open("/proc/self/ns/ipc", O_RDONLY | O_CLOEXEC);
+    if (nsfd < 0) {
+        GTEST_SKIP() << "proc namespace-fd IPC setns unavailable (errno=" << errno
+                     << "): requires FilePrivateData::Namespace; see "
+                        "kernel/src/process/namespace/setns.rs:150-155";
+    }
+    FdGuard namespace_fd(nsfd);
+    int report_pipe[2];
+    ASSERT_EQ(0, pipe(report_pipe));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard nsfd_child(child);
+    if (child == 0) {
+        close(report_pipe[0]);
+        _exit(RunNamespaceSetnsChild(sem.id(), namespace_fd.get(), CLONE_NEWIPC, report_pipe[1]));
+    }
+    FdGuard report_read(report_pipe[0]);
+    FdGuard report_write(report_pipe[1]);
+    report_write.Close();
+    NamespaceUndoReport report = {};
+    ASSERT_TRUE(ReadNamespaceReportAndReap(report_read.get(), &nsfd_child, &report));
+    if (report.setns_result == -1 && (report.setns_errno == EPERM || report.setns_errno == EACCES)) {
+        GTEST_SKIP() << "IPC namespace-fd setns needs CAP_SYS_ADMIN in target user namespace";
+    }
+    ASSERT_EQ(0, report.setns_result) << "namespace-fd setns errno=" << report.setns_errno;
+    EXPECT_EQ(0, report.value_before_exit)
+        << "successful namespace-fd detach must replay and discard old attachment";
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0))
+        << "namespace-fd detach must leave no old attachment for child exit";
+}
+
+TEST(SysVSem, SemUndoPidfdDetachesAttachment) {
+    SemSet sem(1, IPC_CREAT | 0600);
+    ASSERT_TRUE(sem.valid());
+    RequireSemUndoAvailable(sem);
+
+    int pidfd = static_cast<int>(syscall(SYS_pidfd_open, getpid(), 0));
+    if (pidfd < 0) {
+        GTEST_SKIP() << "pidfd_open unavailable errno=" << errno;
+    }
+    FdGuard pidfd_guard(pidfd);
+    int report_pipe[2];
+    ASSERT_EQ(0, pipe(report_pipe));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard pidfd_child(child);
+    if (child == 0) {
+        close(report_pipe[0]);
+        _exit(RunNamespaceSetnsChild(sem.id(), pidfd_guard.get(), CLONE_NEWIPC, report_pipe[1]));
+    }
+    FdGuard report_read(report_pipe[0]);
+    FdGuard report_write(report_pipe[1]);
+    report_write.Close();
+    NamespaceUndoReport report = {};
+    ASSERT_TRUE(ReadNamespaceReportAndReap(report_read.get(), &pidfd_child, &report));
+    if (report.setns_result == -1 && (report.setns_errno == EPERM || report.setns_errno == EACCES)) {
+        GTEST_SKIP() << "pidfd IPC setns needs capability/permission in target user namespace";
+    }
+    ASSERT_EQ(0, report.setns_result) << "pidfd setns errno=" << report.setns_errno;
+    EXPECT_EQ(0, report.value_before_exit)
+        << "same-Arc pidfd setns must replay and discard old attachment";
+    EXPECT_EQ(0, SemCtl(sem.id(), 0, GETVAL, 0))
+        << "pidfd detach must leave no old attachment for child exit";
+}
+
+TEST(SysVSem, SemUndoCredentialDenied) {
+    SemSet probe(1, IPC_CREAT | 0600);
+    SemSet private_sem(1, IPC_CREAT | 0000);
+    ASSERT_TRUE(probe.valid());
+    ASSERT_TRUE(private_sem.valid());
+    RequireSemUndoAvailable(probe);
+
+    int permission_pipe[2];
+    ASSERT_EQ(0, pipe(permission_pipe));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    ChildGuard permission_child(child);
+    if (child == 0) {
+        close(permission_pipe[0]);
+        NamespaceUndoReport permission = {-1, 0, -1, 0, 0};
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            permission.precondition_errno = errno;
+        } else {
+            struct sembuf access = {0, 1, SEM_UNDO | IPC_NOWAIT};
+            errno = 0;
+            SemOp(private_sem.id(), &access, 1);
+            permission.inaccessible_sem_errno = errno;
+        }
+        const bool wrote = WriteExact(permission_pipe[1], &permission, sizeof(permission));
+        _exit(wrote ? 0 : 103);
+    }
+    FdGuard permission_read(permission_pipe[0]);
+    FdGuard permission_write(permission_pipe[1]);
+    permission_write.Close();
+    NamespaceUndoReport report = {};
+    ASSERT_TRUE(ReadNamespaceReportAndReap(permission_read.get(), &permission_child, &report));
+    ASSERT_EQ(0, SemCtl(private_sem.id(), 0, IPC_RMID, 0));
+    private_sem.release();
+    if (report.precondition_errno != 0) {
+        GTEST_SKIP() << "credential-drop EACCES precondition unavailable errno=" << report.precondition_errno;
+    }
+    EXPECT_EQ(EACCES, report.inaccessible_sem_errno);
 }
 
 // ============ blocking & wakeup ============
@@ -1044,6 +2040,10 @@ TEST(SysVSem, ConcurrentWorkers) {
 }
 
 int main(int argc, char** argv) {
+    g_program_path = argv[0];
+    if (argc == 2 && strcmp(argv[1], "--sem-undo-exec-helper") == 0) {
+        return 0;
+    }
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
